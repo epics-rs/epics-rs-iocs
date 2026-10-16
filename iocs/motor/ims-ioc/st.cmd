@@ -20,11 +20,6 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 0)
 #asynSetOption("$(IPPORT)", -1, "baud", "9600")
 
-# IMS framing: queries reply terminated by "\n"; the driver owns the output
-# terminator (\r\n, or \r/\n for a Lexium MDrive), so only the input EOS is set
-# here. Do NOT set an output EOS.
-asynOctetSetInputEos("$(IPPORT)", 0, "\n")
-
 # ---- IMS controller ----
 # ImsMDrivePlusCreateController(motorPort, ioPort, [deviceName], [movingPollMs],
 #                              [idlePollMs], [timeoutMs]). One axis; DTYP is the

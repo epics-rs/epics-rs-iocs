@@ -17,12 +17,12 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
-use motor_common::connect::connect_serial;
+use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
 
-use crate::kohzu::{KohzuAxis, KohzuController};
+use crate::kohzu::{INPUT_EOS, KohzuAxis, KohzuController, OUTPUT_EOS};
 
 /// Serial command timeout (C `TIMEOUT` 3 s).
 const SC800_TIMEOUT: Duration = Duration::from_secs(3);
@@ -67,7 +67,13 @@ pub fn sc800_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let asyn_port = req_string(args, 1, "asynPort")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
 
-            let handle = connect_serial(&asyn_port, SC800_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                SC800_TIMEOUT,
+                INPUT_EOS,
+                OUTPUT_EOS,
+                EosRefusal::Ignored,
+            )?;
             let controller =
                 KohzuController::new(handle).map_err(|e| format!("SC800Config: {e}"))?;
             let ident = controller.ident().to_string();

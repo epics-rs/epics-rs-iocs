@@ -28,15 +28,17 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
 use epics_rs::motor::poll_loop::PollCommand;
+use motor_common::connect::{EosConnectError, EosRefusal, connect_with_eos};
 
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
 use crate::conex::ConexAxis;
-use crate::esp300::{Esp300Axis, Esp300Controller};
+use crate::esp300::{self, Esp300Axis, Esp300Controller};
 use crate::hxp::{HXP_GROUP, HxpAxis, HxpController, MoveCoordSys, NUM_HXP_AXES};
 use crate::mm3000::{Mm3000Axis, Mm3000Controller};
 use crate::mm4000::{Mm4000Axis, Mm4000Controller};
@@ -141,7 +143,6 @@ struct HxpRegistration {
 /// device-support factory during iocInit.
 pub struct NewportHolder {
     motors: Mutex<HashMap<String, Option<MotorDeviceSupport>>>,
-    poll_senders: Mutex<Vec<tokio::sync::mpsc::Sender<PollCommand>>>,
     /// Agilis controllers keyed by motor port, bridging the two-step
     /// `AG_UCCreateController` / `AG_UCCreateAxis` iocsh API.
     ag_uc_controllers: Mutex<HashMap<String, AgUcRegistration>>,
@@ -157,28 +158,14 @@ impl NewportHolder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             motors: Mutex::new(HashMap::new()),
-            poll_senders: Mutex::new(Vec::new()),
             ag_uc_controllers: Mutex::new(HashMap::new()),
             xps_controllers: Mutex::new(HashMap::new()),
             hxp_controllers: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Start polling on all registered controllers.
-    /// Call after PINI processing to avoid queue buildup.
-    pub fn start_all_polling(&self) {
-        for tx in self
-            .poll_senders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            let _ = tx.try_send(PollCommand::StartPolling);
-        }
-    }
-
     /// Shared wiring for every `*CreateController` command: build the motor
-    /// record + poll loop for `motor`, spawn the poll loop (starts idle), and
+    /// record + poll loop for `motor`, spawn the poll loop (polling from iocRun), and
     /// store the device support under `dtyp_key` for later `dbLoadRecords`
     /// binding.
     fn install(
@@ -203,10 +190,13 @@ impl NewportHolder {
 
         ctx.bridge().spawn(poll_loop.run());
 
-        self.poll_senders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(poll_cmd_tx);
+        // Released when the IOC runs, as C's poller starts delivering status
+        // after iocInit: owned here so no IOC binary can leave the axis unpolled.
+        init_hook_register(Arc::new(move |state| {
+            if state == InitHookState::AfterIocRunning {
+                let _ = poll_cmd_tx.try_send(PollCommand::StartPolling);
+            }
+        }));
         self.motors
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1495,7 +1485,20 @@ impl NewportHolder {
                 let serial_port = req_string(args, 1, "serialPort")?;
                 let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
 
-                let handle = connect_serial(&serial_port, ESP300_TIMEOUT)?;
+                let handle = connect_with_eos(
+                    &serial_port,
+                    ESP300_TIMEOUT,
+                    esp300::INPUT_EOS,
+                    esp300::OUTPUT_EOS,
+                    EosRefusal::InputFatal,
+                )
+                .map_err(|e| match e {
+                    EosConnectError::InputEos(_, e) => format!(
+                        "drvESP300.c:motor_init: ASYN setInputEos error = {}",
+                        e.status() as i32
+                    ),
+                    e => e.into(),
+                })?;
                 let controller = Esp300Controller::new(handle)
                     .map_err(|e| format!("ESP300CreateController: {e}"))?;
                 let ident = controller.ident().to_string();
@@ -1849,7 +1852,7 @@ fn opt_string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
 }
 
 /// Parse the optional `movingPollMs`/`idlePollMs` trailing args, defaulting and
-/// rejecting non-positive values.
+/// rejecting negative values.
 fn poll_intervals(args: &[ArgValue], moving_i: usize, idle_i: usize) -> Result<(u64, u64), String> {
     let moving = poll_ms(args.get(moving_i), DEFAULT_MOVING_POLL_MS, "movingPollMs")?;
     let idle = poll_ms(args.get(idle_i), DEFAULT_IDLE_POLL_MS, "idlePollMs")?;
@@ -1858,8 +1861,9 @@ fn poll_intervals(args: &[ArgValue], moving_i: usize, idle_i: usize) -> Result<(
 
 fn poll_ms(arg: Option<&ArgValue>, default: u64, name: &str) -> Result<u64, String> {
     match arg {
-        Some(ArgValue::Int(v)) if *v > 0 => Ok(*v as u64),
-        Some(ArgValue::Int(_)) => Err(format!("{name} must be positive")),
+        // 0 is C's "wait for a poll event only" (asynMotorController.cpp:633).
+        Some(ArgValue::Int(v)) if *v >= 0 => Ok(*v as u64),
+        Some(ArgValue::Int(_)) => Err(format!("{name} must not be negative")),
         None | Some(ArgValue::Missing) => Ok(default),
         _ => Err(format!("{name} must be an integer")),
     }

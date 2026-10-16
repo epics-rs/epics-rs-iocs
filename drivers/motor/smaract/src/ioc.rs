@@ -17,13 +17,13 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
-use motor_common::connect::{connect_ip, connect_serial};
+use motor_common::connect::{EosRefusal, connect_serial, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
 
-use crate::mcs::{McsAxis, McsController};
-use crate::mcs2::{Mcs2Axis, Mcs2Controller};
+use crate::mcs::{self, McsAxis, McsController};
+use crate::mcs2::{self, Mcs2Axis, Mcs2Controller};
 use crate::scu::{ScuAxis, ScuController};
 
 /// Command timeout.
@@ -62,7 +62,13 @@ pub fn mcs2_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_ip(&asyn_port, MCS2_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                MCS2_TIMEOUT,
+                mcs2::INPUT_EOS,
+                mcs2::OUTPUT_EOS,
+                EosRefusal::Ignored,
+            )?;
             let controller =
                 Mcs2Controller::new(handle).map_err(|e| format!("MCS2CreateController: {e}"))?;
             let ident = controller.ident().to_string();
@@ -245,7 +251,13 @@ pub fn mcs_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
             let disable_speed = matches!(args.get(5), Some(ArgValue::Double(d)) if *d != 0.0);
 
-            let handle = connect_ip(&asyn_port, MCS_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                MCS_TIMEOUT,
+                mcs::INPUT_EOS,
+                mcs::OUTPUT_EOS,
+                EosRefusal::Ignored,
+            )?;
             let controller = Arc::new(Mutex::new(McsController::new(handle, disable_speed)));
 
             mcs_registry()

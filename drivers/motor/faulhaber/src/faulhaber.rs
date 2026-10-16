@@ -45,9 +45,6 @@ use motor_common::util::{atof, nint};
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 128;
 
-/// Command terminator: CR, matching the startup-script output EOS.
-const TERMINATOR: &[u8] = b"\r";
-
 /// Maximum modules per serial line (C `MCDC2805_NUM_CARDS` axis table width).
 const MAX_MOTORS: usize = 8;
 
@@ -63,6 +60,16 @@ pub struct FaulhaberController {
     handle: SyncIOHandle,
     ident: String,
     num_axes: usize,
+    comm_state: CommState,
+}
+
+/// Controller communication state (C `cntrl->status`, shared by the axes):
+/// one failed `GST` is retried silently, a second in a row is a comm error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommState {
+    Normal,
+    Retry,
+    CommErr,
 }
 
 impl FaulhaberController {
@@ -75,6 +82,7 @@ impl FaulhaberController {
             handle,
             ident: String::new(),
             num_axes: 0,
+            comm_state: CommState::Normal,
         };
         let n = num_motors.min(MAX_MOTORS);
         let mut total = 0;
@@ -117,10 +125,9 @@ impl FaulhaberController {
 
     fn framed(node: usize, cmd: &str) -> Vec<u8> {
         let prefix = node.to_string();
-        let mut out = Vec::with_capacity(prefix.len() + cmd.len() + TERMINATOR.len());
+        let mut out = Vec::with_capacity(prefix.len() + cmd.len());
         out.extend_from_slice(prefix.as_bytes());
         out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
         out
     }
 
@@ -132,8 +139,11 @@ impl FaulhaberController {
 
     /// Send a query to `node` and return its reply, trimmed of framing.
     fn query(&self, node: usize, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(node, cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        // C send_mess/recv_mess write then read with no flush, so one stray
+        // line shifts every later reply; write_read flushes first.
+        let raw = self
+            .handle
+            .write_read(0, &Self::framed(node, cmd), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text
             .trim_matches(|c: char| c.is_control() || c.is_whitespace())
@@ -332,31 +342,29 @@ impl AsynMotor for FaulhaberAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
-        let gst = ctrl.query(self.node, "GST");
+        let mut ctrl = self.lock();
+        // C drvMCDC2805.cc:229-251: an empty or failed GST keeps the previous
+        // status once (RETRY); a second in a row raises COMM_ERR. Nothing else
+        // is sent on that poll.
+        let gst = ctrl.query(self.node, "GST").ok().filter(|r| !r.is_empty());
+        let Some(status_buff) = gst else {
+            let hard = ctrl.comm_state != CommState::Normal;
+            ctrl.comm_state = if hard {
+                CommState::CommErr
+            } else {
+                CommState::Retry
+            };
+            drop(ctrl);
+            if hard {
+                self.last_status.comms_error = true;
+                self.last_status.problem = true;
+            }
+            return Ok(self.last_status.clone());
+        };
+        ctrl.comm_state = CommState::Normal;
         let pos = ctrl.query(self.node, "POS");
         let gast = ctrl.query(self.node, "GAST");
         let gv = ctrl.query(self.node, "GV");
-
-        // C: an empty GST reply is a comms failure (RETRY once, then hard error).
-        let Ok(status_buff) = gst else {
-            drop(ctrl);
-            self.last_status = MotorStatus {
-                comms_error: true,
-                problem: true,
-                ..self.last_status.clone()
-            };
-            return Ok(self.last_status.clone());
-        };
-        if status_buff.is_empty() {
-            drop(ctrl);
-            self.last_status = MotorStatus {
-                comms_error: true,
-                problem: true,
-                ..self.last_status.clone()
-            };
-            return Ok(self.last_status.clone());
-        }
 
         let status_bytes = status_buff.as_bytes();
         let home = status_bytes.get(6) == Some(&b'1');
@@ -417,9 +425,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn framed_prefixes_node_and_terminator() {
-        assert_eq!(FaulhaberController::framed(0, "GST"), b"0GST\r");
-        assert_eq!(FaulhaberController::framed(3, "LA 1000"), b"3LA 1000\r");
+    fn framed_prefixes_node() {
+        assert_eq!(FaulhaberController::framed(0, "GST"), b"0GST");
+        assert_eq!(FaulhaberController::framed(3, "LA 1000"), b"3LA 1000");
     }
 
     #[test]

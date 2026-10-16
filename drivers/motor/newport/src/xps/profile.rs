@@ -168,7 +168,7 @@ impl Profile {
     ///
     /// `max_acceleration` gives each axis's controller S-gamma max acceleration
     /// (same order as `self.axes`), read via `PositionerSGammaParametersGet`.
-    /// Each is reduced by [`XPS_ACCEL_ROUNDOFF_MARGIN`] before use, exactly as C.
+    /// Each is reduced by `XPS_ACCEL_ROUNDOFF_MARGIN` before use, exactly as C.
     ///
     /// The file is: one leading acceleration element (ramp from rest to the
     /// first segment velocity), `num_points - 1` trajectory elements (each a

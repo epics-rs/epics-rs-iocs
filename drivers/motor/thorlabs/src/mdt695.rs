@@ -4,8 +4,7 @@
 //! (the model-1 dev/drv pair). The MDT695/693 drives three piezo channels
 //! (`X`/`Y`/`Z`) and the MDT694 a single channel, all over one serial line.
 //! Each command is prefixed with the axis letter; commands and replies are
-//! CR-terminated (`\r` — the driver owns output framing, the startup script
-//! sets the input EOS).
+//! CR-terminated (`\r`, the port EOS set both ways at connect as C does).
 //!
 //! ## Open-loop voltage control
 //!
@@ -43,8 +42,9 @@ use motor_common::util::atof;
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
 
-/// Command terminator (C `MDT695_OUT_EOS`); the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
+/// Port EOS set at connect (C `MDT695_IN_EOS`/`MDT695_OUT_EOS`, drvMDT695.cc:555-558).
+pub const INPUT_EOS: &[u8] = b"\r";
+pub const OUTPUT_EOS: &[u8] = b"\r";
 
 /// Axis letters by 0-based signal (C `MDT694_axis`).
 const AXIS_LETTERS: [char; 3] = ['X', 'Y', 'Z'];
@@ -61,11 +61,27 @@ fn thorlabs_err(message: impl Into<String>) -> AsynError {
     }
 }
 
+fn trim_line(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .trim_matches(['\r', '\n', '\0'])
+        .to_string()
+}
+
 /// Shared controller endpoint owning the serial handle.
 pub struct Mdt695Controller {
     handle: SyncIOHandle,
     ident: String,
     num_axes: usize,
+    comm_state: CommState,
+}
+
+/// Controller communication state (C `cntrl->status`, shared by the axes):
+/// one failed readback is retried silently, a second in a row is a comm error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommState {
+    Normal,
+    Retry,
+    CommErr,
 }
 
 impl Mdt695Controller {
@@ -78,6 +94,7 @@ impl Mdt695Controller {
             handle,
             ident: String::new(),
             num_axes: 3,
+            comm_state: CommState::Normal,
         };
 
         let mut model = String::new();
@@ -90,8 +107,7 @@ impl Mdt695Controller {
                 break;
             }
             // Reply corrupted (likely echo on): toggle echo and retry.
-            ctrl.write_only("E")?;
-            let _ = ctrl.read_line();
+            let _ = ctrl.query("E");
         }
         if !found {
             return Err(thorlabs_err(
@@ -102,15 +118,16 @@ impl Mdt695Controller {
         ctrl.num_axes = if model.contains("694") { 1 } else { 3 };
 
         // Multi-line identification (Model / Version lines).
-        ctrl.write_only("I")?;
         let mut ident_parts = Vec::new();
-        while let Ok(line) = ctrl.read_line() {
+        let mut next = ctrl.query("I");
+        while let Ok(line) = next {
             if line.is_empty() {
                 break;
             }
             if line.contains("Model") || line.contains("Version") {
                 ident_parts.push(line);
             }
+            next = ctrl.read_line();
         }
         ctrl.ident = if ident_parts.is_empty() {
             model
@@ -131,30 +148,23 @@ impl Mdt695Controller {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command with no reply expected (C `cmnd_response == false`).
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Read one CR-terminated reply line (trimmed).
     fn read_line(&self) -> AsynResult<String> {
         let raw = self.handle.read_octet(0, READ_BUF)?;
-        let text = String::from_utf8_lossy(&raw);
-        Ok(text.trim_matches(['\r', '\n', '\0']).to_string())
+        Ok(trim_line(&raw))
     }
 
-    /// Write a query and return its reply line.
+    /// Write a query and return its reply line. C send_mess flushes the input
+    /// before every write (drvMDT695.cc:393), as `write_read` does.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.write_only(cmd)?;
-        self.read_line()
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        Ok(trim_line(&raw))
     }
 }
 
@@ -163,7 +173,6 @@ pub struct Mdt695Axis {
     controller: Arc<Mutex<Mdt695Controller>>,
     letter: char,
     prev_position: f64,
-    comms_error: bool,
 }
 
 impl Mdt695Axis {
@@ -173,7 +182,6 @@ impl Mdt695Axis {
             controller,
             letter: axis_letter(index),
             prev_position: 0.0,
-            comms_error: false,
         }
     }
 
@@ -252,27 +260,30 @@ impl AsynMotor for Mdt695Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
-        let reply = ctrl.query(&format!("{}R?", self.letter))?;
-        drop(ctrl);
-
-        // C parses the voltage from reply offset 2 (skips the 2-char prefix).
-        let mut comms_error = true;
-        let mut position = self.prev_position;
-        if reply.len() > 2 {
-            let tail = &reply[2..];
-            let trimmed = tail.trim_start();
-            if trimmed
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit() || c == '+' || c == '-' || c == '.')
-            {
-                position = atof(trimmed);
-                comms_error = false;
+        let mut ctrl = self.lock();
+        let reading = ctrl
+            .query(&format!("{}R?", self.letter))
+            .ok()
+            .and_then(|reply| parse_reading(&reply));
+        match reading {
+            Some(_) => ctrl.comm_state = CommState::Normal,
+            None => {
+                // C drvMDT695.cc:254-257: flush, toggle echo with `E`, read its
+                // reply; a retry keeps the previous status.
+                let _ = ctrl.query("E");
+                ctrl.comm_state = if ctrl.comm_state == CommState::Normal {
+                    CommState::Retry
+                } else {
+                    CommState::CommErr
+                };
             }
         }
-        self.comms_error = comms_error;
-        self.prev_position = position;
+        let comms_error = ctrl.comm_state == CommState::CommErr;
+        drop(ctrl);
+        if let Some(volts) = reading {
+            self.prev_position = volts;
+        }
+        let position = self.prev_position;
 
         Ok(MotorStatus {
             position,
@@ -289,6 +300,16 @@ impl AsynMotor for Mdt695Axis {
     }
 }
 
+/// C parses the voltage from reply offset 2 (skips the 2-char prefix).
+fn parse_reading(reply: &str) -> Option<f64> {
+    let trimmed = reply.get(2..)?.trim_start();
+    trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == '+' || c == '-' || c == '.')
+        .then(|| atof(trimmed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +321,12 @@ mod tests {
         assert_eq!(axis_letter(2), 'Z');
         // Out-of-range clamps to the last channel.
         assert_eq!(axis_letter(5), 'Z');
+    }
+
+    #[test]
+    fn reading_parses_after_the_two_char_prefix() {
+        assert_eq!(parse_reading("X 12.5"), Some(12.5));
+        assert_eq!(parse_reading("XR?"), None);
+        assert_eq!(parse_reading("X"), None);
     }
 }

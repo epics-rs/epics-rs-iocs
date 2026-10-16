@@ -19,10 +19,6 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 0)
 #asynSetOption("$(IPPORT)", -1, "baud", "115200")
 
-# Ensemble framing: replies end with "\n"; the driver owns the "\n" output
-# terminator, so only the input EOS is set here. Do NOT set an output EOS.
-asynOctetSetInputEos("$(IPPORT)", 0, "\n")
-
 # ---- Ensemble controller ----
 # EnsembleAsynConfig(card, asynPort, numAxes, [movingPollMs], [idlePollMs],
 #                    [timeoutMs]). Probes axes 0.. and attaches the first numAxes

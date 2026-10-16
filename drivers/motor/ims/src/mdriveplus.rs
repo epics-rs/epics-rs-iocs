@@ -13,10 +13,9 @@
 //!
 //! ## Framing
 //!
-//! The driver owns the output terminator; `st.cmd` sets only the input EOS
-//! (`\n`). The output terminator is `\r\n` by default, but a Lexium MDrive
-//! (`LMD`) uses `\r` without a device name or `\n` with one (C
-//! `readHomeAndLimitConfig` switches `setOutputEos` after reading `PR VR`). The
+//! The port EOS is set at connect as C does ([`INPUT_EOS`]/[`OUTPUT_EOS`]); a
+//! Lexium MDrive (`LMD`) then switches the output EOS to `\r` without a device
+//! name or `\n` with one (C `readHomeAndLimitConfig` after `PR VR`). The
 //! device name, when set, is prepended to every command with no separator.
 //!
 //! ## Units
@@ -27,13 +26,6 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! - **Lexium (`LMM`/`LMD`) `PR IS` switch discovery.** The C reads the whole
-//!   `IS` I/O-setup block in one shot by temporarily forcing a NUL input EOS on
-//!   the raw octet interface. The asyn-rs `SyncIOHandle` has no per-read EOS
-//!   override, so this port discovers home/limit switch inputs only for the
-//!   MForce path (`PR S1`..`PR S4`); on a Lexium the switch inputs stay
-//!   unconfigured (no home/limit switch status is surfaced, matching a drive
-//!   with none of S1-S4 set).
 //! - **`saveToNVM` (`S`) / `clearLockedRotor` (`CF`) / locked-rotor readback
 //!   (`PR LR`).** These are asyn extra-parameter actions driven by separate PVs,
 //!   outside the motor record, so they are not part of the [`AsynMotor`]
@@ -42,8 +34,13 @@
 //!   `motorStatusActualVelocity`, `motorStatusDirection` or `motorStatusPowerOn`,
 //!   so those are left at their defaults here too.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -52,6 +49,38 @@ use motor_common::util::{atof, atoi};
 /// Reply read buffer size (C `MAX_BUFF_LEN`).
 const READ_BUF: usize = 80;
 
+/// Port EOS set at connect (ImsMDrivePlusMotorController.cpp:81-82).
+pub const INPUT_EOS: &[u8] = b"\n";
+pub const OUTPUT_EOS: &[u8] = b"\r\n";
+
+/// `PR IS` read buffer and timeout (C `resp[1024]`, `IMS_TIMEOUT`).
+const IS_READ_BUF: usize = 1024;
+const IS_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Rule under the setup-config banner lines.
+const RULE: &str = "-------------------------------------------";
+
+/// `(input, function)` per line of a `PR IS` block: C turns every non-digit
+/// into a separator and scans `%d %d %d` (input, function, active level) from
+/// each LF-terminated line; text after the last LF is not scanned.
+fn parse_input_setup(block: &[u8]) -> Vec<(i32, i32)> {
+    let mut lines: Vec<&[u8]> = block.split(|&b| b == b'\n').collect();
+    lines.pop();
+    lines
+        .into_iter()
+        .filter_map(|line| {
+            let mut nums = line
+                .split(|b| !b.is_ascii_digit())
+                .filter(|f| !f.is_empty())
+                .map(|f| std::str::from_utf8(f).ok()?.parse::<i32>().ok());
+            match (nums.next(), nums.next(), nums.next()) {
+                (Some(Some(input)), Some(Some(function)), Some(Some(_))) => Some((input, function)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 fn ims_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
@@ -59,12 +88,11 @@ fn ims_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Build the on-wire command: device name (party mode) + command + terminator.
-fn frame(device_name: &str, cmd: &str, terminator: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(device_name.len() + cmd.len() + terminator.len());
+/// Build the on-wire command: device name (party mode) + command.
+fn frame(device_name: &str, cmd: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(device_name.len() + cmd.len());
     out.extend_from_slice(device_name.as_bytes());
     out.extend_from_slice(cmd.as_bytes());
-    out.extend_from_slice(terminator);
     out
 }
 
@@ -75,8 +103,6 @@ pub struct ImsMDrivePlusAxis {
     /// Device name (`DN`) prepended to every command for party mode; empty when
     /// not in party mode.
     device_name: String,
-    /// Output terminator (`\r\n`, or `\r`/`\n` for a Lexium MDrive).
-    terminator: Vec<u8>,
     /// I/O input number configured as the home switch (C `homeSwitchInput`).
     home_switch: Option<i32>,
     /// I/O input number configured as the positive-limit switch.
@@ -91,25 +117,25 @@ pub struct ImsMDrivePlusAxis {
 
 impl ImsMDrivePlusAxis {
     /// Connect an axis on `handle`, addressing it by `device_name` (empty for no
-    /// party mode). Probes the firmware version (to pick the terminator and,
+    /// party mode). `port` is the octet port under `handle`, whose output EOS a
+    /// Lexium MDrive switches. Probes the firmware version (to pick the EOS and,
     /// on MForce, the S1-S4 switch config) and the encoder flag.
-    pub fn new(handle: SyncIOHandle, device_name: String) -> AsynResult<Self> {
+    pub fn new(handle: SyncIOHandle, port: &PortHandle, device_name: String) -> AsynResult<Self> {
         let mut axis = Self {
             handle,
             device_name,
-            terminator: b"\r\n".to_vec(),
             home_switch: None,
             pos_limit_switch: None,
             neg_limit_switch: None,
             has_encoder: false,
             homing: false,
         };
-        axis.setup()?;
+        axis.setup(port)?;
         Ok(axis)
     }
 
     fn framed(&self, cmd: &str) -> Vec<u8> {
-        frame(&self.device_name, cmd, &self.terminator)
+        frame(&self.device_name, cmd)
     }
 
     /// Write a set command; the controller sends no reply (C `writeController`).
@@ -118,15 +144,15 @@ impl ImsMDrivePlusAxis {
         Ok(())
     }
 
-    /// Write a query and read one reply line (C `writeReadController`).
+    /// Write a query and read one reply line (C `writeReadController`:
+    /// `pasynOctetSyncIO->writeRead`, which flushes a stray line first).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &self.framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &self.framed(cmd), READ_BUF)?;
         let s = String::from_utf8_lossy(&raw);
         Ok(s.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
 
-    fn setup(&mut self) -> AsynResult<()> {
+    fn setup(&mut self, port: &PortHandle) -> AsynResult<()> {
         // Firmware version: retry a few times, require a plausible reply (C
         // requires strlen >= 2). MForce 1 answers `PR VR` with an error, so a
         // short/failed reply is not necessarily fatal — but a total silence is.
@@ -145,27 +171,59 @@ impl ImsMDrivePlusAxis {
             ));
         }
 
+        // Console lines are C readHomeAndLimitConfig's printfs.
+        println!("Controller version {version}");
+        println!("Setup config:");
         let vlow = version.to_lowercase();
-        if vlow.contains("lmd") {
-            // Lexium MDrive: terminator depends on party mode.
-            self.terminator = if self.device_name.is_empty() {
-                b"\r".to_vec()
-            } else {
-                b"\n".to_vec()
-            };
-        }
-
         if vlow.contains("lmm") || vlow.contains("lmd") {
-            // Lexium switch config comes from `PR IS`, which needs a block read
-            // this port cannot do (see module docs) — leave switches unconfigured.
+            if vlow.contains("lmm") {
+                println!("Lexium Motor Module detected");
+                println!("{RULE}");
+            } else {
+                // Lexium MDrive: output EOS depends on party mode.
+                println!("Lexium MDrive detected");
+                println!("{RULE}");
+                let eos: &[u8] = if self.device_name.is_empty() {
+                    println!("Have no device name, line ending CR.");
+                    b"\r"
+                } else {
+                    println!("Have device name going party modus, line ending LF.");
+                    b"\n"
+                };
+                port.set_output_eos_blocking(AsynUser::new(0).with_addr(0), eos)?;
+            }
+            let block = self.read_input_setup(port).unwrap_or_default();
+            let text = block.split(|&b| b == 0).next().unwrap_or_default();
+            println!("{}", String::from_utf8_lossy(text));
+            for (input_no, function) in parse_input_setup(&block) {
+                self.set_switch(function, input_no);
+            }
         } else {
             // MForce: read the S1-S4 I/O setup and map any home/limit inputs.
+            println!("MForce 1 driver detected");
+            println!("{RULE}");
+            println!("Checking setup for home, pos and neg limit switches:");
             for input_no in 1..=4 {
-                if let Ok(resp) = self.write_read(&format!("PR S{input_no}")) {
-                    self.set_switch(atoi(&resp), input_no);
-                }
+                let resp = self
+                    .write_read(&format!("PR S{input_no}"))
+                    .unwrap_or_default();
+                println!("{resp}");
+                self.set_switch(atoi(&resp), input_no);
             }
         }
+        println!(
+            "    HOME limit switch input line: {}",
+            self.home_switch.unwrap_or(-1)
+        );
+        println!(
+            "POSITIVE limit switch input line: {}",
+            self.pos_limit_switch.unwrap_or(-1)
+        );
+        println!(
+            "NEGATIVE limit switch input line: {}",
+            self.neg_limit_switch.unwrap_or(-1)
+        );
+        println!("{RULE}");
 
         // Encoder present? (`EE` echo-encoder flag.)
         if let Ok(resp) = self.write_read("PR EE") {
@@ -174,15 +232,59 @@ impl ImsMDrivePlusAxis {
         Ok(())
     }
 
+    /// Lexium `PR IS`: the whole I/O-setup block, read with a NUL input EOS
+    /// under the port lock so the read runs to the timeout and gathers every
+    /// line (ImsMDrivePlusMotorController.cpp:221-237). The input EOS is put
+    /// back to `\n` as C does, on every path.
+    fn read_input_setup(&self, port: &PortHandle) -> AsynResult<Vec<u8>> {
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1 << 48);
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let user = || {
+            let mut u = AsynUser::new(0).with_addr(0).with_timeout(IS_READ_TIMEOUT);
+            u.block_token = Some(token);
+            u
+        };
+        port.submit_blocking(RequestOp::BlockProcess { all_devices: true }, user())?;
+        let read = (|| {
+            port.set_input_eos_blocking(user(), b"\0")?;
+            port.submit_blocking(
+                RequestOp::OctetWrite {
+                    data: self.framed("PR IS"),
+                },
+                user(),
+            )?;
+            match port.submit_blocking(
+                RequestOp::OctetRead {
+                    buf_size: IS_READ_BUF,
+                },
+                user(),
+            ) {
+                Ok(r) => Ok(r.data.unwrap_or_default()),
+                Err(e) => e.partial_read().map(|p| p.data.clone()).ok_or(e),
+            }
+        })();
+        let restored = port.set_input_eos_blocking(user(), INPUT_EOS);
+        let unblocked =
+            port.submit_blocking(RequestOp::UnblockProcess { all_devices: true }, user());
+        let block = read?;
+        restored?;
+        unblocked?;
+        Ok(block)
+    }
+
     /// Map an I/O setup type code to the switch input it configures (C
     /// `set_switch_vars`: 1 = home, 2 = positive limit, 3 = negative limit).
     fn set_switch(&mut self, type_code: i32, input_no: i32) {
-        match type_code {
-            1 => self.home_switch = Some(input_no),
-            2 => self.pos_limit_switch = Some(input_no),
-            3 => self.neg_limit_switch = Some(input_no),
-            _ => {}
-        }
+        let (slot, name) = match type_code {
+            1 => (&mut self.home_switch, "HOME"),
+            2 => (&mut self.pos_limit_switch, "POSITIVE"),
+            3 => (&mut self.neg_limit_switch, "NEGATIVE"),
+            _ => return,
+        };
+        *slot = Some(input_no);
+        println!(
+            "Setup type {type_code} found: {name} limit switch input line is set to {input_no}"
+        );
     }
 
     /// Set base velocity (`VI`, only if > 0), max velocity (`VM`), acceleration
@@ -352,14 +454,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frame_prepends_device_name_and_terminator() {
-        // Party mode: device name prepended with no separator, `\r\n` terminator.
-        assert_eq!(frame("M06", "MA 100", b"\r\n"), b"M06MA 100\r\n");
+    fn frame_prepends_device_name() {
+        // Party mode: device name prepended with no separator.
+        assert_eq!(frame("M06", "MA 100"), b"M06MA 100");
+        assert_eq!(frame("", "PR P"), b"PR P");
     }
 
     #[test]
-    fn frame_no_device_name_lexium_terminator() {
-        // No party mode, Lexium MDrive `\r` terminator.
-        assert_eq!(frame("", "PR P", b"\r"), b"PR P\r");
+    fn input_setup_scans_each_lf_terminated_line() {
+        // Non-digits are separators; the unterminated tail is not scanned.
+        let block = b"IS = 1, 1, 0\r\nIS = 2, 2, 1\r\nIS = 3, 0, 0\r\nIS = 4, 3";
+        assert_eq!(parse_input_setup(block), vec![(1, 1), (2, 2), (3, 0)]);
+        assert_eq!(parse_input_setup(b"junk\n"), vec![]);
     }
 }

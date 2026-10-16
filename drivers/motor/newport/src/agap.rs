@@ -38,10 +38,6 @@ use crate::util::{leading_hex, parse_value_at};
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
 
-/// Command line terminator (CR/LF); this driver owns framing (see
-/// [`crate::conex`] for rationale).
-const TERMINATOR: &[u8] = b"\r\n";
-
 // C fixes `stepSize_ = 0.0001` to map its raw-step record boundary onto the
 // AGAP's mm/deg wire units. The asyn-rs motor boundary is dial-frame EGU in
 // both directions, which already matches the wire units, so this port applies
@@ -118,21 +114,14 @@ impl AgapController {
         Ok(ctrl)
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let reply = self.handle.read_octet(0, READ_BUF)?;
+        // C writeReadController: pasynOctetSyncIO->writeRead.
+        let reply = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&reply).into_owned())
     }
 

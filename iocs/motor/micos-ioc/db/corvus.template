@@ -1,10 +1,10 @@
 # Micos SMC corvus: one motor record per axis. Load once per axis with N =
 # 0-based axis index (DTYP CORVUS_$(CARD)_$(N)); the command prefix uses N + 1.
 #
-# The driver reports positions in controller-native engineering units (the
-# axisRes = pitch/(4*polePairs) scale cancels at the EGU boundary), so MRES = 1
-# and EGU = the controller's unit. If you want the record scaled into a
-# different unit, set MRES here instead of the (unported) ChangeResolution cmd.
+# The driver reports positions in controller-native engineering units. MRES is
+# the record's step (RRBV is an integer count and RDBD >= MRES), so set it to
+# the axis resolution, C's axisRes = pitch/(4*polePairs); the default is the C
+# example's (motor.substitutions.SMCcorvus).
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "CORVUS_$(CARD)_$(N)")
@@ -13,7 +13,7 @@ record(motor, "$(P)$(M)") {
     field(ACCL, "$(ACCL=0.2)")
     field(DHLM, "$(HLM=100.0)")
     field(DLLM, "$(LLM=-100.0)")
-    field(MRES, "$(MRES=1.0)")
+    field(MRES, "$(MRES=0.005)")
     field(EGU,  "$(EGU=mm)")
     field(PREC, "$(PREC=4)")
 }

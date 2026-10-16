@@ -15,11 +15,13 @@
 //!
 //! ## Units
 //!
-//! The C driver's `axisRes = clPeriod` only bridges the record's raw-step
-//! boundary to the controller's engineering units and cancels at the EGU
-//! boundary, so it is dropped: the driver boundary is controller-native units
-//! with `MRES` = 1. `SMCTaurusChangeResolution` is not ported — set the record
-//! `MRES` instead.
+//! The C driver's `axisRes = clPeriod` (read with `getclperiod`) only bridges
+//! the record's raw-step boundary to the controller's engineering units and
+//! cancels at the EGU boundary, so it is dropped: the driver boundary is
+//! controller-native units and `MRES` only sets the record step. This equals C
+//! configured with `MRES = clPeriod`; a C `MRES` that rescales EGU away from
+//! the controller unit has no equivalent. `SMCTaurusChangeResolution` is not
+//! ported.
 //!
 //! ## Deviations (documented)
 //!
@@ -93,8 +95,8 @@ impl TaurusController {
 
     /// Write a query and read one reply line.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.write_only(cmd)?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        // C writeReadController: pasynOctetSyncIO->writeRead.
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())
@@ -117,6 +119,10 @@ impl TaurusAxis {
         let addr = axis_no + 1;
         let reply = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            // C reads axisRes = clPeriod here (SMCTaurusAxis.cpp:15-18); at
+            // this EGU boundary it cancels against MRES, so only the exchange
+            // is kept.
+            ctrl.query(&format!("{addr} getclperiod"))?;
             ctrl.query(&format!("{addr} getnlimit"))?
         };
         let bounds: Vec<f64> = reply
@@ -315,7 +321,6 @@ impl AsynMotor for TaurusAxis {
             velocity: 0.0,
             done: !moving,
             moving,
-            direction: true,
             has_encoder: true,
             gain_support: true,
             high_limit,

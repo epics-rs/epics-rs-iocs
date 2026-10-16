@@ -19,11 +19,6 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 0)
 #asynSetOption("$(IPPORT)", -1, "baud", "115200")
 
-# SPiiPlus framing: ACSPL+ replies are terminated by CR ("\r"). The driver owns
-# the output terminator ("\r"), so only the input EOS is set here. Do NOT set an
-# output EOS (it would double-terminate).
-asynOctetSetInputEos("$(IPPORT)", 0, "\r")
-
 # ---- SPiiPlus controller ----
 # AcsMotionConfig(card, asynPort, numAxes, [virtualAxisList], [homingMethod],
 #                 [movingPollMs], [idlePollMs]). homingMethod default 1

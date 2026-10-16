@@ -20,8 +20,9 @@
 //!
 //! As in the Ensemble port, the C `stepSize = 1 / CountsPerUnit` scaling cancels
 //! at the asyn-rs [`AsynMotor`] (dial-frame EGU) boundary and is dropped: the
-//! driver works in the controller's user units with `MRES` = 1. Command values
-//! are formatted at a fixed [`PRECISION`] (the C derived a per-axis digit count
+//! driver works in the controller's user units, and the record's `MRES` must be
+//! `stepSize` (raw counts are integers). Command values
+//! are formatted at a fixed `PRECISION` (the C derived a per-axis digit count
 //! from `stepSize`, which this port does not carry).
 //!
 //! ## Fault handling (owner model)
@@ -67,8 +68,14 @@ use motor_common::util::{atof, atoi, atol};
 /// Reply read buffer size (C `BUFFER_SIZE`).
 const READ_BUF: usize = 256;
 
-/// Command terminator appended by the driver (C `ASCII_EOS_STR`).
-const TERMINATOR: &[u8] = b"\n";
+fn trim_line(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    s.trim_end_matches(['\r', '\n', '\0']).to_string()
+}
+
+/// Port EOS set at connect (C `ASCII_EOS_STR`, drvA3200Asyn.cc:890-891).
+pub const INPUT_EOS: &[u8] = b"\n";
+pub const OUTPUT_EOS: &[u8] = b"\n";
 
 /// Decimal places used when formatting outgoing numeric values.
 const PRECISION: usize = 6;
@@ -133,23 +140,19 @@ impl A3200Controller {
         }
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     fn read_line(&self) -> AsynResult<String> {
-        let raw = self.handle.read_octet(0, READ_BUF)?;
-        let s = String::from_utf8_lossy(&raw);
-        Ok(s.trim_end_matches(['\r', '\n', '\0']).to_string())
+        Ok(trim_line(&self.handle.read_octet(0, READ_BUF)?))
     }
 
     /// Write a command and read one reply line.
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        self.read_line()
+        // C sendAndReceive: pasynOctetSyncIO->writeRead; plain reads follow
+        // only for the value line after a bare ACK.
+        Ok(trim_line(&self.handle.write_read(
+            0,
+            cmd.as_bytes(),
+            READ_BUF,
+        )?))
     }
 
     /// Send a command that returns only an ACK. Errors on fault/empty.
@@ -560,11 +563,6 @@ impl AsynMotor for A3200Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn framed_appends_terminator() {
-        assert_eq!(A3200Controller::framed("ENABLE X"), b"ENABLE X\n");
-    }
 
     #[test]
     fn fmt_uses_fixed_precision() {

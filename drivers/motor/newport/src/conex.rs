@@ -45,12 +45,6 @@ use crate::util::{leading_hex, parse_int_at, parse_value_at};
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
 
-/// Command line terminator (CR/LF). As with the SMC100 driver, this driver
-/// owns framing and appends the terminator itself rather than relying on port
-/// EOS (asyn-rs exposes no `asynOctetSetInputEos` iocsh command on the
-/// published release). See [`crate::smc100`] for the rationale.
-const TERMINATOR: &[u8] = b"\r\n";
-
 // C `CONEX_TIMEOUT` (2 s) is applied where the transport is opened —
 // `SyncIOHandle::from_handle` in `crate::ioc` — not per write here.
 
@@ -225,7 +219,7 @@ fn parse_closed_loop(resp: &str) -> Option<bool> {
     Some((0x1e..=0x34).contains(&status))
 }
 
-// --- Command formatters (bare text, C `outString_`; the driver frames them).
+// --- Command formatters (bare text, C `outString_`).
 
 fn cmd_set_acceleration(id: i32, accel_egu: f64) -> String {
     format!("{id}AC{accel_egu:.6}")
@@ -279,19 +273,16 @@ fn parse_error(what: &str) -> AsynError {
     conex_err(format!("CONEX: could not parse {what} response"))
 }
 
-// --- Raw framed serial I/O (usable before `ConexAxis` exists, e.g. in `new`).
+// --- Raw serial I/O (usable before `ConexAxis` exists, e.g. in `new`).
 
 fn write_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
-    let mut framed = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-    framed.extend_from_slice(cmd.as_bytes());
-    framed.extend_from_slice(TERMINATOR);
-    handle.write_octet(0, &framed)?;
+    handle.write_octet(0, cmd.as_bytes())?;
     Ok(())
 }
 
 fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
-    write_raw(handle, cmd)?;
-    let reply = handle.read_octet(0, READ_BUF)?;
+    // C writeReadController: pasynOctetSyncIO->writeRead.
+    let reply = handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
     Ok(String::from_utf8_lossy(&reply).into_owned())
 }
 

@@ -2,9 +2,8 @@
 //!
 //! Ported from `motorAcsMotion/acsMotionApp/src/SPiiPlusDriver.cpp` +
 //! `SPiiPlusCommDriver.cpp` (the model-3 `asynMotorController`/`asynMotorAxis`
-//! driver). Commands are ACSPL+ text terminated by CR (`\r`); the driver owns
-//! output framing and the startup script sets only the input EOS (`\r`), as in
-//! the C module's `ACS_Motion.iocsh` (`asynOctetSetInputEos ... "\r"`). A reply
+//! driver). Commands are ACSPL+ text terminated by CR (`\r`); the port EOS is
+//! `\r` both ways, set at connect (see [`INPUT_EOS`]). A reply
 //! whose first character is `?` is a controller error (`?<errno>`), matching the
 //! C `writeReadAck`/`writeReadDouble` check `inString[0] == '?'`. Axes are
 //! addressed by 0-based index on the wire.
@@ -28,8 +27,8 @@
 //! controller's native units, and divides back in `poll` (`APOS/resolution_`).
 //! At the asyn-rs motor boundary (EGU frame) that scale cancels, so this port
 //! drops it and works in the controller's native user units: positions pass
-//! through unscaled, the record's `MRES` is 1, and its `EGU` is the controller
-//! unit (typically mm). Consequently the encoder readback is `?FPOS` directly
+//! through unscaled, its `EGU` is the controller unit (typically mm), and its
+//! `MRES` must be the axis resolution (raw counts are integers). Consequently the encoder readback is `?FPOS` directly
 //! (already in user units), not `FPOS/EFAC` as in the raw-step C frame.
 //!
 //! ## Homing (deviation, documented)
@@ -64,8 +63,10 @@ use motor_common::util::{atof, atoi};
 /// Response buffer size (C `MAX_CONTROLLER_STRING_SIZE` is 256).
 const READ_BUF: usize = 256;
 
-/// Command terminator (C port EOS `\r`); the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
+/// Port EOS set at connect: C sets it in ACS_Motion.iocsh:28-29 and
+/// SPiiPlusCommDriver.cpp:425-426 restores it after every binary poll.
+pub const INPUT_EOS: &[u8] = b"\r";
+pub const OUTPUT_EOS: &[u8] = b"\r";
 
 /// Motor-status (`MST`) bit masks (C `SPiiPlusDriver::poll`).
 const MST_ENABLED: i32 = 1 << 0;
@@ -193,21 +194,14 @@ impl SpiiPlusController {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command and return its reply (trimmed of CR/LF/NUL/`:` prompt and
     /// spaces). A reply whose first character is `?` is a controller error
     /// (`?<errno>`), returned as an [`AsynError`] (C `writeReadAck`). A
     /// successful set/motion command replies with only the prompt (empty after
     /// trimming); a query replies with the value.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        // C SPiiPlusComm::writeReadController: pasynOctetSyncIO->writeRead.
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_matches(['\r', '\n', '\0', ':', ' ']).to_string();
         if text.starts_with('?') {

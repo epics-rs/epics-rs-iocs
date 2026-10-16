@@ -16,7 +16,7 @@
 //! axis cannot change the channel in between.
 //!
 //! The Agilis needs a short delay between serial writes (C `WRITE_DELAY`); this
-//! driver sleeps [`WRITE_DELAY`] after every exchange, matching the C driver.
+//! driver sleeps `WRITE_DELAY` after every exchange, matching the C driver.
 //!
 //! ## Open-loop stepper positioning
 //!
@@ -29,9 +29,9 @@
 //!
 //! Two C bugs are ported faithfully and flagged at their sites:
 //! - `AG_UC.cpp:242`: the reverse-amplitude default clobbers the *forward*
-//!   amplitude (see [`setup_amplitudes`]).
+//!   amplitude (see `setup_amplitudes`).
 //! - `AG_UC.cpp:383`: axis-2 limit test is `(lim == 3 || lim == 3)` — a
-//!   duplicated condition (see [`ph_limit`]).
+//!   duplicated condition (see `ph_limit`).
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -46,10 +46,6 @@ use crate::util::{nint, parse_int_at};
 
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
-
-/// Command line terminator (CR/LF); this driver owns framing (see
-/// [`crate::conex`] for rationale).
-const TERMINATOR: &[u8] = b"\r\n";
 
 /// C `WRITE_DELAY`: the Agilis needs a short delay between serial writes.
 pub(crate) const WRITE_DELAY: Duration = Duration::from_millis(10);
@@ -161,24 +157,17 @@ fn ph_limit(axis_id: i32, lim: i32) -> bool {
     }
 }
 
-// --- Raw framed serial I/O, each followed by WRITE_DELAY (C spacing).
-
-fn framed(cmd: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-    out.extend_from_slice(cmd.as_bytes());
-    out.extend_from_slice(TERMINATOR);
-    out
-}
+// --- Raw serial I/O, each followed by WRITE_DELAY (C spacing).
 
 fn write_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
-    handle.write_octet(0, &framed(cmd))?;
+    handle.write_octet(0, cmd.as_bytes())?;
     thread::sleep(WRITE_DELAY);
     Ok(())
 }
 
 fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
-    handle.write_octet(0, &framed(cmd))?;
-    let reply = handle.read_octet(0, READ_BUF)?;
+    // C writeReadController: pasynOctetSyncIO->writeRead.
+    let reply = handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
     thread::sleep(WRITE_DELAY);
     Ok(String::from_utf8_lossy(&reply).into_owned())
 }

@@ -8,7 +8,7 @@
 //! `dbLoadRecords` binds. This crate factors out everything that is not
 //! protocol-specific:
 //!
-//! - [`MotorHolder`] — stores the device supports + poll-loop senders, wires
+//! - [`MotorHolder`] — stores the device supports, wires
 //!   each motor through motor-rs's [`MotorBuilder`], and hands the device
 //!   support back to the record layer by `DTYP` name ([`take`
 //!   semantics][MotorHolder::device_support_factory]).
@@ -31,13 +31,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::iocsh::registry::CommandContext;
 use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
 use epics_rs::motor::poll_loop::PollCommand;
 
 /// Holds every motor device support created by a vendor's `*CreateController`
-/// commands and the poll-loop command senders, keyed for the record layer to
+/// commands, keyed for the record layer to
 /// claim by `DTYP` name.
 ///
 /// One holder is shared (via `Arc`) across all of a controller's axes and
@@ -48,7 +49,6 @@ use epics_rs::motor::poll_loop::PollCommand;
 #[derive(Default)]
 pub struct MotorHolder {
     motors: Mutex<HashMap<String, Option<MotorDeviceSupport>>>,
-    poll_senders: Mutex<Vec<tokio::sync::mpsc::Sender<PollCommand>>>,
 }
 
 impl MotorHolder {
@@ -58,7 +58,7 @@ impl MotorHolder {
     }
 
     /// Wire one motor into a record + poll loop: build the device support and
-    /// poll loop for `motor`, spawn the poll loop (starts idle), and store the
+    /// poll loop for `motor`, spawn the poll loop (polling from iocRun), and store the
     /// device support under `dtyp_key` for later `dbLoadRecords` binding.
     pub fn install(
         &self,
@@ -82,27 +82,17 @@ impl MotorHolder {
 
         ctx.bridge().spawn(poll_loop.run());
 
-        self.poll_senders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(poll_cmd_tx);
+        // Released when the IOC runs, as C's poller starts delivering status
+        // after iocInit: owned here so no IOC binary can leave the axis unpolled.
+        init_hook_register(Arc::new(move |state| {
+            if state == InitHookState::AfterIocRunning {
+                let _ = poll_cmd_tx.try_send(PollCommand::StartPolling);
+            }
+        }));
         self.motors
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(dtyp_key, Some(device_support));
-    }
-
-    /// Start polling on every registered controller. Call after PINI
-    /// processing to avoid queue buildup.
-    pub fn start_all_polling(&self) {
-        for tx in self
-            .poll_senders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            let _ = tx.try_send(PollCommand::StartPolling);
-        }
     }
 
     /// Dynamic device-support factory: hand the record layer the device

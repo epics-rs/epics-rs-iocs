@@ -3,7 +3,7 @@
 //! Ported from `motorKohzu/kohzuApp/src/drvSC800.cc` + `devSC800.cc`. The SC-800
 //! (and its 4-axis SC-400 / 2-axis SC-200 siblings) is a stepper controller.
 //! Every command is prefixed with STX (0x02) and terminated by CR+LF (the
-//! driver owns this framing); the startup script configures only the input EOS.
+//! port EOS, set both ways at connect as C does).
 //! The controller answers **every** command with a tab-separated `C\t…` reply,
 //! so each command is written and its reply consumed to keep the stream
 //! synchronized. Queries used here:
@@ -52,8 +52,10 @@ const READ_BUF: usize = 160;
 /// Start-of-text prefix on every command (C `STX`).
 const STX: u8 = 0x02;
 
-/// Command terminator (C `SC800_OUT_EOS`); the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r\n";
+/// Port EOS set at connect (C `SC800_IN_EOS`/`SC800_OUT_EOS`,
+/// drvSC800.cc:551-554).
+pub const INPUT_EOS: &[u8] = b"\r\n";
+pub const OUTPUT_EOS: &[u8] = b"\r\n";
 
 /// Jog speed clamp (C `devSC800.cc` JOG validity check).
 const JOG_MIN: i32 = 1;
@@ -114,10 +116,9 @@ impl KohzuController {
     }
 
     fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + cmd.len() + TERMINATOR.len());
+        let mut out = Vec::with_capacity(1 + cmd.len());
         out.push(STX);
         out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
         out
     }
 
@@ -125,8 +126,8 @@ impl KohzuController {
     /// command produces a `C\t…` reply, so this is used for both queries and
     /// set commands (whose reply is discarded) to keep the stream synchronized.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        // C send_mess flushes the input before every write.
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text
             .trim_matches(|c: char| c == '\r' || c == '\n' || c == '\0' || c == '\u{2}')
@@ -184,7 +185,7 @@ impl KohzuAxis {
             prev_position: 0,
             last_status: MotorStatus {
                 done: true,
-                gain_support: false,
+                gain_support: true,
                 ..MotorStatus::default()
             },
         }
@@ -372,7 +373,8 @@ impl AsynMotor for KohzuAxis {
             powered,
             comms_error: false,
             problem: false,
-            gain_support: false,
+            // C motor_init sets GAIN_SUPPORT, so CNEN drives COF.
+            gain_support: true,
             ..MotorStatus::default()
         };
         Ok(self.last_status.clone())
@@ -384,11 +386,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn framed_wraps_stx_and_crlf() {
+    fn framed_prefixes_stx() {
         let f = KohzuController::framed("APS1/2/0/0/500/0/0/1");
         assert_eq!(f[0], STX);
-        assert_eq!(&f[f.len() - 2..], b"\r\n");
-        assert_eq!(&f[1..f.len() - 2], b"APS1/2/0/0/500/0/0/1");
+        assert_eq!(&f[1..], b"APS1/2/0/0/500/0/0/1");
     }
 
     #[test]

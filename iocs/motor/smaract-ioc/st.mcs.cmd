@@ -17,11 +17,6 @@ epicsEnvSet("HOST",    "192.168.1.210:5000")
 # ---- asyn IP octet port (RAW terminal server) ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
-# MCS framing: the driver appends the LF command terminator, so only the input
-# EOS is configured here. Do not set an output EOS — the port would append it a
-# second time.
-asynOctetSetInputEos("$(IPPORT)", 0, "\n")
-
 # ---- MCS controller + axes ----
 # smarActMCSCreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs],
 #                           [disableSpeed]). disableSpeed non-zero suppresses SCLS.

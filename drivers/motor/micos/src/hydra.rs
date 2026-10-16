@@ -3,8 +3,8 @@
 //! Ported from `motorMicos/micosApp/src/SMChydraAxis.cpp` +
 //! `SMChydraDriver.cpp` (a model-3 `asynMotorController`/`asynMotorAxis` pair).
 //! Connects over a `drvAsynIPPort` or `drvAsynSerialPort`; commands are ASCII,
-//! CR/LF-terminated (the startup script sets the input EOS, the driver owns
-//! output framing).
+//! CR/LF-terminated (the startup script sets both EOS, as the C example does;
+//! the driver sends bare commands).
 //!
 //! ## Per-axis addressing
 //!
@@ -17,7 +17,8 @@
 //! The C driver's `axisRes` (`pitch/(4·polePairs)` for a stepper motor form, or
 //! `clPeriod` otherwise) only bridges the record's raw-step boundary to the
 //! controller's engineering units and cancels at the EGU boundary, so it is
-//! dropped: the driver boundary is controller-native units with `MRES` = 1. The
+//! dropped: the driver boundary is controller-native units, and the record's
+//! `MRES` must carry `axisRes` as its step (raw counts are integers). The
 //! `SMChydraChangeResolution` iocsh command (a runtime `axisRes` override) is
 //! not ported — set the record `MRES` instead. The motor form is still read
 //! (`getmotor`) because it selects the `set_closed_loop` behaviour.
@@ -50,9 +51,6 @@ use motor_common::util::{atof, atoi};
 
 /// Response buffer size.
 const READ_BUF: usize = 128;
-
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r\n";
 
 /// `nst` status bits.
 const STATUS_MOVING: i32 = 0x1; // axis in motion
@@ -87,23 +85,16 @@ impl HydraController {
         Self { handle }
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command with no reply expected.
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Write a query and read one reply line.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.write_only(cmd)?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        // C writeReadController: pasynOctetSyncIO->writeRead.
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())
@@ -304,7 +295,6 @@ impl AsynMotor for HydraAxis {
             velocity: 0.0,
             done: !moving,
             moving,
-            direction: true,
             has_encoder: true,
             gain_support: true,
             high_limit,

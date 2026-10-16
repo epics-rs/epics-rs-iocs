@@ -8,7 +8,7 @@
 //! startup: responses are CR-terminated with the axis letter prefixed and no
 //! command acknowledgement suppression, and the C driver reads one reply
 //! after *every* command message (`cmnd_response = true`) — this port does
-//! the same via [`Pm500Controller::command`].
+//! the same via `Pm500Controller::command`.
 //!
 //! The C example st.cmd sets no EOS (GPIB-era, EOI-terminated); for RS-232
 //! this driver owns framing like its siblings (appends `\r`) and expects

@@ -2,8 +2,7 @@
 //!
 //! Ported from `motorAcsTech80/acsTech80App/src/drvSPiiPlus.cc` +
 //! `devSPiiPlus.cc` (the model-1 dev/drv pair). Commands are ACSPL+ text
-//! terminated by CR (`\r`, the driver owns output framing; the startup script
-//! sets only the input EOS). Query commands begin with `?` and return a value;
+//! terminated by CR (`\r`, the port EOS set both ways at connect as C does). Query commands begin with `?` and return a value;
 //! a reply containing `?` signals a controller error. Set/motion commands do
 //! not return a value, but the framework reads an acknowledgment after every
 //! command, so this port reads (and discards) a reply after each command to
@@ -57,8 +56,9 @@ use motor_common::util::{atof, atoi, nint};
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
 
-/// Command terminator (C `ACS_EOS`); the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
+/// Port EOS set at connect (C `ACS_EOS`, drvSPiiPlus.cc:690-691).
+pub const INPUT_EOS: &[u8] = b"\r";
+pub const OUTPUT_EOS: &[u8] = b"\r";
 
 /// Motor-status (`MST`) bit masks (C `MOTOR_STATUS`).
 const MST_ENABLED: i32 = 0x01;
@@ -182,19 +182,13 @@ impl SpiiPlusController {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command and return its reply (trimmed). Every command produces an
     /// acknowledgment or value, so this is used for both queries and set
     /// commands (whose reply is discarded) to keep the stream synchronized.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        // C send_mess/send_recv_mess flush the input before every write;
+        // write_read is that flush, write and read as one exchange.
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
@@ -267,6 +261,7 @@ impl SpiiPlusAxis {
             last_status: MotorStatus {
                 done: true,
                 has_encoder: true,
+                gain_support: true,
                 ..MotorStatus::default()
             },
         }
@@ -455,6 +450,8 @@ impl AsynMotor for SpiiPlusAxis {
             direction: d.direction,
             powered: d.powered,
             has_encoder: true,
+            // C motor_init sets GAIN_SUPPORT, so CNEN drives enable/disable.
+            gain_support: true,
             ..MotorStatus::default()
         };
         self.last_status = status.clone();

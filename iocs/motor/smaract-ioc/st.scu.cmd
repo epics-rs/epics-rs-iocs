@@ -22,10 +22,10 @@ asynSetOption("$(SERPORT)", 0, "bits", "8")
 asynSetOption("$(SERPORT)", 0, "parity", "none")
 asynSetOption("$(SERPORT)", 0, "stop", "1")
 
-# SCU framing: the driver appends the LF command terminator, so only the input
-# EOS is configured here. Do not set an output EOS — the port would append it a
-# second time.
+# Port EOS as the C example sets it (smaractscu.iocsh:7-8);
+# the driver sends bare commands.
 asynOctetSetInputEos("$(SERPORT)", 0, "\n")
+asynOctetSetOutputEos("$(SERPORT)", 0, "\n")
 
 # ---- SCU controller + axes ----
 # smarActSCUCreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]).

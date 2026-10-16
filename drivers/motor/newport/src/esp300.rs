@@ -4,8 +4,8 @@
 //! (a model-1 dev/drv pair). Commands are `{axis:02}CC[value]` with a 1-based
 //! zero-padded axis prefix; several record transactions join commands with
 //! `;` into one write (a move is `VB;VA;AC;AG;PA`). Replies end in CR/LF
-//! (C sets input EOS `\n` and strips the `\r`; this driver owns framing like
-//! its siblings and trims both).
+//! (the port EOS is set at connect as C does, input `\n` / output `\r`; the
+//! leftover `\r` is trimmed).
 //!
 //! ## Shared-serial concurrency
 //!
@@ -37,9 +37,15 @@ use crate::util::{atof, atoi, is_unsolicited_limit_error, leading_hex};
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
 
-/// Command line terminator (C output EOS `"\r"`). This driver owns framing
-/// explicitly, like its siblings (see [`crate::smc100`]).
-const TERMINATOR: &[u8] = b"\r";
+/// Replies end in CR/LF (C strips the LF via input EOS, the CR itself).
+fn trim_reply(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    s.trim_end_matches(['\r', '\n']).to_string()
+}
+
+/// Port EOS set at connect (C `input_terminator`/`output_terminator`, drvESP300.cc:649-650, :679-684).
+pub const INPUT_EOS: &[u8] = b"\n";
+pub const OUTPUT_EOS: &[u8] = b"\r";
 
 /// Maximum axes per controller (C `ESP300_MAX_AXIS`).
 pub(crate) const ESP300_MAX_AXES: usize = 6;
@@ -127,30 +133,19 @@ impl Esp300Controller {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
-    /// Write a command (C `send_mess`); the terminator is appended here.
+    /// Write a command (C `send_mess`); the port output EOS terminates it.
     fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Write a command and read the reply (C `send_mess` + `recv_mess`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        self.read_reply()
-    }
-
-    /// Read one reply, working around the ESP300 firmware bug where an
-    /// unsolicited hard-travel-limit error message (`E35`..`E42`) precedes
-    /// the real reply — C `recv_mess` re-reads to flush it.
-    fn read_reply(&self) -> AsynResult<String> {
-        let reply = self.read_once()?;
+        // C writes then reads with no flush, so one stray line shifts every
+        // later reply; write_read flushes first. The ESP300 firmware can
+        // still put an unsolicited hard-limit error (E35..E42) ahead of the
+        // real reply, which C recv_mess re-reads past.
+        let reply = trim_reply(&self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?);
         if is_unsolicited_limit_error(&reply) {
             return self.read_once();
         }
@@ -158,10 +153,7 @@ impl Esp300Controller {
     }
 
     fn read_once(&self) -> AsynResult<String> {
-        let raw = self.handle.read_octet(0, READ_BUF)?;
-        let s = String::from_utf8_lossy(&raw);
-        // Replies end in CR/LF (C strips the LF via input EOS, the CR itself).
-        Ok(s.trim_end_matches(['\r', '\n']).to_string())
+        Ok(trim_reply(&self.handle.read_octet(0, READ_BUF)?))
     }
 }
 
