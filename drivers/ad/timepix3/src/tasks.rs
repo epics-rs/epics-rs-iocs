@@ -5,7 +5,7 @@
 use std::io::Read;
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ADStatus;
@@ -14,6 +14,8 @@ use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::interrupt::InterruptValue;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -85,18 +87,18 @@ impl Ctx {
     }
 
     /// C `doCallbacksInt64Array` from the stream threads (serval_stream.cpp:975,
-    /// histogram_io.cpp:541/605). The array also lands in the parameter, which
-    /// C does not keep; a read then returns the last published array.
-    async fn set_int64_array(&self, reason: usize, addr: i32, data: Vec<i64>) {
-        self.set(
+    /// histogram_io.cpp:541/605): the array goes to the asynInt64Array
+    /// subscribers only, is not stored, and is not gated on interruptAccept
+    /// (asynPortDriver.cpp:1829-1866).
+    fn post_int64_array(&self, reason: usize, addr: i32, data: Vec<i64>) {
+        self.handle.interrupts().notify(InterruptValue {
+            reason,
             addr,
-            vec![ParamSetValue::new(
-                reason,
-                addr,
-                ParamValue::Int64Array(data.into()),
-            )],
-        )
-        .await;
+            value: ParamValue::Int64Array(data.into()),
+            timestamp: SystemTime::now(),
+            iface: Some(InterfaceType::Int64Array),
+            ..Default::default()
+        });
     }
 }
 
@@ -1091,7 +1093,7 @@ async fn publish_accumulation(
     sum_n_param: usize,
     sum_n_addr: i32,
 ) {
-    ctx.set_int64_array(
+    ctx.post_int64_array(
         sum_param,
         sum_addr,
         update
@@ -1099,18 +1101,16 @@ async fn publish_accumulation(
             .iter()
             .map(|&v| i64::try_from(v).unwrap_or(i64::MAX))
             .collect(),
-    )
-    .await;
+    );
     if let Some(sum_n) = &update.sum_n {
-        ctx.set_int64_array(
+        ctx.post_int64_array(
             sum_n_param,
             sum_n_addr,
             sum_n
                 .iter()
                 .map(|&v| i64::try_from(v).unwrap_or(i64::MAX))
                 .collect(),
-        )
-        .await;
+        );
     }
 }
 
@@ -1199,19 +1199,18 @@ mod tests {
 
     #[tokio::test]
     async fn preview_sums_reach_io_intr_subscribers() {
-        use epics_rs::asyn::interrupt::{InterruptFilter, InterruptManager};
+        use epics_rs::asyn::interrupt::InterruptFilter;
         use epics_rs::asyn::runtime::config::RuntimeConfig;
         use epics_rs::asyn::runtime::port::create_port_runtime;
-        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
         let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
         let shared = Arc::new(Shared::new());
         let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
-        let mut driver =
+        // The port's interruptAccept is never opened: C's doCallbacksArray
+        // does not consult it.
+        let driver =
             crate::driver::TimePix3Driver::new("TPXT", http.clone(), shared.clone(), 0, cmd_tx)
                 .unwrap();
-        // No database here, so the port gets an already-open interruptAccept.
-        driver.ad.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
         let (p, ad) = (driver.p, driver.ad.params);
         let (runtime, _) = create_port_runtime(
             &epics_rs::asyn::registry::claim_port("TPXT").unwrap(),
@@ -1236,8 +1235,7 @@ mod tests {
             },
             1024,
         );
-        ctx.set_int64_array(p.prv_hst_histogram_data, 0, vec![3, 1, 4])
-            .await;
+        ctx.post_int64_array(p.prv_hst_histogram_data, 0, vec![3, 1, 4]);
         let v = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("no callback")
@@ -1246,6 +1244,7 @@ mod tests {
             panic!("expected an Int64Array, got {:?}", v.value);
         };
         assert_eq!(&a[..], [3, 1, 4]);
+        assert_eq!(v.iface, Some(InterfaceType::Int64Array));
     }
 
     #[test]
