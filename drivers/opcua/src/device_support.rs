@@ -797,18 +797,9 @@ impl DeviceSupport for OpcuaDevice {
             is_item_record: op == Op::Item,
         };
         let defaults = InfoDefaults::from_info(&self.info);
+        defaults.warn_deprecated(&self.record_name);
         let link = parse_link(&self.link_text, kind, &defaults, &*self.registry)
             .map_err(|e| CaError::LinkError(format!("{}: {e}", self.record_name)))?;
-
-        // `bini=write` is what an output record's own value is for; an input
-        // record has nothing to write. An item record does: its elements' values,
-        // which go out as one structure.
-        if link.bini == Bini::Write && !is_output && op != Op::Item {
-            log::warn!(
-                "{}: bini=write on the input record type '{record_type}'",
-                self.record_name
-            );
-        }
 
         let names = (
             link.session().unwrap_or_default().to_string(),

@@ -296,13 +296,22 @@ impl InfoDefaults {
         }
     }
 
-    fn any(&self) -> bool {
-        self.sampling.is_some()
-            || self.qsize.is_some()
-            || self.discard.is_some()
-            || self.timestamp.is_some()
-            || self.readback.is_some()
-            || self.element.is_some()
+    /// C `linkParser.cpp:104-190`: one deprecation line per info item set.
+    pub fn warn_deprecated(&self, record: &str) {
+        let set = [
+            &self.sampling,
+            &self.qsize,
+            &self.discard,
+            &self.timestamp,
+            &self.readback,
+            &self.element,
+        ];
+        for _ in set.iter().filter(|v| v.is_some()) {
+            eprintln!(
+                "{record} DEPRECATION WARNING: setting parameters through info items is deprecated; \
+                 use link parameters instead."
+            );
+        }
     }
 }
 
@@ -354,12 +363,6 @@ pub fn parse_link(
         monitor: defaults::DEFAULT_OUTPUT_READBACK.load(Ordering::Relaxed) != 0,
     };
 
-    if info.any() {
-        log::warn!(
-            "DEPRECATION WARNING: setting parameters through info items is deprecated; \
-             use link parameters instead."
-        );
-    }
     apply_info_defaults(&mut pinfo, info)?;
 
     let link = link.trim_start();
