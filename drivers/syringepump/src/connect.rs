@@ -29,6 +29,15 @@ pub const EOS: &[u8] = b"\r";
 
 /// Connect a [`SyncIOHandle`] to a pre-configured octet port (serial or IP)
 /// by name and address, after applying [`EOS`] to both directions.
+/// C sets these on a line that may still be down (`lockPort` in
+/// `asynOctetSyncIO.c:306`, `asynSetEos`'s QUEUE_EVEN_IF_NOT_CONNECTED), so a
+/// powered-off device must not fail the configure.
+fn eos_user(addr: i32) -> epics_rs::asyn::user::AsynUser {
+    epics_rs::asyn::user::AsynUser::default()
+        .with_addr(addr)
+        .queue_even_if_not_connected()
+}
+
 pub fn connect_octet(
     port_name: &str,
     addr: i32,
@@ -40,10 +49,10 @@ pub fn connect_octet(
         )
     })?;
     port.handle
-        .set_input_eos_blocking(epics_rs::asyn::user::AsynUser::default(), EOS)
+        .set_input_eos_blocking(eos_user(addr), EOS)
         .map_err(|e| format!("failed to set input EOS on '{port_name}': {e}"))?;
     port.handle
-        .set_output_eos_blocking(epics_rs::asyn::user::AsynUser::default(), EOS)
+        .set_output_eos_blocking(eos_user(addr), EOS)
         .map_err(|e| format!("failed to set output EOS on '{port_name}': {e}"))?;
     Ok(SyncIOHandle::from_handle(
         port.handle.clone(),

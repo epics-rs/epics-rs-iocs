@@ -145,7 +145,8 @@ impl OctetIo {
     /// `pasynOctetSyncIO->setInputEos`. Called once at driver construction;
     /// nothing writes this cell afterwards.
     pub fn set_input_eos(&self, eos: &[u8]) -> AsynResult<()> {
-        self.handle.set_input_eos_blocking(AsynUser::default(), eos)
+        self.handle
+            .set_input_eos_blocking(self.user().queue_even_if_not_connected(), eos)
     }
 
     /// `asynOctetSyncIO->flush`.
