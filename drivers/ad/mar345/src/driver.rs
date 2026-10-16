@@ -174,7 +174,7 @@ impl PortDriver for Mar345Driver {
                 line!(),
                 format_args!(
                     "mar345:writeInt32: error, status={} function={function}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => user.print(
@@ -422,6 +422,39 @@ pub(crate) mod tests {
         let mut user = AsynUser::new(reason).with_addr(1);
         d.write_int32(&mut user, 3).unwrap();
         assert_eq!(d.ad.port_base.get_int32_param(reason, 0).unwrap(), 3);
+    }
+
+    /// mar345.cpp:647-650 prints asynParamWrongType for an int written to
+    /// ADAcquireTime.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MAR345_STATUS";
+        let mut d = driver(port, 0);
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let reason = d.ad.params.acquire_time;
+        let mut user = AsynUser::new(reason);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        assert!(d.write_int32(&mut user, 1).is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(&format!(
+                "mar345:writeInt32: error, status=8 function={reason}, value=1"
+            )),
+            "{text}"
+        );
     }
 
     /// A non-detector mode is ADDriver::setShutter inside the write
