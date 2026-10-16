@@ -660,9 +660,9 @@ fn resolve_tcp_port(ip_port: &str) -> AsynResult<u16> {
 /// `capaNCDT6200Configure` + `setLink` (`capaNCDT6200Sup.c:467-496,682-791`):
 /// build the internal `_RBK` transport port (`noAutoConnect=1,
 /// noProcessEos=1`) and this driver's own outer port, wire the late-bound
-/// self-handle the reader thread needs (see [`DataDriver::self_handle`]), and
-/// register only the outer port -- the `_RBK` port stays unregistered/
-/// invisible, matching C.
+/// self-handle the reader thread needs (see [`DataDriver::self_handle`]).
+/// Both ports are registered, as C's `drvAsynIPPortConfigure` registers the
+/// `_RBK` one.
 pub fn configure(
     port_name: &str,
     ip_address: &str,
@@ -684,8 +684,17 @@ pub fn configure(
     // (`capaNCDT6200Sup.c:476`): noAutoConnect=1.
     rbk_driver.base_mut().init_auto_connect(false);
     // noProcessEos=1: no `push_interpose` call -- no EOS interpose installed.
-    let (rbk_runtime, _rbk_actor_jh) = create_port_runtime(rbk_driver, RuntimeConfig::default())?;
+    let rbk_claim = asyn_record::claim_port(&rbk_port_name)?;
+    let (rbk_runtime, _rbk_actor_jh) =
+        create_port_runtime(&rbk_claim, rbk_driver, RuntimeConfig::default())?;
     let rbk_port_handle = rbk_runtime.port_handle().clone();
+    rbk_claim.publish(rbk_port_handle.clone(), owner)?;
+
+    let Ok(claim) = asyn_record::claim_port(port_name) else {
+        println!("registerPort failed");
+        keep_port_runtime_alive(rbk_runtime);
+        return Ok(());
+    };
 
     let self_handle: Arc<Mutex<Option<PortHandle>>> = Arc::new(Mutex::new(None));
     let driver = DataDriver::new(
@@ -694,10 +703,11 @@ pub fn configure(
         self_handle.clone(),
         owner.clone(),
     )?;
-    let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor_jh) =
+        create_port_runtime(&claim, driver, RuntimeConfig::default())?;
     *self_handle.lock().unwrap() = Some(runtime_handle.port_handle().clone());
 
-    asyn_record::register_port(port_name, runtime_handle.port_handle().clone(), owner)?;
+    claim.publish(runtime_handle.port_handle().clone(), owner)?;
 
     // See the module doc's `PortRuntimeHandle` gap note: both runtimes must
     // outlive this function.
@@ -803,8 +813,9 @@ mod tests {
         let dummy = DummyPort {
             base: PortDriverBase::new("dummy_rbk_for_test", 1, PortFlags::default()),
         };
+        let claim = asyn_record::claim_port("dummy_rbk_for_test").unwrap();
         let (rbk_runtime, _jh) =
-            create_port_runtime(dummy, RuntimeConfig::default()).expect("rbk port runtime");
+            create_port_runtime(&claim, dummy, RuntimeConfig::default()).expect("rbk port runtime");
         let rbk_handle = rbk_runtime.port_handle().clone();
         let driver = DataDriver::new(
             "test_data_port",
