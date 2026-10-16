@@ -17,11 +17,13 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{ControllerParams, ParamWrite};
 
@@ -734,37 +736,21 @@ impl ControllerParams for Lc400ControllerParams {
         Ok(())
     }
 
+    /// C `writeInt32`: the controller's own registers are written here and
+    /// the base never runs for them, so nothing is stored or posted.
     fn write_int32(
-        &mut self,
-        base: &mut PortDriverBase,
-        user: &AsynUser,
-        value: i32,
-    ) -> ParamWrite {
-        self.write_int32_own(base, user, value).into()
-    }
-
-    fn write_float64(
-        &mut self,
-        base: &mut PortDriverBase,
-        user: &AsynUser,
-        value: f64,
-    ) -> ParamWrite {
-        self.write_float64_own(base, user, value).into()
-    }
-}
-
-/// The driver's own write code, which then passes to the base.
-impl Lc400ControllerParams {
-    fn write_int32_own(
         &mut self,
         _base: &mut PortDriverBase,
         user: &AsynUser,
         value: i32,
-    ) -> AsynResult<()> {
-        let address = self.address(user)?;
+    ) -> ParamWrite {
+        let address = match self.address(user) {
+            Ok(address) => address,
+            Err(e) => return ParamWrite::Handled(Err(e)),
+        };
         let mut ctrl = lock(&self.controller);
         let Some(p) = ctrl.params else {
-            return Ok(());
+            return ParamWrite::PassToBase(Ok(()));
         };
         let register = match user.reason {
             r if r == p.servo_state => SERVO_STATE,
@@ -778,37 +764,67 @@ impl Lc400ControllerParams {
                 if let Some(state) = ctrl.axes.get_mut(user.addr as usize) {
                     state.max_pts = value;
                 }
-                return Ok(());
+                return ParamWrite::PassToBase(Ok(()));
             }
-            _ => return Ok(()),
+            _ => return ParamWrite::PassToBase(Ok(())),
         };
-        ctrl.write_single(address + register, value)
+        ParamWrite::Handled(ctrl.write_single(address + register, value))
     }
-    fn write_float64_own(
+
+    /// C `writeFloat64`, its own registers handled as in
+    /// [`Self::write_int32`], each traced as C does. C also traces the
+    /// base's writes with its line, after the base ran; the hook runs
+    /// before the base and cannot.
+    fn write_float64(
         &mut self,
-        _base: &mut PortDriverBase,
+        base: &mut PortDriverBase,
         user: &AsynUser,
         value: f64,
-    ) -> AsynResult<()> {
-        let address = self.address(user)?;
-        let ctrl = lock(&self.controller);
-        let Some(p) = ctrl.params else {
-            return Ok(());
+    ) -> ParamWrite {
+        let status = match self.address(user) {
+            Err(e) => Err(e),
+            Ok(address) => {
+                let ctrl = lock(&self.controller);
+                let Some(p) = ctrl.params else {
+                    return ParamWrite::PassToBase(Ok(()));
+                };
+                match user.reason {
+                    r if r == p.digital_pos => {
+                        ctrl.write_single(address + ST_DIGITAL_SP, value as i32)
+                    }
+                    r if r == p.p_gain => ctrl.write_double(address + P_GAIN, value),
+                    r if r == p.i_gain => ctrl.write_double(address + I_GAIN, value),
+                    r if r == p.d_gain => ctrl.write_double(address + D_GAIN, value),
+                    _ => return ParamWrite::PassToBase(Ok(())),
+                }
+            }
         };
-        let result = match user.reason {
-            r if r == p.digital_pos => ctrl.write_single(address + ST_DIGITAL_SP, value as i32),
-            r if r == p.p_gain => ctrl.write_double(address + P_GAIN, value),
-            r if r == p.i_gain => ctrl.write_double(address + I_GAIN, value),
-            r if r == p.d_gain => ctrl.write_double(address + D_GAIN, value),
-            _ => return Ok(()),
+        let function = user.reason;
+        let print = |mask, args: std::fmt::Arguments<'_>| {
+            PortManager::global().trace_manager().print(
+                Some(&base.port_name),
+                Some(user.addr),
+                function as i32,
+                mask,
+                args,
+            )
         };
-        if result.is_err() {
-            eprintln!(
-                "LC400MotorDriver:writeFloat64: error, function={}, value={value:.6}",
-                user.reason
-            );
+        match &status {
+            Err(e) => print(
+                TraceMask::ERROR,
+                format_args!(
+                    "LC400MotorDriver:writeFloat64: error, status={} function={function}, value={value:.6}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => print(
+                TraceMask::IO_DRIVER,
+                format_args!(
+                    "LC400MotorDriver:writeFloat64: function={function}, value={value:.6}"
+                ),
+            ),
         }
-        result
+        ParamWrite::Handled(status)
     }
 }
 
