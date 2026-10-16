@@ -201,8 +201,6 @@ pub enum RestError {
         code: u16,
     },
     Parse(String),
-    /// The request was never made: the detector is marked disconnected.
-    Disconnected(String),
 }
 
 impl std::fmt::Display for RestError {
@@ -211,11 +209,6 @@ impl std::fmt::Display for RestError {
             Self::Transport(m) => write!(f, "transport: {m}"),
             Self::Status { path, code } => write!(f, "[{path}] server returned error code {code}"),
             Self::Parse(m) => write!(f, "parse: {m}"),
-            Self::Disconnected(path) => write!(
-                f,
-                "[{path}] not sent: the detector is disconnected — write ADAcquire to probe it \
-                 again"
-            ),
         }
     }
 }
@@ -310,21 +303,10 @@ impl RestApi {
         self.connected.load(Ordering::Acquire)
     }
 
-    /// The gate every request passes through.
-    ///
-    /// INVARIANT: while the detector is marked disconnected nothing goes to the
-    /// network. Each request would otherwise sit out its full timeout — 20 s for
-    /// most of them — and the driver issues one per parameter: the ~80 records
-    /// that process at `iocInit`, plus a fetch for every `EIG_*` parameter
-    /// `drv_user_create` builds, cost minutes between them.
-    fn guarded<T>(&self, what: &str, call: impl FnOnce() -> RestResult<T>) -> RestResult<T> {
-        if !self.is_connected() {
-            return Err(RestError::Disconnected(what.to_string()));
-        }
-        self.exchange(call)
-    }
-
-    /// Run one request and let its outcome own the connection state.
+    /// Run one request and let its outcome own the connection state. Every
+    /// request goes to the network whatever that state is: C's `doRequest`
+    /// reconnects the socket each time (restApi.cpp:609-620), and its lines
+    /// are what an operator reads while the detector is away.
     ///
     /// The only writer of `connected`. Only a transport failure means the
     /// detector is not there: an error status code or a body the driver cannot
@@ -338,16 +320,12 @@ impl RestApi {
             Err(RestError::Transport(_)) => {
                 self.connected.store(false, Ordering::Release);
             }
-            // Never produced by a real request: `guarded` returns it instead of
-            // calling one.
-            Err(RestError::Disconnected(_)) => {}
         }
         result
     }
 
-    /// The one request allowed past the gate: it asks which SIMPLON API the
-    /// detector speaks, and by answering at all it proves the detector is there
-    /// (C's `RestAPI` constructor, restApi.cpp:258-274).
+    /// Ask which SIMPLON API the detector speaks; answering at all proves the
+    /// detector is there (C's `RestAPI` constructor, restApi.cpp:258-274).
     pub fn probe(&self) -> RestResult<ApiVersion> {
         let url = self.url(Sys::ApiVersion, "");
         let body = self.exchange(|| self.raw_get(&url, "", DATA_NATIVE, TIMEOUT_PROBE))?;
@@ -380,11 +358,10 @@ impl RestApi {
     /// GET a parameter, returning the raw JSON body (C `RestAPI::get`).
     pub fn get(&self, sys: Sys, param: &str, timeout: Duration) -> RestResult<String> {
         let url = self.url(sys, param);
-        self.guarded(&url, || self.raw_get(&url, param, DATA_NATIVE, timeout))
+        self.exchange(|| self.raw_get(&url, param, DATA_NATIVE, timeout))
     }
 
-    /// The GET itself, with no gate around it — [`RestApi::probe`] is the only
-    /// caller that is allowed to reach the network unconditionally.
+    /// The GET itself, printing C's `RestAPI::get` lines on failure.
     fn raw_get(
         &self,
         url: &str,
@@ -514,7 +491,7 @@ impl RestApi {
         } else {
             put_body(raw_value)
         };
-        self.guarded(&url, || {
+        self.exchange(|| {
             let mut resp = self
                 .agent
                 .put(&url)
@@ -613,7 +590,7 @@ impl RestApi {
     pub fn wait_file(&self, filename: &str, timeout: Duration) -> RestResult<bool> {
         let url = self.url(Sys::Data, filename);
         let start = std::time::Instant::now();
-        self.guarded(&url, || {
+        self.exchange(|| {
             loop {
                 let resp = self.agent.head(&url).call().map_err(|e| {
                     self.report_transport(&e, None);
@@ -652,7 +629,7 @@ impl RestApi {
     /// Delete a data file (C `RestAPI::deleteFile`). The detector answers 204.
     pub fn delete_file(&self, filename: &str) -> RestResult<()> {
         let url = self.url(Sys::Data, filename);
-        self.guarded(&url, || {
+        self.exchange(|| {
             let resp = self.agent.delete(&url).call().map_err(|e| {
                 self.report_transport(&e, None);
                 rest_err(
@@ -692,7 +669,7 @@ impl RestApi {
     /// GET a binary body (C `RestAPI::getBlob`).
     fn get_blob(&self, sys: Sys, name: &str, accept: &str) -> RestResult<Vec<u8>> {
         let url = self.url(sys, name);
-        self.guarded(&url, || {
+        self.exchange(|| {
             let mut resp = self
                 .agent
                 .get(&url)

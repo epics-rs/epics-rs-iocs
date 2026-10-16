@@ -558,9 +558,7 @@ impl ParamOps {
         let body = match self.rest.get(def.sys, &def.remote_name, DEFAULT_TIMEOUT) {
             Ok(body) => body,
             Err(e) => {
-                if !matches!(e, RestError::Disconnected(_)) {
-                    base_failed("unable to parse json response", "");
-                }
+                base_failed("unable to parse json response", "");
                 return Err(e);
             }
         };
@@ -683,14 +681,12 @@ impl ParamOps {
         let reply = self
             .rest
             .put(def.sys, &def.remote_name, raw, timeout)
-            .inspect_err(|e| {
-                if !matches!(e, RestError::Disconnected(_)) {
-                    self.trace.param_err(
-                        name,
-                        "basePut",
-                        &format!("[param={name}] underlying RestAPI put failed"),
-                    );
-                }
+            .inspect_err(|_| {
+                self.trace.param_err(
+                    name,
+                    "basePut",
+                    &format!("[param={name}] underlying RestAPI put failed"),
+                );
             })?;
 
         // The reply is a JSON array of the detector-config parameters this write
@@ -764,14 +760,12 @@ impl ParamOps {
             .map_err(|e| RestError::Parse(format!("[{}] {e}", def.asyn_name)))?;
             updates = self
                 .base_put(&def, &raw, DEFAULT_TIMEOUT)
-                .inspect_err(|e| {
-                    if !matches!(e, RestError::Disconnected(_)) {
-                        self.trace.param_err(
-                            &def.asyn_name,
-                            "put<int>",
-                            &format!("[param={}] underlying basePut failed", def.asyn_name),
-                        );
-                    }
+                .inspect_err(|_| {
+                    self.trace.param_err(
+                        &def.asyn_name,
+                        "put<int>",
+                        &format!("[param={}] underlying basePut failed", def.asyn_name),
+                    );
                 })?;
         }
 
