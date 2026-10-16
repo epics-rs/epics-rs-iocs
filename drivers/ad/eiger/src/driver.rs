@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase};
+use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::user::AsynUser;
 
 use crate::param::{AsynType, ParamOps, ParamRegistry, ParamUpdate};
@@ -47,7 +48,16 @@ impl EigerDriver {
             max_size_y,
             max_memory,
         } = cfg;
-        let mut ad = ADDriverBase::new(&port_name, max_size_x, max_size_y, max_memory)?;
+        let mut ad = ADDriverBase::new(
+            &port_name,
+            max_size_x,
+            max_size_y,
+            max_memory,
+            PortFlags {
+                multi_device: true,
+                ..ASYN_CANBLOCK
+            },
+        )?;
 
         let mut reg = ParamRegistry::new();
         let p = params::create(&mut ad.port_base, &mut reg, api, model)?;
