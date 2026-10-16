@@ -305,7 +305,11 @@ async fn publish(
     });
 
     let data = NDDataBuffer::U16(pixels);
-    let mut array = ctx.pool.wrap(dims, data);
+    // C dereferences a refused alloc unchecked (pixirad.cpp:1033); here the frame
+    // is dropped after the pool's limit line.
+    let Ok(mut array) = ctx.pool.wrap(dims, data) else {
+        return;
+    };
     array.unique_id = unique_id;
     array.timestamp = ts;
     array.time_stamp = ts.as_f64();
