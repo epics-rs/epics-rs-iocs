@@ -10,9 +10,8 @@
 //! after *every* command message (`cmnd_response = true`) — this port does
 //! the same via `Pm500Controller::command`.
 //!
-//! The C example st.cmd sets no EOS (GPIB-era, EOI-terminated); for RS-232
-//! this driver owns framing like its siblings (appends `\r`) and expects
-//! `asynOctetSetInputEos("\r")` in st.cmd.
+//! Commands go out bare (the C driver sets no EOS); the port EOS `"\r"` both
+//! ways comes from the startup script, as in C's Newport_PM500.iocsh:22-23.
 //!
 //! ## Units
 //!
@@ -47,9 +46,6 @@ use crate::util::{atof, max_digits};
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
-
-/// Command line terminator (`ENAINT` bit 7: CR-only framing).
-const TERMINATOR: &[u8] = b"\r";
 
 /// Axis letters, in controller channel order (C `PM500_axis_names`,
 /// `PM500_NUM_CHANNELS` 12).
@@ -142,17 +138,10 @@ impl Pm500Controller {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command message and read its reply (C `send_mess`, which
     /// flushes stale input first, + `recv_mess`).
     fn exchange(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 

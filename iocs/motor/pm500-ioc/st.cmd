@@ -24,9 +24,10 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# PM500 responses are CR-terminated (SENAINT $AF framing). The driver
-# appends the CR command terminator itself, so no output EOS is needed.
+# Port EOS as the C example sets it (Newport_PM500.iocsh:22-23);
+# the driver sends bare commands.
 asynOctetSetInputEos("$(SERIAL)", 0, "\r")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- PM500 controller ----
 # PM500CreateController(motorPort, serialPort, [movingPollMs], [idlePollMs])
