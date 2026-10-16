@@ -55,6 +55,9 @@ mod pid2_rcv {
     pub const SPECTRUM_256_LO: u8 = 0x01;
     pub const SPECTRUM_8192_HI: u8 = 0x0C;
     pub const CONFIG_READBACK: u8 = 0x07;
+    /// `RCVPT_SCOPE_DATA`..`RCVPT_DIAGNOSTIC_DATA` and
+    /// `RCVPT_OPTION_PA_CALIBRATION` (`DP5Protocol.h:219-230`).
+    pub const UNPROCESSED_MISC: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x0C];
 }
 
 /// `DP5Protocol.h enum PID2_ACK_TYPE` -- the status byte
@@ -245,6 +248,11 @@ pub enum ReceivedPacket {
     /// (`ParsePacket.cpp:156-159`). Never produced for an ack packet --
     /// see [`ReceivedPacket::Ack`].
     Error { status: AckStatus },
+    /// A misc packet `ParsePacket` routes somewhere `ReceiveData` does not
+    /// handle (scope, text, diagnostic, PA calibration, Ethernet settings,
+    /// `ParsePacket.cpp:131-153`): `ReceiveData` returns false without the
+    /// error print.
+    Unprocessed,
 }
 
 /// `CConsoleHelper::ProcessSpectrumEx` (`ConsoleHelper.cpp:736-754`):
@@ -405,6 +413,8 @@ pub fn parse_packet(raw: &[u8]) -> ReceivedPacket {
         && (pid2_rcv::SPECTRUM_256_LO..=pid2_rcv::SPECTRUM_8192_HI).contains(&pid2)
     {
         ReceivedPacket::Spectrum { pid2, data }
+    } else if pid1 == pid1::RCV_SCOPE_MISC && pid2_rcv::UNPROCESSED_MISC.contains(&pid2) {
+        ReceivedPacket::Unprocessed
     } else if pid1 == pid1::RCV_SCOPE_MISC && pid2 == pid2_rcv::CONFIG_READBACK {
         ReceivedPacket::ConfigReadback { data }
     } else if pid1 == pid1::ACK {
@@ -641,6 +651,20 @@ mod tests {
                 status: AckStatus::PidError,
             }
         );
+    }
+
+    #[test]
+    fn parse_packet_scope_misc_is_unprocessed() {
+        for pid2 in [0x01, 0x02, 0x03, 0x04, 0x05, 0x0C] {
+            assert_eq!(
+                parse_packet(&pack_out(0x82, pid2, &[])),
+                ReceivedPacket::Unprocessed
+            );
+        }
+        assert!(matches!(
+            parse_packet(&pack_out(0x82, 0x06, &[])),
+            ReceivedPacket::Error { .. }
+        ));
     }
 
     /// `doAmptekNetFinderPacket`'s hardcoded 8-byte literal

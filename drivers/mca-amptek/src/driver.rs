@@ -550,7 +550,12 @@ impl AmptekDriver {
                 self.spectrum = values;
             }
             ReceivedPacket::ConfigReadback { .. } | ReceivedPacket::Ack { .. } => {}
-            ReceivedPacket::Error { .. } => return None,
+            ReceivedPacket::Error { .. } => {
+                // C spelling (`ConsoleHelper.cpp:725`).
+                eprintln!("Error recevied");
+                return None;
+            }
+            ReceivedPacket::Unprocessed => return None,
         }
         Some(packet)
     }

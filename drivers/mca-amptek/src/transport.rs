@@ -214,10 +214,15 @@ impl AmptekUdpTransport {
                 .socket
                 .send_to(&net_finder::build_broadcast_request(rand), dest);
             std::thread::sleep(Duration::from_millis(100));
+            println!("Searching for Amptek modules on network:");
             loop {
                 let (n, addr) = self.recv_from_nf_addr(&mut buf);
                 if n > 0 {
                     if net_finder::have_netfinder_packet(&buf, rand, n) {
+                        let shown = addr.map(|a| a.to_string()).unwrap_or_default();
+                        println!(
+                            "  Address: {shown}  Port: {NETFINDER_BROADCAST_PORT}   bytes:{n}"
+                        );
                         found.push(addr);
                     }
                 } else {
@@ -229,6 +234,7 @@ impl AmptekUdpTransport {
                 }
             }
         }
+        println!("Found {} Amptek units", found.len());
         found
     }
 
