@@ -73,8 +73,8 @@ use asyn_rs::user::AsynUser;
 use epics_rs::base::server::recgbl::alarm_status;
 
 use crate::ads::defs::{
-    ADSIGRP_MEMORY_BYTE, ADSIGRP_SYM_VALBYHND, GLOBALERR_TARGET_PORT, LOCAL_PORT_BASE,
-    error_to_string,
+    ADSIGRP_MEMORY_BYTE, ADSIGRP_SYM_VALBYHND, ADSIGRP_SYM_VERSION, GLOBALERR_TARGET_PORT,
+    LOCAL_PORT_BASE, error_to_string,
 };
 use crate::ads::sumup::{self, SumEntry};
 use crate::ads::{
@@ -241,6 +241,15 @@ struct AmsPortState {
     state_param: Option<usize>,
     /// Handles of the PLC clock symbols, once resolved.
     ts_handles: Option<(u32, u32)>,
+    /// C `amsPortInfo::refreshNeeded`: set when the port drops, cleared only
+    /// by a successful `ADSIGRP_SYM_VERSION` subscription.
+    refresh_needed: bool,
+    /// That subscription's notification handle (C `hCallbackNotify`).
+    symbols_notify: Option<u32>,
+    /// A symbols-changed push arrived; the supervisor runs C
+    /// `adsSymbolsChangedCallback`'s invalidate and refresh, which cannot
+    /// block the reader thread the push came in on.
+    symbols_changed: bool,
 }
 
 /// Driver state the actor thread and the background threads share.
@@ -334,6 +343,11 @@ impl AdsShared {
             connected: false,
             state_param: None,
             ts_handles: None,
+            // C starts it clear, its constructor having waited for the PLC; a
+            // port first named while disconnected still needs the refresh.
+            refresh_needed: !self.is_connected(),
+            symbols_notify: None,
+            symbols_changed: false,
         });
     }
 
@@ -412,34 +426,55 @@ impl AdsShared {
         }
     }
 
-    /// Alarm every parameter of one AMS port and mark it for refresh — the PLC
-    /// dropped, so its symbol handles are gone (C `invalidateParams`).
-    fn invalidate_ams_port(&self, ams_port: u16) {
-        let reasons: Vec<usize> = {
-            let mut params = self.params.lock();
-            let mut hit = Vec::new();
-            for (reason, slot) in params.iter_mut().enumerate() {
-                let Some(p) = slot.as_mut() else { continue };
-                if p.info.ams_port != ams_port || p.info.data_source != DataSource::Plc {
-                    continue;
-                }
-                p.handle = None;
-                p.notification = None;
-                p.refresh_needed = true;
-                hit.push(reason);
+    /// Mark every PLC parameter of one AMS port for refresh (C
+    /// `invalidateParams`).
+    fn invalidate_ams_port(&self, ams_port: u16) -> Vec<usize> {
+        let mut params = self.params.lock();
+        let mut hit = Vec::new();
+        for (reason, slot) in params.iter_mut().enumerate() {
+            let Some(p) = slot.as_mut() else { continue };
+            if p.info.ams_port != ams_port || p.info.data_source != DataSource::Plc {
+                continue;
             }
-            hit
-        };
-        // A dead connection's notification handles mean nothing on the next one.
+            p.refresh_needed = true;
+            hit.push(reason);
+        }
+        hit
+    }
+
+    /// One AMS port went away (C `cyclicThread`'s drop branch): invalidate it,
+    /// forget the handles and subscriptions that died with it, flag the port
+    /// for refresh and alarm its parameters.
+    fn drop_ams_port(&self, ams_port: u16) {
+        let reasons = self.invalidate_ams_port(ams_port);
+        {
+            let mut params = self.params.lock();
+            for &reason in &reasons {
+                if let Some(p) = params[reason].as_mut() {
+                    p.handle = None;
+                    p.notification = None;
+                }
+            }
+        }
         self.notifications
             .lock()
             .retain(|_, reason| !reasons.contains(reason));
+        if let Some(port) = self
+            .ports
+            .lock()
+            .iter_mut()
+            .find(|p| p.ams_port == ams_port)
+        {
+            port.refresh_needed = true;
+            port.symbols_notify = None;
+        }
         for reason in reasons {
             self.alarm(reason, alarm_status::COMM_ALARM, INVALID_ALARM);
         }
     }
 
-    /// Re-resolve every parameter of one AMS port that needs it
+    /// Re-resolve every parameter of one AMS port that needs it, then renew
+    /// the port's symbols-changed subscription if the port needs that
     /// (C `refreshParams`).
     fn refresh_ams_port(&self, ams_port: u16) {
         let pending: Vec<usize> = self
@@ -459,6 +494,64 @@ impl AdsShared {
         // refresh_param prints C's line for whatever failed.
         for reason in pending {
             let _ = self.refresh_param(reason);
+        }
+
+        let old = {
+            let ports = self.ports.lock();
+            match ports.iter().find(|p| p.ams_port == ams_port) {
+                Some(port) if port.refresh_needed => port.symbols_notify,
+                _ => return,
+            }
+        };
+        let Ok(client) = self.client() else { return };
+        if let Some(handle) = old {
+            self.set_symbols_notify(ams_port, None);
+            if let Err(e) = client.del_notification(ams_port, handle) {
+                self.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}:adsDelSymbolsChangedCallback: Delete device notification failed with: {}",
+                        CStatus(&e)
+                    ),
+                );
+            }
+        }
+        self.print(
+            TraceMask::FLOW,
+            format_args!("{DRIVER_NAME}:adsAddSymbolsChangedCallback: Ams-port {ams_port}."),
+        );
+        match client.add_notification(
+            ams_port,
+            ADSIGRP_SYM_VERSION,
+            0,
+            1,
+            Duration::from_secs_f64(self.cfg.default_sample_time_ms / 1000.0),
+            Duration::from_secs_f64(self.cfg.default_max_delay_time_ms / 1000.0),
+        ) {
+            Ok(handle) => {
+                if let Some(port) = self.ports.lock().iter_mut().find(|p| p.ams_port == ams_port) {
+                    port.symbols_notify = Some(handle);
+                    port.refresh_needed = false;
+                }
+            }
+            Err(e) => self.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "{DRIVER_NAME}:adsAddSymbolsChangedCallback: Add device notification failed with: {}",
+                    CStatus(&e)
+                ),
+            ),
+        }
+    }
+
+    fn set_symbols_notify(&self, ams_port: u16, handle: Option<u32>) {
+        if let Some(port) = self
+            .ports
+            .lock()
+            .iter_mut()
+            .find(|p| p.ams_port == ams_port)
+        {
+            port.symbols_notify = handle;
         }
     }
 
@@ -834,6 +927,7 @@ impl AdsShared {
         // A cancel and a sample in flight cross. C keys the sample by hUser,
         // which outlives the cancel, so it has no line for this.
         let Some(&reason) = self.notifications.lock().get(&sample.handle) else {
+            self.on_symbols_changed(sample.handle);
             return;
         };
         if !self.publish(reason, &sample.data, sample.timestamp) {
@@ -844,6 +938,27 @@ impl AdsShared {
                 ),
             );
         }
+    }
+}
+
+impl AdsShared {
+    /// C `adsSymbolsChangedCallback`'s line; its invalidate and refresh run on
+    /// the supervisor's next pass.
+    fn on_symbols_changed(&self, handle: u32) {
+        let ams_port = {
+            let mut ports = self.ports.lock();
+            let Some(port) = ports.iter_mut().find(|p| p.symbols_notify == Some(handle)) else {
+                return;
+            };
+            port.symbols_changed = true;
+            port.ams_port
+        };
+        self.print(
+            TRACE_INFO,
+            format_args!(
+                "{DRIVER_NAME}:adsSymbolsChangedCallback: Symbols changed for Ams-port {ams_port}."
+            ),
+        );
     }
 }
 
@@ -1327,8 +1442,8 @@ impl PortDriver for AdsPortDriver {
             return Ok(DrvUserInfo::from_reason(reason));
         }
 
-        // Resolve it against the PLC now if we can; the supervisor picks up
-        // whatever is still `refresh_needed` when the link comes up.
+        // Resolve it against the PLC now if we can; one created while the
+        // link is down is resolved by the refresh when it comes up.
         // refresh_param prints C's line for whatever failed.
         if self.shared.is_connected() {
             let _ = self.shared.refresh_param(reason);
@@ -1727,7 +1842,7 @@ fn disconnect(shared: &Arc<AdsShared>) {
     shared.bulk.lock().clear();
     let ams_ports: Vec<u16> = shared.ports.lock().iter().map(|p| p.ams_port).collect();
     for ams_port in ams_ports {
-        shared.invalidate_ams_port(ams_port);
+        shared.drop_ams_port(ams_port);
     }
     for port in shared.ports.lock().iter_mut() {
         port.connected = false;
@@ -1787,7 +1902,7 @@ fn cyclic_pass(shared: &Arc<AdsShared>) -> bool {
         };
         any_connected |= connected;
 
-        let (was_connected, old_state, state_param) = {
+        let (was_connected, old_state, state_param, refresh, symbols_changed) = {
             let mut ports = shared.ports.lock();
             let Some(port) = ports.iter_mut().find(|p| p.ams_port == ams_port) else {
                 continue;
@@ -1796,11 +1911,19 @@ fn cyclic_pass(shared: &Arc<AdsShared>) -> bool {
             let old = port.state;
             port.connected = connected;
             port.state = state;
-            (was, old, port.state_param)
+            let changed = connected && std::mem::take(&mut port.symbols_changed);
+            (was, old, port.state_param, port.refresh_needed, changed)
         };
 
-        if was_connected && !connected {
+        if symbols_changed {
             shared.invalidate_ams_port(ams_port);
+            shared.refresh_ams_port(ams_port);
+        }
+        if connected && refresh {
+            shared.refresh_ams_port(ams_port);
+        }
+        if was_connected && !connected {
+            shared.drop_ams_port(ams_port);
             // C then `exit(-1)`s; this reconnects instead.
             shared.print(
                 TraceMask::ERROR,
@@ -1809,9 +1932,6 @@ fn cyclic_pass(shared: &Arc<AdsShared>) -> bool {
                     shared.cfg.port_name
                 ),
             );
-        }
-        if connected {
-            shared.refresh_ams_port(ams_port);
         }
 
         // `.AMSPORTSTATE.` records see the runtime's state, whatever it is.
@@ -2129,7 +2249,10 @@ mod tests {
         }
         d.shared.notifications.lock().insert(7, reason);
 
-        d.shared.invalidate_ams_port(851);
+        d.shared.ports.lock()[0].refresh_needed = false;
+        d.shared.ports.lock()[0].symbols_notify = Some(9);
+
+        d.shared.drop_ams_port(851);
 
         let params = d.shared.params.lock();
         let p = params[reason].as_ref().unwrap();
@@ -2139,6 +2262,44 @@ mod tests {
         assert!(p.refresh_needed);
         assert_eq!(p.alarm, (alarm_status::COMM_ALARM, INVALID_ALARM));
         assert!(d.shared.notifications.lock().is_empty());
+        let ports = d.shared.ports.lock();
+        assert!(ports[0].refresh_needed);
+        assert_eq!(ports[0].symbols_notify, None);
+    }
+
+    #[test]
+    fn a_symbols_change_marks_the_params_but_keeps_the_live_handles() {
+        let mut d = driver();
+        let reason = bind(
+            &mut d,
+            "ADSPORT=851/.ADR.16#4020,16#0,4,3?",
+            InterfaceType::Int32,
+        );
+        {
+            let mut params = d.shared.params.lock();
+            let p = params[reason].as_mut().unwrap();
+            p.handle = Some(0x1234);
+            p.notification = Some(7);
+            p.refresh_needed = false;
+        }
+        d.shared.ports.lock()[0].refresh_needed = false;
+        d.shared.ports.lock()[0].symbols_notify = Some(9);
+
+        // A push on a handle no parameter owns is the symbol-version one.
+        d.shared.on_symbols_changed(9);
+        assert!(d.shared.ports.lock()[0].symbols_changed);
+        d.shared.on_symbols_changed(10);
+
+        assert_eq!(d.shared.invalidate_ams_port(851), vec![reason]);
+        let params = d.shared.params.lock();
+        let p = params[reason].as_ref().unwrap();
+        // C invalidateParams only flags: refresh_param releases the handle.
+        assert_eq!(p.handle, Some(0x1234));
+        assert_eq!(p.notification, Some(7));
+        assert!(p.refresh_needed);
+        assert_eq!(p.alarm, (alarm_status::NO_ALARM, NO_ALARM_SEV));
+        // The subscription is still good, so the port needs no renewal.
+        assert!(!d.shared.ports.lock()[0].refresh_needed);
     }
 
     #[test]
