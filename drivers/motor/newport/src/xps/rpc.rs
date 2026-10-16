@@ -209,11 +209,10 @@ impl XpsSocket {
     /// return it with the terminator stripped. Self-contained: it does not rely
     /// on any port-level input EOS.
     fn query(&self, cmd: &str) -> XpsResult<XpsReply> {
-        self.handle.write_octet(OCTET_REASON, cmd.as_bytes())?;
-        let mut buf = Vec::new();
+        let mut buf = self
+            .handle
+            .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)?;
         loop {
-            let chunk = self.handle.read_octet(OCTET_REASON, READ_BUF)?;
-            buf.extend_from_slice(&chunk);
             if buf.ends_with(XPS_TERMINATOR.as_bytes()) {
                 break;
             }
@@ -223,6 +222,7 @@ impl XpsSocket {
                     message: "XPS reply exceeded maximum length without terminator".into(),
                 }));
             }
+            buf.extend_from_slice(&self.handle.read_octet(OCTET_REASON, READ_BUF)?);
         }
         let text = String::from_utf8_lossy(&buf).into_owned();
         let text = text
@@ -242,8 +242,10 @@ impl XpsSocket {
     /// the move socket) so the write returns promptly.
     fn fire(&self, cmd: &str) -> XpsResult<()> {
         for _ in 0..MOVE_MAX_RETRIES {
-            self.handle.write_octet(OCTET_REASON, cmd.as_bytes())?;
-            match self.handle.read_octet(OCTET_REASON, READ_BUF) {
+            match self
+                .handle
+                .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
+            {
                 Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     ..

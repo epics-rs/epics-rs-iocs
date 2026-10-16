@@ -105,10 +105,8 @@ impl Pm500Controller {
             comm_state: CommState::Normal,
         };
         // C sends SCUM 1 and SENAINT $AF and reads (ignoring) one reply each.
-        ctrl.write("SCUM 1")?;
-        let _ = ctrl.read_once();
-        ctrl.write("SENAINT $AF")?;
-        let _ = ctrl.read_once();
+        let _ = ctrl.exchange("SCUM 1");
+        let _ = ctrl.exchange("SENAINT $AF");
 
         // Identity probe (C sends SVN? twice: existence check, then read).
         let probe = ctrl.command("SVN?").unwrap_or_default();
@@ -151,15 +149,10 @@ impl Pm500Controller {
         out
     }
 
-    /// Write a command message (C `send_mess`); the terminator is appended
-    /// here.
-    fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        Ok(())
-    }
-
-    fn read_once(&self) -> AsynResult<String> {
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+    /// Write a command message and read its reply (C `send_mess`, which
+    /// flushes stale input first, + `recv_mess`).
+    fn exchange(&self, cmd: &str) -> AsynResult<String> {
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 
@@ -168,8 +161,7 @@ impl Pm500Controller {
     /// so even pure motion messages consume a response. C `recv_mess` logs
     /// a "system error" on an `SE` reply but still returns it.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.write(cmd)?;
-        let reply = self.read_once()?;
+        let reply = self.exchange(cmd)?;
         if reply.starts_with("SE") {
             eprintln!("PM500 system error: {reply}");
         }

@@ -321,8 +321,7 @@ impl PmncController {
     /// `send_recv_mess`): the CR terminator is appended here, and the reply
     /// text (everything up to the `>` prompt EOS) is returned trimmed.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '>', ' '])
             .to_string())

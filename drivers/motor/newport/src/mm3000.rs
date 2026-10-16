@@ -212,17 +212,16 @@ impl Mm3000Controller {
 
     /// Write a command and read the reply (C `send_mess` + `recv_mess`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        self.read_reply()
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        self.read_reply(String::from_utf8_lossy(&raw).into_owned())
     }
 
-    /// Read one reply with C `recv_mess`'s two retry rules: an unsolicited
+    /// Apply C `recv_mess`'s two retry rules to the first reply: an unsolicited
     /// hard-travel-limit error (`E35`..`E42`, an unconfirmed MM3000 firmware
     /// bug) is flushed with one extra read, and any other reply starting with
     /// `E` is reported and re-read (C recurses; the retry normally times out,
     /// which surfaces here as the read error).
-    fn read_reply(&self) -> AsynResult<String> {
-        let mut reply = self.read_once()?;
+    fn read_reply(&self, mut reply: String) -> AsynResult<String> {
         if is_unsolicited_limit_error(&reply) {
             reply = self.read_once()?;
         }
