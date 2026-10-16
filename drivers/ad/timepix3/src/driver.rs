@@ -32,6 +32,15 @@ enum HttpPrint<'a> {
 /// the voltage rails 0-5 on the same port.
 pub const MAX_ADDR: usize = 8;
 
+/// ADTIMEPIX_VERSION.REVISION.MODIFICATION (ADTimePix.h:20-22).
+const DRIVER_VERSION: &str = "1.6.4";
+
+/// C `calculateImgMemoryUsageMB()` before the first frame (ADTimePix.cpp:1545):
+/// the 512x512 UINT16 current frame, the 512x512 default for the two Int64 and
+/// one Int32 waveforms, plus the fixed 0.1 MB overhead.
+const INITIAL_IMG_MEMORY_MB: f64 =
+    (512.0 * 512.0 * (2.0 + 8.0 + 8.0 + 4.0)) / (1024.0 * 1024.0) + 0.1;
+
 /// The per-chip DAC names Serval takes on `/detector/chips/<n>/dacs/`
 /// (ADTimePix.cpp:1123-1147). These are on-wire names, not display names.
 type DacParam = fn(&TimePixParams) -> usize;
@@ -101,22 +110,32 @@ impl TimePix3Driver {
             shared,
             cmd_tx,
         };
-        driver.init_params(port_name)?;
+        driver.init_params()?;
         Ok(driver)
     }
 
-    /// C's constructor tail (ADTimePix.cpp:1440-1520).
-    fn init_params(&mut self, port_name: &str) -> AsynResult<()> {
+    /// C's constructor seeds (ADTimePix.cpp:1414-1553, ADTimePix3 R1-6-4).
+    /// Manufacturer and Model come from the dashboard, and the PrvHst sum
+    /// parameters from the first histogram frame or write, as in C.
+    fn init_params(&mut self) -> AsynResult<()> {
         let server = self.http.base_url().to_string();
+        let p = self.p;
+        let ad = &self.ad.params;
         let base = &mut self.ad.port_base;
-        base.set_string_param(self.ad.params.base.manufacturer, 0, "ASI")?;
-        base.set_string_param(self.ad.params.base.model, 0, "TimePix3")?;
-        base.set_string_param(self.p.server_name, 0, server)?;
-        base.set_string_param(self.ad.params.base.port_name_self, 0, port_name)?;
-        base.set_int32_param(self.p.img_frames_to_sum, 0, 10)?;
-        base.set_int32_param(self.p.img_sum_update_interval_frames, 0, 1)?;
-        base.set_int32_param(self.p.prv_hst_frames_to_sum, 0, 10)?;
-        base.set_int32_param(self.p.prv_hst_sum_update_interval, 0, 1)?;
+        base.set_string_param(ad.base.driver_version, 0, DRIVER_VERSION)?;
+        base.set_string_param(p.server_name, 0, server)?;
+        base.set_int32_param(p.img_accumulation_enable, 0, 1)?;
+        base.set_int32_param(p.prv_hst_accumulation_enable, 0, 1)?;
+        base.set_int32_param(p.img_frames_to_sum, 0, 10)?;
+        base.set_int32_param(p.img_sum_update_interval_frames, 0, 1)?;
+        base.set_int64_param(p.img_total_counts, 0, 0)?;
+        base.set_float64_param(p.img_processing_time, 0, 0.0)?;
+        base.set_float64_param(p.img_memory_usage, 0, INITIAL_IMG_MEMORY_MB)?;
+        base.set_int32_param(p.write_processed_img, 0, 0)?;
+        base.set_int32_param(p.processed_img_output_type, 0, 0)?;
+        base.set_int32_param(p.write_processed_hst, 0, 0)?;
+        base.set_int32_param(p.processed_hst_output_type, 0, 0)?;
+        base.set_int32_param(ad.num_images, 0, 0)?;
         Ok(())
     }
 
