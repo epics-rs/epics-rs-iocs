@@ -11,6 +11,7 @@
 //!
 //! - [`install`] — wires one axis through motor-rs's [`MotorBuilder`],
 //!   registers it and starts its poller.
+//! - [`model1::Model1`] — a model-1 driver's `Setup` and card table.
 //! - [`iocsh`] — argument parsing helpers for the create commands.
 //! - [`connect`] — octet-port connect helpers ([`connect_serial`],
 //!   [`connect_ip`]).
@@ -24,6 +25,7 @@
 
 pub mod connect;
 pub mod iocsh;
+pub mod model1;
 pub mod util;
 
 use std::sync::{Arc, Mutex};
