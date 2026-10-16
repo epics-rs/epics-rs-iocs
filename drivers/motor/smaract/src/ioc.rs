@@ -96,11 +96,11 @@ pub fn mcs2_create_controller_command() -> CommandDef {
     )
 }
 
-/// A controller `smarAct{SCU,MCS}CreateController` made: `None` when its I/O
-/// port could not be connected, as C's constructor then carries on without it.
+/// A controller `smarAct{SCU,MCS}CreateController` made, connected to its I/O
+/// port or not, as C's constructor carries on either way.
 struct Registered<C> {
     port_name: String,
-    controller: Option<Arc<Mutex<C>>>,
+    controller: Arc<Mutex<C>>,
     moving_poll_ms: u64,
     idle_poll_ms: u64,
     axes: BTreeSet<i32>,
@@ -137,7 +137,7 @@ fn register<C>(
     ctx: &CommandContext,
     registry: &Registry<C>,
     args: &[ArgValue],
-    connect: impl FnOnce(&str) -> Option<C>,
+    connect: impl FnOnce(&str) -> C,
 ) -> Result<(), String> {
     let port_name = req_string(args, 0, "Port name [string]")?;
     register_port(ctx, &port_name, c_int(args, 2))?;
@@ -147,7 +147,7 @@ fn register<C>(
         .unwrap_or_else(|e| e.into_inner())
         .push(Registered {
             port_name,
-            controller: controller.map(|c| Arc::new(Mutex::new(c))),
+            controller: Arc::new(Mutex::new(controller)),
             moving_poll_ms: period_ms(args, 3),
             idle_poll_ms: period_ms(args, 4),
             axes: BTreeSet::new(),
@@ -163,7 +163,7 @@ fn create_axis<C>(
     duplicate: &str,
     args: &[ArgValue],
     ctx: &CommandContext,
-    build: impl FnOnce(Arc<Mutex<C>>, i32, i32) -> Result<Arc<Mutex<dyn AsynMotor>>, String>,
+    build: impl FnOnce(Arc<Mutex<C>>, i32, i32) -> Arc<Mutex<dyn AsynMotor>>,
 ) -> Result<(), String> {
     let controller_port = req_string(args, 0, "Controller Port name [string]")?;
     let axis = c_int(args, 1);
@@ -177,10 +177,8 @@ fn create_axis<C>(
         println!("{duplicate} failed:axis {axis} already exists");
         return Ok(());
     }
-    let Some(controller) = reg.controller.clone() else {
-        return Ok(());
-    };
-    let motor = build(controller, axis, channel).map_err(|e| format!("{command}: {e}"))?;
+    let controller = reg.controller.clone();
+    let motor = build(controller, axis, channel);
     install(
         ctx,
         asyn_user(&controller_port, axis),
@@ -215,7 +213,7 @@ pub fn scu_create_controller_command() -> CommandDef {
                         "SmarActSCUController: unable to connect serial channel\n"
                     ));
                 }
-                Some(ScuController::new(handle))
+                ScuController::new(handle)
             })?;
             Ok(CommandOutcome::Continue)
         },
@@ -244,7 +242,7 @@ pub fn scu_create_axis_command() -> CommandDef {
                             e.status() as i32
                         ));
                     }
-                    Ok(Arc::new(Mutex::new(ax)))
+                    Arc::new(Mutex::new(ax))
                 },
             )?;
             Ok(CommandOutcome::Continue)
@@ -272,16 +270,9 @@ pub fn mcs_create_controller_command() -> CommandDef {
                      been disabled for this controller\n"
                 ));
             }
-            register(ctx, &MCS_CONTROLLERS, args, |_| {
-                let controller = mcs::connect_link(&port_name, &io_port, MCS_TIMEOUT)
-                    .map(|handle| McsController::new(handle, disable_speed));
-                if controller.is_none() {
-                    eprintln!(
-                        "SmarActMCSController:SmarActMCSController: cannot connect to MCS controller"
-                    );
-                    println!("SmarActMCSController: unable to connect serial channel");
-                }
-                controller
+            register(ctx, &MCS_CONTROLLERS, args, |port_name| {
+                let link = mcs::connect_link(port_name, &io_port, MCS_TIMEOUT);
+                McsController::new(link, disable_speed)
             })?;
             Ok(CommandOutcome::Continue)
         },
@@ -301,9 +292,15 @@ pub fn mcs_create_axis_command() -> CommandDef {
                 "SmarActMCSCreateAxis",
                 args,
                 ctx,
-                |controller, _axis, channel| {
-                    let ax = McsAxis::new(controller, channel).map_err(|e| e.to_string())?;
-                    Ok(Arc::new(Mutex::new(ax)))
+                |controller, axis, channel| {
+                    let (ax, probed) = McsAxis::new(controller, channel);
+                    if let Err(e) = probed {
+                        errlog_vprintf(format_args!(
+                            "SmarActMCSAxis::SmarActMCSAxis -- channel {axis} ASYN error {}\n",
+                            e.status() as i32
+                        ));
+                    }
+                    Arc::new(Mutex::new(ax))
                 },
             )?;
             Ok(CommandOutcome::Continue)
