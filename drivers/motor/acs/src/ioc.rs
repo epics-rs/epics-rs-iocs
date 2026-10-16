@@ -11,6 +11,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
@@ -49,10 +50,14 @@ pub fn mcb4b_create_controller_command() -> CommandDef {
             let num_axes = num_axes as usize;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
+            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            if get_port(&asyn_port).is_none() {
+                eprintln!("MCB4BController::MCB4BController: cannot connect to MCB-4B controller");
+                return Ok(CommandOutcome::Continue);
+            }
             let handle = connect_serial(&asyn_port, MCB4B_TIMEOUT)?;
             let controller = Arc::new(Mutex::new(Mcb4bController::new(handle, num_axes)));
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
             for index in 0..num_axes {
                 let ax = Mcb4bAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
