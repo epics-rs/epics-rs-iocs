@@ -25,8 +25,6 @@ pmacAsynIPConfigure("$(PORT)", "$(HOST)")
 # A PMAC on a serial line (or a terminal server passing raw ASCII) instead:
 #drvAsynSerialPortConfigure("$(PORT)", "/dev/ttyS0", 0, 0, 0)
 #asynSetOption("$(PORT)", -1, "baud", "38400")
-#asynOctetSetInputEos("$(PORT)", 0, "\006")
-#asynOctetSetOutputEos("$(PORT)", 0, "\r")
 
 # ---- controller ----
 # pmacCreateController(controllerName, lowLevelPortName, lowLevelPortAddress,

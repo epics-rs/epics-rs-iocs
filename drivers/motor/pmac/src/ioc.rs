@@ -31,6 +31,7 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
@@ -63,13 +64,24 @@ fn registry_lock(registry: &Registry) -> std::sync::MutexGuard<'_, HashMap<Strin
 }
 
 /// Connect a [`SyncIOHandle`] to an already-configured octet port at the given
-/// asyn address (C `pasynOctetSyncIO->connect(lowLevelPortName,
-/// lowLevelPortAddress, …)`). motor-common's helpers hard-code address 0, and
-/// the PMAC commands carry the address explicitly.
+/// asyn address and set its ACK input / CR output EOS, as C
+/// `lowLevelPortConnect` does (pmacController.cpp:194, pmacAsynCoord.c:802);
+/// every PMAC reply ends in ACK, so without it every read times out.
+/// motor-common's helpers hard-code address 0, and the PMAC commands carry the
+/// address explicitly.
 fn connect_octet(port: &str, addr: i32) -> Result<SyncIOHandle, String> {
     let entry = get_port(port).ok_or_else(|| {
         format!("low level port '{port}' not found (call pmacAsynIPConfigure or drvAsynIPPortConfigure first)")
     })?;
+    let user = || AsynUser::new(0).with_addr(addr);
+    entry
+        .handle
+        .set_input_eos_blocking(user(), b"\x06")
+        .map_err(|e| format!("failed to set input EOS on '{port}': {e}"))?;
+    entry
+        .handle
+        .set_output_eos_blocking(user(), b"\r")
+        .map_err(|e| format!("failed to set output EOS on '{port}': {e}"))?;
     Ok(SyncIOHandle::from_handle(
         entry.handle.clone(),
         addr,

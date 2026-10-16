@@ -390,11 +390,9 @@ impl OctetInterpose for PmacIpInterpose {
 /// The C function is `drvAsynIPPortConfigure(..., noProcessEos=1)` followed by
 /// `pmacAsynIPPortConfigureEos`, which interposes the framing layer directly on
 /// the driver and then `asynInterposeEosConfig`s an EOS layer above it. This
-/// builds the same three-layer stack in one step. The input EOS is left for the
-/// driver to set (C `pmacController::lowLevelPortConnect` sets IEOS `\x06`
-/// (ACK) and OEOS `\r` on its own asyn user), so a startup script that uses
-/// this command must still `asynOctetSetInputEos(port, 0, "\006")` and
-/// `asynOctetSetOutputEos(port, 0, "\r")` — the crate's `st.cmd` does.
+/// builds the same three-layer stack in one step. The EOS is left for the
+/// driver to set, as C `pmacController::lowLevelPortConnect` sets IEOS `\x06`
+/// (ACK) and OEOS `\r` (the crate's `connect_octet`).
 pub fn pmac_asyn_ip_configure_command() -> CommandDef {
     CommandDef::new(
         "pmacAsynIPConfigure",
