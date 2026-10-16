@@ -526,8 +526,16 @@ async fn cmd_loop(w: Worker, mut rx: rt::CommandReceiver<Cmd>) {
             Cmd::Init => {
                 let mut guard = w.server.lock().await;
                 let srv = &mut *guard;
-                // C constructor: getServerMode -> getConfig -> getState.
-                srv.get_server_mode().await;
+                // C constructor: getServerMode -> getConfig -> getState; it
+                // returns at a failed getServerMode (marCCD.cpp:1543-1549).
+                if srv.get_server_mode().await.is_err() {
+                    let msg = format!(
+                        "marCCD:marCCD: error calling getServerMode for server port {}",
+                        srv.server_port_name()
+                    );
+                    srv.trace(TraceMask::ERROR, &msg);
+                    continue;
+                }
                 srv.get_config().await;
                 srv.get_state().await;
             }

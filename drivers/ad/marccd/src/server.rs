@@ -112,6 +112,11 @@ impl Server {
         let _ = self.handle.set_params_and_notify(0, updates).await;
     }
 
+    /// C `serverPort`, the `marCCDConfig` argument.
+    pub fn server_port_name(&self) -> &str {
+        self.server_port.port_name()
+    }
+
     /// C `asynPrint(pasynUserSelf, mask, ...)`.
     pub fn trace(&self, mask: TraceMask, message: &str) {
         self.handle

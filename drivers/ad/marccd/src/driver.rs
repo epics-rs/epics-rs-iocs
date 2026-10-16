@@ -344,3 +344,76 @@ pub fn create_marccd_detector(
         tasks,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+    /// A marServer that answers each command with `reply(command)` and logs
+    /// what it was sent.
+    fn fake_server(name: &str, reply: fn(&str) -> &'static str) -> Arc<Mutex<Vec<String>>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let command = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let answer = reply(&command);
+                seen.lock().push(command);
+                if !answer.is_empty() && stream.write_all(answer.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        });
+        let ip = format!("{name}_IP");
+        let claim = claim_port(&ip).unwrap();
+        let (runtime, _) = create_port_runtime(
+            &claim,
+            DrvAsynIPPort::new(&ip, &addr).unwrap(),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        std::mem::forget(runtime);
+        log
+    }
+
+    /// Build the detector on `name`'s fake server, then wait for a `set_bin`
+    /// queued behind the constructor's Init to reach it.
+    fn after_init(name: &str, reply: fn(&str) -> &'static str) -> (MarccdRuntime, Vec<String>) {
+        let log = fake_server(name, reply);
+        let det =
+            create_marccd_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        det.port_handle()
+            .write_int32_blocking(det.ad_params.bin_x, 0, 1)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !log.lock().iter().any(|c| c.starts_with("set_bin")) {
+            assert!(Instant::now() < deadline, "set_bin never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let sent = log.lock().clone();
+        (det, sent)
+    }
+
+    #[test]
+    fn a_failed_get_server_mode_ends_the_init() {
+        let (_det, sent) = after_init("MARCCD_BAD_MODE", |_| "7");
+        assert_eq!(sent[0], "get_mode");
+        assert!(sent[1].starts_with("set_bin"), "{sent:?}");
+    }
+}
