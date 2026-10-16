@@ -234,8 +234,7 @@ impl PhytronController {
     /// removed). A NAK or malformed reply is an error (C `bACKonly = true`).
     fn command(&self, cmd: &str) -> AsynResult<String> {
         let frame = build_frame(self.ctrl_type, self.address, cmd);
-        self.handle.write_octet(0, &frame)?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &frame, READ_BUF)?;
         parse_reply(&raw)
     }
 
