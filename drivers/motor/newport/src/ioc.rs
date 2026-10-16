@@ -28,6 +28,7 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
@@ -141,7 +142,6 @@ struct HxpRegistration {
 /// device-support factory during iocInit.
 pub struct NewportHolder {
     motors: Mutex<HashMap<String, Option<MotorDeviceSupport>>>,
-    poll_senders: Mutex<Vec<tokio::sync::mpsc::Sender<PollCommand>>>,
     /// Agilis controllers keyed by motor port, bridging the two-step
     /// `AG_UCCreateController` / `AG_UCCreateAxis` iocsh API.
     ag_uc_controllers: Mutex<HashMap<String, AgUcRegistration>>,
@@ -157,28 +157,14 @@ impl NewportHolder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             motors: Mutex::new(HashMap::new()),
-            poll_senders: Mutex::new(Vec::new()),
             ag_uc_controllers: Mutex::new(HashMap::new()),
             xps_controllers: Mutex::new(HashMap::new()),
             hxp_controllers: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Start polling on all registered controllers.
-    /// Call after PINI processing to avoid queue buildup.
-    pub fn start_all_polling(&self) {
-        for tx in self
-            .poll_senders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            let _ = tx.try_send(PollCommand::StartPolling);
-        }
-    }
-
     /// Shared wiring for every `*CreateController` command: build the motor
-    /// record + poll loop for `motor`, spawn the poll loop (starts idle), and
+    /// record + poll loop for `motor`, spawn the poll loop (polling from iocRun), and
     /// store the device support under `dtyp_key` for later `dbLoadRecords`
     /// binding.
     fn install(
@@ -203,10 +189,13 @@ impl NewportHolder {
 
         ctx.bridge().spawn(poll_loop.run());
 
-        self.poll_senders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(poll_cmd_tx);
+        // Released when the IOC runs, as C's poller starts delivering status
+        // after iocInit: owned here so no IOC binary can leave the axis unpolled.
+        init_hook_register(Arc::new(move |state| {
+            if state == InitHookState::AfterIocRunning {
+                let _ = poll_cmd_tx.try_send(PollCommand::StartPolling);
+            }
+        }));
         self.motors
             .lock()
             .unwrap_or_else(|e| e.into_inner())
