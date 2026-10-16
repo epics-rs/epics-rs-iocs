@@ -23,7 +23,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::runtime::config::RuntimeConfig;
-use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::log::errlog_printf;
 use epics_rs::base::server::iocsh::registry::*;
@@ -31,15 +31,6 @@ use epics_rs::ca::server::ioc_app::IocApplication;
 
 use mca::dev_mca_asyn;
 use mca_rontec::driver::RontecDriver;
-
-/// Every asyn port `RontecConfig` creates, kept alive for the life of the
-/// process. Dropping a `PortRuntimeHandle` closes its actor's shutdown
-/// channel and ends the actor thread even though a `PortHandle` clone
-/// survives in `asyn_record` -- love-ioc's `drvLoveInit`/syringepump-ioc/
-/// delaygen-ioc all drop theirs at the end of their command closure and hit
-/// this (flagged, unfixed there); this IOC follows mca-ioc's own `Ports`
-/// pattern instead since it is new code, not a preserved defect.
-type Ports = Arc<Mutex<Vec<PortRuntimeHandle>>>;
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -52,8 +43,6 @@ async fn main() -> CaResult<()> {
     };
 
     epics_rs::base::runtime::env::set_default("MCA_RONTEC_IOC", env!("CARGO_MANIFEST_DIR"));
-
-    let ports: Ports = Arc::new(Mutex::new(Vec::new()));
 
     let mut app = IocApplication::new();
 
@@ -94,7 +83,6 @@ async fn main() -> CaResult<()> {
     // RontecConfig(portName,serialPort,serialPortAddress) -- C
     // RontecConfig (`drvMcaRontec.c:165`).
     {
-        let ports_c = ports.clone();
         app = app.register_startup_command(CommandDef::new(
             "RontecConfig",
             vec![
@@ -147,10 +135,6 @@ async fn main() -> CaResult<()> {
                     ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
-                ports_c
-                    .lock()
-                    .expect("port list poisoned")
-                    .push(runtime_handle);
 
                 Ok(CommandOutcome::Continue)
             },

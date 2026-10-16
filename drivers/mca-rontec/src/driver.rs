@@ -182,6 +182,9 @@ pub struct RontecDriver {
     ereal: i32,
     /// C `pPvt->acquiring`.
     acquiring: bool,
+    /// C `pPvt->inputEos`: saved once at `RontecConfig` and restored after
+    /// every spectrum read.
+    input_eos: Vec<u8>,
     /// C `pPvt->mcaBuffer`: kept across transfers, so a short reply leaves
     /// the previous transfer's tail in place exactly as in C.
     mca_buffer: Vec<u8>,
@@ -191,13 +194,7 @@ impl RontecDriver {
     /// C `RontecConfig(portName,serialPort,serialPortAddress)`
     /// (`drvMcaRontec.c:165-257`). `serial_port_name` must already be
     /// registered (`drvAsynSerialPortConfigure`) -- this only looks it up,
-    /// matching `pasynOctetSyncIO->connect`'s own precondition. Unlike C,
-    /// the input EOS is not saved here: `Self::read_spectrum` uses
-    /// [`RequestOp::OctetReadBinary`], which brackets the save/suppress/
-    /// restore atomically inside the port actor (C `getInputEos` +
-    /// `setInputEos("",0)` + `setInputEos(saved)` around `int32ArrayRead`,
-    /// `drvMcaRontec.c:196-197,458,462`), so there is no saved EOS to carry
-    /// on this struct.
+    /// matching `pasynOctetSyncIO->connect`'s own precondition.
     pub fn connect(
         port_name: &str,
         serial_port_name: &str,
@@ -211,7 +208,16 @@ impl RontecDriver {
                 AsynStatus::Error as i32
             ))
         })?;
+        Self::on_serial(port_name, entry.handle, serial_port_name, serial_port_addr)
+    }
 
+    /// The part of C `RontecConfig` after the serial port is found.
+    fn on_serial(
+        port_name: &str,
+        serial: PortHandle,
+        serial_port_name: &str,
+        serial_port_addr: i32,
+    ) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
             port_name,
             1,
@@ -223,9 +229,9 @@ impl RontecDriver {
         );
         let reasons = McaReason::create_params(&mut base)?;
 
-        let driver = RontecDriver {
+        let mut driver = RontecDriver {
             base,
-            serial: entry.handle,
+            serial,
             serial_port: serial_port_name.to_owned(),
             addr: serial_port_addr,
             reasons,
@@ -236,8 +242,18 @@ impl RontecDriver {
             elive: 0,
             ereal: 0,
             acquiring: false,
+            input_eos: Vec::new(),
             mca_buffer: vec![0; MCA_BUFFER_SIZE],
         };
+
+        // C: "Get the input EOS to be able to reset it later"
+        // (`drvMcaRontec.c:196-197`), status ignored.
+        driver.input_eos = driver
+            .serial
+            .submit_blocking(RequestOp::GetInputEos, driver.octet_user(RONTEC_TIMEOUT))
+            .ok()
+            .and_then(|r| r.data)
+            .unwrap_or_default();
 
         // C: `sendMessage(pPvt, "$SM 4,0", NULL);` -- send 4 bytes/channel,
         // don't clear after sending. Best-effort: C ignores this call's
@@ -330,13 +346,9 @@ impl RontecDriver {
         // C brackets a single `pasynOctetSyncIO->writeRead` (flush → write →
         // read) with `setInputEos("",0)` / `setInputEos(saved,len)`
         // (`drvMcaRontec.c:458,461-462`) so the binary reply isn't cut short
-        // by the ASCII input EOS, ignoring every status but the length.
-        let saved_eos = self
-            .serial
-            .submit_blocking(RequestOp::GetInputEos, self.octet_user(SPECTRUM_TIMEOUT))
-            .ok()
-            .and_then(|r| r.data)
-            .unwrap_or_default();
+        // by the ASCII input EOS, ignoring every status but the length. Each
+        // is its own port lock in C as here, so another user of the serial
+        // port can run between them in both.
         let _ = self.serial.submit_blocking(
             RequestOp::SetInputEos { eos: Vec::new() },
             self.octet_user(SPECTRUM_TIMEOUT),
@@ -350,7 +362,9 @@ impl RontecDriver {
             self.octet_user(SPECTRUM_TIMEOUT),
         );
         let _ = self.serial.submit_blocking(
-            RequestOp::SetInputEos { eos: saved_eos },
+            RequestOp::SetInputEos {
+                eos: self.input_eos.clone(),
+            },
             self.octet_user(SPECTRUM_TIMEOUT),
         );
         let raw = match &read_result {
@@ -681,6 +695,7 @@ mod tests {
             elive: 0,
             ereal: 0,
             acquiring: false,
+            input_eos: Vec::new(),
             mca_buffer: vec![0; MCA_BUFFER_SIZE],
         }
     }
@@ -783,7 +798,7 @@ mod tests {
     /// A Rontec port on a [`FakeSerial`], both tracing into one file.
     struct Rig {
         rontec: epics_rs::asyn::runtime::port::PortRuntimeHandle,
-        _serial: epics_rs::asyn::runtime::port::PortRuntimeHandle,
+        serial: epics_rs::asyn::runtime::port::PortRuntimeHandle,
         writes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
         trace_path: std::path::PathBuf,
     }
@@ -808,18 +823,14 @@ mod tests {
                 input_eos: b"\r".to_vec(),
             };
             let (serial_rt, _) = create_port_runtime(serial, config()).expect("serial runtime");
-            let mut d = dummy_driver();
-            d.base = PortDriverBase::new(
+            let d = RontecDriver::on_serial(
                 &rontec_name,
-                1,
-                PortFlags {
-                    multi_device: true,
-                    can_block: true,
-                    destructible: true,
-                },
-            );
-            d.reasons = McaReason::create_params(&mut d.base).expect("params");
-            d.serial = serial_rt.port_handle().clone();
+                serial_rt.port_handle().clone(),
+                &serial_name,
+                0,
+            )
+            .expect("rontec driver");
+            writes.lock().unwrap().clear();
             let (rontec, _) = create_port_runtime(d, config()).expect("rontec runtime");
             let trace_path =
                 std::env::temp_dir().join(format!("mca-rontec-{tag}-{}.trace", std::process::id()));
@@ -833,7 +844,7 @@ mod tests {
             }
             Rig {
                 rontec,
-                _serial: serial_rt,
+                serial: serial_rt,
                 writes,
                 trace_path,
             }
@@ -1044,6 +1055,32 @@ mod tests {
             "{}",
             rig.trace()
         );
+    }
+
+    /// C restores the input EOS `RontecConfig` saved, not the one in force
+    /// when the spectrum is read (`drvMcaRontec.c:197,462`).
+    #[test]
+    fn a_spectrum_read_restores_the_input_eos_saved_at_config() {
+        let rig = Rig::new("eos", rontec_reply);
+        let serial = rig.serial.port_handle();
+        serial
+            .submit_blocking(
+                RequestOp::SetInputEos {
+                    eos: b"\n".to_vec(),
+                },
+                AsynUser::default(),
+            )
+            .expect("set eos");
+        rig.submit(
+            RequestOp::Int32ArrayRead { max_elements: 1 },
+            McaReason::Data,
+        )
+        .expect("read");
+        let eos = serial
+            .submit_blocking(RequestOp::GetInputEos, AsynUser::default())
+            .expect("get eos")
+            .data;
+        assert_eq!(eos.as_deref(), Some(&b"\r"[..]));
     }
 
     #[test]
