@@ -477,6 +477,9 @@ impl SessionWorker {
         let config = self.handle.config.lock().clone();
         let identity = config.setup_identity();
         let connection = self.connector.connect(&config, &identity).await?;
+        if config.debug > 0 {
+            eprintln!("Session {}: connect service succeeded", self.handle.name);
+        }
         if let Some(endpoint) = connection.endpoint() {
             self.report_connected(&identity, &endpoint);
         }
