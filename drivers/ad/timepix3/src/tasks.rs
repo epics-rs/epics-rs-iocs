@@ -18,9 +18,11 @@ use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interrupt::InterruptValue;
 use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::request::{DriverCall, ParamSetValue, RequestOp};
 use epics_rs::asyn::trace::TraceMask;
+use epics_rs::asyn::user::AsynUser;
 use serde_json::Value;
 
 use crate::accum::{RangeState, Update, clamp_average_to_u32};
@@ -31,7 +33,7 @@ use crate::family::DetectorFamily;
 use crate::http::{ServalHttp, TIMEOUT_POLL};
 use crate::params::TimePixParams;
 use crate::serval;
-use crate::state::{Command, Shared};
+use crate::state::{Command, Mirrored, Shared};
 use crate::stream::{Channel, DecodeError, Frame, FrameDecoder, ImageLimits, parse_tcp_path};
 use crate::window::{Configuration, RollingSumStatus};
 use crate::worker::{Generation, WorkerState};
@@ -75,6 +77,50 @@ pub struct Ctx {
 }
 
 pub type Outputs = Arc<[Arc<parking_lot::Mutex<NDArrayOutput>>]>;
+
+/// Whether C runs a caller under the port lock: the stream workers never take
+/// it (serval_stream.cpp, histogram_io.cpp), `pushProcessed*ToPlugins` runs
+/// in writeInt32 under it (ADTimePix.cpp:588-600).
+#[derive(Clone, Copy)]
+enum Locking {
+    Unlocked,
+    Locked,
+}
+
+/// The actor's `CallParamCallbacks`, from a worker job: every update stored,
+/// a failed one reported, then the callbacks for `addr`.
+fn apply_updates(base: &mut PortDriverBase, addr: i32, updates: &[ParamSetValue]) {
+    for u in updates {
+        let outcome = match u {
+            ParamSetValue::Value {
+                reason,
+                addr,
+                value,
+            } => base.set_param_value(*reason, *addr, value.clone()),
+            ParamSetValue::UInt32Digital {
+                reason,
+                addr,
+                value,
+                mask,
+                interrupt_mask,
+            } => base.set_uint32_param(*reason, *addr, *value, *mask, *interrupt_mask),
+            ParamSetValue::Status {
+                reason,
+                addr,
+                status,
+                alarm_status,
+                alarm_severity,
+            } => base.set_param_status(*reason, *addr, *status, *alarm_status, *alarm_severity),
+        };
+        if let Err(e) = outcome {
+            base.trace_print(
+                TraceMask::ERROR,
+                format_args!("callParamCallbacks: param set failed: {e}"),
+            );
+        }
+    }
+    let _ = base.call_param_callbacks(addr);
+}
 
 /// A fresh output for each of the port's `MAX_ADDR` addresses.
 pub fn new_outputs() -> Outputs {
@@ -124,9 +170,16 @@ impl Ctx {
 
     /// The parameter half of C `updatePrvHstRangeState` /
     /// `updateImgRangeState` (ADTimePix.cpp:1329-1334, :1344-1349).
-    async fn post_range(&self, saturated: usize, status: usize, range: Option<RangeState>) {
+    async fn post_range(
+        &self,
+        locking: Locking,
+        saturated: usize,
+        status: usize,
+        range: Option<RangeState>,
+    ) {
         let Some(range) = range else { return };
-        self.set(
+        self.post_as(
+            locking,
             ADDR,
             vec![
                 ParamSetValue::new(
@@ -142,6 +195,71 @@ impl Ctx {
             ],
         )
         .await;
+    }
+
+    /// C's unlocked `getIntegerParam` from a stream worker.
+    fn mirrored(&self, which: Mirrored) -> i32 {
+        self.shared.mirror.get(which)
+    }
+
+    /// C's unlocked `set*Param` + `callParamCallbacks` from a stream worker,
+    /// which a stop holding the port does not hold up.
+    fn post(&self, addr: i32, updates: Vec<ParamSetValue>) {
+        self.shared
+            .port_jobs
+            .push(move |base| apply_updates(base, addr, &updates));
+        self.flush_jobs();
+    }
+
+    fn post_int64(&self, reason: usize, value: i64) {
+        self.post(
+            ADDR,
+            vec![ParamSetValue::new(reason, ADDR, ParamValue::Int64(value))],
+        );
+    }
+
+    /// Have the actor run the workers' jobs; a stop that holds the port runs
+    /// them itself, and this flush then finds none.
+    fn flush_jobs(&self) {
+        let shared = self.shared.clone();
+        let call = DriverCall::new(move |d| shared.port_jobs.run(d.base_mut()));
+        let _ = self
+            .handle
+            .try_submit(RequestOp::WithDriver(call), AsynUser::default());
+    }
+
+    /// C's unlocked `getAttributes` from a stream worker, evaluated where its
+    /// PARAM values live.
+    async fn worker_attributes(&self, array: &mut DriverArray) {
+        let owner = self.pool.owner().clone();
+        if owner.attributes().lock().list.is_empty() {
+            return;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.shared.port_jobs.push(move |base| {
+            let _ = tx.send(owner.attributes().lock().update(base));
+        });
+        self.flush_jobs();
+        if let Ok(fresh) = rx.await {
+            array.attributes.copy_from(&fresh);
+        }
+    }
+
+    async fn post_as(&self, locking: Locking, addr: i32, updates: Vec<ParamSetValue>) {
+        match locking {
+            Locking::Unlocked => self.post(addr, updates),
+            Locking::Locked => self.set(addr, updates).await,
+        }
+    }
+
+    async fn attributes_as(&self, locking: Locking, array: &mut DriverArray) {
+        match locking {
+            Locking::Unlocked => self.worker_attributes(array).await,
+            // C ignores the getAttributes status.
+            Locking::Locked => {
+                let _ = self.pool.owner().get_attributes(array).await;
+            }
+        }
     }
 
     /// C `doCallbacksInt64Array` from the stream threads (serval_stream.cpp:975,
@@ -1128,7 +1246,7 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stre
     while worker.running(run) {
         // C leaves the histogram socket unread while accumulation is off
         // (histogram_io.cpp:1018-1023).
-        if kind == StreamKind::PrvHst && !prv_hst_accumulating(ctx).await {
+        if kind == StreamKind::PrvHst && !prv_hst_accumulating(ctx) {
             worker.wait_for_stop_for(run, PRV_HST_PAUSED_WAIT);
             continue;
         }
@@ -1154,7 +1272,7 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stre
 
         while worker.running(run) {
             if kind.channel() == Channel::Image {
-                decoder.set_image_limits(image_limits(ctx).await);
+                decoder.set_image_limits(image_limits(ctx));
             }
             match decoder.next_frame() {
                 Ok(Some(frame)) => handle_frame(ctx, kind, frame).await,
@@ -1172,12 +1290,8 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stre
 
 /// C `ADTimePixPrvHstAccumulationEnable`, which gates the PrvHst worker and
 /// both of its frame handlers.
-async fn prv_hst_accumulating(ctx: &Ctx) -> bool {
-    ctx.handle
-        .read_int32(ctx.p.prv_hst_accumulation_enable, 0)
-        .await
-        .unwrap_or(0)
-        != 0
+fn prv_hst_accumulating(ctx: &Ctx) -> bool {
+    ctx.mirrored(Mirrored::PrvHstAccumulationEnable) != 0
 }
 
 /// The window half of C `processImgFrame` / `processPrvHstFrame`
@@ -1230,7 +1344,8 @@ async fn post_window(ctx: &Ctx, which: Accum, update: &Update) {
                 .lock()
                 .report_range(RangeState::AccumulatorSaturated);
             let (saturated, range_status) = which.range_params(p);
-            ctx.post_range(saturated, range_status, range).await;
+            ctx.post_range(Locking::Unlocked, saturated, range_status, range)
+                .await;
         }
         let message = format!("Update failed: {}", push.name());
         ctx.trace(
@@ -1243,7 +1358,7 @@ async fn post_window(ctx: &Ctx, which: Accum, update: &Update) {
         updates.push(text(status, message));
     }
     updates.push(int(summed, update.frames_summed));
-    ctx.set(ADDR, updates).await;
+    ctx.post(ADDR, updates);
 }
 
 /// C `IMG_MEMORY_UPDATE_INTERVAL_SEC` / `PRVHST_MEMORY_UPDATE_INTERVAL_SEC`
@@ -1282,7 +1397,7 @@ async fn post_metrics(ctx: &Ctx, which: Accum, started: f64) {
         .map(|(reason, v)| ParamSetValue::new(reason, ADDR, ParamValue::Float64(v)))
         .collect();
     if !updates.is_empty() {
-        ctx.set(ADDR, updates).await;
+        ctx.post(ADDR, updates);
     }
 }
 
@@ -1326,12 +1441,11 @@ pub(crate) fn prv_hst_memory_mb(
 
 /// C `detectorImageFrameLimits` from the detector params
 /// (serval_stream.cpp:520-527).
-async fn image_limits(ctx: &Ctx) -> ImageLimits {
-    let int = |reason| async move { ctx.handle.read_int32(reason, 0).await.unwrap_or(0) };
+fn image_limits(ctx: &Ctx) -> ImageLimits {
     ImageLimits::detector(
-        int(ctx.ad.max_size_x).await,
-        int(ctx.ad.max_size_y).await,
-        int(ctx.p.pix_count).await,
+        ctx.mirrored(Mirrored::MaxSizeX),
+        ctx.mirrored(Mirrored::MaxSizeY),
+        ctx.mirrored(Mirrored::PixCount),
     )
 }
 
@@ -1410,7 +1524,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
                 "PrvImg ",
             );
-            ctx.set(
+            ctx.post(
                 ADDR,
                 geometry(ctx, &f)
                     .into_iter()
@@ -1440,8 +1554,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                         ParamSetValue::new(p.prv_img_acq_rate, ADDR, ParamValue::Float64(r))
                     }))
                     .collect(),
-            )
-            .await;
+            );
             attach_attributes(ctx, &mut array, &f).await;
             publish_image(ctx, PRV_IMG_ADDR, array).await;
         }
@@ -1460,12 +1573,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             let p = ctx.p;
             // processImgDataLine counts every Img frame, NDArrayCallbacks or
             // not, before getAttributes (serval_stream.cpp:880-883).
-            let counter = ctx
-                .handle
-                .read_int32(ctx.ad.base.array_counter, 0)
-                .await
-                .unwrap_or(0)
-                + 1;
+            let counter = ctx.mirrored(Mirrored::ArrayCounter) + 1;
             let rate = frame_rate(
                 ctx,
                 f.frame_number,
@@ -1473,7 +1581,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 adlog::PROCESS_IMG_DATA_LINE,
                 "Img ",
             );
-            ctx.set(
+            ctx.post(
                 ADDR,
                 geometry(ctx, &f)
                     .into_iter()
@@ -1505,18 +1613,12 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                         }),
                     )
                     .collect(),
-            )
-            .await;
+            );
             attach_attributes(ctx, &mut array, &f).await;
 
             // processImgFrame runs after getAttributes, on threshold 0 only and
             // only while ImgAccumulationEnable is set (serval_stream.cpp:948-982).
-            let enabled = ctx
-                .handle
-                .read_int32(p.img_accumulation_enable, 0)
-                .await
-                .unwrap_or(0)
-                != 0;
+            let enabled = ctx.mirrored(Mirrored::ImgAccumulationEnable) != 0;
             if enabled && f.threshold_id != 1 {
                 let started = EpicsTimestamp::now().as_f64();
                 // C's ImageData holds a uint8 frame as UINT16.
@@ -1532,7 +1634,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                     (img.total_counts(), img.frame_count())
                 };
                 post_metrics(ctx, Accum::Img, started).await;
-                ctx.set(
+                ctx.post(
                     ADDR,
                     vec![ParamSetValue::new(
                         p.img_image_frame,
@@ -1545,14 +1647,11 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                                 .into(),
                         ),
                     )],
-                )
-                .await;
-                ctx.set_int64(
+                );
+                ctx.post_int64(
                     p.img_total_counts,
-                    ADDR,
                     i64::try_from(counts).unwrap_or(i64::MAX),
-                )
-                .await;
+                );
 
                 publish_accumulation(
                     ctx,
@@ -1577,7 +1676,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
         (StreamKind::PrvHst, Frame::Histogram(h)) => {
             // histogram_io.cpp:165-170, :425-433: a frame read before
             // accumulation was turned off is dropped whole.
-            if !prv_hst_accumulating(ctx).await {
+            if !prv_hst_accumulating(ctx) {
                 return;
             }
             let started = EpicsTimestamp::now().as_f64();
@@ -1597,7 +1696,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 (hst.frame_count(), hst.total_counts())
             };
 
-            ctx.set(
+            ctx.post(
                 ADDR,
                 vec![
                     ParamSetValue::new(
@@ -1638,23 +1737,19 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                         ),
                     ),
                 ],
-            )
-            .await;
-            ctx.set(
+            );
+            ctx.post(
                 ADDR,
                 vec![ParamSetValue::new(
                     p.prv_hst_histogram_time_ms,
                     ADDR,
                     ParamValue::Float64Array(h.time_axis_ms().into()),
                 )],
-            )
-            .await;
-            ctx.set_int64(
+            );
+            ctx.post_int64(
                 p.prv_hst_total_counts,
-                ADDR,
                 i64::try_from(counts).unwrap_or(i64::MAX),
-            )
-            .await;
+            );
             post_window(ctx, Accum::PrvHst, &update).await;
 
             publish_accumulation(
@@ -1669,13 +1764,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
 
             // histogram_io.cpp:720-830: every frame also goes to the plugins on
             // addresses 4-7, the window sum only on the frames it was updated.
-            if ctx
-                .handle
-                .read_int32(ctx.ad.base.array_callbacks, 0)
-                .await
-                .unwrap_or(0)
-                != 0
-            {
+            if ctx.mirrored(Mirrored::ArrayCallbacks) != 0 {
                 let time_ms = h.time_axis_ms();
                 let arrays = HstArrays {
                     window: update.sum_n.map(|w| (w, update.frames_summed as u64)),
@@ -1684,7 +1773,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                     current: Some(h.counts),
                     time_ms,
                 };
-                publish_hst_arrays(ctx, arrays, SumOutput::Sum).await;
+                publish_hst_arrays(ctx, Locking::Unlocked, arrays, SumOutput::Sum).await;
             }
             post_metrics(ctx, Accum::PrvHst, started).await;
         }
@@ -1919,6 +2008,7 @@ fn add_time_attributes(array: &mut DriverArray, time_ms: &[f64]) {
 /// average clamped to u32 with any clamp latched as `OutputClamped`.
 async fn sum_buffer(
     ctx: &Ctx,
+    locking: Locking,
     accum: Accum,
     sum: &[u64],
     frames: u64,
@@ -1942,7 +2032,7 @@ async fn sum_buffer(
                     .lock()
                     .report_range(RangeState::OutputClamped);
                 let (saturated, status) = accum.range_params(&ctx.p);
-                ctx.post_range(saturated, status, posted).await;
+                ctx.post_range(locking, saturated, status, posted).await;
             }
             NDDataBuffer::U32(avg)
         }
@@ -1953,7 +2043,7 @@ async fn sum_buffer(
 /// current frame on 6 and the window sum on 4 (ADTimePix.cpp:1209-1305,
 /// histogram_io.cpp:765-830). Every array carries one `time_stamp`, taken
 /// before the first is built.
-async fn publish_hst_arrays(ctx: &Ctx, a: HstArrays, output: SumOutput) {
+async fn publish_hst_arrays(ctx: &Ctx, locking: Locking, a: HstArrays, output: SumOutput) {
     let bins = a.running.len();
     if bins == 0 {
         return;
@@ -1962,9 +2052,17 @@ async fn publish_hst_arrays(ctx: &Ctx, a: HstArrays, output: SumOutput) {
     let dims = || vec![NDDimension::new(bins)];
     let (range, units) = output.range_units();
 
-    let data = sum_buffer(ctx, Accum::PrvHst, &a.running, a.frame_count.max(1), output).await;
+    let data = sum_buffer(
+        ctx,
+        locking,
+        Accum::PrvHst,
+        &a.running,
+        a.frame_count.max(1),
+        output,
+    )
+    .await;
     if let Ok(mut array) = ctx.pool.wrap(dims(), data) {
-        let _ = ctx.pool.owner().get_attributes(&mut array).await;
+        ctx.attributes_as(locking, &mut array).await;
         add_time_attributes(&mut array, &a.time_ms);
         let saturated = Accum::PrvHst.saturated(&ctx.shared);
         add_range_attributes(&mut array, range, units, saturated);
@@ -1972,22 +2070,30 @@ async fn publish_hst_arrays(ctx: &Ctx, a: HstArrays, output: SumOutput) {
     }
 
     if let Ok(mut array) = ctx.pool.wrap(dims(), NDDataBuffer::F64(a.time_ms.clone())) {
-        let _ = ctx.pool.owner().get_attributes(&mut array).await;
+        ctx.attributes_as(locking, &mut array).await;
         ctx.publish_at(7, array, time_stamp).await;
     }
 
     if let Some(current) = a.current.filter(|c| c.len() == bins)
         && let Ok(mut array) = ctx.pool.wrap(dims(), NDDataBuffer::U32(current))
     {
-        let _ = ctx.pool.owner().get_attributes(&mut array).await;
+        ctx.attributes_as(locking, &mut array).await;
         add_range_attributes(&mut array, "uint32", "counts", false);
         ctx.publish_at(6, array, time_stamp).await;
     }
 
     if let Some((window, frames)) = a.window.filter(|(w, _)| w.len() >= bins) {
-        let data = sum_buffer(ctx, Accum::PrvHst, &window[..bins], frames.max(1), output).await;
+        let data = sum_buffer(
+            ctx,
+            locking,
+            Accum::PrvHst,
+            &window[..bins],
+            frames.max(1),
+            output,
+        )
+        .await;
         if let Ok(mut array) = ctx.pool.wrap(dims(), data) {
-            let _ = ctx.pool.owner().get_attributes(&mut array).await;
+            ctx.attributes_as(locking, &mut array).await;
             add_time_attributes(&mut array, &a.time_ms);
             let saturated = Accum::PrvHst.saturated(&ctx.shared);
             add_range_attributes(&mut array, range, units, saturated);
@@ -2031,7 +2137,7 @@ async fn push_processed_hst(ctx: &Ctx) {
             time_ms: crate::stream::time_axis_ms(offset, width, hst.running().len()),
         }
     };
-    publish_hst_arrays(ctx, arrays, output).await;
+    publish_hst_arrays(ctx, Locking::Locked, arrays, output).await;
 }
 
 /// One of processImgFrame's NDUInt64 sums on address 2 or 3.
@@ -2050,7 +2156,7 @@ async fn publish_img_sum(
         return;
     };
     array.unique_id = unique_id;
-    let _ = ctx.pool.owner().get_attributes(&mut array).await;
+    ctx.worker_attributes(&mut array).await;
     let saturated = Accum::Img.saturated(&ctx.shared);
     add_range_attributes(&mut array, "uint64", "counts", saturated);
     ctx.publish_at(addr, array, EpicsTimestamp::now().as_f64())
@@ -2087,7 +2193,15 @@ async fn push_processed_img(ctx: &Ctx) {
     let dims = || shape.iter().map(|&n| NDDimension::new(n)).collect();
     let (range, units) = output.range_units();
 
-    let data = sum_buffer(ctx, Accum::Img, &running, frames.max(1), output).await;
+    let data = sum_buffer(
+        ctx,
+        Locking::Locked,
+        Accum::Img,
+        &running,
+        frames.max(1),
+        output,
+    )
+    .await;
     if let Ok(mut array) = ctx.pool.wrap(dims(), data) {
         let _ = ctx.pool.owner().get_attributes(&mut array).await;
         let saturated = Accum::Img.saturated(&ctx.shared);
@@ -2097,7 +2211,15 @@ async fn push_processed_img(ctx: &Ctx) {
     }
 
     if let Some((window, frames)) = window.filter(|(w, _)| w.len() >= running.len()) {
-        let data = sum_buffer(ctx, Accum::Img, &window[..running.len()], frames, output).await;
+        let data = sum_buffer(
+            ctx,
+            Locking::Locked,
+            Accum::Img,
+            &window[..running.len()],
+            frames,
+            output,
+        )
+        .await;
         if let Ok(mut array) = ctx.pool.wrap(dims(), data) {
             let _ = ctx.pool.owner().get_attributes(&mut array).await;
             let saturated = Accum::Img.saturated(&ctx.shared);
@@ -2172,7 +2294,7 @@ async fn attach_attributes(ctx: &Ctx, array: &mut DriverArray, f: &crate::stream
     array.unique_id = f.frame_number;
     array.timestamp = EpicsTimestamp::now();
     array.time_stamp = array.timestamp.as_f64();
-    let _ = ctx.pool.owner().get_attributes(array).await;
+    ctx.worker_attributes(array).await;
     array.attributes.add(NDAttribute::new_static(
         "ThresholdID",
         "Serval jsonimage thresholdID",
@@ -2182,13 +2304,7 @@ async fn attach_attributes(ctx: &Ctx, array: &mut DriverArray, f: &crate::stream
 }
 
 async fn publish_image(ctx: &Ctx, addr: usize, array: DriverArray) {
-    if ctx
-        .handle
-        .read_int32(ctx.ad.base.array_callbacks, 0)
-        .await
-        .unwrap_or(0)
-        != 0
-    {
+    if ctx.mirrored(Mirrored::ArrayCallbacks) != 0 {
         ArrayPublisher::new(ctx.outputs[addr].clone())
             .publish(array)
             .await;
@@ -2237,17 +2353,40 @@ mod tests {
         assert_eq!(r[3], (0.0, 0.0));
     }
 
+    /// A set the actor has stored once this returns, so a worker reading
+    /// the mirror next sees it.
+    async fn set_synced(ctx: &Ctx, reason: usize, addr: i32, value: i32) {
+        ctx.set_int(reason, addr, value).await;
+        let _ = ctx.handle.read_int32(reason, addr).await;
+    }
+
     fn idle_ctx(name: &str) -> Ctx {
+        idle_ctx_at(name, "http://127.0.0.1:1", None)
+    }
+
+    /// An idle port talking to `serval`, its pool the driver's with
+    /// `attributes` loaded when given.
+    fn idle_ctx_at(name: &str, serval: &str, attributes: Option<&[u8]>) -> Ctx {
         use epics_rs::asyn::runtime::config::RuntimeConfig;
         use epics_rs::asyn::runtime::port::create_port_runtime;
 
-        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let http = Arc::new(ServalHttp::new(serval));
         let shared = Arc::new(Shared::new());
         let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
-        let driver =
+        let mut driver =
             crate::driver::TimePix3Driver::new(name, http.clone(), shared.clone(), 0, cmd_tx)
                 .unwrap();
         let (p, ad) = (driver.p, driver.ad.params);
+        let pool = match attributes {
+            Some(xml) => {
+                driver
+                    .ad
+                    .write_octet(&AsynUser::new(ad.base.attributes_file), xml)
+                    .unwrap();
+                driver.ad.pool.clone()
+            }
+            None => DriverPool::standalone(0),
+        };
         let (runtime, _) = create_port_runtime(
             &epics_rs::asyn::registry::claim_port(name).unwrap(),
             driver,
@@ -2263,7 +2402,7 @@ mod tests {
             p,
             ad,
             outputs: new_outputs(),
-            pool: DriverPool::standalone(0),
+            pool,
         }
     }
 
@@ -2446,7 +2585,7 @@ mod tests {
             outputs,
             pool: DriverPool::standalone(0),
         });
-        ctx.set_int(ad.base.array_callbacks, 0, 1).await;
+        set_synced(&ctx, ad.base.array_callbacks, 0, 1).await;
 
         for (kind, frame_number) in [(StreamKind::PrvImg, 41), (StreamKind::Img, 97)] {
             let frame = Frame::Image(crate::stream::ImageFrame {
@@ -2509,7 +2648,7 @@ mod tests {
             outputs,
             pool: DriverPool::standalone(0),
         });
-        ctx.set_int(ad.base.array_callbacks, 0, 1).await;
+        set_synced(&ctx, ad.base.array_callbacks, 0, 1).await;
 
         for kind in [StreamKind::PrvImg, StreamKind::Img] {
             for format in [PixelFormat::UInt8, PixelFormat::UInt16, PixelFormat::UInt32] {
@@ -2580,7 +2719,7 @@ mod tests {
             outputs: new_outputs(),
             pool: DriverPool::standalone(0),
         });
-        ctx.set_int(p.img_accumulation_enable, 0, 1).await;
+        set_synced(&ctx, p.img_accumulation_enable, 0, 1).await;
         let frame = Frame::Image(crate::stream::ImageFrame {
             width: 2,
             height: 1,
@@ -2657,7 +2796,7 @@ mod tests {
             outputs,
             pool,
         });
-        ctx.set_int(ad.base.array_callbacks, 0, 1).await;
+        set_synced(&ctx, ad.base.array_callbacks, 0, 1).await;
         ctx.set(
             0,
             vec![ParamSetValue::new(
@@ -2803,7 +2942,7 @@ mod tests {
         let int = |reason| ctx.handle.read_int32(reason, 0);
 
         // Counted with NDArrayCallbacks off.
-        ctx.set_int(ad.base.array_callbacks, 0, 0).await;
+        set_synced(&ctx, ad.base.array_callbacks, 0, 0).await;
         handle_frame(
             &ctx,
             StreamKind::Img,
@@ -2812,7 +2951,7 @@ mod tests {
         .await;
         assert_eq!(int(ad.base.array_counter).await.unwrap(), 1);
 
-        ctx.set_int(ad.base.array_callbacks, 0, 1).await;
+        set_synced(&ctx, ad.base.array_callbacks, 0, 1).await;
         handle_frame(
             &ctx,
             StreamKind::PrvImg,
@@ -2894,8 +3033,8 @@ mod tests {
             outputs,
             pool,
         });
-        ctx.set_int(ad.base.array_callbacks, 0, 1).await;
-        ctx.set_int(p.img_accumulation_enable, 0, 1).await;
+        set_synced(&ctx, ad.base.array_callbacks, 0, 1).await;
+        set_synced(&ctx, p.img_accumulation_enable, 0, 1).await;
         for (frame_number, before) in [(1, 0), (2, 3)] {
             let frame = Frame::Image(crate::stream::ImageFrame {
                 width: 2,
@@ -2942,7 +3081,7 @@ mod tests {
         assert_eq!(total(), 0);
         handle_frame(&ctx, StreamKind::Img, frame(0)).await;
         assert_eq!(total(), 3);
-        ctx.set_int(ctx.p.img_accumulation_enable, 0, 0).await;
+        set_synced(&ctx, ctx.p.img_accumulation_enable, 0, 0).await;
         handle_frame(&ctx, StreamKind::Img, frame(0)).await;
         assert_eq!(total(), 3);
     }
@@ -2961,9 +3100,9 @@ mod tests {
             ctx.outputs[addr].lock().add(tx);
             sinks.push(rx);
         }
-        ctx.set_int(ctx.ad.base.array_callbacks, 0, 1).await;
-        ctx.set_int(ctx.p.prv_hst_frame_bin_offset, 0, 0).await;
-        ctx.set_int(ctx.p.prv_hst_frame_bin_width, 0, 2).await;
+        set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
+        set_synced(&ctx, ctx.p.prv_hst_frame_bin_offset, 0, 0).await;
+        set_synced(&ctx, ctx.p.prv_hst_frame_bin_width, 0, 2).await;
         {
             let mut hst = ctx.shared.hst.lock();
             hst.add(&[1, u32::MAX]);
@@ -2999,7 +3138,7 @@ mod tests {
             Some(&NDAttrValue::Int32(2))
         );
 
-        ctx.set_int(ctx.p.processed_hst_output_type, 0, 1).await;
+        set_synced(&ctx, ctx.p.processed_hst_output_type, 0, 1).await;
         push_processed_hst(&ctx).await;
         let avg4 = recv(0).await;
         let avg5 = recv(1).await;
@@ -3119,6 +3258,98 @@ mod tests {
         );
     }
 
+    /// C's stop holds the port while Serval sends the last frames and closes
+    /// the streams, and its workers, which never take the port lock, post
+    /// them meanwhile (acquisition_runtime.cpp:207-211): a frame Serval sends
+    /// after /measurement/stop is posted before the stop returns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_drains_the_frames_serval_sends_after_the_stop_request() {
+        use crate::coordinator::Resource;
+        use std::io::{BufRead, BufReader, Write};
+
+        let stream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer: Arc<parking_lot::Mutex<Option<TcpStream>>> = Arc::default();
+        let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", http.local_addr().unwrap());
+        let tail = peer.clone();
+        std::thread::spawn(move || {
+            for conn in http.incoming().flatten() {
+                let mut reader = BufReader::new(conn);
+                let mut request = String::new();
+                let _ = reader.read_line(&mut request);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                if request.contains("/measurement/stop") {
+                    let tail = tail.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(300));
+                        let mut peer = tail.lock().take().unwrap();
+                        let mut bytes =
+                            br#"{"width":1,"height":1,"pixelFormat":"uint16","frameNumber":7}"#
+                                .to_vec();
+                        bytes.extend_from_slice(b"\n\x00\x01");
+                        peer.write_all(&bytes).unwrap();
+                    });
+                }
+                let _ = reader.get_mut().write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+
+        let ctx = Arc::new(idle_ctx_at(
+            "TPX_STOP_DRAIN",
+            &url,
+            Some(br#"<Attributes><Attribute name="Exposure" type="PARAM" source="ACQ_TIME" datatype="DOUBLE"/></Attributes>"#),
+        ));
+        let (tx, mut rx) =
+            epics_rs::ad_core::plugin::channel::ndarray_channel("TPX_STOP_DRAIN_SINK", 4);
+        ctx.outputs[PRV_IMG_ADDR].lock().add(tx);
+        set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
+        let path = format!("tcp://{}", stream.local_addr().unwrap());
+        ctx.shared.set_stream_paths(Some(path), None, None);
+        let acquisition = &ctx.shared.acquisition;
+        assert!(acquisition.begin_start());
+        for resource in [Resource::RemoteMeasurement, Resource::MonitorThread] {
+            assert!(acquisition.note_resource(resource));
+        }
+        assert!(acquisition.commit_start());
+        assert!(ctx.shared.prv_img_worker.start());
+        let c = ctx.clone();
+        let _worker = rt::run_thread_named("TpxStopDrain", move || async move {
+            stream_worker(c, StreamKind::PrvImg).await;
+        });
+        *peer.lock() = Some(stream.accept().unwrap().0);
+        assert!(
+            ctx.shared
+                .prv_img_worker
+                .wait_for_connected_for(Duration::from_secs(5))
+        );
+
+        ctx.handle
+            .with_driver(|d: &mut TimePix3Driver| d.stop_acquisition(false, ""))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ctx.handle
+                .read_int32(ctx.p.prv_img_frame_number, 0)
+                .await
+                .unwrap_or(0),
+            7
+        );
+        // The frame's getAttributes was served while the stop held the port.
+        let array = tokio::time::timeout(Duration::from_millis(10), rx.recv())
+            .await
+            .expect("the frame was not published before the stop returned")
+            .unwrap();
+        assert!(array.attributes.get("Exposure").is_some());
+    }
+
     /// C neither reads the histogram socket nor handles a frame while
     /// PrvHstAccumulationEnable is 0 (histogram_io.cpp:165-170, :1018-1023):
     /// a frame sent meanwhile waits in the socket and is taken on re-enable.
@@ -3128,7 +3359,7 @@ mod tests {
 
         let ctx = Arc::new(idle_ctx("TPX_HST_GATE"));
         let enable = ctx.p.prv_hst_accumulation_enable;
-        ctx.set_int(enable, 0, 0).await;
+        set_synced(&ctx, enable, 0, 0).await;
         assert!(ctx.shared.prv_hst_worker.start());
         let run = ctx.shared.prv_hst_worker.wait_for_start(None);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3147,7 +3378,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(ctx.shared.hst.lock().frame_count(), 0);
 
-        ctx.set_int(enable, 0, 1).await;
+        set_synced(&ctx, enable, 0, 1).await;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while ctx.shared.hst.lock().frame_count() == 0 {
             assert!(std::time::Instant::now() < deadline, "frame never taken");
@@ -3170,7 +3401,7 @@ mod tests {
             ctx.outputs[addr].lock().add(tx);
             sinks.push(rx);
         }
-        ctx.set_int(ctx.ad.base.array_callbacks, 0, 1).await;
+        set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
         for counts in [vec![1, 2], vec![3, 4]] {
             let frame = Frame::Histogram(crate::stream::HistogramFrame {
                 bin_width: 2,
@@ -3242,14 +3473,14 @@ mod tests {
             assert_eq!(sum_n.unique_id, i + 1);
         }
         // The second frame's pair was the last one sent.
-        ctx.set_int(ctx.ad.base.array_callbacks, 0, 1).await;
+        set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
         push_processed_img(&ctx).await;
         let (sum, sum_n) = (recv(0).await, recv(1).await);
         assert!(matches!(&sum.data, NDDataBuffer::U64(v) if *v == vec![4, 6]));
         assert!(matches!(&sum_n.data, NDDataBuffer::U64(v) if *v == vec![4, 6]));
         assert_eq!(sum.dims.len(), 2);
 
-        ctx.set_int(ctx.p.processed_img_output_type, 0, 1).await;
+        set_synced(&ctx, ctx.p.processed_img_output_type, 0, 1).await;
         push_processed_img(&ctx).await;
         let (avg, avg_n) = (recv(0).await, recv(1).await);
         assert!(matches!(&avg.data, NDDataBuffer::U32(v) if *v == vec![2, 3]));

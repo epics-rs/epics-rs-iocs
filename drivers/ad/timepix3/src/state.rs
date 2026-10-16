@@ -3,13 +3,17 @@
 //! In C this is a pile of `ADTimePix` members guarded by three `epicsMutex`es
 //! — and the stream workers reach straight into the asyn parameter library
 //! without holding the port lock (UPSTREAM DEFECT, serval_stream.cpp:582-700,
-//! :1447-1533, histogram_io.cpp:430-700). Here the workers own only this
-//! struct; every parameter update goes through the port handle, which is the
-//! single owner of the parameter library.
+//! :1447-1533, histogram_io.cpp:430-700). Here the workers read the few
+//! parameters they need from [`ParamMirror`] and hand their writes to
+//! [`PortJobs`], so neither waits for the port: a stop that holds the port
+//! through the workers' drain, as C's does, still sees them drain.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::Duration;
 
-use parking_lot::Mutex;
+use epics_rs::asyn::port::PortDriverBase;
+use parking_lot::{Condvar, Mutex};
 
 use crate::accum::Accumulator;
 use crate::coordinator::Coordinator;
@@ -45,6 +49,87 @@ pub struct StreamPaths {
     pub prv_hst: Option<String>,
 }
 
+/// A parameter the stream workers read with C's unlocked `getIntegerParam`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mirrored {
+    ArrayCallbacks,
+    ArrayCounter,
+    MaxSizeX,
+    MaxSizeY,
+    PixCount,
+    ImgAccumulationEnable,
+    PrvHstAccumulationEnable,
+}
+
+impl Mirrored {
+    pub const ALL: [Self; 7] = [
+        Self::ArrayCallbacks,
+        Self::ArrayCounter,
+        Self::MaxSizeX,
+        Self::MaxSizeY,
+        Self::PixCount,
+        Self::ImgAccumulationEnable,
+        Self::PrvHstAccumulationEnable,
+    ];
+}
+
+/// The address-0 values of the [`Mirrored`] parameters, stored by an Int32
+/// store rule on each, so every store of the parameter lands here too.
+#[derive(Debug, Default)]
+pub struct ParamMirror([AtomicI32; Mirrored::ALL.len()]);
+
+impl ParamMirror {
+    pub fn get(&self, which: Mirrored) -> i32 {
+        self.0[which as usize].load(Ordering::Acquire)
+    }
+
+    pub fn store(&self, which: Mirrored, value: i32) {
+        self.0[which as usize].store(value, Ordering::Release);
+    }
+}
+
+type PortJob = Box<dyn FnOnce(&mut PortDriverBase) + Send>;
+
+/// What the stream workers do to the parameter library, in their order. Runs
+/// on the port's actor, from whichever comes first: the flush each push
+/// submits, or a stop that holds the port while it waits for the workers.
+#[derive(Default)]
+pub struct PortJobs {
+    queue: Mutex<VecDeque<PortJob>>,
+    pushed: Condvar,
+}
+
+impl PortJobs {
+    pub fn push(&self, job: impl FnOnce(&mut PortDriverBase) + Send + 'static) {
+        self.queue.lock().push_back(Box::new(job));
+        self.pushed.notify_all();
+    }
+
+    /// Run every queued job, oldest first. Only the actor calls it, so jobs
+    /// run one at a time.
+    pub fn run(&self, base: &mut PortDriverBase) {
+        while let Some(job) = self.queue.lock().pop_front() {
+            job(base);
+        }
+    }
+
+    /// Run the jobs pushed until `timeout`, or until a push after the first
+    /// wait: the stop's wait loop.
+    pub fn run_for(&self, base: &mut PortDriverBase, timeout: Duration) {
+        {
+            let mut q = self.queue.lock();
+            if q.is_empty() {
+                self.pushed.wait_for(&mut q, timeout);
+            }
+        }
+        self.run(base);
+    }
+}
+
+/// How often a stop waiting on the workers looks at their state; a job
+/// pushed meanwhile wakes it at once.
+const WORKER_STATE_POLL: Duration = Duration::from_millis(5);
+
 pub struct Shared {
     /// The Img channel's accumulation (asyn addresses 1-3).
     pub img: Mutex<Accumulator>,
@@ -67,6 +152,8 @@ pub struct Shared {
     family: AtomicI32,
     /// C `detectorFamilyApplied_`.
     family_applied: AtomicBool,
+    pub mirror: ParamMirror,
+    pub port_jobs: PortJobs,
 }
 
 impl Default for Shared {
@@ -90,6 +177,8 @@ impl Shared {
             acquisition: Coordinator::default(),
             family: AtomicI32::new(DetectorFamily::Unknown as i32),
             family_applied: AtomicBool::new(false),
+            mirror: ParamMirror::default(),
+            port_jobs: PortJobs::default(),
         }
     }
 
@@ -114,11 +203,33 @@ impl Shared {
         [&self.prv_img_worker, &self.img_worker, &self.prv_hst_worker]
     }
 
-    /// The stop half of C `stopAndJoinStreamWorkers` (acquire.cpp:159-199).
-    pub fn stop_stream_workers(&self) {
+    /// C `waitForStreamWorkersToStop` (acquisition_runtime.cpp:84-104): wait
+    /// up to `timeout` for every worker to end its run, running the workers'
+    /// jobs meanwhile. The caller holds the port.
+    pub fn wait_for_stream_workers_to_stop(&self, base: &mut PortDriverBase, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.stream_workers().iter().any(|w| w.any_running()) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            self.port_jobs
+                .run_for(base, (deadline - now).min(WORKER_STATE_POLL));
+        }
+        self.port_jobs.run(base);
+    }
+
+    /// C `stopAndJoinStreamWorkers` (acquire.cpp:159-199): stop every worker
+    /// and wait, as C's join does without a bound, until each has left its
+    /// run, running the workers' jobs meanwhile. The caller holds the port.
+    pub fn stop_and_join_stream_workers(&self, base: &mut PortDriverBase) {
         for worker in self.stream_workers() {
             worker.request_stop();
         }
+        while !self.stream_workers().iter().all(|w| w.parked()) {
+            self.port_jobs.run_for(base, WORKER_STATE_POLL);
+        }
+        self.port_jobs.run(base);
     }
 
     pub fn set_orientation(&self, orientation: i32) {

@@ -23,7 +23,7 @@ use crate::http::{HttpError, ServalHttp, TIMEOUT_CONFIG, TIMEOUT_POLL, decode_ba
 use crate::mask::{self, Geometry, PIXEL_CONFIG_BYTES};
 use crate::params::TimePixParams;
 use crate::serval;
-use crate::state::{Command, Shared};
+use crate::state::{Command, Mirrored, Shared};
 use crate::tasks::{self, Accum};
 use crate::window::{Configuration, RollingSumStatus};
 
@@ -172,6 +172,9 @@ fn one_shot(value: i32) -> bool {
     value == 1
 }
 
+/// C `kStreamCloseTimeout` (acquisition_runtime.cpp:24).
+const STREAM_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
+
 /// C `kMpx3BothCountersTriggerMsg` (ADTimePix.cpp:2129-2130).
 const MPX3_TRIGGER_MSG: &str =
     "MPX3: BothCounters requires non-Continuous TriggerMode (use AutoTrgSt_TmrSp=4)";
@@ -223,6 +226,7 @@ impl TimePix3Driver {
             destinations: destination::Policy::default(),
         };
         driver.init_params()?;
+        driver.mirror_worker_params();
         driver.configure_calibration(
             &std::env::var("ADTIMEPIX_CALIBRATION_ROOT").unwrap_or_default(),
         )?;
@@ -230,6 +234,35 @@ impl TimePix3Driver {
             &std::env::var("ADTIMEPIX_DESTINATION_ALLOWLIST").unwrap_or_default(),
         )?;
         Ok(driver)
+    }
+
+    /// Keep [`Shared::mirror`] equal to the address-0 values of what the
+    /// stream workers read, from now on and from what is already stored.
+    fn mirror_worker_params(&mut self) {
+        let ad = self.ad.params;
+        for which in Mirrored::ALL {
+            let reason = match which {
+                Mirrored::ArrayCallbacks => ad.base.array_callbacks,
+                Mirrored::ArrayCounter => ad.base.array_counter,
+                Mirrored::MaxSizeX => ad.max_size_x,
+                Mirrored::MaxSizeY => ad.max_size_y,
+                Mirrored::PixCount => self.p.pix_count,
+                Mirrored::ImgAccumulationEnable => self.p.img_accumulation_enable,
+                Mirrored::PrvHstAccumulationEnable => self.p.prv_hst_accumulation_enable,
+            };
+            let shared = self.shared.clone();
+            self.ad.port_base.set_int32_rule(
+                reason,
+                Arc::new(move |_: &mut PortDriverBase, addr, value| {
+                    if addr == 0 {
+                        shared.mirror.store(which, value);
+                    }
+                    Ok(())
+                }),
+            );
+            let value = self.ad.port_base.get_int32_param(reason, 0).unwrap_or(0);
+            self.shared.mirror.store(which, value);
+        }
     }
 
     /// C `ADTimePixConfig`'s ADTIMEPIX_DESTINATION_ALLOWLIST, permissive when
@@ -1390,7 +1423,8 @@ impl TimePix3Driver {
     fn start_measurement(&mut self) -> Result<(), &'static str> {
         const FAILED: &str = "Failed to start acquisition";
         // acquire.cpp:333-336: start from one known worker generation.
-        self.shared.stop_stream_workers();
+        self.shared
+            .stop_and_join_stream_workers(&mut self.ad.port_base);
         if self.mpx3_trigger_conflict(self.int(self.ad.params.trigger_mode, 0)) {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
@@ -1612,7 +1646,16 @@ impl TimePix3Driver {
         let mut measurement_valid = false;
         if had_remote {
             match self.http.get(serval::MEASUREMENT_STOP, TIMEOUT_POLL) {
-                Ok(_) => stop_succeeded = true,
+                Ok(_) => {
+                    stop_succeeded = true;
+                    // acquisition_runtime.cpp:207: Serval closes the streams
+                    // once it has sent the last frames; the workers drain
+                    // them while the port stays held.
+                    self.shared.wait_for_stream_workers_to_stop(
+                        &mut self.ad.port_base,
+                        STREAM_CLOSE_TIMEOUT,
+                    );
+                }
                 Err(e) => {
                     self.log_http(
                         &e,
@@ -1626,7 +1669,8 @@ impl TimePix3Driver {
             }
         }
         // acquisition_runtime.cpp:211.
-        self.shared.stop_stream_workers();
+        self.shared
+            .stop_and_join_stream_workers(&mut self.ad.port_base);
         if had_remote {
             match self.http.get(serval::MEASUREMENT, TIMEOUT_POLL) {
                 Ok(body) => match serval::parse_status_response(&body) {

@@ -25,6 +25,9 @@ struct Inner {
     /// The connected socket, so a stop can interrupt a blocked receive (C
     /// `stopAndJoinStreamWorkers` calls `client->interrupt()`).
     socket: Option<TcpStream>,
+    /// The worker is serving a run rather than parked in `wait_for_start`:
+    /// what C's `epicsThreadMustJoin` waits out.
+    serving: bool,
 }
 
 /// The run of a worker one `start` admitted.
@@ -64,10 +67,13 @@ impl WorkerState {
     /// Park the worker until a start newer than `served`.
     pub fn wait_for_start(&self, served: Option<Generation>) -> Generation {
         let mut s = self.inner.lock();
+        s.serving = false;
+        self.changed.notify_all();
         let served = served.map_or(0, |g| g.0);
         self.changed.wait_while(&mut s, |s| {
             s.phase == Phase::Stopped || s.generation == served
         });
+        s.serving = true;
         Generation(s.generation)
     }
 
@@ -110,6 +116,16 @@ impl WorkerState {
     pub fn running(&self, g: Generation) -> bool {
         let s = self.inner.lock();
         s.generation == g.0 && s.phase != Phase::Stopped
+    }
+
+    /// C `running`, for whichever run the worker is on.
+    pub fn any_running(&self) -> bool {
+        self.inner.lock().phase != Phase::Stopped
+    }
+
+    /// The worker has left its last run and is parked: C's join has returned.
+    pub fn parked(&self) -> bool {
+        !self.inner.lock().serving
     }
 
     /// C `connected`.
@@ -184,6 +200,28 @@ mod tests {
         let t0 = std::time::Instant::now();
         assert!(!w.wait_for_connected_for(Duration::from_secs(5)));
         assert!(t0.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_worker_is_parked_until_it_takes_a_run_and_again_after_it() {
+        let w = Arc::new(WorkerState::default());
+        assert!(w.parked());
+        assert!(w.start());
+        let worker = w.clone();
+        let t = std::thread::spawn(move || {
+            let g = worker.wait_for_start(None);
+            worker.wait_for_stop_for(g, Duration::from_secs(5));
+            worker.wait_for_start(Some(g));
+        });
+        while w.parked() {
+            std::thread::yield_now();
+        }
+        w.request_stop();
+        while !w.parked() {
+            std::thread::yield_now();
+        }
+        assert!(w.start());
+        t.join().unwrap();
     }
 
     #[test]
