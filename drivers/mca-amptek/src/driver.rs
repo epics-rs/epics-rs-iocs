@@ -362,6 +362,10 @@ pub struct AmptekDriver {
     /// read site already tolerates the all-zero baseline the same way C's
     /// own pre-connect zeroed struct does.
     last_status: Dp5Status,
+    /// `CConsoleHelper::DP5Proto.SPECTRUM`: the last spectrum
+    /// [`Self::receive_data`] decoded. `readInt32Array` copies it whenever
+    /// `ReceiveData` succeeds, whatever packet type arrived.
+    spectrum: Vec<i32>,
     /// `CConsoleHelper::HwCfgDP5`.
     hw_cfg_dp5: String,
 }
@@ -422,6 +426,7 @@ impl AmptekDriver {
             acquiring: false,
             failed_sends: 0,
             last_status: status::process_status(&[0u8; 64]),
+            spectrum: Vec::new(),
             hw_cfg_dp5: String::new(),
         })
     }
@@ -466,7 +471,7 @@ impl AmptekDriver {
     /// branch): send the fixed-shape request packet for `cmd` to `target`
     /// and wait for a response, with no bookkeeping and no parsing -- both
     /// are the caller's decision (see [`Self::send_command`] and
-    /// [`Self::send_and_receive`]).
+    /// [`Self::receive_data`]).
     fn raw_send(&self, target: Ipv4Addr, cmd: TransmitPacketType) -> AsynResult<Vec<u8>> {
         let expected_size = if cmd == TransmitPacketType::SendStatus {
             72
@@ -478,11 +483,10 @@ impl AmptekDriver {
             .send_packet_inet(target, &protocol::build_command(cmd), expected_size)?)
     }
 
-    /// `drvAmptek::sendCommand` (`drvAmptek.cpp:361-382`): fire-and-forget
-    /// -- success means only "got any response bytes", the content is never
-    /// parsed. [`Self::send_and_receive`] is the variant the three callers
-    /// that also need the response parsed use instead.
-    fn send_command(&mut self, cmd: TransmitPacketType) -> AsynResult<()> {
+    /// `drvAmptek::sendCommand` (`drvAmptek.cpp:361-382`): success means
+    /// only "got any response bytes". The bytes are C's `DP5Proto.PacketIn`,
+    /// returned for the callers that go on to [`Self::receive_data`].
+    fn send_command(&mut self, cmd: TransmitPacketType) -> AsynResult<Vec<u8>> {
         let target = self.target.ok_or_else(disconnected_error)?;
         let raw = self.raw_send(target, cmd)?;
         if raw.is_empty() {
@@ -492,32 +496,31 @@ impl AmptekDriver {
             )));
         }
         self.failed_sends = 0;
-        Ok(())
+        Ok(raw)
     }
 
-    /// `CH_.SendCommand(cmd)` + the separate `CH_.ReceiveData()` parse step
-    /// (`ConsoleHelper.cpp:690-733`), collapsed into one round trip since
-    /// there is no real gap between them (`ReceiveData` always parses
-    /// whatever `SendCommand` just stored). `Err` only for the send half
-    /// failing (empty response); a *parse* failure (framing error or
-    /// unmatched PID) surfaces as `Ok(ReceivedPacket::Error{..})` -- callers
-    /// match on that themselves, since C's own callers disagree on whether
-    /// a parse failure also counts toward `failedSends_` (some do, some
-    /// don't -- see each call site below).
-    fn send_and_receive(
-        &mut self,
-        target: Ipv4Addr,
-        cmd: TransmitPacketType,
-    ) -> AsynResult<ReceivedPacket> {
-        let raw = self.raw_send(target, cmd)?;
-        if raw.is_empty() {
-            self.check_failed_comm();
-            return Err(protocol_error(format!(
-                "error calling CH_.SendCommand({cmd:?})"
-            )));
+    /// `CConsoleHelper::ReceiveData` (`ConsoleHelper.cpp:690-733`): parse a
+    /// response and update the cached status/spectrum its packet carries.
+    /// `None` is C's `false` (a framing error or an unrouted PID).
+    fn receive_data(&mut self, raw: &[u8]) -> Option<ReceivedPacket> {
+        let packet = protocol::parse_packet(raw);
+        match &packet {
+            ReceivedPacket::Status { data } => self.last_status = status::process_status(data),
+            ReceivedPacket::Spectrum { pid2, data } => {
+                // `ProcessSpectrumEx` (`ConsoleHelper.cpp:736-754`): an even
+                // PID2 carries the status block after the channels.
+                let (channels, values) = protocol::decode_spectrum(*pid2, data);
+                if pid2 & 1 == 0
+                    && let Some(block) = data.get(channels * 3..channels * 3 + 64)
+                {
+                    self.last_status = status::process_status(block);
+                }
+                self.spectrum = values;
+            }
+            ReceivedPacket::ConfigReadback { .. } | ReceivedPacket::Ack { .. } => {}
+            ReceivedPacket::Error { .. } => return None,
         }
-        self.failed_sends = 0;
-        Ok(protocol::parse_packet(&raw))
+        Some(packet)
     }
 
     /// `drvAmptek::connectDevice` (`drvAmptek.cpp:279-359`).
@@ -553,13 +556,12 @@ impl AmptekDriver {
                 "error calling SendCommand for XMTPT_SEND_STATUS",
             ));
         }
-        let ReceivedPacket::Status { data } = protocol::parse_packet(&raw) else {
+        self.target = Some(ip);
+        if self.receive_data(&raw).is_none() {
             return Err(protocol_error(
                 "calling ReceiveData() for XMTPT_SEND_STATUS",
             ));
-        };
-        self.last_status = status::process_status(&data);
-        self.target = Some(ip);
+        }
 
         // `readConfigurationFromHardware()`'s return value is not checked
         // here (`drvAmptek.cpp:341`) -- connection proceeds regardless.
@@ -613,18 +615,18 @@ impl AmptekDriver {
             }
             Ok(raw) => {
                 self.failed_sends = 0;
-                match protocol::parse_packet(&raw) {
-                    ReceivedPacket::Error { status } => Err(protocol_error(format!(
+                match self.receive_data(&raw) {
+                    None => Err(protocol_error(format!(
                         "error in response for CH_.SendCommand_Config(XMTPT_SEND_CONFIG_PACKET_EX, \
-                         {command_string}): {status:?}"
+                         {command_string})"
                     ))),
-                    ReceivedPacket::Ack { status, data } => {
+                    Some(ReceivedPacket::Ack { status, data }) => {
                         match protocol::offending_command_text(status, &data) {
                             Some(text) => Err(protocol_error(format!("ACK error {text}"))),
                             None => Ok(()),
                         }
                     }
-                    _ => Ok(()),
+                    Some(_) => Ok(()),
                 }
             }
             Err(e) => Err(e),
@@ -937,21 +939,21 @@ impl AmptekDriver {
         }
         self.failed_sends = 0;
 
-        match protocol::parse_packet(&raw) {
-            ReceivedPacket::ConfigReadback { data } => {
+        match self.receive_data(&raw) {
+            Some(ReceivedPacket::ConfigReadback { data }) => {
                 self.hw_cfg_dp5 = insert_crlf_after_semicolons(&data);
                 self.apply_parsed_configuration()
             }
-            ReceivedPacket::Error { status } => {
+            None => {
                 self.check_failed_comm();
-                Err(protocol_error(format!(
-                    "error calling ReceiveData() for XMTPT_FULL_READ_CONFIG_PACKET: {status:?}"
-                )))
+                Err(protocol_error(
+                    "error calling ReceiveData() for XMTPT_FULL_READ_CONFIG_PACKET",
+                ))
             }
             // `ReceiveData()==true` but `HwCfgReady` was never set --
             // matches C falling through to `return asynError` when the
             // classified packet wasn't a config readback.
-            _ => Err(protocol_error(
+            Some(_) => Err(protocol_error(
                 "XMTPT_FULL_READ_CONFIG_PACKET response was not a configuration readback",
             )),
         }
@@ -960,10 +962,9 @@ impl AmptekDriver {
     /// `drvAmptek::writeInt32`'s `mcaReadStatus_` branch (`drvAmptek.cpp:
     /// 873-894`).
     fn handle_read_status(&mut self) -> AsynResult<()> {
-        let target = self.target.ok_or_else(disconnected_error)?;
-        match self.send_and_receive(target, TransmitPacketType::SendStatus)? {
-            ReceivedPacket::Status { data } => {
-                self.last_status = status::process_status(&data);
+        let raw = self.send_command(TransmitPacketType::SendStatus)?;
+        match self.receive_data(&raw) {
+            Some(_) => {
                 let s = self.last_status;
                 self.base.set_float64_param(
                     self.amptek[AmptekReason::SlowCounts as usize],
@@ -1003,13 +1004,12 @@ impl AmptekDriver {
                 }
                 Ok(())
             }
-            ReceivedPacket::Error { status } => {
+            None => {
                 self.check_failed_comm();
-                Err(protocol_error(format!(
-                    "calling ReceiveData() for XMTPT_SEND_STATUS: {status:?}"
-                )))
+                Err(protocol_error(
+                    "calling ReceiveData() for XMTPT_SEND_STATUS",
+                ))
             }
-            _ => Ok(()),
         }
     }
 }
@@ -1085,7 +1085,9 @@ impl PortDriver for AmptekDriver {
 
         if reason == self.mca[McaReason::StartAcquire as usize] {
             if !self.acquiring {
-                status = self.send_command(TransmitPacketType::EnableMcaMcs);
+                status = self
+                    .send_command(TransmitPacketType::EnableMcaMcs)
+                    .map(drop);
                 if status.is_ok() {
                     self.acquiring = true;
                     self.base
@@ -1093,9 +1095,13 @@ impl PortDriver for AmptekDriver {
                 }
             }
         } else if reason == self.mca[McaReason::StopAcquire as usize] {
-            status = self.send_command(TransmitPacketType::DisableMcaMcs);
+            status = self
+                .send_command(TransmitPacketType::DisableMcaMcs)
+                .map(drop);
         } else if reason == self.mca[McaReason::Erase as usize] {
-            status = self.send_command(TransmitPacketType::SendClearSpectrumStatus);
+            status = self
+                .send_command(TransmitPacketType::SendClearSpectrumStatus)
+                .map(drop);
         } else if reason == self.mca[McaReason::ReadStatus as usize] {
             status = self.handle_read_status();
         } else if reason == self.amptek[AmptekReason::LoadConfigFile as usize] {
@@ -1181,27 +1187,16 @@ impl PortDriver for AmptekDriver {
 
     /// `drvAmptek::readInt32Array` (`drvAmptek.cpp:997-1026`).
     fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
-        let target = self.target.ok_or_else(disconnected_error)?;
-        match self.send_and_receive(target, TransmitPacketType::SendSpectrumStatus)? {
-            ReceivedPacket::Spectrum { pid2, data } => {
-                let (channels, values) = protocol::decode_spectrum(pid2, &data);
-                let n = channels.min(buf.len()).min(values.len());
-                buf[..n].copy_from_slice(&values[..n]);
-                Ok(n)
-            }
-            ReceivedPacket::Error { status } => {
-                self.check_failed_comm();
-                Err(protocol_error(format!(
-                    "error calling ReceiveData() for XMTPT_SEND_SPECTRUM_STATUS: {status:?}"
-                )))
-            }
-            // `ReceiveData()==true` but not a spectrum packet: C would
-            // reread its stale `pData_`-style buffer here (see the module
-            // doc's "no cached-spectrum-buffer state" note); this port has
-            // no such buffer to stale-read, so it reports zero channels
-            // rather than fabricating spectrum content.
-            _ => Ok(0),
+        let raw = self.send_command(TransmitPacketType::SendSpectrumStatus)?;
+        if self.receive_data(&raw).is_none() {
+            self.check_failed_comm();
+            return Err(protocol_error(
+                "error calling ReceiveData() for XMTPT_SEND_SPECTRUM_STATUS",
+            ));
         }
+        let n = self.spectrum.len().min(buf.len());
+        buf[..n].copy_from_slice(&self.spectrum[..n]);
+        Ok(n)
     }
 }
 
@@ -1329,12 +1324,15 @@ mod tests {
     }
 
     /// `readInt32Array` sends `XMTPT_SEND_SPECTRUM_STATUS` once
-    /// (`drvAmptek.cpp:1003-1008`).
+    /// (`drvAmptek.cpp:1003-1008`), and a spectrum+status packet refreshes
+    /// the cached status (`ConsoleHelper.cpp:747-753`).
     #[test]
-    fn read_int32_array_sends_spectrum_request_once() {
+    fn read_int32_array_sends_once_and_refreshes_status() {
         let status = [0u8; 64];
+        let mut fresh = [0u8; 64];
+        fresh[4] = 77; // SlowCount
         let (mut driver, fake) = driver_with_fake(move |req| match (req[2], req[3]) {
-            (0x02, 0x03) => Some(spectrum_reply(0x01, &status)),
+            (0x02, 0x03) => Some(spectrum_reply(0x02, &fresh)),
             _ => default_reply(req, &status),
         });
         connect(&mut driver).unwrap();
@@ -1347,6 +1345,27 @@ mod tests {
         assert_eq!(n, 256);
         assert_eq!(buf[5], 5);
         assert_eq!(fake.pids()[before..], [(0x02, 0x03)]);
+
+        let counts = AsynUser::new(driver.mca[McaReason::ElapsedCounts as usize]);
+        assert_eq!(driver.read_float64(&counts).unwrap(), 77.0);
+    }
+
+    /// An odd PID2 (spectrum only) leaves the cached status alone.
+    #[test]
+    fn spectrum_without_status_keeps_cached_status() {
+        let mut status = [0u8; 64];
+        status[4] = 9;
+        let (mut driver, _fake) = driver_with_fake(move |req| match (req[2], req[3]) {
+            (0x02, 0x03) => Some(spectrum_reply(0x01, &[0u8; 64])),
+            _ => default_reply(req, &status),
+        });
+        connect(&mut driver).unwrap();
+        let mut buf = vec![0i32; 256];
+        driver
+            .read_int32_array(&AsynUser::new(0), &mut buf)
+            .unwrap();
+        let counts = AsynUser::new(driver.mca[McaReason::ElapsedCounts as usize]);
+        assert_eq!(driver.read_float64(&counts).unwrap(), 9.0);
     }
 
     #[test]
