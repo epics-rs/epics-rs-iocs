@@ -296,8 +296,7 @@ impl PIGCS2Controller {
     /// Write a framed command and read one reply line (C `sendAndReceive`),
     /// trimmed of any stray CR/NUL.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &framed(cmd), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_end_matches(['\r', '\0'])
             .to_string())
@@ -308,10 +307,9 @@ impl PIGCS2Controller {
     /// reads (no further write) while the previous line ended in a space,
     /// then trim that marker off each line (C `findConnectedAxes`).
     fn find_connected_axes(&self) -> AsynResult<Vec<String>> {
-        self.handle.write_octet(0, &framed("SAI?"))?;
+        let mut raw = self.handle.write_read(0, &framed("SAI?"), READ_BUF)?;
         let mut names = Vec::new();
         loop {
-            let raw = self.handle.read_octet(0, READ_BUF)?;
             let line = String::from_utf8_lossy(&raw)
                 .trim_end_matches(['\r', '\0'])
                 .to_string();
@@ -323,6 +321,7 @@ impl PIGCS2Controller {
             if !continues {
                 break;
             }
+            raw = self.handle.read_octet(0, READ_BUF)?;
         }
         Ok(names)
     }
@@ -492,8 +491,7 @@ impl PIGCS2Controller {
     /// `char(4)` -> `(homing, moving, negLimit, posLimit, servoControl)` for
     /// `axis_no` (C `PIGCSMotorController::getStatus`).
     fn get_status(&self, axis_no: usize) -> AsynResult<(bool, bool, bool, bool, bool)> {
-        self.handle.write_octet(0, &[0x04])?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &[0x04], READ_BUF)?;
         let reply = String::from_utf8_lossy(&raw)
             .trim_end_matches(['\r', '\0'])
             .to_string();
