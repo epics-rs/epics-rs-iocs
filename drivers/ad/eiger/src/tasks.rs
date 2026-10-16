@@ -1621,6 +1621,42 @@ mod tests {
         port
     }
 
+    /// eigerDetector.cpp:587-588 hands every int32 below mFirstParam to
+    /// ADDriver::writeInt32.
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        use epics_rs::ad_core::driver::ShutterMode;
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::asyn::user::AsynUser;
+
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: "EIGER_BASE_WRITE".to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_size_x: 0,
+            max_size_y: 0,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let mut det = crate::driver::EigerDriver::new(cfg, rest, signals).expect("driver");
+        let ad = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(ad.shutter_control), 1)
+            .unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
+
     #[tokio::test]
     async fn the_unique_id_is_the_array_counter_before_its_increment() {
         use epics_rs::ad_core::plugin::channel::ndarray_channel;

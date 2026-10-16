@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
@@ -488,6 +488,9 @@ impl EigerDriver {
                     self.signals.stream_apis(None);
                 }
             }
+        } else if reason < self.p.state {
+            // mFirstParam is mState's index (eigerDetector.cpp:228, :587-588).
+            ADDriver::ad_write_int32(self, user, value)?;
         } else {
             self.ad.port_base.set_int32_param(reason, addr, value)?;
         }
@@ -564,6 +567,16 @@ pub(crate) fn asyn_err(message: String) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
         message,
+    }
+}
+
+impl ADDriver for EigerDriver {
+    fn ad_base(&self) -> &ADDriverBase {
+        &self.ad
+    }
+
+    fn ad_base_mut(&mut self) -> &mut ADDriverBase {
+        &mut self.ad
     }
 }
 
