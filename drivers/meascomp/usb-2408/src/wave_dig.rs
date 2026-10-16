@@ -2,11 +2,13 @@ use std::time::SystemTime;
 
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
 use meascomp::analog_in::AInScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
 use crate::params::*;
+use crate::trace::{DRIVER_NAME, SelfTrace};
 
 /// Waveform digitizer state.
 pub struct WaveDigState {
@@ -25,10 +27,8 @@ pub struct WaveDigState {
     /// Time waveform per point.
     pub time_buffer: Vec<f32>,
     pub dwell_actual: f64,
-    // Saved parameters for auto-restart
-    pub input_mode: i32,
-    pub range: i32,
-    pub options: i32,
+    /// The settings of the last start, which an auto-restart reuses.
+    pub last_scan: Option<WaveDigScan>,
 }
 
 impl WaveDigState {
@@ -49,9 +49,7 @@ impl WaveDigState {
             abs_time_buffer: vec![0.0; max_points],
             time_buffer: vec![0.0; max_points],
             dwell_actual: 0.001,
-            input_mode: AI_DIFFERENTIAL,
-            range: BIP10VOLTS,
-            options: SO_DEFAULTIO,
+            last_scan: None,
         }
     }
 }
@@ -72,12 +70,15 @@ pub struct WaveDigScan {
     pub burst_mode: bool,
 }
 
-/// Start the waveform digitizer (analog input scan).
+/// Start the waveform digitizer (analog input scan). C `startWaveDig`;
+/// the error is the uldaq status it reported.
 pub fn start_wave_dig(
     device: &DaqDevice,
     state: &mut WaveDigState,
     scan: &WaveDigScan,
-) -> Result<(), String> {
+    trace: &SelfTrace,
+) -> Result<(), UlError> {
+    const FUNCTION: &str = "startWaveDig";
     let WaveDigScan {
         first_chan,
         num_chans,
@@ -109,9 +110,14 @@ pub fn start_wave_dig(
             ..AiQueueElement::default()
         });
     }
-    device
-        .analog_in_load_queue(&queue)
-        .map_err(|e| format!("analog_in_load_queue error: {e}"))?;
+    let status = trace.report(
+        &device.analog_in_load_queue(&queue),
+        FUNCTION,
+        "Calling ALoadQueue",
+    );
+    if status != 0 {
+        return Err(status);
+    }
 
     let mut rate = if dwell > 0.0 { 1.0 / dwell } else { 1000.0 };
 
@@ -132,39 +138,41 @@ pub fn start_wave_dig(
         options |= SO_BURSTMODE;
     }
 
-    // Save for auto-restart
-    state.input_mode = input_mode;
-    state.range = range;
-    state.options = options;
+    state.last_scan = Some(*scan);
 
-    device
-        .analog_in_scan(
-            &AInScanConfig {
-                low_chan: first_chan as i32,
-                high_chan: (first_chan + num_chans - 1) as i32,
-                input_mode,
-                range,
-                samples_per_chan: num_points as i32,
-                options,
-                flags: AINSCAN_FF_DEFAULT,
-            },
-            &mut rate,
-            &mut state.scan_buffer,
-        )
-        .map_err(|e| format!("analog_in_scan error: {e}"))?;
+    let result = device.analog_in_scan(
+        &AInScanConfig {
+            low_chan: first_chan as i32,
+            high_chan: (first_chan + num_chans - 1) as i32,
+            input_mode,
+            range,
+            samples_per_chan: num_points as i32,
+            options,
+            flags: AINSCAN_FF_DEFAULT,
+        },
+        &mut rate,
+        &mut state.scan_buffer,
+    );
+    let status = trace.report(&result, FUNCTION, "Calling AInScan");
+    if status != 0 {
+        return Err(status);
+    }
 
     state.dwell_actual = 1.0 / rate;
     state.running = true;
+    let last_chan = first_chan + num_chans - 1;
+    trace.print(
+        TraceMask::FLOW,
+        format_args!(
+            "{DRIVER_NAME}:{FUNCTION}: called cbAInScan, firstChan={first_chan}, lastChan={last_chan}, numPoints={num_points}, dwell={:.6}, options=0x{options:x}",
+            state.dwell_actual
+        ),
+    );
 
     // Compute time waveform
     for i in 0..num_points {
         state.time_buffer[i] = (i as f64 * state.dwell_actual) as f32;
     }
-
-    log::info!(
-        "WaveDig started: ch{first_chan}-{}, {num_points} pts, rate={rate:.0} Hz",
-        first_chan + num_chans - 1
-    );
     Ok(())
 }
 
@@ -181,95 +189,71 @@ pub fn points_transferred(current_index: i64, n_chans: usize, num_points: usize)
     (current_index as usize / n_chans + 1).min(num_points)
 }
 
-/// Read waveform digitizer data from scan buffer. Called from poller.
-pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
-    let (status, xfer) = match device.analog_in_scan_status() {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("WaveDig scan status error: {e}");
-            return;
-        }
-    };
-
-    if xfer.current_total_count == 0 {
-        return;
-    }
+/// The digitizer half of C `pollerThread`: copy the points transferred
+/// since the last poll and, once the scan is idle, run C `stopWaveDig`.
+/// `Err` is the failed `ulAInScanStatus` status, for the poller's
+/// once-per-outage report; `Ok(Some(..))` the array callbacks of a scan
+/// that just ended.
+pub fn read_wave_dig(
+    device: &DaqDevice,
+    state: &mut WaveDigState,
+    params: &MultiFunctionParams,
+    trace: &SelfTrace,
+) -> Result<Option<Vec<ParamSetValue>>, UlError> {
+    let (status, xfer) = device.analog_in_scan_status().map_err(|e| e.code)?;
+    trace.print(
+        TraceMask::IO_DRIVER,
+        format_args!(
+            "{DRIVER_NAME}::pollerThread waveform digitizer status, aiStatus={status}, aiCount={}, aiIndex={}",
+            xfer.current_total_count, xfer.current_index
+        ),
+    );
 
     let n_chans = state.num_chans;
-    if n_chans == 0 || xfer.current_index < 0 {
-        return;
-    }
-
-    let last_point = points_transferred(xfer.current_index, n_chans, state.num_points);
-    let now = current_time_secs();
-
-    // Copy new data
-    while state.current_point < last_point {
-        let buf_offset = state.current_point * n_chans;
-        for j in 0..n_chans {
-            let ch = state.first_chan + j;
-            if ch < MAX_ANALOG_IN {
-                state.channel_buffers[ch][state.current_point] = state.scan_buffer[buf_offset + j];
+    if xfer.current_total_count != 0 && n_chans != 0 && xfer.current_index >= 0 {
+        let last_point = points_transferred(xfer.current_index, n_chans, state.num_points);
+        let now = current_time_secs();
+        while state.current_point < last_point {
+            let buf_offset = state.current_point * n_chans;
+            for j in 0..n_chans {
+                let ch = state.first_chan + j;
+                if ch < MAX_ANALOG_IN {
+                    state.channel_buffers[ch][state.current_point] =
+                        state.scan_buffer[buf_offset + j];
+                }
             }
+            state.abs_time_buffer[state.current_point] = now;
+            state.current_point += 1;
         }
-        state.abs_time_buffer[state.current_point] = now;
-        state.current_point += 1;
     }
 
     if status == SS_IDLE {
-        state.running = false;
-        if state.auto_restart {
-            state.current_point = 0;
-            // Reload queue with saved parameters
-            let mut queue = Vec::with_capacity(state.num_chans);
-            for i in 0..state.num_chans {
-                queue.push(AiQueueElement {
-                    channel: (state.first_chan + i) as i32,
-                    input_mode: state.input_mode,
-                    range: state.range,
-                    ..AiQueueElement::default()
-                });
-            }
-            if let Err(e) = device.analog_in_load_queue(&queue) {
-                log::warn!("WaveDig auto-restart: queue reload failed: {e}");
-            } else {
-                // Restart scan with saved options
-                let mut rate = if state.dwell_actual > 0.0 {
-                    1.0 / state.dwell_actual
-                } else {
-                    1000.0
-                };
-                match device.analog_in_scan(
-                    &AInScanConfig {
-                        low_chan: state.first_chan as i32,
-                        high_chan: (state.first_chan + state.num_chans - 1) as i32,
-                        input_mode: state.input_mode,
-                        range: state.range,
-                        samples_per_chan: state.num_points as i32,
-                        options: state.options,
-                        flags: AINSCAN_FF_DEFAULT,
-                    },
-                    &mut rate,
-                    &mut state.scan_buffer,
-                ) {
-                    Ok(()) => {
-                        state.running = true;
-                    }
-                    Err(e) => log::warn!("WaveDig auto-restart: scan failed: {e}"),
-                }
-            }
-        }
+        return Ok(Some(stop_wave_dig(device, state, params, trace)));
     }
+    Ok(None)
 }
 
-/// Stop the waveform digitizer.
-pub fn stop_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
-    if state.running {
-        if let Err(e) = device.analog_in_scan_stop() {
-            log::warn!("WaveDig scan stop error: {e}");
-        }
-        state.running = false;
+/// C `stopWaveDig`: hand the acquired points to the records
+/// (`readWaveDig`), stop the scan, and start it again under AUTO_RESTART.
+pub fn stop_wave_dig(
+    device: &DaqDevice,
+    state: &mut WaveDigState,
+    params: &MultiFunctionParams,
+    trace: &SelfTrace,
+) -> Vec<ParamSetValue> {
+    state.running = false;
+    let updates = waveform_updates(params, state, trace);
+    trace.report(
+        &device.analog_in_scan_stop(),
+        "stopWaveDig",
+        "Stopping AIn scan",
+    );
+    if state.auto_restart
+        && let Some(scan) = state.last_scan
+    {
+        let _ = start_wave_dig(device, state, &scan, trace);
     }
+    updates
 }
 
 fn current_time_secs() -> f64 {
@@ -285,12 +269,23 @@ fn current_time_secs() -> f64 {
 ///
 /// Returned rather than applied so the actor thread (a WAVEDIG_READ_WF write)
 /// and the poller thread can each push them through their own owner.
-pub fn waveform_updates(params: &MultiFunctionParams, state: &WaveDigState) -> Vec<ParamSetValue> {
+pub fn waveform_updates(
+    params: &MultiFunctionParams,
+    state: &WaveDigState,
+    trace: &SelfTrace,
+) -> Vec<ParamSetValue> {
     let n = state.current_point.min(state.num_points);
     let mut updates = Vec::with_capacity(state.num_chans + 1);
     for j in 0..state.num_chans {
         let ch = state.first_chan + j;
         if ch < MAX_ANALOG_IN {
+            trace.print(
+                TraceMask::FLOW,
+                format_args!(
+                    "{DRIVER_NAME}:readWaveDig:, doing callbacks on input {ch}, first value={:.6}",
+                    state.channel_buffers[ch][0]
+                ),
+            );
             updates.push(ParamSetValue::new(
                 params.wave_dig_volt_wf,
                 ch as i32,

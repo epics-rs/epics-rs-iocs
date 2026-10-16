@@ -9,5 +9,4 @@ uldaq-sys = { path = "../uldaq-sys" }
 meascomp = { path = "../meascomp" }
 epics-rs = { workspace = true, features = ["asyn"] }
 parking_lot = "0.12"
-log = "0.4"
 anyhow = "1.0"

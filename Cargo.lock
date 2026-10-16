@@ -4875,7 +4875,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "epics-rs",
- "log",
  "meascomp",
  "parking_lot",
  "uldaq-sys",
@@ -4886,7 +4885,6 @@ name = "usb-2408-ioc"
 version = "0.1.0"
 dependencies = [
  "asyn-rs",
- "env_logger",
  "epics-rs",
  "tokio",
  "usb-2408",

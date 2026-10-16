@@ -2,7 +2,10 @@ use meascomp::analog_out::AOutScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
+use epics_rs::asyn::trace::TraceMask;
+
 use crate::params::*;
+use crate::trace::{DRIVER_NAME, SelfTrace};
 
 /// Waveform generator state.
 pub struct WaveGenState {
@@ -134,14 +137,17 @@ pub struct WaveGenScan {
     pub retrigger: bool,
 }
 
-/// Start the waveform generator (analog output scan).
+/// Start the waveform generator (analog output scan). C `startWaveGen`
+/// from `ulAOutScan` on; the error is the uldaq status it reported.
 pub fn start_wave_gen(
     device: &DaqDevice,
     state: &mut WaveGenState,
     scan: &WaveGenScan,
     waveform_data: &[f64],
     saved_outputs: &[f64],
-) -> Result<(), String> {
+    trace: &SelfTrace,
+) -> Result<(), UlError> {
+    const FUNCTION: &str = "startWaveGen";
     let WaveGenScan {
         first_chan,
         last_chan,
@@ -191,64 +197,81 @@ pub fn start_wave_gen(
         options |= SO_RETRIGGER;
     }
 
-    device
-        .analog_out_scan(
-            &AOutScanConfig {
-                low_chan: first_chan,
-                high_chan: last_chan,
-                range,
-                samples_per_chan: num_points as i32,
-                options,
-                flags: AOUTSCAN_FF_NOSCALEDATA,
-            },
-            &mut rate,
-            &mut state.scan_buffer,
-        )
-        .map_err(|e| format!("analog_out_scan error: {e}"))?;
+    let result = device.analog_out_scan(
+        &AOutScanConfig {
+            low_chan: first_chan,
+            high_chan: last_chan,
+            range,
+            samples_per_chan: num_points as i32,
+            options,
+            flags: AOUTSCAN_FF_NOSCALEDATA,
+        },
+        &mut rate,
+        &mut state.scan_buffer,
+    );
+    let status = trace.report(&result, FUNCTION, "Calling AOutScan");
+    if status != 0 {
+        return Err(status);
+    }
 
     state.dwell_actual = if rate > 0.0 { 1.0 / rate } else { 0.001 };
     state.running = true;
-
-    log::info!("WaveGen started: ch{first_chan}-{last_chan}, {num_points} pts, rate={rate:.0} Hz");
+    trace.print(
+        TraceMask::FLOW,
+        format_args!(
+            "{DRIVER_NAME}:{FUNCTION}: called cbAOutScan, firstChan={first_chan}, lastChan={last_chan}, numPoints*numWaveGenChans_={}, dwell={:.6}, options=0x{options:x}",
+            num_chans * num_points,
+            state.dwell_actual
+        ),
+    );
     Ok(())
 }
 
-/// Read waveform generator status. Called from poller.
-pub fn read_wave_gen(device: &DaqDevice, state: &mut WaveGenState) {
-    let (status, xfer) = match device.analog_out_scan_status() {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("WaveGen scan status error: {e}");
-            return;
-        }
-    };
+/// The generator half of C `pollerThread`. `Err` is the failed
+/// `ulAOutScanStatus` status, for the poller's once-per-outage report.
+pub fn read_wave_gen(
+    device: &DaqDevice,
+    state: &mut WaveGenState,
+    trace: &SelfTrace,
+) -> Result<(), UlError> {
+    let (status, xfer) = device.analog_out_scan_status().map_err(|e| e.code)?;
+    trace.print(
+        TraceMask::IO_DRIVER,
+        format_args!(
+            "{DRIVER_NAME}::pollerThread waveform generator status, aoStatus={status}, aoCount={}, aoIndex={}",
+            xfer.current_total_count, xfer.current_index
+        ),
+    );
 
     if state.num_chans > 0 && xfer.current_index >= 0 {
         state.current_point = (xfer.current_index as usize / state.num_chans) + 1;
     }
 
     if status == SS_IDLE {
-        stop_wave_gen(device, state);
+        stop_wave_gen(device, state, trace);
     }
+    Ok(())
 }
 
-/// Stop the waveform generator and restore saved output values.
-pub fn stop_wave_gen(device: &DaqDevice, state: &mut WaveGenState) {
-    if state.running {
-        if let Err(e) = device.analog_out_scan_stop() {
-            log::warn!("WaveGen scan stop error: {e}");
-        }
-        // Restore saved outputs
-        for ch in 0..MAX_ANALOG_OUT {
-            let _ = device.analog_out(
+/// Stop the waveform generator and restore saved output values. C
+/// `stopWaveGen`; returns the `ulAOutScanStop` status, which C does not
+/// print.
+pub fn stop_wave_gen(device: &DaqDevice, state: &mut WaveGenState, trace: &SelfTrace) -> UlError {
+    state.running = false;
+    let err = device.analog_out_scan_stop().err().map_or(0, |e| e.code);
+    for ch in 0..MAX_ANALOG_OUT {
+        trace.report(
+            &device.analog_out(
                 ch as i32,
                 BIP10VOLTS,
                 AOUT_FF_NOSCALEDATA,
                 state.saved_outputs[ch],
-            );
-        }
-        state.running = false;
+            ),
+            "stopWaveGen",
+            "calling AOut",
+        );
     }
+    err
 }
 
 #[cfg(test)]
