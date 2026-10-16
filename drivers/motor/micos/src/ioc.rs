@@ -13,7 +13,7 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::{connect_controller, connect_ip};
+use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
@@ -158,14 +158,20 @@ pub fn taurus_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_ip(&taurus_port, TAURUS_TIMEOUT)?;
-            let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
-
             register_port(ctx, &port_name, num_axes as i32)?;
 
+            let (handle, _) = connect_controller(
+                &taurus_port,
+                TAURUS_TIMEOUT,
+                &port_name,
+                format_args!(
+                    "SMCTaurusController::SMCTaurusController: cannot connect to SMC Taurus controller"
+                ),
+            );
+            let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
+
             for index in 0..num_axes as usize {
-                let ax = TaurusAxis::new(controller.clone(), index)
-                    .map_err(|e| format!("SMCTaurusCreateController: axis {index}: {e}"))?;
+                let ax = TaurusAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 install(
                     ctx,
