@@ -259,16 +259,14 @@ impl MultiFunctionDriver {
         updates: &mut Vec<ParamSetValue>,
     ) -> AsynResult<UlError> {
         let p = self.params;
-        let refuse = |this: &mut Self, msg: Option<&str>| -> AsynResult<UlError> {
+        // C returns -1 and leaves the 1 writeInt32 set in WAVEGEN_RUN.
+        let refuse = |msg: Option<&str>| -> AsynResult<UlError> {
             if let Some(msg) = msg {
                 trace.print(
                     TraceMask::ERROR,
                     format_args!("{DRIVER_NAME}:startWaveGen: {msg}"),
                 );
             }
-            // The record must not be left reading "Run": it follows this
-            // parameter back to Stop.
-            this.base.set_int32_param(p.wave_gen_run, 0, 0)?;
             Ok(-1)
         };
         let ext_trigger = self.base.get_int32_param(p.wave_gen_ext_trigger, 0)? != 0;
@@ -293,18 +291,17 @@ impl MultiFunctionDriver {
             // Internal types take their dwell from the frequency, so the two
             // kinds cannot share a scan.
             if (first_type == wave_gen::WAVE_TYPE_USER) != (wave_type == wave_gen::WAVE_TYPE_USER) {
-                return refuse(
-                    self,
-                    Some("ERROR if any enabled waveform type is user-defined then all must be."),
-                );
+                return refuse(Some(
+                    "ERROR if any enabled waveform type is user-defined then all must be.",
+                ));
             }
             span = Some((first, ch));
             if !self.define_waveform(wave_gen_state, ch, trace, updates)? {
-                return refuse(self, None);
+                return refuse(None);
             }
         }
         let Some((first_chan, last_chan)) = span else {
-            return refuse(self, Some("ERROR no enabled channels"));
+            return refuse(Some("ERROR no enabled channels"));
         };
 
         // defineWaveform has set these.
@@ -354,7 +351,6 @@ impl MultiFunctionDriver {
             &saved,
             trace,
         ) {
-            self.base.set_int32_param(p.wave_gen_run, 0, 0)?;
             return Ok(code);
         }
         self.base
@@ -628,9 +624,6 @@ impl PortDriver for MultiFunctionDriver {
                 )?;
                 (status, wave_arrays) =
                     wave_dig::start_wave_dig(&dev, &mut st.wave_dig, &self.params, &scan, &trace);
-                if status != 0 {
-                    self.base.set_int32_param(reason, addr, 0)?;
-                }
             } else if value == 0 && st.wave_dig.running {
                 let restart = WaveDigScan::read_restart(
                     &self.params,
