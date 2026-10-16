@@ -179,6 +179,9 @@ impl PortDriver for PhotonIIDetector {
             }
         } else if reason == self.params.num_subframes {
             self.command(&protocol::set_num_subframes(value))?;
+        } else if reason < self.params.dr_sum_enable {
+            // FIRST_PII_PARAM is PII_DRSumEnable (PhotonII.h:47).
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -318,4 +321,45 @@ pub fn create_photonii_detector(
         array_output,
         task,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::ad_core::driver::ShutterMode;
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::registry::claim_port;
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        let ip = "PII_BASE_WRITE_IP";
+        let (runtime, _) = create_port_runtime(
+            &claim_port(ip).unwrap(),
+            DrvAsynIPPort::new(ip, "127.0.0.1:1").unwrap(),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let p2 = P2Util::new(runtime.port_handle().clone());
+        std::mem::forget(runtime);
+        let shared = Arc::new(SharedState {
+            stop_requested: AtomicBool::new(false),
+        });
+        let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
+        let mut det = PhotonIIDetector::new("PII_BASE_WRITE", p2, 0, shared, tx).unwrap();
+        let ad = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(ad.shutter_control), 1)
+            .unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
 }
