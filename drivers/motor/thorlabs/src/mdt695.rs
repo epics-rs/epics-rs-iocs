@@ -61,6 +61,12 @@ fn thorlabs_err(message: impl Into<String>) -> AsynError {
     }
 }
 
+fn trim_line(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .trim_matches(['\r', '\n', '\0'])
+        .to_string()
+}
+
 /// Shared controller endpoint owning the serial handle.
 pub struct Mdt695Controller {
     handle: SyncIOHandle,
@@ -101,8 +107,7 @@ impl Mdt695Controller {
                 break;
             }
             // Reply corrupted (likely echo on): toggle echo and retry.
-            ctrl.write_only("E")?;
-            let _ = ctrl.read_line();
+            let _ = ctrl.query("E");
         }
         if !found {
             return Err(thorlabs_err(
@@ -113,15 +118,16 @@ impl Mdt695Controller {
         ctrl.num_axes = if model.contains("694") { 1 } else { 3 };
 
         // Multi-line identification (Model / Version lines).
-        ctrl.write_only("I")?;
         let mut ident_parts = Vec::new();
-        while let Ok(line) = ctrl.read_line() {
+        let mut next = ctrl.query("I");
+        while let Ok(line) = next {
             if line.is_empty() {
                 break;
             }
             if line.contains("Model") || line.contains("Version") {
                 ident_parts.push(line);
             }
+            next = ctrl.read_line();
         }
         ctrl.ident = if ident_parts.is_empty() {
             model
@@ -158,14 +164,14 @@ impl Mdt695Controller {
     /// Read one CR-terminated reply line (trimmed).
     fn read_line(&self) -> AsynResult<String> {
         let raw = self.handle.read_octet(0, READ_BUF)?;
-        let text = String::from_utf8_lossy(&raw);
-        Ok(text.trim_matches(['\r', '\n', '\0']).to_string())
+        Ok(trim_line(&raw))
     }
 
-    /// Write a query and return its reply line.
+    /// Write a query and return its reply line. C send_mess flushes the input
+    /// before every write (drvMDT695.cc:393), as `write_read` does.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.write_only(cmd)?;
-        self.read_line()
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        Ok(trim_line(&raw))
     }
 }
 
