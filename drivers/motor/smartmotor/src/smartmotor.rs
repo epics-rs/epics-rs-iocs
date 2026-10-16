@@ -461,10 +461,15 @@ mod tests {
 
     #[test]
     fn a_port_refusing_every_eos_set_still_finds_the_chain() {
+        use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
-        let (rt, _actor) =
-            create_port_runtime(chain("smartEosRefused"), RuntimeConfig::default()).unwrap();
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("smartEosRefused").unwrap(),
+            chain("smartEosRefused"),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
         let port = rt.port_handle().clone();
         assert!(port.set_input_eos_blocking(eos_user(), INPUT_EOS).is_err());
         let ctrl = SmartMotorController::new(port, Duration::from_secs(1)).unwrap();
@@ -474,13 +479,19 @@ mod tests {
 
     #[test]
     fn a_refused_write_still_reads_the_echo_and_the_command_succeeds() {
+        use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
         use std::sync::atomic::Ordering;
 
         let chain = chain("smartWriteRefused");
         let refuse = chain.refuse_writes.clone();
         let reads = chain.reads.clone();
-        let (rt, _actor) = create_port_runtime(chain, RuntimeConfig::default()).unwrap();
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("smartWriteRefused").unwrap(),
+            chain,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
         let ctrl =
             SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
         let mut axis = SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0);
