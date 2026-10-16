@@ -740,32 +740,52 @@ impl PortDriver for MultiFunctionDriver {
 
     /// Generator time bases: WAVEGEN_USER_TIME_WF and WAVEGEN_INT_TIME_WF,
     /// each `i * dwell` over its own point count. C computeWaveGenTimes.
+    /// C `readFloat32Array`: at most WAVEGEN_NUM_POINTS (WAVEDIG_NUM_POINTS
+    /// for the digitizer time axis) of the selected buffer.
     fn read_float32_array(&mut self, user: &AsynUser, buf: &mut [f32]) -> AsynResult<usize> {
-        let (points_param, dwell_param) = if user.reason == self.params.wave_gen_user_time_wf {
-            (
-                self.params.wave_gen_user_num_points,
-                self.params.wave_gen_user_dwell,
-            )
-        } else if user.reason == self.params.wave_gen_int_time_wf {
-            (
-                self.params.wave_gen_int_num_points,
-                self.params.wave_gen_int_dwell,
-            )
-        } else {
-            return Ok(0);
+        const FUNCTION: &str = "readFloat32Array";
+        let p = self.params;
+        let addr = device_addr(user.addr);
+        let error = |msg: std::fmt::Arguments<'_>| {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("{DRIVER_NAME}:{FUNCTION}: ERROR: {msg}"),
+            );
+            trace::asyn_status(-1).map(|()| 0)
         };
-        let num_points = (self
-            .base
-            .get_int32_param(points_param, 0)
-            .unwrap_or(0)
-            .max(0) as usize)
-            .min(self.max_output_points)
-            .min(buf.len());
-        let dwell = self.base.get_float64_param(dwell_param, 0).unwrap_or(0.0);
-        for (i, slot) in buf[..num_points].iter_mut().enumerate() {
-            *slot = (i as f64 * dwell) as f32;
+        if addr >= MAX_ANALOG_OUT as i32 {
+            return error(format_args!("addr={addr} max={}", MAX_ANALOG_OUT - 1));
         }
-        Ok(num_points)
+        let reason = user.reason;
+        let mut num_points = self.base.get_int32_param(p.wave_gen_num_points, 0)?;
+        let time_axis = |points, dwell| -> AsynResult<Vec<f32>> {
+            Ok(wave_dig::time_axis(
+                self.base.get_int32_param(points, 0)?,
+                self.base.get_float64_param(dwell, 0)?,
+            ))
+        };
+        let st = self.state.lock().unwrap();
+        let data: std::borrow::Cow<'_, [f32]> = if reason == p.wave_gen_user_wf {
+            st.wave_gen.user_waveforms[addr as usize].as_slice().into()
+        } else if reason == p.wave_gen_int_wf {
+            st.wave_gen.int_waveforms[addr as usize].as_slice().into()
+        } else if reason == p.wave_gen_user_time_wf {
+            time_axis(p.wave_gen_user_num_points, p.wave_gen_user_dwell)?.into()
+        } else if reason == p.wave_gen_int_time_wf {
+            time_axis(p.wave_gen_int_num_points, p.wave_gen_int_dwell)?.into()
+        } else if reason == p.wave_dig_time_wf {
+            num_points = self.base.get_int32_param(p.wave_dig_num_points, 0)?;
+            time_axis(p.wave_dig_num_points, p.wave_dig_dwell)?.into()
+        } else {
+            return error(format_args!("unknown function={reason}"));
+        };
+        // C copies past a time axis' last computed point from its zeroed
+        // buffer; here the copy stops at the data.
+        let n = buf.len().min(num_points.max(0) as usize).min(data.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok(n)
     }
 
     /// Load a user-defined generator waveform (volts) for one channel.
