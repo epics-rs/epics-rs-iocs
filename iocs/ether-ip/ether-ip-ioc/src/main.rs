@@ -6,6 +6,7 @@
 use std::sync::atomic::Ordering;
 
 use epics_rs::base::error::CaResult;
+use epics_rs::base::server::ioc_app::init_hook_register;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -224,12 +225,20 @@ async fn main() -> CaResult<()> {
     app = app.register_startup_command(report.clone());
     app = app.register_shell_command(report);
 
-    // The scan tasks must not start until every record has registered its tag,
-    // so they start after iocInit -- the C does the same from its device-support
-    // `init(run==1)` hook, which calls drvEtherIP_restart().
-    app = app.register_after_init(|| {
-        driver::start_scan_tasks();
-    });
+    let init = CommandDef::new(
+        "drvEtherIP_init",
+        vec![],
+        "drvEtherIP_init",
+        |_args: &[ArgValue], _ctx: &CommandContext| {
+            driver::init();
+            Ok(CommandOutcome::Continue)
+        },
+    );
+    app = app.register_startup_command(init.clone());
+    app = app.register_shell_command(init);
+
+    // drvEtherIP_drvInit's initHookRegister.
+    init_hook_register(std::sync::Arc::new(driver::init_hook));
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

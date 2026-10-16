@@ -514,6 +514,9 @@ impl DeviceSupport for EtherIpDevice {
             errlog_vprintf(format_args!("devEtherIP ({name}): {msg}\n"));
             Err(CaError::InvalidValue(msg))
         };
+        if !driver::initialized() {
+            return fail("Failed to all drvEtherIP_init()".to_string());
+        }
         let (link, plc) = match analyze_link(
             &self.link_text,
             count,
@@ -1073,6 +1076,14 @@ const OUTPUT_TYPES: &[&str] = &[
 mod tests {
     use super::*;
 
+    /// `drvEtherIP_init` then `drvEtherIP_define_PLC`, as a st.cmd does.
+    fn define_plc(name: &str, ip_addr: &str, slot: u8) {
+        if !driver::initialized() {
+            driver::init();
+        }
+        driver::define_plc(name, ip_addr, slot);
+    }
+
     /// A raw BOOL-array (CIP BITS) buffer holding `words` UDINTs.
     fn bits_buf(words: &[u32]) -> Vec<u8> {
         let mut v = CipType::Bits.code().to_le_bytes().to_vec();
@@ -1145,7 +1156,7 @@ mod tests {
         use epics_rs::base::server::record::CommonFields;
         use epics_rs::base::server::records::ao::AoRecord;
 
-        driver::define_plc("forceudf", "127.0.0.1", 0);
+        define_plc("forceudf", "127.0.0.1", 0);
         for (udf, want_val, want_write) in [(1u8, 5.0, false), (0, 0.0, true)] {
             let mut record = AoRecord::default();
             let mut dev = EtherIpDevice::new("@forceudf REAL S 1 FORCE", true);
@@ -1209,7 +1220,7 @@ mod tests {
     #[test]
     fn an_output_without_data_raises_write_alarm() {
         use epics_rs::base::server::records::ao::AoRecord;
-        driver::define_plc("nodata", "127.0.0.1", 0);
+        define_plc("nodata", "127.0.0.1", 0);
         let mut record = AoRecord::default();
         let mut dev = EtherIpDevice::new("@nodata REAL S 1", true);
         dev.init(&mut record).unwrap();
@@ -1223,7 +1234,7 @@ mod tests {
     #[test]
     fn a_statistic_without_tag_data_raises_read_alarm() {
         use epics_rs::base::server::records::ai::AiRecord;
-        driver::define_plc("statnodata", "127.0.0.1", 0);
+        define_plc("statnodata", "127.0.0.1", 0);
         let mut record = AiRecord::default();
         let mut dev = EtherIpDevice::new("@statnodata REAL PLC_ERRORS", false);
         dev.init(&mut record).unwrap();

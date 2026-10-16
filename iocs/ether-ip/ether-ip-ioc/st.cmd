@@ -7,6 +7,8 @@
 # types are built in and the "EtherIP" device support is registered from
 # main.rs.
 
+drvEtherIP_init()
+
 # Optional driver knobs, all effective before the scan tasks start.
 # EIP_timeout(5000)
 # EIP_buffer_limit(480)

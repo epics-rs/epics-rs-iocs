@@ -5,8 +5,8 @@
 //! as many tag reads/writes as fit under the transfer-buffer limit into one CIP
 //! MultiRequest, sends it, and fans the results back out to the tags.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -16,6 +16,7 @@ use crate::cip::{self, CipType, ParsedTag};
 use crate::connection::{Connection, EipError};
 use crate::encap::{self, ETHERIP_PORT};
 use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::server::ioc_app::InitHookState;
 use epics_rs::base::server::records::printf::format_g;
 
 /// `EIP_TIMEOUT` -- default connect / response timeout.
@@ -295,15 +296,67 @@ pub fn reset_statistics() {
     }
 }
 
-/// Start one scan thread per defined PLC. Idempotent: a PLC whose thread is
-/// already running is skipped (C `drvEtherIP_restart` checks `scan_task_id`).
-pub fn start_scan_tasks() -> usize {
+/// `drvEtherIP_private.lock` being set: `drvEtherIP_init` has run.
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// `databaseIsReady`: set at `initHookAfterScanInit`.
+static DATABASE_READY: AtomicBool = AtomicBool::new(false);
+
+/// `drvEtherIP_init`.
+pub fn init() {
+    if INITIALIZED.swap(true, Ordering::SeqCst) {
+        crate::eip_printf!(0, "drvEtherIP_init called more than once!\n");
+    }
+}
+
+/// `drvEtherIP_initialized`.
+pub fn initialized() -> bool {
+    INITIALIZED.load(Ordering::SeqCst)
+}
+
+/// The init hooks C's driver and device support act on: devEtherIP's
+/// `init(1)` (finishDevSup, before `initHookAfterFinishDevSup`) and
+/// `drvEtherIP_initHook` at `initHookAfterScanInit`. Both call
+/// `drvEtherIP_restart`; only the second finds the database ready.
+pub fn init_hook(state: InitHookState) {
+    match state {
+        InitHookState::AfterFinishDevSup => {
+            restart();
+        }
+        InitHookState::AfterScanInit if initialized() => {
+            DATABASE_READY.store(true, Ordering::SeqCst);
+            restart();
+        }
+        _ => {}
+    }
+}
+
+/// `drvEtherIP_restart`: drop every PLC's connection (its scan thread
+/// reconnects) and start the scan threads not running yet. Returns how many
+/// it started; nothing happens before `drvEtherIP_init` or while the
+/// database is not ready.
+pub fn restart() -> usize {
+    if !initialized() {
+        return 0;
+    }
+    if !DATABASE_READY.load(Ordering::SeqCst) {
+        for plc in all_plcs() {
+            crate::eip_printf!(
+                4,
+                "drvEtherIP: Delaying launch of scan task for PLC '{}' until database ready\n",
+                plc.name
+            );
+        }
+        return 0;
+    }
     let mut started = 0;
     for plc in all_plcs() {
+        // Held like C's plc->lock: a running pass finishes first.
+        let mut conn = plc.conn.lock();
+        disconnect(&plc, &mut conn);
         if plc.started.swap(true, Ordering::SeqCst) {
             continue;
         }
-        let name = format!("EIP{}", plc.name);
+        let name: String = format!("EIP{}", plc.name.chars().take(16).collect::<String>());
         let p = plc.clone();
         match std::thread::Builder::new()
             .name(name)
@@ -317,6 +370,16 @@ pub fn start_scan_tasks() -> usize {
         }
     }
     started
+}
+
+/// C `disconnect_PLC`: close a live connection and invalidate the tags.
+fn disconnect(plc: &Plc, conn: &mut Option<Connection>) {
+    if let Some(c) = conn.take() {
+        crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
+        c.shutdown();
+        plc.connected.store(false, Ordering::Relaxed);
+        plc.invalidate_tags();
+    }
 }
 
 /// `drvEtherIP_describe`: describe `type_id` on every PLC, over the
@@ -472,12 +535,7 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
 
     if failed {
         // Drop the session and reconnect on the next turn.
-        crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
-        if let Some(c) = conn.take() {
-            c.shutdown();
-        }
-        plc.connected.store(false, Ordering::Relaxed);
-        plc.invalidate_tags();
+        disconnect(plc, conn);
         return None;
     }
 
