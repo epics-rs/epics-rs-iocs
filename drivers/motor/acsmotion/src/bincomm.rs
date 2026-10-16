@@ -84,7 +84,7 @@ impl Span {
         }
     }
 
-    fn elements(&self) -> usize {
+    pub(crate) fn elements(&self) -> usize {
         ((self.idx1.1 - self.idx1.0 + 1) * (self.idx2.1 - self.idx2.0 + 1)).max(0) as usize
     }
 
