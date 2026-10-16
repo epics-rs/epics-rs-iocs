@@ -18,9 +18,10 @@ use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDimension};
+use epics_rs::ad_core::ndarray::NDDimension;
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
@@ -35,8 +36,7 @@ pub(crate) struct AcquisitionContext {
     pub p2: P2Util,
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    #[allow(dead_code)] // held so plugins can be back-pressured on the queue
-    pub queued: Arc<QueuedArrayCounter>,
+    pub pool: Arc<NDArrayPool>,
     pub ad_params: ADBaseParams,
     pub params: PhotonIIParams,
     pub shared: Arc<SharedState>,
@@ -383,7 +383,7 @@ async fn publish_frame(
 
     let ts = EpicsTimestamp::now();
     let data_type = data.data_type();
-    let mut array = NDArray::with_data(
+    let mut array = ctx.pool.wrap(
         vec![NDDimension::new(PII_SIZE_X), NDDimension::new(PII_SIZE_Y)],
         data,
     );
