@@ -1,8 +1,9 @@
 //! ACS SPiiPlus motion controller IOC (motorAcsMotion).
 //!
 //! Assembles: a serial/TCP octet port (`drvAsynSerialPortConfigure` /
-//! `drvAsynIPPortConfigure`), the `AcsMotionConfig` and `SPiiPlusComm`
-//! iocsh commands, the motor record type, and the CA + PVA (QSRV) server.
+//! `drvAsynIPPortConfigure`), the `AcsMotionConfig`, `SPiiPlusComm` and
+//! `AcsMotionAuxIOConfig` iocsh commands, the motor record type, and the
+//! CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p acsmotion-ioc -- st.cmd
@@ -13,6 +14,7 @@ use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use motor_acsmotion::ioc::acsmotion_config_command;
+use motor_acsmotion::ioc_aux::acsmotion_aux_io_config_command;
 use motor_acsmotion::ioc_comm::spiiplus_comm_command;
 
 #[epics_rs::base::epics_main]
@@ -43,6 +45,7 @@ async fn main() -> CaResult<()> {
     // SPiiPlus iocsh commands + motor device support.
     app = app.register_startup_command(acsmotion_config_command());
     app = app.register_startup_command(spiiplus_comm_command());
+    app = app.register_startup_command(acsmotion_aux_io_config_command());
     app = app.register_dynamic_device_support(
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),
