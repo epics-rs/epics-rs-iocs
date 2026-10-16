@@ -110,7 +110,7 @@ pub fn opt_int(args: &[ArgValue], i: usize, default: i64, name: &str) -> Result<
 }
 
 /// Parse the optional `movingPollMs`/`idlePollMs` trailing args, defaulting and
-/// rejecting non-positive values.
+/// rejecting negative values.
 pub fn poll_intervals(
     args: &[ArgValue],
     moving_i: usize,
@@ -123,8 +123,9 @@ pub fn poll_intervals(
 
 fn poll_ms(arg: Option<&ArgValue>, default: u64, name: &str) -> Result<u64, String> {
     match arg {
-        Some(ArgValue::Int(v)) if *v > 0 => Ok(*v as u64),
-        Some(ArgValue::Int(_)) => Err(format!("{name} must be positive")),
+        // 0 is C's "wait for a poll event only" (asynMotorController.cpp:633).
+        Some(ArgValue::Int(v)) if *v >= 0 => Ok(*v as u64),
+        Some(ArgValue::Int(_)) => Err(format!("{name} must not be negative")),
         None | Some(ArgValue::Missing) => Ok(default),
         _ => Err(format!("{name} must be an integer")),
     }
