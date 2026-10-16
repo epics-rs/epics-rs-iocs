@@ -1006,14 +1006,14 @@ pub trait QuadEmDevice {
     }
 
     /// `drvQuadEM::setAcquire`: starting an acquisition clears `NumAcquired`.
-    fn base_set_acquire(&mut self, value: i32) -> AsynResult<()> {
+    /// C discards both statuses and returns asynSuccess.
+    fn base_set_acquire(&mut self, value: i32) {
         if value == 1 {
             self.qe_shared().acq.lock().num_acquired = 0;
             let idx = self.qe_base().params.num_acquired;
-            self.qe_base().port_base.set_int32_param(idx, 0, 0)?;
-            self.qe_base().port_base.call_param_callbacks(0)?;
+            let _ = self.qe_base().port_base.set_int32_param(idx, 0, 0);
+            let _ = self.qe_base().port_base.call_param_callbacks(0);
         }
-        Ok(())
     }
 
     /// `drvQuadEM::reset`: push every cached EPICS setting back to the meter,
