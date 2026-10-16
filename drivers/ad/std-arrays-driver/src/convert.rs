@@ -10,7 +10,7 @@
 //! `copyBuffer<epicsType, NDArrayType>` and `fillBuffer<NDArrayType>` cast with
 //! a plain C cast `(NDArrayType)value`, which for integer targets truncates
 //! toward zero and then wraps modulo 2^N. Rust's `as` saturates instead.
-//! [`CCast::from_f64_c`] restores the C behaviour by going through `i128`
+//! `CCast::from_f64_c` restores the C behaviour by going through `i128`
 //! (truncate) before the narrowing bit-truncation. Every waveform input type
 //! (`epicsInt8/16/32`, `epicsFloat32/64`) is exactly representable in `f64`, so
 //! converting each input element to `f64` first and then casting to the output

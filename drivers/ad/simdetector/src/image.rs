@@ -12,7 +12,7 @@
 //! platform's `double -> integer` conversion, which truncates toward zero and
 //! then wraps modulo 2^N. Rust's `as` saturates instead, so a `gain * j` ramp
 //! that overruns `u8` would clamp at 255 rather than wrap — visibly a different
-//! image. [`SimPixel::from_f64_c`] restores the C behaviour by going through
+//! image. `SimPixel::from_f64_c` restores the C behaviour by going through
 //! `i128` (truncate) before the narrowing bit-truncation.
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
