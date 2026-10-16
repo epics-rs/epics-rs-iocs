@@ -18,6 +18,7 @@ use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{ParamSetValue, RequestOp};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::params::MarccdParams;
@@ -108,9 +109,22 @@ impl Server {
     /// C `callParamCallbacks()` — apply the pending writes and post monitors.
     pub async fn callbacks(&mut self) {
         let updates = std::mem::take(&mut self.batch);
-        if let Err(e) = self.handle.set_params_and_notify(0, updates).await {
-            log::error!("marccd: callParamCallbacks failed: {e}");
-        }
+        let _ = self.handle.set_params_and_notify(0, updates).await;
+    }
+
+    /// C `asynPrint(pasynUserSelf, mask, ...)`.
+    pub fn trace(&self, mask: TraceMask, message: &str) {
+        self.handle
+            .trace()
+            .output(self.handle.port_name(), mask, message);
+    }
+
+    /// C `asynPrint(pasynUserServer, ASYN_TRACE_ERROR, ...)`: the server
+    /// port's trace mask gates it.
+    fn trace_server_error(&self, message: &str) {
+        self.server_port
+            .trace()
+            .output(self.server_port.port_name(), TraceMask::ERROR, message);
     }
 
     /// Flush pending writes so a following read observes them.
@@ -140,10 +154,7 @@ impl Server {
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 String::from_utf8_lossy(&bytes[..end]).into_owned()
             }
-            Err(e) => {
-                log::error!("marccd: getStringParam({reason}) failed: {e}");
-                String::new()
-            }
+            Err(_) => String::new(),
         }
     }
 
@@ -172,7 +183,10 @@ impl Server {
         {
             Ok(_) => CamStatus::Success,
             Err(e) => {
-                log::error!("marccd: writeServer failed, sent {output:?}: {e}");
+                self.trace_server_error(&format!(
+                    "marCCD:writeServer, status={}, sent\n{output}",
+                    e.status() as i32
+                ));
                 classify(&e)
             }
         };
@@ -207,7 +221,10 @@ impl Server {
                 // C's asynOctetSyncIO null-terminates at nbytesTransfered,
                 // which is 0 on a failed read.
                 self.from.clear();
-                log::error!("marccd: readServer timeout={timeout}, status error: {e}");
+                self.trace_server_error(&format!(
+                    "marCCD:readServer, timeout={timeout:.6}, status={} received 0 bytes\n",
+                    e.status() as i32
+                ));
                 classify(&e)
             }
         };
@@ -295,9 +312,12 @@ impl Server {
             self.server_mode = v;
         }
         if !(1..=2).contains(&self.server_mode) {
-            log::error!(
-                "marccd: error serverMode must be 1 or 2, actual={}",
-                self.server_mode
+            self.trace(
+                TraceMask::ERROR,
+                &format!(
+                    "marCCD:getServerMode: error serverMode must be 1 or 2, actual={}",
+                    self.server_mode
+                ),
             );
             self.server_mode = 1;
             return CamStatus::Error;
