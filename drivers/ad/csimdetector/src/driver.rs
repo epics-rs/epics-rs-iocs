@@ -160,7 +160,7 @@ impl PortDriver for CSimDetector {
                 line!(),
                 format_args!(
                     "ADCSimDetector:writeInt32 error, status={} function={reason}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => user.print(
@@ -409,6 +409,39 @@ mod tests {
             Err(AsynError::ParamInvalidList(_))
         ));
         assert!(f.start_rx.try_recv().is_ok());
+    }
+
+    /// ADCSimDetector.cpp:375-378 prints setIntegerParam's
+    /// asynParamInvalidList.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let mut f = Fixture::new();
+        let port = "CSIMTEST";
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("csim-status-{}", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let reason = f.det.nd.acquire;
+        let mut user = AsynUser::new(reason).with_addr(MAX_ADDR as i32);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        assert!(f.det.write_int32(&mut user, 1).is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(&format!(
+                "ADCSimDetector:writeInt32 error, status=11 function={reason}, value=1"
+            )),
+            "{text}"
+        );
     }
 
     #[test]
