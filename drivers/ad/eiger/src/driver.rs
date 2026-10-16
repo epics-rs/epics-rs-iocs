@@ -515,8 +515,15 @@ impl PortDriver for EigerDriver {
                 // Selecting the stream re-arms the detector's stream interface:
                 // it has to be off and on again for the socket to deliver.
                 if data_source == SOURCE_STREAM {
+                    let version = self
+                        .ad
+                        .port_base
+                        .get_int32_param(self.p.stream_version, 0)?;
+                    self.signals.stream_apis(Some(version));
                     self.put_bool(self.p.stream_enable, false)?;
                     self.put_bool(self.p.stream_enable, true)?;
+                } else {
+                    self.signals.stream_apis(None);
                 }
             }
         } else {

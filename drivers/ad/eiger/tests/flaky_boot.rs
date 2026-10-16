@@ -74,7 +74,7 @@ fn half_dead_detector(puts: Arc<AtomicUsize>) -> u16 {
 fn the_driver_is_created_when_the_detector_stops_answering_after_the_state_fetch() {
     let puts = Arc::new(AtomicUsize::new(0));
     let rest = RestApi::new("127.0.0.1", half_dead_detector(puts.clone()));
-    let (signals, _ctl_rx, _init_rx, _restart_rx) = tasks::signals();
+    let (signals, _receivers) = tasks::signals();
     let cfg = EigerConfig {
         port_name: "EIGER_FLAKY".to_string(),
         api: ApiVersion::V1_6_0,

@@ -123,7 +123,7 @@ fn every_request_reaches_the_detector_while_it_is_disconnected() {
 fn an_acquisition_reconnects_a_detector_that_was_offline_at_boot() {
     let det = switchable_detector();
     let rest = RestApi::new("127.0.0.1", det.port);
-    let (signals, _ctl_rx, _init_rx, _restart_rx) = tasks::signals();
+    let (signals, _receivers) = tasks::signals();
     let cfg = EigerConfig {
         port_name: "EIGER_RECONNECT".to_string(),
         api: ApiVersion::V1_6_0,

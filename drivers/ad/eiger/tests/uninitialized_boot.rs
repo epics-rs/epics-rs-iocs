@@ -77,7 +77,7 @@ fn uninitialized_detector(init_fails: bool, log: Arc<Mutex<Vec<String>>>) -> u16
 fn boot(name: &str, init_fails: bool) -> (EigerDriver, Vec<String>) {
     let log = Arc::new(Mutex::new(Vec::new()));
     let rest = RestApi::new("127.0.0.1", uninitialized_detector(init_fails, log.clone()));
-    let (signals, _ctl_rx, _init_rx, _restart_rx) = tasks::signals();
+    let (signals, _receivers) = tasks::signals();
     let cfg = EigerConfig {
         port_name: name.to_string(),
         api: ApiVersion::V1_6_0,

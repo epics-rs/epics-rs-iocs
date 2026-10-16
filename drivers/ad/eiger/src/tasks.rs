@@ -9,7 +9,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
@@ -52,7 +52,13 @@ pub enum CtlCommand {
 pub struct Flags {
     stop: AtomicBool,
     trigger: AtomicBool,
+    /// Which of C's `mStreamAPI` / `mStream2API` exist ([`STREAM_API`],
+    /// [`STREAM2_API`]); the stream task holds a socket only for these.
+    stream_apis: AtomicU8,
 }
+
+const STREAM_API: u8 = 1;
+const STREAM2_API: u8 = 2;
 
 /// The driver's end of every task signal.
 #[derive(Clone)]
@@ -60,7 +66,16 @@ pub struct Signals {
     ctl_tx: rt::CommandSender<CtlCommand>,
     init_tx: rt::CommandSender<()>,
     restart_tx: rt::CommandSender<()>,
+    stream_apis_tx: rt::CommandSender<()>,
     flags: Arc<Flags>,
+}
+
+/// The task ends of [`Signals`].
+pub struct Receivers {
+    ctl: rt::CommandReceiver<CtlCommand>,
+    init: rt::CommandReceiver<()>,
+    restart: rt::CommandReceiver<()>,
+    stream_apis: rt::CommandReceiver<()>,
 }
 
 impl Signals {
@@ -82,6 +97,25 @@ impl Signals {
 
     pub fn restart(&self) {
         let _ = self.restart_tx.try_send(());
+    }
+
+    /// `Some(version)` creates that version's stream API, `None` deletes both
+    /// (C `writeInt32` on DataSource/StreamVersion, eigerDetector.cpp:553-584),
+    /// so a DataSource other than stream leaves no PULL socket taking the
+    /// detector's frames from other clients.
+    pub fn stream_apis(&self, version: Option<i32>) {
+        match version {
+            Some(STREAM_VERSION_STREAM) => self
+                .flags
+                .stream_apis
+                .fetch_or(STREAM_API, Ordering::AcqRel),
+            Some(_) => self
+                .flags
+                .stream_apis
+                .fetch_or(STREAM2_API, Ordering::AcqRel),
+            None => self.flags.stream_apis.swap(0, Ordering::AcqRel),
+        };
+        let _ = self.stream_apis_tx.try_send(());
     }
 }
 
@@ -256,12 +290,13 @@ pub struct TaskChannels {
 }
 
 /// Start every background task. Returns the thread handles.
-pub fn start(
-    shared: Arc<Shared>,
-    ctl_rx: rt::CommandReceiver<CtlCommand>,
-    init_rx: rt::CommandReceiver<()>,
-    restart_rx: rt::CommandReceiver<()>,
-) -> Vec<std::thread::JoinHandle<()>> {
+pub fn start(shared: Arc<Shared>, rx: Receivers) -> Vec<std::thread::JoinHandle<()>> {
+    let Receivers {
+        ctl: ctl_rx,
+        init: init_rx,
+        restart: restart_rx,
+        stream_apis: stream_apis_rx,
+    } = rx;
     let (poll_tx, poll_rx) = rt::command_channel::<Acquisition>(1);
     let (poll_done_tx, poll_done_rx) = rt::command_channel::<bool>(1);
     let (download_tx, download_rx) = rt::command_channel::<Arc<FileJob>>(QUEUE_CAPACITY);
@@ -339,7 +374,7 @@ pub fn start(
         threads.push(rt::run_thread_named(
             "eigerStreamTask",
             move || async move {
-                stream_task(s, stream_start_rx, stream_done_tx).await;
+                stream_task(s, stream_start_rx, stream_apis_rx, stream_done_tx).await;
             },
         ));
     }
@@ -1030,37 +1065,55 @@ async fn monitor_task(s: Arc<Shared>) {
 async fn stream_task(
     s: Arc<Shared>,
     mut start_rx: rt::CommandReceiver<()>,
+    mut apis_rx: rt::CommandReceiver<()>,
     done_tx: rt::CommandSender<bool>,
 ) {
     let mut api: Option<StreamApi> = None;
     let mut api2: Option<Stream2Api> = None;
 
-    while start_rx.recv().await.is_some() {
-        let version = s.get_int(s.p.stream_version).await;
-        let connected = if version == STREAM_VERSION_STREAM {
-            if api.is_none() {
-                api = StreamApi::connect(&s.hostname).await.ok();
+    loop {
+        let start = tokio::select! {
+            r = start_rx.recv() => r.is_some(),
+            r = apis_rx.recv() => {
+                if r.is_none() {
+                    return;
+                }
+                false
             }
-            api.is_some()
-        } else {
-            if api2.is_none() {
-                api2 = Stream2Api::connect(&s.hostname).await.ok();
-            }
-            api2.is_some()
         };
-        if !connected {
-            s.trace()
-                .err("streamTask", "mStreamAPI is null, Stream API not enabled?");
-            let _ = done_tx.send(false).await;
+
+        // Hold a socket for each API C has. zmq.rs connects eagerly where
+        // libzmq reconnects in the background, so a failed connect is retried
+        // here on the next signal.
+        let apis = s.flags.stream_apis.load(Ordering::Acquire);
+        if apis & STREAM_API == 0 {
+            api = None;
+        } else if api.is_none() {
+            api = StreamApi::connect(&s.hostname).await.ok();
+        }
+        if apis & STREAM2_API == 0 {
+            api2 = None;
+        } else if api2.is_none() {
+            api2 = Stream2Api::connect(&s.hostname).await.ok();
+        }
+        if !start {
             continue;
         }
 
-        let complete = match (api.as_mut(), api2.as_mut()) {
-            (Some(stream), _) if version == STREAM_VERSION_STREAM => {
-                stream_series(&s, stream).await
+        let version = s.get_int(s.p.stream_version).await;
+        let complete = match (
+            version == STREAM_VERSION_STREAM,
+            api.as_mut(),
+            api2.as_mut(),
+        ) {
+            (true, Some(stream), _) => stream_series(&s, stream).await,
+            (false, _, Some(stream)) => stream2_series(&s, stream).await,
+            _ => {
+                s.trace()
+                    .err("streamTask", "mStreamAPI is null, Stream API not enabled?");
+                let _ = done_tx.send(false).await;
+                continue;
             }
-            (_, Some(stream)) => stream2_series(&s, stream).await,
-            _ => unreachable!("connected above"),
         };
         s.stream_complete.store(complete, Ordering::Release);
 
@@ -1393,24 +1446,48 @@ pub fn shared(
 }
 
 /// Create the driver's signal handles and the matching receiver ends.
-pub fn signals() -> (
-    Signals,
-    rt::CommandReceiver<CtlCommand>,
-    rt::CommandReceiver<()>,
-    rt::CommandReceiver<()>,
-) {
-    let (ctl_tx, ctl_rx) = rt::command_channel::<CtlCommand>(4);
-    let (init_tx, init_rx) = rt::command_channel::<()>(1);
-    let (restart_tx, restart_rx) = rt::command_channel::<()>(1);
+pub fn signals() -> (Signals, Receivers) {
+    let (ctl_tx, ctl) = rt::command_channel::<CtlCommand>(4);
+    let (init_tx, init) = rt::command_channel::<()>(1);
+    let (restart_tx, restart) = rt::command_channel::<()>(1);
+    let (stream_apis_tx, stream_apis) = rt::command_channel::<()>(1);
     (
         Signals {
             ctl_tx,
             init_tx,
             restart_tx,
+            stream_apis_tx,
             flags: Arc::new(Flags::default()),
         },
-        ctl_rx,
-        init_rx,
-        restart_rx,
+        Receivers {
+            ctl,
+            init,
+            restart,
+            stream_apis,
+        },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_apis_follow_c_create_and_delete() {
+        let (signals, mut rx) = signals();
+        let apis = || signals.flags.stream_apis.load(Ordering::Acquire);
+
+        signals.stream_apis(Some(STREAM_VERSION_STREAM));
+        assert_eq!(apis(), STREAM_API);
+        // Switching version under DataSource=stream keeps the other object.
+        signals.stream_apis(Some(STREAM_VERSION_STREAM + 1));
+        assert_eq!(apis(), STREAM_API | STREAM2_API);
+        // Any other DataSource deletes both.
+        signals.stream_apis(None);
+        assert_eq!(apis(), 0);
+
+        // Signals coalesce: the task rereads the flags on one wake.
+        assert!(rx.stream_apis.try_recv().is_ok());
+        assert!(rx.stream_apis.try_recv().is_err());
+    }
 }

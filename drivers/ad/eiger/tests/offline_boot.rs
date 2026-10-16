@@ -39,7 +39,7 @@ fn a_failed_version_read_fails_the_client_with_cs_text() {
 #[test]
 fn the_driver_is_created_when_the_detector_does_not_answer() {
     let rest = RestApi::new("127.0.0.1", dead_port());
-    let (signals, _ctl_rx, _init_rx, _restart_rx) = tasks::signals();
+    let (signals, _receivers) = tasks::signals();
     let cfg = EigerConfig {
         port_name: "EIGER_OFFLINE_DRV".to_string(),
         api: ApiVersion::V1_6_0,

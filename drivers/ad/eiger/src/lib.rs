@@ -117,7 +117,7 @@ pub fn create_eiger_detector_on_port(
         .unwrap_or_default();
     let model = Model::from_description(&description);
 
-    let (signals, ctl_rx, init_rx, restart_rx) = tasks::signals();
+    let (signals, receivers) = tasks::signals();
 
     // The sensor size is only known once the parameters have been fetched, so
     // the pool starts from the detector's own x/y_pixels_in_detector.
@@ -159,7 +159,7 @@ pub fn create_eiger_detector_on_port(
         outputs.clone(),
         &signals,
     );
-    let task_handles = tasks::start(shared, ctl_rx, init_rx, restart_rx);
+    let task_handles = tasks::start(shared, receivers);
 
     Ok(EigerRuntime {
         runtime_handle,
