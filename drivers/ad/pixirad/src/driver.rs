@@ -407,17 +407,20 @@ impl PortDriver for PixiradDetector {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad
+        let mut status = self
+            .ad
             .port_base
-            .set_float64_param(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value);
 
         let p = self.ad.params;
         let q = self.params;
-        let mut status = Ok(());
         if reason == p.temperature || reason == q.hv_value {
             status = self.set_cooling_and_hv();
         } else if reason == q.hit_threshold || q.threshold.contains(&reason) {
             status = self.set_thresholds(1);
+        } else if reason < q.system_reset {
+            // ADDriver::writeFloat64 is asynPortDriver's (pixirad.cpp:1469).
+            status = self.ad.port_base.write_float64_param(user, value);
         }
 
         match &status {
@@ -896,5 +899,43 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(t.pool.num_alloc_buffers(), 1);
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (pixirad.cpp:1469), whose
+    /// IO_DRIVER line precedes the driver's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "PIXI_BASE_F64";
+        let mut det = detector(port, None);
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let delay = det.ad.params.shutter_open_delay;
+        let mut user = AsynUser::new(delay).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        let _ = det.write_float64(&mut user, 2.0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = format!("pixirad:writeFloat64: function={delay}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
     }
 }
