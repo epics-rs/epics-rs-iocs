@@ -94,8 +94,9 @@ pub const INTEGRATION_MODES: [&str; 3] = ["sum", "average", "last"];
 pub const SPLIT_STRATEGIES: [&str; 2] = ["single_file", "frame"];
 /// `TPX3_PRV_SAMPLMODE`.
 pub const SAMPLING_MODES: [&str; 2] = ["skipOnFrame", "skipOnPeriod"];
-/// `ADTriggerMode` (TimePix3Base.template).
-pub const TRIGGER_MODES: [&str; 8] = [
+/// `ADTriggerMode`'s Serval names (C `kTriggerModes[].servalName`,
+/// ADTimePix.cpp:900-910).
+pub const TRIGGER_MODES: [&str; 9] = [
     "PEXSTART_NEXSTOP",
     "NEXSTART_PEXSTOP",
     "PEXSTART_TIMERSTOP",
@@ -104,6 +105,29 @@ pub const TRIGGER_MODES: [&str; 8] = [
     "CONTINUOUS",
     "SOFTWARESTART_TIMERSTOP",
     "SOFTWARESTART_SOFTWARESTOP",
+    "FOLLOWING",
+];
+/// `ADTriggerMode`'s menu, which the driver's `readEnum` supplies: index 7 is
+/// shortened to fit an EPICS state string (C `kTriggerModes[].menuLabel`).
+pub const TRIGGER_MODE_LABELS: [&str; 9] = [
+    "PEXSTART_NEXSTOP",
+    "NEXSTART_PEXSTOP",
+    "PEXSTART_TIMERSTOP",
+    "NEXSTART_TIMERSTOP",
+    "AUTOTRIGSTART_TIMERSTOP",
+    "CONTINUOUS",
+    "SOFTWARESTART_TIMERSTOP",
+    "SwReSt_SwReSp",
+    "FOLLOWING",
+];
+/// `TPX3_MSMT_PIPELINE_STATE`'s menu (C `kPipelineStates`,
+/// ADTimePix.cpp:920-926).
+pub const PIPELINE_STATES: [(i32, &str); 5] = [
+    (0, "DA_STARTING"),
+    (1, "DA_RECORDING"),
+    (2, "DA_STOPPING"),
+    (3, "DA_IDLE"),
+    (-1, "Unknown"),
 ];
 /// `TPX3_CHAIN_MODE`.
 pub const CHAIN_MODES: [&str; 3] = ["NONE", "LEADER", "FOLLOWER"];
@@ -568,7 +592,7 @@ mod tests {
     #[test]
     fn an_out_of_range_trigger_mode_fails_instead_of_sending_null() {
         let mut c = config();
-        c.trigger_mode = 8;
+        c.trigger_mode = 9;
         assert!(detector_config_body(&json!({}), &c).is_err());
         c.trigger_mode = -1;
         assert!(detector_config_body(&json!({}), &c).is_err());

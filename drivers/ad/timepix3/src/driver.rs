@@ -6,6 +6,7 @@ use std::sync::Arc;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::param::EnumEntry;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -1226,6 +1227,27 @@ impl PortDriver for TimePix3Driver {
         Ok(data.len())
     }
 
+    /// C `readEnum` (ADTimePix.cpp:979-1023): the orientation, trigger-mode
+    /// and pipeline-state menus come from the driver, not the template.
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        let entry = |(value, s): (i32, &str)| EnumEntry {
+            string: s.to_string(),
+            value,
+            severity: 0,
+        };
+        let entries: Arc<[EnumEntry]> = if user.reason == self.p.detector_orientation {
+            (0..).zip(serval::ORIENTATIONS).map(entry).collect()
+        } else if user.reason == self.ad.params.trigger_mode {
+            (0..).zip(serval::TRIGGER_MODE_LABELS).map(entry).collect()
+        } else if user.reason == self.p.pipeline_state {
+            serval::PIPELINE_STATES.into_iter().map(entry).collect()
+        } else {
+            return self.ad.port_base.params.get_enum(user.reason, user.addr);
+        };
+        let index = usize::try_from(self.int(user.reason, user.addr)).unwrap_or(0);
+        Ok((index, entries))
+    }
+
     /// The mask waveform reads back what the driver drew (C `readInt32Array`,
     /// mask_io.cpp:18).
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
@@ -1299,6 +1321,34 @@ mod tests {
             .read_int32_array(&AsynUser::new(p.pixel_config_diff), &mut buf)
             .unwrap();
         assert_eq!((n, buf), (4, [5, 6, 0, 0]));
+    }
+
+    /// The trigger-mode menu is C's nine labels, FOLLOWING included, and the
+    /// pipeline state carries -1 for Unknown (ADTimePix.cpp:900-926).
+    #[test]
+    fn the_driver_supplies_the_trigger_mode_and_pipeline_menus() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_READ_ENUM",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let (_, menu) = det
+            .read_enum(&AsynUser::new(det.ad.params.trigger_mode))
+            .unwrap();
+        assert_eq!(menu.len(), 9);
+        assert_eq!(menu[7].string, "SwReSt_SwReSp");
+        assert_eq!((menu[8].string.as_str(), menu[8].value), ("FOLLOWING", 8));
+        let (_, menu) = det.read_enum(&AsynUser::new(det.p.pipeline_state)).unwrap();
+        assert_eq!((menu[4].string.as_str(), menu[4].value), ("Unknown", -1));
+        let (_, menu) = det
+            .read_enum(&AsynUser::new(det.p.detector_orientation))
+            .unwrap();
+        assert_eq!(menu[7].string, "LEFT_MIRRORED");
+        assert!(det.read_enum(&AsynUser::new(det.p.gain_mode)).is_err());
     }
 
     /// An out-of-range GainMode, PixelDepth, TriggerMode or orientation is
