@@ -20,7 +20,7 @@ use epics_rs::base::server::device_support::{
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::recgbl::alarm_status;
-use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType, menu_scan};
+use epics_rs::base::server::record::{AlarmSeverity, ProcessContext, Record, ScanType, menu_scan};
 use epics_rs::base::types::EpicsValue;
 
 use crate::cip::{self, CipType};
@@ -281,6 +281,8 @@ pub struct EtherIpDevice {
     name: String,
     /// The record's SCAN, for C's `get_period`.
     scan: ScanType,
+    /// `rec->udf` as the cycle began: FORCE yields to the PLC while it is set.
+    udf: u8,
     link_text: String,
     is_output: bool,
     link: Option<Link>,
@@ -295,6 +297,7 @@ impl EtherIpDevice {
         EtherIpDevice {
             name: String::new(),
             scan: ScanType::Passive,
+            udf: 1,
             link_text: link_text.to_string(),
             is_output,
             link: None,
@@ -409,6 +412,10 @@ impl DeviceSupport for EtherIpDevice {
     fn set_record_info(&mut self, name: &str, scan: ScanType) {
         self.name = name.to_string();
         self.scan = scan;
+    }
+
+    fn set_process_context(&mut self, ctx: &ProcessContext) {
+        self.udf = ctx.udf;
     }
 
     // Every C init_record/analyze_link failure returns an `S_*` status after
@@ -706,8 +713,7 @@ impl EtherIpDevice {
             return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
         }
 
-        let udf = matches!(record.get_field("UDF"), Some(EpicsValue::Char(1)));
-        let force = forced && !udf;
+        let force = forced && self.udf == 0;
 
         match rtype {
             "ao" => match cip::typecode(&data.buf) {
@@ -1013,6 +1019,35 @@ mod tests {
         assert_eq!(get_period("r", ScanType::SEC10), Some(10.0));
         assert_eq!(get_period("r", ScanType::Passive), None);
         assert_eq!(get_period("r", ScanType::IoIntr), None);
+    }
+
+    /// devEtherIP.c:361-375: FORCE re-writes the record's value only once
+    /// the record is defined; an undefined record takes the PLC's.
+    #[test]
+    fn force_yields_to_the_plc_while_the_record_is_undefined() {
+        use epics_rs::base::server::record::CommonFields;
+        use epics_rs::base::server::records::ao::AoRecord;
+
+        driver::define_plc("forceudf", "127.0.0.1", 0);
+        for (udf, want_val, want_write) in [(1u8, 5.0, false), (0, 0.0, true)] {
+            let mut record = AoRecord::default();
+            let mut dev = EtherIpDevice::new("@forceudf REAL S 1 FORCE", true);
+            dev.init(&mut record).unwrap();
+            let tag = dev.tag.clone().unwrap();
+            {
+                let mut d = tag.data.lock();
+                d.buf = CipType::Real.code().to_le_bytes().to_vec();
+                d.buf.extend_from_slice(&5.0f32.to_le_bytes());
+                d.valid_data_size = d.buf.len();
+                d.do_write = false;
+            }
+            let mut common = CommonFields::default();
+            common.udf = udf;
+            dev.set_process_context(&common.process_context());
+            dev.read(&mut record).unwrap();
+            assert_eq!(f64_field(&record, "VAL"), want_val, "udf={udf}");
+            assert_eq!(tag.data.lock().do_write, want_write, "udf={udf}");
+        }
     }
 
     // -- link parsing --------------------------------------------------------
