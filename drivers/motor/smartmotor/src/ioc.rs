@@ -1,23 +1,20 @@
 //! `SmartMotorSetup` / `SmartMotorConfig` iocsh commands for the Animatics
 //! SmartMotor.
 //!
-//! Mirrors C `SmartMotorConfig(card, port)`: connect the serial octet port,
-//! probe the single SmartMotor ([`SmartMotorController::new`]), and register its
-//! axis behind a `DTYP`-keyed motor device support (`SMARTMOTOR_{card}_0`).
+//! Mirrors C `SmartMotorConfig(card, port)`: look up the serial octet port,
+//! count the motors on it ([`SmartMotorController::new`]), and register each
+//! behind a `DTYP`-keyed motor device support (`SMARTMOTOR_{card}_{axis}`).
 //! `SmartMotorSetup` (which only sized a controller array in C) is accepted as a
 //! no-op for startup-script parity.
-//!
-//! Only single-motor (non-daisy-chain) controllers are supported; see the
-//! [`crate::smartmotor`] module docs.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
-use motor_common::connect::connect_with_eos;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
@@ -57,8 +54,8 @@ pub fn smartmotor_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             arg_int_opt("idlePollMs"),
         ],
         "SmartMotorConfig(card, asynPort, [movingPollMs], [idlePollMs]) - \
-         Create a single Animatics SmartMotor (DTYP SMARTMOTOR_{card}_0); \
-         daisy-chain controllers are not supported",
+         Create one Animatics SmartMotor or a daisy chain of them \
+         (DTYP SMARTMOTOR_{card}_{axis})",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let card = req_int(args, 0, "card")?;
             if card < 0 {
@@ -67,19 +64,26 @@ pub fn smartmotor_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let asyn_port = req_string(args, 1, "asynPort")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
 
-            let handle = connect_with_eos(&asyn_port, SMARTMOTOR_TIMEOUT, b"\r", b"\n")?;
-            let controller =
-                SmartMotorController::new(handle).map_err(|e| format!("SmartMotorConfig: {e}"))?;
+            let port = get_port(&asyn_port).ok_or_else(|| {
+                format!(
+                    "serial port '{asyn_port}' not found (call drvAsynSerialPortConfigure first)"
+                )
+            })?;
+            let controller = SmartMotorController::new(port.handle.clone(), SMARTMOTOR_TIMEOUT)
+                .map_err(|e| format!("SmartMotorConfig: {e}"))?;
+            let num_axes = controller.num_axes();
             let controller = Arc::new(Mutex::new(controller));
 
-            let ax = SmartMotorAxis::new(controller);
-            let dtyp_key = format!("SMARTMOTOR_{card}_0");
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            for axis in 0..num_axes {
+                let ax = SmartMotorAxis::new(controller.clone(), axis);
+                let dtyp_key = format!("SMARTMOTOR_{card}_{axis}");
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            }
 
             println!(
-                "SmartMotorConfig: card={card} asynPort={asyn_port} \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=SMARTMOTOR_{card}_0)"
+                "SmartMotorConfig: card={card} asynPort={asyn_port} axes={num_axes} \
+                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=SMARTMOTOR_{card}_0..)"
             );
             Ok(CommandOutcome::Continue)
         },

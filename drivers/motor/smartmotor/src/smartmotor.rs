@@ -7,23 +7,18 @@
 //! `\r` (`SmartMotorConfig` sets both, as C `motor_init`). Set commands produce no reply;
 //! status is read back with `R*` query commands.
 //!
-//! ## Single-motor mode only
+//! ## Wire modes
 //!
-//! The C driver supports two wire modes, auto-detected at init by probing
-//! `RBe`:
+//! [`SmartMotorController::new`] auto-detects the mode by probing `RBe`, as C
+//! `motor_init`:
 //!
-//! - **Single motor (no echo):** commands are sent verbatim and status queries
-//!   reply terminated by `\r`. This is the mode implemented here.
-//! - **Daisy chain (echo on):** each command is prefixed with a binary address
-//!   byte (`128 + axis`) and the motor echoes the command terminated by `\n`
-//!   *before* the `\r`-terminated response. The C driver reads these two frames
-//!   by switching the port input EOS between `\n` (echo) and `\r` (response) on
-//!   every transaction.
-//!
-//! [`SmartMotorController::new`] detects echo mode and returns an error rather
-//! than driving it incorrectly. Supporting daisy chain means switching the
-//! input EOS per transaction through `PortHandle::set_input_eos_blocking`, as
-//! C does; that is not ported.
+//! - **Single motor (no echo):** commands are sent verbatim and queries reply
+//!   terminated by `\r`; one axis.
+//! - **Daisy chain (echo on):** each command is prefixed with the binary
+//!   address byte `129 + axis` and the chain echoes it terminated by `\n`
+//!   before the `\r`-terminated response. Every transaction switches the port
+//!   input EOS to `\n` to discard the echo and back to `\r` (C `send_mess`),
+//!   and axes are counted up to the first that does not answer `RBe`.
 //!
 //! ## Units
 //!
@@ -41,9 +36,12 @@
 //!   returns an error and [`set_pid_gain`](AsynMotor::set_pid_gain) is a no-op.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -51,6 +49,24 @@ use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 20;
+
+/// Read timeout (C `recv_mess` 0.25 s); writes use the caller's timeout.
+const RECV_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Response terminator (C `input_terminator`).
+const INPUT_EOS: &[u8] = b"\r";
+
+/// Echo terminator in daisy-chain mode (C `echo_terminator`).
+const ECHO_EOS: &[u8] = b"\n";
+
+/// Command terminator (C `output_terminator`).
+const OUTPUT_EOS: &[u8] = b"\n";
+
+/// Most axes on one chain (C `MAX_AXIS`).
+const MAX_AXIS: usize = 32;
+
+/// Address byte of axis 0 in daisy-chain mode (C `SmartMotor_addr[0]`).
+const FIRST_ADDR: u8 = 129;
 
 /// Minimum acceleration the controller accepts (C forces `A >= 2`).
 const MIN_ACCEL: i32 = 2;
@@ -68,9 +84,19 @@ fn smartmotor_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Shared controller endpoint: owns the serial handle for a single SmartMotor.
+fn eos_user() -> AsynUser {
+    AsynUser::new(0).with_addr(0)
+}
+
+/// Shared controller endpoint: owns the serial port for one SmartMotor or a
+/// daisy chain of them.
 pub struct SmartMotorController {
-    handle: SyncIOHandle,
+    port: PortHandle,
+    writer: SyncIOHandle,
+    reader: SyncIOHandle,
+    /// Daisy-chain echo mode (C `num_motors != 1` in `send_mess`).
+    echo: bool,
+    num_axes: usize,
     comm_state: CommState,
 }
 
@@ -84,57 +110,106 @@ enum CommState {
 }
 
 impl SmartMotorController {
-    /// Connect and probe a single SmartMotor (C `motor_init`, single-motor path):
-    /// send `RBe` and require a bare `0`/`1` reply. If the command is echoed back
-    /// the controller is in daisy-chain echo mode, which this port cannot frame
-    /// (see the module docs) and is rejected. Performs blocking serial I/O.
-    pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
-        let ctrl = Self {
-            handle,
+    /// Connect and count the motors (C `motor_init`): set the port EOS, probe
+    /// `RBe` on axis 0 bare, switch to echo mode if the command comes back
+    /// echoed, then probe each axis address up to the first that does not
+    /// answer `0`/`1` in three tries. Performs blocking serial I/O.
+    pub fn new(port: PortHandle, timeout: Duration) -> AsynResult<Self> {
+        port.set_output_eos_blocking(eos_user(), OUTPUT_EOS)?;
+        port.set_input_eos_blocking(eos_user(), INPUT_EOS)?;
+        let mut ctrl = Self {
+            writer: SyncIOHandle::from_handle(port.clone(), 0, timeout),
+            reader: SyncIOHandle::from_handle(port.clone(), 0, RECV_TIMEOUT),
+            port,
+            echo: false,
+            num_axes: 0,
             comm_state: CommState::Normal,
         };
-        let reply = ctrl.query("RBe")?;
-        if reply.starts_with("RBe") || reply.contains('\n') {
-            return Err(smartmotor_err(
-                "SmartMotor: controller is in daisy-chain echo mode, which is \
-                 unsupported (needs per-transaction input-EOS switching)",
-            ));
+        ctrl.flush();
+
+        let mut total = 0;
+        while total < MAX_AXIS {
+            let mut answered = false;
+            let mut retry = 0;
+            while !answered && retry < 3 {
+                let reply = ctrl.query(total, "RBe").unwrap_or_default();
+                if total == 0 && !ctrl.echo && reply.starts_with("RBe") {
+                    // Echo ON: start over with addressed commands.
+                    ctrl.echo = true;
+                    retry = 0;
+                    ctrl.flush();
+                }
+                answered = reply.starts_with(['0', '1']);
+                retry += 1;
+            }
+            if !answered {
+                break;
+            }
+            total += 1;
+            if !ctrl.echo {
+                break;
+            }
         }
-        if reply != "0" && reply != "1" {
-            return Err(smartmotor_err(format!(
-                "SmartMotor: no valid response to RBe probe (got '{reply}')"
-            )));
+        if total == 0 {
+            return Err(smartmotor_err("SmartMotor: no valid response to RBe probe"));
         }
+        ctrl.num_axes = total;
         Ok(ctrl)
     }
 
-    /// Send a command with no reply (moves and set commands; the SmartMotor does
-    /// not echo or answer these in single-motor mode).
-    fn send_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
-        Ok(())
+    /// Motors found by [`new`](Self::new): 1 without echo, else the chain length.
+    pub fn num_axes(&self) -> usize {
+        self.num_axes
     }
 
-    /// Send a query command and return its `\r`-terminated reply (trimmed).
-    fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+    fn flush(&self) {
+        let user = AsynUser::new(0).with_addr(0).with_timeout(RECV_TIMEOUT);
+        let _ = self.port.submit_blocking(RequestOp::Flush, user);
+    }
+
+    /// Write one command to `axis` (C `send_mess`). In echo mode it carries the
+    /// axis address byte and the echo is read to `\n` and discarded, the input
+    /// EOS restored to `\r` afterwards.
+    fn send(&self, axis: usize, cmd: &str) -> AsynResult<()> {
+        if !self.echo {
+            self.writer.write_octet(0, cmd.as_bytes())?;
+            return Ok(());
+        }
+        let mut out = Vec::with_capacity(cmd.len() + 1);
+        out.push(FIRST_ADDR + axis as u8);
+        out.extend_from_slice(cmd.as_bytes());
+        self.port.set_input_eos_blocking(eos_user(), ECHO_EOS)?;
+        let sent = self.writer.write_octet(0, &out);
+        if sent.is_ok() {
+            let _ = self.reader.read_octet(0, READ_BUF);
+        }
+        self.port.set_input_eos_blocking(eos_user(), INPUT_EOS)?;
+        sent.map(|_| ())
+    }
+
+    /// Send a query to `axis` and return its `\r`-terminated reply (trimmed).
+    fn query(&self, axis: usize, cmd: &str) -> AsynResult<String> {
+        self.send(axis, cmd)?;
+        let raw = self.reader.read_octet(0, READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
 }
 
-/// A single SmartMotor axis. Implements [`AsynMotor`].
+/// One SmartMotor on the controller's port. Implements [`AsynMotor`].
 pub struct SmartMotorAxis {
     controller: Arc<Mutex<SmartMotorController>>,
+    axis: usize,
     prev_position: i32,
     last_status: MotorStatus,
 }
 
 impl SmartMotorAxis {
-    /// Construct the (single) axis for a SmartMotor controller.
-    pub fn new(controller: Arc<Mutex<SmartMotorController>>) -> Self {
+    /// Construct axis `axis` (0-based chain position) of a controller.
+    pub fn new(controller: Arc<Mutex<SmartMotorController>>, axis: usize) -> Self {
         Self {
             controller,
+            axis,
             prev_position: 0,
             last_status: MotorStatus {
                 done: true,
@@ -154,14 +229,15 @@ impl SmartMotorAxis {
     /// acceleration is clamped to the controller minimum.
     fn program_speeds(
         ctrl: &SmartMotorController,
+        axis: usize,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
         if velocity > 0.0 {
-            ctrl.send_only(&format!("V={}", nint(velocity)))?;
+            ctrl.send(axis, &format!("V={}", nint(velocity)))?;
         }
         if acceleration > 0.0 {
-            ctrl.send_only(&format!("A={}", clamped_accel(acceleration)))?;
+            ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)))?;
         }
         Ok(())
     }
@@ -177,9 +253,9 @@ impl AsynMotor for SmartMotorAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        SmartMotorAxis::program_speeds(&ctrl, velocity, acceleration)?;
-        ctrl.send_only(&format!("P={}", nint(position)))?;
-        ctrl.send_only("G")?;
+        SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
+        ctrl.send(self.axis, &format!("P={}", nint(position)))?;
+        ctrl.send(self.axis, "G")?;
         Ok(())
     }
 
@@ -192,9 +268,9 @@ impl AsynMotor for SmartMotorAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        SmartMotorAxis::program_speeds(&ctrl, velocity, acceleration)?;
-        ctrl.send_only(&format!("D={}", nint(distance)))?;
-        ctrl.send_only("G")?;
+        SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
+        ctrl.send(self.axis, &format!("D={}", nint(distance)))?;
+        ctrl.send(self.axis, "G")?;
         Ok(())
     }
 
@@ -207,7 +283,7 @@ impl AsynMotor for SmartMotorAxis {
     ) -> AsynResult<()> {
         // C JOG: "MV\rV=<v>\rG" — velocity mode, set signed velocity, go.
         let ctrl = self.lock();
-        ctrl.send_only(&format!("MV\rV={}\rG", nint(velocity)))?;
+        ctrl.send(self.axis, &format!("MV\rV={}\rG", nint(velocity)))?;
         Ok(())
     }
 
@@ -225,13 +301,13 @@ impl AsynMotor for SmartMotorAxis {
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.send_only("S")?;
+        ctrl.send(self.axis, "S")?;
         Ok(())
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.send_only(&format!("O={}", nint(position)))?;
+        ctrl.send(self.axis, &format!("O={}", nint(position)))?;
         Ok(())
     }
 
@@ -239,10 +315,10 @@ impl AsynMotor for SmartMotorAxis {
         let ctrl = self.lock();
         if enable {
             // C ENABLE_TORQUE: position mode, hold at the current actual position.
-            ctrl.send_only("MP\ra=@P\rP=a\rG")?;
+            ctrl.send(self.axis, "MP\ra=@P\rP=a\rG")?;
         } else {
             // C DISABL_TORQUE: de-energize.
-            ctrl.send_only("OFF")?;
+            ctrl.send(self.axis, "OFF")?;
         }
         Ok(())
     }
@@ -258,7 +334,7 @@ impl AsynMotor for SmartMotorAxis {
         // Trajectory-busy flag: RBt == 0 means the move is done. C
         // drvSmartMotor.cc:239-263: an empty or failed RBt keeps the previous
         // status once (RETRY); a second in a row raises COMM_ERR.
-        let rbt = ctrl.query("RBt").ok().filter(|r| !r.is_empty());
+        let rbt = ctrl.query(self.axis, "RBt").ok().filter(|r| !r.is_empty());
         let Some(rbt) = rbt else {
             let hard = ctrl.comm_state != CommState::Normal;
             ctrl.comm_state = if hard {
@@ -276,23 +352,23 @@ impl AsynMotor for SmartMotorAxis {
         ctrl.comm_state = CommState::Normal;
         let done = atoi(&rbt) == 0;
 
-        let position = nint(atof(&ctrl.query("RP")?));
+        let position = nint(atof(&ctrl.query(self.axis, "RP")?));
 
-        let plus_ls = atoi(&ctrl.query("RBp")?) != 0;
-        let minus_ls = atoi(&ctrl.query("RBm")?) != 0;
+        let plus_ls = atoi(&ctrl.query(self.axis, "RBp")?) != 0;
+        let minus_ls = atoi(&ctrl.query(self.axis, "RBm")?) != 0;
 
         // Latched right/left travel-limit flags: clear them if set (C Zr/Zl).
-        if atoi(&ctrl.query("RBr")?) != 0 {
-            ctrl.send_only("Zr")?;
+        if atoi(&ctrl.query(self.axis, "RBr")?) != 0 {
+            ctrl.send(self.axis, "Zr")?;
         }
-        if atoi(&ctrl.query("RBl")?) != 0 {
-            ctrl.send_only("Zl")?;
+        if atoi(&ctrl.query(self.axis, "RBl")?) != 0 {
+            ctrl.send(self.axis, "Zl")?;
         }
 
         // RBo != 0 means "not on commanded position" (C clears EA_POSITION).
-        let on_position = atoi(&ctrl.query("RBo")?) == 0;
+        let on_position = atoi(&ctrl.query(self.axis, "RBo")?) == 0;
 
-        let velocity_raw = atoi(&ctrl.query("RV")?);
+        let velocity_raw = atoi(&ctrl.query(self.axis, "RV")?);
         drop(ctrl);
 
         let direction = position >= self.prev_position;
