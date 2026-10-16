@@ -54,8 +54,9 @@ use motor_common::util::atoi;
 /// Response buffer size.
 const READ_BUF: usize = 64;
 
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\n";
+/// Port EOS set at connect (smarActMCSMotorDriver.cpp:202-203).
+pub const INPUT_EOS: &[u8] = b"\n";
+pub const OUTPUT_EOS: &[u8] = b"\n";
 
 /// Micro-degrees per revolution (C `UDEG_PER_REV`).
 const UDEG_PER_REV: i64 = 360_000_000;
@@ -140,16 +141,9 @@ impl McsController {
         }
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command and read back its reply (every MCS command replies).
     fn transact(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())
