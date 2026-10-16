@@ -162,8 +162,7 @@ impl PiJedsController {
     /// Send a query command and return its reply, stripped of framing control
     /// bytes (STX/ETX) and surrounding whitespace.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text
             .trim_matches(|c: char| c.is_control() || c.is_whitespace())
