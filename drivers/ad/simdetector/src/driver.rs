@@ -112,7 +112,8 @@ impl SimDetector {
         let mode = self
             .ad
             .port_base
-            .get_int32_param(self.ad.params.shutter_mode, 0)?;
+            .get_int32_param(self.ad.params.shutter_mode, 0)
+            .unwrap_or(0);
         match shutter_op(mode, open) {
             ShutterOp::DetectorStatus(v) => {
                 self.ad
@@ -145,8 +146,14 @@ impl PortDriver for SimDetector {
         let p = self.ad.params;
         let sim = self.sim;
 
-        let acquiring = self.ad.port_base.get_int32_param(p.acquire, 0)? != 0;
-        let image_mode = ImageMode::from_i32(self.ad.port_base.get_int32_param(p.image_mode, 0)?);
+        // C ignores these statuses and gets 0 (simDetector.cpp:900-902).
+        let acquiring = self.ad.port_base.get_int32_param(p.acquire, 0).unwrap_or(0) != 0;
+        let image_mode = ImageMode::from_i32(
+            self.ad
+                .port_base
+                .get_int32_param(p.image_mode, 0)
+                .unwrap_or(0),
+        );
 
         // "Ensure that ADStatus is set correctly before we set ADAcquire."
         if reason == p.acquire {
