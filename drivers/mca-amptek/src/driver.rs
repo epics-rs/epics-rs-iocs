@@ -662,7 +662,8 @@ impl AmptekDriver {
                 );
                 self.trace_error(&msg);
                 self.check_failed_comm("sendCommandString");
-                Err(protocol_error(msg))
+                // C returns before the readback (`drvAmptek.cpp:450-455`).
+                return Err(protocol_error(msg));
             }
             Ok(raw) => {
                 self.failed_sends = 0;
@@ -1570,6 +1571,21 @@ mod tests {
             err_message(&err),
             "DPP device 127.0.0.1 not found, total devices found=0"
         );
+    }
+
+    /// A config send nobody answers fails without the readback query
+    /// (`drvAmptek.cpp:450-455`).
+    #[test]
+    fn unanswered_config_send_skips_the_readback() {
+        let status = [0u8; 64];
+        let (mut driver, fake) = driver_with_fake(move |req| match (req[2], req[3]) {
+            (0x20, 0x02) => None,
+            _ => default_reply(req, &status),
+        });
+        connect(&mut driver).unwrap();
+        let before = fake.pids().len();
+        assert!(driver.send_command_string("GAIN=1;").is_err());
+        assert_eq!(fake.pids()[before..], [(0x20, 0x02)]);
     }
 
     #[test]
