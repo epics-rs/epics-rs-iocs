@@ -612,17 +612,16 @@ impl OpcuaDevice {
             return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
         }
         if self.is_output {
-            // The record's readback does the mask, the shift and the state
-            // lookup, over the MASK [`init_mask`] installed — which is what the
-            // C spells out inline for mbbo (`devOpcua.cpp:812-826`), an output
-            // record having no reverse conversion of its own.
+            // The dset masks (`devOpcua.cpp:813`) over the MASK [`init_mask`]
+            // installed; the record's readback does the shift and the state
+            // lookup the C spells out inline (`devOpcua.cpp:814-826`).
             //
             // Deviation: the C shifts `prec->rval` down *in place* before the
             // lookup (`devOpcua.cpp:816`), leaving RVAL holding the shifted
             // value until the record's next forward conversion rebuilds it. Here
-            // RVAL keeps the raw the server sent, masked
-            // (`mbbo.rs:893-903`).
-            raw_readback(record, raw)?;
+            // RVAL keeps the masked raw.
+            let masked = raw & ulong(record, "MASK")?;
+            raw_readback(record, masked)?;
             Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
         } else {
             // mbbi converts RVAL itself: mask, shift, state lookup
