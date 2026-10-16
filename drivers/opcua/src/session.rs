@@ -826,13 +826,14 @@ impl SessionWorker {
                 };
                 for (item, status) in monitored.iter().zip(&statuses) {
                     if status.is_bad() {
-                        let item = item.lock();
+                        let mut item = item.lock();
                         eprintln!(
                             "OPC UA record {} monitored item {} failed with error {}",
                             item.addressing_record(),
                             item.wire_node_id(),
                             status_name(*status)
                         );
+                        item.set_incoming_event(ProcessReason::ConnectionLoss, *status);
                     }
                 }
                 if config.debug > 0 {

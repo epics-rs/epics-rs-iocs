@@ -31,6 +31,8 @@ struct Behaviour {
     write_status: Option<StatusCode>,
     /// Return one result short of what was asked for — a server that under-answers.
     truncate_read: bool,
+    /// The per-item status `CreateMonitoredItems` answers with.
+    monitor_status: Option<StatusCode>,
 }
 
 #[derive(Default)]
@@ -155,7 +157,8 @@ impl UaConnection for Mock {
     ) -> Result<Vec<StatusCode>, StatusCode> {
         let n = items.len();
         self.calls.lock().monitored.extend(items);
-        Ok(vec![StatusCode::Good; n])
+        let status = self.behaviour.lock().monitor_status;
+        Ok(vec![status.unwrap_or(StatusCode::Good); n])
     }
 
     async fn disconnect(&self) {
@@ -845,6 +848,30 @@ async fn a_monitored_item_carries_the_links_monitoring_parameters() {
         .clone();
     assert_eq!(filter.deadband_type, DeadbandType::Absolute as u32);
     assert_eq!(filter.deadband_value, 0.5);
+}
+
+/// `SubscriptionOpen62541::addMonitoredItems` files a connection loss for an
+/// item the server refuses to monitor.
+#[tokio::test]
+async fn a_refused_monitored_item_is_told_the_connection_is_lost() {
+    let mock = Mock::arc();
+    mock.behave(|b| b.monitor_status = Some(StatusCode::BadNodeIdUnknown));
+    let (item0, leaf0) = item("subs ns=2;s=Sensor", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone()],
+    );
+    handle
+        .subscriptions
+        .lock()
+        .push(SubscriptionConfig::new("subs", "sess"));
+    until(|| !mock.calls.lock().monitored.is_empty()).await;
+    until(|| item0.lock().state == ConnectionStatus::Down).await;
+
+    let last = drain(&leaf0).pop().expect("the leaf has an update");
+    assert_eq!(last.reason, ProcessReason::ConnectionLoss);
+    assert_eq!(last.status, StatusCode::BadNodeIdUnknown);
 }
 
 #[tokio::test]
