@@ -7,6 +7,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase};
@@ -115,6 +116,12 @@ impl PortDriver for PvaDriver {
         }
 
         self.ad.port_base.call_param_callbacks(0)?;
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("pvaDriver:writeInt32: function={reason}, value={value}"),
+        );
         Ok(())
     }
 
@@ -147,12 +154,30 @@ impl PortDriver for PvaDriver {
                     .set_string_param(reason, user.addr, old_value)?;
             }
         } else {
-            return self.ad.write_octet(user, data);
+            let n = self.ad.write_octet(user, data)?;
+            trace_octet(user, data);
+            return Ok(n);
         }
 
+        trace_octet(user, data);
         self.ad.port_base.call_param_callbacks(0)?;
         Ok(data.len())
     }
+}
+
+/// The `ASYN_TRACEIO_DRIVER` line `pvaDriver::writeOctet` ends with; a
+/// failure only fills `errorMessage`, so it prints nothing.
+fn trace_octet(user: &AsynUser, value: &[u8]) {
+    user.print(
+        TraceMask::IO_DRIVER,
+        file!(),
+        line!(),
+        format_args!(
+            "pvaDriver:writeOctet: function={}, value={}",
+            user.reason,
+            String::from_utf8_lossy(value)
+        ),
+    );
 }
 
 impl ADDriver for PvaDriver {
