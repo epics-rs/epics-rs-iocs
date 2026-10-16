@@ -93,8 +93,7 @@ impl AcrController {
 
     /// Write a query and read its reply.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.write_only(cmd)?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())

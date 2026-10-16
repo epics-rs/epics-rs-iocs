@@ -80,25 +80,23 @@ impl OemController {
         out
     }
 
-    fn read_line(&self) -> AsynResult<String> {
-        let raw = self.handle.read_octet(0, READ_BUF)?;
-        Ok(String::from_utf8_lossy(&raw)
+    fn trimmed(raw: &[u8]) -> String {
+        String::from_utf8_lossy(raw)
             .trim_matches(['\r', '\n', '\0', ' '])
-            .to_string())
+            .to_string()
     }
 
     /// Send a command and read its single acknowledgement line.
     fn command(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let _ack = self.read_line()?;
+        let _ack = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         Ok(())
     }
 
     /// Send a query and read the echo line then the data line (returned).
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let _echo = self.read_line()?;
-        self.read_line()
+        let _echo = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.read_octet(0, READ_BUF)?;
+        Ok(Self::trimmed(&raw))
     }
 }
 
