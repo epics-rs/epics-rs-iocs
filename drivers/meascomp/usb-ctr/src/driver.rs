@@ -96,8 +96,14 @@ impl CtrDriver {
 
         // C sets numCounters_ only for these two boards.
         let num_counters = match product_name.as_str() {
-            "USB-CTR08" => 8,
-            "USB-CTR04" => 4,
+            "USB-CTR08" => {
+                base.set_int32_param(params.model, 0, 0)?;
+                8
+            }
+            "USB-CTR04" => {
+                base.set_int32_param(params.model, 0, 1)?;
+                4
+            }
             _ => {
                 println!("Unknown model");
                 MAX_COUNTERS
