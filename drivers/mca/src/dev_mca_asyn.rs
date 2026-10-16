@@ -256,7 +256,7 @@ impl McaLink {
     /// C's `parg=NULL -> ivalue=0` convention for the argument-less
     /// commands (`devMcaAsyn.c:264-282`).
     ///
-    /// `Data`/`ReadStatus` are reads, which [`McaDset::send_msg`] queues as
+    /// `Data`/`ReadStatus` are reads, which [`McaDset::send_read`] queues as
     /// cells; they stay explicit no-op arms so a new [`McaCommand`] variant
     /// fails to compile instead of being swallowed.
     fn send_command(&self, command: McaCommand) -> AsynResult<()> {
@@ -458,18 +458,17 @@ fn queued(result: AsynResult<()>) -> Result<(), Nack> {
 
 /// C `send_msg` (`devMcaAsyn.c:229-338`) and `read_array` (`:395-407`).
 impl McaDset for McaPort {
-    /// A read sent as a plain command — C `:630` sends `MODE` 0 as `mcaData`
-    /// — fills the buffer without re-entering the record.
+    /// The record sends its reads, a MODE put's `mcaData` included, through
+    /// [`McaDset::send_read`].
     fn send_msg(&mut self, command: McaCommand) -> Result<(), Nack> {
-        match command {
-            McaCommand::Data => self.queue(McaRead::Data, None).map(drop),
-            McaCommand::ReadStatus => self.queue(McaRead::Status, None).map(drop),
-            command => queued(self.link.send_command(command)),
-        }
+        queued(self.link.send_command(command))
     }
 
+    /// Every read a pass sends re-enters the record: C duplicates the
+    /// asynUser per `send_msg` (`devMcaAsyn.c:263`), so a MODE put's queued
+    /// `mcaData` and the status read after it each process it.
     fn send_read(&mut self, read: McaRead) -> Result<Sent, Nack> {
-        let reentry = self.reentry.get_mut().unwrap().take();
+        let reentry = self.reentry.get_mut().unwrap().clone();
         Ok(match self.queue(read, reentry)? {
             QueueOutcome::Queued => Sent::Queued,
             QueueOutcome::Ran => Sent::Ran,
@@ -958,39 +957,35 @@ mod tests {
         assert_eq!(f.rec.acqg, 0);
     }
 
-    /// A spectrum read through an IOC: the status trip, then the data trip
-    /// (`mcaRecord.c:670-681`, `:765-781`). On an `ASYN_CANBLOCK` port each
-    /// ends its pass PACT and the port thread re-enters the record, which
-    /// forward-links once; on a port without it C's three `process` calls
-    /// nest and each forward-links (`:824-826`). The driver is read once.
-    #[test]
-    fn a_read_takes_two_trips_on_both_port_kinds() {
+    /// A put to `field` through an IOC on both port kinds, once it settles:
+    /// the record's VAL and its forward links, and the driver's array reads.
+    fn put_through_ioc(
+        prefix: &str,
+        field: &str,
+        value: EpicsValue,
+    ) -> [(bool, EpicsValue, Option<f64>, usize); 2] {
         use std::collections::HashMap;
         use std::time::Duration;
 
         use epics_rs::base::runtime::task::{sleep, test_block_on};
         use epics_rs::base::server::ioc_builder::IocBuilder;
 
-        for (can_block, flnks) in [(true, 1.0), (false, 3.0)] {
-            let port = if can_block {
-                "MCATRIPBLK"
-            } else {
-                "MCATRIPSYNC"
-            };
-            let (runtime, _, array_reads, _) = driver_port(port, can_block, None, None, None);
+        [true, false].map(|can_block| {
+            let port = format!("{prefix}{}", if can_block { "BLK" } else { "SYNC" });
+            let (runtime, _, array_reads, _) = driver_port(&port, can_block, None, None, None);
             let db = format!(
                 r#"
-record(mca, "MCATRIP") {{
+record(mca, "{prefix}") {{
     field(DTYP, "asynMCA")
     field(INP, "@asyn({port})")
     field(NMAX, "4")
     field(NUSE, "4")
-    field(FLNK, "MCATRIPN")
+    field(FLNK, "{prefix}N")
 }}
-record(calc, "MCATRIPN") {{ field(CALC, "A+1") field(INPA, "MCATRIPN") }}
+record(calc, "{prefix}N") {{ field(CALC, "A+1") field(INPA, "{prefix}N") }}
 "#
             );
-            test_block_on(async {
+            let (val, flnks) = test_block_on(async {
                 let (name, factory) = mca_rs::mca_record_factory();
                 let (db, _) = IocBuilder::new()
                     .register_record_type(name, factory)
@@ -1000,11 +995,11 @@ record(calc, "MCATRIPN") {{ field(CALC, "A+1") field(INPA, "MCATRIPN") }}
                     .build()
                     .await
                     .unwrap();
-                db.put_record_field_from_ca("MCATRIP", "READ", EpicsValue::Enum(1))
+                db.put_record_field_from_ca(prefix, field, value.clone())
                     .await
                     .unwrap();
                 for _ in 0..400 {
-                    if !db.get_record("MCATRIP").unwrap().read().is_processing() {
+                    if !db.get_record(prefix).unwrap().read().is_processing() {
                         break;
                     }
                     sleep(Duration::from_millis(5)).await;
@@ -1012,26 +1007,52 @@ record(calc, "MCATRIPN") {{ field(CALC, "A+1") field(INPA, "MCATRIPN") }}
                 // A further pass would land within this window.
                 sleep(Duration::from_millis(100)).await;
                 let get = |pv: &str| db.get_pv(pv).unwrap();
-                assert!(!db.get_record("MCATRIP").unwrap().read().is_processing());
-                assert_eq!(
-                    get("MCATRIP.VAL"),
-                    EpicsValue::LongArray(vec![1, 2, 3, 4].into()),
-                    "can_block={can_block}"
-                );
-                assert_eq!(
-                    get("MCATRIPN").to_f64(),
-                    Some(flnks),
-                    "can_block={can_block}"
-                );
-                assert_eq!(get("MCATRIP.RDNG").to_f64(), Some(0.0));
+                assert!(!db.get_record(prefix).unwrap().read().is_processing());
+                assert_eq!(get(&format!("{prefix}.RDNG")).to_f64(), Some(0.0));
+                (
+                    get(&format!("{prefix}.VAL")),
+                    get(&format!("{prefix}N")).to_f64(),
+                )
             });
-            assert_eq!(
-                array_reads.load(Ordering::SeqCst),
-                1,
-                "can_block={can_block}"
-            );
+            let reads = array_reads.load(Ordering::SeqCst);
             drop(runtime);
-        }
+            (can_block, val, flnks, reads)
+        })
+    }
+
+    /// A spectrum read through an IOC: the status trip, then the data trip
+    /// (`mcaRecord.c:670-681`, `:765-781`). On an `ASYN_CANBLOCK` port each
+    /// ends its pass PACT and the port thread re-enters the record, which
+    /// forward-links once; on a port without it C's three `process` calls
+    /// nest and each forward-links (`:824-826`). The driver is read once.
+    #[test]
+    fn a_read_takes_two_trips_on_both_port_kinds() {
+        let spectrum = EpicsValue::LongArray(vec![1, 2, 3, 4].into());
+        assert_eq!(
+            put_through_ioc("MCATRIP", "READ", EpicsValue::Enum(1)),
+            [
+                (true, spectrum.clone(), Some(1.0), 1),
+                (false, spectrum, Some(3.0), 1),
+            ]
+        );
+    }
+
+    /// A MODE put's PHA is `mcaData` (`mcaRecord.c:630`), which sets RDNG
+    /// (`devMcaAsyn.c:287`) and re-enters the record with the spectrum. On
+    /// a port without `ASYN_CANBLOCK` the data pass and the status pass nest
+    /// in the put's: three links. On a CANBLOCK port the data and status
+    /// reads queue together; the data callback's pass links, the status
+    /// callback's queues a fresh status read, and that one's pass links.
+    #[test]
+    fn a_pha_mode_put_reads_the_spectrum_on_both_port_kinds() {
+        let spectrum = EpicsValue::LongArray(vec![1, 2, 3, 4].into());
+        assert_eq!(
+            put_through_ioc("MCAPHA", "MODE", EpicsValue::Enum(0)),
+            [
+                (true, spectrum.clone(), Some(2.0), 1),
+                (false, spectrum, Some(3.0), 1),
+            ]
+        );
     }
 
     /// On an `ASYN_CANBLOCK` port every request a cycle makes is queued, as
@@ -1153,13 +1174,6 @@ record(mca, "MCAHOLD") {
             );
             run(1).await;
             assert_eq!(array_reads.load(Ordering::SeqCst), 2);
-            assert_eq!(reentered(), 2.0);
-
-            for _ in 0..3 {
-                assert_eq!(port.send_msg(McaCommand::Data), Ok(()));
-            }
-            run(3).await;
-            assert_eq!(array_reads.load(Ordering::SeqCst), 5);
             assert_eq!(reentered(), 2.0);
         });
         drop(runtime);
