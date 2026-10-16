@@ -15,13 +15,11 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
-use epics_rs::ad_core::driver::ndarray_driver::NDArrayDriverBase;
+use epics_rs::ad_core::driver::ndarray_driver::{ArrayOwner, NDArrayDriverBase};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataType};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
 use crate::params::CSimParams;
@@ -45,7 +43,7 @@ pub struct CSimDetector {
     pub nd: NDArrayDriverParams,
     pub sim: CSimParams,
     pub pool: Arc<NDArrayPool>,
-    pub queued_counter: Arc<QueuedArrayCounter>,
+    pub owner: Arc<ArrayOwner>,
     last_array: LastArray,
     /// C `acquiring_`, written by the simulation task and read by `setAcquire`.
     acquiring: Arc<AtomicBool>,
@@ -79,7 +77,7 @@ impl CSimDetector {
             mut port_base,
             params: nd,
             pool,
-            queued_counter,
+            owner,
             ..
         } = NDArrayDriverBase::new(
             port_name,
@@ -111,7 +109,7 @@ impl CSimDetector {
             nd,
             sim,
             pool,
-            queued_counter,
+            owner,
             last_array: shared.last_array,
             acquiring: shared.acquiring,
             start_tx: shared.start_tx,
@@ -243,7 +241,6 @@ pub struct CSimDetectorRuntime {
     pool: Arc<NDArrayPool>,
     /// Index 0 is the 2-D array output; `1..=MAX_SIGNALS` the per-signal ones.
     outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     /// Owns the `SimDetTask` thread for the lifetime of the IOC.
     pub task_handle: std::thread::JoinHandle<()>,
 }
@@ -262,8 +259,7 @@ impl CSimDetectorRuntime {
         &self.outputs[addr]
     }
 
-    pub fn connect_downstream(&self, addr: usize, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, addr: usize, sender: NDArraySender) {
         self.outputs[addr].lock().add(sender);
     }
 }
@@ -302,7 +298,6 @@ pub fn create_c_sim_detector(
     let nd_params = det.nd;
     let sim_params = det.sim;
     let pool = det.pool.clone();
-    let queued_counter = det.queued_counter.clone();
 
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
 
@@ -331,7 +326,6 @@ pub fn create_c_sim_detector(
         sim_params,
         pool,
         outputs,
-        queued_counter,
         task_handle,
     })
 }
@@ -494,7 +488,7 @@ mod tests {
             .unwrap();
         f.write_i32(f.det.nd.acquire, 0, 1);
         f.acquiring.store(true, Ordering::Release);
-        f.det.queued_counter.increment();
+        f.det.owner.queued().increment();
 
         f.write_i32(f.det.nd.acquire, 0, 0);
         assert_eq!(f.get_i32(f.det.nd.acquire, 0), 0);
