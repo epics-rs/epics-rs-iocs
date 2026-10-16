@@ -145,7 +145,19 @@ impl OctetIo {
     /// `pasynOctetSyncIO->setInputEos`. Called once at driver construction;
     /// nothing writes this cell afterwards.
     pub fn set_input_eos(&self, eos: &[u8]) -> AsynResult<()> {
-        self.handle.set_input_eos_blocking(AsynUser::default(), eos)
+        self.handle.set_input_eos_blocking(self.eos_user(), eos)
+    }
+
+    /// `pasynOctetSyncIO->setOutputEos`.
+    pub fn set_output_eos(&self, eos: &[u8]) -> AsynResult<()> {
+        self.handle.set_output_eos_blocking(self.eos_user(), eos)
+    }
+
+    /// C's SyncIO EOS setters take `lockPort`, not `queueLockPort`, so they
+    /// succeed on a port whose device is down — the constructor runs before
+    /// the meter is reachable.
+    fn eos_user(&self) -> AsynUser {
+        self.user().queue_even_if_not_connected()
     }
 
     /// `asynOctetSyncIO->flush`.
@@ -197,4 +209,24 @@ pub fn connect_octet(port_name: &str, timeout: Duration) -> AsynResult<OctetIo> 
             ),
         })?;
     Ok(OctetIo::new(port.handle.clone(), timeout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The driver constructors set the EOS before the meter is reachable.
+    #[test]
+    fn eos_setters_succeed_on_a_port_that_is_not_connected() {
+        let (io, _runtime) = create_ip_port(
+            "QE_EOS_DOWN",
+            "127.0.0.1:1",
+            Duration::from_millis(200),
+            true,
+            true,
+        )
+        .unwrap();
+        io.set_input_eos(b"\r\n").unwrap();
+        io.set_output_eos(b"\r").unwrap();
+    }
 }

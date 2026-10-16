@@ -89,14 +89,16 @@ fn eos_command(name: &'static str, input: bool) -> CommandDef {
                 ctx.println(&format!("{name}: port '{port}' not found"));
                 return Ok(CommandOutcome::Continue);
             };
+            // C `asynSetEos` queues at Connect priority with
+            // ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED: the EOS is set before
+            // the device is reachable.
+            let user = epics_rs::asyn::user::AsynUser::default()
+                .with_timeout(std::time::Duration::from_secs(2))
+                .queue_even_if_not_connected();
             let res = if input {
-                entry
-                    .handle
-                    .set_input_eos_blocking(epics_rs::asyn::user::AsynUser::default(), &eos)
+                entry.handle.set_input_eos_blocking(user, &eos)
             } else {
-                entry
-                    .handle
-                    .set_output_eos_blocking(epics_rs::asyn::user::AsynUser::default(), &eos)
+                entry.handle.set_output_eos_blocking(user, &eos)
             };
             if let Err(e) = res {
                 ctx.println(&format!("{name}: {e}"));
