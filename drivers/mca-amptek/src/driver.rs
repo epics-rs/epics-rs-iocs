@@ -14,13 +14,6 @@
 //! thread).
 //!
 //! # Restructuring vs. C
-//! - **Every param access is pinned to addr 0** (`PARAM_ADDR`). The port
-//!   is not `ASYN_MULTIDEVICE` (`drvAmptek.cpp:68`), so C's `getAddress`
-//!   turns every record's ADDR into 0, and the 8 `Amptek_SCAn.db` instances
-//!   share one set of SCA params. asyn-rs does not do that mapping, so the
-//!   overridden read/write methods do it. Interrupt delivery to a record
-//!   with ADDR > 0 still matches on the record's own ADDR in the asyn-rs
-//!   device support, so those `_RBV` records see no callbacks.
 //! - **USB/Serial rejected at construction**, not merely left to fail at
 //!   connect time. C's constructor switch (`drvAmptek.cpp:140-153`) forces
 //!   `directMode=0` for `DppInterfaceUSB`/`DppInterfaceSerial` and
@@ -113,10 +106,8 @@ use crate::protocol::{self, ReceivedPacket, TransmitPacketType};
 use crate::status::{self, Dp5Status};
 use crate::transport::AmptekUdpTransport;
 
-/// The param address every request uses: the port is not
-/// `ASYN_MULTIDEVICE` (`drvAmptek.cpp:68`), so `pasynManager->getAddr` gives
-/// -1 and `asynPortDriver::getAddress` maps it to 0 whatever the record's
-/// ADDR. asyn-rs passes `user.addr` through, so the driver pins it.
+/// The address C's single-argument `getIntegerParam(index)` and friends
+/// read: list 0.
 const PARAM_ADDR: i32 = 0;
 
 /// `DppInterface_t` (`DppConst.h`): only `DppInterfaceEthernet` (`0`) is
@@ -781,10 +772,10 @@ impl AmptekDriver {
             .unwrap_or_default()
     }
 
-    /// `drvAmptek::sendSCAs` (`drvAmptek.cpp:479-508`). C's
+    /// `drvAmptek::sendSCAs` (`drvAmptek.cpp:479-508`): SCA `i` from addr
+    /// `i`, where its `Amptek_SCAn.db` record writes it. C's
     /// `getIntegerParam(i, ...)` zeroes `itemp` for a param never set at
-    /// addr `i` (`asynPortDriver.cpp:304`), and on this non-multidevice port
-    /// only addr 0 is ever set, so SCAs 2-8 send 0 / OFF.
+    /// addr `i` (`asynPortDriver.cpp:304`).
     fn send_scas(&mut self) -> AsynResult<()> {
         let reasons = [
             self.amptek[AmptekReason::SCALowChannel as usize],
@@ -1127,7 +1118,7 @@ impl PortDriver for AmptekDriver {
         if !self.base.is_connected() {
             return Err(disconnected_error());
         }
-        let addr = PARAM_ADDR;
+        let addr = self.base.get_address(user.addr, user.reason)?;
         let reason = user.reason;
         let mut status = self.base.set_int32_param(reason, addr, value);
 
@@ -1194,7 +1185,8 @@ impl PortDriver for AmptekDriver {
             }
             Ok(i32::from(self.acquiring))
         } else {
-            self.base.get_int32_param(user.reason, PARAM_ADDR)
+            let addr = self.base.get_address(user.addr, user.reason)?;
+            self.base.get_int32_param(user.reason, addr)
         }
     }
 
@@ -1208,7 +1200,8 @@ impl PortDriver for AmptekDriver {
         } else if user.reason == self.mca[McaReason::ElapsedCounts as usize] {
             Ok(s.slow_count)
         } else {
-            self.base.get_float64_param(user.reason, PARAM_ADDR)
+            let addr = self.base.get_address(user.addr, user.reason)?;
+            self.base.get_float64_param(user.reason, addr)
         }
     }
 
@@ -1219,25 +1212,27 @@ impl PortDriver for AmptekDriver {
         if !self.base.is_connected() {
             return Err(disconnected_error());
         }
-        let addr = PARAM_ADDR;
+        let addr = self.base.get_address(user.addr, user.reason)?;
         self.base.set_float64_param(user.reason, addr, value)?;
         let status = self.send_configuration();
         self.base.call_param_callbacks(addr)?;
         status
     }
 
-    /// `asynPortDriver::readOctet` at `PARAM_ADDR`.
+    /// `asynPortDriver::readOctet`.
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let bytes = self.base.get_string_param(user.reason, PARAM_ADDR)?;
+        let addr = self.base.get_address(user.addr, user.reason)?;
+        let bytes = self.base.get_string_param(user.reason, addr)?;
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
         Ok(n)
     }
 
-    /// `asynPortDriver::writeOctet` at `PARAM_ADDR`.
+    /// `asynPortDriver::writeOctet`.
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        self.base.set_string_param(user.reason, PARAM_ADDR, data)?;
-        self.base.call_param_callbacks(PARAM_ADDR)?;
+        let addr = self.base.get_address(user.addr, user.reason)?;
+        self.base.set_string_param(user.reason, addr, data)?;
+        self.base.call_param_callbacks(addr)?;
         user.print(
             TraceMask::IO_DRIVER,
             file!(),
@@ -1459,10 +1454,11 @@ mod tests {
         );
     }
 
-    /// Every record ADDR lands on addr 0, and `sendSCAs` repeats the last
-    /// value read for each param unset at addr 1..7 (`drvAmptek.cpp:479-508`).
+    /// The port is multi-device (asynPortDriver.cpp:4014), so an SCA write
+    /// lands at its record's ADDR and `sendSCAs` sends SCA `i` from addr `i`,
+    /// zero for a param never set there (`drvAmptek.cpp:479-508,855-857`).
     #[test]
-    fn sca_writes_use_addr_0_and_send_scas_zeroes_undefined_params() {
+    fn sca_writes_land_at_their_addr_and_send_scas_reads_each() {
         let status = [0u8; 64];
         let (mut driver, fake) = driver_with_fake(move |req| default_reply(req, &status));
         connect(&mut driver).unwrap();
@@ -1473,8 +1469,8 @@ mod tests {
         let mut user = AsynUser::new(level).with_addr(7);
         driver.write_int32(&mut user, 1).unwrap();
 
-        assert_eq!(driver.base.get_int32_param(low, 0).unwrap(), 5);
-        assert!(driver.base.get_int32_param(low, 3).is_err());
+        assert_eq!(driver.base.get_int32_param(low, 3).unwrap(), 5);
+        assert!(driver.base.get_int32_param(low, 0).is_err());
         assert_eq!(
             driver.read_int32(&AsynUser::new(low).with_addr(3)).unwrap(),
             5
@@ -1487,12 +1483,25 @@ mod tests {
             .map(|r| String::from_utf8_lossy(&r[6..r.len() - 2]).into_owned())
             .collect();
         assert!(
-            sent[0].starts_with("SCAI=1;SCAL=5;SCAH=0;SCAO=OFF;SCAI=2;SCAL=0;SCAH=0;SCAO=OFF;")
+            sent[0].starts_with("SCAI=1;SCAL=0;SCAH=0;SCAO=OFF;"),
+            "{}",
+            sent[0]
         );
         assert!(
-            sent[1].starts_with("SCAI=1;SCAL=5;SCAH=0;SCAO=HIGH;SCAI=2;SCAL=0;SCAH=0;SCAO=OFF;")
+            sent[0].contains("SCAI=4;SCAL=5;SCAH=0;SCAO=OFF;"),
+            "{}",
+            sent[0]
         );
-        assert!(sent[1].ends_with("SCAI=8;SCAL=0;SCAH=0;SCAO=OFF;"));
+        assert!(
+            sent[1].contains("SCAI=4;SCAL=5;SCAH=0;SCAO=OFF;"),
+            "{}",
+            sent[1]
+        );
+        assert!(
+            sent[1].ends_with("SCAI=8;SCAL=0;SCAH=0;SCAO=HIGH;"),
+            "{}",
+            sent[1]
+        );
     }
 
     /// A param the device never reported sends C's zeroed value
