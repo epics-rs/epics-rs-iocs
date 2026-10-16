@@ -17,6 +17,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
@@ -118,6 +119,7 @@ impl PortDriver for MarccdDriver {
                 .set_int32_param(function, user.addr, value)?;
         }
 
+        let mut status = Ok(());
         if function == params.acquire {
             if value != 0 {
                 // C calls getState here to gate the start; that server round-trip
@@ -144,11 +146,28 @@ impl PortDriver for MarccdDriver {
             self.send(Cmd::WriteFile);
         } else if function < p.first() {
             // Base-class parameter: pool controls plus plain stores.
-            self.ad.write_int32_pool(function, value)?;
+            status = self.ad.write_int32_pool(function, value).map(|_| ());
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "marCCD:writeInt32: error, status={} function={function}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("marCCD:writeInt32: function={function}, value={value}"),
+            ),
+        }
+        status
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -165,7 +184,13 @@ impl PortDriver for MarccdDriver {
         // Parameters below FIRST_MARCCD_PARAM need no extra work beyond the
         // `set_float64` above, which is all `ADDriver::writeFloat64` does.
 
-        self.ad.port_base.call_param_callbacks(0)?;
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("marCCD:writeFloat64: function={function}, value={value:.6}"),
+        );
         Ok(())
     }
 
