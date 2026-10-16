@@ -280,11 +280,11 @@ pub fn create_marccd_detector(
     let marccd_params = driver.p;
     let pool = driver.ad.pool.clone();
 
+    let queued_counter = driver.ad.queued_counter.clone();
     let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the marCCD port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     // The three worker contexts share one `Server` behind a `tokio::sync::Mutex`
     // — C's driver-lock analog serialising all marServer I/O.
