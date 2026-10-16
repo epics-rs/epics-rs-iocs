@@ -24,7 +24,6 @@ use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::{EnumEntry, ParamType};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
@@ -32,13 +31,14 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex as PlMutex;
 
 use crate::codec::{DefineFatArgs, DefineFrrArgs};
 use crate::params::SpecsParams;
 use crate::task::{Worker, start_task};
-use crate::types::{Event, RunMode};
+use crate::types::{Event, RunMode, SOCKET_TIMEOUT, secs};
 use crate::wire::{self, DiscoveredValue, WireLink};
 
 fn enum_choices(values: &[String]) -> Arc<[EnumEntry]> {
@@ -64,7 +64,7 @@ pub struct SpecsAnalyserDriver {
     scan_ranges: Arc<Mutex<Vec<String>>>,
     wire_state: Arc<Mutex<u32>>,
     connected: Arc<AtomicBool>,
-    driver_port: PortHandle,
+    driver_port: Arc<SyncIOHandle>,
     driver_addr: i32,
     /// C `firstConnect_`.
     first_connect: bool,
@@ -93,7 +93,7 @@ pub struct SharedWireHandles {
 impl SpecsAnalyserDriver {
     fn new(
         port_name: &str,
-        driver_port: PortHandle,
+        driver_port: Arc<SyncIOHandle>,
         driver_addr: i32,
         max_buffers: i32,
         max_memory: usize,
@@ -730,10 +730,12 @@ impl SpecsAnalyserRuntime {
     }
 }
 
-/// `specsAnalyserConfig`'s equivalent. `driver_port_name` must already exist
-/// (`drvAsynIPPortConfigure` + `asynOctetSetInputEos`/`asynOctetSetOutputEos`
-/// in `st.cmd`) — C connects to it with `pasynOctetSyncIO->connect` in the
-/// constructor; here the EOS is configured entirely by `st.cmd`.
+/// `specsAnalyserConfig`'s equivalent. `driver_port_name` is created by
+/// `drvAsynIPPortConfigure` + `asynOctetSetInputEos`/`asynOctetSetOutputEos`
+/// in `st.cmd` — C connects to it with `pasynOctetSyncIO->connect` in the
+/// constructor; here the EOS is configured entirely by `st.cmd`. A missing
+/// port keeps C's unconnected user, so the detector comes up failed to
+/// initialise.
 pub fn create_specs_analyser_detector(
     claim: &PortClaim,
     driver_port_name: &str,
@@ -741,10 +743,9 @@ pub fn create_specs_analyser_detector(
     max_memory: usize,
 ) -> Result<SpecsAnalyserRuntime, String> {
     let port_name = claim.name();
-    let driver_port_entry = get_port(driver_port_name).ok_or_else(|| {
-        format!("driver port '{driver_port_name}' not found (call drvAsynIPPortConfigure first)")
-    })?;
-    let driver_port = driver_port_entry.handle.clone();
+    // C's debug() trace of the failure is off by default.
+    let (driver_port, _) = SyncIOHandle::connect_port(driver_port_name, 0, secs(SOCKET_TIMEOUT));
+    let driver_port = Arc::new(driver_port);
 
     let wire_state = Arc::new(Mutex::new(0u32));
     let connected = Arc::new(AtomicBool::new(false));
