@@ -20,7 +20,7 @@ pub struct WaveDigState {
     pub current_point: usize,
     /// Scan buffer (f64, allocated by ulAInScan).
     pub scan_buffer: Vec<f64>,
-    /// Per-channel waveform data [channel][point], in volts.
+    /// Per-channel waveform data `[channel][point]`, in volts.
     pub channel_buffers: Vec<Vec<f64>>,
     /// Absolute time per point.
     pub abs_time_buffer: Vec<f64>,
