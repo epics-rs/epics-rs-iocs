@@ -1290,54 +1290,63 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             .await;
             attach_attributes(ctx, &mut array, &f).await;
 
-            // processImgFrame runs after getAttributes (serval_stream.cpp:948-982).
-            let update = ctx
-                .shared
-                .img
-                .lock()
-                .add_shaped(&f.pixels, &[f.width, f.height]);
-            let (counts, frames) = {
-                let img = ctx.shared.img.lock();
-                (img.total_counts(), img.frame_count())
-            };
-            ctx.set(
-                ADDR,
-                vec![ParamSetValue::new(
-                    p.img_image_frame,
+            // processImgFrame runs after getAttributes, on threshold 0 only and
+            // only while ImgAccumulationEnable is set (serval_stream.cpp:948-982).
+            let enabled = ctx
+                .handle
+                .read_int32(p.img_accumulation_enable, 0)
+                .await
+                .unwrap_or(0)
+                != 0;
+            if enabled && f.threshold_id != 1 {
+                let update = ctx
+                    .shared
+                    .img
+                    .lock()
+                    .add_shaped(&f.pixels, &[f.width, f.height]);
+                let (counts, frames) = {
+                    let img = ctx.shared.img.lock();
+                    (img.total_counts(), img.frame_count())
+                };
+                ctx.set(
                     ADDR,
-                    ParamValue::Int32Array(
-                        f.pixels
-                            .iter()
-                            .map(|&v| v as i32)
-                            .collect::<Vec<i32>>()
-                            .into(),
-                    ),
-                )],
-            )
-            .await;
-            ctx.set_int64(
-                p.img_total_counts,
-                ADDR,
-                i64::try_from(counts).unwrap_or(i64::MAX),
-            )
-            .await;
+                    vec![ParamSetValue::new(
+                        p.img_image_frame,
+                        ADDR,
+                        ParamValue::Int32Array(
+                            f.pixels
+                                .iter()
+                                .map(|&v| v as i32)
+                                .collect::<Vec<i32>>()
+                                .into(),
+                        ),
+                    )],
+                )
+                .await;
+                ctx.set_int64(
+                    p.img_total_counts,
+                    ADDR,
+                    i64::try_from(counts).unwrap_or(i64::MAX),
+                )
+                .await;
 
-            publish_accumulation(
-                ctx,
-                &update,
-                p.img_image_data,
-                ADDR,
-                p.img_image_sum_n_frames,
-                ADDR,
-            )
-            .await;
-            // processImgFrame hands the running sum to the plugins on address 2
-            // and the window sum, when it updates, on 3; C does not check
-            // NDArrayCallbacks here (serval_stream.cpp:1257-1343).
-            let uid = i32::try_from(frames).unwrap_or(i32::MAX);
-            publish_img_sum(ctx, 2, f.width, f.height, update.running, uid).await;
-            if let Some(sum_n) = update.sum_n {
-                publish_img_sum(ctx, 3, f.width, f.height, sum_n, uid).await;
+                publish_accumulation(
+                    ctx,
+                    &update,
+                    p.img_image_data,
+                    ADDR,
+                    p.img_image_sum_n_frames,
+                    ADDR,
+                )
+                .await;
+                // processImgFrame hands the running sum to the plugins on address 2
+                // and the window sum, when it updates, on 3; C does not check
+                // NDArrayCallbacks here (serval_stream.cpp:1257-1343).
+                let uid = i32::try_from(frames).unwrap_or(i32::MAX);
+                publish_img_sum(ctx, 2, f.width, f.height, update.running, uid).await;
+                if let Some(sum_n) = update.sum_n {
+                    publish_img_sum(ctx, 3, f.width, f.height, sum_n, uid).await;
+                }
             }
             publish_image(ctx, IMG_ADDR, array).await;
         }
@@ -2489,6 +2498,33 @@ mod tests {
             );
         }
         std::mem::forget(runtime);
+    }
+
+    /// processImgDataLine accumulates only threshold-0 frames, and only while
+    /// ImgAccumulationEnable is set (serval_stream.cpp:949-951).
+    #[tokio::test]
+    async fn img_accumulation_takes_enabled_threshold_0_frames_only() {
+        let ctx = Arc::new(idle_ctx("TPX_IMG_GATE"));
+        let frame = |threshold_id| {
+            Frame::Image(crate::stream::ImageFrame {
+                width: 2,
+                height: 1,
+                format: crate::stream::PixelFormat::UInt16,
+                frame_number: 1,
+                time_at_frame: 0.0,
+                threshold_id,
+                integration_size: 0,
+                pixels: vec![1, 2],
+            })
+        };
+        let total = || ctx.shared.img.lock().total_counts();
+        handle_frame(&ctx, StreamKind::Img, frame(1)).await;
+        assert_eq!(total(), 0);
+        handle_frame(&ctx, StreamKind::Img, frame(0)).await;
+        assert_eq!(total(), 3);
+        ctx.set_int(ctx.p.img_accumulation_enable, 0, 0).await;
+        handle_frame(&ctx, StreamKind::Img, frame(0)).await;
+        assert_eq!(total(), 3);
     }
 
     /// C `pushProcessedHstToPlugins` hands the accumulated PrvHst state to the
