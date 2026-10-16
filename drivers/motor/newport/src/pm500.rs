@@ -162,8 +162,8 @@ impl Pm500Axis {
     /// Construct the axis at 0-based channel `index`, running the C
     /// per-motor init: `{letter}CONFIG?` → firmware string at reply offset 8
     /// → drive resolution by lookup (only the command precision survives the
-    /// EGU boundary — module Units note). Performs blocking serial I/O under
-    /// the controller lock.
+    /// EGU boundary — module Units note), then `set_status`. Performs
+    /// blocking serial I/O under the controller lock.
     pub fn new(controller: Arc<Mutex<Pm500Controller>>, index: usize) -> Self {
         let name = PM500_AXIS_NAMES[index];
         let digits = {
@@ -172,12 +172,21 @@ impl Pm500Axis {
             let config = ctrl.command(&format!("{name}CONFIG?")).unwrap_or_default();
             max_digits(resolution_for_firmware(config.get(8..).unwrap_or("")))
         };
-        Self {
+        let mut ax = Self {
             controller,
             name,
             digits,
-            last_status: MotorStatus::default(),
-        }
+            // C clears the status, then hard-wires EA_PRESENT and
+            // GAIN_SUPPORT ("PM500 only supports DC motors").
+            last_status: MotorStatus {
+                gain_support: true,
+                has_encoder: true,
+                vbas_supported: false,
+                ..MotorStatus::default()
+            },
+        };
+        ax.set_status();
+        ax
     }
 
     fn lock(&self) -> MutexGuard<'_, Pm500Controller> {
@@ -319,9 +328,15 @@ impl AsynMotor for Pm500Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        // Port of C `set_status`: one `{letter}R` status/position query, then
-        // `{letter}M?` for the servo state. Reply format
-        // `[letter][status][sign+digits...]`, e.g. `XB+5.012`.
+        Ok(self.set_status())
+    }
+}
+
+impl Pm500Axis {
+    /// Port of C `set_status`: one `{letter}R` status/position query, then
+    /// `{letter}M?` for the servo state. Reply format
+    /// `[letter][status][sign+digits...]`, e.g. `XB+5.012`.
+    fn set_status(&mut self) -> MotorStatus {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let c = self.name;
@@ -335,12 +350,12 @@ impl AsynMotor for Pm500Axis {
                 // One empty reply: retry silently next poll (C RETRY state),
                 // leaving the record's bits stale.
                 ctrl.comm_state = CommState::Retry;
-                return Ok(self.last_status.clone());
+                return self.last_status.clone();
             }
             ctrl.comm_state = CommState::CommErr;
             self.last_status.comms_error = true;
             self.last_status.problem = true;
-            return Ok(self.last_status.clone());
+            return self.last_status.clone();
         }
         ctrl.comm_state = CommState::Normal;
 
@@ -384,7 +399,7 @@ impl AsynMotor for Pm500Axis {
             vbas_supported: false,
             ..MotorStatus::default()
         };
-        Ok(self.last_status.clone())
+        self.last_status.clone()
     }
 }
 
@@ -431,6 +446,86 @@ mod tests {
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
         assert!(Pm500Controller::new(io).is_none());
+    }
+
+    /// A PM500 with one axis (`X`) that records every command.
+    struct Scripted {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reply: Vec<u8>,
+        sent: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Scripted {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            self.reply = match cmd.as_str() {
+                "SVN?" => "XD PM500 1.0",
+                "XSTAT?" => "X0",
+                "YSTAT?" => "YE",
+                "XCONFIG?" => "XCONFIG 302",
+                "XR" => "XB+5.012",
+                "XM?" => "XM1",
+                _ => "OK",
+            }
+            .as_bytes()
+            .to_vec();
+            self.sent.lock().unwrap().push(cmd);
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = std::mem::take(&mut self.reply);
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    /// drvPM500.cc motor_init ends each axis with set_status.
+    #[test]
+    fn axis_init_runs_set_status_after_config() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+        use std::time::Duration;
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let line = Scripted {
+            base: PortDriverBase::new("pm500_init", 1, PortFlags::default()),
+            reply: Vec::new(),
+            sent: sent.clone(),
+        };
+        let (rt, _jh) = create_port_runtime(
+            &claim_port("pm500_init").unwrap(),
+            line,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
+        let ctrl = Pm500Controller::new(io).unwrap();
+        assert_eq!(ctrl.num_axes(), 1);
+        let axis = Pm500Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [
+                "SCUM 1",
+                "SENAINT $AF",
+                "SVN?",
+                "SVN?",
+                "XSTAT?",
+                "YSTAT?",
+                "XCONFIG?",
+                "XR",
+                "XM?"
+            ]
+        );
+        let s = &axis.last_status;
+        assert_eq!(s.position, 5.012);
+        assert!(s.moving && s.direction && s.powered && s.has_encoder);
     }
 
     #[test]
