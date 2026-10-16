@@ -345,8 +345,8 @@ fn socket_thread(ctx: SocketContext) {
         // pollThread's later attempts print `reconnect timeout`.
         let mut reconnect = false;
         loop {
-            match tokio_tungstenite::connect_async(&uri).await {
-                Ok((stream, _)) => {
+            match connect(&uri).await {
+                Ok(stream) => {
                     link.set_connected(true);
                     // C++ reconnectWebSocket: an acquisition in progress has to
                     // be re-subscribed and re-polled on the new socket.
@@ -357,8 +357,8 @@ fn socket_thread(ctx: SocketContext) {
                     run_session(stream, &mut out_rx, &in_tx, &link, &shared).await;
                     link.set_connected(false);
                 }
-                Err(e) => {
-                    eprintln!("drvFX4: WebSocket error: {e}");
+                Err(reason) => {
+                    eprintln!("drvFX4: WebSocket error: {reason}");
                     if reconnect {
                         eprintln!("drvFX4: reconnect timeout to {uri}");
                     }
@@ -368,6 +368,89 @@ fn socket_thread(ctx: SocketContext) {
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
+}
+
+type Fx4Stream = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+/// ixwebsocket's `WebSocket::connect`: the TCP connect, then the handshake.
+/// The error is the `errorInfo.reason` drvFX4's onError prints.
+async fn connect(uri: &str) -> Result<Fx4Stream, String> {
+    let parsed: tokio_tungstenite::tungstenite::http::Uri = uri
+        .parse()
+        .map_err(|_| format!("Could not parse url: '{uri}'"))?;
+    let host = parsed.host().unwrap_or_default();
+    // UrlParser drops an IPv6 literal's brackets; ws:// defaults to port 80.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port = parsed.port_u16().unwrap_or(80);
+    let tcp = ix_tcp_connect(host, port)
+        .await
+        .map_err(|e| format!("Unable to connect to {host} on port {port}, error: {e}"))?;
+    tokio_tungstenite::client_async(uri, tcp)
+        .await
+        .map(|(stream, _)| stream)
+        .map_err(|e| e.to_string())
+}
+
+/// ixwebsocket's `SocketConnect::connect`: each resolved address in turn,
+/// failing with the last address's `errMsg` (IXSocketConnect.cpp:32-124).
+async fn ix_tcp_connect(host: &str, port: u16) -> Result<tokio::net::TcpStream, String> {
+    let addrs = tokio::net::lookup_host((host, port)).await.map_err(|e| {
+        // C's errMsg is gai_strerror alone.
+        let text = e.to_string();
+        text.strip_prefix("failed to lookup address information: ")
+            .map_or(text.clone(), str::to_string)
+    })?;
+    let mut err = String::new();
+    for addr in addrs {
+        match ix_connect_address(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => err = e,
+        }
+    }
+    Err(err)
+}
+
+/// `connectToAddress`: a non-blocking connect whose immediate failure is the
+/// bare strerror, and whose failure found by poll is `Connect error: ...`.
+async fn ix_connect_address(addr: std::net::SocketAddr) -> Result<tokio::net::TcpStream, String> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+        .map_err(|_| "Cannot create a socket".to_string())?;
+    let _ = socket.set_tcp_nodelay(true);
+    socket.set_nonblocking(true).map_err(|e| strerror(&e))?;
+    match socket.connect(&addr.into()) {
+        Ok(()) => {}
+        Err(e) if connect_in_progress(&e) => {}
+        Err(e) => return Err(strerror(&e)),
+    }
+    let polled = |e: &std::io::Error| format!("Connect error: {}", strerror(e));
+    let stream = tokio::net::TcpStream::from_std(socket.into()).map_err(|e| polled(&e))?;
+    stream.writable().await.map_err(|e| polled(&e))?;
+    match stream.take_error() {
+        Ok(None) => Ok(stream),
+        Ok(Some(e)) | Err(e) => Err(polled(&e)),
+    }
+}
+
+/// `Socket::isWaitNeeded`: the connect continues in the background.
+fn connect_in_progress(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::EINPROGRESS) {
+        return true;
+    }
+    e.kind() == std::io::ErrorKind::WouldBlock
+}
+
+/// C's `strerror(errno)`: the OS text without Rust's ` (os error N)`.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(code) => text
+            .strip_suffix(&format!(" (os error {code})"))
+            .map_or(text.clone(), str::to_string),
+        None => text,
+    }
 }
 
 /// Pump one connected socket until it fails: frames in, queued messages out,
@@ -600,4 +683,34 @@ pub fn create_fx4(
         _data_thread: data_thread_handle,
         _callback_thread: callback_thread,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused connect is found by poll, so ixwebsocket prefixes
+    /// `Connect error: `; drvFX4's onError line carries the whole reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_connect_reads_as_ixwebsocket_reason() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let Err(reason) = rt.block_on(connect(&format!("ws://127.0.0.1:{port}"))) else {
+            panic!("nothing listens");
+        };
+        let refused = strerror(&std::io::Error::from_raw_os_error(libc::ECONNREFUSED));
+        assert_eq!(
+            reason,
+            format!(
+                "Unable to connect to 127.0.0.1 on port {port}, error: Connect error: {refused}"
+            )
+        );
+    }
 }
