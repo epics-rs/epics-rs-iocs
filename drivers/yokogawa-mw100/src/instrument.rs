@@ -280,8 +280,8 @@ impl Instrument {
             ChannelFamily::Math => {
                 scaled_value(cache.calc_data[idx].value, cache.calc_info[idx].scale)
             }
-            ChannelFamily::Comm => cache.comm_input[idx],
-            ChannelFamily::Const => cache.constant[idx],
+            ChannelFamily::Comm => f64::from(cache.comm_input[idx]),
+            ChannelFamily::Const => f64::from(cache.constant[idx]),
         }
     }
 
@@ -919,7 +919,7 @@ impl Actor {
             let mut cache = self.cache.lock();
             for line in &lines {
                 if let Some(slot) = cache.comm_input.get_mut(line.index) {
-                    *slot = line.value;
+                    *slot = line.value as f32;
                 }
             }
         }
@@ -934,7 +934,7 @@ impl Actor {
             let mut cache = self.cache.lock();
             for line in &lines {
                 if let Some(slot) = cache.constant.get_mut(line.index) {
-                    *slot = line.value;
+                    *slot = line.value as f32;
                 }
             }
         }
@@ -1308,8 +1308,8 @@ mod tests {
             ascii_frame(b"E"),
             one_record_fd1_binary(),
             empty_fo1_binary(),
-            ascii_frame(b"xxx001,-7.5\nE"),
-            ascii_frame(b"xxx01,12.5\nE"),
+            ascii_frame(b"xxx001,-0.1\nE"),
+            ascii_frame(b"xxx01,0.3\nE"),
             b"E1 205 x\r\n".to_vec(), // CE0 -> device error
         ];
         let device = spawn_fake_device(listener, responses);
@@ -1319,8 +1319,15 @@ mod tests {
         assert!(instrument.module_presence(0));
         assert_eq!(instrument.channel_get_egu(ChannelFamily::Signal, 1), "DEGC");
         assert_eq!(instrument.analog_get(ChannelFamily::Signal, 1), 1.234);
-        assert_eq!(instrument.analog_get(ChannelFamily::Const, 1), 12.5);
-        assert_eq!(instrument.analog_get(ChannelFamily::Comm, 1), -7.5);
+        // float comm_input[]/constant[] (drvMW100.c:436-437) round atof.
+        assert_eq!(
+            instrument.analog_get(ChannelFamily::Const, 1),
+            f64::from(0.3f32)
+        );
+        assert_eq!(
+            instrument.analog_get(ChannelFamily::Comm, 1),
+            f64::from(-0.1f32)
+        );
         assert!(!instrument.get_error_flag());
 
         let mut error_rx = instrument.register_interrupt(InterruptCategory::Error);

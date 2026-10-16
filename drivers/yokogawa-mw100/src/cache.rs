@@ -160,8 +160,9 @@ pub struct Cache {
     pub calc_data: Vec<ChannelData>,
     pub calc_expr: Vec<ExprInfo>,
 
-    pub comm_input: Vec<f64>,
-    pub constant: Vec<f64>,
+    /// `float` in C (`drvMW100.c:436-437`).
+    pub comm_input: Vec<f32>,
+    pub constant: Vec<f32>,
 
     pub modules: Vec<Module>,
 
