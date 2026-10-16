@@ -125,7 +125,6 @@ impl EigerDriver {
             self.ops
                 .trace
                 .err("eigerDetector", "unable to set detector parameters");
-            return Ok(());
         }
         self.ad.port_base.call_param_callbacks(0)
     }
@@ -135,7 +134,11 @@ impl EigerDriver {
     /// Returns false when the initialize failed, where C abandons the rest of
     /// the constructor.
     fn initialize_if_needed(&mut self) -> AsynResult<bool> {
-        let state = self.ad.port_base.get_string_param(self.p.state, 0)?;
+        let state = self
+            .ad
+            .port_base
+            .get_string_param(self.p.state, 0)
+            .unwrap_or_default();
         if state != b"na" {
             return Ok(true);
         }
@@ -196,7 +199,11 @@ impl EigerDriver {
         // stay in the index domain. Asking the library for a string here — as
         // this did — is a type error against an `asynParamInt32`, which failed
         // `init_params` for every detector, reachable or not.
-        let roi_mode = self.ad.port_base.get_int32_param(self.p.roi_mode, 0)?;
+        let roi_mode = self
+            .ad
+            .port_base
+            .get_int32_param(self.p.roi_mode, 0)
+            .unwrap_or(0);
         let restore = match self.ops.enum_index_of(self.p.roi_mode, "disabled") {
             Some(disabled) if disabled != roi_mode => {
                 let _ = self.put_int(self.p.roi_mode, disabled);
@@ -207,11 +214,13 @@ impl EigerDriver {
         let max_size_x = self
             .ad
             .port_base
-            .get_int32_param(self.p.nd_array_size_x, 0)?;
+            .get_int32_param(self.p.nd_array_size_x, 0)
+            .unwrap_or(0);
         let max_size_y = self
             .ad
             .port_base
-            .get_int32_param(self.p.nd_array_size_y, 0)?;
+            .get_int32_param(self.p.nd_array_size_y, 0)
+            .unwrap_or(0);
         if restore {
             let _ = self.put_int(self.p.roi_mode, roi_mode);
         }
@@ -220,9 +229,12 @@ impl EigerDriver {
         base.set_int32_param(self.ad.params.max_size_x, 0, max_size_x)?;
         base.set_int32_param(self.ad.params.max_size_y, 0, max_size_y)?;
 
-        // The description is "<manufacturer> <model>".
-        let description =
-            String::from_utf8_lossy(base.get_string_param(self.p.description, 0)?).into_owned();
+        // The description is "<manufacturer> <model>". C ORs its status into
+        // the return and still sets every default below (eigerDetector.cpp:1646).
+        let (description, described) = match base.get_string_param(self.p.description, 0) {
+            Ok(bytes) => (String::from_utf8_lossy(bytes).into_owned(), Ok(())),
+            Err(e) => (String::new(), Err(e)),
+        };
         let (manufacturer, model) = match description.split_once(' ') {
             Some((m, rest)) => (m.to_string(), rest.to_string()),
             None => (description.clone(), String::new()),
@@ -257,7 +269,7 @@ impl EigerDriver {
         let _ = self.put_bool(self.p.auto_summation, true);
         let _ = self.put_int(self.p.fw_img_num_start, params::DEFAULT_NR_START);
         let _ = self.put_int(self.p.monitor_buf_size, 1);
-        Ok(())
+        described
     }
 
     fn apply(&mut self, updates: Vec<ParamUpdate>) -> AsynResult<()> {
@@ -271,11 +283,14 @@ impl EigerDriver {
         Ok(())
     }
 
-    fn string_param(&self, index: usize) -> AsynResult<String> {
-        self.ad
-            .port_base
-            .get_string_param(index, 0)
-            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    fn string_param(&self, index: usize) -> String {
+        String::from_utf8_lossy(
+            self.ad
+                .port_base
+                .get_string_param(index, 0)
+                .unwrap_or_default(),
+        )
+        .into_owned()
     }
 
     fn put_int(&mut self, index: usize, value: i32) -> AsynResult<()> {
@@ -289,11 +304,7 @@ impl EigerDriver {
     }
 
     fn put_f64(&mut self, index: usize, value: f64) -> AsynResult<()> {
-        let current = self
-            .ad
-            .port_base
-            .get_float64_param(index, 0)
-            .unwrap_or(f64::NAN);
+        let current = self.ad.port_base.get_float64_param(index, 0).unwrap_or(0.0);
         let updates = self.ops.put_f64(index, value, current).map_err(rest_err)?;
         self.apply(updates)
     }
@@ -333,7 +344,8 @@ impl EigerDriver {
         if self
             .ad
             .port_base
-            .get_int32_param(self.ad.params.acquire, 0)?
+            .get_int32_param(self.ad.params.acquire, 0)
+            .unwrap_or(0)
             != 0
         {
             return Ok(());
@@ -352,7 +364,7 @@ impl EigerDriver {
         if self.api == ApiVersion::V1_6_0 {
             indices.extend([self.p.link0, self.p.link1].into_iter().flatten());
             // The Eiger 500K has no link2/link3.
-            let model = self.string_param(self.ad.params.base.model)?;
+            let model = self.string_param(self.ad.params.base.model);
             if !model.contains("500K") {
                 indices.extend([self.p.link2, self.p.link3].into_iter().flatten());
             }
@@ -390,7 +402,8 @@ impl EigerDriver {
         let ad_status = self
             .ad
             .port_base
-            .get_int32_param(self.ad.params.status, 0)?;
+            .get_int32_param(self.ad.params.status, 0)
+            .unwrap_or(0);
 
         if reason == acquire {
             if value != 0 && ad_status != ADStatus::Acquire as i32 {
@@ -435,12 +448,16 @@ impl EigerDriver {
         } else if reason == self.p.file_perms {
             self.put_int(reason, value & FILE_PERMS_MASK)?;
         } else if Some(reason) == self.p.hv_reset {
-            let reset_time = self.ad.port_base.get_float64_param(
-                self.p
-                    .hv_reset_time
-                    .expect("hv_reset implies hv_reset_time"),
-                0,
-            )?;
+            let reset_time = self
+                .ad
+                .port_base
+                .get_float64_param(
+                    self.p
+                        .hv_reset_time
+                        .expect("hv_reset implies hv_reset_time"),
+                    0,
+                )
+                .unwrap_or(0.0);
             let _ = self.ops.rest.hv_reset(reset_time as i32);
         } else if reason == self.p.trigger_mode {
             // INTE and EXTE deliver exactly one image per trigger.
@@ -451,14 +468,19 @@ impl EigerDriver {
         } else if self.ops.reg.lock().contains(reason) {
             self.put_int(reason, value)?;
             if reason == self.p.data_source || reason == self.p.stream_version {
-                let data_source = self.ad.port_base.get_int32_param(self.p.data_source, 0)?;
+                let data_source = self
+                    .ad
+                    .port_base
+                    .get_int32_param(self.p.data_source, 0)
+                    .unwrap_or(0);
                 // Selecting the stream re-arms the detector's stream interface:
                 // it has to be off and on again for the socket to deliver.
                 if data_source == SOURCE_STREAM {
                     let version = self
                         .ad
                         .port_base
-                        .get_int32_param(self.p.stream_version, 0)?;
+                        .get_int32_param(self.p.stream_version, 0)
+                        .unwrap_or(0);
                     self.signals.stream_apis(Some(version));
                     let _ = self.put_bool(self.p.stream_enable, false);
                     let _ = self.put_bool(self.p.stream_enable, true);
