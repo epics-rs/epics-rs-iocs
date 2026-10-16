@@ -43,8 +43,8 @@
 //!   per-axis `AsynMotor::poll` boundary. Slightly more traffic; same result.
 //! - The auxiliary parameter records exposed through the C `writeInt32` /
 //!   `writeFloat64` overrides, closed-loop gain status (`CL?`), the following-
-//!   error / encoder-status word (`EA`), and the `setEncoderRatio` hook (ratio
-//!   stays 1.0). These are not motor-record motion fields.
+//!   error / encoder-status word (`EA`). These are not motor-record motion
+//!   fields.
 //! - The init-time firmware-version gate and axis-count auto-detection: the
 //!   driver reads the firmware string once for logging, assumes the modern
 //!   (>= 1.30) command forms MAXnet mandates, and trusts the configured axis
@@ -157,6 +157,8 @@ pub struct OmsAxis {
     /// Command selector char (`A<char>`).
     axis_char: char,
     has_encoder: bool,
+    /// C `omsBaseAxis::encoderRatio`, set by `setEncoderRatio`.
+    encoder_ratio: f64,
     /// Limit true-state inversion (C `invertLimit`, from `LT?`).
     invert_limit: bool,
     /// Last base velocity sent, to order `VL`/`VB` so `VB < VL` always holds.
@@ -199,6 +201,7 @@ impl OmsAxis {
             axis_index: index,
             axis_char,
             has_encoder,
+            encoder_ratio: 1.0,
             invert_limit,
             last_min_velo: 0,
             move_delay: 0,
@@ -233,8 +236,8 @@ impl OmsAxis {
             let ctrl = self.lock();
             let ch = self.axis_char;
             let enc = atoi(&ctrl.send_receive(&format!("A{ch};RE;"))?);
-            // encoderRatio is fixed at 1.0 (the setEncoderRatio hook is unported).
-            ctrl.send_only(&format!("A{ch};LO{enc};"))?;
+            let motor_position = (f64::from(enc) / self.encoder_ratio) as i32;
+            ctrl.send_only(&format!("A{ch};LO{motor_position};"))?;
         }
 
         let pos = Self::nint(position);
@@ -261,6 +264,13 @@ impl OmsAxis {
 }
 
 impl AsynMotor for OmsAxis {
+    /// C `omsBaseAxis::setEncoderRatio` (omsBaseAxis.h:37): stored for the
+    /// encoder sync before each move.
+    fn set_encoder_ratio(&mut self, _user: &AsynUser, ratio: f64) -> AsynResult<()> {
+        self.encoder_ratio = ratio;
+        Ok(())
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -457,6 +467,72 @@ mod tests {
         assert!(!is_notification("MDNN,MDNN"));
         assert!(!is_notification("12345"));
         assert!(!is_notification("3F"));
+    }
+
+    /// An encoder axis whose `RE` reads 1000; records every command.
+    struct EncoderAxis {
+        base: epics_rs::asyn::port::PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+        reply: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for EncoderAxis {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            self.reply = if cmd.ends_with("PS?") {
+                b"=E".to_vec()
+            } else if cmd.ends_with("LT?") {
+                b"=h".to_vec()
+            } else if cmd.ends_with("RE;") {
+                b"1000".to_vec()
+            } else {
+                Vec::new()
+            };
+            self.written.lock().unwrap().push(cmd);
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = std::mem::take(&mut self.reply);
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    #[test]
+    fn the_encoder_sync_before_a_move_divides_by_the_encoder_ratio() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let port = EncoderAxis {
+            base: PortDriverBase::new("omsEncoderRatio", 1, PortFlags::default()),
+            written: written.clone(),
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("omsEncoderRatio").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_secs(1),
+        );
+        let controller = Arc::new(Mutex::new(OmsController::new(io, "MAXnet")));
+        let mut axis = OmsAxis::new(controller, 0).unwrap();
+        let user = AsynUser::new(0);
+        axis.set_encoder_ratio(&user, 4.0).unwrap();
+        axis.move_absolute(&user, 10.0, 1.0, 100.0, 1000.0).unwrap();
+        assert!(written.lock().unwrap().iter().any(|c| c == "AX;LO250;"));
     }
 
     #[test]
