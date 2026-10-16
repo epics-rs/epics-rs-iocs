@@ -6,6 +6,5 @@ publish = false
 
 [dependencies]
 ether-ip = { path = "../../../drivers/ether-ip" }
-log = "0.4"
 epics-rs = { workspace = true, features = ["bridge"] }
 tokio = { version = "1", features = ["full"] }

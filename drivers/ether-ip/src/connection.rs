@@ -19,6 +19,9 @@ use crate::encap::{self, TransactionId};
 pub enum EipError {
     #[error("I/O: {0}")]
     Io(#[from] io::Error),
+    /// The request never left: C's `EIP_send_connection_buffer` failure.
+    #[error("send: {0}")]
+    Send(io::Error),
     #[error("cannot resolve '{0}'")]
     Resolve(String),
     #[error("target does not support CIP PDU encapsulation")]
@@ -128,7 +131,7 @@ impl Connection {
                 limit: encap::BUFFER_SIZE,
             });
         }
-        self.stream.write_all(request)?;
+        self.stream.write_all(request).map_err(EipError::Send)?;
 
         let mut buf = vec![0u8; encap::HEADER_SIZE];
         self.stream.read_exact(&mut buf)?;

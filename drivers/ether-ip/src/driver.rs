@@ -16,9 +16,14 @@ use tokio::sync::mpsc::Sender;
 use crate::cip::{self, CipType, ParsedTag};
 use crate::connection::{Connection, EipError};
 use crate::encap::{self, ETHERIP_PORT};
+use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::server::records::printf::format_g;
 
 /// `EIP_TIMEOUT` -- default connect / response timeout.
 pub const DEFAULT_TIMEOUT_MS: u32 = 5000;
+
+/// `epicsThreadSleepQuantum()` on POSIX: one clock tick, 1/100 s.
+const SLEEP_QUANTUM: f64 = 0.01;
 
 /// `EIP_MIN_TIMEOUT` -- the idle delay when no scan list is due.
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -300,11 +305,11 @@ pub fn start_scan_tasks() -> usize {
             .name(name)
             .spawn(move || scan_loop(p))
         {
-            Ok(_) => started += 1,
-            Err(e) => {
-                plc.started.store(false, Ordering::SeqCst);
-                log::error!("EIP: cannot start scan task for PLC '{}': {e}", plc.name);
+            Ok(_) => {
+                crate::eip_printf!(5, "drvEtherIP: launch scan task for PLC '{}'\n", plc.name);
+                started += 1;
             }
+            Err(_) => plc.started.store(false, Ordering::SeqCst),
         }
     }
     started
@@ -328,17 +333,22 @@ fn scan_loop(plc: Arc<Plc>) {
         // -- connect ---------------------------------------------------------
         if conn.is_none() {
             let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;
+            crate::eip_printf_time!(4, "EIP connecting {}\n", plc.name);
             match Connection::startup(&plc.ip_addr, ETHERIP_PORT, plc.slot, timeout(), limit) {
                 Ok(mut c) => {
-                    log::info!(
-                        "EIP: PLC '{}' connected ({}), '{}'",
-                        plc.name,
-                        plc.ip_addr,
-                        c.identity.name
-                    );
                     *plc.identity.lock() = Some(c.identity.clone());
                     if !complete_tag_infos(&plc, &mut c) {
-                        log::error!("EIP: PLC '{}': not a single tag could be read", plc.name);
+                        errlog_vprintf(format_args!(
+                            "EIP error during scan list completion for {}:{ETHERIP_PORT}\n",
+                            plc.ip_addr
+                        ));
+                        crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
+                        c.shutdown();
+                        crate::eip_printf_time!(
+                            2,
+                            "drvEtherIP: PLC '{}' is disconnected\n",
+                            plc.name
+                        );
                         plc.stats.lock().plc_errors += 1;
                         std::thread::sleep(timeout());
                         continue;
@@ -346,8 +356,12 @@ fn scan_loop(plc: Arc<Plc>) {
                     plc.connected.store(true, Ordering::Relaxed);
                     conn = Some(c);
                 }
-                Err(e) => {
-                    log::warn!("EIP: PLC '{}' is disconnected: {e}", plc.name);
+                Err(_) => {
+                    errlog_vprintf(format_args!(
+                        "EIP connection failed for {}:{ETHERIP_PORT}\n",
+                        plc.ip_addr
+                    ));
+                    crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
                     plc.connected.store(false, Ordering::Relaxed);
                     plc.invalidate_tags();
                     std::thread::sleep(timeout());
@@ -356,6 +370,7 @@ fn scan_loop(plc: Arc<Plc>) {
             }
         }
         let c = conn.as_mut().expect("connected above");
+        crate::eip_printf_time!(10, "drvEtherIP scan PLC '{}'\n", plc.name);
 
         // -- scan every list that is due --------------------------------------
         let lists: Vec<_> = plc.scanlists.lock().clone();
@@ -407,8 +422,11 @@ fn scan_loop(plc: Arc<Plc>) {
 
         if failed {
             // Drop the session and reconnect on the next turn.
+            crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
+            if let Some(mut c) = conn.take() {
+                c.shutdown();
+            }
             plc.connected.store(false, Ordering::Relaxed);
-            conn = None;
             plc.invalidate_tags();
             continue;
         }
@@ -427,8 +445,16 @@ fn scan_loop(plc: Arc<Plc>) {
         match next_due {
             None => std::thread::sleep(MIN_TIMEOUT),
             Some(due) if due > now => std::thread::sleep(due - now),
-            Some(_) => {
-                plc.stats.lock().slow_scans += 1;
+            Some(due) => {
+                let delay = -(now - due).as_secs_f64();
+                if delay <= -SLEEP_QUANTUM {
+                    crate::eip_printf!(
+                        8,
+                        "drvEtherIP scan task slow, {} sec delay\n",
+                        format_g(delay, 6)
+                    );
+                    plc.stats.lock().slow_scans += 1;
+                }
             }
         }
     }
@@ -456,8 +482,10 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
     let mut tried = 0usize;
     let mut ok = 0usize;
 
+    crate::eip_printf!(5, "complete_PLC_ScanList_TagInfos PLC '{}':\n", plc.name);
     let lists: Vec<_> = plc.scanlists.lock().clone();
     for list in lists {
+        crate::eip_printf!(5, "- Scanlist {:.2}\n", list.period);
         let tags: Vec<_> = list.tags.lock().clone();
         for info in tags {
             tried += 1;
@@ -476,21 +504,24 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
                     let type_and_data = d.r_response - 4;
                     d.w_request = d.r_request + type_and_data;
                     d.w_response = 4;
+                    crate::eip_printf!(
+                        5,
+                        "  tag '{}': req {}, resp {} bytes\n",
+                        info.string_tag,
+                        d.r_request,
+                        d.r_response
+                    );
 
                     if data.len() < encap::BUFFER_SIZE {
                         d.buf = data;
                         d.valid_data_size = d.buf.len();
                     } else {
-                        log::warn!(
-                            "EIP: rejecting tag '{}' data size of {} bytes",
-                            info.string_tag,
-                            data.len()
-                        );
+                        print_rejected(&info.string_tag, data.len());
                         d.valid_data_size = 0;
                     }
                 }
-                Err(e) => {
-                    log::warn!("EIP: tag '{}': cannot read: {e}", info.string_tag);
+                Err(_) => {
+                    crate::eip_printf!(3, "tag '{}': Cannot read!\n", info.string_tag);
                     let mut d = info.data.lock();
                     d.r_request = 0;
                     d.r_response = 0;
@@ -503,7 +534,11 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
         }
     }
 
-    log::debug!("EIP: PLC '{}': tried {tried} tags, got {ok} tags", plc.name);
+    crate::eip_printf!(
+        5,
+        "complete_PLC_ScanList_TagInfos PLC '{}': tried {tried} tags, got {ok} tags\n",
+        plc.name
+    );
     ok > 0 || tried == 0
 }
 
@@ -513,6 +548,8 @@ struct Item {
     /// The write half of the handshake was taken for this pass.
     writing: bool,
     request: Vec<u8>,
+    /// The response size this item was budgeted at.
+    response_size: usize,
 }
 
 /// C `determine_MultiRequest_count` + the build half of `process_ScanList`,
@@ -588,12 +625,21 @@ fn build_multi_request(limit: usize, tags: &[Arc<TagInfo>], start: usize) -> (Ve
         let multi_resp = cip::multi_response_size(items.len() + 1, try_resp);
 
         if multi_req > limit || multi_resp > limit {
+            crate::eip_printf!(
+                8,
+                " Skipping tag '{}', reached buffer limit at req/resp: {}, {}\n",
+                info.string_tag,
+                cip::multi_request_size(items.len(), requests_size),
+                cip::multi_response_size(items.len(), responses_size)
+            );
             if items.is_empty() {
-                log::error!(
-                    "EIP: tag '{}' can never be transferred: it alone exceeds the \
-                     buffer limit of {limit} bytes (request {multi_req}, response {multi_resp})",
+                crate::eip_printf!(
+                    2,
+                    "Tag '{}' can never be read because it alone exceeds buffer limit of {limit} bytes,\n",
                     info.string_tag
                 );
+                crate::eip_printf!(3, " Request   size: {try_req:>10} bytes\n");
+                crate::eip_printf!(3, " Response  size: {try_resp:>10} bytes\n");
                 // Give the write handshake back -- this pass will never send it.
                 if writing {
                     info.data.lock().is_writing = false;
@@ -608,8 +654,17 @@ fn build_multi_request(limit: usize, tags: &[Arc<TagInfo>], start: usize) -> (Ve
             info: info.clone(),
             writing,
             request,
+            response_size: resp,
         });
         at += 1;
+    }
+    if at == tags.len() {
+        crate::eip_printf!(
+            8,
+            " End of list, total req/resp: {}, {}\n",
+            cip::multi_request_size(items.len(), requests_size),
+            cip::multi_response_size(items.len(), responses_size)
+        );
     }
     (items, at)
 }
@@ -634,31 +689,45 @@ fn process_scan_list(c: &mut Connection, list: &Arc<ScanList>) -> bool {
 
         let t0 = Instant::now();
         let response = match c.send_routed(&multi) {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("EIP process_ScanList: {e}");
+            Ok(r) => Some(r),
+            Err(EipError::Send(_) | EipError::TooLarge { .. }) => {
+                crate::eip_printf_time!(2, "EIP process_ScanList: Error while sending request\n");
+                release_writes(&items);
+                return false;
+            }
+            Err(EipError::TransactionMismatch { got, want }) => {
+                crate::eip_printf_time!(2, "EIP process_ScanList: Mismatch in transaction ID\n");
+                crate::eip_printf!(2, "expected {want} received {got}\n");
+                release_writes(&items);
+                return false;
+            }
+            Err(EipError::Malformed | EipError::EncapStatus { .. }) => None,
+            Err(_) => {
+                crate::eip_printf_time!(2, "EIP process_ScanList: No response\n");
                 release_writes(&items);
                 return false;
             }
         };
         let transfer_time = t0.elapsed().as_secs_f64();
 
-        if !cip::check_multi_request_response(&response) {
-            log::error!(
-                "EIP process_ScanList: error in response for tags {:?}",
-                items.iter().map(|i| &i.info.string_tag).collect::<Vec<_>>()
+        let Some(response) = response.filter(|r| cip::check_multi_request_response(r)) else {
+            crate::eip_printf_time!(2, "EIP process_ScanList: Error in response\n");
+            for (i, item) in items.iter().enumerate() {
+                crate::eip_printf!(2, "Tag {i}: '{}'\n", item.info.string_tag);
+            }
+            crate::eip_printf!(
+                2,
+                "Request size: {} bytes, response size: {}, buffer limit: {limit}\n",
+                cip::multi_request_size(items.len(), items.iter().map(|i| i.request.len()).sum()),
+                cip::multi_response_size(items.len(), items.iter().map(|i| i.response_size).sum())
             );
             release_writes(&items);
             return false;
-        }
+        };
 
         let n = response.len();
         for (i, item) in items.iter().enumerate() {
             let Some(sub) = cip::get_multi_request_response(&response, n, i) else {
-                log::error!(
-                    "EIP process_ScanList: missing sub-response {i} for '{}'",
-                    item.info.string_tag
-                );
                 release_writes(&items);
                 return false;
             };
@@ -686,6 +755,14 @@ fn release_writes(items: &[Item]) {
     }
 }
 
+/// `reserve_tag_data`'s refusal of a value that would not fit `EIP_BUFFER_SIZE`.
+fn print_rejected(tag: &str, size: usize) {
+    crate::eip_printf!(
+        2,
+        "EIP reserve_tag_data: rejecting tag '{tag}' data size of {size} bytes\n"
+    );
+}
+
 fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
     let mut d = item.info.data.lock();
     d.transfer_time = transfer_time;
@@ -693,7 +770,7 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
     if item.writing {
         d.is_writing = false;
         if !cip::check_write_data_response(sub) {
-            log::error!("EIP: CIPWrite failed for '{}'", item.info.string_tag);
+            crate::eip_printf_time!(0, "EIP: CIPWrite failed for '{}'\n", item.info.string_tag);
             d.valid_data_size = 0;
         }
         return;
@@ -704,8 +781,9 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
             if d.do_write {
                 // A record staged a write while this read was in flight; keep
                 // its data, the next pass sends it (C process_ScanList).
-                log::debug!(
-                    "EIP '{}': device support requested a write in the middle of a read cycle",
+                crate::eip_printf!(
+                    8,
+                    "EIP '{}': Device support requested write in middle of read cycle.\n",
                     item.info.string_tag
                 );
             } else if data.len() < encap::BUFFER_SIZE {
@@ -713,18 +791,11 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
                 d.buf.extend_from_slice(data);
                 d.valid_data_size = data.len();
             } else {
-                log::warn!(
-                    "EIP: rejecting tag '{}' data size of {} bytes",
-                    item.info.string_tag,
-                    data.len()
-                );
+                print_rejected(&item.info.string_tag, data.len());
                 d.valid_data_size = 0;
             }
         }
-        _ => {
-            log::warn!("EIP: read failed for '{}'", item.info.string_tag);
-            d.valid_data_size = 0;
-        }
+        _ => d.valid_data_size = 0,
     }
 }
 

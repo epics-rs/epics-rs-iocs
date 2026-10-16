@@ -35,6 +35,30 @@ pub fn eip_printf(level: i32, args: std::fmt::Arguments<'_>) {
     let _ = std::io::stderr().write_fmt(args);
 }
 
+/// `EIP_printf_time`: [`eip_printf`] behind a local `%Y/%m/%d %H:%M:%S.%04f`
+/// stamp.
+pub fn eip_printf_time(level: i32, args: std::fmt::Arguments<'_>) {
+    if level > EIP_VERBOSITY.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = chrono::Local::now();
+    let mut err = std::io::stderr().lock();
+    let _ = write!(
+        err,
+        "{}.{:04} ",
+        now.format("%Y/%m/%d %H:%M:%S"),
+        now.timestamp_subsec_nanos() / 100_000
+    );
+    let _ = err.write_fmt(args);
+}
+
+#[macro_export]
+macro_rules! eip_printf_time {
+    ($level:expr, $($arg:tt)*) => {
+        $crate::eip_printf_time($level, format_args!($($arg)*))
+    };
+}
+
 #[macro_export]
 macro_rules! eip_printf {
     ($level:expr, $($arg:tt)*) => {

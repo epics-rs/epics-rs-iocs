@@ -172,8 +172,7 @@ async fn main() -> CaResult<()> {
     // so they start after iocInit -- the C does the same from its device-support
     // `init(run==1)` hook, which calls drvEtherIP_restart().
     app = app.register_after_init(|| {
-        let n = driver::start_scan_tasks();
-        log::info!("EIP: started {n} scan task(s)");
+        driver::start_scan_tasks();
     });
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await

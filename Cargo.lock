@@ -1487,6 +1487,7 @@ dependencies = [
 name = "ether-ip"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "epics-rs",
  "log",
  "parking_lot",
@@ -1500,7 +1501,6 @@ version = "0.1.0"
 dependencies = [
  "epics-rs",
  "ether-ip",
- "log",
  "tokio",
 ]
 
