@@ -1443,10 +1443,13 @@ impl PortDriver for AdsPortDriver {
         }
 
         // Resolve it against the PLC now if we can; one created while the
-        // link is down is resolved by the refresh when it comes up.
-        // refresh_param prints C's line for whatever failed.
+        // link is down is resolved by the refresh when it comes up. C fails
+        // the bind (and so the record) on a symbol the PLC refuses; the
+        // parameter stays created, as C's does. refresh_param prints C's line.
         if self.shared.is_connected() {
-            let _ = self.shared.refresh_param(reason);
+            self.shared
+                .refresh_param(reason)
+                .map_err(|e| asyn_err(format!("drvInfo '{}': {e}", req.drv_info)))?;
         }
 
         Ok(DrvUserInfo::from_reason(reason))
@@ -2372,6 +2375,71 @@ mod tests {
         assert_eq!(g.entries[1].index_group, ADSIGRP_MEMORY_BYTE);
         assert_eq!(g.reasons, vec![None, None, Some(a), Some(b)]);
         assert_eq!(g.entries[3].size, 8);
+    }
+
+    /// A PLC that answers every request with `result`.
+    fn connect_refusing_plc(d: &AdsPortDriver, result: u32) {
+        use crate::ads::defs::STATE_FLAG_RESPONSE;
+        use crate::ads::frame::{
+            AMS_TCP_HEADER_LEN, AOE_HEADER_LEN, AoeHeader, decode_tcp_header, encode_frame,
+        };
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            loop {
+                let mut tcp = [0u8; AMS_TCP_HEADER_LEN];
+                if stream.read_exact(&mut tcp).is_err() {
+                    return;
+                }
+                let mut body = vec![0u8; decode_tcp_header(&tcp).unwrap() as usize];
+                stream.read_exact(&mut body).unwrap();
+                let req = AoeHeader::decode(&body[..AOE_HEADER_LEN]).unwrap();
+                let mut payload = result.to_le_bytes().to_vec();
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                let header = AoeHeader {
+                    target: req.source,
+                    source: req.target,
+                    state_flags: STATE_FLAG_RESPONSE,
+                    length: payload.len() as u32,
+                    error_code: 0,
+                    ..req
+                };
+                let _ = stream.write_all(&encode_frame(&header, &payload));
+            }
+        });
+        let client = AdsClient::from_stream(
+            TcpStream::connect(addr).unwrap(),
+            AmsAddr {
+                net_id: AmsNetId([10, 0, 0, 2, 1, 1]),
+                port: LOCAL_PORT_BASE,
+            },
+            d.shared.cfg.remote_net_id,
+            Duration::from_millis(500),
+            Arc::new(|_| {}),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        *d.shared.client.lock() = Some(Arc::new(client));
+    }
+
+    #[test]
+    fn binding_a_symbol_the_plc_does_not_have_fails() {
+        let mut d = driver();
+        connect_refusing_plc(&d, 0x710); // ADSERR_DEVICE_SYMBOLNOTFOUND
+        let req = DrvUserRequest::new("ADSPORT=851/MAIN.nope?", 0).with_iface(InterfaceType::Int32);
+        assert!(d.drv_user_create(&req).is_err());
+        // C keeps the parameter it created before asking the PLC.
+        let reason = d.base.find_param("ADSPORT=851/MAIN.nope?").unwrap();
+        assert!(
+            d.shared.params.lock()[reason]
+                .as_ref()
+                .unwrap()
+                .refresh_needed
+        );
     }
 
     #[test]
