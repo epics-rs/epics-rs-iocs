@@ -535,6 +535,8 @@ fn reader_thread(
                     if is_asyn_timeout(&e) {
                         ReadOutcome::Timeout
                     } else {
+                        // C waits before it counts the failure (`:428`).
+                        long_wait();
                         ReadOutcome::ReadError
                     }
                 }
