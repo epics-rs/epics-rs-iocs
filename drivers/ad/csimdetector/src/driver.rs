@@ -16,7 +16,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::ndarray_driver::{
-    ArrayOwner, NDArrayDriverBase, handle_pool_write_int32,
+    ArrayOwner, NDArrayDriverBase, handle_write_int32,
 };
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::ndarray_pool::DriverPool;
@@ -138,18 +138,18 @@ impl PortDriver for CSimDetector {
 
         self.port_base.set_int32_param(reason, addr, value)?;
 
-        let status: AsynResult<()> = Ok(());
+        let mut status: AsynResult<()> = Ok(());
         if reason == self.nd.acquire {
             self.set_acquire(value);
         } else if self.sim.belongs_to_base(reason) {
-            // `asynNDArrayDriver::writeInt32` keeps only its store's status (:682).
             let template = self.owner.array(0);
-            let _ = handle_pool_write_int32(
+            status = handle_write_int32(
                 &mut self.port_base,
                 &self.nd,
                 &self.pool,
-                reason,
                 template.as_deref(),
+                user,
+                value,
             );
         }
 
@@ -520,6 +520,39 @@ mod tests {
             .unwrap();
         f.write_i32(f.det.nd.pool_pre_alloc, 0, 1);
         assert_eq!(f.get_i32(f.det.nd.pool_free_buffers, 0), 2);
+    }
+
+    /// ADCSimDetector.cpp:370 runs asynNDArrayDriver::writeInt32, whose
+    /// closing ASYN_TRACEIO_DRIVER line is asynNDArrayDriver.cpp:703-705.
+    #[test]
+    fn a_base_class_write_runs_asyn_nd_array_drivers_write_int32() {
+        use epics_rs::asyn::trace::TraceFile;
+        let name = "CSIMTEST";
+        let f = Fixture::new();
+        let poll = f.det.nd.pool_poll_stats;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            f.det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        h.write_int32_blocking(poll, 0, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains(&format!("asynNDArrayDriver:writeInt32: function={poll}")),
+            "{text:?}"
+        );
+        std::mem::forget(runtime);
     }
 
     #[test]
