@@ -156,10 +156,9 @@ impl BrukerDetector {
     /// The acquisition task asks for this through `BIS_START_SCAN`, so the
     /// command socket has exactly one user and the parameters the command is
     /// built from are read where they are owned.
-    fn start_scan(&mut self) -> AsynResult<()> {
-        // C ignores createFileName's status and every read here
-        // (BISDetector.cpp:496-505): a failed name leaves the last one in
-        // NDFullFileName.
+    fn start_scan(&mut self) {
+        // C ignores every status here (BISDetector.cpp:496-530): a failed
+        // name leaves the last one in NDFullFileName.
         let _ = self.create_file_name();
 
         let p = self.ad.params;
@@ -179,14 +178,14 @@ impl BrukerDetector {
         )
         .into_owned();
 
-        self.ad
+        let _ = self
+            .ad
             .port_base
-            .set_string_param(p.status_message, 0, "Starting exposure")?;
-        self.ad.port_base.call_param_callbacks(0)?;
+            .set_string_param(p.status_message, 0, "Starting exposure");
+        let _ = self.ad.port_base.call_param_callbacks(0);
 
         let command = protocol::acquire(frame_type, &file_name, acquire_time, num_darks);
         self.command(&command, BIS_COMMAND_TIMEOUT);
-        Ok(())
     }
 }
 
@@ -240,12 +239,13 @@ impl PortDriver for BrukerDetector {
                 });
             }
         } else if reason == q.start_scan {
-            self.start_scan()?;
+            self.start_scan();
         } else if reason == q.epics_shutter {
             // C called `ADDriver::setShutter` from the acquisition task, going
             // past its own override on purpose: in EPICS shutter mode the
-            // shutter is not BIS's to drive.
-            self.ad.set_shutter(value != 0)?;
+            // shutter is not BIS's to drive. It is void there
+            // (BISDetector.cpp:541, :561).
+            let _ = self.ad.set_shutter(value != 0);
         } else if reason < q.sfrm_timeout {
             // FIRST_BIS_PARAM is BISSFRMTimeout (BISDetector.cpp:84).
             status = ADDriver::ad_write_int32(self, user, value);
