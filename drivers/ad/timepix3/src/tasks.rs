@@ -1170,7 +1170,19 @@ fn strerror(e: &std::io::Error) -> String {
 
 async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
     match (kind, frame) {
-        (StreamKind::PrvImg, Frame::Image(f)) => {
+        (StreamKind::PrvImg, Frame::Image(mut f)) => {
+            let pixels = std::mem::take(&mut f.pixels);
+            let Some(mut array) = image_array(
+                ctx,
+                &f,
+                pixels,
+                &adlog::err(
+                    adlog::PROCESS_PRV_IMG_DATA_LINE,
+                    "Failed to allocate NDArray or NDArray has no data pointer",
+                ),
+            ) else {
+                return;
+            };
             let p = ctx.p;
             let rate = frame_rate(
                 ctx,
@@ -1211,18 +1223,21 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                     .collect(),
             )
             .await;
-            publish_image(
-                ctx,
-                PRV_IMG_ADDR,
-                f,
-                &adlog::err(
-                    adlog::PROCESS_PRV_IMG_DATA_LINE,
-                    "Failed to allocate NDArray or NDArray has no data pointer",
-                ),
-            )
-            .await;
+            attach_attributes(ctx, &mut array, &f).await;
+            publish_image(ctx, PRV_IMG_ADDR, array).await;
         }
         (StreamKind::Img, Frame::Image(f)) => {
+            let Some(mut array) = image_array(
+                ctx,
+                &f,
+                f.pixels.clone(),
+                &adlog::err(
+                    adlog::PROCESS_IMG_DATA_LINE,
+                    "Failed to allocate NDArray or NDArray has no data pointer",
+                ),
+            ) else {
+                return;
+            };
             let p = ctx.p;
             // processImgDataLine counts every Img frame, NDArrayCallbacks or
             // not, before getAttributes (serval_stream.cpp:880-883).
@@ -1232,18 +1247,50 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 .await
                 .unwrap_or(0)
                 + 1;
+            let rate = frame_rate(
+                ctx,
+                f.frame_number,
+                |r| &mut r.img,
+                adlog::PROCESS_IMG_DATA_LINE,
+                "Img ",
+            );
             ctx.set(
                 ADDR,
                 geometry(ctx, &f)
                     .into_iter()
-                    .chain([ParamSetValue::new(
-                        ctx.ad.base.array_counter,
-                        ADDR,
-                        ParamValue::Int32(counter),
-                    )])
+                    .chain([
+                        ParamSetValue::new(
+                            ctx.ad.base.array_counter,
+                            ADDR,
+                            ParamValue::Int32(counter),
+                        ),
+                        ParamSetValue::new(
+                            p.img_frame_number,
+                            ADDR,
+                            ParamValue::Int32(f.frame_number),
+                        ),
+                        ParamSetValue::new(
+                            p.img_threshold_id,
+                            ADDR,
+                            ParamValue::Int32(f.threshold_id),
+                        ),
+                        ParamSetValue::new(
+                            p.img_time_at_frame,
+                            ADDR,
+                            ParamValue::Float64(f.time_at_frame),
+                        ),
+                    ])
+                    .chain(
+                        rate.map(|r| {
+                            ParamSetValue::new(p.img_acq_rate, ADDR, ParamValue::Float64(r))
+                        }),
+                    )
                     .collect(),
             )
             .await;
+            attach_attributes(ctx, &mut array, &f).await;
+
+            // processImgFrame runs after getAttributes (serval_stream.cpp:948-982).
             let update = ctx
                 .shared
                 .img
@@ -1253,47 +1300,19 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 let img = ctx.shared.img.lock();
                 (img.total_counts(), img.frame_count())
             };
-            let rate = frame_rate(
-                ctx,
-                f.frame_number,
-                |r| &mut r.img,
-                adlog::PROCESS_IMG_DATA_LINE,
-                "Img ",
-            );
-            if let Some(rate) = rate {
-                ctx.set(
-                    ADDR,
-                    vec![ParamSetValue::new(
-                        p.img_acq_rate,
-                        ADDR,
-                        ParamValue::Float64(rate),
-                    )],
-                )
-                .await;
-            }
-
             ctx.set(
                 ADDR,
-                vec![
-                    ParamSetValue::new(p.img_frame_number, ADDR, ParamValue::Int32(f.frame_number)),
-                    ParamSetValue::new(p.img_threshold_id, ADDR, ParamValue::Int32(f.threshold_id)),
-                    ParamSetValue::new(
-                        p.img_time_at_frame,
-                        ADDR,
-                        ParamValue::Float64(f.time_at_frame),
+                vec![ParamSetValue::new(
+                    p.img_image_frame,
+                    ADDR,
+                    ParamValue::Int32Array(
+                        f.pixels
+                            .iter()
+                            .map(|&v| v as i32)
+                            .collect::<Vec<i32>>()
+                            .into(),
                     ),
-                    ParamSetValue::new(
-                        p.img_image_frame,
-                        ADDR,
-                        ParamValue::Int32Array(
-                            f.pixels
-                                .iter()
-                                .map(|&v| v as i32)
-                                .collect::<Vec<i32>>()
-                                .into(),
-                        ),
-                    ),
-                ],
+                )],
             )
             .await;
             ctx.set_int64(
@@ -1320,16 +1339,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             if let Some(sum_n) = update.sum_n {
                 publish_img_sum(ctx, 3, f.width, f.height, sum_n, uid).await;
             }
-            publish_image(
-                ctx,
-                IMG_ADDR,
-                f,
-                &adlog::err(
-                    adlog::PROCESS_IMG_DATA_LINE,
-                    "Failed to allocate NDArray or NDArray has no data pointer",
-                ),
-            )
-            .await;
+            publish_image(ctx, IMG_ADDR, array).await;
         }
         (StreamKind::PrvHst, Frame::Histogram(h)) => {
             let p = ctx.p;
@@ -1845,42 +1855,53 @@ fn geometry(ctx: &Ctx, f: &crate::stream::ImageFrame) -> [ParamSetValue; 7] {
     ]
 }
 
-async fn publish_image(ctx: &Arc<Ctx>, addr: usize, f: crate::stream::ImageFrame, refused: &str) {
-    if ctx
-        .handle
-        .read_int32(ctx.ad.base.array_callbacks, 0)
-        .await
-        .unwrap_or(0)
-        == 0
-    {
-        return;
-    }
-    // C prints and drops a refused alloc before it counts
-    // (serval_stream.cpp:177-183, :808-814).
-    let Ok(mut array) = ctx.pool.wrap(
+/// The frame's NDArray, allocated before anything is posted, as C does
+/// whether or not NDArrayCallbacks is on (serval_stream.cpp:177-183,
+/// :808-814).
+fn image_array(
+    ctx: &Ctx,
+    f: &crate::stream::ImageFrame,
+    pixels: Vec<u32>,
+    refused: &str,
+) -> Option<DriverArray> {
+    let array = ctx.pool.wrap(
         vec![NDDimension::new(f.width), NDDimension::new(f.height)],
-        NDDataBuffer::U32(f.pixels),
-    ) else {
+        NDDataBuffer::U32(pixels),
+    );
+    if array.is_err() {
         ctx.trace(TraceMask::ERROR, refused);
-        return;
-    };
+    }
+    array.ok()
+}
+
+/// C hands the frame the getAttributes set plus ThresholdID, and no
+/// ColorMode attribute (serval_stream.cpp:236-240, :291-296, :886-890,
+/// :942-947); C ignores the getAttributes status.
+async fn attach_attributes(ctx: &Ctx, array: &mut DriverArray, f: &crate::stream::ImageFrame) {
     array.unique_id = f.frame_number;
     array.timestamp = EpicsTimestamp::now();
     array.time_stamp = array.timestamp.as_f64();
-    // C hands the frame the getAttributes set plus ThresholdID, and no
-    // ColorMode attribute (serval_stream.cpp:292-295, :943-946); C ignores
-    // the status.
-    let _ = ctx.pool.owner().get_attributes(&mut array).await;
+    let _ = ctx.pool.owner().get_attributes(array).await;
     array.attributes.add(NDAttribute::new_static(
         "ThresholdID",
         "Serval jsonimage thresholdID",
         NDAttrSource::Driver,
         NDAttrValue::Int32(f.threshold_id),
     ));
+}
 
-    ArrayPublisher::new(ctx.outputs[addr].clone())
-        .publish(array)
-        .await;
+async fn publish_image(ctx: &Ctx, addr: usize, array: DriverArray) {
+    if ctx
+        .handle
+        .read_int32(ctx.ad.base.array_callbacks, 0)
+        .await
+        .unwrap_or(0)
+        != 0
+    {
+        ArrayPublisher::new(ctx.outputs[addr].clone())
+            .publish(array)
+            .await;
+    }
 }
 
 #[cfg(test)]
@@ -2393,6 +2414,80 @@ mod tests {
         assert_eq!(attr(&array, "Counter"), Some(NDAttrValue::Int32(2)));
         assert_eq!(int(ad.size_x).await.unwrap(), 3);
         assert_eq!(int(ad.base.color_mode).await.unwrap(), 0);
+        std::mem::forget(runtime);
+    }
+
+    /// processImgFrame accumulates after getAttributes, so an Img frame's
+    /// TPX3_IMG_TOTAL_COUNTS attribute is the total before that frame
+    /// (serval_stream.cpp:942-982).
+    #[tokio::test]
+    async fn an_img_frame_is_accumulated_after_get_attributes() {
+        use epics_rs::ad_core::attributes::NDAttrValue;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::user::AsynUser;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut driver = crate::driver::TimePix3Driver::new(
+            "TPXACCORD",
+            http.clone(),
+            shared.clone(),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let (p, ad, pool) = (driver.p, driver.ad.params, driver.ad.pool.clone());
+        driver
+            .ad
+            .write_octet(
+                &AsynUser::new(ad.base.attributes_file),
+                br#"<Attributes><Attribute name="Total" type="PARAM" source="TPX3_IMG_TOTAL_COUNTS" datatype="INT64"/></Attributes>"#,
+            )
+            .unwrap();
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("TPXACCORD").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let outputs = new_outputs();
+        let (tx, mut rx) = ndarray_channel("TPXACCORD_SINK", 4);
+        outputs[IMG_ADDR].lock().add(tx);
+        let ctx = Arc::new(Ctx {
+            handle: runtime.port_handle().clone(),
+            http,
+            shared,
+            p,
+            ad,
+            outputs,
+            pool,
+        });
+        ctx.set_int(ad.base.array_callbacks, 0, 1).await;
+        ctx.set_int(p.img_accumulation_enable, 0, 1).await;
+        for (frame_number, before) in [(1, 0), (2, 3)] {
+            let frame = Frame::Image(crate::stream::ImageFrame {
+                width: 2,
+                height: 1,
+                format: crate::stream::PixelFormat::UInt16,
+                frame_number,
+                time_at_frame: 0.0,
+                threshold_id: 0,
+                integration_size: 0,
+                pixels: vec![1, 2],
+            });
+            handle_frame(&ctx, StreamKind::Img, frame).await;
+            let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no array")
+                .unwrap();
+            assert_eq!(
+                array.attributes.get("Total").map(|a| &a.value),
+                Some(&NDAttrValue::Int64(before))
+            );
+        }
         std::mem::forget(runtime);
     }
 
