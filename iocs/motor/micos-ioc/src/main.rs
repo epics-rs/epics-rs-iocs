@@ -19,7 +19,7 @@ use epics_rs::ca::server::ioc_app::IocApplication;
 use motor_micos::ioc::{
     corvus_change_resolution_command, corvus_create_controller_command,
     hydra_change_resolution_command, hydra_create_controller_command,
-    taurus_create_controller_command,
+    taurus_change_resolution_command, taurus_create_controller_command,
 };
 
 #[epics_rs::base::epics_main]
@@ -50,6 +50,7 @@ async fn main() -> CaResult<()> {
     app = app.register_startup_command(hydra_create_controller_command());
     app = app.register_startup_command(hydra_change_resolution_command());
     app = app.register_startup_command(taurus_create_controller_command());
+    app = app.register_startup_command(taurus_change_resolution_command());
     app = app.register_dynamic_device_support(
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),

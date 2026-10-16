@@ -1,11 +1,10 @@
 # Micos SMC Taurus: one motor record per axis. Load once per axis with ADDR =
 # 0-based axis index of port PORT; the command prefix uses ADDR + 1.
 #
-# The driver reports positions in controller-native engineering units. MRES is
-# the record's step (RRBV is an integer count and RDBD >= MRES). motorMicos
-# ships no Taurus example; the default is the corvus example's mm step
-# (motor.substitutions.SMCcorvus). Changing DHLM/DLLM pushes the soft limits to
-# the controller (setnlimit).
+# The driver scales the record's steps by axisRes = clPeriod into the
+# controller's units, as C. motorMicos ships no Taurus example; the MRES default
+# is the corvus example's (motor.substitutions.SMCcorvus). Changing DHLM/DLLM
+# pushes the soft limits to the controller (setnlimit).
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "asynMotor")

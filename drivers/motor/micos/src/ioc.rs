@@ -51,6 +51,12 @@ impl ChangeResolution for HydraAxis {
     }
 }
 
+impl ChangeResolution for TaurusAxis {
+    fn change_resolution(&mut self, new_resolution: f64) {
+        TaurusAxis::change_resolution(self, new_resolution);
+    }
+}
+
 type ResolutionAxes = HashMap<String, Vec<Arc<Mutex<dyn ChangeResolution>>>>;
 
 /// The axes of every controller port, as C's `findAsynPortDriver` +
@@ -231,6 +237,16 @@ pub fn hydra_create_controller_command() -> CommandDef {
     )
 }
 
+/// Build the `SMCTaurusChangeResolution(portName, axisNo, newResolution)`
+/// command.
+pub fn taurus_change_resolution_command() -> CommandDef {
+    change_resolution_command(
+        "SMCTaurusChangeResolution",
+        "SMC Taurus port name",
+        "SMCTaurusDriver.cpp",
+    )
+}
+
 /// Build the `SMCTaurusCreateController(portName, SMCTaurusPortName, numAxes,
 /// movingPollPeriod, idlePollPeriod)` command, periods in ms.
 pub fn taurus_create_controller_command() -> CommandDef {
@@ -267,8 +283,9 @@ pub fn taurus_create_controller_command() -> CommandDef {
             let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
 
             for index in 0..num_axes as usize {
-                let ax = TaurusAxis::new(controller.clone(), index);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                let ax = Arc::new(Mutex::new(TaurusAxis::new(controller.clone(), index)));
+                register_resolution_axis(&port_name, ax.clone());
+                let motor: Arc<Mutex<dyn AsynMotor>> = ax;
                 install(
                     ctx,
                     asyn_user(&port_name, index as i32),
