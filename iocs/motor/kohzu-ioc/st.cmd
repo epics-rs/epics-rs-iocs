@@ -23,12 +23,6 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# SC-800 framing: the driver prefixes STX (0x02) and appends the CR+LF
-# terminator to each command, so only the input EOS is configured here (replies
-# are CR+LF terminated). Do not set an output EOS — the port would append it a
-# second time.
-asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
-
 # ---- SC800 controller ----
 # SC800Setup(maxControllers, [scanRate]) is accepted for startup-script parity;
 # the asyn-rs port allocates per SC800Config call.

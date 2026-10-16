@@ -52,8 +52,10 @@ const READ_BUF: usize = 160;
 /// Start-of-text prefix on every command (C `STX`).
 const STX: u8 = 0x02;
 
-/// Command terminator (C `SC800_OUT_EOS`); the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r\n";
+/// Port EOS set at connect (C `SC800_IN_EOS`/`SC800_OUT_EOS`,
+/// drvSC800.cc:551-554).
+pub const INPUT_EOS: &[u8] = b"\r\n";
+pub const OUTPUT_EOS: &[u8] = b"\r\n";
 
 /// Jog speed clamp (C `devSC800.cc` JOG validity check).
 const JOG_MIN: i32 = 1;
@@ -114,10 +116,9 @@ impl KohzuController {
     }
 
     fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + cmd.len() + TERMINATOR.len());
+        let mut out = Vec::with_capacity(1 + cmd.len());
         out.push(STX);
         out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
         out
     }
 
@@ -385,11 +386,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn framed_wraps_stx_and_crlf() {
+    fn framed_prefixes_stx() {
         let f = KohzuController::framed("APS1/2/0/0/500/0/0/1");
         assert_eq!(f[0], STX);
-        assert_eq!(&f[f.len() - 2..], b"\r\n");
-        assert_eq!(&f[1..f.len() - 2], b"APS1/2/0/0/500/0/0/1");
+        assert_eq!(&f[1..], b"APS1/2/0/0/500/0/0/1");
     }
 
     #[test]
