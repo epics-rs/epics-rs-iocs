@@ -149,15 +149,6 @@ impl MoveStrings {
         prem
     }
 
-    /// Building a move the device splits into several messages, the last
-    /// of which is the motion node: PREM was overwritten and POST hangs off
-    /// a node the last one replaces, so neither goes out
-    /// (devMCDC2805.cc:222-236, motordrvCom.cc:420, 437).
-    pub fn split(&mut self) {
-        self.next = None;
-        self.post = None;
-    }
-
     /// `set_status` seeing the move done or stopped by a limit: the POST as
     /// the field holds it now, once. An emptied field gives nothing, as
     /// `send_mess` returns on an empty message.

@@ -254,9 +254,11 @@ impl FaulhaberAxis {
         Ok(())
     }
 
-    /// C `MOVE_ABS`/`MOVE_REL`: PREM and a blank lead the move's own
-    /// message, and its POST waits for the move to end.
-    fn load_target(&mut self, command: &str) -> AsynResult<()> {
+    /// PREM and a blank lead a move's first message, and its POST waits for
+    /// the move to end. C HOME/JOG strcpy their first split message over
+    /// PREM and replace the motion node holding POST; that defect is not
+    /// copied.
+    fn lead_move(&mut self, command: &str) -> AsynResult<()> {
         let mut line = self.strings.arm();
         if !line.is_empty() {
             line.push(b' ');
@@ -283,7 +285,7 @@ impl AsynMotor for FaulhaberAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         self.program_motion(&self.lock(), velocity, acceleration)?;
-        self.load_target(&format!("LA {}", nint(position)))?;
+        self.lead_move(&format!("LA {}", nint(position)))?;
         self.lock().write_cmd(self.node, "M")
     }
 
@@ -296,7 +298,7 @@ impl AsynMotor for FaulhaberAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         self.program_motion(&self.lock(), velocity, acceleration)?;
-        self.load_target(&format!("LR {}", nint(distance)))?;
+        self.lead_move(&format!("LR {}", nint(distance)))?;
         self.lock().write_cmd(self.node, "M")
     }
 
@@ -309,10 +311,8 @@ impl AsynMotor for FaulhaberAxis {
     ) -> AsynResult<()> {
         // C JOG: set speed, then enter velocity mode with the signed rate.
         let rpm = vel_to_rpm(velocity, self.counts_per_rev);
-        self.strings.split();
-        let ctrl = self.lock();
-        ctrl.write_cmd(self.node, &format!("SP {}", rpm.abs()))?;
-        ctrl.write_cmd(self.node, &format!("V {rpm}"))
+        self.lead_move(&format!("SP {}", rpm.abs()))?;
+        self.lock().write_cmd(self.node, &format!("V {rpm}"))
     }
 
     fn home(
@@ -329,10 +329,8 @@ impl AsynMotor for FaulhaberAxis {
         if !forward {
             rpm = -rpm;
         }
-        self.strings.split();
-        let ctrl = self.lock();
-        ctrl.write_cmd(self.node, &format!("HOSP{rpm}"))?;
-        ctrl.write_cmd(self.node, "GOHOSEQ")
+        self.lead_move(&format!("HOSP{rpm}"))?;
+        self.lock().write_cmd(self.node, "GOHOSEQ")
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -551,24 +549,23 @@ mod tests {
         assert_eq!(r.line.sent(), ["1EN LR -5", "1M"]);
     }
 
-    /// devMCDC2805.cc:222-236 and 286-300: HOME and JOG strcpy their first
-    /// message over PREM, and their last message replaces the motion node
-    /// that held POST.
+    /// devMCDC2805.cc:222-236 and 286-300 lose PREM and POST on HOME and
+    /// JOG; rs sends both as for any other move.
     #[test]
-    fn split_moves_send_neither_prem_nor_post() {
+    fn home_and_jog_send_prem_and_post() {
         let mut r = Rig::new("mcdc_split");
         r.axis
             .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
             .unwrap();
         r.axis.home(&r.user, 0.0, 1000.0, 0.0, false).unwrap();
-        assert_eq!(r.line.sent(), ["1HOSP-60", "1GOHOSEQ"]);
-        assert!(r.poll_extra().is_empty());
+        assert_eq!(r.line.sent(), ["1EN HOSP-60", "1GOHOSEQ"]);
+        assert_eq!(r.poll_extra(), ["1DI"]);
         r.axis
             .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
             .unwrap();
         r.axis.move_velocity(&r.user, 0.0, 1000.0, 0.0).unwrap();
-        assert_eq!(r.line.sent(), ["1SP 60", "1V 60"]);
-        assert!(r.poll_extra().is_empty());
+        assert_eq!(r.line.sent(), ["1EN SP 60", "1V 60"]);
+        assert_eq!(r.poll_extra(), ["1DI"]);
     }
 
     /// drvMCDC2805.cc:360-366: POST once the move is done, not while it
