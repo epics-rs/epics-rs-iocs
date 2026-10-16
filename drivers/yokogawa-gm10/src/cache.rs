@@ -142,8 +142,9 @@ pub struct Cache {
     pub comm_info: Vec<ChannelInfo>,
     pub comm_data: Vec<ChannelData>,
 
-    pub constant: Vec<f64>,
-    pub varconstant: Vec<f64>,
+    /// `float` in C (`drvGM10.c:244-245`).
+    pub constant: Vec<f32>,
+    pub varconstant: Vec<f32>,
 
     pub modules: Vec<Module>,
 

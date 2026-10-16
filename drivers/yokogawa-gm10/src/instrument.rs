@@ -259,8 +259,8 @@ impl Instrument {
             ChannelFamily::Comm => {
                 scaled_value(cache.comm_data[idx].value, cache.comm_info[idx].scale)
             }
-            ChannelFamily::Const => cache.constant[idx],
-            ChannelFamily::VarConst => cache.varconstant[idx],
+            ChannelFamily::Const => f64::from(cache.constant[idx]),
+            ChannelFamily::VarConst => f64::from(cache.varconstant[idx]),
         }
     }
 
@@ -831,7 +831,7 @@ impl Actor {
             let mut cache = self.cache.lock();
             for line in &lines {
                 if let Some(slot) = cache.constant.get_mut(line.index) {
-                    *slot = line.value;
+                    *slot = line.value as f32;
                 }
             }
         }
@@ -845,7 +845,7 @@ impl Actor {
             let mut cache = self.cache.lock();
             for line in &lines {
                 if let Some(slot) = cache.varconstant.get_mut(line.index) {
-                    *slot = line.value;
+                    *slot = line.value as f32;
                 }
             }
         }
@@ -1087,6 +1087,21 @@ pub(crate) mod test_support {
         // C sizes meas_* at MAX_MEAS_CHAN = 1000, so address 1000 is stored.
         assert_eq!(cache.meas_type[999], ChannelType::InputAnalog);
         assert_eq!(cache.meas_info[999].scale, 1);
+    }
+
+    #[test]
+    fn constants_are_stored_as_c_float() {
+        let mut responses = default_init_responses();
+        responses[8] = ascii_frame(b"aaaaaaaa001,0.1\nE");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        device.join().unwrap();
+        assert_eq!(
+            instrument.analog_get(ChannelFamily::Const, 1),
+            f64::from(0.1f32)
+        );
     }
 
     #[test]
