@@ -58,20 +58,6 @@
 //!
 //! # Framework gaps (documented, not silently worked around)
 //!
-//! - **No process-exit hook for driver crates**: C registers
-//!   `capaNCDT6200Shutdown` via `epicsAtExit`, itself installed from an
-//!   `initHookRegister` callback firing at `initHookAfterIocRunning`
-//!   (`capaNCDT6200Sup.c:498-518`), so the reader thread's `for(;;)` checks a
-//!   shutdown flag at each blocking point and exits cleanly on IOC shutdown.
-//!   epics-base-rs 0.22.1 has a real `init_hook_register`/`InitHookState`
-//!   (`epics_base_rs::server::ioc_app::init_hooks`) but no atExit/process-exit
-//!   hook exposed to driver crates -- grepped exhaustively (`atexit`/`AtExit`/
-//!   `ctrlc`/`signal::`) across epics-base-rs and asyn-rs; the only hits are
-//!   `ioc_app.rs`'s own internal Ctrl-C/SIGTERM handling, not registrable by a
-//!   driver crate. [`reader_thread`] therefore has no graceful-shutdown gate
-//!   and runs until process exit (matching this workspace's
-//!   `scaler974::poll_loop` precedent, which also has no shutdown flag) --
-//!   but unlike C, the socket is never explicitly closed on IOC exit.
 //! - **`PortRuntimeHandle` must outlive `configure()`**: dropping the last
 //!   [`PortRuntimeHandle`] closes its internal shutdown channel and the
 //!   actor thread exits (empirically confirmed: a `PortHandle` clone
@@ -95,7 +81,8 @@
 //!   module's own [`configure`] and `iocs/microepsilon-ioc`'s
 //!   `CapaNCDT6200ConfigInit` both retain their runtimes correctly.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -111,7 +98,9 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::exit::at_exit;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::recgbl::alarm_status;
 use epics_rs::base::server::record::AlarmSeverity;
 
@@ -457,18 +446,44 @@ impl PortDriver for DataDriver {
     }
 }
 
-/// `capaNCDT6200LongWait` (`capaNCDT6200Sup.c:238-249`): C sleeps in ten
-/// 3-second increments (30s total), checking a shutdown flag each time. This
-/// port has no shutdown flag to check (see the module doc's process-exit-hook
-/// gap), so the ten increments collapse to one sleep of the same total
-/// duration.
-fn long_wait() {
-    println!("capaNCDT6200LongWait called.");
-    thread::sleep(Duration::from_secs(30));
+/// C `capaNCDT6200ShutdownRequest`, set by the atExit callback.
+static SHUTDOWN_REQUEST: AtomicBool = AtomicBool::new(false);
+
+fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUEST.load(Ordering::Relaxed)
 }
 
-/// `readerThread` (`capaNCDT6200Sup.c:254-462`). Runs until process exit (see
-/// the module doc's process-exit-hook gap).
+/// `capaNCDT6200ShutdownSetup` (`capaNCDT6200Sup.c:506-518`): the atExit
+/// callback is registered at `initHookAfterIocRunning`, after every
+/// configure, so it runs before the ports are torn down.
+fn shutdown_setup() {
+    static BEEN_HERE: Once = Once::new();
+    BEEN_HERE.call_once(|| {
+        let registered = AtomicBool::new(false);
+        init_hook_register(Arc::new(move |state| {
+            if state == InitHookState::AfterIocRunning && !registered.swap(true, Ordering::Relaxed)
+            {
+                at_exit("capaNCDT6200Shutdown", || {
+                    SHUTDOWN_REQUEST.store(true, Ordering::Relaxed)
+                });
+            }
+        }));
+    });
+}
+
+/// `capaNCDT6200LongWait` (`capaNCDT6200Sup.c:238-249`).
+fn long_wait() {
+    println!("capaNCDT6200LongWait called.");
+    for _ in 0..10 {
+        if shutdown_requested() {
+            return;
+        }
+        thread::sleep(Duration::from_secs(3));
+    }
+}
+
+/// `readerThread` (`capaNCDT6200Sup.c:254-462`). Returns once the IOC's
+/// atExit callbacks have asked it to.
 fn reader_thread(
     rbk_port_handle: PortHandle,
     shared: Arc<Mutex<SharedState>>,
@@ -511,6 +526,9 @@ fn reader_thread(
                     long_wait();
                 }
             }
+            if shutdown_requested() {
+                return;
+            }
         }
 
         // C resets `eopReached` only on an open port; otherwise it keeps the
@@ -535,6 +553,9 @@ fn reader_thread(
                 Duration::from_secs_f64(reader_state.read_timeout_secs),
             );
             let read_result = sync_handle.read_octet(TRANSPORT_REASON, want);
+            if shutdown_requested() {
+                return;
+            }
 
             let outcome = match read_result {
                 Ok(bytes) => {
@@ -566,6 +587,9 @@ fn reader_thread(
                     } else {
                         // C waits before it counts the failure (`:428`).
                         long_wait();
+                        if shutdown_requested() {
+                            return;
+                        }
                         ReadOutcome::ReadError
                     }
                 }
@@ -651,6 +675,7 @@ pub fn configure(
         return Ok(());
     }
     let tcp_port = resolve_tcp_port(ip_port)?;
+    shutdown_setup();
 
     let host = format!("{ip_address}:{tcp_port} TCP");
     let rbk_port_name = format!("{port_name}_RBK");
