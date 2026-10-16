@@ -23,7 +23,7 @@ pub struct McsState {
 
     /// Scan buffer for ulDaqInScan (f64 values).
     pub scan_buffer: Vec<f64>,
-    /// Per-counter MCS data [counter][point].
+    /// Per-counter MCS data `[counter][point]`.
     pub mcs_buffers: Vec<Vec<i32>>,
     /// Absolute time per point.
     pub abs_time_buffer: Vec<f64>,
