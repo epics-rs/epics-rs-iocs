@@ -1115,6 +1115,48 @@ pub const CH_STATUS_NORMAL: u8 = 1;
 pub const CH_STATUS_DIFF: u8 = 2;
 pub const CH_STATUS_UNKNOWN: u8 = 3;
 
+/// C `strtol(s, &end, 10)`: leading `isspace`, an optional sign, then
+/// decimal digits up to the first non-digit. Returns the value and the
+/// bytes consumed, `(0, 0)` when no digit follows.
+pub fn c_strtol(s: &[u8]) -> (i64, usize) {
+    let mut i = 0;
+    while i < s.len() && epics_rs::base::runtime::stdlib::c_isspace(s[i] as char) {
+        i += 1;
+    }
+    let negative = match s.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits = i;
+    let mut value: i64 = 0;
+    while let Some(d) = s.get(i).filter(|c| c.is_ascii_digit()) {
+        value = value.saturating_mul(10).saturating_add(i64::from(d - b'0'));
+        i += 1;
+    }
+    if i == digits {
+        return (0, 0);
+    }
+    (if negative { -value } else { value }, i)
+}
+
+/// C `atoi`, which glibc defines as `(int) strtol(s, NULL, 10)`.
+pub fn c_atoi(s: &[u8]) -> i32 {
+    c_strtol(s).0 as i32
+}
+
+/// C `address = atoi(...) - 1` as an array index. `None` where C indexes
+/// out of bounds (undefined behaviour), so that line is dropped.
+fn zero_based(n: i32) -> Option<usize> {
+    usize::try_from(i64::from(n) - 1).ok()
+}
+
 fn find_byte(payload: &[u8], from: usize, target: u8) -> Option<usize> {
     payload
         .get(from..)?
@@ -1140,29 +1182,22 @@ pub fn parse_fe1(payload: &[u8]) -> Option<Vec<ChannelInfoLine>> {
         let channel = &payload[p..p + 4];
         p += 4;
         let (family, index) = if channel[0] == b'A' {
-            let digits = std::str::from_utf8(&channel[1..4]).ok()?;
-            (
-                InfoFamily::Math,
-                digits.trim_start_matches('0').parse::<i64>().unwrap_or(0),
-            )
+            (InfoFamily::Math, zero_based(c_atoi(&channel[1..4])))
         } else {
-            let digits = std::str::from_utf8(channel).ok()?;
-            (
-                InfoFamily::Signal,
-                digits.trim_start_matches('0').parse::<i64>().unwrap_or(0),
-            )
+            (InfoFamily::Signal, zero_based(c_atoi(channel)))
         };
-        let index = (index - 1).max(0) as usize;
 
         if status == CH_STATUS_SKIP {
             let nl = find_byte(payload, p, b'\n')?;
-            out.push(ChannelInfoLine {
-                family,
-                index,
-                status,
-                unit: "----".to_string(),
-                scale: 0,
-            });
+            if let Some(index) = index {
+                out.push(ChannelInfoLine {
+                    family,
+                    index,
+                    status,
+                    unit: "----".to_string(),
+                    scale: 0,
+                });
+            }
             p = nl + 1;
             continue;
         }
@@ -1179,18 +1214,17 @@ pub fn parse_fe1(payload: &[u8]) -> Option<Vec<ChannelInfoLine>> {
         if scale_start + 3 > payload.len() {
             return None;
         }
-        let scale: u8 = std::str::from_utf8(&payload[scale_start..scale_start + 3])
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let scale = c_atoi(&payload[scale_start..scale_start + 3]) as u8;
 
-        out.push(ChannelInfoLine {
-            family,
-            index,
-            status,
-            unit,
-            scale,
-        });
+        if let Some(index) = index {
+            out.push(ChannelInfoLine {
+                family,
+                index,
+                status,
+                unit,
+                scale,
+            });
+        }
 
         let nl = find_byte(payload, scale_start + 3, b'\n')?;
         p = nl + 1;
@@ -1680,6 +1714,30 @@ mod tests {
         assert_eq!(lines[0].status, CH_STATUS_SKIP);
         assert_eq!(lines[0].unit, "----");
         assert_eq!(lines[0].scale, 0);
+    }
+
+    #[test]
+    fn c_strtol_matches_c() {
+        assert_eq!(c_strtol(b"0012x"), (12, 4));
+        assert_eq!(c_strtol(b" -3,"), (-3, 3));
+        assert_eq!(c_strtol(b"+7"), (7, 2));
+        assert_eq!(c_strtol(b"x1"), (0, 0));
+        assert_eq!(c_strtol(b"-"), (0, 0));
+        assert_eq!(c_atoi(b" 12 "), 12);
+    }
+
+    #[test]
+    fn fe1_channel_index_is_atoi() {
+        // atoi stops at the first non-digit; " 12" and "012x" both read 12.
+        let lines = parse_fe1(b"xxxxN  12DEGC ,003\nN A012DEGC ,0 3\nE").unwrap();
+        assert_eq!(lines[0].index, 11);
+        assert_eq!(lines[1].family, InfoFamily::Math);
+        assert_eq!(lines[1].index, 11);
+        assert_eq!(lines[1].scale, 0);
+        // Index 0 is C's out-of-bounds write; the line is dropped, not
+        // folded onto channel 1.
+        let lines = parse_fe1(b"xxxxN 0000DEGC ,003\nS A000\nE").unwrap();
+        assert!(lines.is_empty());
     }
 
     #[test]
