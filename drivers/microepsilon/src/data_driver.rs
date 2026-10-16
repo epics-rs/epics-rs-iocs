@@ -58,12 +58,6 @@
 //!
 //! # Framework gaps (documented, not silently worked around)
 //!
-//! - **No `interruptAccept` equivalent**: C's `processDataPacket` gates the
-//!   averaging/push tail on the global `extern volatile int interruptAccept`
-//!   (set once iocInit's scan pass completes). epics-base-rs/asyn-rs 0.22.1
-//!   expose no equivalent flag (grepped exhaustively for `interrupt_accept`/
-//!   `InterruptAccept` across both crates: zero matches). [`reader_thread`]
-//!   always passes `true` to [`packet::process_data_packet`].
 //! - **No process-exit hook for driver crates**: C registers
 //!   `capaNCDT6200Shutdown` via `epicsAtExit`, itself installed from an
 //!   `initHookRegister` callback firing at `initHookAfterIocRunning`
@@ -286,6 +280,8 @@ pub struct DataDriver {
     reader_started: bool,
     /// Taken by [`DataDriver::maybe_start_reader`] on first spawn.
     rbk_port_handle: Option<PortHandle>,
+    /// The database's `interruptAccept`, which `processDataPacket` waits on.
+    interrupt_accept: Arc<InterruptGate>,
 }
 
 impl DataDriver {
@@ -293,6 +289,7 @@ impl DataDriver {
         port_name: &str,
         rbk_port_handle: PortHandle,
         self_handle: Arc<Mutex<Option<PortHandle>>>,
+        interrupt_accept: Arc<InterruptGate>,
     ) -> AsynResult<Self> {
         // max_addr = 5 covers addr 0..=4: the disp channels (1-4) are the
         // only addresses ever run through the ParamList (`set_float64_param`/
@@ -316,6 +313,7 @@ impl DataDriver {
             self_handle,
             reader_started: false,
             rbk_port_handle: Some(rbk_port_handle),
+            interrupt_accept,
         })
     }
 
@@ -331,7 +329,10 @@ impl DataDriver {
         };
         let shared = self.shared.clone();
         let self_handle = self.self_handle.clone();
-        thread::spawn(move || reader_thread(rbk_port_handle, shared, self_handle));
+        let interrupt_accept = self.interrupt_accept.clone();
+        thread::spawn(move || {
+            reader_thread(rbk_port_handle, shared, self_handle, interrupt_accept)
+        });
     }
 
     /// [`PUSH_DISP_REASON`] handler: apply a reader-thread-staged
@@ -460,6 +461,7 @@ fn reader_thread(
     rbk_port_handle: PortHandle,
     shared: Arc<Mutex<SharedState>>,
     self_handle: Arc<Mutex<Option<PortHandle>>>,
+    interrupt_accept: Arc<InterruptGate>,
 ) {
     let initial_throttle = shared.lock().unwrap().pv_throttle;
     let mut reader_state = ReaderState::new(initial_throttle);
@@ -535,7 +537,7 @@ fn reader_thread(
                 outcome,
                 last_meas_value_counter,
                 last_chan_values,
-                true, // interruptAccept gap, see module doc
+                interrupt_accept.is_open(),
             );
             // C's counters and `measValueCounter` are the reader's own
             // fields, so `int32Read` sees every pass, processed or not.
@@ -610,7 +612,12 @@ pub fn configure(
     let rbk_port_handle = rbk_runtime.port_handle().clone();
 
     let self_handle: Arc<Mutex<Option<PortHandle>>> = Arc::new(Mutex::new(None));
-    let driver = DataDriver::new(port_name, rbk_port_handle, self_handle.clone())?;
+    let driver = DataDriver::new(
+        port_name,
+        rbk_port_handle,
+        self_handle.clone(),
+        owner.clone(),
+    )?;
     let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())?;
     *self_handle.lock().unwrap() = Some(runtime_handle.port_handle().clone());
 
@@ -722,8 +729,13 @@ mod tests {
         let (rbk_runtime, _jh) =
             create_port_runtime(dummy, RuntimeConfig::default()).expect("rbk port runtime");
         let rbk_handle = rbk_runtime.port_handle().clone();
-        let driver =
-            DataDriver::new("test_data_port", rbk_handle, Arc::new(Mutex::new(None))).unwrap();
+        let driver = DataDriver::new(
+            "test_data_port",
+            rbk_handle,
+            Arc::new(Mutex::new(None)),
+            InterruptGate::new(),
+        )
+        .unwrap();
         (driver, rbk_runtime)
     }
 
