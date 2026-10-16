@@ -671,6 +671,14 @@ pub fn create_usb_ctr(
         .unwrap()
         .trace
         .bind(runtime_handle.port_handle().clone());
+    // C puts the pulse generators in a known state before its poller starts.
+    {
+        let st = state.lock().unwrap();
+        let dev = device.lock().unwrap();
+        for timer in 0..NUM_TIMERS as i32 {
+            let _ = pulse_gen::stop(&st.trace, &dev, timer);
+        }
+    }
     let poller_handle = poller::start_poller(
         runtime_handle.port_handle().clone(),
         params,
