@@ -431,24 +431,17 @@ impl AmptekDriver {
         }
         self.target = None;
         self.base.set_connected(false);
-        let _ = self.set_params_alarm(
-            AsynStatus::Error,
-            alarm_status::COMM_ALARM,
-            AlarmSeverity::Invalid as u16,
-        );
+        let _ = self.set_params_alarm(alarm_status::COMM_ALARM, AlarmSeverity::Invalid as u16);
     }
 
     /// `drvAmptek::setParamsAlarm` (`drvAmptek.cpp:237-248`): every MCA and
     /// Amptek param, at every SCA address, gets the same alarm status/
-    /// severity.
-    fn set_params_alarm(
-        &mut self,
-        status: AsynStatus,
-        alarm_status: u16,
-        alarm_severity: u16,
-    ) -> AsynResult<()> {
+    /// severity. C calls only `setParamAlarmStatus`/`setParamAlarmSeverity`,
+    /// so each param's asyn status is kept as it is.
+    fn set_params_alarm(&mut self, alarm_status: u16, alarm_severity: u16) -> AsynResult<()> {
         for addr in 0..MAX_SCAS as i32 {
             for &idx in self.mca.iter().chain(self.amptek.iter()) {
+                let (status, _, _) = self.base.get_param_status(idx, addr)?;
                 self.base
                     .set_param_status(idx, addr, status, alarm_status, alarm_severity)?;
             }
@@ -589,11 +582,7 @@ impl AmptekDriver {
             status::byte_version_to_string(self.last_status.fpga),
         )?;
 
-        self.set_params_alarm(
-            AsynStatus::Success,
-            alarm_status::NO_ALARM,
-            AlarmSeverity::NoAlarm as u16,
-        )?;
+        self.set_params_alarm(alarm_status::NO_ALARM, AlarmSeverity::NoAlarm as u16)?;
         Ok(())
     }
 
@@ -1340,6 +1329,29 @@ mod tests {
     fn new_accepts_ethernet_interface_type_and_starts_disconnected() {
         let driver = AmptekDriver::new("test4", 0, "192.168.0.1", false).unwrap();
         assert!(!driver.base.is_connected());
+    }
+
+    /// `setParamsAlarm` touches only the alarm fields (`drvAmptek.cpp:237-248`).
+    #[test]
+    fn disconnect_sets_comm_alarm_and_keeps_param_status() {
+        let mut driver = AmptekDriver::new("alarm1", 0, "192.168.0.1", false).unwrap();
+        let gain = driver.amptek[AmptekReason::Gain as usize];
+        driver
+            .base
+            .set_param_status(gain, 3, AsynStatus::Timeout, 0, 0)
+            .unwrap();
+        driver.base.set_connected(true);
+        driver.do_disconnect();
+
+        let invalid = AlarmSeverity::Invalid as u16;
+        assert_eq!(
+            driver.base.get_param_status(gain, 3).unwrap(),
+            (AsynStatus::Timeout, alarm_status::COMM_ALARM, invalid)
+        );
+        assert_eq!(
+            driver.base.get_param_status(gain, 0).unwrap(),
+            (AsynStatus::Success, alarm_status::COMM_ALARM, invalid)
+        );
     }
 
     #[test]
