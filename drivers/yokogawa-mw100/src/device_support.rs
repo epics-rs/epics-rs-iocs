@@ -978,7 +978,7 @@ mod tests {
 
     fn registry_with(name: &str, instrument: Arc<Instrument>) -> Arc<Registry> {
         let registry = Arc::new(Registry::new());
-        registry.insert(name.to_string(), instrument).unwrap();
+        registry.insert_connected(name, instrument);
         registry
     }
 

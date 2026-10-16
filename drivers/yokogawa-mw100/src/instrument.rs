@@ -13,9 +13,9 @@ use crate::link::ChannelFamily;
 use crate::wire::{self, RawResponse};
 use epics_rs::base::server::database::WriteDone;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io;
-use std::net::TcpStream;
+use std::net::{SocketAddr, SocketAddrV4, TcpStream};
 use std::sync::Arc;
 use std::sync::mpsc;
 
@@ -119,23 +119,21 @@ pub struct Instrument {
 }
 
 impl Instrument {
-    /// `init_mw100` (`drvMW100.c:1465-1561`): connect, read the unsolicited
-    /// post-connect `E0` greeting, negotiate binary byte order, then run the
-    /// fixed load sequence — modules must load first, everything else
-    /// indexes off it.
-    pub fn connect(address: &str) -> io::Result<Arc<Self>> {
-        let stream = TcpStream::connect((address, PORT))?;
-        Self::connect_stream(stream)
+    /// The connect half of `init_mw100` (`drvMW100.c:1523-1556`): connect,
+    /// read the unsolicited post-connect `E0` greeting, negotiate binary
+    /// byte order, then run the fixed load sequence into `cache`, which
+    /// keeps whatever loaded if a step fails.
+    fn connect(address: SocketAddr, cache: Arc<Mutex<Cache>>) -> io::Result<Arc<Self>> {
+        Self::connect_stream(TcpStream::connect(address)?, cache)
     }
 
     #[cfg(test)]
-    pub(crate) fn connect_to(addr: std::net::SocketAddr) -> io::Result<Arc<Self>> {
-        Self::connect_stream(TcpStream::connect(addr)?)
+    pub(crate) fn connect_to(addr: SocketAddr) -> io::Result<Arc<Self>> {
+        Self::connect(addr, Arc::default())
     }
 
-    fn connect_stream(stream: TcpStream) -> io::Result<Arc<Self>> {
+    fn connect_stream(stream: TcpStream, cache: Arc<Mutex<Cache>>) -> io::Result<Arc<Self>> {
         let peer_address = stream.peer_addr()?.ip().to_string();
-        let cache = Arc::new(Mutex::new(Cache::default()));
         let interrupts = Arc::new(Interrupts::default());
         let (tx, rx) = mpsc::channel::<Job>();
         let mut actor = Actor {
@@ -1014,31 +1012,91 @@ fn ch_status_to_wire(status: ChStatus) -> u8 {
     }
 }
 
-/// `mw100_connect` (`drvMW100.c:1628-1641`): a name-keyed registry populated
-/// by the `mw100Init` iocsh command.
+/// One `mw100Init` entry (C `struct queue_link` plus its `devqueue`).
+struct Device {
+    name: String,
+    /// `None` when the connect or load sequence failed.
+    instrument: Option<Arc<Instrument>>,
+}
+
+/// `mw100_queue_list` (`drvMW100.c:449`): every `mw100Init` device,
+/// newest first.
 #[derive(Default)]
 pub struct Registry {
-    instruments: Mutex<HashMap<String, Arc<Instrument>>>,
+    devices: Mutex<Vec<Device>>,
 }
 
 impl Registry {
     pub fn new() -> Self {
-        Self {
-            instruments: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
-    pub fn insert(&self, name: String, instrument: Arc<Instrument>) -> Result<(), &'static str> {
-        let mut instruments = self.instruments.lock();
-        if instruments.contains_key(&name) {
-            return Err("device already exists");
+    /// `init_mw100` (`drvMW100.c:1465-1561`), which reports nothing; `false`
+    /// is its `return 1`. A device whose connect or load fails stays listed
+    /// (it blocks the name and shows in the report, as in C) but resolves
+    /// no records: C binds them to a queue no thread serves, so they would
+    /// hang in PACT. A bad address registers nothing, where C leaves a
+    /// freed `devqueue` in the list (`drvMW100.c:1525-1529`).
+    pub fn init_mw100(&self, device: Option<&[u8]>, address: Option<&[u8]>) -> bool {
+        let Some(name) = device.filter(|d| valid_device_name(d)) else {
+            return false;
+        };
+        let name = String::from_utf8_lossy(name).into_owned();
+        if self.devices.lock().iter().any(|d| d.name == name) {
+            return false;
         }
-        instruments.insert(name, instrument);
-        Ok(())
+        let Some(address) = address.and_then(inet_aton) else {
+            return false;
+        };
+        self.devices.lock().insert(
+            0,
+            Device {
+                name: name.clone(),
+                instrument: None,
+            },
+        );
+        let Ok(instrument) =
+            Instrument::connect(SocketAddrV4::new(address, PORT).into(), Arc::default())
+        else {
+            return false;
+        };
+        let mut devices = self.devices.lock();
+        if let Some(entry) = devices.iter_mut().find(|d| d.name == name) {
+            entry.instrument = Some(instrument);
+        }
+        true
     }
 
+    /// `mw100_connect` (`drvMW100.c:1628-1641`).
     pub fn get(&self, name: &str) -> Option<Arc<Instrument>> {
-        self.instruments.lock().get(name).cloned()
+        self.devices
+            .lock()
+            .iter()
+            .find(|d| d.name == name)
+            .and_then(|d| d.instrument.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_connected(&self, name: &str, instrument: Arc<Instrument>) {
+        self.devices.lock().insert(
+            0,
+            Device {
+                name: name.to_string(),
+                instrument: Some(instrument),
+            },
+        );
+    }
+}
+
+/// `init_mw100`'s name check (`drvMW100.c:1477-1490`): a letter, then
+/// letters, digits or `_`.
+fn valid_device_name(name: &[u8]) -> bool {
+    match name.split_first() {
+        Some((first, rest)) => {
+            first.is_ascii_alphabetic()
+                && rest.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_')
+        }
+        None => false,
     }
 }
 
@@ -1358,5 +1416,57 @@ mod tests {
                 "CE0\r\n",
             ]
         );
+    }
+
+    #[test]
+    fn init_mw100_rejects_bad_names_and_addresses_without_registering() {
+        let registry = Registry::new();
+        for name in [
+            None,
+            Some(&b""[..]),
+            Some(b"1dau"),
+            Some(b"dau-1"),
+            Some(b"_dau"),
+        ] {
+            assert!(!registry.init_mw100(name, Some(b"127.0.0.1")));
+        }
+        assert!(!registry.init_mw100(Some(b"dau1"), None));
+        assert!(!registry.init_mw100(Some(b"dau1"), Some(b"localhost")));
+        assert!(registry.devices.lock().is_empty());
+    }
+
+    #[test]
+    fn init_mw100_duplicate_check_runs_before_connect() {
+        let registry = Registry::new();
+        registry.insert_connected("dau1", connect_default_fixture());
+        // Nothing listens at 192.0.2.1 (TEST-NET-1); a connect would hang.
+        assert!(!registry.init_mw100(Some(b"dau1"), Some(b"192.0.2.1")));
+        assert_eq!(registry.devices.lock().len(), 1);
+    }
+
+    #[test]
+    fn failed_init_stays_listed_but_resolves_nothing() {
+        // 127.0.0.2 so the fixed MW100 port does not clash with a real
+        // listener on 127.0.0.1.
+        let listener = TcpListener::bind(("127.0.0.2", PORT)).unwrap();
+        // E0 greeting, BO1, CF0, then EOF during the IS0 status load.
+        let device = spawn_fake_device(
+            listener,
+            vec![b"E0\r\n".to_vec(), cf0_one_input_analog_module()],
+        );
+        let registry = Registry::new();
+        registry.insert_connected("first", connect_default_fixture());
+        assert!(!registry.init_mw100(Some(b"dau2"), Some(b"127.0.0.2")));
+        device.join().unwrap();
+
+        assert!(registry.get("dau2").is_none());
+        assert!(!registry.init_mw100(Some(b"dau2"), Some(b"192.0.2.1")));
+        let names: Vec<_> = registry
+            .devices
+            .lock()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(names, ["dau2", "first"]);
     }
 }

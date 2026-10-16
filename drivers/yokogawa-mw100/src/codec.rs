@@ -1120,6 +1120,63 @@ pub fn c_strtol(s: &[u8]) -> (i64, usize) {
     (if negative { -value } else { value }, i)
 }
 
+/// glibc `inet_aton`: one to four `.`-separated `strtoul(.., 0)` numbers
+/// (decimal, `0` octal, `0x` hex), the last filling the remaining bytes;
+/// the address may end at a whitespace byte.
+pub fn inet_aton(s: &[u8]) -> Option<std::net::Ipv4Addr> {
+    let mut parts = [0u32; 3];
+    let mut n = 0;
+    let mut i = 0;
+    let last = loop {
+        if !s.get(i).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        let (value, len) = strtoul_base0(&s[i..])?;
+        i += len;
+        if s.get(i) != Some(&b'.') {
+            break value;
+        }
+        if n > 2 || value > 0xff {
+            return None;
+        }
+        parts[n] = value as u32;
+        n += 1;
+        i += 1;
+    };
+    if s.get(i)
+        .is_some_and(|&c| !epics_rs::base::runtime::stdlib::c_isspace(c as char))
+    {
+        return None;
+    }
+    if last > [0xffff_ffff, 0xff_ffff, 0xffff, 0xff][n] {
+        return None;
+    }
+    let mut address = last as u32;
+    for (k, part) in parts[..n].iter().enumerate() {
+        address |= part << (24 - 8 * k);
+    }
+    Some(address.into())
+}
+
+/// `strtoul(s, &end, 0)` on a string that starts with a digit: the value
+/// and the digits consumed, `None` on `ERANGE`.
+fn strtoul_base0(s: &[u8]) -> Option<(u64, usize)> {
+    let (radix, start) = match s {
+        [b'0', b'x' | b'X', c, ..] if c.is_ascii_hexdigit() => (16, 2),
+        [b'0', ..] => (8, 0),
+        _ => (10, 0),
+    };
+    let mut value: u64 = 0;
+    let mut i = start;
+    while let Some(d) = s.get(i).and_then(|&c| (c as char).to_digit(radix)) {
+        value = value
+            .checked_mul(u64::from(radix))?
+            .checked_add(u64::from(d))?;
+        i += 1;
+    }
+    Some((value, i))
+}
+
 /// C `atoi`, which glibc defines as `(int) strtol(s, NULL, 10)`.
 pub fn c_atoi(s: &[u8]) -> i32 {
     c_strtol(s).0 as i32
@@ -1555,6 +1612,45 @@ mod tests {
         assert_eq!(cmd_ex_set(0).unwrap(), "EX0\r\n");
         assert_eq!(cmd_ex_set(4), None);
         assert_eq!(cmd_ex_set(-1), None);
+    }
+
+    #[test]
+    fn inet_aton_matches_glibc() {
+        // Expected values recorded from glibc inet_aton.
+        let cases: &[(&str, Option<&str>)] = &[
+            ("192.168.1.10", Some("192.168.1.10")),
+            ("4294967295", Some("255.255.255.255")),
+            ("4294967296", None),
+            ("18446744073709551616", None),
+            ("10.1", Some("10.0.0.1")),
+            ("0x0a.0.0.1", Some("10.0.0.1")),
+            ("012.0.0.1", Some("10.0.0.1")),
+            ("08.0.0.1", None),
+            ("1.2.3.4 junk", Some("1.2.3.4")),
+            ("1.2.3.4\tx", Some("1.2.3.4")),
+            ("1.2.3.4x", None),
+            ("1.2.3.256", None),
+            ("1.2.65535", Some("1.2.255.255")),
+            ("1.2.65536", None),
+            ("1.2.3.4.5", None),
+            ("", None),
+            (" 1.2.3.4", None),
+            ("1..2", None),
+            ("0x", None),
+            ("0x.1", None),
+            ("1.2.3.", None),
+            ("+1.2.3.4", None),
+            ("0xffffffff", Some("255.255.255.255")),
+            ("1.0xffffff", Some("1.255.255.255")),
+            ("localhost", None),
+        ];
+        for &(input, want) in cases {
+            assert_eq!(
+                inet_aton(input.as_bytes()).map(|a| a.to_string()),
+                want.map(str::to_string),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

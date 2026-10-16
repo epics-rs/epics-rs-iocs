@@ -4,9 +4,9 @@
 //! 34318), not Modbus — so this IOC wires a dynamic `DeviceSupport` factory
 //! (`yokogawa_mw100::device_support::factory`) instead of an asyn port. The
 //! `mw100Init` startup command mirrors the C `mw100Init(netDevice, address)`
-//! iocsh command: it connects, then registers the resulting `Instrument`
-//! under `netDevice` in a shared name-keyed `Registry` that every record's
-//! `@netDevice CMD:ADDRESS` link resolves against at `iocInit`.
+//! iocsh command: it registers `netDevice` in the shared `Registry` and
+//! connects it; every record's `@netDevice CMD:ADDRESS` link resolves
+//! against that registry at `iocInit`.
 //!
 //! Usage:
 //!   cargo run -p yokogawa-mw100-ioc -- st.cmd
@@ -18,7 +18,7 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use yokogawa_mw100::device_support;
-use yokogawa_mw100::instrument::{Instrument, Registry};
+use yokogawa_mw100::instrument::Registry;
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -31,6 +31,7 @@ async fn main() -> CaResult<()> {
     };
 
     let registry = Arc::new(Registry::new());
+    let init_registry = registry.clone();
 
     epics_rs::base::runtime::env::set_default("MW100", env!("CARGO_MANIFEST_DIR"));
 
@@ -51,20 +52,12 @@ async fn main() -> CaResult<()> {
         ],
         "mw100Init netDevice address",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let net_device = match &args[0] {
-                ArgValue::String(s) => s.to_str()?.to_owned(),
-                _ => return Err("netDevice required".into()),
+            // A NULL `sval` for an absent argument; C ignores the result.
+            let arg = |v: &ArgValue| match v {
+                ArgValue::String(s) => Some(s.as_bytes().to_vec()),
+                _ => None,
             };
-            let address = match &args[1] {
-                ArgValue::String(s) => s.to_str()?.to_owned(),
-                _ => return Err("address required".into()),
-            };
-
-            let instrument = Instrument::connect(&address)
-                .map_err(|e| format!("mw100Init: connect to {address} failed: {e}"))?;
-            registry
-                .insert(net_device.clone(), instrument)
-                .map_err(|e| format!("mw100Init: {net_device}: {e}"))?;
+            init_registry.init_mw100(arg(&args[0]).as_deref(), arg(&args[1]).as_deref());
             Ok(CommandOutcome::Continue)
         },
     ));
