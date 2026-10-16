@@ -501,7 +501,7 @@ impl PortDriver for AhxxxDriver {
     }
 
     /// C++ `drvAHxxx::report`, which ends in the base report.
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
             out,
             "drvAHxxx: port={}, IP port={}, firmware version={}",

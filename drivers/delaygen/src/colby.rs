@@ -236,7 +236,7 @@ impl PortDriver for ColbyDriver {
     }
 
     /// C `report()`: `fprintf(fp,"    %s units %s\n",pport->ident,pport->units);`.
-    fn report(&self, out: &mut dyn std::fmt::Write, _level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, _level: i32) {
         let _ = writeln!(out, "    {} units {}", self.ident, self.units);
     }
 

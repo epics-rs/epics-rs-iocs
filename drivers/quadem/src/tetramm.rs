@@ -507,7 +507,7 @@ impl PortDriver for TetrAmmDriver {
     }
 
     /// C++ `drvTetrAMM::report` at details 0.
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
             out,
             "drvTetrAMM: port={}, IP port={}, firmware version={}, numResync={}",
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn report_prints_cs_line_then_the_base_report() {
-        let drv = driver_on("QE_TETRA_REPORT", "127.0.0.1:1");
+        let mut drv = driver_on("QE_TETRA_REPORT", "127.0.0.1:1");
         drv.num_resync.fetch_add(3, Ordering::Relaxed);
         let mut out = String::new();
         drv.report(&mut out, 0);

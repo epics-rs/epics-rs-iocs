@@ -286,7 +286,7 @@ impl PortDriver for Fx4Driver {
     }
 
     /// C++ `drvFX4::report`, which ends in the base report.
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
             out,
             "drvFX4: port={} connected={}",

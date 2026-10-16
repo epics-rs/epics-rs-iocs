@@ -477,7 +477,7 @@ impl PortDriver for NslsEmDriver {
     }
 
     /// C++ `drvNSLS_EM::report`, which ends in the base report.
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(out, "drvNSLS_EM: port={}", self.base.port_base.port_name);
         if level > 0 {
             let scale_factor = self.state.lock().scale_factor;
@@ -725,7 +725,7 @@ mod tests {
         )
         .unwrap();
         std::mem::forget(runtime);
-        let drv = NslsEmDriver {
+        let mut drv = NslsEmDriver {
             base: QuadEmBase::new("QE_NSLS_REPORT", 0).unwrap(),
             command: Some(command),
             shared: QuadEmShared::new(16).0,

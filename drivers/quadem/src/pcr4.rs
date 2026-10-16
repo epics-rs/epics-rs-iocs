@@ -502,7 +502,7 @@ impl PortDriver for Pcr4Driver {
 
     /// C++ `drvPCR4::report` at details 0. `numResync_` is never incremented
     /// by C++ (drvPCR4.cpp:78 is its only store), so it prints 0.
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
             out,
             "drvPCR4: port={}, IP port={}, firmware version={}, numResync=0",
