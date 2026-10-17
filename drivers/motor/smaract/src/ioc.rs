@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::trace::MotorTrace;
@@ -23,7 +24,7 @@ use motor_common::model1::c_int;
 use motor_common::{Controller, asyn_user, register_port, register_port_with};
 
 use crate::mcs::{self, McsAxis, McsController};
-use crate::mcs2::{self, Mcs2Axis, Mcs2AxisReport, Mcs2Controller, Mcs2Params};
+use crate::mcs2::{self, Mcs2Axis, Mcs2AxisReport, Mcs2Controller, Mcs2Params, Mcs2Reasons};
 use crate::scu::{ScuAxis, ScuController};
 
 /// Command timeout (C `DEFAULT_CONTROLLER_TIMEOUT` = 2.0 s).
@@ -67,10 +68,9 @@ pub fn mcs2_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
             let unused_mask = c_int(args, 5);
 
-            let params = Mcs2Params {
-                moving_poll: moving_poll_ms as f64 / 1000.0,
-                idle_poll: idle_poll_ms as f64 / 1000.0,
-            };
+            let params =
+                Mcs2Params::new(moving_poll_ms as f64 / 1000.0, idle_poll_ms as f64 / 1000.0);
+            let slot = params.controller_slot();
             register_port_with(ctx, &port_name, num_axes, params)?;
             let (handle, _) = connect_controller(
                 &mcs2_port,
@@ -81,10 +81,15 @@ pub fn mcs2_create_controller_command() -> CommandDef {
                 ),
             );
             set_eos_ignored(&handle, mcs2::INPUT_EOS, mcs2::OUTPUT_EOS);
-            let controller = Arc::new(Mutex::new(Mcs2Controller::new(
-                handle,
-                &MotorTrace::new(&port_name, 0),
-            )));
+            let mut controller = Mcs2Controller::new(handle, &MotorTrace::new(&port_name, 0));
+            let port = PortManager::global()
+                .find_port_handle(&port_name)
+                .map_err(|e| format!("MCS2CreateController: {e}"))?;
+            let reasons =
+                Mcs2Reasons::lookup(&port).map_err(|e| format!("MCS2CreateController: {e}"))?;
+            controller.post_params_to(port, reasons);
+            let controller = Arc::new(Mutex::new(controller));
+            let _ = slot.set(controller.clone());
             let poller = Controller::new();
             for axis in 0..num_axes {
                 if unused_mask & (1 << axis) != 0 {
