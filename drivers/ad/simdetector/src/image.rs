@@ -338,11 +338,18 @@ macro_rules! sim_buffers {
                 let zeroed = || match data_type {
                     $(NDDataType::$dt => NDDataBuffer::$buf(vec![<$t as SimPixel>::ZERO; n])),*
                 };
+                // C allocates each with a NULL pData (simDetector.cpp:631-638),
+                // so each is held to the pool's limit; `wrap` is not.
+                let alloc = || -> ADResult<DriverArray> {
+                    let mut a = pool.alloc(dims.to_vec(), data_type)?;
+                    a.data = zeroed();
+                    Ok(a)
+                };
                 Ok(Self {
-                    raw: pool.wrap(dims.to_vec(), zeroed())?,
-                    background: pool.wrap(dims.to_vec(), zeroed())?,
-                    ramp: pool.wrap(dims.to_vec(), zeroed())?,
-                    peak: pool.wrap(dims.to_vec(), zeroed())?,
+                    raw: alloc()?,
+                    background: alloc()?,
+                    ramp: alloc()?,
+                    peak: alloc()?,
                 })
             }
 
