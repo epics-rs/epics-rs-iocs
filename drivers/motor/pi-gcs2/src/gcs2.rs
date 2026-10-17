@@ -982,9 +982,14 @@ impl PIGCS2Controller {
     /// `RON {axis} 0` / `POS {axis} {position}` / `RON {axis} 1`, one
     /// `ERR? == 0` after all three (C `setAxisPosition`).
     fn set_axis_position(&self, axis: &str, position: f64) -> AsynResult<()> {
-        self.send_only(&format!("RON {axis} 0"))?;
-        self.send_only(&format!("POS {axis} {}", CFloat(position)))?;
-        self.send_only(&format!("RON {axis} 1"))?;
+        let pos = format!("POS {axis} {}", CFloat(position));
+        for cmd in [&format!("RON {axis} 0"), &pos, &format!("RON {axis} 1")] {
+            self.send_only(cmd)?;
+            self.trace(
+                TraceMask::FLOW,
+                format_args!("PIGCSController::setAxisPosition() sent \"{cmd}\"\n"),
+            );
+        }
         self.check(0, |err| {
             format!("PIGCSController::setAxisPosition() failed, GCS error {err}\n")
         })
@@ -2035,9 +2040,17 @@ impl AsynMotor for PIGCS2Axis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         self.log_here();
-        let result = self
-            .lock()
-            .set_axis_position(&self.axis_name, position / self.cpu);
+        let ctrl = self.lock();
+        // C setAxisPositionCts.
+        ctrl.trace(
+            TraceMask::FLOW,
+            format_args!(
+                "PIGCSController::setAxisPositionCts(, {}) \n",
+                CFloat(position)
+            ),
+        );
+        let result = ctrl.set_axis_position(&self.axis_name, position / self.cpu);
+        drop(ctrl);
         self.flow(format_args!(
             "PIasynAxis:setPositionAxis: Set driver {}, axis {} set position to {} - status={}\n",
             self.port_name,
@@ -3148,6 +3161,35 @@ mod tests {
         // ERR? 0 after HLT is haltAxis's failure: it wants 10.
         axis.stop(&user, 0.0).unwrap();
         assert_eq!(sent_lines(&line), ["HLT 1", "ERR?"]);
+    }
+
+    /// `PIGCSController::setAxisPositionCts` and `setAxisPosition`'s FLOW
+    /// lines (PIGCSController.cpp:185-217), one per command sent.
+    #[test]
+    fn a_set_position_prints_c_flow_lines() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2SetPosFlowLine", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2SetPosFlowLine")));
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2SetPosFlow");
+        let printed = traced_mask("gcs2SetPosFlow", TraceMask::FLOW, || {
+            axis.set_position(&AsynUser::new(0), 7.0).unwrap();
+        });
+        let lines: Vec<_> = printed
+            .lines()
+            .filter_map(|l| l.split_once(" PIGCSController::"))
+            .map(|(_, rest)| rest)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "setAxisPositionCts(, 7.000000) ",
+                "setAxisPosition() sent \"RON 1 0\"",
+                "setAxisPosition() sent \"POS 1 7.000000\"",
+                "setAxisPosition() sent \"RON 1 1\"",
+            ],
+            "{printed}"
+        );
     }
 
     /// `PI_CS_TARGETMODE` (PIasynController.cpp:320-324, 587) picks the
