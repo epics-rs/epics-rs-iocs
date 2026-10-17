@@ -2319,7 +2319,8 @@ impl PortDriver for TimePix3Driver {
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let reason = user.reason;
-        let addr = user.addr;
+        // ADTimePix.cpp:424-425.
+        let addr = self.ad.port_base.parse_user(user)?;
         let p = self.p;
         // C stores a base-class string without chaining to
         // asynNDArrayDriver::writeOctet (ADTimePix.cpp:443-444), so
@@ -4063,6 +4064,25 @@ mod tests {
             let _ = det.write_int32(&mut AsynUser::new(reason).with_addr(3), 7);
             assert_eq!(det.int(reason, 0), 0, "reason {reason}");
         }
+    }
+
+    /// An octet write past maxAddr fails in parseAsynUser with asynError,
+    /// before the store (ADTimePix.cpp:424-425).
+    #[test]
+    fn an_octet_write_past_max_addr_is_asyn_error() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_OCTET_ADDR",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let e = det
+            .write_octet(&mut AsynUser::new(det.p.write_msg).with_addr(20), b"x")
+            .unwrap_err();
+        assert_eq!(e.c_status_code(), 3);
     }
 
     /// The upload runs, and its status is the write's, even where the
