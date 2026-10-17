@@ -12,9 +12,14 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
+use epics_rs::motor::controller_port::ParamWrite;
 
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -76,6 +81,41 @@ impl ControllerParams for ControllerLine {
             CFloat(self.idle_poll_s)
         );
         ctx.report(out, level);
+    }
+}
+
+/// SMChydraController's port: its line, and `SMCHYDRA_REGULATOR_MODE`
+/// (SMChydraDriver.cpp:47), whose writes set the mode the axis's
+/// `setClosedLoop` sends (SMChydraAxis.cpp:205-209).
+struct HydraParams {
+    line: ControllerLine,
+    regulator_mode: Option<usize>,
+    modes: Vec<Arc<AtomicI32>>,
+}
+
+impl ControllerParams for HydraParams {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.regulator_mode = Some(base.create_param("SMCHYDRA_REGULATOR_MODE", ParamType::Int32)?);
+        Ok(())
+    }
+
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> ParamWrite {
+        if Some(user.reason) == self.regulator_mode {
+            let addr = base.get_address(user.addr, user.reason);
+            if let Some(mode) = addr.ok().and_then(|a| self.modes.get(a as usize)) {
+                mode.store(value, Ordering::Relaxed);
+            }
+        }
+        ParamWrite::PassToBase(Ok(()))
+    }
+
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        self.line.report(ctx, out, level);
     }
 }
 
@@ -256,12 +296,13 @@ pub fn hydra_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port_with(
-                ctx,
-                &port_name,
-                num_axes as i32,
-                ControllerLine::new("SMC hydra", moving_poll_ms, idle_poll_ms),
-            )?;
+            let modes: Vec<Arc<AtomicI32>> = (0..num_axes).map(|_| Arc::default()).collect();
+            let params = HydraParams {
+                line: ControllerLine::new("SMC hydra", moving_poll_ms, idle_poll_ms),
+                regulator_mode: None,
+                modes: modes.clone(),
+            };
+            register_port_with(ctx, &port_name, num_axes as i32, params)?;
 
             let (handle, _) = connect_controller(
                 &hydra_port,
@@ -275,8 +316,8 @@ pub fn hydra_create_controller_command() -> CommandDef {
 
             // C startPoller, SMChydraDriver.cpp:60
             let poller = Controller::new();
-            for index in 0..num_axes as usize {
-                let axis = HydraAxis::new(controller.clone(), index);
+            for (index, mode) in modes.into_iter().enumerate() {
+                let axis = HydraAxis::new(controller.clone(), index, mode);
                 let report = axis.members();
                 let ax = Arc::new(Mutex::new(axis));
                 register_resolution_axis(&port_name, ax.clone());
@@ -638,5 +679,46 @@ mod report {
             ),
             "{text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod regulator_mode {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::sync_io::SyncIOHandle;
+    use epics_rs::motor::controller_port::index;
+    use motor_common::testing::{LineRig, run_command};
+
+    /// SMChydraAxis.cpp:205-209: `setClosedLoop` sends the axis's
+    /// `SMCHYDRA_REGULATOR_MODE`, which SMChydraAxis.db's RegulatorMode
+    /// record writes.
+    #[epics_rs::base::epics_test]
+    async fn setcloop_sends_the_axis_s_regulator_mode() {
+        let (line, _io) = LineRig::new("hydraRegLine", |_| "1".into());
+        let args = vec![
+            ArgValue::String("hydraReg".into()),
+            ArgValue::String("hydraRegLine".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ];
+        run_command(hydra_create_controller_command(), args).await;
+        let port = PortManager::global().find_port_handle("hydraReg").unwrap();
+        let io = SyncIOHandle::from_handle(port, 1, Duration::from_secs(1));
+        let mode = io.drv_user_create("SMCHYDRA_REGULATOR_MODE").unwrap();
+        io.write_int32(mode, 2).unwrap();
+        line.sent();
+        io.write_int32(index::CLOSED_LOOP, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut sent = Vec::new();
+        while !sent.iter().any(|s: &String| s.ends_with("setcloop")) {
+            assert!(Instant::now() < deadline, "{sent:?}");
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+            sent.extend(line.sent());
+        }
+        assert!(sent.iter().any(|s| s == "2 2 setcloop"), "{sent:?}");
     }
 }
