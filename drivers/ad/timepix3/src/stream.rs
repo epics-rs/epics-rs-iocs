@@ -4,9 +4,9 @@
 //! Serval's `jsonimage` / `jsonhisto` channels are a *raw TCP byte stream* (not
 //! HTTP): for every frame it writes one line of ASCII JSON terminated by `\n`,
 //! immediately followed by `width*height*bytesPerPixel` (or `binSize*4`) bytes
-//! of **big-endian** payload. There is no trailer and no length prefix outside
-//! the header, so a decoder that miscounts consumed bytes by even one desyncs
-//! the stream permanently.
+//! of **big-endian** payload, then a `\n` terminator. There is no length
+//! prefix outside the header, so a decoder that miscounts consumed bytes by
+//! even one desyncs the stream permanently.
 
 use serde_json::Value;
 
@@ -246,38 +246,167 @@ pub enum Frame {
     Histogram(HistogramFrame),
 }
 
-/// A header the decoder cannot get past. The frame is unrecoverable: the
-/// payload length is unknown, so the stream has to be torn down rather than
-/// guessed past. Each variant is one of C's error prints.
-#[derive(Debug, PartialEq, Eq)]
-pub enum DecodeError {
-    /// No newline within `MAX_HEADER` bytes.
-    NoNewline,
-    /// The header line is not JSON.
-    Json(String),
-    /// C `validateJsonImageHeader` refused the image header.
-    Image(ImageHeaderError),
-    /// Histogram bin count out of range.
-    BinSize(i64),
+/// C `FrameResult` (serval_stream_framing.h): the ways `append` / `next`
+/// refuse the stream. Each ends the worker's run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameError {
+    /// The payload-size resolver refused the header; its message.
+    InvalidHeader(String),
+    InvalidTrailer,
+    HeaderTooLarge,
+    PayloadTooLarge,
+    BufferLimitExceeded,
 }
 
-impl std::fmt::Display for DecodeError {
+impl std::fmt::Display for FrameError {
+    /// C `frameResultMessage`, then `": "` and the resolver's message when
+    /// there is one (serval_stream.cpp:607-610).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoNewline => write!(f, "no newline in the header"),
-            Self::Json(e) => write!(f, "header is not JSON: {e}"),
-            Self::Image(e) => write!(f, "{e}"),
-            Self::BinSize(n) => write!(f, "binSize {n}"),
+            Self::InvalidHeader(e) if e.is_empty() => f.write_str("invalid JSON frame header"),
+            Self::InvalidHeader(e) => write!(f, "invalid JSON frame header: {e}"),
+            Self::InvalidTrailer => f.write_str("invalid or missing frame payload terminator"),
+            Self::HeaderTooLarge => f.write_str("frame header exceeds the configured limit"),
+            Self::PayloadTooLarge => f.write_str("frame payload exceeds the configured limit"),
+            Self::BufferLimitExceeded => f.write_str("stream buffer exceeds the configured limit"),
         }
     }
 }
 
-impl std::error::Error for DecodeError {}
+/// C `EndOfStreamStatus`: where the bytes buffered at EOF stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndOfStream {
+    Clean,
+    TruncatedHeader,
+    TruncatedPayload,
+    TruncatedTrailer,
+}
 
-/// C's bin-count guard (histogram_io.cpp:245).
+impl EndOfStream {
+    /// C `endOfStreamStatusMessage`.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Clean => "clean frame boundary",
+            Self::TruncatedHeader => "truncated frame header",
+            Self::TruncatedPayload => "truncated frame payload",
+            Self::TruncatedTrailer => "truncated frame payload terminator",
+        }
+    }
+}
+
+/// C `MAX_BUFFER_SIZE` (ADTimePix.h:415): the header and trailing-byte
+/// limits of every stream's `FrameBuffer`.
+const MAX_BUFFER_SIZE: usize = 32768;
+/// C `maxHistogramBins` (histogram_io.cpp:973).
 const MAX_BINS: usize = 1_000_000;
-/// A header line longer than this is not a header; the connection is desynced.
-const MAX_HEADER: usize = 64 * 1024;
+
+/// A header the resolver accepted and the payload it declared.
+struct Resolved<T> {
+    header_bytes: usize,
+    payload_bytes: usize,
+    header: T,
+}
+
+/// C `ADTimePix3Stream::FrameBuffer` (serval_stream_framing.cpp): a header
+/// line, its declared payload and a `\n` terminator, consumed together. The
+/// resolver runs once per header and no payload byte is searched for a
+/// delimiter.
+pub struct FrameBuffer<T> {
+    max_header: usize,
+    max_payload: usize,
+    max_buffered: usize,
+    bytes: Vec<u8>,
+    current: Option<Resolved<T>>,
+}
+
+impl<T> FrameBuffer<T> {
+    pub fn new(max_header: usize, max_payload: usize, max_trailing: usize) -> Self {
+        Self {
+            max_header,
+            max_payload,
+            max_buffered: max_header
+                .saturating_add(max_payload)
+                .saturating_add(max_trailing)
+                .saturating_add(2),
+            bytes: Vec::new(),
+            current: None,
+        }
+    }
+
+    pub fn append(&mut self, data: &[u8]) -> Result<(), FrameError> {
+        if self.bytes.len() > self.max_buffered || data.len() > self.max_buffered - self.bytes.len()
+        {
+            return Err(FrameError::BufferLimitExceeded);
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// The next frame's resolved header and payload, `None` until it is
+    /// complete. `resolve` sees the header line without its `\r\n` and
+    /// returns the payload size.
+    pub fn next(
+        &mut self,
+        resolve: impl FnOnce(&[u8]) -> Result<(usize, T), String>,
+    ) -> Result<Option<(T, Vec<u8>)>, FrameError> {
+        if self.current.is_none() {
+            let Some(newline) = self.bytes.iter().position(|&b| b == b'\n') else {
+                return if self.bytes.len() > self.max_header {
+                    Err(FrameError::HeaderTooLarge)
+                } else {
+                    Ok(None)
+                };
+            };
+            if newline > self.max_header {
+                return Err(FrameError::HeaderTooLarge);
+            }
+            let text = match self.bytes[..newline] {
+                [ref head @ .., b'\r'] => head,
+                ref line => line,
+            };
+            let (payload_bytes, header) = resolve(text).map_err(FrameError::InvalidHeader)?;
+            if payload_bytes > self.max_payload {
+                return Err(FrameError::PayloadTooLarge);
+            }
+            self.current = Some(Resolved {
+                header_bytes: newline + 1,
+                payload_bytes,
+                header,
+            });
+        }
+        let Some(current) = &self.current else {
+            unreachable!("resolved above");
+        };
+        let body = current.header_bytes + current.payload_bytes;
+        if self.bytes.len() <= body {
+            return Ok(None);
+        }
+        if self.bytes[body] != b'\n' {
+            return Err(FrameError::InvalidTrailer);
+        }
+        let Some(current) = self.current.take() else {
+            unreachable!("checked above");
+        };
+        let payload = self.bytes[current.header_bytes..body].to_vec();
+        self.bytes.drain(..=body);
+        Ok(Some((current.header, payload)))
+    }
+
+    pub fn end_of_stream(&self) -> EndOfStream {
+        match &self.current {
+            _ if self.bytes.is_empty() => EndOfStream::Clean,
+            None => EndOfStream::TruncatedHeader,
+            Some(c) if self.bytes.len() < c.header_bytes + c.payload_bytes => {
+                EndOfStream::TruncatedPayload
+            }
+            Some(_) => EndOfStream::TruncatedTrailer,
+        }
+    }
+
+    pub fn buffered(&self) -> usize {
+        self.bytes.len()
+    }
+}
 
 /// Which channel a decoder is reading — the two share the framing but not the
 /// header schema.
@@ -287,18 +416,24 @@ pub enum Channel {
     Histogram,
 }
 
-/// An incremental frame decoder: push bytes, pull frames.
+/// A channel's `FrameBuffer` with its payload-size resolver: C
+/// `runJsonImageTcpWorker` (serval_stream.cpp:507-538) and
+/// `prvHstWorkerThread` (histogram_io.cpp:973-996).
 pub struct FrameDecoder {
     channel: Channel,
-    buf: Vec<u8>,
+    buffer: FrameBuffer<(Pending, Value)>,
     limits: ImageLimits,
 }
 
 impl FrameDecoder {
     pub fn new(channel: Channel) -> Self {
+        let max_payload = match channel {
+            Channel::Image => ImageLimits::detector(0, 0, 0).max_payload_bytes,
+            Channel::Histogram => MAX_BINS * 4,
+        };
         Self {
             channel,
-            buf: Vec::new(),
+            buffer: FrameBuffer::new(MAX_BUFFER_SIZE, max_payload, MAX_BUFFER_SIZE),
             limits: ImageLimits::detector(0, 0, 0),
         }
     }
@@ -309,47 +444,37 @@ impl FrameDecoder {
         self.limits = limits;
     }
 
-    pub fn push(&mut self, bytes: &[u8]) {
-        self.buf.extend_from_slice(bytes);
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), FrameError> {
+        self.buffer.append(bytes)
     }
 
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buffer.buffered()
+    }
+
+    pub fn end_of_stream(&self) -> EndOfStream {
+        self.buffer.end_of_stream()
     }
 
     /// The next complete frame, or `None` when more bytes are needed.
-    pub fn next_frame(&mut self) -> Result<Option<Frame>, DecodeError> {
-        let Some(newline) = self.buf.iter().position(|&b| b == b'\n') else {
-            if self.buf.len() > MAX_HEADER {
-                return Err(DecodeError::NoNewline);
-            }
-            return Ok(None);
-        };
-
-        // C skips leading bytes before the '{' (serval_stream.cpp:452); a line
-        // with no '{' at all is a keep-alive/blank line, not an error.
-        let line = &self.buf[..newline];
-        let Some(brace) = line.iter().position(|&b| b == b'{') else {
-            self.buf.drain(..=newline);
-            return self.next_frame();
-        };
-        let header: Value =
-            serde_json::from_slice(&line[brace..]).map_err(|e| DecodeError::Json(e.to_string()))?;
-
-        let (payload_len, frame) = match self.channel {
-            Channel::Image => image_header(&header, &self.limits)?,
-            Channel::Histogram => histogram_header(&header)?,
-        };
-
-        if self.buf.len() < newline + 1 + payload_len {
-            return Ok(None); // Header stays buffered; retry when more arrives.
-        }
-        let payload: Vec<u8> = self
-            .buf
-            .drain(..newline + 1 + payload_len)
-            .skip(newline + 1)
-            .collect();
-        Ok(Some(frame.finish(&payload, header)))
+    pub fn next_frame(&mut self) -> Result<Option<Frame>, FrameError> {
+        let (channel, limits) = (self.channel, &self.limits);
+        let resolved = self.buffer.next(|line| {
+            let header = serde_json::from_slice::<Value>(line)
+                .ok()
+                .filter(Value::is_object);
+            let (payload, pending) = match channel {
+                Channel::Image => {
+                    let header = header
+                        .as_ref()
+                        .ok_or("malformed or non-object jsonimage header")?;
+                    image_header(header, limits).map_err(|e| e.to_string())?
+                }
+                Channel::Histogram => histogram_header(header.as_ref())?,
+            };
+            Ok((payload, (pending, header.unwrap_or_default())))
+        })?;
+        Ok(resolved.map(|((pending, header), payload)| pending.finish(&payload, header)))
     }
 }
 
@@ -462,13 +587,16 @@ fn threshold_id(header: &Value) -> i32 {
         .map_or(0, |v| v as i32)
 }
 
-fn image_header(header: &Value, limits: &ImageLimits) -> Result<(usize, Pending), DecodeError> {
+fn image_header(
+    header: &Value,
+    limits: &ImageLimits,
+) -> Result<(usize, Pending), ImageHeaderError> {
     let ImageLayout {
         width,
         height,
         format,
         payload_bytes: payload,
-    } = validate_image_header(header, limits).map_err(DecodeError::Image)?;
+    } = validate_image_header(header, limits)?;
     Ok((
         payload,
         Pending::Image {
@@ -486,15 +614,21 @@ fn image_header(header: &Value, limits: &ImageLimits) -> Result<(usize, Pending)
     ))
 }
 
-fn histogram_header(header: &Value) -> Result<(usize, Pending), DecodeError> {
-    let bin_size = header_i64(header, "binSize", -1);
-    let Ok(bins) = usize::try_from(bin_size) else {
-        return Err(DecodeError::BinSize(bin_size));
+/// C `prvHstWorkerThread`'s payload-size resolver (histogram_io.cpp:978-995)
+/// over a header that parsed as an object, or `None`.
+fn histogram_header(header: Option<&Value>) -> Result<(usize, Pending), String> {
+    let Some((header, Value::Number(n))) = header.and_then(|h| Some((h, h.get("binSize")?))) else {
+        return Err("malformed jsonhisto header or invalid binSize".into());
     };
-    if bins == 0 || bins > MAX_BINS {
-        return Err(DecodeError::BinSize(bin_size));
+    if n.is_f64() {
+        return Err("malformed jsonhisto header or invalid binSize".into());
     }
-    let bin_size = bins;
+    // A u64 past i64::MAX is negative as C's `get<long long>`.
+    let bin_size = n
+        .as_i64()
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|&v| v > 0 && v <= MAX_BINS)
+        .ok_or("binSize is outside the supported range")?;
     Ok((
         bin_size * 4,
         Pending::Histogram {
@@ -542,13 +676,14 @@ mod tests {
         for p in pixels {
             out.extend_from_slice(&p.to_be_bytes());
         }
+        out.push(b'\n');
         out
     }
 
     #[test]
     fn a_whole_image_frame_decodes() {
         let mut d = FrameDecoder::new(Channel::Image);
-        d.push(&image_bytes(2, 2, 7, &[1, 2, 3, 0xbeef]));
+        d.push(&image_bytes(2, 2, 7, &[1, 2, 3, 0xbeef])).unwrap();
         let Some(Frame::Image(f)) = d.next_frame().unwrap() else {
             panic!("no frame")
         };
@@ -568,9 +703,9 @@ mod tests {
         let mut d = FrameDecoder::new(Channel::Image);
         for split in 1..bytes.len() {
             let mut d2 = FrameDecoder::new(Channel::Image);
-            d2.push(&bytes[..split]);
+            d2.push(&bytes[..split]).unwrap();
             assert_eq!(d2.next_frame().unwrap(), None, "split at {split}");
-            d2.push(&bytes[split..]);
+            d2.push(&bytes[split..]).unwrap();
             let Some(Frame::Image(f)) = d2.next_frame().unwrap() else {
                 panic!("split at {split}: no frame")
             };
@@ -578,7 +713,7 @@ mod tests {
         }
         // A byte at a time, too.
         for b in &bytes {
-            d.push(std::slice::from_ref(b));
+            d.push(std::slice::from_ref(b)).unwrap();
             let _ = d.next_frame().unwrap();
         }
         assert!(d.buffered() <= bytes.len());
@@ -592,7 +727,7 @@ mod tests {
         bytes.extend(image_bytes(2, 1, 2, &[0xcccc, 0xdddd]));
         bytes.extend(image_bytes(1, 1, 3, &[0x0a0a]));
         let mut d = FrameDecoder::new(Channel::Image);
-        d.push(&bytes);
+        d.push(&bytes).unwrap();
 
         let mut seen = Vec::new();
         while let Some(Frame::Image(f)) = d.next_frame().unwrap() {
@@ -616,7 +751,7 @@ mod tests {
         let mut bytes = image_bytes(1, 1, 1, &[0x0a0a]);
         bytes.extend(image_bytes(1, 1, 2, &[0x0001]));
         let mut d = FrameDecoder::new(Channel::Image);
-        d.push(&bytes);
+        d.push(&bytes).unwrap();
         let Some(Frame::Image(a)) = d.next_frame().unwrap() else {
             panic!()
         };
@@ -635,8 +770,9 @@ mod tests {
         bytes.push(b'\n');
         bytes.extend_from_slice(&0x0102_0304u32.to_be_bytes());
         bytes.extend_from_slice(&0xdead_beefu32.to_be_bytes());
+        bytes.push(b'\n');
         let mut d = FrameDecoder::new(Channel::Image);
-        d.push(&bytes);
+        d.push(&bytes).unwrap();
         let Some(Frame::Image(f)) = d.next_frame().unwrap() else {
             panic!()
         };
@@ -663,9 +799,9 @@ mod tests {
                 format!(r#"{{"width":1,"height":1,"pixelFormat":"uint16"{sep}{fields}}}"#)
                     .into_bytes();
             bytes.push(b'\n');
-            bytes.extend_from_slice(&[0, 7]);
+            bytes.extend_from_slice(&[0, 7, b'\n']);
             let mut d = FrameDecoder::new(Channel::Image);
-            d.push(&bytes);
+            d.push(&bytes).unwrap();
             let Some(Frame::Image(f)) = d.next_frame().unwrap() else {
                 panic!("{fields}")
             };
@@ -767,9 +903,9 @@ mod tests {
     #[test]
     fn uint8_pixels_decode_and_a_refused_header_is_an_error() {
         let mut bytes = br#"{"width":2,"height":1,"bitDepth":8}"#.to_vec();
-        bytes.extend_from_slice(b"\n\x07\xff");
+        bytes.extend_from_slice(b"\n\x07\xff\n");
         let mut d = FrameDecoder::new(Channel::Image);
-        d.push(&bytes);
+        d.push(&bytes).unwrap();
         let Some(Frame::Image(f)) = d.next_frame().unwrap() else {
             panic!()
         };
@@ -777,11 +913,13 @@ mod tests {
 
         let mut d = FrameDecoder::new(Channel::Image);
         d.set_image_limits(ImageLimits::detector(1, 1, 1));
-        d.push(br#"{"width":2,"height":1}"#);
-        d.push(b"\n");
+        d.push(br#"{"width":2,"height":1}"#).unwrap();
+        d.push(b"\n").unwrap();
         assert_eq!(
             d.next_frame(),
-            Err(DecodeError::Image(ImageHeaderError::InvalidDimension))
+            Err(FrameError::InvalidHeader(
+                ImageHeaderError::InvalidDimension.to_string()
+            ))
         );
     }
 
@@ -794,8 +932,9 @@ mod tests {
         for v in [1u32, 2, 0xffff_ffff] {
             bytes.extend_from_slice(&v.to_be_bytes());
         }
+        bytes.push(b'\n');
         let mut d = FrameDecoder::new(Channel::Histogram);
-        d.push(&bytes);
+        d.push(&bytes).unwrap();
         let Some(Frame::Histogram(h)) = d.next_frame().unwrap() else {
             panic!()
         };
@@ -821,7 +960,7 @@ mod tests {
             let mut bytes = header.to_vec();
             bytes.push(b'\n');
             let mut d = FrameDecoder::new(Channel::Image);
-            d.push(&bytes);
+            d.push(&bytes).unwrap();
             assert!(
                 d.next_frame().is_err(),
                 "{}",
@@ -829,32 +968,105 @@ mod tests {
             );
         }
         let mut d = FrameDecoder::new(Channel::Histogram);
-        d.push(b"{\"binSize\":0}\n");
+        d.push(b"{\"binSize\":0}\n").unwrap();
         assert!(d.next_frame().is_err());
     }
 
+    /// C `FrameBuffer` (serval_stream_framing.cpp:55-127): the header line
+    /// must be the JSON object, a `\r` before its newline is dropped, and the
+    /// payload must be followed by `\n`.
     #[test]
-    fn a_line_without_a_brace_is_skipped() {
-        let mut bytes = b"\r\n".to_vec();
-        bytes.extend(image_bytes(1, 1, 9, &[7]));
+    fn a_frame_is_framed_as_c_frame_buffer() {
         let mut d = FrameDecoder::new(Channel::Image);
-        d.push(&bytes);
+        d.push(b"garbage{\"width\":1,\"height\":1}\n").unwrap();
+        assert_eq!(
+            d.next_frame().unwrap_err().to_string(),
+            "invalid JSON frame header: malformed or non-object jsonimage header"
+        );
+
+        let mut d = FrameDecoder::new(Channel::Image);
+        d.push(b"{\"width\":1,\"height\":1}\r\n\x00\x07\n").unwrap();
         let Some(Frame::Image(f)) = d.next_frame().unwrap() else {
             panic!()
         };
-        assert_eq!(f.frame_number, 9);
+        assert_eq!(f.pixels, vec![7]);
+
+        let mut d = FrameDecoder::new(Channel::Image);
+        d.push(b"{\"width\":1,\"height\":1}\n\x00\x07").unwrap();
+        assert_eq!(d.next_frame(), Ok(None));
+        assert_eq!(d.end_of_stream(), EndOfStream::TruncatedTrailer);
+        d.push(b"{").unwrap();
+        assert_eq!(
+            d.next_frame().unwrap_err().to_string(),
+            "invalid or missing frame payload terminator"
+        );
     }
 
+    /// C `endOfStreamStatus` at each point of a frame.
     #[test]
-    fn leading_junk_before_the_brace_is_skipped() {
-        let mut bytes = b"garbage".to_vec();
-        bytes.extend(image_bytes(1, 1, 3, &[42]));
+    fn the_end_of_stream_status_names_where_the_bytes_stop() {
         let mut d = FrameDecoder::new(Channel::Image);
-        d.push(&bytes);
-        let Some(Frame::Image(f)) = d.next_frame().unwrap() else {
-            panic!()
-        };
-        assert_eq!(f.pixels, vec![42]);
+        assert_eq!(d.end_of_stream(), EndOfStream::Clean);
+        d.push(b"{\"width\":1").unwrap();
+        assert_eq!(d.next_frame(), Ok(None));
+        assert_eq!(d.end_of_stream(), EndOfStream::TruncatedHeader);
+        d.push(b",\"height\":1}\n\x00").unwrap();
+        assert_eq!(d.next_frame(), Ok(None));
+        assert_eq!(d.end_of_stream(), EndOfStream::TruncatedPayload);
+        d.push(b"\x07\n").unwrap();
+        assert!(d.next_frame().unwrap().is_some());
+        assert_eq!(d.end_of_stream(), EndOfStream::Clean);
+        assert_eq!(
+            EndOfStream::TruncatedPayload.message(),
+            "truncated frame payload"
+        );
+    }
+
+    /// The header and buffer limits (serval_stream_framing.cpp:26-53, :62-73).
+    #[test]
+    fn a_stream_past_the_limits_is_refused() {
+        let mut d = FrameDecoder::new(Channel::Histogram);
+        d.push(&vec![b'x'; MAX_BUFFER_SIZE + 1]).unwrap();
+        assert_eq!(d.next_frame(), Err(FrameError::HeaderTooLarge));
+
+        let mut b = FrameBuffer::<()>::new(4, 4, 4);
+        b.append(&[0; 14]).unwrap();
+        assert_eq!(b.append(&[0]), Err(FrameError::BufferLimitExceeded));
+        let mut b = FrameBuffer::<()>::new(16, 4, 16);
+        b.append(b"h\n").unwrap();
+        assert_eq!(b.next(|_| Ok((5, ()))), Err(FrameError::PayloadTooLarge));
+    }
+
+    /// C `prvHstWorkerThread`'s resolver messages (histogram_io.cpp:981-992).
+    #[test]
+    fn a_histogram_header_is_refused_with_c_messages() {
+        for (header, message) in [
+            (&b"[1]"[..], "malformed jsonhisto header or invalid binSize"),
+            (b"{}", "malformed jsonhisto header or invalid binSize"),
+            (
+                b"{\"binSize\":2.0}",
+                "malformed jsonhisto header or invalid binSize",
+            ),
+            (b"{\"binSize\":0}", "binSize is outside the supported range"),
+            (
+                b"{\"binSize\":1000001}",
+                "binSize is outside the supported range",
+            ),
+            (
+                b"{\"binSize\":18446744073709551615}",
+                "binSize is outside the supported range",
+            ),
+        ] {
+            let mut d = FrameDecoder::new(Channel::Histogram);
+            d.push(header).unwrap();
+            d.push(b"\n").unwrap();
+            assert_eq!(
+                d.next_frame(),
+                Err(FrameError::InvalidHeader(message.into())),
+                "{}",
+                String::from_utf8_lossy(header)
+            );
+        }
     }
 
     #[test]

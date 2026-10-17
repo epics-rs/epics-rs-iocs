@@ -34,7 +34,9 @@ use crate::http::{DEFAULT_TIMEOUT, ServalHttp, TIMEOUT_5000_MS};
 use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Mirrored, Shared};
-use crate::stream::{Channel, DecodeError, Frame, FrameDecoder, ImageLimits, parse_tcp_path};
+use crate::stream::{
+    Channel, EndOfStream, Frame, FrameDecoder, FrameError, ImageLimits, parse_tcp_path,
+};
 use crate::window::{Configuration, RollingSumStatus};
 use crate::worker::{Generation, WorkerState};
 
@@ -44,10 +46,9 @@ const CONNECTION_POLL: Duration = Duration::from_secs(5);
 const ACQUISITION_POLL: Duration = Duration::from_millis(10);
 /// C's `reconnectDelay` (serval_stream.cpp:497, histogram_io.cpp:962).
 const RECONNECT_WAIT: Duration = Duration::from_millis(1000);
-/// A read timeout the C worker does not set at all (UPSTREAM DEFECT,
-/// network_client.cpp:157): C blocks in `recv` forever and relies on another
-/// thread closing the socket underneath it, which is a use-after-close race.
-const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// C `kReceivePollTimeoutMs`, the stream socket's `SO_RCVTIMEO`
+/// (network_client.h:25, network_client.cpp:96-101).
+const READ_TIMEOUT: Duration = Duration::from_millis(250);
 /// C's `accumulationDelay` (histogram_io.cpp:963).
 const PRV_HST_PAUSED_WAIT: Duration = Duration::from_millis(100);
 
@@ -1409,18 +1410,18 @@ impl StreamKind {
     }
 
     /// The C functions whose `__PRETTY_FUNCTION__` the image channels' asyn
-    /// lines carry: connect, worker thread, header parse. C's PrvHst code
-    /// prints with `printf`/`fprintf` instead, so it has none.
+    /// lines carry: connect, the shared read loop, header parse. C's PrvHst
+    /// code prints with `printf`/`fprintf` instead, so it has none.
     fn c_functions(self) -> Option<[&'static str; 3]> {
         match self {
             Self::PrvImg => Some([
                 "void ADTimePix::prvImgConnect()",
-                "void ADTimePix::prvImgWorkerThread()",
+                RUN_JSON_IMAGE_TCP_WORKER,
                 "bool ADTimePix::processPrvImgDataLine(char*, char*, size_t)",
             ]),
             Self::Img => Some([
                 "void ADTimePix::imgConnect()",
-                "void ADTimePix::imgWorkerThread()",
+                RUN_JSON_IMAGE_TCP_WORKER,
                 "bool ADTimePix::processImgDataLine(char*, char*, size_t)",
             ]),
             Self::PrvHst => None,
@@ -1444,6 +1445,13 @@ impl StreamKind {
         }
     }
 }
+
+/// g++'s `__PRETTY_FUNCTION__` for C `runJsonImageTcpWorker`, the image
+/// channels' read loop (serval_stream.cpp:484-495).
+const RUN_JSON_IMAGE_TCP_WORKER: &str = "void ADTimePix::runJsonImageTcpWorker(epicsMutexId, \
+ADTimePix3StreamWorker::State&, std::string&, int&, std::shared_ptr<NetworkClient>&, \
+std::vector<char>&, size_t&, void (ADTimePix::*)(), void (ADTimePix::*)(), \
+bool (ADTimePix::*)(char*, char*, size_t), const char*)";
 
 /// One worker. C `runJsonImageTcpWorker` / `prvHstWorkerThread`
 /// (serval_stream.cpp:483-645, histogram_io.cpp:957-1124) run once per
@@ -1543,19 +1551,36 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stre
         }
         match stream.read(&mut buf) {
             Ok(0) => {
+                let end = decoder.end_of_stream();
+                if end != EndOfStream::Clean && worker.running(run) {
+                    let msg = format!("{} TCP stream ended with {}", kind.name(), end.message());
+                    match kind.c_functions() {
+                        Some([_, worker, _]) => {
+                            ctx.trace(TraceMask::ERROR, &adlog::err(worker, &msg))
+                        }
+                        None => eprintln!("ERROR | ADTimePix::prvHstWorkerThread: {msg}"),
+                    }
+                }
                 println!("{} TCP connection closed by peer", kind.name());
                 return;
             }
-            Ok(n) => decoder.push(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(n) => {
+                if let Err(e) = decoder.push(&buf[..n]) {
+                    framing_failed(ctx, kind, &e);
+                    return;
+                }
+            }
+            // C `isReceiveTimeout` (network_client.cpp:236-238).
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && worker.running(run) => continue,
             Err(e) => {
-                let msg = format!("{} TCP socket error: {}", kind.name(), strerror(&e));
-                match kind.c_functions() {
-                    Some([_, worker, _]) => {
-                        ctx.trace(TraceMask::IO_DRIVER, &adlog::log(worker, &msg))
+                if worker.running(run) {
+                    let msg = format!("{} TCP socket error: {}", kind.name(), strerror(&e));
+                    match kind.c_functions() {
+                        Some([_, worker, _]) => {
+                            ctx.trace(TraceMask::IO_DRIVER, &adlog::log(worker, &msg))
+                        }
+                        None => eprintln!("{msg}"),
                     }
-                    None => println!("{msg}"),
                 }
                 return;
             }
@@ -1569,9 +1594,7 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stre
                 Ok(Some(frame)) => handle_frame(ctx, kind, frame).await,
                 Ok(None) => break,
                 Err(e) => {
-                    // The payload length is unknown, so the stream cannot be
-                    // resynchronised: drop the connection and start over.
-                    decode_failed(ctx, kind, &e);
+                    framing_failed(ctx, kind, &e);
                     return;
                 }
             }
@@ -1740,46 +1763,13 @@ fn image_limits(ctx: &Ctx) -> ImageLimits {
     )
 }
 
-/// The line C prints for a header it cannot use.
-fn decode_failed(ctx: &Ctx, kind: StreamKind, e: &DecodeError) {
-    match (kind.c_functions(), e) {
-        (Some([_, worker, _]), DecodeError::NoNewline) => ctx.trace(
-            TraceMask::IO_DRIVER,
-            &adlog::log(
-                worker,
-                &format!(
-                    "{} TCP buffer full without finding newline, resetting",
-                    kind.name()
-                ),
-            ),
-        ),
-        (None, DecodeError::NoNewline) => {
-            println!("PrvHst TCP buffer full without finding newline, resetting");
-        }
-        (Some([_, _, line]), DecodeError::Json(m)) => ctx.trace(
-            TraceMask::ERROR,
-            &adlog::err(line, &format!("JSON parse error: {m}")),
-        ),
-        (None, DecodeError::Json(m)) => {
-            eprintln!("ERROR | ADTimePix::processPrvHstDataLine: JSON parse error in PrvHst: {m}");
-        }
-        // The worker's payload-size resolver refuses the header before the
-        // line processor sees it (serval_stream.cpp:532-535, :606-611).
-        (Some([_, worker, _]), DecodeError::Image(e)) => ctx.trace(
-            TraceMask::ERROR,
-            &adlog::err(
-                worker,
-                &format!(
-                    "{} rejected TCP stream: invalid JSON frame header: {e}",
-                    kind.name()
-                ),
-            ),
-        ),
-        (None, DecodeError::BinSize(n)) => {
-            eprintln!("ERROR | ADTimePix::processPrvHstDataLine: Invalid bin size: {n}");
-        }
-        // Each channel's decoder only produces its own header's errors.
-        _ => {}
+/// C's `rejected TCP stream` line for a framing failure
+/// (serval_stream.cpp:589-611, histogram_io.cpp:1060-1083).
+fn framing_failed(ctx: &Ctx, kind: StreamKind, e: &FrameError) {
+    let msg = format!("{} rejected TCP stream: {e}", kind.name());
+    match kind.c_functions() {
+        Some([_, worker, _]) => ctx.trace(TraceMask::ERROR, &adlog::err(worker, &msg)),
+        None => eprintln!("ERROR | ADTimePix::prvHstWorkerThread: {msg}"),
     }
 }
 
@@ -3637,7 +3627,7 @@ mod tests {
                         let mut bytes =
                             br#"{"width":1,"height":1,"pixelFormat":"uint16","frameNumber":7}"#
                                 .to_vec();
-                        bytes.extend_from_slice(b"\n\x00\x01");
+                        bytes.extend_from_slice(b"\n\x00\x01\n");
                         peer.write_all(&bytes).unwrap();
                     });
                 }
@@ -3719,7 +3709,7 @@ mod tests {
 
         let mut bytes = br#"{"binSize":2,"binWidth":1,"binOffset":0,"frameNumber":1}"#.to_vec();
         bytes.push(b'\n');
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 2]);
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 2, b'\n']);
         peer.write_all(&bytes).unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(ctx.shared.hst.lock().frame_count(), 0);
@@ -3945,6 +3935,49 @@ mod tests {
                 h.read_int32(ctx.ad.status, 0).await.unwrap(),
                 ADStatus::Disconnected as i32,
                 "{name}"
+            );
+        }
+    }
+
+    /// C `runJsonImageTcpWorker`'s framing lines (serval_stream.cpp:567-611):
+    /// a stream cut mid-frame and a header the resolver refuses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_image_read_loop_reports_framing_as_c() {
+        use std::io::Write;
+
+        for (name, sent, expected) in [
+            (
+                "TPX_END_MID",
+                &br#"{"width":1,"height":1,"pixelFormat":"uint16"}"#[..],
+                "PrvImg TCP stream ended with truncated frame payload",
+            ),
+            (
+                "TPX_BAD_HDR",
+                b"[1]\n",
+                "PrvImg rejected TCP stream: invalid JSON frame header: \
+                 malformed or non-object jsonimage header",
+            ),
+        ] {
+            let ctx = Arc::new(idle_ctx(name));
+            let path = capture_errors(&ctx, name);
+            assert!(ctx.shared.prv_img_worker.start());
+            let run = ctx.shared.prv_img_worker.wait_for_start(None);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let _ = client.set_read_timeout(Some(READ_TIMEOUT));
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut bytes = sent.to_vec();
+            if name == "TPX_END_MID" {
+                bytes.extend_from_slice(b"\n\x00");
+            }
+            peer.write_all(&bytes).unwrap();
+            drop(peer);
+            read_stream(&ctx, StreamKind::PrvImg, run, client).await;
+            let text = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                text.contains(&adlog::err(RUN_JSON_IMAGE_TCP_WORKER, expected)),
+                "{text}"
             );
         }
     }
