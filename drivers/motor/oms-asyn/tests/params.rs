@@ -35,6 +35,19 @@ fn maxnet_reply(cmd: &str) -> String {
     .into()
 }
 
+/// A MAXnet with firmware 1.29.0, older than the 1.30 MAXnet's newer
+/// command forms need.
+fn old_maxnet_reply(cmd: &str) -> String {
+    match cmd.trim_end() {
+        "WY" => "MAXnet ver:1.29.0, s/n:1".into(),
+        "AX ?PS" => "=E".into(),
+        "AX ?LS" => "=h".into(),
+        "AX ?PM" => "=on".into(),
+        "AX PS?" | "AX LT?" | "AM;CL?;" => String::new(),
+        other => maxnet_reply(other),
+    }
+}
+
 /// The poller's own reads, which a test of what a write sends leaves out.
 fn polled(cmd: &str) -> bool {
     cmd.starts_with("AM") || cmd == "#WS"
@@ -46,8 +59,22 @@ async fn on_maxnet<T: Send + 'static>(
     port: &str,
     body: impl FnOnce(PortHandle, &Mutex<LineRig>) -> T + Send + 'static,
 ) -> T {
+    on_line(port, maxnet_reply, move |port, rig| {
+        rig.lock().unwrap().sent();
+        body(port, rig)
+    })
+    .await
+}
+
+/// [`on_maxnet`] on a line answering with `reply`, what config sent left
+/// on the line.
+async fn on_line<T: Send + 'static>(
+    port: &str,
+    reply: fn(&str) -> String,
+    body: impl FnOnce(PortHandle, &Mutex<LineRig>) -> T + Send + 'static,
+) -> T {
     let line = format!("{port}Line");
-    let (rig, _io) = LineRig::new(&line, maxnet_reply);
+    let (rig, _io) = LineRig::new(&line, reply);
     let config = motor_oms_asyn::ioc::oms_commands()
         .into_iter()
         .next()
@@ -66,7 +93,6 @@ async fn on_maxnet<T: Send + 'static>(
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         config.handler.call(&args, &ctx).unwrap();
         let rig = Mutex::new(rig);
-        rig.lock().unwrap().sent();
         body(PortManager::global().find_port_handle(&port).unwrap(), &rig)
     });
     while !shell.is_finished() {
@@ -143,4 +169,30 @@ async fn a_deferred_move_write_says_it_is_not_implemented() {
     let _ = std::fs::remove_file(&path);
     let want = format!("omsBaseDriver:writeInt32:{name} Deferred Move: not yet implemented");
     assert!(text.lines().any(|l| l.ends_with(&want)), "{text}");
+}
+
+/// Before firmware 1.30 a MAXnet takes the older forms: `?PS` and `?LS` at
+/// init, `HN` / `HF` for closed loop and a `?PM` per axis for its status
+/// (omsBaseController.cpp:279-290, 528-556, 871-885).
+#[epics_rs::base::epics_test]
+async fn old_firmware_takes_the_older_command_forms() {
+    let (init, sent) = on_line("omsOldFw", old_maxnet_reply, |port, line| {
+        let init = line.lock().unwrap().sent();
+        port.write_int32_blocking(index::CLOSED_LOOP, 0, 1).unwrap();
+        port.write_int32_blocking(index::CLOSED_LOOP, 0, 0).unwrap();
+        (init, sent_within(line, Duration::from_millis(1500)))
+    })
+    .await;
+    let init: Vec<_> = init.iter().map(|c| c.trim_end()).collect();
+    assert!(
+        init.contains(&"AX ?PS") && init.contains(&"AX ?LS"),
+        "{init:?}"
+    );
+    assert!(
+        !init.contains(&"AX PS?") && !init.contains(&"AX LT?"),
+        "{init:?}"
+    );
+    let (status, writes): (Vec<_>, Vec<_>) = sent.iter().partition(|c| *c == "AX ?PM");
+    assert_eq!(writes, ["AX HN", "AX HF"], "{sent:?}");
+    assert!(!status.is_empty(), "{sent:?}");
 }

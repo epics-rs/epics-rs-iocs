@@ -17,7 +17,7 @@ use epics_rs::motor::poll_loop::PollCommand;
 
 use motor_common::util::leading_hex;
 
-use crate::oms::OmsController;
+use crate::oms::{AXIS_CHARS, OmsController};
 
 /// C `driverName`.
 const DRIVER: &str = "omsBaseDriver";
@@ -407,9 +407,23 @@ impl OmsPoller {
         axes_array(&self.lock(), self.num_axes, cmd)
     }
 
-    /// C `getClosedLoopStatus` in the `CL?` form this port assumes. C sets 1
-    /// for a field that is *not* `on`; its status is the last field's.
+    /// C `getClosedLoopStatus` (omsBaseController.cpp:852-891): one `CL?`
+    /// for all axes, or before firmware 1.30 a `?PM` per axis. C sets 1
+    /// for a reply that is *not* `on`; its status is the last axis's.
     fn closed_loop_status(&mut self) -> bool {
+        if !self.lock().modern() {
+            let mut found = true;
+            for (i, ch) in AXIS_CHARS.iter().take(self.num_axes).enumerate() {
+                found = match self.send_receive(&format!("A{ch} ?PM")) {
+                    Ok(reply) => {
+                        self.closed_loop[i] = !reply.starts_with("=on");
+                        true
+                    }
+                    Err(_) => false,
+                };
+            }
+            return found;
+        }
         let Ok(reply) = self.send_receive("AM;CL?;") else {
             return false;
         };
