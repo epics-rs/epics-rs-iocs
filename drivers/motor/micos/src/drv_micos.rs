@@ -235,6 +235,9 @@ impl AsynMotor for DrvMicosAxis {
         self.send(&["dh,ud".to_string()])
     }
 
+    /// devMicos.cc:305-314 marks SET_HIGH/LOW_LIMIT "nothing to send" with
+    /// IDLE_STATE, then returns motor_end_trans_com's ERROR for that state,
+    /// so the record reverts every HLM/LLM/DHLM/DLLM put; not copied.
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         self.high_limit = position;
         Ok(())

@@ -47,10 +47,6 @@ impl Exchange {
         }
     }
 
-    pub(crate) fn read_line(&self) -> AsynResult<String> {
-        Ok(trim_line(&self.handle.read_octet(0, self.read_buf)?))
-    }
-
     /// Write a command and read one reply line.
     pub(crate) fn write_read(&self, cmd: &str) -> AsynResult<String> {
         let driver = self.driver;
