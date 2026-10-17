@@ -144,7 +144,9 @@ impl Model1 {
             }));
         }
         let Task::Filling(builder, _) = &mut *task else {
-            // C's drvSup init has already set up the cards it had.
+            // Deliberate deviation from a C defect: C's Config fills the slot
+            // after drvSup init without a word, and that card is never
+            // initialized or polled; refuse it instead.
             return Err(format!(
                 "{}: card {card} configured after iocInit",
                 self.row.choice
