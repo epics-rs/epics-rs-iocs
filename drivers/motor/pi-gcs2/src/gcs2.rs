@@ -1217,15 +1217,36 @@ impl PIGCS2Controller {
     }
 
     /// `char(4)` -> `(homing, moving, negLimit, posLimit, servoControl)` for
-    /// `axis_no` (C `PIGCSMotorController::getStatus`).
-    fn get_status(&self, axis_no: usize) -> AsynResult<(bool, bool, bool, bool, bool)> {
+    /// `axis_no` (C `PIGCSMotorController::getStatus`, and
+    /// `PIC885Controller`'s, which differs only in its FLOW line).
+    fn get_status(&self, axis: &str, axis_no: usize) -> AsynResult<(bool, bool, bool, bool, bool)> {
         let reply = self.query_char(4)?;
         let mask = status_mask_at(&reply, axis_no).ok_or_else(|| {
             pigcs2_err(format!(
                 "status reply too short for axis {axis_no}: {reply:?}"
             ))
         })?;
-        Ok(status_from_bitmask(mask))
+        let status = status_from_bitmask(mask);
+        let (homing, moving, _, _, servo) = status;
+        // C cuts its buffer after the axis's word, then prints it.
+        let buf = reply.get(..2 + axis_no * 4 + 4).unwrap_or(&reply);
+        let (moving, servo, homing) = (i32::from(moving), i32::from(servo), i32::from(homing));
+        if self.model == Model::C885 {
+            self.trace(
+                TraceMask::FLOW,
+                format_args!(
+                    "PIC885Controller::getStatus() Axis: {axis}, buf:{buf} moving {moving}, svo: {servo}, homming: {homing}\n"
+                ),
+            );
+        } else {
+            self.trace(
+                TraceMask::FLOW,
+                format_args!(
+                    "PIGCSMotorController::getStatus() buf:{buf} moving {moving}, svo: {servo}\n"
+                ),
+            );
+        }
+        Ok(status)
     }
 }
 
@@ -1623,7 +1644,7 @@ impl PIGCS2Axis {
             return Ok((ctrl.hexapod.homing, moving, false, false, self.servo_on));
         }
         if !matches!(ctrl.model, Model::E755 | Model::C702) {
-            return ctrl.get_status(self.axis_no);
+            return ctrl.get_status(&self.axis_name, self.axis_no);
         }
         // PIE755Controller::getStatus, and PIC702Controller's after the
         // first second of a REF: busy is homing and moving, no limits. C
@@ -3190,6 +3211,33 @@ mod tests {
             ],
             "{printed}"
         );
+    }
+
+    /// `PIGCSMotorController::getStatus` and `PIC885Controller::getStatus`
+    /// print the `#4` reply cut after the axis's word (PIGCSMotorController
+    /// .cpp:168-175, PIC885Controller.cpp:34-47).
+    #[test]
+    fn a_status_read_prints_its_c_flow_line() {
+        for (model, name, want) in [
+            (
+                Model::Motor,
+                "gcs2StatFlowM",
+                "PIGCSMotorController::getStatus() buf:011000 moving 0, svo: 1\n",
+            ),
+            (
+                Model::C885,
+                "gcs2StatFlowC",
+                "PIC885Controller::getStatus() Axis: 1, buf:011000 moving 0, svo: 1, homming: 0\n",
+            ),
+        ] {
+            let (_line, io) = motor_common::testing::LineRig::new(name, |_| "0110002000".into());
+            let mut ctrl = PIGCS2Controller::new(io, name);
+            ctrl.set_model(model);
+            let printed = traced_mask(name, TraceMask::FLOW, || {
+                ctrl.get_status("1", 0).unwrap();
+            });
+            assert!(printed.contains(want), "{want:?} not in {printed}");
+        }
     }
 
     /// `PI_CS_TARGETMODE` (PIasynController.cpp:320-324, 587) picks the
