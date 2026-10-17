@@ -18,7 +18,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, FinishedWrite, ParamDelta, ParamWrite, WriteHook, WriteValue, index,
+    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, index,
 };
 
 use motor_common::util::{atof, atoi};
@@ -394,7 +394,7 @@ struct Nf874xWriteHook;
 
 impl WriteHook for Nf874xWriteHook {
     /// C traces every write at its end, the base's included.
-    fn after_write(&self, write: &FinishedWrite<'_>) -> ParamDelta {
+    fn after_write(&self, write: &FinishedWrite<'_>) -> WriteOutcome {
         let function = write.function;
         let (method, value) = match write.value {
             WriteValue::Int32(v) => ("writeInt32", v.to_string()),
@@ -413,7 +413,7 @@ impl WriteHook for Nf874xWriteHook {
                 format_args!("nf874xMotorDriver:{method}: function={function}, value={value}\n"),
             ),
         }
-        ParamDelta::default()
+        WriteOutcome::default()
     }
 }
 
