@@ -148,15 +148,6 @@ impl Ctx {
         .await;
     }
 
-    /// C `setInteger64Param` + `callParamCallbacks`.
-    async fn set_int64(&self, reason: usize, addr: i32, value: i64) {
-        self.set(
-            addr,
-            vec![ParamSetValue::new(reason, addr, ParamValue::Int64(value))],
-        )
-        .await;
-    }
-
     /// C `doCallbacksGenericPointer(pArray, NDArrayData, addr)`: stamp the
     /// array's epicsTS (`updateTimeStamp`), then hand it to the plugins on
     /// `addr`.
@@ -423,52 +414,115 @@ async fn refresh_measurement_config(ctx: &Arc<Ctx>) -> bool {
         .unwrap_or(false)
 }
 
-/// C `checkConnection` (serval_http.cpp:274).
+/// C `checkConnection` (serval_http.cpp:363).
 async fn check_connection(ctx: &Arc<Ctx>) -> bool {
-    let p = ctx.p;
     let reply = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL);
-    let (serval_ok, det_ok, det_type, code) = match &reply {
+    let code = reply.as_ref().map_or_else(|e| e.code(), |_| 200);
+    let mut updates = vec![ParamSetValue::new(
+        ctx.p.http_code,
+        0,
+        ParamValue::Int32(code),
+    )];
+    let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
+    connection_status(ctx, serval_ok, det_ok, &mut updates);
+    ctx.set(0, updates).await;
+    serval_ok && det_ok
+}
+
+/// C `publishDashboardSnapshot` and `publishDashboardFailure`
+/// (serval_http.cpp:219-249), which every dashboard read runs; returns
+/// whether Serval and the detector are connected.
+fn publish_dashboard(
+    ctx: &Arc<Ctx>,
+    reply: &crate::http::HttpResult<Value>,
+    updates: &mut Vec<ParamSetValue>,
+) -> (bool, bool) {
+    let p = ctx.p;
+    let (serval_ok, det_type) = match reply {
         Ok(dashboard) => {
             let detector = dashboard.get("Detector").unwrap_or(&Value::Null);
-            let det_ok = !detector.is_null();
-            let det_type = if det_ok {
+            let det_type = (!detector.is_null()).then(|| {
                 serval::json_to_string(detector.get("DetectorType").unwrap_or(&Value::Null))
-            } else {
-                "null".to_string()
-            };
-            (true, det_ok, det_type, 200)
+            });
+            (true, det_type)
         }
-        Err(e) => (false, false, "null".to_string(), e.code()),
+        Err(_) => (false, None),
     };
-
-    let mut updates = vec![
-        ParamSetValue::new(p.http_code, 0, ParamValue::Int32(code)),
-        ParamSetValue::new(
-            p.serval_connected,
-            0,
-            ParamValue::Int32(i32::from(serval_ok)),
-        ),
-        ParamSetValue::new(p.det_connected, 0, ParamValue::Int32(i32::from(det_ok))),
-        ParamSetValue::new(
-            p.det_type,
-            0,
-            ParamValue::Octet(det_type.clone().into_bytes().into()),
-        ),
-    ];
-    connection_status(ctx, serval_ok, det_ok, &mut updates);
-    if det_ok {
+    let det_ok = det_type.is_some();
+    updates.push(ParamSetValue::new(
+        p.serval_connected,
+        0,
+        ParamValue::Int32(i32::from(serval_ok)),
+    ));
+    updates.push(ParamSetValue::new(
+        p.det_connected,
+        0,
+        ParamValue::Int32(i32::from(det_ok)),
+    ));
+    let shown = det_type.as_deref().unwrap_or("null");
+    updates.push(ParamSetValue::new(
+        p.det_type,
+        0,
+        ParamValue::Octet(shown.as_bytes().to_vec().into()),
+    ));
+    if let Some(det_type) = &det_type {
         updates.push(ParamSetValue::new(
             ctx.ad.base.model,
             0,
-            ParamValue::Octet(det_type.into_bytes().into()),
+            ParamValue::Octet(det_type.as_bytes().to_vec().into()),
         ));
     }
-    if let Ok(dashboard) = &reply {
-        serval_version(ctx, dashboard, &mut updates);
-        disk_space(ctx, dashboard, &mut updates);
+    match reply {
+        Ok(dashboard) => {
+            serval_version(ctx, dashboard, updates);
+            disk_space(ctx, dashboard, updates);
+            if let Some(status) = dashboard_measurement_status(dashboard) {
+                measurement_status(p, status, updates);
+            }
+        }
+        Err(_) => measurement_status(p, &Value::Null, updates),
     }
-    ctx.set(0, updates).await;
-    serval_ok && det_ok
+    (serval_ok, det_ok)
+}
+
+/// C `updateMeasurementFromDashboard` (acquire.cpp:100-111): the dashboard
+/// clears `Measurement` when idle, and then the last status stays.
+fn dashboard_measurement_status(dashboard: &Value) -> Option<&Value> {
+    let meas = dashboard.get("Measurement").filter(|m| !m.is_null())?;
+    meas.get("Info")
+        .filter(|i| i.is_object())
+        .and_then(|i| i.get("Status"))
+        .or_else(|| meas.get("Status"))
+}
+
+/// C `updateMeasurementStatusFromJson` (acquire.cpp:84-98).
+fn measurement_status(p: TimePixParams, status: &Value, updates: &mut Vec<ParamSetValue>) {
+    let (text, index) = match status {
+        Value::Null => (String::new(), -1),
+        Value::String(s) => (s.clone(), pipeline_state_index(s)),
+        other => (other.to_string(), -1),
+    };
+    updates.push(ParamSetValue::new(
+        p.status,
+        0,
+        ParamValue::Octet(text.into_bytes().into()),
+    ));
+    updates.push(ParamSetValue::new(
+        p.pipeline_state,
+        0,
+        ParamValue::Int32(index),
+    ));
+}
+
+/// C `pipelineStateIndex` (acquire.cpp:64-70).
+fn pipeline_state_index(status: &str) -> i32 {
+    match status {
+        "DA_STARTING" => 0,
+        "DA_RECORDING" => 1,
+        "DA_STOPPING" => 2,
+        "DA_IDLE" | "DA_STOPPED" => 3,
+        _ => -1,
+    }
 }
 
 /// C `updateStatusFromConnection` (serval_http.cpp:251-285): a connected
@@ -531,14 +585,20 @@ fn serval_version(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetV
 }
 
 /// The first disk in `Server.DiskSpace`, which is empty until raw file writing
-/// is configured (C getDashboard, serval_http.cpp:388).
+/// is configured (C `publishDashboardSnapshot`, serval_http.cpp:228-239).
 fn disk_space(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
     let p = ctx.p;
     let Some(disk) = dashboard.pointer("/Server/DiskSpace/0") else {
         return;
     };
+    if let Some(v) = disk.get("FreeSpace").and_then(Value::as_i64) {
+        updates.push(ParamSetValue::new(p.free_space, 0, ParamValue::Int64(v)));
+    }
     if let Some(v) = disk.get("WriteSpeed").and_then(Value::as_f64) {
         updates.push(ParamSetValue::new(p.write_speed, 0, ParamValue::Float64(v)));
+    }
+    if let Some(v) = disk.get("LowerLimit").and_then(Value::as_i64) {
+        updates.push(ParamSetValue::new(p.lower_limit, 0, ParamValue::Int64(v)));
     }
     if let Some(v) = disk.get("DiskLimitReached").and_then(as_bool_or_int) {
         updates.push(ParamSetValue::new(p.l_lim_reached, 0, ParamValue::Int32(v)));
@@ -553,22 +613,13 @@ fn as_bool_or_int(v: &Value) -> Option<i32> {
     }
 }
 
-/// `getDashboard`'s int64 fields.
+/// C `getDashboard` (serval_http.cpp:431-454).
 async fn refresh_dashboard(ctx: &Arc<Ctx>) {
-    let p = ctx.p;
-    if let Ok(dashboard) = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL) {
-        let mut updates = Vec::new();
-        serval_version(ctx, &dashboard, &mut updates);
-        ctx.set(0, updates).await;
-        if let Some(disk) = dashboard.pointer("/Server/DiskSpace/0") {
-            if let Some(v) = disk.get("FreeSpace").and_then(Value::as_i64) {
-                ctx.set_int64(p.free_space, 0, v).await;
-            }
-            if let Some(v) = disk.get("LowerLimit").and_then(Value::as_i64) {
-                ctx.set_int64(p.lower_limit, 0, v).await;
-            }
-        }
-    }
+    let reply = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL);
+    let mut updates = Vec::new();
+    let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
+    connection_status(ctx, serval_ok, det_ok, &mut updates);
+    ctx.set(0, updates).await;
 }
 
 /// C `getDetector` (serval_http.cpp:1293); false when `/detector` failed.
@@ -1076,15 +1127,11 @@ pub(crate) fn measurement_updates(
         }
     }
     if let Some(status) = &m.status {
-        let index = match status.as_str() {
-            "DA_STARTING" => 0,
-            "DA_RECORDING" => 1,
-            "DA_STOPPING" => 2,
-            "DA_IDLE" | "DA_STOPPED" => 3,
-            _ => -1,
-        };
         updates.push((p.status, ParamValue::Octet(status.as_bytes().into())));
-        updates.push((p.pipeline_state, ParamValue::Int32(index)));
+        updates.push((
+            p.pipeline_state,
+            ParamValue::Int32(pipeline_state_index(status)),
+        ));
     }
     updates
 }
@@ -3630,5 +3677,68 @@ mod tests {
                 ADStatus::Error as i32
             );
         }
+    }
+
+    /// An idle dashboard has no `Measurement`, and the last status stays;
+    /// a non-string status is shown as its JSON (acquire.cpp:84-111).
+    #[test]
+    fn the_dashboard_measurement_status_follows_c() {
+        let status = |dashboard: &str| {
+            dashboard_measurement_status(&serde_json::from_str(dashboard).unwrap()).cloned()
+        };
+        assert_eq!(status(r#"{"Measurement":null}"#), None);
+        assert_eq!(status(r#"{}"#), None);
+        assert_eq!(
+            status(r#"{"Measurement":{"Status":"DA_IDLE"}}"#),
+            Some("DA_IDLE".into())
+        );
+        assert_eq!(
+            status(r#"{"Measurement":{"Info":{},"Status":"DA_IDLE"}}"#),
+            Some("DA_IDLE".into())
+        );
+        let p = idle_ctx("TPX_DASH_JSON").p;
+        let mut updates = Vec::new();
+        measurement_status(p, &serde_json::json!({"a": 1}), &mut updates);
+        assert_eq!(octet_set(&updates, p.status).as_deref(), Some(r#"{"a":1}"#));
+        assert_eq!(int_set(&updates, p.pipeline_state), Some(-1));
+    }
+
+    /// Every dashboard read publishes the free space, the lower limit and
+    /// the measurement status, and a failed read clears the status
+    /// (serval_http.cpp:219-249, acquire.cpp:84-111).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dashboard_read_publishes_the_measurement_status() {
+        let (url, _log) = logging_serval(&[], |path| match path {
+            "/dashboard" => {
+                r#"{"Server":{"DiskSpace":[{"FreeSpace":7000000000,"LowerLimit":42}]},
+                    "Detector":{"DetectorType":"TPX3"},
+                    "Measurement":{"Status":"DA_IDLE","Info":{"Status":"DA_RECORDING"}}}"#
+            }
+            _ => "{}",
+        });
+        let ctx = Arc::new(idle_ctx_at("TPX_DASH_MEAS", &url, None));
+        let (h, p) = (&ctx.handle, ctx.p);
+        assert!(check_connection(&ctx).await);
+        assert_eq!(h.read_int64(p.free_space, 0).await.unwrap(), 7_000_000_000);
+        assert_eq!(h.read_int64(p.lower_limit, 0).await.unwrap(), 42);
+        assert_eq!(
+            h.read_octet(p.status, 0, 64).await.unwrap(),
+            b"DA_RECORDING\0"
+        );
+        assert_eq!(h.read_int32(p.pipeline_state, 0).await.unwrap(), 1);
+
+        let ctx = Arc::new(idle_ctx_at("TPX_DASH_GONE", "http://127.0.0.1:1", None));
+        let (h, p) = (&ctx.handle, ctx.p);
+        ctx.set(
+            0,
+            vec![
+                ParamSetValue::new(p.status, 0, ParamValue::Octet(b"DA_IDLE".to_vec().into())),
+                ParamSetValue::new(p.pipeline_state, 0, ParamValue::Int32(3)),
+            ],
+        )
+        .await;
+        assert!(!check_connection(&ctx).await);
+        assert_eq!(h.read_octet(p.status, 0, 64).await.unwrap(), b"\0");
+        assert_eq!(h.read_int32(p.pipeline_state, 0).await.unwrap(), -1);
     }
 }
