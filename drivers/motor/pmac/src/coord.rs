@@ -12,10 +12,12 @@
 //! - a move is started by running the motion program (`B{prog}R`) in the CS,
 //!   after an abort (`&{cs}A`) that re-closes the loops.
 //!
-//! The C file is a *model-2* driver (`motorAxisDrvSET_t`, wired up by
-//! `drvAsynMotorConfigure`) with its own polling thread; this port is model-3
-//! ([`AsynMotor`]) like the real-axis driver, so the poll loop comes from
-//! motor-rs. Everything on the wire is unchanged.
+//! The C file is a *model-2* driver (`motorAxisDrvSET_t`) and so is this
+//! port: `pmacAsynCoordCreate` builds card `ref` of the
+//! [`motor_common::model2::Model2`] driver `pmacAsynCoord`, and
+//! `drvAsynMotorConfigure` opens its nine [`AsynMotor`] axes and attaches
+//! each axis's [`AxisLog`]. The poll loop is motor-rs's, not C's own thread.
+//! Everything on the wire is unchanged.
 //!
 //! ## Units
 //!
