@@ -205,6 +205,7 @@ pub fn ensemble_config_command() -> CommandDef {
             let mut axes = Vec::new();
             let mut reports: Vec<Arc<dyn AxisReport>> = Vec::new();
             let mut logs = Vec::new();
+            let (mut setters, mut getters) = (Vec::new(), Vec::new());
             for axis in 0..ENSEMBLE_MAX_AXES {
                 if axes.len() as i32 == num_axes {
                     break;
@@ -218,8 +219,10 @@ pub fn ensemble_config_command() -> CommandDef {
                         .map_err(|e| format!("EnsembleAsynConfig: axis {axis}: {e}"))?;
                     reports.push(ax.report());
                     logs.push(ax.log());
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    axes.push(motor);
+                    getters.push(ax.params() as Arc<dyn DrvGet>);
+                    let ax = Arc::new(Mutex::new(ax));
+                    setters.push(ax.clone() as Arc<Mutex<dyn DrvSet>>);
+                    axes.push(ax as Arc<Mutex<dyn AsynMotor>>);
                 }
             }
             // C ignores the reply.
@@ -230,6 +233,8 @@ pub fn ensemble_config_command() -> CommandDef {
             lock_cards(&ENSEMBLE_CARDS)[card as usize].axes = reports;
             MOTOR_ENSEMBLE.set_card(card, axes, moving_poll_ms, idle_poll_ms);
             MOTOR_ENSEMBLE.set_axis_logs(card, logs);
+            MOTOR_ENSEMBLE.set_axis_setters(card, setters);
+            MOTOR_ENSEMBLE.set_axis_getters(card, getters);
             Ok(CommandOutcome::Continue)
         },
     )
