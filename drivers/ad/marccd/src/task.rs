@@ -201,7 +201,7 @@ impl Worker {
         // C dereferences a refused alloc (marCCD.cpp:314); the frame is
         // dropped after the pool's reached-limit line.
         if array_callbacks != 0
-            && let Ok(mut array) = self.pool.wrap(
+            && let Ok(mut array) = self.pool.alloc_with(
                 vec![NDDimension::new(nx), NDDimension::new(ny)],
                 NDDataBuffer::U16(data),
             )
