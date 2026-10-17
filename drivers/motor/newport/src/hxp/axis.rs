@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::user::AsynUser;
 
@@ -69,6 +69,8 @@ pub struct HxpAxis {
     line: Arc<MoveLine>,
     /// 0..=5 → X, Y, Z, U, V, W.
     axis_no: usize,
+    /// The controller-port steps of the last move, for the owner to apply.
+    sets: PortSets,
 }
 
 impl HxpAxis {
@@ -77,6 +79,7 @@ impl HxpAxis {
             controller,
             line,
             axis_no,
+            sets: PortSets::default(),
         }
     }
 
@@ -88,12 +91,12 @@ impl HxpAxis {
     /// at this axis's, so another axis's shows at the next controller poll.
     /// `-27` (the record reversing, which aborts the move) is posted but
     /// not failed.
-    fn finish_move(&self, result: XpsResult<()>) -> AsynResult<()> {
+    fn finish_move(&mut self, result: XpsResult<()>) -> AsynResult<()> {
         let status = xps_status(&result);
         let (code, desc) = self.line.error_values(status);
-        let ctrl = self.lock_controller();
-        if let Some(p) = ctrl.params {
-            ctrl.post(
+        let params = self.lock_controller().params;
+        if let Some(p) = params {
+            self.sets = HxpController::post(
                 self.axis_no as i32,
                 vec![
                     (p.error, ParamValue::Int32(code)),
@@ -113,6 +116,10 @@ impl AsynMotor for HxpAxis {
     /// `motorStatusCommsError_` on every axis.
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
     }
 
     fn move_absolute(

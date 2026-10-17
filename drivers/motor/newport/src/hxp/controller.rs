@@ -9,9 +9,8 @@
 
 use std::sync::Arc;
 
+use epics_rs::asyn::interfaces::motor::PortSets;
 use epics_rs::asyn::param::ParamValue;
-use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
 
 use super::axis::MoveLine;
 use super::params::HxpParams;
@@ -126,9 +125,8 @@ pub struct HxpController {
     data: HxpPollData,
     /// Each axis's move line, for the parameter writes C runs on it.
     lines: [Option<Arc<MoveLine>>; NUM_HXP_AXES],
-    /// The controller port's parameters and, once published, its handle.
+    /// The controller port's parameters, once published.
     pub(super) params: Option<HxpParams>,
-    port: Option<PortHandle>,
 }
 
 impl HxpController {
@@ -144,13 +142,7 @@ impl HxpController {
             data: HxpPollData::default(),
             lines: Default::default(),
             params: None,
-            port: None,
         }
-    }
-
-    /// Post what the poll reads to the controller port from here on.
-    pub fn attach_port(&mut self, port: PortHandle) {
-        self.port = Some(port);
     }
 
     /// Axis `axis_no`'s move line, which the parameter writes use too.
@@ -165,15 +157,13 @@ impl HxpController {
 
     /// Set address-0 `values` and run the callbacks at `addr`: C sets
     /// `pC_`'s parameters and flushes the caller's address.
-    pub(super) fn post(&self, addr: i32, values: Vec<(usize, ParamValue)>) {
-        let Some(port) = &self.port else {
-            return;
-        };
-        let updates = values
-            .into_iter()
-            .map(|(reason, value)| ParamSetValue::new(reason, 0, value))
-            .collect();
-        let _ = port.set_params_and_notify_blocking(addr, updates);
+    pub(super) fn post(addr: i32, values: Vec<(usize, ParamValue)>) -> PortSets {
+        let mut sets = PortSets::default();
+        for (reason, value) in values {
+            sets.set(0, reason, value);
+        }
+        sets.call_param_callbacks(addr);
+        sets
     }
 
     /// The shared poll socket (`Query` mode).
@@ -211,7 +201,7 @@ impl HxpController {
     /// C `HXPController::poll`. On an RPC failure the firmware probe is
     /// reset and every axis reports problem + comms error until a poll
     /// succeeds, exactly as C's `done:` path.
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> PortSets {
         let mut status = None;
         let polled = self.poll_once(&mut status);
         // C sets HXP_STATUS once GroupStatusGet answers, and every poll ends
@@ -220,7 +210,7 @@ impl HxpController {
             (Some(p), Some(status)) => vec![(p.status, ParamValue::Int32(status))],
             _ => Vec::new(),
         };
-        self.post(0, values);
+        let sets = Self::post(0, values);
         match polled {
             Ok(data) => self.data = data,
             Err(_) => {
@@ -234,6 +224,7 @@ impl HxpController {
                 self.data.homed = false;
             }
         }
+        sets
     }
 
     fn poll_once(&mut self, status: &mut Option<i32>) -> XpsResult<HxpPollData> {
