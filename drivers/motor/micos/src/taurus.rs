@@ -43,6 +43,8 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi};
 
+use crate::smc::{SmcMembers, SmcState, travel_limits};
+
 /// Response buffer size.
 const READ_BUF: usize = 128;
 
@@ -53,9 +55,6 @@ const TERMINATOR: &[u8] = b"\r\n";
 const STATUS_MOVING: i32 = 0x1; // axis in motion
 const STATUS_POWER_OFF: i32 = 0x100; // drive power disabled
 const STATUS_ESTOP_SWITCH: i32 = 0x200; // e-stop switch active
-
-/// Switch-config bit that disables (masks) a limit switch.
-const SWITCH_IGNORE: i32 = 0x2;
 
 /// Delay required by the controller after an `init` command.
 const INIT_DELAY: Duration = Duration::from_millis(200);
@@ -108,14 +107,9 @@ impl TaurusController {
 /// One Taurus axis sharing a controller. Implements [`AsynMotor`].
 pub struct TaurusAxis {
     controller: Arc<Mutex<TaurusController>>,
-    /// 0-based axis index; commands use `axis_no + 1`.
-    axis_no: usize,
-    /// Cached travel limits in controller units (needed as a pair for
-    /// `setnlimit`).
-    neg_travel_limit: f64,
-    pos_travel_limit: f64,
-    /// C `axisRes_` (`clPeriod`): controller units per record step.
-    axis_res: f64,
+    /// The travel limits are cached in controller units, as `setnlimit`
+    /// takes them as a pair; `axisRes` starts as `clPeriod`.
+    members: Arc<SmcMembers>,
 }
 
 impl TaurusAxis {
@@ -125,37 +119,52 @@ impl TaurusAxis {
     /// stays 0.
     pub fn new(controller: Arc<Mutex<TaurusController>>, axis_no: usize) -> Self {
         let addr = axis_no + 1;
-        let (axis_res, reply) = {
+        let (cl_period, reply) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let axis_res = atof(
+            let cl_period = atof(
                 &ctrl
                     .query(&format!("{addr} getclperiod"))
                     .unwrap_or_default(),
             );
             (
-                axis_res,
+                cl_period,
                 ctrl.query(&format!("{addr} getnlimit")).unwrap_or_default(),
             )
         };
-        let mut bounds = reply
-            .split_whitespace()
-            .map_while(|tok| tok.parse::<f64>().ok());
+        let state = SmcState {
+            axis_res: cl_period,
+            travel_limits: travel_limits(&reply),
+            ..SmcState::default()
+        };
         Self {
             controller,
-            axis_no,
-            neg_travel_limit: bounds.next().unwrap_or(0.0),
-            pos_travel_limit: bounds.next().unwrap_or(0.0),
-            axis_res,
+            members: Arc::new(SmcMembers {
+                axis_no,
+                motor_form: None,
+                pitch: None,
+                pole_pairs: None,
+                cl_period,
+                state: Mutex::new(state),
+            }),
         }
+    }
+
+    /// What C's `report` prints of the axis.
+    pub fn members(&self) -> Arc<SmcMembers> {
+        self.members.clone()
     }
 
     /// C `changeResolution`: replace `axisRes`.
     pub fn change_resolution(&mut self, new_resolution: f64) {
-        self.axis_res = new_resolution;
+        self.members.state().axis_res = new_resolution;
     }
 
     fn addr(&self) -> usize {
-        self.axis_no + 1
+        self.members.axis_no + 1
+    }
+
+    fn axis_res(&self) -> f64 {
+        self.members.axis_res()
     }
 
     fn lock(&self) -> MutexGuard<'_, TaurusController> {
@@ -173,20 +182,16 @@ impl TaurusAxis {
     ) -> AsynResult<()> {
         let addr = self.addr();
         ctrl.write_all([
-            format!("{:.6} {addr} snv", (velocity * self.axis_res).abs()),
-            format!("{:.6} {addr} sna", (acceleration * self.axis_res).abs()),
+            format!("{:.6} {addr} snv", (velocity * self.axis_res()).abs()),
+            format!("{:.6} {addr} sna", (acceleration * self.axis_res()).abs()),
             cmd,
         ])
     }
 
     /// Push the current travel-limit pair to the controller (`setnlimit`).
     fn send_travel_limits(&self, ctrl: &TaurusController) -> AsynResult<()> {
-        ctrl.write_only(&format!(
-            "{:.6} {:.6} {} setnlimit",
-            self.neg_travel_limit,
-            self.pos_travel_limit,
-            self.addr()
-        ))
+        let (neg, pos) = self.members.state().travel_limits;
+        ctrl.write_only(&format!("{neg:.6} {pos:.6} {} setnlimit", self.addr()))
     }
 }
 
@@ -205,7 +210,7 @@ impl AsynMotor for TaurusAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let cmd = format!("{:.6} {} nm", position * self.axis_res, self.addr());
+        let cmd = format!("{:.6} {} nm", position * self.axis_res(), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -217,7 +222,7 @@ impl AsynMotor for TaurusAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let cmd = format!("{:.6} {} nr", distance * self.axis_res, self.addr());
+        let cmd = format!("{:.6} {} nr", distance * self.axis_res(), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -229,11 +234,8 @@ impl AsynMotor for TaurusAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         // No jog command — move to the cached axis travel limit.
-        let target = if velocity > 0.0 {
-            self.pos_travel_limit
-        } else {
-            self.neg_travel_limit
-        };
+        let (neg, pos) = self.members.state().travel_limits;
+        let target = if velocity > 0.0 { pos } else { neg };
         let cmd = format!("{target:.6} {} nm", self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
@@ -262,7 +264,7 @@ impl AsynMotor for TaurusAxis {
         // origin, hence the negation (C multiplies by -1).
         ctrl.write_only(&format!(
             "{:.6} {} setnpos",
-            -position * self.axis_res,
+            -position * self.axis_res(),
             self.addr()
         ))
     }
@@ -283,13 +285,15 @@ impl AsynMotor for TaurusAxis {
     }
 
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.pos_travel_limit = position * self.axis_res;
+        let pos = position * self.axis_res();
+        self.members.state().travel_limits.1 = pos;
         let ctrl = self.lock();
         self.send_travel_limits(&ctrl)
     }
 
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.neg_travel_limit = position * self.axis_res;
+        let neg = position * self.axis_res();
+        self.members.state().travel_limits.0 = neg;
         let ctrl = self.lock();
         self.send_travel_limits(&ctrl)
     }
@@ -317,14 +321,7 @@ impl AsynMotor for TaurusAxis {
 
         // Switch config: bit 1 (0x2) masks (disables) the switch.
         let sw = ctrl.query(&format!("{addr} getsw"))?;
-        let cfg: Vec<i32> = sw
-            .split_whitespace()
-            .filter_map(|tok| tok.parse::<i32>().ok())
-            .collect();
-        let (ignore_low, ignore_high) = match cfg.as_slice() {
-            [low, high, ..] => (low & SWITCH_IGNORE, high & SWITCH_IGNORE),
-            _ => (0, 0),
-        };
+        let (ignore_low, ignore_high) = self.members.read_limit_config(&sw);
 
         // Switch state: "low high", 0=inactive 1=active.
         let st = ctrl.query(&format!("{addr} getswst"))?;
@@ -334,14 +331,14 @@ impl AsynMotor for TaurusAxis {
             .collect();
         let (mut low_limit, mut high_limit) = (false, false);
         if let [low, high, ..] = state.as_slice() {
-            low_limit = ignore_low == 0 && *low != 0;
-            high_limit = ignore_high == 0 && *high != 0;
+            low_limit = !ignore_low && *low != 0;
+            high_limit = !ignore_high && *high != 0;
         }
         drop(ctrl);
 
         Ok(MotorStatus {
-            position: position / self.axis_res,
-            encoder_position: position / self.axis_res,
+            position: position / self.axis_res(),
+            encoder_position: position / self.axis_res(),
             velocity: 0.0,
             done: !moving,
             moving,
@@ -368,7 +365,7 @@ mod tests {
             SyncIOHandle::connect_port("TAURUS_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
         let axis = TaurusAxis::new(controller, 0);
-        assert_eq!((axis.neg_travel_limit, axis.pos_travel_limit), (0.0, 0.0));
+        assert_eq!(axis.members.state().travel_limits, (0.0, 0.0));
     }
 
     /// Refuses every setting write (`snv`, `sna`, `setcloop`); records
@@ -425,10 +422,18 @@ mod tests {
         let handle = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let mut axis = TaurusAxis {
             controller: Arc::new(Mutex::new(TaurusController::new(handle))),
-            axis_no: 0,
-            neg_travel_limit: -100.0,
-            pos_travel_limit: 100.0,
-            axis_res: 0.5,
+            members: Arc::new(SmcMembers {
+                axis_no: 0,
+                motor_form: None,
+                pitch: None,
+                pole_pairs: None,
+                cl_period: 0.0,
+                state: Mutex::new(SmcState {
+                    axis_res: 0.5,
+                    travel_limits: (-100.0, 100.0),
+                    ..SmcState::default()
+                }),
+            }),
         };
         let user = AsynUser::default();
         axis.move_absolute(&user, 2.0, 0.0, 2.0, 4.0).unwrap();
@@ -465,12 +470,5 @@ mod tests {
         assert!(powered(0x1));
         assert!(problem(0x200));
         assert!(!problem(0x1));
-    }
-
-    #[test]
-    fn switch_ignore_mask() {
-        let ignored = |cfg: i32| (cfg & SWITCH_IGNORE) != 0;
-        assert!(!ignored(0x1));
-        assert!(ignored(0x2));
     }
 }

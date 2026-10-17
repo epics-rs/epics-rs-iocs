@@ -23,8 +23,7 @@ use motor_common::iocsh::{
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::{
-    Controller, ControllerParams, ControllerReport, asyn_user, model1_device, register_port,
-    register_port_with,
+    Controller, ControllerParams, ControllerReport, asyn_user, model1_device, register_port_with,
 };
 
 use crate::corvus::{CorvusAxis, CorvusController};
@@ -321,7 +320,12 @@ pub fn taurus_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, num_axes as i32)?;
+            register_port_with(
+                ctx,
+                &port_name,
+                num_axes as i32,
+                ControllerLine::new("SMC Taurus", moving_poll_ms, idle_poll_ms),
+            )?;
 
             let (handle, _) = connect_controller(
                 &taurus_port,
@@ -336,10 +340,12 @@ pub fn taurus_create_controller_command() -> CommandDef {
             // C startPoller, SMCTaurusDriver.cpp:41
             let poller = Controller::new();
             for index in 0..num_axes as usize {
-                let ax = Arc::new(Mutex::new(TaurusAxis::new(controller.clone(), index)));
+                let axis = TaurusAxis::new(controller.clone(), index);
+                let report = axis.members();
+                let ax = Arc::new(Mutex::new(axis));
                 register_resolution_axis(&port_name, ax.clone());
                 let motor: Arc<Mutex<dyn AsynMotor>> = ax;
-                poller.install(asyn_user(&port_name, index as i32), motor)?;
+                poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
@@ -488,7 +494,7 @@ mod report {
     /// limit configuration C's report prints.
     async fn polled(line: &LineRig, cmd: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !line.sent().iter().any(|s| s == cmd) {
+        while !line.sent().iter().any(|s| s.trim_end() == cmd) {
             assert!(Instant::now() < deadline, "no {cmd}");
             epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
         }
@@ -523,6 +529,34 @@ mod report {
                     polePairs 50\n    clPeriod 0.000100\n    axisRes 0.005000\n    \
                     lowLimitConfig 2\n    highLimitConfig 0\n    posTravelLimit 100.000000\n    \
                     negTravelLimit -100.000000\nPort: corvusRep\n";
+        assert!(text.contains(want), "{text}");
+    }
+
+    /// SMCTaurusController::report then SMCTaurusAxis::report
+    /// (SMCTaurusDriver.cpp:54-58, SMCTaurusAxis.cpp:37-50).
+    #[epics_rs::base::epics_test]
+    async fn smc_taurus_report_prints_the_controller_then_each_axis() {
+        let (line, _io) = LineRig::new("taurusRepLine", |cmd| {
+            let verb = cmd.trim_end().rsplit(' ').next().unwrap_or_default();
+            match verb {
+                "getclperiod" => "0.0001",
+                "getnlimit" => "-100 100",
+                "getsw" => "2 0",
+                _ => "0",
+            }
+            .into()
+        });
+        run_command(
+            taurus_create_controller_command(),
+            args("taurusRep", "taurusRepLine", 1),
+        )
+        .await;
+        polled(&line, "1 getsw").await;
+        let text = port_report("taurusRep", 1);
+        let want = "SMC Taurus motor driver taurusRep, numAxes=1, moving poll period=0.100000, \
+                    idle poll period=1.000000\n  axis 0\n    clPeriod 0.000100\n    \
+                    axisRes 0.000100\n    lowLimitConfig 2\n    highLimitConfig 0\n    \
+                    posTravelLimit 100.000000\n    negTravelLimit -100.000000\nPort: taurusRep\n";
         assert!(text.contains(want), "{text}");
     }
 
