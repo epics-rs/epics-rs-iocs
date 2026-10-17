@@ -3811,22 +3811,25 @@ impl PortDriver for TimePix3Driver {
             self.ad.port_base.call_param_callbacks(0)?;
             return Ok(buf.len());
         }
-        // C answers every other reason with nElements, zero-filled past the
-        // data, including before the first value (mask_io.cpp:23-74, :205).
-        let data = self
-            .ad
-            .port_base
-            .params
-            .get_int32_array(reason, user.addr)
-            .unwrap_or_default();
-        let n = buf.len().min(data.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        buf[n..].fill(0);
-        // Only PixelConfigDiff and ImgImageFrame return before C's
-        // callParamCallbacks (mask_io.cpp:38-91, :243).
-        if reason != self.p.pixel_config_diff && reason != self.p.img_image_frame {
-            self.ad.port_base.call_param_callbacks(0)?;
+        if reason == self.p.pixel_config_diff || reason == self.p.img_image_frame {
+            // C answers these two with nElements, zero-filled past the data,
+            // including before the first value, and returns before its
+            // callParamCallbacks (mask_io.cpp:38-91).
+            let data = self
+                .ad
+                .port_base
+                .params
+                .get_int32_array(reason, user.addr)
+                .unwrap_or_default();
+            let n = buf.len().min(data.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            buf[n..].fill(0);
+            return Ok(buf.len());
         }
+        // asynPortDriver's readArray writes nothing, so C returns nElements
+        // of the record's own VAL (asynPortDriver.cpp:1813-1817,
+        // mask_io.cpp:92, :239-247).
+        self.ad.port_base.call_param_callbacks(0)?;
         Ok(buf.len())
     }
 }
@@ -7182,6 +7185,58 @@ mod tests {
                 .unwrap();
             assert_eq!(posted.lock().contains(&value), posts, "reason {reason}");
         }
+    }
+
+    /// PROC on PrvHstHistogramFrame keeps the waveform's VAL: C's readArray
+    /// writes nothing and returns nElements (mask_io.cpp:92, :239-247).
+    #[test]
+    fn a_processed_histogram_waveform_keeps_its_value() {
+        use epics_rs::asyn::adapter::{AsynDeviceSupport, AsynLink};
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::server::device_support::DeviceSupport;
+        use epics_rs::base::server::record::{Record, ScanType};
+        use epics_rs::base::server::records::waveform::WaveformRecord;
+        use epics_rs::base::types::{DbFieldType, EpicsValue};
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_PRVHST_PROC",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        det.ad
+            .port_base
+            .params
+            .set_int32_array(det.p.prv_hst_histogram_frame, 0, vec![1, 2])
+            .unwrap();
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("TPX_PRVHST_PROC").unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let link = AsynLink {
+            port_name: "TPX_PRVHST_PROC".into(),
+            addr: 0,
+            timeout: Some(std::time::Duration::from_secs(1)),
+            drv_info: "TPX3_PRV_HST_HISTOGRAM_FRAME".into(),
+        };
+        let mut ads =
+            AsynDeviceSupport::from_handle(runtime.port_handle().clone(), link, "asynInt32Array");
+        ads.set_record_info("TPX:PrvHstHistogramFrame", ScanType::Passive);
+        let mut rec = WaveformRecord::new(4, DbFieldType::Long);
+        ads.init(&mut rec).unwrap();
+        rec.put_field("VAL", EpicsValue::LongArray(vec![5, 6, 7].into()))
+            .unwrap();
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::LongArray(vec![5, 6, 7, 0].into()))
+        );
+        std::mem::forget(runtime);
     }
 
     /// A Medipix3 counting both counters refuses 24-bit depth and CONTINUOUS
