@@ -944,6 +944,11 @@ impl PhytronController {
                     AsynStatus::Error as i32
                 }
             }
+            // Each controller-parallel axis then finds no answers and raises
+            // its problem bit. C also raises it on every serial axis, whose
+            // own poll overwrites it in the same pass (phytronAxisMotor.cpp:
+            // 982-986, a loop over axes_ under the apTodoAxis branch); that
+            // C defect is not copied.
             Err(code) => phy_to_asyn(code).status() as i32,
         };
         if status != 0 {
