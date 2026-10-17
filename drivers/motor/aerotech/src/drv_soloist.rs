@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
@@ -150,6 +150,11 @@ fn decimals(resolution: f64) -> usize {
 pub struct DrvSoloistAxis {
     card: Arc<Mutex<SoloistCard>>,
     setup: AxisSetup,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// missed reply (RETRY, drvSoloist.cc:232), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next or on a reply other than `%` (COMM_ERR,
+    /// :237, :246).
+    failure: PollFailure,
     status: MotorStatus,
     /// The record's PREM and POST for the move it sends next.
     strings: Option<(Vec<u8>, Option<PostMessage>)>,
@@ -165,6 +170,7 @@ impl DrvSoloistAxis {
         let mut axis = Self {
             card,
             setup,
+            failure: PollFailure::NONE,
             status: MotorStatus {
                 has_encoder: setup.encoder,
                 gain_support: setup.gain,
@@ -227,9 +233,8 @@ impl DrvSoloistAxis {
 }
 
 impl AsynMotor for DrvSoloistAxis {
-    /// `poll` never fails: `set_status`'s missed replies are handled in it.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::NONE
+        self.failure
     }
 
     fn move_absolute(
@@ -342,22 +347,23 @@ impl AsynMotor for DrvSoloistAxis {
     }
 
     /// `set_status`: `AXISSTATUS()`, `AXISFAULT()` and `PFBKPROG()`. A first
-    /// missed status keeps the last status; a second, or a reply other than
-    /// `%`, raises the comms error. C zeroes the position when `PFBKPROG()`
+    /// missed status fails the poll raising nothing; a second, or a reply
+    /// other than `%`, raises the comms error. C zeroes the position when `PFBKPROG()`
     /// is not acknowledged; it is kept here.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let card = self.card.clone();
         let mut ctrl = card.lock().unwrap_or_else(|e| e.into_inner());
         let reply = ctrl.ask(b"AXISSTATUS()");
         if reply.first() != Some(&ACK) {
-            if reply.is_empty() && ctrl.comm == CommState::Normal {
-                ctrl.comm = CommState::Retry;
+            (ctrl.comm, self.failure) = if reply.is_empty() && ctrl.comm == CommState::Normal {
+                (CommState::Retry, PollFailure::NONE)
             } else {
-                ctrl.comm = CommState::CommErr;
-                self.status.comms_error = true;
-                self.status.problem = true;
-            }
-            return Ok(self.status.clone());
+                (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR)
+            };
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "Soloist: AXISSTATUS() not acknowledged".into(),
+            });
         }
         ctrl.comm = CommState::Normal;
         let axis_status = atoi(&String::from_utf8_lossy(&reply[1..]));
@@ -413,5 +419,44 @@ mod tests {
         assert_eq!(decimals(1.0), 2);
         assert_eq!(decimals(1.0 / 3.0), 2);
         assert_eq!(decimals(1000.0), 1);
+    }
+
+    /// drvSoloist.cc:222-251: a first missed `AXISSTATUS()` is RETRY
+    /// (nothing raised, nothing posted), the next COMM_ERR, and a reply
+    /// clears it.
+    #[test]
+    fn a_missed_axis_status_is_retry_then_comm_error() {
+        use motor_common::testing::LineRig;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("soloistRetry", move |_| {
+            if q.load(Ordering::SeqCst) {
+                String::new()
+            } else {
+                "%0".into()
+            }
+        });
+        let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+        let setup = AxisSetup {
+            encoder: false,
+            gain: false,
+            resolution: 1.0,
+            digits: 0,
+            home_dparam: 0,
+        };
+        let mut axis = DrvSoloistAxis::new(card, setup);
+        let user = AsynUser::new(0);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

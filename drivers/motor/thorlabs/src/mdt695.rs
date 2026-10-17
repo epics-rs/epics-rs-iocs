@@ -29,6 +29,8 @@
 //! identification is seen, matching the C retry loop.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::sleep;
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
@@ -49,6 +51,9 @@ pub const OUTPUT_EOS: &[u8] = b"\r";
 
 /// Axis letters by 0-based signal (C `MDT694_axis`).
 const AXIS_LETTERS: [char; 3] = ['X', 'Y', 'Z'];
+
+/// C `MOTION_DELAY` (drvMDT695.cc:67), slept on entering RETRY.
+const MOTION_DELAY: Duration = Duration::from_millis(100);
 
 /// Map a 0-based axis index to its wire letter, clamped to the last channel.
 /// Volts per record step (C `MDT695_RESOLUTION`).
@@ -177,6 +182,11 @@ pub struct Mdt695Axis {
     controller: Arc<Mutex<Mdt695Controller>>,
     letter: char,
     prev_position: f64,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// missed reply (RETRY, drvMDT695.cc:262), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :265). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     strings: MoveStrings,
 }
 
@@ -187,6 +197,7 @@ impl Mdt695Axis {
             controller,
             letter: axis_letter(index),
             prev_position: 0.0,
+            failure: PollFailure::NONE,
             strings: MoveStrings::default(),
         }
     }
@@ -219,11 +230,8 @@ impl Mdt695Axis {
 }
 
 impl AsynMotor for Mdt695Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvMDT695.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -320,31 +328,32 @@ impl AsynMotor for Mdt695Axis {
             .query(&format!("{}R?", self.letter))
             .ok()
             .and_then(|reply| parse_reading(&reply));
-        match reading {
-            Some(_) => ctrl.comm_state = CommState::Normal,
-            None => {
-                // C drvMDT695.cc:254-257: flush, toggle echo with `E`, read its
-                // reply; a retry keeps the previous status.
-                let _ = ctrl.query("E");
-                ctrl.comm_state = if ctrl.comm_state == CommState::Normal {
-                    CommState::Retry
-                } else {
-                    CommState::CommErr
-                };
-            }
-        }
-        let comms_error = ctrl.comm_state == CommState::CommErr;
+        let Some(volts) = reading else {
+            // C drvMDT695.cc:254-257: flush, toggle echo with `E`, read its
+            // reply.
+            let _ = ctrl.query("E");
+            self.failure = if ctrl.comm_state == CommState::Normal {
+                ctrl.comm_state = CommState::Retry;
+                drop(ctrl);
+                sleep(MOTION_DELAY);
+                PollFailure::NONE
+            } else {
+                ctrl.comm_state = CommState::CommErr;
+                PollFailure::PROBLEM_AND_COMMS_ERROR
+            };
+            return Err(thorlabs_err(format!(
+                "MDT695 {}R?: no reading",
+                self.letter
+            )));
+        };
+        ctrl.comm_state = CommState::Normal;
         // drvMDT695.cc:333-339: RA_DONE is always set, so POST goes at the
         // first good readback after the move, unaddressed.
-        if ctrl.comm_state == CommState::Normal
-            && let Some(post) = self.strings.post_due()
-        {
+        if let Some(post) = self.strings.post_due() {
             let _ = ctrl.write_only(&post);
         }
         drop(ctrl);
-        if let Some(volts) = reading {
-            self.prev_position = f64::from(nint(volts / DRIVE_RESOLUTION));
-        }
+        self.prev_position = f64::from(nint(volts / DRIVE_RESOLUTION));
         let position = self.prev_position;
 
         Ok(MotorStatus {
@@ -355,8 +364,6 @@ impl AsynMotor for Mdt695Axis {
             done: true,
             moving: false,
             direction: true,
-            comms_error,
-            problem: comms_error,
             ..MotorStatus::default()
         })
     }
@@ -410,6 +417,35 @@ mod tests {
         let p = PostMessage::default();
         p.set(text);
         p
+    }
+
+    /// drvMDT695.cc:250-283: a first missed `R?` is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a reading clears it.
+    #[test]
+    fn a_missed_reading_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (line, io) = LineRig::new("mdt695Retry", move |last| match last {
+            "D" => "MDT695".into(),
+            "YR?" if !q.load(Ordering::SeqCst) => "Y 1.5".into(),
+            _ => String::new(),
+        });
+        let ctrl = Mdt695Controller::new(io).unwrap();
+        let mut axis = Mdt695Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        line.sent();
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert_eq!(line.sent(), ["YR?", "E"]);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        assert_eq!(axis.poll(&user).unwrap().position, 15.0);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
     /// devMDT695.cc:190-194: INIT's first '#' carries the axis letter.

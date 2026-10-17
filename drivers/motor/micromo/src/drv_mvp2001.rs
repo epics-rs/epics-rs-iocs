@@ -153,6 +153,11 @@ pub struct DrvMvp2001Axis {
     limits: (i32, i32),
     /// The record's OUT parm, `"ENC_CPR,MAX_mA"`.
     parm: String,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// missed `ST` (RETRY, drvMVP2001.cc:320), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :326). Per axis, as the chain's
+    /// state can move on under another axis's poll.
+    failure: PollFailure,
     status: MotorStatus,
     /// `motor_info->position`.
     position: i32,
@@ -174,6 +179,7 @@ impl DrvMvp2001Axis {
             addr: signal + 1,
             limits,
             parm: String::new(),
+            failure: PollFailure::NONE,
             status: MotorStatus {
                 gain_support: true,
                 ..MotorStatus::default()
@@ -252,9 +258,8 @@ fn refused(message: &str) -> AsynError {
 }
 
 impl AsynMotor for DrvMvp2001Axis {
-    /// `poll` never fails: `set_status`'s missed replies are handled in it.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::NONE
+        self.failure
     }
 
     fn move_absolute(
@@ -380,21 +385,18 @@ impl AsynMotor for DrvMvp2001Axis {
     }
 
     /// `set_status`: `ST` for motion, limits and power, `POS` for the
-    /// position. A first unanswered `ST` keeps the last status; a second
-    /// raises the comms error.
+    /// position. A first unanswered `ST` fails the poll raising nothing; a
+    /// second raises the comms error.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let chain = self.chain.clone();
         let mut ctrl = chain.lock().unwrap_or_else(|e| e.into_inner());
         let st = ctrl.ask(&format!("{} ST", self.addr));
         if st.is_empty() {
-            if ctrl.comm == CommState::Normal {
-                ctrl.comm = CommState::Retry;
-            } else {
-                ctrl.comm = CommState::CommErr;
-                self.status.comms_error = true;
-                self.status.problem = true;
-            }
-            return Ok(self.status.clone());
+            (ctrl.comm, self.failure) = match ctrl.comm {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
+            };
+            return Err(refused(&format!("MVP2001 {}: no ST reply", self.addr)));
         }
         ctrl.comm = CommState::Normal;
         let pos = ctrl.ask(&format!("{} POS", self.addr));
@@ -451,5 +453,34 @@ mod tests {
         assert_eq!(ano(500), nint(500.0 * 0.865909 + 2103.431));
         assert_eq!(ano(50), ano(100));
         assert_eq!(ano(3000), ano(100));
+    }
+
+    /// drvMVP2001.cc:311-333: a first unanswered `ST` is RETRY (nothing
+    /// raised, nothing posted), the next COMM_ERR, and a reply clears it.
+    #[test]
+    fn an_unanswered_st_is_retry_then_comm_error() {
+        use motor_common::testing::LineRig;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("mvp2001Retry", move |last| match last {
+            "1 ST" if !q.load(Ordering::SeqCst) => "0001 0000".into(),
+            "1 POS" => "0001 00000010".into(),
+            _ => String::new(),
+        });
+        let chain = Arc::new(Mutex::new(Mvp2001Chain::new(io)));
+        let mut axis = DrvMvp2001Axis::new(chain, 0, (0, 0));
+        let user = AsynUser::new(0);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }
