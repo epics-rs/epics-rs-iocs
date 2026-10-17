@@ -189,9 +189,6 @@ pub struct Shared {
     pub hst: Mutex<Accumulator>,
     /// The three streams' acquisition rates.
     pub rates: Mutex<Rates>,
-    /// The mask waveform the driver draws into (C mutates the *record's*
-    /// buffer; the driver owns it here).
-    pub mask: Mutex<Vec<i32>>,
     pub streams: Mutex<StreamPaths>,
     pub endpoints: Mutex<StreamEndpoints>,
     /// C `prvImgWorkerState_`, `prvImg1WorkerState_`, `imgWorkerState_`,
@@ -225,7 +222,6 @@ impl Shared {
             img: Mutex::new(Accumulator::new()),
             hst: Mutex::new(Accumulator::prv_hst()),
             rates: Mutex::new(Rates::default()),
-            mask: Mutex::new(Vec::new()),
             streams: Mutex::new(StreamPaths::default()),
             endpoints: Mutex::new(StreamEndpoints::default()),
             prv_img_worker: WorkerState::default(),
@@ -307,39 +303,11 @@ impl Shared {
         let applied = self.family_applied.swap(true, Ordering::AcqRel);
         old != family as i32 || !applied
     }
-
-    /// Take the mask out for editing, growing it to the geometry first.
-    pub fn take_mask(&self, len: usize) -> Vec<i32> {
-        let mut mask = self.mask.lock();
-        if mask.len() != len {
-            mask.clear();
-            mask.resize(len, 0);
-        }
-        std::mem::take(&mut *mask)
-    }
-
-    pub fn put_mask(&self, mask: Vec<i32>) {
-        *self.mask.lock() = mask;
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_mask_grows_to_the_geometry_and_survives_a_round_trip() {
-        let s = Shared::new();
-        let mut m = s.take_mask(4);
-        assert_eq!(m, vec![0, 0, 0, 0]);
-        m[2] = 1;
-        s.put_mask(m);
-        assert_eq!(s.take_mask(4), vec![0, 0, 1, 0]);
-
-        // A geometry change discards the old mask rather than reinterpreting it.
-        s.put_mask(vec![0, 0, 1, 0]);
-        assert_eq!(s.take_mask(2), vec![0, 0]);
-    }
 
     #[test]
     fn the_stream_paths_round_trip() {

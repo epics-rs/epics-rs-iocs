@@ -3782,11 +3782,10 @@ impl PortDriver for TimePix3Driver {
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
         let reason = user.reason;
         if reason == self.p.mask_bp_c {
-            let mut mask = self.shared.take_mask(buf.len());
-            let drawn = self.mask_bp_c(&mut mask);
-            buf.copy_from_slice(&mask);
-            self.shared.put_mask(mask);
-            return drawn.map(|()| buf.len());
+            // C draws into the record's value (mask_io.cpp:99-129), which
+            // `buf` holds. C leaves a failed draw part-drawn in VAL; an Err
+            // here leaves VAL unchanged, deliberately.
+            return self.mask_bp_c(buf).map(|()| buf.len());
         }
         if reason == self.p.bp_c {
             // C mask_io.cpp:209-237: the packed pixel, with bit 8 (TPX3) or
@@ -6128,17 +6127,10 @@ mod tests {
             })
             .unwrap()
         };
-        assert!(
-            h.with_driver_blocking::<TimePix3Driver, _>(|d| d.shared.take_mask(4))
-                .unwrap()
-                .iter()
-                .all(|&v| v == 0),
-            "the flag write drew nothing"
-        );
         let (r, buf, _, status) = read(65536 + 2);
         assert_eq!(r, Ok(65538));
         assert!(buf[..65536].iter().all(|&v| v == 3), "reset assigns OnOff");
-        assert_eq!(&buf[65536..], &[0, 0]);
+        assert_eq!(&buf[65536..], &[-1, -1], "VAL past the image is kept");
         assert_eq!(status, AsynStatus::Success);
         assert_eq!(
             h.with_driver_blocking::<TimePix3Driver, _>(|d| d.int(d.p.mask_reset, 0))
@@ -6161,6 +6153,15 @@ mod tests {
         let (r, _, msg, _) = read(65536);
         assert!(r.is_err());
         assert_eq!(msg, "invalid mask geometry or operation");
+
+        // The draw edits the record's VAL, not a driver copy.
+        h.write_int32_blocking(p.mask_size_x, 0, 1).unwrap();
+        h.write_int32_blocking(p.mask_size_y, 0, 1).unwrap();
+        h.write_int32_blocking(p.mask_on_off_pel, 0, 0).unwrap();
+        let (r, buf, _, _) = read(65536);
+        assert_eq!(r, Ok(65536));
+        assert_eq!(&buf[..2], &[-2, -1], "unmasking clears bit 0 of VAL");
+        assert!(buf[1..].iter().all(|&v| v == -1));
 
         h.write_int32_blocking(p.mask_rectangle, 0, 0).unwrap();
         let (r, _, _, status) = read(65536);
