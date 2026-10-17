@@ -478,6 +478,7 @@ impl AmptekDriver {
             }
             self.failed_sends = 0;
         }
+        // C defect not copied: drvAmptek::connect skips exceptionConnect when the link is already up.
         self.base.set_addr_connected(user.addr, true);
         Ok(())
     }
