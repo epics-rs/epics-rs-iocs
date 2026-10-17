@@ -1,8 +1,9 @@
 //! Driver test rigs: a recording serial line, where every write is kept and
-//! a read answers the last command written through the test's `reply`, and a
-//! count of
+//! a read answers the last command written through the test's `reply` (or
+//! takes the next line it queued), and a count of
 //! the process's `motorPoller` threads.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 type Reply = Box<dyn Fn(&str) -> String + Send + Sync>;
+type Lines = Box<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 type Fails = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 struct Line {
@@ -22,8 +24,16 @@ struct Line {
     /// The last write that was more than a terminator: GCS2 writes a command
     /// and its `\n` separately, and the reply belongs to the command.
     command: String,
-    reply: Reply,
+    answer: Answer,
     fails: Fails,
+}
+
+enum Answer {
+    /// Every read answers the last command.
+    Last(Reply),
+    /// A command queues its lines; a read takes the next one and times out
+    /// once none is left, as a real line does.
+    Queued(Lines, VecDeque<String>),
 }
 
 impl PortDriver for Line {
@@ -37,6 +47,9 @@ impl PortDriver for Line {
         let line = String::from_utf8_lossy(data).into_owned();
         if !data.iter().all(|b| matches!(b, b'\r' | b'\n')) {
             self.command.clone_from(&line);
+            if let Answer::Queued(lines, queue) = &mut self.answer {
+                *queue = lines(&self.command).into();
+            }
         }
         let failed = (self.fails)(&line);
         self.sent.lock().unwrap().push(line);
@@ -59,7 +72,13 @@ impl PortDriver for Line {
         Ok(())
     }
     fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let reply = (self.reply)(&self.command);
+        let reply = match &mut self.answer {
+            Answer::Last(reply) => reply(&self.command),
+            Answer::Queued(_, queue) => queue.pop_front().ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "LineRig: nothing to read".into(),
+            })?,
+        };
         let n = reply.len().min(buf.len());
         buf[..n].copy_from_slice(&reply.as_bytes()[..n]);
         Ok(n)
@@ -89,13 +108,30 @@ impl LineRig {
         reply: impl Fn(&str) -> String + Send + Sync + 'static,
         fails: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> (Self, SyncIOHandle) {
+        Self::open(name, Answer::Last(Box::new(reply)), Box::new(fails))
+    }
+
+    /// [`Self::new`] for a device that answers a command with `lines`, one
+    /// per read, then sends nothing.
+    pub fn queued(
+        name: &str,
+        lines: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
+    ) -> (Self, SyncIOHandle) {
+        Self::open(
+            name,
+            Answer::Queued(Box::new(lines), VecDeque::new()),
+            Box::new(|_| false),
+        )
+    }
+
+    fn open(name: &str, answer: Answer, fails: Fails) -> (Self, SyncIOHandle) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let line = Line {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             sent: sent.clone(),
             command: String::new(),
-            reply: Box::new(reply),
-            fails: Box::new(fails),
+            answer,
+            fails,
         };
         let claim = claim_port(name).unwrap();
         let (rt, _jh) = create_port_runtime(&claim, line, RuntimeConfig::default()).unwrap();

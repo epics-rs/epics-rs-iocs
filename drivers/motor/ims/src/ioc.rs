@@ -71,7 +71,7 @@ pub fn ims_create_controller_command() -> CommandDef {
                  IOPortName={io_port}, devName={device_name} "
             );
             set_eos_ignored(&handle, INPUT_EOS, OUTPUT_EOS);
-            let line = ImsLine::new(handle, device_name);
+            let line = ImsLine::new(handle, device_name, &motor_port);
             // The port C's constructor builds first; it needs the line here.
             let owner = ctx.db().scan_control().interrupt_gate();
             let port =
@@ -366,14 +366,15 @@ mod extra_params {
     /// A controller `port` on line `line` with device name `A`, and the
     /// controller port's user at axis 0.
     async fn controller(port: &str, line: &str) -> (LineRig, SyncIOHandle) {
-        failing_controller(port, line, |_| false).await
+        failing_controller(port, line, 1000.0, |_| false).await
     }
 
-    /// [`controller`], with the writes `fails` picks refused; `PR ER`
-    /// answers 73.
+    /// [`controller`] polled at `idle_ms` when idle, with the writes `fails`
+    /// picks refused; `PR ER` answers 73.
     async fn failing_controller(
         port: &str,
         line: &str,
+        idle_ms: f64,
         fails: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> (LineRig, SyncIOHandle) {
         let reply = |last: &str| {
@@ -393,7 +394,7 @@ mod extra_params {
             ArgValue::String(line.into()),
             ArgValue::String("A".into()),
             ArgValue::Double(100.0),
-            ArgValue::Double(1000.0),
+            ArgValue::Double(idle_ms),
         ];
         run_command(ims_create_controller_command(), args).await;
         let handle = PortManager::global().find_port_handle(port).unwrap();
@@ -423,13 +424,81 @@ mod extra_params {
         assert_eq!(io.read_int32(save).unwrap(), 1);
     }
 
+    /// ImsMDrivePlusMotorController.cpp:317-318: an IMS write at an address
+    /// with no axis (a create that failed after the port) fails before the
+    /// val= print, the store or a command.
+    #[epics_rs::base::epics_test]
+    async fn an_ims_write_with_no_axis_does_nothing() {
+        use epics_rs::asyn::registry::open_owner;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let (line, handle) = LineRig::new("imsNoAxisLine", |_| "0".into());
+        let ims = ImsLine::new(handle, "A".into(), "imsNoAxis");
+        let port =
+            register_controller_port(&open_owner(), "imsNoAxis", 1, ImsParams::new(ims)).unwrap();
+        let io = SyncIOHandle::from_handle(port, 0, IMS_TIMEOUT);
+        let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
+        let path = std::env::temp_dir().join(format!("imsNoAxis-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        let all = TraceMask::IO_DRIVER | TraceMask::FLOW | TraceMask::ERROR;
+        trace.set_trace_mask(Some("imsNoAxis"), all);
+        trace.set_trace_file(Some("imsNoAxis"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("imsNoAxis", 0, TraceFile::File(file));
+        assert!(io.write_int32(save, 1).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!text.contains(DRIVER_NAME), "{text}");
+        assert!(line.sent().is_empty());
+        assert_ne!(io.read_int32(save).ok(), Some(1));
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:525, :552 and
+    /// ImsMDrivePlusMotorController.cpp:369: a sent `S` or `CF` prints its
+    /// writeController line, then its axis method's IO_DRIVER line.
+    #[epics_rs::base::epics_test]
+    async fn a_sent_ims_write_prints_its_io_driver_lines() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let (line, io) = failing_controller("imsIoNvm", "imsIoNvmLine", 3.6e6, |_| false).await;
+        let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
+        let clear = io.drv_user_create("IMS_CLEARLRERROR").unwrap();
+        let path = std::env::temp_dir().join(format!("imsIoNvm-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("imsIoNvm"), TraceMask::IO_DRIVER);
+        trace.set_trace_file(Some("imsIoNvm"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("imsIoNvm", 0, TraceFile::File(file));
+        line.sent();
+        io.write_int32(save, 1).unwrap();
+        io.write_int32(clear, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .filter(|l| !l.contains("writeInt32"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "ImsMDrivePlusMotorDriver:writeController(): deviceName=A, command=AS",
+                "ImsMDrivePlusMotorDriver:saveToNVM(): Saved to NVM",
+                "ImsMDrivePlusMotorDriver:writeController(): deviceName=A, command=ACF",
+                "ImsMDrivePlusMotorDriver:clearLockedRotor(): Clear Locked Rotor Error",
+            ],
+            "{text}"
+        );
+    }
+
     /// ImsMDrivePlusMotorAxis.cpp:528-532 then
     /// ImsMDrivePlusMotorController.cpp:328: a failed `S` runs saveToNVM's
     /// handleAxisError before writeInt32's own ERROR line.
     #[epics_rs::base::epics_test]
     async fn a_failed_save_to_nvm_prints_the_drive_s_error_code() {
         use epics_rs::asyn::trace::{TraceFile, TraceMask};
-        let (line, io) = failing_controller("imsNvmErr", "imsNvmErrLine", |l| l == "AS").await;
+        let (line, io) =
+            failing_controller("imsNvmErr", "imsNvmErrLine", 1000.0, |l| l == "AS").await;
         let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
         let path = std::env::temp_dir().join(format!("imsNvmErr-{}", std::process::id()));
         let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
@@ -459,6 +528,49 @@ mod extra_params {
         );
     }
 
+    /// ImsMDrivePlusMotorAxis.cpp:582 under writeInt32: a failed
+    /// IMS_CLEARLRERROR sets the axis's problem bit, which reaches the addr-0
+    /// MOTOR_STATUS_PROBLEM and MOTOR_STATUS params until the next good poll
+    /// (:497) clears it.
+    #[epics_rs::base::epics_test]
+    async fn a_failed_clear_lr_error_sets_the_problem_params() {
+        // An hour's idle period: the first poll is the only one.
+        let (_line, io) =
+            failing_controller("imsLrProb", "imsLrProbLine", 3.6e6, |l| l == "ACF").await;
+        let clear = io.drv_user_create("IMS_CLEARLRERROR").unwrap();
+        let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
+        let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
+        let locked = io.drv_user_create("IMS_LOCKEDROTOR").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while io.read_int32(locked).unwrap_or(0) != 1 {
+            assert!(std::time::Instant::now() < deadline);
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(io.read_int32(problem).unwrap(), 0);
+        assert!(io.write_int32(clear, 1).is_err());
+        assert_eq!(io.read_int32(problem).unwrap(), 1);
+        assert_ne!(io.read_int32(msta).unwrap() & 1 << 9, 0);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:497: the good poll after a failed
+    /// IMS_CLEARLRERROR clears MOTOR_STATUS_PROBLEM again.
+    #[epics_rs::base::epics_test]
+    async fn a_good_poll_clears_the_problem_param() {
+        let (_line, io) =
+            failing_controller("imsLrClr", "imsLrClrLine", 50.0, |l| l == "ACF").await;
+        let clear = io.drv_user_create("IMS_CLEARLRERROR").unwrap();
+        let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
+        assert!(io.write_int32(clear, 1).is_err());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while io.read_int32(problem).unwrap() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "problem never cleared"
+            );
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// ImsMDrivePlusMotorController.cpp:371-373, ImsMDrivePlusMotorAxis.cpp:
     /// 494-497: a failed IO sets the controller's addr-0 COMMS_ERROR param,
     /// not MSTA; a good poll clears it.
@@ -470,7 +582,7 @@ mod extra_params {
             let dead = dead.clone();
             move |l: &str| l == "APR P" && dead.load(Ordering::Relaxed)
         };
-        let (_line, io) = failing_controller("imsComms", "imsCommsLine", fails).await;
+        let (_line, io) = failing_controller("imsComms", "imsCommsLine", 1000.0, fails).await;
         let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
         let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
         let until = |want: i32| {
@@ -486,6 +598,23 @@ mod extra_params {
         assert_eq!(io.read_int32(msta).unwrap() & 1 << 12, 0);
         dead.store(false, Ordering::Relaxed);
         until(0);
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:403-406, ImsMDrivePlusMotorAxis.cpp:
+    /// 504: a first poll that fails posts COMMS_ERROR 1 with its problem
+    /// bit, in the same callParamCallbacks.
+    #[epics_rs::base::epics_test]
+    async fn a_failed_first_poll_leaves_comms_error_set() {
+        let (_line, io) =
+            failing_controller("imsComms1", "imsComms1Line", 3.6e6, |l| l == "APR P").await;
+        let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
+        let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while io.read_int32(problem).unwrap_or(0) != 1 {
+            assert!(std::time::Instant::now() < deadline, "problem never 1");
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(io.read_int32(comms).unwrap(), 1);
     }
 
     /// ImsMDrivePlusMotorController.cpp:335-343 and

@@ -19,6 +19,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, Pos
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, atoi, nint};
 
@@ -241,7 +242,10 @@ impl DrvIm483Axis {
     /// The record's `SET_VELOCITY` and `SET_VEL_BASE`; `SET_ACCEL` sends
     /// nothing.
     fn speeds(min_velocity: f64, velocity: f64) -> [String; 2] {
-        [format!("V{velocity:.2};"), format!("I{min_velocity:.2};")]
+        [
+            format!("V{:.2};", CFloat(velocity)),
+            format!("I{:.2};", CFloat(min_velocity)),
+        ]
     }
 }
 
@@ -259,7 +263,7 @@ impl AsynMotor for DrvIm483Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let [v, i] = Self::speeds(min_velocity, velocity);
-        self.send_move(&[v, i, format!("R{position:.2}")])
+        self.send_move(&[v, i, format!("R{:.2}", CFloat(position))])
     }
 
     fn move_relative(
@@ -271,7 +275,7 @@ impl AsynMotor for DrvIm483Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let [v, i] = Self::speeds(min_velocity, velocity);
-        self.send_move(&[v, i, format!("{distance:+.2}")])
+        self.send_move(&[v, i, format!("{:+.2}", CFloat(distance))])
     }
 
     fn move_velocity(
@@ -281,7 +285,10 @@ impl AsynMotor for DrvIm483Axis {
         velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        self.send_move(&[format!("I{min_velocity:.2};"), format!("M{velocity:.2};")])
+        self.send_move(&[
+            format!("I{:.2};", CFloat(min_velocity)),
+            format!("M{:.2};", CFloat(velocity)),
+        ])
     }
 
     fn home(
@@ -549,6 +556,24 @@ mod tests {
         sm.axis.set_move_strings(&sm.user, b"MO", None).unwrap();
         sm.move_to(10.0);
         assert_eq!(sm.sent(), ["V2.00;", "I1.00;", "MO;R10.00"]);
+    }
+
+    /// devIM483PL.cc's `%.*f` and `%+.*f` of a non-finite step value.
+    #[test]
+    fn a_nan_target_goes_out_as_c_printf_spells_it() {
+        let mut pl = Rig::new("im483_nan", true);
+        pl.axis
+            .move_absolute(&pl.user, f64::NAN, f64::INFINITY, 2.0, 0.0)
+            .unwrap();
+        pl.axis
+            .move_relative(&pl.user, f64::NAN, 1.0, 2.0, 0.0)
+            .unwrap();
+        assert_eq!(
+            pl.sent(),
+            [
+                "A V2.00;", "A Iinf;", "A Rnan", "A V2.00;", "A I1.00;", "A +nan"
+            ]
+        );
     }
 
     /// drvIM483PL.cc:361-366: POST once the move is done, not while it runs.
