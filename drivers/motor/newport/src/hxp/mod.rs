@@ -12,6 +12,8 @@
 pub mod axis;
 pub mod commands;
 pub mod controller;
+pub mod params;
 
-pub use axis::HxpAxis;
+pub use axis::{HxpAxis, MoveLine};
 pub use controller::{HXP_GROUP, HxpController, MoveCoordSys, NUM_HXP_AXES};
+pub use params::HxpControllerParams;

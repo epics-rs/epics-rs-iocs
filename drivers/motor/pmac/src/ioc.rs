@@ -33,16 +33,16 @@ use motor_common::iocsh::{
 };
 use motor_common::model1::c_int;
 use motor_common::model2::Model2;
-use motor_common::{asyn_user, install, register_controller_port};
+use motor_common::{Controller, asyn_user, register_controller_port};
 
 use crate::axis::PmacAxis;
 use crate::controller::{PMAC_TIMEOUT, PmacController, PmacControllerParams};
 use crate::coord::{CS_AXES, PmacCoordSystem, PmacCsAxis};
 use crate::ethernet::pmac_asyn_ip_configure_command;
 
-/// How long a polled global status (`???`, `%`) or coordinate-system status
-/// (`&{cs}??`, `Q8{n}`) stays fresh. One controller-wide read serves every axis
-/// polling within the window, which is what C's single poller thread does.
+/// How long a polled coordinate-system status (`&{cs}??`, `Q8{n}`) stays
+/// fresh. One read serves every axis polling within the window, which is what
+/// C's single poller thread does.
 const POLL_CACHE_TTL: Duration = Duration::from_millis(50);
 
 /// pmacAsynCoord.c's `motorAxisDrvSET_t`, its cards keyed by `reference`.
@@ -53,12 +53,11 @@ pub static PMAC_ASYN_COORD: Model2 = Model2::new("pmacAsynCoord", 0);
 const COORD_MOVING_POLL_MS: u64 = 100;
 const COORD_IDLE_POLL_MS: u64 = 500;
 
-/// A controller and the poll periods `pmacCreateController` gave it.
+/// A controller and the poller `pmacCreateController` started for it.
 struct ControllerReg {
     name: String,
     controller: Arc<Mutex<PmacController>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
+    poller: Controller,
 }
 
 type Registry = Arc<Mutex<Vec<ControllerReg>>>;
@@ -195,8 +194,10 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
 
             let controller = Arc::new(Mutex::new(PmacController::new(
+                &name,
+                &low_level_port,
+                low_level_addr,
                 low_level_port_connect(&name, &low_level_port, low_level_addr),
-                POLL_CACHE_TTL,
             )));
             let params = PmacControllerParams::new(controller.clone());
             let owner = ctx.db().scan_control().interrupt_gate();
@@ -205,14 +206,19 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .attach_port(handle);
+            let polled = controller.clone();
+            let poller = Controller::new().controller_poll(move || {
+                polled.lock().unwrap_or_else(|e| e.into_inner()).poll();
+            });
+            // pmacController.cpp:201, before any axis exists.
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 10);
             registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(ControllerReg {
                     name,
                     controller,
-                    moving_poll_ms,
-                    idle_poll_ms,
+                    poller,
                 });
             Ok(CommandOutcome::Continue)
         },
@@ -220,12 +226,7 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
 }
 
 /// Create axis `axis` of controller `reg` as `@asyn(name,axis)`.
-fn create_axis(
-    reg: &ControllerReg,
-    ctx: &CommandContext,
-    command: &str,
-    axis: i32,
-) -> Result<(), String> {
+fn create_axis(reg: &ControllerReg, command: &str, axis: i32) -> Result<(), String> {
     reg.controller
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -233,14 +234,9 @@ fn create_axis(
         .map_err(|e| format!("{command}: {e}"))?;
     let motor: Arc<Mutex<dyn AsynMotor>> =
         Arc::new(Mutex::new(PmacAxis::new(reg.controller.clone(), axis)));
-    install(
-        ctx,
-        asyn_user(&reg.name, axis),
-        motor,
-        reg.moving_poll_ms,
-        reg.idle_poll_ms,
-        10, // C startPoller, tpmac pmacController.cpp:201
-    )
+    reg.poller
+        .install(asyn_user(&reg.name, axis), motor)
+        .map(drop)
 }
 
 /// C `pmacCreateAxis(pmacName, axis)`, printing what C's does.
@@ -253,7 +249,7 @@ fn pmac_create_axis_command(registry: &Registry) -> CommandDef {
             arg_int_req("Axis number"),
         ],
         "pmacCreateAxis(pmacName, axis)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let name = req_string(args, 0, "Controller port name")?;
             let axis = c_int(args, 1);
             let created = find(&registry, &name, |reg| {
@@ -264,7 +260,7 @@ fn pmac_create_axis_command(registry: &Registry) -> CommandDef {
                     );
                     return Ok(());
                 }
-                create_axis(reg, ctx, "pmacCreateAxis", axis)
+                create_axis(reg, "pmacCreateAxis", axis)
             });
             match created {
                 Some(result) => result?,
@@ -285,11 +281,11 @@ fn pmac_create_axes_command(registry: &Registry) -> CommandDef {
         "pmacCreateAxes",
         vec![arg_str_req("Controller port name"), arg_int_req("Num Axes")],
         "pmacCreateAxes(pmacName, numAxes)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let name = req_string(args, 0, "Controller port name")?;
             let num_axes = c_int(args, 1);
             let created = find(&registry, &name, |reg| {
-                (1..=num_axes).try_for_each(|axis| create_axis(reg, ctx, "pmacCreateAxes", axis))
+                (1..=num_axes).try_for_each(|axis| create_axis(reg, "pmacCreateAxes", axis))
             });
             match created {
                 Some(result) => result?,
@@ -325,19 +321,13 @@ fn pmac_disable_limits_check_command(registry: &Registry) -> CommandDef {
             let done = find(&registry, &name, |reg| {
                 let mut controller = reg.controller.lock().unwrap_or_else(|e| e.into_inner());
                 match all_axes {
-                    1 => {
-                        controller.disable_limits_check_all();
-                        Ok(())
-                    }
-                    0 => controller
-                        .disable_limits_check(axis)
-                        .map_err(|e| format!("pmacDisableLimitsCheck: {e}")),
-                    _ => Ok(()),
+                    1 => controller.disable_limits_check_all(),
+                    0 => controller.disable_limits_check(axis),
+                    _ => {}
                 }
             });
-            match done {
-                Some(result) => result?,
-                None => port_not_found("pmacDisableLimitsCheck", &name),
+            if done.is_none() {
+                port_not_found("pmacDisableLimitsCheck", &name);
             }
             Ok(CommandOutcome::Continue)
         },
@@ -364,11 +354,9 @@ fn pmac_set_open_loop_encoder_axis_command(registry: &Registry) -> CommandDef {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .set_open_loop_encoder_axis(axis, encoder_axis, 1.0)
-                    .map_err(|e| format!("pmacSetOpenLoopEncoderAxis: {e}"))
             });
-            match done {
-                Some(result) => result?,
-                None => port_not_found("pmacSetOpenLoopEncoderAxis", &name),
+            if done.is_none() {
+                port_not_found("pmacSetOpenLoopEncoderAxis", &name);
             }
             Ok(CommandOutcome::Continue)
         },
@@ -652,7 +640,11 @@ fn lock_system(system: &Mutex<PmacCoordSystem>) -> std::sync::MutexGuard<'_, Pma
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::asyn::error::AsynResult;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use epics_rs::asyn::error::{AsynResult, AsynStatus};
+    use epics_rs::asyn::interfaces::motor::MotorStatus;
     use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
@@ -730,7 +722,12 @@ mod tests {
     }
 
     fn controller_on(port: &str) -> PmacController {
-        PmacController::new(low_level_port_connect("pmacTest", port, 0), POLL_CACHE_TTL)
+        PmacController::new(
+            "pmacTest",
+            port,
+            0,
+            low_level_port_connect("pmacTest", port, 0),
+        )
     }
 
     #[test]
@@ -786,8 +783,10 @@ mod tests {
         }
     }
 
+    /// pmacController.cpp:594-625: the global status is the controller
+    /// poll's, which the poller runs before every axis; the axis reads none.
     #[test]
-    fn an_axis_reply_that_does_not_parse_still_reads_the_global_status() {
+    fn the_controller_poll_reads_the_global_status_and_the_axis_does_not() {
         let name = "pmacGlobalFirst";
         let written = Arc::new(Mutex::new(Vec::new()));
         let driver = GlobalOnly {
@@ -802,14 +801,16 @@ mod tests {
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
         let controller = Arc::new(Mutex::new(controller_on(name)));
-        let mut axis = PmacAxis::new(controller, 1);
+        let mut axis = PmacAxis::new(controller.clone(), 1);
         assert_eq!(
             std::mem::take(&mut *written.lock().unwrap()),
             ["I113 I114 I130 I131 I133"]
         );
         assert!(!axis.has_encoder);
-        assert!(axis.poll(&AsynUser::new(0).with_addr(1)).is_err());
-        assert_eq!(written.lock().unwrap()[0], "???");
+        controller.lock().unwrap().poll();
+        assert_eq!(std::mem::take(&mut *written.lock().unwrap()), ["???"]);
+        assert!(axis.poll(&AsynUser::new(0).with_addr(1)).is_ok());
+        assert_eq!(*written.lock().unwrap(), ["#1 ? F P"]);
         drop(rt);
     }
 
@@ -857,5 +858,394 @@ mod tests {
             trace.contains("pmacController: unable to set input EOS on pmacTraceLow: "),
             "{trace:?}"
         );
+    }
+
+    /// A PMAC that answers the commands in `replies` and times out on any
+    /// other, counting the disconnects its port is asked for.
+    struct Scripted {
+        base: PortDriverBase,
+        rig: Rig,
+        reply: Option<Vec<u8>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Rig {
+        replies: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        written: Arc<Mutex<Vec<String>>>,
+        disconnects: Arc<AtomicUsize>,
+    }
+
+    impl Rig {
+        fn answer(&self, command: &str, reply: &[u8]) {
+            let mut replies = self.replies.lock().unwrap();
+            replies.insert(command.into(), reply.into());
+        }
+        fn silence(&self, command: &str) {
+            self.replies.lock().unwrap().remove(command);
+        }
+        fn written(&self) -> Vec<String> {
+            std::mem::take(&mut *self.written.lock().unwrap())
+        }
+        fn disconnects(&self) -> usize {
+            self.disconnects.load(Ordering::SeqCst)
+        }
+    }
+
+    impl PortDriver for Scripted {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn set_input_eos(&mut self, _: &AsynUser, _: &[u8]) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_output_eos(&mut self, _: &AsynUser, _: &[u8]) -> AsynResult<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self, _: &AsynUser) -> AsynResult<()> {
+            self.rig.disconnects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            self.reply = self.rig.replies.lock().unwrap().get(&cmd).cloned();
+            self.rig.written.lock().unwrap().push(cmd);
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = self.reply.take().ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "timeout".into(),
+            })?;
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    fn publish_scripted(name: &str) -> (PortRuntimeHandle, Rig) {
+        let rig = Rig::default();
+        let driver = Scripted {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            rig: rig.clone(),
+            reply: None,
+        };
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        (rt, rig)
+    }
+
+    /// pmacController.cpp:335-343: a failed transfer disconnects the port; a
+    /// reply the PMAC rejected is a transfer that worked.
+    #[test]
+    fn a_failed_transfer_disconnects_the_low_level_port() {
+        let (_rt, rig) = publish_scripted("pmacDisconnect");
+        rig.answer("I100", b"\x07ERR003\r");
+        let controller = controller_on("pmacDisconnect");
+        assert!(controller.write_read("I100").is_err());
+        assert_eq!(rig.disconnects(), 0);
+        assert!(controller.write_read("I200").is_err());
+        assert_eq!(rig.disconnects(), 1);
+    }
+
+    /// pmacController.cpp:594-708: an unread global status is 0, the feed
+    /// rate is still read after a failed `???`, and the feed-rate read's
+    /// verdict is the comms error.
+    #[test]
+    fn a_failed_global_status_read_clears_the_global_problem() {
+        let (_rt, rig) = publish_scripted("pmacGlobalLow");
+        rig.answer("???", b"008000\r");
+        rig.answer("%", b"100\r");
+        let controller = Arc::new(Mutex::new(controller_on("pmacGlobalLow")));
+        let params = PmacControllerParams::new(controller.clone());
+        let port = epics_rs::motor::devices::register_controller_port(
+            &open_owner(),
+            "pmacGlobalCtl",
+            2,
+            params,
+        )
+        .unwrap();
+        controller.lock().unwrap().attach_port(port.clone());
+        let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
+        let read = |name| io.read_int32(io.drv_user_create(name).unwrap()).unwrap();
+        let posted = || {
+            (
+                read("PMAC_C_GLOBALSTATUS"),
+                read("PMAC_C_COMMSERROR"),
+                read("PMAC_C_FEEDRATE"),
+            )
+        };
+        let poll = || controller.lock().unwrap().poll();
+        let problem = || controller.lock().unwrap().controller_problem();
+        let feed_rate_poll = io.drv_user_create("PMAC_C_FEEDRATE_POLL").unwrap();
+        io.write_int32(feed_rate_poll, 1).unwrap();
+
+        poll();
+        assert_eq!(rig.written(), ["???", "%"]);
+        assert!(problem());
+        assert_eq!(posted(), (1, 0, 100));
+
+        rig.silence("???");
+        rig.answer("%", b"50\r");
+        poll();
+        assert_eq!(rig.written(), ["???", "%"]);
+        assert!(!problem());
+        assert_eq!(posted(), (0, 0, 50));
+
+        rig.answer("???", b"008000\r");
+        rig.silence("%");
+        poll();
+        assert_eq!(posted(), (1, 1, 50));
+    }
+
+    /// pmacAxis.cpp:494-498, 606-613: a failed status read keeps the status
+    /// but the power-on bit, read from zeroed words, and is no failure.
+    #[test]
+    fn a_failed_axis_status_read_clears_only_power_on() {
+        let (_rt, rig) = publish_scripted("pmacAxisSilent");
+        rig.answer("#1 ? F P", b"882000000001\r0\r100.0\r");
+        rig.answer("i124", b"$0\r");
+        let controller = Arc::new(Mutex::new(controller_on("pmacAxisSilent")));
+        let mut axis = PmacAxis::new(controller, 1);
+        let user = AsynUser::new(0).with_addr(1);
+        let read = axis.poll(&user).unwrap();
+        assert!(read.powered);
+        assert_eq!(read.position, 100.0);
+
+        rig.silence("#1 ? F P");
+        let failed = axis.poll(&user).unwrap();
+        assert_eq!(
+            failed,
+            MotorStatus {
+                powered: false,
+                moving: false,
+                ..read
+            }
+        );
+    }
+
+    /// pmacAxis.cpp:578-579: a failed `i{n}24` read skips the limits check.
+    #[test]
+    fn a_failed_limits_read_is_no_poll_failure() {
+        let (_rt, rig) = publish_scripted("pmacIx24Silent");
+        rig.answer("#1 ? F P", b"882000000001\r0\r100.0\r");
+        let controller = Arc::new(Mutex::new(controller_on("pmacIx24Silent")));
+        let mut axis = PmacAxis::new(controller, 1);
+        let status = axis.poll(&AsynUser::new(0).with_addr(1)).unwrap();
+        assert!(status.powered && !status.problem);
+    }
+
+    /// `port`'s trace, address 0 included, without the prefix, so what it
+    /// holds is the driver's own bytes.
+    struct TraceCapture {
+        path: std::path::PathBuf,
+        seen: std::cell::Cell<usize>,
+    }
+
+    impl TraceCapture {
+        fn on(port: &str) -> Self {
+            use epics_rs::asyn::trace::TraceInfoMask;
+            let path = std::env::temp_dir().join(format!("pmac-err-{port}-{}", std::process::id()));
+            let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+            let manager = PortManager::global();
+            let trace = manager.trace_manager();
+            trace.set_trace_info_mask(Some(port), TraceInfoMask::empty());
+            trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+            trace.set_device_trace_info_mask(port, 0, TraceInfoMask::empty());
+            trace.set_device_trace_file(port, 0, TraceFile::File(file));
+            Self {
+                path,
+                seen: std::cell::Cell::new(0),
+            }
+        }
+
+        /// What was printed since the last call.
+        fn take(&self) -> String {
+            let text = std::fs::read_to_string(&self.path).unwrap();
+            let new = text[self.seen.get()..].to_owned();
+            self.seen.set(text.len());
+            new
+        }
+    }
+
+    impl Drop for TraceCapture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Controller port `name` over low-level port `low`, with its parameters.
+    fn controller_port(name: &str, low: &str) -> (Arc<Mutex<PmacController>>, SyncIOHandle) {
+        let connected = low_level_port_connect(name, low, 0);
+        let controller = Arc::new(Mutex::new(PmacController::new(name, low, 0, connected)));
+        let params = PmacControllerParams::new(controller.clone());
+        let port =
+            epics_rs::motor::devices::register_controller_port(&open_owner(), name, 2, params)
+                .unwrap();
+        controller.lock().unwrap().attach_port(port.clone());
+        (
+            controller,
+            SyncIOHandle::from_handle(port, 0, Duration::from_secs(1)),
+        )
+    }
+
+    /// pmacController.cpp:341, 601-708: C's error lines on the low-level
+    /// port's trace, the feed-rate one once per `PMAC_ERROR_PRINT_TIME_`
+    /// unless the rate recovered in between.
+    #[test]
+    fn controller_errors_print_c_lines_on_the_low_level_trace() {
+        let (_rt, rig) = publish_scripted("pmacErrLow");
+        let low = TraceCapture::on("pmacErrLow");
+        let (controller, io) = controller_port("pmacErrCtl", "pmacErrLow");
+        let write = |name, value| {
+            io.write_int32(io.drv_user_create(name).unwrap(), value)
+                .unwrap()
+        };
+        write("PMAC_C_FEEDRATE_LIMIT", 100);
+        write("PMAC_C_FEEDRATE_POLL", 1);
+        let poll = || controller.lock().unwrap().poll();
+        let failed = |command| {
+            format!(
+                "pmacController::lowLevelWriteRead: Error from pasynOctetSyncIO->writeRead. \
+                 command: {command}, status=1\n"
+            )
+        };
+        let unread_global = format!(
+            "{}pmacController::getGlobalStatus: Error reading ???.\n",
+            failed("???")
+        );
+        let below = "pmacController::poll: *** ERROR ***: global feed rate below limit. \
+                     feedrate: 50, feedrate limit 100\n";
+
+        rig.answer("%", b"50\r");
+        poll();
+        assert_eq!(low.take(), format!("{unread_global}{below}"));
+        poll();
+        assert_eq!(low.take(), unread_global);
+
+        rig.answer("???", b"zz\r");
+        rig.answer("%", b"\r");
+        poll();
+        assert_eq!(
+            low.take(),
+            "pmacController::getGlobalStatus: Error reading ???. nvals: 0, response: zz\r\n\
+             pmacController::getGlobalStatus: Error reading feedrate: nvals: -1, response: \r\n\
+             pmacController::poll: Error reading or setting params.\n"
+        );
+
+        rig.answer("???", b"000000\r");
+        rig.answer("%", b"100\r");
+        poll();
+        assert_eq!(low.take(), "");
+        rig.answer("%", b"50\r");
+        poll();
+        assert_eq!(low.take(), below);
+
+        rig.silence("%");
+        poll();
+        assert_eq!(
+            low.take(),
+            format!(
+                "{}pmacController::getGlobalStatus: Error reading feedrate.\n\
+                 pmacController::poll: Error reading or setting params.\n",
+                failed("%")
+            )
+        );
+    }
+
+    /// pmacAxis.cpp:96, 136, 243-305, 497, 585: C's axis error lines on the
+    /// controller's trace, the limits warning throttled as the feed rate's.
+    #[test]
+    fn axis_errors_print_c_lines_on_the_controller_trace() {
+        let (_rt, rig) = publish_scripted("pmacAxErrLow");
+        let (controller, _io) = controller_port("pmacAxErrCtl", "pmacAxErrLow");
+        // After the port exists: registering it resets its trace.
+        let own = TraceCapture::on("pmacAxErrCtl");
+        let mut axis = PmacAxis::new(controller, 1);
+        assert_eq!(
+            own.take(),
+            "pmacAxis::getAxisInitialStatus: Error: initial status poll failed on axis 1.\n\
+             pmacAxis::pmacAxis: getAxisInitialStatus failed to return asynSuccess. \
+             Controller: pmacAxErrCtl, Axis: 1.\n"
+        );
+
+        let user = AsynUser::new(0).with_addr(1);
+        rig.answer("#1 ? F P", b"zz\r");
+        axis.poll(&user).unwrap();
+        assert_eq!(
+            own.take(),
+            "drvPmacAxisGetStatus: not all status values returned. Status: 0\n\
+             Command :#1 ? F P\nResponse:zz\r"
+        );
+        rig.silence("#1 ? F P");
+        axis.poll(&user).unwrap();
+        assert_eq!(
+            own.take(),
+            "drvPmacAxisGetStatus: not all status values returned. Status: 1\n\
+             Command :#1 ? F P\nResponse:"
+        );
+
+        let warning = "*** WARNING *** Limits are disabled on controller pmacAxErrCtl, axis 1\n";
+        rig.answer("#1 ? F P", b"882000000001\r0\r100.0\r");
+        // The failed polls took this period's print.
+        rig.answer("i124", b"$20000\r");
+        axis.poll(&user).unwrap();
+        assert_eq!(own.take(), "");
+        rig.answer("i124", b"$0\r");
+        axis.poll(&user).unwrap();
+        rig.answer("i124", b"$20000\r");
+        axis.poll(&user).unwrap();
+        axis.poll(&user).unwrap();
+        assert_eq!(own.take(), warning);
+
+        let home = |axis: &mut PmacAxis| axis.home(&user, 0.0, 2.0, 0.0, false);
+        let addr = "Controller pmacAxErrCtl Addr 1. pmacAxis::home: ERROR";
+        assert!(home(&mut axis).is_err());
+        assert_eq!(own.take(), format!("{addr} Reading Controller Type.\n"));
+        rig.answer("cid", b"12\r");
+        assert!(home(&mut axis).is_err());
+        assert_eq!(
+            own.take(),
+            format!("{addr} Unknown controller type = 12.\n")
+        );
+        rig.answer("cid", b"603382\r");
+        assert!(home(&mut axis).is_err());
+        assert_eq!(own.take(), format!("{addr} Cannot Read Home Flags.\n"));
+        rig.answer("I7012 I7013 i124 i123 i126", b"0\r0\r$0\r10\r0\r");
+        rig.answer("#1 HOME", b"\r");
+        assert!(home(&mut axis).is_ok());
+        assert_eq!(
+            own.take(),
+            "pmacAxis::home: Error: Cannot disable limits to home PMAC controller \
+             pmacAxErrCtl, axis 1, type:0, flag:$0, vel:-0.002000, mode:0x0, offset: 0\n"
+        );
+    }
+
+    /// pmacController.cpp:201: one poller from pmacCreateController, which
+    /// pmacCreateAxes joins.
+    #[epics_rs::base::epics_test]
+    async fn pmac_create_axes_joins_the_controller_poller() {
+        use motor_common::testing::pollers_after;
+
+        let commands = pmac_commands();
+        let command = |name: &str| commands.iter().find(|c| c.name == name).unwrap().clone();
+        let args = vec![
+            ArgValue::String("pmacOnePoller".into()),
+            ArgValue::String("pmacOnePollerNoLine".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(3),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+        ];
+        assert_eq!(
+            pollers_after(command("pmacCreateController"), args).await,
+            1
+        );
+        let args = vec![ArgValue::String("pmacOnePoller".into()), ArgValue::Int(3)];
+        assert_eq!(pollers_after(command("pmacCreateAxes"), args).await, 1);
     }
 }

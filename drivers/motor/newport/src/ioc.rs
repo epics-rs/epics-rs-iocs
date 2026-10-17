@@ -11,9 +11,8 @@
 //!   `<Drv>Config(card, port, addr)`; records reach the axes as
 //!   `DTYP "<Drv>"`, `OUT "#C card S signal"`.
 //!
-//! The XPS profile, position-compare and TCL commands and the HXP
-//! move-all/coordinate-system commands are driver-private: C drives them from
-//! controller-level records this port does not serve.
+//! The XPS profile, position-compare and TCL commands are driver-private: C
+//! drives them from controller-level records this port does not serve.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,20 +36,20 @@ use motor_common::connect::{
     EosConnectError, EosRefusal, connect_controller, connect_serial, connect_with_eos,
 };
 use motor_common::iocsh::{
-    arg_double_opt, arg_double_req, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double,
-    opt_int, opt_string, poll_intervals, req_double, req_string,
+    arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_int,
+    opt_string, poll_intervals, req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 use motor_common::model2::Model2;
 use motor_common::util::atof;
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{Controller, asyn_user, install, register_controller_port, register_port};
 
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
 use crate::conex::ConexAxis;
 use crate::esp300::{self, Esp300Axis, Esp300Controller};
-use crate::hxp::{HXP_GROUP, HxpAxis, HxpController, MoveCoordSys, NUM_HXP_AXES};
+use crate::hxp::{HxpAxis, HxpController, HxpControllerParams, MoveLine, NUM_HXP_AXES};
 use crate::mm3000::{Mm3000Axis, Mm3000Controller};
 use crate::mm4000::{self, Mm4000Axis, Mm4000Controller, Mm4000Refusal};
 use crate::pm500::{Pm500Axis, Pm500Controller};
@@ -203,6 +202,7 @@ pub fn smc100_create_controller_command() -> CommandDef {
                 ),
             );
             // C builds every axis on pasynUserController_, connected or not.
+            let poller = Controller::new();
             let mut controller_user = Some(handle);
             for axis in 0..num_axes {
                 let handle = controller_user.take().unwrap_or_else(|| {
@@ -219,15 +219,9 @@ pub fn smc100_create_controller_command() -> CommandDef {
                     (axis + 1) as u8,
                     step_size,
                 )));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, SMC100Driver.cpp:67
-                )?;
+                poller.install(asyn_user(&port_name, axis), motor)?;
             }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // SMC100Driver.cpp:67
             Ok(CommandOutcome::Continue)
         },
     )
@@ -322,18 +316,13 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             let controller = Arc::new(Mutex::new(controller));
+            let poller = Controller::new();
             for axis in 0..agap::NUM_AXES {
                 let motor: Arc<Mutex<dyn AsynMotor>> =
                     Arc::new(Mutex::new(AgapAxis::new(controller.clone(), axis)));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, AGAP_CONEX.cpp:79
-                )?;
+                poller.install(asyn_user(&port_name, axis as i32), motor)?;
             }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // AGAP_CONEX.cpp:79
             Ok(CommandOutcome::Continue)
         },
     )
@@ -344,8 +333,7 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
 struct AgUcRegistration {
     port_name: String,
     controller: Arc<Mutex<AgUcController>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
+    poller: Arc<Controller>,
 }
 
 static AG_UC_CONTROLLERS: Mutex<Vec<AgUcRegistration>> = Mutex::new(Vec::new());
@@ -380,18 +368,20 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
                     "AG_UCController::AG_UCController: cannot connect to Agilis controller"
                 ),
             );
-            let controller = Arc::new(Mutex::new(AgUcController::new(
-                handle,
-                &MotorTrace::new(&port_name, 0),
-            )));
+            let controller = AgUcController::new(handle, &MotorTrace::new(&port_name, 0));
+            // C's constructor returns before startPoller without a model
+            // (AG_UC.cpp:79, :96, :99); the axes created later stay unpolled.
+            let poller = Arc::new(Controller::new());
+            if controller.model().is_some() {
+                poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+            }
             AG_UC_CONTROLLERS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(AgUcRegistration {
                     port_name,
-                    controller,
-                    moving_poll_ms,
-                    idle_poll_ms,
+                    controller: Arc::new(Mutex::new(controller)),
+                    poller,
                 });
             Ok(CommandOutcome::Continue)
         },
@@ -412,16 +402,16 @@ pub fn ag_uc_create_axis_command() -> CommandDef {
         ],
         "AG_UCCreateAxis(controllerPortName, axis, hasLimits, forwardAmplitude, \
          reverseAmplitude)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Controller port name")?;
             let axis = c_int(args, 1);
-            let (controller, moving_poll_ms, idle_poll_ms) = {
+            let (controller, poller) = {
                 let controllers = AG_UC_CONTROLLERS.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(reg) = controllers.iter().find(|r| r.port_name == port_name) else {
                     println!("AG_UCCreateAxis: Error port {port_name} not found");
                     return Ok(CommandOutcome::Continue);
                 };
-                (reg.controller.clone(), reg.moving_poll_ms, reg.idle_poll_ms)
+                (reg.controller.clone(), reg.poller.clone())
             };
             let ax = AgUcAxis::new(
                 controller,
@@ -431,14 +421,7 @@ pub fn ag_uc_create_axis_command() -> CommandDef {
                 c_int(args, 4),
             );
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            install(
-                ctx,
-                asyn_user(&port_name, axis),
-                motor,
-                moving_poll_ms,
-                idle_poll_ms,
-                2, // C startPoller, AG_UC.cpp:99
-            )?;
+            poller.install(asyn_user(&port_name, axis), motor)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -454,8 +437,8 @@ struct XpsRegistration {
     controller: Option<Arc<Mutex<XpsController>>>,
     /// The controller's `moveSocket_`, which runs profiles.
     profile_sock: Option<Arc<XpsSocket>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
+    /// The poller `XPSCreateController` starts; `XPSCreateAxis` joins it.
+    poller: Arc<Controller>,
     /// `XPSCreateProfile`'s FTP account.
     ftp_login: Option<(String, String)>,
 }
@@ -536,6 +519,9 @@ pub fn xps_create_controller_command() -> CommandDef {
                 ))),
                 None => None,
             };
+            // C starts the poller before any axis exists (XPSController.cpp:197).
+            let poller = Arc::new(Controller::new());
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 10);
             XPS_CONTROLLERS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -545,8 +531,7 @@ pub fn xps_create_controller_command() -> CommandDef {
                     ip_port,
                     controller,
                     profile_sock,
-                    moving_poll_ms,
-                    idle_poll_ms,
+                    poller,
                     ftp_login: None,
                 });
             Ok(CommandOutcome::Continue)
@@ -570,14 +555,13 @@ pub fn xps_create_axis_command() -> CommandDef {
             let port_name = req_string(args, 0, "Controller port name")?;
             let axis = c_int(args, 1);
             let positioner_name = req_string(args, 2, "Axis name")?;
-            let Some((controller, ip, ip_port, moving_poll_ms, idle_poll_ms)) =
+            let Some((controller, ip, ip_port, poller)) =
                 with_xps(&port_name, "XPSCreateAxis", |reg| {
                     (
                         reg.controller.clone(),
                         reg.ip.clone(),
                         reg.ip_port,
-                        reg.moving_poll_ms,
-                        reg.idle_poll_ms,
+                        reg.poller.clone(),
                     )
                 })
             else {
@@ -608,14 +592,7 @@ pub fn xps_create_axis_command() -> CommandDef {
                 1.0 / steps_per_unit,
             );
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            install(
-                ctx,
-                asyn_user(&port_name, axis),
-                motor,
-                moving_poll_ms,
-                idle_poll_ms,
-                10, // C startPoller, XPSController.cpp:197
-            )?;
+            poller.install(asyn_user(&port_name, axis), motor)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1386,16 +1363,6 @@ pub fn xps_readback_profile_command() -> CommandDef {
     )
 }
 
-/// A hexapod `HXPCreateController` made. Keeps a `Fire`-mode move socket of
-/// its own for the driver-private commands.
-struct HxpRegistration {
-    port_name: String,
-    controller: Arc<Mutex<HxpController>>,
-    move_sock: XpsSocket,
-}
-
-static HXP_CONTROLLERS: Mutex<Vec<HxpRegistration>> = Mutex::new(Vec::new());
-
 /// `HXPCreateController(portName, IPAddress, IPPort, movingPollPeriod,
 /// idlePollPeriod)`: the controller and its six axes X, Y, Z, U, V, W
 /// (0..5), each axis on a move socket of its own.
@@ -1416,237 +1383,59 @@ pub fn hxp_create_controller_command() -> CommandDef {
             let ip_port = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, NUM_HXP_AXES as i32)?;
-            let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
-                println!(
-                    "HXPDriver:HXPController::HXPController: error calling TCP_ConnectToServer for pollSocket"
-                );
-                return Ok(CommandOutcome::Continue);
-            };
-            let poll_sock = XpsSocket::new(handle, &port_name, SocketMode::Query, HXP_POLL_TIMEOUT);
-            // One group poll serves all six axis polls per period: cache for
-            // half the fastest poll interval.
-            let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
-            let controller = Arc::new(Mutex::new(HxpController::new(poll_sock, cache_ttl)));
-
-            for axis_no in 0..NUM_HXP_AXES {
-                let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
-                    continue;
-                };
-                let move_sock =
-                    XpsSocket::new(handle, &port_name, SocketMode::Fire, HXP_MOVE_TIMEOUT);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(HxpAxis::new(
-                    controller.clone(),
-                    move_sock,
-                    axis_no,
-                )));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis_no as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, HXPDriver.cpp:116
-                )?;
-            }
-
-            let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
-                return Ok(CommandOutcome::Continue);
-            };
-            HXP_CONTROLLERS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(HxpRegistration {
-                    port_name: port_name.clone(),
-                    controller,
-                    move_sock: XpsSocket::new(
-                        handle,
-                        &port_name,
-                        SocketMode::Fire,
-                        HXP_MOVE_TIMEOUT,
-                    ),
-                });
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// Run `f` with the HXP registration for `motor_port` (the sockets are not
-/// clonable, so callers borrow the registration under the lock — every
-/// hexapod command RPC is a single bounded exchange).
-fn with_hxp_registration<R>(
-    motor_port: &str,
-    cmd: &str,
-    f: impl FnOnce(&HxpRegistration) -> Result<R, String>,
-) -> Result<R, String> {
-    let controllers = HXP_CONTROLLERS.lock().unwrap_or_else(|e| e.into_inner());
-    let reg = controllers
-        .iter()
-        .find(|r| r.port_name == motor_port)
-        .ok_or_else(|| {
-            format!("{cmd}: controller '{motor_port}' not found (call HXPCreateController first)")
-        })?;
-    f(reg)
-}
-
-/// Create the `HXPMoveAll` iocsh command.
-///
-/// `HXPMoveAll(motorPort, x, y, z, u, v, w)`
-///
-/// Moves all six hexapod axes to absolute Work-coordinate targets with a
-/// single `HexapodMoveAbsolute` (C `HXPController::moveAll`, which reads
-/// the targets from the `HXP_MOVE_ALL_TARGET_*` records; here they are
-/// arguments). Fire-and-forget on the move socket — poll the motor records
-/// for completion.
-pub fn hxp_move_all_command() -> CommandDef {
-    CommandDef::new(
-        "HXPMoveAll",
-        vec![
-            arg_str_req("motorPort"),
-            arg_double_req("x"),
-            arg_double_req("y"),
-            arg_double_req("z"),
-            arg_double_req("u"),
-            arg_double_req("v"),
-            arg_double_req("w"),
-        ],
-        "HXPMoveAll(motorPort, x, y, z, u, v, w) - Move all six hexapod axes to absolute Work-coordinate targets in one motion (device units)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let motor_port = req_string(args, 0, "motorPort")?;
-            let mut targets = [0.0; 6];
-            for (i, t) in targets.iter_mut().enumerate() {
-                *t = req_double(args, i + 1, ["x", "y", "z", "u", "v", "w"][i])?;
-            }
-            with_hxp_registration(&motor_port, "HXPMoveAll", |reg| {
-                reg.move_sock
-                    .hexapod_move_absolute(HXP_GROUP, "Work", &targets)
-                    .map_err(|e| format!("HXPMoveAll: {e}"))
-            })?;
-            println!(
-                "HXPMoveAll: motorPort={motor_port} targets={targets:?} (Work coordinates, fire-and-forget)"
-            );
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// Create the `HXPCoordSysRead` iocsh command.
-///
-/// `HXPCoordSysRead(motorPort)`
-///
-/// Reads and prints the Tool, Work, and Base coordinate-system definitions
-/// (C `HXPController::readAllCS`, which posts them to the
-/// `HXP_COORD_SYS_*` records; here they are printed). Runs on the poll
-/// socket (DEVIATION: C reads over the move socket's 0.1 s best-effort
-/// read; the `Query` poll socket waits for the reply reliably).
-pub fn hxp_coord_sys_read_command() -> CommandDef {
-    CommandDef::new(
-        "HXPCoordSysRead",
-        vec![arg_str_req("motorPort")],
-        "HXPCoordSysRead(motorPort) - Read and print the hexapod Tool/Work/Base coordinate-system definitions",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let motor_port = req_string(args, 0, "motorPort")?;
-            let controller = with_hxp_registration(&motor_port, "HXPCoordSysRead", |reg| {
-                Ok(reg.controller.clone())
-            })?;
-            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let sock = ctrl.poll_socket();
-            for cs in ["Tool", "Work", "Base"] {
-                let p = sock
-                    .hexapod_coordinate_system_get(HXP_GROUP, cs)
-                    .map_err(|e| format!("HXPCoordSysRead: {cs}: {e}"))?;
-                println!(
-                    "HXPCoordSysRead: {cs:<4} X={:.6} Y={:.6} Z={:.6} U={:.6} V={:.6} W={:.6}",
-                    p[0], p[1], p[2], p[3], p[4], p[5]
-                );
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// Create the `HXPCoordSysSet` iocsh command.
-///
-/// `HXPCoordSysSet(motorPort, coordSystem, x, y, z, u, v, w)`
-///
-/// Redefines the origin of one hexapod coordinate system
-/// (`Work`/`Tool`/`Base`, or C's record encoding `1`/`2`/`3`) —
-/// C `HXPController::setCS`. Runs on the poll socket (same DEVIATION as
-/// `HXPCoordSysRead`).
-pub fn hxp_coord_sys_set_command() -> CommandDef {
-    CommandDef::new(
-        "HXPCoordSysSet",
-        vec![
-            arg_str_req("motorPort"),
-            arg_str_req("coordSystem"),
-            arg_double_req("x"),
-            arg_double_req("y"),
-            arg_double_req("z"),
-            arg_double_req("u"),
-            arg_double_req("v"),
-            arg_double_req("w"),
-        ],
-        "HXPCoordSysSet(motorPort, coordSystem, x, y, z, u, v, w) - Redefine the origin of a hexapod coordinate system (Work/Tool/Base)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let motor_port = req_string(args, 0, "motorPort")?;
-            let cs_arg = req_string(args, 1, "coordSystem")?;
-            let cs = match cs_arg.to_ascii_lowercase().as_str() {
-                "work" | "1" => "Work",
-                "tool" | "2" => "Tool",
-                "base" | "3" => "Base",
-                other => {
-                    return Err(format!(
-                        "coordSystem must be Work, Tool or Base, got '{other}'"
-                    ));
+            // C goes on with socket -1 for either socket (HXPDriver.cpp:106-116,
+            // 559-562).
+            let poll_sock = match connect_to_server(ctx, &ip, ip_port) {
+                Some(handle) => {
+                    XpsSocket::new(handle, &port_name, SocketMode::Query, HXP_POLL_TIMEOUT)
+                }
+                None => {
+                    println!(
+                        "HXPDriver:HXPController::HXPController: error calling TCP_ConnectToServer for pollSocket"
+                    );
+                    XpsSocket::invalid(&port_name, SocketMode::Query)
                 }
             };
-            let mut origin = [0.0; 6];
-            for (i, t) in origin.iter_mut().enumerate() {
-                *t = req_double(args, i + 2, ["x", "y", "z", "u", "v", "w"][i])?;
-            }
-            let controller = with_hxp_registration(&motor_port, "HXPCoordSysSet", |reg| {
-                Ok(reg.controller.clone())
-            })?;
-            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            ctrl.poll_socket()
-                .hexapod_coordinate_system_set(HXP_GROUP, cs, &origin)
-                .map_err(|e| format!("HXPCoordSysSet: {e}"))?;
-            println!("HXPCoordSysSet: motorPort={motor_port} {cs} origin={origin:?}");
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// Create the `HXPSetMoveCoordSys` iocsh command.
-///
-/// `HXPSetMoveCoordSys(motorPort, coordSystem)`
-///
-/// Selects the coordinate system motor-record moves use: `Work`/`0`
-/// (default) or `Tool`/`1` — the C `HXP_MOVE_COORD_SYS` record parameter
-/// as a command.
-pub fn hxp_set_move_coord_sys_command() -> CommandDef {
-    CommandDef::new(
-        "HXPSetMoveCoordSys",
-        vec![arg_str_req("motorPort"), arg_str_req("coordSystem")],
-        "HXPSetMoveCoordSys(motorPort, coordSystem) - Select the coordinate system for motor-record moves: Work/0 (default) or Tool/1",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let motor_port = req_string(args, 0, "motorPort")?;
-            let cs_arg = req_string(args, 1, "coordSystem")?;
-            let cs = match cs_arg.to_ascii_lowercase().as_str() {
-                "work" | "0" => MoveCoordSys::Work,
-                "tool" | "1" => MoveCoordSys::Tool,
-                other => {
-                    return Err(format!("coordSystem must be Work or Tool, got '{other}'"));
-                }
-            };
-            let controller = with_hxp_registration(&motor_port, "HXPSetMoveCoordSys", |reg| {
-                Ok(reg.controller.clone())
-            })?;
+            let controller = Arc::new(Mutex::new(HxpController::new(poll_sock)));
+            let owner = ctx.db().scan_control().interrupt_gate();
+            let port = register_controller_port(
+                owner,
+                &port_name,
+                NUM_HXP_AXES as i32,
+                HxpControllerParams::new(controller.clone()),
+            )?;
             controller
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .set_move_coord_sys(cs);
-            println!("HXPSetMoveCoordSys: motorPort={motor_port} coordSystem={cs:?}");
+                .attach_port(port);
+            // C startPoller, HXPDriver.cpp:116.
+            let polled = controller.clone();
+            let poller = Controller::new()
+                .controller_poll(move || polled.lock().unwrap_or_else(|e| e.into_inner()).poll());
+
+            for axis_no in 0..NUM_HXP_AXES {
+                let move_sock = match connect_to_server(ctx, &ip, ip_port) {
+                    Some(handle) => {
+                        XpsSocket::new(handle, &port_name, SocketMode::Fire, HXP_MOVE_TIMEOUT)
+                    }
+                    None => {
+                        println!(
+                            "SetTCPTimeout, SocketIndex=-1, must be >=0 and < {}",
+                            NEXT_SOCKET.load(Ordering::Relaxed)
+                        );
+                        XpsSocket::invalid(&port_name, SocketMode::Fire)
+                    }
+                };
+                let line = Arc::new(MoveLine::new(move_sock));
+                controller
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .add_line(axis_no, line.clone());
+                let motor: Arc<Mutex<dyn AsynMotor>> =
+                    Arc::new(Mutex::new(HxpAxis::new(controller.clone(), line, axis_no)));
+                poller.install(asyn_user(&port_name, axis_no as i32), motor)?;
+            }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -2108,5 +1897,193 @@ mod tests {
         *line.fail.lock().unwrap() = "TCLScriptExecute";
         assert_eq!(tclcall(Some(&socket), "a.tcl", "t", "1"), -3);
         assert_eq!(tclcall(None, "a.tcl", "t", "1"), -22);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod one_poller {
+    use std::net::TcpListener;
+
+    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::user::AsynUser;
+    use epics_rs::base::server::iocsh::registry::ArgValue;
+    use motor_common::testing::pollers_after;
+
+    use super::*;
+
+    /// A serial port under `name` that answers every read with `reply`.
+    fn publish_line(name: &str, reply: &'static str) {
+        struct Line(PortDriverBase, &'static str);
+        impl PortDriver for Line {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+                let n = self.1.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.1.as_bytes()[..n]);
+                Ok(n)
+            }
+        }
+        let base = PortDriverBase::new(name, 1, PortFlags::default());
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Line(base, reply), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        std::mem::forget(rt);
+    }
+
+    /// HXPDriver.cpp:116: one startPoller for the six axes.
+    #[epics_rs::base::epics_test]
+    async fn hxp_create_controller_polls_its_axes_on_one_poller() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(8).collect();
+            std::thread::park();
+            drop(held);
+        });
+        let args = vec![
+            ArgValue::String("hxpOnePoller".into()),
+            ArgValue::String("127.0.0.1".into()),
+            ArgValue::Int(port.into()),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+        ];
+        let cmd = hxp_create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// HXPDriver.cpp:106-116: a failed poll or move socket still builds the
+    /// controller, its axes and its poller.
+    #[epics_rs::base::epics_test]
+    async fn hxp_create_controller_without_sockets_still_polls_its_axes() {
+        // Every ConnectToServer takes socket 0, whose port name is held.
+        let _held = epics_rs::asyn::registry::claim_port("hxp.nosocket:1:0").unwrap();
+        let args = vec![
+            ArgValue::String("hxpNoSocket".into()),
+            ArgValue::String("hxp.nosocket".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+        ];
+        let cmd = hxp_create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// SMC100Driver.cpp:67: one startPoller after the axes, which C builds
+    /// on an unconnected line too.
+    #[epics_rs::base::epics_test]
+    async fn smc100_create_controller_polls_its_axes_on_one_poller() {
+        let args = vec![
+            ArgValue::String("smcOnePoller".into()),
+            ArgValue::String("smcOnePollerNoLine".into()),
+            ArgValue::Int(3),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+            ArgValue::String("0.001".into()),
+        ];
+        let cmd = smc100_create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// AGAP_CONEX.cpp:79: one startPoller for axes U and V.
+    #[epics_rs::base::epics_test]
+    async fn agap_conex_create_controller_polls_its_axes_on_one_poller() {
+        publish_line("agapOnePollerLine", "1VE CONEX-AGAP");
+        let args = vec![
+            ArgValue::String("agapOnePoller".into()),
+            ArgValue::String("agapOnePollerLine".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+        ];
+        let cmd = agap_conex_create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// Run AG_UCCreateController on a line answering VE with `version`, then
+    /// two AG_UCCreateAxis, returning the poller count after each.
+    async fn ag_uc_pollers(prefix: &str, version: &'static str) -> Vec<usize> {
+        let line = format!("{prefix}Line");
+        publish_line(&line, version);
+        let args = vec![
+            ArgValue::String(prefix.into()),
+            ArgValue::String(line.into()),
+            ArgValue::Int(2),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+        ];
+        let mut counts = vec![pollers_after(ag_uc_create_controller_command(), args).await];
+        for axis in 0..2 {
+            let args = vec![
+                ArgValue::String(prefix.into()),
+                ArgValue::Int(axis),
+                ArgValue::Int(0),
+                ArgValue::Int(50),
+                ArgValue::Int(-50),
+            ];
+            counts.push(pollers_after(ag_uc_create_axis_command(), args).await);
+        }
+        counts
+    }
+
+    /// AG_UC.cpp:99: the controller's poller, which every AG_UCCreateAxis
+    /// joins.
+    #[epics_rs::base::epics_test]
+    async fn ag_uc_create_axis_joins_the_controller_poller() {
+        assert_eq!(ag_uc_pollers("agUcOne", "AG-UC8 v1").await, [1, 1, 1]);
+    }
+
+    /// AG_UC.cpp:96: no model, no poller.
+    #[epics_rs::base::epics_test]
+    async fn ag_uc_unknown_model_starts_no_poller() {
+        assert_eq!(ag_uc_pollers("agUcNone", "XX").await, [0, 0, 0]);
+    }
+
+    /// XPSController.cpp:197: the controller's poller, which every
+    /// XPSCreateAxis joins.
+    #[epics_rs::base::epics_test]
+    async fn xps_create_axis_joins_the_controller_poller() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(4).collect();
+            std::thread::park();
+            drop(held);
+        });
+        let args = vec![
+            ArgValue::String("xpsOnePoller".into()),
+            ArgValue::String("127.0.0.1".into()),
+            ArgValue::Int(port.into()),
+            ArgValue::Int(2),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+            ArgValue::Int(0),
+            ArgValue::Int(0),
+        ];
+        assert_eq!(
+            pollers_after(xps_create_controller_command(), args).await,
+            1
+        );
+        for (axis, name) in [(0, "G1.P1"), (1, "G1.P2")] {
+            let args = vec![
+                ArgValue::String("xpsOnePoller".into()),
+                ArgValue::Int(axis),
+                ArgValue::String(name.into()),
+                ArgValue::String("1000".into()),
+            ];
+            assert_eq!(pollers_after(xps_create_axis_command(), args).await, 1);
+        }
     }
 }

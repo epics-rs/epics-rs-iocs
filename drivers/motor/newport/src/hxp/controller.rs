@@ -3,13 +3,18 @@
 //! Port of the controller half of `HXPDriver.cpp`. The hexapod is a single
 //! six-axis group, so C polls at the *controller* level (`HXPController::poll`:
 //! firmware probe, `GroupStatusGet`, two position-array reads) and each axis
-//! just reads its slice. Here every [`HxpAxis`](super::HxpAxis) polls
-//! independently, so the controller refreshes the group poll at most once per
-//! cache window and serves the cached [`HxpPollData`] to the other five axes —
-//! keeping the RPC traffic at C's controller-poll rate.
+//! just reads its slice. [`HxpController::poll`] is that controller poll, run
+//! once per pass of the axes' one poller ahead of the
+//! [`HxpAxis`](super::HxpAxis) polls.
 
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
+use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::ParamSetValue;
+
+use super::axis::MoveLine;
+use super::params::HxpParams;
 use crate::xps::rpc::{XpsResult, XpsSocket};
 
 /// The hexapod's fixed group name (C `GROUP`).
@@ -39,7 +44,7 @@ pub struct HxpPollData {
     /// Current encoder positions, device units (C `encoderPosition_`).
     pub encoder: [f64; 6],
     /// "Setpoint" positions, device units (C `setpointPosition_`; see the
-    /// upstream quirk note in [`HxpController::poll_data`]).
+    /// upstream quirk note in [`HxpController::poll`]).
     pub setpoint: [f64; 6],
     pub moving: bool,
     pub problem: bool,
@@ -117,27 +122,58 @@ pub struct HxpController {
     /// Firmware is HXP-D (C `is_firmware_hxpd_`): different status decoding
     /// and position RPC name.
     is_hxpd: bool,
-    cache: HxpPollData,
-    fetched_at: Option<Instant>,
-    /// Serve the cache within this window so six axis polls per period cost
-    /// one group poll (C polls once per period at the controller level).
-    cache_ttl: Duration,
+    /// What the last controller poll read, for the axis polls after it.
+    data: HxpPollData,
+    /// Each axis's move line, for the parameter writes C runs on it.
+    lines: [Option<Arc<MoveLine>>; NUM_HXP_AXES],
+    /// The controller port's parameters and, once published, its handle.
+    pub(super) params: Option<HxpParams>,
+    port: Option<PortHandle>,
 }
 
 impl HxpController {
     /// Build the controller over a connected `Query`-mode poll socket. The
     /// firmware probe happens lazily on the first poll (C probes in `poll()`,
     /// not the constructor).
-    pub fn new(poll: XpsSocket, cache_ttl: Duration) -> Self {
+    pub fn new(poll: XpsSocket) -> Self {
         Self {
             poll,
             move_coord_sys: MoveCoordSys::Work,
             firmware: String::new(),
             is_hxpd: false,
-            cache: HxpPollData::default(),
-            fetched_at: None,
-            cache_ttl,
+            data: HxpPollData::default(),
+            lines: Default::default(),
+            params: None,
+            port: None,
         }
+    }
+
+    /// Post what the poll reads to the controller port from here on.
+    pub fn attach_port(&mut self, port: PortHandle) {
+        self.port = Some(port);
+    }
+
+    /// Axis `axis_no`'s move line, which the parameter writes use too.
+    pub fn add_line(&mut self, axis_no: usize, line: Arc<MoveLine>) {
+        self.lines[axis_no] = Some(line);
+    }
+
+    pub(super) fn line(&self, addr: i32) -> Option<Arc<MoveLine>> {
+        let axis_no = usize::try_from(addr).ok()?;
+        self.lines.get(axis_no)?.clone()
+    }
+
+    /// Set address-0 `values` and run the callbacks at `addr`: C sets
+    /// `pC_`'s parameters and flushes the caller's address.
+    pub(super) fn post(&self, addr: i32, values: Vec<(usize, ParamValue)>) {
+        let Some(port) = &self.port else {
+            return;
+        };
+        let updates = values
+            .into_iter()
+            .map(|(reason, value)| ParamSetValue::new(reason, 0, value))
+            .collect();
+        let _ = port.set_params_and_notify_blocking(addr, updates);
     }
 
     /// The shared poll socket (`Query` mode).
@@ -167,40 +203,40 @@ impl HxpController {
         self.poll.hexapod_positions_get(HXP_GROUP, self.is_hxpd)
     }
 
-    /// Drop the poll snapshot: a command sent since makes it stale, and C
-    /// wakes its poller after one.
-    pub fn invalidate(&mut self) {
-        self.fetched_at = None;
+    /// What the last [`Self::poll`] read.
+    pub fn data(&self) -> &HxpPollData {
+        &self.data
     }
 
-    /// The group-wide poll, refreshed when the cache window has passed
-    /// (C `HXPController::poll`). On an RPC failure the firmware probe is
+    /// C `HXPController::poll`. On an RPC failure the firmware probe is
     /// reset and every axis reports problem + comms error until a poll
     /// succeeds, exactly as C's `done:` path.
-    pub fn poll_data(&mut self) -> HxpPollData {
-        if let Some(at) = self.fetched_at
-            && at.elapsed() < self.cache_ttl
-        {
-            return self.cache.clone();
-        }
-        match self.poll_once() {
-            Ok(data) => self.cache = data,
+    pub fn poll(&mut self) {
+        let mut status = None;
+        let polled = self.poll_once(&mut status);
+        // C sets HXP_STATUS once GroupStatusGet answers, and every poll ends
+        // in callParamCallbacks() at address 0.
+        let values = match (self.params, status) {
+            (Some(p), Some(status)) => vec![(p.status, ParamValue::Int32(status))],
+            _ => Vec::new(),
+        };
+        self.post(0, values);
+        match polled {
+            Ok(data) => self.data = data,
             Err(_) => {
                 // C: status error → firmware re-probed next poll; all axes get
                 // problem=1, commsError=1, homed/powerOn=0; positions and the
                 // moving flag keep their last values.
                 self.firmware.clear();
-                self.cache.problem = true;
-                self.cache.comms_error = true;
-                self.cache.powered = false;
-                self.cache.homed = false;
+                self.data.problem = true;
+                self.data.comms_error = true;
+                self.data.powered = false;
+                self.data.homed = false;
             }
         }
-        self.fetched_at = Some(Instant::now());
-        self.cache.clone()
     }
 
-    fn poll_once(&mut self) -> XpsResult<HxpPollData> {
+    fn poll_once(&mut self, status: &mut Option<i32>) -> XpsResult<HxpPollData> {
         if self.firmware.is_empty() {
             let fw = self.poll.firmware_version_get()?;
             if fw.contains("HXP") {
@@ -211,6 +247,7 @@ impl HxpController {
             // discarded and re-probed on the next poll; the poll continues.
         }
         let group_status = self.poll.group_status_get(HXP_GROUP)?;
+        *status = Some(group_status);
         let flags = HxpStatusFlags::from_status(group_status, self.is_hxpd);
         let encoder = self.poll.hexapod_positions_get(HXP_GROUP, self.is_hxpd)?;
         // Upstream quirk kept for wire parity: C `HXPGroupPositionSetpointGet`

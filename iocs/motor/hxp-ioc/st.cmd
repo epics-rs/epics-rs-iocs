@@ -20,20 +20,15 @@ epicsEnvSet("IP",   "192.168.0.254")
 HXPCreateController("$(PORT)", "$(IP)", 5001, 200, 1000)
 
 dbLoadRecords("$(HXP_IOC)/db/hxp.template", "P=$(P),MX=mX,MY=mY,MZ=mZ,MU=mU,MV=mV,MW=mW,PORT=$(PORT)")
+# Coordinate system for moves, group status/error, move-all targets.
+dbLoadRecords("$(HXP_IOC)/db/HXP_extra.db", "P=$(P),R=,PORT=$(PORT)")
+# Coordinate-system definitions: read back, set, then sync the motors.
+dbLoadRecords("$(HXP_IOC)/db/HXP_coords.db", "P=$(P),R=,PORT=$(PORT),M1=mX,M2=mY,M3=mZ,M4=mU,M5=mV,M6=mW")
 
 iocInit()
-
-# Motor-record moves default to Work coordinates; switch to Tool with:
-#   HXPSetMoveCoordSys("$(PORT)", "Tool")
-#
-# Move all six axes in one motion (absolute Work coordinates, device units):
-#   HXPMoveAll("$(PORT)", 0.0, 0.0, 1.5, 0.0, 0.0, 0.0)
-#
-# Read or redefine the coordinate-system origins (Work/Tool/Base):
-#   HXPCoordSysRead("$(PORT)")
-#   HXPCoordSysSet("$(PORT)", "Work", 0.0, 0.0, 10.0, 0.0, 0.0, 0.0)
 
 # Example:
 #   dbl
 #   camonitor HXP:mZ HXP:mZ.RBV
 #   caput HXP:mZ 1.0
+#   caput HXP:T3 1.5; caput HXP:MOVE_ALL 1

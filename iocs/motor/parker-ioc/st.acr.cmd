@@ -16,10 +16,9 @@ epicsEnvSet("NAXES",  "1")
 # ---- asyn IP octet port ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
-# ACR framing: the driver appends the CR command terminator, so only the input
-# EOS is configured here. Do not set an output EOS — the port would append it a
-# second time.
+# ACR framing: CR both ways, set on the port as C's st.cmd.acr does.
 asynOctetSetInputEos("$(IPPORT)", 0, "\r")
+asynOctetSetOutputEos("$(IPPORT)", 0, "\r")
 
 # ---- ACR controller ----
 # ACRCreateController(portName, ACRPortName, numAxes, movingPollPeriod, idlePollPeriod).

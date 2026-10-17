@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::{ParamType, ParamValue};
@@ -37,6 +37,7 @@ use epics_rs::motor::controller_port::{
     ControllerParams, FinishedWrite, ParamDelta, ParamWrite, WriteHook, WriteOutcome, WriteValue,
     index,
 };
+use epics_rs::motor::trace::MotorTrace;
 
 use crate::cs_groups::{AxisPoll, CsGroups, DeferredMove, fast_deferred_command};
 use crate::protocol::{HARDWARE_PROB, parse_feedrate, parse_global_status};
@@ -49,6 +50,41 @@ pub const PMAC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Feed-rate hysteresis (C `PMAC_FEEDRATE_DEADBAND_`).
 const FEEDRATE_DEADBAND: i32 = 1;
+
+/// C `PMAC_ERROR_PRINT_TIME_`, in seconds.
+const ERROR_PRINT_TIME: u64 = 600;
+
+/// C's `printErrors` / `printNextError_` pair: a repeated error prints once
+/// per [`ERROR_PRINT_TIME`], and at once after the problem has cleared.
+#[derive(Default)]
+pub(crate) struct ErrorThrottle {
+    last_secs: u64,
+    pub(crate) print_next: bool,
+}
+
+impl ErrorThrottle {
+    /// C's `printErrors`, taken at the top of each poll.
+    pub(crate) fn print_errors(&mut self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let due = now.saturating_sub(self.last_secs) >= ERROR_PRINT_TIME;
+        if due {
+            self.last_secs = now;
+        }
+        due || self.print_next
+    }
+}
+
+/// What C's `sscanf` returns for a reply it converts nothing from: EOF when
+/// only whitespace is left, else 0.
+pub(crate) fn sscanf_nvals(reply: &str) -> i32 {
+    if reply.bytes().all(|b| b" \t\n\x0b\x0c\r".contains(&b)) {
+        -1
+    } else {
+        0
+    }
+}
 
 /// `<BELL>` opens a PMAC error reply (`<BELL>ERRxxx<CR>`), documented in the C
 /// `pmacAsynIPPort.c` header.
@@ -102,7 +138,13 @@ pub fn pmac_err(message: impl Into<String>) -> AsynError {
 /// command left the record believing it had been accepted. Here a `<BELL>` reply
 /// is an error.
 pub fn octet_write_read(handle: &SyncIOHandle, command: &str) -> AsynResult<String> {
-    let raw = handle.write_read(0, command.as_bytes(), PMAC_MAXBUF)?;
+    checked_reply(
+        command,
+        handle.write_read(0, command.as_bytes(), PMAC_MAXBUF)?,
+    )
+}
+
+fn checked_reply(command: &str, raw: Vec<u8>) -> AsynResult<String> {
     if raw.first() == Some(&BELL) {
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_matches(|c: char| c.is_control() || c == '\0');
@@ -134,23 +176,24 @@ pub struct PmacController {
     feed_rate_poll: bool,
     feed_rate_limit: i32,
     feed_rate: i32,
-    /// Cached global-status verdict and when it was read. C polls `???` once per
-    /// controller poll cycle; the asyn-rs motor boundary polls per axis, so the
-    /// read is cached for one poll period to keep the traffic the same.
+    /// The verdicts the last [`Self::poll`] read, for the axis polls after it.
     global_problem: bool,
     feed_rate_problem: bool,
-    global_read_at: Option<Instant>,
-    global_ttl: Duration,
     /// The controller port's parameters and, once published, its handle, to
     /// post what the poll reads.
     params: Option<PmacParams>,
     port: Option<PortHandle>,
+    /// C's `pasynUserSelf` (the controller port, `portName`) and
+    /// `lowLevelPortUser_`, which its error lines print through.
+    own: MotorTrace,
+    low: MotorTrace,
+    throttle: ErrorThrottle,
 }
 
 impl PmacController {
     /// C's constructor: no deferral and no feed-rate poll until the
     /// template's records write them.
-    pub fn new(handle: Option<SyncIOHandle>, global_ttl: Duration) -> Self {
+    pub fn new(port: &str, low_port: &str, low_addr: i32, handle: Option<SyncIOHandle>) -> Self {
         Self {
             handle,
             axes: BTreeSet::new(),
@@ -164,11 +207,22 @@ impl PmacController {
             feed_rate: 0,
             global_problem: false,
             feed_rate_problem: false,
-            global_read_at: None,
-            global_ttl,
             params: None,
             port: None,
+            own: MotorTrace::new(port, 0),
+            low: MotorTrace::new(low_port, low_addr),
+            throttle: ErrorThrottle::default(),
         }
+    }
+
+    /// C `pasynUserSelf`, which the axes print through too.
+    pub(crate) fn trace(&self) -> &MotorTrace {
+        &self.own
+    }
+
+    /// C `portName`.
+    pub(crate) fn port_name(&self) -> &str {
+        self.own.port()
     }
 
     /// Post what the poll reads to the controller port from here on.
@@ -184,11 +238,40 @@ impl PmacController {
 
     /// C `pmacController::lowLevelWriteRead`; see [`octet_write_read`].
     pub fn write_read(&self, command: &str) -> AsynResult<String> {
+        checked_reply(command, self.transfer(command)?)
+    }
+
+    /// C `lowLevelWriteRead` with C's view of the reply: a `<BELL>` reply is
+    /// a reply, for the queries whose `sscanf` then rejects it.
+    pub(crate) fn reply(&self, command: &str) -> AsynResult<String> {
+        let raw = self.transfer(command)?;
+        Ok(String::from_utf8_lossy(&raw).trim_matches('\0').to_string())
+    }
+
+    /// A failed transfer disconnects the low-level port (pmacController.cpp:
+    /// 335-343): the rest of the pass fails at once instead of timing out
+    /// command by command, and the port's autoconnect brings the line back.
+    fn transfer(&self, command: &str) -> AsynResult<Vec<u8>> {
         let handle = self
             .handle
             .as_ref()
             .ok_or_else(|| pmac_err("no low level asynOctetSyncIO port"))?;
-        octet_write_read(handle, command)
+        handle
+            .write_read(0, command.as_bytes(), PMAC_MAXBUF)
+            .inspect_err(|e| {
+                self.low.print(
+                    TraceMask::ERROR,
+                    0,
+                    format_args!(
+                        "pmacController::lowLevelWriteRead: Error from \
+                         pasynOctetSyncIO->writeRead. command: {command}, status={}\n",
+                        e.c_status_code()
+                    ),
+                );
+                if let Ok(port) = handle.port() {
+                    let _ = port.disconnect_blocking();
+                }
+            })
     }
 
     /// Send a command whose reply carries no value (moves, jogs, set-position).
@@ -235,15 +318,20 @@ impl PmacController {
         })
     }
 
-    /// C `pmacController::pmacDisableLimitsCheck`. Errors on an axis that was
-    /// never created, as C does.
-    pub fn disable_limits_check(&mut self, axis: i32) -> Result<(), String> {
-        let cfg = self
-            .config
-            .get_mut(&axis)
-            .ok_or_else(|| format!("axis {axis} has not been configured using pmacCreateAxis"))?;
-        cfg.limits_check_disabled = true;
-        Ok(())
+    /// C `pmacController::pmacDisableLimitsCheck(axis)`. C returns on an
+    /// unknown axis without its `unlock()`, which wedges the controller; the
+    /// lock here is released.
+    pub fn disable_limits_check(&mut self, axis: i32) {
+        match self.config.get_mut(&axis) {
+            Some(cfg) => cfg.limits_check_disabled = true,
+            None => self.own.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "pmacController::pmacDisableLimitsCheck: Error: axis {axis} has not been \
+                     configured using pmacCreateAxis.\n"
+                ),
+            ),
+        }
     }
 
     pub fn disable_limits_check_all(&mut self) {
@@ -253,81 +341,120 @@ impl PmacController {
     }
 
     /// C `pmacController::pmacSetOpenLoopEncoderAxis`. Both the axis and the
-    /// encoder axis must already exist.
-    pub fn set_open_loop_encoder_axis(
-        &mut self,
-        axis: i32,
-        encoder_axis: i32,
-        encoder_ratio: f64,
-    ) -> Result<(), String> {
-        if !self.axes.contains(&encoder_axis) {
-            return Err(format!(
-                "encoder axis {encoder_axis} has not been configured using pmacCreateAxis"
-            ));
-        }
-        let cfg = self
-            .config
-            .get_mut(&axis)
-            .ok_or_else(|| format!("axis {axis} has not been configured using pmacCreateAxis"))?;
-        cfg.encoder_axis = encoder_axis;
-        cfg.encoder_ratio = encoder_ratio;
-        Ok(())
+    /// encoder axis must already exist; an error returns without C's
+    /// `unlock()`, as [`Self::disable_limits_check`].
+    pub fn set_open_loop_encoder_axis(&mut self, axis: i32, encoder_axis: i32, encoder_ratio: f64) {
+        let error = match self.config.get_mut(&axis) {
+            None => format!("axis {axis}"),
+            Some(_) if !self.axes.contains(&encoder_axis) => {
+                format!("encoder axis {encoder_axis}")
+            }
+            Some(cfg) => {
+                cfg.encoder_axis = encoder_axis;
+                cfg.encoder_ratio = encoder_ratio;
+                return;
+            }
+        };
+        self.own.print_self(
+            TraceMask::ERROR,
+            format_args!(
+                "pmacController::pmacSetOpenLoopEncoderAxis: Error: {error} has not been \
+                 configured using pmacCreateAxis.\n"
+            ),
+        );
     }
 
     // ---- global status ----
 
-    /// C `pmacController::getGlobalStatus` + the `PMAC_C_GLOBALSTATUS` /
-    /// `PMAC_C_FEEDRATE_PROBLEM` handling in `pmacController::poll`, refreshed at
-    /// most once per poll period. Returns whether the controller has a problem
-    /// that must raise the axis PROBLEM bit.
-    pub fn controller_problem(&mut self) -> bool {
-        let fresh = self
-            .global_read_at
-            .is_some_and(|t| t.elapsed() < self.global_ttl);
-        if !fresh {
-            self.global_read_at = Some(Instant::now());
-            self.refresh_global();
-        }
+    /// Whether the last [`Self::poll`] found a problem that raises every axis
+    /// PROBLEM bit.
+    pub fn controller_problem(&self) -> bool {
         self.global_problem || self.feed_rate_problem
     }
 
-    fn refresh_global(&mut self) {
-        match self
-            .write_read("???")
-            .ok()
-            .as_deref()
-            .and_then(parse_global_status)
-        {
-            Some(status) => self.global_problem = (status & HARDWARE_PROB) != 0,
-            // A failed read leaves the previous verdict, as C does (it sets the
-            // comms-error param and keeps the last global status).
-            None => return self.post(|p| vec![(p.comms_error, 1)]),
+    /// C `pmacController::poll`: `getGlobalStatus` and the
+    /// `PMAC_C_GLOBALSTATUS` / `PMAC_C_FEEDRATE_PROBLEM` handling.
+    pub fn poll(&mut self) {
+        if self.handle.is_none() {
+            return;
         }
-        let rate = self
-            .feed_rate_poll
-            .then(|| self.write_read("%").ok())
-            .flatten()
-            .as_deref()
-            .and_then(parse_feedrate);
+        let print_errors = self.throttle.print_errors();
+        // An unread global status is 0, and with feed-rate polling on the `%`
+        // read's verdict replaces the `???` read's (pmacController.cpp:662-708).
+        let global = self.read_global("???", "???.", "???.", parse_global_status);
+        let (rate, read_ok) = if self.feed_rate_poll {
+            let rate = self.read_global("%", "feedrate.", "feedrate:", parse_feedrate);
+            (rate, rate.is_some())
+        } else {
+            (None, global.is_some())
+        };
+        self.global_problem = global.unwrap_or(0) & HARDWARE_PROB != 0;
         if let Some(rate) = rate {
             self.feed_rate = rate;
             self.feed_rate_problem = rate < self.feed_rate_limit - FEEDRATE_DEADBAND;
+            if !self.feed_rate_problem {
+                self.throttle.print_next = true;
+            } else if print_errors {
+                self.low.print(
+                    TraceMask::ERROR,
+                    0,
+                    format_args!(
+                        "pmacController::poll: *** ERROR ***: global feed rate below limit. \
+                         feedrate: {rate}, feedrate limit {}\n",
+                        self.feed_rate_limit
+                    ),
+                );
+                self.throttle.print_next = false;
+            }
         }
-        let feed_rate_read = rate.is_some();
-        // C `pmacController::poll`: the feed rate and its verdict are posted
-        // only while polled.
-        let (global, rate, problem) = (
+        let (global, problem) = (
             i32::from(self.global_problem),
-            self.feed_rate,
             i32::from(self.feed_rate_problem),
         );
         self.post(|p| {
-            let mut values = vec![(p.global_status, global), (p.comms_error, 0)];
-            if feed_rate_read {
+            let mut values = vec![
+                (p.global_status, global),
+                (p.comms_error, i32::from(!read_ok)),
+            ];
+            if let Some(rate) = rate {
                 values.extend([(p.feed_rate, rate), (p.feed_rate_problem, problem)]);
             }
             values
         });
+        if !read_ok {
+            self.low.print(
+                TraceMask::ERROR,
+                0,
+                format_args!("pmacController::poll: Error reading or setting params.\n"),
+            );
+        }
+    }
+
+    /// One `getGlobalStatus` read, printing C's line for a failed transfer
+    /// (`failed`) or reply (`unparsed`).
+    fn read_global<T>(
+        &self,
+        command: &str,
+        failed: &str,
+        unparsed: &str,
+        parse: impl FnOnce(&str) -> Option<T>,
+    ) -> Option<T> {
+        let print = |args: std::fmt::Arguments<'_>| self.low.print(TraceMask::ERROR, 0, args);
+        let Ok(reply) = self.reply(command) else {
+            print(format_args!(
+                "pmacController::getGlobalStatus: Error reading {failed}\n"
+            ));
+            return None;
+        };
+        let value = parse(&reply);
+        if value.is_none() {
+            print(format_args!(
+                "pmacController::getGlobalStatus: Error reading {unparsed} nvals: {}, \
+                 response: {reply}\n",
+                sscanf_nvals(&reply)
+            ));
+        }
+        value
     }
 
     /// Set address-0 parameters and run their callbacks.
@@ -393,10 +520,17 @@ impl PmacController {
     }
 
     fn process_deferred_moves(&mut self) -> AsynResult<()> {
-        match fast_deferred_command(&self.deferred) {
-            Some(cmd) => self.command(&cmd),
-            None => Ok(()),
-        }
+        let Some(cmd) = fast_deferred_command(&self.deferred) else {
+            return Ok(());
+        };
+        self.command(&cmd).inspect_err(|_| {
+            self.own.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "pmacController::processDeferredMoves ERROR Sending Deferred Move Command.\n"
+                ),
+            );
+        })
     }
 
     fn process_deferred_coord_moves(&mut self) -> AsynResult<()> {
@@ -603,7 +737,7 @@ mod tests {
     /// speed, accel and GET_INFO writes the record now sends included.
     #[test]
     fn every_write_prints_pmac_controllers_flow_line() {
-        let ctrl = Arc::new(Mutex::new(PmacController::new(None, Duration::ZERO)));
+        let ctrl = Arc::new(Mutex::new(PmacController::new("pmacTest", "", 0, None)));
         let params = PmacControllerParams::new(ctrl);
         let port = register_controller_port(&open_owner(), "pmacFlow", 2, params).unwrap();
         let lines = traced("pmacFlow", || {
@@ -626,7 +760,7 @@ mod tests {
 
     #[test]
     fn every_write_sets_motor_status_comms_error_from_its_status() {
-        let ctrl = Arc::new(Mutex::new(PmacController::new(None, Duration::ZERO)));
+        let ctrl = Arc::new(Mutex::new(PmacController::new("pmacTest", "", 0, None)));
         let params = PmacControllerParams::new(ctrl.clone());
         let port = register_controller_port(&open_owner(), "pmacComms", 2, params).unwrap();
         let group = lock(&ctrl).params.unwrap().coord_sys_group;
@@ -648,7 +782,7 @@ mod tests {
 
     #[test]
     fn defer_value_arms_the_mode_and_zero_releases_it() {
-        let mut c = PmacController::new(None, Duration::ZERO);
+        let mut c = PmacController::new("pmacTest", "", 0, None);
         c.set_moves_deferred(DEFERRED_COORDINATED_MOVES).unwrap();
         assert!(c.moves_deferred());
         c.set_moves_deferred(0).unwrap();

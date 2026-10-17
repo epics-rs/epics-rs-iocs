@@ -44,6 +44,11 @@ impl PortDriver for FakeXps {
                 digital = format!("0,{}", self.digital.lock().unwrap());
                 &digital
             }
+            "ErrorStringGet" if cmd.contains("(-3,") => {
+                "0,Error in the command parameters of a hexapod call"
+            }
+            "ErrorStringGet" => "0,Not allowed action",
+            "HexapodCoordinateSystemGet" => "0,1,2,3,4,5,6",
             "GroupStatusGet" => "0,12",
             "GroupPositionCurrentGet" if cmd.contains(".P2,") => "0,2.5",
             "GroupPositionCurrentGet" => "0,1.5",

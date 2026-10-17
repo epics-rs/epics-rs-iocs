@@ -47,6 +47,19 @@ impl XpsSocket {
         Ok(r.string(1).to_string())
     }
 
+    /// C `HXPErrorStringGet` (hxp_drivers.cpp:271-303): `out` takes the
+    /// reply's string and keeps what it held when there is none, as the
+    /// move socket's timed-out `"0"`.
+    pub fn error_string_get_into(&self, code: i32, out: &mut String) {
+        let cmd = format!("ErrorStringGet ({code},char *)");
+        if let Ok(reply) = self.exec(&cmd)
+            && reply.code() == 0
+            && let Some(text) = reply.field(1)
+        {
+            *out = text.to_string();
+        }
+    }
+
     // --- Group status / position ------------------------------------------
 
     /// `GroupStatusGet(group)` → the group status code.

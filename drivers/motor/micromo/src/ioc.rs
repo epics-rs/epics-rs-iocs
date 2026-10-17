@@ -22,7 +22,7 @@ use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{asyn_user, install, model1_device, register_port};
+use motor_common::{Controller, asyn_user, model1_device, register_port};
 
 use crate::drv_mvp2001::{self, DrvMvp2001Axis, MVP2001_NUM_CARDS, Mvp2001Chain};
 use crate::mvp2001::{Mvp2001Axis, Mvp2001Controller};
@@ -30,11 +30,10 @@ use crate::mvp2001::{Mvp2001Axis, Mvp2001Controller};
 /// Command timeout (C `DEFAULT_CONTROLLER_TIMEOUT`).
 const MVP2001_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// A registered controller plus the poll intervals its axes should install with.
+/// A registered controller and the poller its axes join.
 struct Registered {
     controller: Arc<Mutex<Mvp2001Controller>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
+    poller: Arc<Controller>,
 }
 
 /// Controllers registered by `MVP2001CreateController`, keyed by port name, so
@@ -82,14 +81,13 @@ pub fn mvp2001_create_controller_command() -> CommandDef {
                 num_axes as usize,
             )));
 
-            registry().lock().unwrap_or_else(|e| e.into_inner()).insert(
-                port_name,
-                Registered {
-                    controller,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                },
-            );
+            // MVP2001Driver.cpp:57, before any axis exists.
+            let poller = Arc::new(Controller::new());
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+            registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(port_name, Registered { controller, poller });
             Ok(CommandOutcome::Continue)
         },
     )
@@ -108,7 +106,7 @@ pub fn mvp2001_create_axis_command() -> CommandDef {
             arg_int_req("Limit polarity"),
         ],
         "MVP2001CreateAxis(MVP2001Name, axisNo, encLPR, maxCurr, limPol)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Controller port name")?;
             let axis_no = req_int(args, 1, "Axis number")?;
             if axis_no < 0 {
@@ -118,17 +116,13 @@ pub fn mvp2001_create_axis_command() -> CommandDef {
             let max_curr = req_int(args, 3, "Max current (ma)")?;
             let lim_pol = req_int(args, 4, "Limit polarity")?;
 
-            let (controller, moving_poll_ms, idle_poll_ms) = {
+            let (controller, poller) = {
                 let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
                 let Some(entry) = reg.get(&port_name) else {
                     println!("Error port {port_name} not found");
                     return Ok(CommandOutcome::Continue);
                 };
-                (
-                    entry.controller.clone(),
-                    entry.moving_poll_ms,
-                    entry.idle_poll_ms,
-                )
+                (entry.controller.clone(), entry.poller.clone())
             };
 
             let ax = Mvp2001Axis::new(
@@ -139,14 +133,7 @@ pub fn mvp2001_create_axis_command() -> CommandDef {
                 lim_pol as i32,
             );
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            install(
-                ctx,
-                asyn_user(&port_name, axis_no as i32),
-                motor,
-                moving_poll_ms,
-                idle_poll_ms,
-                2, // C startPoller, MVP2001Driver.cpp:57
-            )?;
+            poller.install(asyn_user(&port_name, axis_no as i32), motor)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -203,4 +190,36 @@ pub fn micromo_config_command() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod one_poller {
+    use motor_common::testing::pollers_after;
+
+    use super::*;
+
+    /// MVP2001Driver.cpp:57: the controller's poller, which every
+    /// MVP2001CreateAxis joins.
+    #[epics_rs::base::epics_test]
+    async fn mvp2001_create_axis_joins_the_controller_poller() {
+        let args = vec![
+            ArgValue::String("mvpOnePoller".into()),
+            ArgValue::String("mvpOnePollerNoLine".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+        ];
+        let cmd = mvp2001_create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+        for axis in 0..2 {
+            let args = vec![
+                ArgValue::String("mvpOnePoller".into()),
+                ArgValue::Int(axis),
+                ArgValue::Int(512),
+                ArgValue::Int(500),
+                ArgValue::Int(1),
+            ];
+            assert_eq!(pollers_after(mvp2001_create_axis_command(), args).await, 1);
+        }
+    }
 }
