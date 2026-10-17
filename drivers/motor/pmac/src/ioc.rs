@@ -1159,6 +1159,77 @@ mod tests {
 
     /// pmacAxis.cpp:96, 136, 243-305, 497, 585: C's axis error lines on the
     /// controller's trace, the limits warning throttled as the feed rate's.
+    /// pmacCsGroups.cpp:149, 237-261, 305, 323: the group switch and the
+    /// coordinated release print C's lines on the controller's trace.
+    #[test]
+    fn cs_group_errors_print_c_lines_on_the_controller_trace() {
+        use crate::controller::DEFERRED_COORDINATED_MOVES;
+        use crate::cs_groups::{AxisPoll, DeferredMove};
+
+        let (_rt, rig) = publish_scripted("pmacCsErrLow");
+        let (controller, _io) = controller_port("pmacCsErrCtl", "pmacCsErrLow");
+        let own = TraceCapture::on("pmacCsErrCtl");
+        let mut c = controller.lock().unwrap();
+        assert!(c.switch_cs_group(5).is_err());
+        assert_eq!(
+            own.take(),
+            "pmacCsGroups::switchToGroup: Invalid Coordinate System Group Number\n"
+        );
+
+        let groups = c.cs_groups_mut();
+        groups.add_group(1, "g");
+        for (axis, def, cs) in [(1, "X", 2), (2, "U*2", 2), (3, "Y", 3), (4, "Z", 2)] {
+            groups.add_axis(1, axis, def, cs).unwrap();
+        }
+        groups.switch_commands(1).unwrap();
+        rig.answer("&2A", b"\x06");
+        rig.answer("&3A", b"\x06");
+        let to = DeferredMove {
+            position: 1.0,
+            relative: false,
+            time_ms: 0.0,
+        };
+        let release = |axes: &[i32], c: &mut PmacController| {
+            c.set_moves_deferred(DEFERRED_COORDINATED_MOVES).unwrap();
+            for &axis in axes {
+                c.defer_move(axis, to);
+            }
+            assert!(c.set_moves_deferred(0).is_err());
+            own.take()
+        };
+        let line = |text: &str| format!("pmacCsGroups::processDeferredCoordMoves {text}\n");
+        assert_eq!(
+            release(&[5], &mut c),
+            line("Error: deferred coordinated move on real axis 5 not in a coordinate system")
+        );
+        assert_eq!(
+            release(&[1, 3], &mut c),
+            line("Error: deferred coordinated move on multiple coordinate systems 2 and 3")
+        );
+        assert_eq!(
+            release(&[2], &mut c),
+            line("Error: illegal deferred coordinated move on real axis 2 defined as U*2 in CS 2")
+        );
+        c.record_poll(
+            4,
+            AxisPoll {
+                position: 0.0,
+                moving: true,
+            },
+        );
+        assert_eq!(
+            release(&[1], &mut c),
+            line(
+                "Error: illegal deferred coordinated move - real axis 4 in CS 2 is already moving"
+            )
+        );
+        c.record_poll(4, AxisPoll::default());
+        assert_eq!(
+            release(&[1], &mut c),
+            line("ERROR Sending Deferred Move Command.")
+        );
+    }
+
     #[test]
     fn axis_errors_print_c_lines_on_the_controller_trace() {
         let (_rt, rig) = publish_scripted("pmacAxErrLow");

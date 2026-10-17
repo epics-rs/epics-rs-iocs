@@ -532,12 +532,22 @@ impl PmacController {
     }
 
     fn process_deferred_coord_moves(&mut self) -> AsynResult<()> {
+        const FUNCTION: &str = "pmacCsGroups::processDeferredCoordMoves";
         let cmds = self
             .cs_groups
             .coord_move_commands(&self.deferred, &self.poll_cache)
+            .inspect_err(|e| {
+                self.own
+                    .print_self(TraceMask::ERROR, format_args!("{FUNCTION} Error: {e}\n"))
+            })
             .map_err(pmac_err)?;
         for cmd in cmds {
-            self.command(&cmd)?;
+            self.command(&cmd).inspect_err(|_| {
+                self.own.print_self(
+                    TraceMask::ERROR,
+                    format_args!("{FUNCTION} ERROR Sending Deferred Move Command.\n"),
+                )
+            })?;
         }
         Ok(())
     }
@@ -551,7 +561,18 @@ impl PmacController {
     /// C `pmacCreateCsGroup` + `pmacCsGroupAddAxis` are pure bookkeeping;
     /// `pmacCsGroups::switchToGroup` is the one that talks to the controller.
     pub fn switch_cs_group(&mut self, id: i32) -> AsynResult<()> {
-        let cmds = self.cs_groups.switch_commands(id).map_err(pmac_err)?;
+        let cmds = self
+            .cs_groups
+            .switch_commands(id)
+            .inspect_err(|_| {
+                self.own.print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "pmacCsGroups::switchToGroup: Invalid Coordinate System Group Number\n"
+                    ),
+                )
+            })
+            .map_err(pmac_err)?;
         for cmd in cmds {
             self.command(&cmd)?;
         }
