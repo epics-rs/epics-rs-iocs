@@ -83,12 +83,9 @@ impl PslDetector {
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<(Self, bool)> {
         let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
+        // C PSL never sets NDDriverVersion: it keeps asynNDArrayDriver's
+        // ADCore version string.
         let params = PslParams::create(&mut ad.port_base)?;
-        ad.port_base.set_string_param(
-            ad.params.base.driver_version,
-            0,
-            env!("CARGO_PKG_VERSION"),
-        )?;
 
         let mut det = Self {
             ad,
@@ -785,6 +782,10 @@ mod tests {
         };
         assert_eq!(octet(rt.ad_params.status_message), "");
         assert!(sync.read_octet(rt.ad_params.base.model, 64).is_err());
+        assert_eq!(
+            octet(rt.ad_params.base.driver_version),
+            octet(rt.ad_params.base.ad_core_version)
+        );
     }
 
     /// ADDriver::writeInt32 and asynNDArrayDriver::writeInt32 each close with
