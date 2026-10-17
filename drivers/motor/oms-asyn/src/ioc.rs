@@ -15,7 +15,7 @@ use motor_common::iocsh::{arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
 use motor_common::{Controller, asyn_user, register_port_with};
 
-use crate::oms::{OmsAxis, OmsController, OmsParams};
+use crate::oms::{FirmwareVersion, OmsAxis, OmsController, OmsParams};
 
 /// C `OMS_MAX_AXES`.
 const OMS_MAX_AXES: usize = 10;
@@ -35,8 +35,12 @@ pub fn oms_commands() -> Vec<CommandDef> {
 /// idlePollPeriod, initString)`. As C's constructor, a failure past the
 /// port's creation is printed and leaves the port without axes.
 fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> CommandDef {
-    // The constructors' minFwMinor.
-    let min_fw_minor = if controller_type == "MAXnet" { 30 } else { 0 };
+    // The constructors' minFwMajor, minFwMinor, minFwRevision.
+    let min_fw = FirmwareVersion {
+        major: 1,
+        minor: if controller_type == "MAXnet" { 30 } else { 0 },
+        revision: 0,
+    };
     CommandDef::new(
         cmd_name,
         vec![
@@ -87,7 +91,8 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                 }
             };
             let _ = report.fw.set(fw);
-            if fw.minor < min_fw_minor {
+            controller.set_firmware(fw, min_fw);
+            if fw.minor < min_fw.minor {
                 println!(
                     "{}",
                     unsupported_firmware(controller_type, fw.major, fw.minor)

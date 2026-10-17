@@ -42,10 +42,6 @@
 //! ## Not modeled (documented)
 //!
 //! - The notification interrupt (`asynCallback`): see above.
-//! - The init-time firmware-version gate: the driver reads the firmware
-//!   string once as a comms check and assumes the modern (>= 1.30) command
-//!   forms MAXnet mandates, `CL?` included; only the watchdog check reads
-//!   the version.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -79,7 +75,7 @@ static CONTROLLERS: AtomicUsize = AtomicUsize::new(0);
 const READ_BUF: usize = 256;
 
 /// Per-axis command selector characters (C `axisChrArr`).
-const AXIS_CHARS: [char; 10] = ['X', 'Y', 'Z', 'T', 'U', 'V', 'R', 'S', 'W', 'K'];
+pub(crate) const AXIS_CHARS: [char; 10] = ['X', 'Y', 'Z', 'T', 'U', 'V', 'R', 'S', 'W', 'K'];
 
 /// Move parameter clamps (C `omsBaseAxis`).
 const MAX_VELOCITY: i32 = 4_000_000;
@@ -124,6 +120,14 @@ fn scan_int(s: &str) -> Option<(i32, &str)> {
     }
     let end = sign + digits;
     Some((t[..end].parse().ok()?, &t[end..]))
+}
+
+impl FirmwareVersion {
+    /// C `firmwareMin(major, minor, revision)`: this version is at least
+    /// `min`.
+    pub fn at_least(self, min: FirmwareVersion) -> bool {
+        (min.major, min.minor, min.revision) <= (self.major, self.minor, self.revision)
+    }
 }
 
 fn oms_err(message: impl Into<String>) -> AsynError {
@@ -352,6 +356,9 @@ pub struct OmsController {
     controller_number: usize,
     /// The axes' status parameters and the poll event.
     poll_shared: Arc<PollShared>,
+    /// C `firmwareMin(minFwMajor, minFwMinor, minFwRevision)`, which picks
+    /// the command forms of firmware 1.30 on.
+    modern: bool,
 }
 
 impl OmsController {
@@ -371,7 +378,19 @@ impl OmsController {
             _connect_callback: None,
             controller_number: CONTROLLERS.fetch_add(1, Ordering::Relaxed),
             poll_shared: Arc::default(),
+            modern: true,
         }
+    }
+
+    /// Pick the command forms for firmware `fw` on a controller whose
+    /// newer forms need `min`.
+    pub fn set_firmware(&mut self, fw: FirmwareVersion, min: FirmwareVersion) {
+        self.modern = fw.at_least(min);
+    }
+
+    /// Whether the firmware takes the 1.30 command forms.
+    pub(crate) fn modern(&self) -> bool {
+        self.modern
     }
 
     pub(crate) fn port_name(&self) -> &str {
@@ -567,9 +586,9 @@ pub struct OmsAxis {
 }
 
 impl OmsAxis {
-    /// Construct axis `index` and probe its type (`PS?`) and limit true-state
-    /// (`LT?`), and add its status parameters. Axes are created in order.
-    /// Assumes the modern (firmware >= 1.30) command forms.
+    /// Construct axis `index` and probe its type (`PS?`, before firmware
+    /// 1.30 `?PS`) and limit true-state (`LT?` or `?LS`), and add its
+    /// status parameters. Axes are created in order.
     pub fn new(controller: Arc<Mutex<OmsController>>, index: usize) -> AsynResult<Self> {
         let axis_char = *AXIS_CHARS
             .get(index)
@@ -578,14 +597,17 @@ impl OmsAxis {
         let (has_encoder, poll_shared) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // Axis type: "=O" stepper/no-encoder, "=M" servo, "=E" stepper+enc.
-            let ps = ctrl.send_receive(&format!("A{axis_char} PS?"))?;
+            let modern = ctrl.modern();
+            let ps = if modern { "PS?" } else { "?PS" };
+            let ps = ctrl.send_receive(&format!("A{axis_char} {ps}"))?;
             let has_encoder = match ps.as_bytes().get(1) {
                 Some(b'O') => false,
                 Some(b'M') | Some(b'E') => true,
                 _ => return Err(oms_err(format!("oms: unknown axis type '{ps}'"))),
             };
             // Limit true-state: "=l"/"=L" invert, "=h"/"=H" no invert.
-            let lt = ctrl.send_receive(&format!("A{axis_char} LT?"))?;
+            let lt = if modern { "LT?" } else { "?LS" };
+            let lt = ctrl.send_receive(&format!("A{axis_char} {lt}"))?;
             let invert_limit = match lt.as_bytes().get(1) {
                 Some(b'l') | Some(b'L') => true,
                 Some(b'h') | Some(b'H') => false,
@@ -692,7 +714,12 @@ impl AsynMotor for OmsAxis {
             format!("omsBaseDriver:writeInt32:{port} SetInteger axis {axis} closed loop disable\n")
         };
         self.print(TraceMask::FLOW, index::CLOSED_LOOP, format_args!("{flow}"));
-        let cmd = if enable { "CL1" } else { "CL0" };
+        let cmd = match (self.lock().modern(), enable) {
+            (true, true) => "CL1",
+            (true, false) => "CL0",
+            (false, true) => "HN",
+            (false, false) => "HF",
+        };
         self.lock().send_only(&format!("A{ch} {cmd}"))
     }
 
@@ -1123,6 +1150,23 @@ mod tests {
         );
         OmsController::new(io, "omsDeadInit", "omsDeadInit", "MAXnet").init("AX LP0;");
         assert_eq!(*written.lock().unwrap(), ["IC;", "AM SA;", "AX LP0;"]);
+    }
+
+    /// C `firmwareMin` (omsBaseController.cpp:920-929) takes the minimum
+    /// itself; a lower field anywhere is below it.
+    #[test]
+    fn firmware_at_least_takes_the_minimum_itself() {
+        let v = |major, minor, revision| FirmwareVersion {
+            major,
+            minor,
+            revision,
+        };
+        let min = v(1, 30, 0);
+        assert!(v(1, 30, 0).at_least(min));
+        assert!(v(1, 30, 1).at_least(min));
+        assert!(v(2, 0, 0).at_least(min));
+        assert!(!v(1, 29, 9).at_least(min));
+        assert!(!v(0, 99, 0).at_least(min));
     }
 
     #[test]
