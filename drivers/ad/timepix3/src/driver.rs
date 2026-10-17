@@ -1767,57 +1767,80 @@ impl TimePix3Driver {
             })
     }
 
-    /// The one mask drawing entry point (C's `readInt32Array` mask branch,
-    /// mask_io.cpp:88-170, which mutates the *record's* buffer in place).
-    ///
-    /// The driver owns the mask here, so a re-read of the waveform cannot
-    /// re-apply an operation and the record's buffer is never the source of
-    /// truth.
-    fn mask_op(&mut self) -> AsynResult<()> {
-        let geom = self.geometry()?;
-        let on = self.int(self.p.mask_on_off_pel, 0) != 0;
-        let mut mask = self.shared.take_mask(geom.pixel_count());
-
-        if self.int(self.p.mask_reset, 0) == 1 {
-            mask::mask_reset(&geom, &mut mask, on);
-        } else if self.int(self.p.mask_rectangle, 0) == 1 {
-            mask::mask_rectangle(
-                &geom,
-                &mut mask,
-                self.int(self.p.mask_min_x, 0),
-                self.int(self.p.mask_size_x, 0),
-                self.int(self.p.mask_min_y, 0),
-                self.int(self.p.mask_size_y, 0),
-                on,
-            );
-        } else if self.int(self.p.mask_circle, 0) == 1 {
-            mask::mask_circle(
-                &geom,
-                &mut mask,
-                self.int(self.p.mask_min_x, 0),
-                self.int(self.p.mask_min_y, 0),
-                self.int(self.p.mask_radius, 0),
-                on,
-            );
-        } else if self.int(self.p.mask_pel, 0) == 1 {
+    /// C `readInt32Array`'s MaskBPC branch (mask_io.cpp:95-207, :240-242): the
+    /// db sets one operation flag and processes the waveform, so the operation
+    /// runs on the waveform read, over its `nElements`.
+    fn mask_bp_c(&mut self, mask: &mut [i32]) -> AsynResult<()> {
+        let p = self.p;
+        let flag = |s: &Self, reason| s.int(reason, 0) == 1;
+        let on_off = self.int(p.mask_on_off_pel, 0);
+        let (x, y) = (self.int(p.mask_min_x, 0), self.int(p.mask_min_y, 0));
+        let n = mask.len();
+        let drawn = if flag(self, p.mask_reset) {
+            self.mask_flow(&format!("MaskBPC: reset (waveform nElements={n})"));
+            let image = self.mask_image();
+            mask::reset(mask, image, on_off)
+        } else if flag(self, p.mask_rectangle) {
+            self.mask_flow(&format!("MaskBPC: rectangle (waveform nElements={n})"));
+            let (sx, sy) = (self.int(p.mask_size_x, 0), self.int(p.mask_size_y, 0));
+            let image = self.mask_image();
+            mask::rectangle(mask, image, x, sx, y, sy, on_off != 0)
+        } else if flag(self, p.mask_circle) {
+            self.mask_flow(&format!("MaskBPC: circle (waveform nElements={n})"));
+            let radius = self.int(p.mask_radius, 0);
+            let image = self.mask_image();
+            mask::circle(mask, image, x, y, radius, on_off != 0)
+        } else if flag(self, p.mask_pel) {
+            let geom = self.geometry()?;
             let bpc = self.read_bpc()?;
             let map = self.pel_table(&geom);
-            mask::mask_from_bpc(&map, &bpc, &mut mask);
-        } else if self.int(self.p.mask_write, 0) == 1 {
+            mask::mask_from_bpc(&map, &bpc, mask);
+            Ok(())
+        } else if flag(self, p.mask_write) {
+            let geom = self.geometry()?;
             let mut bpc = self.read_bpc()?;
             let map = self.pel_table(&geom);
-            mask::apply_mask_to_bpc(&map, &mask, &mut bpc);
+            mask::apply_mask_to_bpc(&map, mask, &mut bpc);
             self.write_mask_file(&bpc)?;
+            Ok(())
+        } else {
+            self.mask_flow(&format!("MaskBPC: no draw op (nElements={n})"));
+            Ok(())
+        };
+        let status = match drawn {
+            Ok(()) => AsynStatus::Success,
+            Err(e) => {
+                self.set_text(p.write_msg, e.message())?;
+                AsynStatus::Error
+            }
+        };
+        self.ad
+            .port_base
+            .set_param_status(p.mask_bp_c, 0, status, 0, 0)?;
+        self.ad.port_base.call_param_callbacks(0)?;
+        match status {
+            AsynStatus::Success => Ok(()),
+            // C returns with the message ADDriver::readInt32Array left in the
+            // asynUser (asynPortDriver.cpp:1815-1816).
+            _ => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "asynPortDriver:readArray not implemented".into(),
+            }),
         }
+    }
 
-        let n = mask.iter().filter(|&&v| v & 1 != 0).count();
-        self.shared.put_mask(mask);
-        self.ad.port_base.set_int32_param(
-            self.p.bp_cmasked,
-            0,
-            i32::try_from(n).unwrap_or(i32::MAX),
-        )?;
-        Ok(())
+    /// The (COLS, ROWS) C's mask helpers draw in; zeros when `rowsCols`
+    /// fails, whose status C ignores (mask_io.cpp:424-466).
+    fn mask_image(&mut self) -> (i32, i32) {
+        let g = self.rows_cols().unwrap_or_default();
+        (g.cols, g.rows)
+    }
+
+    fn mask_flow(&self, msg: &str) {
+        self.ad.port_base.trace_print(
+            TraceMask::FLOW,
+            format_args!("{}", adlog::log(adlog::READ_INT32_ARRAY, msg)),
+        );
     }
 
     /// C `readBPCfile` (mask_io.cpp:586).
@@ -2904,17 +2927,6 @@ impl TimePix3Driver {
                     .set_int32_param(p.prv_hst_data_reset, 0, 0)?;
             }
             set
-        } else if reason == p.mask_reset
-            || reason == p.mask_rectangle
-            || reason == p.mask_circle
-            || reason == p.mask_pel
-            || reason == p.mask_write
-        {
-            let r = self.mask_op();
-            // These are one-shot triggers, exactly as the db's autosave-free
-            // bo records expect.
-            self.ad.port_base.set_int32_param(reason, 0, 0)?;
-            r.and(set)
         } else if reason == p.health {
             self.cmd_tx
                 .try_send(Command::RefreshStatus)
@@ -3183,16 +3195,16 @@ impl PortDriver for TimePix3Driver {
         Ok((index, entries))
     }
 
-    /// The mask waveform reads back what the driver drew (C `readInt32Array`,
-    /// mask_io.cpp:18).
+    /// C `readInt32Array` (mask_io.cpp:32-249). C draws into the record's own
+    /// buffer; the driver keeps that buffer here, one per waveform length.
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
         let reason = user.reason;
         if reason == self.p.mask_bp_c {
-            let mask = self.shared.mask.lock();
-            let n = buf.len().min(mask.len());
-            buf[..n].copy_from_slice(&mask[..n]);
-            buf[n..].fill(0);
-            return Ok(buf.len());
+            let mut mask = self.shared.take_mask(buf.len());
+            let drawn = self.mask_bp_c(&mut mask);
+            buf.copy_from_slice(&mask);
+            self.shared.put_mask(mask);
+            return drawn.map(|()| buf.len());
         }
         if reason == self.p.bp_c {
             let bpc = self.read_bpc()?;
@@ -5324,6 +5336,114 @@ mod tests {
             assert!(text.contains(&line), "{line}: {text:?}");
         }
         let _ = std::fs::remove_dir_all(&tmp);
+        std::mem::forget(runtime);
+    }
+
+    /// A mask flag write only stores the flag; the operation runs on the
+    /// MaskBPC read over its nElements, with C's FLOW line, WriteMsg and
+    /// MaskBPC status (mask_io.cpp:95-130, :240-242, mask_geometry.cpp).
+    #[test]
+    fn a_mask_operation_runs_on_the_mask_waveform_read_as_c() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "TPX_MASK_READ";
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        for (reason, v) in [
+            (p.pix_count, 65536),
+            (p.row_len, 1),
+            (p.number_of_chips, 1),
+            (p.number_of_rows, 256),
+        ] {
+            det.ad.port_base.set_int32_param(reason, 0, v).unwrap();
+        }
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace().set_trace_mask(Some(name), TraceMask::FLOW);
+
+        h.write_int32_blocking(p.mask_on_off_pel, 0, 3).unwrap();
+        h.write_int32_blocking(p.mask_reset, 0, 1).unwrap();
+        let read = |n: usize| {
+            h.with_driver_blocking::<TimePix3Driver, _>(move |d| {
+                let mut buf = vec![-1i32; n];
+                let r = d
+                    .read_int32_array(&AsynUser::new(d.p.mask_bp_c), &mut buf)
+                    .map_err(|e| e.message());
+                let status = d.ad.port_base.params.get_param_status(d.p.mask_bp_c, 0);
+                (r, buf, d.text(d.p.write_msg, 0), status.unwrap().0)
+            })
+            .unwrap()
+        };
+        assert!(
+            h.with_driver_blocking::<TimePix3Driver, _>(|d| d.shared.take_mask(4))
+                .unwrap()
+                .iter()
+                .all(|&v| v == 0),
+            "the flag write drew nothing"
+        );
+        let (r, buf, _, status) = read(65536 + 2);
+        assert_eq!(r, Ok(65538));
+        assert!(buf[..65536].iter().all(|&v| v == 3), "reset assigns OnOff");
+        assert_eq!(&buf[65536..], &[0, 0]);
+        assert_eq!(status, AsynStatus::Success);
+        assert_eq!(
+            h.with_driver_blocking::<TimePix3Driver, _>(|d| d.int(d.p.mask_reset, 0))
+                .unwrap(),
+            1,
+            "C leaves the flag to the db"
+        );
+
+        let (r, _, msg, status) = read(100);
+        assert_eq!(
+            r,
+            Err("asynPortDriver:readArray not implemented".to_string())
+        );
+        assert_eq!(msg, "mask waveform is smaller than detector geometry");
+        assert_eq!(status, AsynStatus::Error);
+
+        h.write_int32_blocking(p.mask_reset, 0, 0).unwrap();
+        h.write_int32_blocking(p.mask_rectangle, 0, 1).unwrap();
+        h.write_int32_blocking(p.mask_size_x, 0, -1).unwrap();
+        let (r, _, msg, _) = read(65536);
+        assert!(r.is_err());
+        assert_eq!(msg, "invalid mask geometry or operation");
+
+        h.write_int32_blocking(p.mask_rectangle, 0, 0).unwrap();
+        let (r, _, _, status) = read(65536);
+        assert_eq!(r, Ok(65536));
+        assert_eq!(status, AsynStatus::Success);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for line in [
+            "MaskBPC: reset (waveform nElements=65538)",
+            "MaskBPC: reset (waveform nElements=100)",
+            "MaskBPC: rectangle (waveform nElements=65536)",
+            "MaskBPC: no draw op (nElements=65536)",
+        ] {
+            let line = adlog::log(adlog::READ_INT32_ARRAY, line);
+            assert!(text.contains(&line), "{line}: {text:?}");
+        }
         std::mem::forget(runtime);
     }
 

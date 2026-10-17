@@ -68,6 +68,8 @@ pub const INITIAL_SERVER_CHECK_CONNECTION: &str =
 pub const CONSTRUCTOR: &str = "ADTimePix::ADTimePix(const char*, const char*, int, size_t, int, \
      int, int, const char*, const char*)";
 pub const WRITE_INT32: &str = "virtual asynStatus ADTimePix::writeInt32(asynUser*, epicsInt32)";
+pub const READ_INT32_ARRAY: &str =
+    "virtual asynStatus ADTimePix::readInt32Array(asynUser*, epicsInt32*, size_t, size_t*)";
 pub const WRITE_FLOAT64: &str =
     "virtual asynStatus ADTimePix::writeFloat64(asynUser*, epicsFloat64)";
 pub const WRITE_OCTET: &str =

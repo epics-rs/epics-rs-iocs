@@ -25,15 +25,6 @@ impl Geometry {
     pub fn pixel_count(&self) -> usize {
         usize::try_from(self.rows).unwrap_or(0) * usize::try_from(self.cols).unwrap_or(0)
     }
-
-    /// The row-major offset of image pixel `(i, j)`.
-    fn offset(&self, i: usize, j: usize) -> Option<usize> {
-        let cols = usize::try_from(self.cols).ok()?;
-        if i >= cols || j >= usize::try_from(self.rows).ok()? {
-            return None;
-        }
-        Some(j * cols + i)
-    }
 }
 
 /// C `ADTimePix3DetectorGeometry::Status` (detector_geometry.h:23-29).
@@ -313,74 +304,104 @@ pub fn dual_quad_image_to_bpc(x: i32, y: i32, w: i32) -> Option<i32> {
     Some(chip_offset + chip * w * w + lx + ly * w)
 }
 
-/// The mask bit the driver draws with (C `1 << 0`).
-const MASK_BIT: i32 = 1 << 0;
-
-/// Set or clear the mask bit on every pixel (C `maskReset`, mask_io.cpp:229).
-///
-/// UPSTREAM DEFECT (mask_io.cpp:238): C *assigns* `OnOff` to the whole element,
-/// wiping the other bits the waveform carries (bit 1, the "in the BPC file"
-/// flag the mask read at mask_io.cpp:141 sets, and bit 8 from the BPC PV) —
-/// while the rectangle and circle operations right below it set and clear bit 0
-/// alone. Reset now touches the same one bit.
-pub fn mask_reset(geom: &Geometry, buf: &mut [i32], on: bool) {
-    for k in 0..geom.pixel_count().min(buf.len()) {
-        set_bit(&mut buf[k], on);
-    }
+/// C `ADTimePix3MaskGeometry::Status` failures; `message` is its
+/// `statusMessage` (mask_geometry.cpp:123-135).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawError {
+    InvalidArgument,
+    BufferTooSmall,
 }
 
-/// C `maskRectangle` (mask_io.cpp:244).
-pub fn mask_rectangle(
-    geom: &Geometry,
-    buf: &mut [i32],
-    x: i32,
-    x_size: i32,
-    y: i32,
-    y_size: i32,
-    on: bool,
-) {
-    for j in y..y.saturating_add(y_size) {
-        for i in x..x.saturating_add(x_size) {
-            let (Ok(i), Ok(j)) = (usize::try_from(i), usize::try_from(j)) else {
-                continue;
-            };
-            if let Some(k) = geom.offset(i, j)
-                && k < buf.len()
-            {
-                set_bit(&mut buf[k], on);
-            }
+impl DrawError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::InvalidArgument => "invalid mask geometry or operation",
+            Self::BufferTooSmall => "mask waveform is smaller than detector geometry",
         }
     }
 }
 
-/// C `maskCircle` (mask_io.cpp:267).
-pub fn mask_circle(geom: &Geometry, buf: &mut [i32], x: i32, y: i32, radius: i32, on: bool) {
-    if radius < 0 {
-        return;
+/// C `validate` (mask_geometry.cpp:16-30): the `width * height` elements an
+/// operation may touch. The image is C's (width, height): rowsCols' (COLS, ROWS).
+fn validate(buf: &[i32], (width, height): (i32, i32)) -> Result<usize, DrawError> {
+    if width <= 0 || height <= 0 {
+        return Err(DrawError::InvalidArgument);
     }
-    for j in y - radius..=y + radius {
-        for i in x - radius..=x + radius {
-            if (i - x) * (i - x) + (j - y) * (j - y) > radius * radius {
-                continue;
-            }
-            let (Ok(iu), Ok(ju)) = (usize::try_from(i), usize::try_from(j)) else {
-                continue;
-            };
-            if let Some(k) = geom.offset(iu, ju)
-                && k < buf.len()
-            {
-                set_bit(&mut buf[k], on);
-            }
-        }
+    let required = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(DrawError::InvalidArgument)?;
+    if buf.len() < required {
+        return Err(DrawError::BufferTooSmall);
     }
+    Ok(required)
 }
 
-fn set_bit(cell: &mut i32, on: bool) {
-    if on {
-        *cell |= MASK_BIT;
+fn set_mask_bit(cell: &mut i32, masked: bool) {
+    if masked {
+        *cell |= 1;
     } else {
-        *cell &= !MASK_BIT;
+        *cell &= !1;
     }
+}
+
+/// C `ADTimePix3MaskGeometry::reset`: assigns `value` to every element of the
+/// image.
+pub fn reset(buf: &mut [i32], image: (i32, i32), value: i32) -> Result<(), DrawError> {
+    let required = validate(buf, image)?;
+    buf[..required].fill(value);
+    Ok(())
+}
+
+/// C `ADTimePix3MaskGeometry::rectangle`, clipped to the image.
+pub fn rectangle(
+    buf: &mut [i32],
+    (width, height): (i32, i32),
+    x: i32,
+    size_x: i32,
+    y: i32,
+    size_y: i32,
+    masked: bool,
+) -> Result<(), DrawError> {
+    validate(buf, (width, height))?;
+    if size_x < 0 || size_y < 0 {
+        return Err(DrawError::InvalidArgument);
+    }
+    let (x0, y0) = (i64::from(x).max(0), i64::from(y).max(0));
+    let x1 = i64::from(width).min(i64::from(x) + i64::from(size_x));
+    let y1 = i64::from(height).min(i64::from(y) + i64::from(size_y));
+    for iy in y0..y1 {
+        for ix in x0..x1 {
+            set_mask_bit(&mut buf[(iy * i64::from(width) + ix) as usize], masked);
+        }
+    }
+    Ok(())
+}
+
+/// C `ADTimePix3MaskGeometry::circle`, clipped to the image; C compares in
+/// `long double`, exact here in `i128`.
+pub fn circle(
+    buf: &mut [i32],
+    (width, height): (i32, i32),
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    masked: bool,
+) -> Result<(), DrawError> {
+    validate(buf, (width, height))?;
+    if radius < 0 {
+        return Err(DrawError::InvalidArgument);
+    }
+    let (cx, cy, r) = (i64::from(cx), i64::from(cy), i64::from(radius));
+    let r2 = i128::from(r) * i128::from(r);
+    for iy in (cy - r).max(0)..=(cy + r).min(i64::from(height) - 1) {
+        for ix in (cx - r).max(0)..=(cx + r).min(i64::from(width) - 1) {
+            let (dx, dy) = (i128::from(ix - cx), i128::from(iy - cy));
+            if dx * dx + dy * dy <= r2 {
+                set_mask_bit(&mut buf[(iy * i64::from(width) + ix) as usize], masked);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The mask waveform Serval's BPC file implies: bit 1 set wherever the file has
@@ -401,7 +422,7 @@ pub fn mask_from_bpc(map: &[i32], bpc: &[u8], out: &mut [i32]) {
 pub fn apply_mask_to_bpc(map: &[i32], mask: &[i32], bpc: &mut [u8]) -> usize {
     let mut dropped = 0;
     for (src, &k) in map.iter().enumerate() {
-        if src >= mask.len() || mask[src] & MASK_BIT == 0 {
+        if src >= mask.len() || mask[src] & 1 == 0 {
             continue;
         }
         match usize::try_from(k) {
@@ -637,25 +658,64 @@ mod tests {
         assert_eq!(pel_index(&g, 1, 0, 5, 255), (5, None));
     }
 
+    fn image(g: &Geometry) -> (i32, i32) {
+        (g.cols, g.rows)
+    }
+
+    fn masked(buf: &[i32]) -> usize {
+        buf.iter().filter(|&&v| v & 1 != 0).count()
+    }
+
     #[test]
-    fn reset_touches_only_the_mask_bit() {
+    fn reset_assigns_the_value_as_c() {
         let g = single();
-        let mut buf = vec![0i32; g.pixel_count()];
-        // Bit 1 is the "present in the BPC file" flag the mask read sets.
+        let mut buf = vec![0i32; g.pixel_count() + 3];
         buf[7] = 1 << 1;
-        mask_reset(&g, &mut buf, true);
-        assert_eq!(buf[7], (1 << 1) | 1, "C's reset assigns and wipes bit 1");
-        assert_eq!(buf[0], 1);
-        mask_reset(&g, &mut buf, false);
-        assert_eq!(buf[7], 1 << 1);
-        assert_eq!(buf[0], 0);
+        buf[g.pixel_count()] = 9;
+        reset(&mut buf, image(&g), 5).unwrap();
+        assert_eq!(buf[7], 5);
+        assert!(buf[..g.pixel_count()].iter().all(|&v| v == 5));
+        // Past the image the waveform is left alone.
+        assert_eq!(buf[g.pixel_count()], 9);
+    }
+
+    #[test]
+    fn a_draw_is_refused_with_c_status() {
+        let g = single();
+        let mut small = vec![0i32; g.pixel_count() - 1];
+        for r in [
+            reset(&mut small, image(&g), 1),
+            rectangle(&mut small, image(&g), 0, 1, 0, 1, true),
+            circle(&mut small, image(&g), 0, 0, 1, true),
+        ] {
+            assert_eq!(r, Err(DrawError::BufferTooSmall));
+        }
+        let mut buf = vec![0i32; g.pixel_count()];
+        for r in [
+            reset(&mut buf, (0, 0), 1),
+            rectangle(&mut buf, image(&g), 0, -1, 0, 1, true),
+            rectangle(&mut buf, image(&g), 0, 1, 0, -1, true),
+            circle(&mut buf, image(&g), 3, 4, -2, true),
+        ] {
+            assert_eq!(r, Err(DrawError::InvalidArgument));
+        }
+        assert_eq!(rectangle(&mut buf, image(&g), 0, 0, 0, 5, true), Ok(()));
+        assert_eq!(masked(&buf), 0);
+        assert_eq!(
+            DrawError::BufferTooSmall.message(),
+            "mask waveform is smaller than detector geometry"
+        );
+        assert_eq!(
+            DrawError::InvalidArgument.message(),
+            "invalid mask geometry or operation"
+        );
     }
 
     #[test]
     fn a_rectangle_sets_exactly_its_pixels() {
         let g = single();
         let mut buf = vec![0i32; g.pixel_count()];
-        mask_rectangle(&g, &mut buf, 2, 3, 4, 2, true);
+        rectangle(&mut buf, image(&g), 2, 3, 4, 2, true).unwrap();
         let on: Vec<usize> = buf
             .iter()
             .enumerate()
@@ -667,7 +727,7 @@ mod tests {
             .collect();
         assert_eq!(on, want);
 
-        mask_rectangle(&g, &mut buf, 2, 3, 4, 2, false);
+        rectangle(&mut buf, image(&g), 2, 3, 4, 2, false).unwrap();
         assert!(buf.iter().all(|&v| v == 0));
     }
 
@@ -675,14 +735,12 @@ mod tests {
     fn a_rectangle_is_clipped_to_the_detector() {
         let g = single();
         let mut buf = vec![0i32; g.pixel_count()];
-        mask_rectangle(&g, &mut buf, 254, 10, 254, 10, true);
-        // Only the 2x2 corner survives.
-        assert_eq!(buf.iter().filter(|&&v| v & 1 != 0).count(), 4);
+        rectangle(&mut buf, image(&g), 254, 10, 254, 10, true).unwrap();
+        assert_eq!(masked(&buf), 4);
         assert_eq!(buf[255 * 256 + 255] & 1, 1);
-        // A negative origin clips too, rather than indexing backwards.
         let mut buf = vec![0i32; g.pixel_count()];
-        mask_rectangle(&g, &mut buf, -2, 3, -1, 2, true);
-        assert_eq!(buf.iter().filter(|&&v| v & 1 != 0).count(), 1);
+        rectangle(&mut buf, image(&g), -2, 3, -1, 2, true).unwrap();
+        assert_eq!(masked(&buf), 1);
         assert_eq!(buf[0] & 1, 1);
     }
 
@@ -690,37 +748,33 @@ mod tests {
     fn a_circle_sets_the_disc() {
         let g = single();
         let mut buf = vec![0i32; g.pixel_count()];
-        mask_circle(&g, &mut buf, 10, 10, 1, true);
-        // Radius 1 -> the centre and its four neighbours.
-        assert_eq!(buf.iter().filter(|&&v| v & 1 != 0).count(), 5);
+        circle(&mut buf, image(&g), 10, 10, 1, true).unwrap();
+        assert_eq!(masked(&buf), 5);
         for (i, j) in [(10, 10), (9, 10), (11, 10), (10, 9), (10, 11)] {
             assert_eq!(buf[j * 256 + i] & 1, 1, "({i},{j})");
         }
-        // Radius 0 -> a single pixel; a negative radius -> nothing.
         let mut buf = vec![0i32; g.pixel_count()];
-        mask_circle(&g, &mut buf, 3, 4, 0, true);
-        assert_eq!(buf.iter().filter(|&&v| v & 1 != 0).count(), 1);
-        mask_circle(&g, &mut buf, 3, 4, -2, true);
-        assert_eq!(buf.iter().filter(|&&v| v & 1 != 0).count(), 1);
+        circle(&mut buf, image(&g), 3, 4, 0, true).unwrap();
+        assert_eq!(masked(&buf), 1);
     }
 
     #[test]
     fn a_circle_at_the_edge_does_not_wrap_or_overflow() {
         let g = single();
         let mut buf = vec![0i32; g.pixel_count()];
-        mask_circle(&g, &mut buf, 0, 0, 2, true);
+        circle(&mut buf, image(&g), 0, 0, 2, true).unwrap();
         // A quarter disc: (0,0),(1,0),(2,0),(0,1),(1,1),(0,2).
-        assert_eq!(buf.iter().filter(|&&v| v & 1 != 0).count(), 6);
-        assert_eq!(buf[0] & 1, 1);
-        assert_eq!(buf[2] & 1, 1);
+        assert_eq!(masked(&buf), 6);
         assert_eq!(buf[2 * 256] & 1, 1);
+        let mut buf = vec![0i32; g.pixel_count()];
+        circle(&mut buf, image(&g), i32::MAX, i32::MIN, i32::MAX, true).unwrap();
     }
 
     #[test]
     fn the_mask_round_trips_through_a_bpc_buffer() {
         let g = quad();
         let mut mask = vec![0i32; g.pixel_count()];
-        mask_rectangle(&g, &mut mask, 300, 2, 100, 2, true);
+        rectangle(&mut mask, image(&g), 300, 2, 100, 2, true).unwrap();
         let mut bpc = vec![0u8; 4 * PIXEL_CONFIG_BYTES];
         let map = table(&g, 4, 0);
         assert_eq!(apply_mask_to_bpc(&map, &mask, &mut bpc), 0);
@@ -740,7 +794,7 @@ mod tests {
     fn a_bpc_buffer_too_small_for_the_mask_drops_pixels_instead_of_overflowing() {
         let g = quad();
         let mut mask = vec![0i32; g.pixel_count()];
-        mask_reset(&g, &mut mask, true);
+        reset(&mut mask, image(&g), 1).unwrap();
         // Only one chip's worth of file for a four-chip mask.
         let mut bpc = vec![0u8; PIXEL_CONFIG_BYTES];
         let dropped = apply_mask_to_bpc(&table(&g, 4, 0), &mask, &mut bpc);
@@ -773,7 +827,7 @@ mod tests {
             let g = quad();
             let map = table(&g, 4, o);
             let mut mask = vec![0i32; g.pixel_count()];
-            mask_rectangle(&g, &mut mask, 10, 1, 400, 1, true);
+            rectangle(&mut mask, image(&g), 10, 1, 400, 1, true).unwrap();
             let mut bpc = vec![0u8; 4 * PIXEL_CONFIG_BYTES];
             apply_mask_to_bpc(&map, &mask, &mut bpc);
             assert_eq!(
