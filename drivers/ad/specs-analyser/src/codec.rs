@@ -102,6 +102,13 @@ pub struct ErrorInfo {
     pub message: String,
 }
 
+impl ErrorInfo {
+    /// `sendSimpleCommand`'s `ADStatusMessage` (`specsAnalyser.cpp:1329-1331`).
+    pub fn status_message(&self) -> String {
+        format!("{}: {}", self.code, self.message)
+    }
+}
+
 /// Parse an `ERROR ...` payload (payload already known to start with
 /// `"ERROR"`) into its code and message. Upstream accumulates the code by
 /// scanning character-by-character until the first space, looping past the

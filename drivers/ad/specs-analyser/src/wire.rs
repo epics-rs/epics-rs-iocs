@@ -1,23 +1,13 @@
-//! Blocking wire transport to `driverPort_`, used from a plain OS thread (no
-//! active Tokio runtime) spawned by `write_int32`/`write_float64`, and
-//! directly at construction time before the port actor exists.
-//!
-//! A `PortDriver` method runs inside its port actor's own current-thread
-//! Tokio runtime and cannot block there (`PortHandle`'s `_blocking` methods
-//! panic via `block_in_place` on a current-thread runtime); `write_int32`
-//! instead spawns a plain thread with no Tokio runtime for the branches that
-//! need a wire round trip, uses [`WireLink`] here, and joins it. The
-//! persistent acquisition worker ([`crate::task`]) needs its own async
-//! transport instead (it must `.await` on `ArrayPublisher::publish`, so it
-//! runs on a dedicated Tokio runtime) and does not use this module; the two
-//! duplicate only the thin write/read loop, not any parsing logic (that is
-//! all in [`crate::codec`]).
+//! The exchange with `driverPort_`: C's `commandResponse`/`asynWriteRead`
+//! and the commands built on them. A [`WireLink`] borrows the driver, so every
+//! exchange runs on the port actor, under the driver lock, with
+//! `SPECSMsgCounter_` and `SPECSConnected_` kept in the parameter library as
+//! C keeps them.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use epics_rs::asyn::error::AsynError;
+use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -26,6 +16,7 @@ use crate::codec::{
     self, BeginOutcome, ErrorInfo, ResponseAssembler, clean_string, next_counter,
     parse_double_field, parse_integer_field, parse_values_list,
 };
+use crate::params::SpecsParams;
 use crate::types::{MAX_MESSAGE_SIZE, RunMode, SOCKET_TIMEOUT, SpecsValueType, secs};
 
 /// Reasons a wire exchange failed.
@@ -40,27 +31,43 @@ pub enum WireError {
     Frame(codec::FrameError),
     /// The device returned an `ERROR` response.
     Device(ErrorInfo),
+    /// The reply lacked the named field or it did not decode
+    /// (`readIntegerData`/`readDoubleData`, `specsAnalyser.cpp:1635-1661`).
+    Field(&'static str),
+}
+
+/// Every failure is C's `asynError` except the round trip's own status.
+impl From<WireError> for AsynError {
+    fn from(e: WireError) -> Self {
+        match e {
+            WireError::Io(e) => e,
+            e => AsynError::Status {
+                status: AsynStatus::Error,
+                message: e.status_message(),
+            },
+        }
+    }
 }
 
 impl WireError {
-    /// `SpecsAnalyser::sendSimpleCommand`'s `ADStatusMessage` on error
-    /// (`specsAnalyser.cpp:1329-1331`, `"{code}: {message}"`).
+    /// The asynStatus C's exchange returns for it.
+    pub fn status(&self) -> AsynStatus {
+        match self {
+            WireError::Io(e) => e.status(),
+            _ => AsynStatus::Error,
+        }
+    }
+
+    /// The error's text.
     pub fn status_message(&self) -> String {
         match self {
             WireError::NotConnected => "Not connected to SPECS".to_string(),
             WireError::Io(e) => format!("SPECS communication error: {e}"),
             WireError::Frame(e) => format!("SPECS protocol framing error: {e:?}"),
-            WireError::Device(info) => format!("{}: {}", info.code, info.message),
+            WireError::Device(info) => info.status_message(),
+            WireError::Field(name) => format!("SPECS reply has no valid {name}"),
         }
     }
-}
-
-/// The server's answer to the `Connect` command
-/// (`SpecsAnalyser::asynPortConnect`, `specsAnalyser.cpp:1861-1869`).
-#[derive(Debug, Clone, Default)]
-pub struct ConnectInfo {
-    pub server_name: String,
-    pub protocol_version: String,
 }
 
 /// One analyser parameter discovered by `setupEPICSParameters`
@@ -109,22 +116,15 @@ pub struct OrdinateRange {
     pub max: Option<f64>,
 }
 
-/// Borrowed link to `driverPort_` plus the shared session state: the wire
-/// message counter (C `SPECSMsgCounter_`) and the connected flag (C
-/// `SPECSConnected_`), both shared with [`crate::task`]. `command_response`
-/// locks `wire_state` for its own whole request/reply exchange (including any
-/// continuation reads) so two contexts (e.g. `write_int32`'s spawned thread
-/// and the acquisition worker) can never interleave frames on the shared
-/// connection — the one property C's coarser `this->lock()` (held across an
-/// entire multi-command sequence) actually depends on here, since the
-/// EPICS param store's own consistency is already serialised by the port
-/// actor, independent of this lock.
+/// `driverPort_` and the driver's parameter library.
 pub struct WireLink<'a> {
     /// C `portUser_`, unconnected when st.cmd named a missing port.
     pub driver_port: &'a SyncIOHandle,
     pub addr: i32,
-    pub wire_state: &'a Mutex<u32>,
-    pub connected: &'a AtomicBool,
+    pub base: &'a mut PortDriverBase,
+    pub p: &'a SpecsParams,
+    /// `ADStatusMessage`.
+    pub status_message: usize,
 }
 
 impl WireLink<'_> {
@@ -134,27 +134,35 @@ impl WireLink<'_> {
             .with_timeout(secs(SOCKET_TIMEOUT))
     }
 
-    /// `SpecsAnalyser::commandResponse` + `SpecsAnalyser::asynWriteRead`
-    /// (`specsAnalyser.cpp:1897-2118`). Advances and returns the wire
-    /// message counter unconditionally before attempting the round trip,
-    /// matching upstream incrementing/publishing `SPECSMsgCounter_` before
-    /// `pasynOctetSyncIO->writeRead` regardless of its outcome.
+    /// `SpecsAnalyser::sendSimpleCommand` (`specsAnalyser.cpp:1313-1339`),
+    /// the path of every exchange. `asynWriteRead` advances and posts
+    /// `SPECSMsgCounter_` before its connected checks (`:2056-2090`).
     pub fn command_response(
         &mut self,
         command: &str,
     ) -> Result<HashMap<String, String>, WireError> {
-        if !self.connected.load(Ordering::SeqCst) {
+        let current = self
+            .base
+            .get_int32_param(self.p.msg_counter, 0)
+            .unwrap_or(0);
+        let counter = next_counter(current.max(0) as u32);
+        let _ = self
+            .base
+            .set_int32_param(self.p.msg_counter, 0, counter as i32);
+        let _ = self.base.call_param_callbacks(0);
+        let port = match self.driver_port.port() {
+            Ok(port) => port,
+            Err(e) => {
+                let _ = self.base.set_int32_param(self.p.connected, 0, 0);
+                return Err(WireError::Io(e));
+            }
+        };
+        if self.base.get_int32_param(self.p.connected, 0).unwrap_or(0) != 1 {
             return Err(WireError::NotConnected);
         }
-        let mut guard = self.wire_state.lock().unwrap();
-        let counter = next_counter(*guard);
-        *guard = counter;
         let request = codec::format_request(counter, command);
 
-        let result = self
-            .driver_port
-            .port()
-            .map_err(WireError::Io)?
+        let result = port
             .submit_blocking(
                 RequestOp::OctetWriteRead {
                     data: request.into_bytes(),
@@ -171,10 +179,7 @@ impl WireLink<'_> {
         match assembler.begin(payload) {
             BeginOutcome::Ok => {}
             BeginOutcome::NeedsMore => loop {
-                let more = self
-                    .driver_port
-                    .port()
-                    .map_err(WireError::Io)?
+                let more = port
                     .submit_blocking(
                         RequestOp::OctetRead {
                             buf_size: MAX_MESSAGE_SIZE,
@@ -188,39 +193,37 @@ impl WireLink<'_> {
                 }
             },
             BeginOutcome::Error(info) => {
-                // `SpecsAnalyser::commandResponse`, `specsAnalyser.cpp:2021-2024`.
+                // `SpecsAnalyser::commandResponse`, `specsAnalyser.cpp:2021-2024`:
+                // disconnect() drops a connected link (`:243-258`, `:1882`).
                 if info.code == "3" {
-                    self.connected.store(false, Ordering::SeqCst);
+                    let _ = self.base.set_int32_param(self.p.connected, 0, 0);
                 }
+                let _ = self
+                    .base
+                    .set_string_param(self.status_message, 0, info.status_message());
                 return Err(WireError::Device(info));
             }
         }
         Ok(assembler.finish())
     }
 
-    /// `SpecsAnalyser::asynPortConnect` (`specsAnalyser.cpp:1831-1871`,
-    /// minus the low-level `pasynOctetSyncIO::connect`/`setInputEos`/
-    /// `setOutputEos`, which have no Rust equivalent here — the underlying
-    /// port and its EOS are configured once via `st.cmd` iocsh commands, not
-    /// per `Connect`). `SPECSConnected_`/`SPECSMsgCounter_` are set *before*
-    /// issuing the `Connect` command and are not reverted if it fails,
-    /// matching upstream exactly.
-    pub fn connect(&mut self) -> Result<ConnectInfo, WireError> {
-        *self.wire_state.lock().unwrap() = 0;
-        self.connected.store(true, Ordering::SeqCst);
+    /// `SpecsAnalyser::asynPortConnect` (`specsAnalyser.cpp:1831-1871`). The
+    /// port and its EOS come from st.cmd, so `pasynOctetSyncIO->connect`'s
+    /// part is only the check that the port exists.
+    pub fn connect(&mut self) -> Result<(), WireError> {
+        self.driver_port.port().map_err(WireError::Io)?;
+        let _ = self.base.set_int32_param(self.p.msg_counter, 0, 0);
+        let _ = self.base.set_int32_param(self.p.connected, 0, 1);
         let data = self.command_response("Connect")?;
-        Ok(ConnectInfo {
-            server_name: clean_string(
-                data.get("ServerName").map(String::as_str).unwrap_or(""),
-                "\"",
-            ),
-            protocol_version: clean_string(
-                data.get("ProtocolVersion")
-                    .map(String::as_str)
-                    .unwrap_or(""),
-                "\"",
-            ),
-        })
+        let field =
+            |name: &str| clean_string(data.get(name).map(String::as_str).unwrap_or(""), "\"");
+        let _ = self
+            .base
+            .set_string_param(self.p.server_name, 0, field("ServerName"));
+        let _ = self
+            .base
+            .set_string_param(self.p.protocol_version, 0, field("ProtocolVersion"));
+        Ok(())
     }
 
     /// `SpecsAnalyser::readDeviceVisibleName` (`specsAnalyser.cpp:1345-1361`).
@@ -250,18 +253,19 @@ impl WireLink<'_> {
     pub fn get_analyser_parameter_int(&mut self, name: &str) -> Result<i32, WireError> {
         let data = self.command_response(&codec::get_value_command(name))?;
         let value = data.get("Value").map(String::as_str).unwrap_or("");
-        Ok(match value {
-            "\"false\"" => 0,
-            "\"true\"" => 1,
-            _ => parse_integer_field(value).unwrap_or(0),
-        })
+        match value {
+            "\"false\"" => Ok(0),
+            "\"true\"" => Ok(1),
+            _ => parse_integer_field(value).ok_or(WireError::Field("Value")),
+        }
     }
 
     /// `SpecsAnalyser::getAnalyserParameter(name, double&)`
     /// (`specsAnalyser.cpp:1539-1552`).
     pub fn get_analyser_parameter_double(&mut self, name: &str) -> Result<f64, WireError> {
         let data = self.command_response(&codec::get_value_command(name))?;
-        Ok(parse_double_field(data.get("Value").map(String::as_str).unwrap_or("")).unwrap_or(0.0))
+        parse_double_field(data.get("Value").map(String::as_str).unwrap_or(""))
+            .ok_or(WireError::Field("Value"))
     }
 
     /// `SpecsAnalyser::getAnalyserParameter(name, std::string&)`
@@ -351,20 +355,13 @@ impl WireLink<'_> {
     }
 
     /// `SpecsAnalyser::readSpectrumParameter` (`specsAnalyser.cpp:1663-1738`),
-    /// minus the `doCallbacksEnum` publish, which the caller does with
-    /// direct struct access. Always returns at least one entry — on any
-    /// failure that is the `"Not connected"` sentinel upstream pushes to
-    /// avoid an EDM/mbbi `SDEF`-field display problem — and reports whether
-    /// the read itself succeeded via the second tuple element.
-    pub fn read_spectrum_parameter(&mut self, param_name: &str) -> (Vec<String>, bool) {
-        let result = self.command_response(&codec::get_spectrum_command(param_name));
-        match result {
-            Ok(data) => match data.get("Values") {
-                Some(values) => (parse_values_list(values), true),
-                None => (vec!["Not connected".to_string()], false),
-            },
-            Err(_) => (vec!["Not connected".to_string()], false),
-        }
+    /// minus the `doCallbacksEnum` publish and the `"Not connected"` entry it
+    /// substitutes on failure, which the caller applies.
+    pub fn read_spectrum_parameter(&mut self, param_name: &str) -> Result<Vec<String>, WireError> {
+        let data = self.command_response(&codec::get_spectrum_command(param_name))?;
+        data.get("Values")
+            .map(|values| parse_values_list(values))
+            .ok_or(WireError::Field("Values"))
     }
 
     /// `SpecsAnalyser::readSpectrumDataInfo(SPECSOrdinateRange)`
