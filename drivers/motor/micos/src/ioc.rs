@@ -16,6 +16,8 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use motor_common::connect::{EosRefusal, connect_controller, connect_with_eos};
 use motor_common::iocsh::{
     arg_double_req, arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_double, req_int,
@@ -66,12 +68,12 @@ impl ControllerParams for ControllerLine {
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
             out,
-            "{} motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            "{} motor driver {}, numAxes={}, moving poll period={}, idle poll period={}",
             self.driver,
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll_s,
-            self.idle_poll_s
+            CFloat(self.moving_poll_s),
+            CFloat(self.idle_poll_s)
         );
         ctx.report(out, level);
     }

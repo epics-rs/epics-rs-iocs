@@ -3,6 +3,8 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use motor_common::AxisReport;
 
 /// Switch-config bit that disables (masks) a limit switch.
@@ -71,17 +73,19 @@ impl AxisReport for SmcMembers {
             let _ = writeln!(out, "    motorForm {motor_form}");
         }
         if let Some(pitch) = self.pitch {
-            let _ = writeln!(out, "    pitch {pitch:.6}");
+            let _ = writeln!(out, "    pitch {}", CFloat(pitch));
         }
         if let Some(pole_pairs) = self.pole_pairs {
             let _ = writeln!(out, "    polePairs {pole_pairs}");
         }
         let _ = write!(
             out,
-            "    clPeriod {:.6}\n    axisRes {axis_res:.6}\n    lowLimitConfig {low}\n    \
-             highLimitConfig {high}\n    posTravelLimit {pos:.6}\n    \
-             negTravelLimit {neg:.6}\n",
-            self.cl_period
+            "    clPeriod {}\n    axisRes {}\n    lowLimitConfig {low}\n    \
+             highLimitConfig {high}\n    posTravelLimit {}\n    negTravelLimit {}\n",
+            CFloat(self.cl_period),
+            CFloat(axis_res),
+            CFloat(pos),
+            CFloat(neg)
         );
     }
 }
@@ -123,6 +127,31 @@ mod tests {
         assert_eq!(limit_config("2 3", (0, 0)), (2, 3));
         assert_eq!(limit_config("2 x", (0, 1)), (2, 1));
         assert_eq!(limit_config("", (4, 5)), (4, 5));
+    }
+
+    /// C's `%f` spells a non-finite member as glibc does.
+    #[test]
+    fn the_report_spells_non_finite_members_as_c_printf() {
+        let members = SmcMembers {
+            axis_no: 0,
+            motor_form: None,
+            pitch: Some(f64::INFINITY),
+            pole_pairs: None,
+            cl_period: -f64::NAN,
+            state: Mutex::new(SmcState {
+                axis_res: 0.005,
+                limit_config: (0, 0),
+                travel_limits: (f64::NEG_INFINITY, f64::NAN),
+            }),
+        };
+        let mut out = String::new();
+        members.report(&mut out, 1);
+        assert_eq!(
+            out,
+            "  axis 0\n    pitch inf\n    clPeriod -nan\n    axisRes 0.005000\n    \
+             lowLimitConfig 0\n    highLimitConfig 0\n    posTravelLimit nan\n    \
+             negTravelLimit -inf\n"
+        );
     }
 
     #[test]

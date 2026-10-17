@@ -38,6 +38,8 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, Pol
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use motor_common::util::{atof, atoi};
 
 use crate::smc::{SmcMembers, SmcState, travel_limits};
@@ -184,8 +186,11 @@ impl HydraAxis {
     ) -> AsynResult<()> {
         let addr = self.addr();
         ctrl.write_all([
-            format!("{:.6} {addr} snv", (velocity * self.axis_res()).abs()),
-            format!("{:.6} {addr} sna", (acceleration * self.axis_res()).abs()),
+            format!("{} {addr} snv", CFloat((velocity * self.axis_res()).abs())),
+            format!(
+                "{} {addr} sna",
+                CFloat((acceleration * self.axis_res()).abs())
+            ),
             cmd,
         ])
     }
@@ -206,7 +211,7 @@ impl AsynMotor for HydraAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let cmd = format!("{:.6} {} nm", position * self.axis_res(), self.addr());
+        let cmd = format!("{} {} nm", CFloat(position * self.axis_res()), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -218,7 +223,7 @@ impl AsynMotor for HydraAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let cmd = format!("{:.6} {} nr", distance * self.axis_res(), self.addr());
+        let cmd = format!("{} {} nr", CFloat(distance * self.axis_res()), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -232,7 +237,7 @@ impl AsynMotor for HydraAxis {
         // No jog command: move to the travel limit the constructor read.
         let (neg, pos) = self.members.state().travel_limits;
         let target = if velocity > 0.0 { pos } else { neg };
-        let cmd = format!("{target:.6} {} nm", self.addr());
+        let cmd = format!("{} {} nm", CFloat(target), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -254,7 +259,10 @@ impl AsynMotor for HydraAxis {
         let addr = self.addr();
         // Set stop deceleration, then abort this axis.
         ctrl.write_all([
-            format!("{:.6} {addr} ssd", (acceleration * self.axis_res()).abs()),
+            format!(
+                "{} {addr} ssd",
+                CFloat((acceleration * self.axis_res()).abs())
+            ),
             format!("{addr} nabort"),
         ])
     }
@@ -264,8 +272,8 @@ impl AsynMotor for HydraAxis {
         // setnpos takes the distance from the current position to the desired
         // origin, hence the negation (C multiplies by -1).
         ctrl.write_only(&format!(
-            "{:.6} {} setnpos",
-            -position * self.axis_res(),
+            "{} {} setnpos",
+            CFloat(-position * self.axis_res()),
             self.addr()
         ))
     }
@@ -358,6 +366,33 @@ mod tests {
             SyncIOHandle::connect_port("HYDRA_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(HydraController::new(handle)));
         assert_eq!(HydraAxis::new(controller, 0).motor_form, 0);
+    }
+
+    /// C `sprintf("%f %i nm")` of a NaN target sends glibc's `nan`.
+    #[test]
+    fn a_nan_target_goes_out_as_c_printf_spells_it() {
+        use motor_common::testing::LineRig;
+        let (line, handle) = LineRig::new("hydraNan", |_| String::new());
+        let mut axis = HydraAxis {
+            controller: Arc::new(Mutex::new(HydraController::new(handle))),
+            members: Arc::new(SmcMembers {
+                axis_no: 0,
+                motor_form: Some(0),
+                pitch: Some(0.0),
+                pole_pairs: Some(0),
+                cl_period: 0.0,
+                state: Mutex::new(SmcState {
+                    axis_res: 0.5,
+                    ..SmcState::default()
+                }),
+            }),
+            motor_form: 0,
+        };
+        line.sent();
+        axis.move_absolute(&AsynUser::default(), f64::NAN, 0.0, 2.0, 4.0)
+            .unwrap();
+        let sent = line.sent();
+        assert!(sent.iter().any(|s| s.trim_end() == "nan 1 nm"), "{sent:?}");
     }
 
     #[test]

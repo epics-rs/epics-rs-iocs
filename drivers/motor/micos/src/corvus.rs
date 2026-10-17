@@ -39,6 +39,8 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, Pol
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use motor_common::util::{atof, atoi};
 
 use crate::smc::{SmcMembers, SmcState, travel_limits};
@@ -116,7 +118,7 @@ impl CorvusController {
     fn send_target_vector(&self, targets: &[f64], verb: &str) -> AsynResult<()> {
         let mut cmd = String::new();
         for t in targets {
-            cmd.push_str(&format!("{t:.6} "));
+            cmd.push_str(&format!("{} ", CFloat(*t)));
         }
         cmd.push_str(verb);
         self.write_only(&cmd)
@@ -225,8 +227,8 @@ impl CorvusAxis {
     /// units.
     fn accel_velocity(&self, velocity: f64, acceleration: f64) -> [String; 2] {
         [
-            format!("{:.6} sv", (velocity * self.axis_res()).abs()),
-            format!("{:.6} sa", (acceleration * self.axis_res()).abs()),
+            format!("{} sv", CFloat((velocity * self.axis_res()).abs())),
+            format!("{} sa", CFloat((acceleration * self.axis_res()).abs())),
         ]
     }
 }
