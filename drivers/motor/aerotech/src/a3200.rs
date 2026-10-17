@@ -287,13 +287,13 @@ impl A3200Axis {
                 .get_param("EndOfTravelLimitSetup", &axis_name)
                 .map(|s| atol(&s) as u32)
                 .unwrap_or(0);
+            ctrl.command(&format!("RAMP MODE RATE {axis_name}"))?;
             // C builds this query and never sends it, reading the RAMP MODE
             // RATE reply instead (drvA3200Asyn.cc:971-974); not copied.
             let reverse_direc = ctrl
                 .get_param("ReverseMotionDirection", &axis_name)
                 .map(|s| atoi(&s) != 0)
                 .unwrap_or(false);
-            ctrl.command(&format!("RAMP MODE RATE {axis_name}"))?;
             (
                 has_encoder,
                 step_size,
@@ -681,6 +681,29 @@ mod tests {
         assert_eq!(fmt(f64::NAN, 5), "nan");
         assert_eq!(fmt(f64::INFINITY, 5), "inf");
         assert_eq!(step_size(Err(a3200_err("refused"))), 1.0);
+    }
+
+    /// drvA3200Asyn.cc:935-974: the axis probe in C's order, with the
+    /// ReverseMotionDirection query C builds after RAMP MODE RATE sent.
+    #[test]
+    fn the_axis_probe_reads_reverse_direction_after_ramp_mode() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::new("a32ProbeLine", |_| "%0".into());
+        let controller = A3200Controller::new(io, "a32ProbeLine", "0", 1, true);
+        line.sent();
+        A3200Axis::new(Arc::new(Mutex::new(controller)), "X".into()).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "PositionFeedbackType.X",
+                "CountsPerUnit.X",
+                "HomeOffset.X",
+                "HomeSetup.X",
+                "EndOfTravelLimitSetup.X",
+                "RAMP MODE RATE X",
+                "ReverseMotionDirection.X",
+            ]
+        );
     }
 
     /// drvA3200Asyn.cc:348-382: the setters the A3200 refuses print their
