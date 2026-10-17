@@ -23,9 +23,9 @@
 //!   instead returns `Err` for anything but the Ethernet interface, making
 //!   the feasibility gate visible at IOC-startup time (an iocsh
 //!   config-command failure) rather than a confusing later connect failure.
-//!   C's genuinely-unrecognized-type arm (partial construction, a bare
-//!   `return;` leaving the instance half-built, `drvAmptek.cpp:148-152`) is
-//!   likewise replaced by the same `Err` return.
+//!   C's genuinely-unrecognized-type arm (`drvAmptek.cpp:148-152`) is
+//!   followed: the line is traced, and the port exists with no address, so
+//!   every connect fails until a `hostInfo` option write gives it one.
 //! - **A successful `connect` always marks the user's address connected.**
 //!   C's `connect` (`drvAmptek.cpp:161-183`) calls `exceptionConnect` only
 //!   when it opened the DPP link itself, so an address asked while the
@@ -336,7 +336,9 @@ pub struct AmptekDriver {
     mca: [usize; McaReason::COUNT],
     amptek: [usize; AmptekReason::COUNT],
     transport: AmptekUdpTransport,
-    address_info: String,
+    /// `drvAmptek::addressInfo_`: `None` is C's NULL, left by an unknown
+    /// interface type until a `hostInfo` option write sets it.
+    address_info: Option<String>,
     direct_mode: bool,
     /// `CConsoleHelper::isConnected` -- the confirmed device address, once
     /// [`AmptekDriver::connect_device`] has probed it; `None` before the
@@ -368,9 +370,9 @@ pub struct AmptekDriver {
 
 impl AmptekDriver {
     /// `drvAmptekConfigure(portName, interfaceType, addressInfo, directMode)`
-    /// (`drvAmptek.cpp:63-159`). Returns `Err` for any `interface_type`
-    /// other than Ethernet (`0`) -- see the module doc's "USB/Serial
-    /// rejected at construction" note.
+    /// (`drvAmptek.cpp:63-159`). Returns `Err` for USB (`1`) and Serial
+    /// (`2`) -- see the module doc's "USB/Serial rejected at construction"
+    /// note; an unknown type builds C's address-less port.
     pub fn new(
         port_name: &str,
         interface_type: i32,
@@ -378,10 +380,18 @@ impl AmptekDriver {
         direct_mode: bool,
     ) -> AsynResult<Self> {
         if !(0..=2).contains(&interface_type) {
-            // `drvAmptek.cpp:148-152`; the constructor then stops half-built.
-            return Err(protocol_error(format!(
+            // `drvAmptek.cpp:148-152`: the port exists, with no address.
+            let mut driver = Self::with_transport(
+                port_name,
+                address_info,
+                direct_mode,
+                AmptekUdpTransport::bind()?,
+            )?;
+            driver.address_info = None;
+            driver.trace_error(&format!(
                 "drvAmptek::drvAmptek unknown interface type={interface_type}"
-            )));
+            ));
+            return Ok(driver);
         }
         if interface_type != DPP_INTERFACE_ETHERNET {
             return Err(protocol_error(format!(
@@ -425,7 +435,7 @@ impl AmptekDriver {
             mca,
             amptek,
             transport,
-            address_info: address_info.to_string(),
+            address_info: Some(address_info.to_string()),
             direct_mode,
             target: None,
             acquiring: false,
@@ -585,9 +595,12 @@ impl AmptekDriver {
     /// `drvAmptek::connectDevice` (`drvAmptek.cpp:279-359`), tracing on the
     /// caller's `pasynUser`, not `pasynUserSelf`.
     fn connect_device(&mut self, user: &AsynUser) -> AsynResult<()> {
-        let ip = resolve_ipv4(&self.address_info).ok_or_else(|| {
-            protocol_error(format!("Cannot resolve address: {}", self.address_info))
-        })?;
+        // C: "drvAmptekConfigure() was called with invalid interface type".
+        let Some(address_info) = self.address_info.clone() else {
+            return Err(protocol_error(""));
+        };
+        let ip = resolve_ipv4(&address_info)
+            .ok_or_else(|| protocol_error(format!("Cannot resolve address: {address_info}")))?;
 
         if self.direct_mode {
             let (confirmed, num_devices) = self.transport.connect_direct(ip)?;
@@ -595,7 +608,7 @@ impl AmptekDriver {
             if !confirmed {
                 return Err(protocol_error(format!(
                     "Network DPP device {} not found",
-                    self.address_info
+                    address_info
                 )));
             }
             self.base.trace_print_at(
@@ -606,7 +619,7 @@ impl AmptekDriver {
                 line!(),
                 format_args!(
                     "drvAmptek::connectDevice DPP device {} connected\n",
-                    self.address_info
+                    address_info
                 ),
             );
         } else {
@@ -615,7 +628,7 @@ impl AmptekDriver {
             if !confirmed {
                 return Err(protocol_error(format!(
                     "DPP device {} not found, total devices found={}",
-                    self.address_info, self.num_devices
+                    address_info, self.num_devices
                 )));
             }
             self.base.trace_print_at(
@@ -626,7 +639,7 @@ impl AmptekDriver {
                 line!(),
                 format_args!(
                     "drvAmptek::connectDevice DPP device {} connected, total devices found={}\n",
-                    self.address_info, self.num_devices
+                    address_info, self.num_devices
                 ),
             );
         }
@@ -1125,7 +1138,8 @@ impl PortDriver for AmptekDriver {
     /// is recognized.
     fn get_option(&self, key: &str) -> AsynResult<String> {
         if key.eq_ignore_ascii_case("hostInfo") {
-            Ok(self.address_info.clone())
+            // glibc's `%s` of C's NULL `addressInfo_`.
+            Ok(self.address_info.clone().unwrap_or_else(|| "(null)".into()))
         } else {
             Err(protocol_error(format!("Unsupported key \"{key}\"")))
         }
@@ -1136,7 +1150,7 @@ impl PortDriver for AmptekDriver {
     /// a silent no-op, matching C's `epicsStrCaseCmp(key, "") != 0` guard.
     fn set_option(&mut self, user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
         if key.eq_ignore_ascii_case("hostInfo") {
-            self.address_info = value.to_string();
+            self.address_info = Some(value.to_string());
             self.do_disconnect(user.addr);
             Ok(())
         } else if !key.is_empty() {
@@ -1749,10 +1763,40 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_non_ethernet_interface_types() {
+    fn new_rejects_usb_and_serial() {
         assert!(AmptekDriver::new("test1", 1, "192.168.0.1", false).is_err());
         assert!(AmptekDriver::new("test2", 2, "192.168.0.1", false).is_err());
-        assert!(AmptekDriver::new("test3", 99, "192.168.0.1", false).is_err());
+    }
+
+    /// C traces an unknown interface type and leaves the port with a NULL
+    /// `addressInfo_` (`drvAmptek.cpp:148-152`): `connectDevice` is a bare
+    /// asynError (:285-288) until a `hostInfo` write sets one (:224-225).
+    #[test]
+    fn an_unknown_interface_type_traces_and_builds_an_address_less_port() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let path = std::env::temp_dir().join(format!("amptek-iface-{}.trace", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let services = PortServices::global();
+        services
+            .trace()
+            .set_trace_file(Some("test3"), TraceFile::File(file));
+
+        let mut driver = AmptekDriver::new("test3", 99, "192.168.0.1", false).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.ends_with(" drvAmptek::drvAmptek unknown interface type=99\n"),
+            "{out:?}"
+        );
+        assert!(driver.base.is_connected());
+        assert_eq!(err_message(&connect(&mut driver).unwrap_err()), "");
+        assert_eq!(driver.get_option("hostInfo").unwrap(), "(null)");
+        driver
+            .set_option(&mut AsynUser::new(0), "hostInfo", "192.168.0.2")
+            .unwrap();
+        assert_eq!(driver.get_option("hostInfo").unwrap(), "192.168.0.2");
     }
 
     /// C's port is connected by the base asynPortDriver::connect at
