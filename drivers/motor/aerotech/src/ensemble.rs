@@ -343,14 +343,18 @@ impl EnsembleAxis {
                 self.units(max_v)
             ))?;
         }
-        self.set_direction(posdir);
+        self.set_started(posdir);
         Ok(())
     }
 
-    /// `motorAxisDirection`, which a command sets before its callback.
-    fn set_direction(&mut self, direction: bool) {
+    /// `motorAxisDirection` and `motorAxisDone` 0, which a move, a home
+    /// and a velocity move set together before their callback, so the
+    /// record's next status update sees the motion started.
+    fn set_started(&mut self, direction: bool) {
         self.status.direction = direction;
-        self.status_writes.push(StatusWrite::Direction(direction));
+        self.status.done = false;
+        self.status_writes
+            .extend([StatusWrite::Direction(direction), StatusWrite::Done(false)]);
     }
 }
 
@@ -502,8 +506,8 @@ impl AsynMotor for EnsembleAxis {
             let _ = ctrl.send(&format!("RAMP RATE @{axis} {}", self.units(acceleration)));
             ctrl.send(&format!("FREERUN @{axis} {}", self.units(velocity)))
         };
-        // C sets it whatever FREERUN returned (drvEnsembleAsyn.cc:630-636).
-        self.set_direction(velocity > 0.0);
+        // C sets them whatever FREERUN returned (drvEnsembleAsyn.cc:630-636).
+        self.set_started(velocity > 0.0);
         sent
     }
 
@@ -554,7 +558,7 @@ impl AsynMotor for EnsembleAxis {
         let _ = ctrl.send(&format!("IGLOBAL(33) = {axis}"));
         ctrl.send("PROGRAM RUN 5, \"HomeAsync.bcx\"")?;
         drop(ctrl);
-        self.set_direction(forward);
+        self.set_started(forward);
         Ok(())
     }
 
@@ -1279,11 +1283,12 @@ mod tests {
         );
     }
 
-    /// drvEnsembleAsyn.cc:510-541, :591-603, :630-636: a move and a home set motorAxisDirection once their checked
-    /// exchange succeeded, a velocity move whatever FREERUN returned.
+    /// drvEnsembleAsyn.cc:510-541, :591-603, :630-636: a move and a home set motorAxisDirection and
+    /// motorAxisDone 0 once their checked exchange succeeded, a velocity move
+    /// whatever FREERUN returned.
     #[test]
     fn commands_post_the_direction_they_set() {
-        use epics_rs::asyn::interfaces::motor::StatusWrite::Direction;
+        use epics_rs::asyn::interfaces::motor::StatusWrite::{Direction, Done};
         let failing = Arc::new(Mutex::new(String::new()));
         let fails = {
             let failing = failing.clone();
@@ -1296,20 +1301,20 @@ mod tests {
         let (_line, mut axis) = rig_axis("ensDirLine", |_| "%0".into(), fails);
         let user = AsynUser::new(0);
         axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
-        assert_eq!(axis.take_status_writes(), [Direction(true)]);
+        assert_eq!(axis.take_status_writes(), [Direction(true), Done(false)]);
         axis.move_relative(&user, -1.0, 0.0, 1.0, 1.0).unwrap();
-        assert_eq!(axis.take_status_writes(), [Direction(false)]);
+        assert_eq!(axis.take_status_writes(), [Direction(false), Done(false)]);
         axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
-        assert_eq!(axis.take_status_writes(), [Direction(true)]);
+        assert_eq!(axis.take_status_writes(), [Direction(true), Done(false)]);
         axis.home(&user, 0.0, 1.0, 1.0, false).unwrap();
-        assert_eq!(axis.take_status_writes(), [Direction(false)]);
+        assert_eq!(axis.take_status_writes(), [Direction(false), Done(false)]);
 
         fail("LINEAR");
         assert!(axis.move_absolute(&user, -1.0, 0.0, 1.0, 1.0).is_err());
         assert_eq!(axis.take_status_writes(), []);
         fail("FREERUN");
         assert!(axis.move_velocity(&user, 0.0, -1.0, 1.0).is_err());
-        assert_eq!(axis.take_status_writes(), [Direction(false)]);
+        assert_eq!(axis.take_status_writes(), [Direction(false), Done(false)]);
         fail("PROGRAM");
         assert!(axis.home(&user, 0.0, 1.0, 1.0, true).is_err());
         assert_eq!(axis.take_status_writes(), []);
