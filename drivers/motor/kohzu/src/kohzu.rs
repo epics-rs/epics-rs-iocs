@@ -58,9 +58,9 @@ const STX: u8 = 0x02;
 pub const INPUT_EOS: &[u8] = b"\r\n";
 pub const OUTPUT_EOS: &[u8] = b"\r\n";
 
-/// Jog speed clamp (C `devSC800.cc` JOG validity check).
-const JOG_MIN: i32 = 1;
-const JOG_MAX: i32 = 4095500;
+/// Base/slew speed clamp (C `devSC800.cc` SET_VEL_BASE/SET_VELOCITY/JOG validity check).
+const SPEED_MIN: i32 = 1;
+const SPEED_MAX: i32 = 4095500;
 
 fn kohzu_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
@@ -177,7 +177,8 @@ struct Speeds {
 }
 
 /// Derive the programmable speeds from move parameters. Base/slew are the
-/// min/target velocities (steps/s). The controller's acceleration parameter is
+/// min/target velocities (steps/s), clamped as SET_VEL_BASE/SET_VELOCITY do
+/// (devSC800.cc). The controller's acceleration parameter is
 /// the acceleration *time* (`velocity / acceleration`) scaled by 100, matching
 /// C `NINT(mr->accl * 100)`; when it cannot be derived (non-positive velocity or
 /// acceleration) `prev_accel` is kept.
@@ -188,8 +189,8 @@ fn compute_speeds(min_velocity: f64, velocity: f64, acceleration: f64, prev_acce
         prev_accel
     };
     Speeds {
-        base: nint(min_velocity),
-        slew: nint(velocity),
+        base: nint(min_velocity).clamp(SPEED_MIN, SPEED_MAX),
+        slew: nint(velocity).clamp(SPEED_MIN, SPEED_MAX),
         accel,
     }
 }
@@ -304,11 +305,10 @@ impl AsynMotor for KohzuAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        // C JOG: clamp the slew speed, cap base speed to it, program, then FRP
+        // C JOG: cap base speed to the slew speed, program, then FRP
         // with the direction polarity.
         let polarity = if velocity > 0.0 { '1' } else { '0' };
         self.set_speeds(min_velocity, velocity.abs(), acceleration);
-        self.speeds.slew = self.speeds.slew.clamp(JOG_MIN, JOG_MAX);
         if self.speeds.base > self.speeds.slew {
             self.speeds.base = self.speeds.slew;
         }
@@ -609,6 +609,9 @@ mod tests {
         assert_eq!(s.slew, 1000);
         assert_eq!(s.base, 100);
         assert_eq!(s.accel, 20);
+        // devSC800.cc SET_VEL_BASE/SET_VELOCITY clamp to [1, 4095500].
+        let s = compute_speeds(0.0, 5e6, 5000.0, 100);
+        assert_eq!((s.base, s.slew), (1, 4_095_500));
         // Non-positive acceleration keeps the previous accel parameter.
         let s = compute_speeds(100.0, 1000.0, 0.0, 42);
         assert_eq!(s.accel, 42);
