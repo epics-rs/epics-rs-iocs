@@ -5358,6 +5358,7 @@ dependencies = [
 name = "yokogawa-gm10"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "log",
  "parking_lot",
