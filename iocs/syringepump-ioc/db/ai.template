@@ -1,8 +1,10 @@
-# Vendored, byte-for-byte, from epics-modbus-rs 0.22.1's db/ai.template.
-# See aiFloat64.template's header comment for why this is a local copy
+# Copied verbatim from modbus R3-4 modbusApp/Db/ai.template. See
+# aiFloat64.template's header comment for why this is a local copy
 # rather than a MODBUS-macro reference.
+# ai record template for register inputs
 record(ai, "$(P)$(R)") {
     field(DTYP,"asynInt32")
+    field(DESC, "$(DESC=)")
     field(INP,"@asynMask($(PORT) $(OFFSET) $(BITS))MODBUS_DATA")
     field(LINR,"LINEAR")
     field(EGUL,"$(EGUL)")
@@ -12,3 +14,4 @@ record(ai, "$(P)$(R)") {
     field(PREC,"$(PREC)")
     field(SCAN,"$(SCAN)")
 }
+
