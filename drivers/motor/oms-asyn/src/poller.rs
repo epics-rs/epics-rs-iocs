@@ -1,8 +1,7 @@
 //! C `omsBaseController::omsPoller` (omsBaseController.cpp:584-844): one
 //! thread per controller reads every axis at once — one command per quantity —
-//! and writes the axes' status parameters. [`crate::oms::OmsAxis::poll`] only
-//! reads those parameters back for the motor poll loops, which deliver them
-//! to the records as `callParamCallbacks` does.
+//! writes the axes' status parameters and posts each axis, as its
+//! `callParamCallbacks` does, through the axis's motor poll loop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -12,7 +11,9 @@ use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::MotorStatus;
 use epics_rs::base::runtime::exit::at_exit;
 use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
+use epics_rs::motor::poll_loop::PollCommand;
 
 use motor_common::util::leading_hex;
 
@@ -71,11 +72,13 @@ impl PollShared {
         self.axes()[axis].status.clone()
     }
 
-    /// A move's `setIntegerParam(motorStatusDone_, 0)` and `wakeupPoller`
-    /// (asynMotorController.cpp:300-357), whatever the move returned.
+    /// A move's `setIntegerParam(motorStatusDone_, 0)`
+    /// (asynMotorController.cpp:300-357), whatever the move returned. Its
+    /// `wakeupPoller` is the motor poll loop's pass after the move, whose
+    /// `OmsAxis::poll` signals; a second signal here
+    /// ran a second controller read per move.
     pub(crate) fn moved(&self, axis: usize) {
         self.axes()[axis].status.done = false;
-        self.wakeup();
     }
 
     /// `writeFloat64`'s `setDoubleParam(motorPosition_, value)` ahead of
@@ -89,7 +92,7 @@ impl PollShared {
     }
 
     /// C `epicsEventSignal(pollEventId_)`.
-    fn wakeup(&self) {
+    pub(crate) fn wakeup(&self) {
         *self.event.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.signal.notify_one();
     }
@@ -110,13 +113,19 @@ impl PollShared {
 }
 
 /// C `startPoller` and the constructor's `epicsAtExit(callShutdown)`.
+/// `posters` are the axes' poll loops, in axis order.
 pub fn start(
     controller: &Arc<Mutex<OmsController>>,
+    posters: Vec<mpsc::Sender<PollCommand>>,
     moving_poll: Duration,
     idle_poll: Duration,
     fw_minor: i32,
 ) {
-    let poller = OmsPoller::new(controller.clone(), moving_poll, idle_poll, fw_minor);
+    let mut poller = OmsPoller::new(controller.clone(), moving_poll, idle_poll, fw_minor);
+    poller.posters = posters;
+    // C creates the event with the controller; the axes' startup polls
+    // signalled this one before the poller existed.
+    poller.shared.wait(Duration::ZERO);
     let shared = poller.shared.clone();
     at_exit(format!("omsPoller {}", poller.port_name), move || {
         shared.shutting_down.store(true, Ordering::Release)
@@ -151,6 +160,8 @@ struct OmsPoller {
     enabled: bool,
     /// C `closedLoopStatus`, an array that keeps its values across loops.
     closed_loop: [bool; OMS_MAX_AXES],
+    /// Each axis's poll loop, which posts its status on change.
+    posters: Vec<mpsc::Sender<PollCommand>>,
 }
 
 impl OmsPoller {
@@ -183,6 +194,7 @@ impl OmsPoller {
             fast_polls: 0,
             enabled: true,
             closed_loop: [false; OMS_MAX_AXES],
+            posters: Vec::new(),
         }
     }
 
@@ -271,6 +283,7 @@ impl OmsPoller {
 
         self.any_moving = false;
         let status = status.as_bytes();
+        let mut posts = Vec::with_capacity(self.num_axes);
         let mut axes = self.shared.axes();
         for (i, axis) in axes.iter_mut().enumerate() {
             if !self.enabled || self.shared.shutting_down() {
@@ -338,8 +351,14 @@ impl OmsPoller {
             if have_closed_loop {
                 st.gain_support = self.closed_loop[i];
             }
+            posts.push(st.clone());
         }
         drop(axes);
+        // `callParamCallbacks`, sent outside the parameter lock: a poll loop
+        // reading the parameters must not hold up a full channel.
+        for (poster, status) in self.posters.iter().zip(posts) {
+            let _ = poster.blocking_send(PollCommand::Post(status));
+        }
 
         Some(if self.fast_polls > 0 {
             self.fast_polls -= 1;
@@ -361,27 +380,8 @@ impl OmsPoller {
             .then_some(status)
     }
 
-    /// C `getAxesArray`: one value per axis from a comma-separated reply.
-    /// A failed read fails silently, a bad reply with a line.
     fn axes_array(&self, cmd: &str) -> Option<[i32; OMS_MAX_AXES]> {
-        let reply = self.send_receive(cmd).ok()?;
-        if reply.len() < self.num_axes.wrapping_sub(1) {
-            errlog_vprintf(format_args!(
-                "{DRIVER}:getAxesArray:{}: read string too short {}\n",
-                self.port_name,
-                reply.len()
-            ));
-            return None;
-        }
-        let (values, count) = parse_axes_array(&reply);
-        if count != self.num_axes {
-            errlog_vprintf(format_args!(
-                "{DRIVER}:getAxesArray:{}: array string conversion error, count: {count}, axes: {}, input: >{reply}<\n",
-                self.port_name, self.num_axes
-            ));
-            return None;
-        }
-        Some(values)
+        axes_array(&self.lock(), self.num_axes, cmd)
     }
 
     /// C `getClosedLoopStatus` in the `CL?` form this port assumes. C sets 1
@@ -417,6 +417,43 @@ impl OmsPoller {
                 self.port_name
             ));
             self.enabled = false;
+        }
+    }
+}
+
+/// C `getAxesArray`: one value per axis from a comma-separated reply.
+/// A failed read fails silently, a bad reply with a line.
+fn axes_array(ctrl: &OmsController, num_axes: usize, cmd: &str) -> Option<[i32; OMS_MAX_AXES]> {
+    let reply = ctrl.send_receive(cmd).ok()?;
+    if reply.len() < num_axes.wrapping_sub(1) {
+        errlog_vprintf(format_args!(
+            "{DRIVER}:getAxesArray:{}: read string too short {}\n",
+            ctrl.port_name(),
+            reply.len()
+        ));
+        return None;
+    }
+    let (values, count) = parse_axes_array(&reply);
+    if count != num_axes {
+        errlog_vprintf(format_args!(
+            "{DRIVER}:getAxesArray:{}: array string conversion error, count: {count}, axes: {num_axes}, input: >{reply}<\n",
+            ctrl.port_name()
+        ));
+        return None;
+    }
+    Some(values)
+}
+
+/// The end of C `Init` (omsBaseController.cpp:565-568): every axis's
+/// position from one `AM PP;`, so a record initialised before the poller's
+/// first good loop starts from the controller, not from 0.
+pub(crate) fn init_positions(controller: &Mutex<OmsController>) {
+    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+    let shared = ctrl.poll_shared();
+    let num_axes = shared.axes().len();
+    if let Some(positions) = axes_array(&ctrl, num_axes, "AM PP;") {
+        for (axis, position) in positions.iter().take(num_axes).enumerate() {
+            shared.set_position(axis, f64::from(*position));
         }
     }
 }
@@ -630,6 +667,51 @@ mod tests {
             rig.axes[1].poll(&user).unwrap().home,
             "untouched until the next loop"
         );
+    }
+
+    /// Each axis is posted at the end of the loop; a status poll wakes the
+    /// poller as C `omsBaseAxis::poll` does.
+    #[test]
+    fn the_loop_posts_every_axis_and_a_poll_wakes_it() {
+        let mut rig = rig("omsPollerPosts", 2, &HEALTHY);
+        let mut poller = poller(&rig);
+        let (tx, mut rx): (Vec<_>, Vec<_>) = (0..2).map(|_| mpsc::channel(4)).unzip();
+        poller.posters = tx;
+        poller.pass();
+        for (i, rx) in rx.iter_mut().enumerate() {
+            let Ok(PollCommand::Post(status)) = rx.try_recv() else {
+                panic!("axis {i} not posted");
+            };
+            assert_eq!(status, rig.axes[i].poll(&AsynUser::default()).unwrap());
+            assert!(rx.try_recv().is_err());
+        }
+        assert!(poller.shared.wait(Duration::ZERO));
+        assert!(!poller.shared.wait(Duration::ZERO));
+    }
+
+    /// Init's `AM PP;` positions stand until the poller's first good loop.
+    #[test]
+    fn init_reads_every_axis_position() {
+        let mut rig = rig("omsInitPositions", 2, &[("AM PP;", "3000,-5")]);
+        init_positions(&rig.controller);
+        assert_eq!(*rig.written.lock().unwrap(), ["AM PP;"]);
+        let user = AsynUser::default();
+        assert_eq!(rig.axes[0].poll(&user).unwrap().position, 3000.0);
+        assert_eq!(rig.axes[1].poll(&user).unwrap().position, -5.0);
+    }
+
+    /// A move signals the poller once, through the poll that follows it.
+    #[test]
+    fn a_move_wakes_the_poller_only_through_its_poll() {
+        let mut rig = rig("omsPollerMoveWake", 1, &HEALTHY);
+        let shared = rig.controller.lock().unwrap().poll_shared().clone();
+        let user = AsynUser::default();
+        rig.axes[0]
+            .move_absolute(&user, 10.0, 1.0, 100.0, 1000.0)
+            .unwrap();
+        assert!(!shared.wait(Duration::ZERO));
+        rig.axes[0].poll(&user).unwrap();
+        assert!(shared.wait(Duration::ZERO));
     }
 
     /// A status that never comes: six `RI` reads for the whole controller,

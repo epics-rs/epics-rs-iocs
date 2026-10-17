@@ -25,13 +25,10 @@
 //! ## Polling
 //!
 //! As in C, one poller thread per controller ([`crate::poller`]) reads the
-//! status of every axis at once and owns the axes' status parameters;
-//! [`OmsAxis::poll`] returns them without touching the line. The asyn-rs
-//! motor poll loops still run per axis, so a change reaches the record at the
-//! axis loop's next pass rather than at the poller's `callParamCallbacks`,
-//! and a forced status refresh posts the parameters without waking the
-//! poller as C `omsBaseAxis::poll` does: the axis poll also serves the timed
-//! passes, where a wakeup would run the controller loop once per axis.
+//! status of every axis at once, owns the axes' status parameters and posts
+//! each axis at the end of its loop. The axes' motor poll loops have no
+//! timed pass; [`OmsAxis::poll`] wakes the poller and returns the parameters
+//! without touching the line.
 //!
 //! ## Units
 //!
@@ -545,8 +542,10 @@ impl AsynMotor for OmsAxis {
         self.lock().send_only(&format!("A{ch} LP{pos};"))
     }
 
-    /// The status parameters as the controller's poller left them.
+    /// C `omsBaseAxis::poll`: wake the poller; the status is the
+    /// parameters as it left them.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        self.poll_shared.wakeup();
         Ok(self.poll_shared.status(self.axis_index))
     }
 }

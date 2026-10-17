@@ -10,10 +10,11 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::motor::builder::{AxisSetup, MotorBuilder};
 
 use motor_common::iocsh::{arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{asyn_user, register_port};
 
 use crate::oms::{OmsAxis, OmsController};
 
@@ -113,21 +114,33 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
             }
 
             let controller = Arc::new(Mutex::new(controller));
-            for axis in 0..total_axes {
-                let axis_dev = OmsAxis::new(controller.clone(), axis)
-                    .map_err(|e| format!("{cmd_name}: axis {axis}: {e}"))?;
+            let axes = (0..total_axes)
+                .map(|axis| {
+                    OmsAxis::new(controller.clone(), axis)
+                        .map_err(|e| format!("{cmd_name}: axis {axis}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            crate::poller::init_positions(&controller);
+            let mut posters = Vec::with_capacity(total_axes);
+            for (axis, axis_dev) in axes.into_iter().enumerate() {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_dev));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    10, // C startPoller, omsMAXnet.cpp:364, omsMXA.cpp:359
-                )?;
+                // No timed pass: the OMS poller posts (zero periods wait on
+                // events alone).
+                let AxisSetup {
+                    axis,
+                    poll_loop,
+                    poll_cmd_tx,
+                } = MotorBuilder::new(motor)
+                    .trace_user(asyn_user(&port_name, axis as i32))
+                    .poll_interval(Duration::ZERO)
+                    .build_axis();
+                epics_rs::motor::devices::register_axis(axis)?;
+                ctx.bridge().spawn(poll_loop.run());
+                posters.push(poll_cmd_tx);
             }
             crate::poller::start(
                 &controller,
+                posters,
                 Duration::from_millis(moving_poll_ms),
                 Duration::from_millis(idle_poll_ms),
                 fw_minor,
