@@ -987,9 +987,7 @@ pub(crate) fn read_detector(
     let temps = chip_temperatures(&detector);
     let rails = rail_voltages(&detector);
     let chips = detector.pointer("/Chips").and_then(Value::as_array);
-    let layout = detector
-        .pointer("/Layout/Original/Chips")
-        .and_then(Value::as_array);
+    let layout = layout_chips(&detector, shared.family());
     for chip in 0..crate::driver::MAX_ADDR {
         let addr = i32::try_from(chip).unwrap_or(0);
         let mut updates = Vec::new();
@@ -1014,7 +1012,7 @@ pub(crate) fn read_detector(
                 ParamValue::Int32(temps.get(chip).copied().unwrap_or(0)),
             ));
         }
-        if let Some(c) = layout.and_then(|l| l.get(chip)) {
+        if let Some(c) = layout.and_then(|l| chip_layout_entry(l, addr)) {
             updates.push(ParamSetValue::new(
                 p.layout,
                 addr,
@@ -1044,6 +1042,34 @@ pub(crate) fn read_detector(
     ));
     read.ok = true;
     read
+}
+
+/// The chip layouts C getDetector publishes (serval_http.cpp:1525-1542):
+/// MPX3 assembles its images in the `Rotated` layout, so it prefers it;
+/// otherwise `Original`, falling back to `Rotated`.
+fn layout_chips(detector: &Value, family: DetectorFamily) -> Option<&Vec<Value>> {
+    let chips = |name: &str| {
+        detector
+            .pointer(&format!("/Layout/{name}/Chips"))
+            .and_then(Value::as_array)
+    };
+    (family == DetectorFamily::Mpx3)
+        .then(|| chips("Rotated"))
+        .flatten()
+        .or_else(|| chips("Original"))
+        .or_else(|| chips("Rotated"))
+}
+
+/// C `publishChipLayout`: the entry whose integer `Chip` is `chip`, not the
+/// entry at that position.
+fn chip_layout_entry(chips: &[Value], chip: i32) -> Option<&Value> {
+    chips.iter().find(|entry| {
+        entry
+            .get("Chip")
+            .filter(|c| c.is_i64() || c.is_u64())
+            .and_then(Value::as_i64)
+            == Some(i64::from(chip))
+    })
 }
 
 /// `Detector.Health` is a single object on Serval 3 and an array — one entry
@@ -4279,6 +4305,62 @@ mod tests {
         assert_eq!(
             int_set(&read.updates[0].1, ctx.p.detector_orientation),
             Some(0)
+        );
+    }
+
+    /// The chip layout is the entry whose `Chip` is the chip number, from
+    /// `Rotated` on MPX3 and `Original` otherwise (serval_http.cpp:1525-1553).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chip_layout_is_matched_by_chip_from_the_family_layout() {
+        fn read(name: &str, body_for: fn(&str) -> &'static str) -> Vec<String> {
+            let (url, _log) = logging_serval(&[], body_for);
+            let ctx = idle_ctx_at(name, &url, None);
+            let read = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad);
+            assert!(read.ok);
+            (0..2)
+                .map(|chip| {
+                    read.updates
+                        .iter()
+                        .filter(|(addr, _)| *addr == chip)
+                        .find_map(|(_, u)| octet_set(u, ctx.p.layout))
+                        .unwrap_or_default()
+                })
+                .collect()
+        }
+        let mpx3 = |path: &str| match path {
+            "/detector" => {
+                r#"{"Info":{"PixCount":131072,"RowLen":2,"NumberOfChips":2,"NumberOfRows":256,"MpxType":0,"ChipType":"MPX3"},"Config":{},"Layout":{
+                "Original":{"Chips":[{"Chip":0,"X":0},{"Chip":1,"X":1}]},
+                "Rotated":{"Chips":[{"Chip":1,"X":9},{"Chip":0,"X":8}]}}}"#
+            }
+            _ => "{}",
+        };
+        let tpx3 = |path: &str| match path {
+            "/detector" => {
+                r#"{"Info":{"PixCount":131072,"RowLen":2,"NumberOfChips":2,"NumberOfRows":256,"MpxType":0,"ChipType":"TPX3"},"Config":{},"Layout":{
+                "Original":{"Chips":[{"Chip":0,"X":0},{"Chip":1,"X":1}]},
+                "Rotated":{"Chips":[{"Chip":1,"X":9},{"Chip":0,"X":8}]}}}"#
+            }
+            _ => "{}",
+        };
+        let rotated_only = |path: &str| match path {
+            "/detector" => {
+                r#"{"Info":{"PixCount":131072,"RowLen":2,"NumberOfChips":2,"NumberOfRows":256,"MpxType":0,"ChipType":"TPX3"},"Config":{},"Layout":{
+                "Rotated":{"Chips":[{"Chip":1,"X":9},{"Chip":"0","X":8}]}}}"#
+            }
+            _ => "{}",
+        };
+        assert_eq!(
+            read("TPX_LAYOUT_MPX3", mpx3),
+            [r#"{"Chip":0,"X":8}"#, r#"{"Chip":1,"X":9}"#]
+        );
+        assert_eq!(
+            read("TPX_LAYOUT_TPX3", tpx3),
+            [r#"{"Chip":0,"X":0}"#, r#"{"Chip":1,"X":1}"#]
+        );
+        assert_eq!(
+            read("TPX_LAYOUT_ROT", rotated_only),
+            ["", r#"{"Chip":1,"X":9}"#]
         );
     }
 
