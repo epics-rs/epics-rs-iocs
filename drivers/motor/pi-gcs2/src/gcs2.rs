@@ -126,11 +126,6 @@
 //!   fallback status transport for controllers that don't understand
 //!   `char(4)`; unreachable once `PIGCSMotorController::getStatus` overrides
 //!   it, so not ported.
-//! - **Max-acceleration clamp micro-optimization**: `setAccelerationCts`'s
-//!   "skip if unchanged from last set" cache is not replicated (harmless
-//!   extra wire traffic on repeated identical values, no behavioral
-//!   difference); the max-acceleration *value* itself is still queried and
-//!   clamped to, lazily cached per axis exactly as upstream does.
 //! - **Velocity readback**: the init `getAxisVelocity` (`VEL?`) is sent, but
 //!   the `m_velocity` it seeds is never read back (not in `PIasynAxis::poll`),
 //!   so `MotorStatus::velocity` stays `0.0`.
@@ -695,6 +690,8 @@ pub struct PIGCS2Axis {
     /// Lazily-queried `min(MOT_MAX_ACCEL, MOT_MAX_DECEL)`, cached like C's
     /// `pAxis->m_maxAcceleration` (`-1.0` sentinel there, `None` here).
     max_acceleration: Option<f64>,
+    /// C `m_acceleration`: the clamped acceleration last set.
+    acceleration: f64,
 }
 
 impl PIGCS2Axis {
@@ -728,6 +725,7 @@ impl PIGCS2Axis {
             low_limit: 0.0,
             high_limit: 0.0,
             max_acceleration: None,
+            acceleration: 0.0,
         };
         let _ = axis.init_axis(port_name);
         let ctrl = axis.lock();
@@ -793,12 +791,18 @@ impl PIGCS2Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `setAccelerationCts`: convert the record's steps/s² by the CPU, lazily cache `min(MAX_ACCEL, MAX_DECEL)`, clamp
-    /// the requested acceleration to it, and write `CURR_ACCEL`/`CURR_DECEL`.
-    /// Gated on `knows_vel`, matching both `getMaxAcceleration` and
-    /// `setAcceleration`'s own early return.
+    /// `setAccelerationCts`: convert the record's steps/s² by the CPU, skip
+    /// it when equal to the last one set, lazily cache `min(MAX_ACCEL,
+    /// MAX_DECEL)`, clamp the request to it, and write `CURR_ACCEL`/
+    /// `CURR_DECEL`. Gated on `knows_vel`, matching both `getMaxAcceleration`
+    /// and `setAcceleration`'s own early return.
     fn apply_acceleration(&mut self, acceleration: f64) -> AsynResult<()> {
         if !self.lock().knows_vel() {
+            return Ok(());
+        }
+        let acceleration = (acceleration / self.cpu).abs();
+        // C compares the unclamped request with the clamped value stored.
+        if acceleration == self.acceleration {
             return Ok(());
         }
         if self.max_acceleration.is_none() {
@@ -810,12 +814,12 @@ impl PIGCS2Axis {
                 .get_gcs_parameter(&self.axis_name, PARA_MOT_MAX_DECEL)?;
             self.max_acceleration = Some(max_acc.min(max_dec));
         }
-        let accel = (acceleration / self.cpu)
-            .abs()
-            .min(self.max_acceleration.unwrap());
+        let accel = acceleration.min(self.max_acceleration.unwrap());
         let ctrl = self.lock();
         ctrl.set_gcs_parameter(&self.axis_name, PARA_MOT_CURR_ACCEL, accel)?;
         ctrl.set_gcs_parameter(&self.axis_name, PARA_MOT_CURR_DECEL, accel)?;
+        drop(ctrl);
+        self.acceleration = accel;
         Ok(())
     }
 }
@@ -1191,6 +1195,7 @@ mod tests {
             low_limit: 0.0,
             high_limit: 0.0,
             max_acceleration: None,
+            acceleration: 0.0,
         };
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         assert_eq!(status.position, 2.5);
@@ -1257,6 +1262,28 @@ mod tests {
         let at = |q: &str| sent.iter().position(|w| w.starts_with(q));
         assert_eq!(at("VEL? 1").map(|i| i + 1), at("POS? 1"), "{sent:?}");
         assert!(at("SPA? 1 15") < at("VEL? 1"), "{sent:?}");
+    }
+
+    /// C `setAccelerationCts` (PIGCSMotorController.cpp:40-53) skips a
+    /// request equal to the last acceleration set, compared before the
+    /// clamp against the clamped value `setAcceleration` stored (:218).
+    #[test]
+    fn an_unchanged_acceleration_is_not_resent() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2AccelSkip", |last| {
+            if last == "ERR?" { "0" } else { "1=5" }.into()
+        });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2AccelSkip");
+        ctrl.knows_vel = true;
+        let mut axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "1".into(), 0, "gcs2AccelSkip");
+        line.sent();
+        let mut sends = Vec::new();
+        for accel in [2.0, 2.0, 3.0, 9.0, 9.0] {
+            axis.apply_acceleration(accel).unwrap();
+            let sent = line.sent();
+            sends.push(sent.iter().filter(|w| w.starts_with("SPA 1 11 ")).count());
+        }
+        // 9 clamps to 5, so a second 9 differs from the stored 5.
+        assert_eq!(sends, [1, 0, 1, 1, 1]);
     }
 
     #[test]
