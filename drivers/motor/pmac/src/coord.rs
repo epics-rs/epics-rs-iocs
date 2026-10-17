@@ -369,11 +369,15 @@ impl AsynMotor for PmacCsAxis {
 
         let flags = decode_cs_status((status1, status2, status3), system.deferred[axis - 1]);
 
+        let done = flags.done && !std::mem::take(&mut self.motion_sent);
         Ok(MotorStatus {
             position,
             encoder_position: position,
-            done: flags.done && !std::mem::take(&mut self.motion_sent),
-            moving: flags.moving,
+            done,
+            // C paces on motorAxisDone (pmacAsynCoord.c:719-724) and sets
+            // motorAxisMoving from in-position alone (659).
+            moving: !done,
+            msta_moving: flags.moving,
             high_limit: flags.limit,
             low_limit: flags.limit,
             direction,
@@ -519,6 +523,8 @@ mod tests {
         let wire = sent.lock().unwrap().clone();
         assert_eq!(wire.len(), 3, "{wire:?}");
         assert!(!after.done);
+        // In position yet not done: C paces fast, motorAxisMoving stays 0.
+        assert!(after.moving && !after.msta_moving);
 
         sent.lock().unwrap().clear();
         assert!(axis.poll(&user).unwrap().done);

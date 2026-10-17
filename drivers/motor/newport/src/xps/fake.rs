@@ -48,6 +48,7 @@ impl PortDriver for FakeXps {
             "GroupPositionCurrentGet" if cmd.contains(".P2,") => "0,2.5",
             "GroupPositionCurrentGet" => "0,1.5",
             "GroupPositionSetpointGet" => "0,1.25",
+            "GroupVelocityCurrentGet" if cmd.contains(".P2,") => "0,3",
             "PositionerSGammaParametersGet" => "0,10,40,0.02,0.02",
             _ => "0,0",
         };

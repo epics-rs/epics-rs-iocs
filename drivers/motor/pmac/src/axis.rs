@@ -433,7 +433,10 @@ impl AsynMotor for PmacAxis {
             position,
             encoder_position,
             done: flags.done,
-            moving: flags.moving,
+            // C paces on `!done` (pmacAxis.cpp:538-542) and sets
+            // motorStatusMoving_ from the velocity/amp bits (548).
+            moving: !flags.done,
+            msta_moving: flags.moving,
             high_limit: flags.high_limit,
             low_limit: flags.low_limit,
             homed: flags.home_complete,
@@ -534,6 +537,15 @@ mod tests {
         assert!(!flags.done);
         assert!(flags.moving);
         assert!(flags.amp_enabled);
+    }
+
+    /// Desired velocity zero but not yet in position: C keeps polling fast
+    /// (`!done`) with motorStatusMoving_ already 0.
+    #[test]
+    fn a_settling_axis_is_not_done_and_not_moving() {
+        let flags = decode_axis_status(MOVING1 | STATUS1_DESIRED_VELOCITY_ZERO, 0, false);
+        assert!(!flags.done);
+        assert!(!flags.moving);
     }
 
     #[test]

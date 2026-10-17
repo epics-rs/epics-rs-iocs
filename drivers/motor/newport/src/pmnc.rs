@@ -371,6 +371,9 @@ pub struct PmncAxis {
     /// What the last failed poll raises: nothing on C's first missed reply
     /// (RETRY), `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next (COMM_ERR).
     failure: PollFailure,
+    /// The status a RETRY exit stored after an answered exchange, which the
+    /// poller carries to its next post.
+    left: Option<MotorStatus>,
     last_status: MotorStatus,
     strings: MoveStrings,
 }
@@ -393,6 +396,7 @@ impl PmncAxis {
             last_reading: 0,
             no_motion_count: 0,
             failure: PollFailure::NONE,
+            left: None,
             last_status: MotorStatus::default(),
             strings: MoveStrings::default(),
         })
@@ -461,6 +465,10 @@ impl PmncAxis {
 impl AsynMotor for PmncAxis {
     fn poll_failure(&self) -> PollFailure {
         self.failure
+    }
+
+    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+        self.left.take()
     }
 
     fn move_absolute(
@@ -645,20 +653,31 @@ impl AsynMotor for PmncAxis {
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let (d, m) = (self.def.driver_num, self.def.motor_num);
 
+        // `$answered`: an earlier exchange of this pass got its reply.
         macro_rules! checked {
-            ($reply:expr) => {
+            ($reply:expr, $answered:expr) => {
                 match $reply {
                     Ok(s) if !s.is_empty() => {
                         ctrl.comm_state = CommState::Normal;
+                        self.last_status.comms_error = false;
                         s
                     }
                     _ => {
                         // drvPMNC87xx.cc:283-292: RETRY fails the poll
-                        // raising nothing, COMM_ERR raising both bits.
-                        (ctrl.comm_state, self.failure) = match ctrl.comm_state {
-                            CommState::Normal => (CommState::Retry, PollFailure::NONE),
-                            _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
-                        };
+                        // raising nothing, COMM_ERR raising both bits; `exit`
+                        // stores either in motor_info->status (:541-542).
+                        if ctrl.comm_state == CommState::Normal {
+                            ctrl.comm_state = CommState::Retry;
+                            self.failure = PollFailure::NONE;
+                            if $answered {
+                                self.left = Some(self.last_status.clone());
+                            }
+                        } else {
+                            ctrl.comm_state = CommState::CommErr;
+                            self.failure = PollFailure::PROBLEM_AND_COMMS_ERROR;
+                            self.last_status.comms_error = true;
+                            self.last_status.problem = true;
+                        }
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
                             message: format!("PMNC87xx driver {d}: no reply"),
@@ -670,28 +689,28 @@ impl AsynMotor for PmncAxis {
 
         // 1. Which motor is selected on this driver? (8751 has only motor 0.)
         let select_motor = if self.is_8753() {
-            let reply = checked!(ctrl.command(&format!("CHL {d}")));
+            let reply = checked!(ctrl.command(&format!("CHL {d}")), false);
             atoi(&reply)
         } else {
             0
         };
 
         // 2. Status byte.
-        let sta = checked!(ctrl.status(d));
+        let sta = checked!(ctrl.status(d), self.is_8753());
         let mstat = parse_status_byte(&sta).unwrap_or(0);
 
         // 3. Aux status (8751 only).
         let auxstat = if self.is_8753() {
             0
         } else {
-            let diag = checked!(ctrl.command(&format!("DIAG {d}")));
+            let diag = checked!(ctrl.command(&format!("DIAG {d}")), true);
             parse_status_byte(&diag).unwrap_or(0)
         };
 
         // 4. Position, only if this motor is currently selected.
         let mut reading = self.last_reading;
         if select_motor == m {
-            let pos = checked!(ctrl.command(&format!("POS {d}")));
+            let pos = checked!(ctrl.command(&format!("POS {d}")), true);
             if let Some(v) = parse_int_after_eq(&pos) {
                 reading = v;
             }
@@ -1115,5 +1134,44 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPMNC87xx.cc:278-292,541: a DIAG missed after a good STA is RETRY,
+    /// and `exit` stores CNTRL_COMM_ERR cleared over the COMM_ERR status,
+    /// RA_PROBLEM kept, for the next post to carry.
+    #[test]
+    fn a_retry_after_an_answer_leaves_the_comm_error_cleared() {
+        use std::sync::atomic::AtomicBool;
+        let (quiet, quiet_diag) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (q, qd) = (quiet.clone(), quiet_diag.clone());
+        let (_line, io) = LineRig::new("pmncDiagRetry", move |last| match last {
+            "VER" => "Version 1.6.0>".into(),
+            "DRT" => "A0=2>".into(),
+            "STA 0" if q.load(Ordering::SeqCst) => String::new(),
+            "STA 0" => format!("A0=0x{:02x}>", S8751_MOVE_DONE | S8751_POWER_ON),
+            "DIAG 0" if qd.load(Ordering::SeqCst) => String::new(),
+            "DIAG 0" => "A0=0x04>".into(),
+            "POS 0" => "A0=0>".into(),
+            _ => ">".into(),
+        });
+        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
+        let mut axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.take_failed_poll_status(), None);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        assert_eq!(axis.take_failed_poll_status(), None);
+        quiet.store(false, Ordering::SeqCst);
+        quiet_diag.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        let left = axis.take_failed_poll_status().unwrap();
+        assert!(!left.comms_error && left.problem);
+        assert_eq!(axis.take_failed_poll_status(), None);
     }
 }

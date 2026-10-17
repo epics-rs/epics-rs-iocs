@@ -267,6 +267,9 @@ pub struct Mm3000Axis {
     /// What the last failed poll raises: nothing on C's first missed reply
     /// (RETRY), `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next (COMM_ERR).
     failure: PollFailure,
+    /// The status a RETRY exit stored after a good `MS`, which the poller
+    /// carries to its next post.
+    left: Option<MotorStatus>,
     strings: MoveStrings,
 }
 
@@ -292,6 +295,7 @@ impl Mm3000Axis {
             // C clears the status, then sets EA_PRESENT and GAIN_SUPPORT
             // for an encoder.
             failure: PollFailure::NONE,
+            left: None,
             last_status: MotorStatus {
                 gain_support: true,
                 has_encoder: true,
@@ -330,6 +334,10 @@ impl Mm3000Axis {
 impl AsynMotor for Mm3000Axis {
     fn poll_failure(&self) -> PollFailure {
         self.failure
+    }
+
+    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+        self.left.take()
     }
 
     fn move_absolute(
@@ -510,8 +518,7 @@ impl Mm3000Axis {
         };
 
         let Some(ms) = exchange(&mut ctrl, &format!("{a}MS")) else {
-            self.failure = failure(ctrl.comm_state);
-            return Err(retry(a));
+            return Err(self.missed(ctrl.comm_state, false));
         };
         // C writes the MS bits into the status before asking TP, and its
         // exit stores them even when TP goes unanswered.
@@ -527,8 +534,7 @@ impl Mm3000Axis {
         s.powered = mstat.powered;
 
         let Some(tp) = exchange(&mut ctrl, &format!("{a}TP")) else {
-            self.failure = failure(ctrl.comm_state);
-            return Err(retry(a));
+            return Err(self.missed(ctrl.comm_state, true));
         };
         // drvMM3000.cc:371-378; C ignores the write's status too.
         let ls_active = (mstat.plus_tl && mstat.direction) || (mstat.minus_tl && !mstat.direction);
@@ -546,6 +552,20 @@ impl Mm3000Axis {
         s.velocity = 0.0; // C: "Parse motor velocity? NEEDS WORK"
         s.problem = false;
         Ok(s.clone())
+    }
+
+    /// C `set_status`'s `exit` after a missed reply, storing
+    /// `motor_info->status`: COMM_ERR with both bits raised, RETRY with the
+    /// MS bits when `ms_set`.
+    fn missed(&mut self, comm_state: CommState, ms_set: bool) -> AsynError {
+        self.failure = failure(comm_state);
+        if comm_state == CommState::CommErr {
+            self.last_status.comms_error = true;
+            self.last_status.problem = true;
+        } else if ms_set {
+            self.left = Some(self.last_status.clone());
+        }
+        retry(self.axis)
     }
 }
 
@@ -938,5 +958,43 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvMM3000.cc:311-334,380: a TP missed after a good MS is RETRY, and
+    /// `exit` stores the MS bits over the COMM_ERR status before it, for
+    /// the next post to carry.
+    #[test]
+    fn a_tp_retry_leaves_the_ms_bits_for_the_next_post() {
+        use std::sync::atomic::AtomicBool;
+        let (quiet, quiet_tp) = (
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (q, qt) = (quiet.clone(), quiet_tp.clone());
+        let (_line, io) = LineRig::new("mm3000TpRetry", move |last| match last {
+            "VE" => "MM3000".into(),
+            "RC" => "1=dc".into(),
+            _ if q.load(Ordering::SeqCst) => String::new(),
+            "1MS" => "%".into(),
+            "1TP" if qt.load(Ordering::SeqCst) => String::new(),
+            "1TP" => "0 ".into(),
+            _ => String::new(),
+        });
+        let ctrl = Mm3000Controller::new(io).unwrap();
+        let mut axis = Mm3000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        let user = AsynUser::default();
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.take_failed_poll_status(), None);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        assert_eq!(axis.take_failed_poll_status(), None);
+        quiet.store(false, Ordering::SeqCst);
+        quiet_tp.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        let left = axis.take_failed_poll_status().unwrap();
+        assert!(left.moving && !left.done && left.direction && left.home);
+        assert!(!left.comms_error && left.problem && !left.msta_moving);
+        assert_eq!(axis.take_failed_poll_status(), None);
     }
 }
