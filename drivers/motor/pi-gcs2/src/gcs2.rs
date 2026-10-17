@@ -332,7 +332,7 @@ impl PIGCS2Controller {
             Err(e) => e,
         };
         self.print(format_args!(
-            "PIGCSController:sendOnly: error sending command {cmd}, sent={}, status={}\n",
+            "PIGCSController:sendOnly: error sending command {cmd}, sent={}, status={}",
             e.partial_write().unwrap_or(0),
             e.status() as i32
         ));
@@ -353,7 +353,7 @@ impl PIGCS2Controller {
     fn send_and_receive(&self, cmd: &str) -> AsynResult<Vec<u8>> {
         let short_write = |status: i32, message: &str| {
             self.print(format_args!(
-                "PIGCSController:sendAndReceive error calling write, output={cmd} status={status}, error={message}\n"
+                "PIGCSController:sendAndReceive error calling write, output={cmd} status={status}, error={message}"
             ));
             pigcs2_err(message)
         };
@@ -367,7 +367,7 @@ impl PIGCS2Controller {
             .map_err(|e| match e.octet_step() {
                 Some(OctetStep::Read) => {
                     self.print(format_args!(
-                        "PIGCSController:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
+                        "PIGCSController:sendAndReceive error calling writeRead, output={cmd} status={}, error={}",
                         e.status() as i32,
                         e.message()
                     ));
@@ -586,7 +586,7 @@ impl PIGCS2Controller {
                 _ => pigcs2_err(e.message()),
             };
             self.print(format_args!(
-                "PIInterface::sendAndReceive error calling writeRead, output=4 status={}, error={}\n",
+                "PIInterface::sendAndReceive error calling writeRead, output=4 status={}, error={}",
                 e.status() as i32,
                 e.message()
             ));
@@ -694,17 +694,17 @@ impl PIGCS2Axis {
         let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         self.has_limit_switches = ctrl.has_limit_switches(&self.axis_name)?;
         flow(format_args!(
-            "PIGCSController::hasLimitSwitches() axis has {}limit switches\n",
+            "PIGCSController::hasLimitSwitches() axis has {}limit switches",
             if self.has_limit_switches { "" } else { "no " }
         ));
         self.has_reference = ctrl.has_reference_sensor(&self.axis_name)?;
         flow(format_args!(
-            "PIGCSController::hasReferenceSwitch() axis has {}reference sensor\n",
+            "PIGCSController::hasReferenceSwitch() axis has {}reference sensor",
             if self.has_reference { "" } else { "no " }
         ));
         let stage_id = ctrl.stage_id(&self.axis_name)?;
         flow(format_args!(
-            "PIGCSController::initAxis() stage configuration: {stage_id}\n"
+            "PIGCSController::initAxis() stage configuration: {stage_id}"
         ));
         ctrl.set_servo(&self.axis_name, true)?;
         self.servo_on = true;

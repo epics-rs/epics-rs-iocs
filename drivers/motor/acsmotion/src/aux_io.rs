@@ -172,7 +172,7 @@ fn poll(
                 Some(0),
                 0,
                 TraceMask::ERROR,
-                format_args!("SPiiPlusAuxIO:pollerThread: ERROR reading I/O, status={e}\n"),
+                format_args!("SPiiPlusAuxIO:pollerThread: ERROR reading I/O, status={e}"),
             );
         }
         for i in 0..n {

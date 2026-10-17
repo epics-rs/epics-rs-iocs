@@ -93,7 +93,7 @@ impl Mcs2Controller {
             Err(_) => trace.print_self(
                 TraceMask::ERROR,
                 format_args!(
-                    "SmarActMCS2MotorDriver:MCS2Controller: cannot connect to MCS2 controller\n"
+                    "SmarActMCS2MotorDriver:MCS2Controller: cannot connect to MCS2 controller"
                 ),
             ),
         }
@@ -101,7 +101,7 @@ impl Mcs2Controller {
         trace.print_self(
             TraceMask::ERROR,
             format_args!(
-                "MCS2Controller::MCS2Controller: Device Name: {}\n",
+                "MCS2Controller::MCS2Controller: Device Name: {}",
                 ctrl.ident
             ),
         );

@@ -328,7 +328,7 @@ impl ConexAxis {
             trace.print_self(
                 TraceMask::ERROR,
                 format_args!(
-                    "AG_CONEXController::AG_CONEXController: cannot read version information from AG_CONEX controller\n"
+                    "AG_CONEXController::AG_CONEXController: cannot read version information from AG_CONEX controller"
                 ),
             );
             return None;
@@ -338,7 +338,7 @@ impl ConexAxis {
             trace.print_self(
                 TraceMask::ERROR,
                 format_args!(
-                    "AG_CONEXAxis::AG_CONEXAxis: unknown model, firmware string={version}\n"
+                    "AG_CONEXAxis::AG_CONEXAxis: unknown model, firmware string={version}"
                 ),
             );
             return Some(Self {

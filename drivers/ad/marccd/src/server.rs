@@ -93,7 +93,7 @@ impl MarccdDriver {
     pub fn trace(&self, mask: TraceMask, message: &str) {
         self.ad
             .port_base
-            .trace_print(mask, format_args!("{message}\n"));
+            .trace_print(mask, format_args!("{message}"));
     }
 
     /// C `asynPrint(pasynUserServer, ASYN_TRACE_ERROR, ...)`: the server
@@ -161,7 +161,7 @@ impl MarccdDriver {
                 // which is 0 on a failed read.
                 self.from.clear();
                 self.trace_server_error(&format!(
-                    "marCCD:readServer, timeout={timeout:.6}, status={} received 0 bytes\n",
+                    "marCCD:readServer, timeout={timeout:.6}, status={} received 0 bytes",
                     e.status() as i32
                 ));
                 classify(&e)

@@ -205,7 +205,7 @@ impl AgUcController {
                 trace.print_self(
                     TraceMask::ERROR,
                     format_args!(
-                        "AG_UCController::AG_UCController: cannot read version information from Agilis controller\n"
+                        "AG_UCController::AG_UCController: cannot read version information from Agilis controller"
                     ),
                 );
                 None
@@ -216,7 +216,7 @@ impl AgUcController {
                     trace.print_self(
                         TraceMask::ERROR,
                         format_args!(
-                            "AG_UCController::AG_UCController: unknown model, firmware string={version}\n"
+                            "AG_UCController::AG_UCController: unknown model, firmware string={version}"
                         ),
                     );
                 }
