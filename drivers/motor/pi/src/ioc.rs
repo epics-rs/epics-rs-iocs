@@ -508,6 +508,11 @@ static PIE517: Model1 = Model1::new(&DEV_PIE517, 10, SCAN_RATE);
 
 /// `PIE517Setup(num_cards, scan_rate)`.
 pub fn pie517_setup_command() -> CommandDef {
+    PIE517.register_report("drvPIE517", |cards| {
+        cards.report("PIE517", |card, line| {
+            format!("    PIE517 controller #{card}, {line} \n")
+        })
+    });
     PIE517.setup_command("PIE517Setup")
 }
 
@@ -538,6 +543,8 @@ pub fn pie517_config_command() -> CommandDef {
             let controller =
                 PIE517Controller::new(handle).map_err(|e| format!("PIE517Config: {e}"))?;
             let num_axes = controller.num_axes();
+            // C copies an uninitialised buffer into the ident (see crate::e517).
+            let line = format!("port={asyn_port}, id: ");
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
@@ -546,6 +553,7 @@ pub fn pie517_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                 PIE517.install(ctx, card, axis as i32, motor)?;
             }
+            PIE517.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -854,6 +862,32 @@ mod report {
             after,
             "    PIE516 controller 0 connection failed.\n    PIE516 controller #1, \
              port=e516RepLine, id: E-516 \n"
+        );
+    }
+
+    /// drvPIE517.cc:148-173, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pie517_controller() {
+        let setup = pie517_setup_command();
+        let (_line, _io) = LineRig::new("e517RepLine", |last| match last {
+            "SVO? 1" => "1=1".into(),
+            "POS? 1" => "1=0.000".into(),
+            _ => String::new(),
+        });
+        let (before, after) = reports(
+            "drvPIE517",
+            (setup, vec![int(2), int(10)]),
+            (
+                pie517_config_command(),
+                vec![int(1), port("e517RepLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIE517 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIE517 controller 0 connection failed.\n    PIE517 controller #1, \
+             port=e517RepLine, id:  \n"
         );
     }
 }
