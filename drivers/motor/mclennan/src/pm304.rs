@@ -284,18 +284,16 @@ impl Pm304Axis {
     }
 
     /// Program the speeds before a move or home (C sends `SV`/`SA`/`SD` as
-    /// separate transactions ahead of the motion command). Non-positive
-    /// values are skipped; the record sends SET_ACCEL only for a positive
-    /// rate (motorRecord.cc:874, 940).
+    /// separate transactions ahead of the motion command). SV goes out
+    /// whatever its value, as SET_VELOCITY always does; the record sends
+    /// SET_ACCEL only for a positive rate (motorRecord.cc:874, 940).
     fn program_speeds(
         ctrl: &Pm304Controller,
         axis: u32,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        if velocity > 0.0 {
-            ctrl.command(&format!("{axis}SV{}", nint(velocity)))?;
-        }
+        ctrl.command(&format!("{axis}SV{}", nint(velocity)))?;
         if acceleration > 0.0 {
             let accel = nint(acceleration);
             ctrl.command(&format!("{axis}SA{accel}"))?;
@@ -360,12 +358,11 @@ impl AsynMotor for Pm304Axis {
         self.send_prem(&ctrl)?;
         match ctrl.model {
             Model::Pm304 => {
-                // PM304: set the (unsigned) slew speed, then a signed direction.
-                let speed = nint(velocity.abs());
-                if speed > 0 {
-                    ctrl.command(&format!("{}SV{speed}", self.axis))?;
-                }
-                let dir = if velocity >= 0.0 { 1 } else { -1 };
+                // PM304: the signed speed as SV, then CV1 only for a
+                // positive one (devPM304.cc JOG case).
+                let speed = nint(velocity);
+                ctrl.command(&format!("{}SV{speed}", self.axis))?;
+                let dir = if speed > 0 { 1 } else { -1 };
                 ctrl.command(&format!("{}CV{dir}", self.axis))?;
             }
             Model::Pm600 => {
@@ -540,7 +537,27 @@ mod tests {
         axis.home(&user, 0.0, 400.0, 800.0, true).unwrap();
         assert_eq!(line.sent(), ["1SV400\r", "1SA800\r", "1SD800\r", "1IX\r"]);
         axis.move_velocity(&user, 0.0, -300.0, 600.0).unwrap();
-        assert_eq!(line.sent(), ["1SA600\r", "1SD600\r", "1SV300\r", "1CV-1\r"]);
+        assert_eq!(
+            line.sent(),
+            ["1SA600\r", "1SD600\r", "1SV-300\r", "1CV-1\r"]
+        );
+    }
+
+    /// devPM304.cc sends SV%ld whatever its value, signed on a jog, and
+    /// CV-1 unless the rounded jog speed is positive.
+    #[test]
+    fn sv_goes_out_signed_and_a_zero_jog_runs_negative() {
+        let (line, mut axis) = pm304_line("pm304_sv");
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 10.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["1SV0\r", "1MA10\r"]);
+        axis.move_velocity(&user, 0.0, -300.0, 600.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            ["1SA600\r", "1SD600\r", "1SV-300\r", "1CV-1\r"]
+        );
+        axis.move_velocity(&user, 0.0, 0.4, 600.0).unwrap();
+        assert_eq!(line.sent(), ["1SA600\r", "1SD600\r", "1SV0\r", "1CV-1\r"]);
     }
 
     /// devPM304.cc: INIT and a CR, PREM just ahead of the motion command,
