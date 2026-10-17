@@ -24,8 +24,8 @@
 //! 1, and its `EGU` is steps. Base/slew speeds cross the boundary in steps/s.
 //! The controller's acceleration parameter is the record's acceleration *time*
 //! scaled by 100 (C `NINT(mr->accl * 100)`); at the boundary the acceleration
-//! *rate* (steps/s²) is supplied instead, so the time is reconstructed as
-//! `velocity / acceleration`.
+//! *rate* (steps/s²) is supplied instead, so the time is reconstructed by
+//! inverting motorRecord's accEGUfromVelo, `(velocity - vbase) / acceleration`.
 //!
 //! ## Deviations from C (documented)
 //!
@@ -58,9 +58,9 @@ const STX: u8 = 0x02;
 pub const INPUT_EOS: &[u8] = b"\r\n";
 pub const OUTPUT_EOS: &[u8] = b"\r\n";
 
-/// Jog speed clamp (C `devSC800.cc` JOG validity check).
-const JOG_MIN: i32 = 1;
-const JOG_MAX: i32 = 4095500;
+/// Base/slew speed clamp (C `devSC800.cc` SET_VEL_BASE/SET_VELOCITY/JOG validity check).
+const SPEED_MIN: i32 = 1;
+const SPEED_MAX: i32 = 4095500;
 
 fn kohzu_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
@@ -177,19 +177,25 @@ struct Speeds {
 }
 
 /// Derive the programmable speeds from move parameters. Base/slew are the
-/// min/target velocities (steps/s). The controller's acceleration parameter is
-/// the acceleration *time* (`velocity / acceleration`) scaled by 100, matching
-/// C `NINT(mr->accl * 100)`; when it cannot be derived (non-positive velocity or
-/// acceleration) `prev_accel` is kept.
+/// min/target velocities (steps/s), clamped as SET_VEL_BASE/SET_VELOCITY do
+/// (devSC800.cc). The controller's acceleration parameter is C
+/// `NINT(mr->accl * 100)`, the ACCL that motorRecord's accEGUfromVelo turned
+/// into `acceleration`; when it cannot be derived (non-positive acceleration)
+/// `prev_accel` is kept.
 fn compute_speeds(min_velocity: f64, velocity: f64, acceleration: f64, prev_accel: i32) -> Speeds {
-    let accel = if velocity > 0.0 && acceleration > 0.0 {
-        nint(velocity / acceleration * 100.0)
+    let accel = if acceleration > 0.0 {
+        let rise = if velocity > min_velocity {
+            velocity - min_velocity
+        } else {
+            velocity
+        };
+        nint(rise / acceleration * 100.0)
     } else {
         prev_accel
     };
     Speeds {
-        base: nint(min_velocity),
-        slew: nint(velocity),
+        base: nint(min_velocity).clamp(SPEED_MIN, SPEED_MAX),
+        slew: nint(velocity).clamp(SPEED_MIN, SPEED_MAX),
         accel,
     }
 }
@@ -304,13 +310,17 @@ impl AsynMotor for KohzuAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        // C JOG: clamp the slew speed, cap base speed to it, program, then FRP
+        // C JOG: cap base speed to the slew speed, program, then FRP
         // with the direction polarity.
-        let polarity = if velocity > 0.0 { '1' } else { '0' };
+        // C takes the polarity from NINT(v), so |v| < 0.5 jogs reverse.
+        let polarity = if nint(velocity) > 0 { '1' } else { '0' };
         self.set_speeds(min_velocity, velocity.abs(), acceleration);
-        self.speeds.slew = self.speeds.slew.clamp(JOG_MIN, JOG_MAX);
         if self.speeds.base > self.speeds.slew {
             self.speeds.base = self.speeds.slew;
+        }
+        // C `NINT((jvel - vbas) / jar * 100)`, with no VBAS guard.
+        if acceleration > 0.0 {
+            self.speeds.accel = nint((velocity.abs() - min_velocity) / acceleration * 100.0);
         }
         self.write_move(&format!("FRP{}/2/0/0/{}/1", self.axis, polarity))
     }
@@ -323,7 +333,9 @@ impl AsynMotor for KohzuAxis {
         acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
-        // C HOME_FOR/HOME_REV both emit the same ORG sequence.
+        // C HOME_FOR/HOME_REV both emit the same ORG sequence. C leaves
+        // accl_rate at the raw SET_ACCEL rate (steps/s^2) where ASI takes
+        // the time; the move's time is used here instead.
         self.set_speeds(min_velocity, velocity, acceleration);
         self.write_move(&format!("ORG{}/2/0/0/3/1", self.axis))
     }
@@ -366,6 +378,18 @@ impl AsynMotor for KohzuAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        self.poll_status(None)
+    }
+
+    /// drvSC800.cc:278-282: a moving axis reports the record's CDIR.
+    fn poll_in_motion(&mut self, _user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
+        self.poll_status(Some(*cdir))
+    }
+}
+
+impl KohzuAxis {
+    /// C `set_status`; `cdir` is the record's while its move is held.
+    fn poll_status(&mut self, cdir: Option<bool>) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // Status: "C\tSTR<a>\t1\t<move>\t<norg>\t<orgg>\t<cw>\t<ccw>\t<swng>\t<err>"
@@ -396,11 +420,11 @@ impl AsynMotor for KohzuAxis {
                 f.get(2).and_then(|s| s.trim().parse::<i32>().ok())
             })
             .unwrap_or(self.prev_position);
-        let direction = if position != self.prev_position {
+        let direction = cdir.unwrap_or(if position != self.prev_position {
             position >= self.prev_position
         } else {
             self.last_status.direction
-        };
+        });
         self.prev_position = position;
 
         // Torque: "C\tRSY<a>\t21\t<torque>" (0 = enabled).
@@ -522,7 +546,7 @@ mod tests {
     fn prem_goes_ahead_of_the_move() {
         let (line, mut axis, _) = strings_rig("sc800Prem");
         let user = AsynUser::default();
-        let asi = "ASI1/10/100/10/10/0/0/0/0/0/0/0/0/0";
+        let asi = "ASI1/10/100/9/9/0/0/0/0/0/0/0/0/0";
         axis.set_move_strings(&user, b"COF1/0", None).unwrap();
         axis.move_absolute(&user, 5.0, 10.0, 100.0, 1000.0).unwrap();
         assert_eq!(sent(&line), ["COF1/0", asi, "APS1/2/0/0/5/0/0/1"]);
@@ -534,6 +558,11 @@ mod tests {
         axis.set_move_strings(&user, b"COF1/0", None).unwrap();
         axis.move_velocity(&user, 10.0, -100.0, 1000.0).unwrap();
         assert_eq!(sent(&line), ["COF1/0", asi, "FRP1/2/0/0/0/1"]);
+        axis.move_velocity(&user, 0.0, 0.4, 1000.0).unwrap();
+        assert!(
+            sent(&line).last().unwrap().ends_with("/0/1"),
+            "NINT(0.4) = 0"
+        );
     }
 
     /// drvSC800.cc:325-332: POST once the move is done, not while it runs.
@@ -566,6 +595,22 @@ mod tests {
         assert_eq!(poll_extra(&line, &mut axis), ["COF1/1"]);
     }
 
+    /// drvSC800.cc:278-282: a held move reports its record's CDIR, and the
+    /// direction stays there at rest until the position moves.
+    #[test]
+    fn a_held_move_reports_the_record_cdir() {
+        let (_line, mut axis, state) = strings_rig("sc800Cdir");
+        let user = AsynUser::default();
+        state.store(MOVING | CCW, Ordering::SeqCst);
+        let mut cdir = false;
+        let s = axis.poll_in_motion(&user, &mut cdir).unwrap();
+        assert!(!s.direction && !cdir);
+        let mut cdir = true;
+        assert!(axis.poll_in_motion(&user, &mut cdir).unwrap().direction);
+        state.store(0, Ordering::SeqCst);
+        assert!(axis.poll(&user).unwrap().direction, "kept at rest");
+    }
+
     #[test]
     fn framed_prefixes_stx() {
         let f = KohzuController::framed("APS1/2/0/0/500/0/0/1");
@@ -575,12 +620,16 @@ mod tests {
 
     #[test]
     fn speeds_reconstruct_accel_time() {
-        // velocity 1000 steps/s, acceleration 5000 steps/s² → accel time 0.2 s
-        // → accel param NINT(0.2 * 100) = 20.
-        let s = compute_speeds(100.0, 1000.0, 5000.0, 100);
+        // accEGUfromVelo inverted: (1000 - 100) / 4500 = ACCL 0.2 s → 20.
+        let s = compute_speeds(100.0, 1000.0, 4500.0, 100);
         assert_eq!(s.slew, 1000);
         assert_eq!(s.base, 100);
         assert_eq!(s.accel, 20);
+        // VELO <= VBAS: the record's rate is VELO / ACCL.
+        assert_eq!(compute_speeds(100.0, 100.0, 500.0, 0).accel, 20);
+        // devSC800.cc SET_VEL_BASE/SET_VELOCITY clamp to [1, 4095500].
+        let s = compute_speeds(0.0, 5e6, 5000.0, 100);
+        assert_eq!((s.base, s.slew), (1, 4_095_500));
         // Non-positive acceleration keeps the previous accel parameter.
         let s = compute_speeds(100.0, 1000.0, 0.0, 42);
         assert_eq!(s.accel, 42);
