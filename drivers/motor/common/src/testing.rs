@@ -187,6 +187,33 @@ pub fn pollers() -> usize {
         .count()
 }
 
+/// Set in the child [`child_stdout`] runs.
+const CHILD: &str = "MOTOR_TESTING_CHILD";
+
+/// Whether this is the child [`child_stdout`] started.
+pub fn in_child() -> bool {
+    std::env::var_os(CHILD).is_some()
+}
+
+/// Run test `test` of `module` (its `module_path!()`) again as a child of
+/// this binary and return its stdout, where a C `printf` at iocInit lands:
+/// no iocsh redirect reaches it.
+pub fn child_stdout(module: &str, test: &str) -> String {
+    let module = module.split_once("::").map_or("", |(_, m)| m);
+    let name = format!("{module}::{test}");
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
 /// Run `cmd` with `args` as the shell does, on a thread of its own.
 pub async fn run_command(
     cmd: epics_rs::base::server::iocsh::registry::CommandDef,
