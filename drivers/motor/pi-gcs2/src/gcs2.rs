@@ -513,15 +513,16 @@ impl PIGCS2Controller {
         if self.model.is_hexapod() {
             let _ = self.get_global_state();
         }
-        // PICoordinateSystem::getActivate/getLink; every other class's
-        // leaves both empty. C defect not copied: a failed query hands on
-        // its uninitialized reply buffer; rs posts it empty.
+        // PICoordinateSystem::getActivate/getLink, which post their buffer
+        // whatever the status; every other class's leaves both empty. C
+        // defect not copied: a write that fails leaves the buffer
+        // uninitialized; rs posts it empty.
         let (mut activate, mut link) = (String::new(), String::new());
         if self.model == Model::CoordinateSystem {
-            activate = self.query("KEN?").unwrap_or_default().replace('\n', "");
+            activate = self.query_buffer("KEN?").0.replace('\n', "");
             link = self
-                .query("KLN?")
-                .unwrap_or_default()
+                .query_buffer("KLN?")
+                .0
                 .replace('\n', "")
                 .replace('\t', " ");
         }
@@ -750,19 +751,27 @@ impl PIGCS2Controller {
     /// Write a command and read one reply line (C `sendAndReceive`),
     /// trimmed of any stray CR/NUL.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.send_and_receive(cmd)?;
-        Ok(String::from_utf8_lossy(&raw)
+        let (reply, status) = self.query_buffer(cmd);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::query`]'s text, kept when the exchange fails, as C's buffer
+    /// is.
+    fn query_buffer(&self, cmd: &str) -> (String, AsynResult<()>) {
+        let (raw, status) = self.send_and_receive_buffer(cmd);
+        let reply = String::from_utf8_lossy(&raw)
             .trim_end_matches(['\r', '\0'])
-            .to_string())
+            .to_string();
+        (reply, status)
     }
 
     /// C `sendAndReceive(const char*)`: the command, then a writeRead of its
     /// `\n`. Either write falling short is asynError. PI GCS marks a
     /// non-final reply line with a trailing space: each line after one is a
     /// plain read, joined on `\n`, whose failure C does not print. A failed
-    /// read still ends in the `received` line, and the last read's status is
-    /// the result.
-    fn send_and_receive(&self, cmd: &str) -> AsynResult<Vec<u8>> {
+    /// read still ends in the `received` line; the buffer comes back with
+    /// the last read's status.
+    fn send_and_receive_buffer(&self, cmd: &str) -> (Vec<u8>, AsynResult<()>) {
         self.trace(
             TraceMask::IO_DRIVER,
             format_args!("PIInterface::sendAndReceive() sending \"{cmd}\"\n"),
@@ -775,13 +784,21 @@ impl PIGCS2Controller {
         };
         match self.handle.write_octet(0, cmd.as_bytes()) {
             Ok(n) if n == cmd.len() => {}
-            Ok(_) => return Err(short_write(0, "")),
-            Err(e) => return Err(short_write(e.status() as i32, &e.message())),
+            Ok(_) => return (Vec::new(), Err(short_write(0, ""))),
+            Err(e) => {
+                return (
+                    Vec::new(),
+                    Err(short_write(e.status() as i32, &e.message())),
+                );
+            }
         }
         let read = self.handle.write_read(0, TERMINATOR, READ_BUF);
         if let Err(e) = &read {
             if e.octet_step() != Some(OctetStep::Read) {
-                return Err(short_write(e.status() as i32, &e.message()));
+                return (
+                    Vec::new(),
+                    Err(short_write(e.status() as i32, &e.message())),
+                );
             }
             self.trace(IO_ERROR, format_args!(
                 "PIGCSController:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
@@ -796,6 +813,12 @@ impl PIGCS2Controller {
             status = append_read(&mut reply, self.handle.read_octet(0, READ_BUF));
         }
         self.trace_received(&reply);
+        (reply, status)
+    }
+
+    /// [`Self::send_and_receive_buffer`]'s reply, or its error.
+    fn send_and_receive(&self, cmd: &str) -> AsynResult<Vec<u8>> {
+        let (reply, status) = self.send_and_receive_buffer(cmd);
         status.map(|()| reply)
     }
 
@@ -3212,6 +3235,26 @@ mod tests {
         let read = |reason| port.get_string_param_blocking(reason, 0, 255).unwrap();
         assert_eq!(read(p.cs_activate), b"KS1");
         assert_eq!(read(p.cs_link), b"KS1 KS2 ZERO");
+    }
+
+    /// A failed `KEN?`/`KLN?` still posts what its buffer holds: here each
+    /// reply's first line, whose continuation read times out.
+    #[test]
+    fn a_failed_coordinate_system_query_posts_what_it_read() {
+        let (_line, io) =
+            motor_common::testing::LineRig::queued("gcs2CsCutLine", |cmd| match cmd {
+                "KEN?" => vec!["KS1 ".into()],
+                "KLN?" => vec!["KS1\tKS2 ".into()],
+                cmd => vec![hexapod_reply(cmd)],
+            });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2CsCutLine");
+        ctrl.set_model(Model::CoordinateSystem);
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let (port, p, _) = controller_port("gcs2CsCut", &ctrl, "X");
+        ctrl.lock().unwrap().poll();
+        let read = |reason| port.get_string_param_blocking(reason, 0, 255).unwrap();
+        assert_eq!(read(p.cs_activate), b"KS1 ");
+        assert_eq!(read(p.cs_link), b"KS1 KS2 ");
     }
 
     /// `PIasynController::writeOctet` (PIasynController.cpp:430-465): a
