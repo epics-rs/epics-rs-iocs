@@ -13,7 +13,7 @@ use epics_rs::base::server::record::DevSup;
 
 use motor_common::connect::connect_serial;
 use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
-use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1::{Model1, Model1Cards, SCAN_RATE, c_int};
 use motor_common::model1_device;
 
 use crate::pm304::{Pm304Axis, Pm304Controller};
@@ -27,8 +27,23 @@ static DEV_PM304: DevSup = model1_device("devPM304", "Mclennan PM304");
 /// `PM304_NUM_CARDS` (drvPM304.h:27).
 static PM304: Model1 = Model1::new(&DEV_PM304, 4, SCAN_RATE);
 
+/// drvPM304's drvet `report` (drvPM304.cc:149-162): a card whose
+/// `motor_init` failed prints nothing.
+fn pm304_report(cards: &Model1Cards<'_>) -> String {
+    if cards.num_cards() <= 0 {
+        return "    NO PM304 controllers found\n".into();
+    }
+    (0..cards.num_cards())
+        .filter_map(|card| {
+            let ident = cards.card(card)?;
+            Some(format!("    PM304 controller {card}, id: {ident} \n"))
+        })
+        .collect()
+}
+
 /// `PM304Setup(num_cards, scan_rate)`.
 pub fn pm304_setup_command() -> CommandDef {
+    PM304.register_report("drvPM304", pm304_report);
     PM304.setup_command("PM304Setup")
 }
 
@@ -58,6 +73,7 @@ pub fn pm304_config_command() -> CommandDef {
             let controller =
                 Pm304Controller::new(handle, n_axes).map_err(|e| format!("PM304Config: {e}"))?;
             let num_axes = controller.num_axes();
+            let ident = controller.ident().to_string();
             let controller = Arc::new(Mutex::new(controller));
 
             for index in 0..num_axes {
@@ -65,7 +81,37 @@ pub fn pm304_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 PM304.install(ctx, card, index as i32, motor)?;
             }
+            PM304.describe(card, ident);
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, run_command};
+
+    /// drvPM304.cc's drvet `report` (drvPM304.cc:149-162), which `dbior`
+    /// runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pm304_card() {
+        let setup = pm304_setup_command();
+        assert_eq!(
+            driver_report("drvPM304", 0),
+            "    NO PM304 controllers found\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("pm304RepLine", |cmd| match cmd {
+            "1ID\r" => "Mclennan PM304 v1".into(),
+            _ => "OK".into(),
+        });
+        let config = vec![int(1), ArgValue::String("pm304RepLine".into()), int(1)];
+        run_command(pm304_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvPM304", 0),
+            "    PM304 controller 1, id: Mclennan PM304 v1 \n"
+        );
+    }
 }
