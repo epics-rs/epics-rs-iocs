@@ -15,21 +15,22 @@
 //!   (`NetFinder.cpp`).
 //! * [`transport`] -- the Ethernet/UDP transport (`DppSocket.cpp`'s
 //!   `DppInterfaceEthernet` path).
+//! * [`usb`] -- the USB transport (`DppLibUsb.cpp` and `ConsoleHelper.cpp`'s
+//!   `LibUsb_*`) over a [`usb::UsbBus`], on nusb with the default `usb`
+//!   feature.
 //! * [`driver`] -- the asyn `PortDriver` implementation
 //!   (`drvAmptek.cpp`/`drvAmptek.h`).
 //!
-//! **Not ported** (feasibility-gated, see the crate's port report rather
-//! than this doc for the full determination):
-//! * USB (`DppLibUsb.cpp`, `libusb`-based) -- needs a Rust USB crate
-//!   (`rusb`/`nusb`) not currently in this workspace.
-//! * Serial (`DppInterfaceSerial`) -- unimplemented even in the upstream
-//!   C driver itself (`ConnectDpp`'s and `SendCommand`'s serial branches
-//!   are both empty no-ops), so there is nothing to port.
+//! Serial (`DppInterfaceSerial`) is unimplemented in the C driver itself
+//! (`ConnectDpp`'s and `SendCommand`'s serial branches are empty), so a
+//! Serial port is built as C builds it and never connects.
 
 pub mod ascii_cmd;
 pub mod config;
 pub mod driver;
+mod link;
 pub mod net_finder;
 pub mod protocol;
 pub mod status;
 pub mod transport;
+pub mod usb;
