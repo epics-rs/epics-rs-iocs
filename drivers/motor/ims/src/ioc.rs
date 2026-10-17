@@ -93,6 +93,12 @@ static IM483PL: Model1 = Model1::new(&DEV_IM483PL, IM483PL_NUM_CARDS, SCAN_RATE)
 
 /// `IM483PLSetup(num_cards, scan_rate)`.
 pub fn im483pl_setup_command() -> CommandDef {
+    IM483PL.register_report("drvIM483PL", |cards| {
+        cards.report("IM483PL", |card, port| {
+            // C clears `ident`: no identification message (drvIM483PL.cc:541).
+            format!("    IM483PL controller #{card}, port={port}, id:  \n")
+        })
+    });
     IM483PL.setup_command("IM483PLSetup")
 }
 
@@ -129,6 +135,9 @@ pub fn im483pl_config_command() -> CommandDef {
                     signal,
                 )));
                 IM483PL.install(ctx, card, signal as i32, motor)?;
+            }
+            if axes > 0 {
+                IM483PL.describe(card, asyn_port);
             }
             Ok(CommandOutcome::Continue)
         },
@@ -249,5 +258,32 @@ mod one_poller {
         let cmd = ims_create_controller_command();
         assert_eq!(pollers_after(cmd, args).await, 1);
         assert!(!line.sent().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, run_command};
+
+    /// drvIM483PL.cc's drvet `report` (drvIM483PL.cc:147-171), which `dbior`
+    /// runs; the IM483PL has no identification message.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_im483pl_card() {
+        let setup = im483pl_setup_command();
+        assert_eq!(
+            driver_report("drvIM483PL", 0),
+            "    No IM483PL controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("im483plRepLine", |_| "0".into());
+        let config = vec![int(1), ArgValue::String("im483plRepLine".into())];
+        run_command(im483pl_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvIM483PL", 0),
+            "    IM483PL controller 0 connection failed.\n    IM483PL controller #1, \
+             port=im483plRepLine, id:  \n"
+        );
     }
 }
