@@ -13,9 +13,12 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
+use epics_rs::motor::devices::{
+    motor_interface_device, register_motor_interface_device, register_motor_interface_driver,
+};
 use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_int, req_string};
-use motor_common::model1::{Model1, c_int};
-use motor_common::{asyn_user, install, model1_device, register_port};
+use motor_common::model1::c_int;
+use motor_common::{TraceUser, asyn_user, install, register_port};
 
 use crate::motorsim::{
     DEFAULT_HI_LIMIT, DEFAULT_HOME, DEFAULT_LOW_LIMIT, DEFAULT_START, DrvMotorSimAxis, MotorSimAxis,
@@ -27,16 +30,18 @@ const POLL_MS: u64 = 100;
 
 /// `device(motor,VME_IO,devMotorSim,"Motor Simulation")`
 /// (motorSimSupport.dbd:1).
-static DEV_MOTOR_SIM: DevSup = model1_device("devMotorSim", "Motor Simulation");
+static DEV_MOTOR_SIM: DevSup = motor_interface_device("devMotorSim", "Motor Simulation");
 
-/// drvMotorSim.c has no `Setup`; its task calls back every `DELTA`.
-static MOTOR_SIM: Model1 = Model1::new(&DEV_MOTOR_SIM, i32::MAX, (1000 / POLL_MS) as i32);
+/// `driver(motorSim)`: the drvet a record's `OUT "#C card S signal
+/// @motorSim"` names.
+const DRIVER: &str = "motorSim";
 
 /// `motorSimCreate(card, signal, lowLimit, hiLimit, home, nCards, nSignals,
 /// startPosn)`: axes `signal..signal+nSignals` of cards `card..card+nCards`
 /// for `DTYP "Motor Simulation"`, `OUT "#C card S signal @motorSim"`.
 pub fn motor_sim_create_command() -> CommandDef {
-    MOTOR_SIM.register_row();
+    register_motor_interface_device(&DEV_MOTOR_SIM);
+    register_motor_interface_driver(DRIVER);
     let created: Mutex<HashSet<(i32, i32)>> = Mutex::new(HashSet::new());
     CommandDef::new(
         "motorSimCreate",
@@ -75,7 +80,18 @@ pub fn motor_sim_create_command() -> CommandDef {
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
                         DrvMotorSimAxis::new(low as f64, hi as f64, home as f64),
                     ));
-                    MOTOR_SIM.install(ctx, c, s, motor)?;
+                    let user = TraceUser::MotorInterface {
+                        device: DEV_MOTOR_SIM.choice,
+                        driver: DRIVER,
+                        card: c,
+                        signal: s,
+                    };
+                    // motorProcTask calls back every DELTA, moving or idle
+                    // (drvMotorSim.c:660-690). C devMotorSim's callback
+                    // scanOnce's from init_record, before scanInit, and
+                    // segfaults (a C defect); here a callback before the
+                    // gate only sets needUpdate.
+                    install(ctx, user, motor, POLL_MS, POLL_MS, 0)?;
                     println!("Created motor for card {c}, signal {s} OK");
                 }
             }
