@@ -1203,7 +1203,7 @@ async fn publish_image(
     }
     // C prints and drops a refused alloc before it counts
     // (serval_stream.cpp:177-183, :808-814).
-    let Ok(mut array) = ctx.pool.wrap(
+    let Ok(mut array) = ctx.pool.alloc_with(
         vec![NDDimension::new(width), NDDimension::new(height)],
         NDDataBuffer::U32(pixels),
     ) else {
@@ -1391,6 +1391,57 @@ mod tests {
                 .unwrap();
             assert_eq!(array.unique_id, frame_number);
         }
+        std::mem::forget(runtime);
+    }
+
+    /// serval_stream.cpp:177-183 allocates the frame with a NULL pData, so a
+    /// frame over the pool's maxMemory is refused before it is counted.
+    #[tokio::test]
+    async fn a_frame_over_the_pool_limit_is_refused() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let driver =
+            crate::driver::TimePix3Driver::new("TPXPOOL", http.clone(), shared.clone(), 0, cmd_tx)
+                .unwrap();
+        let (p, ad) = (driver.p, driver.ad.params);
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("TPXPOOL").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let mut output = NDArrayOutput::new();
+        let (tx, mut rx) = ndarray_channel("TPXPOOL_SINK", 4);
+        output.add(tx);
+        let ctx = Arc::new(Ctx {
+            handle: runtime.port_handle().clone(),
+            http,
+            shared,
+            p,
+            ad,
+            output: Arc::new(parking_lot::Mutex::new(output)),
+            pool: DriverPool::standalone(4),
+        });
+        ctx.set_int(ad.base.array_callbacks, 0, 1).await;
+
+        publish_image(&ctx, 1, 2, 1, vec![1, 2], "refused\n").await;
+        assert_eq!(
+            ctx.handle
+                .read_int32(ad.base.array_counter, 0)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err()
+        );
         std::mem::forget(runtime);
     }
 }
