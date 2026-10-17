@@ -1,5 +1,5 @@
-//! The blocking HTTP client for Serval (port of `serval_http.cpp`'s
-//! `ADTimePix3ServalHttp` helpers, serval_http.cpp:63-89).
+//! The blocking HTTP client for Serval (port of the `ADTimePix3ServalHttp`
+//! helpers, serval_http_client.cpp).
 //!
 //! C uses cpr (libcurl); this uses `ureq`. Serval is plain HTTP, so no TLS
 //! stack is linked.
@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-/// The timeout C passes to its polling GETs (`SERVAL_TIMEOUT_MS`).
-pub const TIMEOUT_POLL: Duration = Duration::from_secs(5);
-/// The timeout C passes to the two configuration PUTs.
-pub const TIMEOUT_CONFIG: Duration = Duration::from_secs(10);
+/// C `kDefaultTimeoutMs` (serval_http.h:18), what a helper call without a
+/// timeout argument gets.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(10000);
+/// The 5000 ms C passes explicitly at its short polls.
+pub const TIMEOUT_5000_MS: Duration = Duration::from_millis(5000);
 
 #[derive(Debug)]
 pub enum HttpError {
@@ -107,7 +108,7 @@ impl ServalHttp {
         let agent = ureq::Agent::config_builder()
             // The driver inspects status codes itself.
             .http_status_as_error(false)
-            .timeout_global(Some(TIMEOUT_POLL))
+            .timeout_global(Some(DEFAULT_TIMEOUT))
             .build()
             .new_agent();
         Self {
@@ -122,18 +123,37 @@ impl ServalHttp {
         &self.base
     }
 
-    /// GET, returning the body.
-    ///
-    /// UPSTREAM DEFECT (serval_http.cpp:37): every C `get()` appends the query
-    /// string `?anon=true&key=value` — cpr sample-code parameters that mean
-    /// nothing to Serval. They are not sent here.
-    ///
-    /// UPSTREAM DEFECT (serval_http.cpp:185, 569, 1490, 2199, 2254): several C
-    /// calls pass no timeout at all and can park the calling thread forever.
-    /// Every request here carries one.
+    /// C `get`: GET with the query `?anon=true&key=value` (`kServalParams`).
     pub fn get(&self, path: &str, timeout: Duration) -> HttpResult<String> {
+        self.get_with(path, timeout, true, false)
+    }
+
+    /// C `getAuthOnly`: GET with no query parameters.
+    pub fn get_auth_only(&self, path: &str, timeout: Duration) -> HttpResult<String> {
+        self.get_with(path, timeout, false, false)
+    }
+
+    /// C `getJson`: GET with no query parameters and a
+    /// `Content-Type: application/json` header.
+    pub fn get_json(&self, path: &str, timeout: Duration) -> HttpResult<String> {
+        self.get_with(path, timeout, false, true)
+    }
+
+    fn get_with(
+        &self,
+        path: &str,
+        timeout: Duration,
+        serval_params: bool,
+        json_header: bool,
+    ) -> HttpResult<String> {
         let url = format!("{}{path}", self.base);
-        let mut req = self.agent.get(&url).header("Accept", "application/json");
+        let mut req = self.agent.get(&url);
+        if serval_params {
+            req = req.query("anon", "true").query("key", "value");
+        }
+        if json_header {
+            req = req.header("Content-Type", "application/json");
+        }
         if let Some(auth) = &self.auth {
             req = req.header("Authorization", auth);
         }
@@ -152,13 +172,6 @@ impl ServalHttp {
             return Err(HttpError::Status { url, code, body });
         }
         Ok(body)
-    }
-
-    /// GET and parse the body as JSON.
-    pub fn get_json(&self, path: &str, timeout: Duration) -> HttpResult<Value> {
-        let body = self.get(path, timeout)?;
-        serde_json::from_str(&body)
-            .map_err(|e| HttpError::Parse(format!("GET {path}: unparseable json: {e}")))
     }
 
     /// PUT a JSON body, returning the reply body.
@@ -192,6 +205,13 @@ impl ServalHttp {
         }
         Ok(reply)
     }
+}
+
+/// A request line without the query `get` adds, which Serval ignores: what
+/// the test Servals route on.
+#[cfg(test)]
+pub(crate) fn without_serval_params(request_line: &str) -> String {
+    request_line.replacen("?anon=true&key=value", "", 1)
 }
 
 /// C `servalCredentials` (serval_http_client.cpp:21-35): read once from
@@ -341,5 +361,70 @@ mod tests {
         let seen: Vec<_> = rx.iter().take(4).collect();
         let basic = Some(basic_auth_header("u", "p"));
         assert_eq!(seen, [basic.clone(), basic, None, None]);
+    }
+
+    /// Each helper's query and headers as serval_http_client.cpp sends them:
+    /// only `get` carries `kServalParams`, only `getJson`/`putJson` carry
+    /// `kJsonHeader`, and none overrides curl's `Accept: */*`.
+    #[test]
+    fn each_helper_sends_c_query_and_headers() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<String>)>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut headers = Vec::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let line = line.trim().to_ascii_lowercase();
+                    if let Some(n) = line.strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap();
+                    }
+                    if line.starts_with("accept:") || line.starts_with("content-type:") {
+                        headers.push(line);
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let _ = tx.send((request.trim().to_owned(), headers));
+                let _ = reader.get_mut().write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        let http = ServalHttp::with_credentials(&url, None);
+        http.get("/a", DEFAULT_TIMEOUT).unwrap();
+        http.get("", DEFAULT_TIMEOUT).unwrap();
+        http.get_auth_only("/b?x=1", DEFAULT_TIMEOUT).unwrap();
+        http.get_json("/c", DEFAULT_TIMEOUT).unwrap();
+        http.put_json("/d", &serde_json::json!({}), DEFAULT_TIMEOUT)
+            .unwrap();
+        let seen: Vec<_> = rx.iter().take(5).collect();
+        let accept = "accept: */*".to_owned();
+        let json = "content-type: application/json".to_owned();
+        assert_eq!(
+            seen,
+            [
+                (
+                    "GET /a?anon=true&key=value HTTP/1.1".into(),
+                    vec![accept.clone()]
+                ),
+                (
+                    "GET /?anon=true&key=value HTTP/1.1".into(),
+                    vec![accept.clone()]
+                ),
+                ("GET /b?x=1 HTTP/1.1".into(), vec![accept.clone()]),
+                ("GET /c HTTP/1.1".into(), vec![accept.clone(), json.clone()]),
+                ("PUT /d HTTP/1.1".into(), vec![accept, json]),
+            ]
+        );
     }
 }

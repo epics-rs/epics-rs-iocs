@@ -19,7 +19,9 @@ use crate::calibration::{PathAccess, PathPolicy};
 use crate::coordinator::{Phase, Resource};
 use crate::destination;
 use crate::family::DetectorFamily;
-use crate::http::{HttpError, HttpResult, ServalHttp, TIMEOUT_CONFIG, TIMEOUT_POLL, decode_base64};
+use crate::http::{
+    DEFAULT_TIMEOUT, HttpError, HttpResult, ServalHttp, TIMEOUT_5000_MS, decode_base64,
+};
 use crate::mask::{self, Geometry, PIXEL_CONFIG_BYTES};
 use crate::params::TimePixParams;
 use crate::serval;
@@ -700,7 +702,7 @@ impl TimePix3Driver {
             status: AsynStatus::Error,
             message: format!("timepix3: {what} /detector/config: {message}"),
         };
-        let current = match self.http.get(serval::DETECTOR_CONFIG, TIMEOUT_CONFIG) {
+        let current = match self.http.get(serval::DETECTOR_CONFIG, DEFAULT_TIMEOUT) {
             Ok(body) => body,
             Err(e) => {
                 // serval_http.cpp:2449-2458.
@@ -823,7 +825,7 @@ impl TimePix3Driver {
 
         let reply = self
             .http
-            .put_json(serval::DETECTOR_CONFIG, &body, TIMEOUT_CONFIG);
+            .put_json(serval::DETECTOR_CONFIG, &body, DEFAULT_TIMEOUT);
         // serval_http.cpp:2626-2648.
         let code = reply.as_ref().map_or_else(HttpError::code, |_| 200);
         self.ad.port_base.set_int32_param(p.http_code, 0, code)?;
@@ -853,7 +855,7 @@ impl TimePix3Driver {
     /// C re-reads PixelDepth and GainMode after a rejected Medipix3 PUT so the
     /// setpoints match Serval (serval_http.cpp:2632-2647).
     fn resync_mpx3_setpoints(&mut self) -> AsynResult<()> {
-        let Ok(body) = self.http.get(serval::DETECTOR_CONFIG, TIMEOUT_CONFIG) else {
+        let Ok(body) = self.http.get(serval::DETECTOR_CONFIG, DEFAULT_TIMEOUT) else {
             return Ok(());
         };
         let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&body) else {
@@ -883,7 +885,10 @@ impl TimePix3Driver {
             status: AsynStatus::Error,
             message: format!("timepix3: GET /measurement/config: {message}"),
         };
-        let body = match self.http.get(serval::MEASUREMENT_CONFIG, TIMEOUT_POLL) {
+        let body = match self
+            .http
+            .get_json(serval::MEASUREMENT_CONFIG, TIMEOUT_5000_MS)
+        {
             Ok(body) => body,
             Err(e) => {
                 let message = serval::ConfigResponseError::HttpFailure.message();
@@ -937,7 +942,7 @@ impl TimePix3Driver {
         // WriteMsg is the PUT's reply body, accepted or not (serval_http.cpp:2308-2309).
         let e = match self
             .http
-            .put_json(serval::MEASUREMENT_CONFIG, &body, TIMEOUT_CONFIG)
+            .put_json(serval::MEASUREMENT_CONFIG, &body, DEFAULT_TIMEOUT)
         {
             Ok(reply) => {
                 self.http_ok();
@@ -973,7 +978,9 @@ impl TimePix3Driver {
 
     /// C `getMeasurementConfig` (serval_http.cpp:2198-2232).
     pub(crate) fn get_measurement_config(&mut self) -> AsynResult<()> {
-        let reply = self.http.get(serval::MEASUREMENT_CONFIG, TIMEOUT_POLL);
+        let reply = self
+            .http
+            .get_json(serval::MEASUREMENT_CONFIG, TIMEOUT_5000_MS);
         let snapshot = match &reply {
             Ok(body) => serval::parse_config_readback(body),
             Err(_) => Err(serval::ConfigReadbackError::HttpFailure),
@@ -1346,7 +1353,7 @@ impl TimePix3Driver {
         println!("server={}", serval::dump_indent3_ascii(&server));
         let reply = self
             .http
-            .put_json(serval::SERVER_DESTINATION, &server, TIMEOUT_CONFIG);
+            .put_json(serval::SERVER_DESTINATION, &server, DEFAULT_TIMEOUT);
         // serval_http.cpp:2182-2183.
         self.write_msg_from(&reply);
         reply.map_err(|e| {
@@ -1367,7 +1374,7 @@ impl TimePix3Driver {
     /// C `getServer` (serval_http.cpp:1583-1653): an unset destination reads
     /// as no channels; any other refused reply leaves the readbacks alone.
     pub(crate) fn get_server(&mut self) -> AsynResult<()> {
-        let reply = self.http.get(serval::SERVER_DESTINATION, TIMEOUT_POLL);
+        let reply = self.http.get(serval::SERVER_DESTINATION, TIMEOUT_5000_MS);
         let (code, body) = match &reply {
             Ok(body) => (200, body.as_str()),
             Err(e) => (e.code(), e.body()),
@@ -1444,7 +1451,7 @@ impl TimePix3Driver {
             status: AsynStatus::Error,
             message: format!("timepix3: writeDac {what} {path}: {message}"),
         };
-        let body = match self.http.get(&path, TIMEOUT_CONFIG) {
+        let body = match self.http.get(&path, DEFAULT_TIMEOUT) {
             Ok(body) => body,
             Err(e) => {
                 let base = &mut self.ad.port_base;
@@ -1483,7 +1490,7 @@ impl TimePix3Driver {
             }
         };
 
-        let reply = self.http.put_json(&path, &dacs, TIMEOUT_CONFIG);
+        let reply = self.http.put_json(&path, &dacs, DEFAULT_TIMEOUT);
         let e = match reply {
             Ok(text) => {
                 let base = &mut self.ad.port_base;
@@ -1507,7 +1514,7 @@ impl TimePix3Driver {
         // value validated before the PUT.
         let restored = match self
             .http
-            .get(&path, TIMEOUT_CONFIG)
+            .get(&path, DEFAULT_TIMEOUT)
             .ok()
             .and_then(|body| serval::prepare_dac_update(&body, name, value).ok())
         {
@@ -1543,13 +1550,15 @@ impl TimePix3Driver {
             status: AsynStatus::Error,
             message: format!("timepix3: orientation {orientation} is not one of the eight"),
         })?;
-        self.http.get(&path, TIMEOUT_CONFIG).map_err(|e| {
-            self.http_failed(
-                "GET /detector/layout/rotate",
-                &e,
-                HttpPrint::Failure("rotateLayout", "GET", &path),
-            )
-        })?;
+        self.http
+            .get_auth_only(&path, DEFAULT_TIMEOUT)
+            .map_err(|e| {
+                self.http_failed(
+                    "GET /detector/layout/rotate",
+                    &e,
+                    HttpPrint::Failure("rotateLayout", "GET", &path),
+                )
+            })?;
         self.http_ok();
         self.shared.set_orientation(orientation);
         Ok(())
@@ -1581,7 +1590,7 @@ impl TimePix3Driver {
             }
         };
         let url = serval::config_load(format, &file.to_string_lossy());
-        let reply = self.http.get(&url, TIMEOUT_CONFIG);
+        let reply = self.http.get_auth_only(&url, DEFAULT_TIMEOUT);
         let (code, text) = match &reply {
             Ok(text) => (200, text.as_str()),
             Err(e) => (e.code(), e.body()),
@@ -1754,7 +1763,7 @@ impl TimePix3Driver {
 
         for chip in 0..geom.num_chips {
             let path = serval::chip_pixel_config(i32::try_from(chip).unwrap_or(0));
-            let reply = self.http.get(&path, TIMEOUT_POLL).map_err(|e| {
+            let reply = self.http.get(&path, TIMEOUT_5000_MS).map_err(|e| {
                 let err = self.http_failed(&format!("GET {path}"), &e, HttpPrint::None);
                 self.ad.port_base.trace_print(
                     TraceMask::ERROR,
@@ -1948,12 +1957,12 @@ impl TimePix3Driver {
             "GET",
             serval::MEASUREMENT_STOP,
         );
-        if let Err(e) = self.http.get(serval::MEASUREMENT_STOP, TIMEOUT_POLL)
+        if let Err(e) = self.http.get(serval::MEASUREMENT_STOP, DEFAULT_TIMEOUT)
             && e.code() != 404
         {
             self.log_http(&e, prior_stop);
         }
-        let measurement = match self.http.get(serval::MEASUREMENT, TIMEOUT_POLL) {
+        let measurement = match self.http.get(serval::MEASUREMENT, DEFAULT_TIMEOUT) {
             Ok(body) if !body.is_empty() => match serval::parse_status_response(&body) {
                 Ok(m) => Some(m),
                 Err(e) => {
@@ -1989,7 +1998,7 @@ impl TimePix3Driver {
                     )
                 ),
             );
-            if let Err(e) = self.http.get(serval::MEASUREMENT_STOP, TIMEOUT_POLL) {
+            if let Err(e) = self.http.get(serval::MEASUREMENT_STOP, DEFAULT_TIMEOUT) {
                 self.log_http(&e, prior_stop);
             }
         }
@@ -2001,7 +2010,7 @@ impl TimePix3Driver {
         {
             return Err("Acquisition start was cancelled");
         }
-        if let Err(e) = self.http.get(serval::MEASUREMENT_START, TIMEOUT_CONFIG) {
+        if let Err(e) = self.http.get(serval::MEASUREMENT_START, DEFAULT_TIMEOUT) {
             self.log_http(
                 &e,
                 HttpPrint::Failure(
@@ -2153,7 +2162,7 @@ impl TimePix3Driver {
         let mut remote_stopped = !had_remote;
         let mut measurement_valid = false;
         if had_remote {
-            match self.http.get(serval::MEASUREMENT_STOP, TIMEOUT_POLL) {
+            match self.http.get(serval::MEASUREMENT_STOP, DEFAULT_TIMEOUT) {
                 Ok(_) => {
                     stop_succeeded = true;
                     // acquisition_runtime.cpp:207: Serval closes the streams
@@ -2180,7 +2189,7 @@ impl TimePix3Driver {
         self.shared
             .stop_and_join_stream_workers(&mut self.ad.port_base);
         if had_remote {
-            match self.http.get(serval::MEASUREMENT, TIMEOUT_POLL) {
+            match self.http.get(serval::MEASUREMENT, DEFAULT_TIMEOUT) {
                 Ok(body) => match serval::parse_status_response(&body) {
                     Ok(m) => {
                         measurement_valid = true;
@@ -3521,6 +3530,7 @@ mod tests {
                 let mut reader = BufReader::new(stream);
                 let (mut request, mut length) = (String::new(), 0);
                 let _ = reader.read_line(&mut request);
+                request = crate::http::without_serval_params(&request);
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
@@ -3714,6 +3724,7 @@ mod tests {
                 let mut reader = BufReader::new(stream);
                 let (mut request, mut length) = (String::new(), 0);
                 let _ = reader.read_line(&mut request);
+                request = crate::http::without_serval_params(&request);
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
@@ -4524,6 +4535,7 @@ mod tests {
                 let mut reader = BufReader::new(stream);
                 let (mut request, mut length) = (String::new(), 0);
                 let _ = reader.read_line(&mut request);
+                request = crate::http::without_serval_params(&request);
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {

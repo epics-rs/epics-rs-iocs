@@ -30,7 +30,7 @@ use crate::adlog;
 use crate::coordinator::Phase;
 use crate::driver::TimePix3Driver;
 use crate::family::DetectorFamily;
-use crate::http::{ServalHttp, TIMEOUT_POLL};
+use crate::http::{DEFAULT_TIMEOUT, ServalHttp, TIMEOUT_5000_MS};
 use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Mirrored, Shared};
@@ -372,7 +372,7 @@ async fn connection_poll(
 /// read-only state, and a partial reconciliation keeps the edge open for the
 /// next poll. Returns the new "was up".
 async fn poll_connection(ctx: &Arc<Ctx>, was_up: bool) -> bool {
-    let reply = read_dashboard(ctx);
+    let reply = read_dashboard(ctx, TIMEOUT_5000_MS);
     let mut updates = Vec::new();
     let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
     let up = serval_ok && det_ok;
@@ -447,7 +447,7 @@ async fn refresh_measurement_config(ctx: &Arc<Ctx>) -> bool {
 /// C `checkConnection()` with its defaults, publishing the HTTP status and
 /// the connection status (serval_http.cpp:363-392).
 async fn check_connection(ctx: &Arc<Ctx>) -> bool {
-    let reply = read_dashboard(ctx);
+    let reply = read_dashboard(ctx, TIMEOUT_5000_MS);
     let mut updates = vec![ParamSetValue::new(
         ctx.p.http_code,
         0,
@@ -479,9 +479,9 @@ pub fn initial_server_check_connection(ctx: &Arc<Ctx>) -> bool {
         );
         return false;
     }
-    let reply = match ctx.http.get("", TIMEOUT_POLL) {
+    let reply = match ctx.http.get("", DEFAULT_TIMEOUT) {
         Ok(_) => {
-            let reply = read_dashboard(ctx);
+            let reply = read_dashboard(ctx, DEFAULT_TIMEOUT);
             log_dashboard_failure(
                 ctx,
                 adlog::INITIAL_SERVER_CHECK_CONNECTION,
@@ -537,8 +537,8 @@ struct DashboardReply {
     parsed: Result<serval::Dashboard, serval::DashboardError>,
 }
 
-fn read_dashboard(ctx: &Ctx) -> DashboardReply {
-    let (code, body) = match ctx.http.get(serval::DASHBOARD, TIMEOUT_POLL) {
+fn read_dashboard(ctx: &Ctx, timeout: Duration) -> DashboardReply {
+    let (code, body) = match ctx.http.get(serval::DASHBOARD, timeout) {
         Ok(body) => (200, body),
         Err(e) => (e.code(), e.body().to_string()),
     };
@@ -750,7 +750,7 @@ fn as_bool_or_int(v: &Value) -> Option<i32> {
 
 /// C `getDashboard` (serval_http.cpp:431-454).
 async fn refresh_dashboard(ctx: &Arc<Ctx>) {
-    let reply = read_dashboard(ctx);
+    let reply = read_dashboard(ctx, TIMEOUT_5000_MS);
     log_dashboard_failure(
         ctx,
         adlog::GET_DASHBOARD,
@@ -779,7 +779,7 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
     // C getDetector (serval_http.cpp:1300-1323).
     let detector = match ctx
         .http
-        .get(serval::DETECTOR, TIMEOUT_POLL)
+        .get(serval::DETECTOR, TIMEOUT_5000_MS)
         .map_err(|e| (e.body().to_string(), Some(e)))
         .and_then(|body| {
             serval::parse_detector_response(&body).map_err(|e| (e.message().to_string(), None))
@@ -1317,7 +1317,7 @@ pub(crate) fn measurement_updates(
 /// One `GET /measurement`, printing C `timePixCallback`'s line for a failure;
 /// the error is the reason the acquisition rolls back with.
 fn poll_measurement(ctx: &Ctx, first: bool) -> Result<serval::StatusSnapshot, &'static str> {
-    match ctx.http.get(serval::MEASUREMENT, TIMEOUT_POLL) {
+    match ctx.http.get(serval::MEASUREMENT, DEFAULT_TIMEOUT) {
         Ok(body) => serval::parse_status_response(&body).map_err(|e| {
             let what = if first { "measurement" } else { "poll" };
             ctx.trace(
@@ -3553,6 +3553,7 @@ mod tests {
                 let mut reader = BufReader::new(conn);
                 let mut request = String::new();
                 let _ = reader.read_line(&mut request);
+                request = crate::http::without_serval_params(&request);
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
@@ -3783,6 +3784,7 @@ mod tests {
                 let mut reader = BufReader::new(conn);
                 let mut request = String::new();
                 let _ = reader.read_line(&mut request);
+                request = crate::http::without_serval_params(&request);
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
