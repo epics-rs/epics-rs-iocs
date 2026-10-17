@@ -4469,6 +4469,30 @@ mod tests {
         (url, log)
     }
 
+    /// Each Serval read the tasks make carries C's timeout: 5000 ms on the
+    /// dashboard polls and `/detector`, the default elsewhere
+    /// (serval_http.cpp:317-322, :366, :434, :1296; acquisition_runtime.cpp:220).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_task_read_carries_c_timeout() {
+        let (url, _log) = logging_serval(&[], |_| "{}");
+        let ctx = Arc::new(idle_ctx_at("TPX_TASK_TIMEOUTS", &url, None));
+        let sent = || std::mem::take(&mut *ctx.http.sent.lock());
+        let (default, short) = (DEFAULT_TIMEOUT, TIMEOUT_5000_MS);
+        let get = |path: &str, t| (format!("GET {path}"), t);
+        initial_server_check_connection(&ctx);
+        assert_eq!(sent(), [get("", default), get("/dashboard", default)]);
+        check_connection(&ctx).await;
+        assert_eq!(sent(), [get("/dashboard", short)]);
+        poll_connection(&ctx, false).await;
+        assert_eq!(sent(), [get("/dashboard", short)]);
+        refresh_dashboard(&ctx).await;
+        assert_eq!(sent(), [get("/dashboard", short)]);
+        let _ = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad, false);
+        assert_eq!(sent()[0], get("/detector", short));
+        let _ = poll_measurement(&ctx, true);
+        assert_eq!(sent(), [get("/measurement", default)]);
+    }
+
     /// A dashboard reply C `parseResponse` rejects is a dashboard failure as
     /// a whole; a 200 still means Serval is reachable
     /// (serval_http.cpp:363-392, serval_dashboard.cpp:49-98).

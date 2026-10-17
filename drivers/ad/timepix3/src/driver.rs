@@ -7602,6 +7602,105 @@ mod tests {
         }
     }
 
+    /// Each Serval request the port thread makes carries C's timeout
+    /// (serval_http.cpp:557-638, :1106, :1296, :1612, :1682, :2180-2307,
+    /// :2447-2635; acquire.cpp:352-392; acquisition_runtime.cpp:200-220).
+    #[test]
+    fn each_port_request_carries_c_timeout() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let name = "TPX_PORT_TIMEOUTS";
+        // A refused start rolls back.
+        let http = Arc::new(ServalHttp::new(&fake_serval("/measurement/start")));
+        let mut det =
+            TimePix3Driver::new(name, http.clone(), Arc::new(Shared::new()), 0, cmd_tx).unwrap();
+        calibration_files(&mut det, name);
+        let p = det.p;
+        for (reason, value) in [
+            (p.pix_count, 65536),
+            (p.row_len, 1),
+            (p.number_of_chips, 1),
+            (p.number_of_rows, 256),
+            (p.write_raw, 1),
+        ] {
+            det.ad.port_base.set_int32_param(reason, 0, value).unwrap();
+        }
+        det.set_text(p.raw_base, "file:/data").unwrap();
+        let sent = || std::mem::take(&mut *http.sent.lock());
+        let (default, short) = (DEFAULT_TIMEOUT, TIMEOUT_5000_MS);
+        let get = |path: &str, t| (format!("GET {path}"), t);
+        let put = |path: &str, t| (format!("PUT {path}"), t);
+
+        let _ = det.init_acquisition();
+        assert_eq!(
+            sent(),
+            [
+                get("/detector/config", default),
+                get("/detector", short),
+                put("/detector/config", default),
+            ]
+        );
+        let _ = det.resync_mpx3_setpoints();
+        assert_eq!(sent(), [get("/detector/config", default)]);
+        let _ = det.send_measurement_config();
+        assert_eq!(
+            sent(),
+            [
+                get("/measurement/config", short),
+                put("/measurement/config", default),
+            ]
+        );
+        let _ = det.get_measurement_config();
+        assert_eq!(sent(), [get("/measurement/config", short)]);
+        let _ = det.file_writer();
+        assert_eq!(sent(), [put("/server/destination", default)]);
+        let _ = det.get_server();
+        assert_eq!(sent(), [get("/server/destination", short)]);
+        // A refused DAC write restores.
+        let dacs = "/detector/chips/0/dacs/";
+        let refusing = Arc::new(ServalHttp::new(&fake_serval_with(
+            "PUT /detector/chips/0/dacs/",
+            &[("GET /detector/chips/0/dacs/", r#"{"Vthreshold_fine": 4}"#)],
+        )));
+        let port_http = std::mem::replace(&mut det.http, refusing.clone());
+        let _ = det.write_dac(0, p.vthreshold_fine, "Vthreshold_fine", 5, 4);
+        det.http = port_http;
+        assert_eq!(
+            std::mem::take(&mut *refusing.sent.lock()),
+            [get(dacs, default), put(dacs, default), get(dacs, default)]
+        );
+        let _ = det.rotate_layout(0);
+        assert_eq!(sent(), [get("/detector/layout/rotate?reset=true", default)]);
+        let _ = det.config_load("dacs", p.da_cs_file_path, p.da_cs_file_name);
+        let sent_load = sent();
+        assert_eq!(sent_load.len(), 1);
+        assert!(
+            sent_load[0]
+                .0
+                .starts_with("GET /config/load?format=dacs&file=")
+        );
+        assert_eq!(sent_load[0].1, default);
+        let _ = det.refresh_pixel_config();
+        assert_eq!(sent(), [get("/detector/chips/0/PixelConfig", short)]);
+        assert!(det.shared.acquisition.begin_start());
+        let _ = det.start_measurement();
+        assert_eq!(
+            sent(),
+            [
+                get("/measurement/stop", default),
+                get("/measurement", default),
+                get("/measurement/start", default),
+            ]
+        );
+        let _ = det.stop_acquisition(false, "");
+        assert_eq!(
+            sent(),
+            [
+                get("/measurement/stop", default),
+                get("/measurement", default),
+            ]
+        );
+    }
+
     fn calibration_files(det: &mut TimePix3Driver, name: &str) {
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

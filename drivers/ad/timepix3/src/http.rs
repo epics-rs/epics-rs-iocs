@@ -63,6 +63,9 @@ pub struct ServalHttp {
     base: String,
     /// The `Authorization` header, sent only when credentials are configured.
     auth: Option<String>,
+    /// Each request's method, path and timeout, for the per-site tests.
+    #[cfg(test)]
+    pub(crate) sent: std::sync::Arc<parking_lot::Mutex<Vec<(String, Duration)>>>,
 }
 
 impl ServalHttp {
@@ -83,6 +86,8 @@ impl ServalHttp {
             // A trailing slash would double up in every path.
             base: server_url.trim_end_matches('/').to_string(),
             auth: credentials.map(|(user, pass)| basic_auth_header(&user, &pass)),
+            #[cfg(test)]
+            sent: Default::default(),
         }
     }
 
@@ -113,6 +118,8 @@ impl ServalHttp {
         serval_params: bool,
         json_header: bool,
     ) -> HttpResult<String> {
+        #[cfg(test)]
+        self.sent.lock().push((format!("GET {path}"), timeout));
         let url = format!("{}{path}", self.base);
         let mut req = self.agent.get(&url);
         if serval_params {
@@ -144,6 +151,8 @@ impl ServalHttp {
     /// C `putJson`: PUT `body`, already dumped as the caller's C `dump` call
     /// lays it out, returning the reply body.
     pub fn put_json(&self, path: &str, body: &str, timeout: Duration) -> HttpResult<String> {
+        #[cfg(test)]
+        self.sent.lock().push((format!("PUT {path}"), timeout));
         let url = format!("{}{path}", self.base);
         let mut req = self
             .agent
@@ -313,6 +322,38 @@ mod tests {
         let seen: Vec<_> = rx.iter().take(4).collect();
         let basic = Some(basic_auth_header("u", "p"));
         assert_eq!(seen, [basic.clone(), basic, None, None]);
+    }
+
+    /// The caller's timeout bounds the whole request, as `cpr::Timeout`
+    /// does (serval_http_client.cpp:44-95).
+    #[test]
+    fn each_helper_gives_up_at_its_timeout() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                        line.clear();
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                    let _ = reader.get_mut().write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    );
+                });
+            }
+        });
+        let http = ServalHttp::with_credentials(&url, None);
+        let (short, long) = (Duration::from_millis(100), Duration::from_secs(5));
+        assert!(http.get("/a", short).is_err());
+        assert!(http.get_auth_only("/a", short).is_err());
+        assert!(http.get_json("/a", short).is_err());
+        assert!(http.put_json("/a", "{}", short).is_err());
+        assert_eq!(http.get("/a", long).unwrap(), "{}");
+        assert_eq!(http.put_json("/a", "{}", long).unwrap(), "{}");
     }
 
     /// Each helper's query and headers as serval_http_client.cpp sends them:
