@@ -39,7 +39,6 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, Pol
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{DrvUserRequest, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -124,8 +123,8 @@ impl Mcs2Reasons {
 pub struct Mcs2Controller {
     handle: SyncIOHandle,
     ident: String,
-    /// The controller port the poll sets the channel parameters on.
-    port: Option<(PortHandle, Mcs2Reasons)>,
+    /// The channel parameters the poll sets, once the port created them.
+    reasons: Option<Mcs2Reasons>,
 }
 
 impl Mcs2Controller {
@@ -136,7 +135,7 @@ impl Mcs2Controller {
         let mut ctrl = Self {
             handle,
             ident: String::new(),
-            port: None,
+            reasons: None,
         };
         ctrl.clear_errors();
         match ctrl.query(":DEV:SNUM?") {
@@ -160,9 +159,9 @@ impl Mcs2Controller {
         ctrl
     }
 
-    /// Let each channel poll set its parameters on controller port `port`.
-    pub fn post_params_to(&mut self, port: PortHandle, reasons: Mcs2Reasons) {
-        self.port = Some((port, reasons));
+    /// Let each channel poll set its parameters, `reasons`.
+    pub fn set_reasons(&mut self, reasons: Mcs2Reasons) {
+        self.reasons = Some(reasons);
     }
 
     /// The controller serial-number identification string.
@@ -376,6 +375,8 @@ pub struct Mcs2Axis {
     has_encoder: bool,
     /// Software-tracked position for open-loop step moves (driver units).
     tracked_position: f64,
+    /// The channel parameters the last poll set, for the poller to post.
+    poll_params: Vec<(usize, ParamValue)>,
 }
 
 impl Mcs2Axis {
@@ -391,6 +392,7 @@ impl Mcs2Axis {
             channel: axis_no as i32,
             has_encoder: false,
             tracked_position: 0.0,
+            poll_params: Vec::new(),
         }
     }
 
@@ -408,7 +410,7 @@ impl Mcs2Axis {
         set: &mut Vec<(usize, i32)>,
     ) -> AsynResult<(i64, bool, f64, f64, String)> {
         let c = self.channel;
-        let r = ctrl.port.as_ref().map(|(_, r)| *r).unwrap_or_default();
+        let r = ctrl.reasons.unwrap_or_default();
         let state = atof(&ctrl.query(&format!(":CHAN{c}:STAT?"))?) as i64;
         set.push((r.pstat, state as i32));
         let sensor_present = (state & SENSOR_PRESENT) != 0;
@@ -473,6 +475,10 @@ impl Mcs2Axis {
 impl AsynMotor for Mcs2Axis {
     /// C `MCS2Axis::poll`'s `skip` label sets only `motorStatusProblem_`
     /// (smarActMCS2MotorDriver.cpp).
+    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
+        std::mem::take(&mut self.poll_params)
+    }
+
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM
     }
@@ -583,16 +589,15 @@ impl AsynMotor for Mcs2Axis {
         let ctrl = self.lock();
         let mut set = Vec::new();
         let polled = self.poll_channel(&ctrl, &mut set);
-        // C's `skip:` posts what was set before a failed query.
-        if let Some((port, _)) = &ctrl.port {
-            let c = self.channel;
-            let set = set
-                .into_iter()
-                .map(|(reason, value)| ParamSetValue::new(reason, c, ParamValue::Int32(value)))
-                .collect();
-            let _ = port.set_params_and_notify_blocking(c, set);
-        }
+        let posts = ctrl.reasons.is_some();
         drop(ctrl);
+        // C's `skip:` posts what was set before a failed query.
+        if posts {
+            self.poll_params.extend(
+                set.into_iter()
+                    .map(|(reason, value)| (reason, ParamValue::Int32(value))),
+            );
+        }
         let (state, sensor_present, encoder_position, theory_position, ampl) = polled?;
 
         let done = (state & ACTIVELY_MOVING) == 0;

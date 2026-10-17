@@ -87,7 +87,7 @@ pub fn mcs2_create_controller_command() -> CommandDef {
                 .map_err(|e| format!("MCS2CreateController: {e}"))?;
             let reasons =
                 Mcs2Reasons::lookup(&port).map_err(|e| format!("MCS2CreateController: {e}"))?;
-            controller.post_params_to(port, reasons);
+            controller.set_reasons(reasons);
             let controller = Arc::new(Mutex::new(controller));
             let _ = slot.set(controller.clone());
             let poller = Controller::new();
