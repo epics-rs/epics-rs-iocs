@@ -1,15 +1,21 @@
+# Newport CONEX axis on PORT. The driver boundary is raw steps of the
+# model's stepSize_ (CC/AGP SU?/IF?, PP FRS?/FRM?/1000, DL 1e-4, FCL200 1),
+# so MRES must equal it. Defaults are C's motor.substitutions.CONEX-PP
+# (NSA12 stage, 6.35 um per full step, 128 micro-steps).
 record(motor, "$(P)$(M)") {
     field(DTYP, "asynMotor")
     field(OUT,  "@asyn($(PORT),$(ADDR=0))")
     field(SCAN, "Passive")
-    field(VELO, "$(VELO=1.0)")
-    field(ACCL, "$(ACCL=0.5)")
-    field(DHLM, "$(HLM=100.0)")
-    field(DLLM, "$(LLM=-100.0)")
-    # Positions travel the driver boundary in EGU (controller units, mm)
-    # directly; MRES only sets the record's raw-count resolution
-    # (display/deadband granularity).
-    field(MRES, "$(MRES=0.0001)")
+    field(DIR,  "$(DIR=Pos)")
+    field(VELO, "$(VELO=1.)")
+    field(VBAS, "$(VBAS=0.1)")
+    field(ACCL, "$(ACCL=.25)")
+    field(BDST, "$(BDST=0)")
+    field(BVEL, "$(BVEL=1)")
+    field(BACC, "$(BACC=.2)")
+    field(DHLM, "$(HLM=28)")
+    field(DLLM, "$(LLM=-1)")
+    field(MRES, "$(MRES=4.9609375e-5)")
     field(EGU,  "$(EGU=mm)")
     field(PREC, "$(PREC=4)")
 }

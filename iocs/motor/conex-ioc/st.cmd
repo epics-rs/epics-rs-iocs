@@ -35,6 +35,7 @@ asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 # AG_CONEXCreateController(portName, serialPort, controllerID, movingPollPeriod, idlePollPeriod)
 AG_CONEXCreateController("$(PORT)", "$(SERIAL)", $(CID), 100, 1000)
 
+# MRES must equal the model's stepSize_ (the boundary is raw steps).
 dbLoadRecords("$(CONEX_IOC)/db/conex.template", "P=$(P),M=$(M),PORT=$(PORT),ADDR=0,EGU=mm")
 
 iocInit()
