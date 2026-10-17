@@ -480,6 +480,9 @@ pub fn detector_config_body(current: &Value, c: &DetectorConfig) -> Result<Value
     let period = if c.trigger_mode == 5 {
         c.exposure_time
     } else {
+        // `max` drops a NaN AcquirePeriod. C's `<=` is false for NaN, so it
+        // sends the NaN, which json writes as `"TriggerPeriod": null`
+        // (serval_http.cpp:2510-2516); a C defect, not copied.
         c.trigger_period.max(c.exposure_time + 0.003)
     };
     body["TriggerPeriod"] = json!(period);
