@@ -460,6 +460,8 @@ impl AsynMotor for Emc18011Axis {
         if !z.moving {
             // Stopped or at a limit: a position reply releases the slot; with
             // none C keeps the motor selected and the old position.
+            // C tests the strtod end against an uninitialised `brkptr`
+            // (drvEMC18011.cc:225, :270), which passes any reply.
             if let Some(reply) = ctrl.command("A").ok().filter(|r| !r.is_empty()) {
                 position = f64::from(nint(atof(&reply) / DRIVE_RESOLUTION));
                 ctrl.active = None;
