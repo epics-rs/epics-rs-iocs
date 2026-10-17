@@ -21,7 +21,7 @@ use motor_common::iocsh::{
     arg_double_req, arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_double, req_int,
     req_string,
 };
-use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1::{Model1, Model1Cards, SCAN_RATE, c_int};
 use motor_common::{
     Controller, ControllerParams, ControllerReport, asyn_user, model1_device, register_port_with,
 };
@@ -367,6 +367,7 @@ static MICOS_NUM_AXES: AtomicI32 = AtomicI32::new(MICOS_NUM_AXIS);
 /// `MicosSetup(num_cards, num_channels, scan_rate)`.
 pub fn micos_setup_command() -> CommandDef {
     MICOS.register_row();
+    MICOS.register_report("drvMicos", micos_report);
     CommandDef::new(
         "MicosSetup",
         vec![
@@ -387,6 +388,20 @@ pub fn micos_setup_command() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// drvMicos.cc's `report` (drvMicos.cc:125-141): a card whose Config
+/// failed is not named.
+fn micos_report(cards: &Model1Cards<'_>) -> String {
+    if cards.num_cards() <= 0 {
+        return "    NO Micos controllers found\n".into();
+    }
+    (0..cards.num_cards())
+        .filter_map(|card| {
+            let ident = cards.card(card)?;
+            Some(format!("    Micos controller group {card}, id: {ident} \n"))
+        })
+        .collect()
 }
 
 /// `MicosConfig(card, name)`. Connects and probes the card at once, where
@@ -427,6 +442,8 @@ pub fn micos_config_command() -> CommandDef {
                     Arc::new(Mutex::new(DrvMicosAxis::new(controller.clone(), signal)));
                 MICOS.install(ctx, card, signal, motor)?;
             }
+            // C motor_init's `strcpy(brdptr->ident, "MICOS")` (drvMicos.cc:541).
+            MICOS.describe(card, "MICOS");
             Ok(CommandOutcome::Continue)
         },
     )
@@ -558,6 +575,27 @@ mod report {
                     axisRes 0.000100\n    lowLimitConfig 2\n    highLimitConfig 0\n    \
                     posTravelLimit 100.000000\n    negTravelLimit -100.000000\nPort: taurusRep\n";
         assert!(text.contains(want), "{text}");
+    }
+
+    /// drvMicos.cc's drvet `report` (drvMicos.cc:125-141), which `dbior`
+    /// runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_configured_micos_card() {
+        use motor_common::testing::driver_report;
+        let setup = micos_setup_command();
+        assert_eq!(
+            driver_report("drvMicos", 0),
+            "    NO Micos controllers found\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new("micosRepLine", |_| "ok".into());
+        let config = vec![int(1), ArgValue::String("micosRepLine".into())];
+        run_command(micos_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvMicos", 0),
+            "    Micos controller group 1, id: MICOS \n"
+        );
     }
 
     /// SMChydraController::report then SMChydraAxis::report
