@@ -396,12 +396,18 @@ async fn refresh_on_reconnect(ctx: &Arc<Ctx>) -> bool {
     if complete {
         connection_status(ctx, true, true, &mut updates);
     } else {
-        eprintln!(
-            "ERROR | ADTimePix::refreshOnReconnect: Reconnect state refresh incomplete: \
-             destination={} detector={} measurementConfig={}",
-            i32::from(destination),
-            i32::from(detector),
-            i32::from(measurement_config),
+        ctx.trace(
+            TraceMask::ERROR,
+            &adlog::err(
+                "refreshOnReconnect",
+                &format!(
+                    "Reconnect state refresh incomplete: destination={} detector={} \
+                     measurementConfig={}",
+                    i32::from(destination),
+                    i32::from(detector),
+                    i32::from(measurement_config),
+                ),
+            ),
         );
         updates.push(ParamSetValue::new(
             ctx.ad.status_message,
@@ -3658,6 +3664,15 @@ mod tests {
             _ => "{}",
         });
         let ctx = Arc::new(idle_ctx_at("TPX_RECONNECT", &url, None));
+        let path = std::env::temp_dir().join(format!("TPX_RECONNECT-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        ctx.handle.trace().set_trace_file(
+            Some("TPX_RECONNECT"),
+            epics_rs::asyn::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        ctx.handle
+            .trace()
+            .set_trace_mask(Some("TPX_RECONNECT"), TraceMask::ERROR);
         let destination_reads = || {
             log.lock()
                 .iter()
@@ -3681,6 +3696,13 @@ mod tests {
                 ADStatus::Error as i32
             );
         }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let line = adlog::err(
+            "refreshOnReconnect",
+            "Reconnect state refresh incomplete: destination=0 detector=1 measurementConfig=1",
+        );
+        assert_eq!(text.matches(&line).count(), 2, "{text}");
     }
 
     /// An idle dashboard has no `Measurement`, and the last status stays;
