@@ -109,12 +109,31 @@ const PM500_TIMEOUT: Duration = Duration::from_secs(2);
 /// `PMNC_TIMEOUT` 3 s).
 const PMNC_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Default XPS FTP account and trajectory directory: the factory
-/// `Administrator` login C's `XPSCreateProfile` is normally given, and the
-/// XPS-C/Q public trajectory folder.
+/// Default XPS FTP account: the factory `Administrator` login C's
+/// `XPSCreateProfile` is normally given.
 const XPS_FTP_USER: &str = "Administrator";
 const XPS_FTP_PASSWORD: &str = "Administrator";
-const XPS_TRAJECTORY_DIR: &str = "/Admin/Public/Trajectories";
+
+/// The trajectory folders by controller (XPSController.h:19-21).
+const XPS_C_TRAJECTORY_DIRECTORY: &str = "/Admin/Public/Trajectories";
+const XPS_Q_TRAJECTORY_DIRECTORY: &str = "/Public/Trajectories";
+const XPS_D_TRAJECTORY_DIRECTORY: &str = "/Admin/Public/Trajectories";
+
+/// `buildProfile`'s firmware switch (XPSController.cpp:695-706): the
+/// trajectory folder, and whether the upload is SFTP (C `useSFTP_`).
+fn trajectory_upload(firmware: &str) -> Result<(&'static str, bool), String> {
+    if firmware.contains("XPS-C") {
+        Ok((XPS_C_TRAJECTORY_DIRECTORY, false))
+    } else if firmware.contains("XPS-Q") {
+        Ok((XPS_Q_TRAJECTORY_DIRECTORY, false))
+    } else if firmware.contains("XPS-D") {
+        Ok((XPS_D_TRAJECTORY_DIRECTORY, true))
+    } else {
+        Err(format!(
+            "Firmware version does not contain XPS-C, XPS-Q, or XPS-D={firmware}\n"
+        ))
+    }
+}
 
 /// `MAX_SOCKETS` (asynOctetSocket.cpp:36).
 const MAX_SOCKETS: usize = 1000;
@@ -1146,9 +1165,8 @@ pub fn xps_define_profile_command() -> CommandDef {
 /// XPS trajectory folder, then verifies it against the group dynamics and
 /// each axis's soft limits (C `buildProfile`). `fileName` is the bare
 /// trajectory file name the controller opens; `host` is the XPS IP/hostname
-/// (no port). Credentials and directory default to the XPS factory
-/// `Administrator` account and `/Admin/Public/Trajectories`; `ftpDir` must
-/// name the controller's actual trajectory folder if overridden.
+/// (no port). Credentials default to the XPS factory `Administrator`
+/// account and the directory to the firmware's trajectory folder.
 pub fn xps_build_profile_command() -> CommandDef {
     CommandDef::new(
         "XPSBuildProfile",
@@ -1180,7 +1198,7 @@ pub fn xps_build_profile_command() -> CommandDef {
                     .unwrap_or_else(|| (XPS_FTP_USER.into(), XPS_FTP_PASSWORD.into()));
             let ftp_user = opt_string(args, 3)?.unwrap_or(default_user);
             let ftp_pass = opt_string(args, 4)?.unwrap_or(default_pass);
-            let ftp_dir = opt_string(args, 5)?.unwrap_or_else(|| XPS_TRAJECTORY_DIR.to_string());
+            let ftp_dir = opt_string(args, 5)?;
 
             let controller = xps_controller(&motor_port, "XPSBuildProfile")?;
 
@@ -1188,13 +1206,15 @@ pub fn xps_build_profile_command() -> CommandDef {
             // poll socket); the FTP upload touches no controller state, so
             // it runs between the two without the lock held.
             let build = || {
-                let built = controller
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .build_profile_text()?;
+                let (built, firmware) = {
+                    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                    (ctrl.build_profile_text()?, ctrl.firmware().to_string())
+                };
+                let (directory, _sftp) = trajectory_upload(&firmware)?;
+                let directory = ftp_dir.clone().unwrap_or_else(|| directory.to_string());
                 ftp::upload_trajectory(
                     &host,
-                    &ftp_dir,
+                    &directory,
                     &file_name,
                     &built.text,
                     &ftp_user,
@@ -1203,14 +1223,18 @@ pub fn xps_build_profile_command() -> CommandDef {
                 controller
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .verify_profile(&file_name, &built)
+                    .verify_profile(&file_name, &built)?;
+                Ok::<_, String>(directory)
             };
-            if let Err(message) = build() {
-                xps_profile_failed(&motor_port, "buildProfile", &message);
-                return Ok(CommandOutcome::Continue);
-            }
+            let directory = match build() {
+                Ok(directory) => directory,
+                Err(message) => {
+                    xps_profile_failed(&motor_port, "buildProfile", &message);
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
             println!(
-                "XPSBuildProfile: motorPort={motor_port} file={file_name} uploaded to {host}:{ftp_dir} and verified"
+                "XPSBuildProfile: motorPort={motor_port} file={file_name} uploaded to {host}:{directory} and verified"
             );
             Ok(CommandOutcome::Continue)
         },
@@ -2117,6 +2141,28 @@ fn xps_profile_failed(motor_port: &str, function: &str, message: &str) {
 mod tests {
     use super::*;
     use crate::xps::fake::FakeLine;
+
+    /// XPSController.cpp:695-706: the trajectory folder and transport follow
+    /// the firmware string, and any other firmware fails the build.
+    #[test]
+    fn the_firmware_picks_the_trajectory_folder() {
+        assert_eq!(
+            trajectory_upload("XPS-C8 Firmware V2.6.x"),
+            Ok(("/Admin/Public/Trajectories", false))
+        );
+        assert_eq!(
+            trajectory_upload("XPS-Q8 Firmware V1.4.x"),
+            Ok(("/Public/Trajectories", false))
+        );
+        assert_eq!(
+            trajectory_upload("XPS-D8 Firmware V1.0.x"),
+            Ok(("/Admin/Public/Trajectories", true))
+        );
+        assert_eq!(
+            trajectory_upload("0"),
+            Err("Firmware version does not contain XPS-C, XPS-Q, or XPS-D=0\n".to_string())
+        );
+    }
 
     fn plan() -> ExecutionPlan {
         ExecutionPlan {
