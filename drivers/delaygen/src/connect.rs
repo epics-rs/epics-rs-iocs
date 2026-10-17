@@ -9,7 +9,7 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::trace::TraceMask;
+use epics_rs::asyn::trace::{TraceMask, TraceOut};
 
 /// A driver's C `pasynOctetSyncIO` user on its io port: the blocking handle
 /// plus the port and address its `asynPrint` lines resolve against.
@@ -26,6 +26,19 @@ impl OctetLink {
         self.port
             .trace()
             .print(Some(self.port.port_name()), addr, 0, mask, args);
+    }
+
+    /// [`Self::print`] for a line that carries device bytes, written by
+    /// `body` with [`TraceOut::write_bytes`] as C's `%s` writes them.
+    pub fn write_trace(
+        &self,
+        mask: TraceMask,
+        body: impl FnOnce(&mut TraceOut<'_>) -> std::fmt::Result,
+    ) {
+        let addr = (self.addr >= 0).then_some(self.addr);
+        self.port
+            .trace()
+            .print_with(Some(self.port.port_name()), addr, 0, mask, ("", 0), body);
     }
 
     /// C's recovery after a failed transaction: `lockPort`, then
