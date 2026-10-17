@@ -615,6 +615,7 @@ fn coord_create(
         COORD_MOVING_POLL_MS,
         COORD_IDLE_POLL_MS,
     );
+    PMAC_ASYN_COORD.set_axis_logs(reference, lock_system(&system).logs());
     systems.push(CoordSystem {
         reference,
         port: port.to_string(),
@@ -1248,6 +1249,56 @@ mod tests {
         );
         rig.answer("&2A Q74=Q84", b"\x07ERR003\r");
         assert!(axis.stop(&user, 1.0).is_err());
+        assert_eq!(own.take(), "");
+    }
+
+    /// pmacAsynCoord.c:320-332: a command prints what it sends and what came
+    /// back on its axis's drvAsynMotorConfigure user; the poll's reads
+    /// (logGlobal) do not.
+    #[epics_rs::base::epics_test]
+    async fn a_cs_command_traces_on_the_axis_s_log_user() {
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::model2::drv_asyn_motor_configure_command;
+        use motor_common::testing::run_command;
+
+        let (_rt, rig) = publish_scripted("pmacCsLog");
+        coord_create("pmacCsLog", 0, 3, 9301, 10).unwrap();
+        let args = vec![
+            ArgValue::String("pmacCsLogM".into()),
+            ArgValue::String("pmacAsynCoord".into()),
+            ArgValue::Int(9301),
+            ArgValue::Int(9),
+        ];
+        run_command(
+            drv_asyn_motor_configure_command(vec![&PMAC_ASYN_COORD]),
+            args,
+        )
+        .await;
+        let own = TraceCapture::on("pmacCsLogM");
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        let mask = TraceMask::ERROR | TraceMask::IO_DRIVER;
+        trace.set_trace_mask(Some("pmacCsLogM"), mask);
+        trace.set_device_trace_mask("pmacCsLogM", 0, mask);
+        let axis = COORD_SYSTEMS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.reference == 9301)
+            .unwrap()
+            .axes[0]
+            .clone();
+        let user = AsynUser::new(0);
+        rig.answer("&3A Q71=Q81", b"\x06");
+        axis.lock().unwrap().stop(&user, 1.0).unwrap();
+        assert_eq!(
+            own.take(),
+            "Sending to PMAC C.S. ref 9301 command : &3A Q71=Q81\n\
+             Recvd from PMAC C.S. ref 9301 response: \x06\n"
+        );
+        rig.answer("&3??", b"000000\r020000\r000000\r");
+        rig.answer("&3Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"0 0 0 0 0 0 0 0 0\r");
+        axis.lock().unwrap().poll(&user).unwrap();
         assert_eq!(own.take(), "");
     }
 

@@ -44,6 +44,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
+use motor_common::model2::AxisLog;
 
 use crate::controller::{PMAC_MAXBUF, checked_reply, pmac_err};
 use crate::protocol::{
@@ -100,6 +101,8 @@ pub struct PmacCoordSystem {
     trace: MotorTrace,
     /// C `pDrv->ref`, the `pmacAsynCoordCreate` reference.
     reference: i32,
+    /// C `motorAxis::logParam` of each CS axis.
+    logs: [Arc<AxisLog>; CS_AXES],
 }
 
 impl PmacCoordSystem {
@@ -123,7 +126,13 @@ impl PmacCoordSystem {
             status: [0; 3],
             poll_ttl,
             step_size: [DEFAULT_STEP_SIZE; CS_AXES],
+            logs: Default::default(),
         }
+    }
+
+    /// The axes' logs, A first, for `Model2::set_axis_logs`.
+    pub fn logs(&self) -> Vec<Arc<AxisLog>> {
+        self.logs.to_vec()
     }
 
     /// C `asynPrint(pAxis->pasynUser, ASYN_TRACE_ERROR, line)`, then the
@@ -160,27 +169,47 @@ impl PmacCoordSystem {
     /// its line. C returns MOTOR_AXIS_OK on a refused (BELL) reply
     /// (pmacAsynCoord.c:345); that C defect is not copied (see the crate doc).
     fn write_read(&self, axis: usize, command: &str) -> AsynResult<String> {
-        checked_reply(command, self.transfer(axis, command)?)
+        checked_reply(command, self.transfer(axis, command, false)?)
     }
 
     /// [`Self::write_read`] without the BELL check: the reply as C sees it.
-    fn transfer(&self, axis: usize, command: &str) -> AsynResult<Vec<u8>> {
-        self.handle
-            .write_read(0, command.as_bytes(), PMAC_MAXBUF)
-            .inspect_err(|e| {
-                self.trace.print(
-                    TraceMask::ERROR,
-                    0,
-                    format_args!(
-                        "Read/write error to PMAC C.S. ref {}, axis {} command {command}. \
+    /// Only a `log_global` read leaves the axis's log quiet.
+    fn transfer(&self, axis: usize, command: &str, log_global: bool) -> AsynResult<Vec<u8>> {
+        let log = (!log_global).then(|| &self.logs[axis - 1]);
+        let reference = self.reference;
+        if let Some(log) = log {
+            log.print(
+                TraceMask::IO_DRIVER,
+                format_args!("Sending to PMAC C.S. ref {reference} command : {command}\n"),
+            );
+        }
+        let reply = self.handle.write_read(0, command.as_bytes(), PMAC_MAXBUF);
+        if let (Some(log), Ok(raw)) = (log, &reply)
+            && !raw.is_empty()
+        {
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            log.print(
+                TraceMask::IO_DRIVER,
+                format_args!(
+                    "Recvd from PMAC C.S. ref {reference} response: {}\n",
+                    String::from_utf8_lossy(&raw[..end])
+                ),
+            );
+        }
+        reply.inspect_err(|e| {
+            self.trace.print(
+                TraceMask::ERROR,
+                0,
+                format_args!(
+                    "Read/write error to PMAC C.S. ref {}, axis {} command {command}. \
                          Status={}, Error={}\n",
-                        self.reference,
-                        axis_name(axis).unwrap_or(' '),
-                        e.c_status_code(),
-                        e.message_display()
-                    ),
-                );
-            })
+                    self.reference,
+                    axis_name(axis).unwrap_or(' '),
+                    e.c_status_code(),
+                    e.message_display()
+                ),
+            );
+        })
     }
 
     /// C `drvPmacGetAxesStatus`: `&{cs}??` for the status words, then one
@@ -189,7 +218,7 @@ impl PmacCoordSystem {
         let cs = self.cs;
         // C `drvPmacGetCoordStatus(first_axis, ...)`.
         let command = format!("&{cs}??");
-        let (cmd_status, response) = match self.transfer(1, &command) {
+        let (cmd_status, response) = match self.transfer(1, &command, true) {
             // C `MOTOR_AXIS_ERROR`, over the empty response buffer.
             Err(_) => (-1, String::new()),
             Ok(raw) => (
@@ -216,7 +245,7 @@ impl PmacCoordSystem {
         }
         // A failed read leaves C's position buffer uninitialised; that
         // garbage is not posted here.
-        let raw = self.transfer(1, &query)?;
+        let raw = self.transfer(1, &query, true)?;
         let response = String::from_utf8_lossy(&raw);
         // strtod reads 0 past the end of a short reply, which C posts.
         let mut positions = parse_cs_positions(response.trim_matches('\0'), CS_AXES);
