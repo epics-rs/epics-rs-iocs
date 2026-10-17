@@ -366,15 +366,28 @@ mod extra_params {
     /// A controller `port` on line `line` with device name `A`, and the
     /// controller port's user at axis 0.
     async fn controller(port: &str, line: &str) -> (LineRig, SyncIOHandle) {
-        let (rig, _io) = LineRig::new(line, |last| {
+        failing_controller(port, line, |_| false).await
+    }
+
+    /// [`controller`], with the writes `fails` picks refused; `PR ER`
+    /// answers 73.
+    async fn failing_controller(
+        port: &str,
+        line: &str,
+        fails: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (LineRig, SyncIOHandle) {
+        let reply = |last: &str| {
             if last.contains("PR VR") {
                 "1.000".into()
             } else if last.contains("PR LR") {
                 "1".into()
+            } else if last.contains("PR ER") {
+                "73".into()
             } else {
                 "0".into()
             }
-        });
+        };
+        let (rig, _io) = LineRig::failing(line, reply, fails);
         let args = vec![
             ArgValue::String(port.into()),
             ArgValue::String(line.into()),
@@ -408,6 +421,42 @@ mod extra_params {
         io.write_int32(save, 1).unwrap();
         assert_eq!(not_polled(line.sent()), ["AS"]);
         assert_eq!(io.read_int32(save).unwrap(), 1);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:528-532 then
+    /// ImsMDrivePlusMotorController.cpp:328: a failed `S` runs saveToNVM's
+    /// handleAxisError before writeInt32's own ERROR line.
+    #[epics_rs::base::epics_test]
+    async fn a_failed_save_to_nvm_prints_the_drive_s_error_code() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let (line, io) = failing_controller("imsNvmErr", "imsNvmErrLine", |l| l == "AS").await;
+        let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
+        let path = std::env::temp_dir().join(format!("imsNvmErr-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("imsNvmErr"), TraceMask::ERROR);
+        trace.set_trace_file(Some("imsNvmErr"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("imsNvmErr", 0, TraceFile::File(file));
+        line.sent();
+        assert!(io.write_int32(save, 1).is_err());
+        // `APR ER` is among the poll's `APR ` commands; the line below is its reply.
+        assert_eq!(not_polled(line.sent()), ["AS"]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "ImsMDrivePlusMotorDriver:handleAxisError(): ImsMDrivePlusMotorDriver:saveToNVM(): \
+                 ERROR saving to NVM, 73:'Tried to save while moving'",
+                "ImsMDrivePlusMotorDriver:writeInt32: ERROR saving to NVM",
+            ],
+            "{text}"
+        );
     }
 
     /// ImsMDrivePlusMotorController.cpp:335-343 and

@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::registry::{claim_port, open_owner};
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -14,6 +14,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 type Reply = Box<dyn Fn(&str) -> String + Send + Sync>;
+type Fails = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 struct Line {
     base: PortDriverBase,
@@ -22,6 +23,7 @@ struct Line {
     /// and its `\n` separately, and the reply belongs to the command.
     command: String,
     reply: Reply,
+    fails: Fails,
 }
 
 impl PortDriver for Line {
@@ -36,7 +38,14 @@ impl PortDriver for Line {
         if !data.iter().all(|b| matches!(b, b'\r' | b'\n')) {
             self.command.clone_from(&line);
         }
+        let failed = (self.fails)(&line);
         self.sent.lock().unwrap().push(line);
+        if failed {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "LineRig: write failed".into(),
+            });
+        }
         Ok(data.len())
     }
     // A line takes any terminator, as a port with `asynInterposeEos` does, so
@@ -70,12 +79,23 @@ impl LineRig {
         name: &str,
         reply: impl Fn(&str) -> String + Send + Sync + 'static,
     ) -> (Self, SyncIOHandle) {
+        Self::failing(name, reply, |_| false)
+    }
+
+    /// [`Self::new`], with each write `fails` picks recorded and then
+    /// refused with an asyn error.
+    pub fn failing(
+        name: &str,
+        reply: impl Fn(&str) -> String + Send + Sync + 'static,
+        fails: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (Self, SyncIOHandle) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let line = Line {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             sent: sent.clone(),
             command: String::new(),
             reply: Box::new(reply),
+            fails: Box::new(fails),
         };
         let claim = claim_port(name).unwrap();
         let (rt, _jh) = create_port_runtime(&claim, line, RuntimeConfig::default()).unwrap();
