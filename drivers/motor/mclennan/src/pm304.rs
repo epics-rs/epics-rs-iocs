@@ -257,7 +257,8 @@ pub struct Pm304Axis {
     /// 0-based index into the controller's `use_encoder` table.
     index: usize,
     prev_position: i32,
-    last_status: MotorStatus,
+    /// C's RA_DIRECTION, carried from poll to poll in `motor_info->status`.
+    direction: bool,
     strings: MoveStrings,
 }
 
@@ -269,10 +270,7 @@ impl Pm304Axis {
             axis: index as u32 + 1,
             index,
             prev_position: 0,
-            last_status: MotorStatus {
-                done: true,
-                ..MotorStatus::default()
-            },
+            direction: false,
             strings: MoveStrings::default(),
         }
     }
@@ -458,15 +456,21 @@ impl AsynMotor for Pm304Axis {
 
         let position = parse_position(&pos_reply);
 
-        // Direction: a limit switch fixes it (C); otherwise infer from motion.
-        let direction = if bits.plus_ls {
-            true
-        } else if bits.minus_ls {
-            false
-        } else {
-            position >= self.prev_position
-        };
-        self.prev_position = position;
+        // drvPM304.cc:252-261, 302-311: a PM304 limit sets the direction,
+        // a position change sets it after that, and otherwise it keeps its
+        // last value.
+        if model == Model::Pm304 {
+            if bits.plus_ls {
+                self.direction = true;
+            }
+            if bits.minus_ls {
+                self.direction = false;
+            }
+        }
+        if position != self.prev_position {
+            self.direction = position > self.prev_position;
+            self.prev_position = position;
+        }
 
         let status = MotorStatus {
             position: position as f64,
@@ -476,13 +480,12 @@ impl AsynMotor for Pm304Axis {
             high_limit: bits.plus_ls,
             low_limit: bits.minus_ls,
             problem: bits.problem,
-            direction,
+            direction: self.direction,
             // No GAIN_SUPPORT or EA_PRESENT: C set_status keeps the status
             // word zeroed at init, so the record never sends torque (RS/AB)
             // or gain commands and never offers UEIP.
             ..MotorStatus::default()
         };
-        self.last_status = status.clone();
         Ok(status)
     }
 }
@@ -626,6 +629,40 @@ mod tests {
         axis.move_absolute(&AsynUser::default(), 50.0, 0.0, 400.0, 0.0)
             .unwrap();
         assert_eq!(line.sent(), ["1SV400\r", "1MA50\r"]);
+    }
+
+    /// drvPM304.cc:252-261, 302-311: the direction follows a position
+    /// change, holds while the position does, and only a PM304 limit sets it.
+    #[test]
+    fn direction_holds_until_the_position_moves() {
+        use std::sync::Mutex as StdMutex;
+        let replies = Arc::new(StdMutex::new(("00010000", "AP=10")));
+        let r = replies.clone();
+        let (_line, io) = LineRig::new("pm304Dir", move |last| match last {
+            "1ID\r" => "Mclennan PM304".into(),
+            "1OS\r" => r.lock().unwrap().0.into(),
+            "1OA\r" => r.lock().unwrap().1.into(),
+            _ => "OK".into(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        assert!(axis.poll(&user).unwrap().direction);
+        *replies.lock().unwrap() = ("00010000", "AP=5");
+        assert!(!axis.poll(&user).unwrap().direction);
+        assert!(!axis.poll(&user).unwrap().direction);
+        *replies.lock().unwrap() = ("01010000", "AP=5");
+        assert!(axis.poll(&user).unwrap().direction);
+
+        let (_line, io) = LineRig::new("pm600Dir", |last| match last {
+            "1ID\r" => "1ID\rMclennan PM600".into(),
+            "1OS\r" => "1OS\r01:10100000".into(),
+            _ => "1OA\r01:0".into(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let s = axis.poll(&user).unwrap();
+        assert!(s.high_limit && !s.direction);
     }
 
     #[test]
