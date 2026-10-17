@@ -43,7 +43,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_int,
     opt_string, poll_intervals, req_string,
 };
-use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1::{CardInit, Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 use motor_common::model2::{Model2, Model2Axis};
 use motor_common::{
@@ -1731,13 +1731,13 @@ fn model1_config_args() -> Vec<ArgDesc> {
     ]
 }
 
-/// A model-1 `<name>(card, port, addr)` whose card `build` fills, if the
-/// driver's `Setup` sized a table holding `card`. `addr` is the GPIB address,
-/// which an octet port at address 0 has no use for.
+/// A model-1 `<name>(card, port, addr)` whose `motor_init` pass `build` is,
+/// if the driver's `Setup` sized a table holding `card`. `addr` is the asyn
+/// address C connects at.
 fn model1_config_command(
     name: &'static str,
     driver: &'static Model1,
-    build: fn(&CommandContext, i32, &str, i32) -> Result<(), String>,
+    build: fn(&mut CardInit, &str, i32),
 ) -> CommandDef {
     CommandDef::new(
         name,
@@ -1749,7 +1749,8 @@ fn model1_config_command(
                 return Ok(CommandOutcome::Continue);
             }
             let port = req_string(args, 1, "asyn port name")?;
-            build(ctx, card, &port, c_int(args, 2))?;
+            let addr = c_int(args, 2);
+            driver.config(ctx, card, move |init| build(init, &port, addr))?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1774,23 +1775,22 @@ pub fn mm3000_setup_command() -> CommandDef {
 /// `MM3000Config(card, name, addr)`: one signal per axis slot the
 /// controller's `RC` reports, including the trailing `unused` slot C counts.
 pub fn mm3000_config_command() -> CommandDef {
-    model1_config_command("MM3000Config", &MM3000, |ctx, card, port, addr| {
+    model1_config_command("MM3000Config", &MM3000, |init, port, addr| {
         // C drops a card it cannot connect to without a word.
-        let Ok(handle) = connect_serial(port, MM3000_TIMEOUT) else {
-            return Ok(());
+        let Ok(handle) = connect_serial(port, addr, MM3000_TIMEOUT) else {
+            return;
         };
         let Some(controller) = Mm3000Controller::new(handle) else {
-            return Ok(());
+            return;
         };
         let num_axes = controller.axis_types().len();
         let line = format!("{port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
             let ax = Mm3000Axis::new(controller.clone(), axis);
-            MM3000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
+            init.axis((axis - 1) as i32, Arc::new(Mutex::new(ax)));
         }
-        MM3000.describe(card, line);
-        Ok(())
+        init.describe(line);
     })
 }
 
@@ -1834,10 +1834,10 @@ pub fn mm4000_setup_command() -> CommandDef {
 /// `MM4000Config(card, name, addr)`: one signal per axis the controller's
 /// `TH;` reports.
 pub fn mm4000_config_command() -> CommandDef {
-    model1_config_command("MM4000Config", &MM4000, |ctx, card, port, addr| {
+    model1_config_command("MM4000Config", &MM4000, |init, port, addr| {
         // C drops a card it cannot connect to without a word.
-        let Ok(handle) = connect_serial(port, MM4000_TIMEOUT) else {
-            return Ok(());
+        let Ok(handle) = connect_serial(port, addr, MM4000_TIMEOUT) else {
+            return;
         };
         // Six per-axis polls share one controller-wide exchange: cache for
         // half the default scan period.
@@ -1848,21 +1848,24 @@ pub fn mm4000_config_command() -> CommandDef {
                 errlog_vprintf(format_args!(
                     "drvMM4000.c:motor_init() - invalid model = {ident}\n"
                 ));
-                return Ok(());
+                return;
             }
-            Err(_) => return Ok(()),
+            Err(_) => return,
         };
         let num_axes = controller.num_axes();
         let line = format!("port={port}, address={addr}, id: {}", controller.firmware());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let mut ax =
-                Mm4000Axis::new(controller.clone(), card, axis, mm4000::MODEL1_POLL_FAILURE);
+            let mut ax = Mm4000Axis::new(
+                controller.clone(),
+                init.card(),
+                axis,
+                mm4000::MODEL1_POLL_FAILURE,
+            );
             ax.model1_set_status();
-            MM4000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
+            init.axis((axis - 1) as i32, Arc::new(Mutex::new(ax)));
         }
-        MM4000.describe(card, line);
-        Ok(())
+        init.describe(line);
     })
 }
 
@@ -1985,7 +1988,7 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 c.moving_s = f64::from(c_int(args, 4)) / 1000.0;
                 c.idle_s = f64::from(c_int(args, 5)) / 1000.0;
             });
-            let Ok(handle) = connect_serial(&port_name, MM4000_TIMEOUT) else {
+            let Ok(handle) = connect_serial(&port_name, c_int(args, 2), MM4000_TIMEOUT) else {
                 println!("MM4000AsynConfig: cannot connect to asyn port {port_name}");
                 return Ok(CommandOutcome::Continue);
             };
@@ -2056,6 +2059,17 @@ static PM500: Model1 = Model1::new(&DEV_PM500, 4, SCAN_RATE);
 
 /// `PM500Setup(num_cards, scan_rate)`.
 pub fn pm500_setup_command() -> CommandDef {
+    PM500.register_report("drvPM500", |cards| {
+        if cards.num_cards() <= 0 {
+            return "    No PM500 controllers configured.\n".into();
+        }
+        (0..cards.num_cards())
+            .map(|card| match cards.card(card) {
+                Some(line) => format!("    PM500 controller {card} {line} \n"),
+                None => format!("    PM500 controller #{card} connection failed.\n"),
+            })
+            .collect()
+    });
     PM500.setup_command("PM500Setup")
 }
 
@@ -2063,20 +2077,21 @@ pub fn pm500_setup_command() -> CommandDef {
 /// scan finds. C `motor_init` drops a controller it cannot connect to or
 /// that leaves `SVN?` unanswered without a word (drvPM500.cc:577, :671-672).
 pub fn pm500_config_command() -> CommandDef {
-    model1_config_command("PM500Config", &PM500, |ctx, card, port, _addr| {
-        let Ok(handle) = connect_serial(port, PM500_TIMEOUT) else {
-            return Ok(());
+    model1_config_command("PM500Config", &PM500, |init, port, addr| {
+        let Ok(handle) = connect_serial(port, addr, PM500_TIMEOUT) else {
+            return;
         };
         let Some(controller) = Pm500Controller::new(handle) else {
-            return Ok(());
+            return;
         };
         let num_axes = controller.num_axes();
+        let line = format!("port={port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for index in 0..num_axes {
             let ax = Pm500Axis::new(controller.clone(), index);
-            PM500.install(ctx, card, index as i32, Arc::new(Mutex::new(ax)))?;
+            init.axis(index as i32, Arc::new(Mutex::new(ax)));
         }
-        Ok(())
+        init.describe(line);
     })
 }
 
@@ -2098,10 +2113,11 @@ pub fn esp300_setup_command() -> CommandDef {
 /// `ESP300Config(card, name, addr)`: one signal per axis C `motor_init`
 /// finds (stop each axis until "axis number out of range").
 pub fn esp300_config_command() -> CommandDef {
-    model1_config_command("ESP300Config", &ESP300, |ctx, card, port, addr| {
+    model1_config_command("ESP300Config", &ESP300, |init, port, addr| {
         const ERRMSG: &str = "drvESP300.c:motor_init: ASYN";
         let handle = match connect_with_eos(
             port,
+            addr,
             ESP300_TIMEOUT,
             esp300::INPUT_EOS,
             esp300::OUTPUT_EOS,
@@ -2113,28 +2129,27 @@ pub fn esp300_config_command() -> CommandDef {
                     "{ERRMSG} setInputEos error = {}\n",
                     e.status() as i32
                 ));
-                return Ok(());
+                return;
             }
             Err(_) => {
                 errlog_vprintf(format_args!(
                     "{ERRMSG} connect error = {}\n",
                     AsynStatus::Error as i32
                 ));
-                return Ok(());
+                return;
             }
         };
         let Some(controller) = Esp300Controller::new(handle) else {
-            return Ok(());
+            return;
         };
         let num_axes = controller.num_axes();
         let line = format!("port={port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
             let ax = Esp300Axis::new(controller.clone(), axis);
-            ESP300.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
+            init.axis((axis - 1) as i32, Arc::new(Mutex::new(ax)));
         }
-        ESP300.describe(card, line);
-        Ok(())
+        init.describe(line);
     })
 }
 
@@ -2148,8 +2163,8 @@ static PMNC87XX: Model1 = Model1::new(&DEV_PMNC87XX, 10, SCAN_RATE);
 /// are discovered, so `num_drivers` has no use.
 pub fn pmnc87xx_setup_command() -> CommandDef {
     PMNC87XX.register_row();
-    // C breaks out of the card loop after the first configured card
-    // (drvPMNC87xx.cc:233), leaving the rest unreported; not copied.
+    // The `break` at drvPMNC87xx.cc:233 ends C's card loop after the first
+    // configured card, leaving the rest unreported; a C defect not copied.
     PMNC87XX.register_report("drvPMNC87xx", |cards| {
         cards.report("PMNC87xx", |card, line| {
             format!("    PMNC87xx controller {card} asyn port= {line} \n")
@@ -2174,22 +2189,29 @@ pub fn pmnc87xx_setup_command() -> CommandDef {
 /// modules found (`MPV` for the 8750, `DRT` for the 8752). The controller
 /// sets the port EOS itself, as C `motor_init` does.
 pub fn pmnc87xx_config_command() -> CommandDef {
-    model1_config_command("PMNC87xxConfig", &PMNC87XX, |ctx, card, port, addr| {
-        let asyn_port = get_port(port).ok_or_else(|| {
-            format!("IP port '{port}' not found (call drvAsynIPPortConfigure first)")
-        })?;
-        let controller = PmncController::new(asyn_port.handle.clone(), PMNC_TIMEOUT)
-            .map_err(|e| format!("PMNC87xxConfig: {e}"))?;
-        let num_axes = controller.num_axes();
+    model1_config_command("PMNC87xxConfig", &PMNC87XX, |init, port, addr| {
+        let Some(asyn_port) = get_port(port) else {
+            // A missing port is the one connect refusal; connectDevice
+            // returns asynError for it.
+            println!(
+                "drvPMNC:motor_init(), error calling pasynOctetSyncIO->connect port={port} \
+                 error={}",
+                AsynStatus::Error as i32
+            );
+            return;
+        };
+        let Ok(controller) = PmncController::new(asyn_port.handle.clone(), addr, PMNC_TIMEOUT)
+        else {
+            return;
+        };
         let line = format!("{port}, address={addr}, id: {}", controller.ident());
-        let controller = Arc::new(Mutex::new(controller));
-        for index in 0..num_axes {
-            let ax = PmncAxis::new(controller.clone(), index)
-                .map_err(|e| format!("PMNC87xxConfig: axis {index}: {e}"))?;
-            PMNC87XX.install(ctx, card, index as i32, Arc::new(Mutex::new(ax)))?;
+        for (index, ax) in PmncAxis::all(Arc::new(Mutex::new(controller)))
+            .into_iter()
+            .enumerate()
+        {
+            init.axis(index as i32, Arc::new(Mutex::new(ax)));
         }
-        PMNC87XX.describe(card, line);
-        Ok(())
+        init.describe(line);
     })
 }
 
@@ -2932,7 +2954,7 @@ mod one_poller {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{port_report, run_command};
+    use motor_common::testing::{drvsup_init, port_report, run_command};
 
     /// AG_UCController::report then AG_UCAxis::report (AG_UC.cpp:192-201,
     /// :255-267); currentPosition is the last poll's.
@@ -3251,6 +3273,7 @@ mod report {
         });
         let config = vec![int(1), ArgValue::String("esp300RepLine".into()), int(3)];
         run_command(esp300_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvESP300", 0),
             "    ESP300 controller 0 connection failed.\n    ESP300 controller 1 \
@@ -3274,6 +3297,7 @@ mod report {
         });
         let config = vec![int(0), ArgValue::String("mm3000RepLine".into()), int(4)];
         run_command(mm3000_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvMM3000", 0),
             "    MM3000 controller 0 asyn port= mm3000RepLine, address=4, id: MM3000 Version \
@@ -3298,9 +3322,139 @@ mod report {
         });
         let config = vec![int(0), ArgValue::String("mm4000RepLine".into()), int(0)];
         run_command(mm4000_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvMM4000", 0),
             "    MM4000 controller 0, port=mm4000RepLine, address=0, id: MM4005 Version 2.0 \n"
+        );
+    }
+
+    /// drvPM500.cc's drvet `report` (drvPM500.cc:163-189), which `dbior`
+    /// runs at every level; `strncpy` keeps 50 bytes of the ident (:584).
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pm500_controller() {
+        use motor_common::testing::{LineRig, driver_report, drvsup_init};
+        let setup = pm500_setup_command();
+        let none = "    No PM500 controllers configured.\n";
+        assert_eq!(driver_report("drvPM500", 0), none);
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let ident = format!("PM500 {}", "v".repeat(50));
+        let svn = format!("XD{ident}");
+        let (_line, _io) = LineRig::new("pm500RepLine", move |last| match last.trim_end() {
+            "SVN?" => svn.clone(),
+            "XSTAT?" => "XB".into(),
+            _ => "YE".into(),
+        });
+        let config = vec![int(1), ArgValue::String("pm500RepLine".into()), int(3)];
+        run_command(pm500_config_command(), config).await;
+        drvsup_init().await;
+        for level in [0, 1, 2] {
+            assert_eq!(
+                driver_report("drvPM500", level),
+                format!(
+                    "    PM500 controller #0 connection failed.\n    PM500 controller 1 \
+                     port=pm500RepLine, address=3, id: {} \n",
+                    &ident[..50]
+                )
+            );
+        }
+    }
+
+    /// drvESP300.cc:671-676, now at motor_init rather than ESP300Config.
+    #[epics_rs::base::epics_test]
+    async fn esp300_errlogs_a_connect_error_at_ioc_init() {
+        use motor_common::testing::ioc_init_errlog;
+        let int = ArgValue::Int;
+        run_command(esp300_setup_command(), vec![int(1), int(10)]).await;
+        let config = vec![int(0), ArgValue::String("espNowhere".into()), int(0)];
+        run_command(esp300_config_command(), config).await;
+        assert_eq!(
+            ioc_init_errlog("").await,
+            ["drvESP300.c:motor_init: ASYN connect error = 3"]
+        );
+    }
+
+    /// drvMM4000.cc:728-733, now at motor_init rather than MM4000Config.
+    #[epics_rs::base::epics_test]
+    async fn mm4000_errlogs_an_invalid_model_at_ioc_init() {
+        use motor_common::testing::{LineRig, ioc_init_errlog};
+        let int = ArgValue::Int;
+        run_command(mm4000_setup_command(), vec![int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new("mm4000Odd", |last| match last {
+            "TH;" => "TH 0".into(),
+            "VE;" => "VEXPS 1.0".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("mm4000Odd".into()), int(0)];
+        run_command(mm4000_config_command(), config).await;
+        assert_eq!(
+            ioc_init_errlog("").await,
+            ["drvMM4000.c:motor_init() - invalid model = XPS 1.0"]
+        );
+    }
+
+    /// drvPMNC87xx.cc:853-856: a refused connect at motor_init is printf'd.
+    #[epics_rs::base::epics_test]
+    async fn pmnc87xx_prints_a_connect_error_at_ioc_init() {
+        use motor_common::testing::{child_stdout, drvsup_init, in_child};
+        if !in_child() {
+            let out = child_stdout(
+                module_path!(),
+                "pmnc87xx_prints_a_connect_error_at_ioc_init",
+            );
+            let line = "drvPMNC:motor_init(), error calling pasynOctetSyncIO->connect \
+                        port=pmncNowhere error=3\n";
+            assert_eq!(out.matches(line).count(), 1, "{out}");
+            return;
+        }
+        let int = ArgValue::Int;
+        run_command(pmnc87xx_setup_command(), vec![int(1), int(1), int(10)]).await;
+        let config = vec![int(0), ArgValue::String("pmncNowhere".into()), int(0)];
+        run_command(pmnc87xx_config_command(), config).await;
+        drvsup_init().await;
+    }
+
+    /// The errlog drvPMNC87xx.cc's motor_init prints for a card that
+    /// answers `VER` with `ver` and `DRT` with `drt`.
+    async fn pmnc87xx_init_errlog(port: &str, ver: &'static str, drt: &'static str) -> Vec<String> {
+        use motor_common::testing::{LineRig, ioc_init_errlog};
+        let int = ArgValue::Int;
+        run_command(pmnc87xx_setup_command(), vec![int(1), int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new(port, move |last| match last {
+            "VER" => ver.into(),
+            "DRT" => drt.into(),
+            _ => ">".into(),
+        });
+        let config = vec![int(0), ArgValue::String(port.into()), int(0)];
+        run_command(pmnc87xx_config_command(), config).await;
+        ioc_init_errlog("").await
+    }
+
+    /// drvPMNC87xx.cc:919-924: no `VER_STR` in the ident.
+    #[epics_rs::base::epics_test]
+    async fn pmnc87xx_errlogs_an_unknown_version() {
+        assert_eq!(
+            pmnc87xx_init_errlog("pmncNoVer", "Picomotor 2.0", "A0=2>").await,
+            ["drvPMNC87xx.c:motor_init() - unknown version = Picomotor 2.0"]
+        );
+    }
+
+    /// drvPMNC87xx.cc:935-938: a firmware digit other than 0, 5 or 6.
+    #[epics_rs::base::epics_test]
+    async fn pmnc87xx_errlogs_an_invalid_model() {
+        assert_eq!(
+            pmnc87xx_init_errlog("pmncBadModel", "Version 1.9.0", "A0=2>").await,
+            ["drvPMNC87xx:motor_init() - invalid model = Version 1.9.0"]
+        );
+    }
+
+    /// drvPMNC87xx.cc:984-987: a DRT driver type other than 8753 or 8751.
+    #[epics_rs::base::epics_test]
+    async fn pmnc87xx_errlogs_an_invalid_driver() {
+        assert_eq!(
+            pmnc87xx_init_errlog("pmncBadDrt", "Version 1.6.0", "A0=7>").await,
+            ["drvPMNC87xx:motor_init() - invalid driver = 7"]
         );
     }
 
@@ -3332,6 +3486,7 @@ mod report {
                 "    PMNC87xx controller {card} asyn port= {port}, address=0, id: Version 1.6.0 \n"
             )
         };
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvPMNC87xx", 0),
             format!(
@@ -3339,6 +3494,26 @@ mod report {
                 id(0, "pmncRepA"),
                 id(2, "pmncRepB")
             )
+        );
+    }
+
+    /// drvPMNC87xx.cc:944-993: once `VER` answered, a silent `DRT` leaves
+    /// the card with no axes; only an invalid model or driver drops it.
+    #[epics_rs::base::epics_test]
+    async fn pmnc87xx_card_answering_ver_survives_silent_drt() {
+        use motor_common::testing::{LineRig, driver_report};
+        let int = ArgValue::Int;
+        run_command(pmnc87xx_setup_command(), vec![int(1), int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new("pmncNoDrt", |last| match last {
+            "VER" => "Version 1.6.0".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("pmncNoDrt".into()), int(0)];
+        run_command(pmnc87xx_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvPMNC87xx", 0),
+            "    PMNC87xx controller 0 asyn port= pmncNoDrt, address=0, id: Version 1.6.0 \n"
         );
     }
 

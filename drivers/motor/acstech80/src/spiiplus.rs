@@ -136,37 +136,31 @@ impl SpiiPlusController {
             num_axes: 0,
         };
 
-        // Probe the controller (retry up to 3 times), then stop all motion.
-        let mut probed = false;
-        for _ in 0..3 {
-            let reply = ctrl.command("?VR")?;
-            if !reply.is_empty() && !reply.contains('?') {
-                probed = true;
-                break;
-            }
+        // C's send_recv_mess returns the bytes read, so any reply makes the
+        // card present and only a silent one is probed again
+        // (drvSPiiPlus.cc:692-701); halt and ident statuses are ignored.
+        let answered = (0..3).any(|_| {
+            ctrl.handle
+                .write_read(0, b"?VR", READ_BUF)
+                .is_ok_and(|reply| !reply.is_empty())
+        });
+        if !answered {
+            return Err(spiiplus_err("SPiiPlus: no response to ?VR probe"));
         }
-        if !probed {
-            return Err(spiiplus_err("SPiiPlus: no valid response to ?VR probe"));
-        }
-        ctrl.command("halt all")?;
-        ctrl.ident = ctrl.command("?VR")?;
+        let _ = ctrl.command("halt all");
+        ctrl.ident = ctrl.command("?VR").unwrap_or_default();
 
-        // Auto-detect the axis count: ?APOS(n) succeeds until n is out of range.
-        let mut n = 0usize;
-        loop {
-            let reply = ctrl.command(&format!("?APOS({n})"))?;
-            if reply.is_empty() || reply.contains('?') {
-                break;
-            }
-            n += 1;
-            if n > AXIS_LETTERS.len() {
-                break;
-            }
-        }
-        if n == 0 {
-            return Err(spiiplus_err("SPiiPlus: no axes detected (?APOS(0) failed)"));
-        }
-        ctrl.num_axes = n;
+        // Auto-detect the axis count: ?APOS(n) succeeds until n is out of
+        // range. A failed one only ends the count (drvSPiiPlus.cc:711-717),
+        // so a card that answered ?VR stays, with no axes at worst.
+        // C counts on past its 8 ACSPL_axis[] letters and reads beyond them;
+        // a C defect not copied: the count stops at the last letter.
+        ctrl.num_axes = (0..AXIS_LETTERS.len())
+            .take_while(|n| {
+                let reply = ctrl.command(&format!("?APOS({n})")).unwrap_or_default();
+                !reply.is_empty() && !reply.contains('?')
+            })
+            .count();
         Ok(ctrl)
     }
 
@@ -625,6 +619,22 @@ mod tests {
         let axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
         (line, axis)
+    }
+
+    /// A controller answering every `?APOS(n)` gets one axis per
+    /// `ACSPL_axis[]` letter, and its last axis polls in Connect mode.
+    #[test]
+    fn the_apos_count_stops_at_the_axis_letters() {
+        let (_line, io) = LineRig::new("spiiAllApos", |last| match last {
+            "?VR" => "ACS SPiiPlus".into(),
+            l if l.starts_with("?APOS") || l.starts_with("?FPOS") => "0".into(),
+            _ => "0".into(),
+        });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Connect).unwrap();
+        let num_axes = ctrl.num_axes();
+        assert_eq!(num_axes, AXIS_LETTERS.len());
+        let mut last = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), num_axes - 1);
+        let _ = last.poll(&AsynUser::default());
     }
 
     /// motorRecord.cc:872-884: VEL, ACC, HOME, GO; GO's `start` goes alone.

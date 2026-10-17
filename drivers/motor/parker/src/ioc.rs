@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
@@ -155,9 +156,8 @@ pub fn pc6k_setup_command() -> CommandDef {
     PC6K.setup_command("PC6KSetup")
 }
 
-/// `PC6KConfig(card, name)`. Connects and probes the card at once, where
-/// C's `motor_init` does so at iocInit; a card that does not answer as a
-/// 6K is left unconfigured, as there.
+/// `PC6KConfig(card, name)`. `motor_init` at iocInit connects and probes
+/// the card; a card that does not answer as a 6K is left unconfigured.
 pub fn pc6k_config_command() -> CommandDef {
     CommandDef::new(
         "PC6KConfig",
@@ -172,34 +172,47 @@ pub fn pc6k_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let handle = connect_with_eos(
-                &asyn_port,
-                drv_pc6k::TIMEOUT,
-                b">",
-                b"\n",
-                EosRefusal::Ignored,
-            )?;
-            let controller = Pc6kCard::new(handle);
-            let Some((ident, axes)) = drv_pc6k::motor_init(&controller) else {
-                return Ok(CommandOutcome::Continue);
-            };
-            let controller = Arc::new(Mutex::new(controller));
-            for (signal, limits) in axes.into_iter().enumerate() {
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvPc6kAxis::new(
-                    controller.clone(),
-                    signal,
-                    limits,
-                )));
-                PC6K.install(ctx, card, signal as i32, motor)?;
-            }
-            // C prints `cntrl->asyn_address`, which PC6KConfig never sets
-            // (drvPC6K.cc:648-662), a read of uninitialized memory not
-            // copied; this is the address the line is opened at.
-            PC6K.describe(card, format!("port={asyn_port}, address=0, id: {ident}"));
-            PC6K_CARDS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(card, controller);
+            PC6K.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    // C connects at an asyn_address PC6KConfig never sets (drvPC6K.cc:782).
+                    0,
+                    drv_pc6k::TIMEOUT,
+                    b">",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    // A missing port is the one connect refusal; connectDevice
+                    // returns asynError for it.
+                    println!(
+                        "drvPC68K:motor_init(), error calling pasynOctetSyncIO->connect \
+                         port={asyn_port} error={}",
+                        AsynStatus::Error as i32
+                    );
+                    return;
+                };
+                let controller = Pc6kCard::new(handle);
+                let Some((ident, axes)) = drv_pc6k::motor_init(&controller) else {
+                    return;
+                };
+                let controller = Arc::new(Mutex::new(controller));
+                for (signal, limits) in axes.into_iter().enumerate() {
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvPc6kAxis::new(
+                        controller.clone(),
+                        signal,
+                        limits,
+                    )));
+                    init.axis(signal as i32, motor);
+                }
+                // C prints `cntrl->asyn_address`, which PC6KConfig never sets
+                // (drvPC6K.cc:648-662), a read of uninitialized memory not
+                // copied; this is the address the line is opened at.
+                init.describe(format!("port={asyn_port}, address=0, id: {ident}"));
+                PC6K_CARDS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(card, controller);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -280,7 +293,9 @@ mod one_poller {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{LineRig, driver_report, port_report, run_command};
+    use motor_common::testing::{
+        LineRig, child_stdout, driver_report, drvsup_init, in_child, port_report, run_command,
+    };
 
     /// drvPC6K.cc's drvet `report` (drvPC6K.cc:199-225), which `dbior` runs.
     #[epics_rs::base::epics_test]
@@ -299,11 +314,29 @@ mod report {
         });
         let config = vec![int(1), ArgValue::String("pc6kRepLine".into())];
         run_command(pc6k_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvPC6K", 0),
             "    PC6K controller 0 connection failed.\n    PC6K controller 1, \
              port=pc6kRepLine, address=0, id: *TREV92-016740-01-6K4 \n"
         );
+    }
+
+    /// drvPC6K.cc:783-785: a refused connect at motor_init is printf'd.
+    #[epics_rs::base::epics_test]
+    async fn pc6k_prints_a_connect_error_at_ioc_init() {
+        if !in_child() {
+            let out = child_stdout(module_path!(), "pc6k_prints_a_connect_error_at_ioc_init");
+            let line = "drvPC68K:motor_init(), error calling pasynOctetSyncIO->connect \
+                        port=pc6kNowhere error=3\n";
+            assert_eq!(out.matches(line).count(), 1, "{out}");
+            return;
+        }
+        let int = ArgValue::Int;
+        run_command(pc6k_setup_command(), vec![int(1), int(10)]).await;
+        let config = vec![int(0), ArgValue::String("pc6kNowhere".into())];
+        run_command(pc6k_config_command(), config).await;
+        drvsup_init().await;
     }
 
     /// OEMController::report; OEMAxis::report prints nothing

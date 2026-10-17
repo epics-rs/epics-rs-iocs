@@ -180,6 +180,7 @@ pub fn ensemble_config_command() -> CommandDef {
 
             let Ok(handle) = connect_with_eos(
                 &port_name,
+                c_int(args, 2),
                 TIMEOUT,
                 ensemble::INPUT_EOS,
                 ensemble::OUTPUT_EOS,
@@ -272,6 +273,7 @@ pub fn a3200_config_command() -> CommandDef {
 
             let Ok(handle) = connect_with_eos(
                 &port_name,
+                c_int(args, 2),
                 TIMEOUT,
                 a3200::INPUT_EOS,
                 a3200::OUTPUT_EOS,
@@ -345,9 +347,8 @@ pub fn soloist_setup_command() -> CommandDef {
 
 /// `SoloistConfig(card, name, addr)`. C registers the command with two
 /// arguments and reads the address past them; it is taken here, 0 when
-/// absent. Connects and probes the card at once, where C's `motor_init`
-/// does so at iocInit; a card that does not answer is left without its
-/// axis, as there.
+/// absent. `motor_init` at iocInit connects and probes the card; a card
+/// that does not answer is left without its axis.
 pub fn soloist_config_command() -> CommandDef {
     CommandDef::new(
         "SoloistConfig",
@@ -364,31 +365,32 @@ pub fn soloist_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let addr = c_int(args, 2);
-            let (handle, connected) = SyncIOHandle::connect_port(
-                &asyn_port,
-                addr,
-                drv_soloist::TIMEOUT,
-                InterfaceType::Octet,
-            );
-            if connected.is_err() {
-                return Ok(CommandOutcome::Continue);
-            }
-            let controller = SoloistCard::new(handle, addr);
-            let Some(init) = drv_soloist::motor_init(&controller) else {
-                return Ok(CommandOutcome::Continue);
-            };
-            let ident = init.user_string.unwrap_or_else(|| format!("Soloist{card}"));
-            SOLOIST.describe(
-                card,
-                format!("port={asyn_port}, address={addr}, id: {ident}"),
-            );
-            let Some(setup) = init.axis else {
-                return Ok(CommandOutcome::Continue);
-            };
-            let controller = Arc::new(Mutex::new(controller));
-            let motor: Arc<Mutex<dyn AsynMotor>> =
-                Arc::new(Mutex::new(DrvSoloistAxis::new(controller, setup)));
-            SOLOIST.install(ctx, card, 0, motor)?;
+            SOLOIST.config(ctx, card, move |init| {
+                let (handle, connected) = SyncIOHandle::connect_port(
+                    &asyn_port,
+                    addr,
+                    drv_soloist::TIMEOUT,
+                    InterfaceType::Octet,
+                );
+                if connected.is_err() {
+                    return;
+                }
+                let controller = SoloistCard::new(handle, addr);
+                let Some(found) = drv_soloist::motor_init(&controller) else {
+                    return;
+                };
+                let ident = found
+                    .user_string
+                    .unwrap_or_else(|| format!("Soloist{card}"));
+                init.describe(format!("port={asyn_port}, address={addr}, id: {ident}"));
+                let Some(setup) = found.axis else {
+                    return;
+                };
+                let controller = Arc::new(Mutex::new(controller));
+                let motor: Arc<Mutex<dyn AsynMotor>> =
+                    Arc::new(Mutex::new(DrvSoloistAxis::new(controller, setup)));
+                init.axis(0, motor);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -400,7 +402,7 @@ mod report {
 
     use super::*;
     use motor_common::model2::drv_asyn_motor_configure_command;
-    use motor_common::testing::{LineRig, driver_report, run_command};
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
     fn config(card: i64, line: &str, num_axes: i64) -> Vec<ArgValue> {
         vec![
@@ -568,6 +570,7 @@ mod report {
             ];
             run_command(soloist_config_command(), args).await;
         }
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvSoloist", 0),
             "    Soloist controller 0, port=solRepA, address=0, id: Soloist0 \n    \

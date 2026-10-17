@@ -326,11 +326,7 @@ impl PIC848Axis {
     /// Construct axis `signal` (0-based; wire letter `A`+`signal`), seeding the
     /// initial status (C `motor_init`'s `set_status`). A failed initial poll is
     /// not an error.
-    pub fn new(
-        controller: Arc<Mutex<PIC848Controller>>,
-        card: i32,
-        signal: u8,
-    ) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<PIC848Controller>>, card: i32, signal: u8) -> Self {
         let reference = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             ctrl.reference(signal)
@@ -357,7 +353,7 @@ impl PIC848Axis {
             drop(ctrl);
             axis.apply(polled, false);
         }
-        Ok(axis)
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, PIC848Controller> {
@@ -666,7 +662,7 @@ mod tests {
             _ => "A=0".into(),
         });
         let ctrl = PIC848Controller::new(io).unwrap();
-        let axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0).unwrap();
+        let axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0);
         line.sent();
         (line, axis, sta)
     }
@@ -875,7 +871,7 @@ mod tests {
             }
         });
         let ctrl = PIC848Controller::new(io).unwrap();
-        let mut axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0).unwrap();
+        let mut axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());

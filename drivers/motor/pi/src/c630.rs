@@ -167,7 +167,7 @@ impl PIC630Controller {
         for addr in 1..=num_axes {
             let mut reply;
             loop {
-                ctrl.send(&format!("{addr}TS"))?;
+                let _ = ctrl.send(&format!("{addr}TS"));
                 reply = ctrl.recv();
                 retry += 1;
                 if !(reply.is_empty() && retry < 3) {
@@ -253,11 +253,7 @@ impl PIC630Axis {
     /// order of C `motor_init`'s init loop. `signal` is 0-based; wire address
     /// is `signal + 1`. A failed initial poll is not an error (C leaves the
     /// zeroed defaults in place).
-    pub fn new(
-        controller: Arc<Mutex<PIC630Controller>>,
-        signal: u8,
-        current: i32,
-    ) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<PIC630Controller>>, signal: u8, current: i32) -> Self {
         let addr = signal + 1;
         let mut axis = Self {
             controller: controller.clone(),
@@ -272,12 +268,12 @@ impl PIC630Axis {
         };
 
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        ctrl.send(&format!("{addr}DC{current}"))?;
-        ctrl.send(&format!("{addr}AB"))?;
+        let _ = ctrl.send(&format!("{addr}DC{current}"));
+        let _ = ctrl.send(&format!("{addr}AB"));
         let polled = axis.poll_locked(&ctrl);
         drop(ctrl);
         axis.apply(polled);
-        Ok(axis)
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, PIC630Controller> {
@@ -522,7 +518,7 @@ mod tests {
             c => c.into(),
         });
         let ctrl = PIC630Controller::new(io, 1).unwrap();
-        let mut axis = PIC630Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0).unwrap();
+        let mut axis = PIC630Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0);
         let user = AsynUser::default();
         axis.set_high_limit(&user, 100.0).unwrap();
         axis.set_low_limit(&user, -100.0).unwrap();

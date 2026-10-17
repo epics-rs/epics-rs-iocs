@@ -528,9 +528,9 @@ fn micos_report(cards: &Model1Cards<'_>) -> String {
         .collect()
 }
 
-/// `MicosConfig(card, name)`. Connects and probes the card at once, where
-/// C's `motor_init` does so at iocInit; a card where any of the
-/// `num_channels` drivers is silent is left unconfigured, as there.
+/// `MicosConfig(card, name)`. `motor_init` at iocInit connects and probes
+/// the card; a card where any of the `num_channels` drivers is silent is
+/// left unconfigured.
 pub fn micos_config_command() -> CommandDef {
     CommandDef::new(
         "MicosConfig",
@@ -548,26 +548,31 @@ pub fn micos_config_command() -> CommandDef {
             // The MoCo ends a reply with CR LF ETX. C asks for all three as
             // the input EOS, which asyn refuses (eoslen > 2), so its reads
             // end only on timeout; the ETX alone ends one here.
-            let handle = connect_with_eos(
-                &asyn_port,
-                MICOS_TIMEOUT,
-                b"\x03",
-                b"\r",
-                EosRefusal::Ignored,
-            )?;
-            let controller = MicosController::new(handle);
-            let num_axis = MICOS_NUM_AXES.load(Ordering::Relaxed);
-            if !micos_probe(&controller, num_axis) {
-                return Ok(CommandOutcome::Continue);
-            }
-            let controller = Arc::new(Mutex::new(controller));
-            for signal in 0..num_axis {
-                let motor: Arc<Mutex<dyn AsynMotor>> =
-                    Arc::new(Mutex::new(DrvMicosAxis::new(controller.clone(), signal)));
-                MICOS.install(ctx, card, signal, motor)?;
-            }
-            // C motor_init's `strcpy(brdptr->ident, "MICOS")` (drvMicos.cc:541).
-            MICOS.describe(card, "MICOS");
+            MICOS.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    MICOS_TIMEOUT,
+                    b"\x03",
+                    b"\r",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let controller = MicosController::new(handle);
+                let num_axis = MICOS_NUM_AXES.load(Ordering::Relaxed);
+                if !micos_probe(&controller, num_axis) {
+                    return;
+                }
+                let controller = Arc::new(Mutex::new(controller));
+                for signal in 0..num_axis {
+                    let motor: Arc<Mutex<dyn AsynMotor>> =
+                        Arc::new(Mutex::new(DrvMicosAxis::new(controller.clone(), signal)));
+                    init.axis(signal, motor);
+                }
+                // C motor_init's `strcpy(brdptr->ident, "MICOS")` (drvMicos.cc:541).
+                init.describe("MICOS");
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -705,7 +710,7 @@ mod report {
     /// runs.
     #[epics_rs::base::epics_test]
     async fn dbior_prints_each_configured_micos_card() {
-        use motor_common::testing::driver_report;
+        use motor_common::testing::{driver_report, drvsup_init};
         let setup = micos_setup_command();
         assert_eq!(
             driver_report("drvMicos", 0),
@@ -716,6 +721,7 @@ mod report {
         let (_line, _io) = LineRig::new("micosRepLine", |_| "ok".into());
         let config = vec![int(1), ArgValue::String("micosRepLine".into())];
         run_command(micos_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvMicos", 0),
             "    Micos controller group 1, id: MICOS \n"

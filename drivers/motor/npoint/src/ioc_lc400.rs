@@ -54,7 +54,7 @@ fn lc400_create_controller_command(registry: &Registry) -> CommandDef {
             let num_axes = c_int(args, 2).max(0);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&lc400_port, LC400_TIMEOUT)
+            let handle = connect_serial(&lc400_port, 0, LC400_TIMEOUT)
                 .inspect_err(|_| {
                     eprintln!(
                         "LC400MotorDriver:LC400Controller: cannot connect to LC400 controller"

@@ -1,8 +1,7 @@
 //! `SPiiPlusSetup` / `SPiiPlusConfig` iocsh commands for the ACS Tech80
 //! SPiiPlus, C's model-1 interface: records reach axis `signal` of `card`
-//! through `DTYP "SPiiPlus"` and `OUT "#C card S signal"`. Config connects
-//! and identifies the controller at once, where C's `motor_init` does so at
-//! iocInit.
+//! through `DTYP "SPiiPlus"` and `OUT "#C card S signal"`. Config keeps
+//! the port; `motor_init` at iocInit connects and identifies the controller.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,6 +28,11 @@ static SPIIPLUS: Model1 = Model1::new(&DEV_SPIIPLUS, 8, SCAN_RATE);
 
 /// `SPiiPlusSetup(num_cards, scan_rate)`.
 pub fn spiiplus_setup_command() -> CommandDef {
+    SPIIPLUS.register_report("drvSPiiPlus", |cards| {
+        cards.report("SPiiPlus", |card, line| {
+            format!("    SPiiPlus controller {card}, {line} \n")
+        })
+    });
     SPIIPLUS.setup_command("SPiiPlusSetup")
 }
 
@@ -49,25 +53,156 @@ pub fn spiiplus_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let mode = CommandMode::parse(&opt_string(args, 2)?.unwrap_or_default());
+            ctx.println(&format!("SPiiPlus config mode = {}", mode as i32));
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                SPIIPLUS_TIMEOUT,
-                INPUT_EOS,
-                OUTPUT_EOS,
-                EosRefusal::Ignored,
-            )?;
-            let controller = SpiiPlusController::new(handle, mode)
-                .map_err(|e| format!("SPiiPlusConfig: {e}"))?;
-            let num_axes = controller.num_axes();
-            let controller = Arc::new(Mutex::new(controller));
-
-            for index in 0..num_axes {
-                let ax = SpiiPlusAxis::new(controller.clone(), index);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                SPIIPLUS.install(ctx, card, index as i32, motor)?;
-            }
+            SPIIPLUS.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    // C connects at an asyn_address SPiiPlusConfig never sets (drvSPiiPlus.cc:682).
+                    0,
+                    SPIIPLUS_TIMEOUT,
+                    INPUT_EOS,
+                    OUTPUT_EOS,
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = SpiiPlusController::new(handle, mode) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                let line = format!("port={asyn_port}, address=0, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
+                for index in 0..num_axes {
+                    let ax = SpiiPlusAxis::new(controller.clone(), index);
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    init.axis(index as i32, motor);
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::base::runtime::task::BlockingBridge;
+    use epics_rs::base::server::database::PvDatabase;
+    use epics_rs::base::server::iocsh::IocShell;
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
+
+    /// drvSPiiPlus.cc:638 prints the parsed mode at Config, BUFFER 0,
+    /// CONNECT 1, DIRECT 2 (drvSPiiPlus.h:79).
+    #[epics_rs::base::epics_test]
+    async fn config_prints_the_command_mode() {
+        let int = ArgValue::Int;
+        run_command(spiiplus_setup_command(), vec![int(3), int(10)]).await;
+        let out = std::env::temp_dir().join(format!("spiiplus-mode-{}", std::process::id()));
+        let shell = IocShell::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
+        shell.register(spiiplus_config_command());
+        for (card, mode) in [(0, "buffer"), (1, "con"), (2, "Dir")] {
+            let line = format!(
+                "SPiiPlusConfig({card}, \"spRig\", \"{mode}\") >> {}",
+                out.display()
+            );
+            shell.execute_line(line).unwrap();
+        }
+        let printed = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(
+            printed,
+            "SPiiPlus config mode = 0\nSPiiPlus config mode = 1\nSPiiPlus config mode = 2\n"
+        );
+    }
+
+    /// drvSPiiPlus.cc's drvet `report` (drvSPiiPlus.cc:159-185), which
+    /// `dbior` runs at every level. C prints an `asyn_address` SPiiPlusConfig
+    /// never sets; 0 is the address the line is opened at.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_spiiplus_card() {
+        let int = ArgValue::Int;
+        let setup = spiiplus_setup_command();
+        assert_eq!(
+            driver_report("drvSPiiPlus", 0),
+            "    No SPiiPlus controllers configured.\n"
+        );
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("spRepLine", |cmd| match cmd.trim_end() {
+            "?VR" => "SPiiPlus 6.50".into(),
+            "?APOS(0)" => "0".into(),
+            "?APOS(1)" => "?1033".into(),
+            _ => ":".into(),
+        });
+        let config = vec![
+            int(1),
+            ArgValue::String("spRepLine".into()),
+            ArgValue::String("BUF".into()),
+        ];
+        run_command(spiiplus_config_command(), config).await;
+        drvsup_init().await;
+        for level in [0, 1, 2] {
+            assert_eq!(
+                driver_report("drvSPiiPlus", level),
+                "    SPiiPlus controller 0 connection failed.\n    SPiiPlus controller 1, \
+                 port=spRepLine, address=0, id: SPiiPlus 6.50 \n"
+            );
+        }
+    }
+
+    /// drvSPiiPlus.cc:692-701: any non-empty `?VR` reply makes the card
+    /// present, an ACSPL error reply such as `?2001` included; only an empty
+    /// one is sent again, up to 3 times.
+    #[epics_rs::base::epics_test]
+    async fn a_question_mark_probe_reply_still_makes_the_card() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let int = ArgValue::Int;
+        run_command(spiiplus_setup_command(), vec![int(1), int(10)]).await;
+        let probes = AtomicUsize::new(0);
+        let (line, _io) = LineRig::new("spErrVr", move |cmd| match cmd.trim_end() {
+            "?VR" if probes.fetch_add(1, Ordering::SeqCst) < 2 => String::new(),
+            "?VR" => "?2001".into(),
+            "?APOS(0)" => "0".into(),
+            "?APOS(1)" => "?1033".into(),
+            _ => ":".into(),
+        });
+        let config = vec![
+            int(0),
+            ArgValue::String("spErrVr".into()),
+            ArgValue::String("BUF".into()),
+        ];
+        run_command(spiiplus_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvSPiiPlus", 0),
+            "    SPiiPlus controller 0, port=spErrVr, address=0, id: ?2001 \n"
+        );
+        let vr = line.sent().iter().filter(|c| c.trim_end() == "?VR").count();
+        assert_eq!(vr, 4);
+    }
+
+    /// drvSPiiPlus.cc:711-717: a `?APOS(0)` that errors only ends the axis
+    /// count; the card that answered `?VR` stays, with no axes.
+    #[epics_rs::base::epics_test]
+    async fn a_card_answering_vr_survives_an_apos_error() {
+        let int = ArgValue::Int;
+        run_command(spiiplus_setup_command(), vec![int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new("spNoApos", |cmd| match cmd.trim_end() {
+            "?VR" => "SPiiPlus 6.50".into(),
+            "?APOS(0)" => "?1033".into(),
+            _ => ":".into(),
+        });
+        let config = vec![
+            int(0),
+            ArgValue::String("spNoApos".into()),
+            ArgValue::String("BUF".into()),
+        ];
+        run_command(spiiplus_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvSPiiPlus", 0),
+            "    SPiiPlus controller 0, port=spNoApos, address=0, id: SPiiPlus 6.50 \n"
+        );
+    }
 }

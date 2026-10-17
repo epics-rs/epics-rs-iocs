@@ -244,7 +244,7 @@ impl PIE516Controller {
         // 1. Assure ONLINE (bounded to 3 iterations — see module docs).
         let mut online = false;
         for _ in 0..3 {
-            ctrl.send("ONL 1")?;
+            let _ = ctrl.send("ONL 1");
             let reply = ctrl.exchange("ONL?");
             if !reply.is_empty() {
                 online = atoi(&reply) == 1;
@@ -272,8 +272,9 @@ impl PIE516Controller {
         }
         ctrl.num_axes = num_axes;
 
-        // 4. Velocity-control mode ON (all axes).
-        ctrl.send("VCO A1 B1 C1")?;
+        // 4. Velocity-control mode ON (all axes). Both sets are bare
+        // send_mess in C (drvPIE516.cc:588, 628).
+        let _ = ctrl.send("VCO A1 B1 C1");
 
         Ok(ctrl)
     }
@@ -394,7 +395,7 @@ impl PIE516Axis {
     /// `set_status` call). A failed initial poll is not an error — C leaves the
     /// zeroed defaults in place either way. `prev_position` starts at 0 (C
     /// `motor_info->position = 0`).
-    pub fn new(controller: Arc<Mutex<PIE516Controller>>, axis: usize) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<PIE516Controller>>, axis: usize) -> Self {
         let mut me = Self {
             controller: controller.clone(),
             axis,
@@ -414,7 +415,7 @@ impl PIE516Axis {
             drop(ctrl);
             me.last_status = fold_reading(&mut me.prev_position, false, &reading);
         }
-        Ok(me)
+        me
     }
 
     fn label(&self) -> &'static str {
@@ -615,7 +616,7 @@ mod tests {
             _ => String::new(),
         });
         let ctrl = PIE516Controller::new(io).unwrap();
-        let axis = PIE516Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let axis = PIE516Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
         (line, axis, ont)
     }
@@ -859,7 +860,7 @@ mod tests {
             }
         });
         let ctrl = PIE516Controller::new(io).unwrap();
-        let mut axis = PIE516Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let mut axis = PIE516Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());

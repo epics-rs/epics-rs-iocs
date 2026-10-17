@@ -435,7 +435,7 @@ pub struct PIE710Axis {
 impl PIE710Axis {
     /// Construct one axis, seeding the initial status (C `motor_init`'s
     /// per-axis `set_status`). `prev_position` starts at 0.
-    pub fn new(controller: Arc<Mutex<PIE710Controller>>, axis: usize) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<PIE710Controller>>, axis: usize) -> Self {
         let mut me = Self {
             controller: controller.clone(),
             axis,
@@ -455,7 +455,7 @@ impl PIE710Axis {
             drop(ctrl);
             me.last_status = fold_reading(&mut me.prev_position, false, &reading);
         }
-        Ok(me)
+        me
     }
 
     fn label(&self) -> &'static str {
@@ -668,7 +668,7 @@ mod tests {
             _ => String::new(),
         });
         let ctrl = PIE710Controller::new(io).unwrap();
-        let axis = PIE710Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let axis = PIE710Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
         (line, axis, gi8)
     }
@@ -926,7 +926,7 @@ mod tests {
             }
         });
         let ctrl = PIE710Controller::new(io).unwrap();
-        let mut axis = PIE710Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let mut axis = PIE710Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());

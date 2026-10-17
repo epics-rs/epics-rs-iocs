@@ -293,7 +293,7 @@ pub struct PIE816Axis {
 impl PIE816Axis {
     /// Construct one axis, seeding the initial status. `prev_position` starts
     /// at 0.
-    pub fn new(controller: Arc<Mutex<PIE816Controller>>, axis: usize) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<PIE816Controller>>, axis: usize) -> Self {
         let mut me = Self {
             controller: controller.clone(),
             axis,
@@ -313,7 +313,7 @@ impl PIE816Axis {
             drop(ctrl);
             me.last_status = fold_reading(&mut me.prev_position, false, &reading);
         }
-        Ok(me)
+        me
     }
 
     fn label(&self) -> &'static str {
@@ -514,7 +514,7 @@ mod tests {
             _ => String::new(),
         });
         let ctrl = PIE816Controller::new(io).unwrap();
-        let axis = PIE816Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let axis = PIE816Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
         (line, axis, ont)
     }
@@ -680,7 +680,7 @@ mod tests {
             }
         });
         let ctrl = PIE816Controller::new(io).unwrap();
-        let mut axis = PIE816Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let mut axis = PIE816Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());

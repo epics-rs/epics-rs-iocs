@@ -1,8 +1,7 @@
 //! `MCDC2805Setup` / `MCDC2805Config` iocsh commands for the Faulhaber
 //! MCDC2805, C's model-1 interface: records reach axis `signal` of `card`
-//! through `DTYP "MCDC2805"` and `OUT "#C card S signal"`. Config connects
-//! and identifies the controller at once, where C's `motor_init` does so at
-//! iocInit.
+//! through `DTYP "MCDC2805"` and `OUT "#C card S signal"`. Config keeps
+//! the port; `motor_init` at iocInit connects and identifies the controller.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,22 +57,25 @@ pub fn mcdc2805_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 2, "asyn port name")?;
 
-            let handle = connect_serial(&asyn_port, MCDC2805_TIMEOUT)?;
-            let controller = FaulhaberController::new(handle, num_motors as usize)
-                .map_err(|e| format!("MCDC2805Config: {e}"))?;
-            let num_axes = controller.num_axes();
-            let line = format!("port={asyn_port}, id: {}", controller.ident());
-            let controller = Arc::new(Mutex::new(controller));
-
-            for node in 0..num_axes {
-                let ax = FaulhaberAxis::new(controller.clone(), node)
-                    .map_err(|e| format!("MCDC2805Config: node {node}: {e}"))?;
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                MCDC2805.install(ctx, card, node as i32, motor)?;
-            }
-            if num_axes > 0 {
-                MCDC2805.describe(card, line);
-            }
+            MCDC2805.config(ctx, card, move |init| {
+                let Ok(handle) = connect_serial(&asyn_port, 0, MCDC2805_TIMEOUT) else {
+                    return;
+                };
+                let Ok(controller) = FaulhaberController::new(handle, num_motors as usize) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                let line = format!("port={asyn_port}, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
+                for node in 0..num_axes {
+                    let ax = FaulhaberAxis::new(controller.clone(), node);
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    init.axis(node as i32, motor);
+                }
+                if num_axes > 0 {
+                    init.describe(line);
+                }
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -82,7 +84,7 @@ pub fn mcdc2805_config_command() -> CommandDef {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{LineRig, driver_report, run_command};
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
     /// drvMCDC2805.cc's drvet `report` (drvMCDC2805.cc:129-153), which
     /// `dbior` runs; C's per-card line says MCDC2805SM.
@@ -105,10 +107,40 @@ mod report {
         });
         let config = vec![int(1), int(1), ArgValue::String("mcdcRepLine".into())];
         run_command(mcdc2805_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvMCDC2805", 0),
             "    MCDC2805 controller 0 connection failed.\n    MCDC2805SM controller #1, \
              port=mcdcRepLine, id: MCDC 2805 \n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
+
+    /// drvMCDC2805.cc:584-626: after the VER probe every setup command is a
+    /// bare send_mess, so a refused `SOR 0` keeps the card and its axes.
+    #[epics_rs::base::epics_test]
+    async fn card_answering_ver_survives_refused_setup() {
+        let int = ArgValue::Int;
+        run_command(mcdc2805_setup_command(), vec![int(1), int(10)]).await;
+        let (_line, _io) = LineRig::failing(
+            "mcdcSetupRefused",
+            |cmd| match cmd.trim_end() {
+                c if c.ends_with("VER") => "V1".into(),
+                _ => String::new(),
+            },
+            |cmd| cmd.contains("SOR"),
+        );
+        let config = vec![int(0), int(2), ArgValue::String("mcdcSetupRefused".into())];
+        run_command(mcdc2805_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvMCDC2805", 0),
+            "    MCDC2805SM controller #0, port=mcdcSetupRefused, id: V1 \n"
         );
     }
 }

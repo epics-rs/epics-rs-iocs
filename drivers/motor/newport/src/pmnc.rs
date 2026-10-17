@@ -50,6 +50,7 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atoi, nint};
 use motor_common::model1::MoveStrings;
@@ -160,17 +161,11 @@ fn parse_int_after_eq(reply: &str) -> Option<i64> {
     s.get(..end)?.parse().ok()
 }
 
-/// Parse a `DRT` line `A{driver}={type}` into a driver-module model
-/// (C: type 1 → 8753, type 2 → 8751).
-fn parse_drt_line(line: &str) -> Option<(i32, PmdModel)> {
+/// Parse a `DRT` line `A{driver}={type}` (C `sscanf(buff, "A%d=%d", …)`).
+fn parse_drt_line(line: &str) -> Option<(i32, i32)> {
     let (a, rest) = line.split_once('=')?;
     let driver: i32 = a.trim().trim_start_matches('A').trim().parse().ok()?;
-    let model = match rest.trim().parse::<i32>().ok()? {
-        1 => PmdModel::Pmd8753,
-        2 => PmdModel::Pmd8751,
-        _ => return None,
-    };
-    Some((driver, model))
+    Some((driver, rest.trim().parse().ok()?))
 }
 
 /// Parse an `MPV` line `A{driver} M{motor}=...` into (driver, motor)
@@ -189,22 +184,31 @@ fn parse_mpv_line(line: &str) -> Option<(i32, i32)> {
 }
 
 /// Firmware digit after [`VER_STR`] → model, plus the changeEOS flag
-/// (firmware `1.5.3`/`1.5.4`). C: `'0'` → 8750, `'5'`/`'6'` → 8752.
-fn model_from_ident(ident: &str) -> Option<(PmncModel, bool)> {
-    let tail = &ident[ident.find(VER_STR)? + VER_STR.len()..];
-    let mut chars = tail.chars();
-    let model = match chars.next()? {
-        '0' => PmncModel::Pmnc8750,
-        '5' | '6' => PmncModel::Pmnc8752,
-        _ => return None,
+/// (firmware `1.5.3`/`1.5.4`). C: `'0'` → 8750, `'5'`/`'6'` → 8752; the
+/// error is the line C errlogs (drvPMNC87xx.cc:922, 937).
+fn model_from_ident(ident: &str) -> Result<(PmncModel, bool), String> {
+    let Some(at) = ident.find(VER_STR) else {
+        return Err(format!(
+            "drvPMNC87xx.c:motor_init() - unknown version = {ident}"
+        ));
+    };
+    let tail = &ident[at + VER_STR.len()..];
+    let model = match tail.chars().next() {
+        Some('0') => PmncModel::Pmnc8750,
+        Some('5' | '6') => PmncModel::Pmnc8752,
+        _ => {
+            return Err(format!(
+                "drvPMNC87xx:motor_init() - invalid model = {ident}"
+            ));
+        }
     };
     // C inspects the char two positions on (the sub-minor digit).
     let change_eos = matches!(tail.as_bytes().get(2), Some(b'3') | Some(b'4'));
-    Some((model, change_eos))
+    Ok((model, change_eos))
 }
 
-fn eos_user() -> AsynUser {
-    AsynUser::new(0).with_addr(0)
+fn eos_user(addr: i32) -> AsynUser {
+    AsynUser::new(0).with_addr(addr)
 }
 
 /// Shared controller endpoint: owns the octet handle and the cross-axis
@@ -213,6 +217,8 @@ pub struct PmncController {
     handle: SyncIOHandle,
     /// The same port, for the per-read input-EOS switch.
     port: PortHandle,
+    /// `PMNC87xxConfig`'s address, which C connects at (drvPMNC87xx.cc:853).
+    addr: i32,
     /// Firmware 1.5.3/1.5.4: `STA` replies end in `\n` (C `changeEOS`).
     change_eos: bool,
     ident: String,
@@ -227,14 +233,15 @@ impl PmncController {
     /// — an 8750 lists its 8753 channels indirectly via `MPV`, an 8752 reads
     /// each module's type via `DRT` (8753 → 3 channels, 8751 → 1). Performs
     /// blocking I/O.
-    pub fn new(port: PortHandle, timeout: Duration) -> AsynResult<Self> {
+    pub fn new(port: PortHandle, addr: i32, timeout: Duration) -> AsynResult<Self> {
         // C ignores every setInputEos/setOutputEos status
         // (drvPMNC87xx.cc:586, 595, 720, 727, 873-874).
-        let _ = port.set_input_eos_blocking(eos_user(), PROMPT_EOS);
-        let _ = port.set_output_eos_blocking(eos_user(), CMND_EOS);
+        let _ = port.set_input_eos_blocking(eos_user(addr), PROMPT_EOS);
+        let _ = port.set_output_eos_blocking(eos_user(addr), CMND_EOS);
         let mut ctrl = Self {
-            handle: SyncIOHandle::from_handle(port.clone(), 0, timeout),
+            handle: SyncIOHandle::from_handle(port.clone(), addr, timeout),
             port,
+            addr,
             change_eos: false,
             ident: String::new(),
             model: PmncModel::Pmnc8750,
@@ -256,17 +263,24 @@ impl PmncController {
             return Err(pmnc_err("PMNC: no response to VER identity query".into()));
         }
         ctrl.ident = ident;
-        let (model, change_eos) = model_from_ident(&ctrl.ident)
-            .ok_or_else(|| pmnc_err(format!("PMNC: unknown version = {}", ctrl.ident)))?;
+        // An invalid model or driver makes C return ERROR from motor_init
+        // (drvPMNC87xx.cc:938, 987), abandoning every later card and the
+        // poll task; a C defect not copied: only this card is dropped.
+        let refuse = |line: String| {
+            errlog_vprintf(format_args!("{line}\n"));
+            pmnc_err(line)
+        };
+        let (model, change_eos) = model_from_ident(&ctrl.ident).map_err(refuse)?;
         ctrl.model = model;
         ctrl.change_eos = change_eos;
 
-        // Axis enumeration.
+        // Axis enumeration. C reads the list without checking the exchange
+        // (drvPMNC87xx.cc:947-993): a silent one keeps the card with no axes.
         let mut axes = Vec::new();
         match model {
             PmncModel::Pmnc8750 => {
                 // Each MPV line is one 8753 channel.
-                let blob = ctrl.command("MPV")?;
+                let blob = ctrl.command("MPV").unwrap_or_default();
                 for line in blob.lines() {
                     if let Some((driver_num, motor_num)) = parse_mpv_line(line.trim()) {
                         axes.push(AxisDef {
@@ -280,14 +294,19 @@ impl PmncController {
             PmncModel::Pmnc8752 => {
                 // Each DRT line is a module; 8753 contributes 3 channels,
                 // 8751 one.
-                let blob = ctrl.command("DRT")?;
+                let blob = ctrl.command("DRT").unwrap_or_default();
                 for line in blob.lines() {
                     let Some((driver_num, driver_type)) = parse_drt_line(line.trim()) else {
                         continue;
                     };
-                    let channels = match driver_type {
-                        PmdModel::Pmd8753 => 3,
-                        PmdModel::Pmd8751 => 1,
+                    let (driver_type, channels) = match driver_type {
+                        1 => (PmdModel::Pmd8753, 3),
+                        2 => (PmdModel::Pmd8751, 1),
+                        other => {
+                            return Err(refuse(format!(
+                                "drvPMNC87xx:motor_init() - invalid driver = {other}"
+                            )));
+                        }
                     };
                     for motor_num in 0..channels {
                         axes.push(AxisDef {
@@ -298,9 +317,6 @@ impl PmncController {
                     }
                 }
             }
-        }
-        if axes.is_empty() {
-            return Err(pmnc_err("PMNC: no axes discovered".into()));
         }
         ctrl.axes = axes;
         Ok(ctrl)
@@ -321,10 +337,6 @@ impl PmncController {
         self.axes.len()
     }
 
-    fn axis_def(&self, index: usize) -> Option<AxisDef> {
-        self.axes.get(index).copied()
-    }
-
     /// Write one command and read its one prompt-framed reply (C
     /// `send_recv_mess`), returned trimmed.
     fn command(&self, cmd: &str) -> AsynResult<String> {
@@ -343,9 +355,13 @@ impl PmncController {
         if !self.change_eos {
             return self.command(&cmd);
         }
-        let _ = self.port.set_input_eos_blocking(eos_user(), NL_EOS);
+        let _ = self
+            .port
+            .set_input_eos_blocking(eos_user(self.addr), NL_EOS);
         let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF);
-        let _ = self.port.set_input_eos_blocking(eos_user(), PROMPT_EOS);
+        let _ = self
+            .port
+            .set_input_eos_blocking(eos_user(self.addr), PROMPT_EOS);
         Self::trimmed(raw?)
     }
 
@@ -384,16 +400,21 @@ pub struct PmncAxis {
 }
 
 impl PmncAxis {
-    /// Construct the axis at discovery index `index` (0-based across all
-    /// modules). No controller I/O beyond looking up the discovered
-    /// addressing.
-    pub fn new(controller: Arc<Mutex<PmncController>>, index: usize) -> AsynResult<Self> {
-        let def = {
-            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            ctrl.axis_def(index)
-                .ok_or_else(|| pmnc_err(format!("PMNC: axis index {index} out of range")))?
-        };
-        Ok(Self {
+    /// One axis per discovered channel, in discovery order. No controller
+    /// I/O.
+    pub fn all(controller: Arc<Mutex<PmncController>>) -> Vec<Self> {
+        let defs = controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .axes
+            .clone();
+        defs.into_iter()
+            .map(|def| Self::new(controller.clone(), def))
+            .collect()
+    }
+
+    fn new(controller: Arc<Mutex<PmncController>>, def: AxisDef) -> Self {
+        Self {
             controller,
             def,
             position: 0,
@@ -404,7 +425,7 @@ impl PmncAxis {
             left: None,
             last_status: MotorStatus::default(),
             strings: MoveStrings::default(),
-        })
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, PmncController> {
@@ -831,8 +852,8 @@ mod tests {
             "POS 0" => "A0=0>".into(),
             _ => ">".into(),
         });
-        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
-        let axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(0);
         line.sent();
         (line, axis, sta)
     }
@@ -845,7 +866,7 @@ mod tests {
             "DRT" => "A0=2>".into(),
             _ => ">".into(),
         });
-        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
         assert_eq!(ctrl.unwrap().ident(), " Version 1.6.0\r\n");
     }
 
@@ -920,8 +941,8 @@ mod tests {
             "DRT" => "A0=1>".into(),
             _ => ">".into(),
         });
-        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
-        let mut axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 1).unwrap();
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(1);
         line.sent();
         axis.move_velocity(&AsynUser::default(), 50.0, -100.0, 200.0)
             .unwrap();
@@ -1020,22 +1041,28 @@ mod tests {
     fn model_and_change_eos_from_ident() {
         assert_eq!(
             model_from_ident("New Focus Version 1.0.2"),
-            Some((PmncModel::Pmnc8750, false))
+            Ok((PmncModel::Pmnc8750, false))
         );
         assert_eq!(
             model_from_ident("Version 1.5.4"),
-            Some((PmncModel::Pmnc8752, true))
+            Ok((PmncModel::Pmnc8752, true))
         );
         assert_eq!(
             model_from_ident("Version 1.5.3"),
-            Some((PmncModel::Pmnc8752, true))
+            Ok((PmncModel::Pmnc8752, true))
         );
         assert_eq!(
             model_from_ident("Version 1.6.0"),
-            Some((PmncModel::Pmnc8752, false))
+            Ok((PmncModel::Pmnc8752, false))
         );
-        assert_eq!(model_from_ident("Version 1.9.0"), None);
-        assert_eq!(model_from_ident("no version here"), None);
+        assert_eq!(
+            model_from_ident("Version 1.9.0"),
+            Err("drvPMNC87xx:motor_init() - invalid model = Version 1.9.0".into())
+        );
+        assert_eq!(
+            model_from_ident("no version here"),
+            Err("drvPMNC87xx.c:motor_init() - unknown version = no version here".into())
+        );
     }
 
     #[test]
@@ -1055,10 +1082,11 @@ mod tests {
     }
 
     #[test]
-    fn drt_line_maps_type_to_model() {
-        assert_eq!(parse_drt_line("A0=1"), Some((0, PmdModel::Pmd8753)));
-        assert_eq!(parse_drt_line("A3=2"), Some((3, PmdModel::Pmd8751)));
-        assert_eq!(parse_drt_line("A1=9"), None);
+    fn drt_line_reads_driver_and_type() {
+        assert_eq!(parse_drt_line("A0=1"), Some((0, 1)));
+        assert_eq!(parse_drt_line("A3=2"), Some((3, 2)));
+        assert_eq!(parse_drt_line("A1=9"), Some((1, 9)));
+        assert_eq!(parse_drt_line("A1"), None);
     }
 
     #[test]
@@ -1114,8 +1142,8 @@ mod tests {
         )
         .unwrap();
         let port = rt.port_handle().clone();
-        assert!(port.set_input_eos_blocking(eos_user(), NL_EOS).is_err());
-        let ctrl = PmncController::new(port, Duration::from_secs(1)).unwrap();
+        assert!(port.set_input_eos_blocking(eos_user(0), NL_EOS).is_err());
+        let ctrl = PmncController::new(port, 0, Duration::from_secs(1)).unwrap();
         assert!(ctrl.change_eos);
         assert_eq!(ctrl.num_axes(), 3);
         assert_eq!(ctrl.status(0).unwrap(), "A0=0x05");
@@ -1137,8 +1165,8 @@ mod tests {
             "POS 0" => "A0=0>".into(),
             _ => ">".into(),
         });
-        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
-        let mut axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
@@ -1174,8 +1202,8 @@ mod tests {
             "POS 0" => "A0=0>".into(),
             _ => ">".into(),
         });
-        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
-        let mut axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());

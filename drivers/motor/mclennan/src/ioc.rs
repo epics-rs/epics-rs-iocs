@@ -1,8 +1,7 @@
 //! `PM304Setup` / `PM304Config` iocsh commands for the Mclennan PM304/PM600,
 //! C's model-1 interface: records reach axis `signal` of `card` through
-//! `DTYP "Mclennan PM304"` and `OUT "#C card S signal"`. Config connects and
-//! identifies the controller at once, where C's `motor_init` does so at
-//! iocInit.
+//! `DTYP "Mclennan PM304"` and `OUT "#C card S signal"`. Config keeps the
+//! port; `motor_init` at iocInit connects and identifies the controller.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,19 +68,23 @@ pub fn pm304_config_command() -> CommandDef {
             }
             let n_axes = usize::try_from(n_axes).map_err(|_| "PM304Config: n_axes < 0")?;
 
-            let handle = connect_serial(&asyn_port, PM304_TIMEOUT)?;
-            let controller =
-                Pm304Controller::new(handle, n_axes).map_err(|e| format!("PM304Config: {e}"))?;
-            let num_axes = controller.num_axes();
-            let ident = controller.ident().to_string();
-            let controller = Arc::new(Mutex::new(controller));
-
-            for index in 0..num_axes {
-                let ax = Pm304Axis::new(controller.clone(), index);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                PM304.install(ctx, card, index as i32, motor)?;
-            }
-            PM304.describe(card, ident);
+            PM304.config(ctx, card, move |init| {
+                let Ok(handle) = connect_serial(&asyn_port, 0, PM304_TIMEOUT) else {
+                    return;
+                };
+                let Ok(controller) = Pm304Controller::new(handle, n_axes) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                let ident = controller.ident().to_string();
+                let controller = Arc::new(Mutex::new(controller));
+                for index in 0..num_axes {
+                    let ax = Pm304Axis::new(controller.clone(), index);
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    init.axis(index as i32, motor);
+                }
+                init.describe(ident);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -90,7 +93,7 @@ pub fn pm304_config_command() -> CommandDef {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{LineRig, driver_report, run_command};
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
     /// drvPM304.cc's drvet `report` (drvPM304.cc:149-162), which `dbior`
     /// runs.
@@ -109,9 +112,93 @@ mod report {
         });
         let config = vec![int(1), ArgValue::String("pm304RepLine".into()), int(1)];
         run_command(pm304_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvPM304", 0),
             "    PM304 controller 1, id: Mclennan PM304 v1 \n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use motor_common::testing::{
+        LineRig, call_command, driver_report, drvsup_init, ioc_init_errlog, run_command,
+    };
+
+    /// C's PM304Config only stores the port (drvPM304.cc:497-509); motor_init
+    /// drops a card that does not answer without a word, and its record
+    /// says so (motordevCom.cc:231-235).
+    #[epics_rs::base::epics_test]
+    async fn a_silent_card_fails_its_record_not_its_config() {
+        let (_line, _io) = LineRig::new("pm304Silent", |_| String::new());
+        run_command(
+            pm304_setup_command(),
+            vec![ArgValue::Int(1), ArgValue::Int(10)],
+        )
+        .await;
+        let config = vec![
+            ArgValue::Int(0),
+            ArgValue::String("pm304Silent".into()),
+            ArgValue::Int(1),
+        ];
+        assert!(call_command(pm304_config_command(), config).await.is_ok());
+        let db = r##"record(motor, "pm304:m1") {
+            field(DTYP, "Mclennan PM304")
+            field(OUT, "#C0 S0 @")
+        }"##;
+        assert_eq!(
+            ioc_init_errlog(db).await,
+            vec![
+                "recGblRecordError: motor_init_record_com(): card does not exist! \
+                 Illegal field value PV: pm304:m1"
+            ]
+        );
+    }
+
+    /// drvPM304.cc:643-648: `1OA` probes the card up to 3 times before
+    /// `1ST` and `1ID`; a card silent to all three gets nothing more.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_probes_1oa_before_identifying() {
+        let int = ArgValue::Int;
+        run_command(pm304_setup_command(), vec![int(2), int(10)]).await;
+        let (live, _io1) = LineRig::new("pm304Live", |cmd| match cmd.trim_end() {
+            "1ID" => "Mclennan PM304 V6.11".into(),
+            _ => "OK".into(),
+        });
+        let (mute, _io2) = LineRig::new("pm304Mute", |_| String::new());
+        for (card, port) in [(0, "pm304Live"), (1, "pm304Mute")] {
+            let config = vec![int(card), ArgValue::String(port.into()), int(1)];
+            run_command(pm304_config_command(), config).await;
+        }
+        drvsup_init().await;
+        let sent = |line: &LineRig| -> Vec<String> {
+            line.sent()
+                .iter()
+                .map(|c| c.trim_end().to_owned())
+                .collect()
+        };
+        assert_eq!(sent(&live)[..3], ["1OA", "1ST", "1ID"]);
+        assert_eq!(sent(&mute), ["1OA", "1OA", "1OA"]);
+    }
+
+    /// drvPM304.cc:653-700: only the `1OA` probe decides the card; a silent
+    /// `1ID` leaves an empty ident and a PM600 guess, and the card stays.
+    #[epics_rs::base::epics_test]
+    async fn r43_card_answering_1oa_survives_silent_1id() {
+        let int = ArgValue::Int;
+        run_command(pm304_setup_command(), vec![int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new("pm304NoId", |cmd| match cmd.trim_end() {
+            "1OA" => "0".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("pm304NoId".into()), int(1)];
+        run_command(pm304_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvPM304", 0),
+            "    PM304 controller 0, id:  \n"
         );
     }
 }

@@ -110,9 +110,8 @@ fn mcb4b_report(cards: &Model1Cards<'_>) -> String {
         .collect()
 }
 
-/// `MCB4BConfig(card, name)`. Connects and probes the card at once, where
-/// C's `motor_init` does so at iocInit; a card that never answers is left
-/// unconfigured, as there.
+/// `MCB4BConfig(card, name)`. `motor_init` at iocInit connects and probes
+/// the card; a card that never answers is left unconfigured.
 pub fn mcb4b_config_command() -> CommandDef {
     CommandDef::new(
         "MCB4BConfig",
@@ -127,19 +126,23 @@ pub fn mcb4b_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let handle = connect_serial(&asyn_port, DRV_MCB4B_TIMEOUT)?;
-            let controller = Mcb4bController::new(handle, MCB4B_NUM_AXES);
-            if !motor_init(&controller) {
-                return Ok(CommandOutcome::Continue);
-            }
-            let controller = Arc::new(Mutex::new(controller));
-            for index in 0..MCB4B_NUM_AXES {
-                let motor: Arc<Mutex<dyn AsynMotor>> =
-                    Arc::new(Mutex::new(DrvMcb4bAxis::new(controller.clone(), index)));
-                MCB4B.install(ctx, card, index as i32, motor)?;
-            }
-            // C's ident is the constant motor_init copies (drvMCB4B.cc:501).
-            MCB4B.describe(card, format!("port={asyn_port}, id: MCB-4B"));
+            MCB4B.config(ctx, card, move |init| {
+                let Ok(handle) = connect_serial(&asyn_port, 0, DRV_MCB4B_TIMEOUT) else {
+                    return;
+                };
+                let controller = Mcb4bController::new(handle, MCB4B_NUM_AXES);
+                if !motor_init(&controller) {
+                    return;
+                }
+                let controller = Arc::new(Mutex::new(controller));
+                for index in 0..MCB4B_NUM_AXES {
+                    let motor: Arc<Mutex<dyn AsynMotor>> =
+                        Arc::new(Mutex::new(DrvMcb4bAxis::new(controller.clone(), index)));
+                    init.axis(index as i32, motor);
+                }
+                // C's ident is the constant motor_init copies (drvMCB4B.cc:501).
+                init.describe(format!("port={asyn_port}, id: MCB-4B"));
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -148,7 +151,7 @@ pub fn mcb4b_config_command() -> CommandDef {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{LineRig, driver_report, run_command};
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
     /// drvMCB4B.cc's drvet `report` (:123-140), which `dbior` runs; C
     /// prints nothing for a card that never answered.
@@ -166,6 +169,7 @@ mod report {
             let args = vec![ArgValue::Int(card), ArgValue::String(line.into())];
             run_command(mcb4b_config_command(), args).await;
         }
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvMCB4B", 0),
             "    MCB4B controller 1, port=mcbRepLine, id: MCB-4B \n"

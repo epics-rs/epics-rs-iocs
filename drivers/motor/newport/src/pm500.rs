@@ -108,7 +108,8 @@ impl Pm500Controller {
             return None;
         }
         let ident = ctrl.command("SVN?").unwrap_or_default();
-        ctrl.ident = ident.get(2..).unwrap_or("").to_string(); // skip "XD"
+        // C strncpy's 50 bytes past the "XD" (drvPM500.cc:584).
+        ctrl.ident = ident.get(2..).unwrap_or("").chars().take(50).collect();
 
         // Axis discovery: STAT? each channel letter in order; an 'E' at
         // reply byte 1 ends the scan (C checks buff[1]).

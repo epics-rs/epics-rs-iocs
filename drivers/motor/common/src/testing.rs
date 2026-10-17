@@ -21,6 +21,8 @@ type Fails = Box<dyn Fn(&str) -> bool + Send + Sync>;
 struct Line {
     base: PortDriverBase,
     sent: Arc<Mutex<Vec<String>>>,
+    /// The asyn address of each write in `sent`.
+    addrs: Arc<Mutex<Vec<i32>>>,
     /// The last write that was more than a terminator: GCS2 writes a command
     /// and its `\n` separately, and the reply belongs to the command.
     command: String,
@@ -43,8 +45,9 @@ impl PortDriver for Line {
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
     }
-    fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+    fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let line = String::from_utf8_lossy(data).into_owned();
+        self.addrs.lock().unwrap().push(user.addr);
         if !data.iter().all(|b| matches!(b, b'\r' | b'\n')) {
             self.command.clone_from(&line);
             if let Answer::Queued(lines, queue) = &mut self.answer {
@@ -88,6 +91,7 @@ impl PortDriver for Line {
 /// The test's side of one port.
 pub struct LineRig {
     sent: Arc<Mutex<Vec<String>>>,
+    addrs: Arc<Mutex<Vec<i32>>>,
 }
 
 impl LineRig {
@@ -108,7 +112,7 @@ impl LineRig {
         reply: impl Fn(&str) -> String + Send + Sync + 'static,
         fails: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> (Self, SyncIOHandle) {
-        Self::open(name, Answer::Last(Box::new(reply)), Box::new(fails))
+        Self::open(name, 1, Answer::Last(Box::new(reply)), Box::new(fails))
     }
 
     /// [`Self::new`] for a device that answers a command with `lines`, one
@@ -119,16 +123,34 @@ impl LineRig {
     ) -> (Self, SyncIOHandle) {
         Self::open(
             name,
+            1,
             Answer::Queued(Box::new(lines), VecDeque::new()),
             Box::new(|_| false),
         )
     }
 
-    fn open(name: &str, answer: Answer, fails: Fails) -> (Self, SyncIOHandle) {
+    /// [`Self::new`] on a multi-device port of `max_addr` addresses, as a
+    /// GPIB port is; [`Self::addresses`] gives where each write went.
+    pub fn multi_device(
+        name: &str,
+        max_addr: usize,
+        reply: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (Self, SyncIOHandle) {
+        Self::open(
+            name,
+            max_addr,
+            Answer::Last(Box::new(reply)),
+            Box::new(|_| false),
+        )
+    }
+
+    fn open(name: &str, max_addr: usize, answer: Answer, fails: Fails) -> (Self, SyncIOHandle) {
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let addrs = Arc::new(Mutex::new(Vec::new()));
         let line = Line {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(name, max_addr, PortFlags::default()),
             sent: sent.clone(),
+            addrs: addrs.clone(),
             command: String::new(),
             answer,
             fails,
@@ -140,12 +162,17 @@ impl LineRig {
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        (Self { sent }, io)
+        (Self { sent, addrs }, io)
     }
 
     /// The messages written since the last call.
     pub fn sent(&self) -> Vec<String> {
         std::mem::take(&mut *self.sent.lock().unwrap())
+    }
+
+    /// The address of each write since the last call.
+    pub fn addresses(&self) -> Vec<i32> {
+        std::mem::take(&mut *self.addrs.lock().unwrap())
     }
 }
 
@@ -160,26 +187,102 @@ pub fn pollers() -> usize {
         .count()
 }
 
+/// Set in the child [`child_stdout`] runs.
+const CHILD: &str = "MOTOR_TESTING_CHILD";
+
+/// Whether this is the child [`child_stdout`] started.
+pub fn in_child() -> bool {
+    std::env::var_os(CHILD).is_some()
+}
+
+/// Run test `test` of `module` (its `module_path!()`) again as a child of
+/// this binary and return its stdout, where a C `printf` at iocInit lands:
+/// no iocsh redirect reaches it.
+pub fn child_stdout(module: &str, test: &str) -> String {
+    let module = module.split_once("::").map_or("", |(_, m)| m);
+    let name = format!("{module}::{test}");
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
 /// Run `cmd` with `args` as the shell does, on a thread of its own.
 pub async fn run_command(
     cmd: epics_rs::base::server::iocsh::registry::CommandDef,
     args: Vec<epics_rs::base::server::iocsh::registry::ArgValue>,
 ) {
-    use epics_rs::base::runtime::task::{BlockingBridge, sleep};
+    call_command(cmd, args).await.unwrap();
+}
+
+/// [`run_command`], returning what the command returned: an `Err` is what
+/// the shell would print for it.
+pub async fn call_command(
+    cmd: epics_rs::base::server::iocsh::registry::CommandDef,
+    args: Vec<epics_rs::base::server::iocsh::registry::ArgValue>,
+) -> epics_rs::base::server::iocsh::registry::CommandResult {
+    use epics_rs::base::runtime::task::BlockingBridge;
     use epics_rs::base::server::database::PvDatabase;
     use epics_rs::base::server::iocsh::registry::CommandContext;
 
     let bridge = BlockingBridge::capture();
-    let shell = std::thread::spawn(move || {
+    off_runtime(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
-        cmd.handler.call(&args, &ctx).unwrap();
-    });
-    // Awaited, not joined: an axis joining a started poller waits on it, and
-    // the poller's thread is spawned by a task this runtime has to run.
+        cmd.handler.call(&args, &ctx)
+    })
+    .await
+}
+
+/// iocInit's drvSup init, where each model-1 driver's `motor_init` runs
+/// over the cards its `Config` filled.
+pub async fn drvsup_init() {
+    use epics_rs::base::server::ioc_app::{InitHookState, init_hook_announce};
+    off_runtime(|| init_hook_announce(InitHookState::AfterInitDrvSup)).await;
+}
+
+/// The errlog lines of iocInit from drvSup init through record init, with
+/// the motor records of `db` loaded: what C's console shows for the cards
+/// and their records.
+pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
+    use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+    use epics_rs::base::server::ioc_builder::IocBuilder;
+    use epics_rs::motor::devices::{device_support_factory, devices};
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
+    drvsup_init().await;
+    let (name, factory) = epics_rs::motor::motor_record_factory();
+    let _db = IocBuilder::new()
+        .register_record_type(name, factory)
+        .register_dynamic_device_support(&devices(), device_support_factory())
+        .db_string(db, &std::collections::HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    errlog_flush();
+    errlog_remove_listener(id);
+    lines.lock().unwrap().clone()
+}
+
+/// Run `f` on a thread of its own. Awaited, not joined: an axis joining a
+/// started poller waits on it, and the poller's thread is spawned by a task
+/// this runtime has to run.
+async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    use epics_rs::base::runtime::task::sleep;
+    let shell = std::thread::spawn(f);
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;
     }
-    shell.join().unwrap();
+    shell.join().unwrap()
 }
 
 /// Run `cmd` with `args` as [`run_command`], and return the `motorPoller`
@@ -282,6 +385,7 @@ mod tests {
         let (_rig, _io) = LineRig::new("lineRigEos", |_| String::new());
         let io = connect_with_eos(
             "lineRigEos",
+            0,
             Duration::from_secs(1),
             b"\n",
             b"",

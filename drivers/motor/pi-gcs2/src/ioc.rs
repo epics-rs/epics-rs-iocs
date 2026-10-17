@@ -107,7 +107,14 @@ pub fn pigcs2_config_command() -> CommandDef {
 /// C's `pasynOctetSyncIO->connect` and EOS sets on `pAsynCom`; each refusal is
 /// printed on that user and leaves the controller without axes.
 fn connect(asyn_port: &str) -> Option<SyncIOHandle> {
-    let e = match connect_with_eos(asyn_port, PIGCS2_TIMEOUT, b"\n", b"", EosRefusal::BothFatal) {
+    let e = match connect_with_eos(
+        asyn_port,
+        0,
+        PIGCS2_TIMEOUT,
+        b"\n",
+        b"",
+        EosRefusal::BothFatal,
+    ) {
         Ok(handle) => return Some(handle),
         Err(e) => e,
     };

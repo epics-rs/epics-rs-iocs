@@ -393,7 +393,7 @@ impl PIC862Axis {
     /// `motor_init`'s `set_status(card_index, motor_index)` call). A failed
     /// initial poll is not an error — C leaves the zeroed defaults in place
     /// either way.
-    pub fn new(controller: Arc<Mutex<PIC862Controller>>) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<PIC862Controller>>) -> Self {
         let mut axis = Self {
             controller: controller.clone(),
             high_limit: None,
@@ -412,7 +412,7 @@ impl PIC862Axis {
         if let Some(polled) = ctrl.poll_status() {
             axis.last_status = status_from_polled(&polled);
         }
-        Ok(axis)
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, PIC862Controller> {
@@ -603,7 +603,7 @@ mod tests {
             _ => "C-862\r".into(),
         });
         let ctrl = PIC862Controller::new(io, 1).unwrap();
-        let mut axis = PIC862Axis::new(Arc::new(Mutex::new(ctrl))).unwrap();
+        let mut axis = PIC862Axis::new(Arc::new(Mutex::new(ctrl)));
         let user = AsynUser::default();
         axis.set_high_limit(&user, 100.0).unwrap();
         axis.set_low_limit(&user, -100.0).unwrap();
@@ -799,7 +799,7 @@ mod tests {
             }
         });
         let ctrl = PIC862Controller::new(io, 1).unwrap();
-        let mut axis = PIC862Axis::new(Arc::new(Mutex::new(ctrl))).unwrap();
+        let mut axis = PIC862Axis::new(Arc::new(Mutex::new(ctrl)));
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());

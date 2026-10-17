@@ -1,8 +1,7 @@
 //! `SmartMotorSetup` / `SmartMotorConfig` iocsh commands for the Animatics
 //! SmartMotor, C's model-1 interface: records reach axis `signal` of `card`
-//! through `DTYP "SmartMotor"` and `OUT "#C card S signal"`. Config connects
-//! and identifies the controller at once, where C's `motor_init` does so at
-//! iocInit.
+//! through `DTYP "SmartMotor"` and `OUT "#C card S signal"`. Config keeps
+//! the port; `motor_init` at iocInit connects and identifies the controller.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,22 +57,24 @@ pub fn smartmotor_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            let port = get_port(&asyn_port).ok_or_else(|| {
-                format!(
-                    "serial port '{asyn_port}' not found (call drvAsynSerialPortConfigure first)"
-                )
+            SMART_MOTOR.config(ctx, card, move |init| {
+                let Some(port) = get_port(&asyn_port) else {
+                    return;
+                };
+                let Ok(controller) =
+                    SmartMotorController::new(port.handle.clone(), SMARTMOTOR_TIMEOUT)
+                else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                let controller = Arc::new(Mutex::new(controller));
+                for axis in 0..num_axes {
+                    let ax = SmartMotorAxis::new(controller.clone(), axis);
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    init.axis(axis as i32, motor);
+                }
+                init.describe(asyn_port);
             })?;
-            let controller = SmartMotorController::new(port.handle.clone(), SMARTMOTOR_TIMEOUT)
-                .map_err(|e| format!("SmartMotorConfig: {e}"))?;
-            let num_axes = controller.num_axes();
-            let controller = Arc::new(Mutex::new(controller));
-
-            for axis in 0..num_axes {
-                let ax = SmartMotorAxis::new(controller.clone(), axis);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                SMART_MOTOR.install(ctx, card, axis as i32, motor)?;
-            }
-            SMART_MOTOR.describe(card, asyn_port);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -82,7 +83,7 @@ pub fn smartmotor_config_command() -> CommandDef {
 #[cfg(all(test, target_os = "linux"))]
 mod report {
     use epics_rs::base::server::driver_support::find_driver_support;
-    use motor_common::testing::{LineRig, run_command};
+    use motor_common::testing::{LineRig, drvsup_init, run_command};
 
     use super::*;
 
@@ -100,6 +101,7 @@ mod report {
         let config = smartmotor_config_command();
         let args = vec![ArgValue::Int(1), ArgValue::String("smReportLine".into())];
         run_command(config, args).await;
+        drvsup_init().await;
         assert_eq!(
             drvet.report(0).unwrap(),
             "    SmartMotor controller 0 connection failed.\n    \
