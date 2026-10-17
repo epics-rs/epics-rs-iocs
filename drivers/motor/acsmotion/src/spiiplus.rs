@@ -773,7 +773,7 @@ impl AcsMotionParams {
                 Some(0),
                 0,
                 TraceMask::IO_DRIVER,
-                format_args!("SPiiPlusController:writeInt32: homingMethod = {value}"),
+                format_args!("SPiiPlusController:writeInt32: homingMethod = {value}\n"),
             );
         }
         Ok(())
@@ -828,7 +828,7 @@ mod tests {
             .collect();
         assert_eq!(mine.len(), 1, "{text}");
         assert!(
-            mine[0].ends_with("SPiiPlusController:writeInt32: homingMethod = 3"),
+            text.contains("SPiiPlusController:writeInt32: homingMethod = 3\n"),
             "{text}"
         );
         assert_eq!(rig.ctrl.lock().unwrap().homing(1).method, 3);
