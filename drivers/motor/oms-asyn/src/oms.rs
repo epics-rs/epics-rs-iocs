@@ -42,8 +42,8 @@
 //! ## Not modeled (documented)
 //!
 //! - The notification interrupt (`asynCallback`): see above.
-//! - The auxiliary parameter records exposed through the C `writeInt32` /
-//!   `writeFloat64` overrides. These are not motor-record motion fields.
+//! - The C `writeInt32` / `writeFloat64` overrides of the base motor
+//!   functions.
 //! - The init-time firmware-version gate: the driver reads the firmware
 //!   string once as a comms check and assumes the modern (>= 1.30) command
 //!   forms MAXnet mandates, `CL?` included; only the watchdog check reads
@@ -62,6 +62,11 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
+
+use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::motor::controller_port::ParamWrite;
+use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::atoi;
 use motor_common::{ControllerParams, ControllerReport};
@@ -129,18 +134,33 @@ fn oms_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// What C `omsBaseController::report` prints from the controller: the
-/// version once read and the axes once Init has created them.
+/// What the Config command fills once the port exists: the version once
+/// read, the controller, and the axes once Init has created them.
 #[derive(Default)]
 pub struct OmsReportState {
     pub(crate) fw: OnceLock<FirmwareVersion>,
+    pub(crate) controller: OnceLock<Arc<Mutex<OmsController>>>,
     pub(crate) axes: OnceLock<Arc<PollShared>>,
 }
 
-/// The controller's report: its type and the state the Config command fills.
+/// The constructor's `createParam`s (omsBaseController.cpp:101-104).
+#[derive(Clone, Copy, Default)]
+struct OmsReasons {
+    poll: usize,
+    send: usize,
+    send_receive: usize,
+    receive: usize,
+}
+
+/// C `MAX_STRING_SIZE`, the size of writeOctet's reply buffer.
+const MAX_STRING_SIZE: usize = 40;
+
+/// The controller's own parameters and report, and the state the Config
+/// command fills.
 pub struct OmsParams {
     controller_type: &'static str,
     state: Arc<OmsReportState>,
+    reasons: OmsReasons,
 }
 
 impl OmsParams {
@@ -149,12 +169,118 @@ impl OmsParams {
         let params = Self {
             controller_type,
             state: state.clone(),
+            reasons: OmsReasons::default(),
         };
         (params, state)
+    }
+
+    /// C `getAxis(pasynUser)`: the axis Init created at the address.
+    fn axis(&self, base: &PortDriverBase, user: &AsynUser) -> Option<i32> {
+        let count = self.state.axes.get().map_or(0, |a| a.axis_count());
+        base.resolve_address(user.addr)
+            .ok()
+            .filter(|&addr| (addr as usize) < count)
     }
 }
 
 impl ControllerParams for OmsParams {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.reasons = OmsReasons {
+            poll: base.create_param("OMS_POLL", ParamType::Int32)?,
+            send: base.create_param("OMS_STRING_SEND", ParamType::Octet)?,
+            send_receive: base.create_param("OMS_STRING_SENDRECV", ParamType::Octet)?,
+            receive: base.create_param("OMS_STRING_RECV", ParamType::Octet)?,
+        };
+        let r = self.reasons;
+        for reason in [r.send, r.send_receive, r.receive] {
+            base.set_string_param(reason, 0, "")?;
+        }
+        Ok(())
+    }
+
+    /// C `omsBaseController::writeInt32`'s OMS_POLL, which wakes the
+    /// poller (omsBaseController.cpp:275-308).
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> ParamWrite {
+        if user.reason != self.reasons.poll {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        let Some(axis) = self.axis(base, user) else {
+            return ParamWrite::Handled(Err(oms_err("oms: no axis at this address")));
+        };
+        let _ = base.set_int32_param(user.reason, axis, value);
+        if value != 0
+            && let Some(axes) = self.state.axes.get()
+        {
+            axes.wakeup();
+        }
+        let _ = base.call_param_callbacks(axis);
+        ParamWrite::Handled(Ok(()))
+    }
+
+    /// C `omsBaseController::writeOctet` (omsBaseController.cpp:178-219):
+    /// OMS_STRING_SEND goes to the controller, OMS_STRING_SENDRECV too with
+    /// its reply posted as OMS_STRING_RECV; neither is stored, and any
+    /// other octet write is taken and dropped.
+    fn write_octet(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        data: &[u8],
+    ) -> ParamWrite {
+        let Some(axis) = self.axis(base, user) else {
+            return ParamWrite::Handled(Err(oms_err("oms: no axis at this address")));
+        };
+        let r = self.reasons;
+        if user.reason != r.send && user.reason != r.send_receive {
+            return ParamWrite::Handled(Ok(()));
+        }
+        let Some(controller) = self.state.controller.get() else {
+            return ParamWrite::Handled(Err(oms_err("oms: controller not connected")));
+        };
+        let value = data.split(|&b| b == 0).next().unwrap_or_default();
+        let value = String::from_utf8_lossy(value);
+        let trace = MotorTrace::new(&*base.port_name, user.addr);
+        let print =
+            |args: std::fmt::Arguments<'_>| trace.print(TraceMask::ERROR, user.reason as i32, args);
+        let port = base.port_name.to_string();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        if user.reason == r.send {
+            let sent = ctrl.send_only(&value);
+            if sent.is_err() {
+                print(format_args!(
+                    "omsBaseDriver:writeOctet:{port}: send Error\n"
+                ));
+            }
+            return ParamWrite::Handled(sent);
+        }
+        let (mut reply, status) = ctrl.send_receive_buffer(&value);
+        drop(ctrl);
+        if status.is_err() {
+            print(format_args!(
+                "omsBaseDriver:writeOctet:{port}: sendReceive Error\n"
+            ));
+            return ParamWrite::Handled(status);
+        }
+        // strncpy into a MAX_STRING_SIZE buffer, its last byte the NUL.
+        reply.truncate(
+            (0..MAX_STRING_SIZE)
+                .rev()
+                .find(|&i| reply.is_char_boundary(i))
+                .unwrap_or(0),
+        );
+        let _ = base.set_string_param(r.receive, axis, &reply);
+        let _ = base.call_param_callbacks(axis);
+        print(format_args!(
+            "omsBaseDriver:writeOctet:{port}: answer is {reply}\n"
+        ));
+        ParamWrite::Handled(Ok(()))
+    }
+
     /// C `omsBaseController::report` (omsBaseController.cpp:130-161). C
     /// dereferences a null `pAxes` on a controller whose Init failed; here
     /// it has no axis lines.
@@ -646,6 +772,72 @@ impl AsynMotor for OmsAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::port_handle::PortHandle;
+
+    /// A controller port on the poller tests' one-axis MAXnet line.
+    fn params_port(
+        name: &str,
+        replies: &[(&str, &str)],
+    ) -> (PortHandle, crate::poller::tests::Rig) {
+        let rig = crate::poller::tests::rig(&format!("{name}_IO"), 1, replies);
+        let (params, state) = OmsParams::new("MAXnet");
+        let _ = state.controller.set(rig.controller.clone());
+        let _ = state
+            .axes
+            .set(rig.controller.lock().unwrap().poll_shared().clone());
+        let port = epics_rs::motor::devices::register_controller_port(
+            &epics_rs::asyn::registry::open_owner(),
+            name,
+            2,
+            params,
+        )
+        .unwrap();
+        (port, rig)
+    }
+
+    fn reason(port: &PortHandle, name: &str) -> usize {
+        port.drv_user_create_blocking(&epics_rs::asyn::port::DrvUserRequest::new(name, 0))
+            .unwrap()
+            .reason
+    }
+
+    /// OMS_STRING_SEND goes to the line, OMS_STRING_SENDRECV too with its
+    /// reply in OMS_STRING_RECV; neither is stored, other strings are
+    /// dropped, and an address with no axis is refused
+    /// (omsBaseController.cpp:178-219).
+    #[test]
+    fn string_writes_go_to_the_controller() {
+        let (port, rig) = params_port("omsStrings", &[("AX RP", "1234")]);
+        let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_secs(1));
+        let send = reason(&port, "OMS_STRING_SEND");
+        let send_receive = reason(&port, "OMS_STRING_SENDRECV");
+        let receive = reason(&port, "OMS_STRING_RECV");
+        io.write_octet(send, b"AX ST;").unwrap();
+        io.write_octet(send_receive, b"AX RP").unwrap();
+        assert_eq!(*rig.written.lock().unwrap(), ["AX ST;", "AX RP"]);
+        assert_eq!(io.read_octet(receive, 40).unwrap(), b"1234\0");
+        assert_eq!(io.read_octet(send, 40).unwrap(), b"\0");
+        assert_eq!(io.read_octet(send_receive, 40).unwrap(), b"\0");
+        let message = epics_rs::motor::controller_port::index::PROFILE_BUILD_MESSAGE;
+        io.write_octet(message, b"dropped").unwrap();
+        assert!(io.read_octet(message, 40).is_err());
+        let past = SyncIOHandle::from_handle(port, 1, Duration::from_secs(1));
+        assert!(past.write_octet(send, b"AX ST;").is_err());
+        assert_eq!(rig.written.lock().unwrap().len(), 2);
+    }
+
+    /// A non-zero OMS_POLL wakes the poller (omsBaseController.cpp:298-302).
+    #[test]
+    fn an_oms_poll_write_wakes_the_poller() {
+        let (port, rig) = params_port("omsPollWrite", &[]);
+        let shared = rig.controller.lock().unwrap().poll_shared().clone();
+        let poll = reason(&port, "OMS_POLL");
+        port.write_int32_blocking(poll, 0, 0).unwrap();
+        assert!(!shared.wait(Duration::ZERO));
+        port.write_int32_blocking(poll, 0, 1).unwrap();
+        assert!(shared.wait(Duration::ZERO));
+        assert_eq!(port.read_int32_blocking(poll, 0).unwrap(), 1);
+    }
 
     #[test]
     fn nint_rounds_away_from_zero() {
