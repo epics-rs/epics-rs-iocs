@@ -21,8 +21,8 @@ use mythen::driver::MythenDriver;
 use mythen::transport::Transport;
 
 /// A healthy detector whose module count is unknown (`-get nmodules` = -1), so
-/// every per-module command is refused without touching the wire while the
-/// `getSettings` queries still succeed.
+/// every module loop runs zero times while the `getSettings` queries still
+/// succeed.
 fn fake_detector(name: &str) -> (PortHandle, mpsc::Receiver<String>) {
     fake_detector_with(name, -1, None)
 }
@@ -100,24 +100,26 @@ fn ran_get_settings(received: &mpsc::Receiver<String>) -> bool {
 #[test]
 fn a_refused_int32_command_still_reads_the_settings_back() {
     let (mut driver, received) = driver("MYTHEN_WS_INT");
-    let mut user = AsynUser::new(driver.p.setting);
+    // An int written to the float SDThreshold: setIntegerParam refuses it.
+    let mut user = AsynUser::new(driver.p.threshold);
 
     assert!(driver.write_int32(&mut user, 1).is_err());
     assert!(
         ran_get_settings(&received),
-        "getSettings did not run after the refused loadSettings"
+        "getSettings did not run after the refused setIntegerParam"
     );
 }
 
 #[test]
 fn a_refused_float64_command_still_reads_the_settings_back() {
     let (mut driver, received) = driver("MYTHEN_WS_F64");
-    let mut user = AsynUser::new(driver.p.threshold);
+    // A float written to the int SDSetting: setDoubleParam refuses it.
+    let mut user = AsynUser::new(driver.p.setting);
 
     assert!(driver.write_float64(&mut user, 7.0).is_err());
     assert!(
         ran_get_settings(&received),
-        "getSettings did not run after the refused setKthresh"
+        "getSettings did not run after the refused setDoubleParam"
     );
 }
 
@@ -139,11 +141,11 @@ fn an_illegal_tau_still_reads_the_settings_back() {
 fn a_failed_write_hands_the_record_no_message() {
     let (mut driver, _received) = driver("MYTHEN_WS_MESSAGE");
     let e = driver
-        .write_int32(&mut AsynUser::new(driver.p.setting), 1)
+        .write_int32(&mut AsynUser::new(driver.p.threshold), 1)
         .unwrap_err();
     assert_eq!(e.message(), "");
     let e = driver
-        .write_float64(&mut AsynUser::new(driver.p.threshold), 7.0)
+        .write_float64(&mut AsynUser::new(driver.p.setting), 7.0)
         .unwrap_err();
     assert_eq!(e.message(), "");
     let e = driver
@@ -384,28 +386,34 @@ fn a_refused_tau_prints_the_last_command() {
 fn a_failed_threshold_or_energy_prints_the_refusal() {
     use epics_rs::asyn::services::PortServices;
     use epics_rs::asyn::trace::TraceFile;
-    let port = "MYTHEN_WS_KTH";
-    let (mut driver, _received) = driver(port);
     let manager = PortServices::global().trace().clone();
-    let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
-    let file = std::fs::File::create(&log).unwrap();
-    manager.set_trace_file(
-        Some(port),
-        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
-    );
-    for reason in [driver.p.threshold, driver.p.energy] {
-        let last = driver.det.out_string();
+    for (port, command) in [
+        ("MYTHEN_WS_KTH", "-kthresh 7.000000"),
+        ("MYTHEN_WS_EN", "-energy 7.000000"),
+    ] {
+        let (mut driver, _received) = driver_on(port, fake_detector_with(port, 1, Some(command)));
+        let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let reason = if command.starts_with("-kthresh") {
+            driver.p.threshold
+        } else {
+            driver.p.energy
+        };
         let e = driver
             .write_float64(&mut AsynUser::new(reason), 7.0)
             .unwrap_err();
-        assert_eq!(e.c_status_code(), 3);
         let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert_eq!(e.c_status_code(), 3);
         assert!(
-            text.contains(&format!("error check if value > 0 (outString = {last})")),
+            text.contains(&format!("error check if value > 0 (outString = {command})")),
             "{text}"
         );
     }
-    let _ = std::fs::remove_file(&log);
 }
 
 /// mythen.cpp:377-382: C's module loop carries on past a failed command and
@@ -433,4 +441,23 @@ fn a_module_loop_runs_to_its_last_command() {
         text.contains("error check if value > 0 (outString = -kthresh 7.000000)"),
         "{text}"
     );
+}
+
+/// mythen.cpp:377, :406, :604, :666: with no module count C's module loops
+/// run zero times and succeed, so nothing is sent and nothing refused.
+#[test]
+fn an_unknown_module_count_runs_the_module_loops_zero_times() {
+    let (mut driver, received) = driver("MYTHEN_WS_NOMOD");
+    let float = [driver.p.threshold, driver.p.energy];
+    let int = [driver.p.setting, driver.p.reset];
+    for reason in float {
+        driver
+            .write_float64(&mut AsynUser::new(reason), 7.0)
+            .unwrap();
+    }
+    for reason in int {
+        driver.write_int32(&mut AsynUser::new(reason), 1).unwrap();
+    }
+    let sent: Vec<String> = received.try_iter().collect();
+    assert!(!sent.iter().any(|c| c.starts_with("-module")), "{sent:?}");
 }

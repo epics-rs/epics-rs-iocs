@@ -347,14 +347,10 @@ impl Detector {
     /// `-module N` followed by `command`, for every module (C repeats this
     /// pattern in setKthresh / setEnergy / loadSettings / setReset).
     ///
-    /// Refuses when the module count is unknown rather than looping zero times:
-    /// a silent no-op here is a threshold the operator believes was applied.
-    /// Like C it carries on past a failed command and returns the last
-    /// command's status.
+    /// Like C it runs zero times while the module count is unknown, carries on
+    /// past a failed command and returns the last command's status.
     fn for_each_module(&self, command: &str) -> AsynResult<()> {
-        let nmodules = self
-            .nmodules()
-            .ok_or_else(|| unknown_nmodules(&format!("send [{command}] to every module")))?;
+        let nmodules = self.nmodules().unwrap_or(0);
         let mut status = Ok(());
         for module in 0..nmodules {
             let _ = self.send(&format!("-module {module}"));
@@ -529,18 +525,6 @@ fn disconnected(what: &str) -> AsynError {
         message: format!(
             "mythen: [{what}] not sent: the detector is disconnected — write ADAcquire to probe \
              it again"
-        ),
-    }
-}
-
-/// The error a caller gets when it asks for detector work whose size depends on
-/// a module count the detector has never reported.
-pub fn unknown_nmodules(what: &str) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message: format!(
-            "mythen: cannot {what}: the module count is unknown — `-get nmodules` has not \
-             answered since the IOC started"
         ),
     }
 }
