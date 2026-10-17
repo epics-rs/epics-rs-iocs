@@ -299,6 +299,9 @@ impl ControllerParams for OemParams {
 }
 
 /// Acceleration ramp time `A` = (velocity - min_velocity) / acceleration (C).
+///
+/// C divides by a zero acceleration and sends `A` with `%.2f` of inf or nan
+/// (OEMMotorDriver.cpp:238); here a zero acceleration sends `A0.00`.
 fn ramp_time(velocity: f64, min_velocity: f64, acceleration: f64) -> f64 {
     if acceleration != 0.0 {
         (velocity - min_velocity) / acceleration
