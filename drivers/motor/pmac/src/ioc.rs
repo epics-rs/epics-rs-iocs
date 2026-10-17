@@ -2036,6 +2036,7 @@ mod tests {
 
     /// pmacController.cpp:201: one poller from pmacCreateController, which
     /// pmacCreateAxes joins.
+    #[cfg(target_os = "linux")]
     #[epics_rs::base::epics_test]
     async fn pmac_create_axes_joins_the_controller_poller() {
         use motor_common::testing::pollers_after;
