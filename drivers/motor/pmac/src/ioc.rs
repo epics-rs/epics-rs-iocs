@@ -1159,6 +1159,26 @@ mod tests {
 
     /// pmacAxis.cpp:96, 136, 243-305, 497, 585: C's axis error lines on the
     /// controller's trace, the limits warning throttled as the feed rate's.
+    /// pmacCsGroups.cpp:156-161: the group changes only once `undefine all`
+    /// went through.
+    #[test]
+    fn a_failed_undefine_keeps_the_current_cs_group() {
+        let (_rt, rig) = publish_scripted("pmacCsSwitchLow");
+        let (controller, _io) = controller_port("pmacCsSwitchCtl", "pmacCsSwitchLow");
+        let mut c = controller.lock().unwrap();
+        let groups = c.cs_groups_mut();
+        groups.add_group(1, "a");
+        groups.add_axis(1, 1, "X", 2).unwrap();
+        groups.add_group(2, "b");
+        groups.add_axis(2, 1, "X", 7).unwrap();
+        rig.answer("\x01\nundefine all", b"\x06");
+        rig.answer("&2 #1->X", b"\x06");
+        c.switch_cs_group(1).unwrap();
+        rig.silence("\x01\nundefine all");
+        assert!(c.switch_cs_group(2).is_err());
+        assert_eq!(c.cs_groups_mut().abort_command(1).unwrap(), "&2A");
+    }
+
     /// pmacCsGroups.cpp:228-233: the release aborts the first deferred
     /// axis's CS before it validates the rest, and drops the abort's status.
     #[test]
@@ -1173,7 +1193,7 @@ mod tests {
         groups.add_group(1, "g");
         groups.add_axis(1, 1, "X", 2).unwrap();
         groups.add_axis(1, 3, "Y", 3).unwrap();
-        groups.switch_commands(1).unwrap();
+        groups.select(1);
         let to = DeferredMove {
             position: 1.0,
             relative: false,
@@ -1216,7 +1236,7 @@ mod tests {
         for (axis, def, cs) in [(1, "X", 2), (2, "U*2", 2), (3, "Y", 3), (4, "Z", 2)] {
             groups.add_axis(1, axis, def, cs).unwrap();
         }
-        groups.switch_commands(1).unwrap();
+        groups.select(1);
         rig.answer("&2A", b"\x06");
         rig.answer("&3A", b"\x06");
         let to = DeferredMove {

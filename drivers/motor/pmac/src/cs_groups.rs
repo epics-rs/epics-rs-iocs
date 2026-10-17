@@ -152,18 +152,23 @@ impl CsGroups {
     /// `&0 #0->` for key 0 (axes are 1-based), grows the map as it walks it,
     /// and silently mis-maps any non-contiguous axis set. This port iterates
     /// the definitions themselves.
-    pub fn switch_commands(&mut self, id: i32) -> Result<Vec<String>, String> {
+    /// The mappings; [`UNDEFINE_ALL`] goes first.
+    pub fn switch_commands(&self, id: i32) -> Result<Vec<String>, String> {
         let group = self
             .groups
             .get(&id)
             .ok_or_else(|| format!("invalid coordinate system group number {id}"))?;
-        // 0x01 is ctrl-A: abort all motion and all motion programs.
-        let mut cmds = vec!["\x01\nundefine all".to_string()];
-        for (axis, def) in &group.axis_defs {
-            cmds.push(format!("&{} #{}->{}", def.coord_sys, axis, def.definition));
-        }
+        Ok(group
+            .axis_defs
+            .iter()
+            .map(|(axis, def)| format!("&{} #{}->{}", def.coord_sys, axis, def.definition))
+            .collect())
+    }
+
+    /// Make group `id` current, once its `undefine all` went through
+    /// (C `switchToGroup`).
+    pub fn select(&mut self, id: i32) {
         self.current = id;
-        Ok(cmds)
     }
 
     /// The command that aborts the motion program in the CS `axis` is mapped
@@ -292,6 +297,10 @@ impl CsGroups {
     }
 }
 
+/// What `switchToGroup` sends before a group's mappings: ctrl-A, which
+/// aborts all motion and motion programs, then `undefine all`.
+pub const UNDEFINE_ALL: &str = "\x01\nundefine all";
+
 /// What a coordinated release sends: the abort, then the PROG 101 line,
 /// `Ok(None)` when no axis is deferred.
 pub struct CoordRelease {
@@ -338,17 +347,10 @@ mod tests {
     }
 
     #[test]
-    fn switch_emits_abort_then_one_definition_per_axis() {
-        let mut g = group_with(&[(1, "X", 2), (2, "Y", 2)]);
+    fn switch_emits_one_definition_per_axis() {
+        let g = group_with(&[(1, "X", 2), (2, "Y", 2)]);
         let cmds = g.switch_commands(1).unwrap();
-        assert_eq!(
-            cmds,
-            vec![
-                "\x01\nundefine all".to_string(),
-                "&2 #1->X".to_string(),
-                "&2 #2->Y".to_string(),
-            ]
-        );
+        assert_eq!(cmds, vec!["&2 #1->X".to_string(), "&2 #2->Y".to_string(),]);
     }
 
     #[test]
@@ -356,18 +358,15 @@ mod tests {
         // The C loop indexes the axis map by 0..size, so axes {1,3,5} come out
         // as keys 0..5 — a bogus `&0 #0->` plus default-inserted junk. Here the
         // definitions themselves are iterated.
-        let mut g = group_with(&[(1, "X", 2), (3, "Y", 2), (5, "Z", 2)]);
+        let g = group_with(&[(1, "X", 2), (3, "Y", 2), (5, "Z", 2)]);
         let cmds = g.switch_commands(1).unwrap();
-        assert_eq!(cmds.len(), 4);
         assert!(!cmds.iter().any(|c| c.contains("#0->")));
-        assert_eq!(cmds[1], "&2 #1->X");
-        assert_eq!(cmds[2], "&2 #3->Y");
-        assert_eq!(cmds[3], "&2 #5->Z");
+        assert_eq!(cmds, ["&2 #1->X", "&2 #3->Y", "&2 #5->Z"]);
     }
 
     #[test]
     fn switch_rejects_an_unknown_group() {
-        let mut g = group_with(&[(1, "X", 2)]);
+        let g = group_with(&[(1, "X", 2)]);
         assert!(g.switch_commands(7).is_err());
     }
 
@@ -381,7 +380,7 @@ mod tests {
     fn axis_coord_sys_is_zero_until_a_group_is_selected() {
         let mut g = group_with(&[(1, "X", 2)]);
         assert_eq!(g.axis_coord_sys(1), 0);
-        g.switch_commands(1).unwrap();
+        g.select(1);
         assert_eq!(g.axis_coord_sys(1), 2);
         assert_eq!(g.axis_coord_sys(9), 0);
         assert_eq!(g.abort_command(1).as_deref(), Some("&2A"));
@@ -414,7 +413,7 @@ mod tests {
     #[test]
     fn coord_move_holds_the_other_axes_in_the_cs_at_their_last_position() {
         let mut g = group_with(&[(1, "X", 2), (2, "Y", 2), (3, "Z", 2)]);
-        g.switch_commands(1).unwrap();
+        g.select(1);
 
         let mut deferred = BTreeMap::new();
         deferred.insert(
@@ -453,7 +452,7 @@ mod tests {
     #[test]
     fn coord_move_rejects_axes_in_different_coordinate_systems() {
         let mut g = group_with(&[(1, "X", 2), (2, "X", 3)]);
-        g.switch_commands(1).unwrap();
+        g.select(1);
         let mut deferred = BTreeMap::new();
         for axis in [1, 2] {
             deferred.insert(
@@ -494,7 +493,7 @@ mod tests {
     #[test]
     fn coord_move_rejects_a_non_one_to_one_axis_definition() {
         let mut g = group_with(&[(1, "U*2300+20", 2)]);
-        g.switch_commands(1).unwrap();
+        g.select(1);
         let mut deferred = BTreeMap::new();
         deferred.insert(
             1,
@@ -514,7 +513,7 @@ mod tests {
     #[test]
     fn coord_move_rejects_a_held_axis_that_is_already_moving() {
         let mut g = group_with(&[(1, "X", 2), (2, "Y", 2)]);
-        g.switch_commands(1).unwrap();
+        g.select(1);
         let mut deferred = BTreeMap::new();
         deferred.insert(
             1,

@@ -39,7 +39,7 @@ use epics_rs::motor::controller_port::{
 };
 use epics_rs::motor::trace::MotorTrace;
 
-use crate::cs_groups::{AxisPoll, CsGroups, DeferredMove, fast_deferred_command};
+use crate::cs_groups::{AxisPoll, CsGroups, DeferredMove, UNDEFINE_ALL, fast_deferred_command};
 use crate::protocol::{HARDWARE_PROB, parse_feedrate, parse_global_status};
 
 /// Response buffer size (C `PMAC_MAXBUF`).
@@ -577,6 +577,8 @@ impl PmacController {
                 )
             })
             .map_err(pmac_err)?;
+        self.command(UNDEFINE_ALL)?;
+        self.cs_groups.select(id);
         for cmd in cmds {
             self.command(&cmd)?;
         }
