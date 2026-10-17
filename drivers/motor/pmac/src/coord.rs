@@ -103,7 +103,10 @@ impl PmacCoordSystem {
         self.cs
     }
 
-    fn command(&self, command: &str) -> AsynResult<()> {
+    /// The poll snapshot predates the command, so the next poll reads the
+    /// system again (C signals its poller after a move).
+    fn command(&mut self, command: &str) -> AsynResult<()> {
+        self.poll = None;
         octet_write_read(&self.handle, command).map(|_| ())
     }
 
@@ -161,6 +164,9 @@ pub struct PmacCsAxis {
     axis: usize,
     previous_position: f64,
     previous_direction: bool,
+    /// A move was sent since the last poll: C `motorAxisMove` clears
+    /// `motorAxisDone` so the record's next status update is not done.
+    motion_sent: bool,
 }
 
 fn lock(system: &Arc<Mutex<PmacCoordSystem>>) -> std::sync::MutexGuard<'_, PmacCoordSystem> {
@@ -182,6 +188,7 @@ impl PmacCsAxis {
             axis,
             previous_position: 0.0,
             previous_direction: false,
+            motion_sent: false,
         })
     }
 }
@@ -231,7 +238,9 @@ impl AsynMotor for PmacCsAxis {
             system.command(&format!("&{cs}A"))?;
             command.push_str(&format!("B{}R", system.program));
         }
-        system.command(&command)
+        let sent = system.command(&command);
+        self.motion_sent = true;
+        sent
     }
 
     /// **Upstream fix.** C `motorAxisMove` takes a `relative` argument and never
@@ -301,7 +310,7 @@ impl AsynMotor for PmacCsAxis {
     /// updates the demand register, keeping it consistent with the readback.
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
-        let system = lock(&self.system);
+        let mut system = lock(&self.system);
         let cs = system.cs;
         system.command(&format!("&{cs}Q7{axis}={position:.6}"))
     }
@@ -342,7 +351,7 @@ impl AsynMotor for PmacCsAxis {
         Ok(MotorStatus {
             position,
             encoder_position: position,
-            done: flags.done,
+            done: flags.done && !std::mem::take(&mut self.motion_sent),
             moving: flags.moving,
             high_limit: flags.limit,
             low_limit: flags.limit,
@@ -388,6 +397,78 @@ fn decode_cs_status(status: (u32, u32, u32), deferred: bool) -> CsFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A coordinate system in position with no program running.
+    struct Idle {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reply: Vec<u8>,
+        sent: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Idle {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            self.reply = match cmd.as_str() {
+                "&1??" => b"000000\r020000\r000000\r".to_vec(),
+                c if c.starts_with("&1Q81") => b"1.5 0 0 0 0 0 0 0 0\r".to_vec(),
+                _ => b"\r".to_vec(),
+            };
+            self.sent.lock().unwrap().push(cmd);
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let n = self.reply.len();
+            buf[..n].copy_from_slice(&self.reply);
+            Ok(n)
+        }
+    }
+
+    /// pmacAsynCoord.c motorAxisMove clears motorAxisDone and wakes the
+    /// poller: the poll after a move reads the system and is not done, the
+    /// one after it is served from that read again.
+    #[test]
+    fn the_poll_after_a_move_is_fresh_and_not_done() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let line = Idle {
+            base: PortDriverBase::new("pmac_cs_moved", 1, PortFlags::default()),
+            reply: Vec::new(),
+            sent: sent.clone(),
+        };
+        let (rt, _jh) = create_port_runtime(
+            &claim_port("pmac_cs_moved").unwrap(),
+            line,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let system = PmacCoordSystem::new(io, 1, 0, Duration::from_secs(3600));
+        let mut axis = PmacCsAxis::new(Arc::new(Mutex::new(system)), 1).unwrap();
+        let user = AsynUser::default();
+        assert!(axis.poll(&user).unwrap().done);
+        sent.lock().unwrap().clear();
+        assert!(axis.poll(&user).unwrap().done);
+        assert!(sent.lock().unwrap().is_empty(), "inside the TTL");
+
+        axis.move_absolute(&user, 2.0, 0.0, 0.0, 0.0).unwrap();
+        let after = axis.poll(&user).unwrap();
+        let wire = sent.lock().unwrap().clone();
+        assert_eq!(wire.len(), 3, "{wire:?}");
+        assert!(!after.done);
+
+        sent.lock().unwrap().clear();
+        assert!(axis.poll(&user).unwrap().done);
+        assert!(sent.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn axis_names_are_the_kinematic_letters() {
