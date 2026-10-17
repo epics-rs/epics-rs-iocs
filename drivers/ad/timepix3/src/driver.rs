@@ -2812,6 +2812,7 @@ impl TimePix3Driver {
             (this.int(write, 0) != 0).then(|| this.text(base, 0))
         };
         let prv_img = enabled(self, p.write_prv_img, p.prv_img_base);
+        let prv_img1 = enabled(self, p.write_prv_img1, p.prv_img1_base);
         let img = enabled(self, p.write_img, p.img_base)
             .filter(|_| self.int(p.img_accumulation_enable, 0) != 0);
         let prv_hst = enabled(self, p.write_prv_hst, p.prv_hst_base).filter(|path| {
@@ -2826,7 +2827,12 @@ impl TimePix3Driver {
             return Err("Histogram TCP path is invalid");
         }
         self.sync_tcp_stream_endpoints();
-        self.shared.set_stream_paths(prv_img, img, prv_hst);
+        self.shared.set_stream_paths(crate::state::StreamPaths {
+            prv_img,
+            prv_img1,
+            img,
+            prv_hst,
+        });
         Ok(())
     }
 
@@ -2946,6 +2952,12 @@ impl TimePix3Driver {
                 &s.prv_img_worker,
                 Resource::PreviewWorker,
                 "Preview stream did not become ready",
+            ),
+            (
+                paths.prv_img1,
+                &s.prv_img1_worker,
+                Resource::IntegratedPreviewWorker,
+                "Integrated preview stream did not become ready",
             ),
             (
                 paths.img,
@@ -6689,10 +6701,10 @@ mod tests {
         );
     }
 
-    /// Stand in for the three stream workers: every run a start admits
+    /// Stand in for the four stream workers: every run a start admits
     /// connects, or fails at once when `connect` is false.
     fn serve_workers(shared: &Arc<Shared>, connect: bool) {
-        for which in 0..3 {
+        for which in 0..4 {
             let shared = shared.clone();
             std::thread::spawn(move || {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6717,7 +6729,7 @@ mod tests {
     /// worker that does not fails the start, and a stop ends the runs.
     #[test]
     fn a_start_waits_for_its_stream_workers() {
-        let start = |name: &str, connect: bool| {
+        let start = |name: &str, connect: bool, integrated: bool| {
             let shared = Arc::new(Shared::new());
             serve_workers(&shared, connect);
             let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
@@ -6730,30 +6742,44 @@ mod tests {
             )
             .unwrap();
             let p = det.p;
-            det.ad
-                .port_base
-                .set_int32_param(p.write_prv_img, 0, 1)
-                .unwrap();
-            det.set_text(p.prv_img_base, "tcp://localhost:8089")
-                .unwrap();
+            let (write, base) = if integrated {
+                (p.write_prv_img1, p.prv_img1_base)
+            } else {
+                (p.write_prv_img, p.prv_img_base)
+            };
+            det.ad.port_base.set_int32_param(write, 0, 1).unwrap();
+            det.set_text(base, "tcp://localhost:8089").unwrap();
             let started = det
                 .write_int32(&mut AsynUser::new(det.ad.params.acquire), 1)
                 .is_ok();
             (det, shared, started)
         };
 
-        let (mut det, shared, started) = start("TPX_READY_OK", true);
+        let (mut det, shared, started) = start("TPX_READY_OK", true, false);
         assert!(started);
         assert!(shared.prv_img_worker.connected());
         det.write_int32(&mut AsynUser::new(det.ad.params.acquire), 0)
             .unwrap();
         assert!(!shared.prv_img_worker.connected());
 
-        let (det, _, started) = start("TPX_READY_FAIL", false);
+        let (det, _, started) = start("TPX_READY_FAIL", false, false);
         assert!(!started);
         assert_eq!(
             det.text(det.ad.params.status_message, 0),
             "Preview stream did not become ready"
+        );
+
+        // acquire.cpp:448-459: an enabled PrvImg1 needs its own worker.
+        let (mut det, shared, started) = start("TPX_READY_INT_OK", true, true);
+        assert!(started);
+        assert!(shared.prv_img1_worker.connected());
+        det.write_int32(&mut AsynUser::new(det.ad.params.acquire), 0)
+            .unwrap();
+        let (det, _, started) = start("TPX_READY_INT_FAIL", false, true);
+        assert!(!started);
+        assert_eq!(
+            det.text(det.ad.params.status_message, 0),
+            "Integrated preview stream did not become ready"
         );
     }
 

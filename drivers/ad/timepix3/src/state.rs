@@ -41,12 +41,13 @@ pub enum Command {
     PushProcessedImg,
 }
 
-/// Where the three preview channels stream from, as Serval's `Base` PVs give
+/// Where the four streamed channels stream from, as Serval's `Base` PVs give
 /// it (`tcp://[listen@]host:port`, or a `file://` path when the channel writes
 /// to disk instead).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamPaths {
     pub prv_img: Option<String>,
+    pub prv_img1: Option<String>,
     pub img: Option<String>,
     pub prv_hst: Option<String>,
 }
@@ -188,8 +189,10 @@ pub struct Shared {
     /// buffer; the driver owns it here).
     pub mask: Mutex<Vec<i32>>,
     pub streams: Mutex<StreamPaths>,
-    /// C `prvImgWorkerState_`, `imgWorkerState_`, `prvHstWorkerState_`.
+    /// C `prvImgWorkerState_`, `prvImg1WorkerState_`, `imgWorkerState_`,
+    /// `prvHstWorkerState_`.
     pub prv_img_worker: WorkerState,
+    pub prv_img1_worker: WorkerState,
     pub img_worker: WorkerState,
     pub prv_hst_worker: WorkerState,
     /// The PrvImg and PrvImg1 preview streams' state.
@@ -220,6 +223,7 @@ impl Shared {
             mask: Mutex::new(Vec::new()),
             streams: Mutex::new(StreamPaths::default()),
             prv_img_worker: WorkerState::default(),
+            prv_img1_worker: WorkerState::default(),
             img_worker: WorkerState::default(),
             prv_hst_worker: WorkerState::default(),
             preview: Default::default(),
@@ -232,25 +236,21 @@ impl Shared {
         }
     }
 
-    pub fn set_stream_paths(
-        &self,
-        prv_img: Option<String>,
-        img: Option<String>,
-        prv_hst: Option<String>,
-    ) {
-        *self.streams.lock() = StreamPaths {
-            prv_img,
-            img,
-            prv_hst,
-        };
+    pub fn set_stream_paths(&self, paths: StreamPaths) {
+        *self.streams.lock() = paths;
     }
 
     pub fn stream_paths(&self) -> StreamPaths {
         self.streams.lock().clone()
     }
 
-    pub fn stream_workers(&self) -> [&WorkerState; 3] {
-        [&self.prv_img_worker, &self.img_worker, &self.prv_hst_worker]
+    pub fn stream_workers(&self) -> [&WorkerState; 4] {
+        [
+            &self.prv_img_worker,
+            &self.prv_img1_worker,
+            &self.img_worker,
+            &self.prv_hst_worker,
+        ]
     }
 
     /// C `waitForStreamWorkersToStop` (acquisition_runtime.cpp:84-104): wait
@@ -338,7 +338,11 @@ mod tests {
     #[test]
     fn the_stream_paths_round_trip() {
         let s = Shared::new();
-        s.set_stream_paths(Some("tcp://h:1".into()), None, Some("tcp://h:2".into()));
+        s.set_stream_paths(StreamPaths {
+            prv_img: Some("tcp://h:1".into()),
+            prv_hst: Some("tcp://h:2".into()),
+            ..Default::default()
+        });
         let p = s.stream_paths();
         assert_eq!(p.prv_img.as_deref(), Some("tcp://h:1"));
         assert_eq!(p.img, None);

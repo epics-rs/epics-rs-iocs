@@ -95,6 +95,16 @@ const PRV_IMG: Preview = Preview {
     tag: "PrvImg",
 };
 
+/// C `processPrvImg1DataLine` (serval_stream.cpp:1582-1605).
+const PRV_IMG1: Preview = Preview {
+    index: 1,
+    th0: 10,
+    th1: 11,
+    diff: 12,
+    metadata: false,
+    tag: "PrvImg1",
+};
+
 pub struct Ctx {
     pub handle: PortHandle,
     pub http: Arc<ServalHttp>,
@@ -325,6 +335,7 @@ pub fn start(
     let mut threads = vec![connection, acquisition];
     for (name, channel) in [
         ("tpx3PrvImgWorker", StreamKind::PrvImg),
+        ("tpx3PrvImg1Worker", StreamKind::PrvImg1),
         ("tpx3ImgWorker", StreamKind::Img),
         ("tpx3PrvHstWorker", StreamKind::PrvHst),
     ] {
@@ -1749,12 +1760,13 @@ fn poll_measurement(ctx: &Ctx, first: bool) -> Result<serval::StatusSnapshot, &'
 
 // ---------------------------------------------------------------------------
 // Stream workers (C `imgWorkerThread`, `prvImgWorkerThread`,
-// `prvHstWorkerThread`)
+// `prvImg1WorkerThread`, `prvHstWorkerThread`)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamKind {
     PrvImg,
+    PrvImg1,
     Img,
     PrvHst,
 }
@@ -1770,6 +1782,7 @@ impl StreamKind {
     fn name(self) -> &'static str {
         match self {
             Self::PrvImg => "PrvImg",
+            Self::PrvImg1 => "PrvImg1",
             Self::Img => "Img",
             Self::PrvHst => "PrvHst",
         }
@@ -1785,6 +1798,11 @@ impl StreamKind {
                 RUN_JSON_IMAGE_TCP_WORKER,
                 "bool ADTimePix::processPrvImgDataLine(char*, char*, size_t)",
             ]),
+            Self::PrvImg1 => Some([
+                "void ADTimePix::prvImg1Connect()",
+                RUN_JSON_IMAGE_TCP_WORKER,
+                "bool ADTimePix::processPrvImg1DataLine(char*, char*, size_t)",
+            ]),
             Self::Img => Some([
                 "void ADTimePix::imgConnect()",
                 RUN_JSON_IMAGE_TCP_WORKER,
@@ -1797,6 +1815,7 @@ impl StreamKind {
     fn worker(self, s: &Shared) -> &WorkerState {
         match self {
             Self::PrvImg => &s.prv_img_worker,
+            Self::PrvImg1 => &s.prv_img1_worker,
             Self::Img => &s.img_worker,
             Self::PrvHst => &s.prv_hst_worker,
         }
@@ -1806,6 +1825,7 @@ impl StreamKind {
         let paths = s.stream_paths();
         match self {
             Self::PrvImg => paths.prv_img,
+            Self::PrvImg1 => paths.prv_img1,
             Self::Img => paths.img,
             Self::PrvHst => paths.prv_hst,
         }
@@ -1902,6 +1922,13 @@ fn disconnected(ctx: &Ctx, kind: StreamKind) {
             &adlog::log(
                 "void ADTimePix::prvImgDisconnect()",
                 "PrvImg TCP disconnected",
+            ),
+        ),
+        StreamKind::PrvImg1 => ctx.trace(
+            TraceMask::IO_DRIVER,
+            &adlog::log(
+                "void ADTimePix::prvImg1Disconnect()",
+                "PrvImg1 TCP disconnected",
             ),
         ),
         StreamKind::Img => {}
@@ -2193,6 +2220,7 @@ fn strerror(e: &std::io::Error) -> String {
 async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
     match (kind, frame) {
         (StreamKind::PrvImg, Frame::Image(f)) => return preview_frame(ctx, PRV_IMG, f).await,
+        (StreamKind::PrvImg1, Frame::Image(f)) => return preview_frame(ctx, PRV_IMG1, f).await,
         (StreamKind::Img, Frame::Image(f)) => {
             let Some(mut array) = image_array(
                 ctx,
@@ -4136,7 +4164,10 @@ mod tests {
         let ctx = Arc::new(idle_ctx("TPX_ONE_SHOT"));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let path = format!("tcp://{}", listener.local_addr().unwrap());
-        ctx.shared.set_stream_paths(Some(path), None, None);
+        ctx.shared.set_stream_paths(crate::state::StreamPaths {
+            prv_img: Some(path),
+            ..Default::default()
+        });
         assert!(ctx.shared.acquisition.begin_start());
         assert!(ctx.shared.prv_img_worker.start());
         let c = ctx.clone();
@@ -4212,7 +4243,10 @@ mod tests {
         ctx.outputs[PRV_IMG_ADDR].lock().add(tx);
         set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
         let path = format!("tcp://{}", stream.local_addr().unwrap());
-        ctx.shared.set_stream_paths(Some(path), None, None);
+        ctx.shared.set_stream_paths(crate::state::StreamPaths {
+            prv_img: Some(path),
+            ..Default::default()
+        });
         let acquisition = &ctx.shared.acquisition;
         assert!(acquisition.begin_start());
         for resource in [Resource::RemoteMeasurement, Resource::MonitorThread] {
@@ -4644,6 +4678,71 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(!text.contains("rejected TCP stream"), "{text}");
+    }
+
+    /// C's PrvImg1 worker streams the integrated preview to addresses
+    /// 10-12 and posts none of PrvImg's parameters
+    /// (serval_stream.cpp:708-714, :1582-1605, :1708-1757).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_integrated_preview_streams_to_its_own_addresses() {
+        use std::io::Write;
+        let name = "TPX_PRVIMG1";
+        let ctx = Arc::new(idle_ctx(name));
+        let path = capture_errors(&ctx, name);
+        ctx.handle
+            .trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let (tx, mut rx) = epics_rs::ad_core::plugin::channel::ndarray_channel("TPX_PRVIMG1_10", 4);
+        ctx.outputs[PRV_IMG1.th0].lock().add(tx);
+        set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        ctx.shared.set_stream_paths(crate::state::StreamPaths {
+            prv_img1: Some(format!("tcp://{addr}")),
+            ..Default::default()
+        });
+        let worker = &ctx.shared.prv_img1_worker;
+        assert!(worker.start());
+        let c = ctx.clone();
+        let _thread = rt::run_thread_named("TpxPrvImg1", move || async move {
+            stream_worker(c, StreamKind::PrvImg1).await;
+        });
+        let mut peer = listener.accept().unwrap().0;
+        assert!(worker.wait_for_connected_for(Duration::from_secs(5)));
+        let mut bytes =
+            br#"{"width":1,"height":1,"pixelFormat":"uint16","frameNumber":7}"#.to_vec();
+        bytes.extend_from_slice(b"\n\x00\x05\n");
+        peer.write_all(&bytes).unwrap();
+        let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no array at 10")
+            .unwrap();
+        assert_eq!(array.unique_id, 7);
+        assert_eq!(
+            ctx.handle
+                .read_int32(ctx.p.prv_img_frame_number, 0)
+                .await
+                .unwrap_or(0),
+            0
+        );
+        worker.request_stop();
+        drop(peer);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains(&adlog::log(
+                "void ADTimePix::prvImg1Connect()",
+                &format!("PrvImg1 TCP connected to {}:{}", addr.ip(), addr.port())
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&adlog::log(
+                adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+                "Processed PrvImg1 frame: width=1, height=1, format=uint16, frame=7, thresholdID=0"
+            )),
+            "{text}"
+        );
     }
 
     /// C sends a threshold-1 frame to its own address, and a T1 then T0
