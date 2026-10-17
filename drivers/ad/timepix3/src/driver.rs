@@ -1009,7 +1009,7 @@ impl TimePix3Driver {
     }
 
     /// C `getServer` (serval_http.cpp:1420): read back the configured channels.
-    fn get_server(&mut self) -> AsynResult<()> {
+    pub(crate) fn get_server(&mut self) -> AsynResult<()> {
         let dest = self
             .http
             .get_json(serval::SERVER_DESTINATION, TIMEOUT_POLL)

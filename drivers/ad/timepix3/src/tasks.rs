@@ -354,32 +354,73 @@ async fn connection_poll(
         }
 
         let up = check_connection(&ctx).await;
-        // A 0 -> 1 edge re-reads everything (C `refreshOnReconnect`,
-        // serval_http.cpp:340).
+        // A 0 -> 1 edge reconciles the read-only state; a partial
+        // reconciliation is retried on the next poll (C `connectionPollThread`,
+        // serval_http.cpp:408-420).
         //
         // UPSTREAM DEFECT (ADTimePix.cpp:1579): C never initialises
         // `lastServalConnected_`/`lastDetConnected_`, so whether the first
         // successful poll runs the reconnect refresh depends on uninitialised
         // memory. Here the edge starts from "down", so the first success
         // always refreshes.
-        if up && !was_up {
-            refresh_dashboard(&ctx).await;
-            refresh_detector(&ctx).await;
-            refresh_measurement_config(&ctx).await;
-        }
-        was_up = up;
+        let complete = if up && !was_up {
+            refresh_on_reconnect(&ctx).await
+        } else {
+            true
+        };
+        was_up = up && complete;
     }
+}
+
+/// C `refreshOnReconnect` (serval_http.cpp:287-312): every readback runs,
+/// and the status reports whether all of them succeeded.
+async fn refresh_on_reconnect(ctx: &Arc<Ctx>) -> bool {
+    let destination = ctx
+        .handle
+        .with_driver::<TimePix3Driver, _>(|d| d.get_server().is_ok())
+        .await
+        .unwrap_or(false);
+    let detector = refresh_detector(ctx).await;
+    let measurement_config = refresh_measurement_config(ctx).await;
+    let complete = destination && detector && measurement_config;
+
+    let mut updates = Vec::new();
+    if complete {
+        connection_status(ctx, true, true, &mut updates);
+    } else {
+        eprintln!(
+            "ERROR | ADTimePix::refreshOnReconnect: Reconnect state refresh incomplete: \
+             destination={} detector={} measurementConfig={}",
+            i32::from(destination),
+            i32::from(detector),
+            i32::from(measurement_config),
+        );
+        updates.push(ParamSetValue::new(
+            ctx.ad.status_message,
+            0,
+            ParamValue::Octet(
+                b"Connected; reconnect state refresh incomplete"
+                    .to_vec()
+                    .into(),
+            ),
+        ));
+        updates.push(ParamSetValue::new(
+            ctx.ad.status,
+            0,
+            ParamValue::Int32(ADStatus::Error as i32),
+        ));
+    }
+    ctx.set(0, updates).await;
+    complete
 }
 
 /// C `getMeasurementConfig`, which the Health scan and the reconnect refresh
 /// run (ADTimePix.cpp:560, serval_http.cpp:297-298).
-async fn refresh_measurement_config(ctx: &Arc<Ctx>) {
-    let _ = ctx
-        .handle
-        .with_driver::<TimePix3Driver, _>(|d| {
-            let _ = d.get_measurement_config();
-        })
-        .await;
+async fn refresh_measurement_config(ctx: &Arc<Ctx>) -> bool {
+    ctx.handle
+        .with_driver::<TimePix3Driver, _>(|d| d.get_measurement_config().is_ok())
+        .await
+        .unwrap_or(false)
 }
 
 /// C `checkConnection` (serval_http.cpp:274).
@@ -530,14 +571,14 @@ async fn refresh_dashboard(ctx: &Arc<Ctx>) {
     }
 }
 
-/// C `getDetector` (serval_http.cpp:1293).
-async fn refresh_detector(ctx: &Arc<Ctx>) {
+/// C `getDetector` (serval_http.cpp:1293); false when `/detector` failed.
+async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
     let p = ctx.p;
     let detector = match ctx.http.get_json(serval::DETECTOR, TIMEOUT_POLL) {
         Ok(d) => d,
         Err(_) => {
             ctx.set_int(p.det_connected, 0, 0).await;
-            return;
+            return false;
         }
     };
 
@@ -750,6 +791,7 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
             ctx.set(addr, updates).await;
         }
     }
+    true
 }
 
 /// `Detector.Health` is a single object on Serval 3 and an array — one entry
@@ -3498,5 +3540,95 @@ mod tests {
             avg.attributes.get("ADTimePixCountUnits").map(|a| &a.value),
             Some(&NDAttrValue::String("counts/frame".into()))
         );
+    }
+
+    /// Serval answering every request with 200 and `body_for(path)`, except
+    /// the paths in `fail` (500); it logs each request line.
+    fn logging_serval(
+        fail: &'static [&'static str],
+        body_for: fn(&str) -> &'static str,
+    ) -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let log: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let mut reader = BufReader::new(conn);
+                let mut request = String::new();
+                let _ = reader.read_line(&mut request);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let path = request.split(' ').nth(1).unwrap_or("").to_string();
+                seen.lock().push(request.trim_end().to_string());
+                let (status, body) = if fail.contains(&path.as_str()) {
+                    ("500 Internal Server Error", "")
+                } else {
+                    ("200 OK", body_for(&path))
+                };
+                let _ = reader.get_mut().write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (url, log)
+    }
+
+    /// The reconnect refresh reads the destination, the detector and the
+    /// measurement config; a failed readback reports the refresh incomplete
+    /// and is retried on the next poll (serval_http.cpp:287-312, :408-420).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_incomplete_reconnect_refresh_is_reported_and_retried() {
+        let (url, log) = logging_serval(&["/server/destination"], |path| match path {
+            "/dashboard" => r#"{"Server":{},"Detector":{"DetectorType":"TPX3"}}"#,
+            _ => "{}",
+        });
+        let ctx = Arc::new(idle_ctx_at("TPX_RECONNECT", &url, None));
+        let (cmd_tx, cmd_rx) = rt::command_channel::<Command>(1);
+        let (acq_tx, _acq_rx) = rt::command_channel::<()>(1);
+        tokio::spawn(connection_poll(ctx.clone(), cmd_rx, acq_tx));
+
+        let destination_reads = || {
+            log.lock()
+                .iter()
+                .filter(|r| r.starts_with("GET /server/destination "))
+                .count()
+        };
+        for expected in 1..=2 {
+            cmd_tx.send(Command::RefreshConnection).await.unwrap();
+            for _ in 0..200 {
+                if destination_reads() >= expected
+                    && log
+                        .lock()
+                        .last()
+                        .is_some_and(|r| r.contains("/measurement/config"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(destination_reads(), expected);
+            assert_eq!(
+                ctx.handle
+                    .read_octet(ctx.ad.status_message, 0, 64)
+                    .await
+                    .unwrap(),
+                b"Connected; reconnect state refresh incomplete\0"
+            );
+            assert_eq!(
+                ctx.handle.read_int32(ctx.ad.status, 0).await.unwrap(),
+                ADStatus::Error as i32
+            );
+        }
     }
 }
