@@ -35,12 +35,10 @@
 //!
 //! ## Units
 //!
-//! The controller works in millimetres (`A` returns mm, `G`/`T` take mm). The C
-//! driver multiplies the record's raw steps by a fixed `drive_resolution`
-//! (0.01) to reach mm and divides on readback; at the asyn-rs motor boundary,
-//! which is dial-frame EGU, that scaling cancels, so this port works directly in
-//! mm (`EGU` is mm). The record's `MRES` must still be `drive_resolution`:
-//! raw counts are integers, so it is the step.
+//! The controller works in millimetres (`A` returns mm, `G`/`T` take mm).
+//! As C, record steps and steps/s go out times [`DRIVE_RESOLUTION`] and `A`
+//! comes back as `NINT(mm / DRIVE_RESOLUTION)`, so the record's `MRES` must
+//! be that value for `EGU` mm.
 //!
 //! ## Deviations from C (documented)
 //!
@@ -64,6 +62,9 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, nint};
+
+/// Millimetres per record step (C `EMC18011_RESOLUTION`, drvEMC18011.h).
+pub const DRIVE_RESOLUTION: f64 = 0.01;
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
@@ -286,7 +287,7 @@ impl Emc18011Axis {
         let mut ctrl = self.lock();
         ctrl.select(self.index)?;
         if velocity > 0.0 {
-            ctrl.command(&vel_cmd(velocity))?;
+            ctrl.command(&vel_cmd(velocity * DRIVE_RESOLUTION))?;
         }
         send_prem(&ctrl, &prem)?;
         ctrl.command(move_str)?;
@@ -316,7 +317,7 @@ impl AsynMotor for Emc18011Axis {
         velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        self.issue_move(velocity, &move_cmd('G', position))
+        self.issue_move(velocity, &move_cmd('G', position * DRIVE_RESOLUTION))
     }
 
     fn move_relative(
@@ -327,7 +328,7 @@ impl AsynMotor for Emc18011Axis {
         velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        self.issue_move(velocity, &move_cmd('T', distance))
+        self.issue_move(velocity, &move_cmd('T', distance * DRIVE_RESOLUTION))
     }
 
     fn move_velocity(
@@ -343,9 +344,11 @@ impl AsynMotor for Emc18011Axis {
         let mut ctrl = self.lock();
         ctrl.select(self.index)?;
         send_prem(&ctrl, &prem)?;
-        ctrl.command(&vel_cmd(velocity.abs()))?;
-        // Direction character: '>' forward, '<' reverse (C JOG).
-        let dir = if velocity >= 0.0 { ">" } else { "<" };
+        // C prints the signed velocity, a `V-` the direction character
+        // already carries; not copied.
+        ctrl.command(&vel_cmd((velocity * DRIVE_RESOLUTION).abs()))?;
+        // Direction character: '>' unless C's NINT(steps/s) is negative.
+        let dir = if nint(velocity) >= 0 { ">" } else { "<" };
         ctrl.command(dir)?;
         Ok(())
     }
@@ -458,7 +461,7 @@ impl AsynMotor for Emc18011Axis {
             // Stopped or at a limit: a position reply releases the slot; with
             // none C keeps the motor selected and the old position.
             if let Some(reply) = ctrl.command("A").ok().filter(|r| !r.is_empty()) {
-                position = atof(&reply);
+                position = f64::from(nint(atof(&reply) / DRIVE_RESOLUTION));
                 ctrl.active = None;
             }
         }
@@ -540,12 +543,12 @@ mod tests {
         let (line, mut axis, _) = strings_rig("emcPrem");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"CA", None).unwrap();
-        axis.move_absolute(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
+        axis.move_absolute(&user, 150.0, 0.0, 200.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["M1", "V2.00", "CA", "G1.5", "A"]);
-        axis.move_relative(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
+        axis.move_relative(&user, 150.0, 0.0, 200.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["V2.00", "T1.5", "A"]);
         axis.set_move_strings(&user, b"CA", None).unwrap();
-        axis.move_velocity(&user, 0.0, -2.0, 0.0).unwrap();
+        axis.move_velocity(&user, 0.0, -200.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["CA", "V2.00", "<"]);
     }
 
@@ -580,6 +583,20 @@ mod tests {
         line.sent();
         *z.lock().unwrap() = Z_LSDOWN;
         assert_eq!(poll_extra(&line, &mut axis), ["S"]);
+    }
+
+    /// devEMC18011.cc:189, 371-374 and drvEMC18011.cc:272: steps go out
+    /// times drive_resolution, `A` comes back divided by it, and a jog
+    /// under half a step/s backwards is still `>`.
+    #[test]
+    fn record_steps_scale_by_drive_resolution() {
+        let (line, mut axis, _) = strings_rig("emcSteps");
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 1234.0, 0.0, 50.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["M1", "V0.50", "G12.3", "A"]);
+        assert_eq!(axis.poll(&user).unwrap().position, 100.0);
+        axis.move_velocity(&user, 0.0, -0.3, 0.0).unwrap();
+        assert_eq!(line.sent().last().unwrap(), ">");
     }
 
     #[test]
