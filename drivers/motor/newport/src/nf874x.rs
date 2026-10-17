@@ -22,6 +22,7 @@ use epics_rs::motor::controller_port::{
 };
 
 use motor_common::util::{atof, atoi};
+use motor_common::{AxisReport, ControllerReport};
 
 /// `DEFAULT_CONTROLLER_TIMEOUT` of asynMotorController.
 pub const NF874X_TIMEOUT: Duration = Duration::from_secs(2);
@@ -128,6 +129,17 @@ struct Nf874xParams {
     update_interval: usize,
     deadband: usize,
     following_error: usize,
+}
+
+/// `nf874xAxis::report` (874xMotorDriver.cpp:265-273) for axis `.0`.
+pub struct Nf874xAxisReport(pub i32);
+
+impl AxisReport for Nf874xAxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let _ = writeln!(out, "  axis {}", self.0);
+        }
+    }
 }
 
 /// One picomotor axis, numbered from 1.
@@ -371,11 +383,22 @@ impl AsynMotor for Nf874xAxis {
 /// `nf874xController`'s parameters and its `writeInt32` / `writeFloat64`.
 pub struct Nf874xControllerParams {
     controller: Arc<Mutex<Nf874xController>>,
+    /// C's `movingPollPeriod_`/`idlePollPeriod_`, in seconds.
+    moving_poll_s: f64,
+    idle_poll_s: f64,
 }
 
 impl Nf874xControllerParams {
-    pub fn new(controller: Arc<Mutex<Nf874xController>>) -> Self {
-        Self { controller }
+    pub fn new(
+        controller: Arc<Mutex<Nf874xController>>,
+        moving_poll_ms: u64,
+        idle_poll_ms: u64,
+    ) -> Self {
+        Self {
+            controller,
+            moving_poll_s: moving_poll_ms as f64 / 1000.0,
+            idle_poll_s: idle_poll_ms as f64 / 1000.0,
+        }
     }
 
     /// Send `mnemonic value` to the axis at `user`. C dereferences the null
@@ -419,6 +442,19 @@ impl WriteHook for Nf874xWriteHook {
 }
 
 impl ControllerParams for Nf874xControllerParams {
+    /// C `nf874xController::report` (874xMotorDriver.cpp:115-122).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "nf874x motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll_s,
+            self.idle_poll_s
+        );
+        ctx.report(out, level);
+    }
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let params = Nf874xParams {
             update_interval: base.create_param("MOTOR_UPDATE_INTERVAL", ParamType::Float64)?,
@@ -515,7 +551,7 @@ mod tests {
     /// A port `name` with no line and axis 1.
     fn port(name: &str) -> (PortHandle, Arc<Mutex<Nf874xController>>) {
         let ctrl = Arc::new(Mutex::new(controller(false)));
-        let params = Nf874xControllerParams::new(ctrl.clone());
+        let params = Nf874xControllerParams::new(ctrl.clone(), 100, 1000);
         let port = register_controller_port(&open_owner(), name, 2, params).unwrap();
         let motor: Arc<Mutex<dyn AsynMotor>> =
             Arc::new(Mutex::new(Nf874xAxis::new(ctrl.clone(), 1)));
