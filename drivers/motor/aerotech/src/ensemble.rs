@@ -37,6 +37,7 @@
 //!   which removes the `set_closed_loop`/`poll` coupling and matches the motor
 //!   record's limit semantics (a limit is not a fault that must be acknowledged).
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -44,6 +45,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::AxisReport;
 use motor_common::util::{atof, atoi, atol};
 
 use crate::exchange::Exchange;
@@ -81,6 +83,7 @@ const PARAM_END_OF_TRAVEL_LIMIT_SETUP: i32 = 61;
 const PARAM_ABORT_DECEL_RATE: i32 = 73;
 const PARAM_HOME_SETUP: i32 = 75;
 const PARAM_HOME_SPEED: i32 = 76;
+const PARAM_HOME_OFFSET: i32 = 77;
 const PARAM_HOME_RAMP_RATE: i32 = 78;
 const PARAM_AXIS_NAME: i32 = 140;
 
@@ -200,6 +203,36 @@ impl EnsembleController {
     }
 }
 
+/// The `motorAxis` members C's `motorAxisReportAxis` prints
+/// (drvEnsembleAsyn.cc:218-228); it reads them without the axis lock.
+pub struct EnsembleAxisReport {
+    axis: i32,
+    /// C `stepSize`, signed.
+    step_size: f64,
+    max_digits: usize,
+    /// C `homePreset`: the `HomeOffset` parameter, 0 when refused.
+    home_preset: f64,
+    /// C `axisStatus`: the poller's last `AXISSTATUS` reply.
+    axis_status: AtomicU32,
+}
+
+impl AxisReport for EnsembleAxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let _ = write!(
+                out,
+                "Axis {}\n   axisStatus:  0x{:x}\n   home preset: {:.6}\n   \
+                 step size:   {:.6}\n   max digits:  {}\n",
+                self.axis,
+                self.axis_status.load(Ordering::Relaxed),
+                self.home_preset,
+                self.step_size,
+                self.max_digits
+            );
+        }
+    }
+}
+
 /// One Ensemble axis sharing a controller. Implements [`AsynMotor`].
 pub struct EnsembleAxis {
     controller: Arc<Mutex<EnsembleController>>,
@@ -216,19 +249,24 @@ pub struct EnsembleAxis {
     step: f64,
     /// C `maxDigits`.
     digits: usize,
+    report: Arc<EnsembleAxisReport>,
 }
 
 impl EnsembleAxis {
     /// Construct axis `axis` and probe its feedback type, home/limit setup and
     /// reverse-direction parameters, then set `RAMP MODE RATE`.
     pub fn new(controller: Arc<Mutex<EnsembleController>>, axis: i32) -> AsynResult<Self> {
-        let (has_encoder, step_size, home_direction, reverse_direc, swconfig) = {
+        let (has_encoder, step_size, home_preset, home_direction, reverse_direc, swconfig) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let has_encoder = ctrl
                 .get_param(axis, PARAM_POSITION_FEEDBACK_TYPE)
                 .map(|s| atoi(&s) > 0)
                 .unwrap_or(false);
             let step_size = step_size(ctrl.get_param(axis, PARAM_COUNTS_PER_UNIT));
+            let home_preset = ctrl
+                .get_param(axis, PARAM_HOME_OFFSET)
+                .map(|s| atof(&s))
+                .unwrap_or(0.0);
             let home_direction = ctrl
                 .get_param(axis, PARAM_HOME_SETUP)
                 .map(|s| atol(&s) as u32)
@@ -245,6 +283,7 @@ impl EnsembleAxis {
             (
                 has_encoder,
                 step_size,
+                home_preset,
                 home_direction,
                 reverse_direc,
                 swconfig,
@@ -260,7 +299,19 @@ impl EnsembleAxis {
             swconfig,
             step: step_size.abs(),
             digits: max_digits(step_size),
+            report: Arc::new(EnsembleAxisReport {
+                axis,
+                step_size,
+                max_digits: max_digits(step_size),
+                home_preset,
+                axis_status: AtomicU32::new(0),
+            }),
         })
+    }
+
+    /// What C's `motorAxisReport` prints of this axis.
+    pub fn report(&self) -> Arc<EnsembleAxisReport> {
+        self.report.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, EnsembleController> {
@@ -419,6 +470,9 @@ impl AsynMotor for EnsembleAxis {
         let (axis_status, plane_active, enc_pos, cmd_pos, fault, act_vel) = {
             let ctrl = self.lock();
             let axis_status = atol(&ctrl.query(&format!("AXISSTATUS(@{axis})"))?) as u32;
+            self.report
+                .axis_status
+                .store(axis_status, Ordering::Relaxed);
             let plane_active = (atoi(&ctrl.query("PLANESTATUS(0)")?) & 0x01) != 0;
             let enc_pos = atof(&ctrl.query(&format!("PFBKPROG(@{axis})"))?);
             let cmd_pos = atof(&ctrl.query(&format!("PCMDPROG(@{axis})"))?);
