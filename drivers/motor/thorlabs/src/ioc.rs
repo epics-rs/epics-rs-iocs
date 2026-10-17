@@ -115,4 +115,34 @@ mod report {
              port=mdtRepLine, address=0, id:  \n"
         );
     }
+
+    /// drvMDT695.cc:557-570: a `D` that fails is retried with echo toggled,
+    /// up to 3 times, like a reply without `MDT`.
+    #[epics_rs::base::epics_test]
+    async fn a_refused_first_d_is_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let int = ArgValue::Int;
+        run_command(mdt695_setup_command(), vec![int(1), int(10)]).await;
+        let tries = AtomicUsize::new(0);
+        let (_line, _io) = LineRig::failing(
+            "mdtRefusedD",
+            |cmd| match cmd.trim_end() {
+                "D" => "MDT694".into(),
+                _ => String::new(),
+            },
+            move |cmd| match cmd.trim_end() {
+                "D" => tries.fetch_add(1, Ordering::SeqCst) == 0,
+                // A quiet line: the I read times out and ends the ident.
+                "I" => true,
+                _ => false,
+            },
+        );
+        let config = vec![int(0), ArgValue::String("mdtRefusedD".into())];
+        run_command(mdt695_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvMDT695", 0),
+            "    MDT695 controller 0, port=mdtRefusedD, address=0, id:  \n"
+        );
+    }
 }
