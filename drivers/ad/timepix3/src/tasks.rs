@@ -1623,7 +1623,11 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stre
                 decoder.set_image_limits(image_limits(ctx));
             }
             match decoder.next_frame() {
-                Ok(Some(frame)) => handle_frame(ctx, kind, frame).await,
+                Ok(Some(frame)) => {
+                    if !handle_frame(ctx, kind, frame).await {
+                        return;
+                    }
+                }
                 Ok(None) => break,
                 Err(e) => {
                     framing_failed(ctx, kind, &e);
@@ -1849,7 +1853,9 @@ fn strerror(e: &std::io::Error) -> String {
     }
 }
 
-async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
+/// C's `processLineFn`: `false` (a refused NDArray allocation) fails the
+/// worker as a framing failure does (serval_stream.cpp:618-626, :639-644).
+async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
     match (kind, frame) {
         (StreamKind::PrvImg, Frame::Image(mut f)) => {
             log_json_header(ctx, &f.header);
@@ -1859,11 +1865,11 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 &f,
                 pixels,
                 &adlog::err(
-                    adlog::PROCESS_PRV_IMG_DATA_LINE,
-                    "Failed to allocate NDArray or NDArray has no data pointer",
+                    adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+                    "PrvImg failed to allocate NDArray",
                 ),
             ) else {
-                return;
+                return false;
             };
             let p = ctx.p;
             let rate = frame_rate(
@@ -1917,7 +1923,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                     "Failed to allocate NDArray or NDArray has no data pointer",
                 ),
             ) else {
-                return;
+                return false;
             };
             let p = ctx.p;
             // processImgDataLine counts every Img frame, NDArrayCallbacks or
@@ -2026,7 +2032,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             // histogram_io.cpp:165-170, :425-433: a frame read before
             // accumulation was turned off is dropped whole.
             if !prv_hst_accumulating(ctx) {
-                return;
+                return true;
             }
             let started = EpicsTimestamp::now().as_f64();
             let p = ctx.p;
@@ -2129,6 +2135,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
         // The decoder is created for the channel, so this cannot happen.
         _ => {}
     }
+    true
 }
 
 /// C's PrvImg/Img rate block (serval_stream.cpp:248-283, :899-936): the
@@ -4014,6 +4021,65 @@ mod tests {
                 text.contains(&adlog::err(RUN_JSON_IMAGE_TCP_WORKER, expected)),
                 "{text}"
             );
+        }
+    }
+
+    /// A refused frame allocation fails the worker as a framing failure
+    /// does, with the peer still connected (serval_stream.cpp:177-183,
+    /// :808-815, :618-626).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_frame_allocation_fails_the_worker() {
+        use std::io::Write;
+
+        for (name, kind, expected) in [
+            (
+                "TPX_ALLOC_PRV",
+                StreamKind::PrvImg,
+                adlog::err(
+                    adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+                    "PrvImg failed to allocate NDArray",
+                ),
+            ),
+            (
+                "TPX_ALLOC_IMG",
+                StreamKind::Img,
+                adlog::err(
+                    adlog::PROCESS_IMG_DATA_LINE,
+                    "Failed to allocate NDArray or NDArray has no data pointer",
+                ),
+            ),
+        ] {
+            let mut ctx = idle_ctx(name);
+            ctx.pool = DriverPool::standalone(8);
+            let ctx = Arc::new(ctx);
+            let path = capture_errors(&ctx, name);
+            assert!(kind.worker(&ctx.shared).start());
+            let run = kind.worker(&ctx.shared).wait_for_start(None);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let _ = client.set_read_timeout(Some(READ_TIMEOUT));
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut frame = br#"{"width":2,"height":2,"pixelFormat":"uint32"}"#.to_vec();
+            frame.push(b'\n');
+            frame.resize(frame.len() + 16, 0);
+            frame.push(b'\n');
+            peer.write_all(&frame).unwrap();
+            let reader = tokio::spawn({
+                let ctx = ctx.clone();
+                async move { read_stream(&ctx, kind, run, client).await }
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !reader.is_finished() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let returned = reader.is_finished();
+            kind.worker(&ctx.shared).request_stop();
+            reader.await.unwrap();
+            drop(peer);
+            assert!(returned, "{name}: the worker kept reading");
+            let text = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert!(text.contains(&expected), "{name}: {text}");
         }
     }
 

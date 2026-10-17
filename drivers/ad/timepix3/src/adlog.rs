@@ -28,8 +28,6 @@ pub const ENSURE_PREVIEW_TCP_PORTS_FREE: &str =
     "asynStatus ADTimePix::ensurePreviewTcpPortsFree(bool)";
 pub const STOP_ACQUISITION: &str =
     "asynStatus ADTimePix::stopAcquisition(bool, const std::string&)";
-pub const PROCESS_PRV_IMG_DATA_LINE: &str =
-    "bool ADTimePix::processPrvImgDataLine(char*, char*, size_t)";
 pub const PROCESS_PREVIEW_JSONIMAGE_LINE: &str = "bool ADTimePix::processPreviewJsonimageLine(\
     const ADTimePix::PreviewJsonimageStream&, char*, char*, size_t)";
 pub const PROCESS_IMG_DATA_LINE: &str = "bool ADTimePix::processImgDataLine(char*, char*, size_t)";
