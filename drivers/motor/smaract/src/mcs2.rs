@@ -43,7 +43,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, has_motor_axis,
+    AxisUser, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, has_motor_axis,
 };
 use epics_rs::motor::trace::MotorTrace;
 
@@ -308,7 +308,7 @@ impl ControllerParams for Mcs2Params {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         // C refuses a missing axis before anything, as the base does.

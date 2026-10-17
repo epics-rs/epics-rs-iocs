@@ -153,3 +153,16 @@ async fn every_write_prints_the_driver_s_line() {
         assert_eq!(text.matches(&line).count(), 1, "{line}{text}");
     }
 }
+
+/// A user at address -1 writes channel 0, getAddress's axis for it
+/// (asynPortDriver.cpp:1901-1914).
+#[epics_rs::base::epics_test]
+async fn a_write_at_address_minus_one_reaches_channel_0() {
+    let (_, sent) = on_mcs2("mcs2AddrM1", |port| {
+        port.write_int32_blocking(reason(&port, "PTYP"), -1, 302)
+            .unwrap();
+    })
+    .await;
+    let sent: Vec<&str> = sent.iter().map(|c| c.trim_end()).collect();
+    assert!(sent.contains(&":CHAN0:PTYP 302"), "{sent:?}");
+}
