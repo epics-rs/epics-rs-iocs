@@ -89,9 +89,14 @@ fn write_all(link: &OctetLink, cmd: &str) -> Result<usize, OctetFailure> {
 /// already stripped (C `pasynOctetSyncIO->writeRead`, composed from the two
 /// primitives asyn-rs exposes).
 pub fn write_read(link: &OctetLink, cmd: &str) -> Result<String, OctetFailure> {
+    write_read_bytes(link, cmd).map(|raw| String::from_utf8_lossy(&raw).into_owned())
+}
+
+/// [`write_read`]'s reply as the device sent it.
+pub fn write_read_bytes(link: &OctetLink, cmd: &str) -> Result<Vec<u8>, OctetFailure> {
     let sent = write_all(link, cmd)?;
     match link.sync.read_octet(OCTET_REASON, 4096) {
-        Ok(raw) => Ok(String::from_utf8_lossy(&raw).into_owned()),
+        Ok(raw) => Ok(raw),
         Err(error) => Err(OctetFailure {
             received: error.partial_read().map_or(0, |p| p.nbytes_transferred()),
             error,

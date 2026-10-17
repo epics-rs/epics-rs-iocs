@@ -525,20 +525,25 @@ impl Dg645Driver {
     /// C `writeRead`: the transaction and its `asynPrint` lines, which C
     /// sends through `pasynUserTrace` on this driver's own port.
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
+        use std::fmt::Write as _;
         let port = &self.base.port_name;
-        let result = wire::write_read(&self.handle, cmd);
+        let result = wire::write_read_bytes(&self.handle, cmd);
         if let Err(f) = &result {
             self.base.trace_print(
                 TraceMask::ERROR,
                 format_args!("{port} writeRead: error {} wrote \"{cmd}\"\n", f.status()),
             );
         }
-        let read = result.as_deref().unwrap_or("");
-        self.base.trace_print(
-            TraceMask::IO_FILTER,
-            format_args!("{port} writeRead: wrote \"{cmd}\" read \"{read}\"\n"),
-        );
-        Ok(result?)
+        // C's `%s` of inpBuf: the reply's bytes as sent, up to a NUL.
+        let read = result.as_deref().unwrap_or_default();
+        let read = &read[..read.iter().position(|&b| b == 0).unwrap_or(read.len())];
+        self.base
+            .trace_write_at(0, 0, TraceMask::IO_FILTER, file!(), line!(), |out| {
+                write!(out, "{port} writeRead: wrote \"{cmd}\" read \"")?;
+                out.write_bytes(read)?;
+                out.write_str("\"\n")
+            });
+        Ok(String::from_utf8_lossy(&result?).into_owned())
     }
 
     /// C `writeOnly`; see [`Self::write_read`].
@@ -964,6 +969,35 @@ mod init_tests {
         let e = dg.drv_user_create(&req("NO_SUCH_TAG")).unwrap_err();
         assert_eq!(e.message(), "");
         assert_eq!(e.status(), AsynStatus::Error);
+    }
+
+    /// C's `%s` of the reply prints its bytes as sent, up to a NUL
+    /// (drvAsynDG645.cpp:1206-1208).
+    #[test]
+    fn write_read_traces_the_raw_reply() {
+        use crate::connect::replying_link;
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let dg =
+            Dg645Driver::new("DG645_RAW", replying_link("DG645_RAW_IO", b"\xff7\0tail")).unwrap();
+        let path = std::env::temp_dir().join(format!("dg645-raw-{}.trace", std::process::id()));
+        let file =
+            std::sync::Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+        let services = PortServices::global();
+        let trace = services.trace();
+        trace.set_trace_mask(Some("DG645_RAW"), TraceMask::IO_FILTER);
+        trace.set_trace_file(Some("DG645_RAW"), TraceFile::File(file));
+
+        assert_eq!(dg.write_read("LERR?").unwrap(), "\u{fffd}7\0tail");
+        let out = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let want: &[u8] = b"DG645_RAW writeRead: wrote \"LERR?\" read \"\xff7\"\n";
+        assert!(
+            out.windows(want.len()).any(|w| w == want),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     /// C never writes the record's errorMessage: a failed transfer carries
