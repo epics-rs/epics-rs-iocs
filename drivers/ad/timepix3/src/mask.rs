@@ -697,17 +697,6 @@ pub fn absolute_packed_difference(
     Some(pack(first)?.abs_diff(pack(second)?))
 }
 
-/// The masked pixels of a BPC file, as image coordinates (C
-/// `exportMaskedPelsJsonFromBpcBuffer`, serval_http.cpp:920-940).
-pub fn masked_pixels(geom: &Geometry, map: &[i32], bpc: &[u8]) -> Vec<(usize, usize)> {
-    let cols = usize::try_from(geom.cols).unwrap_or(0).max(1);
-    map.iter()
-        .enumerate()
-        .filter(|&(_, &k)| usize::try_from(k).is_ok_and(|k| bpc.get(k).is_some_and(|b| b & 1 != 0)))
-        .map(|(n, _)| (n % cols, n / cols))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,22 +1136,5 @@ mod tests {
         );
         assert_eq!(absolute_packed_difference(&[1, 2], &[1, 2], 1, 2), None);
         assert_eq!(absolute_packed_difference(&[1], &[1], 0, 3), None);
-    }
-
-    #[test]
-    fn masked_pixels_land_where_the_mask_editor_put_them() {
-        for o in 0..8 {
-            let g = quad();
-            let map = table(&g, 4, o);
-            let mut mask = vec![0i32; g.pixel_count()];
-            rectangle(&mut mask, image(&g), 10, 1, 400, 1, true).unwrap();
-            let mut bpc = vec![0u8; 4 * CHIP_PIXELS];
-            apply_mask_to_bpc(DetectorFamily::Tpx3, &offsets(&map, 1), &mask, &mut bpc);
-            assert_eq!(
-                masked_pixels(&g, &map, &bpc),
-                vec![(10, 400)],
-                "orientation {o}"
-            );
-        }
     }
 }

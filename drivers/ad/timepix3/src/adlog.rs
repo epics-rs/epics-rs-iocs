@@ -12,6 +12,8 @@ const LOG_HTTP_WARNING: &str = "void ADTimePix::logHttpWarning(const char*, cons
 pub const REFRESH_PIXEL_CONFIG: &str = "asynStatus ADTimePix::refreshPixelConfigFromServal()";
 pub const WRITE_BPC_FILE: &str =
     "asynStatus ADTimePix::writeBPCfile(const std::vector<unsigned char>&)";
+pub const EXPORT_MASKED_PELS_JSON: &str =
+    "void ADTimePix::exportMaskedPelsJsonFromBpcBuffer(const std::vector<unsigned char>&)";
 pub const READ_BPC_FILE: &str = "asynStatus ADTimePix::readBPCfile(std::vector<unsigned char>&)";
 pub const EXPECTED_BPC_SIZE: &str = "asynStatus ADTimePix::expectedBPCSize(std::size_t&)";
 pub const UPDATE_DETECTOR_FAMILY: &str =

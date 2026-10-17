@@ -223,6 +223,39 @@ const NLOHMANN_EMPTY_INPUT: &str = "[json.exception.parse_error.101] parse error
      column 1: attempting to parse an empty input; check that your input string or stream \
      contains the expected JSON";
 
+/// C `stripBpcExtForMaskedJson`: drop a trailing `.bpc`, any case.
+fn strip_bpc_ext(name: &str) -> &str {
+    match name.len().checked_sub(4) {
+        Some(n) if name.is_char_boundary(n) && name[n..].eq_ignore_ascii_case(".bpc") => &name[..n],
+        _ => name,
+    }
+}
+
+/// C `utcIso8601Now`'s `%Y-%m-%dT%H:%M:%SZ` of `now`.
+fn utc_iso8601(now: std::time::SystemTime) -> String {
+    let secs = match now.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60
+    )
+}
+
 /// C `pixelConfigDiff_`'s fixed length (ADTimePix.cpp:1911).
 const PIXEL_CONFIG_DIFF_LEN: usize = 262144;
 
@@ -2400,9 +2433,7 @@ impl TimePix3Driver {
                     }
                 }
             }
-            let map = self.pel_table(&g);
-            let masked = mask::masked_pixels(&g, &map, bpc);
-            self.export_masked_pixels(&masked)?;
+            self.export_masked_pels_json(bpc)?;
         }
         self.ad
             .port_base
@@ -2445,35 +2476,146 @@ impl TimePix3Driver {
         base.call_param_callbacks(chip)
     }
 
-    /// C `exportMaskedPelsJsonFromBpcBuffer` (serval_http.cpp:900).
-    fn export_masked_pixels(&mut self, masked: &[(usize, usize)]) -> AsynResult<()> {
-        let path = self.text(self.p.masked_pels_json_path, 0);
-        self.ad.port_base.set_int32_param(
-            self.p.masked_pels_count,
-            0,
-            i32::try_from(masked.len()).unwrap_or(i32::MAX),
-        )?;
-        if path.is_empty() {
+    /// C `exportMaskedPelsJsonFromBpcBuffer` (serval_http.cpp:911-1072); the
+    /// caller's BPC is never empty, so C's empty-buffer branch is not ported.
+    fn export_masked_pels_json(&mut self, bpc: &[u8]) -> AsynResult<()> {
+        let p = self.p;
+        let family = self.shared.family();
+        let refuse = |d: &mut Self, count: i32, status: &str| -> AsynResult<()> {
+            d.set_text(p.masked_pels_json_path, "")?;
+            d.ad.port_base
+                .set_int32_param(p.masked_pels_count, 0, count)?;
+            d.set_text(p.masked_pels_export_status, status)?;
+            d.ad.port_base.call_param_callbacks(0)
+        };
+        if !mask::operator_mask_supported(family) {
+            let status = format!(
+                "Unavailable: {} pixel mask encoding is not documented",
+                family.name()
+            );
+            return refuse(self, -1, &status);
+        }
+        let (dir, name) = (
+            self.text(p.bp_c_file_path, 0),
+            self.text(p.bp_c_file_name, 0),
+        );
+        if name.is_empty() {
+            return refuse(self, 0, "Skipped: BPCFileName empty");
+        }
+        let out_name = format!("{}_masked_pels.json", strip_bpc_ext(&name));
+        let Ok(out_path) = self.resolve_calibration_file(&dir, &out_name, PathAccess::Write) else {
+            return refuse(self, 0, "Blocked: outside calibration root");
+        };
+        let g = self.rows_cols().unwrap_or_default();
+        let num_chips = self.int(p.number_of_chips, 0);
+        let orientation = self.int(p.detector_orientation, 0);
+        let width = usize::try_from(g.pel_width).unwrap_or(0);
+        let chip_pels = width * width;
+        let pixel_bytes = mask::bytes_per_pixel(family);
+        let Some(offsets) = self.bpc_image_byte_offsets() else {
+            return refuse(self, -1, "Unavailable: detector BPC layout is incomplete");
+        };
+        let source = self
+            .resolve_calibration_file(&dir, &name, PathAccess::Read)
+            .map_or_else(|_| name.clone(), |s| s.to_string_lossy().into_owned());
+        let det_type = self.text(p.det_type, 0);
+        let cols = usize::try_from(g.cols).unwrap_or(0);
+
+        // Keys in nlohmann's sorted order, whatever serde_json's map is.
+        let (mut masked, mut bad) = (Vec::new(), Vec::new());
+        for (image, offset) in offsets.iter().enumerate() {
+            let Some(byte) = *offset else { continue };
+            let Some(value) = mask::pixel_value(family, bpc, byte).filter(|v| v & 1 != 0) else {
+                continue;
+            };
+            let logical = byte / pixel_bytes;
+            let local = logical.checked_rem(chip_pels).unwrap_or(0);
+            let (i, j) = (
+                image.checked_rem(cols).unwrap_or(0),
+                image.checked_div(cols).unwrap_or(0),
+            );
+            masked.push(json!({
+                "bpc_index": byte,
+                "bpc_pixel_index": logical,
+                "chip": logical.checked_div(chip_pels).unwrap_or(0) as i32,
+                "i": i as i32,
+                "index": masked.len() + 1,
+                "j": j as i32,
+                "lx": local.checked_rem(width).unwrap_or(0) as i32,
+                "ly": local.checked_div(width).unwrap_or(0) as i32,
+                "value": value,
+            }));
+            bad.push(json!({ "Median": [1, 1], "Pixel": [i as i32, j as i32] }));
+        }
+        let counter = i32::try_from(masked.len()).unwrap_or(i32::MAX);
+        let mut root = json!({
+            "Bad pixels": bad,
+            "acquisition": {
+                "BPCFileName": name,
+                "BPCFilePath": dir,
+                "detector_orientation": orientation,
+            },
+            "counts": { "masked_pels": counter },
+        });
+        if !det_type.is_empty() {
+            root["detector"] = json!({ "type": det_type });
+        }
+        root["format_version"] = json!(1);
+        root["masked_pels"] = Value::Array(masked);
+        root["source"] = json!({
+            "bpc_bytes_per_pixel": pixel_bytes,
+            "bpc_path": source,
+            "chip_pel_width": g.pel_width,
+            "detector_orientation": orientation,
+            "exported_at_utc": utc_iso8601(std::time::SystemTime::now()),
+            "num_chips": num_chips,
+            "tool": "ADTimePix RefreshPixelConfig mask export",
+        });
+
+        let serialized = serde_json::to_string_pretty(&root).unwrap_or_default();
+        let status = bpc_file::write_atomic(&out_path, serialized.as_bytes());
+        if status != bpc_file::Status::Ok {
+            let message = adlog::snprintf(
+                256,
+                format!("Write failed: {}: {}", status.message(), out_path.display()),
+            );
+            self.set_text(p.masked_pels_json_path, "")?;
             self.ad
                 .port_base
-                .set_string_param(self.p.masked_pels_export_status, 0, "no path")?;
-            return Ok(());
+                .set_int32_param(p.masked_pels_count, 0, 0)?;
+            self.set_text(p.masked_pels_export_status, &message)?;
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "{}",
+                    adlog::err(
+                        adlog::EXPORT_MASKED_PELS_JSON,
+                        &format!("exportMaskedPelsJson: {message}")
+                    )
+                ),
+            );
+            return self.ad.port_base.call_param_callbacks(0);
         }
-        let body = json!({
-            "MaskedPixels": masked
-                .iter()
-                .map(|&(x, y)| json!({ "x": x, "y": y }))
-                .collect::<Vec<_>>(),
-        });
-        let status =
-            match std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap_or_default()) {
-                Ok(()) => format!("wrote {} pixels", masked.len()),
-                Err(e) => format!("write failed: {e}"),
-            };
+        let out = out_path.to_string_lossy();
+        self.set_text(p.masked_pels_json_path, &out)?;
         self.ad
             .port_base
-            .set_string_param(self.p.masked_pels_export_status, 0, status)?;
-        Ok(())
+            .set_int32_param(p.masked_pels_count, 0, counter)?;
+        self.set_text(
+            p.masked_pels_export_status,
+            &format!("OK: wrote {counter} masked pels"),
+        )?;
+        self.ad.port_base.trace_print(
+            TraceMask::FLOW,
+            format_args!(
+                "{}",
+                adlog::log(
+                    adlog::EXPORT_MASKED_PELS_JSON,
+                    &format!("masked pels JSON {out} ({counter} entries)")
+                )
+            ),
+        );
+        self.ad.port_base.call_param_callbacks(0)
     }
 
     // -- Acquisition ---------------------------------------------------------
@@ -7169,6 +7311,128 @@ mod tests {
                 "PixelConfig refresh completed with one or more chip errors.".into()
             )
         );
+    }
+
+    /// The masked-pixel export names its file after the BPC, lists every
+    /// masked pixel with its BPC and image coordinates in nlohmann's key
+    /// order, and publishes the path it wrote (serval_http.cpp:911-1072).
+    #[test]
+    fn export_masked_pels_json_writes_beside_the_bpc_as_c() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let name = "TPX_MASKED_PELS";
+        let shared = Arc::new(Shared::new());
+        shared.note_family(DetectorFamily::Tpx3);
+        let mut det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            shared.clone(),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        calibration_files(&mut det, name);
+        let p = det.p;
+        for (reason, value) in [
+            (p.pix_count, 65536),
+            (p.row_len, 1),
+            (p.number_of_chips, 1),
+            (p.number_of_rows, 256),
+        ] {
+            det.ad.port_base.set_int32_param(reason, 0, value).unwrap();
+        }
+        det.set_text(p.bp_c_file_name, "cal.BPC").unwrap();
+        det.set_text(p.det_type, "TPX3").unwrap();
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let mut bpc = vec![0u8; 65536];
+        bpc[5] = 3;
+        bpc[300] = 1;
+        bpc[301] = 2;
+        std::fs::write(dir.join("cal.BPC"), &bpc).unwrap();
+
+        det.export_masked_pels_json(&bpc).unwrap();
+        let out = dir.canonicalize().unwrap().join("cal_masked_pels.json");
+        assert_eq!(
+            (
+                det.text(p.masked_pels_json_path, 0),
+                det.int(p.masked_pels_count, 0),
+                det.text(p.masked_pels_export_status, 0),
+            ),
+            (
+                out.display().to_string(),
+                2,
+                "OK: wrote 2 masked pels".into()
+            )
+        );
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.starts_with("{\n  \"Bad pixels\": [\n    {\n      \"Median\": ["));
+        let root: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(root["counts"]["masked_pels"], 2);
+        assert_eq!(root["detector"]["type"], "TPX3");
+        assert_eq!(
+            root["source"]["bpc_path"],
+            dir.canonicalize()
+                .unwrap()
+                .join("cal.BPC")
+                .display()
+                .to_string()
+        );
+        let stamp = root["source"]["exported_at_utc"].as_str().unwrap();
+        assert_eq!((stamp.len(), &stamp[10..11], &stamp[19..]), (20, "T", "Z"));
+        let g = det.rows_cols().unwrap();
+        let mut pixels: Vec<_> = root["masked_pels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let (i, j) = (row["i"].as_i64().unwrap(), row["j"].as_i64().unwrap());
+                let (k, _) = mask::pel_index(&g, 1, 0, i as i32, j as i32);
+                assert_eq!(row["bpc_index"], i64::from(k));
+                assert_eq!(row["bpc_pixel_index"], i64::from(k));
+                assert_eq!(
+                    (row["lx"].as_i64().unwrap(), row["ly"].as_i64().unwrap()),
+                    (i64::from(k) % 256, i64::from(k) / 256)
+                );
+                (k, row["value"].as_u64().unwrap())
+            })
+            .collect();
+        pixels.sort();
+        assert_eq!(pixels, [(5, 3), (300, 1)]);
+        assert_eq!(root["Bad pixels"].as_array().unwrap().len(), 2);
+
+        det.set_text(p.bp_c_file_name, "").unwrap();
+        det.export_masked_pels_json(&bpc).unwrap();
+        assert_eq!(
+            (
+                det.int(p.masked_pels_count, 0),
+                det.text(p.masked_pels_export_status, 0)
+            ),
+            (0, "Skipped: BPCFileName empty".into())
+        );
+        shared.note_family(DetectorFamily::Unknown);
+        det.export_masked_pels_json(&bpc).unwrap();
+        assert_eq!(
+            (
+                det.int(p.masked_pels_count, 0),
+                det.text(p.masked_pels_export_status, 0)
+            ),
+            (
+                -1,
+                "Unavailable: UNKNOWN pixel mask encoding is not documented".into()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_export_time_is_utc_iso8601() {
+        let at = |secs| utc_iso8601(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        assert_eq!(at(0), "1970-01-01T00:00:00Z");
+        assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(at(1_792_195_199), "2026-10-16T23:59:59Z");
+        assert_eq!(strip_bpc_ext("a.Bpc"), "a");
+        assert_eq!(strip_bpc_ext(".bpc"), "");
+        assert_eq!(strip_bpc_ext("bpc"), "bpc");
+        assert_eq!(strip_bpc_ext("a.bpcx"), "a.bpcx");
     }
 
     /// Point the BPC and DACS file PVs at real files, which C
