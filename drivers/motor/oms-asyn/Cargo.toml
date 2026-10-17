@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn", "motor"] }
+epics-libcom-rs = "0.32.0"
 motor-common = { path = "../common" }
 
 [dev-dependencies]

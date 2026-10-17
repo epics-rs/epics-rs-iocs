@@ -42,8 +42,6 @@
 //! ## Not modeled (documented)
 //!
 //! - The notification interrupt (`asynCallback`): see above.
-//! - The C `writeInt32` / `writeFloat64` overrides of the base motor
-//!   functions.
 //! - The init-time firmware-version gate: the driver reads the firmware
 //!   string once as a comms check and assumes the modern (>= 1.30) command
 //!   forms MAXnet mandates, `CL?` included; only the watchdog check reads
@@ -55,7 +53,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::exception::{AsynException, ExceptionCallbackGuard};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -63,9 +61,10 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::motor::controller_port::ParamWrite;
+use epics_rs::motor::controller_port::{ParamWrite, index};
 use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::atoi;
@@ -285,7 +284,6 @@ impl ControllerParams for OmsParams {
     /// dereferences a null `pAxes` on a controller whose Init failed; here
     /// it has no axis lines.
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
-        use epics_rs::motor::controller_port::index;
         // MOTOR_STATUS_HAS_ENCODER, MSTA bit 8.
         const HAS_ENCODER: usize = index::STATUS_DIRECTION + 8;
 
@@ -658,6 +656,13 @@ impl OmsAxis {
         self.last_min_velo = minvelo;
         self.lock().send_only(&cmd)
     }
+
+    /// C's `asynPrint(pasynUser, ...)` in `omsBaseController::writeInt32`
+    /// / `writeFloat64`, through the writer's user at this axis.
+    fn print(&self, mask: TraceMask, function: usize, args: std::fmt::Arguments<'_>) {
+        let port = self.lock().port_name().to_owned();
+        MotorTrace::new(port, self.axis_index as i32).print(mask, function as i32, args);
+    }
 }
 
 impl AsynMotor for OmsAxis {
@@ -671,6 +676,97 @@ impl AsynMotor for OmsAxis {
     fn set_encoder_ratio(&mut self, _user: &AsynUser, ratio: f64) -> AsynResult<()> {
         self.encoder_ratio = ratio;
         Ok(())
+    }
+
+    /// C `omsBaseController::writeInt32`'s motorClosedLoop_
+    /// (omsBaseController.cpp:260-293).
+    fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
+        let (port, axis, ch) = (
+            self.lock().port_name().to_owned(),
+            self.axis_index,
+            self.axis_char,
+        );
+        let flow = if enable {
+            format!("omsBaseDriver:writeInt32:{port} axis {axis} closed loop enable\n")
+        } else {
+            format!("omsBaseDriver:writeInt32:{port} SetInteger axis {axis} closed loop disable\n")
+        };
+        self.print(TraceMask::FLOW, index::CLOSED_LOOP, format_args!("{flow}"));
+        let cmd = if enable { "CL1" } else { "CL0" };
+        self.lock().send_only(&format!("A{ch} {cmd}"))
+    }
+
+    /// C `writeInt32`'s motorDeferMoves_, which it does not implement
+    /// (omsBaseController.cpp:254-259).
+    fn set_deferred_moves(&mut self, _user: &AsynUser, _defer: bool) -> AsynResult<()> {
+        let port = self.lock().port_name().to_owned();
+        self.print(
+            TraceMask::ERROR,
+            index::DEFER_MOVES,
+            format_args!("omsBaseDriver:writeInt32:{port} Deferred Move: not yet implemented\n"),
+        );
+        Ok(())
+    }
+
+    /// C `writeFloat64`'s motorEncoderPosition_, an encoder axis only
+    /// (omsBaseController.cpp:333-343).
+    fn set_encoder_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        if !self.has_encoder {
+            return Ok(());
+        }
+        let (port, axis, ch) = (
+            self.lock().port_name().to_owned(),
+            self.axis_index,
+            self.axis_char,
+        );
+        self.print(
+            TraceMask::FLOW,
+            index::ENCODER_POSITION,
+            format_args!(
+                "omsBaseDriver:writeFloat64:{port} axis {axis} set encoder position to {:.6}\n",
+                CFloat(position)
+            ),
+        );
+        self.lock()
+            .send_only(&format!("A{ch} LPE{};", position as i32))
+    }
+
+    /// C `writeFloat64`'s motorPGain_, motorIGain_ and motorDGain_
+    /// (omsBaseController.cpp:361-406). C tests `0.00 >= value`, which
+    /// sends only a gain at or below zero; rs takes the range its message
+    /// names.
+    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
+        let (port, axis, ch) = (
+            self.lock().port_name().to_owned(),
+            self.axis_index,
+            self.axis_char,
+        );
+        let (function, what, cmd) = match kind {
+            PidGainKind::Proportional => (index::PGAIN, "proportional", "KP"),
+            PidGainKind::Integral => (index::IGAIN, "integral", "KI"),
+            PidGainKind::Derivative => (index::DGAIN, "derivative", "KD"),
+        };
+        if !(0.0..32768.0).contains(&gain) {
+            self.print(
+                TraceMask::ERROR,
+                function,
+                format_args!(
+                    "omsBaseDriver:writeFloat64:{port} axis {axis} {what} gain {:.6} not in range 0.0 -> 32768.0\n",
+                    CFloat(gain)
+                ),
+            );
+            return Ok(());
+        }
+        self.print(
+            TraceMask::FLOW,
+            function,
+            format_args!(
+                "omsBaseDriver:writeFloat64:{port} axis {axis} set {what} gain to {:.6}\n",
+                CFloat(gain)
+            ),
+        );
+        self.lock()
+            .send_only(&format!("A{ch} {cmd}{:.6};", CFloat(gain)))
     }
 
     fn move_absolute(
