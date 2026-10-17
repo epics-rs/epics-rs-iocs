@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::runtime::sync::mpsc;
+use epics_rs::base::server::driver_support::{DriverSupport, register_driver_support};
 use epics_rs::base::server::iocsh::registry::CommandContext;
 use epics_rs::motor::builder::{
     AxisSetup, ControllerAxes, ControllerAxis, ControllerBuilder, MotorBuilder,
@@ -68,6 +69,21 @@ pub fn register_port_with(
 ) -> Result<(), String> {
     let owner = ctx.db().scan_control().interrupt_gate();
     register_controller_port(owner, port, num_axes, params).map(drop)
+}
+
+/// A `.dbd` `driver(name)` line with its drvet `report`, which `dbior` runs
+/// with its level and prints after `Driver: name`.
+pub fn register_driver_report(
+    name: &'static str,
+    report: impl Fn(i32) -> String + Send + Sync + 'static,
+) {
+    struct Drvet<F>(F);
+    impl<F: Fn(i32) -> String + Send + Sync + 'static> DriverSupport for Drvet<F> {
+        fn report(&self, level: i32) -> Option<String> {
+            Some((self.0)(level))
+        }
+    }
+    register_driver_support(name, Arc::new(Drvet(report)));
 }
 
 /// The trace user of an axis a C asyn driver serves: its port and address.
