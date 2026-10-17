@@ -262,8 +262,10 @@ impl Pm304Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Program the move speeds before a move (C sends `SV`/`SA`/`SD` as separate
-    /// transactions ahead of the move command). Non-positive values are skipped.
+    /// Program the speeds before a move or home (C sends `SV`/`SA`/`SD` as
+    /// separate transactions ahead of the motion command). Non-positive
+    /// values are skipped; the record sends SET_ACCEL only for a positive
+    /// rate (motorRecord.cc:874, 940).
     fn program_speeds(
         ctrl: &Pm304Controller,
         axis: u32,
@@ -321,9 +323,14 @@ impl AsynMotor for Pm304Axis {
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
+        // The record's jog sends SET_ACCEL whatever the rate
+        // (motorRecord.cc:2141), so SA/SD always lead.
+        let accel = nint(acceleration);
+        ctrl.command(&format!("{}SA{accel}", self.axis))?;
+        ctrl.command(&format!("{}SD{accel}", self.axis))?;
         match ctrl.model {
             Model::Pm304 => {
                 // PM304: set the (unsigned) slew speed, then a signed direction.
@@ -346,11 +353,12 @@ impl AsynMotor for Pm304Axis {
         &mut self,
         _user: &AsynUser,
         _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
+        velocity: f64,
+        acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
+        Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
         let cmd = match (ctrl.model, forward) {
             (Model::Pm304, true) => format!("{}IX", self.axis),
             (Model::Pm304, false) => format!("{}IX-1", self.axis),
@@ -429,6 +437,7 @@ impl AsynMotor for Pm304Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
 
     #[test]
     fn pm304_status_moving_and_limits() {
@@ -453,6 +462,28 @@ mod tests {
         assert!(!s.problem);
         assert!(s.plus_ls);
         assert!(!s.minus_ls);
+    }
+
+    fn pm304_line(name: &str) -> (LineRig, Pm304Axis) {
+        let (line, io) = LineRig::new(name, |last| match last {
+            "1ID\r" => "Mclennan PM304".into(),
+            _ => "OK".into(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        line.sent();
+        (line, Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0))
+    }
+
+    /// devPM304.cc builds the record's SET_VELOCITY and SET_ACCEL parts of
+    /// a home, and SET_ACCEL of a jog, ahead of the motion command.
+    #[test]
+    fn home_and_jog_program_the_record_speeds() {
+        let (line, mut axis) = pm304_line("pm304_speeds");
+        let user = AsynUser::default();
+        axis.home(&user, 0.0, 400.0, 800.0, true).unwrap();
+        assert_eq!(line.sent(), ["1SV400\r", "1SA800\r", "1SD800\r", "1IX\r"]);
+        axis.move_velocity(&user, 0.0, -300.0, 600.0).unwrap();
+        assert_eq!(line.sent(), ["1SA600\r", "1SD600\r", "1SV300\r", "1CV-1\r"]);
     }
 
     #[test]
