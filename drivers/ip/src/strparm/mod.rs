@@ -600,9 +600,9 @@ impl DeviceSupport for DevStrParm {
         matches!(self.kind, Kind::Ai | Kind::Ao)
     }
 
-    /// `strParmConvert` writes through an `aiRecord *` cast, which on an ao
-    /// lands on LOPR and the low half of ASLO; that is not copied, so an ao
-    /// keeps only the record's EOFF rebase.
+    /// `strParmConvert` writes through an `aiRecord *` cast (`devXxStrParm.c:534`), which on
+    /// an ao lands on LOPR and the low half of ASLO; that C defect is not
+    /// copied, so an ao keeps only the record's EOFF rebase.
     fn special_linconv(&mut self, record: &mut dyn Record, _after: bool) -> CaResult<()> {
         if self.kind == Kind::Ai {
             crate::unit_slope(record)?;
