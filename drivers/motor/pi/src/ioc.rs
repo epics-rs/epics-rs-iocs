@@ -379,6 +379,11 @@ static PIC848: Model1 = Model1::new(&DEV_PIC848, 8, SCAN_RATE);
 
 /// `PIC848Setup(num_cards, scan_rate)`.
 pub fn pic848_setup_command() -> CommandDef {
+    PIC848.register_report("drvPIC848", |cards| {
+        cards.report("PIC848", |card, line| {
+            format!("    PIC848 controller #{card}, {line} \n")
+        })
+    });
     PIC848.setup_command("PIC848Setup")
 }
 
@@ -415,6 +420,7 @@ pub fn pic848_config_command() -> CommandDef {
                      (CST? => NOSTAGE on axis A)"
                 ));
             }
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for signal in 0..num_axes {
@@ -423,6 +429,7 @@ pub fn pic848_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 PIC848.install(ctx, card, signal as i32, motor)?;
             }
+            PIC848.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -754,6 +761,33 @@ mod report {
             after,
             "    PIC844 controller 0 connection failed.\n    PIC844 controller #1, \
              port=c844RepLine, id: C-844 \n"
+        );
+    }
+
+    /// drvPIC848.cc:134-159, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic848_controller() {
+        let setup = pic848_setup_command();
+        let (_line, _io) = LineRig::new("c848RepLine", |last| match last {
+            "*IDN?" => "C-848".into(),
+            "CST? A" => "A=M-110".into(),
+            "CST? B" => "B=NOSTAGE".into(),
+            _ => "A=0".into(),
+        });
+        let (before, after) = reports(
+            "drvPIC848",
+            (setup, vec![int(2), int(10)]),
+            (
+                pic848_config_command(),
+                vec![int(1), port("c848RepLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIC848 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC848 controller 0 connection failed.\n    PIC848 controller #1, \
+             port=c848RepLine, id: C-848 \n"
         );
     }
 }
