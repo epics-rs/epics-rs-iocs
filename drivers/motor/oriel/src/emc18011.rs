@@ -41,7 +41,8 @@
 //!   [`poll`](AsynMotor::poll).
 //! - Homing, PID gains, torque enable/disable and travel-limit setting are
 //!   unsupported in C (`build_trans` returns `ERROR`); [`home`](AsynMotor::home)
-//!   returns an error and the others are no-ops.
+//!   returns an error, [`Emc18011Build`] refuses the limits, and the others
+//!   are no-ops.
 //! - `set_position` only supports zeroing (`CA`), matching C `LOAD_POS`.
 
 use std::sync::atomic::{AtomicI32, Ordering};
