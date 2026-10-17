@@ -208,6 +208,14 @@ fn pigcs2_err(message: impl Into<String>) -> AsynError {
     }
 }
 
+/// The `errorMessage` C's `referenceVelCts` writes on a failure, as the
+/// error. C defect not copied: it writes it through `pAxis->m_pasynUser`,
+/// which is never set (NULL at PIasynAxis.cpp:54; the assignment at
+/// PIasynController.cpp:230 is commented out), so C crashes instead.
+fn reference_err(status: AsynStatus, message: String) -> AsynError {
+    AsynError::Status { status, message }
+}
+
 /// `PIGCSController::getValue`: return the substring after the first `=`, or
 /// `None` if there is no `=` at all (an empty tail, e.g. `"1="`, is `Some("")`
 /// — `atof`/`atoi` on an empty string parse as `0`, matching C `atof("")`).
@@ -986,6 +994,20 @@ impl PIGCS2Controller {
         Err(pigcs2_err(format!("GCS error {err}")))
     }
 
+    /// `referenceVelCts`'s `ERR? == 0`: any other code prints `{class}`'s
+    /// `failed` line and is C's `GCS Error` [`reference_err`].
+    fn check_reference(&self, class: &str) -> AsynResult<()> {
+        let err = self.get_gcs_error();
+        if err == 0 {
+            return Ok(());
+        }
+        self.print(format_args!("{class}::referenceVelCts() failed\n"));
+        Err(reference_err(
+            AsynStatus::Error,
+            format!("{class}::referenceVelCts() failed - GCS Error {err}"),
+        ))
+    }
+
     /// C `move`'s `MOV {axis} {position}` and its FLOW line.
     fn send_mov(&self, axis: &str, position: f64) -> AsynResult<()> {
         let cmd = format!("MOV {axis} {}", CFloat(position));
@@ -1163,11 +1185,14 @@ impl PIGCS2Controller {
     /// whatever the axis.
     fn init_platform(&mut self) -> AsynResult<()> {
         if let Err(e) = self.send_only("INI X") {
-            self.get_gcs_error();
+            let err = self.get_gcs_error();
             self.print(format_args!(
                 "PIHexapodController::referenceVelCts() failed\n"
             ));
-            return Err(e);
+            return Err(reference_err(
+                e.status(),
+                format!("PIHexapodController::referenceVelCts() failed - GCS Error {err}"),
+            ));
         }
         self.hexapod.homing = true;
         Ok(())
@@ -1348,9 +1373,7 @@ impl PIGCS2Controller {
             "SPA {axis} {REF_VEL_PARAM_HEX} {}",
             CFloat(velocity.abs())
         ));
-        self.check(0, |_| {
-            "PIGCSMotorController::referenceVelCts() failed\n".into()
-        })
+        self.check_reference("PIGCSMotorController")
     }
 
     /// `FRF`/`FPL`/`FNL {axis}` + `ERR? == 0` (C `referenceAxis`, and the
@@ -1376,11 +1399,12 @@ impl PIGCS2Controller {
             self.print(format_args!(
                 "{class}::referenceVelCts() failed - axis has no reference/limit switch\n"
             ));
-            return Err(pigcs2_err(format!(
-                "axis {axis} has no reference sensor or limit switch to home against"
-            )));
+            return Err(reference_err(
+                AsynStatus::Error,
+                format!("{class}::referenceVelCts() failed - axis has no reference/limit switch"),
+            ));
         }
-        self.check(0, |_| format!("{class}::referenceVelCts() failed\n"))
+        self.check_reference(class)
     }
 
     /// C `sendAndReceive(char)`: a short write is asynError. The byte is
@@ -2263,9 +2287,7 @@ impl PIGCS2Axis {
             self.set_servo(true)?;
             let ctrl = self.lock();
             ctrl.send_only(&format!("FRF {}", self.axis_name))?;
-            return ctrl.check(0, |_| {
-                "PIGCS2_HexapodController::referenceVelCts() failed\n".into()
-            });
+            return ctrl.check_reference("PIGCS2_HexapodController");
         }
         if model == Model::C702 {
             return self.reference_c702(velocity, forward);
@@ -2297,14 +2319,14 @@ impl PIGCS2Axis {
             ctrl.print(format_args!(
                 "PIGCSPiezoController::referenceVelCts() failed - axis has no reference switch\n"
             ));
-            return Err(pigcs2_err(
-                "PIGCSPiezoController::referenceVelCts() failed - axis has no reference switch",
+            return Err(reference_err(
+                AsynStatus::Error,
+                "PIGCSPiezoController::referenceVelCts() failed - axis has no reference switch"
+                    .into(),
             ));
         }
         ctrl.send_only(&format!("FRF {}", self.axis_name))?;
-        ctrl.check(0, |_| {
-            "PIGCSPiezoController::referenceVelCts() failed\n".into()
-        })
+        ctrl.check_reference("PIGCSPiezoController")
     }
 
     /// C `PIC702Controller::referenceVelCts`: servo on, `VEL`, then
@@ -2322,8 +2344,10 @@ impl PIGCS2Axis {
             self.lock().print(format_args!(
                 "PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch\n"
             ));
-            return Err(pigcs2_err(
-                "PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch",
+            return Err(reference_err(
+                AsynStatus::Error,
+                "PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch"
+                    .into(),
             ));
         };
         let mut ctrl = self.lock();
@@ -5192,6 +5216,98 @@ mod tests {
         assert_eq!(
             messages(&printed),
             ["PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch\n"]
+        );
+    }
+
+    /// A failed `referenceVelCts` is the `errorMessage` C writes
+    /// (PIGCSMotorController.cpp:69-70, 110-111, 128-129;
+    /// PIC885Controller.cpp:137-138, 152-153; PIGCSPiezoController.cpp:
+    /// 179-180, 193-194; PIHexapodController.cpp:435-436;
+    /// PIGCS2_HexapodController.cpp:77-78; PIC702Controller.cpp:182-183).
+    #[test]
+    fn a_failed_reference_is_cs_error_message() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let message = |r: AsynResult<()>| r.unwrap_err().message();
+
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2RefMsg", |_| "1=5".into());
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2RefMsg");
+        let gcs = "PIGCSMotorController::referenceVelCts() failed - GCS Error 1";
+        assert_eq!(message(ctrl.set_reference_velocity("1", 1.0)), gcs);
+        assert_eq!(message(ctrl.reference_axis("1", true, true, false)), gcs);
+        assert_eq!(
+            message(ctrl.reference_axis("1", true, false, false)),
+            "PIGCSMotorController::referenceVelCts() failed - axis has no reference/limit switch"
+        );
+        ctrl.set_model(Model::C885);
+        assert_eq!(
+            message(ctrl.reference_axis("1", true, true, false)),
+            "PIC885Controller::referenceVelCts() failed - GCS Error 1"
+        );
+        assert_eq!(
+            message(ctrl.reference_axis("1", true, false, false)),
+            "PIC885Controller::referenceVelCts() failed - axis has no reference/limit switch"
+        );
+
+        // send_only's status is its terminator's, so the `\n` after
+        // `INI X` fails.
+        let after_ini = std::sync::atomic::AtomicBool::new(false);
+        let (_line, io) = motor_common::testing::LineRig::failing(
+            "gcs2RefMsgHex",
+            |_| "5".into(),
+            move |line| {
+                let failed = line == "\n" && after_ini.load(Ordering::SeqCst);
+                after_ini.store(line == "INI X", Ordering::SeqCst);
+                failed
+            },
+        );
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2RefMsgHex");
+        ctrl.set_model(Model::Hexapod);
+        assert_eq!(
+            message(ctrl.init_platform()),
+            "PIHexapodController::referenceVelCts() failed - GCS Error 5"
+        );
+
+        // `ERR?` reads 0 until `ok` runs out, then 5: the servo write
+        // passes and the `FRF` fails.
+        let ok = Arc::new(AtomicUsize::new(usize::MAX));
+        let reply = |ok: Arc<AtomicUsize>, base: fn(&str) -> String| {
+            move |last: &str| match last {
+                "ERR?" if ok.fetch_sub(1, Ordering::SeqCst) == 0 => "5".into(),
+                last => base(last),
+            }
+        };
+        let (_line, _ctrl, mut axis) =
+            piezo("gcs2RefMsgPiezo", "E-712", reply(ok.clone(), piezo_reply));
+        ok.store(1, Ordering::SeqCst);
+        assert_eq!(
+            message(axis.reference_piezo()),
+            "PIGCSPiezoController::referenceVelCts() failed - GCS Error 5"
+        );
+        axis.has_reference = false;
+        assert_eq!(
+            message(axis.reference_piezo()),
+            "PIGCSPiezoController::referenceVelCts() failed - axis has no reference switch"
+        );
+
+        let ok = Arc::new(AtomicUsize::new(usize::MAX));
+        let (_line, _ctrl, mut axis) = gcs2_hexapod(
+            "gcs2RefMsgGcs2Hex",
+            "X",
+            0,
+            reply(ok.clone(), hexapod_reply),
+        );
+        ok.store(1, Ordering::SeqCst);
+        assert_eq!(
+            message(axis.reference_vel_cts(1.0, true)),
+            "PIGCS2_HexapodController::referenceVelCts() failed - GCS Error 5"
+        );
+
+        let (_line, mut axis) = c702_axis("gcs2RefMsgC702", true);
+        axis.has_reference = false;
+        axis.has_limit_switches = false;
+        assert_eq!(
+            message(axis.reference_c702(1.0, true)),
+            "PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch"
         );
     }
 
