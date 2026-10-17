@@ -2666,6 +2666,7 @@ dependencies = [
 name = "motor-aerotech"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2730,6 +2731,7 @@ dependencies = [
 name = "motor-micos"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2789,6 +2791,7 @@ dependencies = [
 name = "motor-oriel"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2876,6 +2879,7 @@ dependencies = [
 name = "motor-thorlabs"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
