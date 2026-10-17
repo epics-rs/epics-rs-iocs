@@ -772,6 +772,18 @@ impl TimePix3Driver {
                 return Err(refused("GET", &message));
             }
         };
+        // serval_http.cpp:2477-2479: the trigger and depth checks below need
+        // the family.
+        if self.shared.family() == DetectorFamily::Unknown {
+            let read = crate::tasks::read_detector(&self.http, &self.shared, p, ad);
+            let base = &mut self.ad.port_base;
+            for (mask, line) in &read.traces {
+                base.trace_print(*mask, format_args!("{line}"));
+            }
+            for (addr, updates) in &read.updates {
+                crate::tasks::apply_updates(base, *addr, updates);
+            }
+        }
 
         let mut trigger_mode = self.int(ad.trigger_mode, 0);
         if !(0..serval::TRIGGER_MODES.len() as i32).contains(&trigger_mode) {
@@ -4841,7 +4853,11 @@ mod tests {
         let line = adlog::err(adlog::INIT_ACQUISITION, &format!("initAcquisition: {msg}"));
         assert!(text.contains(&line), "{line}: {text:?}");
 
-        let (ok, seen, _, _) = run("TPX_INIT_BIAS", "\0", &[], false, |d| {
+        const DET: (&str, &str) = (
+            "GET /detector ",
+            r#"{"Info":{"MpxType":6,"PixCount":65536,"RowLen":1,"NumberOfChips":1,"NumberOfRows":256},"Config":{}}"#,
+        );
+        let (ok, seen, _, _) = run("TPX_INIT_BIAS", "\0", &[DET], false, |d| {
             d.ad.port_base
                 .set_int32_param(d.p.bias_enable, 0, 2)
                 .unwrap();
@@ -4852,10 +4868,16 @@ mod tests {
             (1, 400, s("BiasEnabled must be 0 or 1"), s(""), 0, 24, 0)
         );
 
-        let (ok, seen, _, _) = run("TPX_INIT_TRIG", "\0", &[(PUT, "accepted")], false, |d| {
-            let mode = d.ad.params.trigger_mode;
-            d.ad.port_base.set_int32_param(mode, 0, 9).unwrap();
-        });
+        let (ok, seen, _, _) = run(
+            "TPX_INIT_TRIG",
+            "\0",
+            &[(PUT, "accepted"), DET],
+            false,
+            |d| {
+                let mode = d.ad.params.trigger_mode;
+                d.ad.port_base.set_int32_param(mode, 0, 9).unwrap();
+            },
+        );
         assert!(ok);
         assert_eq!(seen, (1, 200, s("accepted"), s(""), 0, 24, 0));
 
@@ -4870,6 +4892,27 @@ mod tests {
         assert_eq!(seen, (1, 400, s(MPX3_TRIGGER_MSG), s(""), 5, 24, 0));
         let line = adlog::err(adlog::INIT_ACQUISITION, MPX3_TRIGGER_MSG);
         assert!(text.contains(&line), "{line}: {text:?}");
+
+        // serval_http.cpp:2477-2479: an Unknown family is read from
+        // /detector before the MPX3 checks.
+        let (ok, seen, _, _) = run(
+            "TPX_INIT_UNKNOWN",
+            "\0",
+            &[(
+                "GET /detector ",
+                r#"{"Info":{"MpxType":5,"PixCount":65536,"RowLen":1,"NumberOfChips":1,"NumberOfRows":256},"Config":{}}"#,
+            )],
+            false,
+            |d| {
+                let mode = d.ad.params.trigger_mode;
+                d.ad.port_base.set_int32_param(mode, 0, 5).unwrap();
+                d.ad.port_base
+                    .set_int32_param(d.p.both_counters, 0, 1)
+                    .unwrap();
+            },
+        );
+        assert!(!ok);
+        assert_eq!(seen, (1, 400, s(MPX3_TRIGGER_MSG), s(""), 5, 12, 1));
 
         let (ok, seen, text, url) = run(
             "TPX_INIT_PUT",

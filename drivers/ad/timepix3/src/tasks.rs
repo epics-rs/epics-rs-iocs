@@ -89,7 +89,7 @@ enum Locking {
 
 /// The actor's `CallParamCallbacks`, from a worker job: every update stored,
 /// a failed one reported, then the callbacks for `addr`.
-fn apply_updates(base: &mut PortDriverBase, addr: i32, updates: &[ParamSetValue]) {
+pub(crate) fn apply_updates(base: &mut PortDriverBase, addr: i32, updates: &[ParamSetValue]) {
     for u in updates {
         let outcome = match u {
             ParamSetValue::Value {
@@ -764,21 +764,50 @@ async fn refresh_dashboard(ctx: &Arc<Ctx>) {
     ctx.set(0, updates).await;
 }
 
-/// C `getDetector` (serval_http.cpp:1293); false when `/detector` failed.
+/// C `getDetector` (serval_http.cpp:1293) from the task; false when
+/// `/detector` failed.
 async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
-    let p = ctx.p;
+    let read = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad);
+    for (mask, line) in &read.traces {
+        ctx.trace(*mask, line);
+    }
+    for (addr, updates) in read.updates {
+        ctx.set(addr, updates).await;
+    }
+    read.ok
+}
+
+/// What C `getDetector` leaves: its trace lines and its param writes per
+/// address, in order, for the task or the port (initAcquisition) to apply.
+pub(crate) struct DetectorRead {
+    pub ok: bool,
+    pub traces: Vec<(TraceMask, String)>,
+    pub updates: Vec<(i32, Vec<ParamSetValue>)>,
+}
+
+/// C `getDetector`'s reading of `/detector`.
+pub(crate) fn read_detector(
+    http: &ServalHttp,
+    shared: &Shared,
+    p: TimePixParams,
+    ad: ADDriverParams,
+) -> DetectorRead {
+    let mut read = DetectorRead {
+        ok: false,
+        traces: Vec::new(),
+        updates: Vec::new(),
+    };
     let failure = |write_msg: String, message: &str, status: ADStatus| {
         let octet = |s: &str| ParamValue::Octet(s.as_bytes().to_vec().into());
         vec![
             ParamSetValue::new(p.det_connected, 0, ParamValue::Int32(0)),
             ParamSetValue::new(p.write_msg, 0, octet(&write_msg)),
-            ParamSetValue::new(ctx.ad.status_message, 0, octet(message)),
-            ParamSetValue::new(ctx.ad.status, 0, ParamValue::Int32(status as i32)),
+            ParamSetValue::new(ad.status_message, 0, octet(message)),
+            ParamSetValue::new(ad.status, 0, ParamValue::Int32(status as i32)),
         ]
     };
     // C getDetector (serval_http.cpp:1300-1323).
-    let detector = match ctx
-        .http
+    let detector = match http
         .get(serval::DETECTOR, TIMEOUT_5000_MS)
         .map_err(|e| (e.body().to_string(), Some(e)))
         .and_then(|body| {
@@ -786,27 +815,27 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
         }) {
         Ok(d) => d,
         Err((body, Some(e))) => {
-            let url = format!("{}{}", ctx.http.base_url(), serval::DETECTOR);
+            let url = format!("{}{}", http.base_url(), serval::DETECTOR);
             if let Some(line) = adlog::http_failure("getDetector GET /detector", "GET", &url, &e) {
-                ctx.trace(TraceMask::ERROR, &line);
+                read.traces.push((TraceMask::ERROR, line));
             }
             let updates = failure(
                 body,
                 "Failed to read detector information",
                 ADStatus::Disconnected,
             );
-            ctx.set(0, updates).await;
-            return false;
+            read.updates.push((0, updates));
+            return read;
         }
         Err((reason, None)) => {
             let message = format!("Invalid detector response: {reason}");
-            ctx.trace(
+            read.traces.push((
                 TraceMask::ERROR,
-                &adlog::err(adlog::GET_DETECTOR, &format!("getDetector: {message}")),
-            );
+                adlog::err(adlog::GET_DETECTOR, &format!("getDetector: {message}")),
+            ));
             let updates = failure(message.clone(), &message, ADStatus::Error);
-            ctx.set(0, updates).await;
-            return false;
+            read.updates.push((0, updates));
+            return read;
         }
     };
 
@@ -824,7 +853,7 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
     octet(p.sw_version, detector.pointer("/Info/SW_version"));
     octet(p.fw_version, detector.pointer("/Info/FW_version"));
     octet(
-        ctx.ad.base.firmware_version,
+        ad.base.firmware_version,
         detector.pointer("/Info/FW_version"),
     );
     // UPSTREAM DEFECT (serval_http.cpp:1190): C sets ADSerialNumber from
@@ -832,7 +861,7 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
     // and the line that would have used the chipboard ID sits commented out
     // right above it. The chipboard ID is the detector's identity.
     octet(
-        ctx.ad.base.serial_number,
+        ad.base.serial_number,
         detector.pointer("/Info/Boards/0/ChipboardId"),
     );
     octet(p.boards_id, detector.pointer("/Info/Boards/0/ChipboardId"));
@@ -899,12 +928,12 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
 
     // serval_http.cpp:1349-1350; parse_detector_response made rows positive.
     updates.push(ParamSetValue::new(
-        ctx.ad.max_size_x,
+        ad.max_size_x,
         0,
         ParamValue::Int32(i32::try_from(pix_count / rows).unwrap_or(0)),
     ));
     updates.push(ParamSetValue::new(
-        ctx.ad.max_size_y,
+        ad.max_size_y,
         0,
         ParamValue::Int32(i32::try_from(rows).unwrap_or(0)),
     ));
@@ -922,22 +951,16 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
     float(p.timer_step, detector.pointer("/Info/TimerStep"));
     float(p.clock_timepix, detector.pointer("/Info/ClockTimepix"));
     float(p.exposure_time, detector.pointer("/Config/ExposureTime"));
-    float(
-        ctx.ad.acquire_time,
-        detector.pointer("/Config/ExposureTime"),
-    );
+    float(ad.acquire_time, detector.pointer("/Config/ExposureTime"));
     float(p.trigger_period, detector.pointer("/Config/TriggerPeriod"));
-    float(
-        ctx.ad.acquire_period,
-        detector.pointer("/Config/TriggerPeriod"),
-    );
+    float(ad.acquire_period, detector.pointer("/Config/TriggerPeriod"));
     float(p.trigger_delay, detector.pointer("/Config/TriggerDelay"));
     float(
         p.global_timestamp_interval,
         detector.pointer("/Config/GlobalTimestampInterval"),
     );
 
-    update_detector_family(ctx, &detector, &mut updates);
+    update_detector_family(shared, p, &detector, &mut updates, &mut read.traces);
 
     // The detector orientation drives the mask geometry, so it also goes into
     // the shared state the mask code reads.
@@ -946,7 +969,7 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
         .and_then(Value::as_str)
         .and_then(serval::orientation_index)
     {
-        ctx.shared.set_orientation(o);
+        shared.set_orientation(o);
         updates.push(ParamSetValue::new(
             p.detector_orientation,
             0,
@@ -954,8 +977,8 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
         ));
     }
 
-    health(ctx, &detector, &mut updates);
-    ctx.set(0, updates).await;
+    health(p, &detector, &mut updates);
+    read.updates.push((0, updates));
 
     // The per-address readbacks: the DACs, the chip temperature and the chip
     // layout, one address per chip (C `fetchDacs`, serval_http.cpp:790), plus
@@ -1011,16 +1034,16 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
             ));
         }
         if !updates.is_empty() {
-            ctx.set(addr, updates).await;
+            read.updates.push((addr, updates));
         }
     }
     // C getDetector (serval_http.cpp:1556).
-    ctx.set(
+    read.updates.push((
         0,
         vec![ParamSetValue::new(p.det_connected, 0, ParamValue::Int32(1))],
-    )
-    .await;
-    true
+    ));
+    read.ok = true;
+    read
 }
 
 /// `Detector.Health` is a single object on Serval 3 and an array — one entry
@@ -1028,8 +1051,13 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
 /// scalars come from the first board.
 /// C `updateDetectorFamily` (ADTimePix.cpp:2107-2127), with the arguments
 /// `getDetector` passes it (serval_http.cpp:1351-1363).
-fn update_detector_family(ctx: &Ctx, detector: &Value, updates: &mut Vec<ParamSetValue>) {
-    let p = ctx.p;
+fn update_detector_family(
+    shared: &Shared,
+    p: TimePixParams,
+    detector: &Value,
+    updates: &mut Vec<ParamSetValue>,
+    traces: &mut Vec<(TraceMask, String)>,
+) {
     let mpx_type = detector
         .pointer("/Info/MpxType")
         .and_then(Value::as_i64)
@@ -1060,18 +1088,18 @@ fn update_detector_family(ctx: &Ctx, detector: &Value, updates: &mut Vec<ParamSe
         caps.supports_image_thresholds.into(),
     ));
 
-    if ctx.shared.note_family(family) {
+    if shared.note_family(family) {
         apply_family_defaults(&p, family, updates);
-        ctx.trace(
+        traces.push((
             TraceMask::FLOW,
-            &adlog::log(
+            adlog::log(
                 adlog::UPDATE_DETECTOR_FAMILY,
                 &format!(
                     "Detector family {} (MpxType={mpx_type} ChipType={chip_type} ChipboardId={chipboard_id})",
                     family.name()
                 ),
             ),
-        );
+        ));
     }
 }
 
@@ -1162,8 +1190,7 @@ fn adjust_code(chip: &Value) -> i32 {
 }
 
 /// The `Detector.Health` scalars, all at address 0.
-fn health(ctx: &Arc<Ctx>, detector: &Value, updates: &mut Vec<ParamSetValue>) {
-    let p = ctx.p;
+fn health(p: TimePixParams, detector: &Value, updates: &mut Vec<ParamSetValue>) {
     let blocks = health_blocks(detector);
     let Some(h) = blocks.first() else {
         return;
@@ -2784,7 +2811,7 @@ mod tests {
         let p = ctx.p;
         let mpx3 = serde_json::json!({"Info": {"MpxType": 5, "Boards": [{"ChipboardId": "41"}]}});
         let mut u = Vec::new();
-        update_detector_family(&ctx, &mpx3, &mut u);
+        update_detector_family(&ctx.shared, p, &mpx3, &mut u, &mut Vec::new());
         assert_eq!(int_set(&u, p.detector_family), Some(2));
         assert_eq!(int_set(&u, p.cap_img_thresholds), Some(1));
         assert_eq!(int_set(&u, p.cap_tdc), Some(0));
@@ -2792,13 +2819,13 @@ mod tests {
         assert_eq!(int_set(&u, p.i_delay3), Some(10));
 
         let mut u = Vec::new();
-        update_detector_family(&ctx, &mpx3, &mut u);
+        update_detector_family(&ctx.shared, p, &mpx3, &mut u, &mut Vec::new());
         assert_eq!(int_set(&u, p.detector_family), Some(2));
         assert_eq!(int_set(&u, p.pixel_depth), None);
 
         let tpx3 = serde_json::json!({"Info": {"ChipType": "tpx3"}});
         let mut u = Vec::new();
-        update_detector_family(&ctx, &tpx3, &mut u);
+        update_detector_family(&ctx.shared, p, &tpx3, &mut u, &mut Vec::new());
         assert_eq!(int_set(&u, p.detector_family), Some(1));
         assert_eq!(int_set(&u, p.cap_tdc), Some(1));
         assert_eq!(int_set(&u, p.pixel_depth), None);
