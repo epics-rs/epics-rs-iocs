@@ -43,7 +43,7 @@ use epics_rs::asyn::request::{ParamSetValue, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerParams, ParamWrite, index};
+use epics_rs::motor::controller_port::{ControllerParams, ParamWrite, has_motor_axis, index};
 use epics_rs::motor::flags::MstaFlags;
 use epics_rs::motor::trace::MotorTrace;
 
@@ -349,6 +349,10 @@ impl ControllerParams for ImsParams {
         user: &AsynUser,
         value: i32,
     ) -> ParamWrite {
+        // ImsMDrivePlusMotorController.cpp:317-318: no axis, no print.
+        if !has_motor_axis(base, user) {
+            return ParamWrite::Handled(Err(ims_err("writeInt32: no axis at this address")));
+        }
         base.trace_print(
             TraceMask::IO_DRIVER,
             format_args!("{DRIVER_NAME}:writeInt32: val={value}\n"),

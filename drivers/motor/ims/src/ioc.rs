@@ -424,6 +424,35 @@ mod extra_params {
         assert_eq!(io.read_int32(save).unwrap(), 1);
     }
 
+    /// ImsMDrivePlusMotorController.cpp:317-318: an IMS write at an address
+    /// with no axis (a create that failed after the port) fails before the
+    /// val= print, the store or a command.
+    #[epics_rs::base::epics_test]
+    async fn an_ims_write_with_no_axis_does_nothing() {
+        use epics_rs::asyn::registry::open_owner;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let (line, handle) = LineRig::new("imsNoAxisLine", |_| "0".into());
+        let ims = ImsLine::new(handle, "A".into(), "imsNoAxis");
+        let port =
+            register_controller_port(&open_owner(), "imsNoAxis", 1, ImsParams::new(ims)).unwrap();
+        let io = SyncIOHandle::from_handle(port, 0, IMS_TIMEOUT);
+        let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
+        let path = std::env::temp_dir().join(format!("imsNoAxis-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        let all = TraceMask::IO_DRIVER | TraceMask::FLOW | TraceMask::ERROR;
+        trace.set_trace_mask(Some("imsNoAxis"), all);
+        trace.set_trace_file(Some("imsNoAxis"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("imsNoAxis", 0, TraceFile::File(file));
+        assert!(io.write_int32(save, 1).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!text.contains(DRIVER_NAME), "{text}");
+        assert!(line.sent().is_empty());
+        assert_ne!(io.read_int32(save).ok(), Some(1));
+    }
+
     /// ImsMDrivePlusMotorAxis.cpp:525, :552 and
     /// ImsMDrivePlusMotorController.cpp:369: a sent `S` or `CF` prints its
     /// writeController line, then its axis method's IO_DRIVER line.
