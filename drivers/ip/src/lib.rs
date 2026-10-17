@@ -32,6 +32,7 @@ pub mod mks;
 pub mod mpc;
 pub mod nd261;
 pub mod runtime;
+pub mod strparm;
 pub mod televac;
 pub mod tpg261;
 pub mod worker;
