@@ -1183,9 +1183,46 @@ impl TimePix3Driver {
         if self.int(enable, 0) == 0 {
             return Ok(());
         }
-        let c = self.image_channel(params);
+        let mut c = self.image_channel(params);
         self.validate_destination(&c.base)?;
-        let body = serval::image_body(&c).map_err(Self::destination_refused)?;
+        if let Some(format) = serval::tcp_format_override(&c.base, c.format) {
+            let path = match (preview, index) {
+                (false, 0) => "Image",
+                (false, _) => "Image[1]",
+                (true, 0) => "Preview",
+                (true, _) => "Preview[1]",
+            };
+            self.ad.port_base.trace_print(
+                TraceMask::IO_DRIVER,
+                format_args!(
+                    "{}",
+                    adlog::log(
+                        adlog::CONFIGURE_IMAGE_CHANNEL,
+                        &format!(
+                            "TCP channel {path}: format index {} invalid for tcp; using jsonimage (3)",
+                            c.format
+                        )
+                    )
+                ),
+            );
+            self.ad.port_base.set_int32_param(params[2], 0, format)?;
+            c.format = format;
+        }
+        let ths = match (preview, index) {
+            (false, 0) => p.img_ths,
+            (false, _) => p.img1_ths,
+            (true, 0) => p.prv_img_ths,
+            (true, _) => p.prv_img1_ths,
+        };
+        let ths_text = self.text(ths, 0);
+        let thresholds = self
+            .shared
+            .family()
+            .capabilities()
+            .supports_image_thresholds
+            .then_some((ths, ths_text.as_str()));
+        let body = serval::image_body(&c, thresholds)
+            .map_err(|m| self.configure_refused(adlog::CONFIGURE_IMAGE_CHANNEL, m))?;
         let channels = if preview {
             &mut server["Preview"]["ImageChannels"]
         } else {
@@ -3679,7 +3716,7 @@ mod tests {
         use epics_rs::asyn::runtime::port::create_port_runtime;
         use epics_rs::asyn::trace::{TraceFile, TraceMask};
         type Setup = fn(&mut TimePix3Driver);
-        fn run(name: &'static str, setup: Setup) -> (bool, Option<serde_json::Value>, String) {
+        fn run(name: &'static str, setup: Setup) -> (bool, Option<serde_json::Value>, String, i32) {
             let (url, rx) = capturing_serval();
             let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
             let mut det = TimePix3Driver::new(
@@ -3708,8 +3745,10 @@ mod tests {
                 Some(name),
                 TraceMask::ERROR | TraceMask::IO_DRIVER | TraceMask::FLOW,
             );
-            let ok = h
-                .with_driver_blocking::<TimePix3Driver, _>(|d| d.file_writer().is_ok())
+            let (ok, format) = h
+                .with_driver_blocking::<TimePix3Driver, _>(|d| {
+                    (d.file_writer().is_ok(), d.int(d.p.img_format, 0))
+                })
                 .unwrap();
             let put = rx
                 .try_iter()
@@ -3718,7 +3757,7 @@ mod tests {
             let text = std::fs::read_to_string(&path).unwrap();
             let _ = std::fs::remove_file(&path);
             std::mem::forget(runtime);
-            (ok, put, text)
+            (ok, put, text, format)
         }
         fn enable(d: &mut TimePix3Driver, write: usize, base: usize) {
             let b = &mut d.ad.port_base;
@@ -3726,7 +3765,7 @@ mod tests {
             b.set_int32_param(write, 0, 1).unwrap();
         }
 
-        let (ok, put, text) = run("TPX_FW_NONE", |_| {});
+        let (ok, put, text, _) = run("TPX_FW_NONE", |_| {});
         assert!(ok);
         assert_eq!(put, None);
         assert!(text.contains(&adlog::log(
@@ -3738,7 +3777,7 @@ mod tests {
             "No channels are enabled. Skipping file writer configuration."
         )));
 
-        let (ok, put, _) = run("TPX_FW_SLOT", |d| {
+        let (ok, put, _, _) = run("TPX_FW_SLOT", |d| {
             let p = d.p;
             enable(d, p.write_raw1, p.raw1_base);
             enable(d, p.write_img1, p.img1_base);
@@ -3757,7 +3796,7 @@ mod tests {
         );
         assert!(put["Preview"].get("SamplingMode").is_some());
 
-        let (ok, put, text) = run("TPX_FW_REFUSED", |d| {
+        let (ok, put, text, _) = run("TPX_FW_REFUSED", |d| {
             let p = d.p;
             enable(d, p.write_img1, p.img1_base);
             d.ad.port_base.set_int32_param(p.img1_format, 0, 9).unwrap();
@@ -3769,7 +3808,7 @@ mod tests {
             "Failed to configure image channel 1"
         )));
 
-        let (ok, _, text) = run("TPX_FW_RAW_SPLIT", |d| {
+        let (ok, _, text, _) = run("TPX_FW_RAW_SPLIT", |d| {
             let p = d.p;
             enable(d, p.write_raw, p.raw_base);
             d.ad.port_base
@@ -3786,7 +3825,7 @@ mod tests {
             "Failed to configure raw channel 0"
         )));
 
-        let (ok, put, text) = run("TPX_FW_HST", |d| {
+        let (ok, put, text, _) = run("TPX_FW_HST", |d| {
             let p = d.p;
             enable(d, p.write_prv_hst, p.prv_hst_base);
             d.ad.port_base
@@ -3802,6 +3841,51 @@ mod tests {
         assert!(text.contains(&adlog::err(
             adlog::FILE_WRITER,
             "Failed to configure histogram channel"
+        )));
+
+        // A Medipix3 tcp image channel: tiff becomes jsonimage, the file
+        // keys stay, and the empty list sends the default thresholds.
+        let (ok, put, text, format) = run("TPX_FW_IMG_TCP", |d| {
+            let p = d.p;
+            d.shared.note_family(DetectorFamily::Mpx3);
+            enable(d, p.write_img, p.img_base);
+            let b = &mut d.ad.port_base;
+            b.set_string_param(p.img_base, 0, "tcp://localhost:8451")
+                .unwrap();
+            b.set_string_param(p.img_ths, 0, "").unwrap();
+            b.set_int32_param(p.img_format, 0, 0).unwrap();
+        });
+        assert!(ok);
+        assert_eq!(format, 3);
+        let put = put.unwrap();
+        assert_eq!(put["Image"][0]["Format"], json!("jsonimage"));
+        assert_eq!(put["Image"][0]["FilePattern"], json!(""));
+        assert_eq!(
+            put["Image"][0]["StopMeasurementOnDiskLimit"],
+            json!("false")
+        );
+        assert_eq!(
+            put["Image"][0]["Thresholds"],
+            json!([0, 1, 2, 3, 4, 5, 6, 7])
+        );
+        assert!(text.contains(&adlog::log(
+            adlog::CONFIGURE_IMAGE_CHANNEL,
+            "TCP channel Image: format index 0 invalid for tcp; using jsonimage (3)"
+        )));
+
+        let (ok, _, text, _) = run("TPX_FW_IMG_THS", |d| {
+            let p = d.p;
+            d.shared.note_family(DetectorFamily::Mpx3);
+            enable(d, p.write_prv_img1, p.prv_img1_base);
+            d.ad.port_base
+                .set_string_param(p.prv_img1_ths, 0, "1,x")
+                .unwrap();
+        });
+        assert!(!ok);
+        assert!(text.contains("Invalid threshold list for channel param"));
+        assert!(text.contains(&adlog::err(
+            adlog::FILE_WRITER,
+            "Failed to configure preview image channel 1"
         )));
     }
 

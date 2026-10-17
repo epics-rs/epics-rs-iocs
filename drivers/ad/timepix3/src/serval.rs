@@ -255,44 +255,65 @@ pub fn channel_slot(array: &mut Value, index: usize) -> &mut Value {
     &mut a[index]
 }
 
-/// A channel whose `Base` is a stream URI has no file on disk, so the
-/// file-related keys must not be sent.
-///
-/// UPSTREAM DEFECT (serval_http.cpp:1603 vs 1881): C's `configureRawChannel`
-/// treats only `tcp://` as a stream, `configureHistogramChannel` treats
-/// `http://` *and* `tcp://`, and `configureImageChannel` checks neither — so an
-/// image channel streaming over `tcp://` is still sent a `FilePattern` and a
-/// `StopMeasurementOnDiskLimit`. One rule, applied to every channel.
-pub fn is_stream(base: &str) -> bool {
-    base.starts_with("tcp://") || base.starts_with("http://")
+/// C `kDefaultThresholdList` (serval_http.cpp:165), sent for an empty list.
+pub const DEFAULT_THRESHOLD_LIST: &str = "0,1,2,3,4,5,6,7";
+
+/// C `parseThresholdList` (serval_http.cpp:147-163): comma-separated
+/// `stoi` values, blank items skipped; `None` for a bad item or no item.
+pub fn parse_threshold_list(text: &str) -> Option<Vec<i32>> {
+    let mut out = Vec::new();
+    for item in text.split(',') {
+        let item = item.trim_matches([' ', '\t']);
+        if item.is_empty() {
+            continue;
+        }
+        out.push(stoi(item)?);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
-pub fn image_body(c: &ImageChannel) -> Result<Value, String> {
-    let format = enum_name(&FORMATS, c.format).ok_or_else(|| format!("format {}", c.format))?;
-    let mode = enum_name(&MODES, c.mode).ok_or_else(|| format!("mode {}", c.mode))?;
-
-    let mut body = json!({
-        "Base": c.base,
-        "Format": format,
-        "Mode": mode,
-        "IntegrationSize": c.integration_size,
-        "QueueSize": c.queue_size,
-    });
-    // C only sends IntegrationMode when the size is neither 0 nor 1
-    // (serval_http.cpp:1800).
+/// An image channel's body (C `configureImageChannel`): FilePattern and
+/// StopMeasurementOnDiskLimit go with every Base, and `thresholds` (the
+/// list parameter's index and text) only where the detector takes them.
+/// The error is C's `ERR_ARGS` message.
+pub fn image_body(c: &ImageChannel, thresholds: Option<(usize, &str)>) -> Result<Value, String> {
+    let mut body = json!({ "Base": c.base, "FilePattern": c.file_pattern });
+    let format = enum_name(&FORMATS, c.format)
+        .ok_or_else(|| format!("Invalid format index: {}", c.format))?;
+    body["Format"] = json!(format);
+    let mode =
+        enum_name(&MODES, c.mode).ok_or_else(|| format!("Invalid mode index: {}", c.mode))?;
+    body["Mode"] = json!(mode);
+    if !(-1..=32).contains(&c.integration_size) {
+        return Err(format!("Invalid integration size: {}", c.integration_size));
+    }
+    body["IntegrationSize"] = json!(c.integration_size);
     if c.integration_size != 0 && c.integration_size != 1 {
         let m = enum_name(&INTEGRATION_MODES, c.integration_mode)
-            .ok_or_else(|| format!("integration mode {}", c.integration_mode))?;
+            .ok_or_else(|| format!("Invalid integration mode index: {}", c.integration_mode))?;
         body["IntegrationMode"] = json!(m);
     }
-    if !is_stream(&c.base) {
-        body["FilePattern"] = json!(c.file_pattern);
-        // UPSTREAM DEFECT (serval_http.cpp:1518): C sends this as the *string*
-        // "true"/"false" while Serval reports it back as a JSON boolean
-        // (serval_http.cpp:1361). Sent as a boolean.
-        body["StopMeasurementOnDiskLimit"] = json!(c.stop_on_disk_limit != 0);
+    let stop = enum_name(&STOP_ON_DISK_LIMIT, c.stop_on_disk_limit)
+        .ok_or_else(|| format!("Invalid stop on disk limit index: {}", c.stop_on_disk_limit))?;
+    body["StopMeasurementOnDiskLimit"] = json!(stop);
+    body["QueueSize"] = json!(c.queue_size);
+    if let Some((param, text)) = thresholds {
+        let text = if text.is_empty() {
+            DEFAULT_THRESHOLD_LIST
+        } else {
+            text
+        };
+        let list = parse_threshold_list(text)
+            .ok_or_else(|| format!("Invalid threshold list for channel param {param}: {text}"))?;
+        body["Thresholds"] = json!(list);
     }
     Ok(body)
+}
+
+/// C `configureImageChannel` (serval_http.cpp:1908-1913): a `tcp://`
+/// channel cannot carry tiff (0) or png (2) and is switched to jsonimage.
+pub fn tcp_format_override(base: &str, format: i32) -> Option<i32> {
+    (base.starts_with("tcp://") && (format == 0 || format == 2)).then_some(3)
 }
 
 pub fn raw_body(c: &RawChannel) -> Result<Value, String> {
@@ -1417,41 +1438,86 @@ mod tests {
         assert_eq!(enum_name(&FORMATS, 3), Some("jsonimage"));
         assert_eq!(enum_name(&FORMATS, 5), None);
         assert_eq!(enum_name(&FORMATS, -1), None);
-        let mut c = image("file:///data");
-        c.format = 9;
-        assert!(image_body(&c).is_err());
     }
 
     #[test]
-    fn a_file_channel_carries_the_file_keys() {
-        let body = image_body(&image("file:///data")).unwrap();
-        assert_eq!(body["FilePattern"], json!("f%d"));
-        // A boolean, not the string "true" (C, serval_http.cpp:1518).
-        assert_eq!(body["StopMeasurementOnDiskLimit"], json!(true));
-        assert_eq!(body["Format"], json!("jsonimage"));
-        assert_eq!(body["Mode"], json!("count"));
-    }
-
-    #[test]
-    fn a_stream_channel_carries_no_file_keys() {
-        for base in ["tcp://localhost:8451", "http://localhost:8451"] {
-            let body = image_body(&image(base)).unwrap();
-            assert!(body.get("FilePattern").is_none(), "{base}");
-            assert!(body.get("StopMeasurementOnDiskLimit").is_none(), "{base}");
-            assert_eq!(body["Base"], json!(base));
+    fn an_image_channel_is_built_as_c() {
+        for base in [
+            "file:/data",
+            "tcp://localhost:8451",
+            "http://localhost:8451",
+        ] {
+            assert_eq!(
+                image_body(&image(base), None),
+                Ok(json!({
+                    "Base": base,
+                    "FilePattern": "f%d",
+                    "Format": "jsonimage",
+                    "Mode": "count",
+                    "IntegrationSize": 0,
+                    "StopMeasurementOnDiskLimit": "true",
+                    "QueueSize": 1024,
+                }))
+            );
         }
-    }
-
-    #[test]
-    fn integration_mode_is_only_sent_for_a_real_integration() {
-        let mut c = image("file:///data");
+        type Bad = (fn(&mut ImageChannel), &'static str);
+        let bad: [Bad; 5] = [
+            (|c| c.format = 5, "Invalid format index: 5"),
+            (|c| c.mode = 5, "Invalid mode index: 5"),
+            (|c| c.integration_size = -2, "Invalid integration size: -2"),
+            (
+                |c| {
+                    c.integration_size = 2;
+                    c.integration_mode = -1;
+                },
+                "Invalid integration mode index: -1",
+            ),
+            (
+                |c| c.stop_on_disk_limit = 2,
+                "Invalid stop on disk limit index: 2",
+            ),
+        ];
+        for (set, want) in bad {
+            let mut c = image("file:/data");
+            set(&mut c);
+            assert_eq!(image_body(&c, None), Err(want.to_owned()));
+        }
+        let mut c = image("file:/data");
         for size in [0, 1] {
             c.integration_size = size;
-            assert!(image_body(&c).unwrap().get("IntegrationMode").is_none());
+            assert!(
+                image_body(&c, None)
+                    .unwrap()
+                    .get("IntegrationMode")
+                    .is_none()
+            );
         }
         c.integration_size = 10;
         c.integration_mode = 1;
-        assert_eq!(image_body(&c).unwrap()["IntegrationMode"], json!("average"));
+        assert_eq!(
+            image_body(&c, None).unwrap()["IntegrationMode"],
+            json!("average")
+        );
+    }
+
+    #[test]
+    fn image_thresholds_are_parsed_as_c() {
+        let c = image("file:/data");
+        let ths = |text| image_body(&c, Some((7, text))).map(|b| b["Thresholds"].clone());
+        assert_eq!(ths(""), Ok(json!([0, 1, 2, 3, 4, 5, 6, 7])));
+        assert_eq!(ths(" 1, ,\t2x ,-3"), Ok(json!([1, 2, -3])));
+        assert_eq!(
+            ths("1,a"),
+            Err("Invalid threshold list for channel param 7: 1,a".into())
+        );
+        assert_eq!(
+            ths(" , "),
+            Err("Invalid threshold list for channel param 7:  , ".into())
+        );
+        assert_eq!(tcp_format_override("tcp://h:1", 0), Some(3));
+        assert_eq!(tcp_format_override("tcp://h:1", 2), Some(3));
+        assert_eq!(tcp_format_override("tcp://h:1", 1), None);
+        assert_eq!(tcp_format_override("http://h:1", 0), None);
     }
 
     #[test]
