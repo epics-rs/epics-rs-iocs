@@ -311,10 +311,14 @@ async fn connection_poll(
 ) {
     let mut was_up = false;
     loop {
-        let command = tokio::time::timeout(CONNECTION_POLL, cmd_rx.recv())
-            .await
-            .unwrap_or(Some(Command::RefreshConnection));
-        let Some(command) = command else { return };
+        let command = match tokio::time::timeout(CONNECTION_POLL, cmd_rx.recv()).await {
+            Ok(Some(command)) => command,
+            Ok(None) => return,
+            Err(_) => {
+                was_up = poll_connection(&ctx, was_up).await;
+                continue;
+            }
+        };
 
         match command {
             Command::AcquisitionStarted => {
@@ -341,26 +345,39 @@ async fn connection_poll(
                 ctx.set_int(ctx.p.write_processed_hst, ADDR, 0).await;
                 continue;
             }
-            Command::RefreshConnection => {}
+            // C runs checkConnection() from writeInt32, outside the poll's
+            // edge tracking (ADTimePix.cpp:563-568).
+            Command::RefreshConnection => {
+                check_connection(&ctx).await;
+            }
         }
-
-        let up = check_connection(&ctx).await;
-        // A 0 -> 1 edge reconciles the read-only state; a partial
-        // reconciliation is retried on the next poll (C `connectionPollThread`,
-        // serval_http.cpp:408-420).
-        //
-        // UPSTREAM DEFECT (ADTimePix.cpp:1579): C never initialises
-        // `lastServalConnected_`/`lastDetConnected_`, so whether the first
-        // successful poll runs the reconnect refresh depends on uninitialised
-        // memory. Here the edge starts from "down", so the first success
-        // always refreshes.
-        let complete = if up && !was_up {
-            refresh_on_reconnect(&ctx).await
-        } else {
-            true
-        };
-        was_up = up && complete;
     }
+}
+
+/// One pass of C `connectionPollThread` (serval_http.cpp:408-420): the
+/// dashboard read publishes no HttpCode, a 0 -> 1 edge reconciles the
+/// read-only state, and a partial reconciliation keeps the edge open for the
+/// next poll. Returns the new "was up".
+///
+/// UPSTREAM DEFECT (ADTimePix.cpp:1579): C never initialises
+/// `lastServalConnected_`/`lastDetConnected_`, so whether the first
+/// successful poll runs the reconnect refresh depends on uninitialised
+/// memory. Here the edge starts from "down", so the first success always
+/// refreshes.
+async fn poll_connection(ctx: &Arc<Ctx>, was_up: bool) -> bool {
+    let reply = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL);
+    let mut updates = Vec::new();
+    let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
+    let up = serval_ok && det_ok;
+    let complete = if up && !was_up {
+        ctx.set(0, updates).await;
+        refresh_on_reconnect(ctx).await
+    } else {
+        connection_status(ctx, serval_ok, det_ok, &mut updates);
+        ctx.set(0, updates).await;
+        true
+    };
+    up && complete
 }
 
 /// C `refreshOnReconnect` (serval_http.cpp:287-312): every readback runs,
@@ -414,7 +431,8 @@ async fn refresh_measurement_config(ctx: &Arc<Ctx>) -> bool {
         .unwrap_or(false)
 }
 
-/// C `checkConnection` (serval_http.cpp:363).
+/// C `checkConnection()` with its defaults, publishing the HTTP status and
+/// the connection status (serval_http.cpp:363-392).
 async fn check_connection(ctx: &Arc<Ctx>) -> bool {
     let reply = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL);
     let code = reply.as_ref().map_or_else(|e| e.code(), |_| 200);
@@ -3640,30 +3658,16 @@ mod tests {
             _ => "{}",
         });
         let ctx = Arc::new(idle_ctx_at("TPX_RECONNECT", &url, None));
-        let (cmd_tx, cmd_rx) = rt::command_channel::<Command>(1);
-        let (acq_tx, _acq_rx) = rt::command_channel::<()>(1);
-        tokio::spawn(connection_poll(ctx.clone(), cmd_rx, acq_tx));
-
         let destination_reads = || {
             log.lock()
                 .iter()
                 .filter(|r| r.starts_with("GET /server/destination "))
                 .count()
         };
+        let mut was_up = false;
         for expected in 1..=2 {
-            cmd_tx.send(Command::RefreshConnection).await.unwrap();
-            for _ in 0..200 {
-                if destination_reads() >= expected
-                    && log
-                        .lock()
-                        .last()
-                        .is_some_and(|r| r.contains("/measurement/config"))
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            was_up = poll_connection(&ctx, was_up).await;
+            assert!(!was_up);
             assert_eq!(destination_reads(), expected);
             assert_eq!(
                 ctx.handle
@@ -3740,5 +3744,62 @@ mod tests {
         assert!(!check_connection(&ctx).await);
         assert_eq!(h.read_octet(p.status, 0, 64).await.unwrap(), b"\0");
         assert_eq!(h.read_int32(p.pipeline_state, 0).await.unwrap(), -1);
+    }
+
+    /// RefreshConnection is C checkConnection(): it publishes the HTTP status
+    /// and runs no reconnect refresh, while the periodic poll leaves the
+    /// last operator HTTP status alone (serval_http.cpp:363-420,
+    /// ADTimePix.cpp:563-568).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_refresh_connection_publishes_the_http_status() {
+        let (url, log) = logging_serval(&[], |path| match path {
+            "/dashboard" => r#"{"Server":{},"Detector":{"DetectorType":"TPX3"}}"#,
+            _ => "{}",
+        });
+        let ctx = Arc::new(idle_ctx_at("TPX_REFRESH_CONN", &url, None));
+        let (h, p) = (&ctx.handle, ctx.p);
+        let (cmd_tx, cmd_rx) = rt::command_channel::<Command>(1);
+        let (acq_tx, _acq_rx) = rt::command_channel::<()>(1);
+        tokio::spawn(connection_poll(ctx.clone(), cmd_rx, acq_tx));
+
+        ctx.set_int(p.http_code, 0, 409).await;
+        cmd_tx.send(Command::RefreshConnection).await.unwrap();
+        for _ in 0..200 {
+            if h.read_int32(p.http_code, 0).await.unwrap() == 200 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(h.read_int32(p.http_code, 0).await.unwrap(), 200);
+        assert_eq!(
+            log.lock()
+                .iter()
+                .filter(|r| !r.starts_with("GET /dashboard "))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_poll_leaves_the_http_status_alone() {
+        let (url, _log) = logging_serval(&[], |path| match path {
+            "/dashboard" => r#"{"Server":{},"Detector":{"DetectorType":"TPX3"}}"#,
+            _ => "{}",
+        });
+        let ctx = Arc::new(idle_ctx_at("TPX_POLL_HTTP", &url, None));
+        ctx.set_int(ctx.p.http_code, 0, 409).await;
+        assert!(poll_connection(&ctx, true).await);
+        assert_eq!(
+            ctx.handle.read_int32(ctx.p.http_code, 0).await.unwrap(),
+            409
+        );
+        assert_eq!(
+            ctx.handle
+                .read_int32(ctx.p.serval_connected, 0)
+                .await
+                .unwrap(),
+            1
+        );
     }
 }
