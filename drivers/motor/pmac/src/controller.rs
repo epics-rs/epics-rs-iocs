@@ -28,14 +28,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::{PortDriverBase, param_list};
+use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, ControllerReport, FinishedWrite, ParamDelta, ParamWrite, WriteHook,
+    AxisUser, ControllerParams, ControllerReport, FinishedWrite, ParamDelta, ParamWrite, WriteHook,
     WriteOutcome, WriteValue, has_motor_axis, index,
 };
 use epics_rs::motor::trace::MotorTrace;
@@ -842,7 +841,7 @@ impl ControllerParams for PmacControllerParams {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         let Some(addr) = self.get_axis(base, user, "writeInt32") else {
@@ -854,7 +853,7 @@ impl ControllerParams for PmacControllerParams {
     fn write_float64(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         _value: f64,
     ) -> ParamWrite {
         self.get_axis(base, user, "writeFloat64");
@@ -864,14 +863,13 @@ impl ControllerParams for PmacControllerParams {
 
 /// The driver's own write code, which then passes to the base.
 impl PmacControllerParams {
-    /// C `getAxis(pasynUser)` (pmacController.cpp:570-576): the address
-    /// `getAddress` resolves, -1 being 0, or None with C's opening FLOW line
-    /// where no axis sits (:396-400, :502-507); the [`PmacWriteHook`] prints
-    /// the line for a write that has one.
-    fn get_axis(&self, base: &PortDriverBase, user: &AsynUser, method: &str) -> Option<i32> {
-        let addr = param_list(base.flags.multi_device, user.addr);
-        if has_motor_axis(base, user) || self.is_controller_axis(addr) {
-            return Some(addr);
+    /// C `getAxis(pasynUser)` (pmacController.cpp:570-576): the user's
+    /// resolved address, or None with C's opening FLOW line where no axis
+    /// sits (:396-400, :502-507); the [`PmacWriteHook`] prints the line for
+    /// a write that has one.
+    fn get_axis(&self, base: &PortDriverBase, user: AxisUser<'_>, method: &str) -> Option<i32> {
+        if has_motor_axis(base, user) || self.is_controller_axis(user.addr) {
+            return Some(user.addr);
         }
         base.trace_print(TraceMask::FLOW, format_args!("pmacController::{method}\n"));
         None
