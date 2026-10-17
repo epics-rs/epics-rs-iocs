@@ -64,12 +64,15 @@ pub fn asyn_user(port: &str, addr: i32) -> TraceUser {
 /// command registered with [`register_port`], or [`TraceUser::Model1`] for
 /// a card of a model-1 driver — and start its poller, which polls from
 /// here on as C's poller thread does from controller creation.
+/// `forced_fast_polls` is the driver's own: C's `startPoller` has no default
+/// (asynMotorController.cpp:567).
 pub fn install(
     ctx: &CommandContext,
     user: TraceUser,
     motor: Arc<Mutex<dyn AsynMotor>>,
     moving_poll_ms: u64,
     idle_poll_ms: u64,
+    forced_fast_polls: u32,
 ) -> Result<(), String> {
     let AxisSetup {
         axis,
@@ -79,6 +82,7 @@ pub fn install(
         .trace_user(user)
         .moving_poll_interval(Duration::from_millis(moving_poll_ms))
         .idle_poll_interval(Duration::from_millis(idle_poll_ms))
+        .forced_fast_polls(forced_fast_polls)
         .build_axis();
     epics_rs::motor::devices::register_axis(axis)?;
     ctx.bridge().spawn(poll_loop.run());

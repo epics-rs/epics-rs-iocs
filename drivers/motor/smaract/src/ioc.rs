@@ -93,6 +93,7 @@ pub fn mcs2_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, smarActMCS2MotorDriver.cpp:95
                 )?;
             }
             Ok(CommandOutcome::Continue)
@@ -189,6 +190,7 @@ fn create_axis<C>(
         motor,
         reg.moving_poll_ms,
         reg.idle_poll_ms,
+        0, // C startPoller, smarActSCUMotorDriver.cpp:114, smarActMCSMotorDriver.cpp:215
     )
 }
 

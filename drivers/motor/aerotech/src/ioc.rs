@@ -28,10 +28,12 @@ use crate::ensemble::{self, ENSEMBLE_MAX_AXES, EnsembleAxis, EnsembleController}
 const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// drvEnsembleAsyn.cc's `motorAxisDrvSET_t`.
-pub static MOTOR_ENSEMBLE: Model2 = Model2::new("motorEnsemble");
+/// drvEnsembleAsyn.cc:703's poller forces no fast polls.
+pub static MOTOR_ENSEMBLE: Model2 = Model2::new("motorEnsemble", 0);
 
 /// drvA3200Asyn.cc's `motorAxisDrvSET_t`.
-pub static MOTOR_A3200: Model2 = Model2::new("motorA3200");
+/// drvA3200Asyn.cc:723's poller forces no fast polls.
+pub static MOTOR_A3200: Model2 = Model2::new("motorA3200", 0);
 
 /// `numEnsembleControllers` / `numA3200Controllers`, which the `Setup`s set.
 static NUM_ENSEMBLE: Mutex<i32> = Mutex::new(0);

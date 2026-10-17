@@ -123,6 +123,7 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    10, // C startPoller, omsMAXnet.cpp:364, omsMXA.cpp:359
                 )?;
             }
             crate::poller::start(

@@ -2,8 +2,8 @@
 //!
 //! Assembles: a TCP octet port (`drvAsynIPPortConfigure`), the New Focus
 //! PMNC controller (`PMNC87xxSetup`/`PMNC87xxConfig`), the 874x controller
-//! (`nf874xCreateController`), the motor record type, and the CA + PVA (QSRV)
-//! server.
+//! (`nf874xCreateController`), the motor record type, asyn's device support,
+//! and the CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p newfocus-ioc -- st.cmd
@@ -33,6 +33,9 @@ async fn main() -> CaResult<()> {
     // Motor record type.
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
+
+    // asyn's devEpics, which newFocus.dbd carries through asyn.dbd.
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`.
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());

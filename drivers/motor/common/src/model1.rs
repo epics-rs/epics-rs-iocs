@@ -119,6 +119,8 @@ impl Model1 {
             motor,
             1000 / scan_rate as u64,
             DEFAULT_IDLE_POLL_MS,
+            // motordrvCom.cc motor_task polls a card only while it moves.
+            0,
         )
     }
 }

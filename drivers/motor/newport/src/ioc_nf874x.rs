@@ -62,6 +62,7 @@ pub fn nf874x_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, 874xMotorDriver.cpp:89
                 )?;
             }
             Ok(CommandOutcome::Continue)

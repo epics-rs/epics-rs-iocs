@@ -43,7 +43,8 @@ use crate::ethernet::pmac_asyn_ip_configure_command;
 const POLL_CACHE_TTL: Duration = Duration::from_millis(50);
 
 /// pmacAsynCoord.c's `motorAxisDrvSET_t`, its cards keyed by `reference`.
-pub static PMAC_ASYN_COORD: Model2 = Model2::new("pmacAsynCoord");
+/// pmacAsynCoord.c:729's poller forces no fast polls.
+pub static PMAC_ASYN_COORD: Model2 = Model2::new("pmacAsynCoord", 0);
 
 /// `defaultMovingPollPeriod` / `defaultIdlePollPeriod` (pmacAsynCoord.c:122).
 const COORD_MOVING_POLL_MS: u64 = 100;
@@ -233,6 +234,7 @@ fn create_axis(
         motor,
         reg.moving_poll_ms,
         reg.idle_poll_ms,
+        10, // C startPoller, tpmac pmacController.cpp:201
     )
 }
 

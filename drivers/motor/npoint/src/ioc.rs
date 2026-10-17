@@ -65,6 +65,7 @@ pub fn c300_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, C300MotorDriver.cpp:82
                 )?;
             }
             Ok(CommandOutcome::Continue)

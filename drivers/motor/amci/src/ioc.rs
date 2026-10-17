@@ -136,6 +136,7 @@ pub fn anf2_create_axis_command() -> CommandDef {
                 motor,
                 DEFAULT_MOVING_POLL_MS,
                 DEFAULT_IDLE_POLL_MS,
+                2, // C startPoller, ANF2Driver.cpp:129
             )?;
             Ok(CommandOutcome::Continue)
         },
@@ -224,6 +225,7 @@ pub fn ang1_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, ANG1Driver.cpp:98
                 )?;
             }
 

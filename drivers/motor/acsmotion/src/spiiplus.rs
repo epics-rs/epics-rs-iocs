@@ -759,7 +759,7 @@ impl ControllerParams for AcsMotionParams {
 impl AcsMotionParams {
     fn write_int32_own(
         &mut self,
-        _: &mut PortDriverBase,
+        base: &mut PortDriverBase,
         user: &AsynUser,
         value: i32,
     ) -> AsynResult<()> {
@@ -767,6 +767,14 @@ impl AcsMotionParams {
             && user.reason == p.method
         {
             self.set(user.addr, |h| h.method = value);
+            // C prints on pasynUserSelf, which is connected to address 0.
+            PortManager::global().trace_manager().print(
+                Some(&base.port_name),
+                Some(0),
+                0,
+                TraceMask::IO_DRIVER,
+                format_args!("SPiiPlusController:writeInt32: homingMethod = {value}\n"),
+            );
         }
         Ok(())
     }
@@ -792,7 +800,39 @@ impl AcsMotionParams {
 
 #[cfg(test)]
 mod tests {
+    use epics_rs::asyn::trace::TraceFile;
+
     use super::*;
+    use crate::profile::tests::{SERVOS, rig};
+
+    #[test]
+    fn a_homing_method_write_is_traced_as_c_traces_it() {
+        let rig = rig("spiiHomingTrace", 2, SERVOS);
+        let method = rig.param("SPIIPLUS_HOMING_METHOD");
+        let path = std::env::temp_dir().join(format!("spii-trace-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("spiiHomingTraceCtrl"), TraceMask::IO_DRIVER);
+        trace.set_trace_file(Some("spiiHomingTraceCtrl"), TraceFile::File(file.clone()));
+        // An address's own slot keeps the file it had.
+        for addr in 0..2 {
+            trace.set_device_trace_file("spiiHomingTraceCtrl", addr, TraceFile::File(file.clone()));
+        }
+        rig.port.write_int32_blocking(method, 1, 3).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mine: Vec<_> = text
+            .lines()
+            .filter(|l| l.contains("SPiiPlusController"))
+            .collect();
+        assert_eq!(mine.len(), 1, "{text}");
+        assert!(
+            text.contains("SPiiPlusController:writeInt32: homingMethod = 3\n"),
+            "{text}"
+        );
+        assert_eq!(rig.ctrl.lock().unwrap().homing(1).method, 3);
+    }
 
     /// A controller of `axes` axes on a fake line, its setup arrays given.
     fn fake(
