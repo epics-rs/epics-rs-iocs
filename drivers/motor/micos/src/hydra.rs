@@ -40,6 +40,8 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi};
 
+use crate::smc::{SmcMembers, SmcState, travel_limits};
+
 /// Response buffer size.
 const READ_BUF: usize = 128;
 
@@ -47,9 +49,6 @@ const READ_BUF: usize = 128;
 const STATUS_MOVING: i32 = 0x1; // axis in motion
 const STATUS_POWER_OFF: i32 = 0x100; // drive power disabled
 const STATUS_ESTOP_SWITCH: i32 = 0x200; // e-stop switch active
-
-/// Switch-config bit that disables (masks) a limit switch.
-const SWITCH_IGNORE: i32 = 0x2;
 
 /// Regulator mode used when enabling closed loop (C startup default, unmodeled
 /// aux parameter `SMCHYDRA_REGULATOR_MODE`).
@@ -106,30 +105,13 @@ fn axis_res(motor_form: i32, pitch: f64, pole_pairs: i32, cl_period: f64) -> f64
     }
 }
 
-/// `sscanf(reply, "%lf %lf", &neg, &pos)` (SMChydraAxis.cpp:57). A value
-/// sscanf does not convert is 0 here; C leaves the member uninitialized, a
-/// defect not copied.
-fn travel_limits(reply: &str) -> (f64, f64) {
-    let mut values = reply
-        .split_whitespace()
-        .map_while(|tok| tok.parse::<f64>().ok());
-    let neg = values.next().unwrap_or(0.0);
-    (neg, values.next().unwrap_or(0.0))
-}
-
 /// One hydra axis sharing a controller. Implements [`AsynMotor`].
 pub struct HydraAxis {
     controller: Arc<Mutex<HydraController>>,
-    /// 0-based axis index; commands use `axis_no + 1`.
-    axis_no: usize,
+    members: Arc<SmcMembers>,
     /// Motor form (`getmotor`): 0 stepper, 1 linear/torque, other. Selects the
     /// `set_closed_loop` behaviour.
     motor_form: i32,
-    /// C `axisRes_`: controller units per record step.
-    axis_res: f64,
-    /// C `negTravelLimit_`/`posTravelLimit_`, the `getnlimit` the
-    /// constructor read; `move_velocity` moves to one (no jog command).
-    travel_limits: (f64, f64),
 }
 
 impl HydraAxis {
@@ -140,32 +122,51 @@ impl HydraAxis {
     /// that does not answer leaves each at `atoi("")`/`atof("")`, 0.
     pub fn new(controller: Arc<Mutex<HydraController>>, axis_no: usize) -> Self {
         let addr = axis_no + 1;
-        let (motor_form, axis_res, travel_limits) = {
+        let (motor_form, members) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let read = |verb: &str| ctrl.query(&format!("{addr} {verb}")).unwrap_or_default();
             let motor_form = atoi(&read("getmotor"));
             let pitch = atof(&read("getpitch"));
             let pole_pairs = atoi(&read("getpolepairs"));
             let cl_period = atof(&read("getclperiod"));
-            let axis_res = axis_res(motor_form, pitch, pole_pairs, cl_period);
-            (motor_form, axis_res, travel_limits(&read("getnlimit")))
+            let state = SmcState {
+                axis_res: axis_res(motor_form, pitch, pole_pairs, cl_period),
+                travel_limits: travel_limits(&read("getnlimit")),
+                ..SmcState::default()
+            };
+            let members = SmcMembers {
+                axis_no,
+                motor_form: Some(motor_form),
+                pitch: Some(pitch),
+                pole_pairs: Some(pole_pairs),
+                cl_period,
+                state: Mutex::new(state),
+            };
+            (motor_form, members)
         };
         Self {
             controller,
-            axis_no,
+            members: Arc::new(members),
             motor_form,
-            axis_res,
-            travel_limits,
         }
+    }
+
+    /// What C's `report` prints of the axis.
+    pub fn members(&self) -> Arc<SmcMembers> {
+        self.members.clone()
     }
 
     /// C `changeResolution`: replace `axisRes`.
     pub fn change_resolution(&mut self, new_resolution: f64) {
-        self.axis_res = new_resolution;
+        self.members.state().axis_res = new_resolution;
     }
 
     fn addr(&self) -> usize {
-        self.axis_no + 1
+        self.members.axis_no + 1
+    }
+
+    fn axis_res(&self) -> f64 {
+        self.members.axis_res()
     }
 
     fn lock(&self) -> MutexGuard<'_, HydraController> {
@@ -183,8 +184,8 @@ impl HydraAxis {
     ) -> AsynResult<()> {
         let addr = self.addr();
         ctrl.write_all([
-            format!("{:.6} {addr} snv", (velocity * self.axis_res).abs()),
-            format!("{:.6} {addr} sna", (acceleration * self.axis_res).abs()),
+            format!("{:.6} {addr} snv", (velocity * self.axis_res()).abs()),
+            format!("{:.6} {addr} sna", (acceleration * self.axis_res()).abs()),
             cmd,
         ])
     }
@@ -205,7 +206,7 @@ impl AsynMotor for HydraAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let cmd = format!("{:.6} {} nm", position * self.axis_res, self.addr());
+        let cmd = format!("{:.6} {} nm", position * self.axis_res(), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -217,7 +218,7 @@ impl AsynMotor for HydraAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let cmd = format!("{:.6} {} nr", distance * self.axis_res, self.addr());
+        let cmd = format!("{:.6} {} nr", distance * self.axis_res(), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -229,7 +230,7 @@ impl AsynMotor for HydraAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         // No jog command: move to the travel limit the constructor read.
-        let (neg, pos) = self.travel_limits;
+        let (neg, pos) = self.members.state().travel_limits;
         let target = if velocity > 0.0 { pos } else { neg };
         let cmd = format!("{target:.6} {} nm", self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
@@ -253,7 +254,7 @@ impl AsynMotor for HydraAxis {
         let addr = self.addr();
         // Set stop deceleration, then abort this axis.
         ctrl.write_all([
-            format!("{:.6} {addr} ssd", (acceleration * self.axis_res).abs()),
+            format!("{:.6} {addr} ssd", (acceleration * self.axis_res()).abs()),
             format!("{addr} nabort"),
         ])
     }
@@ -264,7 +265,7 @@ impl AsynMotor for HydraAxis {
         // origin, hence the negation (C multiplies by -1).
         ctrl.write_only(&format!(
             "{:.6} {} setnpos",
-            -position * self.axis_res,
+            -position * self.axis_res(),
             self.addr()
         ))
     }
@@ -313,14 +314,7 @@ impl AsynMotor for HydraAxis {
 
         // Switch config: bit 1 (0x2) masks (disables) the switch.
         let sw = ctrl.query(&format!("{addr} getsw"))?;
-        let cfg: Vec<i32> = sw
-            .split_whitespace()
-            .filter_map(|tok| tok.parse::<i32>().ok())
-            .collect();
-        let (ignore_low, ignore_high) = match cfg.as_slice() {
-            [low, high, ..] => (low & SWITCH_IGNORE, high & SWITCH_IGNORE),
-            _ => (0, 0),
-        };
+        let (ignore_low, ignore_high) = self.members.read_limit_config(&sw);
 
         // Switch state: "low high", 0=inactive 1=active.
         let st = ctrl.query(&format!("{addr} getswst"))?;
@@ -330,14 +324,14 @@ impl AsynMotor for HydraAxis {
             .collect();
         let (mut low_limit, mut high_limit) = (false, false);
         if let [low, high, ..] = state.as_slice() {
-            low_limit = ignore_low == 0 && *low != 0;
-            high_limit = ignore_high == 0 && *high != 0;
+            low_limit = !ignore_low && *low != 0;
+            high_limit = !ignore_high && *high != 0;
         }
         drop(ctrl);
 
         Ok(MotorStatus {
-            position: position / self.axis_res,
-            encoder_position: position / self.axis_res,
+            position: position / self.axis_res(),
+            encoder_position: position / self.axis_res(),
             velocity: 0.0,
             done: !moving,
             moving,
@@ -433,10 +427,19 @@ mod tests {
         let handle = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let mut axis = HydraAxis {
             controller: Arc::new(Mutex::new(HydraController::new(handle))),
-            axis_no: 0,
+            members: Arc::new(SmcMembers {
+                axis_no: 0,
+                motor_form: Some(0),
+                pitch: Some(0.0),
+                pole_pairs: Some(0),
+                cl_period: 0.0,
+                state: Mutex::new(SmcState {
+                    axis_res: 0.5,
+                    travel_limits: (-100.0, 100.0),
+                    ..SmcState::default()
+                }),
+            }),
             motor_form: 0,
-            axis_res: 0.5,
-            travel_limits: (-100.0, 100.0),
         };
         let user = AsynUser::default();
         axis.move_absolute(&user, 2.0, 0.0, 2.0, 4.0).unwrap();
@@ -472,24 +475,8 @@ mod tests {
     }
 
     #[test]
-    fn travel_limits_scan_as_c_sscanf() {
-        assert_eq!(travel_limits("-100.0 100.0"), (-100.0, 100.0));
-        assert_eq!(travel_limits("-5 x"), (-5.0, 0.0));
-        assert_eq!(travel_limits(""), (0.0, 0.0));
-    }
-
-    #[test]
     fn axis_res_follows_the_motor_form() {
         assert_eq!(axis_res(0, 1.0, 50, 0.0001), 0.005);
         assert_eq!(axis_res(1, 1.0, 50, 0.0001), 0.0001);
-    }
-
-    #[test]
-    fn switch_ignore_mask() {
-        let ignored = |cfg: i32| (cfg & SWITCH_IGNORE) != 0;
-        assert!(!ignored(0x0));
-        assert!(!ignored(0x1));
-        assert!(ignored(0x2));
-        assert!(ignored(0x3));
     }
 }

@@ -22,7 +22,10 @@ use motor_common::iocsh::{
     req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{Controller, asyn_user, model1_device, register_port};
+use motor_common::{
+    Controller, ControllerParams, ControllerReport, asyn_user, model1_device, register_port,
+    register_port_with,
+};
 
 use crate::corvus::{CorvusAxis, CorvusController};
 use crate::drv_micos::{
@@ -39,6 +42,41 @@ const HYDRA_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Taurus command timeout.
 const TAURUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The SMC controllers' `report` override: their one line, then
+/// `asynMotorController::report` (SMChydraDriver.cpp:86-93).
+struct ControllerLine {
+    /// What C's line names the driver.
+    driver: &'static str,
+    /// C's `movingPollPeriod_`/`idlePollPeriod_`, in seconds.
+    moving_poll_s: f64,
+    idle_poll_s: f64,
+}
+
+impl ControllerLine {
+    fn new(driver: &'static str, moving_poll_ms: u64, idle_poll_ms: u64) -> Self {
+        Self {
+            driver,
+            moving_poll_s: moving_poll_ms as f64 / 1000.0,
+            idle_poll_s: idle_poll_ms as f64 / 1000.0,
+        }
+    }
+}
+
+impl ControllerParams for ControllerLine {
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "{} motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            self.driver,
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll_s,
+            self.idle_poll_s
+        );
+        ctx.report(out, level);
+    }
+}
 
 /// An axis whose C `axisRes_` a `*ChangeResolution` command replaces.
 trait ChangeResolution: Send {
@@ -211,7 +249,12 @@ pub fn hydra_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, num_axes as i32)?;
+            register_port_with(
+                ctx,
+                &port_name,
+                num_axes as i32,
+                ControllerLine::new("SMC hydra", moving_poll_ms, idle_poll_ms),
+            )?;
 
             let (handle, _) = connect_controller(
                 &hydra_port,
@@ -226,10 +269,12 @@ pub fn hydra_create_controller_command() -> CommandDef {
             // C startPoller, SMChydraDriver.cpp:60
             let poller = Controller::new();
             for index in 0..num_axes as usize {
-                let ax = Arc::new(Mutex::new(HydraAxis::new(controller.clone(), index)));
+                let axis = HydraAxis::new(controller.clone(), index);
+                let report = axis.members();
+                let ax = Arc::new(Mutex::new(axis));
                 register_resolution_axis(&port_name, ax.clone());
                 let motor: Arc<Mutex<dyn AsynMotor>> = ax;
-                poller.install(asyn_user(&port_name, index as i32), motor)?;
+                poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
@@ -413,5 +458,73 @@ mod one_poller {
         let cmd = taurus_create_controller_command();
         assert_eq!(pollers_after(cmd, args("taurus", "taurusLine", 3)).await, 1);
         assert!(!line.sent().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod report {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use motor_common::testing::{LineRig, port_report, run_command};
+
+    fn args(port: &str, line: &str, num_axes: i64) -> Vec<ArgValue> {
+        vec![
+            ArgValue::String(port.into()),
+            ArgValue::String(line.into()),
+            ArgValue::Int(num_axes),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ]
+    }
+
+    /// Wait for the poller to have sent `cmd`, the poll that reads the
+    /// limit configuration C's report prints.
+    async fn polled(line: &LineRig, cmd: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !line.sent().iter().any(|s| s == cmd) {
+            assert!(Instant::now() < deadline, "no {cmd}");
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// SMChydraController::report then SMChydraAxis::report
+    /// (SMChydraDriver.cpp:86-93, SMChydraAxis.cpp:76-94).
+    #[epics_rs::base::epics_test]
+    async fn smc_hydra_report_prints_the_controller_then_each_axis() {
+        let (line, _io) = LineRig::new("hydraRepLine", |cmd| {
+            let verb = cmd.rsplit(' ').next().unwrap_or_default();
+            match verb {
+                "getmotor" => "0",
+                "getpitch" => "1.0",
+                "getpolepairs" => "50",
+                "getclperiod" => "0.0001",
+                "getnlimit" => "-100 100",
+                "getsw" => "2 0",
+                _ => "0",
+            }
+            .into()
+        });
+        run_command(
+            hydra_create_controller_command(),
+            args("hydraRep", "hydraRepLine", 1),
+        )
+        .await;
+        polled(&line, "1 getsw").await;
+        let text = port_report("hydraRep", 1);
+        let want = "SMC hydra motor driver hydraRep, numAxes=1, moving poll period=0.100000, \
+                    idle poll period=1.000000\n  axis 0\n    motorForm 0\n    pitch 1.000000\n    \
+                    polePairs 50\n    clPeriod 0.000100\n    axisRes 0.005000\n    \
+                    lowLimitConfig 2\n    highLimitConfig 0\n    posTravelLimit 100.000000\n    \
+                    negTravelLimit -100.000000\nPort: hydraRep\n";
+        assert!(text.contains(want), "{text}");
+        let text = port_report("hydraRep", 0);
+        assert!(
+            text.contains(
+                "SMC hydra motor driver hydraRep, numAxes=1, moving poll period=0.100000, \
+                 idle poll period=1.000000\nPort: hydraRep\n"
+            ),
+            "{text}"
+        );
     }
 }
