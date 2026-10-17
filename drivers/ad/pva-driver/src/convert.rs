@@ -334,7 +334,7 @@ pub fn decode_nt_nd_array(pool: &DriverPool, value: &PvField) -> Result<DriverAr
     let time_stamp = (dts_sec as f64 + dts_nsec as f64 * 1e-9) - EPICS_EPOCH_OFFSET as f64;
 
     let mut array = pool
-        .wrap(dims, data)
+        .alloc_with(dims, data)
         .map_err(|_| ConvertError::PoolExhausted)?;
     array.unique_id = unique_id;
     array.timestamp = timestamp;
@@ -454,6 +454,24 @@ mod tests {
             let arr = decode(&nt);
             assert_eq!(arr.data.data_type(), expected);
         }
+    }
+
+    /// pvaDriver.cpp:270-280 allocates with a NULL pData, so a frame over
+    /// the pool's maxMemory is refused.
+    #[test]
+    fn a_frame_over_the_pool_limit_is_refused() {
+        let nt = base_nt(
+            NdArrayBuffer::UByte((0..12).collect()),
+            vec![WireDimension {
+                size: 12,
+                ..Default::default()
+            }],
+        );
+        let value = nt_nd_array_value(&nt);
+        let err = decode_nt_nd_array(&DriverPool::standalone(8), &value)
+            .err()
+            .expect("decode error");
+        assert!(matches!(err, ConvertError::PoolExhausted));
     }
 
     #[test]
