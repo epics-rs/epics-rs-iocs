@@ -77,7 +77,7 @@ use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::ParamWrite;
+use epics_rs::motor::controller_port::{ParamWrite, has_motor_axis};
 use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
@@ -302,6 +302,22 @@ impl PhytronParams {
         );
         Err(phytron_err(format!("{func}: Axis not found")))
     }
+
+    /// C's missing-axis refusal for a reason that is not a P register,
+    /// which never takes the controller lock.
+    fn refuses(base: &PortDriverBase, user: &AsynUser, func: &str) -> Option<ParamWrite> {
+        if has_motor_axis(base, user) {
+            return None;
+        }
+        let port = &*base.port_name;
+        MotorTrace::new(port, 0).print_self(
+            TraceMask::ERROR,
+            format_args!("{func}: Axis not found on the controller {port}\n"),
+        );
+        Some(ParamWrite::PassToBase(Err(phytron_err(format!(
+            "{func}: Axis not found"
+        )))))
+    }
 }
 
 impl ControllerParams for PhytronParams {
@@ -327,7 +343,8 @@ impl ControllerParams for PhytronParams {
         value: i32,
     ) -> ParamWrite {
         let Some(&p) = self.p_regs.get(&user.reason) else {
-            return ParamWrite::PassToBase(Ok(()));
+            return Self::refuses(base, user, "phytronAxis::writeInt32")
+                .unwrap_or(ParamWrite::PassToBase(Ok(())));
         };
         let port = base.port_name.clone();
         let (mut ctrl, m) = match self.axis_controller(&port, "phytronAxis::writeInt32", user.addr)
@@ -343,6 +360,18 @@ impl ControllerParams for PhytronParams {
         let cmd = format!("{m}P{p:02}{}{value}", ctrl.set_char());
         let sent = ctrl.axis_command(&port, "writeInt32", "Writing parameter", user.addr, &cmd);
         ParamWrite::PassToBase(sent.map(|_| ()))
+    }
+
+    /// C `phytronController::writeFloat64` (phytronAxisMotor.cpp:519-541)
+    /// looks the axis up first.
+    fn write_float64(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        _value: f64,
+    ) -> ParamWrite {
+        Self::refuses(base, user, "phytronAxis::writeFloat64")
+            .unwrap_or(ParamWrite::PassToBase(Ok(())))
     }
 
     /// C `phytronController::readInt32` (phytronAxisMotor.cpp:285-357): the

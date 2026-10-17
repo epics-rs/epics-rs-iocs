@@ -159,3 +159,40 @@ async fn a_failed_parameter_read_prints_check_axis_once() {
                 failed with error code: 6\n";
     assert_eq!(text.matches(line).count(), 1, "{text}");
 }
+
+/// C `phytronController::writeInt32`/`writeFloat64` print the missing axis
+/// for any reason (phytronAxisMotor.cpp:386-391, 521-525).
+#[epics_rs::base::epics_test]
+async fn a_write_with_no_axis_prints_axis_not_found() {
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::motor::controller_port::index;
+    let path = std::env::temp_dir().join(format!("phyNoAxis-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    on_mcc("phyNoAxis", move |port| {
+        let file = Arc::new(Mutex::new(file));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_file(Some("phyNoAxis"), TraceFile::File(file.clone()));
+        // pasynUserSelf is address 0, whose device trace has its own file.
+        trace.set_device_trace_file("phyNoAxis", 0, TraceFile::File(file));
+        assert!(
+            port.write_int32_blocking(index::REC_DIRECTION, 2, 1)
+                .is_err()
+        );
+        assert!(
+            port.write_int32_blocking(reason(&port, "RUN_CURRENT"), 2, 100)
+                .is_err()
+        );
+        assert!(
+            port.write_float64_blocking(index::VELOCITY, 2, 1.0)
+                .is_err()
+        );
+    })
+    .await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let int = "phytronAxis::writeInt32: Axis not found on the controller phyNoAxis\n";
+    let float = "phytronAxis::writeFloat64: Axis not found on the controller phyNoAxis\n";
+    assert_eq!(text.matches(int).count(), 2, "{text}");
+    assert_eq!(text.matches(float).count(), 1, "{text}");
+}
