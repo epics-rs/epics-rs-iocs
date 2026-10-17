@@ -17,10 +17,10 @@
 //! commands are acknowledged with a leading `0x06` (stripped here).
 //!
 //! The controller also emits unsolicited `"%000 ..."` *notification* lines when
-//! a move completes. The C driver registers an asyn interrupt handler to count
-//! them and wake the poller; this port skips any notification line that
-//! arrives in the reply stream, and the poller finds the move done at its
-//! next loop.
+//! a move completes. C counts them in an asyn interrupt handler fed by the
+//! reads its poller makes while it waits; here the poller's wait reads the
+//! line itself, and a notification wakes it. One that arrives ahead of a
+//! command's reply is skipped, and wakes the poller too.
 //!
 //! ## Polling
 //!
@@ -38,10 +38,6 @@
 //! OMS ranges: velocity 1..4000000, home velocity 1..1000000, acceleration
 //! 1..8000000, position magnitude <= 67000000). There is no resolution factor
 //! to cancel: the boundary is controller-native steps with `MRES` = 1.
-//!
-//! ## Not modeled (documented)
-//!
-//! - The notification interrupt (`asynCallback`): see above.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -338,6 +334,14 @@ fn is_notification(s: &str) -> bool {
     s.contains("000 0")
 }
 
+/// A reply less C's leading ACK/CR/LF and the terminator.
+fn trim_reply(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .trim_start_matches(['\x06', '\r', '\n'])
+        .trim_end_matches(['\r', '\n', '\0', ' '])
+        .to_string()
+}
+
 /// An OMS MAXnet/MXA controller endpoint owning the asyn octet handle, shared by
 /// its axes behind a mutex so command/reply pairs stay atomic.
 pub struct OmsController {
@@ -490,14 +494,10 @@ impl OmsController {
     /// leaves the bytes it got there, and C callers that ignore the status
     /// read them.
     pub fn send_receive_buffer(&self, cmd: &str) -> (String, AsynResult<()>) {
-        let trim = |raw: &[u8]| {
-            String::from_utf8_lossy(raw)
-                .trim_start_matches(['\x06', '\r', '\n'])
-                .trim_end_matches(['\r', '\n', '\0', ' '])
-                .to_string()
-        };
         let failed = |e: AsynError| {
-            let reply = e.partial_read().map_or_else(String::new, |p| trim(&p.data));
+            let reply = e
+                .partial_read()
+                .map_or_else(String::new, |p| trim_reply(&p.data));
             (reply, Err(e))
         };
         let mut raw = match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
@@ -507,8 +507,8 @@ impl OmsController {
         // A move notification may sit ahead of the real reply; skip it. Bound
         // the retries so a chatty controller cannot spin forever.
         for _ in 0..12 {
-            let trimmed = trim(&raw);
-            if is_notification(&trimmed) {
+            let trimmed = trim_reply(&raw);
+            if self.notification(&trimmed) {
                 raw = match self.handle.read_octet(0, READ_BUF) {
                     Ok(raw) => raw,
                     Err(e) => return failed(e),
@@ -521,6 +521,48 @@ impl OmsController {
             String::new(),
             Err(oms_err("oms: only notification lines received")),
         )
+    }
+
+    /// C `isNotification` (omsMAXnet.cpp:310-327): a notification signals
+    /// the poll event, except `"000 01"`, the controller's command error.
+    fn notification(&self, line: &str) -> bool {
+        if !is_notification(line) {
+            return false;
+        }
+        if line.contains("000 01") {
+            println!(
+                "oms{}Driver:isNotification:{}: CMD_ERR_FLAG received",
+                self.controller_type, self.port_name
+            );
+        } else {
+            self.poll_shared.wakeup();
+        }
+        true
+    }
+
+    /// waitInterruptible's flush of the serial port (omsMAXnet.cpp:184-186).
+    pub(crate) fn flush_line(&self) {
+        if let Ok(port) = self.handle.port() {
+            let _ = port.submit_blocking(RequestOp::Flush, AsynUser::new(0).with_addr(0));
+        }
+    }
+
+    /// waitInterruptible's zero-timeout read (omsMAXnet.cpp:187-195), whose
+    /// `%` `asynCallback` turns into a poll event. C leaves the line for
+    /// sendReceive's drain to run `isNotification` on; read here, it is run
+    /// here.
+    pub(crate) fn poll_line(&self) {
+        let Ok(port) = self.handle.port() else {
+            return;
+        };
+        let user = AsynUser::new(0).with_addr(0).with_timeout(Duration::ZERO);
+        let read = port.submit_blocking(RequestOp::OctetRead { buf_size: READ_BUF }, user);
+        if let Some(data) = read.ok().and_then(|r| r.data)
+            && data.contains(&b'%')
+        {
+            self.poll_shared.wakeup();
+            self.notification(&trim_reply(&data));
+        }
     }
 
     /// C `omsBaseController::getFirmwareVersion`: up to three `WY` tries a

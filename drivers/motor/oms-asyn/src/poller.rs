@@ -243,13 +243,35 @@ impl OmsPoller {
             if self.shared.shutting_down() {
                 break;
             }
-            if self
-                .shared
-                .wait(timeout.saturating_sub(loop_start.elapsed()))
-            {
+            let remaining = timeout.saturating_sub(loop_start.elapsed());
+            if self.wait_interruptible(remaining, timeout == self.idle_poll) {
                 self.fast_polls = FORCED_FAST_POLLS;
             }
         }
+    }
+
+    /// C `waitInterruptible` (omsMAXnet.cpp:168-206, omsMXA.cpp:163-201):
+    /// the wait in slices, each after a read that lets a pending
+    /// notification signal the event. C takes the idle slice on
+    /// `timeout == idlePollPeriod_` with the time left, which no loop that
+    /// took any time meets; here the slice follows the period chosen.
+    fn wait_interruptible(&self, timeout: Duration, idle: bool) -> bool {
+        let slice = if idle {
+            self.idle_poll / 5
+        } else {
+            self.moving_poll / 20
+        };
+        self.lock().flush_line();
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if self.enabled {
+                self.lock().poll_line();
+            }
+            if self.shared.wait(slice) {
+                return true;
+            }
+        }
+        false
     }
 
     /// One loop up to its wait (omsBaseController.cpp:636-815): `None` where
@@ -571,13 +593,18 @@ pub(crate) mod tests {
 
     type Replies = Arc<Mutex<HashMap<String, String>>>;
 
-    /// A controller answering each command from a table; records them all.
+    /// A controller answering each command from a table, then the
+    /// `unsolicited` lines in order; records the commands. A `|` in a reply
+    /// separates the lines the controller sends after it.
     struct Scripted {
         base: PortDriverBase,
         written: Arc<Mutex<Vec<String>>>,
         replies: Replies,
         reply: Vec<u8>,
+        unsolicited: Unsolicited,
     }
+
+    type Unsolicited = Arc<Mutex<std::collections::VecDeque<String>>>;
 
     impl PortDriver for Scripted {
         fn base(&self) -> &PortDriverBase {
@@ -589,14 +616,27 @@ pub(crate) mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data).into_owned();
             let reply = self.replies.lock().unwrap().get(&cmd).cloned();
-            self.reply = reply.unwrap_or_default().into_bytes();
+            let reply = reply.unwrap_or_default();
+            let mut lines = reply.split('|');
+            self.reply = lines.next().unwrap_or_default().as_bytes().to_vec();
+            let mut unsolicited = self.unsolicited.lock().unwrap();
+            unsolicited.extend(lines.map(str::to_owned));
             self.written.lock().unwrap().push(cmd);
             Ok(data.len())
         }
         fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-            let reply = std::mem::take(&mut self.reply);
+            let mut reply = std::mem::take(&mut self.reply);
+            if reply.is_empty() {
+                let next = self.unsolicited.lock().unwrap().pop_front();
+                reply = next.unwrap_or_default().into_bytes();
+            }
             buf[..reply.len()].copy_from_slice(&reply);
             Ok(reply.len())
+        }
+        fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+            self.reply.clear();
+            self.unsolicited.lock().unwrap().clear();
+            Ok(())
         }
     }
 
@@ -606,6 +646,7 @@ pub(crate) mod tests {
         port: PortHandle,
         pub(crate) written: Arc<Mutex<Vec<String>>>,
         replies: Replies,
+        unsolicited: Unsolicited,
     }
 
     /// A MAXnet on port `name` with an `=E`/`=h` X axis and an `=O`/`=l` Y
@@ -623,11 +664,13 @@ pub(crate) mod tests {
         .map(|(c, r)| (c.to_string(), r.to_string()))
         .collect();
         let replies = Arc::new(Mutex::new(table));
+        let unsolicited = Unsolicited::default();
         let driver = Scripted {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             written: written.clone(),
             replies: replies.clone(),
             reply: Vec::new(),
+            unsolicited: unsolicited.clone(),
         };
         let (rt, _actor) =
             create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
@@ -647,6 +690,7 @@ pub(crate) mod tests {
             port,
             written,
             replies,
+            unsolicited,
         }
     }
 
@@ -727,6 +771,58 @@ pub(crate) mod tests {
         }
         assert!(poller.shared.wait(Duration::ZERO));
         assert!(!poller.shared.wait(Duration::ZERO));
+    }
+
+    /// A notification reaching the line while the poller waits ends the
+    /// wait, as C's zero-length reads feeding `asynCallback` do
+    /// (omsMAXnet.cpp:55-73, 187-200).
+    #[test]
+    fn a_notification_ends_the_poller_wait() {
+        let rig = rig("omsWaitNotified", 1, &HEALTHY);
+        let poller = poller(&rig);
+        let line = rig.unsolicited.clone();
+        let notify = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            line.lock().unwrap().push_back("%000 00000001".into());
+        });
+        let start = Instant::now();
+        assert!(poller.wait_interruptible(Duration::from_secs(2), false));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        notify.join().unwrap();
+    }
+
+    /// The wait starts with a flush, so a line already waiting is dropped
+    /// unseen (omsMAXnet.cpp:184-186).
+    #[test]
+    fn a_line_waiting_before_the_wait_is_flushed() {
+        let rig = rig("omsWaitFlushed", 1, &HEALTHY);
+        rig.unsolicited
+            .lock()
+            .unwrap()
+            .push_back("%000 00000001".into());
+        assert!(!poller(&rig).wait_interruptible(Duration::from_millis(100), false));
+    }
+
+    /// A notification ahead of a command's reply is skipped and signals the
+    /// poll event, C sendReceive's `isNotification` loop
+    /// (omsMAXnet.cpp:279-295, 310-327).
+    #[test]
+    fn a_notification_ahead_of_a_reply_is_skipped_and_wakes_the_poller() {
+        let rig = rig("omsReplyNotified", 1, &[("AM;QL;", "%000 00000001|5")]);
+        let ctrl = rig.controller.lock().unwrap();
+        assert!(!ctrl.poll_shared().wait(Duration::ZERO));
+        assert_eq!(ctrl.send_receive("AM;QL;").unwrap(), "5");
+        assert!(ctrl.poll_shared().wait(Duration::ZERO));
+    }
+
+    /// `"000 01"` is the controller's command error, which C prints and
+    /// skips without signalling (omsMAXnet.cpp:316-318).
+    #[test]
+    fn a_command_error_notification_is_skipped_without_a_wake() {
+        let rig = rig("omsReplyCmdErr", 1, &[("AM;QL;", "%000 01000000|5")]);
+        let ctrl = rig.controller.lock().unwrap();
+        assert_eq!(ctrl.send_receive("AM;QL;").unwrap(), "5");
+        assert!(!ctrl.poll_shared().wait(Duration::ZERO));
     }
 
     /// Init's `AM PP;` positions stand until the poller's first good loop.
