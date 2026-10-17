@@ -91,24 +91,19 @@
 //!
 //! ## Not modeled (documented deviations from the full C module)
 //!
-//! - **Hexapod**: `PICoordinateSystem` (the C-887's coordinate systems,
-//!   tool/work offsets) runs on [`Model::Motor`]. The
-//!   `PIasynController` parameters that set and read back the pivot point,
-//!   the target mode and the coordinate systems are not modeled either, so
-//!   a hexapod moves only with `MOV` and its pivot only
-//!   reads at init.
+//! - **Hexapod**: the `PIasynController` parameters that set and read back
+//!   the pivot point, the target mode and the coordinate systems are not
+//!   modeled, so a hexapod moves only with `MOV` and its pivot only reads
+//!   at init.
 //! - **Piezo**: `PIGCSPiezoController`, `PIGCS2PiezoCL` — closed-loop piezo
 //!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
 //!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
 //! - **Per-model controllers**: `PIE517Controller` and `PIE727Controller`
 //!   (piezo-based, each with its own init and status quirks); those
 //!   controllers run on [`Model::Motor`].
-//! - **`SVO?` (`getServo`)**: implemented here as a protocol primitive (the
-//!   task spec calls it out explicitly), but — matching upstream — the
-//!   generic motor axis's `poll` never calls it; servo state comes from the
-//!   `char(4)` status bitmask instead. Upstream's own `getServo` is only
-//!   called from `PICoordinateSystem`/`PIGCSPiezoController` (both out of
-//!   scope).
+//! - **`SVO?` (`getServo`)**: as upstream, only the C-887's status asks it;
+//!   the generic motor axis's servo state comes from the `char(4)` status
+//!   bitmask. `PIGCSPiezoController`'s use of it is not ported.
 //! - **`getAxisOnt`/`getAxisOvf`**: base-class no-ops (on-target/overflow
 //!   status meaningful only for the piezo closed-loop path); not ported.
 //! - **`getMoving`/`getBusy`** (`char(5)`/`char(7)`): the base class's
@@ -294,6 +289,8 @@ pub enum Model {
     Hexapod,
     /// `PIGCS2_HexapodController`.
     Gcs2Hexapod,
+    /// `PICoordinateSystem` (C-887).
+    CoordinateSystem,
 }
 
 impl Model {
@@ -310,7 +307,12 @@ impl Model {
 
     /// `PIHexapodController` or the GCS 2 class built on it.
     fn is_hexapod(self) -> bool {
-        matches!(self, Self::Hexapod | Self::Gcs2Hexapod)
+        self == Self::Hexapod || self.is_gcs2_hexapod()
+    }
+
+    /// `PIGCS2_HexapodController` or `PICoordinateSystem`, built on it.
+    fn is_gcs2_hexapod(self) -> bool {
+        matches!(self, Self::Gcs2Hexapod | Self::CoordinateSystem)
     }
 
     /// C `CanCommunicateWhileHoming`: false on a GCS 1 hexapod, whose
@@ -355,7 +357,7 @@ impl Model {
         } else if any(&["HEXAPOD", "F-HEX", "F-206", "M-8"]) {
             Some(Self::Hexapod)
         } else if idn.contains("C-887") {
-            Some(Self::Motor)
+            Some(Self::CoordinateSystem)
         } else {
             None
         }
@@ -450,6 +452,12 @@ impl PIGCS2Controller {
     pub fn poll(&mut self) {
         if self.model.is_hexapod() {
             let _ = self.get_global_state();
+        }
+        if self.model == Model::CoordinateSystem {
+            // PICoordinateSystem::getActivate/getLink, whose replies feed
+            // the PI_CS_ACTIVATE/PI_CS_LINK parameters, not modeled.
+            let _ = self.query("KEN?");
+            let _ = self.query("KLN?");
         }
     }
 
@@ -717,7 +725,7 @@ impl PIGCS2Controller {
     /// `VEL {axis} {|velocity|}`, gated on [`Self::knows_vel`]; no error
     /// check (C `setVelocityCts` is fire-and-forget).
     fn set_velocity(&self, axis: &str, velocity: f64) -> AsynResult<()> {
-        if self.model == Model::Gcs2Hexapod {
+        if self.model.is_gcs2_hexapod() {
             // PIGCS2_HexapodController::setVelocityCts: the platform's.
             return self.send_only(&format!("VLS {}", CFloat(velocity.abs())));
         }
@@ -853,7 +861,7 @@ impl PIGCS2Controller {
 
     /// C `getAxisVelocity`: `VEL? {axis}` on a controller that knows it.
     fn get_axis_velocity(&self, axis: &str) -> AsynResult<f64> {
-        if self.model == Model::Gcs2Hexapod {
+        if self.model.is_gcs2_hexapod() {
             // PIGCS2_HexapodController::getAxisVelocity: the platform's.
             return get_value_f64(&self.query("VLS?")?);
         }
@@ -887,6 +895,12 @@ impl PIGCS2Controller {
     /// Each limit is stored as soon as it is read, so a failed `TMX?` keeps
     /// the `TMN?` value, as C's reference out-parameters do.
     fn get_travel_limits(&self, axis: &str, neg: &mut f64, pos: &mut f64) -> AsynResult<()> {
+        if self.model == Model::CoordinateSystem {
+            // PICoordinateSystem::getTravelLimits.
+            *neg = get_value_f64(&self.query(&format!("TRA? {axis} -1"))?)?;
+            *pos = get_value_f64(&self.query(&format!("TRA? {axis} 1"))?)?;
+            return Ok(());
+        }
         if self.model.is_hexapod() {
             // PIHexapodController::getTravelLimits.
             (*neg, *pos) = (-100.0, 100.0);
@@ -944,9 +958,7 @@ impl PIGCS2Controller {
         get_value_bool(&self.query(&format!("FRF? {axis}"))?)
     }
 
-    /// `SVO? {axis}` (see "Not modeled": unused by the generic axis's poll,
-    /// kept as a protocol primitive matching the task spec).
-    #[allow(dead_code)]
+    /// `SVO? {axis}`.
     fn get_servo(&self, axis: &str) -> AsynResult<bool> {
         get_value_bool(&self.query(&format!("SVO? {axis}"))?)
     }
@@ -1042,11 +1054,10 @@ impl PIGCS2Controller {
         Ok(busy_from_reply(&self.send_and_receive_char(7)?))
     }
 
-    /// C `getMoving`: `#5`'s hex word masked by the axis bit, C's
-    /// `m_movingStateMask` as `PIGCSController::initAxis` sets it.
-    fn get_moving(&self, axis_no: usize) -> AsynResult<bool> {
-        let state = strtol(&self.query_char(5)?, 16);
-        Ok(state & (1 << axis_no) != 0)
+    /// C `getMoving`: `#5`'s hex word masked by the axis's
+    /// `m_movingStateMask`.
+    fn get_moving(&self, mask: i64) -> AsynResult<bool> {
+        Ok(strtol(&self.query_char(5)?, 16) & mask != 0)
     }
 
     /// `CST? {axis}` (C `initAxis`'s stage-configuration probe, logged only —
@@ -1270,6 +1281,13 @@ impl PIGCS2Axis {
     /// posLimit, servoControl)`.
     fn status(&self) -> AsynResult<(bool, bool, bool, bool, bool)> {
         let ctrl = self.lock();
+        if ctrl.model == Model::CoordinateSystem {
+            // PICoordinateSystem::getStatus: #5 against the mask of 1
+            // PIHexapodController::initAxis gives every axis, and SVO?.
+            let moving = ctrl.get_moving(1)?;
+            let servo = ctrl.get_servo(&self.axis_name)?;
+            return Ok((false, moving, false, false, servo));
+        }
         if ctrl.model.is_hexapod() {
             // PIHexapodController::getStatus: the platform state, no limits.
             // C defect not copied: it never sets servoControl; rs keeps the
@@ -1292,7 +1310,8 @@ impl PIGCS2Axis {
             return Ok((true, true, self.neg_limit, self.pos_limit, self.servo_on));
         }
         let busy = ctrl.get_busy()?;
-        let moving = busy || ctrl.get_moving(self.axis_no)?;
+        // PIGCSController::initAxis's mask, the axis bit.
+        let moving = busy || ctrl.get_moving(1 << self.axis_no)?;
         Ok((busy, moving, false, false, self.servo_on))
     }
 
@@ -1364,7 +1383,7 @@ impl PIGCS2Axis {
         if model == Model::Hexapod {
             return self.lock().init_platform();
         }
-        if model == Model::Gcs2Hexapod {
+        if model.is_gcs2_hexapod() {
             // PIGCS2_HexapodController::referenceVelCts ignores the velocity.
             self.set_servo(true)?;
             let ctrl = self.lock();
@@ -1594,7 +1613,7 @@ impl AsynMotor for PIGCS2Axis {
         ctrl.deferred.remove(&self.axis_no);
         match ctrl.model {
             Model::C885 => ctrl.stop_all(),
-            Model::Hexapod | Model::Gcs2Hexapod => ctrl.halt_platform(),
+            model if model.is_hexapod() => ctrl.halt_platform(),
             _ => ctrl.halt(&self.axis_name),
         }
     }
@@ -2813,6 +2832,73 @@ mod tests {
         assert!(!ctrl.lock().unwrap().hexapod.homing);
     }
 
+    fn c887_reply(last: &str) -> String {
+        match last {
+            "\u{5}" => "1",
+            "SVO? Y" => "Y=0",
+            "TRA? Y -1" => "Y=-12.5",
+            "TRA? Y 1" => "Y=12.5",
+            last => return hexapod_reply(last),
+        }
+        .into()
+    }
+
+    /// `PICoordinateSystem` (PICoordinateSystem.cpp) is the GCS 2 hexapod
+    /// with `TRA?` limits (:150-185); its controller poll asks `KEN?` and
+    /// `KLN?` after `#5` (PIasynController.cpp:590-596).
+    #[test]
+    fn a_c887_reads_tra_limits_and_polls_ken_and_kln() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2C887", c887_reply);
+        let ctrl = PIGCS2Controller::new(io, "gcs2C887");
+        let Some(model) = ctrl.create_model("PI C-887.52") else {
+            panic!("no model")
+        };
+        let mut ctrl = ctrl;
+        ctrl.set_model(model);
+        ctrl.init();
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let axis = PIGCS2Axis::new(ctrl.clone(), "Y".into(), 1, "gcs2C887");
+        assert_eq!(
+            sent_lines(&line),
+            [
+                "VEL?",
+                "\u{4}",
+                "\u{3}",
+                "SPI? R S T",
+                "ERR?",
+                "SVO Y 1",
+                "ERR?",
+                "VLS?",
+                "POS? Y",
+                "TRA? Y -1",
+                "TRA? Y 1",
+                "\u{4}"
+            ]
+        );
+        assert_eq!((axis.low_limit, axis.high_limit), (-12.5, 12.5));
+        ctrl.lock().unwrap().poll();
+        assert_eq!(sent_lines(&line), ["\u{5}", "KEN?", "KLN?"]);
+    }
+
+    /// `PICoordinateSystem::getStatus` (:5-29): `#5` against the mask
+    /// `PIHexapodController::initAxis` gives every axis (1), `SVO?`, and
+    /// no homing or limits.
+    #[test]
+    fn a_c887_axis_polls_moving_bit_0_and_its_servo() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2C887Poll", c887_reply);
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2C887Poll");
+        ctrl.set_model(Model::CoordinateSystem);
+        ctrl.init();
+        let mut axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "Y".into(), 1, "gcs2C887Poll");
+        line.sent();
+        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        assert_eq!(
+            sent_lines(&line),
+            ["\u{5}", "SVO? Y", "POS? Y", "TRA? Y -1", "TRA? Y 1"]
+        );
+        assert!(status.moving && !axis.is_homing && status.problem && !status.powered);
+    }
+
     /// `PIInterface::sendAndReceive` (PIInterface.cpp:133-141) reads, with
     /// no further write, each line that follows one ending in a space, and
     /// joins them with `\n`.
@@ -2857,8 +2943,8 @@ mod tests {
     fn a_moving_word_may_carry_0x() {
         let (_line, io) = motor_common::testing::LineRig::new("gcs2Moving0x", |_| "0x2".into());
         let ctrl = PIGCS2Controller::new(io, "gcs2Moving0x");
-        assert!(ctrl.get_moving(1).unwrap());
-        assert!(!ctrl.get_moving(0).unwrap());
+        assert!(ctrl.get_moving(2).unwrap());
+        assert!(!ctrl.get_moving(1).unwrap());
     }
 
     #[test]
@@ -2896,7 +2982,10 @@ mod tests {
         assert_eq!(Model::from_idn("PI C-702.00"), Some(Model::C702));
         assert_eq!(Model::from_idn("PI M-824"), Some(Model::Hexapod));
         assert_eq!(Model::from_idn("PI F-HEXAPOD"), Some(Model::Hexapod));
-        assert_eq!(Model::from_idn("PI C-887.52"), Some(Model::Motor));
+        assert_eq!(
+            Model::from_idn("PI C-887.52"),
+            Some(Model::CoordinateSystem)
+        );
         assert_eq!(Model::from_idn("PI C-885.M1"), Some(Model::C885));
         assert_eq!(Model::from_idn("PI E-665"), None);
         assert_eq!(Model::from_idn(""), None);
