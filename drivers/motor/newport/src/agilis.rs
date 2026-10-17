@@ -27,9 +27,9 @@
 //!
 //! ## Parity notes
 //!
-//! Two C bugs are ported faithfully and flagged at their sites:
+//! C bugs, flagged at their sites:
 //! - `AG_UC.cpp:242`: the reverse-amplitude default clobbers the *forward*
-//!   amplitude (see `setup_amplitudes`).
+//!   amplitude; not copied (see `setup_amplitudes`).
 //! - `AG_UC.cpp:383`: axis-2 limit test is `(lim == 3 || lim == 3)` — a
 //!   duplicated condition (see `ph_limit`).
 
@@ -129,21 +129,19 @@ fn channel_id(model: Option<AgUcModel>, axis_no: i32) -> i32 {
 
 /// C `AG_UCAxis` constructor step-amplitude setup, returning the (forward,
 /// reverse) amplitudes to send in the two `SU` commands.
-///
-/// Faithfully reproduces the C bug at `AG_UC.cpp:242`: the code intends to
-/// default the reverse amplitude to `-50` when it is non-negative, but assigns
-/// the *forward* amplitude instead. So a non-negative reverse amplitude forces
-/// the forward `SU` to `-50` and leaves the reverse amplitude unchanged.
 fn setup_amplitudes(forward_amplitude: i32, reverse_amplitude: i32) -> (i32, i32) {
-    let mut forward = if forward_amplitude <= 0 {
+    let forward = if forward_amplitude <= 0 {
         DEFAULT_FORWARD_AMPLITUDE
     } else {
         forward_amplitude
     };
-    if reverse_amplitude >= 0 {
-        forward = -50; // C bug: intended `reverse = -50`.
-    }
-    (forward, reverse_amplitude)
+    // AG_UC.cpp:242 assigns this default to forwardAmplitude_, a C defect.
+    let reverse = if reverse_amplitude >= 0 {
+        -50
+    } else {
+        reverse_amplitude
+    };
+    (forward, reverse)
 }
 
 /// C `AG_UCAxis::poll` limit test on the `PH` reply value.
@@ -504,13 +502,11 @@ mod tests {
     }
 
     #[test]
-    fn setup_amplitudes_replicates_forward_clobber_bug() {
-        // Non-positive forward → default 50; negative reverse leaves it as 50.
+    fn a_non_negative_reverse_amplitude_defaults_the_reverse_one() {
         assert_eq!(setup_amplitudes(0, -50), (50, -50));
-        assert_eq!(setup_amplitudes(30, -50), (30, -50));
-        // C bug: a non-negative reverse forces forward to -50 (reverse kept).
-        assert_eq!(setup_amplitudes(30, 0), (-50, 0));
-        assert_eq!(setup_amplitudes(30, 20), (-50, 20));
+        assert_eq!(setup_amplitudes(30, -20), (30, -20));
+        assert_eq!(setup_amplitudes(30, 0), (30, -50));
+        assert_eq!(setup_amplitudes(30, 20), (30, -50));
     }
 
     #[test]
