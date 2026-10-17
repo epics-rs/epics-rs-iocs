@@ -371,12 +371,6 @@ async fn connection_poll(
 /// dashboard read publishes no HttpCode, a 0 -> 1 edge reconciles the
 /// read-only state, and a partial reconciliation keeps the edge open for the
 /// next poll. Returns the new "was up".
-///
-/// UPSTREAM DEFECT (ADTimePix.cpp:1579): C never initialises
-/// `lastServalConnected_`/`lastDetConnected_`, so whether the first
-/// successful poll runs the reconnect refresh depends on uninitialised
-/// memory. Here the edge starts from "down", so the first success always
-/// refreshes.
 async fn poll_connection(ctx: &Arc<Ctx>, was_up: bool) -> bool {
     let reply = read_dashboard(ctx);
     let mut updates = Vec::new();
