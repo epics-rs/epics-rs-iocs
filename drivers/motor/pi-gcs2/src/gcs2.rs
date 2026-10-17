@@ -126,7 +126,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
-use motor_common::util::{atof, atoi};
+use motor_common::util::{atof, atoi, nint};
 use motor_common::{ControllerParams, ControllerReport};
 
 /// Response buffer size for a single reply line.
@@ -233,6 +233,15 @@ fn counts_per_unit(numerator: i32, denominator: i32) -> f64 {
     } else {
         f64::from(numerator) / f64::from(denominator)
     }
+}
+
+/// A move target in whole counts. C defect not copied: C's `int` count
+/// (PIGCSController.h:53 `moveCts(PIasynAxis*, int)`, called with the
+/// record's double at PIasynAxis.cpp:263 and PIasynController.cpp:378, and
+/// `targetsCts[n] = deferred_position` at PIasynController.cpp:250)
+/// truncates toward zero; rs rounds with `NINT`, as the record's `RVAL`.
+fn target_counts(position: f64) -> f64 {
+    f64::from(nint(position))
 }
 
 /// C `TranslatePIError(epicsInt32)`.
@@ -1525,6 +1534,7 @@ impl AsynMotor for PIGCS2Axis {
         if !self.lock().accepts_new_target() {
             return Err(self.refuse_target("moveAxis", "\n"));
         }
+        let position = target_counts(position);
         let mut ctrl = self.lock();
         if ctrl.moves_deferred {
             ctrl.deferred.insert(
@@ -2343,6 +2353,50 @@ mod tests {
                 "PIasynDriver:writeInt32: Clearing Deferred Move flag on driver gcs2DeferLog\n",
             ]
         );
+    }
+
+    /// C sends whole-count targets (`PIGCSController::moveCts(, int)`); rs
+    /// rounds them as the record's `RVAL = NINT(dval/mres)` does, on single
+    /// and deferred moves.
+    #[test]
+    fn move_targets_go_out_as_the_nearest_whole_count() {
+        let (line, mut first, mut second) = two_axes("gcs2Nint");
+        let user = AsynUser::new(0);
+        // MRES 0.1, DVAL 0.3 and -0.3: C truncates to 2 and -2.
+        first
+            .move_absolute(&user, 0.3 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        first
+            .move_absolute(&user, -0.3 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        // DVAL 0.25 and -0.25: half a count.
+        first
+            .move_absolute(&user, 0.25 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        first
+            .move_absolute(&user, -0.25 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        assert_eq!(
+            sent_lines(&line)
+                .into_iter()
+                .filter(|l| l.starts_with("MOV"))
+                .collect::<Vec<_>>(),
+            [
+                "MOV 1 3.000000",
+                "MOV 1 -3.000000",
+                "MOV 1 3.000000",
+                "MOV 1 -3.000000"
+            ]
+        );
+        first.set_deferred_moves(&user, true).unwrap();
+        first
+            .move_absolute(&user, 0.25 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        second
+            .move_absolute(&user, -0.25 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        first.set_deferred_moves(&user, false).unwrap();
+        assert_eq!(sent_lines(&line)[0], "MOV 1 3.000000 2 -3.000000");
     }
 
     /// `PIasynAxis::stop` (:310-316) drops the axis's deferred move.
