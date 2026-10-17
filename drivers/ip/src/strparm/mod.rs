@@ -595,6 +595,21 @@ impl DeviceSupport for DevStrParm {
         Ok(ReadStart::Pending)
     }
 
+    /// C `strParmConvert`, the slot of both devAiStrParm and devAoStrParm.
+    fn has_special_linconv(&self) -> bool {
+        matches!(self.kind, Kind::Ai | Kind::Ao)
+    }
+
+    /// `strParmConvert` writes through an `aiRecord *` cast, which on an ao
+    /// lands on LOPR and the low half of ASLO; that is not copied, so an ao
+    /// keeps only the record's EOFF rebase.
+    fn special_linconv(&mut self, record: &mut dyn Record, _after: bool) -> CaResult<()> {
+        if self.kind == Kind::Ai {
+            crate::unit_slope(record)?;
+        }
+        Ok(())
+    }
+
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         self.complete_input(record)
     }
