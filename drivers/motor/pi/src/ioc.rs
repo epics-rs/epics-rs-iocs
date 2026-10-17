@@ -716,9 +716,7 @@ pub fn pie816_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
 
                 for axis in 0..num_axes {
-                    let Ok(axis_obj) = PIE816Axis::new(controller.clone(), axis) else {
-                        return;
-                    };
+                    let axis_obj = PIE816Axis::new(controller.clone(), axis);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                     init.axis(axis as i32, motor);
                 }
