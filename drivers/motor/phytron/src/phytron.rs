@@ -77,7 +77,7 @@ use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ParamWrite, has_motor_axis};
+use epics_rs::motor::controller_port::{ParamWrite, has_motor_axis, index};
 use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
@@ -261,9 +261,18 @@ pub struct PhytronParams {
     idle_poll: f64,
     /// Set once the controller connects; C's axis lookup fails before.
     controller: Arc<OnceLock<Arc<Mutex<PhytronController>>>>,
+    reasons: Reasons,
     /// Reason -> P register.
     p_regs: HashMap<usize, u32>,
     temps: HashMap<usize, u32>,
+}
+
+/// The reasons C answers outside the P registers.
+#[derive(Default)]
+struct Reasons {
+    controller_status: usize,
+    controller_status_reset: usize,
+    controller_reset: usize,
 }
 
 impl PhytronParams {
@@ -272,6 +281,7 @@ impl PhytronParams {
             moving_poll,
             idle_poll,
             controller: Arc::new(OnceLock::new()),
+            reasons: Reasons::default(),
             p_regs: HashMap::new(),
             temps: HashMap::new(),
         }
@@ -303,6 +313,34 @@ impl PhytronParams {
         Err(phytron_err(format!("{func}: Axis not found")))
     }
 
+    /// The connected controller; C has none to command before it connects.
+    fn controller(&self) -> AsynResult<MutexGuard<'_, PhytronController>> {
+        let ctrl = self
+            .controller
+            .get()
+            .ok_or_else(|| phytron_err("phytron: controller not connected"))?;
+        Ok(ctrl.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// CONTROLLER_RESET (`CR`, then every axis's encoder ratio back to 1,
+    /// C `resetAxisEncoderRatio`) or CONTROLLER_STATUS_RESET (`STC`).
+    fn controller_write(&self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<()> {
+        let port = base.port_name.clone();
+        let mut ctrl = self.controller()?;
+        if user.reason == self.reasons.controller_status_reset {
+            let sent =
+                ctrl.ctrl_command(&port, "writeInt32", "Reseting status", user.reason, "STC");
+            return sent.map(|_| ());
+        }
+        let sent = ctrl.reset(&port, user.reason);
+        for &axis_no in ctrl.axes.keys() {
+            let _ = base.set_float64_param(index::ENCODER_RATIO, axis_no, 1.0);
+        }
+        // C's callParamCallbacks() is address 0's.
+        let _ = base.call_param_callbacks(0);
+        sent
+    }
+
     /// C's missing-axis refusal for a reason that is not a P register,
     /// which never takes the controller lock.
     fn refuses(base: &PortDriverBase, user: &AsynUser, func: &str) -> Option<ParamWrite> {
@@ -322,6 +360,11 @@ impl PhytronParams {
 
 impl ControllerParams for PhytronParams {
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        let r = &mut self.reasons;
+        r.controller_status = base.create_param("CONTROLLER_STATUS", ParamType::Int32)?;
+        r.controller_status_reset =
+            base.create_param("CONTROLLER_STATUS_RESET", ParamType::Int32)?;
+        r.controller_reset = base.create_param("CONTROLLER_RESET", ParamType::Int32)?;
         for (name, p) in AXIS_P_PARAMS {
             self.p_regs
                 .insert(base.create_param(name, ParamType::Int32)?, p);
@@ -342,6 +385,17 @@ impl ControllerParams for PhytronParams {
         user: &AsynUser,
         value: i32,
     ) -> ParamWrite {
+        let r = &self.reasons;
+        if user.reason == r.controller_reset || user.reason == r.controller_status_reset {
+            let status = self.controller_write(base, user);
+            // C's base stores nothing without an axis, and C returns the
+            // command's status rather than its error (:375-386).
+            return if has_motor_axis(base, user) {
+                ParamWrite::PassToBase(status)
+            } else {
+                ParamWrite::Handled(status)
+            };
+        }
         let Some(&p) = self.p_regs.get(&user.reason) else {
             return Self::refuses(base, user, "phytronAxis::writeInt32")
                 .unwrap_or(ParamWrite::PassToBase(Ok(())));
@@ -379,6 +433,21 @@ impl ControllerParams for PhytronParams {
     fn read_int32(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<i32> {
         let value = base.read_int32_param(user).unwrap_or(0);
         let port = base.port_name.clone();
+        let r = &self.reasons;
+        if user.reason == r.controller_reset || user.reason == r.controller_status_reset {
+            return Ok(value);
+        }
+        if user.reason == r.controller_status {
+            let mut ctrl = self.controller()?;
+            let reply = ctrl.ctrl_command(
+                &port,
+                "readInt32",
+                "Reading controller status",
+                user.reason,
+                "ST",
+            )?;
+            return Ok(atoi(&reply));
+        }
         let (mut ctrl, m) =
             self.axis_controller(&port, "phytronController::readInt32", user.addr)?;
         let Some(&p) = self.p_regs.get(&user.reason) else {
@@ -551,6 +620,38 @@ impl PhytronController {
                 0,
                 format_args!(
                     "phytronAxis::{func}: ({port}) {txt} for axis {axis_no} failed with error code: {code}\n"
+                ),
+            );
+        }
+        self.last_status = code;
+        result.map_err(phy_to_asyn)
+    }
+
+    /// CONTROLLER_RESET's `CR`, after which every axis's encoder ratio is 1
+    /// whether or not it was taken (phytronAxisMotor.cpp:377-381).
+    fn reset(&mut self, port: &str, reason: usize) -> AsynResult<()> {
+        let sent = self.ctrl_command(port, "writeInt32", "Reseting controller", reason, "CR");
+        self.encoder_ratios.clear();
+        sent.map(|_| ())
+    }
+
+    /// `cmd` under C `CHECK_CTRL`, which prints a failure on pasynUserSelf
+    /// only when it differs from the last status.
+    fn ctrl_command(
+        &mut self,
+        port: &str,
+        func: &str,
+        txt: &str,
+        reason: usize,
+        cmd: &str,
+    ) -> AsynResult<String> {
+        let result = self.phy_command(cmd);
+        let code = result.as_ref().err().copied().unwrap_or(0);
+        if code != 0 && code != self.last_status {
+            MotorTrace::new(port, 0).print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "phytronController::{func}: ({port}) {txt} failed with error code: {code}, reason: {reason}\n"
                 ),
             );
         }
@@ -1103,11 +1204,17 @@ mod tests {
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let controller = Arc::new(Mutex::new(PhytronController::new(io, CtrlType::Mcc, 0)));
         controller.lock().unwrap().poll("phytronEncoderPoll");
-        let mut axis = PhytronAxis::new(controller, 0, 1).unwrap();
+        let mut axis = PhytronAxis::new(controller.clone(), 0, 1).unwrap();
         let user = AsynUser::new(0);
         assert_eq!(axis.poll(&user).unwrap().encoder_position, 1000.0);
         axis.set_encoder_ratio(&user, 0.5).unwrap();
         assert_eq!(axis.poll(&user).unwrap().encoder_position, 500.0);
+        controller
+            .lock()
+            .unwrap()
+            .reset("phytronEncoderPoll", 0)
+            .unwrap();
+        assert_eq!(axis.poll(&user).unwrap().encoder_position, 1000.0);
     }
 
     #[test]
