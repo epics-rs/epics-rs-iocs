@@ -270,11 +270,13 @@ impl SmartMotorAxis {
     }
 
     /// Program speed/acceleration before a move (C sends `V=`/`A=` as separate
-    /// transactions ahead of the move command); acceleration is clamped to the
-    /// controller minimum.
+    /// transactions ahead of the move command). The record skips SET_ACCEL
+    /// for a zero acceleration (motorRecord.cc:940); one sent is clamped.
     fn program_speeds(ctrl: &SmartMotorController, axis: usize, velocity: f64, acceleration: f64) {
         ctrl.send(axis, &format!("V={}", nint(velocity * VCONFAC)));
-        ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)));
+        if acceleration > 0.0 {
+            ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)));
+        }
     }
 }
 
@@ -320,11 +322,13 @@ impl AsynMotor for SmartMotorAxis {
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
-        // C JOG: "MV\rV=<v>\rG" — velocity mode, set signed velocity, go.
+        // The record's unguarded SET_ACCEL (motorRecord.cc:2141), then C JOG:
+        // "MV\rV=<v>\rG" — velocity mode, set signed velocity, go.
         self.motion_dir = Some(velocity >= 0.0);
         let ctrl = self.lock();
+        ctrl.send(self.axis, &format!("A={}", clamped_accel(acceleration)));
         ctrl.send(self.axis, &format!("MV\rV={}\rG", nint(velocity * VCONFAC)));
         Ok(())
     }
@@ -664,7 +668,8 @@ mod tests {
         axis.move_absolute(&user, 100.0, 0.0, 1000.0, 10_000.0)
             .unwrap();
         axis.move_velocity(&user, 0.0, -1000.0, 0.0).unwrap();
-        // devSmartMotor.cc:249-265: a zero move still sends both.
+        // devSmartMotor.cc:249-251: a zero velocity still goes out; the
+        // record sends no zero acceleration.
         axis.move_relative(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
         let sent: Vec<_> = sent.lock().unwrap().drain(..).collect();
         assert_eq!(
@@ -674,9 +679,9 @@ mod tests {
                 b"\x81A=40",
                 b"\x81P=100",
                 b"\x81G",
+                b"\x81A=2",
                 b"\x81MV\rV=-16106\rG",
                 b"\x81V=0",
-                b"\x81A=2",
                 b"\x81D=5",
                 b"\x81G",
             ]
