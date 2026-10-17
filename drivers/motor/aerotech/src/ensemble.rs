@@ -475,18 +475,21 @@ impl AsynMotor for EnsembleAxis {
                     TraceMask::ERROR,
                     format_args!("motorAxisSetInteger: FAULTACK = {fault:X}\n"),
                 );
-                ctrl.command(&format!("FAULTACK @{axis}"))?;
+                let _ = ctrl.command(&format!("FAULTACK @{axis}"));
             }
-            ctrl.command(&format!("ENABLE @{axis}"))?;
+            let _ = ctrl.command(&format!("ENABLE @{axis}"));
         } else {
-            ctrl.command(&format!("DISABLE @{axis}"))?;
             // C clears it so the user can jog off the limit (:434-435).
             if self.last_fault & TRAVEL_LIMIT_FAULT_MASK != 0 {
                 self.problem = false;
                 self.status_writes.push(StatusWrite::Problem(false));
             }
+            let _ = ctrl.command(&format!("DISABLE @{axis}"));
         }
+        // C's status is WAIT MODE NOWAIT's; PowerOn follows the request even
+        // when ENABLE fails, to force a status update (:461-476).
         ctrl.wait_mode_nowait()?;
+        self.status_writes.push(StatusWrite::PowerOn(closed_loop));
         Ok(())
     }
 
@@ -719,12 +722,15 @@ mod tests {
         assert!(poll(&mut axis, "%4"));
         assert!(poll(&mut axis, "%4"));
         axis.set_closed_loop(&user, false).unwrap();
-        assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(false)]);
+        assert_eq!(
+            axis.take_status_writes(),
+            [StatusWrite::Problem(false), StatusWrite::PowerOn(false)]
+        );
         assert!(!poll(&mut axis, "%4"));
         assert!(!poll(&mut axis, "%0"));
         assert!(poll(&mut axis, "%1"));
         axis.set_closed_loop(&user, false).unwrap();
-        assert!(axis.take_status_writes().is_empty());
+        assert_eq!(axis.take_status_writes(), [StatusWrite::PowerOn(false)]);
         assert!(poll(&mut axis, "%1"));
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -774,6 +780,38 @@ mod tests {
             .collect();
         assert_eq!(lines, ["motorAxisSetInteger: FAULTACK = 1A"], "{text}");
         assert!(sent.iter().any(|s| s == "FAULTACK @0"), "{sent:?}");
+    }
+
+    /// drvEnsembleAsyn.cc:458-476: enable and disable post the requested
+    /// PowerOn whether or not ENABLE or DISABLE was accepted; a failed
+    /// `WAIT MODE NOWAIT` posts nothing and fails the write.
+    #[epics_rs::base::epics_test]
+    async fn closed_loop_posts_power_on_unless_nowait_fails() {
+        use epics_rs::asyn::interfaces::motor::StatusWrite;
+        use motor_common::testing::LineRig;
+
+        let nowait = Arc::new(Mutex::new("%".to_string()));
+        let reply = {
+            let nowait = nowait.clone();
+            move |cmd: &str| match cmd.trim_end() {
+                "ENABLE @0" => "!".into(),
+                "WAIT MODE NOWAIT" => nowait.lock().unwrap().clone(),
+                _ => "%0".into(),
+            }
+        };
+        let (line, io) = LineRig::new("ensPowerLine", reply);
+        let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensPowerLine", "0")));
+        let mut axis = EnsembleAxis::new(controller, 0, 0).unwrap();
+        let user = AsynUser::new(0);
+        line.sent();
+        axis.set_closed_loop(&user, true).unwrap();
+        assert_eq!(line.sent().last().unwrap(), "WAIT MODE NOWAIT");
+        assert_eq!(axis.take_status_writes(), [StatusWrite::PowerOn(true)]);
+        axis.set_closed_loop(&user, false).unwrap();
+        assert_eq!(axis.take_status_writes(), [StatusWrite::PowerOn(false)]);
+        *nowait.lock().unwrap() = "!".into();
+        assert!(axis.set_closed_loop(&user, true).is_err());
+        assert!(axis.take_status_writes().is_empty());
     }
 
     #[test]
