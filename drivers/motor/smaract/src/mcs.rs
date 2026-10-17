@@ -477,6 +477,7 @@ impl McsAxis {
             status_writes: Vec::new(),
         };
         let probed = axis.probe();
+        let probed = axis.bail(probed);
         (axis, probed)
     }
 
@@ -516,7 +517,8 @@ impl McsAxis {
 
     /// C's `bail` label after a command: a failure raises
     /// `motorStatusProblem_` and `motorStatusCommsError_`
-    /// (smarActMCSMotorDriver.cpp:599-604, 624-628, 638-642, 665-669, 713-717).
+    /// (smarActMCSMotorDriver.cpp:385-387, 599-604, 624-628, 638-642,
+    /// 665-669, 713-717).
     fn bail(&mut self, result: AsynResult<()>) -> AsynResult<()> {
         if result.is_err() {
             self.status_writes
@@ -885,6 +887,10 @@ mod tests {
         assert!(!ctrl.axis(1).is_rot && !axis.has_encoder);
         drop(ctrl);
         assert_eq!(axis.vel_cached, 0);
+        assert_eq!(
+            axis.take_status_writes(),
+            [StatusWrite::Problem(true), StatusWrite::CommsError(true)]
+        );
         assert!(axis.poll(&AsynUser::new(0)).is_err());
     }
 }
