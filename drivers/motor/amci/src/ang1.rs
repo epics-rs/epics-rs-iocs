@@ -30,7 +30,7 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ParamWrite, has_motor_axis};
+use epics_rs::motor::controller_port::{AxisUser, ParamWrite, has_motor_axis};
 use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::nint;
@@ -168,7 +168,7 @@ impl ControllerParams for Ang1Params {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         // C dereferences the null axis there (ANG1Driver.cpp:165-169); refused as the base does.
@@ -188,7 +188,7 @@ impl ControllerParams for Ang1Params {
             .write16(JERK, value);
         let _ = base.call_param_callbacks(addr);
         if let Err(e) = &status {
-            MotorTrace::new(base.port_name.to_string(), addr).print(
+            MotorTrace::new(base.port_name.to_string(), user.asyn().addr).print(
                 TraceMask::ERROR,
                 user.reason as i32,
                 format_args!(
