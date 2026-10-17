@@ -2649,6 +2649,7 @@ dependencies = [
 name = "motor-acsmotion"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2745,6 +2746,7 @@ dependencies = [
 name = "motor-micronix"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2803,6 +2805,7 @@ dependencies = [
 name = "motor-phytron"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2856,6 +2859,7 @@ dependencies = [
 name = "motor-smaract"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]

@@ -62,7 +62,11 @@ fn lc400_create_controller_command(registry: &Registry) -> CommandDef {
                 })
                 .ok();
             let controller = Arc::new(Mutex::new(Lc400Controller::new(handle, num_axes as usize)));
-            let params = Lc400ControllerParams::new(controller.clone());
+            let params = Lc400ControllerParams::new(
+                controller.clone(),
+                moving_poll_ms as f64 / 1000.0,
+                idle_poll_ms as f64 / 1000.0,
+            );
             let owner = ctx.db().scan_control().interrupt_gate();
             let port = register_controller_port(owner, &port_name, num_axes, params)?;
             controller

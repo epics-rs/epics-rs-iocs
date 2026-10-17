@@ -50,6 +50,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::atof;
+use motor_common::{ControllerParams, ControllerReport};
 
 /// Response buffer size (C `MAX_C300_STRING_SIZE`).
 const READ_BUF: usize = 300;
@@ -79,13 +80,31 @@ fn parse_at(record: &str, offset: usize) -> Option<f64> {
 pub struct C300Controller {
     handle: SyncIOHandle,
     num_axes: usize,
+    /// Each axis's positions, by axis number, where the report reads them.
+    axes: Vec<AxisState>,
+}
+
+/// C `C300Axis`'s `bitsPerUnit_`, `encoderPosition_` and `theoryPosition_`.
+#[derive(Default)]
+struct AxisState {
+    /// 2^20 over the stage range, 0 while the range is unread.
+    bits_per_unit: f64,
+    encoder_position: f64,
+    /// The theoretical (set-point) position, for relative moves and the
+    /// simulated done comparison.
+    theory_position: f64,
 }
 
 impl C300Controller {
     /// Connect to a C300 and unlock it (`SYS:PASS:CEN "nPoint"`), matching the C
     /// constructor. Performs blocking I/O.
     pub fn new(handle: SyncIOHandle, num_axes: usize) -> Self {
-        let ctrl = Self { handle, num_axes };
+        let axes = (0..num_axes).map(|_| AxisState::default()).collect();
+        let ctrl = Self {
+            handle,
+            num_axes,
+            axes,
+        };
         // C ignores the unlock's status (C300MotorDriver.cpp:68-69).
         let _ = ctrl.write_only("SYS:PASS:CEN \"nPoint\"");
         ctrl
@@ -118,16 +137,19 @@ impl C300Controller {
     }
 
     /// Probe axis `index` (0-based) at construction: query the stage range (to
-    /// confirm the axis and mark encoder/gain support) and the digital-input
-    /// scale factor. Returns `(di_scale_factor, has_encoder)`.
-    fn probe_axis(&self, index: usize) -> (f64, bool) {
+    /// confirm the axis, mark encoder/gain support and set `bitsPerUnit_`)
+    /// and the digital-input scale factor. Returns `(di_scale_factor,
+    /// has_encoder)`.
+    fn probe_axis(&mut self, index: usize) -> (f64, bool) {
         let chan = index + 1;
-        // Range query: only used to detect the axis and set the encoder/gain
-        // flags (the C `bitsPerUnit_` it fed is dead there and dropped here).
-        let has_encoder = self
+        let range = self
             .query(&format!("SYST:CHAN{chan}:STAG:RANG?"))
-            .map(|r| atof(&r) != 0.0)
-            .unwrap_or(false);
+            .map(|r| atof(&r));
+        if let (Ok(range), Some(axis)) = (&range, self.axes.get_mut(index)) {
+            // 2^20 bits per total range (C300MotorDriver.cpp:232-233).
+            axis.bits_per_unit = 1_048_576.0 / range;
+        }
+        let has_encoder = range.is_ok_and(|r| r != 0.0);
 
         let di_scale_factor = self
             .query(&format!("SYST:CHAN{chan}:DI:FACT?"))
@@ -138,18 +160,56 @@ impl C300Controller {
 
         (di_scale_factor, has_encoder)
     }
+
+    fn axis(&mut self, index: usize) -> &mut AxisState {
+        &mut self.axes[index]
+    }
+}
+
+/// The C300 controller's report on its asyn port, with its poll periods in
+/// seconds.
+pub struct C300Params {
+    pub controller: Arc<Mutex<C300Controller>>,
+    pub moving_poll: f64,
+    pub idle_poll: f64,
+}
+
+impl ControllerParams for C300Params {
+    /// C `C300Controller::report` (C300MotorDriver.cpp:108-132).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "C300 motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll,
+            self.idle_poll,
+        );
+        if level > 0 {
+            let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+            for (axis, state) in ctrl.axes.iter().enumerate() {
+                // C prints `currentLimits_`, which nothing sets.
+                let _ = write!(
+                    out,
+                    "  axis {axis}\n  bitsPerUnit_ = {:.6}\n    encoder position={:.6}\n    \
+                     theory position={:.6}\n    limits=0x0\n",
+                    state.bits_per_unit, state.encoder_position, state.theory_position,
+                );
+            }
+        }
+        ctx.report(out, level);
+    }
 }
 
 /// One C300 axis sharing a controller. Implements [`AsynMotor`].
 pub struct C300Axis {
     controller: Arc<Mutex<C300Controller>>,
+    /// Axis number, 0-based.
+    index: usize,
     /// Wire channel name, `CHAN<n>` (1-based).
     chan: String,
     di_scale_factor_inv: f64,
     has_encoder: bool,
-    /// Cached theoretical (set-point) position, for relative moves and the
-    /// simulated done comparison.
-    theory_position: f64,
 }
 
 impl C300Axis {
@@ -161,10 +221,10 @@ impl C300Axis {
             .probe_axis(index);
         Self {
             controller,
+            index,
             chan: format!("CHAN{}", index + 1),
             di_scale_factor_inv: 1.0 / di_scale_factor,
             has_encoder,
-            theory_position: 0.0,
         }
     }
 
@@ -201,8 +261,8 @@ impl AsynMotor for C300Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         // C: relative target = cached theoretical position + distance.
-        let target = self.theory_position + distance;
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
+        let target = ctrl.axis(self.index).theory_position + distance;
         ctrl.write_only(&format!("{}:POS {}", self.chan, target))
     }
 
@@ -248,24 +308,25 @@ impl AsynMotor for C300Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
         let data = ctrl.query(&format!("{}:DATA?", self.chan))?;
-        let pos_query = ctrl.query(&format!("{}:POS?", self.chan))?;
-        drop(ctrl);
-
         // Encoder position from the monitor record (fixed-offset fields).
         let pos_mon = parse_at(&data, DATA_OFFSET).unwrap_or(0.0);
         let analog_in = parse_at(&data, CORR_OFFSET).unwrap_or(0.0);
         let encoder_position = (pos_mon - analog_in) * self.di_scale_factor_inv;
+        ctrl.axis(self.index).encoder_position = encoder_position;
 
         // Theoretical (set-point) position.
-        self.theory_position = atof(&pos_query);
+        let pos_query = ctrl.query(&format!("{}:POS?", self.chan))?;
+        let theory_position = atof(&pos_query);
+        ctrl.axis(self.index).theory_position = theory_position;
+        drop(ctrl);
 
         // Simulated done: within tolerance of the encoder position.
-        let done = (self.theory_position - encoder_position).abs() <= TOLERANCE;
+        let done = (theory_position - encoder_position).abs() <= TOLERANCE;
 
         Ok(MotorStatus {
-            position: self.theory_position,
+            position: theory_position,
             encoder_position,
             velocity: 0.0,
             done,

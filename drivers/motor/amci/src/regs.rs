@@ -173,10 +173,45 @@ pub(crate) mod fake {
     /// `(reason, addr)` of each `MODBUS_READ` write.
     pub type Taken = Arc<Mutex<Vec<(usize, i32)>>>;
 
+    /// `(addr, registers)` of each `MODBUS_DATA` write, by port.
+    static WRITTEN: Mutex<Vec<(String, i32, Vec<i32>)>> = Mutex::new(Vec::new());
+
+    /// The `MODBUS_DATA` writes to port `name` since the last call.
+    pub fn written(name: &str) -> Vec<(i32, Vec<i32>)> {
+        let mut all = WRITTEN.lock().unwrap();
+        let (mine, rest) = std::mem::take(&mut *all)
+            .into_iter()
+            .partition(|(port, ..)| port == name);
+        *all = rest;
+        mine.into_iter()
+            .map(|(_, addr, data)| (addr, data))
+            .collect()
+    }
+
+    /// `addr` of each `MODBUS_READ` write, by port.
+    static FORCED: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
+
+    /// The `MODBUS_READ` writes to port `name` since the last call.
+    pub fn forced(name: &str) -> Vec<i32> {
+        let mut all = FORCED.lock().unwrap();
+        let (mine, rest) = std::mem::take(&mut *all)
+            .into_iter()
+            .partition(|(port, _)| port == name);
+        *all = rest;
+        mine.into_iter().map(|(_, addr)| addr).collect()
+    }
+
     struct Modbus {
         base: PortDriverBase,
         read_reason: usize,
         taken: Taken,
+    }
+
+    impl Modbus {
+        fn record(&self, addr: i32, data: Vec<i32>) {
+            let port = self.base.port_name.to_string();
+            WRITTEN.lock().unwrap().push((port, addr, data));
+        }
     }
 
     impl PortDriver for Modbus {
@@ -186,16 +221,22 @@ pub(crate) mod fake {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
-        fn read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
-            Ok(0)
+        /// Register `addr` reads `addr`.
+        fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+            Ok(user.addr)
         }
-        fn write_int32(&mut self, user: &mut AsynUser, _value: i32) -> AsynResult<()> {
+        fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
             if user.reason == self.read_reason {
                 self.taken.lock().unwrap().push((user.reason, user.addr));
+                let port = self.base.port_name.to_string();
+                FORCED.lock().unwrap().push((port, user.addr));
+            } else {
+                self.record(user.addr, vec![value]);
             }
             Ok(())
         }
-        fn write_int32_array(&mut self, _user: &AsynUser, _data: &[i32]) -> AsynResult<()> {
+        fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
+            self.record(user.addr, data.to_vec());
             Ok(())
         }
     }

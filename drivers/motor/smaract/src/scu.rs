@@ -53,6 +53,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::util::{atof, atoi};
 
 /// Response buffer size.
@@ -376,10 +377,10 @@ impl ScuAxis {
                 rev -= 1;
             }
             let mnem = if relative { "MAR" } else { "MAA" };
-            format!(":{mnem}{ch}A{angle:.3}R{rev}H{hold}:GP{ch}")
+            format!(":{mnem}{ch}A{:.3}R{rev}H{hold}:GP{ch}", CFloat(angle))
         } else {
             let mnem = if relative { "MPR" } else { "MPA" };
-            format!(":{mnem}{ch}P{rpos:.3}H{hold}:GP{ch}")
+            format!(":{mnem}{ch}P{:.3}H{hold}:GP{ch}", CFloat(rpos))
         };
 
         lock(&self.controller).transact(&mut self.io, &cmd)?;
@@ -533,6 +534,22 @@ mod tests {
         assert!(!axis.is_rot && !axis.has_encoder);
         assert_eq!(axis.hold_time, 0);
         assert!(axis.poll(&AsynUser::new(0)).is_err());
+    }
+
+    /// C `epicsSnprintf(":MPA%uP%.3fH%d:GP%u")` spells a NaN `nan`.
+    #[test]
+    fn a_non_finite_move_is_written_as_c_prints_it() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("scuNonFinite", |_| String::new());
+        let controller = Arc::new(Mutex::new(ScuController::new(io)));
+        let (mut axis, _) = ScuAxis::new(controller, 0, "scuNonFinite", 0);
+        rig.sent();
+        let _ = axis.do_move(f64::NAN, false);
+        let sent = rig.sent();
+        assert!(
+            sent.iter().any(|c| c.trim_end() == ":MPA0PnanH0:GP0"),
+            "{sent:?}"
+        );
     }
 
     #[test]

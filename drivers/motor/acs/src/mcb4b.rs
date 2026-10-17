@@ -56,6 +56,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, nint};
+use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
 /// Response buffer size (generous; the MCB-4B replies are short, e.g. `#01P=+1000`).
 const READ_BUF: usize = 200;
@@ -284,6 +285,39 @@ impl AsynMotor for Mcb4bAxis {
             problem: false,
             ..MotorStatus::default()
         })
+    }
+}
+
+/// C `MCB4BController`'s port: its `report` override, the poll periods
+/// in seconds as `startPoller` keeps them.
+pub struct Mcb4bParams {
+    pub moving_poll: f64,
+    pub idle_poll: f64,
+}
+
+impl ControllerParams for Mcb4bParams {
+    /// C `MCB4BController::report` (MCB4BDriver.cpp:95-102).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "MCB-4B motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll,
+            self.idle_poll,
+        );
+        ctx.report(out, level);
+    }
+}
+
+/// C `MCB4BAxis::report` (MCB4BDriver.cpp:109-117) for axis `.0`.
+pub struct Mcb4bAxisReport(pub usize);
+
+impl AxisReport for Mcb4bAxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let _ = writeln!(out, "  axis {}", self.0);
+        }
     }
 }
 
