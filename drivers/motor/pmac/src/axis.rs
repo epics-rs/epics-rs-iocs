@@ -58,6 +58,8 @@ pub struct PmacAxis {
     fatal_following: bool,
     /// C `motorStatusHasEncoder_`: the initial status read succeeded.
     pub(crate) has_encoder: bool,
+    /// The status the last poll posted, which a failed status read keeps.
+    last: MotorStatus,
 }
 
 /// Lock the shared controller. Taken as a free function on the field rather than
@@ -110,6 +112,7 @@ impl PmacAxis {
             amp_enabled: false,
             fatal_following: false,
             has_encoder,
+            last: MotorStatus::default(),
         }
     }
 
@@ -372,9 +375,20 @@ impl AsynMotor for PmacAxis {
         } else {
             format!("#{axis} ? F P")
         };
-        let response = controller.write_read(&query)?;
-        let (status1, status2, first, second) = parse_axis_status(&response)
-            .ok_or_else(|| pmac_err(format!("could not parse axis status: {response:?}")))?;
+        let Some((status1, status2, first, second)) = controller
+            .write_read(&query)
+            .ok()
+            .as_deref()
+            .and_then(parse_axis_status)
+        else {
+            // C keeps every status parameter but the power-on bit, which it
+            // reads from the zeroed status words, and returns success
+            // (pmacAxis.cpp:494-498, 606-613).
+            self.amp_enabled = false;
+            self.last.powered = false;
+            self.last.moving = false;
+            return Ok(self.last.clone());
+        };
 
         // Closed-loop axis: the third field is the following error and the
         // position is the sum of the two. Open-loop axis: they are the two
@@ -427,7 +441,7 @@ impl AsynMotor for PmacAxis {
             },
         );
 
-        Ok(MotorStatus {
+        self.last = MotorStatus {
             position,
             encoder_position,
             done: flags.done,
@@ -445,7 +459,8 @@ impl AsynMotor for PmacAxis {
             gain_support: true,
             has_encoder: self.has_encoder,
             ..MotorStatus::default()
-        })
+        };
+        Ok(self.last.clone())
     }
 }
 

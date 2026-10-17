@@ -651,6 +651,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use epics_rs::asyn::error::{AsynResult, AsynStatus};
+    use epics_rs::asyn::interfaces::motor::MotorStatus;
     use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
@@ -810,7 +811,7 @@ mod tests {
         assert!(!axis.has_encoder);
         controller.lock().unwrap().poll();
         assert_eq!(std::mem::take(&mut *written.lock().unwrap()), ["???"]);
-        assert!(axis.poll(&AsynUser::new(0).with_addr(1)).is_err());
+        assert!(axis.poll(&AsynUser::new(0).with_addr(1)).is_ok());
         assert_eq!(*written.lock().unwrap(), ["#1 ? F P"]);
         drop(rt);
     }
@@ -1001,6 +1002,32 @@ mod tests {
         rig.silence("%");
         poll();
         assert_eq!(posted(), (1, 1, 50));
+    }
+
+    /// pmacAxis.cpp:494-498, 606-613: a failed status read keeps the status
+    /// but the power-on bit, read from zeroed words, and is no failure.
+    #[test]
+    fn a_failed_axis_status_read_clears_only_power_on() {
+        let (_rt, rig) = publish_scripted("pmacAxisSilent");
+        rig.answer("#1 ? F P", b"882000000001\r0\r100.0\r");
+        rig.answer("i124", b"$0\r");
+        let controller = Arc::new(Mutex::new(controller_on("pmacAxisSilent")));
+        let mut axis = PmacAxis::new(controller, 1);
+        let user = AsynUser::new(0).with_addr(1);
+        let read = axis.poll(&user).unwrap();
+        assert!(read.powered);
+        assert_eq!(read.position, 100.0);
+
+        rig.silence("#1 ? F P");
+        let failed = axis.poll(&user).unwrap();
+        assert_eq!(
+            failed,
+            MotorStatus {
+                powered: false,
+                moving: false,
+                ..read
+            }
+        );
     }
 
     /// pmacController.cpp:201: one poller from pmacCreateController, which
