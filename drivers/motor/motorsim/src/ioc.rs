@@ -60,7 +60,8 @@ struct SimAxis<A> {
 
 /// drvMotorSim's `drv`: the axes in its `pFirst` list's creation order
 /// (drvMotorSim.c:719-735) and the one motorSimThread that runs them
-/// (drvMotorSim.c:121, 790). An axis is polled once something opens it.
+/// (drvMotorSim.c:121, 790), which processes every axis from its creation
+/// (drvMotorSim.c:670-678), opened or not.
 struct SimDriver<A = DrvMotorSimAxis> {
     created: Mutex<Vec<SimAxis<A>>>,
     poller: Arc<Controller>,
@@ -74,23 +75,33 @@ fn find<A>(created: &[SimAxis<A>], card: i32, signal: i32) -> Option<Arc<Mutex<A
 }
 
 impl<A: AsynMotor + 'static> SimDriver<A> {
-    /// devMotorSim's open of the axis (drvMotorSim.c:205-214), from a record's
-    /// init_record. C's callback then scanOnce's before scanInit and
-    /// segfaults (a C defect); here a post before the gate only sets
-    /// needUpdate.
-    fn open(&self, card: i32, signal: i32) -> bool {
-        let created = self.created.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(motor) = find(&created, card, signal) else {
-            return false;
-        };
-        drop(created);
+    /// motorSimCreateAxis (drvMotorSim.c:693-760): the axis joins `pFirst`,
+    /// which motorProcTask walks each pass.
+    fn create(&self, card: i32, signal: i32, motor: Arc<Mutex<A>>) -> Result<(), String> {
+        self.created
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(SimAxis {
+                card,
+                signal,
+                motor: motor.clone(),
+            });
         let user = TraceUser::MotorInterface {
             device: DEV_MOTOR_SIM.choice,
             driver: DRIVER,
             card,
             signal,
         };
-        self.poller.install(user, motor).is_ok()
+        self.poller.install(user, motor).map(drop)
+    }
+
+    /// devMotorSim's open of the axis (drvMotorSim.c:205-214), from a record's
+    /// init_record. C's callback then scanOnce's before scanInit and
+    /// segfaults (a C defect); here a post before the gate only sets
+    /// needUpdate.
+    fn open(&self, card: i32, signal: i32) -> bool {
+        let created = self.created.lock().unwrap_or_else(|e| e.into_inner());
+        find(&created, card, signal).is_some()
     }
 }
 
@@ -173,10 +184,13 @@ pub fn motor_sim_create_command() -> CommandDef {
             // motorSimThread, whose motorProcTask runs every axis each DELTA,
             // moving or idle (drvMotorSim.c:657-690, 788-800).
             driver.poller.start(ctx, POLL_MS, POLL_MS, 0);
-            let mut created = driver.created.lock().unwrap_or_else(|e| e.into_inner());
             for c in card..card.saturating_add(num_cards) {
                 for s in signal..signal.saturating_add(num_signals) {
-                    if find(&created, c, s).is_some() {
+                    let exists = {
+                        let created = driver.created.lock().unwrap_or_else(|e| e.into_inner());
+                        find(&created, c, s).is_some()
+                    };
+                    if exists {
                         println!("Motor for card {c}, signal {s} already exists");
                         continue;
                     }
@@ -185,13 +199,10 @@ pub fn motor_sim_create_command() -> CommandDef {
                         hi as f64,
                         home as f64,
                     )));
-                    created.push(SimAxis {
-                        card: c,
-                        signal: s,
-                        motor,
-                    });
+                    driver.create(c, s, motor)?;
                     println!("Created motor for card {c}, signal {s} OK");
                 }
+                let created = driver.created.lock().unwrap_or_else(|e| e.into_inner());
                 // Model2::open indexes by axis, so a card serves the axes
                 // from 0 up to its first gap; drvAsynMotorConfigure installs
                 // them on the driver's poller.
@@ -563,6 +574,34 @@ mod one_poller {
         }
     }
 
+    /// motorProcTask processes every created axis (drvMotorSim.c:670-678),
+    /// so one that neither a record nor drvAsynMotorConfigure opened dumps
+    /// the parameters motorSimProcess sets (:646-653) too.
+    #[epics_rs::base::epics_test]
+    async fn dbior_dumps_an_axis_nothing_opened() {
+        use motor_common::testing::{driver_report, run_command};
+
+        let args = [7, 0, -100, 100, 0, 1, 1, 0].map(ArgValue::Int).to_vec();
+        run_command(motor_sim_create_command(), args).await;
+        sleep(Duration::from_millis(350)).await;
+
+        let text = driver_report(DRIVER, 1);
+        let block = text
+            .split("Found driver")
+            .find(|b| b.starts_with(" for motorSim card 7, axis 0,"))
+            .unwrap_or_else(|| panic!("{text}"));
+        let lines: Vec<&str> = block.lines().collect();
+        assert_eq!(
+            lines[6], "Parameter 0 is a double, value 0.000000",
+            "{text}"
+        );
+        assert_eq!(
+            lines[6 + 12],
+            "Parameter 12 is an integer, value 1",
+            "{text}"
+        );
+    }
+
     /// Polls `motorProcTask` would process; never moves.
     struct Counted(Arc<Mutex<Vec<Instant>>>);
 
@@ -598,8 +637,9 @@ mod one_poller {
         }
     }
 
-    /// drvMotorAsyn and devMotorSim open one drvMotorSim axis, which
-    /// motorProcTask still processes once a pass (drvMotorSim.c:657-680).
+    /// motorSimCreate, drvMotorAsyn and devMotorSim all reach one
+    /// drvMotorSim axis, which motorProcTask still processes once a pass
+    /// (drvMotorSim.c:657-680).
     #[epics_rs::base::epics_test]
     async fn an_axis_opened_by_both_paths_is_installed_once() {
         static ONCE: Model2 = Model2::new("onceSim", 0);
@@ -607,15 +647,17 @@ mod one_poller {
         let counted = Arc::new(Mutex::new(Counted(polls.clone())));
         let motor: Arc<Mutex<dyn AsynMotor>> = counted.clone();
         let driver = Arc::new(SimDriver {
-            created: Mutex::new(vec![SimAxis {
-                card: 0,
-                signal: 0,
-                motor: counted,
-            }]),
+            created: Mutex::new(Vec::new()),
             poller: Arc::new(Controller::new()),
         });
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
         driver.poller.start(&ctx, POLL_MS, POLL_MS, 0);
+        let creator = driver.clone();
+        let create = std::thread::spawn(move || creator.create(0, 0, counted));
+        while !create.is_finished() {
+            sleep(Duration::from_millis(5)).await;
+        }
+        create.join().unwrap().unwrap();
         ONCE.set_card_on(0, vec![motor], driver.poller.clone());
         let args = vec![
             ArgValue::String("onceP".into()),
