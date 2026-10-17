@@ -33,6 +33,10 @@ async fn main() -> CaResult<()> {
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
 
+    // asyn's devEpics, which motorSimIOC links through asyn.dbd
+    // (motorSimApp/src/Makefile:23).
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+
     // motorSimCreateController / motorSimConfigAxis commands, and the
     // asynMotor device support their axes serve. No octet port is needed —
     // the simulator has no hardware.

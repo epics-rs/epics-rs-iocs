@@ -38,7 +38,9 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
+use motor_common::drv_motor_asyn::{DrvSet, function};
 use motor_common::model2::AxisLog;
+use motor_common::param_lib::Params;
 use motor_common::util::{atof, atoi, atol};
 
 use crate::axis_report::AxisMembers;
@@ -189,10 +191,9 @@ pub struct EnsembleAxis {
     index: i32,
     /// C `lastFault`, the AXISFAULT word that last raised `problem`.
     last_fault: i32,
-    /// C's motorParam view of the axis: the poller's sets, kept when a poll
-    /// bails, and `motorAxisProblem` cleared by DISABLE after a travel-limit
-    /// fault.
-    status: MotorStatus,
+    /// `pAxis->params`: the poller's sets, kept when a poll bails, and
+    /// `motorAxisProblem` cleared by DISABLE after a travel-limit fault.
+    params: Arc<Params>,
     /// The status a failed poll left, for the next post.
     failed: Option<MotorStatus>,
     status_writes: Vec<StatusWrite>,
@@ -251,17 +252,20 @@ impl EnsembleAxis {
             )
         };
 
+        let params = Arc::new(Params::default());
+        // motorAxisInit's GAIN_SUPPORT (drvEnsembleAsyn.cc:262) and the
+        // config's encoder (:977).
+        let _ = params.set_integer(function::HAS_CLOSED_LOOP, 1);
+        if has_encoder {
+            let _ = params.set_integer(function::HAS_ENCODER, 1);
+        }
         Ok(Self {
             controller,
+            params,
             card,
             axis,
             index,
             last_fault: 0,
-            status: MotorStatus {
-                has_encoder,
-                gain_support: true,
-                ..Default::default()
-            },
             failed: None,
             status_writes: Vec::new(),
             home_direction,
@@ -282,6 +286,18 @@ impl EnsembleAxis {
     /// What C's `motorAxisReport` prints of this axis.
     pub fn report(&self) -> Arc<AxisMembers> {
         self.report.clone()
+    }
+
+    /// The axis' parameters, which drvAsynMotorConfigure reads and calls
+    /// back through.
+    pub fn params(&self) -> Arc<Params> {
+        self.params.clone()
+    }
+
+    /// A command's set, which the poller also posts to the record.
+    fn post(&mut self, write: StatusWrite) {
+        self.params.apply(write);
+        self.status_writes.push(write);
     }
 
     /// The user C's `PRINT(pAxis->logParam, ...)` lines go through.
@@ -324,11 +340,11 @@ impl EnsembleAxis {
                 CFloat(accel)
             ),
         );
-        // C `currentCmdPos` is the poll's PCMDPROG, as `status.position`.
+        // C `currentCmdPos` is the poll's PCMDPROG, as motorAxisPosition.
         let posdir = if relative {
             position >= 0.0
         } else {
-            position >= self.status.position
+            position >= self.params.motor_status().position
         };
         let mode = if relative { "INC" } else { "ABS" };
         {
@@ -351,26 +367,28 @@ impl EnsembleAxis {
     /// and a velocity move set together before their callback, so the
     /// record's next status update sees the motion started.
     fn set_started(&mut self, direction: bool) {
-        self.status.direction = direction;
-        self.status.done = false;
-        self.status_writes
-            .extend([StatusWrite::Direction(direction), StatusWrite::Done(false)]);
+        self.post(StatusWrite::Direction(direction));
+        self.post(StatusWrite::Done(false));
+        self.params.call_callback();
     }
 }
 
 impl EnsembleAxis {
     /// One axis of C `EnsemblePoller` (drvEnsembleAsyn.cc:713-848), setting
-    /// [`Self::status`] in its order; an `Err` is its `continue` before
+    /// [`Self::params`] in its order; an `Err` is its `continue` before
     /// `callCallback`.
     fn poll_status(&mut self) -> AsynResult<()> {
         let axis = self.axis;
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        let status = &mut self.status;
+        let params = self.params.clone();
+        let bit = |f, v: bool| {
+            let _ = params.set_integer(f, i32::from(v));
+        };
 
         let sent = ctrl.send(&format!("AXISSTATUS(@{axis})"));
         if sent.is_err() || ctrl.input.len() <= 1 {
-            status.comms_error = true;
+            bit(function::COMM_ERROR, true);
             return sent.and(Err(ens_err("ensemble: AXISSTATUS reply too short")));
         }
         if !ctrl.ack() {
@@ -379,57 +397,62 @@ impl EnsembleAxis {
                 ctrl.input
             )));
         }
-        status.comms_error = false;
+        bit(function::COMM_ERROR, false);
         let axis_status = atol(ctrl.rest()) as u32;
         let _ = ctrl.send("PLANESTATUS(0)");
         let move_active = (atoi(ctrl.rest()) & 0x01) != 0 || (axis_status & MOVE_ACTIVE) != 0;
-        status.done = !move_active;
-        status.moving = move_active;
-        status.powered = (axis_status & AXIS_ENABLED) != 0;
-        status.homed = (axis_status & HOME_CYCLE_COMPLETE) != 0;
-        status.home = (axis_status & HOME_LIMIT) != 0;
+        bit(function::DONE, !move_active);
+        bit(function::POWER_ON, (axis_status & AXIS_ENABLED) != 0);
+        bit(function::HOMED, (axis_status & HOME_CYCLE_COMPLETE) != 0);
+        bit(function::HOME_SIGNAL, (axis_status & HOME_LIMIT) != 0);
         let motion_ccw = (axis_status & MOTION_CCW) != 0;
-        status.direction = if self.reverse_direc {
-            motion_ccw
-        } else {
-            !motion_ccw
-        };
+        bit(
+            function::DIRECTION,
+            if self.reverse_direc {
+                motion_ccw
+            } else {
+                !motion_ccw
+            },
+        );
         // Limit switches: XOR the raw limit bit against its configured active
         // level, then map CW/CCW to high/low honouring the reverse-direction flag.
         let cw_sw_active =
             !(((axis_status & CW_LIMIT) != 0) ^ ((self.swconfig & CW_EOT_SW_STATE) != 0));
         let ccw_sw_active =
             !(((axis_status & CCW_LIMIT) != 0) ^ ((self.swconfig & CCW_EOT_SW_STATE) != 0));
-        (status.high_limit, status.low_limit) = if self.reverse_direc {
+        let (high, low) = if self.reverse_direc {
             (ccw_sw_active, cw_sw_active)
         } else {
             (cw_sw_active, ccw_sw_active)
         };
+        bit(function::HIGH_HARD_LIMIT, high);
+        bit(function::LOW_HARD_LIMIT, low);
         self.report.set_axis_status(axis_status);
 
         if let Err(e) = ctrl.send(&format!("PFBKPROG(@{axis})")) {
-            status.comms_error = true;
+            bit(function::COMM_ERROR, true);
             return Err(e);
         }
         let encoder = if ctrl.ack() { atof(ctrl.rest()) } else { 0.0 };
-        status.encoder_position = encoder / self.step;
+        let _ = params.set_double(function::ENCODER_POSN, encoder / self.step);
         let _ = ctrl.send(&format!("PCMDPROG(@{axis})"));
-        status.position = atof(ctrl.rest()) / self.step;
+        let position = atof(ctrl.rest()) / self.step;
+        let _ = params.set_double(function::POSITION, position);
         self.log.print(
             TraceMask::IO_DRIVER,
             format_args!(
                 "EnsemblePoller: axis {axis} axisStatus={axis_status:x}, position={:.6}\n",
-                CFloat(status.position)
+                CFloat(position)
             ),
         );
 
         if let Err(e) = ctrl.send(&format!("AXISFAULT(@{axis})")) {
-            status.comms_error = true;
+            bit(function::COMM_ERROR, true);
             return Err(e);
         }
         if !ctrl.ack() {
-            status.problem = true;
-            status.comms_error = true;
+            bit(function::PROBLEM, true);
+            bit(function::COMM_ERROR, true);
             return Err(ens_err(format!(
                 "ensemble: AXISFAULT refused: '{}'",
                 ctrl.input
@@ -438,10 +461,10 @@ impl EnsembleAxis {
         let fault = atoi(ctrl.rest());
         if fault == 0 {
             self.last_fault = 0;
-            status.problem = false;
+            bit(function::PROBLEM, false);
         } else if fault != self.last_fault {
             self.last_fault = fault;
-            status.problem = true;
+            bit(function::PROBLEM, true);
             self.log.print(
                 TraceMask::ERROR,
                 format_args!(
@@ -452,10 +475,11 @@ impl EnsembleAxis {
         }
 
         if let Err(e) = ctrl.send(&format!("VFBK(@{axis})")) {
-            status.comms_error = true;
+            bit(function::COMM_ERROR, true);
             return Err(e);
         }
-        status.velocity = atof(ctrl.rest()) / self.step;
+        let _ = params.set_double(function::ACTUAL_VEL, atof(ctrl.rest()) / self.step);
+        params.call_callback();
         Ok(())
     }
 }
@@ -565,6 +589,7 @@ impl AsynMotor for EnsembleAxis {
     /// `motorAxisforceCallback` (drvEnsembleAsyn.cc:671-683); the status update it asks for
     /// is the poll that follows it.
     fn force_callback(&mut self, _user: &AsynUser) {
+        self.params.force_callback();
         self.log.print(
             TraceMask::FLOW,
             format_args!(
@@ -622,7 +647,8 @@ impl AsynMotor for EnsembleAxis {
 
     fn set_closed_loop(&mut self, _user: &AsynUser, closed_loop: bool) -> AsynResult<()> {
         let axis = self.axis;
-        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         if closed_loop {
             // C refreshes stepSize on every enable (not maxDigits).
             if let Some(s) = ctrl.get_param(axis, PARAM_COUNTS_PER_UNIT) {
@@ -646,15 +672,13 @@ impl AsynMotor for EnsembleAxis {
         } else {
             // C clears it so the user can jog off the limit (:434-435).
             if self.last_fault & TRAVEL_LIMIT_FAULT_MASK != 0 {
-                self.status.problem = false;
-                self.status_writes.push(StatusWrite::Problem(false));
+                self.post(StatusWrite::Problem(false));
             }
             let _ = ctrl.send(&format!("DISABLE @{axis}"));
         }
         // C's status is WAIT MODE NOWAIT's; PowerOn follows the request even
         // when ENABLE fails, to force a status update (:461-476).
-        self.status.powered = closed_loop;
-        self.status_writes.push(StatusWrite::PowerOn(closed_loop));
+        self.post(StatusWrite::PowerOn(closed_loop));
         ctrl.wait_mode_nowait()
     }
 
@@ -665,13 +689,50 @@ impl AsynMotor for EnsembleAxis {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let polled = self.poll_status();
         if polled.is_err() {
-            self.failed = Some(self.status.clone());
+            self.failed = Some(self.params.motor_status());
         }
-        polled.map(|()| self.status.clone())
+        polled.map(|()| self.params.motor_status())
     }
 
     fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
         self.failed.take()
+    }
+}
+
+/// C `motorAxisSetDouble`/`motorAxisSetInteger` (drvEnsembleAsyn.cc:343-479):
+/// a double it does not set prints a TERROR line and still succeeds, an
+/// integer other than the closed loop fails; a success goes into the
+/// parameters and is called back.
+impl DrvSet for EnsembleAxis {
+    fn set_double(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+        match function {
+            function::POSITION => self.set_position(user, value)?,
+            function::ENCODER_RATIO => self.set_encoder_ratio(user, value)?,
+            function::RESOLUTION => self
+                .refuse("motorAxisSetDouble: Ensemble does not support setting motor resolution"),
+            function::LOW_LIMIT => self.set_low_limit(user, value)?,
+            function::HIGH_LIMIT => self.set_high_limit(user, value)?,
+            function::P_GAIN => self.set_pid_gain(user, PidGainKind::Proportional, value)?,
+            function::I_GAIN => self.set_pid_gain(user, PidGainKind::Integral, value)?,
+            function::D_GAIN => self.set_pid_gain(user, PidGainKind::Derivative, value)?,
+            _ => self.refuse(&format!("motorAxisSetDouble: unknown function {function}")),
+        }
+        let _ = self.params.set_double(function, value);
+        self.params.call_callback();
+        Ok(())
+    }
+
+    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+        if function != function::CLOSED_LOOP {
+            self.refuse(&format!("motorAxisSetInteger: unknown function {function}"));
+            return Err(ens_err(format!(
+                "motorAxisSetInteger: unknown function {function}"
+            )));
+        }
+        self.set_closed_loop(user, value != 0)?;
+        let _ = self.params.set_integer(function, value);
+        self.params.call_callback();
+        Ok(())
     }
 }
 
@@ -695,6 +756,63 @@ mod tests {
     fn step_size_is_one_for_a_refused_counts_per_unit() {
         assert_eq!(step_size(Some("1000".into())), 0.001);
         assert_eq!(step_size(None), 1.0);
+    }
+
+    /// drvEnsembleAsyn.cc:343-479, 743-849: through the port, a double the
+    /// Ensemble does not set succeeds into its parameters, an unknown
+    /// integer fails, and a poll and a move set what C's set.
+    #[epics_rs::base::epics_test]
+    async fn the_port_writes_go_through_the_c_set_switch() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::model2::{Model2, Model2Axis, drv_asyn_motor_configure_command};
+        use motor_common::testing::{LineRig, run_command};
+
+        static DRIVER: Model2 = Model2::new("ensSetTest", 0);
+        let reply = |cmd: &str| match cmd.trim_end() {
+            // axis_enabled, home_cycle_complete.
+            "AXISSTATUS(@0)" => "%3".into(),
+            "PCMDPROG(@0)" => "%2.5".into(),
+            "GETPARM(@0, 2)" => "%1".into(),
+            _ => "%0".into(),
+        };
+        let (_line, io) = LineRig::new("ensSetLine", reply);
+        let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensSetLine", "0")));
+        let axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
+        let params = axis.params();
+        let axis = Arc::new(Mutex::new(axis));
+        let log = axis.lock().unwrap().log();
+        let axes = vec![Model2Axis::new(axis.clone(), params.clone(), log)];
+        DRIVER.set_card(0, axes, 3_600_000, 3_600_000);
+        let args = vec![
+            ArgValue::String("ensSet".into()),
+            ArgValue::String("ensSetTest".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(1),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&DRIVER]), args).await;
+        let port = PortManager::global().find_port_handle("ensSet").unwrap();
+        let reads = std::thread::spawn(move || {
+            let gain = port.write_float64_blocking(function::P_GAIN as usize, 0, 0.5);
+            let unknown = port.write_float64_blocking(function::SLIP as usize, 0, 2.0);
+            let int = port.write_int32_blocking(function::SLIP as usize, 0, 1);
+            let read = port.read_float64_blocking(function::P_GAIN as usize, 0);
+            (gain.is_ok(), unknown.is_ok(), int.is_err(), read.ok())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(reads, (true, true, true, Some(0.5)));
+        assert_eq!(params.get_double(function::SLIP), Ok(Some(2.0)));
+        assert_eq!(params.get_integer(function::HAS_CLOSED_LOOP), Ok(Some(1)));
+        let user = AsynUser::new(0);
+        let mut axis = axis.lock().unwrap();
+        axis.poll(&user).unwrap();
+        assert_eq!(params.get_integer(function::HOMED), Ok(Some(1)));
+        assert_eq!(params.get_integer(function::POWER_ON), Ok(Some(1)));
+        assert_eq!(params.get_double(function::POSITION), Ok(Some(2.5)));
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 0.0).unwrap();
+        assert_eq!(params.get_integer(function::DONE), Ok(Some(0)));
+        assert_eq!(params.get_integer(function::DIRECTION), Ok(Some(0)));
     }
 
     #[test]
@@ -729,18 +847,21 @@ mod tests {
         use epics_rs::asyn::manager::PortManager;
         use epics_rs::asyn::trace::{TraceFile, TraceMask};
         use epics_rs::base::server::iocsh::registry::ArgValue;
-        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::model2::{Model2, Model2Axis, drv_asyn_motor_configure_command};
         use motor_common::testing::{LineRig, run_command};
 
         static DRIVER: Model2 = Model2::new("ensLogTest", 0);
         let (_line, io) = LineRig::new("ensLogLine", |_| "%0".into());
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensLogLine", "0")));
         let axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
-        let log = axis.log();
+        let (getter, log) = (axis.params(), axis.log());
         let axis = Arc::new(Mutex::new(axis));
-        let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
-        DRIVER.set_card(0, vec![motor], 100, 1000);
-        DRIVER.set_axis_logs(0, vec![log]);
+        DRIVER.set_card(
+            0,
+            vec![Model2Axis::new(axis.clone(), getter, log)],
+            100,
+            1000,
+        );
         let args = vec![
             ArgValue::String("ensLog".into()),
             ArgValue::String("ensLogTest".into()),

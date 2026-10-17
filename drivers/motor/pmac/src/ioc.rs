@@ -27,11 +27,12 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::trace::MotorTrace;
 
+use motor_common::drv_motor_asyn::DrvSet;
 use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_req, opt_double, poll_intervals, req_string,
 };
 use motor_common::model1::c_int;
-use motor_common::model2::Model2;
+use motor_common::model2::{Model2, Model2Axis};
 use motor_common::{Controller, asyn_user, register_controller_port};
 
 use crate::axis::PmacAxis;
@@ -594,10 +595,12 @@ fn coord_create(
         program,
         POLL_CACHE_TTL,
     )));
+    let mut setters: Vec<Arc<Mutex<dyn DrvSet>>> = Vec::new();
     let axes = (1..=CS_AXES)
         .map(|axis| {
-            let motor: Arc<Mutex<dyn AsynMotor>> =
-                Arc::new(Mutex::new(PmacCsAxis::new(system.clone(), axis)?));
+            let cs_axis = Arc::new(Mutex::new(PmacCsAxis::new(system.clone(), axis)?));
+            setters.push(cs_axis.clone());
+            let motor: Arc<Mutex<dyn AsynMotor>> = cs_axis;
             trace.print(
                 TraceMask::FLOW,
                 0,
@@ -609,13 +612,22 @@ fn coord_create(
             Ok(motor)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    PMAC_ASYN_COORD.set_card(
-        reference,
-        axes.clone(),
-        COORD_MOVING_POLL_MS,
-        COORD_IDLE_POLL_MS,
-    );
-    PMAC_ASYN_COORD.set_axis_logs(reference, lock_system(&system).logs());
+    let (logs, getters) = {
+        let system = lock_system(&system);
+        (system.logs(), system.getters())
+    };
+    let model2 = axes
+        .iter()
+        .zip(setters)
+        .zip(logs.into_iter().zip(getters))
+        .map(|((motor, setter), (log, getter))| Model2Axis {
+            motor: motor.clone(),
+            setter,
+            getter,
+            log,
+        })
+        .collect();
+    PMAC_ASYN_COORD.set_card(reference, model2, COORD_MOVING_POLL_MS, COORD_IDLE_POLL_MS);
     systems.push(CoordSystem {
         reference,
         port: port.to_string(),

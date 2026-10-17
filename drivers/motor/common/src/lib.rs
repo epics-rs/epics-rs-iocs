@@ -26,9 +26,11 @@
 //! [`connect_ip`]: connect::connect_ip
 
 pub mod connect;
+pub mod drv_motor_asyn;
 pub mod iocsh;
 pub mod model1;
 pub mod model2;
+pub mod param_lib;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod util;
@@ -159,6 +161,17 @@ impl Controller {
         let ControllerAxis { axis, poll_cmd_tx } = self.axes.add(motor, user)?;
         epics_rs::motor::devices::register_axis(with_report(axis, report))?;
         Ok(poll_cmd_tx)
+    }
+
+    /// [`Self::install`]'s poller half: the axis polls, but no record reaches
+    /// it until its [`MotorAxis`] is registered, which a model-2 port's axes
+    /// wait for until the port exists.
+    pub(crate) fn open(
+        &self,
+        user: TraceUser,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+    ) -> Result<ControllerAxis, String> {
+        self.axes.add(motor, user)
     }
 
     /// C `startPoller(movingPollPeriod, idlePollPeriod, forcedFastPolls)`:
