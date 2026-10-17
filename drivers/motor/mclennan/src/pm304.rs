@@ -83,8 +83,8 @@ pub struct Pm304Controller {
 }
 
 impl Pm304Controller {
-    /// Connect and identify a Mclennan controller (C `motor_init`): stop axis 1,
-    /// read `1ID` to select the model, then read each axis `ID` to decide
+    /// Connect and identify a Mclennan controller (C `motor_init`): find it
+    /// by a `1OA` reply, stop axis 1, read `1ID` to select the model, then read each axis `ID` to decide
     /// whether it reports position from the encoder (`OA`) or the command
     /// counter (`OC`). Performs blocking serial I/O.
     pub fn new(handle: SyncIOHandle, n_axes: usize) -> AsynResult<Self> {
@@ -97,25 +97,30 @@ impl Pm304Controller {
             use_encoder: Vec::with_capacity(n_axes),
         };
 
+        // drvPM304.cc:668-675: the card is there once `1OA` gets a reply,
+        // tried three times; every later reply's status is ignored.
+        if !(0..3).any(|_| ctrl.write_read_raw("1OA").is_ok_and(|r| !r.is_empty())) {
+            return Err(pm304_err("PM304: no response to 1OA position query"));
+        }
+
         // Stop axis 1 for safety (C sends "1ST;" before identifying).
-        let _ = ctrl.write_read_raw("1ST")?;
+        let _ = ctrl.write_read_raw("1ST");
 
         // Model detection is robust to the PM600 echo: the reply is
         // "1ID\r<ident>" on the PM600 and "<ident>" on the PM304, and both
         // contain "PM304" only for the PM304.
-        let ident = ctrl.write_read_raw("1ID")?;
+        let ident = ctrl.write_read_raw("1ID").unwrap_or_default();
         ctrl.model = if ident.contains("PM304") {
             Model::Pm304
         } else {
             Model::Pm600
         };
         ctrl.ident = ctrl.strip_echo(&ident).trim().to_string();
-        if ctrl.ident.is_empty() {
-            return Err(pm304_err("PM304: no response to 1ID identification query"));
-        }
 
         for axis in 1..=n_axes {
-            let id = ctrl.write_read_raw(&format!("{axis}ID"))?;
+            let id = ctrl
+                .write_read_raw(&format!("{axis}ID"))
+                .unwrap_or_default();
             // C: PM304 always uses the encoder; PM600 uses the command counter
             // only when the axis reports "Open loop stepper mode".
             let use_encoder = match ctrl.model {
@@ -584,6 +589,28 @@ mod tests {
         axis.poll(&user).unwrap();
         axis.poll(&user).unwrap();
         assert_eq!(line.sent(), ["1OS\r", "1OA\r", "1AB\r\r", "1OS\r", "1OA\r"]);
+    }
+
+    /// drvPM304.cc:668-690: `1OA` finds the card, retried while silent;
+    /// an empty `1ID` does not lose it.
+    #[test]
+    fn the_card_is_found_by_its_position_reply() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let probes = AtomicUsize::new(0);
+        let (line, io) = LineRig::new("pm304Probe", move |last| match last {
+            "1OA\r" if probes.fetch_add(1, Ordering::SeqCst) < 2 => String::new(),
+            "1OA\r" => "AP=0".into(),
+            _ => String::new(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        assert_eq!(ctrl.ident(), "");
+        assert_eq!(
+            line.sent(),
+            ["1OA\r", "1OA\r", "1OA\r", "1ST\r", "1ID\r", "1ID\r"]
+        );
+
+        let (_line, io) = LineRig::new("pm304Absent", |_| String::new());
+        assert!(Pm304Controller::new(io, 1).is_err());
     }
 
     #[test]
