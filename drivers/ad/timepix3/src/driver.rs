@@ -2485,8 +2485,7 @@ impl TimePix3Driver {
         base.call_param_callbacks(chip)
     }
 
-    /// C `exportMaskedPelsJsonFromBpcBuffer` (serval_http.cpp:911-1072); the
-    /// caller's BPC is never empty, so C's empty-buffer branch is not ported.
+    /// C `exportMaskedPelsJsonFromBpcBuffer` (serval_http.cpp:911-1072).
     fn export_masked_pels_json(&mut self, bpc: &[u8]) -> AsynResult<()> {
         let p = self.p;
         let family = self.shared.family();
@@ -2497,6 +2496,9 @@ impl TimePix3Driver {
             d.set_text(p.masked_pels_export_status, status)?;
             d.ad.port_base.call_param_callbacks(0)
         };
+        if bpc.is_empty() {
+            return refuse(self, 0, "Skipped: no BPC buffer");
+        }
         if !mask::operator_mask_supported(family) {
             let status = format!(
                 "Unavailable: {} pixel mask encoding is not documented",
@@ -7595,6 +7597,16 @@ mod tests {
         pixels.sort();
         assert_eq!(pixels, [(5, 3), (300, 1)]);
         assert_eq!(root["Bad pixels"].as_array().unwrap().len(), 2);
+
+        det.export_masked_pels_json(&[]).unwrap();
+        assert_eq!(
+            (
+                det.int(p.masked_pels_count, 0),
+                det.text(p.masked_pels_export_status, 0),
+                det.text(p.masked_pels_json_path, 0)
+            ),
+            (0, "Skipped: no BPC buffer".into(), String::new())
+        );
 
         det.set_text(p.bp_c_file_name, "").unwrap();
         det.export_masked_pels_json(&bpc).unwrap();
