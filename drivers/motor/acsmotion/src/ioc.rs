@@ -24,7 +24,7 @@ use motor_common::model1::c_int;
 use motor_common::{Controller, asyn_user, register_controller_port};
 
 use crate::comm::{SpiiPlusComm, register_comm_port};
-use crate::spiiplus::{AcsMotionParams, SpiiPlusAxis, SpiiPlusController};
+use crate::spiiplus::{AcsMotionParams, SpiiPlusAxis, SpiiPlusAxisReport, SpiiPlusController};
 
 /// Parse the `virtualAxisList` string (comma-separated 0-based indices)
 /// into a set, ignoring blanks and out-of-range/unparseable entries (C warns and
@@ -78,7 +78,8 @@ pub fn acsmotion_config_command() -> CommandDef {
             let comm = SpiiPlusComm::connect(&comm_port, &asyn_port)?;
             let owner = ctx.db().scan_control().interrupt_gate();
             register_comm_port(owner, &comm_port, num_axes as i32)?;
-            let controller = SpiiPlusController::new(comm, &port_name, num_axes, &virtual_axes);
+            let mut controller = SpiiPlusController::new(comm, &port_name, num_axes, &virtual_axes);
+            controller.set_poll_periods(moving_poll, idle_poll);
             let controller = Arc::new(Mutex::new(controller));
 
             let (params, profile_thread) = AcsMotionParams::new(controller.clone());
@@ -101,7 +102,11 @@ pub fn acsmotion_config_command() -> CommandDef {
             for index in 0..num_axes {
                 let ax = SpiiPlusAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                poller.install(asyn_user(&port_name, index as i32), motor)?;
+                let report = Arc::new(SpiiPlusAxisReport {
+                    controller: controller.clone(),
+                    axis: index,
+                });
+                poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
             poller.start(
                 ctx,
@@ -178,5 +183,144 @@ mod tests {
         assert!(!create_profile("spiiCreateNone", 4, 2));
         // The octet line is a port, but not a SPiiPlus controller's.
         assert!(!create_profile("spiiCreateNot", 4, 2));
+    }
+
+    /// `AcsMotionConfig` on a fake line, its poller's first pass taken, and
+    /// the controller port's `asynReport` at `level`.
+    async fn configured_report(name: &str, level: i32) -> String {
+        use epics_rs::base::runtime::task::{BlockingBridge, sleep};
+        use epics_rs::base::server::database::PvDatabase;
+
+        let line = crate::fake::line(&format!("{name}Line"));
+        for (var, values) in [
+            ("MFLAGS", &[12.0, 0.0][..]),
+            ("STEPF", &[0.5, 0.25]),
+            ("EFAC", &[2.0, 4.0]),
+            ("E2FAC", &[3.0]),
+            ("E_TYPE", &[1.0]),
+            ("E2_TYPE", &[2.0]),
+            ("APOS", &[5.0]),
+            ("RPOS", &[6.0]),
+            ("EPOS", &[7.0]),
+            ("FPOS", &[8.0]),
+            ("F2POS", &[9.0]),
+            ("ROFFS", &[1.5]),
+            ("EOFFS", &[2.5]),
+            ("E2OFFS", &[3.5]),
+            ("MST", &[1.0]),
+            ("XVEL", &[100.0]),
+            ("XACC", &[1000.0]),
+        ] {
+            line.lock().unwrap().set(var, values);
+        }
+        let bridge = BlockingBridge::capture();
+        let (name, line_name) = (name.to_string(), format!("{name}Line"));
+        let shell = std::thread::spawn(move || {
+            let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
+            let args = [
+                ArgValue::String(name.as_str().into()),
+                ArgValue::String(line_name.into()),
+                ArgValue::Int(2),
+                ArgValue::Double(0.5),
+                ArgValue::Double(1.0),
+            ];
+            acsmotion_config_command()
+                .handler
+                .call(&args, &ctx)
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            PortManager::global()
+                .find_port_handle(&name)
+                .unwrap()
+                .report_blocking(level)
+                .unwrap()
+        });
+        // The poller's thread is spawned by a task this runtime runs.
+        while !shell.is_finished() {
+            sleep(std::time::Duration::from_millis(5)).await;
+        }
+        shell.join().unwrap()
+    }
+
+    const DRIVER: &str = "====================================
+SPiiPlus motor driver:
+    asyn port: spiiReport1
+    num axes: 2
+    moving poll period: 0.500000
+    idle poll period: 1.000000
+    firmware version: v3.13
+    virtual feedback position support: No
+
+";
+
+    /// C `SPiiPlusController::report` then, at level > 0, the base's at
+    /// level - 1, which runs each `SPiiPlusAxis::report`
+    /// (SPiiPlusDriver.cpp:3029-3104).
+    #[epics_rs::base::epics_test]
+    async fn the_port_report_prints_the_controller_then_each_axis_as_c() {
+        let text = configured_report("spiiReport1", 1).await;
+        let axis0 = "Configuration for axis 0:
+  mflags: 12
+    dummy:  0
+    open:  0
+    micro:  4
+    homed:  8
+    stepper:  0
+    encloop:  0
+    stepenc:  0
+    brushl:  0
+    brushok  0
+    phase2:  0
+    defcon:  0
+    linear:  0
+    abscomm:  0
+    hall:  0
+  resolution: 5.000000e-01
+  reference offset: 1.500000
+  homing method: 0
+  max velocity: 100.000000
+  max acceleration: 1000.000000
+  virtual: No
+Encoder info for axis 0:
+  encoder type: 1
+  encoder resolution: 2.000000e+00
+  encoder offset: 2.500000
+  encoder 2 type: 2
+  encoder 2 resolution: 3.000000e+00
+  encoder 2 offset: 3.500000
+Position info for axis 0:
+  axis position: 5.000000
+  reference position: 6.000000
+  encoder position: 7.000000
+  feedback position: 8.000000
+  feedback 2 position: 9.000000
+  virtual feedback position: 0.000000
+Status for axis 0:
+  moving: 0
+  axis status: 0
+  motor status: 1
+  fault status: 0
+
+Configuration for axis 1:
+  mflags: 0
+";
+        assert!(text.contains(&format!("{DRIVER}{axis0}")), "{text}");
+        assert!(text.contains("  resolution: 4.000000e+00\n"), "{text}");
+        assert!(
+            text.ends_with("\n====================================\n"),
+            "{text}"
+        );
+    }
+
+    /// At level 0 C prints its own lines alone.
+    #[epics_rs::base::epics_test]
+    async fn a_level_0_report_prints_the_controller_alone() {
+        let text = configured_report("spiiReport0", 0).await;
+        let own = DRIVER.replace("spiiReport1", "spiiReport0");
+        assert!(
+            text.ends_with(&format!("{own}====================================\n")),
+            "{text}"
+        );
+        assert!(!text.contains("Configuration for axis"), "{text}");
     }
 }
