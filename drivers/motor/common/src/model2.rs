@@ -31,29 +31,55 @@ struct Card {
     setters: Vec<Arc<Mutex<dyn DrvSet>>>,
 }
 
-/// The `logFunc`/`logParam` pair an axis's `motorAxisSetLog` keeps
-/// (drvMotorAsyn.c:413): the user at `(port, addr)` once
-/// `drvAsynMotorConfigure` opened the axis, the unconnected
-/// `defaultAsynUser` before.
+/// The `print`/`logParam` pair a driver keeps for an axis, or for itself,
+/// which `motorAxisSetLog` replaces: `drvAsynMotorConfigure` gives an
+/// opened axis `logFunc` on the user at `(port, addr)` (drvMotorAsyn.c:413)
+/// and the driver `logFunc` on the unconnected `defaultAsynUser` (:421).
 #[derive(Debug, Default)]
-pub struct AxisLog(Mutex<Option<(String, i32)>>);
+pub struct AxisLog {
+    user: Mutex<LogUser>,
+    /// The driver's own print until then; without one, `logFunc` on
+    /// `defaultAsynUser`.
+    own: Option<fn(TraceMask, std::fmt::Arguments<'_>)>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+enum LogUser {
+    #[default]
+    Own,
+    Default,
+    At(String, i32),
+}
 
 impl AxisLog {
-    fn attach(&self, port: &str, addr: i32) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((port.to_owned(), addr));
+    /// A log that prints with `own` until `drvAsynMotorConfigure` sets it.
+    pub fn with_own(own: fn(TraceMask, std::fmt::Arguments<'_>)) -> Self {
+        Self {
+            user: Mutex::default(),
+            own: Some(own),
+        }
     }
 
-    fn user(&self) -> Option<(String, i32)> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    fn set(&self, user: LogUser) {
+        *self.user.lock().unwrap_or_else(|e| e.into_inner()) = user;
+    }
+
+    fn attach(&self, port: &str, addr: i32) {
+        self.set(LogUser::At(port.to_owned(), addr));
+    }
+
+    fn user(&self) -> LogUser {
+        self.user.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The driver's `PRINT(param, MOTOR_ERROR, ...)`, which `logFunc` turns
     /// into `asynPrint` on the user (drvMotorAsyn.c:793).
     pub fn print(&self, mask: TraceMask, args: std::fmt::Arguments<'_>) {
         let user = self.user();
-        let (port, addr) = match &user {
-            Some((port, addr)) => (Some(port.as_str()), Some(*addr)),
-            None => (None, None),
+        let (port, addr) = match (&user, self.own) {
+            (LogUser::Own, Some(own)) => return own(mask, args),
+            (LogUser::At(port, addr), _) => (Some(port.as_str()), Some(*addr)),
+            _ => (None, None),
         };
         PortManager::global()
             .trace_manager()
@@ -92,6 +118,8 @@ pub struct Model2 {
     name: &'static str,
     forced_fast_polls: u32,
     cards: Mutex<Vec<Card>>,
+    /// The driver's own log, `motorAxisSetLog(NULL, ...)`'s.
+    log: Mutex<Option<Arc<AxisLog>>>,
 }
 
 impl Model2 {
@@ -100,7 +128,13 @@ impl Model2 {
             name,
             forced_fast_polls,
             cards: Mutex::new(Vec::new()),
+            log: Mutex::new(None),
         }
+    }
+
+    /// The log the driver prints on for itself.
+    pub fn set_driver_log(&self, log: Arc<AxisLog>) {
+        *self.log.lock().unwrap_or_else(|e| e.into_inner()) = Some(log);
     }
 
     /// The driver's `motorAxisReport`, the drvet `report` `dbior` runs: C
@@ -299,6 +333,9 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                 }
             }
             driver.add_port(card, &port_name);
+            if let Some(log) = &*driver.log.lock().unwrap_or_else(|e| e.into_inner()) {
+                log.set(LogUser::Default);
+            }
             let port = DrvMotorAsyn::new(&port_name, axes);
             let (rt, _thread) = create_port_runtime(&claim, port, RuntimeConfig::default())
                 .map_err(|e| e.to_string())?;
@@ -447,7 +484,7 @@ mod axis_log {
             ArgValue::Int(3),
         ];
         run_command(drv_asyn_motor_configure_command(vec![&LOGGED]), args).await;
-        assert_eq!(logs[2].user(), None);
+        assert_eq!(logs[2].user(), LogUser::Own);
 
         let path = std::env::temp_dir().join(format!("model2-log-{}", std::process::id()));
         let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
@@ -462,6 +499,48 @@ mod axis_log {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(text.contains("axis one\n"), "{text}");
+    }
+
+    static OWNED: Model2 = Model2::new("owned", 0);
+    static OWN_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn own(_: TraceMask, args: std::fmt::Arguments<'_>) {
+        OWN_LINES.lock().unwrap().push(args.to_string());
+    }
+
+    /// drvMotorAsyn.c:413, :421: setLog replaces the driver's own print, for
+    /// each opened axis and for the driver, and only those.
+    #[epics_rs::base::epics_test]
+    async fn configure_replaces_the_driver_s_own_print() {
+        let logs: Vec<Arc<AxisLog>> = (0..2).map(|_| Arc::new(AxisLog::with_own(own))).collect();
+        let driver_log = Arc::new(AxisLog::with_own(own));
+        let axis = || -> Arc<Mutex<dyn AsynMotor>> { Arc::new(Mutex::new(SimMotor::default())) };
+        OWNED.set_card(0, vec![axis()], 100, 1000);
+        OWNED.set_axis_logs(0, logs.clone());
+        OWNED.set_driver_log(driver_log.clone());
+        for log in [&logs[0], &logs[1], &driver_log] {
+            log.print(TraceMask::FLOW, format_args!("before"));
+        }
+        let args = vec![
+            ArgValue::String("ownedPort".into()),
+            ArgValue::String("owned".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(2),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&OWNED]), args).await;
+        for (log, line) in [
+            (&logs[0], "axis"),
+            (&logs[1], "unopened"),
+            (&driver_log, "driver"),
+        ] {
+            log.print(TraceMask::FLOW, format_args!("{line}"));
+        }
+        assert_eq!(
+            *OWN_LINES.lock().unwrap(),
+            ["before", "before", "before", "unopened"]
+        );
+        assert_eq!(logs[0].user(), LogUser::At("ownedPort".into(), 0));
+        assert_eq!(driver_log.user(), LogUser::Default);
     }
 }
 
