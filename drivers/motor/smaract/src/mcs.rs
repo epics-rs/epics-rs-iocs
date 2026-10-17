@@ -30,27 +30,34 @@
 //! `MRES` = 1e-3 to read microns / millidegrees). Move targets are rounded to
 //! whole controller units.
 //!
-//! ## Not modeled (documented)
+//! ## Channel parameters
 //!
-//! The MCS exposes runtime auxiliary asyn parameters that the motor record does
-//! not cover: positioner type (`SST`/`ptyp`), calibration (`CS`/`cal`), max
-//! closed-loop frequency (`SCLF`/`sclf`), the auto-zero-on-home flag and the
-//! post-move hold time. These are not exposed here; motion uses the C startup
-//! defaults — hold time `0` (no active hold after a move) and auto-zero `1` on
-//! home. Configure the positioner type on the controller beforehand. Exposing
-//! these as runtime PVs would need extra asyn parameters (upstream work).
-//! `set_closed_loop`/`set_pid_gain` are therefore no-ops (as in C).
+//! `PTYP`, `MCLF` and `CAL` send the positioner type (`SST`), max clock
+//! frequency (`SCLF`) and calibration (`CS`); `HOLD` and `AUTO_ZERO` are the
+//! hold time and auto-zero flag moves and homes send, and `poll` reads the
+//! sensor type into `PTYP_RB`. `set_closed_loop`/`set_pid_gain` are no-ops
+//! (as in C).
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::param::{ParamType, ParamValue};
+use epics_rs::asyn::port::{DrvUserRequest, PortDriverBase};
+use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::motor::controller_port::{
+    FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, has_motor_axis,
+};
+use epics_rs::motor::trace::MotorTrace;
 
+use motor_common::ControllerParams;
 use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::util::atoi;
 
@@ -103,11 +110,44 @@ const FAR_AWAY_LIN: i64 = 1_000_000_000;
 /// Very-far rotary velocity-move target (revolutions, C `FAR_AWAY_ROT`).
 const FAR_AWAY_ROT: i64 = 32767;
 
-/// Post-move hold time (C startup default of the `holdTime` aux parameter).
-const HOLD_TIME: i32 = 0;
+/// The parameters C creates, in its order (smarActMCSMotorDriver.cpp:180-185).
+const CHANNEL_PARAMS: [&str; 6] = ["PTYP", "PTYP_RB", "AUTO_ZERO", "HOLD", "MCLF", "CAL"];
 
-/// Auto-zero-on-home flag (C startup default of the `autoZero` aux parameter).
-const AUTO_ZERO: i32 = 1;
+/// The reasons of [`CHANNEL_PARAMS`].
+#[derive(Clone, Copy, Default)]
+pub struct McsReasons {
+    ptyp: usize,
+    ptyp_rb: usize,
+    auto_zero: usize,
+    hold: usize,
+    sclf: usize,
+    cal: usize,
+}
+
+impl McsReasons {
+    fn from_slice(r: [usize; 6]) -> Self {
+        let [ptyp, ptyp_rb, auto_zero, hold, sclf, cal] = r;
+        Self {
+            ptyp,
+            ptyp_rb,
+            auto_zero,
+            hold,
+            sclf,
+            cal,
+        }
+    }
+
+    /// The reasons controller port `port` created.
+    pub fn lookup(port: &PortHandle) -> AsynResult<Self> {
+        let mut r = [0; 6];
+        for (slot, name) in r.iter_mut().zip(CHANNEL_PARAMS) {
+            *slot = port
+                .drv_user_create_blocking(&DrvUserRequest::new(name, 0))?
+                .reason;
+        }
+        Ok(Self::from_slice(r))
+    }
+}
 
 // SmarActMCSStatus codes returned by `GS` that mean the stage is in motion
 // (Stepping, Scanning, Targeting, MoveDelay, Calibrating, FindRefMark). Stopped
@@ -158,11 +198,28 @@ fn parse_angle(reply: &str) -> Option<(bool, i32, i32)> {
     Some((is_err, atoi(parts[1].trim()), atoi(parts[2].trim())))
 }
 
+/// What C keeps per axis that the controller's writes reach as well.
+#[derive(Clone, Copy)]
+struct McsChannel {
+    /// Wire channel (from the create-axis command; distinct from the axis no.).
+    channel: i32,
+    /// C `isRot_`, which `checkType` sets.
+    is_rot: bool,
+    /// The axis's `HOLD` and `AUTO_ZERO`, which C's move and home read
+    /// back from the parameter library.
+    hold_time: i32,
+    auto_zero: i32,
+}
+
 /// Shared MCS controller endpoint owning the asyn octet handle.
 pub struct McsController {
     handle: SyncIOHandle,
     /// When set, speed-set commands (`SCLS`) are suppressed (C `disableSpeed`).
     disable_speed: bool,
+    /// C `pAxes_`, by axis number.
+    axes: BTreeMap<i32, McsChannel>,
+    /// The parameters, once the port created them.
+    reasons: Option<McsReasons>,
 }
 
 impl McsController {
@@ -174,6 +231,27 @@ impl McsController {
         Self {
             handle,
             disable_speed,
+            axes: BTreeMap::new(),
+            reasons: None,
+        }
+    }
+
+    /// Let the axes set the parameters, `reasons`.
+    pub fn set_reasons(&mut self, reasons: McsReasons) {
+        self.reasons = Some(reasons);
+    }
+
+    /// Axis `axis`'s channel state.
+    fn axis(&self, axis: i32) -> &McsChannel {
+        &self.axes[&axis]
+    }
+
+    /// C `SmarActMCSAxis::checkType`: a stage whose linear position does
+    /// not read back is rotary.
+    fn check_type(&mut self, axis: i32) {
+        let is_rot = self.get_val("GP", self.axis(axis).channel).is_err();
+        if let Some(c) = self.axes.get_mut(&axis) {
+            c.is_rot = is_rot;
         }
     }
 
@@ -222,47 +300,188 @@ impl McsController {
     }
 }
 
+/// The MCS controller port's parameters and its `writeInt32`.
+#[derive(Default)]
+pub struct McsParams {
+    /// Set once the controller is created, after the port as in C.
+    controller: Arc<OnceLock<Arc<Mutex<McsController>>>>,
+    reasons: McsReasons,
+}
+
+impl McsParams {
+    /// The slot the create command fills with the controller.
+    pub fn controller_slot(&self) -> Arc<OnceLock<Arc<Mutex<McsController>>>> {
+        self.controller.clone()
+    }
+}
+
+/// C `writeInt32` traces each write at its end, the base's included; a
+/// failed `SST`, `CS` or `SCLF` returns before it
+/// (smarActMCSMotorDriver.cpp:293-327).
+struct McsWriteHook {
+    sent: [usize; 3],
+}
+
+impl WriteHook for McsWriteHook {
+    fn after_write(&self, write: &FinishedWrite<'_>) -> WriteOutcome {
+        let WriteValue::Int32(value) = write.value else {
+            return WriteOutcome::default();
+        };
+        let function = write.function;
+        match write.status {
+            Err(_) if self.sent.contains(&function) => {}
+            Err(e) => write.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "SmarActMCSController:writeInt32: error, status={} function={function}, value={value}\n",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => write.print(
+                TraceMask::IO_DRIVER,
+                format_args!("SmarActMCSController:writeInt32: function={function}, value={value}\n"),
+            ),
+        }
+        WriteOutcome::default()
+    }
+}
+
+impl ControllerParams for McsParams {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        let mut r = [0; 6];
+        for (slot, name) in r.iter_mut().zip(CHANNEL_PARAMS) {
+            *slot = base.create_param(name, ParamType::Int32)?;
+        }
+        self.reasons = McsReasons::from_slice(r);
+        Ok(())
+    }
+
+    fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
+        let r = self.reasons;
+        Some(Arc::new(McsWriteHook {
+            sent: [r.ptyp, r.cal, r.sclf],
+        }))
+    }
+
+    /// C `SmarActMCSController::writeInt32` (smarActMCSMotorDriver.cpp:
+    /// 274-329). C posts at the axis's channel what it set at its axis
+    /// number, a bug where the two differ; both are the axis number here.
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> ParamWrite {
+        let function = user.reason;
+        // C's getAxis, which prints an out-of-range address.
+        let found = has_motor_axis(base, user);
+        let axis = match base.resolve_address(user.addr) {
+            Ok(addr) if found => addr,
+            _ => {
+                MotorTrace::new(&*base.port_name, user.addr).print(
+                    TraceMask::ERROR,
+                    function as i32,
+                    format_args!(
+                        "SmarActMCSController:writeInt32: error, function: {function}. Invalid axis number.\n"
+                    ),
+                );
+                return ParamWrite::Handled(Err(mcs_err("MCS: invalid axis number")));
+            }
+        };
+        let Some(ctrl) = self.controller.get() else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        let mut ctrl = ctrl.lock().unwrap_or_else(|e| e.into_inner());
+        let r = self.reasons;
+        let ch = ctrl.axis(axis).channel;
+        let cmd = match function {
+            f if f == r.ptyp => format!(":SST{ch},{value}"),
+            f if f == r.cal => format!(":CS{ch}"),
+            f if f == r.sclf => format!(":SCLF{ch},{value}"),
+            f => {
+                if let Some(c) = ctrl.axes.get_mut(&axis) {
+                    if f == r.hold {
+                        c.hold_time = value;
+                    } else if f == r.auto_zero {
+                        c.auto_zero = value;
+                    }
+                }
+                return ParamWrite::PassToBase(Ok(()));
+            }
+        };
+        let _ = base.set_int32_param(function, axis, value);
+        let sent = ctrl.command(&cmd);
+        if sent.is_err() {
+            return ParamWrite::Handled(sent);
+        }
+        if function == r.ptyp {
+            ctrl.check_type(axis);
+        }
+        drop(ctrl);
+        let _ = base.call_param_callbacks(axis);
+        ParamWrite::Handled(Ok(()))
+    }
+}
+
 /// One MCS channel sharing a controller. Implements [`AsynMotor`].
 pub struct McsAxis {
     controller: Arc<Mutex<McsController>>,
-    /// Wire channel (from the create-axis command; distinct from the axis no.).
-    channel: i32,
-    /// Rotary vs linear stage (probed at construction).
-    is_rot: bool,
+    /// The axis number, the key of its channel state on the controller.
+    axis_no: i32,
     /// Sensor-present flag probed at construction.
     has_encoder: bool,
     /// Whether speed-set commands are suppressed (copied from the controller).
     disable_speed: bool,
     /// Cached closed-loop speed (`GCLS`), to skip redundant `SCLS` writes.
     vel_cached: i32,
+    /// What the constructor or the last poll set, for the poller's
+    /// callParamCallbacks.
+    poll_params: Vec<(usize, ParamValue)>,
 }
 
 impl McsAxis {
-    /// Construct channel `channel`, probing speed, status, positioner type and
-    /// rotation, matching the C `SmarActMCSAxis` constructor. Blocking I/O.
+    /// Construct axis `axis_no` on channel `channel`, probing speed,
+    /// status, positioner type and rotation, matching the C
+    /// `SmarActMCSAxis` constructor. Blocking I/O.
     ///
     /// Like C's `goto bail`, a failed probe keeps the axis with the values
     /// probed so far; the failure is returned alongside it.
-    pub fn new(controller: Arc<Mutex<McsController>>, channel: i32) -> (Self, AsynResult<()>) {
-        let disable_speed = controller
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .disable_speed;
+    pub fn new(
+        controller: Arc<Mutex<McsController>>,
+        axis_no: i32,
+        channel: i32,
+    ) -> (Self, AsynResult<()>) {
+        let disable_speed = {
+            let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            // C leaves both unset, and its move reads garbage, when the
+            // constructor bails before setting them.
+            ctrl.axes.insert(
+                axis_no,
+                McsChannel {
+                    channel,
+                    is_rot: false,
+                    hold_time: 0,
+                    auto_zero: 1,
+                },
+            );
+            ctrl.disable_speed
+        };
         let mut axis = Self {
             controller,
-            channel,
-            is_rot: false,
+            axis_no,
             has_encoder: false,
             disable_speed,
             vel_cached: 0,
+            poll_params: Vec::new(),
         };
         let probed = axis.probe();
         (axis, probed)
     }
 
     fn probe(&mut self) -> AsynResult<()> {
-        let channel = self.channel;
-        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let axis_no = self.axis_no;
+        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let channel = ctrl.axis(axis_no).channel;
 
         if !self.disable_speed {
             self.vel_cached = ctrl.get_val("GCLS", channel)?;
@@ -271,14 +490,21 @@ impl McsAxis {
         // Comms check.
         ctrl.get_val("GS", channel)?;
 
-        // Rotation is detected by whether linear position reads back.
-        self.is_rot = ctrl.get_val("GP", channel).is_err();
+        // smarActMCSMotorDriver.cpp:367-368
+        if let Some(r) = ctrl.reasons {
+            self.poll_params.extend([
+                (r.auto_zero, ParamValue::Int32(1)),
+                (r.hold, ParamValue::Int32(0)),
+            ]);
+        }
+
+        ctrl.check_type(axis_no);
 
         // Sensor type query (also a comms check).
         ctrl.get_val("GST", channel)?;
 
         // C reads the position again rather than reusing checkType's `GP`.
-        self.has_encoder = if self.is_rot {
+        self.has_encoder = if ctrl.axis(axis_no).is_rot {
             ctrl.get_angle(channel).is_ok()
         } else {
             ctrl.get_val("GP", channel).is_ok()
@@ -298,21 +524,29 @@ impl McsAxis {
         }
         let vel = velocity.abs().round() as i32;
         if vel != self.vel_cached {
-            let ch = self.channel;
-            self.lock().command(&format!(":SCLS{ch},{vel}"))?;
+            let ctrl = self.lock();
+            let ch = ctrl.axis(self.axis_no).channel;
+            ctrl.command(&format!(":SCLS{ch},{vel}"))?;
+            drop(ctrl);
             self.vel_cached = vel;
         }
         Ok(())
     }
 
     /// Shared move: set speed, round to controller units, and issue the linear
-    /// or rotary absolute/relative move with the (default) hold time.
+    /// or rotary absolute/relative move with the axis's hold time.
     fn do_move(&mut self, position: f64, relative: bool, velocity: f64) -> AsynResult<()> {
         self.set_speed(velocity)?;
-        let ch = self.channel;
+        let ctrl = self.lock();
+        let McsChannel {
+            channel: ch,
+            is_rot,
+            hold_time,
+            ..
+        } = *ctrl.axis(self.axis_no);
         let rpos = position.round() as i64;
 
-        let cmd = if self.is_rot {
+        let cmd = if is_rot {
             let mut angle = (rpos as i32) % (UDEG_PER_REV as i32);
             let mut rev = (rpos / UDEG_PER_REV) as i32;
             if angle < 0 {
@@ -320,12 +554,12 @@ impl McsAxis {
                 rev -= 1;
             }
             let mnem = if relative { "MAR" } else { "MAA" };
-            format!(":{mnem}{ch},{angle},{rev},{HOLD_TIME}")
+            format!(":{mnem}{ch},{angle},{rev},{hold_time}")
         } else {
             let mnem = if relative { "MPR" } else { "MPA" };
-            format!(":{mnem}{ch},{rpos},{HOLD_TIME}")
+            format!(":{mnem}{ch},{rpos},{hold_time}")
         };
-        self.lock().command(&cmd)
+        ctrl.command(&cmd)
     }
 }
 
@@ -373,13 +607,18 @@ impl AsynMotor for McsAxis {
         }
         self.set_speed(velocity)?;
         let dir: i64 = if velocity < 0.0 { -1 } else { 1 };
-        let ch = self.channel;
-        let cmd = if self.is_rot {
+        let ctrl = self.lock();
+        let McsChannel {
+            channel: ch,
+            is_rot,
+            ..
+        } = *ctrl.axis(self.axis_no);
+        let cmd = if is_rot {
             format!(":MAR{ch},0,{},0", FAR_AWAY_ROT * dir)
         } else {
             format!(":MPR{ch},{},0", FAR_AWAY_LIN * dir)
         };
-        self.lock().command(&cmd)
+        ctrl.command(&cmd)
     }
 
     fn home(
@@ -391,27 +630,35 @@ impl AsynMotor for McsAxis {
         forward: bool,
     ) -> AsynResult<()> {
         self.set_speed(velocity)?;
-        let ch = self.channel;
+        let ctrl = self.lock();
+        let c = ctrl.axis(self.axis_no);
         let dir = if forward { 0 } else { 1 };
-        self.lock()
-            .command(&format!(":FRM{ch},{dir},{HOLD_TIME},{AUTO_ZERO}"))
+        ctrl.command(&format!(
+            ":FRM{},{dir},{},{}",
+            c.channel, c.hold_time, c.auto_zero
+        ))
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
-        let ch = self.channel;
-        self.lock().command(&format!(":S{ch}"))
+        let ctrl = self.lock();
+        ctrl.command(&format!(":S{}", ctrl.axis(self.axis_no).channel))
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        let ch = self.channel;
+        let ctrl = self.lock();
+        let McsChannel {
+            channel: ch,
+            is_rot,
+            ..
+        } = *ctrl.axis(self.axis_no);
         let rpos = position.round() as i32;
-        if self.is_rot && !(0..UDEG_PER_REV as i32).contains(&rpos) {
+        if is_rot && !(0..UDEG_PER_REV as i32).contains(&rpos) {
             // Rotary set-position is only valid within one revolution (C).
             return Err(mcs_err(format!(
                 "MCS: rotary set-position {rpos} out of [0, {UDEG_PER_REV})"
             )));
         }
-        self.lock().command(&format!(":SP{ch},{rpos}"))
+        ctrl.command(&format!(":SP{ch},{rpos}"))
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
@@ -425,10 +672,14 @@ impl AsynMotor for McsAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ch = self.channel;
-        let ctrl = self.lock();
+        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let McsChannel {
+            channel: ch,
+            is_rot,
+            ..
+        } = *ctrl.axis(self.axis_no);
 
-        let pos = if self.is_rot {
+        let pos = if is_rot {
             let (angle, rev) = ctrl.get_angle(ch)?;
             rev as i64 * UDEG_PER_REV + angle as i64
         } else {
@@ -437,6 +688,14 @@ impl AsynMotor for McsAxis {
 
         let moving = status_is_moving(ctrl.get_val("GS", ch)?);
         let homed = ctrl.get_val("GPPK", ch)? != 0;
+        // C reads the sensor type, `GST`, into PTYP_RB, then reads it again
+        // (smarActMCSMotorDriver.cpp:495-502).
+        let sensor = ctrl.get_val("GST", ch)?;
+        if let Some(r) = ctrl.reasons {
+            self.poll_params
+                .push((r.ptyp_rb, ParamValue::Int32(sensor)));
+        }
+        ctrl.get_val("GST", ch)?;
         drop(ctrl);
 
         Ok(MotorStatus {
@@ -450,6 +709,10 @@ impl AsynMotor for McsAxis {
             homed,
             ..MotorStatus::default()
         })
+    }
+
+    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
+        std::mem::take(&mut self.poll_params)
     }
 }
 
@@ -582,10 +845,12 @@ mod tests {
         let e = link.write_read(0, b":GS0", 16).unwrap_err();
         assert_eq!(e.message(), "asynManager::queueLockPort not connected");
         let controller = Arc::new(Mutex::new(McsController::new(link, false)));
-        let (mut axis, probed) = McsAxis::new(controller, 2);
+        let (mut axis, probed) = McsAxis::new(controller.clone(), 1, 2);
         assert!(probed.is_err());
-        assert_eq!(axis.channel, 2);
-        assert!(!axis.is_rot && !axis.has_encoder);
+        let ctrl = controller.lock().unwrap();
+        assert_eq!(ctrl.axis(1).channel, 2);
+        assert!(!ctrl.axis(1).is_rot && !axis.has_encoder);
+        drop(ctrl);
         assert_eq!(axis.vel_cached, 0);
         assert!(axis.poll(&AsynUser::new(0)).is_err());
     }
