@@ -420,6 +420,10 @@ impl AsynMotor for SmartMotorAxis {
         // RBo != 0 means "not on commanded position" (C clears EA_POSITION).
         let on_position = atoi(&ctrl.reply(self.axis, "RBo")) == 0;
 
+        // C motor_init sets encoder_present, so the encoder is a second RP,
+        // truncated by its (epicsInt32) cast.
+        let encoder_position = atof(&ctrl.reply(self.axis, "RP")) as i32;
+
         let velocity_raw = atoi(&ctrl.reply(self.axis, "RV"));
         drop(ctrl);
 
@@ -448,7 +452,7 @@ impl AsynMotor for SmartMotorAxis {
 
         let status = MotorStatus {
             position: position as f64,
-            encoder_position: position as f64,
+            encoder_position: f64::from(encoder_position),
             velocity,
             done,
             high_limit: plus_ls,
@@ -812,5 +816,15 @@ mod tests {
         quiet.store(false, Ordering::SeqCst);
         replies.lock().unwrap().insert("RP", "-60");
         assert!(!axis.poll(&user).unwrap().direction);
+    }
+
+    /// drvSmartMotor.cc:332-348: the encoder is its own RP after RBo,
+    /// truncated, where the position is rounded.
+    #[test]
+    fn encoder_is_a_second_rp_truncated() {
+        let (mut axis, replies, _, _rt) = single("smartEnc");
+        replies.lock().unwrap().insert("RP", "-7.6");
+        let s = axis.poll(&AsynUser::new(0)).unwrap();
+        assert_eq!((s.position, s.encoder_position), (-8.0, -7.0));
     }
 }
