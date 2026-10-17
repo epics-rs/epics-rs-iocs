@@ -191,13 +191,18 @@ pub enum SocketMode {
 /// [`Query`]: SocketMode::Query
 /// [`Fire`]: SocketMode::Fire
 pub struct XpsSocket {
-    handle: SyncIOHandle,
-    /// The same port at timeout 0, for [`read_pending`](Self::read_pending).
-    pending: SyncIOHandle,
+    /// `None` is C's socket index -1, from a failed `ConnectToServer`.
+    link: Option<Link>,
     /// The asyn port `handle` is connected to: C prints its `SendAndReceive`
     /// errors on that port's user.
     port: String,
     mode: SocketMode,
+}
+
+struct Link {
+    handle: SyncIOHandle,
+    /// The same port at timeout 0, for [`XpsSocket::read_pending`].
+    pending: SyncIOHandle,
 }
 
 impl XpsSocket {
@@ -205,8 +210,20 @@ impl XpsSocket {
     /// send mode and per-call timeout.
     pub fn new(handle: PortHandle, port: &str, mode: SocketMode, timeout: Duration) -> Self {
         Self {
-            pending: SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO),
-            handle: SyncIOHandle::from_handle(handle, 0, timeout),
+            link: Some(Link {
+                pending: SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO),
+                handle: SyncIOHandle::from_handle(handle, 0, timeout),
+            }),
+            port: port.to_string(),
+            mode,
+        }
+    }
+
+    /// C's socket -1, which a driver keeps using after `ConnectToServer`
+    /// failed: every call prints and answers `-22`.
+    pub fn invalid(port: &str, mode: SocketMode) -> Self {
+        Self {
+            link: None,
             port: port.to_string(),
             mode,
         }
@@ -233,9 +250,18 @@ impl XpsSocket {
     /// [`Query`]: SocketMode::Query
     /// [`Fire`]: SocketMode::Fire
     pub fn exec(&self, cmd: &str) -> XpsResult<XpsReply> {
+        let Some(link) = &self.link else {
+            // asynOctetSocket.cpp:137-141.
+            println!("SendAndReceive: invalid SocketIndex -1");
+            let reply = XpsReply("-22".to_string());
+            return match self.mode {
+                SocketMode::Query => Ok(reply),
+                SocketMode::Fire => Err(XpsError::Api(reply.code())),
+            };
+        };
         match self.mode {
-            SocketMode::Query => self.query(cmd),
-            SocketMode::Fire => self.fire(cmd),
+            SocketMode::Query => self.query(link, cmd),
+            SocketMode::Fire => self.fire(link, cmd),
         }
     }
 
@@ -243,9 +269,14 @@ impl XpsSocket {
     /// read until the terminator or the first read that does not succeed.
     /// Returns the byte count.
     pub fn read_pending(&self) -> usize {
+        let Some(link) = &self.link else {
+            // asynOctetSocket.cpp:241-245.
+            println!("ReadXPSSocket: invalid SocketIndex -1");
+            return 0;
+        };
         let mut buf = Vec::new();
         while !buf.ends_with(XPS_TERMINATOR.as_bytes()) && buf.len() < MAX_REPLY {
-            match self.pending.read_octet(OCTET_REASON, READ_BUF) {
+            match link.pending.read_octet(OCTET_REASON, READ_BUF) {
                 // A zero-byte success is the peer closing; C's next read
                 // fails on the closed socket.
                 Ok(chunk) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
@@ -265,11 +296,11 @@ impl XpsSocket {
     /// (`asynOctetSocket.cpp` uses `noProcessEos` and loops the same way), and
     /// return it with the terminator stripped. Self-contained: it does not rely
     /// on any port-level input EOS.
-    fn query(&self, cmd: &str) -> XpsResult<XpsReply> {
+    fn query(&self, link: &Link, cmd: &str) -> XpsResult<XpsReply> {
         // C writeRead (asynOctetSocket.cpp:153) flushes stale input before the
         // write; only the continuation chunks are plain reads.
-        let mut buf = self
-            .handle
+        let handle = &link.handle;
+        let mut buf = handle
             .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
             .inspect_err(|e| {
                 self.trace_error(format_args!(
@@ -279,7 +310,7 @@ impl XpsSocket {
                 ))
             })?;
         while !buf.ends_with(XPS_TERMINATOR.as_bytes()) {
-            let chunk = self.handle.read_octet(OCTET_REASON, READ_BUF)?;
+            let chunk = handle.read_octet(OCTET_REASON, READ_BUF)?;
             buf.extend_from_slice(&chunk);
             if buf.len() > MAX_REPLY {
                 return Err(XpsError::Transport(AsynError::Status {
@@ -304,12 +335,12 @@ impl XpsSocket {
     ///
     /// The move handle's per-call timeout should be short (C sets `-0.1` s on
     /// the move socket) so the write returns promptly.
-    fn fire(&self, cmd: &str) -> XpsResult<XpsReply> {
+    fn fire(&self, link: &Link, cmd: &str) -> XpsResult<XpsReply> {
         let synthesized = || XpsReply("0".to_string());
         for _ in 0..MOVE_MAX_RETRIES {
             // C writeRead (asynOctetSocket.cpp:189), so a late reply to the
             // previous move is flushed rather than read as this one's.
-            match self
+            match link
                 .handle
                 .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
             {
@@ -432,6 +463,22 @@ fn atoi64(s: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// asynOctetSocket.cpp:137-141: socket -1 answers every call with -22.
+    #[test]
+    fn an_invalid_socket_answers_minus_22() {
+        let query = XpsSocket::invalid("xpsInvalid", SocketMode::Query);
+        assert_eq!(
+            query.exec("GroupStatusGet(HEXAPOD,int *)").unwrap().code(),
+            -22
+        );
+        let fire = XpsSocket::invalid("xpsInvalid", SocketMode::Fire);
+        assert!(matches!(
+            fire.exec("HexapodMoveAbsolute()"),
+            Err(XpsError::Api(-22))
+        ));
+        assert_eq!(query.read_pending(), 0);
+    }
+
     use super::*;
 
     #[test]

@@ -1383,14 +1383,19 @@ pub fn hxp_create_controller_command() -> CommandDef {
             let ip_port = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
-                register_port(ctx, &port_name, NUM_HXP_AXES as i32)?;
-                println!(
-                    "HXPDriver:HXPController::HXPController: error calling TCP_ConnectToServer for pollSocket"
-                );
-                return Ok(CommandOutcome::Continue);
+            // C goes on with socket -1 for either socket (HXPDriver.cpp:106-116,
+            // 559-562).
+            let poll_sock = match connect_to_server(ctx, &ip, ip_port) {
+                Some(handle) => {
+                    XpsSocket::new(handle, &port_name, SocketMode::Query, HXP_POLL_TIMEOUT)
+                }
+                None => {
+                    println!(
+                        "HXPDriver:HXPController::HXPController: error calling TCP_ConnectToServer for pollSocket"
+                    );
+                    XpsSocket::invalid(&port_name, SocketMode::Query)
+                }
             };
-            let poll_sock = XpsSocket::new(handle, &port_name, SocketMode::Query, HXP_POLL_TIMEOUT);
             let controller = Arc::new(Mutex::new(HxpController::new(poll_sock)));
             let owner = ctx.db().scan_control().interrupt_gate();
             let port = register_controller_port(
@@ -1409,15 +1414,19 @@ pub fn hxp_create_controller_command() -> CommandDef {
                 .controller_poll(move || polled.lock().unwrap_or_else(|e| e.into_inner()).poll());
 
             for axis_no in 0..NUM_HXP_AXES {
-                let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
-                    continue;
+                let move_sock = match connect_to_server(ctx, &ip, ip_port) {
+                    Some(handle) => {
+                        XpsSocket::new(handle, &port_name, SocketMode::Fire, HXP_MOVE_TIMEOUT)
+                    }
+                    None => {
+                        println!(
+                            "SetTCPTimeout, SocketIndex=-1, must be >=0 and < {}",
+                            NEXT_SOCKET.load(Ordering::Relaxed)
+                        );
+                        XpsSocket::invalid(&port_name, SocketMode::Fire)
+                    }
                 };
-                let line = Arc::new(MoveLine::new(XpsSocket::new(
-                    handle,
-                    &port_name,
-                    SocketMode::Fire,
-                    HXP_MOVE_TIMEOUT,
-                )));
+                let line = Arc::new(MoveLine::new(move_sock));
                 controller
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1948,6 +1957,23 @@ mod one_poller {
             ArgValue::String("hxpOnePoller".into()),
             ArgValue::String("127.0.0.1".into()),
             ArgValue::Int(port.into()),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+        ];
+        let cmd = hxp_create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// HXPDriver.cpp:106-116: a failed poll or move socket still builds the
+    /// controller, its axes and its poller.
+    #[epics_rs::base::epics_test]
+    async fn hxp_create_controller_without_sockets_still_polls_its_axes() {
+        // Every ConnectToServer takes socket 0, whose port name is held.
+        let _held = epics_rs::asyn::registry::claim_port("hxp.nosocket:1:0").unwrap();
+        let args = vec![
+            ArgValue::String("hxpNoSocket".into()),
+            ArgValue::String("hxp.nosocket".into()),
+            ArgValue::Int(1),
             ArgValue::Int(200),
             ArgValue::Int(1000),
         ];
