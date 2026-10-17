@@ -61,8 +61,8 @@ dbLoadRecords("$(ADTIMEPIX)/db/OperatingVoltage.template", "P=$(PREFIX),R=cam1:,
 NDStdArraysConfigure("Image1", 3, 0, "$(PORT)", 0, 0)
 dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),NDARRAY_ADDR=0,TYPE=Int16,FTVL=SHORT,NELEMENTS=$(MASK_BPC_NELEMENTS)")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+iocInit()
+
 # The detector-side initialisation the C IOC does from init_detector*.cmd is
 # site-specific (TCP stream paths, BPC/DACS files, masks). Set it from iocsh or
 # a site file, e.g.:

@@ -102,3 +102,5 @@ asynSetOption("SerialEuro", 0, "stop", "1")
 EurothermConfig("EURO1", "SerialEuro", 0)
 
 dbLoadRecords("$(IP)/db/eurotherm.db", "P=$(PREFIX),ET=et1,PORT=EURO1,LADDR=1")
+
+iocInit()

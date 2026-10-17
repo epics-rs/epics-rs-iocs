@@ -54,8 +54,8 @@ dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=I
 # Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE)).
 < $(ADCORE)/ioc/commonPlugins.cmd
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+iocInit()
+
 # Example interactive commands:
 #   dbl                                       # List all PVs
 #   dbpf XF:23ID2-ES{SPECS}cam1:Acquire 1     # Start acquisition

@@ -111,8 +111,8 @@ dbLoadRecords("$(ADCORE)/db/NDFFT.template","P=$(PREFIX),R=FFT8:,PORT=FFT8,ADDR=
 # Remaining plugin chain
 < $(ADCSIMDETECTOR)/csimDetectorPlugins.cmd
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+iocInit()
+
 # Example interactive commands:
 #   dbl                                      # List all PVs
 #   dbpf 13ADCSIM1:det1:Acquire 1            # Start acquisition

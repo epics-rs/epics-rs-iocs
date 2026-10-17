@@ -54,8 +54,8 @@ dbLoadRecords("$(ADD435I)/db/d435i_depth.template", "P=$(PREFIX),R=depth1:,PORT=
 < $(ADD435I)/d435iDepthPlugins.cmd
 < $(ADD435I)/d435iPCPlugins.cmd
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+iocInit()
+
 # Example interactive commands:
 #   dbl                                # List all PVs
 #   dbpf RS1:cam1:Acquire 1            # Start acquisition

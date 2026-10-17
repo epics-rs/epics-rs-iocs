@@ -77,9 +77,7 @@ set_requestfile_path("$(ADD435I)")
 set_savefile_path("$(ADD435I)/autosave/RS435")
 set_pass1_restoreFile("auto_settings.sav", "P=$(PREFIX)")
 
-# Spelled out so create_monitor_set below runs after record init. epics-rs
-# calls iocInit itself once the script finishes and the command is idempotent,
-# so this is not a second initialisation.
+# Spelled out so create_monitor_set below runs after record init.
 iocInit()
 
 create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
@@ -97,8 +95,6 @@ create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
 # script finishes, so any dbpf written here executes before the restore and
 # processes the default. run-d435i-ioc.sh forces the process once the IOC is up.
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
 # Example interactive commands:
 #   dbl                                  # List all PVs
 #   dbpf RS435:cam1:Acquire 1            # Start acquisition
