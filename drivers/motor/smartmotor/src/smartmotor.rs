@@ -36,6 +36,7 @@
 //!   (`build_trans` sends nothing and returns `ERROR`); [`home`](AsynMotor::home)
 //!   returns an error and [`set_pid_gain`](AsynMotor::set_pid_gain) is a no-op.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -45,6 +46,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 
 use motor_common::util::{atof, atoi, nint};
 
@@ -79,9 +81,23 @@ const ACONFAC: f64 = 3.958322E-3;
 const MIN_ACCEL: i32 = 2;
 
 /// Scale and round an acceleration to the controller value, clamped to the minimum the
-/// SmartMotor accepts (C overrides `A <= 1` to `2`).
+/// SmartMotor accepts (C overrides `A <= 1` to `2`, saying so once per process).
 fn clamped_accel(acceleration: f64) -> i32 {
-    nint(acceleration * ACONFAC).max(MIN_ACCEL)
+    static INVALID_ACCMSG_LATCH: AtomicBool = AtomicBool::new(false);
+    let cacc = nint(acceleration * ACONFAC);
+    if cacc > 1 {
+        return cacc;
+    }
+    if !INVALID_ACCMSG_LATCH.swap(true, Ordering::Relaxed) {
+        // errPrintf(-1, ...): no errSym name, then a space for the nonzero
+        // status. The file and line are ours.
+        errlog_vprintf(format_args!(
+            " filename=\"{}\" line number={} Overriding invalid acceleration; A < 2.\n",
+            file!(),
+            line!()
+        ));
+    }
+    MIN_ACCEL
 }
 
 fn smartmotor_err(message: impl Into<String>) -> AsynError {
@@ -243,15 +259,11 @@ impl SmartMotorAxis {
     }
 
     /// Program speed/acceleration before a move (C sends `V=`/`A=` as separate
-    /// transactions ahead of the move command). Non-positive values are skipped;
-    /// acceleration is clamped to the controller minimum.
+    /// transactions ahead of the move command); acceleration is clamped to the
+    /// controller minimum.
     fn program_speeds(ctrl: &SmartMotorController, axis: usize, velocity: f64, acceleration: f64) {
-        if velocity > 0.0 {
-            ctrl.send(axis, &format!("V={}", nint(velocity * VCONFAC)));
-        }
-        if acceleration > 0.0 {
-            ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)));
-        }
+        ctrl.send(axis, &format!("V={}", nint(velocity * VCONFAC)));
+        ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)));
     }
 }
 
@@ -618,6 +630,8 @@ mod tests {
         axis.move_absolute(&user, 100.0, 0.0, 1000.0, 10_000.0)
             .unwrap();
         axis.move_velocity(&user, 0.0, -1000.0, 0.0).unwrap();
+        // devSmartMotor.cc:249-265: a zero move still sends both.
+        axis.move_relative(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
         let sent: Vec<_> = sent.lock().unwrap().drain(..).collect();
         assert_eq!(
             sent,
@@ -627,6 +641,10 @@ mod tests {
                 b"\x81P=100",
                 b"\x81G",
                 b"\x81MV\rV=-16106\rG",
+                b"\x81V=0",
+                b"\x81A=2",
+                b"\x81D=5",
+                b"\x81G",
             ]
         );
     }
