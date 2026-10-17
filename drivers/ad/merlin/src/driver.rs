@@ -24,6 +24,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
+use epics_rs::ad_core::ndarray::{NDArray, NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
@@ -67,6 +68,9 @@ pub struct MerlinDetector {
     det_type: DetectorType,
     cmd: MpxConnection,
     shared: Arc<SharedState>,
+    /// C `pFlatField`: allocated by the constructor and never used, but it
+    /// holds its pool buffer for the driver's life (merlinDetector.cpp:1390).
+    _flat_field: Option<NDArray>,
 }
 
 impl MerlinDetector {
@@ -88,6 +92,18 @@ impl MerlinDetector {
             max_memory,
             ASYN_CANBLOCK,
         )?;
+        // A refusal leaves C's pointer NULL; the pool has printed its line.
+        let _flat_field = ad
+            .pool
+            .pool()
+            .alloc(
+                vec![
+                    NDDimension::new(max_size_x as usize),
+                    NDDimension::new(max_size_y as usize),
+                ],
+                NDDataType::UInt32,
+            )
+            .ok();
         let params = MerlinParams::create(&mut ad.port_base)?;
         let init_param = ad
             .port_base
@@ -106,11 +122,7 @@ impl MerlinDetector {
         base.set_int32_param(ad.params.base.array_size_x, 0, max_size_x)?;
         base.set_int32_param(ad.params.base.array_size_y, 0, max_size_y)?;
         base.set_int32_param(ad.params.base.array_size, 0, 0)?;
-        base.set_int32_param(
-            ad.params.base.data_type,
-            0,
-            epics_rs::ad_core::ndarray::NDDataType::UInt32 as u8 as i32,
-        )?;
+        base.set_int32_param(ad.params.base.data_type, 0, NDDataType::UInt32 as u8 as i32)?;
         base.set_int32_param(ad.params.image_mode, 0, MerlinImageMode::Continuous as i32)?;
         base.set_int32_param(ad.params.trigger_mode, 0, TriggerMode::Internal as i32)?;
         base.set_int32_param(params.profile_control, 0, MPXPROFILES_IMAGE)?;
@@ -124,6 +136,7 @@ impl MerlinDetector {
             det_type,
             cmd,
             shared,
+            _flat_field,
         })
     }
 
@@ -833,6 +846,20 @@ mod tests {
         assert_eq!(sync.read_int32(p.num_images).unwrap(), 3);
     }
 
+    /// The constructor allocates the flat-field buffer from the driver's pool
+    /// and keeps it (merlinDetector.cpp:1390), so PoolPollStats counts it.
+    #[test]
+    fn the_flat_field_buffer_is_counted_on_the_pool() {
+        let mut det = detector("MERLIN_FLAT_FIELD");
+        let p = det.ad.params.base;
+        let mut user = AsynUser::new(p.pool_poll_stats);
+        det.write_int32(&mut user, 1).unwrap();
+        let base = &det.ad.port_base;
+        assert_eq!(base.get_int32_param(p.pool_alloc_buffers, 0).unwrap(), 1);
+        assert_eq!(base.get_int32_param(p.pool_free_buffers, 0).unwrap(), 0);
+        assert_eq!(base.get_float64_param(p.pool_used_memory, 0).unwrap(), 1.0);
+    }
+
     #[test]
     fn a_base_class_write_reaches_addriver() {
         let mut det = detector("MERLIN_BASE_WRITE");
@@ -976,7 +1003,8 @@ mod tests {
     /// the software-trigger reset and the completion (:290-305).
     #[test]
     fn a_refused_last_frame_leaves_the_acquisition_running() {
-        let (acquire, trigger, _) = last_software_triggered_frame("MERLIN_LAST_OK", 1 << 20);
+        // 1 MiB of the limit is the flat-field buffer.
+        let (acquire, trigger, _) = last_software_triggered_frame("MERLIN_LAST_OK", 2 << 20);
         assert_eq!((acquire, trigger), (0, 0));
         let (acquire, trigger, _) = last_software_triggered_frame("MERLIN_LAST_REFUSED", 1000);
         assert_eq!((acquire, trigger), (1, 1));
