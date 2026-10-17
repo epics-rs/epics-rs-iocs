@@ -21,13 +21,12 @@ use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PersistentArray, 
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::trace::TraceMask;
 use parking_lot::Mutex;
 
 use crate::camserver::Ctx;
-use crate::file_name::{
-    MultipleFileFormat, check_path, format_file_template, make_multiple_file_format,
-};
+use crate::file_name::{MultipleFileFormat, format_file_template, make_multiple_file_format};
 use crate::image::{
     apply_flat_field, apply_flat_field_floor, correct_bad_pixels, decode_tiff, flat_field_average,
     parse_bad_pixel_file,
@@ -43,7 +42,7 @@ use crate::protocol::{
 };
 use crate::types::{
     BadPixel, CAMSERVER_ACQUIRE_TIMEOUT, CAMSERVER_DEFAULT_TIMEOUT, CAMSERVER_RESET_POWER_TIMEOUT,
-    CamStatus, Event, FILE_READ_DELAY, MAX_FILENAME_LEN, MAX_HEADER_STRING_LEN, TriggerMode, secs,
+    Event, FILE_READ_DELAY, MAX_FILENAME_LEN, MAX_HEADER_STRING_LEN, TriggerMode, secs,
 };
 
 /// Work that C performs synchronously inside an asyn `write*` callback. A Rust
@@ -138,9 +137,7 @@ async fn cmd_loop(mut w: Worker, mut rx: rt::CommandReceiver<Cmd>) {
                 w.ctx
                     .cam_write_read(&cmd_imgpath(&path), CAMSERVER_DEFAULT_TIMEOUT)
                     .await;
-                let exists = check_path(&path);
-                let reason = w.ctx.ad.base.file_path_exists;
-                w.ctx.set_i32(reason, i32::from(exists));
+                w.ctx.check_path().await;
                 w.ctx.callbacks().await;
             }
             Cmd::ReadBadPixelFile(file) => read_bad_pixel_file(&mut w, &file).await,
@@ -218,7 +215,7 @@ async fn set_acquire_params(ctx: &mut Ctx) {
 
     // Read back the pixel count-rate cut-off.
     let status = ctx.cam_write_read("Tau", 5.0).await;
-    if !status.is_err()
+    if status == AsynStatus::Success
         && let Some(cutoff) = parse_tau_cutoff(ctx.from())
     {
         ctx.set_i32(ctx.p.pixel_cutoff, cutoff);
@@ -246,7 +243,7 @@ async fn set_threshold(w: &mut Worker) {
 
     // This command can take 96 seconds on a 6M.
     let status = ctx.cam_write_read(&cmd, 110.0).await;
-    let new_status = if status.is_err() {
+    let new_status = if status != AsynStatus::Success {
         ADStatus::Error
     } else {
         ADStatus::Idle
@@ -256,7 +253,7 @@ async fn set_threshold(w: &mut Worker) {
 
     // Read back the actual threshold setting, in case we are out of bounds.
     let status = ctx.cam_write_read("SetThreshold", 5.0).await;
-    if !status.is_err()
+    if status == AsynStatus::Success
         && let Some(ev) = parse_threshold_ev(ctx.from())
     {
         ctx.set_f64(ctx.p.threshold, ev as f64 / 1000.0);
@@ -264,7 +261,7 @@ async fn set_threshold(w: &mut Worker) {
 
     // Read back the actual energy setting.
     let status = ctx.cam_write_read("SetEnergy", 5.0).await;
-    if !status.is_err() {
+    if status == AsynStatus::Success {
         let ev = parse_energy_setting(ctx.from());
         ctx.set_f64(ctx.p.energy, ev as f64 / 1000.0);
     }
@@ -311,7 +308,7 @@ async fn pilatus_status(
 ) {
     if *first_status_call {
         let status = ctx.cam_write_read("version", 1.0).await;
-        if !status.is_err() {
+        if status == AsynStatus::Success {
             if let Some(v) = parse_version(ctx.from()) {
                 ctx.set_str(ctx.p.tvx_version, v.version_string.clone());
                 ctx.set_str(ctx.ad.base.sdk_version, v.version_string);
@@ -333,7 +330,7 @@ async fn pilatus_status(
     }
 
     let status = ctx.cam_write_read("thread", 1.0).await;
-    if !status.is_err() {
+    if status == AsynStatus::Success {
         // Fixed (upstream-c-defects.md #12): resolve each channel independently
         // so a partial reply for one channel never leaks another channel's
         // value (C shared one `temp` / `humid` pair across all channels).
@@ -504,7 +501,7 @@ async fn wait_for_file_to_exist(
     file: &Path,
     start_time: Option<SystemTime>,
     timeout: f64,
-) -> CamStatus {
+) -> AsynStatus {
     let acq_start = start_time.map(epoch_secs).unwrap_or(0);
     let t_start = Instant::now();
     let mut delta_time = 0.0f64;
@@ -528,7 +525,7 @@ async fn wait_for_file_to_exist(
                                 file.display()
                             ),
                         );
-                        return CamStatus::Error;
+                        return AsynStatus::Error;
                     }
                 };
                 // Allow up to 10 seconds of clock skew between this IOC and the
@@ -544,7 +541,7 @@ async fn wait_for_file_to_exist(
         if ctx.stop.wait_timeout(secs(FILE_READ_DELAY)) {
             ctx.set_str(ctx.ad.status_message, "Acquisition aborted");
             ctx.set_i32(ctx.ad.status, ADStatus::Aborted as i32);
-            return CamStatus::Error;
+            return AsynStatus::Error;
         }
         delta_time = t_start.elapsed().as_secs_f64();
     }
@@ -572,9 +569,9 @@ async fn wait_for_file_to_exist(
                 "Timeout waiting for file to be created",
             );
         }
-        return CamStatus::Error;
+        return AsynStatus::Error;
     }
-    CamStatus::Success
+    AsynStatus::Success
 }
 
 /// C `readTiff()` — wait for the file, then retry the decode until the writer
@@ -583,7 +580,7 @@ async fn wait_for_file_to_exist(
 /// Fixed (upstream-c-defects.md #8): when the retry loop exhausts `timeout`
 /// without a successful decode, C falls through and returns `asynSuccess` with
 /// a buffer it never filled — the caller then publishes stale/garbage pixels.
-/// That is a failed read, so this returns [`CamStatus::Error`] and the caller
+/// That is a failed read, so this returns [`AsynStatus::Error`] and the caller
 /// does not publish.
 async fn read_tiff(
     ctx: &mut Ctx,
@@ -593,12 +590,12 @@ async fn read_tiff(
     nx: usize,
     ny: usize,
     bad_pixels: &[BadPixel],
-) -> Result<(Vec<i32>, Option<String>), CamStatus> {
+) -> Result<(Vec<i32>, Option<String>), AsynStatus> {
     let t_start = Instant::now();
     let mut delta_time = 0.0f64;
 
     let status = wait_for_file_to_exist(ctx, file, start_time, timeout).await;
-    if status.is_err() {
+    if status != AsynStatus::Success {
         return Err(status);
     }
 
@@ -635,7 +632,7 @@ async fn read_tiff(
         // Sleep, but check for the stop event so a long acquisition can abort.
         if ctx.stop.wait_timeout(secs(FILE_READ_DELAY)) {
             ctx.set_i32(ctx.ad.status, ADStatus::Aborted as i32);
-            return Err(CamStatus::Error);
+            return Err(AsynStatus::Error);
         }
         delta_time = t_start.elapsed().as_secs_f64();
     }
@@ -643,7 +640,7 @@ async fn read_tiff(
     let Some(img) = decoded else {
         // Fixed (upstream-c-defects.md #8): the retry loop timed out without a
         // valid frame. Do not fabricate a buffer or publish it.
-        return Err(CamStatus::Error);
+        return Err(AsynStatus::Error);
     };
     let (mut data, description) = (img.data, img.description);
     correct_bad_pixels(&mut data, bad_pixels);
@@ -662,7 +659,7 @@ async fn read_image_file(
     nx: usize,
     ny: usize,
     bad_pixels: &[BadPixel],
-) -> Result<(Vec<i32>, Option<String>), CamStatus> {
+) -> Result<(Vec<i32>, Option<String>), AsynStatus> {
     if ends_with_ignore_case(file, ".tif") || ends_with_ignore_case(file, ".tiff") {
         read_tiff(
             ctx,
@@ -676,7 +673,7 @@ async fn read_image_file(
         .await
     } else if ends_with_ignore_case(file, ".cbf") {
         ctx.set_str(ctx.ad.status_message, "CBF files are not supported");
-        Err(CamStatus::Error)
+        Err(AsynStatus::Error)
     } else {
         ctx.trace(
             TraceMask::ERROR,
@@ -689,7 +686,7 @@ async fn read_image_file(
             ctx.ad.status_message,
             "Unsupported file extension, expected .tif or .cbf",
         );
-        Err(CamStatus::Error)
+        Err(AsynStatus::Error)
     }
 }
 
@@ -758,7 +755,7 @@ async fn create_file_name(ctx: &mut Ctx) -> String {
 }
 
 async fn acq_loop(mut w: Worker, start: Arc<Event>) {
-    let mut status = CamStatus::Success;
+    let mut status = AsynStatus::Success;
     let mut aborted = false;
     let mut multiple_file_number = 0i32;
     let mut multiple_file_next_image;
@@ -775,7 +772,7 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
         if aborted || !acquire {
             // Only set the status message if we didn't encounter any errors
             // last time, so we don't overwrite the error message.
-            if !status.is_err() {
+            if status == AsynStatus::Success {
                 let reason = w.ctx.ad.status_message;
                 w.ctx.set_str(reason, "Waiting for acquire command");
             }
@@ -843,11 +840,11 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
         let mut array_callbacks = 0;
         multiple_file_next_image = 0;
 
-        if status.code() > 1 {
+        if status as i32 > 1 {
             acquire = false;
         } else {
             // The timeout was expected.
-            status = CamStatus::Success;
+            status = AsynStatus::Success;
             w.ctx.set_shutter(true).await;
             w.ctx.set_i32(w.ctx.p.armed, 1);
             mff = make_multiple_file_format(&full_file_name, num_images);
@@ -867,10 +864,10 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
                 w.ctx.callbacks().await;
                 let timeout = ((num_exposures - 1) as f64 * acquire_period) + acquire_time;
                 status = w.ctx.cam_read(timeout + CAMSERVER_ACQUIRE_TIMEOUT).await;
-                if status.is_err() {
+                if status != AsynStatus::Success {
                     acquire = false;
                     aborted = true;
-                    if status == CamStatus::Timeout {
+                    if status == AsynStatus::Timeout {
                         let reason = w.ctx.ad.status_message;
                         w.ctx
                             .set_str(reason, "Timeout waiting for camserver response");
@@ -968,7 +965,7 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
         }
 
         // Wait for the 7 OK response from camserver for multiple images.
-        if num_images > 1 && status == CamStatus::Success {
+        if num_images > 1 && status == AsynStatus::Success {
             // With arrayCallbacks off we never waited for the individual image
             // files, so the response can take a long time.
             let timeout = if array_callbacks != 0 {
@@ -982,7 +979,7 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
             w.ctx.callbacks().await;
             status = w.ctx.cam_read(timeout).await;
             // On a timeout camserver could still be acquiring, so send a stop.
-            if status == CamStatus::Timeout {
+            if status == AsynStatus::Timeout {
                 let reason = w.ctx.ad.status_message;
                 w.ctx
                     .set_str(reason, "Timeout waiting for camserver response");
@@ -995,7 +992,7 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
         }
 
         let status_param = w.ctx.get_i32(w.ctx.ad.status).await.unwrap_or(0);
-        if !status.is_err() {
+        if status == AsynStatus::Success {
             w.ctx.set_i32(w.ctx.ad.status, ADStatus::Idle as i32);
         } else if status_param != ADStatus::Aborted as i32 {
             w.ctx.set_i32(w.ctx.ad.status, ADStatus::Error as i32);
@@ -1150,6 +1147,103 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(read.is_ok(), "readFlatFieldFile panicked");
         assert_eq!(h.read_int32_blocking(p.flat_field_valid, 0).unwrap(), 0);
+        std::mem::forget(runtime);
+    }
+
+    /// A FilePath write runs C's `imgpath` then `asynNDArrayDriver::checkPath()`
+    /// (pilatusDetector.cpp:1612-1615, asynNDArrayDriver.cpp:98-111): an empty
+    /// path leaves FilePathExists undefined, any other is written back with its
+    /// separator.
+    #[test]
+    fn a_file_path_write_runs_ndarray_driver_check_path() {
+        use crate::driver::{DriverLinks, PilatusDriver};
+        use epics_rs::ad_core::plugin::channel::NDArrayOutput;
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::sync_io::SyncIOHandle;
+
+        let (cmd_tx, cmd_rx) = rt::command_channel::<Cmd>(4);
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let stop = Arc::new(Event::new());
+        let det = PilatusDriver::new(
+            "PILATUS_CHECK_PATH",
+            2,
+            1,
+            0,
+            DriverLinks {
+                cmd_tx,
+                start: Arc::new(Event::new()),
+                stop: stop.clone(),
+                shared: shared.clone(),
+            },
+        )
+        .unwrap();
+        let (ad, p, pool) = (det.ad.params, det.p, det.ad.pool.clone());
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("PILATUS_CHECK_PATH").unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let (cam, _) = SyncIOHandle::connect_port(
+            "PILATUS_CHECK_PATH_NO_CAMSERVER",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let w = Worker {
+            ctx: Ctx::new(h.clone(), Arc::new(cam), ad, p, stop),
+            shared,
+            output: ArrayPublisher::new(Arc::new(Mutex::new(NDArrayOutput::new()))),
+            pool,
+        };
+        let _cmd_thread = start_cmd_task(w, cmd_rx);
+        let (file_path, exists) = (ad.base.file_path, ad.base.file_path_exists);
+        // The command thread runs its queue in order: once a later oscillation
+        // axis command is on ADStringToServer, the FilePath command has finished.
+        let write_path = |path: Vec<u8>, marker: &'static str| {
+            let writes = h.clone();
+            let written = rt::run_thread_named("PilatusCheckPathTest", move || async move {
+                writes.write_octet(file_path, 0, path).await.unwrap();
+                writes
+                    .write_octet(p.oscill_axis, 0, marker.into())
+                    .await
+                    .unwrap();
+            })
+            .join();
+            assert!(written.is_ok(), "writes refused");
+            let sent = format!("mxsettings Oscillation_axis {marker}");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while String::from_utf8_lossy(
+                &h.get_string_param_blocking(ad.string_to_server, 0, 256)
+                    .unwrap(),
+            ) != sent
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "command thread stalled"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+
+        write_path(Vec::new(), "a");
+        assert!(
+            h.read_int32_blocking(exists, 0).is_err(),
+            "an empty FilePath leaves FilePathExists undefined"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+        write_path(dir_path.clone().into_bytes(), "b");
+        assert_eq!(
+            String::from_utf8_lossy(&h.get_string_param_blocking(file_path, 0, 256).unwrap()),
+            format!("{dir_path}/"),
+            "checkPath writes the path back with its separator"
+        );
+        assert_eq!(h.read_int32_blocking(exists, 0).unwrap(), 1);
         std::mem::forget(runtime);
     }
 
