@@ -1206,7 +1206,7 @@ impl AsynMotor for Mm4000Axis {
         );
         let position = position / step;
         let done = !motion_sent && byte & MM4000_MOVING == 0;
-        self.set_poll_params(&data, byte, position, done);
+        self.set_poll_params(&data, byte, position);
         Ok(MotorStatus {
             position,
             encoder_position: position,
@@ -1234,13 +1234,14 @@ impl AsynMotor for Mm4000Axis {
 impl Mm4000Axis {
     /// MM4000Poller's parameters of the axis (drvMM4000Asyn.c:653-718): a
     /// failed read sets only the comm error. The limit, home and direction
-    /// parameters are C's masked status bits, not 0/1.
-    fn set_poll_params(&self, data: &Mm4000PollData, byte: u8, position: f64, done: bool) {
+    /// parameters are C's masked status bits, not 0/1, and done is the moving
+    /// bit alone.
+    fn set_poll_params(&self, data: &Mm4000PollData, byte: u8, position: f64) {
         let params = &self.params;
         let _ = params.set_integer(function::COMM_ERROR, i32::from(data.comms_error));
         if !data.comms_error {
             for (f, v) in [
-                (function::DONE, i32::from(done)),
+                (function::DONE, i32::from(byte & MM4000_MOVING == 0)),
                 (function::HOME_SIGNAL, i32::from(byte & MM4000_HOME)),
                 (
                     function::HIGH_HARD_LIMIT,
@@ -1948,6 +1949,7 @@ mod tests {
                 "MS;" => "1MS@,2MSE",
                 "TP;" => "1TP0.0,2TP-1.25",
                 "TE;" => "TE@",
+                "1TU" => "1TU0.001",
                 "2TU" => "2TU0.001",
                 "2TL" => "2TL-10.0",
                 "2TR" => "2TR20.0",
@@ -2033,6 +2035,19 @@ mod tests {
         assert_eq!(params.get_integer(function::POWER_ON), Ok(Some(1)));
         assert_eq!(params.get_double(function::POSITION), Ok(Some(-1250.0)));
         assert_eq!(params.get_integer(function::COMM_ERROR), Ok(Some(0)));
+    }
+
+    /// drvMM4000Asyn.c:671-678: motorAxisDone is the status byte's moving
+    /// bit, whatever the record's done holds back after a move.
+    #[epics_rs::base::epics_test]
+    async fn the_done_parameter_is_the_moving_bit() {
+        let (axes, _path) = traced_axes("mm4kDone", TraceMask::ERROR).await;
+        let user = AsynUser::default();
+        let mut axis = axes[0].lock().unwrap();
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        let status = axis.poll(&user).unwrap();
+        assert!(!status.done);
+        assert_eq!(axis.params().get_integer(function::DONE), Ok(Some(1)));
     }
 
     /// drvMM4000Asyn.c:344-381: the encoder ratio and the gains are refused

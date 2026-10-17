@@ -648,8 +648,8 @@ impl AsynMotor for PmacCsAxis {
         let flags = decode_cs_status((status1, status2, status3), system.deferred[axis - 1]);
 
         let done = flags.done && !std::mem::take(&mut self.motion_sent);
-        // C's setInteger block (pmacAsynCoord.c:650-671), with the done and
-        // problem the record sees.
+        // C's setInteger block (pmacAsynCoord.c:650-671), with the problem the
+        // record sees.
         let params = system.params(axis);
         let _ = params.set_double(function::POSITION, position);
         let _ = params.set_double(function::ENCODER_POSN, position);
@@ -658,7 +658,7 @@ impl AsynMotor for PmacCsAxis {
             (function::HIGH_HARD_LIMIT, flags.limit),
             (function::HOME_SIGNAL, false),
             (function::MOVING, flags.moving),
-            (function::DONE, done),
+            (function::DONE, flags.done),
             (function::LOW_HARD_LIMIT, flags.limit),
             (function::FOLLOWING_ERROR, flags.following_error),
             (function::PROBLEM, flags.problem),
@@ -882,6 +882,9 @@ mod tests {
         assert_eq!(get.get_integer(function::COMM_ERROR), Some(0));
         axis.move_absolute(&user, 1.0, 0.0, 0.0, 0.0).unwrap();
         assert_eq!(get.get_integer(function::DONE), Some(0));
+        // pmacAsynCoord.c:660-665: done is the system's status alone.
+        assert!(!axis.poll(&user).unwrap().done);
+        assert_eq!(get.get_integer(function::DONE), Some(1));
     }
 
     /// pmacAsynCoord.c motorAxisMove clears motorAxisDone and wakes the

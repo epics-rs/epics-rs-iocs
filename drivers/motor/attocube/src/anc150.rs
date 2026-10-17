@@ -473,6 +473,9 @@ impl AsynMotor for Anc150Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        // C's axisDone: a move in flight at the poll's start, even one whose
+        // timer has run out (drvANC150Asyn.cc:599-603).
+        let axis_done = !self.moving;
         // Interpolate the software position (C poller).
         let (position, done) = if self.moving {
             let time_remaining = self
@@ -537,7 +540,7 @@ impl AsynMotor for Anc150Axis {
         // drvANC150Asyn.cc:617-649; `axisStatus` is never set, so the switch
         // parameters are 0.
         let params = &self.params;
-        let _ = params.set_integer(function::DONE, i32::from(done));
+        let _ = params.set_integer(function::DONE, i32::from(axis_done));
         for f in [
             function::HOME_SIGNAL,
             function::HIGH_HARD_LIMIT,
@@ -912,7 +915,11 @@ mod tests {
         axis.move_absolute(&user, 2.0, 0.0, 1.0, 1.0).unwrap();
         assert_eq!(params.get_integer(function::DIRECTION), Ok(Some(0)));
         assert_eq!(params.get_integer(function::DONE), Ok(Some(0)));
-        axis.stop(&user, 1.0).unwrap();
+        // drvANC150Asyn.cc:601-605: the poll that finds the timer run out
+        // still reports the axis moving.
+        axis.move_deadline = Some(Instant::now());
+        axis.poll(&user).unwrap();
+        assert_eq!(params.get_integer(function::DONE), Ok(Some(0)));
         axis.poll(&user).unwrap();
         assert_eq!(params.get_integer(function::DONE), Ok(Some(1)));
         assert_eq!(params.get_double(function::POSITION), Ok(Some(2.0)));
