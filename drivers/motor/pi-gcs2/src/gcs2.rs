@@ -131,10 +131,9 @@
 //!   extra wire traffic on repeated identical values, no behavioral
 //!   difference); the max-acceleration *value* itself is still queried and
 //!   clamped to, lazily cached per axis exactly as upstream does.
-//! - **Velocity readback**: `getAxisVelocity` (`VEL?`) seeds a field
-//!   (`m_velocity`) that upstream itself never feeds back to the motor
-//!   record (not read anywhere in `PIasynAxis::poll`), so `MotorStatus::
-//!   velocity` is reported as `0.0` rather than adding an unused round trip.
+//! - **Velocity readback**: the init `getAxisVelocity` (`VEL?`) is sent, but
+//!   the `m_velocity` it seeds is never read back (not in `PIasynAxis::poll`),
+//!   so `MotorStatus::velocity` stays `0.0`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -493,6 +492,14 @@ impl PIGCS2Controller {
         self.check_ok()
     }
 
+    /// C `getAxisVelocity`: `VEL? {axis}` on a controller that knows it.
+    fn get_axis_velocity(&self, axis: &str) -> AsynResult<f64> {
+        if !self.knows_vel {
+            return Ok(0.0);
+        }
+        get_value_f64(&self.query(&format!("VEL? {axis}"))?)
+    }
+
     /// `POS? {axis}`.
     fn get_axis_position(&self, axis: &str) -> AsynResult<f64> {
         get_value_f64(&self.query(&format!("POS? {axis}"))?)
@@ -733,6 +740,7 @@ impl PIGCS2Axis {
                 Ok(counts_per_unit(num as i32, den as i32))
             })
             .unwrap_or(axis.cpu);
+        let _ = ctrl.get_axis_velocity(&axis.axis_name);
         let position = ctrl.get_axis_position(&axis.axis_name);
         let (mut low_limit, mut high_limit) = (axis.low_limit, axis.high_limit);
         let _ = ctrl.get_travel_limits(&axis.axis_name, &mut low_limit, &mut high_limit);
@@ -1228,6 +1236,27 @@ mod tests {
                 "SPA 1 80 2.5",
             ]
         );
+    }
+
+    /// C `PIasynAxis::Init` (PIasynAxis.cpp:89-93): `getResolution`, then
+    /// `getAxisVelocity`'s `VEL?` on a controller that knows it, then the
+    /// position.
+    #[test]
+    fn axis_init_reads_the_velocity_before_the_position() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2InitVel", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2InitVel");
+        ctrl.knows_vel = true;
+        let _axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "1".into(), 0, "gcs2InitVel");
+        let sent: Vec<String> = line
+            .sent()
+            .into_iter()
+            .filter(|w| w.contains('?') && w != "ERR?")
+            .collect();
+        let at = |q: &str| sent.iter().position(|w| w.starts_with(q));
+        assert_eq!(at("VEL? 1").map(|i| i + 1), at("POS? 1"), "{sent:?}");
+        assert!(at("SPA? 1 15") < at("VEL? 1"), "{sent:?}");
     }
 
     #[test]
