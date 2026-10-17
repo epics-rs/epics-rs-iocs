@@ -123,7 +123,7 @@ mod report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use motor_common::testing::{LineRig, call_command, ioc_init_errlog, run_command};
+    use motor_common::testing::{LineRig, call_command, drvsup_init, ioc_init_errlog, run_command};
 
     /// C's PM304Config only stores the port (drvPM304.cc:497-509); motor_init
     /// drops a card that does not answer without a word, and its record
@@ -153,5 +153,31 @@ mod tests {
                  Illegal field value PV: pm304:m1"
             ]
         );
+    }
+
+    /// drvPM304.cc:643-648: `1OA` probes the card up to 3 times before
+    /// `1ST` and `1ID`; a card silent to all three gets nothing more.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_probes_1oa_before_identifying() {
+        let int = ArgValue::Int;
+        run_command(pm304_setup_command(), vec![int(2), int(10)]).await;
+        let (live, _io1) = LineRig::new("pm304Live", |cmd| match cmd.trim_end() {
+            "1ID" => "Mclennan PM304 V6.11".into(),
+            _ => "OK".into(),
+        });
+        let (mute, _io2) = LineRig::new("pm304Mute", |_| String::new());
+        for (card, port) in [(0, "pm304Live"), (1, "pm304Mute")] {
+            let config = vec![int(card), ArgValue::String(port.into()), int(1)];
+            run_command(pm304_config_command(), config).await;
+        }
+        drvsup_init().await;
+        let sent = |line: &LineRig| -> Vec<String> {
+            line.sent()
+                .iter()
+                .map(|c| c.trim_end().to_owned())
+                .collect()
+        };
+        assert_eq!(sent(&live)[..3], ["1OA", "1ST", "1ID"]);
+        assert_eq!(sent(&mute), ["1OA", "1OA", "1OA"]);
     }
 }
