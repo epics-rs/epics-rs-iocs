@@ -335,6 +335,7 @@ impl AsynMotor for SmartMotorAxis {
         _forward: bool,
     ) -> AsynResult<()> {
         // C: Animatics SmartMotors do not use home positions (build_trans ERROR).
+        // C still sends the record's SET_VELOCITY V= ahead of that ERROR; not copied.
         Err(smartmotor_err("SmartMotor: homing is not supported"))
     }
 
