@@ -86,9 +86,7 @@ pub fn pigcs2_config_command() -> CommandDef {
             }
             let controller = Arc::new(Mutex::new(controller));
             report.attach(controller.clone(), port);
-            // C startPoller, PIasynController.cpp:192. Of its poll()
-            // (PIasynController.cpp:579) the coordinate-system parameters it
-            // posts are not modeled.
+            // C startPoller, PIasynController.cpp:192.
             let polled = controller.clone();
             let poller = Controller::new().controller_poll(move || {
                 polled.lock().unwrap_or_else(|e| e.into_inner()).poll();
