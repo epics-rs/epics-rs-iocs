@@ -730,22 +730,34 @@ impl OmsAxis {
 
         let (has_encoder, poll_shared) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            // C ignores both exchanges' status and keeps the axis on a reply
+            // it does not know, as an unencoded axis with uninverted limits.
             // Axis type: "=O" stepper/no-encoder, "=M" servo, "=E" stepper+enc.
             let modern = ctrl.modern();
             let ps = if modern { "PS?" } else { "?PS" };
-            let ps = ctrl.send_receive(&format!("A{axis_char} {ps}"))?;
+            let (ps, _) = ctrl.send_receive_buffer(&format!("A{axis_char} {ps}"));
             let has_encoder = match ps.as_bytes().get(1) {
                 Some(b'O') => false,
                 Some(b'M') | Some(b'E') => true,
-                _ => return Err(oms_err(format!("oms: unknown axis type '{ps}'"))),
+                _ => {
+                    errlog_vprintf(format_args!(
+                        "omsBaseController:Init: error: unknown axis type! ({ps})\n"
+                    ));
+                    false
+                }
             };
             // Limit true-state: "=l"/"=L" invert, "=h"/"=H" no invert.
             let lt = if modern { "LT?" } else { "?LS" };
-            let lt = ctrl.send_receive(&format!("A{axis_char} {lt}"))?;
+            let (lt, _) = ctrl.send_receive_buffer(&format!("A{axis_char} {lt}"));
             let invert_limit = match lt.as_bytes().get(1) {
                 Some(b'l') | Some(b'L') => true,
                 Some(b'h') | Some(b'H') => false,
-                _ => return Err(oms_err(format!("oms: unknown limit true-state '{lt}'"))),
+                _ => {
+                    errlog_vprintf(format_args!(
+                        "omsBaseController:Init: error: unknown limit true state!\n"
+                    ));
+                    false
+                }
             };
             let poll_shared = ctrl.poll_shared().clone();
             poll_shared.add_axis(index, has_encoder, invert_limit);

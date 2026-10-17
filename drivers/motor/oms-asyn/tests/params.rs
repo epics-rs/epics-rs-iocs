@@ -291,3 +291,40 @@ async fn only_a_write_c_returns_to_the_base_prints_the_base_s_lines() {
         "{text}"
     );
 }
+
+/// A MAXnet whose axis answers neither type nor limit state C knows.
+fn unknown_axis_reply(cmd: &str) -> String {
+    match cmd.trim_end() {
+        "AX PS?" => "=S".into(),
+        "AX LT?" => "=x".into(),
+        other => maxnet_reply(other),
+    }
+}
+
+/// C prints an unknown axis type or limit state reply and keeps the axis
+/// (omsBaseController.cpp:528-565).
+#[epics_rs::base::epics_test]
+async fn an_unknown_axis_type_or_limit_state_keeps_the_axis() {
+    use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().unwrap().push(line.to_string())
+    });
+    let sent = on_line("omsUnknownAxis", unknown_axis_reply, |port, line| {
+        line.lock().unwrap().sent();
+        port.write_int32_blocking(index::CLOSED_LOOP, 0, 1).unwrap();
+        sent_within(line, Duration::from_millis(300))
+    })
+    .await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    assert_eq!(sent, ["AX CL1"]);
+    let lines = lines.lock().unwrap();
+    for want in [
+        "omsBaseController:Init: error: unknown axis type! (=S)\n",
+        "omsBaseController:Init: error: unknown limit true state!\n",
+    ] {
+        assert!(lines.iter().any(|l| l == want), "{lines:#?}");
+    }
+}
