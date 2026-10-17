@@ -38,6 +38,7 @@ use epics_rs::asyn::interfaces::motor::{
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::device_support::{BuildTrans, LimitBuild};
 
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -176,6 +177,16 @@ impl Mdt695Controller {
     fn query(&self, cmd: &str) -> AsynResult<String> {
         let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(trim_line(&raw))
+    }
+}
+
+/// devMDT695's `build_trans` as the record sees it.
+pub struct Mdt695Build;
+
+impl BuildTrans for Mdt695Build {
+    /// devMDT695.cc:273-276: SET_HIGH_LIMIT and SET_LOW_LIMIT are ERROR.
+    fn limit(&self, _high: bool, _raw: f64, _mres: f64) -> LimitBuild {
+        LimitBuild::Refused(None)
     }
 }
 
@@ -488,6 +499,42 @@ mod tests {
         assert_eq!(line.sent(), ["YR?", "#H"]);
         axis.poll(&user).unwrap();
         assert_eq!(line.sent(), ["YR?"]);
+    }
+
+    /// devMDT695.cc:273-276 with motorRecord.cc:4112-4121: a refused HLM or
+    /// LLM sends nothing and goes back to the dial limit.
+    #[test]
+    fn limits_are_refused_and_restored() {
+        use epics_rs::base::server::record::Record;
+        use epics_rs::base::types::EpicsValue;
+        use epics_rs::motor::MotorRecord;
+        use epics_rs::motor::device_support::CommandPort;
+        use epics_rs::motor::flags::MstaFlags;
+
+        let mut rec = MotorRecord::new();
+        let (port, mut rx) = CommandPort::capture();
+        rec.set_command_port(port.with_build_trans(Arc::new(Mdt695Build)));
+        rec.conv.mres = 1.0;
+        rec.stat.msta = MstaFlags::DONE;
+        rec.limits.dhlm = 100.0;
+        rec.limits.hlm = 100.0;
+        rec.limits.dllm = -100.0;
+        rec.limits.llm = -100.0;
+        rec.limits.rhlm = 100.0;
+        rec.limits.rllm = -100.0;
+        rec.internal.init_invariants_synced = true;
+        rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+        rec.put_field("LLM", EpicsValue::Double(-50.0)).unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            (
+                rec.limits.hlm,
+                rec.limits.dhlm,
+                rec.limits.llm,
+                rec.limits.dllm
+            ),
+            (100.0, 100.0, -100.0, -100.0)
+        );
     }
 
     /// MOVE_REL builds no command but still carries PREM.
