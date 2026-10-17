@@ -597,6 +597,7 @@ impl AsynMotor for SpiiPlusAxis {
             velocity,
             done: !moving,
             moving,
+            msta_moving: moving,
             high_limit,
             low_limit,
             direction: self.last_direction,
@@ -952,6 +953,16 @@ mod tests {
         line.lock().unwrap().set("MST", &[0.0]);
         line.lock().unwrap().set("FVEL", &[-2.0]);
         assert!(axis.poll(&user).unwrap().direction);
+    }
+
+    #[test]
+    fn motion_sets_the_msta_moving_bit() {
+        let (ctrl, line) = fake("spiiMsta", 1, &[("EFAC", &[1.0])]);
+        let user = AsynUser::default();
+        let mut axis = SpiiPlusAxis::new(ctrl, 0);
+        assert!(!axis.poll(&user).unwrap().msta_moving);
+        line.lock().unwrap().set("MST", &[f64::from(MST_MOTION)]);
+        assert!(axis.poll(&user).unwrap().msta_moving);
     }
 
     #[test]
