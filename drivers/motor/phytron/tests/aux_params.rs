@@ -298,7 +298,7 @@ async fn the_poll_sets_axis_status() {
 #[epics_rs::base::epics_test]
 async fn the_poll_method_option_is_the_controllers_and_an_mcc_refuses_parallel() {
     use epics_rs::asyn::user::AsynUser;
-    let ((refused, missing, axis, shown), _) = on_mcc("phyPollOption", |port| {
+    let ((refused, missing, axis, shown, own), _) = on_mcc("phyPollOption", |port| {
         let at = |addr| AsynUser::default().with_addr(addr);
         let refused = port
             .set_option_blocking(at(0), "pollMethod", "parallel")
@@ -310,11 +310,14 @@ async fn the_poll_method_option_is_the_controllers_and_an_mcc_refuses_parallel()
         port.set_option_blocking(at(0), "pollMethod", " old ")
             .unwrap();
         let shown = port.get_option_blocking(at(0), "pollmethod").unwrap();
-        (refused, missing, axis.is_ok(), shown)
+        let own = port.get_option_blocking(at(1), "pollMethod").unwrap();
+        (refused, missing, axis.is_ok(), shown, own)
     })
     .await;
     assert!(refused, "an MCC has no parallel poll");
     assert!(missing, "no axis 2");
     assert!(axis);
     assert_eq!(shown, "0/serial");
+    // The read resolves the axis from its address (phytronAxisMotor.cpp:596).
+    assert_eq!(own, "-1/default");
 }
