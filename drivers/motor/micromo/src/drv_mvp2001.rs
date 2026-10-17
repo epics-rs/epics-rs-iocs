@@ -406,7 +406,6 @@ impl AsynMotor for DrvMvp2001Axis {
         let status = &mut self.status;
         status.comms_error = false;
         status.done = mstat & IN_MOTION == 0;
-        status.moving = !status.done;
         // C parses a missed POS reply as position 0; the position stands.
         if !pos.is_empty() {
             let data = hex_at(&pos, 8) as i32;

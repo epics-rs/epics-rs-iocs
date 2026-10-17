@@ -478,7 +478,6 @@ impl AsynMotor for Emc18011Axis {
             encoder_position: 0.0,
             velocity: 0.0,
             done: z.done,
-            moving: z.moving,
             high_limit: z.plus_ls,
             low_limit: z.minus_ls,
             direction: z.direction,

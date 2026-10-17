@@ -412,7 +412,6 @@ impl AsynMotor for KohzuAxis {
             velocity: 0.0,
             direction,
             done,
-            moving: !done,
             high_limit: plus_ls,
             low_limit: minus_ls,
             home: false,

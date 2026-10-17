@@ -290,7 +290,6 @@ impl PIC662Axis {
             encoder_position: polled.position as f64,
             velocity: 0.0,
             done: polled.done,
-            moving: !polled.done,
             // E-662: no limit/home/encoder/gain feedback; piezo servo powers
             // its stage continuously. No base velocity (`SET_VEL_BASE` no-op).
             direction,

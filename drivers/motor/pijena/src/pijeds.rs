@@ -430,7 +430,6 @@ impl AsynMotor for PiJedsAxis {
             velocity: 0.0,
             direction,
             done,
-            moving: !done,
             // E-516 has no limit or home switches (C set_status).
             high_limit: false,
             low_limit: false,

@@ -473,7 +473,6 @@ impl AsynMotor for Pm304Axis {
             encoder_position: position as f64,
             velocity: 0.0,
             done: bits.done,
-            moving: !bits.done,
             high_limit: bits.plus_ls,
             low_limit: bits.minus_ls,
             problem: bits.problem,

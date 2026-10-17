@@ -235,7 +235,6 @@ fn status_from_polled(polled: &PolledStatus) -> MotorStatus {
         encoder_position: polled.position,
         velocity: 0.0, // C only ever flips the sign of an otherwise-unset 0.
         done: polled.done,
-        moving: !polled.done,
         high_limit: polled.high_limit,
         low_limit: polled.low_limit,
         direction: polled.direction,

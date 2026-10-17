@@ -174,7 +174,6 @@ fn status_from_polled(polled: &PolledStatus) -> MotorStatus {
         encoder_position: polled.position,
         velocity: 0.0,
         done: polled.done,
-        moving: !polled.done,
         powered: polled.powered,
         high_limit: polled.high_limit,
         low_limit: polled.low_limit,

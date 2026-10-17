@@ -388,7 +388,6 @@ impl AsynMotor for DrvMDriveAxis {
         let status = &mut self.status;
         status.comms_error = false;
         status.done = atoi(&moving) == 0;
-        status.moving = !status.done;
         let data = atof(&position);
         if data != f64::from(self.position) {
             let new = nint(data);
