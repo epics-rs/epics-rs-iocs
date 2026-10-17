@@ -400,29 +400,23 @@ impl AsynMotor for SpiiPlusAxis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
+        // The record's home ends in GO: in Buffer mode it starts the axis
+        // buffer; in Direct/Connect mode HOME adds nothing, so C sends only
+        // VEL and PREM and the axis reports done in place.
         let a = self.axis;
-        let mode = self.lock().mode;
-        match mode {
+        let body = match self.lock().mode {
             CommandMode::Buffer => {
-                // The record's home ends in GO, which starts the axis buffer.
                 let op = if forward { OP_HOME_F } else { OP_HOME_R };
-                let body = format!("Done({a})=0;opReq({a})={op};");
-                self.transaction(
-                    Some(velocity),
-                    acceleration,
-                    &body,
-                    &format!("start {a}, 1"),
-                )
+                format!("Done({a})=0;opReq({a})={op};")
             }
-            // C sends VEL and PREM here and arms POST; PREM is dropped with
-            // the error, POST still follows the next done poll.
-            CommandMode::Connect | CommandMode::Direct => {
-                self.strings.arm();
-                Err(spiiplus_err(
-                    "SPiiPlus: homing is only available in Buffer command mode",
-                ))
-            }
-        }
+            CommandMode::Connect | CommandMode::Direct => String::new(),
+        };
+        self.transaction(
+            Some(velocity),
+            acceleration,
+            &body,
+            &format!("start {a}, 1"),
+        )
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -709,5 +703,16 @@ mod tests {
         assert_eq!(polled(&line), ["P=0"]);
         axis.poll(&user).unwrap();
         assert!(polled(&line).is_empty());
+    }
+
+    /// devSPiiPlus.cc: Direct-mode HOME builds nothing, so the home is the
+    /// record's VEL and PREM alone, and succeeds.
+    #[test]
+    fn a_direct_home_sends_vel_and_prem_only() {
+        let (line, mut axis) = rig("spiiHomeDir", CommandMode::Direct);
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"P=1", None).unwrap();
+        axis.home(&user, 0.0, 100.0, 50.0, false).unwrap();
+        assert_eq!(line.sent(), ["VEL0=100;P=1;"]);
     }
 }
