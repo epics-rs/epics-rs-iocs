@@ -78,12 +78,21 @@ fn eds_err(message: impl Into<String>) -> AsynError {
     }
 }
 
+/// C `CommStatus`, kept per controller.
+#[derive(Clone, Copy, PartialEq)]
+enum CommState {
+    Normal,
+    Retry,
+    CommErr,
+}
+
 /// Shared controller endpoint: owns the serial handle and command framing.
 pub struct PiJedsController {
     handle: SyncIOHandle,
     ident: String,
     version: i32,
     num_axes: usize,
+    comm: CommState,
 }
 
 impl PiJedsController {
@@ -97,6 +106,7 @@ impl PiJedsController {
             ident: String::new(),
             version: 0,
             num_axes: 0,
+            comm: CommState::Normal,
         };
         let mut online = false;
         for _ in 0..3 {
@@ -189,6 +199,8 @@ pub struct PiJedsAxis {
     moving: bool,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// The last failed poll's verdict, per axis as each axis polls alone.
+    failure: PollFailure,
 }
 
 impl PiJedsAxis {
@@ -209,6 +221,7 @@ impl PiJedsAxis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            failure: PollFailure::NONE,
         }
     }
 
@@ -240,19 +253,18 @@ impl PiJedsAxis {
         ctrl.write_cmd(&format!("stat,{}", self.axis))
     }
 
-    /// Send an absolute move to `position` (steps), optionally setting
-    /// the slew velocity first (C `SET_VELOCITY` + `MOVE_ABS`).
+    /// Send an absolute move to `position` (steps) after its slew velocity
+    /// (C `SET_VELOCITY` + `MOVE_ABS`); the record sends SET_VELOCITY
+    /// whatever the rate.
     fn issue_move(&mut self, position: f64, velocity: f64) -> AsynResult<()> {
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        if velocity > 0.0 {
-            ctrl.write_cmd(&format!(
-                "sr,{},{:.*}",
-                self.axis,
-                MAX_RES,
-                velocity * DRIVE_RESOLUTION
-            ))?;
-        }
+        ctrl.write_cmd(&format!(
+            "sr,{},{:.*}",
+            self.axis,
+            MAX_RES,
+            velocity * DRIVE_RESOLUTION
+        ))?;
         self.send_prem(&ctrl, &prem)?;
         ctrl.write_cmd(&format!(
             "set,{},{:.*}",
@@ -269,11 +281,11 @@ impl PiJedsAxis {
 }
 
 impl AsynMotor for PiJedsAxis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvPIJEDS.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
+    /// drvPIJEDS.cc:292-306: a first unread status or position is RETRY,
+    /// raising and posting nothing; the next is COMM_ERR, raising
+    /// `CNTRL_COMM_ERR` and `RA_PROBLEM`.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -323,15 +335,22 @@ impl AsynMotor for PiJedsAxis {
         &mut self,
         _user: &AsynUser,
         _min_velocity: f64,
-        _velocity: f64,
+        velocity: f64,
         _acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
         // C HOME_* send nothing — no home on an absolute closed-loop stage —
-        // but for PREM. C hangs POST off a message it never sends; not
-        // copied, POST goes at the next poll that reports done.
+        // but for the record's SET_VELOCITY of HVEL (motorRecord.cc:2052)
+        // and PREM. C hangs POST off a message it never sends; not copied,
+        // POST goes at the next poll that reports done.
         let prem = self.strings.arm();
         let ctrl = self.lock();
+        ctrl.write_cmd(&format!(
+            "sr,{},{:.*}",
+            self.axis,
+            MAX_RES,
+            velocity * DRIVE_RESOLUTION
+        ))?;
         self.send_prem(&ctrl, &prem)?;
         self.go(&ctrl)
     }
@@ -372,7 +391,7 @@ impl AsynMotor for PiJedsAxis {
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
-        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let status_reply = ctrl.query(&format!("stat,{}", self.axis));
         let pos_reply = ctrl.query(&format!("mess,{}", self.axis));
 
@@ -385,16 +404,16 @@ impl AsynMotor for PiJedsAxis {
             .map(|v| f64::from(nint(atof(v) / DRIVE_RESOLUTION)));
 
         let (Some(status_word), Some(position)) = (status_word, position) else {
-            // C: first failure after NORMAL is a silent RETRY; a repeat failure
-            // is a hard comms error. Keep the last position, flag the error.
-            drop(ctrl);
-            self.last_status = MotorStatus {
-                comms_error: true,
-                problem: true,
-                ..self.last_status.clone()
+            (ctrl.comm, self.failure) = match ctrl.comm {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
             };
-            return Ok(self.last_status.clone());
+            return Err(eds_err(format!(
+                "PIJEDS axis {}: no status or position reply",
+                self.axis
+            )));
         };
+        ctrl.comm = CommState::Normal;
 
         // Settle detection (C set_status): done once the feedback position has
         // stayed within tolerance for two consecutive polls while moving.
@@ -483,6 +502,39 @@ mod tests {
             .collect()
     }
 
+    /// drvPIJEDS.cc:292-306: a first unanswered poll is RETRY (nothing
+    /// raised, nothing posted), the next COMM_ERR, and a reply clears it.
+    #[test]
+    fn an_unanswered_poll_is_retry_then_comm_error() {
+        let quiet = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("pijedsRetry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                return String::new();
+            }
+            match last {
+                "" => "DSM V1.959".into(),
+                "mess,0" => "mess,0,0".into(),
+                "stat,0" => "stat,0,133".into(),
+                _ => "not present".into(),
+            }
+        });
+        let ctrl = PiJedsController::new(io).unwrap();
+        let mut axis = PiJedsAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
     /// devPIJEDS.cc:190-191: INIT as its own message, named like any queued
     /// one.
     #[test]
@@ -499,9 +551,9 @@ mod tests {
         let (line, mut axis, _) = strings_rig("pijedsGo");
         let user = AsynUser::default();
         axis.move_relative(&user, 1000.0, 0.0, 0.0, 0.0).unwrap();
-        assert_eq!(line.sent(), ["set,0,1.000", "stat,0"]);
-        axis.home(&user, 0.0, 0.0, 0.0, true).unwrap();
-        assert_eq!(line.sent(), ["stat,0"]);
+        assert_eq!(line.sent(), ["sr,0,0.000", "set,0,1.000", "stat,0"]);
+        axis.home(&user, 0.0, 500.0, 0.0, true).unwrap();
+        assert_eq!(line.sent(), ["sr,0,0.500", "stat,0"]);
         axis.move_velocity(&user, 0.0, 2000.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["sr,0,2.000"]);
     }
@@ -519,13 +571,13 @@ mod tests {
             ["sr,0,2.000", "cl,0,1", "set,0,1.500", "stat,0"]
         );
         axis.move_absolute(&user, 1500.0, 0.0, 0.0, 0.0).unwrap();
-        assert_eq!(line.sent(), ["set,0,1.500", "stat,0"]);
+        assert_eq!(line.sent(), ["sr,0,0.000", "set,0,1.500", "stat,0"]);
         axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
         axis.move_velocity(&user, 0.0, -2000.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["cl,0,1", "sr,0,2.000"]);
         axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
         axis.home(&user, 0.0, 2000.0, 0.0, true).unwrap();
-        assert_eq!(line.sent(), ["cl,0,1", "stat,0"]);
+        assert_eq!(line.sent(), ["sr,0,2.000", "cl,0,1", "stat,0"]);
     }
 
     /// drvPIJEDS.cc:388-395: POST once the move settles, not while it runs,
