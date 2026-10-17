@@ -41,14 +41,13 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi};
 
+use crate::smc::{SmcMembers, SmcState, travel_limits};
+
 /// Response buffer size.
 const READ_BUF: usize = 128;
 
 /// `st` status-word bit set while any axis is moving.
 const STATUS_MOVING: i32 = 0x1;
-
-/// Switch-config bit that disables (masks) a limit switch.
-const SWITCH_IGNORE: i32 = 0x2;
 
 fn corvus_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
@@ -127,14 +126,11 @@ impl CorvusController {
 /// One corvus axis sharing a controller. Implements [`AsynMotor`].
 pub struct CorvusAxis {
     controller: Arc<Mutex<CorvusController>>,
-    /// 0-based axis index (command prefix uses `axis_no + 1`).
-    axis_no: usize,
+    members: Arc<SmcMembers>,
     num_axes: usize,
     /// What the last poll left: C keeps every parameter a poll did not
     /// write (asynMotorAxis params persist across polls).
     last_status: MotorStatus,
-    /// C `axisRes_`: controller units per record step.
-    axis_res: f64,
     /// The record's soft limits in steps (C `motorHighLimit_`/`motorLowLimit_`),
     /// the jog targets.
     high_limit: f64,
@@ -143,10 +139,9 @@ pub struct CorvusAxis {
 
 impl CorvusAxis {
     /// Construct axis `axis_no` (0-based) and read its pitch, pole pairs,
-    /// closed-loop period and travel limits as C's constructor does; only
-    /// `axisRes` is kept.
+    /// closed-loop period and travel limits as C's constructor does.
     pub fn new(controller: Arc<Mutex<CorvusController>>, axis_no: usize) -> AsynResult<Self> {
-        let (num_axes, axis_res) = {
+        let (num_axes, members) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             if axis_no >= ctrl.num_axes {
                 return Err(corvus_err(format!(
@@ -161,24 +156,48 @@ impl CorvusAxis {
             };
             let pitch = atof(&read("getpitch"));
             let pole_pairs = atoi(&read("getpolepairs"));
-            read("getclperiod");
-            read("getnlimit");
-            (ctrl.num_axes, pitch / (4.0 * f64::from(pole_pairs)))
+            let cl_period = atof(&read("getclperiod"));
+            let state = SmcState {
+                axis_res: pitch / (4.0 * f64::from(pole_pairs)),
+                travel_limits: travel_limits(&read("getnlimit")),
+                ..SmcState::default()
+            };
+            let members = SmcMembers {
+                axis_no,
+                motor_form: None,
+                pitch: Some(pitch),
+                pole_pairs: Some(pole_pairs),
+                cl_period,
+                state: Mutex::new(state),
+            };
+            (ctrl.num_axes, members)
         };
         Ok(Self {
             controller,
-            axis_no,
+            members: Arc::new(members),
             num_axes,
             last_status: MotorStatus::default(),
-            axis_res,
             high_limit: 0.0,
             low_limit: 0.0,
         })
     }
 
+    /// What C's `report` prints of the axis.
+    pub fn members(&self) -> Arc<SmcMembers> {
+        self.members.clone()
+    }
+
     /// C `changeResolution`: replace `axisRes`.
     pub fn change_resolution(&mut self, new_resolution: f64) {
-        self.axis_res = new_resolution;
+        self.members.state().axis_res = new_resolution;
+    }
+
+    fn axis_no(&self) -> usize {
+        self.members.axis_no
+    }
+
+    fn axis_res(&self) -> f64 {
+        self.members.axis_res()
     }
 
     fn lock(&self) -> MutexGuard<'_, CorvusController> {
@@ -198,7 +217,7 @@ impl CorvusAxis {
         // C sends the move with pos1..3 uninitialized when pos fails
         // (SMCcorvusDriver.cpp:257-264); refusing it is a C defect not copied.
         let mut targets = ctrl.read_positions()?;
-        targets[self.axis_no] = target * self.axis_res;
+        targets[self.axis_no()] = target * self.axis_res();
         ctrl.send_target_vector(&targets, "move")
     }
 
@@ -206,8 +225,8 @@ impl CorvusAxis {
     /// units.
     fn accel_velocity(&self, velocity: f64, acceleration: f64) -> [String; 2] {
         [
-            format!("{:.6} sv", (velocity * self.axis_res).abs()),
-            format!("{:.6} sa", (acceleration * self.axis_res).abs()),
+            format!("{:.6} sv", (velocity * self.axis_res()).abs()),
+            format!("{:.6} sa", (acceleration * self.axis_res()).abs()),
         ]
     }
 }
@@ -244,7 +263,7 @@ impl AsynMotor for CorvusAxis {
         // Zero delta for the idle axes; C's absolute position there is a C
         // defect (see module deviations).
         let mut targets = vec![0.0; self.num_axes];
-        targets[self.axis_no] = distance * self.axis_res;
+        targets[self.axis_no()] = distance * self.axis_res();
         ctrl.send_target_vector(&targets, "rmove")
     }
 
@@ -278,7 +297,7 @@ impl AsynMotor for CorvusAxis {
         let verb = if forward { "nrm" } else { "ncal" };
         let [sv, sa] = self.accel_velocity(velocity, acceleration);
         self.lock()
-            .write_all([sv, sa, format!("{} {verb}", self.axis_no + 1)])
+            .write_all([sv, sa, format!("{} {verb}", self.axis_no() + 1)])
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -294,7 +313,7 @@ impl AsynMotor for CorvusAxis {
         let mut targets = ctrl.read_positions()?;
         // setpos takes the distance from the current position to the desired
         // origin, hence the negation (C multiplies by -1).
-        targets[self.axis_no] = -position * self.axis_res;
+        targets[self.axis_no()] = -position * self.axis_res();
         ctrl.send_target_vector(&targets, "setpos")
     }
 
@@ -303,7 +322,7 @@ impl AsynMotor for CorvusAxis {
         ctrl.write_only(&format!(
             "{} {} setcloop",
             if enable { 1 } else { 0 },
-            self.axis_no + 1
+            self.axis_no() + 1
         ))
     }
 
@@ -344,10 +363,10 @@ impl CorvusAxis {
         if let Some(position) = reply
             .split_whitespace()
             .filter_map(|tok| tok.parse::<f64>().ok())
-            .nth(self.axis_no)
+            .nth(self.axis_no())
         {
-            status.position = position / self.axis_res;
-            status.encoder_position = position / self.axis_res;
+            status.position = position / self.axis_res();
+            status.encoder_position = position / self.axis_res();
         }
 
         let moving = (atoi(&ctrl.query("st")?) & STATUS_MOVING) != 0;
@@ -360,28 +379,21 @@ impl CorvusAxis {
         // the controller's interpreter); they keep the last poll's values.
         if !moving {
             // Switch config: bit 1 (0x2) masks (disables) the switch.
-            let sw = ctrl.query(&format!("{} getsw", self.axis_no + 1))?;
-            let cfg: Vec<i32> = sw
-                .split_whitespace()
-                .filter_map(|tok| tok.parse::<i32>().ok())
-                .collect();
-            let (ignore_low, ignore_high) = match cfg.as_slice() {
-                [low, high, ..] => (low & SWITCH_IGNORE, high & SWITCH_IGNORE),
-                _ => (0, 0),
-            };
+            let sw = ctrl.query(&format!("{} getsw", self.axis_no() + 1))?;
+            let (ignore_low, ignore_high) = self.members.read_limit_config(&sw);
 
             // Switch state: "low high", 0=inactive 1=active.
-            let st = ctrl.query(&format!("{} getswst", self.axis_no + 1))?;
+            let st = ctrl.query(&format!("{} getswst", self.axis_no() + 1))?;
             let state: Vec<i32> = st
                 .split_whitespace()
                 .filter_map(|tok| tok.parse::<i32>().ok())
                 .collect();
             if let [low, high, ..] = state.as_slice() {
-                status.low_limit = ignore_low == 0 && *low != 0;
-                status.high_limit = ignore_high == 0 && *high != 0;
+                status.low_limit = !ignore_low && *low != 0;
+                status.high_limit = !ignore_high && *high != 0;
             }
 
-            let drive_on = atoi(&ctrl.query(&format!("{} getmp", self.axis_no + 1))?);
+            let drive_on = atoi(&ctrl.query(&format!("{} getmp", self.axis_no() + 1))?);
             status.powered = drive_on != 0;
         }
         Ok(())
@@ -449,10 +461,19 @@ mod tests {
         );
         let mut axis = CorvusAxis {
             controller: Arc::new(Mutex::new(CorvusController::new(handle, 2))),
-            axis_no: 1,
+            members: Arc::new(SmcMembers {
+                axis_no: 1,
+                motor_form: None,
+                pitch: Some(0.0),
+                pole_pairs: Some(0),
+                cl_period: 0.0,
+                state: Mutex::new(SmcState {
+                    axis_res: 0.5,
+                    ..SmcState::default()
+                }),
+            }),
             num_axes: 2,
             last_status: MotorStatus::default(),
-            axis_res: 0.5,
             high_limit: 10.0,
             low_limit: -10.0,
         };
@@ -486,15 +507,5 @@ mod tests {
         assert!(moving(0x3));
         assert!(!moving(0x0));
         assert!(!moving(0x2));
-    }
-
-    #[test]
-    fn switch_ignore_mask() {
-        // Bit 1 (0x2) disables the switch; bit 0 (polarity) is irrelevant here.
-        let ignored = |cfg: i32| (cfg & SWITCH_IGNORE) != 0;
-        assert!(!ignored(0x0));
-        assert!(!ignored(0x1));
-        assert!(ignored(0x2));
-        assert!(ignored(0x3));
     }
 }
