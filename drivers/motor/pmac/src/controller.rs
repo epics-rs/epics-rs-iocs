@@ -520,17 +520,15 @@ impl PmacController {
     }
 
     fn process_deferred_moves(&mut self) -> AsynResult<()> {
-        let Some(cmd) = fast_deferred_command(&self.deferred) else {
-            return Ok(());
-        };
-        self.command(&cmd).inspect_err(|_| {
-            self.own.print_self(
+        self.command(&fast_deferred_command(&self.deferred))
+            .inspect_err(|_| {
+                self.own.print_self(
                 TraceMask::ERROR,
                 format_args!(
                     "pmacController::processDeferredMoves ERROR Sending Deferred Move Command.\n"
                 ),
             );
-        })
+            })
     }
 
     fn process_deferred_coord_moves(&mut self) -> AsynResult<()> {
@@ -778,6 +776,18 @@ mod tests {
         port.write_float64_blocking(index::VELOCITY, 0, 2.5)
             .unwrap();
         assert_eq!(comms(), PMAC_OK);
+    }
+
+    /// pmacController.cpp:859-871: releasing a fast deferral with no axis
+    /// deferred still sends the (empty) combined line.
+    #[test]
+    fn releasing_fast_moves_sends_the_line_even_when_empty() {
+        let (rig, handle) =
+            motor_common::testing::LineRig::new("pmacEmptyDefer", |_| "\x06".into());
+        let mut c = PmacController::new("pmacEmptyDeferCtl", "pmacEmptyDefer", 0, Some(handle));
+        c.set_moves_deferred(DEFERRED_FAST_MOVES).unwrap();
+        c.set_moves_deferred(0).unwrap();
+        assert_eq!(rig.sent(), [""]);
     }
 
     #[test]

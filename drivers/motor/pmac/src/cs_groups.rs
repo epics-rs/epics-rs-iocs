@@ -299,16 +299,13 @@ fn single_letter(def: &str) -> Option<char> {
 /// the destination buffer as its own source argument, which is undefined
 /// behaviour (overlapping copy). Building a `String` here has the behaviour the
 /// C intends.
-pub fn fast_deferred_command(deferred: &BTreeMap<i32, DeferredMove>) -> Option<String> {
-    if deferred.is_empty() {
-        return None;
-    }
+pub fn fast_deferred_command(deferred: &BTreeMap<i32, DeferredMove>) -> String {
     let mut cmd = String::new();
     for (axis, move_) in deferred {
         let op = if move_.relative { "J^" } else { "J=" };
         cmd.push_str(&format!(" #{axis}{op}{:.2}", move_.position));
     }
-    Some(cmd)
+    cmd
 }
 
 #[cfg(test)]
@@ -394,8 +391,8 @@ mod tests {
                 time_ms: 0.0,
             },
         );
-        assert_eq!(fast_deferred_command(&d).unwrap(), " #1J=100.00 #2J^-5.50");
-        assert_eq!(fast_deferred_command(&BTreeMap::new()), None);
+        assert_eq!(fast_deferred_command(&d), " #1J=100.00 #2J^-5.50");
+        assert_eq!(fast_deferred_command(&BTreeMap::new()), "");
     }
 
     #[test]
