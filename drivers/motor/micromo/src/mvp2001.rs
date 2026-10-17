@@ -219,6 +219,9 @@ pub struct Mvp2001Axis {
     max_current_ma: i32,
     sample_period: i32,
     limit_polarity: i32,
+    /// C's status parameters: written field by field as `poll` gets each
+    /// reply, so a failed poll leaves what it had set.
+    status: MotorStatus,
 }
 
 impl Mvp2001Axis {
@@ -266,6 +269,12 @@ impl Mvp2001Axis {
             max_current_ma,
             sample_period,
             limit_polarity,
+            // MVP2001Driver.cpp:204-206, once.
+            status: MotorStatus {
+                gain_support: true,
+                has_encoder: true,
+                ..MotorStatus::default()
+            },
         }
     }
 
@@ -416,12 +425,16 @@ impl AsynMotor for Mvp2001Axis {
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let n = self.axis_index;
-        let ctrl = self.lock();
+        let controller = Arc::clone(&self.controller);
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
         // Position (8 hex chars, signed via u32 wrap).
         let pos_reply = ctrl.query(&format!("{n} POS"))?;
         let position = parse_hex_reply(&pos_reply, 8)
             .ok_or_else(|| micromo_err(format!("MVP2001: unparseable POS reply {pos_reply:?}")))?;
+
+        self.status.position = position as f64;
+        self.status.encoder_position = position as f64;
 
         // Status word (4 hex chars).
         let status_reply = ctrl.query(&format!("{n} ST"))?;
@@ -433,19 +446,17 @@ impl AsynMotor for Mvp2001Axis {
         // Bit 0 set = moving; 0x2000 = high limit; 0x8000 = low limit;
         // 0x100 set = power off. No home bit on this controller.
         let done = (status & 0x1) == 0;
-        Ok(MotorStatus {
-            position: position as f64,
-            encoder_position: position as f64,
-            velocity: 0.0,
-            done,
-            moving: !done,
-            high_limit: (status & 0x2000) != 0,
-            low_limit: (status & 0x8000) != 0,
-            powered: (status & 0x100) == 0,
-            has_encoder: true,
-            gain_support: true,
-            ..MotorStatus::default()
-        })
+        self.status.done = done;
+        self.status.moving = !done;
+        self.status.high_limit = (status & 0x2000) != 0;
+        self.status.low_limit = (status & 0x8000) != 0;
+        self.status.powered = (status & 0x100) == 0;
+        self.status.problem = false;
+        Ok(self.status.clone())
+    }
+
+    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+        Some(self.status.clone())
     }
 }
 
@@ -488,6 +499,20 @@ mod tests {
             text,
             "MVP2001Axis::moveVelocity: minVelocity=0.500000, maxVelocity=100.000000, acceleration=250.000000\n"
         );
+    }
+
+    /// C sets GAIN_SUPPORT and EA_PRESENT once, in the constructor
+    /// (MVP2001Driver.cpp:204-206), so a poll that fails before any reply
+    /// still posts them.
+    #[test]
+    fn a_failed_poll_keeps_the_constructor_status_bits() {
+        let (handle, _) =
+            SyncIOHandle::connect_port("MVP2001_DEAD", 0, Duration::ZERO, InterfaceType::Octet);
+        let controller = Arc::new(Mutex::new(Mvp2001Controller::new(handle, 1)));
+        let mut axis = Mvp2001Axis::new(controller, "MVP2001_DEAD", 0, 512, 500, 1);
+        assert!(axis.poll(&AsynUser::default()).is_err());
+        let left = axis.take_failed_poll_status().expect("the status C left");
+        assert!(left.gain_support && left.has_encoder, "{left:?}");
     }
 
     #[test]
