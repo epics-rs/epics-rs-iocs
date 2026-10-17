@@ -1897,7 +1897,8 @@ impl TimePix3Driver {
                 set
             }
         } else if reason == p.write_bp_c_file || reason == p.write_da_cs_file {
-            self.ad.port_base.set_int32_param(reason, addr, 0)?;
+            // A refused store does not stop the upload (ADTimePix.cpp:614-621).
+            let _ = self.ad.port_base.set_int32_param(reason, addr, 0);
             if !one_shot(value) {
                 set
             } else if reason == p.write_bp_c_file {
@@ -4039,6 +4040,31 @@ mod tests {
         ] {
             let _ = det.write_int32(&mut AsynUser::new(reason), written);
             assert_eq!(det.int(reason, 0), stored, "reason {reason}");
+        }
+    }
+
+    /// The upload runs, and its status is the write's, even where the
+    /// one-shot's own store is refused (ADTimePix.cpp:614-621).
+    #[test]
+    fn a_refused_one_shot_store_still_uploads() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_UPLOAD_ADDR",
+            Arc::new(ServalHttp::new(&fake_serval("\0"))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        for reason in [p.write_bp_c_file, p.write_da_cs_file] {
+            det.ad.port_base.set_int32_param(p.http_code, 0, 0).unwrap();
+            assert!(
+                det.write_int32(&mut AsynUser::new(reason).with_addr(20), 1)
+                    .is_ok(),
+                "reason {reason}"
+            );
+            assert_eq!(det.int(p.http_code, 0), 200, "reason {reason}");
         }
     }
 
