@@ -163,3 +163,29 @@ mod tests {
         assert_eq!(DRIVER.periods(3), Some((50, 500)));
     }
 }
+
+#[cfg(all(test, feature = "testing", target_os = "linux"))]
+mod one_task {
+    use super::*;
+    use crate::testing::pollers_after;
+    use epics_rs::motor::sim_motor::SimMotor;
+
+    static DRIVER: Model2 = Model2::new("oneTask", 0);
+
+    /// drvMotorAsyn's driver task polls every axis of the card in turn.
+    #[epics_rs::base::epics_test]
+    async fn drv_asyn_motor_configure_polls_the_card_s_axes_on_one_poller() {
+        let axes = (0..3)
+            .map(|_| Arc::new(Mutex::new(SimMotor::default())) as Arc<Mutex<dyn AsynMotor>>)
+            .collect();
+        DRIVER.set_card(0, axes, 100, 1000);
+        let args = vec![
+            ArgValue::String("oneTaskPort".into()),
+            ArgValue::String("oneTask".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(3),
+        ];
+        let cmd = drv_asyn_motor_configure_command(vec![&DRIVER]);
+        assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+}
