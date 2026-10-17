@@ -594,3 +594,41 @@ fn an_exchange_whose_read_times_out_publishes_what_it_read() {
     sync.write_int32(ad.bin_x, 2).unwrap();
     assert_eq!(sync.read_octet(ad.string_from_server, 64).unwrap(), b"\0");
 }
+
+/// BISDetector.cpp:404-434: statusTask posts every successful read as read,
+/// whitespace and empty reads included.
+#[test]
+fn every_status_read_is_posted_as_read() {
+    let status = TcpListener::bind("127.0.0.1:0").expect("status listener");
+    let status_addr = format!("127.0.0.1:{}", status.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        let (mut stream, _) = status.accept().expect("status connection");
+        stream
+            .write_all(b"[DETECTORSTATUS /FRAMESIZE=1024 /CCDTEMP=-40.5] \r\n\n")
+            .expect("status messages");
+        std::thread::sleep(Duration::from_secs(30));
+    });
+    let detector = create_bruker_detector(
+        &claim_port("BISPOSTED").unwrap(),
+        user(closed_port("BISPOSTED_COMMAND")),
+        user(ip_port("BISPOSTED_STATUS", &status_addr, b"\n", b"")),
+        0,
+    )
+    .expect("the detector port");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let (reason, size_x) = (detector.params.status, detector.ad_params.size_x);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let read = || {
+        (
+            sync.read_int32(size_x).unwrap(),
+            sync.read_octet(reason, 128).unwrap(),
+        )
+    };
+    let mut got = read();
+    while got != (1024, b"\0".to_vec()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+        got = read();
+    }
+    assert_eq!(got.0, 1024);
+    assert_eq!(String::from_utf8_lossy(&got.1), "\0");
+}

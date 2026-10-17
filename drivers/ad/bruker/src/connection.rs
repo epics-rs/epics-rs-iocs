@@ -56,7 +56,7 @@ fn failed(message: &str) -> Exchange {
 
 /// C posts `fromBIS` up to its first NUL, whitespace included
 /// (BISDetector.cpp:325).
-fn reply_text(bytes: &[u8]) -> String {
+pub(crate) fn reply_text(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
