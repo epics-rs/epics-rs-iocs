@@ -1,5 +1,6 @@
 //! Driver test rigs: a recording serial line, where every write is kept and
-//! a read answers the last write through the test's `reply`, and a count of
+//! a read answers the last command written through the test's `reply`, and a
+//! count of
 //! the process's `motorPoller` threads.
 
 use std::sync::{Arc, Mutex};
@@ -17,6 +18,9 @@ type Reply = Box<dyn Fn(&str) -> String + Send + Sync>;
 struct Line {
     base: PortDriverBase,
     sent: Arc<Mutex<Vec<String>>>,
+    /// The last write that was more than a terminator: GCS2 writes a command
+    /// and its `\n` separately, and the reply belongs to the command.
+    command: String,
     reply: Reply,
 }
 
@@ -29,6 +33,9 @@ impl PortDriver for Line {
     }
     fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let line = String::from_utf8_lossy(data).into_owned();
+        if !data.iter().all(|b| matches!(b, b'\r' | b'\n')) {
+            self.command.clone_from(&line);
+        }
         self.sent.lock().unwrap().push(line);
         Ok(data.len())
     }
@@ -43,14 +50,7 @@ impl PortDriver for Line {
         Ok(())
     }
     fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let last = self
-            .sent
-            .lock()
-            .unwrap()
-            .last()
-            .cloned()
-            .unwrap_or_default();
-        let reply = (self.reply)(&last);
+        let reply = (self.reply)(&self.command);
         let n = reply.len().min(buf.len());
         buf[..n].copy_from_slice(&reply.as_bytes()[..n]);
         Ok(n)
@@ -64,7 +64,8 @@ pub struct LineRig {
 
 impl LineRig {
     /// A port named `name`, and the handle a driver talks to it through.
-    /// `reply` maps the last message written to what a read returns.
+    /// `reply` maps the last command written, less a terminator written on
+    /// its own, to what a read returns.
     pub fn new(
         name: &str,
         reply: impl Fn(&str) -> String + Send + Sync + 'static,
@@ -73,6 +74,7 @@ impl LineRig {
         let line = Line {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             sent: sent.clone(),
+            command: String::new(),
             reply: Box::new(reply),
         };
         let claim = claim_port(name).unwrap();
@@ -141,6 +143,18 @@ mod tests {
         let io = SyncIOHandle::from_handle(port.handle.clone(), 0, Duration::from_secs(1));
         io.write_octet(0, b"hello").unwrap();
         assert_eq!(rig.sent(), ["hello"]);
+    }
+
+    #[test]
+    fn a_terminator_written_on_its_own_keeps_the_command_s_reply() {
+        let (rig, io) = LineRig::new("lineRigSplit", |cmd| match cmd {
+            "POS? 1" => "1=0.5".into(),
+            _ => String::new(),
+        });
+        io.write_octet(0, b"POS? 1").unwrap();
+        io.write_octet(0, b"\n").unwrap();
+        assert_eq!(io.read_octet(0, 64).unwrap(), b"1=0.5");
+        assert_eq!(rig.sent(), ["POS? 1", "\n"]);
     }
 
     #[test]
