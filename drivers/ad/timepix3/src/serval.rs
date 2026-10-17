@@ -302,7 +302,8 @@ pub fn destination_body(d: &Destination) -> Result<Value, String> {
 // /detector/config (C `initAcquisition`, serval_http.cpp:2254)
 // ---------------------------------------------------------------------------
 
-/// The detector settings the driver owns.
+/// The detector settings the driver owns, as raw PV values; the C
+/// `ADTimePix3ServalConfig` setters refuse an out-of-range one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetectorConfig {
     pub trigger_mode: i32,
@@ -312,56 +313,139 @@ pub struct DetectorConfig {
     pub global_timestamp_interval: f64,
     pub n_triggers: i32,
     pub bias_voltage: i32,
-    pub bias_enabled: bool,
+    pub bias_enabled: i32,
     pub chain_mode: i32,
     pub polarity: i32,
     pub trigger_in: i32,
     pub trigger_out: i32,
     pub log_level: i32,
-    pub external_reference_clock: bool,
-    pub periph_clk80: bool,
+    pub external_reference_clock: i32,
+    pub periph_clk80: i32,
     pub tdc0: i32,
     pub tdc1: i32,
 }
 
-/// Merge the driver's settings into the config Serval reported, which is what C
-/// PUTs back (it GETs `/detector/config` first so unknown keys survive).
-///
-/// UPSTREAM DEFECT (serval_http.cpp:2320-2375): C writes `BiasEnabled`,
-/// `ExternalReferenceClock` and `PeriphClk80` as the JSON *strings* `"true"` /
-/// `"false"` while `getDetector` (serval_http.cpp:1269) reads the same fields
-/// back as booleans. They are booleans here.
-pub fn detector_config_body(current: &Value, c: &DetectorConfig) -> Result<Value, String> {
-    let mut body = current.clone();
-    if !body.is_object() {
-        body = json!({});
+/// C `ADTimePix3ServalConfig::setBoolean` (serval_config.cpp:84-92).
+fn set_boolean(config: &mut Value, field: &str, value: i32) -> bool {
+    let ok = value == 0 || value == 1;
+    if ok {
+        config[field] = json!(value != 0);
     }
-    let trigger = enum_name(&TRIGGER_MODES, c.trigger_mode)
-        .ok_or_else(|| format!("trigger mode {}", c.trigger_mode))?;
-    let chain = enum_name(&CHAIN_MODES, c.chain_mode)
-        .ok_or_else(|| format!("chain mode {}", c.chain_mode))?;
-    let polarity =
-        enum_name(&POLARITIES, c.polarity).ok_or_else(|| format!("polarity {}", c.polarity))?;
-    let tdc0 = enum_name(&TDC_MODES, c.tdc0).ok_or_else(|| format!("tdc0 {}", c.tdc0))?;
-    let tdc1 = enum_name(&TDC_MODES, c.tdc1).ok_or_else(|| format!("tdc1 {}", c.tdc1))?;
+    ok
+}
 
-    body["TriggerMode"] = json!(trigger);
+/// C `initAcquisition`'s merge of the driver's settings into the config
+/// Serval reported (serval_http.cpp:2494-2622); the error is the WriteMsg C
+/// publishes with HttpCode 400. The trigger mode is already in range.
+pub fn detector_config_body(current: &Value, c: &DetectorConfig) -> Result<Value, &'static str> {
+    let mut body = current.clone();
+    body["TriggerMode"] =
+        json!(enum_name(&TRIGGER_MODES, c.trigger_mode).unwrap_or(TRIGGER_MODES[0]));
     body["ExposureTime"] = json!(c.exposure_time);
     body["TriggerPeriod"] = json!(c.trigger_period);
-    body["TriggerDelay"] = json!(c.trigger_delay);
-    body["GlobalTimestampInterval"] = json!(c.global_timestamp_interval);
     body["nTriggers"] = json!(c.n_triggers);
     body["BiasVoltage"] = json!(c.bias_voltage);
-    body["BiasEnabled"] = json!(c.bias_enabled);
-    body["ChainMode"] = json!(chain);
-    body["Polarity"] = json!(polarity);
+    if !set_boolean(&mut body, "BiasEnabled", c.bias_enabled) {
+        return Err("BiasEnabled must be 0 or 1");
+    }
+    body["ChainMode"] =
+        json!(enum_name(&CHAIN_MODES, c.chain_mode).ok_or("ChainMode must be between 0 and 2")?);
+    body["Polarity"] = json!(enum_name(&POLARITIES, c.polarity).ok_or("Polarity must be 0 or 1")?);
     body["TriggerIn"] = json!(c.trigger_in);
     body["TriggerOut"] = json!(c.trigger_out);
+    body["TriggerDelay"] = json!(c.trigger_delay);
+    body["GlobalTimestampInterval"] = json!(c.global_timestamp_interval);
+    let tdc = |n| enum_name(&TDC_MODES, n).ok_or("Tdc values must be between 0 and 5");
+    body["Tdc"] = json!([tdc(c.tdc0)?, tdc(c.tdc1)?]);
+    if !set_boolean(
+        &mut body,
+        "ExternalReferenceClock",
+        c.external_reference_clock,
+    ) {
+        return Err("ExternalReferenceClock must be 0 or 1");
+    }
+    if !set_boolean(&mut body, "PeriphClk80", c.periph_clk80) {
+        return Err("PeriphClk80 must be 0 or 1");
+    }
     body["LogLevel"] = json!(c.log_level);
-    body["ExternalReferenceClock"] = json!(c.external_reference_clock);
-    body["PeriphClk80"] = json!(c.periph_clk80);
-    body["Tdc"] = json!([tdc0, tdc1]);
     Ok(body)
+}
+
+/// C `ADTimePix3ServalConfig::ParseError` (serval_config.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectorConfigParseError {
+    EmptyBody,
+    MalformedJson,
+    InvalidRoot,
+}
+
+impl DetectorConfigParseError {
+    /// C `parseErrorMessage` (serval_config.cpp:52-65).
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::EmptyBody => "empty response body",
+            Self::MalformedJson => "malformed JSON",
+            Self::InvalidRoot => "detector configuration JSON root is not an object",
+        }
+    }
+}
+
+/// C `ADTimePix3ServalConfig::parseResponse` (serval_config.cpp:32-50).
+pub fn parse_detector_config_response(body: &str) -> Result<Value, DetectorConfigParseError> {
+    use DetectorConfigParseError as E;
+    if body.is_empty() {
+        return Err(E::EmptyBody);
+    }
+    let config: Value = serde_json::from_str(body).map_err(|_| E::MalformedJson)?;
+    if !config.is_object() {
+        return Err(E::InvalidRoot);
+    }
+    Ok(config)
+}
+
+/// C `gainModeFromString`/`gainModeToString` (ADTimePix.cpp:2089-2105).
+pub const GAIN_MODES: [&str; 4] = ["SHGM", "HGM", "LGM", "SLGM"];
+
+pub fn gain_mode_from_string(s: &str) -> i32 {
+    GAIN_MODES
+        .iter()
+        .position(|&m| m == s)
+        .map_or(0, |i| i as i32)
+}
+
+/// C `pixelDepthNormalize` (serval_http.cpp:77-84).
+pub fn pixel_depth_normalize(depth: i32) -> i32 {
+    if matches!(depth, 1 | 6 | 12 | 24) {
+        depth
+    } else {
+        12
+    }
+}
+
+/// C `pixelDepthFromJson` (serval_http.cpp:86-114): a number, or a string
+/// `stoi` reads.
+pub fn pixel_depth_from_json(v: &Value) -> i32 {
+    let raw = match v {
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .map(|i| i as i32),
+        Value::String(s) => stoi(s),
+        _ => None,
+    };
+    raw.map_or(12, pixel_depth_normalize)
+}
+
+/// `std::stoi`: optional leading whitespace and sign, then at least one
+/// digit; trailing text is ignored, out of `int` range throws.
+fn stoi(s: &str) -> Option<i32> {
+    let t = s.trim_start();
+    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let n = digits.bytes().take_while(u8::is_ascii_digit).count();
+    if n == 0 {
+        return None;
+    }
+    t[..t.len() - digits.len() + n].parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,14 +1373,14 @@ mod tests {
             global_timestamp_interval: 0.0,
             n_triggers: 1,
             bias_voltage: 103,
-            bias_enabled: true,
+            bias_enabled: 1,
             chain_mode: 0,
             polarity: 0,
             trigger_in: 0,
             trigger_out: 0,
             log_level: 1,
-            external_reference_clock: false,
-            periph_clk80: false,
+            external_reference_clock: 0,
+            periph_clk80: 0,
             tdc0: 2,
             tdc1: 2,
         }
@@ -1305,7 +1389,6 @@ mod tests {
     #[test]
     fn the_detector_config_sends_booleans_as_booleans() {
         let body = detector_config_body(&json!({"Unknown": 7}), &config()).unwrap();
-        // C sends the strings "true"/"false" here (serval_http.cpp:2320).
         assert_eq!(body["BiasEnabled"], json!(true));
         assert_eq!(body["ExternalReferenceClock"], json!(false));
         assert_eq!(body["PeriphClk80"], json!(false));
@@ -1316,13 +1399,57 @@ mod tests {
         assert_eq!(body["Unknown"], json!(7));
     }
 
+    /// The C setters refuse an out-of-range value with the WriteMsg
+    /// initAcquisition publishes (serval_http.cpp:2526-2580).
     #[test]
-    fn an_out_of_range_trigger_mode_fails_instead_of_sending_null() {
-        let mut c = config();
-        c.trigger_mode = 9;
-        assert!(detector_config_body(&json!({}), &c).is_err());
-        c.trigger_mode = -1;
-        assert!(detector_config_body(&json!({}), &c).is_err());
+    fn an_out_of_range_detector_setting_is_refused_as_c() {
+        type Set = fn(&mut DetectorConfig);
+        let cases: [(Set, &str); 7] = [
+            (|c| c.bias_enabled = 2, "BiasEnabled must be 0 or 1"),
+            (|c| c.chain_mode = 3, "ChainMode must be between 0 and 2"),
+            (|c| c.polarity = -1, "Polarity must be 0 or 1"),
+            (|c| c.tdc1 = 6, "Tdc values must be between 0 and 5"),
+            (
+                |c| c.external_reference_clock = -1,
+                "ExternalReferenceClock must be 0 or 1",
+            ),
+            (|c| c.periph_clk80 = 2, "PeriphClk80 must be 0 or 1"),
+            (
+                |c| {
+                    c.chain_mode = 3;
+                    c.bias_enabled = 2;
+                },
+                "BiasEnabled must be 0 or 1",
+            ),
+        ];
+        for (set, msg) in cases {
+            let mut c = config();
+            set(&mut c);
+            assert_eq!(detector_config_body(&json!({}), &c), Err(msg));
+        }
+    }
+
+    /// C `parseResponse` (serval_config.cpp:32-50) and `pixelDepthFromJson`.
+    #[test]
+    fn the_detector_config_reply_is_validated_as_c() {
+        use DetectorConfigParseError as E;
+        assert_eq!(parse_detector_config_response(""), Err(E::EmptyBody));
+        assert_eq!(parse_detector_config_response("{"), Err(E::MalformedJson));
+        assert_eq!(parse_detector_config_response("[]"), Err(E::InvalidRoot));
+        assert_eq!(parse_detector_config_response("{}"), Ok(json!({})));
+        for (v, depth) in [
+            (json!(24), 24),
+            (json!(6.9), 6),
+            (json!("1"), 1),
+            (json!(" 24bit"), 24),
+            (json!(7), 12),
+            (json!("x"), 12),
+            (json!(null), 12),
+        ] {
+            assert_eq!(pixel_depth_from_json(&v), depth, "{v}");
+        }
+        assert_eq!(gain_mode_from_string("LGM"), 2);
+        assert_eq!(gain_mode_from_string("lgm"), 0);
     }
 
     #[test]

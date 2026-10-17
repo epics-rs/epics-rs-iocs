@@ -660,49 +660,162 @@ impl TimePix3Driver {
 
     // -- Serval requests -----------------------------------------------------
 
-    /// C `initAcquisition` (serval_http.cpp:2254): read `/detector/config`,
-    /// merge the driver's settings into it, PUT it back.
+    /// C `initAcquisition` (serval_http.cpp:2438-2660): read
+    /// `/detector/config`, merge the driver's settings into it, PUT it back.
     fn init_acquisition(&mut self) -> AsynResult<()> {
-        let current = self
-            .http
-            .get_json(serval::DETECTOR_CONFIG, TIMEOUT_CONFIG)
-            .map_err(|e| {
-                // serval_http.cpp:2450-2452.
-                let refused = self.http_failed("GET /detector/config", &e, HttpPrint::None);
-                let _ = self.set_text(self.p.write_msg, e.body());
-                refused
-            })?;
-
-        let cfg = serval::DetectorConfig {
-            trigger_mode: self.int(self.ad.params.trigger_mode, 0),
-            exposure_time: self.dbl(self.ad.params.acquire_time, 0),
-            trigger_period: self.dbl(self.ad.params.acquire_period, 0),
-            trigger_delay: self.dbl(self.p.trigger_delay, 0),
-            global_timestamp_interval: self.dbl(self.p.global_timestamp_interval, 0),
-            n_triggers: self.int(self.ad.params.num_images, 0),
-            bias_voltage: self.int(self.p.bias_volt, 0),
-            bias_enabled: self.int(self.p.bias_enable, 0) != 0,
-            chain_mode: self.int(self.p.chain_mode, 0),
-            polarity: self.int(self.p.polarity, 0),
-            trigger_in: self.int(self.p.trigger_in, 0),
-            trigger_out: self.int(self.p.trigger_out, 0),
-            log_level: self.int(self.p.log_level, 0),
-            external_reference_clock: self.int(self.p.external_reference_clock, 0) != 0,
-            periph_clk80: self.int(self.p.periph_clk80, 0) != 0,
-            tdc0: self.int(self.p.tdc0, 0),
-            tdc1: self.int(self.p.tdc1, 0),
-        };
-        let body = serval::detector_config_body(&current, &cfg).map_err(|m| AsynError::Status {
+        let p = self.p;
+        let ad = self.ad.params;
+        let refused = |what: &str, message: &str| AsynError::Status {
             status: AsynStatus::Error,
-            message: format!("timepix3: /detector/config: {m}"),
-        })?;
+            message: format!("timepix3: {what} /detector/config: {message}"),
+        };
+        let current = match self.http.get(serval::DETECTOR_CONFIG, TIMEOUT_CONFIG) {
+            Ok(body) => body,
+            Err(e) => {
+                // serval_http.cpp:2449-2458.
+                let base = &mut self.ad.port_base;
+                base.set_int32_param(p.det_connected, 0, 0)?;
+                base.set_int32_param(p.http_code, 0, e.code())?;
+                base.set_string_param(p.write_msg, 0, e.body())?;
+                base.set_string_param(
+                    ad.status_message,
+                    0,
+                    "Failed to read detector configuration",
+                )?;
+                self.log_http(
+                    &e,
+                    HttpPrint::Failure(
+                        "initAcquisition GET /detector/config",
+                        "GET",
+                        serval::DETECTOR_CONFIG,
+                    ),
+                );
+                self.ad.port_base.call_param_callbacks(0)?;
+                return Err(refused("GET", &e.to_string()));
+            }
+        };
+        self.ad.port_base.set_int32_param(p.det_connected, 0, 1)?;
+        let current = match serval::parse_detector_config_response(&current) {
+            Ok(current) => current,
+            Err(e) => {
+                // serval_http.cpp:2466-2477.
+                let message = format!("Invalid detector configuration response: {}", e.message());
+                let base = &mut self.ad.port_base;
+                base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{}",
+                        adlog::err(
+                            adlog::INIT_ACQUISITION,
+                            &format!("initAcquisition: {message}")
+                        )
+                    ),
+                );
+                base.set_int32_param(p.http_code, 0, 200)?;
+                base.set_string_param(p.write_msg, 0, &message)?;
+                base.set_string_param(ad.status_message, 0, &message)?;
+                base.call_param_callbacks(0)?;
+                return Err(refused("GET", &message));
+            }
+        };
+
+        let mut trigger_mode = self.int(ad.trigger_mode, 0);
+        if !(0..serval::TRIGGER_MODES.len() as i32).contains(&trigger_mode) {
+            trigger_mode = 0;
+            self.ad.port_base.set_int32_param(ad.trigger_mode, 0, 0)?;
+        }
+        if self.mpx3_trigger_conflict(trigger_mode) {
+            // serval_http.cpp:2488-2493.
+            let base = &mut self.ad.port_base;
+            base.trace_print(
+                TraceMask::ERROR,
+                format_args!("{}", adlog::err(adlog::INIT_ACQUISITION, MPX3_TRIGGER_MSG)),
+            );
+            base.set_string_param(p.write_msg, 0, MPX3_TRIGGER_MSG)?;
+            base.set_int32_param(p.http_code, 0, 400)?;
+            return Err(refused("PUT", MPX3_TRIGGER_MSG));
+        }
+        let cfg = serval::DetectorConfig {
+            trigger_mode,
+            exposure_time: self.dbl(ad.acquire_time, 0),
+            trigger_period: self.dbl(ad.acquire_period, 0),
+            trigger_delay: self.dbl(p.trigger_delay, 0),
+            global_timestamp_interval: self.dbl(p.global_timestamp_interval, 0),
+            n_triggers: self.int(ad.num_images, 0),
+            bias_voltage: self.int(p.bias_volt, 0),
+            bias_enabled: self.int(p.bias_enable, 0),
+            chain_mode: self.int(p.chain_mode, 0),
+            polarity: self.int(p.polarity, 0),
+            trigger_in: self.int(p.trigger_in, 0),
+            trigger_out: self.int(p.trigger_out, 0),
+            log_level: self.int(p.log_level, 0),
+            external_reference_clock: self.int(p.external_reference_clock, 0),
+            periph_clk80: self.int(p.periph_clk80, 0),
+            tdc0: self.int(p.tdc0, 0),
+            tdc1: self.int(p.tdc1, 0),
+        };
+        let body = match serval::detector_config_body(&current, &cfg) {
+            Ok(body) => body,
+            Err(message) => {
+                let base = &mut self.ad.port_base;
+                base.set_int32_param(p.http_code, 0, 400)?;
+                base.set_string_param(p.write_msg, 0, message)?;
+                return Err(refused("PUT", message));
+            }
+        };
+
         let reply = self
             .http
             .put_json(serval::DETECTOR_CONFIG, &body, TIMEOUT_CONFIG);
-        // serval_http.cpp:2626-2627.
+        // serval_http.cpp:2626-2648.
+        let code = reply.as_ref().map_or_else(HttpError::code, |_| 200);
+        self.ad.port_base.set_int32_param(p.http_code, 0, code)?;
         self.write_msg_from(&reply);
-        reply.map_err(|e| self.http_failed("PUT /detector/config", &e, HttpPrint::None))?;
-        self.http_ok();
+        let result = match reply {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.set_text(ad.status_message, "Failed to upload detector configuration")?;
+                self.log_http(
+                    &e,
+                    HttpPrint::Failure(
+                        "initAcquisition PUT /detector/config",
+                        "PUT",
+                        serval::DETECTOR_CONFIG,
+                    ),
+                );
+                if self.shared.family() == DetectorFamily::Mpx3 {
+                    self.resync_mpx3_setpoints()?;
+                }
+                Err(refused("PUT", &e.to_string()))
+            }
+        };
+        self.ad.port_base.call_param_callbacks(0)?;
+        result
+    }
+
+    /// C re-reads PixelDepth and GainMode after a rejected Medipix3 PUT so the
+    /// setpoints match Serval (serval_http.cpp:2632-2647).
+    fn resync_mpx3_setpoints(&mut self) -> AsynResult<()> {
+        let Ok(body) = self.http.get(serval::DETECTOR_CONFIG, TIMEOUT_CONFIG) else {
+            return Ok(());
+        };
+        let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&body) else {
+            return Ok(());
+        };
+        if let Some(depth) = cfg.get("PixelDepth") {
+            self.ad.port_base.set_int32_param(
+                self.p.pixel_depth,
+                0,
+                serval::pixel_depth_from_json(depth),
+            )?;
+        }
+        if let Some(gain) = cfg.get("GainMode") {
+            self.ad.port_base.set_int32_param(
+                self.p.gain_mode,
+                0,
+                serval::gain_mode_from_string(&serval::json_to_string(gain)),
+            )?;
+        }
         Ok(())
     }
 
@@ -3500,6 +3613,183 @@ mod tests {
         }
     }
 
+    /// C `initAcquisition`'s failure paths (serval_http.cpp:2449-2493,
+    /// :2526-2580, :2624-2648): what each refusal publishes and logs.
+    #[test]
+    fn init_acquisition_failures_are_published_as_c() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        type Routes = &'static [(&'static str, &'static str)];
+        type Setup = fn(&mut TimePix3Driver);
+        // (DetConnected, HttpCode, WriteMsg, StatusMessage, TriggerMode, PixelDepth, GainMode)
+        type Seen = (i32, i32, String, String, i32, i32, i32);
+        fn run(
+            name: &'static str,
+            fail: &'static str,
+            routes: Routes,
+            mpx3: bool,
+            setup: Setup,
+        ) -> (bool, Seen, String, String) {
+            let url = fake_serval_with(fail, routes);
+            let shared = Arc::new(Shared::new());
+            if mpx3 {
+                shared.note_family(DetectorFamily::Mpx3);
+            }
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+            let mut det =
+                TimePix3Driver::new(name, Arc::new(ServalHttp::new(&url)), shared, 0, cmd_tx)
+                    .unwrap();
+            let p = det.p;
+            det.ad
+                .port_base
+                .set_int32_param(p.det_connected, 0, 7)
+                .unwrap();
+            det.ad
+                .port_base
+                .set_int32_param(p.http_code, 0, -1)
+                .unwrap();
+            det.ad
+                .port_base
+                .set_int32_param(p.pixel_depth, 0, 24)
+                .unwrap();
+            setup(&mut det);
+            let (runtime, _) = create_port_runtime(
+                &epics_rs::asyn::registry::claim_port(name).unwrap(),
+                det,
+                RuntimeConfig::default(),
+            )
+            .unwrap();
+            let h = runtime.port_handle().clone();
+            let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let file = std::fs::File::create(&path).unwrap();
+            h.trace().set_trace_file(
+                Some(name),
+                TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+            h.trace().set_trace_mask(Some(name), TraceMask::ERROR);
+            let (ok, seen) = h
+                .with_driver_blocking::<TimePix3Driver, _>(move |d| {
+                    let ok = d.init_acquisition().is_ok();
+                    let ad = d.ad.params;
+                    (
+                        ok,
+                        (
+                            d.int(p.det_connected, 0),
+                            d.int(p.http_code, 0),
+                            d.text(p.write_msg, 0),
+                            d.text(ad.status_message, 0),
+                            d.int(ad.trigger_mode, 0),
+                            d.int(p.pixel_depth, 0),
+                            d.int(p.gain_mode, 0),
+                        ),
+                    )
+                })
+                .unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            std::mem::forget(runtime);
+            (ok, seen, text, format!("{url}/detector/config"))
+        }
+        let s = String::from;
+        const GET: &str = "GET /detector/config ";
+        const PUT: &str = "PUT /detector/config ";
+
+        let (ok, seen, text, url) =
+            run("TPX_INIT_GET", GET, &[(GET, "no detector")], false, |_| {});
+        assert!(!ok);
+        assert_eq!(
+            seen,
+            (
+                0,
+                500,
+                s("no detector"),
+                s("Failed to read detector configuration"),
+                0,
+                24,
+                0
+            )
+        );
+        let line = adlog::http_failure_reply(
+            "initAcquisition GET /detector/config",
+            "GET",
+            &url,
+            500,
+            "no detector",
+        );
+        assert!(text.contains(&line), "{line}: {text:?}");
+
+        let (ok, seen, text, _) = run("TPX_INIT_ROOT", "\0", &[(GET, "[]")], false, |_| {});
+        let msg = "Invalid detector configuration response: \
+                   detector configuration JSON root is not an object";
+        assert!(!ok);
+        assert_eq!(seen, (1, 200, s(msg), s(msg), 0, 24, 0));
+        let line = adlog::err(adlog::INIT_ACQUISITION, &format!("initAcquisition: {msg}"));
+        assert!(text.contains(&line), "{line}: {text:?}");
+
+        let (ok, seen, _, _) = run("TPX_INIT_BIAS", "\0", &[], false, |d| {
+            d.ad.port_base
+                .set_int32_param(d.p.bias_enable, 0, 2)
+                .unwrap();
+        });
+        assert!(!ok);
+        assert_eq!(
+            seen,
+            (1, 400, s("BiasEnabled must be 0 or 1"), s(""), 0, 24, 0)
+        );
+
+        let (ok, seen, _, _) = run("TPX_INIT_TRIG", "\0", &[(PUT, "accepted")], false, |d| {
+            let mode = d.ad.params.trigger_mode;
+            d.ad.port_base.set_int32_param(mode, 0, 9).unwrap();
+        });
+        assert!(ok);
+        assert_eq!(seen, (1, 200, s("accepted"), s(""), 0, 24, 0));
+
+        let (ok, seen, text, _) = run("TPX_INIT_MPX3_TRIG", "\0", &[], true, |d| {
+            let mode = d.ad.params.trigger_mode;
+            d.ad.port_base.set_int32_param(mode, 0, 5).unwrap();
+            d.ad.port_base
+                .set_int32_param(d.p.both_counters, 0, 1)
+                .unwrap();
+        });
+        assert!(!ok);
+        assert_eq!(seen, (1, 400, s(MPX3_TRIGGER_MSG), s(""), 5, 24, 0));
+        let line = adlog::err(adlog::INIT_ACQUISITION, MPX3_TRIGGER_MSG);
+        assert!(text.contains(&line), "{line}: {text:?}");
+
+        let (ok, seen, text, url) = run(
+            "TPX_INIT_PUT",
+            PUT,
+            &[
+                (PUT, "bad config"),
+                (GET, r#"{"PixelDepth":"6","GainMode":"LGM"}"#),
+            ],
+            true,
+            |_| {},
+        );
+        assert!(!ok);
+        assert_eq!(
+            seen,
+            (
+                1,
+                500,
+                s("bad config"),
+                s("Failed to upload detector configuration"),
+                0,
+                6,
+                2
+            )
+        );
+        let line = adlog::http_failure_reply(
+            "initAcquisition PUT /detector/config",
+            "PUT",
+            &url,
+            500,
+            "bad config",
+        );
+        assert!(text.contains(&line), "{line}: {text:?}");
+    }
+
     const MEASUREMENT_CONFIG_READBACK: &str = r#"{"Stem": {"Scan": {"Width": 64,
         "Height": 32, "DwellTime": 0.25}, "VirtualDetector": {"RadiusOuter": 9,
         "RadiusInner": 3}}, "TimeOfFlight": {"TdcReference": ["PN0123", "NP0123"],
@@ -4178,7 +4468,7 @@ mod tests {
         shared.note_family(DetectorFamily::Mpx3);
         let mut det = TimePix3Driver::new(
             "TPX_MPX3_BOTH",
-            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(ServalHttp::new(&fake_serval("\0"))),
             shared,
             0,
             cmd_tx,

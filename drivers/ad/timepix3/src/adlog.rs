@@ -30,6 +30,7 @@ pub const PROCESS_PRV_HST_FRAME: &str = "void ADTimePix::processPrvHstFrame(cons
 pub const VALIDATE_DESTINATION: &str =
     "asynStatus ADTimePix::validateDestination(const std::string&)";
 pub const GET_SERVER: &str = "asynStatus ADTimePix::getServer()";
+pub const INIT_ACQUISITION: &str = "asynStatus ADTimePix::initAcquisition()";
 pub const CHECK_IMG_PATH: &str = "asynStatus ADTimePix::checkImgPath()";
 pub const CHECK_PRV_IMG_PATH: &str = "asynStatus ADTimePix::checkPrvImgPath()";
 pub const CHECK_PRV_IMG1_PATH: &str = "asynStatus ADTimePix::checkPrvImg1Path()";
