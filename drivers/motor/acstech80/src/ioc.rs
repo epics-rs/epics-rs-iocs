@@ -28,6 +28,11 @@ static SPIIPLUS: Model1 = Model1::new(&DEV_SPIIPLUS, 8, SCAN_RATE);
 
 /// `SPiiPlusSetup(num_cards, scan_rate)`.
 pub fn spiiplus_setup_command() -> CommandDef {
+    SPIIPLUS.register_report("drvSPiiPlus", |cards| {
+        cards.report("SPiiPlus", |card, line| {
+            format!("    SPiiPlus controller {card}, {line} \n")
+        })
+    });
     SPIIPLUS.setup_command("SPiiPlusSetup")
 }
 
@@ -66,12 +71,14 @@ pub fn spiiplus_config_command() -> CommandDef {
                     return;
                 };
                 let num_axes = controller.num_axes();
+                let line = format!("port={asyn_port}, address=0, id: {}", controller.ident());
                 let controller = Arc::new(Mutex::new(controller));
                 for index in 0..num_axes {
                     let ax = SpiiPlusAxis::new(controller.clone(), index);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     init.axis(index as i32, motor);
                 }
+                init.describe(line);
             })?;
             Ok(CommandOutcome::Continue)
         },
@@ -84,7 +91,7 @@ mod tests {
     use epics_rs::base::runtime::task::BlockingBridge;
     use epics_rs::base::server::database::PvDatabase;
     use epics_rs::base::server::iocsh::IocShell;
-    use motor_common::testing::run_command;
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
     /// drvSPiiPlus.cc:638 prints the parsed mode at Config, BUFFER 0,
     /// CONNECT 1, DIRECT 2 (drvSPiiPlus.h:79).
@@ -108,5 +115,39 @@ mod tests {
             printed,
             "SPiiPlus config mode = 0\nSPiiPlus config mode = 1\nSPiiPlus config mode = 2\n"
         );
+    }
+
+    /// drvSPiiPlus.cc's drvet `report` (drvSPiiPlus.cc:159-185), which
+    /// `dbior` runs at every level. C prints an `asyn_address` SPiiPlusConfig
+    /// never sets; 0 is the address the line is opened at.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_spiiplus_card() {
+        let int = ArgValue::Int;
+        let setup = spiiplus_setup_command();
+        assert_eq!(
+            driver_report("drvSPiiPlus", 0),
+            "    No SPiiPlus controllers configured.\n"
+        );
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("spRepLine", |cmd| match cmd.trim_end() {
+            "?VR" => "SPiiPlus 6.50".into(),
+            "?APOS(0)" => "0".into(),
+            "?APOS(1)" => "?1033".into(),
+            _ => ":".into(),
+        });
+        let config = vec![
+            int(1),
+            ArgValue::String("spRepLine".into()),
+            ArgValue::String("BUF".into()),
+        ];
+        run_command(spiiplus_config_command(), config).await;
+        drvsup_init().await;
+        for level in [0, 1, 2] {
+            assert_eq!(
+                driver_report("drvSPiiPlus", level),
+                "    SPiiPlus controller 0 connection failed.\n    SPiiPlus controller 1, \
+                 port=spRepLine, address=0, id: SPiiPlus 6.50 \n"
+            );
+        }
     }
 }
