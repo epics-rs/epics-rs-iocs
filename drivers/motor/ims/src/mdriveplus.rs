@@ -163,6 +163,9 @@ fn error_code_string(code: i32) -> &'static str {
     }
 }
 
+/// MOTOR_STATUS_PROBLEM, MSTA bit 9 (RA_PROBLEM) of the MOTOR_STATUS_* run.
+const STATUS_PROBLEM: usize = index::STATUS_DIRECTION + 9;
+
 /// Build the on-wire command: device name (party mode) + command.
 fn frame(device_name: &str, cmd: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(device_name.len() + cmd.len());
@@ -319,10 +322,16 @@ impl ControllerParams for ImsParams {
         let _ = base.set_int32_param(user.reason, addr, value);
         let status = if value == 1 {
             let status = self.line.write_only(action.command);
-            if status.is_err()
-                && let Some(line) = self.line.axis_error(action.function, action.error)
-            {
-                base.trace_print(TraceMask::ERROR, format_args!("{line}"));
+            if status.is_err() {
+                // handleAxisError's asynMotorAxis::setIntegerParam: the
+                // problem bit and the status word at the axis's address.
+                let _ = base.set_int32_param(STATUS_PROBLEM, addr, 1);
+                if let Ok(word) = base.get_int32_param(index::STATUS, addr) {
+                    let _ = base.set_int32_param(index::STATUS, addr, word | 1 << 9);
+                }
+                if let Some(line) = self.line.axis_error(action.function, action.error) {
+                    base.trace_print(TraceMask::ERROR, format_args!("{line}"));
+                }
             }
             let (mask, line) = match &status {
                 Ok(()) => (TraceMask::FLOW, action.done),
@@ -824,9 +833,12 @@ impl AsynMotor for ImsMDrivePlusAxis {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let status = self.poll_status();
         if status.is_ok() {
-            // C resets motorStatusCommsError_ on every good poll (:496).
+            // C resets motorStatusCommsError_ and motorStatusProblem_ on
+            // every good poll (:496-497); the problem bit a failed
+            // IMS_* write set lives only in the params.
             self.line.take_comms_failed();
             self.post(index::STATUS_COMMS_ERROR, 0);
+            self.post(STATUS_PROBLEM, 0);
         }
         self.bail("poll()", "polling motor", status)
     }

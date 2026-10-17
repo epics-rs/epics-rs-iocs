@@ -366,14 +366,15 @@ mod extra_params {
     /// A controller `port` on line `line` with device name `A`, and the
     /// controller port's user at axis 0.
     async fn controller(port: &str, line: &str) -> (LineRig, SyncIOHandle) {
-        failing_controller(port, line, |_| false).await
+        failing_controller(port, line, 1000.0, |_| false).await
     }
 
-    /// [`controller`], with the writes `fails` picks refused; `PR ER`
-    /// answers 73.
+    /// [`controller`] polled at `idle_ms` when idle, with the writes `fails`
+    /// picks refused; `PR ER` answers 73.
     async fn failing_controller(
         port: &str,
         line: &str,
+        idle_ms: f64,
         fails: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> (LineRig, SyncIOHandle) {
         let reply = |last: &str| {
@@ -393,7 +394,7 @@ mod extra_params {
             ArgValue::String(line.into()),
             ArgValue::String("A".into()),
             ArgValue::Double(100.0),
-            ArgValue::Double(1000.0),
+            ArgValue::Double(idle_ms),
         ];
         run_command(ims_create_controller_command(), args).await;
         let handle = PortManager::global().find_port_handle(port).unwrap();
@@ -429,7 +430,8 @@ mod extra_params {
     #[epics_rs::base::epics_test]
     async fn a_failed_save_to_nvm_prints_the_drive_s_error_code() {
         use epics_rs::asyn::trace::{TraceFile, TraceMask};
-        let (line, io) = failing_controller("imsNvmErr", "imsNvmErrLine", |l| l == "AS").await;
+        let (line, io) =
+            failing_controller("imsNvmErr", "imsNvmErrLine", 1000.0, |l| l == "AS").await;
         let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
         let path = std::env::temp_dir().join(format!("imsNvmErr-{}", std::process::id()));
         let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
@@ -459,6 +461,49 @@ mod extra_params {
         );
     }
 
+    /// ImsMDrivePlusMotorAxis.cpp:582 under writeInt32: a failed
+    /// IMS_CLEARLRERROR sets the axis's problem bit, which reaches the addr-0
+    /// MOTOR_STATUS_PROBLEM and MOTOR_STATUS params until the next good poll
+    /// (:497) clears it.
+    #[epics_rs::base::epics_test]
+    async fn a_failed_clear_lr_error_sets_the_problem_params() {
+        // An hour's idle period: the first poll is the only one.
+        let (_line, io) =
+            failing_controller("imsLrProb", "imsLrProbLine", 3.6e6, |l| l == "ACF").await;
+        let clear = io.drv_user_create("IMS_CLEARLRERROR").unwrap();
+        let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
+        let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
+        let locked = io.drv_user_create("IMS_LOCKEDROTOR").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while io.read_int32(locked).unwrap_or(0) != 1 {
+            assert!(std::time::Instant::now() < deadline);
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(io.read_int32(problem).unwrap(), 0);
+        assert!(io.write_int32(clear, 1).is_err());
+        assert_eq!(io.read_int32(problem).unwrap(), 1);
+        assert_ne!(io.read_int32(msta).unwrap() & 1 << 9, 0);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:497: the good poll after a failed
+    /// IMS_CLEARLRERROR clears MOTOR_STATUS_PROBLEM again.
+    #[epics_rs::base::epics_test]
+    async fn a_good_poll_clears_the_problem_param() {
+        let (_line, io) =
+            failing_controller("imsLrClr", "imsLrClrLine", 50.0, |l| l == "ACF").await;
+        let clear = io.drv_user_create("IMS_CLEARLRERROR").unwrap();
+        let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
+        assert!(io.write_int32(clear, 1).is_err());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while io.read_int32(problem).unwrap() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "problem never cleared"
+            );
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// ImsMDrivePlusMotorController.cpp:371-373, ImsMDrivePlusMotorAxis.cpp:
     /// 494-497: a failed IO sets the controller's addr-0 COMMS_ERROR param,
     /// not MSTA; a good poll clears it.
@@ -470,7 +515,7 @@ mod extra_params {
             let dead = dead.clone();
             move |l: &str| l == "APR P" && dead.load(Ordering::Relaxed)
         };
-        let (_line, io) = failing_controller("imsComms", "imsCommsLine", fails).await;
+        let (_line, io) = failing_controller("imsComms", "imsCommsLine", 1000.0, fails).await;
         let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
         let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
         let until = |want: i32| {
