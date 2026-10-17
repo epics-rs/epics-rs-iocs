@@ -527,6 +527,12 @@ impl A3200Axis {
         );
         // Latch the newest non-zero fault; never clear it here (owner: enable).
         if axis_fault != 0 && axis_fault != self.last_fault {
+            self.log.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "A3200Poller: controller fault on axis={name} fault=0x{axis_fault:X}\n"
+                ),
+            );
             self.last_fault = axis_fault;
         }
         status.velocity = act_vel / self.step;
@@ -1196,6 +1202,52 @@ mod tests {
         assert_eq!(
             lines,
             ["A3200Poller: axis X axisStatus=201, position=6.500000"],
+            "{text}"
+        );
+    }
+
+    /// drvA3200Asyn.cc:792-796: a new non-zero AxisFault prints its TERROR
+    /// line once, until the fault changes.
+    #[epics_rs::base::epics_test]
+    async fn a_new_fault_prints_once() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let fault = Arc::new(Mutex::new(0));
+        let reply = {
+            let fault = fault.clone();
+            move |cmd: &str| {
+                if cmd.starts_with("~STATUS (X") {
+                    format!("%0 0 {} 0 0 0", fault.lock().unwrap())
+                } else {
+                    "%0".into()
+                }
+            }
+        };
+        let (_line, mut axis) = rig_axis("a32FaultLine", true, reply, |_| false);
+        let path = std::env::temp_dir().join(format!("a32-fault-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(None, TraceMask::ERROR);
+        trace.set_trace_file(None, TraceFile::File(file));
+        let user = AsynUser::new(0);
+        for f in [0, 26, 26, 0, 26, 4] {
+            *fault.lock().unwrap() = f;
+            axis.poll(&user).unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "A3200Poller: controller fault on axis=X fault=0x1A",
+                "A3200Poller: controller fault on axis=X fault=0x4",
+            ],
             "{text}"
         );
     }
