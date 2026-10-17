@@ -924,6 +924,7 @@ mod tests {
         use epics_rs::motor::MotorRecord;
         use epics_rs::motor::device_support::CommandPort;
         use epics_rs::motor::flags::MstaFlags;
+        use epics_rs::motor::poll_loop::ToAxis;
 
         let (_line, [a, b], _) = pair_rig("emcLimit");
         let record = |axis: &Emc18011Axis| {
@@ -944,8 +945,10 @@ mod tests {
         macro_rules! sent {
             ($rx:expr) => {{
                 let mut commands = Vec::new();
-                while let Ok(batch) = $rx.try_recv() {
-                    commands.extend(batch.commands);
+                while let Ok(to_axis) = $rx.try_recv() {
+                    if let ToAxis::Batch(batch) = to_axis {
+                        commands.extend(batch.commands);
+                    }
                 }
                 commands
             }};
