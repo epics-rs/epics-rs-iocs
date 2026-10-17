@@ -20,7 +20,7 @@ use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_int, req_st
 use motor_common::model1::c_int;
 use motor_common::model2::Model2;
 pub use motor_common::model2::drv_asyn_motor_configure_command;
-use motor_common::{TraceUser, asyn_user, install, register_port};
+use motor_common::{Controller, TraceUser, asyn_user, install, register_port};
 
 use crate::motorsim::{
     DEFAULT_HI_LIMIT, DEFAULT_HOME, DEFAULT_LOW_LIMIT, DEFAULT_START, DrvMotorSimAxis, MotorSimAxis,
@@ -153,6 +153,7 @@ impl MotorSimHolder {
                     num_axes = 1; // C: `if (numAxes < 1) numAxes = 1;`
                 }
                 register_port(ctx, &port_name, num_axes as i32)?;
+                let poller = Controller::new();
                 for index in 0..num_axes {
                     let axis = Arc::new(Mutex::new(MotorSimAxis::new(
                         DEFAULT_LOW_LIMIT,
@@ -161,20 +162,16 @@ impl MotorSimHolder {
                         DEFAULT_START,
                     )));
                     let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
-                    install(
-                        ctx,
-                        asyn_user(&port_name, index as i32),
-                        motor,
-                        POLL_MS,
-                        POLL_MS,
-                        0, // motorSimDriver.cpp's own 0.1 s loop forces none
-                    )?;
+                    poller.install(asyn_user(&port_name, index as i32), motor)?;
                     holder
                         .axes
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(Self::axis_key(&port_name, index), axis);
                 }
+                // motorSimController's one motorSimTask polls every axis
+                // each DELTA (motorSimDriver.cpp:244), forcing none.
+                poller.start(ctx, POLL_MS, POLL_MS, 0);
                 Ok(CommandOutcome::Continue)
             },
         )
@@ -220,5 +217,24 @@ impl MotorSimHolder {
                 Ok(CommandOutcome::Continue)
             },
         )
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod one_poller {
+    use super::*;
+    use motor_common::testing::pollers_after;
+
+    /// motorSimController's one motorSimTask polls every axis.
+    #[epics_rs::base::epics_test]
+    async fn create_controller_polls_its_axes_on_one_poller() {
+        let args = vec![
+            ArgValue::String("simOnePoller".into()),
+            ArgValue::Int(4),
+            ArgValue::Int(0),
+            ArgValue::Int(0),
+        ];
+        let cmd = MotorSimHolder::new().create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
     }
 }
