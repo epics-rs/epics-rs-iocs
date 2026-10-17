@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -149,8 +149,8 @@ pub struct Nf874xAxis {
     /// stage with no limit switches (8410 rotary).
     limit_checking: bool,
     status: MotorStatus,
-    /// The soft limits the last poll read, for [`AsynMotor::take_poll_params`].
-    limits: Vec<(usize, ParamValue)>,
+    /// The soft limits the last poll read, for [`AsynMotor::take_port_sets`].
+    sets: PortSets,
 }
 
 impl Nf874xAxis {
@@ -168,7 +168,7 @@ impl Nf874xAxis {
             last_direction: false,
             encoder_position: 0.0,
             limit_checking: false,
-            limits: Vec::new(),
+            sets: PortSets::default(),
             status: MotorStatus::default(),
         };
         if closed_loop {
@@ -226,7 +226,7 @@ impl Nf874xAxis {
     }
 
     /// The reads of `poll` up to the first that fails; the soft limits read
-    /// go to `self.limits`.
+    /// go to `self.sets`.
     fn read_status(&mut self) -> AsynResult<()> {
         let ctrl = lock(&self.controller);
         let name = self.name.clone();
@@ -249,7 +249,7 @@ impl Nf874xAxis {
         status.powered = atoi(skip(&ask("MM?")?, &name)) != 0;
         for (reason, query) in [(index::HIGH_LIMIT, "SR?"), (index::LOW_LIMIT, "SL?")] {
             let value = ParamValue::Float64(atof(skip(&ask(query)?, &name)));
-            self.limits.push((reason, value));
+            self.sets.axis(reason, value);
         }
         let (bits, shift) = ctrl.hardware_status(self.axis, &name)?;
         let bit = |i: i32| bits & (1 << (shift + i)) != 0;
@@ -399,14 +399,13 @@ impl AsynMotor for Nf874xAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        self.limits.clear();
         self.status.problem = self.read_status().is_err();
         Ok(self.status.clone())
     }
 
     /// C's `setDoubleParam` of the soft limits, posted with the poll.
-    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
-        std::mem::take(&mut self.limits)
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
     }
 }
 
@@ -551,6 +550,7 @@ impl ControllerParams for Nf874xControllerParams {
 
 #[cfg(test)]
 mod tests {
+    use epics_rs::asyn::interfaces::motor::PortSet;
     use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::port_handle::PortHandle;
     use epics_rs::asyn::registry::open_owner;
@@ -649,16 +649,20 @@ mod tests {
         let ctrl = Arc::new(Mutex::new(Nf874xController::new(Some(io))));
         let mut axis = Nf874xAxis::new(ctrl, 1);
         axis.poll(&AsynUser::default()).unwrap();
+        // On the axis's own address, in the order C sets them.
         let taken: Vec<_> = axis
-            .take_poll_params()
+            .take_port_sets()
             .into_iter()
-            .map(|(reason, value)| match value {
-                ParamValue::Float64(v) => (reason, v),
+            .map(|set| match set {
+                PortSet::Axis {
+                    reason,
+                    value: ParamValue::Float64(v),
+                } => (reason, v),
                 other => panic!("{other:?}"),
             })
             .collect();
         assert_eq!(taken, [(index::HIGH_LIMIT, 2.5), (index::LOW_LIMIT, -1.5)]);
-        assert!(axis.take_poll_params().is_empty());
+        assert!(axis.take_port_sets().is_empty());
     }
 
     #[test]
