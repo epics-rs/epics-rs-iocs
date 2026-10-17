@@ -21,10 +21,13 @@
 //! C creates the controller with an `eguPerStep` of 0 and divides by it at
 //! every poll; `SMC100CreateController` refuses it here.
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use crate::protocol;
 
@@ -41,16 +44,19 @@ pub struct Smc100Axis {
     axis: u8,
     /// Controller units per record step (C `stepSize_`, `eguPerStep`).
     step_size: f64,
+    /// C `pasynUser_`.
+    trace: MotorTrace,
 }
 
 impl Smc100Axis {
     /// Create a driver for `axis` (1-based) over the given serial-port handle.
     /// `step_size` is C's `eguPerStep` (module Units note).
-    pub fn new(handle: SyncIOHandle, axis: u8, step_size: f64) -> Self {
+    pub fn new(handle: SyncIOHandle, axis: u8, step_size: f64, trace: MotorTrace) -> Self {
         Self {
             handle,
             axis,
             step_size,
+            trace,
         }
     }
 
@@ -131,10 +137,20 @@ impl AsynMotor for Smc100Axis {
     fn move_velocity(
         &mut self,
         _user: &AsynUser,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.trace.print(
+            TraceMask::FLOW,
+            0,
+            format_args!(
+                "SMC100Axis::moveVelocity: minVelocity={:.6}, maxVelocity={:.6}, acceleration={:.6}\n",
+                CFloat(min_velocity),
+                CFloat(velocity),
+                CFloat(acceleration)
+            ),
+        );
         // C SMC100Axis::moveVelocity: the SMC100 has no free jog, so the driver
         // queries the configured travel limits (SR?/SL?, already in controller
         // EGU) and moves to the limit in the jog direction.
@@ -225,7 +241,7 @@ mod tests {
             }
             .to_string()
         });
-        let mut axis = Smc100Axis::new(io, 1, 0.00005);
+        let mut axis = Smc100Axis::new(io, 1, 0.00005, MotorTrace::new("SMC100_T", 0));
         let user = AsynUser::default();
         axis.move_absolute(&user, 20000.0, 0.0, 2000.0, 4000.0)
             .unwrap();
@@ -263,9 +279,36 @@ mod tests {
             }
             .to_string()
         });
-        let mut axis = Smc100Axis::new(io, 1, 1.0);
+        let mut axis = Smc100Axis::new(io, 1, 1.0, MotorTrace::new("SMC100_T", 0));
         axis.move_velocity(&AsynUser::default(), 0.0, 0.0, 0.0)
             .unwrap();
         assert_eq!(line.sent().last().unwrap(), "1PA-5.000000");
+    }
+
+    /// SMC100Driver.cpp:218: moveVelocity's FLOW line, on the axis's user
+    /// and before any command.
+    #[test]
+    fn move_velocity_traces_as_c() {
+        use std::sync::{Arc, Mutex};
+
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+
+        let (_line, io) = LineRig::new("smc100_flow_ip", |_| String::new());
+        let mut axis = Smc100Axis::new(io, 1, 1.0, MotorTrace::new("smc100_flow", 0));
+        let path = std::env::temp_dir().join(format!("smc100-flow-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_device_trace_mask("smc100_flow", 0, TraceMask::FLOW);
+        trace.set_device_trace_info_mask("smc100_flow", 0, TraceInfoMask::empty());
+        trace.set_device_trace_file("smc100_flow", 0, TraceFile::File(file));
+        let _ = axis.move_velocity(&AsynUser::default(), 0.5, 100.0, 250.0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            text,
+            "SMC100Axis::moveVelocity: minVelocity=0.500000, maxVelocity=100.000000, acceleration=250.000000\n"
+        );
     }
 }

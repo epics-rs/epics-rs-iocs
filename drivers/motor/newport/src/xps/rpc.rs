@@ -278,12 +278,12 @@ impl XpsSocket {
 
     /// C `ReadXPSSocket(socket, ..., 0)`: whatever reply is already waiting,
     /// read until the terminator or the first read that does not succeed.
-    /// Returns the byte count.
-    pub fn read_pending(&self) -> usize {
+    /// Returns the bytes read.
+    pub fn read_pending(&self) -> Vec<u8> {
         let Some(link) = &self.link else {
             // asynOctetSocket.cpp:241-245.
             println!("ReadXPSSocket: invalid SocketIndex -1");
-            return 0;
+            return Vec::new();
         };
         let mut buf = Vec::new();
         while !buf.ends_with(XPS_TERMINATOR.as_bytes()) && buf.len() < MAX_REPLY {
@@ -294,7 +294,7 @@ impl XpsSocket {
                 _ => break,
             }
         }
-        buf.len()
+        buf
     }
 
     /// C's socket index, -1 when `ConnectToServer` failed.
@@ -441,7 +441,7 @@ mod tests {
             fire.exec("HexapodMoveAbsolute()"),
             Err(XpsError::Api(-22))
         ));
-        assert_eq!(query.read_pending(), 0);
+        assert!(query.read_pending().is_empty());
     }
 
     use super::*;

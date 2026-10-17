@@ -5,10 +5,8 @@
 //! XPSController.cpp:709-747). Two transports there: plain FTP for XPS-C/Q, and
 //! SFTP (`xpsSFTPUpload`) for XPS-D.
 //!
-//! This port implements the plain-FTP path with the blocking `suppaftp` client.
-//! SFTP (XPS-D) needs an SSH transport `suppaftp` does not provide and is not
-//! implemented — [`upload_trajectory`] returns an error naming it, so an XPS-D
-//! caller fails loudly rather than silently skipping the upload.
+//! This is the plain-FTP path, with the blocking `suppaftp` client; the XPS-D
+//! upload is [`super::sftp`].
 
 use std::io::Cursor;
 
