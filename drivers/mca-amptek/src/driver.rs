@@ -379,14 +379,26 @@ impl AmptekDriver {
         address_info: &str,
         direct_mode: bool,
     ) -> AsynResult<Self> {
+        // `CH_` is a member, so every instance opens its socket first.
+        Self::configure(
+            port_name,
+            interface_type,
+            address_info,
+            direct_mode,
+            AmptekUdpTransport::bind(),
+        )
+    }
+
+    fn configure(
+        port_name: &str,
+        interface_type: i32,
+        address_info: &str,
+        direct_mode: bool,
+        transport: AmptekUdpTransport,
+    ) -> AsynResult<Self> {
         if !(0..=2).contains(&interface_type) {
             // `drvAmptek.cpp:148-152`: the port exists, with no address.
-            let mut driver = Self::with_transport(
-                port_name,
-                address_info,
-                direct_mode,
-                AmptekUdpTransport::bind()?,
-            )?;
+            let mut driver = Self::with_transport(port_name, address_info, direct_mode, transport)?;
             driver.address_info = None;
             driver.trace_error(&format!(
                 "drvAmptek::drvAmptek unknown interface type={interface_type}"
@@ -399,12 +411,7 @@ impl AmptekDriver {
                  by this port (USB/Serial are feasibility-gated -- see the mca-amptek crate doc)"
             )));
         }
-        Self::with_transport(
-            port_name,
-            address_info,
-            direct_mode,
-            AmptekUdpTransport::bind()?,
-        )
+        Self::with_transport(port_name, address_info, direct_mode, transport)
     }
 
     fn with_transport(
@@ -1624,6 +1631,30 @@ mod tests {
             err_message(&err),
             "DPP device 127.0.0.1 not found, total devices found=0"
         );
+    }
+
+    /// A failed `epicsSocketCreate` is printed and the port still builds
+    /// (`DppSocket.cpp:18-21`); its connects then find nothing.
+    #[test]
+    fn a_failed_socket_builds_a_port_that_never_connects() {
+        for (direct, text) in [
+            (true, "Network DPP device 127.0.0.1 not found"),
+            (
+                false,
+                "DPP device 127.0.0.1 not found, total devices found=0",
+            ),
+        ] {
+            let transport = AmptekUdpTransport::open(Err(std::io::Error::other("no socket")));
+            let mut driver = AmptekDriver::configure(
+                "nosock",
+                DPP_INTERFACE_ETHERNET,
+                "127.0.0.1",
+                direct,
+                transport,
+            )
+            .unwrap();
+            assert_eq!(err_message(&connect(&mut driver).unwrap_err()), text);
+        }
     }
 
     /// A config send nobody answers fails without the readback query

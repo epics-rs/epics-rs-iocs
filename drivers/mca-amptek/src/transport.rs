@@ -114,8 +114,18 @@ fn ip_addr_to_a_port0(ip: Ipv4Addr) -> String {
     String::from_utf8_lossy(&ip_addr_to_a(addr)).into_owned()
 }
 
+/// A send and one `UDPRecvFrom` on C's invalid descriptor: the failed send
+/// is followed by the 50 ms settle, and the failed `recvfrom` by the
+/// timeout sleep before its failed retry (`DppSocket.cpp:186-200`).
+fn no_socket_exchange() {
+    std::thread::sleep(Duration::from_millis(50) + READ_TIMEOUT);
+}
+
 pub struct AmptekUdpTransport {
-    socket: UdpSocket,
+    /// `CDppSocket::m_hDppSocket`; `None` when `epicsSocketCreate` failed,
+    /// after which C keeps the instance and every send/receive on the
+    /// invalid descriptor fails, so nothing ever replies.
+    socket: Option<UdpSocket>,
     /// The DP5 command port every send targets. Always
     /// [`DP5_COMMAND_PORT`] in production ([`Self::bind`]); tests point
     /// this at a loopback responder's ephemeral port instead of binding
@@ -128,15 +138,22 @@ pub struct AmptekUdpTransport {
 }
 
 impl AmptekUdpTransport {
-    /// Bind an ephemeral local UDP socket with broadcast sends enabled
-    /// (`CDppSocket`'s ctor binds `INADDR_ANY:0`, `DppSocket.cpp:36-64`;
-    /// `SO_BROADCAST` is set per-send in C's `BroadCastSendTo`,
-    /// `DppSocket.cpp:128-136` -- enabled once here instead, since this
-    /// transport only ever broadcasts on the NetFinder discovery path).
-    pub fn bind() -> io::Result<Self> {
-        let mut transport = Self::bind_on_command_port(DP5_COMMAND_PORT).inspect_err(|_| {
+    /// The `CDppSocket` ctor (`DppSocket.cpp:10-64`): an ephemeral
+    /// `INADDR_ANY:0` UDP socket with broadcast sends enabled (C sets
+    /// `SO_BROADCAST` per send in `SendNetFinderBroadCast`; enabled once
+    /// here, since only the NetFinder path broadcasts). A socket failure is
+    /// not fatal, as in C: the line is printed and the transport is built
+    /// without a socket.
+    pub fn bind() -> Self {
+        Self::open(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)))
+    }
+
+    pub(crate) fn open(socket: io::Result<UdpSocket>) -> Self {
+        let Ok(socket) = socket else {
             println!("epicsSocketCreate failed");
-        })?;
+            return Self::with_socket(None, DP5_COMMAND_PORT);
+        };
+        let mut transport = Self::with_socket(Some(socket), DP5_COMMAND_PORT);
         let list = interface_broadcast_list();
         println!("Found {} broadcast interfaces ...", list.len());
         println!("Broadcast list ...");
@@ -144,17 +161,26 @@ impl AmptekUdpTransport {
             println!("{}", ip_addr_to_a_port0(*dest.ip()));
         }
         transport.broadcast_list = list;
-        Ok(transport)
+        transport
     }
 
+    #[cfg(test)]
     pub(crate) fn bind_on_command_port(command_port: u16) -> io::Result<Self> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-        socket.set_broadcast(true)?;
-        Ok(AmptekUdpTransport {
+        Ok(Self::with_socket(Some(socket), command_port))
+    }
+
+    fn with_socket(socket: Option<UdpSocket>, command_port: u16) -> Self {
+        // A refused SO_BROADCAST fails each broadcast send, whose result C
+        // ignores.
+        if let Some(socket) = &socket {
+            let _ = socket.set_broadcast(true);
+        }
+        AmptekUdpTransport {
             socket,
             command_port,
             broadcast_list: Vec::new(),
-        })
+        }
     }
 
     /// `CConsoleHelper::doAmptekNetFinderPacket` (`ConsoleHelper.cpp:199-261`):
@@ -163,11 +189,15 @@ impl AmptekUdpTransport {
     /// acceptable reply arrived (C's `iNumDevices == 0`).
     fn amptek_net_finder_packet(&self, target: Ipv4Addr) -> io::Result<Option<Ipv4Addr>> {
         let request = net_finder::build_direct_request();
-        self.socket.send_to(&request, (target, self.command_port))?;
+        let Some(socket) = &self.socket else {
+            no_socket_exchange();
+            return Ok(None);
+        };
+        socket.send_to(&request, (target, self.command_port))?;
         std::thread::sleep(Duration::from_millis(50));
-        self.socket.set_read_timeout(Some(READ_TIMEOUT))?;
+        socket.set_read_timeout(Some(READ_TIMEOUT))?;
         let mut buf = [0u8; RECV_CHUNK_SIZE];
-        let n = match self.socket.recv_from(&mut buf) {
+        let n = match socket.recv_from(&mut buf) {
             Ok((n, _from)) => n,
             Err(e) if is_no_response(e.kind()) => 0,
             Err(e) => return Err(e),
@@ -203,11 +233,14 @@ impl AmptekUdpTransport {
     /// the one the reply carries at bytes 20..24 when more than 67 bytes
     /// arrived, otherwise `None` (C's empty `szDPP`).
     fn recv_from_nf_addr(&self, buf: &mut [u8; RECV_CHUNK_SIZE]) -> (usize, Option<Ipv4Addr>) {
-        if self.socket.set_nonblocking(true).is_err() {
+        let Some(socket) = &self.socket else {
+            return (0, None);
+        };
+        if socket.set_nonblocking(true).is_err() {
             return (0, None);
         }
-        let n = self.socket.recv_from(buf).map_or(0, |(n, _from)| n);
-        let _ = self.socket.set_nonblocking(false);
+        let n = socket.recv_from(buf).map_or(0, |(n, _from)| n);
+        let _ = socket.set_nonblocking(false);
         let addr = (n > 67).then(|| Ipv4Addr::new(buf[20], buf[21], buf[22], buf[23]));
         (n, addr)
     }
@@ -230,9 +263,9 @@ impl AmptekUdpTransport {
                 ip_addr_to_a_port0(*dest.ip())
             );
             // C ignores the SendNetFinderBroadCast result.
-            let _ = self
-                .socket
-                .send_to(&net_finder::build_broadcast_request(rand), dest);
+            if let Some(socket) = &self.socket {
+                let _ = socket.send_to(&net_finder::build_broadcast_request(rand), dest);
+            }
             std::thread::sleep(Duration::from_millis(100));
             println!("Searching for Amptek modules on network:");
             loop {
@@ -296,14 +329,18 @@ impl AmptekUdpTransport {
         packet: &[u8],
         expected_size: usize,
     ) -> io::Result<Vec<u8>> {
-        self.socket.send_to(packet, (target, self.command_port))?;
+        let Some(socket) = &self.socket else {
+            no_socket_exchange();
+            return Ok(Vec::new());
+        };
+        socket.send_to(packet, (target, self.command_port))?;
         std::thread::sleep(Duration::from_millis(50));
-        self.socket.set_read_timeout(Some(READ_TIMEOUT))?;
+        socket.set_read_timeout(Some(READ_TIMEOUT))?;
 
         let mut total = Vec::new();
         for _ in 0..MAX_RECV_ITERATIONS {
             let mut chunk = [0u8; RECV_CHUNK_SIZE];
-            match self.socket.recv_from(&mut chunk) {
+            match socket.recv_from(&mut chunk) {
                 Ok((n, _from)) if n > 0 => {
                     if total.len() + n > MAX_RESPONSE_SIZE {
                         break;
