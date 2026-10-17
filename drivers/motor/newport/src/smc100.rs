@@ -139,6 +139,8 @@ impl AsynMotor for Smc100Axis {
         // queries the configured travel limits (SR?/SL?, already in controller
         // EGU) and moves to the limit in the jog direction.
         self.send_accel_and_velocity(acceleration, velocity)?;
+        // A reply under 3 bytes is refused: C's `atof(&inString_[3])` reads
+        // past it into the previous reply.
         let high =
             protocol::parse_value(&self.write_read(&protocol::cmd_query_high_limit(self.axis))?)
                 .ok_or_else(|| parse_error("SR?"))?;
