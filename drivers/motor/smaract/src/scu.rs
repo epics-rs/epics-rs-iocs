@@ -337,6 +337,7 @@ impl ScuAxis {
             status_writes: Vec::new(),
         };
         let probed = ax.probe();
+        let probed = ax.bail(probed);
         (ax, probed)
     }
 
@@ -394,8 +395,8 @@ impl ScuAxis {
     }
 
     /// C's check after a command: a failure raises `motorStatusProblem_`
-    /// and `motorStatusCommsError_` (smarActSCUMotorDriver.cpp:446-450,
-    /// 467-471, 485-489).
+    /// and `motorStatusCommsError_` (smarActSCUMotorDriver.cpp:184-186,
+    /// 446-450, 467-471, 485-489).
     fn bail(&mut self, result: AsynResult<()>) -> AsynResult<()> {
         if result.is_err() {
             self.status_writes
@@ -561,6 +562,10 @@ mod tests {
         assert_eq!(axis.channel, 3);
         assert!(!axis.is_rot && !axis.has_encoder);
         assert_eq!(axis.hold_time, 0);
+        assert_eq!(
+            axis.take_status_writes(),
+            [StatusWrite::Problem(true), StatusWrite::CommsError(true)]
+        );
         assert!(axis.poll(&AsynUser::new(0)).is_err());
     }
 
@@ -578,6 +583,7 @@ mod tests {
         let (mut axis, _) = ScuAxis::new(controller, 0, "scu-refusing", 0);
         let user = AsynUser::new(0);
         let raised = vec![StatusWrite::Problem(true), StatusWrite::CommsError(true)];
+        assert_eq!(axis.take_status_writes(), raised, "the constructor's bail");
         assert!(axis.move_absolute(&user, 1.0, 0.0, 1.0, 0.0).is_err());
         assert_eq!(axis.take_status_writes(), raised);
         assert!(axis.home(&user, 0.0, 1.0, 0.0, true).is_err());
