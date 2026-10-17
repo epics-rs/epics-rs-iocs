@@ -1573,6 +1573,8 @@ impl PIGCS2Axis {
             let position = ctrl
                 .get_axis_position(&self.axis_name, self.last_position / self.cpu)
                 .map_or(self.last_position, |p| p * self.cpu);
+            // C reads it again for PI_SUP_POSITION, not modeled yet.
+            let _ = ctrl.get_axis_position(&self.axis_name, position / self.cpu);
             let (mut low_limit, mut high_limit) = (self.low_limit, self.high_limit);
             let _ = ctrl.get_travel_limits(&self.axis_name, &mut low_limit, &mut high_limit);
             drop(ctrl);
@@ -2229,7 +2231,7 @@ mod tests {
             sent_lines(&line),
             [
                 "\u{4}", "FRF? 1", "EAX? 1", "ERR?", "EAX 1 1", "ERR?", "SVO 1 1", "ERR?",
-                "POS? 1", "TMN? 1", "TMX? 1"
+                "POS? 1", "POS? 1", "TMN? 1", "TMX? 1"
             ]
         );
         assert!(status.homed && status.problem && !status.powered);
@@ -2302,7 +2304,7 @@ mod tests {
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         assert_eq!(
             sent_lines(&line),
-            ["\u{7}", "\u{5}", "POS? 1", "TMN? 1", "TMX? 1"]
+            ["\u{7}", "\u{5}", "POS? 1", "POS? 1", "TMN? 1", "TMX? 1"]
         );
         assert!(status.moving && !status.done && !status.high_limit && !status.low_limit);
         assert!(status.powered && !status.problem && !axis.is_homing);
@@ -2753,13 +2755,14 @@ mod tests {
         ctrl.lock().unwrap().poll();
         assert_eq!(sent_lines(&line), ["\u{5}"]);
         let status = axis.poll(&AsynUser::new(0)).unwrap();
-        assert_eq!(sent_lines(&line), ["\u{3}", "\u{3}"]);
+        // PIasynAxis::poll reads the position twice (PIasynAxis.cpp:162-164).
+        assert_eq!(sent_lines(&line), ["\u{3}", "\u{3}", "\u{3}", "\u{3}"]);
         assert!(status.moving && !status.done && status.powered);
         assert_eq!(status.position, 20000.0);
         moving.store(false, std::sync::atomic::Ordering::Relaxed);
         ctrl.lock().unwrap().poll();
         let status = axis.poll(&AsynUser::new(0)).unwrap();
-        assert_eq!(sent_lines(&line), ["\u{5}", "POS? Y"]);
+        assert_eq!(sent_lines(&line), ["\u{5}", "POS? Y", "POS? Y"]);
         assert!(status.done && !status.moving);
         assert_eq!(status.position, 30000.0);
     }
@@ -2790,7 +2793,7 @@ mod tests {
         moving.store(false, std::sync::atomic::Ordering::Relaxed);
         ctrl.lock().unwrap().poll();
         let status = axis.poll(&AsynUser::new(0)).unwrap();
-        assert_eq!(sent_lines(&line), ["\u{5}", "\u{4}", "POS? X"]);
+        assert_eq!(sent_lines(&line), ["\u{5}", "\u{4}", "POS? X", "POS? X"]);
         assert!(!axis.is_homing && status.done && status.homed);
     }
 
@@ -3067,7 +3070,7 @@ mod tests {
             ["VLS 1.000000", "MOV Y 2.000000", "\u{5}"]
         );
         let status = axis.poll(&user).unwrap();
-        assert_eq!(sent_lines(&line), ["POS? Y"]);
+        assert_eq!(sent_lines(&line), ["POS? Y", "POS? Y"]);
         assert!(status.moving && status.position == 20000.0);
         axis.move_velocity(&user, 0.0, 10000.0, 0.0).unwrap();
         assert_eq!(
@@ -3149,7 +3152,14 @@ mod tests {
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         assert_eq!(
             sent_lines(&line),
-            ["\u{5}", "SVO? Y", "POS? Y", "TRA? Y -1", "TRA? Y 1"]
+            [
+                "\u{5}",
+                "SVO? Y",
+                "POS? Y",
+                "POS? Y",
+                "TRA? Y -1",
+                "TRA? Y 1"
+            ]
         );
         assert!(status.moving && !axis.is_homing && status.problem && !status.powered);
     }
