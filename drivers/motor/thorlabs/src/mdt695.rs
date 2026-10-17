@@ -112,7 +112,8 @@ impl Mdt695Controller {
         let mut model = String::new();
         let mut found = false;
         for _ in 0..3 {
-            let reply = ctrl.query("D")?;
+            // drvMDT695.cc:566-569: a failed read is no match, retried.
+            let reply = ctrl.query("D").unwrap_or_default();
             if reply.contains("MDT") {
                 model = reply;
                 found = true;
@@ -437,6 +438,21 @@ mod tests {
         let p = PostMessage::default();
         p.set(text);
         p
+    }
+
+    /// drvMDT695.cc:563-578: a D that gets no reply is retried after `E`,
+    /// not the end of the probe.
+    #[test]
+    fn a_silent_device_probe_is_retried() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let answered = AtomicBool::new(false);
+        let (line, io) = LineRig::queued("mdt695Probe", move |last| match last {
+            "D" if answered.swap(true, Ordering::SeqCst) => vec!["MDT694".into()],
+            _ => Vec::new(),
+        });
+        let ctrl = Mdt695Controller::new(io).unwrap();
+        assert_eq!(ctrl.num_axes(), 1);
+        assert_eq!(line.sent(), ["D", "E", "D", "I"]);
     }
 
     /// drvMDT695.cc:250-283: a first missed `R?` is RETRY (nothing raised,
