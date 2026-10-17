@@ -18,7 +18,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteValue, index,
+    ControllerParams, FinishedWrite, ParamDelta, ParamWrite, WriteHook, WriteValue, index,
 };
 
 use motor_common::util::{atof, atoi};
@@ -394,7 +394,7 @@ struct Nf874xWriteHook;
 
 impl WriteHook for Nf874xWriteHook {
     /// C traces every write at its end, the base's included.
-    fn after_write(&self, write: &FinishedWrite<'_>) {
+    fn after_write(&self, write: &FinishedWrite<'_>) -> ParamDelta {
         let function = write.function;
         let (method, value) = match write.value {
             WriteValue::Int32(v) => ("writeInt32", v.to_string()),
@@ -404,15 +404,16 @@ impl WriteHook for Nf874xWriteHook {
             Err(e) => write.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "nf874xMotorDriver:{method}: error, status={} function={function}, value={value}",
+                    "nf874xMotorDriver:{method}: error, status={} function={function}, value={value}\n",
                     e.c_status_code()
                 ),
             ),
             Ok(()) => write.print(
                 TraceMask::IO_DRIVER,
-                format_args!("nf874xMotorDriver:{method}: function={function}, value={value}"),
+                format_args!("nf874xMotorDriver:{method}: function={function}, value={value}\n"),
             ),
         }
+        ParamDelta::default()
     }
 }
 

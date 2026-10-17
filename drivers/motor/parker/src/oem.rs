@@ -193,12 +193,7 @@ impl ControllerParams for OemParams {
         Ok(())
     }
 
-    fn write_int32(
-        &mut self,
-        _: &mut PortDriverBase,
-        user: &AsynUser,
-        value: i32,
-    ) -> ParamWrite {
+    fn write_int32(&mut self, _: &mut PortDriverBase, user: &AsynUser, value: i32) -> ParamWrite {
         if self.resolution != Some(user.reason) {
             return Ok(()).into();
         }

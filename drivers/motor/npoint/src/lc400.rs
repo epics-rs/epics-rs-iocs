@@ -25,7 +25,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteValue,
+    ControllerParams, FinishedWrite, ParamDelta, ParamWrite, WriteHook, WriteValue,
 };
 
 /// `LC400_TIMEOUT`.
@@ -722,24 +722,25 @@ impl WriteHook for Lc400WriteHook {
     }
 
     /// C `writeFloat64` traces every write at its end, the base's included.
-    fn after_write(&self, write: &FinishedWrite<'_>) {
+    fn after_write(&self, write: &FinishedWrite<'_>) -> ParamDelta {
         let WriteValue::Float64(value) = write.value else {
-            return;
+            return ParamDelta::default();
         };
         let function = write.function;
         match write.status {
             Err(e) => write.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "LC400MotorDriver:writeFloat64: error, status={} function={function}, value={value:.6}",
+                    "LC400MotorDriver:writeFloat64: error, status={} function={function}, value={value:.6}\n",
                     e.status() as i32
                 ),
             ),
             Ok(()) => write.print(
                 TraceMask::IO_DRIVER,
-                format_args!("LC400MotorDriver:writeFloat64: function={function}, value={value:.6}"),
+                format_args!("LC400MotorDriver:writeFloat64: function={function}, value={value:.6}\n"),
             ),
         }
+        ParamDelta::default()
     }
 }
 
