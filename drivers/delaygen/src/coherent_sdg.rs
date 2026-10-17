@@ -65,7 +65,7 @@ use epics_rs::asyn::trace::TraceMask;
 use crate::connect::OctetLink;
 use epics_rs::asyn::user::AsynUser;
 
-use crate::wire::{self, atof, atoi, require_init, write_read};
+use crate::wire::{self, atof, atoi, require_init, write_read_bytes};
 
 /// C `WRITEREADDELAY` (`0.100` seconds).
 const WRITEREADDELAY: Duration = Duration::from_millis(100);
@@ -273,7 +273,8 @@ fn ok_or_device_error(reply: &str) -> AsynResult<()> {
 /// `writeFloatParam`/`writeCmdOnly`) alike. The 100 ms delay runs
 /// unconditionally, even when the I/O itself failed.
 fn device_write_read(port: &str, handle: &OctetLink, cmd: &str) -> AsynResult<String> {
-    let result = write_read(handle, cmd);
+    use std::fmt::Write as _;
+    let result = write_read_bytes(handle, cmd);
     if let Err(f) = &result {
         handle.reset();
         handle.print(
@@ -281,13 +282,17 @@ fn device_write_read(port: &str, handle: &OctetLink, cmd: &str) -> AsynResult<St
             format_args!("{port} writeRead: error {} wrote \"{cmd}\"\n", f.status()),
         );
     }
-    let read = result.as_deref().unwrap_or("");
-    handle.print(
-        TraceMask::IO_FILTER,
-        format_args!("{port} writeRead: wrote \"{cmd}\" read \"{read}\"\n"),
-    );
+    // C's `%s` of inpBuf: the reply's bytes as sent, up to a NUL. C defect
+    // not copied: after a failed read inpBuf is unterminated stale bytes.
+    let read = result.as_deref().unwrap_or_default();
+    let read = &read[..read.iter().position(|&b| b == 0).unwrap_or(read.len())];
+    handle.write_trace(TraceMask::IO_FILTER, |out| {
+        write!(out, "{port} writeRead: wrote \"{cmd}\" read \"")?;
+        out.write_bytes(read)?;
+        out.write_str("\"\n")
+    });
     std::thread::sleep(WRITEREADDELAY);
-    Ok(result?)
+    Ok(String::from_utf8_lossy(&result?).into_owned())
 }
 
 /// Coherent SDG port driver state (C `struct Port`).
@@ -569,6 +574,37 @@ mod init_tests {
         assert!(
             sdg.read_uint32_digital(&AsynUser::default().with_addr(6), 1)
                 .is_err()
+        );
+    }
+
+    /// C's `%s` of the reply prints its bytes as sent, up to a NUL, on the
+    /// io port's user (drvAsynCoherentSDG.cpp:746).
+    #[test]
+    fn write_read_traces_the_raw_reply() {
+        use crate::connect::replying_link;
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let link = replying_link("SDG_RAW_IO", b"\xff7\0tail");
+        let path = std::env::temp_dir().join(format!("sdg-raw-{}.trace", std::process::id()));
+        let file =
+            std::sync::Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+        let services = PortServices::global();
+        let trace = services.trace();
+        trace.set_trace_mask(Some("SDG_RAW_IO"), TraceMask::IO_FILTER);
+        trace.set_trace_file(Some("SDG_RAW_IO"), TraceFile::File(file));
+
+        assert_eq!(
+            device_write_read("SDG_RAW", &link, "status?").unwrap(),
+            "\u{fffd}7\0tail"
+        );
+        let out = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let want: &[u8] = b"SDG_RAW writeRead: wrote \"status?\" read \"\xff7\"\n";
+        assert!(
+            out.windows(want.len()).any(|w| w == want),
+            "{}",
+            String::from_utf8_lossy(&out)
         );
     }
 
