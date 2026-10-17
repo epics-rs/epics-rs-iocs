@@ -40,6 +40,7 @@
 //!   bit reads ON) loops forever if the bit never clears; this port bounds
 //!   the wait at 50 tries (5 s) and errors.
 
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -205,8 +206,13 @@ pub enum Mm4000Refusal {
     NoAnswer,
     /// The firmware string (past `VE`) names no MM4000/4005/4006.
     InvalidModel(String),
-    /// `TP;` reported fewer fields than the axes asked for.
-    TooFewAxes { total_axes: usize },
+    /// `TP;` reported fewer fields than the axes asked for, past the
+    /// firmware and model C has already stored.
+    TooFewAxes {
+        total_axes: usize,
+        firmware: String,
+        model: Mm4000Model,
+    },
 }
 
 impl Mm4000Controller {
@@ -247,7 +253,11 @@ impl Mm4000Controller {
         let tp = ctrl.write_read("TP;").unwrap_or_default();
         let total_axes = strtok_count(&tp);
         if total_axes < num_axes {
-            return Err(Mm4000Refusal::TooFewAxes { total_axes });
+            return Err(Mm4000Refusal::TooFewAxes {
+                total_axes,
+                firmware: ctrl.firmware,
+                model,
+            });
         }
         Ok(ctrl)
     }
@@ -520,6 +530,41 @@ impl Mm4000Controller {
     }
 }
 
+/// drvMM4000Asyn.c `motorAxisReportAxis` (:194-206). The default is C's
+/// calloc'd axis, which a Config that fails past its range checks leaves.
+#[derive(Default)]
+pub struct Mm4000AxisReport {
+    /// 0-based, C's `pAxis->axis`.
+    axis: usize,
+    /// The `MS;` status byte the last poll read, C's `axisStatus`.
+    status: Arc<AtomicI32>,
+    high_limit: f64,
+    low_limit: f64,
+    home_preset: f64,
+    step_size: f64,
+    digits: usize,
+}
+
+impl Mm4000AxisReport {
+    pub fn report(&self, out: &mut String, level: i32) {
+        use std::fmt::Write;
+        if level > 0 {
+            let _ = write!(
+                out,
+                "Axis {}\n   axisStatus:  0x{:x}\n   high limit:  {:.6}\n   low limit:   {:.6}\n   \
+                 home preset: {:.6}\n   step size:   {:.6}\n   max digits:  {}\n",
+                self.axis,
+                self.status.load(Ordering::Relaxed),
+                self.high_limit,
+                self.low_limit,
+                self.home_preset,
+                self.step_size,
+                self.digits
+            );
+        }
+    }
+}
+
 /// One MM4000 axis sharing a controller. Implements [`AsynMotor`].
 pub struct Mm4000Axis {
     controller: Arc<Mutex<Mm4000Controller>>,
@@ -558,6 +603,8 @@ pub struct Mm4000Axis {
     motion_sent: bool,
     /// The model-1 record's PREM and POST.
     strings: MoveStrings,
+    /// What the model-2 poll last read from `MS;`, for [`Mm4000AxisReport`].
+    status: Arc<AtomicI32>,
 }
 
 /// C model-1 `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
@@ -626,6 +673,20 @@ impl Mm4000Axis {
             },
             motion_sent: false,
             strings: MoveStrings::default(),
+            status: Arc::default(),
+        }
+    }
+
+    /// drvMM4000Asyn.c `motorAxisReportAxis`'s view of this axis.
+    pub fn report(&self) -> Mm4000AxisReport {
+        Mm4000AxisReport {
+            axis: self.axis - 1,
+            status: self.status.clone(),
+            high_limit: self.high_limit,
+            low_limit: self.low_limit,
+            home_preset: self.home_preset,
+            step_size: self.step_size,
+            digits: self.digits,
         }
     }
 
@@ -985,6 +1046,8 @@ impl AsynMotor for Mm4000Axis {
                     self.axis
                 ))
             })?;
+        // C stores the status `char`, signed on its targets.
+        self.status.store(i32::from(byte as i8), Ordering::Relaxed);
         let position = data.positions.get(idx).copied().flatten().ok_or_else(|| {
             mm_err(format!(
                 "MM4000 axis {}: missing TP position field",

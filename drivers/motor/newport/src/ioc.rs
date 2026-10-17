@@ -55,7 +55,7 @@ use crate::conex::ConexAxis;
 use crate::esp300::{self, Esp300Axis, Esp300Controller};
 use crate::hxp::{HxpAxis, HxpController, HxpControllerParams, MoveLine, NUM_HXP_AXES};
 use crate::mm3000::{Mm3000Axis, Mm3000Controller};
-use crate::mm4000::{self, Mm4000Axis, Mm4000Controller, Mm4000Refusal};
+use crate::mm4000::{self, Mm4000Axis, Mm4000AxisReport, Mm4000Controller, Mm4000Refusal};
 use crate::pm500::{Pm500Axis, Pm500Controller};
 use crate::pmnc::{PmncAxis, PmncController};
 use crate::report::{AxisLines, ControllerHead, period_s};
@@ -1760,11 +1760,50 @@ pub fn mm4000_config_command() -> CommandDef {
 /// Its poller forces 10 fast polls (drvMM4000Asyn.c:630).
 pub static MOTOR_MM4000: Model2 = Model2::new("motorMM4000", 10);
 
-/// `numMM4000Controllers`, which `MM4000AsynSetup` sets.
-static NUM_MM4000_ASYN: Mutex<i32> = Mutex::new(0);
+/// C's `MM4000Controller`, as `motorAxisReport` prints it: zeroed by
+/// `MM4000AsynSetup`'s calloc, filled by `MM4000AsynConfig` up to where it
+/// stops.
+#[derive(Default)]
+struct Mm4000AsynCard {
+    firmware: String,
+    /// C's `MM_model`: MM4000 0, MM4005 1.
+    model: i32,
+    moving_s: f64,
+    idle_s: f64,
+    axes: Vec<Mm4000AxisReport>,
+}
+
+/// `pMM4000Controller`, `numMM4000Controllers` long.
+static MM4000_ASYN: Mutex<Vec<Mm4000AsynCard>> = Mutex::new(Vec::new());
+
+/// drvMM4000Asyn.c `motorAxisReport` (:208-224).
+fn mm4000_asyn_report(level: i32) -> String {
+    let mut out = String::new();
+    for (i, card) in MM4000_ASYN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .enumerate()
+    {
+        let firmware = format!("Controller {i} firmware version: {}\n", card.firmware);
+        out.push_str(&firmware);
+        if level != 0 {
+            out.push_str(&format!(
+                "    model: {}\n    moving poll period: {:.6}\n    idle poll period: {:.6}\n",
+                card.model, card.moving_s, card.idle_s
+            ));
+            out.push_str(&firmware);
+        }
+        for axis in &card.axes {
+            axis.report(&mut out, level);
+        }
+    }
+    out
+}
 
 /// `MM4000AsynSetup(num_controllers)`, printing what C's does.
 pub fn mm4000_asyn_setup_command() -> CommandDef {
+    MOTOR_MM4000.register_report(mm4000_asyn_report);
     CommandDef::new(
         "MM4000AsynSetup",
         vec![arg_int_req("Max. controller count")],
@@ -1775,7 +1814,9 @@ pub fn mm4000_asyn_setup_command() -> CommandDef {
                 println!("MM4000Setup, num_controllers must be > 0");
                 return Ok(CommandOutcome::Continue);
             }
-            *NUM_MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner()) = num_controllers;
+            *MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner()) = (0..num_controllers)
+                .map(|_| Mm4000AsynCard::default())
+                .collect();
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1804,7 +1845,8 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
             let moving_poll_ms = c_int(args, 4).max(0) as u64;
             let idle_poll_ms = c_int(args, 5).max(0) as u64;
 
-            let num_controllers = *NUM_MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner());
+            let num_controllers =
+                MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner()).len() as i32;
             if num_controllers < 1 {
                 println!("MM4000Config: no MM4000 controllers allocated, call MM4000Setup first");
                 return Ok(CommandOutcome::Continue);
@@ -1820,6 +1862,19 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 println!("MM4000Config: numAxes must in range 1 to {MM4000_MAX_AXES}");
                 return Ok(CommandOutcome::Continue);
             }
+            // C fills its controller as it goes, so a Config stopping below
+            // leaves what the report then prints.
+            let shown = |f: &mut dyn FnMut(&mut Mm4000AsynCard)| {
+                f(&mut MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner())[card as usize]);
+            };
+            shown(&mut |c| {
+                *c = Mm4000AsynCard {
+                    moving_s: f64::from(c_int(args, 4)) / 1000.0,
+                    idle_s: f64::from(c_int(args, 5)) / 1000.0,
+                    axes: (0..num_axes).map(|_| Mm4000AxisReport::default()).collect(),
+                    ..Mm4000AsynCard::default()
+                }
+            });
             let Ok(handle) = connect_serial(&port_name, MM4000_TIMEOUT) else {
                 println!("MM4000AsynConfig: cannot connect to asyn port {port_name}");
                 return Ok(CommandOutcome::Continue);
@@ -1836,25 +1891,40 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 Err(Mm4000Refusal::NoAnswer) => return Ok(CommandOutcome::Continue),
                 Err(Mm4000Refusal::InvalidModel(firmware)) => {
                     println!("MM4000AsynConfig: invalid model = {firmware}");
+                    shown(&mut |c| c.firmware = firmware.clone());
                     return Ok(CommandOutcome::Continue);
                 }
-                Err(Mm4000Refusal::TooFewAxes { total_axes }) => {
+                Err(Mm4000Refusal::TooFewAxes {
+                    total_axes,
+                    firmware,
+                    model,
+                }) => {
+                    shown(&mut |c| {
+                        c.firmware = firmware.clone();
+                        c.model = model as i32;
+                    });
                     println!(
                         "MM4000AsynConfig: actual number of axes={total_axes} < numAxes={num_axes}"
                     );
                     return Ok(CommandOutcome::Continue);
                 }
             };
+            let (firmware, model) = (controller.firmware().to_owned(), controller.model());
             let controller = Arc::new(Mutex::new(controller));
-            let axes =
-                (1..=num_axes as usize)
-                    .map(|axis| {
-                        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
-                            Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL2_POLL_FAILURE),
-                        ));
-                        motor
-                    })
-                    .collect();
+            let (axes, reports): (Vec<_>, Vec<_>) = (1..=num_axes as usize)
+                .map(|axis| {
+                    let ax = Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL2_POLL_FAILURE);
+                    let report = ax.report();
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    (motor, report)
+                })
+                .unzip();
+            let mut reports = Some(reports);
+            shown(&mut |c| {
+                c.firmware = firmware.clone();
+                c.model = model as i32;
+                c.axes = reports.take().unwrap_or_default();
+            });
             MOTOR_MM4000.set_card(card, axes, moving_poll_ms, idle_poll_ms);
             Ok(CommandOutcome::Continue)
         },
@@ -2720,6 +2790,77 @@ mod report {
                 "{}    PMNC87xx controller 1 connection failed.\n{}",
                 id(0, "pmncRepA"),
                 id(2, "pmncRepB")
+            )
+        );
+    }
+
+    /// drvMM4000Asyn.c `motorAxisReport` (:194-224), every controller
+    /// `MM4000AsynSetup` allocated; a Config stopping after its range checks
+    /// leaves its calloc'd axes.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mm4000_asyn_controller() {
+        use motor_common::testing::{LineRig, driver_report};
+        let int = ArgValue::Int;
+        run_command(mm4000_asyn_setup_command(), vec![int(3)]).await;
+        let (_line, _io) = LineRig::new("mm4kAsynLine", |last| {
+            match last {
+                "VE;" => "VEMM4005 Version 2.0",
+                "TP;" => "1TP0.0",
+                "1TU" => "1TU0.001",
+                "1XH" => "1XH1.5",
+                "1TL" => "1TL-10",
+                "1TR" => "1TR10",
+                _ => "",
+            }
+            .to_string()
+        });
+        let config = |card, port: &str, num_axes, moving, idle| {
+            vec![
+                int(card),
+                ArgValue::String(port.into()),
+                int(0),
+                int(num_axes),
+                int(moving),
+                int(idle),
+            ]
+        };
+        let cmd = mm4000_asyn_config_command;
+        run_command(cmd(), config(0, "mm4kAsynLine", 1, 100, 1000)).await;
+        run_command(cmd(), config(1, "mm4kAsynNoPort", 2, 200, 2000)).await;
+        let controller =
+            |n, firmware: &str| format!("Controller {n} firmware version: {firmware}\n");
+        assert_eq!(
+            driver_report("motorMM4000", 0),
+            format!(
+                "{}{}{}",
+                controller(0, "MM4005 Version 2.0"),
+                controller(1, ""),
+                controller(2, "")
+            )
+        );
+        let detail = |n, firmware: &str, model, moving: &str, idle: &str| {
+            format!(
+                "{}    model: {model}\n    moving poll period: {moving}\n    idle poll period: \
+                 {idle}\n{}",
+                controller(n, firmware),
+                controller(n, firmware)
+            )
+        };
+        let axis = |high: &str, low: &str, home: &str, step: &str, digits| {
+            format!(
+                "Axis 0\n   axisStatus:  0x0\n   high limit:  {high}\n   low limit:   {low}\n   \
+                 home preset: {home}\n   step size:   {step}\n   max digits:  {digits}\n"
+            )
+        };
+        let zero = axis("0.000000", "0.000000", "0.000000", "0.000000", 0);
+        assert_eq!(
+            driver_report("motorMM4000", 1),
+            format!(
+                "{}{}{}{zero}{zero}{}",
+                detail(0, "MM4005 Version 2.0", 1, "0.100000", "1.000000"),
+                axis("10.000000", "-10.000000", "1.500000", "0.001000", 5),
+                detail(1, "", 0, "0.200000", "2.000000"),
+                detail(2, "", 0, "0.000000", "0.000000"),
             )
         );
     }
