@@ -324,17 +324,33 @@ impl EnsembleAxis {
                 CFloat(accel)
             ),
         );
+        // C `currentCmdPos` is the poll's PCMDPROG, as `status.position`.
+        let posdir = if relative {
+            position >= 0.0
+        } else {
+            position >= self.status.position
+        };
         let mode = if relative { "INC" } else { "ABS" };
-        let mut ctrl = self.lock();
-        ctrl.send(mode)?;
-        if accel > 0.0 {
-            let _ = ctrl.send(&format!("RAMP RATE {}", self.units(accel)));
+        {
+            let mut ctrl = self.lock();
+            ctrl.send(mode)?;
+            if accel > 0.0 {
+                let _ = ctrl.send(&format!("RAMP RATE {}", self.units(accel)));
+            }
+            ctrl.send(&format!(
+                "LINEAR @{axis} {} F{}",
+                self.units(position),
+                self.units(max_v)
+            ))?;
         }
-        ctrl.send(&format!(
-            "LINEAR @{axis} {} F{}",
-            self.units(position),
-            self.units(max_v)
-        ))
+        self.set_direction(posdir);
+        Ok(())
+    }
+
+    /// `motorAxisDirection`, which a command sets before its callback.
+    fn set_direction(&mut self, direction: bool) {
+        self.status.direction = direction;
+        self.status_writes.push(StatusWrite::Direction(direction));
     }
 }
 
@@ -477,13 +493,18 @@ impl AsynMotor for EnsembleAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let axis = self.axis;
-        let mut ctrl = self.lock();
-        let _ = ctrl.send(&format!(
-            "SETPARM @{axis}, {PARAM_ABORT_DECEL_RATE}, {}",
-            self.units(acceleration)
-        ));
-        let _ = ctrl.send(&format!("RAMP RATE @{axis} {}", self.units(acceleration)));
-        ctrl.send(&format!("FREERUN @{axis} {}", self.units(velocity)))
+        let sent = {
+            let mut ctrl = self.lock();
+            let _ = ctrl.send(&format!(
+                "SETPARM @{axis}, {PARAM_ABORT_DECEL_RATE}, {}",
+                self.units(acceleration)
+            ));
+            let _ = ctrl.send(&format!("RAMP RATE @{axis} {}", self.units(acceleration)));
+            ctrl.send(&format!("FREERUN @{axis} {}", self.units(velocity)))
+        };
+        // C sets it whatever FREERUN returned (drvEnsembleAsyn.cc:630-636).
+        self.set_direction(velocity > 0.0);
+        sent
     }
 
     fn home(
@@ -531,7 +552,10 @@ impl AsynMotor for EnsembleAxis {
         // HomeAsync.bcx protocol: IGLOBAL(32)=1, IGLOBAL(33)=axis, run task 5.
         let _ = ctrl.send("IGLOBAL(32) = 1");
         let _ = ctrl.send(&format!("IGLOBAL(33) = {axis}"));
-        ctrl.send("PROGRAM RUN 5, \"HomeAsync.bcx\"")
+        ctrl.send("PROGRAM RUN 5, \"HomeAsync.bcx\"")?;
+        drop(ctrl);
+        self.set_direction(forward);
+        Ok(())
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -1239,5 +1263,41 @@ mod tests {
             ["EnsemblePoller: axis 0 axisStatus=201, position=6.500000"],
             "{text}"
         );
+    }
+
+    /// drvEnsembleAsyn.cc:510-541, :591-603, :630-636: a move and a home set motorAxisDirection once their checked
+    /// exchange succeeded, a velocity move whatever FREERUN returned.
+    #[test]
+    fn commands_post_the_direction_they_set() {
+        use epics_rs::asyn::interfaces::motor::StatusWrite::Direction;
+        let failing = Arc::new(Mutex::new(String::new()));
+        let fails = {
+            let failing = failing.clone();
+            move |cmd: &str| {
+                let f = failing.lock().unwrap();
+                !f.is_empty() && cmd.starts_with(f.as_str())
+            }
+        };
+        let fail = |prefix: &str| *failing.lock().unwrap() = prefix.into();
+        let (_line, mut axis) = rig_axis("ensDirLine", |_| "%0".into(), fails);
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(true)]);
+        axis.move_relative(&user, -1.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(false)]);
+        axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(true)]);
+        axis.home(&user, 0.0, 1.0, 1.0, false).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(false)]);
+
+        fail("LINEAR");
+        assert!(axis.move_absolute(&user, -1.0, 0.0, 1.0, 1.0).is_err());
+        assert_eq!(axis.take_status_writes(), []);
+        fail("FREERUN");
+        assert!(axis.move_velocity(&user, 0.0, -1.0, 1.0).is_err());
+        assert_eq!(axis.take_status_writes(), [Direction(false)]);
+        fail("PROGRAM");
+        assert!(axis.home(&user, 0.0, 1.0, 1.0, true).is_err());
+        assert_eq!(axis.take_status_writes(), []);
     }
 }

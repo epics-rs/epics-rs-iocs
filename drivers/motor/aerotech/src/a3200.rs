@@ -419,6 +419,12 @@ impl A3200Axis {
         ))))
     }
 
+    /// `motorAxisDirection`, which a command sets before its callback.
+    fn set_direction(&mut self, direction: bool) {
+        self.status.direction = direction;
+        self.status_writes.push(StatusWrite::Direction(direction));
+    }
+
     fn do_move(
         &mut self,
         position: f64,
@@ -446,7 +452,7 @@ impl A3200Axis {
         };
         match self.move_io(position, relative, max_v, accel)? {
             None => {
-                self.status.direction = posdir;
+                self.set_direction(posdir);
                 Ok(())
             }
             Some(taskerr) => {
@@ -576,15 +582,19 @@ impl AsynMotor for A3200Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.status.direction = velocity > 0.0;
         let name = self.axis_name.clone();
-        let mut ctrl = self.lock();
-        let _ = ctrl.send(&format!(
-            "AbortDecelRate.{name} = {}",
-            self.units(acceleration)
-        ));
-        let _ = ctrl.send(&format!("RAMP RATE {name} {}", self.units(acceleration)));
-        ctrl.send(&format!("FREERUN {name} {}", self.units(velocity)))
+        let sent = {
+            let mut ctrl = self.lock();
+            let _ = ctrl.send(&format!(
+                "AbortDecelRate.{name} = {}",
+                self.units(acceleration)
+            ));
+            let _ = ctrl.send(&format!("RAMP RATE {name} {}", self.units(acceleration)));
+            ctrl.send(&format!("FREERUN {name} {}", self.units(velocity)))
+        };
+        // C sets it whatever FREERUN returned (drvA3200Asyn.cc:639-645).
+        self.set_direction(velocity > 0.0);
+        sent
     }
 
     fn home(
@@ -612,9 +622,6 @@ impl AsynMotor for A3200Axis {
             self.home_direction & !1
         };
         self.home_direction = hparam;
-        // C sets motorAxisDirection to `forwards` (not posdir) for a home.
-        self.status.direction = forward;
-
         let name = self.axis_name.clone();
         let mut ctrl = self.lock();
         if velocity > 0.0 {
@@ -627,7 +634,11 @@ impl AsynMotor for A3200Axis {
             ));
         }
         let _ = ctrl.send(&format!("HomeSetup.{name} = {hparam}"));
-        ctrl.send(&format!("HOME {name}"))
+        ctrl.send(&format!("HOME {name}"))?;
+        drop(ctrl);
+        // `forwards`, not posdir, once HOME was sent (drvA3200Asyn.cc:605-610).
+        self.set_direction(forward);
+        Ok(())
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -1250,5 +1261,41 @@ mod tests {
             ],
             "{text}"
         );
+    }
+
+    /// drvA3200Asyn.cc:528-551, :601-612, :639-645: a move and a home set motorAxisDirection once their checked
+    /// exchange succeeded, a velocity move whatever FREERUN returned.
+    #[test]
+    fn commands_post_the_direction_they_set() {
+        use epics_rs::asyn::interfaces::motor::StatusWrite::Direction;
+        let failing = Arc::new(Mutex::new(String::new()));
+        let fails = {
+            let failing = failing.clone();
+            move |cmd: &str| {
+                let f = failing.lock().unwrap();
+                !f.is_empty() && cmd.starts_with(f.as_str())
+            }
+        };
+        let fail = |prefix: &str| *failing.lock().unwrap() = prefix.into();
+        let (_line, mut axis) = rig_axis("a32DirLine", true, |_| "%0".into(), fails);
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(true)]);
+        axis.move_relative(&user, -1.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(false)]);
+        axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(true)]);
+        axis.home(&user, 0.0, 1.0, 1.0, false).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(false)]);
+
+        fail("LINEAR");
+        assert!(axis.move_absolute(&user, -1.0, 0.0, 1.0, 1.0).is_err());
+        assert_eq!(axis.take_status_writes(), []);
+        fail("FREERUN");
+        assert!(axis.move_velocity(&user, 0.0, -1.0, 1.0).is_err());
+        assert_eq!(axis.take_status_writes(), [Direction(false)]);
+        fail("HOME");
+        assert!(axis.home(&user, 0.0, 1.0, 1.0, true).is_err());
+        assert_eq!(axis.take_status_writes(), []);
     }
 }
