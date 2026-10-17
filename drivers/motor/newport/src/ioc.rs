@@ -583,17 +583,18 @@ impl ControllerParams for XpsHead {
                 // XPSCreateProfile, as "(null)".
                 let (user, password) =
                     ftp_login.unwrap_or_else(|| ("(null)".into(), "(null)".into()));
-                // useSFTP_ and movesDeferred_ are set only by an XPS-D profile
-                // build and by deferred moves, neither of which this port has.
+                // useSFTP_ is set only by an XPS-D profile build, which this
+                // port does not have.
                 let _ = write!(
                     out,
                     "       enableSetPosition: {}\n setPositionSettlingTime: {:.6}\n\
                      \x20              IPAddress: {ip}\n                  IPPort: {ip_port}\n\
                      \x20            ftpUserName: {user}\n         ftpUserPassword: {password}\n\
-                     \x20                useSFTP: false\n           movesDeferred: 0\n\
+                     \x20                useSFTP: false\n           movesDeferred: {}\n\
                      \x20             autoEnable: {}\n          noDisableError: {}\n",
                     i32::from(self.enable_set_position),
                     CFloat(self.settling_s),
+                    i32::from(ctrl.moves_deferred()),
                     i32::from(ctrl.auto_enable()),
                     i32::from(ctrl.no_disable_error())
                 );
@@ -1335,7 +1336,7 @@ fn xps_run_profile(
 fn xps_profile_moves(sock: &XpsSocket, mode: MoveMode, moves: &[(String, f64)]) {
     for (positioner, target) in moves {
         let _ = match mode {
-            MoveMode::Absolute => sock.group_move_absolute(positioner, *target),
+            MoveMode::Absolute => sock.group_move_absolute(positioner, &[*target]),
             MoveMode::Relative => sock.group_move_relative(positioner, *target),
         };
     }
@@ -2697,6 +2698,21 @@ mod report {
             text.contains(&format!("{head}{}{axis}", detail("user", "pass", 1))),
             "{text}"
         );
+        // XPSController::setDeferredMoves sets movesDeferred_.
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::motor::controller_port::index;
+        let port = PortManager::global().find_port_handle("xpsRep").unwrap();
+        port.write_int32(index::DEFER_MOVES, 0, 1).await.unwrap();
+        let deferred = "           movesDeferred: 1\n";
+        let mut text = String::new();
+        for _ in 0..200 {
+            text = port_report("xpsRep", 1);
+            if text.contains(deferred) {
+                break;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(text.contains(deferred), "{text}");
     }
 
     /// drvESP300.cc's drvet `report` (drvESP300.cc:153-178), which `dbior`

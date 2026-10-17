@@ -202,9 +202,11 @@ impl XpsSocket {
         Ok(())
     }
 
-    /// `GroupMoveAbsolute(positioner, [target])` (one element).
-    pub fn group_move_absolute(&self, positioner: &str, target: f64) -> XpsResult<()> {
-        let cmd = format!("GroupMoveAbsolute ({positioner},{})", g(target));
+    /// `GroupMoveAbsolute(name, targets)`: one target for a positioner, one
+    /// per positioner for a group.
+    pub fn group_move_absolute(&self, name: &str, targets: &[f64]) -> XpsResult<()> {
+        let targets: Vec<String> = targets.iter().map(|&t| g(t)).collect();
+        let cmd = format!("GroupMoveAbsolute ({name},{})", targets.join(","));
         self.exec(&cmd)?.require_ok()?;
         Ok(())
     }

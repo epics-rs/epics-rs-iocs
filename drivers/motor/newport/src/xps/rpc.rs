@@ -550,7 +550,7 @@ mod tests {
             SocketMode::Fire,
             Duration::from_millis(100),
         );
-        sock.group_move_absolute("G1.P1", 1.0).unwrap();
+        sock.group_move_absolute("G1.P1", &[1.0]).unwrap();
     }
 
     /// asynOctetSocket.cpp:189-215: the move socket's writeRead leaves the

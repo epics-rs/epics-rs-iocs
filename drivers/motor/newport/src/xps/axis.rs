@@ -23,7 +23,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
-use super::controller::{SetPositionFailure, XpsController};
+use super::controller::{DeferredMove, MoveState, SetPositionFailure, XpsController};
 use super::corrector::{self, CorrectorType, PidFailure};
 use super::rpc::{XpsError, XpsResult, XpsSocket};
 
@@ -90,7 +90,9 @@ impl motor_common::AxisReport for XpsAxisReport {
 /// One XPS positioner as an asyn motor axis.
 pub struct XpsAxis {
     controller: Arc<Mutex<XpsController>>,
-    move_sock: XpsSocket,
+    move_sock: Arc<XpsSocket>,
+    /// Shared with the controller's deferred group move.
+    move_state: Arc<Mutex<MoveState>>,
     positioner_name: String,
     group_name: String,
     step_size: f64,
@@ -136,6 +138,8 @@ impl XpsAxis {
             );
         }
         let group_name = group_of(positioner_name).to_string();
+        let move_sock = Arc::new(move_sock);
+        let move_state = Arc::new(Mutex::new(MoveState::default()));
         let (min_jerk, max_jerk, pid) = {
             let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // C ignores a failed read; its jerk times are then whatever the
@@ -145,12 +149,19 @@ impl XpsAxis {
                 .positioner_sgamma_parameters_get(positioner_name)
                 .unwrap_or_default();
             let pid = corrector::get_pid(ctrl.poll_socket(), positioner_name);
-            ctrl.register_axis(axis_no, positioner_name, &group_name);
+            ctrl.register_axis(
+                axis_no,
+                positioner_name,
+                &group_name,
+                move_sock.clone(),
+                move_state.clone(),
+            );
             (min_jerk, max_jerk, pid)
         };
         let axis = Self {
             controller,
             move_sock,
+            move_state,
             positioner_name: positioner_name.to_string(),
             group_name,
             step_size,
@@ -212,6 +223,19 @@ impl XpsAxis {
 
     fn lock_controller(&self) -> MutexGuard<'_, XpsController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lock after the controller, as the deferred group move does.
+    fn lock_move_state(&self) -> MutexGuard<'_, MoveState> {
+        self.move_state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// C `move`'s `movesDeferred_` branch: hold the move for the group move.
+    fn defer(&self, ctrl: &XpsController, position: f64, relative: bool) -> bool {
+        if ctrl.moves_deferred() {
+            self.lock_move_state().deferred = Some(DeferredMove { position, relative });
+        }
+        ctrl.moves_deferred()
     }
 
     /// Read the group status over the poll socket, holding the controller lock
@@ -503,11 +527,14 @@ impl AsynMotor for XpsAxis {
         {
             let ctrl = self.lock_controller();
             self.prepare_move(&ctrl, velocity, acceleration)?;
+            if self.defer(&ctrl, device_units, false) {
+                return Ok(());
+            }
         }
         self.move_result(
             "GroupMoveAbsolute",
             self.move_sock
-                .group_move_absolute(&self.positioner_name, device_units),
+                .group_move_absolute(&self.positioner_name, &[device_units]),
         )?;
         self.moving = true;
         Ok(())
@@ -527,6 +554,9 @@ impl AsynMotor for XpsAxis {
         {
             let ctrl = self.lock_controller();
             self.prepare_move(&ctrl, velocity, acceleration)?;
+            if self.defer(&ctrl, device_units, true) {
+                return Ok(());
+            }
         }
         self.move_result(
             "GroupMoveRelative",
@@ -653,7 +683,14 @@ impl AsynMotor for XpsAxis {
                 .group_kill(&self.group_name)
                 .inspect_err(|e| stop_error("GroupKill", e))?;
         }
+        self.lock_move_state().deferred = None;
         Ok(())
+    }
+
+    fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
+        self.lock_controller()
+            .set_deferred_moves(&self.trace, defer)
+            .map_err(Into::into)
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
@@ -1013,9 +1050,9 @@ impl XpsAxis {
         if moving_mode && self.moving && self.move_sock.read_pending() > 0 {
             self.moving = false;
         }
-        status.done = !self.moving;
-        // C `*moving`, the poller's pace (XPSAxis.cpp:623).
-        status.moving = self.moving;
+        // C `*moving`, the poller's pace (XPSAxis.cpp:623-624).
+        status.moving = self.moving || self.lock_move_state().deferred.is_some();
+        status.done = !status.moving;
 
         // A TCL script may change the soft limits; C re-reads them each poll
         // and ignores a failure.
@@ -1036,6 +1073,7 @@ impl XpsAxis {
         let setpoint = sock
             .group_position_setpoint_get(&self.positioner_name)
             .inspect_err(|e| poll_error("GroupPositionSetpointGet", e))?;
+        self.lock_move_state().setpoint = setpoint;
         status.position = setpoint / self.step_size;
         let positioner_error = sock
             .positioner_error_get(&self.positioner_name)
@@ -1481,5 +1519,118 @@ mod tests {
         log.lock().unwrap().clear();
         axes[1].set_position(&user, 3.0).unwrap();
         assert_eq!(log.lock().unwrap()[0], "GroupKill (G2)");
+    }
+
+    /// XPSController.cpp:430-476 and 342-420: deferred moves go out as one
+    /// GroupMoveAbsolute per group on the release, the polled setpoint
+    /// standing in for an axis with no deferred move, and an axis with a
+    /// deferred move polls as not done.
+    #[test]
+    fn deferred_moves_go_out_as_one_group_move_per_group() {
+        let (mut axes, _fail, log) = fake_axes(
+            "xps_defer",
+            "",
+            false,
+            &["G1.P1", "G2.P1", "G1.P2", "G1.P3"],
+        );
+        let user = AsynUser::default();
+        for axis in axes.iter_mut() {
+            axis.poll(&user).unwrap();
+        }
+        let group_moves = |log: &Log| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.starts_with("GroupMove"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        // C arms deferral on a release with none deferred; here it stays off.
+        axes[0].set_deferred_moves(&user, false).unwrap();
+        axes[0].move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(group_moves(&log), ["GroupMoveAbsolute (G1.P1,1)"]);
+        log.lock().unwrap().clear();
+
+        axes[1].set_deferred_moves(&user, true).unwrap();
+        axes[0].move_absolute(&user, 3.0, 0.0, 1.0, 1.0).unwrap();
+        axes[2].move_relative(&user, 0.5, 0.0, 1.0, 1.0).unwrap();
+        assert!(group_moves(&log).is_empty());
+        assert!(!axes[0].poll(&user).unwrap().done);
+        assert!(axes[1].poll(&user).unwrap().done);
+
+        axes[3].set_deferred_moves(&user, false).unwrap();
+        // A relative deferred move goes out as its absolute target, and a
+        // group split by another axis moves once.
+        assert_eq!(
+            group_moves(&log),
+            [
+                "GroupMoveAbsolute (G1,3,1.75,1.25)",
+                "GroupMoveAbsolute (G2,1.25)"
+            ]
+        );
+        assert!(axes[2].poll(&user).unwrap().done);
+
+        log.lock().unwrap().clear();
+        axes[0].move_absolute(&user, 2.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(group_moves(&log), ["GroupMoveAbsolute (G1.P1,2)"]);
+    }
+
+    /// XPSAxis.cpp:547: a stop drops the axis's deferred move.
+    #[test]
+    fn a_stop_drops_the_deferred_move() {
+        let (mut axes, _fail, log) = fake_axes("xps_defer_stop", "", false, &["G1.P1", "G1.P2"]);
+        let user = AsynUser::default();
+        for axis in axes.iter_mut() {
+            axis.poll(&user).unwrap();
+        }
+        axes[0].set_deferred_moves(&user, true).unwrap();
+        axes[0].move_absolute(&user, 3.0, 0.0, 1.0, 1.0).unwrap();
+        axes[0].stop(&user, 1.0).unwrap();
+        assert!(axes[0].poll(&user).unwrap().done);
+        log.lock().unwrap().clear();
+        axes[0].set_deferred_moves(&user, false).unwrap();
+        assert!(
+            log.lock()
+                .unwrap()
+                .contains(&"GroupMoveAbsolute (G1,1.25,1.25)".to_string())
+        );
+    }
+
+    /// XPSController.cpp:356, 414, 456: the release's FLOW lines and a failed
+    /// group move's ERROR line, on the controller's own user.
+    #[test]
+    fn the_release_traces_as_c() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+
+        let (mut axes, _fail, _log) = fake_axes(
+            "xps_defer_trace",
+            "GroupMoveAbsolute",
+            false,
+            &["G1.P1", "G1.P2"],
+        );
+        let user = AsynUser::default();
+        let path = std::env::temp_dir().join(format!("xps-defer-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_device_trace_mask("MOTOR_T", 0, TraceMask::ERROR | TraceMask::FLOW);
+        trace.set_device_trace_info_mask("MOTOR_T", 0, TraceInfoMask::empty());
+        trace.set_device_trace_file("MOTOR_T", 0, TraceFile::File(file));
+
+        axes[1].set_deferred_moves(&user, true).unwrap();
+        axes[1].move_absolute(&user, 3.0, 0.0, 1.0, 1.0).unwrap();
+        assert!(axes[1].set_deferred_moves(&user, false).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            text,
+            "Processing deferred moves on XPS: MOTOR_T\n\
+             Executing deferred move on XPS: MOTOR_T, Group: G1\n\
+             Executing deferred move on XPS: MOTOR_T, Group: G1\n\
+             Error peforming GroupMoveAbsolute/Relative in processDeferredMovesInGroup. XPS Return code: -3\n\
+             Processing deferred moves on XPS: MOTOR_T\n"
+        );
     }
 }

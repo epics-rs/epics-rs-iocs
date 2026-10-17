@@ -12,7 +12,11 @@
 use epics_libcom_rs::cfmt::CFloat;
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use epics_rs::asyn::trace::TraceMask;
+use epics_rs::motor::trace::MotorTrace;
 
 use super::profile::{MoveMode, Profile, TrajectoryFile};
 use super::rpc::{XpsResult, XpsSocket};
@@ -22,6 +26,25 @@ struct AxisRef {
     axis_no: i32,
     positioner: String,
     group: String,
+    move_sock: Arc<XpsSocket>,
+    state: Arc<Mutex<MoveState>>,
+}
+
+/// The part of an axis a deferred group move reads and clears; the axis and
+/// the controller share it, locked after the controller.
+#[derive(Default)]
+pub struct MoveState {
+    /// C `setpointPosition_`, device units, from the last poll.
+    pub setpoint: f64,
+    /// C `deferredMove_`, with `deferredPosition_` and `deferredRelative_`.
+    pub deferred: Option<DeferredMove>,
+}
+
+/// A move held until the deferral is released, in device units.
+#[derive(Clone, Copy)]
+pub struct DeferredMove {
+    pub position: f64,
+    pub relative: bool,
 }
 
 /// A verified, ready-to-execute PVT trajectory. Produced by
@@ -84,6 +107,55 @@ fn verify_message(status: i32) -> String {
     }
 }
 
+/// C `XPSController::processDeferredMovesInGroup`: move every axis of
+/// `group`, in axis order, to its deferred target or else its setpoint, on
+/// the last axis's move socket, and clear the group's deferred moves.
+///
+/// C sends `GroupMoveRelative` when any axis in the group was ever deferred
+/// relative, with the same absolute targets it builds for
+/// `GroupMoveAbsolute`; here the targets always go out absolute.
+fn process_deferred_moves_in_group(
+    axes: &[&AxisRef],
+    group: &str,
+    trace: &MotorTrace,
+) -> XpsResult<()> {
+    let mut targets = Vec::new();
+    for a in axes {
+        trace.print_self(
+            TraceMask::FLOW,
+            format_args!(
+                "Executing deferred move on XPS: {}, Group: {group}\n",
+                trace.port()
+            ),
+        );
+        if a.group == group {
+            let mut state = a.state.lock().unwrap_or_else(|e| e.into_inner());
+            targets.push(match state.deferred.take() {
+                Some(DeferredMove {
+                    position,
+                    relative: true,
+                }) => state.setpoint + position,
+                Some(DeferredMove { position, .. }) => position,
+                None => state.setpoint,
+            });
+        }
+    }
+    let Some(last) = axes.last() else {
+        return Ok(());
+    };
+    last.move_sock
+        .group_move_absolute(group, &targets)
+        .inspect_err(|e| {
+            trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "Error peforming GroupMoveAbsolute/Relative in processDeferredMovesInGroup. XPS Return code: {}\n",
+                    e.code()
+                ),
+            )
+        })
+}
+
 /// Shared controller state for one XPS, owning the poll socket.
 pub struct XpsController {
     poll: XpsSocket,
@@ -99,6 +171,8 @@ pub struct XpsController {
     /// `enableMovingMode_`: an axis's move is done when its move socket
     /// answers, not when its group stops moving.
     moving_mode: bool,
+    /// C `movesDeferred_`.
+    moves_deferred: bool,
     /// Each registered axis's `(positioner, group)`, in registration order —
     /// for group-membership counts (C `XPSAxis::isInGroup`) and for enumerating
     /// a group's positioners when building/executing a PVT profile.
@@ -133,6 +207,7 @@ impl XpsController {
             auto_enable: true,
             no_disable_error: false,
             moving_mode: false,
+            moves_deferred: false,
             axes: Vec::new(),
             referencing_groups: HashSet::new(),
             profile: None,
@@ -182,13 +257,59 @@ impl XpsController {
     }
 
     /// Record an axis's positioner and group so group-membership counts and
-    /// group positioner enumeration stay accurate.
-    pub fn register_axis(&mut self, axis_no: i32, positioner: &str, group: &str) {
+    /// group positioner enumeration stay accurate, and its move socket and
+    /// move state for the deferred group move.
+    pub fn register_axis(
+        &mut self,
+        axis_no: i32,
+        positioner: &str,
+        group: &str,
+        move_sock: Arc<XpsSocket>,
+        state: Arc<Mutex<MoveState>>,
+    ) {
         self.axes.push(AxisRef {
             axis_no,
             positioner: positioner.to_string(),
             group: group.to_string(),
+            move_sock,
+            state,
         });
+    }
+
+    /// Whether moves are held for a group move (C `movesDeferred_`).
+    pub fn moves_deferred(&self) -> bool {
+        self.moves_deferred
+    }
+
+    /// C `XPSController::setDeferredMoves`, printing on `trace`'s port.
+    ///
+    /// C sets `movesDeferred_` on any call that is not a release of deferred
+    /// moves and never clears it, so a release with none deferred arms
+    /// deferral and every move after a release stays deferred; here the
+    /// flag follows `defer`.
+    pub fn set_deferred_moves(&mut self, trace: &MotorTrace, defer: bool) -> XpsResult<()> {
+        let release = self.moves_deferred && !defer;
+        self.moves_deferred = defer;
+        if !release {
+            return Ok(());
+        }
+        let mut axes: Vec<&AxisRef> = self.axes.iter().collect();
+        axes.sort_by_key(|a| a.axis_no);
+        let mut done: Vec<&str> = Vec::new();
+        let mut result = Ok(());
+        for a in &axes {
+            trace.print_self(
+                TraceMask::FLOW,
+                format_args!("Processing deferred moves on XPS: {}\n", trace.port()),
+            );
+            // C skips only a group equal to the previous axis's, so a group
+            // split by another moves twice, the second time to its setpoints.
+            if !done.contains(&a.group.as_str()) {
+                done.push(&a.group);
+                result = process_deferred_moves_in_group(&axes, &a.group, trace);
+            }
+        }
+        result
     }
 
     /// Number of registered axes in `group` (C `XPSAxis::isInGroup`).
