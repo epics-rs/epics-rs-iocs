@@ -46,6 +46,7 @@ use epics_rs::motor::controller_port::{
     ControllerParams, FinishedWrite, WriteHook, WriteOutcome, WriteValue,
 };
 
+use motor_common::ControllerReport;
 use motor_common::util::{atof, leading_hex};
 
 /// Response buffer size.
@@ -177,13 +178,22 @@ impl OemController {
 pub struct OemParams {
     controller: Arc<Mutex<OemController>>,
     resolution: Option<usize>,
+    /// C's `movingPollPeriod_`/`idlePollPeriod_`, in seconds.
+    moving_poll_s: f64,
+    idle_poll_s: f64,
 }
 
 impl OemParams {
-    pub fn new(controller: Arc<Mutex<OemController>>) -> Self {
+    pub fn new(
+        controller: Arc<Mutex<OemController>>,
+        moving_poll_ms: u64,
+        idle_poll_ms: u64,
+    ) -> Self {
         Self {
             controller,
             resolution: None,
+            moving_poll_s: moving_poll_ms as f64 / 1000.0,
+            idle_poll_s: idle_poll_ms as f64 / 1000.0,
         }
     }
 }
@@ -233,6 +243,20 @@ impl WriteHook for OemWriteHook {
 }
 
 impl ControllerParams for OemParams {
+    /// C `OEMController::report` (OEMMotorDriver.cpp:94-101); `OEMAxis::report`
+    /// adds nothing.
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "OEM motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll_s,
+            self.idle_poll_s
+        );
+        ctx.report(out, level);
+    }
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.resolution = Some(base.create_param("OEM_RESOLUTION", ParamType::Int32)?);
         Ok(())
@@ -545,9 +569,13 @@ mod tests {
             InterfaceType::Octet,
         );
         let ctrl = Arc::new(Mutex::new(OemController::new(handle, 2)));
-        let port =
-            register_controller_port(&open_owner(), "oemTrace", 2, OemParams::new(ctrl.clone()))
-                .unwrap();
+        let port = register_controller_port(
+            &open_owner(),
+            "oemTrace",
+            2,
+            OemParams::new(ctrl.clone(), 100, 1000),
+        )
+        .unwrap();
         let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(OemAxis::new(ctrl, 1)));
         let user = TraceUser::Asyn {
             port: "oemTrace".into(),
@@ -585,9 +613,13 @@ mod tests {
             InterfaceType::Octet,
         );
         let ctrl = Arc::new(Mutex::new(OemController::new(handle, 2)));
-        let port =
-            register_controller_port(&open_owner(), "oemMr", 2, OemParams::new(ctrl.clone()))
-                .unwrap();
+        let port = register_controller_port(
+            &open_owner(),
+            "oemMr",
+            2,
+            OemParams::new(ctrl.clone(), 100, 1000),
+        )
+        .unwrap();
         let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(OemAxis::new(ctrl.clone(), 1)));
         let user = TraceUser::Asyn {
             port: "oemMr".into(),

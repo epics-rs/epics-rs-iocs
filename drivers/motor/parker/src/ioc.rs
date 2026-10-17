@@ -68,7 +68,7 @@ pub fn oem_create_controller_command() -> CommandDef {
                 ctx.db().scan_control().interrupt_gate(),
                 &port_name,
                 num_axes as i32,
-                OemParams::new(controller.clone()),
+                OemParams::new(controller.clone(), moving_poll_ms, idle_poll_ms),
             )?;
 
             let poller = Controller::new();
@@ -268,6 +268,27 @@ mod one_poller {
 mod report {
     use super::*;
     use motor_common::testing::{LineRig, port_report, run_command};
+
+    /// OEMController::report; OEMAxis::report prints nothing
+    /// (OEMMotorDriver.cpp:94-101, :222-226).
+    #[epics_rs::base::epics_test]
+    async fn oem_report_prints_the_controller_line_at_every_level() {
+        let (_line, _io) = LineRig::new("oemRepLine", |_| "0".into());
+        let args = vec![
+            ArgValue::String("oemRep".into()),
+            ArgValue::String("oemRepLine".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(250),
+            ArgValue::Int(2000),
+        ];
+        run_command(oem_create_controller_command(), args).await;
+        let head = "OEM motor driver oemRep, numAxes=2, moving poll period=0.250000, \
+                    idle poll period=2.000000\nPort: oemRep\n";
+        for level in [0, 1] {
+            let text = port_report("oemRep", level);
+            assert!(text.contains(head), "{text}");
+        }
+    }
 
     /// ACRController::report then ACRAxis::report
     /// (ACRMotorDriver.cpp:108-120, :317-333).
