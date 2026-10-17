@@ -116,12 +116,16 @@ pub async fn pollers_after(
     use epics_rs::base::server::iocsh::registry::CommandContext;
 
     let bridge = BlockingBridge::capture();
-    std::thread::spawn(move || {
+    let shell = std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         cmd.handler.call(&args, &ctx).unwrap();
-    })
-    .join()
-    .unwrap();
+    });
+    // Awaited, not joined: an axis joining a started poller waits on it, and
+    // the poller's thread is spawned by a task this runtime has to run.
+    while !shell.is_finished() {
+        sleep(Duration::from_millis(5)).await;
+    }
+    shell.join().unwrap();
     for _ in 0..100 {
         if pollers() > 0 {
             break;
@@ -135,6 +139,37 @@ pub async fn pollers_after(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A create command that starts the poller and then adds an axis to it,
+    /// as a driver whose constructor runs its own task does.
+    #[cfg(target_os = "linux")]
+    #[epics_rs::base::epics_test]
+    async fn an_axis_joining_a_started_poller_does_not_stall_the_helper() {
+        use epics_rs::asyn::interfaces::motor::AsynMotor;
+        use epics_rs::base::server::iocsh::registry::{
+            ArgValue, CommandContext, CommandDef, CommandOutcome,
+        };
+        use epics_rs::motor::sim_motor::SimMotor;
+
+        let senders = Arc::new(Mutex::new(Vec::new()));
+        let kept = senders.clone();
+        let create = CommandDef::new(
+            "joinCreate",
+            vec![],
+            "joinCreate()",
+            move |_: &[ArgValue], ctx: &CommandContext| {
+                crate::register_port(ctx, "joinStarted", 1)?;
+                let controller = crate::Controller::new();
+                controller.start(ctx, 10, 100, 0);
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::default()));
+                let tx = controller.install(crate::asyn_user("joinStarted", 0), motor)?;
+                kept.lock().unwrap().push(tx);
+                Ok(CommandOutcome::Continue)
+            },
+        );
+        assert_eq!(pollers_after(create, vec![]).await, 1);
+        assert_eq!(senders.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn the_rig_s_port_is_found_by_name() {
