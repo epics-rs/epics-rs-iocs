@@ -2777,7 +2777,7 @@ mod report {
         run_command(setup, vec![int(3), int(1), int(10)]).await;
         let rig = |name: &str| {
             LineRig::new(name, |last| match last {
-                "VER" => "Version 1.6.0>".into(),
+                "VER" => "Version 1.6.0".into(),
                 "DRT" => "A0=2>".into(),
                 _ => ">".into(),
             })
