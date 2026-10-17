@@ -26,7 +26,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
     ControllerParams, ControllerReport, FinishedWrite, ParamWrite, WriteHook, WriteOutcome,
-    WriteValue,
+    WriteValue, has_motor_axis,
 };
 
 /// `LC400_TIMEOUT`.
@@ -806,10 +806,14 @@ impl ControllerParams for Lc400ControllerParams {
     /// the base never runs for them, so nothing is stored or posted.
     fn write_int32(
         &mut self,
-        _base: &mut PortDriverBase,
+        base: &mut PortDriverBase,
         user: &AsynUser,
         value: i32,
     ) -> ParamWrite {
+        // C dereferences the null axis there (LC400MotorDriver.cpp:551-554); refused as the base does.
+        if !has_motor_axis(base, user) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
         let address = match axis_address(user.addr) {
             Ok(address) => address,
             Err(e) => return ParamWrite::Handled(Err(e)),
@@ -841,10 +845,14 @@ impl ControllerParams for Lc400ControllerParams {
     /// [`Self::write_int32`]; [`Lc400WriteHook`] traces them.
     fn write_float64(
         &mut self,
-        _base: &mut PortDriverBase,
+        base: &mut PortDriverBase,
         user: &AsynUser,
         value: f64,
     ) -> ParamWrite {
+        // C dereferences the null axis there (LC400MotorDriver.cpp:593-601); refused as the base does.
+        if !has_motor_axis(base, user) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
         let address = match axis_address(user.addr) {
             Ok(address) => address,
             Err(e) => return ParamWrite::Handled(Err(e)),
@@ -914,6 +922,22 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         text.lines().map(str::to_owned).collect()
+    }
+
+    /// C dereferences the null axis of an address with no axis
+    /// (LC400MotorDriver.cpp:551-554); rs refuses there as the base does,
+    /// before the driver's own state changes.
+    #[test]
+    fn a_write_with_no_axis_is_refused_before_the_driver_s_code() {
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(None, 4)));
+        let params = Lc400ControllerParams::new(controller.clone(), 0.0, 0.0);
+        let port = register_controller_port(&open_owner(), "lc400NoAxis", 4, params).unwrap();
+        let p = lock(&controller).params.unwrap();
+        let before = lock(&controller).axes[1].max_pts;
+        let refused = port.write_int32_blocking(p.w_max_pts, 1, before + 9);
+        assert_eq!(refused.unwrap_err().status(), AsynStatus::Error);
+        assert_eq!(lock(&controller).axes[1].max_pts, before);
+        assert!(port.write_float64_blocking(p.p_gain, 1, 0.5).is_err());
     }
 
     #[test]

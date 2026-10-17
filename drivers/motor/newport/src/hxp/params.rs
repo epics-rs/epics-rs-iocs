@@ -9,7 +9,9 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::{PortDriverBase, param_list};
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerParams, ControllerReport, ParamWrite};
+use epics_rs::motor::controller_port::{
+    ControllerParams, ControllerReport, ParamWrite, has_motor_axis,
+};
 
 use super::axis::{MoveLine, xps_status};
 use super::controller::{HXP_GROUP, HxpController, MoveCoordSys};
@@ -138,6 +140,10 @@ impl ControllerParams for HxpControllerParams {
         user: &AsynUser,
         value: i32,
     ) -> ParamWrite {
+        // C dereferences the null axis there (HXPDriver.cpp:185-190); refused as the base does.
+        if !has_motor_axis(base, user) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
         let Some(p) = self.lock().params else {
             return ParamWrite::PassToBase(Ok(()));
         };
@@ -257,6 +263,11 @@ mod tests {
 
     /// An HXP whose axes 0 and 1 have move lines, on `name`'s fake.
     fn rig(name: &str) -> Rig {
+        rig_axes(name, 0..2)
+    }
+
+    /// An HXP with move lines on `axes` only.
+    fn rig_axes(name: &str, axes_made: std::ops::Range<usize>) -> Rig {
         let line = FakeLine::new(&format!("{name}_line"), "");
         let controller = Arc::new(Mutex::new(HxpController::new(
             line.socket(SocketMode::Query),
@@ -265,7 +276,7 @@ mod tests {
         let port = register_controller_port(&open_owner(), name, 6, params).unwrap();
         controller.lock().unwrap().attach_port(port.clone());
         let axes = Controller::new();
-        for axis_no in 0..2 {
+        for axis_no in axes_made {
             let move_line = Arc::new(MoveLine::new(line.socket(SocketMode::Fire)));
             controller
                 .lock()
@@ -298,6 +309,25 @@ mod tests {
                     .unwrap(),
             )
         }
+    }
+
+    /// C dereferences the null axis of an address with no axis
+    /// (HXPDriver.cpp:185-190); rs refuses there as the base does, before
+    /// the address-0 coordinate system changes.
+    #[test]
+    fn a_write_with_no_axis_is_refused_before_the_driver_s_code() {
+        let r = rig_axes("hxpNoAxis", 1..2);
+        assert!(
+            r.port
+                .write_int32_blocking(r.p.move_coord_sys, 0, 1)
+                .is_err()
+        );
+        assert_eq!(
+            r.controller.lock().unwrap().move_coord_sys(),
+            MoveCoordSys::Work
+        );
+        assert!(r.port.write_int32_blocking(r.p.move_all, 3, 1).is_err());
+        assert!(r.line.take_log().is_empty());
     }
 
     /// HXPDriver.cpp:267-285: the targets at address 0 go out in one

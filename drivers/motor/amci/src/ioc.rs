@@ -475,6 +475,42 @@ mod tests {
         assert_eq!(jerk, [(9, vec![1234])]);
     }
 
+    /// Write `value` to `name` at `addr`, whose port has no axis there.
+    async fn put_int32_status(port: &str, name: &'static str, addr: i32, value: i32) -> bool {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::port::DrvUserRequest;
+        let port = port.to_string();
+        on_shell(move || {
+            let handle = PortManager::global().find_port_handle(&port).unwrap();
+            let reason = handle
+                .drv_user_create_blocking(&DrvUserRequest::new(name, 0))
+                .unwrap()
+                .reason;
+            handle.write_int32_blocking(reason, addr, value).is_ok()
+        })
+        .await
+    }
+
+    /// C's ANF2 and ANG1 `writeInt32` dereference the null axis of an
+    /// address with no axis (ANF2Driver.cpp:215-219, ANG1Driver.cpp:165-169);
+    /// rs refuses there as the base does, and writes nothing.
+    #[epics_rs::base::epics_test]
+    async fn a_write_with_no_axis_is_refused_and_sends_nothing() {
+        anf2_report("anf2NoAxis", 0).await;
+        crate::regs::fake::written("anf2NoAxisOut");
+        assert!(!put_int32_status("anf2NoAxis", "ANF2_RESET_ERRORS", 2, 1).await);
+        assert_eq!(crate::regs::fake::written("anf2NoAxisOut"), []);
+
+        let port = "ang1NoAxis";
+        crate::regs::fake::publish("ang1NoAxisIn");
+        crate::regs::fake::publish("ang1NoAxisOut");
+        let cmd = (ang1_create_controller_command(), ang1_args(port));
+        report_after(vec![cmd], port, 0).await;
+        crate::regs::fake::written("ang1NoAxisOut");
+        assert!(!put_int32_status(port, "ANG1_JERK", 5, 1234).await);
+        assert_eq!(crate::regs::fake::written("ang1NoAxisOut"), []);
+    }
+
     #[test]
     fn hex_config_reads_as_strtoul() {
         assert_eq!(strtoul_hex("0x86280000"), Some(0x8628_0000));
