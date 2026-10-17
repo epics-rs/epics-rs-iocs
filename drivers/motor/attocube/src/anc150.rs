@@ -43,6 +43,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::drv_motor_asyn::{DrvSet, function};
 use motor_common::model2::AxisLog;
 use motor_common::util::nint;
 
@@ -530,6 +531,56 @@ impl AsynMotor for Anc150Axis {
     }
 }
 
+/// C `motorAxisSetDouble`/`motorAxisSetInteger` (drvANC150Asyn.cc:298-388),
+/// which drvMotorAsyn's writes reach.
+impl DrvSet for Anc150Axis {
+    fn set_double(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+        let kind = match function {
+            function::POSITION => return self.set_position(user, value),
+            function::ENCODER_RATIO => return self.set_encoder_ratio(user, value),
+            // C breaks out with its status still MOTOR_AXIS_ERROR.
+            function::LOW_LIMIT | function::HIGH_LIMIT => {
+                return Err(anc_err(format!("ANC150 does not set function {function}")));
+            }
+            function::P_GAIN => PidGainKind::Proportional,
+            function::I_GAIN => PidGainKind::Integral,
+            function::D_GAIN => PidGainKind::Derivative,
+            function::RESOLUTION => {
+                self.log.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "motorAxisSetDouble: ANC150 does not support setting resolution\n"
+                    ),
+                );
+                return Err(anc_err("ANC150 does not support setting resolution"));
+            }
+            _ => {
+                self.log.print(
+                    TraceMask::ERROR,
+                    format_args!("motorAxisSetDouble: unknown function {function}\n"),
+                );
+                return Err(anc_err(format!(
+                    "motorAxisSetDouble: unknown function {function}"
+                )));
+            }
+        };
+        self.set_pid_gain(user, kind, value)
+    }
+
+    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+        if function == function::CLOSED_LOOP {
+            return self.set_closed_loop(user, value != 0);
+        }
+        self.log.print(
+            TraceMask::ERROR,
+            format_args!("motorAxisSetInteger: unknown function {function}\n"),
+        );
+        Err(anc_err(format!(
+            "motorAxisSetInteger: unknown function {function}"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,6 +738,11 @@ mod tests {
         // Idle polls an hour apart: past the startup poll only the test's.
         driver.set_card(1, motors, 3_600_000, 3_600_000);
         driver.set_axis_logs(1, logs);
+        let setters = axes
+            .iter()
+            .map(|a| a.clone() as Arc<Mutex<dyn DrvSet>>)
+            .collect();
+        driver.set_axis_setters(1, setters);
         let args = vec![
             ArgValue::String(port.into()),
             ArgValue::String(port.into()),
@@ -733,6 +789,31 @@ mod tests {
              ANC150 does not support setting proportional gain\n\
              ANC150 does not support setting integral gain\n\
              ANC150 does not support setting derivative gain\n"
+        );
+    }
+
+    /// drvANC150Asyn.cc:325, 350, 385: the asyn writes of a function the
+    /// driver does not set print an ERROR line and fail; the soft limits
+    /// fail with none.
+    #[epics_rs::base::epics_test]
+    async fn unknown_functions_print_the_c_error_lines() {
+        let (_axes, path) = traced_axes("ancUnknown", TraceMask::ERROR).await;
+        let port = PortManager::global()
+            .find_port_handle("ancUnknown")
+            .unwrap();
+        std::thread::spawn(move || {
+            assert!(port.write_int32_blocking(26, 1, 1).is_err());
+            assert!(port.write_float64_blocking(27, 1, 3.0).is_err());
+            assert!(port.write_float64_blocking(1, 1, 0.5).is_err());
+            assert!(port.write_float64_blocking(4, 1, 9.0).is_err());
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            take_trace(&path),
+            "motorAxisSetInteger: unknown function 26\n\
+             motorAxisSetDouble: unknown function 27\n\
+             motorAxisSetDouble: ANC150 does not support setting resolution\n"
         );
     }
 
