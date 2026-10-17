@@ -13,7 +13,7 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
 use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
-use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1::{Model1, Model1Cards, SCAN_RATE, c_int};
 use motor_common::model1_device;
 
 use crate::smartmotor::{SmartMotorAxis, SmartMotorController};
@@ -27,9 +27,19 @@ static DEV_SMART_MOTOR: DevSup = model1_device("devSmartMotor", "SmartMotor");
 /// `SmartMotor_NUM_CARDS` (drvSmartMotor.cc:57).
 static SMART_MOTOR: Model1 = Model1::new(&DEV_SMART_MOTOR, 7, SCAN_RATE);
 
-/// `SmartMotorSetup(num_cards, scan_rate)`.
+/// `SmartMotorSetup(num_cards, scan_rate)`, with the `drvSmartMotor` drvet
+/// report its dbd line registers.
 pub fn smartmotor_setup_command() -> CommandDef {
+    SMART_MOTOR.register_report("drvSmartMotor", report);
     SMART_MOTOR.setup_command("SmartMotorSetup")
+}
+
+/// C `report` (drvSmartMotor.cc:143-166). C's `ident` is never filled, so
+/// the id is always empty.
+fn report(cards: &Model1Cards<'_>) -> String {
+    cards.report("SmartMotor", |card, port| {
+        format!("    SmartMotorSM controller #{card}, port={port}, id:  \n")
+    })
 }
 
 /// `SmartMotorConfig(card, name)`.
@@ -63,7 +73,37 @@ pub fn smartmotor_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 SMART_MOTOR.install(ctx, card, axis as i32, motor)?;
             }
+            SMART_MOTOR.describe(card, asyn_port);
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod report {
+    use epics_rs::base::server::driver_support::find_driver_support;
+    use motor_common::testing::{LineRig, run_command};
+
+    use super::*;
+
+    /// C drvSmartMotor.cc:143-166, the drvet report `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_smartmotor_card() {
+        let setup = smartmotor_setup_command();
+        let drvet = find_driver_support("drvSmartMotor").unwrap();
+        assert_eq!(
+            drvet.report(0).unwrap(),
+            "    No SmartMotor controllers configured.\n"
+        );
+        run_command(setup, vec![ArgValue::Int(2), ArgValue::Int(10)]).await;
+        let (_line, _io) = LineRig::new("smReportLine", |_| "0".into());
+        let config = smartmotor_config_command();
+        let args = vec![ArgValue::Int(1), ArgValue::String("smReportLine".into())];
+        run_command(config, args).await;
+        assert_eq!(
+            drvet.report(0).unwrap(),
+            "    SmartMotor controller 0 connection failed.\n    \
+             SmartMotorSM controller #1, port=smReportLine, id:  \n"
+        );
+    }
 }
