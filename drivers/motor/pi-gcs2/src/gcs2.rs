@@ -97,9 +97,9 @@
 //! - **Piezo**: `PIGCSPiezoController`, `PIGCS2PiezoCL` — closed-loop piezo
 //!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
 //!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
-//! - **Per-model controllers**: `PIE517Controller`, `PIE727Controller`,
-//!   `PIE755Controller` and `PIC702Controller` (each has its own init and
-//!   status quirks); those controllers run on [`Model::Motor`].
+//! - **Per-model controllers**: `PIE517Controller`, `PIE727Controller` and
+//!   `PIC702Controller` (each has its own init and status quirks); those
+//!   controllers run on [`Model::Motor`].
 //! - **`TranslatePIError`**: the 2172-line errcode→string table
 //!   (`TranslatePIError.cpp`/`picontrollererrors.h`) is not ported; only the
 //!   numeric `ERR?` code (`atoi`) is surfaced, in error messages.
@@ -218,6 +218,11 @@ fn counts_per_unit(numerator: i32, denominator: i32) -> f64 {
     }
 }
 
+/// C `PIGCSController::getBusy`: the `#7` reply's first byte is 0xB0.
+fn busy_from_reply(raw: &[u8]) -> bool {
+    raw.first() == Some(&0xB0)
+}
+
 /// `PIGCSController::getStatusFromBitMask`.
 fn status_from_bitmask(mask: u32) -> (bool, bool, bool, bool, bool) {
     let homing = mask & STATUS_HOMING != 0;
@@ -248,9 +253,22 @@ pub enum Model {
     MotorNoRefVel,
     /// `PIC885Controller`.
     C885,
+    /// `PIE755Controller`.
+    E755,
 }
 
 impl Model {
+    /// `PIGCSMotorController::getResolution`'s `SPA?` CPU reads; the others
+    /// run the base's fixed one.
+    fn reads_cpu(self) -> bool {
+        !matches!(self, Self::C885 | Self::E755)
+    }
+
+    /// `PIGCSMotorController::setAccelerationCts`; the others' is a no-op.
+    fn sets_acceleration(self) -> bool {
+        !matches!(self, Self::C885 | Self::E755)
+    }
+
     /// `None` where C creates no controller.
     pub fn from_idn(idn: &str) -> Option<Self> {
         let any = |models: &[&str]| models.iter().any(|m| idn.contains(m));
@@ -262,10 +280,11 @@ impl Model {
             Some(Self::Motor)
         } else if idn.contains("C-885") {
             Some(Self::C885)
-        } else if any(&[
-            "E-753", "E-754", "E-709", "E-712", "E-725", "E-727", "E-755", "C-702", "HEXAPOD",
-            "F-HEX", "F-206", "M-8", "C-887",
-        ]) {
+        } else if any(&["E-753", "E-754", "E-709", "E-712", "E-725", "E-727"]) {
+            Some(Self::Motor)
+        } else if idn.contains("E-755") {
+            Some(Self::E755)
+        } else if any(&["C-702", "HEXAPOD", "F-HEX", "F-206", "M-8", "C-887"]) {
             Some(Self::Motor)
         } else {
             None
@@ -622,6 +641,42 @@ impl PIGCS2Controller {
     /// `CST? {axis}` (C `initAxis`'s stage-configuration probe, logged only —
     /// C keeps it purely to surface mis/non-configured controllers in the
     /// log).
+    /// C `sendAndReceive(char)`: a short write is asynError.
+    fn send_and_receive_char(&self, c: u8) -> AsynResult<Vec<u8>> {
+        self.handle.write_read(0, &[c], READ_BUF).map_err(|e| {
+            let e = match e.octet_step() {
+                Some(OctetStep::Read) => e,
+                _ => pigcs2_err(e.message()),
+            };
+            self.print(format_args!(
+                "PIInterface::sendAndReceive error calling writeRead, output={c} status={}, error={}\n",
+                e.status() as i32,
+                e.message()
+            ));
+            e
+        })
+    }
+
+    /// [`Self::send_and_receive_char`]'s reply line.
+    fn query_char(&self, c: u8) -> AsynResult<String> {
+        let raw = self.send_and_receive_char(c)?;
+        Ok(String::from_utf8_lossy(&raw)
+            .trim_end_matches(['\r', '\0'])
+            .to_string())
+    }
+
+    /// C `getBusy`.
+    fn get_busy(&self) -> AsynResult<bool> {
+        Ok(busy_from_reply(&self.send_and_receive_char(7)?))
+    }
+
+    /// C `getMoving`: `#5`'s hex word masked by the axis bit, C's
+    /// `m_movingStateMask` as `PIGCSController::initAxis` sets it.
+    fn get_moving(&self, axis_no: usize) -> AsynResult<bool> {
+        let state = leading_hex(self.query_char(5)?.trim_start()).unwrap_or(0);
+        Ok(state & (1 << axis_no) != 0)
+    }
+
     fn stage_id(&self, axis: &str) -> AsynResult<String> {
         self.query(&format!("CST? {axis}"))
     }
@@ -629,22 +684,7 @@ impl PIGCS2Controller {
     /// `char(4)` -> `(homing, moving, negLimit, posLimit, servoControl)` for
     /// `axis_no` (C `PIGCSMotorController::getStatus`).
     fn get_status(&self, axis_no: usize) -> AsynResult<(bool, bool, bool, bool, bool)> {
-        // C sendAndReceive(char): a short write is asynError.
-        let raw = self.handle.write_read(0, &[0x04], READ_BUF).map_err(|e| {
-            let e = match e.octet_step() {
-                Some(OctetStep::Read) => e,
-                _ => pigcs2_err(e.message()),
-            };
-            self.print(format_args!(
-                "PIInterface::sendAndReceive error calling writeRead, output=4 status={}, error={}\n",
-                e.status() as i32,
-                e.message()
-            ));
-            e
-        })?;
-        let reply = String::from_utf8_lossy(&raw)
-            .trim_end_matches(['\r', '\0'])
-            .to_string();
+        let reply = self.query_char(4)?;
         let mask = status_mask_at(&reply, axis_no).ok_or_else(|| {
             pigcs2_err(format!(
                 "status reply too short/non-hex for axis {axis_no}: {reply:?}"
@@ -763,7 +803,7 @@ impl PIGCS2Axis {
         // C `PIGCSMotorController::getResolution` stops at the first failed
         // read, keeps both defaults unless both succeed, and truncates the
         // replies into ints.
-        let cpu = if ctrl.model == Model::C885 {
+        let cpu = if !ctrl.model.reads_cpu() {
             counts_per_unit(BASE_CPU_Z, 1)
         } else {
             ctrl.get_gcs_parameter(&axis.axis_name, PARA_MOT_CPU_Z)
@@ -832,14 +872,28 @@ impl PIGCS2Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The controller class's `getStatus`: `(homing, moving, negLimit,
+    /// posLimit, servoControl)`.
+    fn status(&self) -> AsynResult<(bool, bool, bool, bool, bool)> {
+        let ctrl = self.lock();
+        if ctrl.model != Model::E755 {
+            return ctrl.get_status(self.axis_no);
+        }
+        // PIE755Controller::getStatus: busy is homing and moving, no
+        // limits. C defect not copied: it never sets servoControl, which
+        // poll then reads uninitialized; rs keeps the last servo state.
+        let busy = ctrl.get_busy()?;
+        let moving = busy || ctrl.get_moving(self.axis_no)?;
+        Ok((busy, moving, false, false, self.servo_on))
+    }
+
     /// `setAccelerationCts`: convert the record's steps/s² by the CPU, skip
     /// it when equal to the last one set, lazily cache `min(MAX_ACCEL,
     /// MAX_DECEL)`, clamp the request to it, and write `CURR_ACCEL`/
     /// `CURR_DECEL`. Gated on `knows_vel`, matching both `getMaxAcceleration`
     /// and `setAcceleration`'s own early return.
     fn apply_acceleration(&mut self, acceleration: f64) -> AsynResult<()> {
-        // C-885 runs the base class's no-op setAccelerationCts.
-        if self.lock().model == Model::C885 || !self.lock().knows_vel() {
+        if !self.lock().model.sets_acceleration() || !self.lock().knows_vel() {
             return Ok(());
         }
         let acceleration = (acceleration / self.cpu).abs();
@@ -898,7 +952,7 @@ impl PIGCS2Axis {
                 .lock()
                 .reference_axis(&self.axis_name, forward, self.has_reference, false);
         }
-        if model == Model::Motor && velocity != 0.0 {
+        if model != Model::MotorNoRefVel && velocity != 0.0 {
             self.lock()
                 .set_reference_velocity(&self.axis_name, velocity / self.cpu)?;
         }
@@ -1012,14 +1066,13 @@ impl AsynMotor for PIGCS2Axis {
         // failed read leaves what the last poll read. On a failed `#4`, C's
         // moving, limit and servo bits are uninitialized locals; that C
         // defect is not copied.
-        let (homing, raw_moving, neg_limit, pos_limit, servo_control) =
-            self.lock().get_status(self.axis_no).unwrap_or((
-                old_homing,
-                self.moving,
-                self.neg_limit,
-                self.pos_limit,
-                self.servo_on,
-            ));
+        let (homing, raw_moving, neg_limit, pos_limit, servo_control) = self.status().unwrap_or((
+            old_homing,
+            self.moving,
+            self.neg_limit,
+            self.pos_limit,
+            self.servo_on,
+        ));
         self.moving = raw_moving;
         self.neg_limit = neg_limit;
         self.pos_limit = pos_limit;
@@ -1477,6 +1530,86 @@ mod tests {
         assert!(status.homed && status.problem && !status.powered);
     }
 
+    /// An E-755 on a line answering `reply`, after `PIasynAxis::Init`.
+    fn e755_axis(
+        name: &str,
+        reply: fn(&str) -> String,
+    ) -> (motor_common::testing::LineRig, PIGCS2Axis) {
+        let (line, io) = motor_common::testing::LineRig::new(name, reply);
+        let mut ctrl = PIGCS2Controller::new(io, name);
+        ctrl.set_model(Model::E755);
+        ctrl.knows_vel = true;
+        let axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "1".into(), 0, name);
+        (line, axis)
+    }
+
+    fn e755_reply(last: &str) -> String {
+        match last {
+            "ERR?" => "0",
+            // Not busy (0xB1); #5 says axis 1 moves.
+            "\u{7}" => "1",
+            "\u{5}" => "1",
+            _ => "1=1",
+        }
+        .into()
+    }
+
+    /// `PIE755Controller` (PIE755Controller.h:22-37) runs the
+    /// `PIGCSMotorController` init, the base `getResolution`
+    /// (PIGCSController.cpp:760-766), which reads no CPU, and no-op
+    /// acceleration writes.
+    #[test]
+    fn an_e755_axis_reads_no_cpu_and_sets_no_acceleration() {
+        let (line, mut axis) = e755_axis("gcs2E755Init", e755_reply);
+        assert_eq!(
+            sent_lines(&line),
+            [
+                "LIM? 1", "TRS? 1", "CST? 1", "SVO 1 1", "ERR?", "VEL? 1", "POS? 1", "TMN? 1",
+                "TMX? 1", "FRF? 1"
+            ]
+        );
+        assert_eq!(axis.cpu, 10000.0);
+        axis.apply_acceleration(5.0).unwrap();
+        assert!(sent_lines(&line).is_empty());
+        // The PIGCSMotorController referenceVelCts it inherits.
+        axis.home(&AsynUser::new(0), 0.0, 20000.0, 0.0, true)
+            .unwrap();
+        assert_eq!(
+            sent_lines(&line),
+            [
+                "SPA 1 0x50 2.000000",
+                "ERR?",
+                "SVO 1 1",
+                "ERR?",
+                "FRF 1",
+                "ERR?"
+            ]
+        );
+    }
+
+    /// `PIE755Controller::getStatus` (PIE755Controller.cpp:9-35): `#7`
+    /// busy is homing, else `#5` masked by the axis bit is moving; no
+    /// limits. C never sets servoControl there; rs keeps the last servo.
+    #[test]
+    fn an_e755_axis_polls_busy_then_moving() {
+        let (line, mut axis) = e755_axis("gcs2E755Poll", e755_reply);
+        line.sent();
+        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        assert_eq!(
+            sent_lines(&line),
+            ["\u{7}", "\u{5}", "POS? 1", "TMN? 1", "TMX? 1"]
+        );
+        assert!(status.moving && !status.done && !status.high_limit && !status.low_limit);
+        assert!(status.powered && !status.problem && !axis.is_homing);
+    }
+
+    #[test]
+    fn a_busy_byte_is_0xb0() {
+        assert!(busy_from_reply(&[0xB0, b'\n']));
+        assert!(!busy_from_reply(&[0xB1]));
+        assert!(!busy_from_reply(&[]));
+    }
+
     #[test]
     fn error_codes_match_c_constants() {
         assert_eq!(PI_CNTR_STOP, 10);
@@ -1501,6 +1634,7 @@ mod tests {
         );
         assert_eq!(Model::from_idn("PI E-873.3QTU"), Some(Model::MotorNoRefVel));
         assert_eq!(Model::from_idn("PI E-873.1AT"), Some(Model::Motor));
+        assert_eq!(Model::from_idn("PI E-755.1CD"), Some(Model::E755));
         assert_eq!(Model::from_idn("PI M-824"), Some(Model::Motor));
         assert_eq!(Model::from_idn("PI C-885.M1"), Some(Model::C885));
         assert_eq!(Model::from_idn("PI E-665"), None);
