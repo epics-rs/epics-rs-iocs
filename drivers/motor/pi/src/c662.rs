@@ -77,7 +77,6 @@
 //!   matching the C-862 port's treatment of `no_motion_count`.
 //! - **`recv_mess(..., FLUSH)`**: replaced by a flush before every query
 //!   (`exchange`), a superset of C's error-path flush.
-//! - **`report()`**: not implemented, as elsewhere in this workspace.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

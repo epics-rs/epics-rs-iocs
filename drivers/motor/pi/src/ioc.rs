@@ -262,6 +262,11 @@ static PIC662: Model1 = Model1::new(&DEV_PIC662, 8, SCAN_RATE);
 
 /// `PIC662Setup(num_cards, scan_rate)`.
 pub fn pic662_setup_command() -> CommandDef {
+    PIC662.register_report("drvPIC662", |cards| {
+        cards.report("PIC662", |card, line| {
+            format!("    PIC662 controller #{card}, {line} \n")
+        })
+    });
     PIC662.setup_command("PIC662Setup")
 }
 
@@ -290,11 +295,13 @@ pub fn pic662_config_command() -> CommandDef {
             )?;
             let controller =
                 PIC662Controller::new(handle).map_err(|e| format!("PIC662Config: {e}"))?;
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             let axis = PIC662Axis::new(controller).map_err(|e| format!("PIC662Config: {e}"))?;
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             PIC662.install(ctx, card, 0, motor)?;
+            PIC662.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -659,6 +666,29 @@ mod report {
             after,
             "    PIC630 controller 0 connection failed.\n    PIC630 controller #1, \
              port=c630RepLine, id: PIC630 \n"
+        );
+    }
+
+    /// drvPIC662.cc:135-160, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic662_controller() {
+        let setup = pic662_setup_command();
+        let (_line, _io) = LineRig::new("c662RepLine", |last| match last {
+            "*IDN?" => "E-662".into(),
+            "*ESR?" => "1".into(),
+            _ => "0.000".into(),
+        });
+        let (before, after) = reports(
+            "drvPIC662",
+            (setup, vec![int(2), int(10)]),
+            (pic662_config_command(), vec![int(1), port("c662RepLine")]),
+        )
+        .await;
+        assert_eq!(before, "    No PIC662 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC662 controller 0 connection failed.\n    PIC662 controller #1, \
+             port=c662RepLine, id: E-662 \n"
         );
     }
 }
