@@ -54,6 +54,7 @@ use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use motor_common::drv_motor_asyn::{DrvSet, function};
 use motor_common::model2::AxisLog;
 
 use crate::util::{atof, atoi, max_digits};
@@ -1209,6 +1210,51 @@ impl AsynMotor for Mm4000Axis {
     }
 }
 
+/// C `motorAxisSetDouble`/`motorAxisSetInteger` (drvMM4000Asyn.c:323-452),
+/// which drvMotorAsyn's writes reach.
+impl DrvSet for Mm4000Axis {
+    fn set_double(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+        let kind = match function {
+            function::POSITION => return self.set_position(user, value),
+            function::ENCODER_RATIO => return self.set_encoder_ratio(user, value),
+            function::LOW_LIMIT => return self.set_low_limit(user, value),
+            function::HIGH_LIMIT => return self.set_high_limit(user, value),
+            function::P_GAIN => PidGainKind::Proportional,
+            function::I_GAIN => PidGainKind::Integral,
+            function::D_GAIN => PidGainKind::Derivative,
+            function::RESOLUTION => {
+                self.print_error(format_args!(
+                    "motorAxisSetDouble: MM4000 does not support setting resolution\n"
+                ));
+                return Err(mm_err(
+                    "MM4000 does not support setting resolution".to_owned(),
+                ));
+            }
+            _ => {
+                self.print_error(format_args!(
+                    "motorAxisSetDouble: unknown function {function}\n"
+                ));
+                return Err(mm_err(format!(
+                    "motorAxisSetDouble: unknown function {function}"
+                )));
+            }
+        };
+        self.set_pid_gain(user, kind, value)
+    }
+
+    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+        if function == function::CLOSED_LOOP {
+            return self.set_closed_loop(user, value != 0);
+        }
+        self.print_error(format_args!(
+            "motorAxisSetInteger: unknown function {function}\n"
+        ));
+        Err(mm_err(format!(
+            "motorAxisSetInteger: unknown function {function}"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1855,6 +1901,11 @@ mod tests {
         // Idle polls an hour apart, so only the test's own calls trace.
         driver.set_card(2, motors, 3_600_000, 3_600_000);
         driver.set_axis_logs(2, logs);
+        let setters = axes
+            .iter()
+            .map(|a| a.clone() as Arc<Mutex<dyn DrvSet>>)
+            .collect();
+        driver.set_axis_setters(2, setters);
         let args = vec![
             ArgValue::String(port.into()),
             ArgValue::String(port.into()),
@@ -1901,6 +1952,29 @@ mod tests {
              MM4000 does not support setting proportional gain\n\
              MM4000 does not support setting integral gain\n\
              MM4000 does not support setting derivative gain\n"
+        );
+    }
+
+    /// drvMM4000Asyn.c:351, 384, 443: the asyn writes of a
+    /// function the driver does not set print an ERROR line and fail.
+    #[epics_rs::base::epics_test]
+    async fn unknown_functions_print_the_c_error_lines() {
+        let (_axes, path) = traced_axes("mm4kUnknown", TraceMask::ERROR).await;
+        let port = PortManager::global()
+            .find_port_handle("mm4kUnknown")
+            .unwrap();
+        std::thread::spawn(move || {
+            assert!(port.write_int32_blocking(26, 1, 1).is_err());
+            assert!(port.write_float64_blocking(27, 1, 3.0).is_err());
+            assert!(port.write_float64_blocking(1, 1, 0.5).is_err());
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            take_trace(&path),
+            "motorAxisSetInteger: unknown function 26\n\
+             motorAxisSetDouble: unknown function 27\n\
+             motorAxisSetDouble: MM4000 does not support setting resolution\n"
         );
     }
 
