@@ -21,10 +21,6 @@ use crate::faulhaber::{FaulhaberAxis, FaulhaberController};
 /// Serial command timeout (C `COMM_TIMEOUT` 2 s).
 const MCDC2805_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The motor record's SREV default: C converts velocities with the record's
-/// SREV (devMCDC2805.cc:227), which does not reach the driver here.
-const SREV_DEFAULT: f64 = 200.0;
-
 /// `device(motor,VME_IO,devMCDC2805,"MCDC2805")` (devFaulhaberMotor.dbd:2).
 static DEV_MCDC2805: DevSup = model1_device("devMCDC2805", "MCDC2805");
 
@@ -64,7 +60,7 @@ pub fn mcdc2805_config_command() -> CommandDef {
             let controller = Arc::new(Mutex::new(controller));
 
             for node in 0..num_axes {
-                let ax = FaulhaberAxis::new(controller.clone(), node, SREV_DEFAULT)
+                let ax = FaulhaberAxis::new(controller.clone(), node)
                     .map_err(|e| format!("MCDC2805Config: node {node}: {e}"))?;
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 MCDC2805.install(ctx, card, node as i32, motor)?;

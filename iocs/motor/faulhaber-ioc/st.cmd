@@ -38,8 +38,7 @@ MCDC2805Config(0, 2, "$(SERIAL)")
 # One motor record per node (DTYP "MCDC2805", OUT #C$(CARD) S0, S1, ...).
 # The MCDC2805 is a DC servo working in encoder counts: positions travel the
 # driver boundary in counts, so MRES = 1 and EGU = counts. VELO/ACCL are
-# converted to the controller's rev/min and rev/s^2 using the record's
-# default SREV (200).
+# converted to the controller's rev/min and rev/s^2 using the record's SREV.
 dbLoadRecords("$(FAULHABER_IOC)/db/mcdc2805.template", "P=$(P),M=m1,C=$(CARD),S=0")
 dbLoadRecords("$(FAULHABER_IOC)/db/mcdc2805.template", "P=$(P),M=m2,C=$(CARD),S=1")
 
