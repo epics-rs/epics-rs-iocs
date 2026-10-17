@@ -1113,17 +1113,19 @@ impl PIGCS2Controller {
         get_value_f64(&self.query(&format!("POS? {axis}"))?)
     }
 
-    /// C `getAxisPositionCts`: the position in whole counts, logged. C
+    /// C `getAxisPositionCts`: the position as read and in whole counts,
+    /// logged. C
     /// defect not copied: `int(x + 0.5)` (PIGCSController.cpp:485), and
     /// `int(x)` on a zero CPU term (:481), round a negative position toward
     /// zero; rs takes the nearest count, as `target_counts`.
-    fn get_axis_position_cts(&self, axis: &str, cpu: f64, last: f64) -> AsynResult<f64> {
-        let counts = nint(self.get_axis_position(axis, last / cpu)? * cpu);
+    fn get_axis_position_cts(&self, axis: &str, cpu: f64, last: f64) -> AsynResult<(f64, f64)> {
+        let position = self.get_axis_position(axis, last / cpu)?;
+        let counts = nint(position * cpu);
         self.trace(
             TraceMask::FLOW,
             format_args!("PIGCSController::getAxisPositionCts() pos:{counts}\n"),
         );
-        Ok(f64::from(counts))
+        Ok((position, f64::from(counts)))
     }
 
     /// `TMN? {axis}` / `TMX? {axis}` -> `(negLimit, posLimit)`.
@@ -1685,6 +1687,8 @@ pub struct PIGCS2Axis {
     cpu: f64,
     /// Last polled position, in record steps.
     last_position: f64,
+    /// The same position as read, in controller units (C `m_position`).
+    position: f64,
     last_direction: bool,
     low_limit: f64,
     high_limit: f64,
@@ -1726,6 +1730,7 @@ impl PIGCS2Axis {
             pos_limit: false,
             cpu: counts_per_unit(DEFAULT_CPU_Z, DEFAULT_CPU_N),
             last_position: 0.0,
+            position: 0.0,
             last_direction: false,
             low_limit: 0.0,
             high_limit: 0.0,
@@ -1756,8 +1761,9 @@ impl PIGCS2Axis {
         let homed = ctrl.get_referenced_state(&axis.axis_name);
         drop(ctrl);
         axis.cpu = cpu;
-        if let Ok(position) = position {
-            axis.last_position = position;
+        if let Ok((position, counts)) = position {
+            axis.position = position;
+            axis.last_position = counts;
         }
         (axis.low_limit, axis.high_limit) = (low_limit, high_limit);
         if let Ok(homed) = homed {
@@ -1963,12 +1969,11 @@ impl PIGCS2Axis {
         self.move_to(counts / self.cpu)
     }
 
-    /// C `PIGCSController::move(pAxis, target)`: the direction is set once
-    /// `MOV` is sent, before its `ERR?`. C compares with the position in
-    /// units, rs with its whole counts.
+    /// C `PIGCSController::move(pAxis, target)`: the direction, against the
+    /// position in units, is set once `MOV` is sent, before its `ERR?`.
     fn move_to(&mut self, target: f64) -> AsynResult<()> {
         self.lock().send_mov(&self.axis_name, target)?;
-        self.last_direction = target * self.cpu > self.last_position;
+        self.last_direction = target > self.position;
         self.lock().check_mov()
     }
 
@@ -2093,9 +2098,9 @@ impl PIGCS2Axis {
         if !homing || self.lock().model.is_gcs2() {
             self.servo_on = servo_control;
             let ctrl = self.lock();
-            let position = ctrl
+            let (units, position) = ctrl
                 .get_axis_position_cts(&self.axis_name, self.cpu, self.last_position)
-                .unwrap_or(self.last_position);
+                .unwrap_or((self.position, self.last_position));
             // C defect not copied: a failed read posts C's uninitialized
             // realPosition (PIasynAxis.cpp:163); rs posts nothing.
             let real = ctrl
@@ -2104,6 +2109,7 @@ impl PIGCS2Axis {
             let (mut low_limit, mut high_limit) = (self.low_limit, self.high_limit);
             let _ = ctrl.get_travel_limits(&self.axis_name, &mut low_limit, &mut high_limit);
             drop(ctrl);
+            self.position = units;
             self.last_position = position;
             self.low_limit = low_limit;
             self.high_limit = high_limit;
@@ -2631,6 +2637,7 @@ mod tests {
             pos_limit: true,
             cpu: 1.0,
             last_position: 0.0,
+            position: 0.0,
             last_direction: true,
             low_limit: 0.0,
             high_limit: 0.0,
@@ -3506,9 +3513,34 @@ mod tests {
         assert!(axis.last_direction);
         fail.store(false, Ordering::Relaxed);
         axis.high_limit = 10.0;
-        axis.last_position = 20000.0;
+        axis.position = 20.0;
         axis.move_velocity(&user, 0.0, 1.0, 0.0).unwrap();
         assert!(!axis.last_direction);
+    }
+
+    /// C `move` sets the direction from the target against the position
+    /// `POS?` read, in units (PIGCSController.cpp:250, :478), not against
+    /// the whole counts it posts.
+    #[test]
+    fn a_move_direction_compares_units_with_the_read_position() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2DirUnitsLine", |last| {
+            match last {
+                "ERR?" => "0",
+                "POS? 1" => "1=1.00004",
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2DirUnitsLine")));
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2DirUnits");
+        let user = AsynUser::new(0);
+        axis.cpu = 10000.0;
+        let _ = axis.poll(&user);
+        assert_eq!(axis.last_position, 10000.0);
+        axis.high_limit = 1.00002;
+        axis.last_direction = true;
+        axis.move_velocity(&user, 0.0, 1.0, 0.0).unwrap();
+        assert!(!axis.last_direction, "1.00002 is below 1.00004");
     }
 
     /// `PIasynAxis`'s FLOW lines on its own user (PIasynAxis.cpp:131-133,
