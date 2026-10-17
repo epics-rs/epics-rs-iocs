@@ -40,8 +40,11 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, Pol
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerParams, ParamWrite};
+use epics_rs::motor::controller_port::{
+    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteValue,
+};
 
 use motor_common::util::{atof, leading_hex};
 
@@ -187,10 +190,41 @@ impl OemParams {
     }
 }
 
+/// `OEMController::writeInt32` / `writeFloat64`'s closing line, which the
+/// record's writes reach as well as the port's.
+struct OemWriteHook;
+
+impl WriteHook for OemWriteHook {
+    fn after_write(&self, write: &FinishedWrite<'_>) {
+        let function = write.function;
+        let (method, value) = match write.value {
+            WriteValue::Int32(v) => ("writeInt32", v.to_string()),
+            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}")),
+        };
+        match write.status {
+            Err(e) => write.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "OEMMotorDriver:{method}: error, status={} function={function}, value={value}",
+                    e.c_status_code()
+                ),
+            ),
+            Ok(()) => write.print(
+                TraceMask::IO_DRIVER,
+                format_args!("OEMMotorDriver:{method}: function={function}, value={value}"),
+            ),
+        }
+    }
+}
+
 impl ControllerParams for OemParams {
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.resolution = Some(base.create_param("OEM_RESOLUTION", ParamType::Int32)?);
         Ok(())
+    }
+
+    fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
+        Some(Arc::new(OemWriteHook))
     }
 
     fn write_int32(&mut self, _: &mut PortDriverBase, user: &AsynUser, value: i32) -> ParamWrite {
@@ -389,6 +423,13 @@ fn switch_from_is(is: &str) -> i32 {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::registry::open_owner;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::motor::builder::MotorBuilder;
+    use epics_rs::motor::controller_port::index;
+    use epics_rs::motor::devices::{register_axis, register_controller_port};
+    use epics_rs::motor::trace::TraceUser;
 
     #[test]
     fn an_axis_of_a_missing_port_is_still_built() {
@@ -417,5 +458,59 @@ mod tests {
         assert_eq!(switch_from_is("ABCDEF00"), 0);
         // Short replies decode as no switch.
         assert_eq!(switch_from_is("AB"), 0);
+    }
+
+    /// `body`'s lines in `port`'s trace at C's error and IO_DRIVER masks.
+    fn traced(port: &str, body: impl FnOnce()) -> Vec<String> {
+        let path = std::env::temp_dir().join(format!("oem-trace-{port}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+        body();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        text.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn every_write_ends_on_cs_line_the_base_included() {
+        let (handle, _) = SyncIOHandle::connect_port(
+            "OEM_NONE",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let ctrl = Arc::new(Mutex::new(OemController::new(handle, 2)));
+        let port =
+            register_controller_port(&open_owner(), "oemTrace", 2, OemParams::new(ctrl.clone()))
+                .unwrap();
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(OemAxis::new(ctrl, 1)));
+        let user = TraceUser::Asyn {
+            port: "oemTrace".into(),
+            addr: 1,
+        };
+        register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
+        let lines = traced("oemTrace", || {
+            port.write_float64_blocking(index::VELOCITY, 1, 2.5)
+                .unwrap();
+            port.write_int32_blocking(index::REC_DIRECTION, 1, 1)
+                .unwrap();
+        });
+        let mine: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("OEMMotorDriver"))
+            .collect();
+        let velocity = index::VELOCITY;
+        let direction = index::REC_DIRECTION;
+        let want = [
+            format!("OEMMotorDriver:writeFloat64: function={velocity}, value=2.500000"),
+            format!("OEMMotorDriver:writeInt32: function={direction}, value=1"),
+        ];
+        assert_eq!(mine.len(), want.len(), "{lines:?}");
+        for (line, want) in mine.iter().zip(&want) {
+            assert!(line.ends_with(want.as_str()), "{line:?} vs {want:?}");
+        }
     }
 }
