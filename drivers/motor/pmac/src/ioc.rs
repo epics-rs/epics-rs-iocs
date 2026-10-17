@@ -1551,6 +1551,33 @@ mod tests {
         assert_eq!(c.poll(&user).unwrap().position, 0.0);
     }
 
+    /// pmacAxis.cpp:131-145: the initial status read sets the axis's soft
+    /// limits and gains.
+    #[test]
+    fn the_initial_status_sets_the_limits_and_gains() {
+        let (_rt, rig) = publish_scripted("pmacInitLow");
+        rig.answer("I113 I114 I130 I131 I133", b"10 -10 0.5 0.25 0.125\r");
+        let controller = Arc::new(Mutex::new(controller_on("pmacInitLow")));
+        let params = PmacControllerParams::new(controller.clone(), 100, 1000);
+        let port = epics_rs::motor::devices::register_controller_port(
+            &open_owner(),
+            "pmacInitCtl",
+            2,
+            params,
+        )
+        .unwrap();
+        controller.lock().unwrap().attach_port(port.clone());
+        controller.lock().unwrap().add_axis(1).unwrap();
+        let _axis = PmacAxis::new(controller, 1);
+        let io = SyncIOHandle::from_handle(port, 1, Duration::from_secs(1));
+        let read = |name| io.read_float64(io.drv_user_create(name).unwrap()).unwrap();
+        assert_eq!(read("MOTOR_HIGH_LIMIT"), 10.0);
+        assert_eq!(read("MOTOR_LOW_LIMIT"), -10.0);
+        assert_eq!(read("MOTOR_PGAIN"), 0.5);
+        assert_eq!(read("MOTOR_IGAIN"), 0.125);
+        assert_eq!(read("MOTOR_DGAIN"), 0.25);
+    }
+
     /// pmacController.cpp:457/463 `%f`: glibc's nan, sign bit included.
     #[test]
     fn a_nan_soft_limit_is_written_as_c_prints_it() {
