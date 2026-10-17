@@ -277,12 +277,16 @@ pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
 /// started poller waits on it, and the poller's thread is spawned by a task
 /// this runtime has to run.
 async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    use epics_rs::base::runtime::task::sleep;
+    use epics_rs::base::runtime::task::{sleep, yield_now};
     let shell = std::thread::spawn(f);
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;
     }
-    shell.join().unwrap()
+    let out = shell.join().unwrap();
+    // A shell that finished before the first check never yielded: run what
+    // it spawned before the caller can block this runtime with a sync wait.
+    yield_now().await;
+    out
 }
 
 /// Run `cmd` with `args` as [`run_command`], and return the `motorPoller`
