@@ -1977,8 +1977,12 @@ impl AsynMotor for PIGCS2Axis {
         };
         let (before, after) = (line("BEFORE"), line("AFTER"));
         self.flow(format_args!("{before}"));
-        self.lock()
-            .set_velocity(&self.axis_name, velocity / self.cpu)?;
+        // C ignores both statuses and returns its initial asynError
+        // whatever happened; that C defect is not copied: rs returns the
+        // move's.
+        let _ = self
+            .lock()
+            .set_velocity(&self.axis_name, velocity / self.cpu);
         let result = self.move_to(target);
         self.flow(format_args!("{after}"));
         result
@@ -2014,7 +2018,8 @@ impl AsynMotor for PIGCS2Axis {
         self.log_here();
         let mut ctrl = self.lock();
         ctrl.deferred.remove(&self.axis_no);
-        let result = match ctrl.model {
+        // C returns asynSuccess whatever haltAxis returned.
+        let _ = match ctrl.model {
             Model::C885 => ctrl.stop_all(),
             model if model.is_hexapod() => ctrl.halt_platform(),
             _ => ctrl.halt(&self.axis_name),
@@ -2025,7 +2030,7 @@ impl AsynMotor for PIGCS2Axis {
             self.axis_no,
             CFloat(acceleration)
         ));
-        result
+        Ok(())
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
@@ -3088,8 +3093,7 @@ mod tests {
         let printed = traced_mask("gcs2AxFlow", TraceMask::FLOW, || {
             axis.move_absolute(&user, 2.5, 0.5, 0.0, 0.0).unwrap();
             axis.move_velocity(&user, 0.0, 2.0, 0.0).unwrap();
-            // C prints the line whatever haltAxis returns.
-            let _ = axis.stop(&user, 3.0);
+            axis.stop(&user, 3.0).unwrap();
             axis.set_position(&user, 7.0).unwrap();
             axis.has_reference = true;
             axis.home(&user, 0.5, 2.0, 1.5, true).unwrap();
@@ -3109,6 +3113,41 @@ mod tests {
         ] {
             assert!(printed.contains(line), "{line:?} not in {printed}");
         }
+    }
+
+    /// `PIasynAxis::moveVelocity` sends `MOV` whatever `VEL` returned
+    /// (PIasynAxis.cpp:298-299), and `stop` returns asynSuccess whatever
+    /// `haltAxis` did (:316-323).
+    #[test]
+    fn move_velocity_and_stop_ignore_their_command_statuses() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // C sendOnly's status is its terminator write's.
+        let after_vel = AtomicBool::new(false);
+        let (line, io) = motor_common::testing::LineRig::failing(
+            "gcs2IgnoreLine",
+            |last| if last == "ERR?" { "0" } else { "1=1" }.into(),
+            move |cmd| match cmd {
+                "\n" => after_vel.swap(false, Ordering::Relaxed),
+                cmd => {
+                    after_vel.store(cmd.starts_with("VEL"), Ordering::Relaxed);
+                    false
+                }
+            },
+        );
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2IgnoreLine");
+        ctrl.knows_vel = true;
+        let mut axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "1".into(), 0, "gcs2Ignore");
+        axis.high_limit = 10.0;
+        let user = AsynUser::new(0);
+        line.sent();
+        axis.move_velocity(&user, 0.0, 2.0, 0.0).unwrap();
+        assert_eq!(
+            sent_lines(&line),
+            ["VEL 1 2.000000", "MOV 1 10.000000", "ERR?"]
+        );
+        // ERR? 0 after HLT is haltAxis's failure: it wants 10.
+        axis.stop(&user, 0.0).unwrap();
+        assert_eq!(sent_lines(&line), ["HLT 1", "ERR?"]);
     }
 
     /// `PI_CS_TARGETMODE` (PIasynController.cpp:320-324, 587) picks the
