@@ -250,7 +250,7 @@ impl PhytronController {
             trace.print_self(
                 TraceMask::WARNING,
                 format_args!(
-                    "phytronController::phytronController: Could not reset controller {name}"
+                    "phytronController::phytronController: Could not reset controller {name}\n"
                 ),
             );
         }
@@ -261,7 +261,7 @@ impl PhytronController {
                 trace.print_self(
                     TraceMask::ERROR,
                     format_args!(
-                        "phytronController::phytronController: no valid answer after controller reset {name}"
+                        "phytronController::phytronController: no valid answer after controller reset {name}\n"
                     ),
                 );
                 break;

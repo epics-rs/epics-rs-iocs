@@ -109,7 +109,7 @@ fn low_level_port_connect(self_port: &str, port: &str, addr: i32) -> Option<Sync
             trace.print_self(
                 TraceMask::ERROR,
                 format_args!(
-                    "pmacController::motorAxisAsynConnect: unable to connect to port {port}"
+                    "pmacController::motorAxisAsynConnect: unable to connect to port {port}\n"
                 ),
             );
             Some(handle)
@@ -130,7 +130,7 @@ fn low_level_port_connect(self_port: &str, port: &str, addr: i32) -> Option<Sync
             trace.print_self(
                 TraceMask::ERROR,
                 format_args!(
-                    "pmacController: unable to set {which} EOS on {port}: {}",
+                    "pmacController: unable to set {which} EOS on {port}: {}\n",
                     e.message_display()
                 ),
             );
@@ -504,7 +504,7 @@ fn coord_create(
                 TraceMask::ERROR,
                 0,
                 format_args!(
-                    "drvPmacCreate: unable to set input EOS on {port}: {}",
+                    "drvPmacCreate: unable to set input EOS on {port}: {}\n",
                     e.message_display()
                 ),
             );
@@ -515,7 +515,7 @@ fn coord_create(
                 TraceMask::ERROR,
                 0,
                 format_args!(
-                    "drvPmacCreate: unable to set output EOS on {port}: {}",
+                    "drvPmacCreate: unable to set output EOS on {port}: {}\n",
                     e.message_display()
                 ),
             );
@@ -536,7 +536,7 @@ fn coord_create(
                 TraceMask::FLOW,
                 0,
                 format_args!(
-                    "Created motor for ref {reference}, C.S. {cs}, signal {} OK",
+                    "Created motor for ref {reference}, C.S. {cs}, signal {} OK\n",
                     axis - 1
                 ),
             );

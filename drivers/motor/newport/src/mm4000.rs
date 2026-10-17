@@ -411,7 +411,7 @@ impl Mm4000Controller {
             &self.serial_port,
             0,
             format_args!(
-                "drvMM4000Asyn:sendOnly: error sending command {cmd}, sent={sent}, status={}",
+                "drvMM4000Asyn:sendOnly: error sending command {cmd}, sent={sent}, status={}\n",
                 e.status() as i32
             ),
         );
@@ -433,7 +433,7 @@ impl Mm4000Controller {
             &self.serial_port,
             0,
             format_args!(
-                "drvMM4000Asyn:sendAndReceive error calling writeRead, output={cmd} status={}, error={}",
+                "drvMM4000Asyn:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
                 e.status() as i32,
                 e.message()
             ),
@@ -476,7 +476,7 @@ impl Mm4000Controller {
                                 self.print_error(
                                     &self.motor_port,
                                     axis as i32,
-                                    format_args!("MM4000Poller: controller error {te}"),
+                                    format_args!("MM4000Poller: controller error {te}\n"),
                                 );
                             }
                             data.problem = true;
@@ -492,7 +492,7 @@ impl Mm4000Controller {
                     self.print_error(
                         &self.motor_port,
                         axis as i32,
-                        format_args!("MM4000Poller: error reading status={}", e.status() as i32),
+                        format_args!("MM4000Poller: error reading status={}\n", e.status() as i32),
                     );
                 }
                 data = Mm4000PollData {

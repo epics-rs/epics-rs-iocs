@@ -185,7 +185,7 @@ impl MpxConnection {
             }
             Err(Some(e)) => {
                 self.trace(&format!(
-                    "merlinDetector:mpxRead, timeout={timeout_s:.6}, status={} received {} bytes",
+                    "merlinDetector:mpxRead, timeout={timeout_s:.6}, status={} received {} bytes\n",
                     e.code(),
                     window.len() - MPX_HEADER.len()
                 ));

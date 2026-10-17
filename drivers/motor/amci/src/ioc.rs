@@ -61,7 +61,7 @@ pub fn anf2_create_controller_command() -> CommandDef {
                 MotorTrace::new(port_name.clone(), 0).print_self(
                     TraceMask::ERROR,
                     format_args!(
-                        "ANF2Controller::ANF2Controller: cannot connect to ANF2 controller"
+                        "ANF2Controller::ANF2Controller: cannot connect to ANF2 controller\n"
                     ),
                 );
             }
@@ -208,7 +208,7 @@ pub fn ang1_create_controller_command() -> CommandDef {
                 MotorTrace::new(port_name.clone(), 0).print_self(
                     TraceMask::ERROR,
                     format_args!(
-                        "ANG1Controller::ANG1Controller: cannot connect to ANG1 controller"
+                        "ANG1Controller::ANG1Controller: cannot connect to ANG1 controller\n"
                     ),
                 );
             }

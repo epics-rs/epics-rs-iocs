@@ -95,7 +95,7 @@ impl SpiiPlusComm {
     fn query(&self, func: &str, cmd: &str) -> AsynResult<String> {
         let reply = self.write_read_controller(cmd)?;
         if reply.starts_with('?') {
-            self.print(format_args!("SPiiPlusComm:{func}: Command failed: {cmd}"));
+            self.print(format_args!("SPiiPlusComm:{func}: Command failed: {cmd}\n"));
             self.error_message(&reply);
             return Err(comm_error(format!("{cmd}: {reply}")));
         }
@@ -140,10 +140,10 @@ impl SpiiPlusComm {
 
     fn print_error(&self, errno: i32, cmd: &str, func: &str) {
         match self.write_read_controller(cmd) {
-            Ok(text) if !text.starts_with('?') => {
-                self.print(format_args!("SPiiPlusComm:{func}: ERROR #{errno}: {text}"))
-            }
-            _ => self.print(format_args!("SPiiPlusComm:{func}: ERROR #{errno}")),
+            Ok(text) if !text.starts_with('?') => self.print(format_args!(
+                "SPiiPlusComm:{func}: ERROR #{errno}: {text}\n"
+            )),
+            _ => self.print(format_args!("SPiiPlusComm:{func}: ERROR #{errno}\n")),
         }
     }
 
@@ -168,14 +168,14 @@ impl SpiiPlusComm {
         let errno = self.binary_error_check(&reply);
         if errno != 0 {
             self.print(format_args!(
-                "SPiiPlusComm:writeReadBinary: Binary read failed (controller)"
+                "SPiiPlusComm:writeReadBinary: Binary read failed (controller)\n"
             ));
             self.binary_error_message(errno);
             return Err(comm_error(format!("binary error {errno}")));
         }
         if let Err(e) = status {
             self.print(format_args!(
-                "SPiiPlusComm:writeReadBinary: Binary read failed (asyn): {e}, nread={}",
+                "SPiiPlusComm:writeReadBinary: Binary read failed (asyn): {e}, nread={}\n",
                 reply.len()
             ));
             return Err(e);
@@ -215,7 +215,7 @@ impl SpiiPlusComm {
             let errno = self.binary_error_check(&reply);
             if errno != 0 {
                 self.print(format_args!(
-                    "SPiiPlusComm:writeReadAckBinary: Binary read failed (controller)"
+                    "SPiiPlusComm:writeReadAckBinary: Binary read failed (controller)\n"
                 ));
                 self.binary_error_message(errno);
             }
@@ -227,14 +227,14 @@ impl SpiiPlusComm {
         }
         if let Err(e) = status {
             self.print(format_args!(
-                "SPiiPlusComm:writeReadAckBinary: Binary read failed (asyn): {e}, nread={}",
+                "SPiiPlusComm:writeReadAckBinary: Binary read failed (asyn): {e}, nread={}\n",
                 reply.len()
             ));
             return Err(e);
         }
         if reply.get(1) != Some(&id) {
             self.print(format_args!(
-                "SPiiPlusComm:writeReadAckBinary: Command ID mismatch: write ID = {id}, read ID = {:?}",
+                "SPiiPlusComm:writeReadAckBinary: Command ID mismatch: write ID = {id}, read ID = {:?}\n",
                 reply.get(1)
             ));
         }
@@ -247,7 +247,7 @@ impl SpiiPlusComm {
         let errno = binary_error_number(reply);
         if let Some(errno) = errno.filter(|&n| n != 0) {
             self.print(format_args!(
-                "SPiiPlusComm:binaryErrorCheck: Binary command error {errno} for command id {:x}",
+                "SPiiPlusComm:binaryErrorCheck: Binary command error {errno} for command id {:x}\n",
                 reply[1]
             ));
         }
@@ -308,13 +308,13 @@ impl SpiiPlusComm {
         }
         let (dimensions, missing) = self.global_var_check(var, span).inspect_err(|_| {
             self.print(format_args!(
-                "SPiiPlusComm:putDoubleArray: Global variable exists but isn't large enough: {var}"
+                "SPiiPlusComm:putDoubleArray: Global variable exists but isn't large enough: {var}\n"
             ))
         })?;
         if missing {
             self.create_global_real_var(var, span).inspect_err(|_| {
                 self.print(format_args!(
-                    "SPiiPlusComm:putDoubleArray: Failed to create gobal variable: {var}"
+                    "SPiiPlusComm:putDoubleArray: Failed to create gobal variable: {var}\n"
                 ))
             })?;
         }
@@ -366,7 +366,7 @@ impl SpiiPlusComm {
             1035 => Err(comm_error(format!("{var} is too small"))),
             errno => {
                 self.print(format_args!(
-                    "SPiiPlusComm:globalVarCheck: Unexpected error! errNo = {errno}"
+                    "SPiiPlusComm:globalVarCheck: Unexpected error! errNo = {errno}\n"
                 ));
                 Err(comm_error(format!("{cmd}: {reply}")))
             }

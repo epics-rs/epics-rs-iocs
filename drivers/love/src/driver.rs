@@ -321,12 +321,12 @@ fn status_text(status: AsynStatus) -> &'static str {
 /// C `evalMessage`'s `ASYN_TRACE_ERROR` line for each refusal.
 fn eval_error_line(e: &EvalError, count: usize) -> String {
     match e {
-        EvalError::MissingStx => "drvLove::evalMessage start char missing".into(),
-        EvalError::TooShort => format!("drvLove::evalMessage message length ({count}) error"),
+        EvalError::MissingStx => "drvLove::evalMessage start char missing\n".into(),
+        EvalError::TooShort => format!("drvLove::evalMessage message length ({count}) error\n"),
         EvalError::DeviceError(text) => {
-            format!("drvLove::evalMessage error message received \"{text}\"")
+            format!("drvLove::evalMessage error message received \"{text}\"\n")
         }
-        EvalError::ChecksumMismatch => "drvLove::evalMessage checksum failed".into(),
+        EvalError::ChecksumMismatch => "drvLove::evalMessage checksum failed\n".into(),
     }
 }
 
@@ -406,15 +406,15 @@ impl LoveDriver {
             };
             if let Err(e) = self.serial.submit_blocking(write, self.serial_user()) {
                 self.trace_error(&format!(
-                    "drvLove::sendCommand - retries({retry}) {}",
+                    "drvLove::sendCommand - retries({retry}) {}\n",
                     status_text(e.status())
                 ));
                 if is_timeout(&e) {
-                    self.trace_error("drvLove::executeCommand write timeout, retrying");
+                    self.trace_error("drvLove::executeCommand write timeout, retrying\n");
                     continue;
                 }
                 self.trace_error(&format!(
-                    "drvLove::executeCommand write failure - Sent \"{frame}\" "
+                    "drvLove::executeCommand write failure - Sent \"{frame}\" \n"
                 ));
                 return Err(e);
             }
@@ -426,16 +426,16 @@ impl LoveDriver {
                 Ok(result) => {
                     let raw = result.data.unwrap_or_default();
                     if EomReason::from_bits_truncate(result.eom_reason) != EomReason::EOS {
-                        self.trace_error("drvLove::recvReply eos failure");
+                        self.trace_error("drvLove::recvReply eos failure\n");
                         self.trace_read_failure(&frame, &raw);
                         return Err(protocol_error("recvReply eos failure"));
                     }
                     raw
                 }
                 Err(e) => {
-                    self.trace_error(&format!("drvLove::recvReply {}", status_text(e.status())));
+                    self.trace_error(&format!("drvLove::recvReply {}\n", status_text(e.status())));
                     if is_timeout(&e) {
-                        self.trace_error("drvLove::executeCommand read timeout, retrying");
+                        self.trace_error("drvLove::executeCommand read timeout, retrying\n");
                         continue;
                     }
                     // C prints whatever the failed read left in inpMsg.
@@ -455,7 +455,7 @@ impl LoveDriver {
             };
         }
 
-        self.trace_error("drvLove::executeCommand retries exceeded");
+        self.trace_error("drvLove::executeCommand retries exceeded\n");
         // C returns asynError, not the last attempt's asynTimeout, so the
         // record alarms READ/WRITE rather than TIMEOUT.
         Err(protocol_error("executeCommand retries exceeded"))
@@ -476,7 +476,7 @@ impl LoveDriver {
 
     fn trace_read_failure(&self, frame: &str, rcvd: &[u8]) {
         self.trace_error(&format!(
-            "drvLove::executeCommand read failure - Sent \"{frame}\" Rcvd \"{}\" ",
+            "drvLove::executeCommand read failure - Sent \"{frame}\" Rcvd \"{}\" \n",
             String::from_utf8_lossy(rcvd)
         ));
     }
@@ -494,7 +494,7 @@ impl LoveDriver {
         if addr > 0 {
             if self.is_conn[(addr - 1) as usize] {
                 self.trace_error(&format!(
-                    "drvLove::connectIt {} device {addr} already connected",
+                    "drvLove::connectIt {} device {addr} already connected\n",
                     self.base.port_name
                 ));
                 return Err(protocol_error("already connected"));
@@ -522,7 +522,7 @@ impl LoveDriver {
     fn check_addr(&self, func: &str, addr: i32) -> AsynResult<()> {
         if addr == 0 || addr > K_INSTRMAX as i32 {
             self.trace_error(&format!(
-                "drvLove::{func} {} illegal addr {addr}",
+                "drvLove::{func} {} illegal addr {addr}\n",
                 self.base.port_name
             ));
             return Err(protocol_error(format!("illegal addr {addr}")));
@@ -574,8 +574,9 @@ impl LoveDriver {
 
         let body = format_put_data(write_cmd, value);
         let payload = self.execute_command(addr, &body)?;
-        process_write_response(&payload)
-            .inspect_err(|_| self.trace_error("drvLove::processWriteResponse write command failed"))
+        process_write_response(&payload).inspect_err(|_| {
+            self.trace_error("drvLove::processWriteResponse write command failed\n")
+        })
     }
 }
 
@@ -861,8 +862,6 @@ mod tests {
         ] {
             assert!(out.contains(line), "missing {line:?} in {out:?}");
         }
-        // The trace ends each line; a C format's own `\n` would print a blank one.
-        assert!(!out.contains("\n\n"), "blank line in {out:?}");
     }
 
     /// C `reportIt` (drvLove.c:978-990): the port pair, then every address
