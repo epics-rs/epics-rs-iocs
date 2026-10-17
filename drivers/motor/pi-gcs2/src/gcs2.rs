@@ -91,14 +91,9 @@
 //!
 //! ## Not modeled (documented deviations from the full C module)
 //!
-//! - **Piezo closed loop**: `PIGCS2PiezoCL` — closed-loop piezo
-//!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
-//!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
 //! - **`SVO?` (`getServo`)**: as upstream, only the C-887's status and
 //!   a piezo's without `SRG?` ask it; the generic motor axis's servo
 //!   state comes from the `char(4)` status bitmask.
-//! - **`getAxisOnt`/`getAxisOvf`**: base-class no-ops (on-target/overflow
-//!   status meaningful only for the piezo closed-loop path); not ported.
 //! - **`getMoving`/`getBusy`** (`char(5)`/`char(7)`): the base class's
 //!   fallback status transport for controllers that don't understand
 //!   `char(4)`; unreachable once `PIGCSMotorController::getStatus` overrides
@@ -298,6 +293,25 @@ fn busy_from_reply(raw: &[u8]) -> bool {
 
 /// C `PIGCSController::MAX_NR_AXES`.
 const MAX_NR_AXES: usize = 64;
+
+/// The closed-loop parameters, as `PI_SUP_{name}` and `PI_SUP_RB{name}`, with
+/// the E-727 parameter each sets (`PIGCS2PiezoCLParams` and
+/// `PI727_CL_PARAM_ADDR::All`, PIGCS2PiezoCL.h).
+const CL_PARAMS: [(&str, u32); 10] = [
+    ("KP", 0x0700_0300),
+    ("KI", 0x0700_0301),
+    ("KFF", 0x0703_0600),
+    ("NTCHFR1", 0x0800_0100),
+    ("NTCHFR2", 0x0800_0101),
+    ("NTCHRJT1", 0x0700_0200),
+    ("NTCHRJT2", 0x0700_0201),
+    ("NTCHBDWDT1", 0x0800_0300),
+    ("NTCHBDWDT2", 0x0800_0301),
+    ("ANALOGTARGET", 0x0600_0500),
+];
+
+/// `PIE727Controller::m_CCL_ADVANCED_ID`/`m_CCL_ADVANCED_PWD`.
+const CCL_ADVANCED: &str = "CCL 1 advanced";
 
 /// `PIGCSController::getStatusFromBitMask`.
 fn status_from_bitmask(mask: u32) -> (bool, bool, bool, bool, bool) {
@@ -1014,6 +1028,45 @@ impl PIGCS2Controller {
         get_value_f64(&reply)
     }
 
+    /// C `setCLAxisParam`: the E-727's sets `param_id` at command level 1
+    /// and returns to 0 whatever the `SPA` did; the base's does nothing.
+    fn set_cl_axis_param(&self, axis: &str, param_id: u32, value: f64) -> AsynResult<()> {
+        if self.model != Model::E727 {
+            return Ok(());
+        }
+        self.send_only(CCL_ADVANCED)?;
+        let status = self.set_gcs_parameter(axis, param_id as i32, value);
+        self.trace(
+            TraceMask::FLOW,
+            format_args!("PIGCSPiezoController::setCLAxisParam(), param: 0x{param_id:08x} \r\n"),
+        );
+        let restored = self.send_only("CCL 0");
+        status.and(restored)
+    }
+
+    /// C `getCLAxisParam`: the E-727's `SPA?`; the base's 0. A failed read
+    /// is the 0 C's poll starts from.
+    fn get_cl_axis_param(&self, axis: &str, param_id: u32) -> f64 {
+        if self.model != Model::E727 {
+            return 0.0;
+        }
+        self.get_gcs_parameter(axis, param_id as i32).unwrap_or(0.0)
+    }
+
+    /// C `getAxisOnt`/`getAxisOvf`: the E-727's `ONT?`/`OVF?` `{axis}`; the
+    /// base's read nothing. C defect not copied: the poll's `axisont` is
+    /// uninitialized, so the base and a failed `ONT?` post garbage; rs posts
+    /// 0, as C does for `axisovf`.
+    fn get_axis_flag(&self, query: &str, axis: &str) -> i32 {
+        if self.model != Model::E727 {
+            return 0;
+        }
+        self.query(&format!("{query} {axis}"))
+            .ok()
+            .and_then(|reply| value_str(&reply).map(atoi))
+            .unwrap_or(0)
+    }
+
     /// C `PIasynController::processDeferredMoves` and
     /// `PIGCSController::moveCts(array)`: one `MOV` for every deferred
     /// axis, then `ERR?`.
@@ -1472,6 +1525,12 @@ struct PiParams {
     rbpivot_x: usize,
     rbpivot_y: usize,
     rbpivot_z: usize,
+    /// `PI_SUP_{name}` of each [`CL_PARAMS`].
+    cl: [usize; 10],
+    /// `PI_SUP_RB{name}` of each [`CL_PARAMS`].
+    rb_cl: [usize; 10],
+    rbont: usize,
+    rbovf: usize,
     target_mode: usize,
     cs_activate: usize,
     cs_link: usize,
@@ -1509,6 +1568,18 @@ impl PIGCS2Params {
     }
 }
 
+/// A Float64 `{prefix}{name}` for each [`CL_PARAMS`].
+fn create_each(
+    create: &mut impl FnMut(&str, ParamType) -> AsynResult<usize>,
+    prefix: &str,
+) -> AsynResult<[usize; 10]> {
+    let mut reasons = [0; 10];
+    for (reason, (name, _)) in reasons.iter_mut().zip(CL_PARAMS) {
+        *reason = create(&format!("{prefix}{name}"), ParamType::Float64)?;
+    }
+    Ok(reasons)
+}
+
 /// C `PIasynController::writeInt32`/`writeFloat64` with no
 /// `m_pGCSController`: asynError before anything is stored.
 fn not_initialized(base: &PortDriverBase, user: &AxisUser<'_>, method: &str) -> ParamWrite {
@@ -1531,24 +1602,29 @@ impl WriteHook for PiWriteHook {
     /// (PIasynController.cpp:294-322, :364-394).
     fn handles(&self, function: usize) -> bool {
         let p = &self.0;
-        [
-            index::CLOSED_LOOP,
-            index::DEFER_MOVES,
-            p.servo,
-            p.clear_err,
-            p.target_mode,
-            p.target,
-            p.pivot_x,
-            p.pivot_y,
-            p.pivot_z,
-        ]
-        .contains(&function)
+        p.cl.contains(&function)
+            || [
+                index::CLOSED_LOOP,
+                index::DEFER_MOVES,
+                p.servo,
+                p.clear_err,
+                p.target_mode,
+                p.target,
+                p.pivot_x,
+                p.pivot_y,
+                p.pivot_z,
+            ]
+            .contains(&function)
     }
 
     /// The closing line; a servo or target write prints its own from the
     /// axis call [`queue_axis_write`] runs.
     fn after_write(&self, write: &FinishedWrite<'_>) -> WriteOutcome {
-        if write.function != self.0.servo && write.function != self.0.target {
+        let p = &self.0;
+        if write.function != p.servo
+            && write.function != p.target
+            && !p.cl.contains(&write.function)
+        {
             write_trailer(
                 &|mask, args| write.print(mask, args),
                 write.function,
@@ -1625,7 +1701,8 @@ impl ControllerParams for PIGCS2Params {
     }
 
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
-        let mut create = |name, kind| base.create_param(name, kind);
+        let mut create = |name: &str, kind| base.create_param(name, kind);
+        // Struct fields evaluate in order: C's creation order.
         let params = PiParams {
             position: create("PI_SUP_POSITION", ParamType::Float64)?,
             target: create("PI_SUP_TARGET", ParamType::Float64)?,
@@ -1638,6 +1715,10 @@ impl ControllerParams for PIGCS2Params {
             rbpivot_x: create("PI_SUP_RBPIVOT_X", ParamType::Float64)?,
             rbpivot_y: create("PI_SUP_RBPIVOT_Y", ParamType::Float64)?,
             rbpivot_z: create("PI_SUP_RBPIVOT_Z", ParamType::Float64)?,
+            cl: create_each(&mut create, "PI_SUP_")?,
+            rb_cl: create_each(&mut create, "PI_SUP_RB")?,
+            rbont: create("PI_SUP_RBONT", ParamType::Int32)?,
+            rbovf: create("PI_SUP_RBOVF", ParamType::Int32)?,
             target_mode: create("PI_CS_TARGETMODE", ParamType::Int32)?,
             cs_activate: create("PI_CS_ACTIVATE", ParamType::Octet)?,
             cs_link: create("PI_CS_LINK", ParamType::Octet)?,
@@ -1701,6 +1782,14 @@ impl ControllerParams for PIGCS2Params {
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // C's sink is the asynUser itself, a `-1` address included.
         ctrl.log_sink = Some((base.port_name.to_string(), user.asyn().addr));
+        if let Some(n) = params.cl.iter().position(|&r| r == user.reason) {
+            drop(ctrl);
+            let param_id = CL_PARAMS[n].1;
+            return queue_axis_write(base, user, WriteValue::Float64(value), move |axis, _| {
+                axis.lock()
+                    .set_cl_axis_param(&axis.axis_name, param_id, value)
+            });
+        }
         let pivots = [params.pivot_x, params.pivot_y, params.pivot_z];
         let pivot = pivots.iter().position(|&r| r == user.reason);
         if pivot.is_none() && user.reason != params.target {
@@ -1774,6 +1863,17 @@ impl ControllerParams for PIGCS2Params {
         }
         ctx.report(out, level);
     }
+}
+
+/// What `PIasynAxis::poll` reads once the axis may be talked to.
+struct PollReads {
+    /// `PI_SUP_POSITION`, when it answered.
+    real: Option<f64>,
+    /// `PI_SUP_RBONT`/`PI_SUP_RBOVF`.
+    ont: i32,
+    ovf: i32,
+    /// Each [`CL_PARAMS`]' readback.
+    cl: [f64; 10],
 }
 
 /// One GCS2 axis sharing a controller. Implements [`AsynMotor`].
@@ -2256,7 +2356,7 @@ impl PIGCS2Axis {
     /// C `PIasynAxis::poll`'s reads after the status, skipped while a
     /// controller that cannot talk while homing homes; the
     /// `PI_SUP_POSITION` read when it ran and answered.
-    fn poll_reads(&mut self, old_homing: bool, servo_control: bool) -> Option<f64> {
+    fn poll_reads(&mut self, old_homing: bool, servo_control: bool) -> Option<PollReads> {
         let homing = self.is_homing;
         // C only re-queries FRF? (the homed flag) right when homing just
         // finished (oldHoming true, new homing false) — not every cycle.
@@ -2294,14 +2394,17 @@ impl PIGCS2Axis {
             let real = ctrl
                 .get_axis_position(&self.axis_name, position / self.cpu)
                 .ok();
+            let ont = ctrl.get_axis_flag("ONT?", &self.axis_name);
+            let ovf = ctrl.get_axis_flag("OVF?", &self.axis_name);
             let (mut low_limit, mut high_limit) = (self.low_limit, self.high_limit);
             let _ = ctrl.get_travel_limits(&self.axis_name, &mut low_limit, &mut high_limit);
+            let cl = CL_PARAMS.map(|(_, id)| ctrl.get_cl_axis_param(&self.axis_name, id));
             drop(ctrl);
             self.position = units;
             self.last_position = position;
             self.low_limit = low_limit;
             self.high_limit = high_limit;
-            return real;
+            return Some(PollReads { real, ont, ovf, cl });
         }
         None
     }
@@ -2541,7 +2644,7 @@ impl AsynMotor for PIGCS2Axis {
         self.pos_limit = pos_limit;
         self.is_homing = homing;
         let model = self.lock().model;
-        let real = if !homing || model.can_communicate_while_homing() {
+        let reads = if !homing || model.can_communicate_while_homing() {
             self.poll_reads(old_homing, servo_control)
         } else {
             None
@@ -2553,11 +2656,20 @@ impl AsynMotor for PIGCS2Axis {
             ));
         }
         let params = self.lock().port.as_ref().map(|&(_, params)| params);
-        if let Some(params) = params {
-            if let Some(real) = real {
+        if let (Some(params), Some(reads)) = (params, reads) {
+            if let Some(real) = reads.real {
                 self.poll_params
                     .push((params.position, ParamValue::Float64(real)));
             }
+            self.poll_params
+                .push((params.rbont, ParamValue::Int32(reads.ont)));
+            self.poll_params
+                .push((params.rbovf, ParamValue::Int32(reads.ovf)));
+            for (&reason, value) in params.rb_cl.iter().zip(reads.cl) {
+                self.poll_params.push((reason, ParamValue::Float64(value)));
+            }
+        }
+        if let Some(params) = params {
             self.poll_params
                 .push((params.servo, ParamValue::Int32(self.servo_on.into())));
         }
@@ -3507,6 +3619,151 @@ mod tests {
         (port, params, setup.poll_loop)
     }
 
+    /// `port`'s reason for `name`, as a record's `drvUserCreate` finds it.
+    fn reason(port: &PortHandle, name: &str) -> usize {
+        use epics_rs::asyn::port::DrvUserRequest;
+        port.drv_user_create_blocking(&DrvUserRequest::new(name, 0))
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .reason
+    }
+
+    /// The `PI_SUP_*` closed-loop parameters PI_SupportCL.db's records link
+    /// to, created after `PI_SUP_RBPIVOT_Z` in PIasynController.cpp:80-101
+    /// order.
+    const CL_PARAM_NAMES: [&str; 22] = [
+        "PI_SUP_KP",
+        "PI_SUP_KI",
+        "PI_SUP_KFF",
+        "PI_SUP_NTCHFR1",
+        "PI_SUP_NTCHFR2",
+        "PI_SUP_NTCHRJT1",
+        "PI_SUP_NTCHRJT2",
+        "PI_SUP_NTCHBDWDT1",
+        "PI_SUP_NTCHBDWDT2",
+        "PI_SUP_ANALOGTARGET",
+        "PI_SUP_RBKP",
+        "PI_SUP_RBKI",
+        "PI_SUP_RBKFF",
+        "PI_SUP_RBNTCHFR1",
+        "PI_SUP_RBNTCHFR2",
+        "PI_SUP_RBNTCHRJT1",
+        "PI_SUP_RBNTCHRJT2",
+        "PI_SUP_RBNTCHBDWDT1",
+        "PI_SUP_RBNTCHBDWDT2",
+        "PI_SUP_RBANALOGTARGET",
+        "PI_SUP_RBONT",
+        "PI_SUP_RBOVF",
+    ];
+
+    #[test]
+    fn the_closed_loop_parameters_follow_the_pivot_readbacks() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2ClNamesLine", piezo_reply);
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2ClNamesLine")));
+        let (port, _, _) = controller_port("gcs2ClNames", &ctrl, "1");
+        let first = reason(&port, "PI_SUP_RBPIVOT_Z") + 1;
+        for (n, name) in CL_PARAM_NAMES.iter().enumerate() {
+            assert_eq!(reason(&port, name), first + n, "{name}");
+        }
+        assert_eq!(
+            reason(&port, "PI_CS_TARGETMODE"),
+            first + CL_PARAM_NAMES.len()
+        );
+    }
+
+    /// `PIasynController::writeFloat64` (PIasynController.cpp:362-372) hands
+    /// a closed-loop write to `setCLAxisParam`: the E-727's sends the
+    /// `PI727_CL_PARAM_ADDR` parameter between `CCL 1 advanced` and `CCL 0`
+    /// (PIE727Controller.cpp:36-91); the base's sends nothing.
+    #[test]
+    fn a_closed_loop_write_sets_the_e727_parameter_at_command_level_1() {
+        for (idn, name) in [("E-727", "gcs2ClW727"), ("E-712", "gcs2ClW712")] {
+            let (line, io) =
+                motor_common::testing::LineRig::new(&format!("{name}Line"), piezo_reply);
+            let mut ctrl = PIGCS2Controller::new(io, &format!("{name}Line"));
+            ctrl.set_model(Model::from_idn(idn).unwrap());
+            let ctrl = Arc::new(Mutex::new(ctrl));
+            let (port, _, mut poll_loop) = controller_port(name, &ctrl, "1");
+            for (param, sent) in [
+                ("PI_SUP_KP", "SPA 1 117441280 0.25"),
+                ("PI_SUP_NTCHRJT2", "SPA 1 117441025 0.25"),
+                ("PI_SUP_ANALOGTARGET", "SPA 1 100664576 0.25"),
+            ] {
+                let reason = reason(&port, param);
+                line.sent();
+                let printed = traced_mask(name, TraceMask::FLOW, || {
+                    port.write_float64_blocking(reason, 0, 0.25).unwrap();
+                    poll_loop.run_queued_commands();
+                });
+                let want: &[&str] = if idn == "E-727" {
+                    &["CCL 1 advanced", sent, "CCL 0"]
+                } else {
+                    &[]
+                };
+                assert_eq!(sent_lines(&line), want, "{idn} {param}");
+                assert_eq!(port.read_float64_blocking(reason, 0).unwrap(), 0.25);
+                assert_eq!(
+                    printed.contains("PIGCSPiezoController::setCLAxisParam(), param: 0x"),
+                    idn == "E-727",
+                    "{printed}"
+                );
+            }
+        }
+    }
+
+    /// `PIasynAxis::poll` (PIasynAxis.cpp:167-182) posts `ONT?`/`OVF?` as
+    /// `PI_SUP_RBONT`/`RBOVF` and each `getCLAxisParam` as its readback: on
+    /// an E-727 `SPA?` (PIE727Controller.cpp:93-150).
+    #[test]
+    fn an_e727_poll_posts_on_target_overflow_and_closed_loop_readbacks() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2ClPollLine", |last| match last {
+            "ONT? 1" => "1=1".into(),
+            "OVF? 1" => "1=0".into(),
+            "SPA? 1 117441280" => "1 0x7000300=0.75".into(),
+            "\u{5}" => "0".into(),
+            last => piezo_reply(last),
+        });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2ClPollLine");
+        ctrl.set_model(Model::from_idn("E-727").unwrap());
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let (port, _, _) = controller_port("gcs2ClPoll", &ctrl, "1");
+        let mut axis = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, "gcs2ClPoll");
+        line.sent();
+        axis.poll(&AsynUser::new(0)).unwrap();
+        let sent = sent_lines(&line);
+        let ont = sent.iter().position(|c| c == "ONT? 1");
+        let tmn = sent.iter().position(|c| c == "TMN? 1");
+        assert!(ont.is_some() && ont < tmn, "{sent:?}");
+        assert_eq!(
+            sent.iter().filter(|c| c.starts_with("SPA? 1 ")).count(),
+            10,
+            "{sent:?}"
+        );
+        let params = axis.take_poll_params();
+        let posted = |name| {
+            let reason = reason(&port, name);
+            params
+                .iter()
+                .find(|(r, _)| *r == reason)
+                .map(|(_, v)| v.clone())
+        };
+        assert!(
+            matches!(posted("PI_SUP_RBONT"), Some(ParamValue::Int32(1))),
+            "{params:?}"
+        );
+        assert!(
+            matches!(posted("PI_SUP_RBOVF"), Some(ParamValue::Int32(0))),
+            "{params:?}"
+        );
+        assert!(
+            matches!(posted("PI_SUP_RBKP"), Some(ParamValue::Float64(v)) if v == 0.75),
+            "{params:?}"
+        );
+        assert!(
+            matches!(posted("PI_SUP_RBKI"), Some(ParamValue::Float64(v)) if v == 1.0),
+            "{params:?}"
+        );
+    }
+
     /// `PIHexapodController::ReadPivotSettings` (PIHexapodController.cpp:
     /// 370-425) keeps the init's `SPI?` point, `PIasynController::poll`
     /// posts it as `PI_SUP_RBPIVOT_*` (PIasynController.cpp:583-585), and a
@@ -4365,9 +4622,10 @@ mod tests {
     }
 
     /// `PIasynAxis::poll` sets the second position read as
-    /// `PI_SUP_POSITION` (PIasynAxis.cpp:162-165) and the servo state as
-    /// `PI_SUP_SERVO` (:204) for the poll's own `callParamCallbacks`; the
-    /// axis posts nothing itself.
+    /// `PI_SUP_POSITION` (PIasynAxis.cpp:162-165), the base class's 0
+    /// on-target, overflow and closed-loop readbacks (:167-182) and the servo
+    /// state as `PI_SUP_SERVO` (:204) for the poll's own
+    /// `callParamCallbacks`; the axis posts nothing itself.
     #[test]
     fn the_axis_poll_posts_its_position_and_servo() {
         let (_line, io) = motor_common::testing::LineRig::new("gcs2SupPosLine", |last| {
@@ -4385,16 +4643,14 @@ mod tests {
         let mut axis = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, "gcs2SupPos");
         axis.poll(&AsynUser::new(0)).unwrap();
         let params = axis.take_poll_params();
-        assert!(
-            matches!(
-                params.as_slice(),
-                [
-                    (position, ParamValue::Float64(2.5)),
-                    (servo, ParamValue::Int32(1)),
-                ] if *position == p.position && *servo == p.servo
-            ),
-            "{params:?}"
-        );
+        let mut want = vec![
+            (p.position, ParamValue::Float64(2.5)),
+            (p.rbont, ParamValue::Int32(0)),
+            (p.rbovf, ParamValue::Int32(0)),
+        ];
+        want.extend(p.rb_cl.map(|r| (r, ParamValue::Float64(0.0))));
+        want.push((p.servo, ParamValue::Int32(1)));
+        assert_eq!(format!("{params:?}"), format!("{want:?}"));
         assert!(axis.take_poll_params().is_empty());
     }
 
