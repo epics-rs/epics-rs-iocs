@@ -45,6 +45,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::drv_motor_asyn::{DrvSet, function};
 use motor_common::model2::AxisLog;
+use motor_common::param_lib::Params;
 use motor_common::util::nint;
 
 /// Response buffer size (C `BUFFER_SIZE` 100, padded for the multi-line reply).
@@ -219,6 +220,8 @@ pub struct Anc150Axis {
     move_deadline: Option<Instant>,
     move_interval: f64,
     last_status: MotorStatus,
+    /// drvANC150Asyn.cc `pAxis->params`.
+    params: Arc<Params>,
 }
 
 impl Anc150Axis {
@@ -255,7 +258,19 @@ impl Anc150Axis {
                 gain_support: true,
                 ..MotorStatus::default()
             },
+            // drvANC150Asyn.cc:773-775.
+            params: {
+                let params = Params::default();
+                let _ = params.set_integer(function::CLOSED_LOOP, 1);
+                let _ = params.set_integer(function::HAS_CLOSED_LOOP, 1);
+                Arc::new(params)
+            },
         })
+    }
+
+    /// The store drvMotorAsyn reads the axis's parameters back from.
+    pub fn params(&self) -> Arc<Params> {
+        self.params.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, Anc150Controller> {
@@ -309,6 +324,13 @@ impl Anc150Axis {
 
         let ctrl = self.lock();
         ctrl.send_only(&format!("{} {} {}", move_command, self.axis + 1, imove))?;
+        drop(ctrl);
+        // drvANC150Asyn.cc:450-457.
+        let _ = self
+            .params
+            .set_integer(function::DIRECTION, i32::from(posdir));
+        let _ = self.params.set_integer(function::DONE, 0);
+        self.params.call_callback();
         Ok(())
     }
 }
@@ -447,6 +469,7 @@ impl AsynMotor for Anc150Axis {
                 self.card, self.axis
             ),
         );
+        self.params.force_callback();
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -511,6 +534,23 @@ impl AsynMotor for Anc150Axis {
         };
         let powered = matches!(mode_reply, Ok(reply) if reply.starts_with("mode = stp"));
 
+        // drvANC150Asyn.cc:617-649; `axisStatus` is never set, so the switch
+        // parameters are 0.
+        let params = &self.params;
+        let _ = params.set_integer(function::DONE, i32::from(done));
+        for f in [
+            function::HOME_SIGNAL,
+            function::HIGH_HARD_LIMIT,
+            function::LOW_HARD_LIMIT,
+        ] {
+            let _ = params.set_integer(f, 0);
+        }
+        let _ = params.set_double(function::POSITION, position);
+        let _ = params.set_double(function::ENCODER_POSN, position);
+        let _ = params.set_integer(function::COMM_ERROR, i32::from(!freq_ok));
+        let _ = params.set_integer(function::POWER_ON, i32::from(powered));
+        params.call_callback();
+
         self.last_status = MotorStatus {
             position,
             encoder_position: position,
@@ -535,6 +575,22 @@ impl AsynMotor for Anc150Axis {
 /// which drvMotorAsyn's writes reach.
 impl DrvSet for Anc150Axis {
     fn set_double(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+        self.set_double_only(user, function, value)?;
+        let _ = self.params.set_double(function, value);
+        self.params.call_callback();
+        Ok(())
+    }
+
+    /// drvANC150Asyn.cc:389-390: stored without a callback.
+    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+        self.set_integer_only(user, function, value)?;
+        let _ = self.params.set_integer(function, value);
+        Ok(())
+    }
+}
+
+impl Anc150Axis {
+    fn set_double_only(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
         let kind = match function {
             function::POSITION => return self.set_position(user, value),
             function::ENCODER_RATIO => return self.set_encoder_ratio(user, value),
@@ -567,7 +623,7 @@ impl DrvSet for Anc150Axis {
         self.set_pid_gain(user, kind, value)
     }
 
-    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+    fn set_integer_only(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
         if function == function::CLOSED_LOOP {
             return self.set_closed_loop(user, value != 0);
         }
@@ -743,6 +799,11 @@ mod tests {
             .map(|a| a.clone() as Arc<Mutex<dyn DrvSet>>)
             .collect();
         driver.set_axis_setters(1, setters);
+        let getters = axes
+            .iter()
+            .map(|a| a.lock().unwrap().params() as Arc<dyn motor_common::drv_motor_asyn::DrvGet>)
+            .collect();
+        driver.set_axis_getters(1, getters);
         let args = vec![
             ArgValue::String(port.into()),
             ArgValue::String(port.into()),
@@ -838,6 +899,33 @@ mod tests {
              Set card 1, axis 1 move to 0.000000, min vel=1.000000, max_vel=0.000000, accel=60.000000\n\
              Set card 1, axis 1 to stop with accel=80.000000\n"
         );
+    }
+
+    /// drvANC150Asyn.cc:389-390, 450-457, 617-649, 773-775: the store
+    /// drvMotorAsyn reads back holds what the C driver puts in it.
+    #[epics_rs::base::epics_test]
+    async fn the_port_reads_back_what_the_driver_keeps() {
+        let (axes, _path) = traced_axes("ancParams", TraceMask::empty()).await;
+        let user = AsynUser::default();
+        let mut axis = axes[1].lock().unwrap();
+        let params = axis.params();
+        assert_eq!(params.get_integer(function::CLOSED_LOOP), Ok(Some(1)));
+        assert_eq!(params.get_integer(function::HAS_CLOSED_LOOP), Ok(Some(1)));
+        axis.move_absolute(&user, 2.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(params.get_integer(function::DIRECTION), Ok(Some(0)));
+        assert_eq!(params.get_integer(function::DONE), Ok(Some(0)));
+        axis.stop(&user, 1.0).unwrap();
+        axis.poll(&user).unwrap();
+        assert_eq!(params.get_integer(function::DONE), Ok(Some(1)));
+        assert_eq!(params.get_double(function::POSITION), Ok(Some(2.0)));
+        assert_eq!(params.get_double(function::ENCODER_POSN), Ok(Some(2.0)));
+        assert_eq!(params.get_integer(function::HIGH_HARD_LIMIT), Ok(Some(0)));
+        assert_eq!(params.get_integer(function::COMM_ERROR), Ok(Some(0)));
+        assert_eq!(params.get_integer(function::POWER_ON), Ok(Some(1)));
+        axis.set_integer(&user, function::CLOSED_LOOP, 0).unwrap();
+        assert_eq!(params.get_integer(function::CLOSED_LOOP), Ok(Some(0)));
+        assert!(DrvSet::set_double(&mut *axis, &user, function::P_GAIN, 0.5).is_err());
+        assert_eq!(params.get_double(function::P_GAIN), Ok(None));
     }
 
     /// drvANC150Asyn.cc:633-634: each poll prints the axis's never-set
