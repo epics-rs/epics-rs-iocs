@@ -14,6 +14,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::AxisReport;
 use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_string};
@@ -64,7 +65,8 @@ fn motor_axis_report(cards: &Mutex<Vec<CardReport>>, level: i32) -> String {
         if level != 0 {
             out += &format!(
                 "    moving poll period: {:.6}\n    idle poll period: {:.6}\n",
-                card.moving_poll_s, card.idle_poll_s
+                CFloat(card.moving_poll_s),
+                CFloat(card.idle_poll_s)
             );
         }
         for axis in &card.axes {

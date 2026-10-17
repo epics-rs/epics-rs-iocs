@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::AxisReport;
 
 /// C reads these without the axis lock; only `axis_status` changes after
@@ -44,8 +45,8 @@ impl AxisReport for AxisMembers {
                  step size:   {:.6}\n   max digits:  {}\n",
                 self.name,
                 self.axis_status.load(Ordering::Relaxed),
-                self.home_preset,
-                self.step_size,
+                CFloat(self.home_preset),
+                CFloat(self.step_size),
                 self.max_digits
             );
         }

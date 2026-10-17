@@ -61,6 +61,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::model2::AxisLog;
 use motor_common::util::{atof, atoi, atol};
 
@@ -112,7 +113,7 @@ fn a3200_err(message: impl Into<String>) -> AsynError {
 
 /// C `%.*f` with the axis `maxDigits`.
 fn fmt(v: f64, digits: usize) -> String {
-    format!("{v:.digits$}")
+    format!("{:.digits$}", CFloat(v))
 }
 
 /// C's `stepSize` from a `CountsPerUnit` reply, 1 when it was refused.
@@ -674,6 +675,9 @@ mod tests {
     fn max_digits_follows_the_step() {
         assert_eq!(max_digits(0.0004), 5);
         assert_eq!(fmt(1.5, 5), "1.50000");
+        // C `%.*f` of a non-finite value.
+        assert_eq!(fmt(f64::NAN, 5), "nan");
+        assert_eq!(fmt(f64::INFINITY, 5), "inf");
         assert_eq!(step_size(Err(a3200_err("refused"))), 1.0);
     }
 

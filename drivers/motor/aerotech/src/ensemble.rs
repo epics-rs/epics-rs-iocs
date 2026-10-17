@@ -37,6 +37,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::model2::AxisLog;
 use motor_common::util::{atof, atoi, atol};
 
@@ -95,7 +96,7 @@ fn ens_err(message: impl Into<String>) -> AsynError {
 
 /// C `%.*f` with the axis `maxDigits`.
 fn fmt(v: f64, digits: usize) -> String {
-    format!("{v:.digits$}")
+    format!("{:.digits$}", CFloat(v))
 }
 
 /// C's `stepSize` from a `CountsPerUnit` reply, 1 when it was refused.
@@ -573,6 +574,9 @@ mod tests {
         assert_eq!(max_digits(1e-4), 6);
         assert_eq!(max_digits(1000.0), 1);
         assert_eq!(fmt(1.5, 2), "1.50");
+        // C `%.*f` of a non-finite value.
+        assert_eq!(fmt(f64::NAN, 2), "nan");
+        assert_eq!(fmt(f64::NEG_INFINITY, 2), "-inf");
     }
 
     #[test]
