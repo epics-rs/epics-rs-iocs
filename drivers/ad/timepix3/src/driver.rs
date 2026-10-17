@@ -3361,15 +3361,25 @@ impl PortDriver for TimePix3Driver {
             return drawn.map(|()| buf.len());
         }
         if reason == self.p.bp_c {
+            // C mask_io.cpp:209-237: the packed pixel, with bit 8 (TPX3) or
+            // bit 16 (MPX3) marking a masked one; an empty file leaves the
+            // waveform as it was.
             let bpc = self.read_bpc()?;
-            for (slot, &b) in buf.iter_mut().zip(bpc.iter()) {
-                // Bit 8 marks a masked pixel for the calibration view
-                // (mask_io.cpp:186).
-                *slot = i32::from(b) | if b & 1 != 0 { 1 << 8 } else { 0 };
+            if !bpc.is_empty() {
+                let family = self.shared.family();
+                let width = mask::bytes_per_pixel(family);
+                let pixels = bpc.len().checked_div(width).unwrap_or(0);
+                let copied = buf.len().min(pixels);
+                for (pixel, slot) in buf[..copied].iter_mut().enumerate() {
+                    let offset = pixel * width;
+                    *slot = i32::from(mask::pixel_value(family, &bpc, offset).unwrap_or(0));
+                    if mask::is_masked(family, &bpc, offset) {
+                        *slot |= if width == 1 { 1 << 8 } else { 1 << 16 };
+                    }
+                }
+                buf[copied..].fill(0);
             }
-            if bpc.len() < buf.len() {
-                buf[bpc.len()..].fill(0);
-            }
+            self.ad.port_base.call_param_callbacks(0)?;
             return Ok(buf.len());
         }
         // C answers every other reason with nElements, zero-filled past the
@@ -5699,6 +5709,44 @@ mod tests {
         let buf = r.unwrap();
         assert_eq!(buf[4 * 256 + 3], 1 << 1);
         assert_eq!(buf.iter().filter(|&&v| v != 0).count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The BPC waveform is the family's packed pixel, a masked one marked by
+    /// bit 8 (TPX3) or bit 16 (MPX3) (mask_io.cpp:209-237).
+    #[test]
+    fn the_bpc_waveform_is_the_packed_pixel_per_family() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let shared = Arc::new(Shared::new());
+        let name = "TPX_BPC_READ";
+        let mut det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            shared.clone(),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        calibration_files(&mut det, name);
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        std::fs::write(dir.join("cal.bpc"), [0x81, 0x01, 0x00, 0x02]).unwrap();
+        let p = det.p;
+        let mut read = |family| {
+            shared.note_family(family);
+            let mut buf = vec![-1i32; 5];
+            det.read_int32_array(&AsynUser::new(p.bp_c), &mut buf)
+                .unwrap();
+            buf
+        };
+        assert_eq!(read(DetectorFamily::Unknown), vec![0; 5]);
+        assert_eq!(
+            read(DetectorFamily::Tpx3),
+            vec![0x81 | 1 << 8, 0x01 | 1 << 8, 0, 2, 0]
+        );
+        assert_eq!(
+            read(DetectorFamily::Mpx3),
+            vec![0x8101 | 1 << 16, 0x0002, 0, 0, 0]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
