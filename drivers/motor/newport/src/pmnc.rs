@@ -418,6 +418,9 @@ impl PmncAxis {
     ) -> AsynResult<()> {
         let (d, m) = (self.def.driver_num, self.def.motor_num);
         let vel = nint(velocity).unsigned_abs().min(MAX_VELOCITY as u32) as i64;
+        // The record writes SET_VELOCITY before SET_VEL_BASE, so on an 8753
+        // C's VEL-at-max lands last and every move runs at 2000 steps/sec.
+        // That C defect is not copied: the record's velocity goes last.
         self.send_vel_base(ctrl, min_velocity)?;
         ctrl.command(&format!("VEL A{d} {m}={vel}"))?;
         if acceleration > 0.0 {
