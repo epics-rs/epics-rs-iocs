@@ -1335,12 +1335,14 @@ pub(crate) mod tests {
         );
     }
 
+    /// getAddress maps an address past the axes to axis 0, so only one
+    /// below -1 has no axis (SPiiPlusDriver.cpp:342-357).
     #[test]
     fn pulse_positions_need_an_axis_at_the_address() {
         let rig = rig("spiiPAddr", 1, SERVOS);
         let pulse_pos = rig.param("SPIIPLUS_PULSE_POS");
-        assert!(rig.array(pulse_pos, 0, &[1.0]).is_ok());
-        assert!(rig.array(pulse_pos, 1, &[1.0]).is_err());
+        assert!(rig.array(pulse_pos, 1, &[1.0]).is_ok());
+        assert!(rig.array(pulse_pos, -2, &[1.0]).is_err());
     }
 
     #[test]
@@ -1411,7 +1413,9 @@ pub(crate) mod tests {
     }
 
     /// SPiiPlusDriver.cpp:398-399, 471-472: at an address with no axis C
-    /// returns asynError before its own code, which indexes the axes.
+    /// returns asynError before its own code, which indexes the axes. Its
+    /// getAddress maps one past the axes to axis 0 and getAddr a negative one
+    /// to -1, so only a driver call below -1 gets there.
     #[test]
     fn a_write_with_no_axis_is_refused_before_the_driver_s_code() {
         use epics_rs::asyn::port::DrvUserRequest;
@@ -1424,8 +1428,16 @@ pub(crate) mod tests {
         };
         let method = reason("SPIIPLUS_HOMING_METHOD");
         let max_dist = reason("SPIIPLUS_HOMING_MAX_DIST");
-        assert!(rig.port.write_int32_blocking(method, 2, 1).is_err());
-        assert!(rig.port.write_float64_blocking(max_dist, 2, 1.0).is_err());
+        let refused = rig
+            .port
+            .with_driver_blocking::<ControllerPort<AcsMotionParams>, _>(move |d| {
+                let mut user = AsynUser::new(method).with_addr(-2);
+                let int = d.write_int32(&mut user, 1);
+                user.reason = max_dist;
+                (int, d.write_float64(&mut user, 1.0))
+            })
+            .unwrap();
+        assert!(refused.0.is_err() && refused.1.is_err());
         // Nothing indexed past the axes: the port still answers.
         rig.int(method, 1, 3);
         assert_eq!(rig.port.read_int32_blocking(method, 1).unwrap(), 3);
