@@ -277,9 +277,7 @@ pub fn pic630_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
 
                 for (signal, current) in (0..num_axes).zip(currents) {
-                    let Ok(axis) = PIC630Axis::new(controller.clone(), signal, current) else {
-                        return;
-                    };
+                    let axis = PIC630Axis::new(controller.clone(), signal, current);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                     init.axis(signal as i32, motor);
                 }
