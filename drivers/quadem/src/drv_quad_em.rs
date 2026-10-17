@@ -4,9 +4,8 @@
 //! The C++ class derives from `asynNDArrayDriver` with `maxAddr =
 //! QE_MAX_DATA+1` (12) and `ASYN_MULTIDEVICE`: addresses 0-10 carry one data
 //! item each (4 currents, 2 sums, sum-all, 2 diffs, 2 positions) and address
-//! 11 carries the full 2-D array. This module reproduces that layout on top of
-//! `asyn_rs::PortDriverBase` plus `ad_core_rs`'s `NDArrayDriverParams` and
-//! `DriverPool`, because `NDArrayDriverBase::new` hard-codes `maxAddr = 1`.
+//! 11 carries the full 2-D array. This module reproduces that layout on
+//! `ad_core_rs`'s `NDArrayDriverBase`, with one `NDArrayOutput` per address.
 //!
 //! Sample flow, unchanged from C++:
 //!
@@ -26,7 +25,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::asyn_print;
 use crate::trace::AsynPrint;
-use epics_rs::ad_core::driver::ndarray_driver::{ArrayOwner, handle_write_int32};
+use epics_rs::ad_core::driver::ndarray_driver::{
+    ArrayOwner, NDArrayDriverBase, handle_write_int32,
+};
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
@@ -1068,25 +1069,27 @@ pub struct QuadEmBase {
 
 impl QuadEmBase {
     pub fn new(port_name: &str, max_memory: usize) -> AsynResult<Self> {
-        let mut port_base = PortDriverBase::new(
+        // asynNDArrayDriver(portName, QE_MAX_DATA+1, ..., ASYN_CANBLOCK |
+        // ASYN_MULTIDEVICE, ...), drvQuadEM.cpp:50-58.
+        let NDArrayDriverBase {
+            mut port_base,
+            params: nd_params,
+            pool,
+            owner,
+            ..
+        } = NDArrayDriverBase::new(
             port_name,
             QE_MAX_DATA + 1,
+            max_memory,
             PortFlags {
                 can_block: true,
                 multi_device: true,
                 ..Default::default()
             },
-        );
-
-        let (nd_params, owner) = NDArrayDriverParams::create(&mut port_base)?;
+        )?;
         let params = QuadEmParams::create(&mut port_base)?;
 
         port_base.set_int32_param(nd_params.array_callbacks, 0, 1)?;
-        port_base.set_float64_param(
-            nd_params.pool_max_memory,
-            0,
-            max_memory as f64 / 1_048_576.0,
-        )?;
 
         // C++ drvQuadEM constructor defaults.
         port_base.set_int32_param(params.ring_overflows, 0, 0)?;
@@ -1112,8 +1115,6 @@ impl QuadEmBase {
         for addr in 0..=QE_MAX_DATA {
             port_base.connect_addr(addr as i32);
         }
-
-        let pool = DriverPool::for_driver(max_memory, &owner);
 
         let outputs = (0..=QE_MAX_DATA)
             .map(|_| Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())))
@@ -1720,6 +1721,36 @@ mod tests {
         for addr in 0..=QE_MAX_DATA as i32 {
             assert!(base.port_base.is_device_connected(addr), "addr {addr}");
         }
+    }
+
+    /// drvQuadEM is an asynNDArrayDriver, whose constructor defines the
+    /// read-only ND parameters (asynNDArrayDriver.cpp:960-1002), so their
+    /// I/O Intr records get a value when iocInit flushes the callbacks.
+    #[test]
+    fn construction_defines_the_ndarray_driver_params() {
+        let base = QuadEmBase::new("QE_ND_DEFAULTS", 0).unwrap();
+        let (pb, nd) = (&base.port_base, &base.nd_params);
+        assert_eq!(
+            pb.get_string_param(nd.port_name_self, 0).unwrap(),
+            b"QE_ND_DEFAULTS"
+        );
+        assert!(
+            !pb.get_string_param(nd.ad_core_version, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(pb.get_float64_param(nd.timestamp_rbv, 0).unwrap(), 0.0);
+        assert_eq!(pb.get_int32_param(nd.n_dimensions, 0).unwrap(), 0);
+        assert_eq!(pb.get_int32_param(nd.bayer_pattern, 0).unwrap(), 0);
+    }
+
+    /// drvQuadEM.cpp sets no PoolMaxMemory, so it reads the 0 the base
+    /// constructor sets until a PoolPollStats write.
+    #[test]
+    fn construction_leaves_pool_max_memory_zero() {
+        let base = QuadEmBase::new("QE_POOL_MAX", 100_000_000).unwrap();
+        let max = base.nd_params.pool_max_memory;
+        assert_eq!(base.port_base.get_float64_param(max, 0).unwrap(), 0.0);
     }
 
     fn acquire_busy(m: &FakeMeter) -> i32 {
