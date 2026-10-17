@@ -5,8 +5,9 @@
 //! link no longer carries the command name (`@asyn(port addr)GET_PRESSURE 1`),
 //! it binds to a parameter of the port instead. The port drives the device over
 //! a pre-configured octet port (`drvAsynSerialPortConfigure` /
-//! `drvAsynIPPortConfigure`), exactly as the C device support did. [`mks`] is
-//! the exception: it stays per-record ai device support, as `devAiMKS.c` is.
+//! `drvAsynIPPortConfigure`), exactly as the C device support did. [`mks`],
+//! [`mpc`] and [`tpg261`] are the exceptions: they stay per-record device
+//! support, as `devAiMKS.c`, `devMPC.c` and `devTPG261.c` are.
 //!
 //! Ported so far:
 //!
