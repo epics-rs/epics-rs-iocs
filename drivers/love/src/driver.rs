@@ -58,9 +58,6 @@
 //!   twos-complement target it silently wraps back to `INT32_MIN`, which
 //!   `wrapping_neg` reproduces as defined behavior instead of a Rust debug
 //!   panic. Not reachable by any real PID setpoint.
-//! - **An address is marked connected for `reportIt` by its first
-//!   request as well as by `connectIt`**: asyn-rs devices start connected,
-//!   so `connectIt` is reached only after a `disconnectIt`.
 //! - **`drv_user_create` bounds-checks `addr` against `1..=K_INSTRMAX`**
 //!   before use. C's `create()` (`drvLove.c:1106-1138`) computes
 //!   `&pport->instr[addr-1]` with *no* range check at all -- an
@@ -83,7 +80,9 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
-use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{
+    DpCells, DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags,
+};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::trace::TraceMask;
@@ -349,11 +348,13 @@ pub struct LoveDriver {
     ser_name: String,
     /// C `Serport::pasynUser`: the serial port, its address and timeout.
     serial: PortHandle,
+    /// The serial user's `dpCommon`, which C's `isConnected` reads without
+    /// queueing on the serial port (asynManager.c:2331-2342).
+    serial_dp: DpCells,
     ser_addr: i32,
     timeout: Duration,
     models: ModelTable,
-    /// C `Instr::isConn`: set by `connectIt` or the address's first request,
-    /// cleared by `disconnectIt`.
+    /// C `Instr::isConn`: set by `connectIt`, cleared by `disconnectIt`.
     is_conn: [bool; K_INSTRMAX],
 }
 
@@ -372,23 +373,23 @@ impl LoveDriver {
         timeout: Duration,
         models: ModelTable,
     ) -> AsynResult<Self> {
+        // C registers the love port with the serial port's canBlock and
+        // autoConnect (drvLove.c:363-364).
         let mut base = PortDriverBase::new(
             port_name,
             K_INSTRMAX + 1,
             PortFlags {
                 multi_device: true,
-                can_block: true,
+                can_block: serial.can_block(),
                 destructible: true,
             },
         );
-        // C registers a bare asynDriver port, which starts down
-        // (asynManager.c:523); only `connectIt` brings it up, and it refuses
-        // while the serial port is down.
-        base.init_connected(false);
+        base.set_auto_connect(serial.connect_device(ser_addr).auto_connect());
 
         Ok(Self {
             base,
             ser_name: ser_name.to_owned(),
+            serial_dp: serial.connect_device(ser_addr),
             serial,
             ser_addr,
             timeout,
@@ -488,7 +489,7 @@ impl LoveDriver {
     /// C `connectIt` (drvLove.c:993-1044).
     fn connect_it(&mut self, user: &AsynUser) -> AsynResult<()> {
         let addr = user.addr;
-        if !self.serial.is_connected_blocking(self.ser_addr)? {
+        if !self.serial_dp.connected() {
             return Err(protocol_error(format!(
                 "port {} not connected to {}",
                 self.base.port_name, self.ser_name
@@ -513,10 +514,12 @@ impl LoveDriver {
     fn disconnect_it(&mut self, user: &AsynUser) -> AsynResult<()> {
         let addr = user.addr;
         self.check_addr("disconnectIt", addr)?;
-        // A device asyn-rs started connected has not set `is_conn`, and is
-        // still connected.
-        let conn = addr > 0 && std::mem::take(&mut self.is_conn[(addr - 1) as usize]);
-        if !conn && !self.base.dp_connected(addr) {
+        let conn = if addr < 0 {
+            self.base.dp_connected(addr)
+        } else {
+            std::mem::take(&mut self.is_conn[(addr - 1) as usize])
+        };
+        if !conn {
             return Err(protocol_error("not connected"));
         }
         self.base.set_addr_connected(addr, false);
@@ -552,7 +555,6 @@ impl LoveDriver {
         if !(1..=K_INSTRMAX as i32).contains(&addr) {
             return Err(AsynError::AddressOutOfRange(addr));
         }
-        self.is_conn[(addr - 1) as usize] = true;
         let spec = &COMMANDS[reason];
         let model = self.model_for(addr);
         let read_cmd = spec.read[model as usize];
@@ -570,7 +572,6 @@ impl LoveDriver {
         if !(1..=K_INSTRMAX as i32).contains(&addr) {
             return Err(AsynError::AddressOutOfRange(addr));
         }
-        self.is_conn[(addr - 1) as usize] = true;
         let spec = &COMMANDS[reason];
         let write_cmd = match spec.write_conv {
             WriteConv::Null => {
@@ -883,6 +884,76 @@ mod tests {
         }
     }
 
+    /// A serial port whose write holds its actor for a second.
+    struct SlowSerial {
+        base: PortDriverBase,
+    }
+
+    impl PortDriver for SlowSerial {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+
+        fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            std::thread::sleep(Duration::from_secs(1));
+            Ok(data.len())
+        }
+    }
+
+    /// C `connectIt` asks `isConnected`, which reads the serial user's
+    /// `dpCommon` without queueing (drvLove.c:1003, asynManager.c:2331-2342),
+    /// so it answers while the serial port is busy.
+    #[test]
+    fn connect_it_does_not_wait_on_a_busy_serial_port() {
+        let base = PortDriverBase::new("LOVETESTBSY", 1, PortFlags::default());
+        let mut love = love_on(SlowSerial { base }, "LOVETESTBSYL");
+        let serial = love.serial.clone();
+        assert!(serial.is_connected_blocking(0).unwrap());
+        let write = std::thread::spawn(move || {
+            serial.submit_blocking(
+                RequestOp::OctetWrite {
+                    data: b"x".to_vec(),
+                },
+                AsynUser::new(OCTET_REASON),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let start = std::time::Instant::now();
+        love.connect_it(&AsynUser::default().with_addr(1)).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
+        );
+        write.join().unwrap().unwrap();
+    }
+
+    /// C registers the love port with the serial port's canBlock and
+    /// autoConnect (drvLove.c:363-364).
+    #[test]
+    fn the_love_port_takes_can_block_and_auto_connect_from_the_serial_port() {
+        for (can_block, auto_connect) in [(true, true), (false, false)] {
+            let name = format!("LOVETESTFLG{}", u8::from(can_block));
+            let mut base = PortDriverBase::new(
+                &name,
+                1,
+                PortFlags {
+                    multi_device: false,
+                    can_block,
+                    destructible: true,
+                },
+            );
+            base.set_auto_connect(auto_connect);
+            let love = love_on(TimeoutSerial { base }, &format!("{name}L"));
+            assert_eq!(love.base().flags.can_block, can_block);
+            assert_eq!(love.base().is_auto_connect(), auto_connect);
+        }
+    }
+
     /// C `connectIt` refuses while the serial port is down, so the love port
     /// never comes up and a request is refused at the queue without a
     /// command reaching the serial line (drvLove.c:1003-1014).
@@ -1043,8 +1114,9 @@ mod tests {
         out
     }
 
-    /// C `disconnectIt` (drvLove.c:1086-1093) clears `isConn`, so `reportIt`
-    /// stops listing the address until `connectIt` sets it again.
+    /// Only C `connectIt` sets `isConn` and only `disconnectIt` clears it
+    /// (drvLove.c:1031, :1086-1093), so a request does not list the address in
+    /// `reportIt`.
     #[test]
     fn disconnect_drops_the_address_from_the_report() {
         let mut love = reply_love("LOVETESTDIS", EomReason::EOS);
@@ -1053,6 +1125,9 @@ mod tests {
         let unlisted = "    LOVETESTDIS is connected to SER\n";
 
         love.do_read(2, 0).unwrap();
+        assert_eq!(report_of(&mut love), unlisted);
+        assert!(love.disconnect_addr(&addr2).is_err());
+        love.connect_addr(&addr2).unwrap();
         assert_eq!(report_of(&mut love), listed);
         love.disconnect_addr(&addr2).unwrap();
         assert_eq!(report_of(&mut love), unlisted);
