@@ -541,6 +541,13 @@ pub struct Mm4000Axis {
     encoder_present: bool,
     /// The status drvMM4000.cc's `set_status` starts from and RETRY keeps.
     last: MotorStatus,
+    /// The axis follows devMM4000.cc (`MM4000Config`), whose commands are
+    /// the record transaction's, not drvMM4000Asyn.c's.
+    model1: bool,
+    /// devMM4000.cc jogs to the record's DHLM/DLLM (controller units): the
+    /// last limit the record wrote, the controller travel limit until then.
+    jog_high: f64,
+    jog_low: f64,
     /// A move or home was sent since the last poll: drvMM4000Asyn.c clears
     /// `motorAxisDone` so the record's next status update is not done.
     motion_sent: bool,
@@ -566,7 +573,7 @@ impl Mm4000Axis {
         axis: usize,
         poll_failure: PollFailure,
     ) -> Self {
-        let (model, step_size, home_preset, low_limit, high_limit, encoder_present) = {
+        let (model1, model, step_size, home_preset, low_limit, high_limit, encoder_present) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // C `&inputBuff[3]`: skip the echoed `nCC` prefix.
             let query = |cc: &str| {
@@ -579,6 +586,7 @@ impl Mm4000Axis {
             let low_limit = atof(&query("TL"));
             let high_limit = atof(&query("TR"));
             (
+                ctrl.is_model1(),
                 ctrl.model(),
                 step_size,
                 home_preset,
@@ -598,6 +606,9 @@ impl Mm4000Axis {
             high_limit,
             poll_failure,
             encoder_present,
+            model1,
+            jog_high: high_limit,
+            jog_low: low_limit,
             // drvMM4000.cc motor_init clears the status and sets
             // GAIN_SUPPORT, and EA_PRESENT on a closed loop.
             last: MotorStatus {
@@ -648,7 +659,8 @@ impl Mm4000Axis {
     }
 
     /// C `motorAxisMove` transaction: `AC;VA;PA|PR;` (trailing `;` as C
-    /// sends it), steps scaled to wire units at this axis's precision.
+    /// sends it), steps scaled to wire units at this axis's precision. On
+    /// model 1 it is the record's SET_VELOCITY, SET_ACCEL, MOVE: `VA;AC;PA;`.
     fn move_command(
         &self,
         cmd: &str,
@@ -658,6 +670,11 @@ impl Mm4000Axis {
     ) -> AsynResult<String> {
         let (a, d, step) = (self.axis, self.digits, self.step_size()?);
         let (acceleration, velocity, value) = (acceleration * step, velocity * step, value * step);
+        if self.model1 {
+            return Ok(format!(
+                "{a}VA{velocity:.d$};{a}AC{acceleration:.d$};{a}{cmd}{value:.d$};"
+            ));
+        }
         Ok(format!(
             "{a}AC{acceleration:.d$};{a}VA{velocity:.d$};{a}{cmd}{value:.d$};"
         ))
@@ -700,6 +717,20 @@ impl AsynMotor for Mm4000Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        if self.model1 {
+            // devMM4000.cc JOG after the record's SET_ACCEL: `AC;VA;PA` to
+            // the record's DHLM/DLLM.
+            let (a, d, step) = (self.axis, self.digits, self.step_size()?);
+            let (speed, acceleration) = (velocity.abs() * step, acceleration * step);
+            let target = if velocity > 0.0 {
+                self.jog_high
+            } else {
+                self.jog_low
+            };
+            return self.start_motion(&format!(
+                "{a}AC{acceleration:.d$};{a}VA{speed:.d$};{a}PA{target:.d$};"
+            ));
+        }
         // C `motorAxisVelocityMove`: no jog command — move absolute to the
         // controller travel limit captured at init, in the jog direction.
         let step = self.step_size()?;
@@ -725,6 +756,12 @@ impl AsynMotor for Mm4000Axis {
         // parity.
         let (a, d, step) = (self.axis, self.digits, self.step_size()?);
         let (acceleration, velocity) = (acceleration * step, velocity * step);
+        if self.model1 {
+            // devMM4000.cc HOME after the record's SET_VELOCITY, SET_ACCEL.
+            return self.start_motion(&format!(
+                "{a}VA{velocity:.d$};{a}AC{acceleration:.d$};{a}OR;"
+            ));
+        }
         self.start_motion(&format!(
             "{a}AC{acceleration:.d$}; {a}VA{velocity:.d$};{a}OR;"
         ))
@@ -734,7 +771,7 @@ impl AsynMotor for Mm4000Axis {
         let a = self.axis;
         // devMM4000.cc STOP_AXIS is `ST;` alone; only drvMM4000Asyn.c
         // motorAxisStop sets the deceleration first.
-        if self.lock().is_model1() {
+        if self.model1 {
             return self.lock().write(&format!("{a}ST;"));
         }
         let (d, step) = (self.digits, self.step_size()?);
@@ -745,7 +782,11 @@ impl AsynMotor for Mm4000Axis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         // C `motorAxisPosition`: set home to the value, define home, then
-        // restore the home preset (`SH;DH;SH`).
+        // restore the home preset (`SH;DH;SH`). devMM4000.cc LOAD_POS sends
+        // it only to an MM4000 and nothing to the other models.
+        if self.model1 && self.model != Mm4000Model::Mm4000 {
+            return Ok(());
+        }
         let (a, d, step) = (self.axis, self.digits, self.step_size()?);
         let position = position * step;
         let mut ctrl = self.lock();
@@ -756,6 +797,16 @@ impl AsynMotor for Mm4000Axis {
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
+        if self.model1 {
+            // devMM4000.cc ENABLE/DISABL_TORQUE: the MM4000 switches every
+            // motor, the other models one axis.
+            let (a, cc) = (self.axis, if enable { "MO" } else { "MF" });
+            let cmd = match self.model {
+                Mm4000Model::Mm4000 => format!("{cc};"),
+                _ => format!("{a}{cc};"),
+            };
+            return self.lock().write(&cmd);
+        }
         // C `motorAxisClosedLoop`: the MM4000 can only switch ALL motors
         // (MO/MF), so it is a no-op there; the MM4005 addresses one axis.
         if self.model == Mm4000Model::Mm4000 {
@@ -786,6 +837,19 @@ impl AsynMotor for Mm4000Axis {
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let (a, d, step) = (self.axis, self.digits, self.step_size()?);
         let position = position * step;
+        if self.model1 {
+            // devMM4000.cc SET_HIGH_LIMIT sends nothing; past the controller
+            // limit it clamps DHLM to it and refuses.
+            if position > self.high_limit {
+                self.jog_high = self.high_limit;
+                return Err(mm_err(format!(
+                    "MM4000 axis {a}: high limit {position} beyond the controller's {}",
+                    self.high_limit
+                )));
+            }
+            self.jog_high = position;
+            return Ok(());
+        }
         let mut ctrl = self.lock();
         ctrl.write(&format!("{a}SR{position:.d$}"))
     }
@@ -793,11 +857,32 @@ impl AsynMotor for Mm4000Axis {
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let (a, d, step) = (self.axis, self.digits, self.step_size()?);
         let position = position * step;
+        if self.model1 {
+            if position < self.low_limit {
+                self.jog_low = self.low_limit;
+                return Err(mm_err(format!(
+                    "MM4000 axis {a}: low limit {position} beyond the controller's {}",
+                    self.low_limit
+                )));
+            }
+            self.jog_low = position;
+            return Ok(());
+        }
         let mut ctrl = self.lock();
         ctrl.write(&format!("{a}SL{position:.d$}"))
     }
 
-    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, _gain: f64) -> AsynResult<()> {
+    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
+        if self.model1 {
+            // devMM4000.cc SET_[PID]GAIN: the record's gain, unscaled.
+            let a = self.axis;
+            let cc = match kind {
+                PidGainKind::Proportional => "KP",
+                PidGainKind::Integral => "KI",
+                PidGainKind::Derivative => "KD",
+            };
+            return self.lock().write(&format!("{a}{cc}{gain:.6};{a}UF;"));
+        }
         Err(mm_err(format!(
             "MM4000 does not support setting {kind:?} gain"
         )))
@@ -1010,6 +1095,56 @@ mod tests {
         assert_eq!((two.position, two.encoder_position), (-2250.0, -2249.0));
         assert!(two.moving && !two.done && two.direction && two.high_limit);
         assert!(two.has_encoder && !two.low_limit && !two.home);
+    }
+
+    /// devMM4000.cc builds each command from the record's transaction parts:
+    /// VA;AC before a move or home, AC;VA;PA to DHLM/DLLM for a jog, no SR/SL,
+    /// unscaled gains, per-axis MO;/MF; and no LOAD_POS on an MM4005. TU
+    /// 0.001 here, so 5 digits.
+    #[test]
+    fn model1_commands_are_the_record_transaction() {
+        let (axes, sent, _) = model1_card("mm4000_m1_cmds", &[], Duration::ZERO);
+        let mut axis = axes.unwrap().remove(0);
+        let user = AsynUser::default();
+        let wire = |f: &mut dyn FnMut()| {
+            sent.lock().unwrap().clear();
+            f();
+            sent.lock().unwrap().clone()
+        };
+        assert_eq!(
+            wire(&mut || axis
+                .move_absolute(&user, 2000.0, 0.0, 1000.0, 500.0)
+                .unwrap()),
+            ["1VA1.00000;1AC0.50000;1PA2.00000;"]
+        );
+        assert_eq!(
+            wire(&mut || axis.home(&user, 0.0, 1000.0, 500.0, true).unwrap()),
+            ["1VA1.00000;1AC0.50000;1OR;"]
+        );
+        assert_eq!(
+            wire(&mut || axis.set_high_limit(&user, 0.5).unwrap()),
+            [] as [&str; 0]
+        );
+        assert!(axis.set_high_limit(&user, 2000.0).is_err());
+        axis.set_high_limit(&user, 0.5).unwrap();
+        assert_eq!(
+            wire(&mut || axis.move_velocity(&user, 0.0, 1000.0, 500.0).unwrap()),
+            ["1AC0.50000;1VA1.00000;1PA0.00050;"]
+        );
+        assert_eq!(
+            wire(&mut || axis
+                .set_pid_gain(&user, PidGainKind::Proportional, 0.25)
+                .unwrap()),
+            ["1KP0.250000;1UF;"]
+        );
+        assert_eq!(
+            wire(&mut || axis.set_closed_loop(&user, false).unwrap()),
+            ["1MF;"]
+        );
+        assert_eq!(
+            wire(&mut || axis.set_position(&user, 5.0).unwrap()),
+            [] as [&str; 0]
+        );
     }
 
     /// devMM4000.cc STOP_AXIS sends `ST;` with no deceleration.
