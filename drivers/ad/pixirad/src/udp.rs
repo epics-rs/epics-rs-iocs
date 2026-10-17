@@ -188,10 +188,11 @@ mod tests {
         let busy = UdpSocket::bind("0.0.0.0:0").unwrap();
         let port = busy.local_addr().unwrap().port();
         let e = bind_status_socket(port).unwrap_err().to_string();
-        assert_eq!(
-            e,
-            format!("Error in binding port {port}: Address already in use")
-        );
+        // The strerror text is the OS's own; Windows words it differently.
+        let text = e
+            .strip_prefix(&format!("Error in binding port {port}: "))
+            .unwrap_or_else(|| panic!("{e}"));
+        assert!(!text.is_empty() && !text.contains("(os error"), "{e}");
     }
 
     fn sensor(packets: usize) -> Sensor {
