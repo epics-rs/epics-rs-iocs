@@ -7,11 +7,14 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::registry::claim_port;
+use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::device_state::Model2Params;
 use epics_rs::motor::devices::{model2_params, motor_interface_params};
 
+use crate::drv_motor_asyn::{Axis, DrvMotorAsyn, DrvSet};
 use crate::iocsh::{arg_int_req, arg_str_req};
 use crate::model1::c_int;
 use crate::{Controller, TraceUser, register_drv_motor_asyn_port};
@@ -25,6 +28,7 @@ struct Card {
     logs: Vec<Arc<AxisLog>>,
     /// The drvAsynMotorConfigure ports that opened the card.
     ports: Vec<String>,
+    setters: Vec<Arc<Mutex<dyn DrvSet>>>,
 }
 
 /// The `logFunc`/`logParam` pair an axis's `motorAxisSetLog` keeps
@@ -124,6 +128,7 @@ impl Model2 {
             },
             logs: Vec::new(),
             ports: Vec::new(),
+            setters: Vec::new(),
         });
     }
 
@@ -141,6 +146,7 @@ impl Model2 {
             poller: Poller::Driver(poller),
             logs: Vec::new(),
             ports: Vec::new(),
+            setters: Vec::new(),
         });
     }
 
@@ -151,6 +157,22 @@ impl Model2 {
         if let Some(c) = cards.iter_mut().find(|c| c.card == card) {
             c.logs = logs;
         }
+    }
+
+    /// The `motorAxisSetInteger`/`motorAxisSetDouble` of each of `card`'s
+    /// axes, by axis, for the port's writes; set after
+    /// `set_card`/`set_card_on`.
+    pub fn set_axis_setters(&self, card: i32, setters: Vec<Arc<Mutex<dyn DrvSet>>>) {
+        let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cards.iter_mut().find(|c| c.card == card) {
+            c.setters = setters;
+        }
+    }
+
+    fn axis_setter(&self, card: i32, axis: i32) -> Option<Arc<Mutex<dyn DrvSet>>> {
+        let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
+        let card = cards.iter().find(|c| c.card == card)?;
+        card.setters.get(usize::try_from(axis).ok()?).cloned()
     }
 
     fn axis_log(&self, card: i32, axis: i32) -> Option<Arc<AxisLog>> {
@@ -247,25 +269,45 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                 println!("drvAsynMotorConfigure ERROR: Can't find driver: {driver_name}");
                 return Ok(CommandOutcome::Continue);
             };
+            let Ok(claim) = claim_port(&port_name) else {
+                println!("drvAsynMotorConfigure ERROR: Can't register port");
+                return Ok(CommandOutcome::Continue);
+            };
             register_drv_motor_asyn_port(&port_name, num_axes)?;
             // The driver's one task polls the card's axes in turn.
             let poller = driver.poller(card);
             let controller = poller.as_ref().map(Poller::controller);
+            let mut axes = Vec::new();
             for addr in 0..num_axes {
                 let (Some(controller), Some(motor)) = (&controller, driver.open(card, addr)) else {
                     println!("drvAsynMotorConfigure: Failed to open axis {addr}");
+                    axes.push(None);
                     continue;
                 };
                 let user = TraceUser::Model2 {
                     port: port_name.clone(),
                     addr,
                 };
-                controller.install(user, motor)?;
+                let wakeup = controller.install(user, motor.clone())?;
+                axes.push(Some(Axis::new(
+                    motor,
+                    driver.axis_setter(card, addr),
+                    wakeup,
+                )));
                 if let Some(log) = driver.axis_log(card, addr) {
                     log.attach(&port_name, addr);
                 }
             }
             driver.add_port(card, &port_name);
+            let port = DrvMotorAsyn::new(&port_name, axes);
+            let (rt, _thread) = create_port_runtime(&claim, port, RuntimeConfig::default())
+                .map_err(|e| e.to_string())?;
+            claim
+                .publish(
+                    rt.port_handle().clone(),
+                    ctx.db().scan_control().interrupt_gate(),
+                )
+                .map_err(|e| e.to_string())?;
             if let (
                 Some(controller),
                 Some(Poller::Configured {
@@ -420,5 +462,169 @@ mod axis_log {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(text.contains("axis one\n"), "{text}");
+    }
+}
+
+#[cfg(all(test, feature = "testing", target_os = "linux"))]
+mod asyn_writes {
+    use super::*;
+    use crate::testing::run_command;
+    use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+    use epics_rs::asyn::interfaces::motor::{MotorStatus, PollFailure};
+    use epics_rs::asyn::port::DrvUserRequest;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::asyn::user::AsynUser;
+
+    /// What the port called on the axis.
+    #[derive(Default)]
+    struct Recorder(Vec<String>);
+
+    impl AsynMotor for Recorder {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            position: f64,
+            min_velocity: f64,
+            velocity: f64,
+            acceleration: f64,
+        ) -> AsynResult<()> {
+            self.0.push(format!(
+                "move {position} {min_velocity} {velocity} {acceleration}"
+            ));
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, forward: bool) -> AsynResult<()> {
+            self.0.push(format!("home {forward}"));
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, acceleration: f64) -> AsynResult<()> {
+            self.0.push(format!("stop {acceleration}"));
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            Ok(MotorStatus::default())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::NONE
+        }
+    }
+
+    /// A driver whose setInteger/setDouble know no function, as MM4000's
+    /// `default:` (drvMM4000Asyn.c:384, :443).
+    struct Unknown(Arc<AxisLog>);
+
+    impl DrvSet for Unknown {
+        fn set_integer(&mut self, _: &AsynUser, function: i32, _: i32) -> AsynResult<()> {
+            self.0.print(
+                TraceMask::ERROR,
+                format_args!("motorAxisSetInteger: unknown function {function}\n"),
+            );
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: String::new(),
+            })
+        }
+        fn set_double(&mut self, _: &AsynUser, function: i32, _: f64) -> AsynResult<()> {
+            self.0.print(
+                TraceMask::ERROR,
+                format_args!("motorAxisSetDouble: unknown function {function}\n"),
+            );
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: String::new(),
+            })
+        }
+    }
+
+    static WRITTEN: Model2 = Model2::new("written", 0);
+
+    /// drvMotorAsyn.c:576-752: the port's writes reach the driver's motion
+    /// calls with the velocities written before, and every other function
+    /// its setInteger/setDouble.
+    #[epics_rs::base::epics_test]
+    async fn the_port_s_writes_reach_the_driver() {
+        let recorder = Arc::new(Mutex::new(Recorder::default()));
+        let log: Arc<AxisLog> = Arc::default();
+        WRITTEN.set_card(0, vec![recorder.clone()], 100, 1000);
+        WRITTEN.set_axis_logs(0, vec![log.clone()]);
+        WRITTEN.set_axis_setters(0, vec![Arc::new(Mutex::new(Unknown(log)))]);
+        let args = vec![
+            ArgValue::String("writtenPort".into()),
+            ArgValue::String("written".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(2),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&WRITTEN]), args).await;
+
+        let path = std::env::temp_dir().join(format!("model2-writes-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("writtenPort"), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        trace.set_device_trace_file("writtenPort", 0, TraceFile::File(file.clone()));
+        let port = manager.find_port_handle("writtenPort").unwrap();
+        let errors = std::thread::spawn(move || {
+            let reason = |info: &str| {
+                port.drv_user_create_blocking(&DrvUserRequest::new(info, 0))
+                    .map(|i| i.reason)
+                    .map_err(|e| e.message().to_string())
+            };
+            let defer = reason("motor_defer_moves").unwrap();
+            let home = reason("MOTOR_MOVE_HOME").unwrap();
+            let mut errors = vec![reason("MOTOR_SPEED").unwrap_err()];
+            port.write_float64_blocking(reason("MOTOR_VELOCITY").unwrap(), 0, 2.0)
+                .unwrap();
+            port.write_float64_blocking(reason("MOTOR_VEL_BASE").unwrap(), 0, 0.5)
+                .unwrap();
+            port.write_float64_blocking(reason("MOTOR_ACCEL").unwrap(), 0, 4.0)
+                .unwrap();
+            port.write_float64_blocking(reason("MOTOR_MOVE_ABS").unwrap(), 0, 7.0)
+                .unwrap();
+            port.write_int32_blocking(reason("MOTOR_HOME").unwrap(), 0, 1)
+                .unwrap();
+            port.write_int32_blocking(reason("MOTOR_STOP_AXIS").unwrap(), 0, 1)
+                .unwrap();
+            assert!(port.write_int32_blocking(defer, 0, 1).is_err());
+            assert!(port.write_float64_blocking(home, 0, 3.0).is_err());
+            for addr in [1, 2] {
+                errors.push(
+                    port.write_int32_blocking(defer, addr, 1)
+                        .unwrap_err()
+                        .message()
+                        .to_string(),
+                );
+            }
+            errors
+        })
+        .join()
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            errors,
+            [
+                "drvmotorAsyn::drvUserCreate, unknown command=MOTOR_SPEED",
+                "drvMotorAsyn::writeInt32 Uninitialised axis 1",
+                "drvMotorAsyn::writeInt32 Invalid axis 2",
+            ]
+        );
+        assert_eq!(
+            recorder.lock().unwrap().0,
+            ["move 7 0.5 2 4", "home true", "stop 4"]
+        );
+        for line in [
+            "drvMotorAsyn::writeFloat64, reason=104, value=7.000000\n",
+            "drvMotorAsyn::writeInt32, reason=106, value=1\n",
+            "motorAxisSetInteger: unknown function 26\n",
+            "drvMotorAsyn::writeInt32, reason=26, value=1\n",
+            "motorAxisSetDouble: unknown function 27\n",
+            "drvMotorAsyn::writeFloat64, reason=27, value=3.000000\n",
+        ] {
+            assert!(text.contains(line), "{line:?} not in {text}");
+        }
     }
 }

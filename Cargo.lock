@@ -2719,6 +2719,7 @@ dependencies = [
 name = "motor-common"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "tokio",
 ]
