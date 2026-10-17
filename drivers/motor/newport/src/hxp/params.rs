@@ -7,10 +7,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::{PortDriverBase, param_list};
-use epics_rs::asyn::user::AsynUser;
+use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::motor::controller_port::{
-    ControllerParams, ControllerReport, ParamWrite, has_motor_axis,
+    AxisUser, ControllerParams, ControllerReport, ParamWrite, has_motor_axis,
 };
 
 use super::axis::{MoveLine, xps_status};
@@ -137,7 +136,7 @@ impl ControllerParams for HxpControllerParams {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         // C dereferences the null axis there (HXPDriver.cpp:185-190); refused as the base does.
@@ -148,8 +147,7 @@ impl ControllerParams for HxpControllerParams {
             return ParamWrite::PassToBase(Ok(()));
         };
         let reason = user.reason;
-        // C getAxis: getAddress resolves -1 to 0.
-        let addr = param_list(base.flags.multi_device, user.addr);
+        let addr = user.addr;
         if reason == p.move_coord_sys && addr == 0 {
             self.coord_sys = value;
             // C `move()` reads it at address 0: 0 is Work, anything else Tool.
@@ -412,6 +410,7 @@ mod tests {
     #[test]
     fn an_axis_move_sets_the_address_0_error() {
         use epics_rs::asyn::interfaces::motor::AsynMotor;
+        use epics_rs::asyn::user::AsynUser;
 
         let r = rig("hxpAxisError");
         let line = r.controller.lock().unwrap().line(1).unwrap();
