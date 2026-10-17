@@ -125,6 +125,12 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                     idle_poll_ms,
                 )?;
             }
+            crate::poller::start(
+                &controller,
+                Duration::from_millis(moving_poll_ms),
+                Duration::from_millis(idle_poll_ms),
+                fw_minor,
+            );
             Ok(CommandOutcome::Continue)
         },
     )
