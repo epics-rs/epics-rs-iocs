@@ -27,9 +27,7 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! The written parameters: disable-set-position guard, encoder offset
-//! sets, max velocity/acceleration writes, global variable read/write and
-//! ACSPL program start/stop.
+//! Global variable read/write and ACSPL program start/stop.
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -239,6 +237,8 @@ pub struct SpiiPlusController {
     homing: Vec<Homing>,
     /// Each axis's `motorRecResolution_`, as the record last wrote it.
     rec_resolution: Vec<Option<f64>>,
+    /// Each axis's `SPIIPLUS_DISABLE_SET_POS`, which `setPosition` reads.
+    disable_set_pos: Vec<bool>,
     /// The readback parameters, once the controller port has made them.
     readbacks: Option<Readbacks>,
     polled: Polled,
@@ -384,6 +384,7 @@ impl SpiiPlusController {
             motion: vec![AxisMotion::default(); num_axes],
             homing: vec![Homing::default(); num_axes],
             rec_resolution: vec![None; num_axes],
+            disable_set_pos: vec![false; num_axes],
             readbacks: None,
             polled: Polled {
                 axis_position: vec![0.0; num_axes],
@@ -596,6 +597,82 @@ impl SpiiPlusController {
         let _ = writeln!(out);
     }
 
+    /// C `setMaxVelocity` / `setMaxAcceleration` (SPiiPlusDriver.cpp:
+    /// 924-957): `var` (`XVEL` or `XACC`) set from EGU through the
+    /// record's MRES. C divides by whatever an unset MRES leaves in its
+    /// local; here the write is refused until the record has set it.
+    fn set_max(&self, a: usize, var: &str, value: f64) -> AsynResult<()> {
+        let mres = self.rec_resolution[a]
+            .ok_or_else(|| spiiplus_err(format!("SPiiPlus: axis {a} has no MRES")))?;
+        let units = value / mres * self.setup[a].resolution;
+        self.command(&format!("{var}({a})={}", fmt(units)))
+    }
+
+    /// C `setEncoderOffset` / `setEncoder2Offset` (SPiiPlusDriver.cpp:
+    /// 1046-1118), `second` choosing encoder 2. Every outcome is printed,
+    /// so an IOC log records offset changes.
+    fn set_encoder_offset(&self, a: usize, offset: f64, second: bool) -> AsynResult<()> {
+        let (function, what, pos, offs, old) = if second {
+            (
+                "setEncoder2Offset",
+                "encoder 2 offset",
+                "F2POS",
+                "E2OFFS",
+                &self.polled.encoder2_offset,
+            )
+        } else {
+            (
+                "setEncoderOffset",
+                "encoder offset",
+                "FPOS",
+                "EOFFS",
+                &self.polled.encoder_offset,
+            )
+        };
+        let error = |args: std::fmt::Arguments<'_>| {
+            PortManager::global().trace_manager().print(
+                Some(&self.port),
+                Some(0),
+                0,
+                TraceMask::ERROR,
+                format_args!("SPiiPlusController:{function}: axis {a} {args}\n"),
+            )
+        };
+        if self.setup[a].is_virtual {
+            error(format_args!(
+                "{what} change not supported because axis is virtual"
+            ));
+            return Err(spiiplus_err(format!("SPiiPlus: axis {a} is virtual")));
+        }
+        let old = old.get(a).copied().unwrap_or_default();
+        let sign = if offset < 0.0 { " " } else { "+" };
+        let status = self.command(&format!(
+            "SET {pos}({a})={pos}({a})-{offs}({a}){sign}{}",
+            fmt(offset)
+        ));
+        match status {
+            Err(_) => error(format_args!("{what} change failed")),
+            Ok(()) => error(format_args!("{what} changed from {old:.6} to {offset:.6}")),
+        }
+        status
+    }
+
+    /// C `test` (SPiiPlusDriver.cpp:3011-3080): three binary read errors,
+    /// from variables the controller does not have.
+    fn test(&self) -> AsynResult<()> {
+        PortManager::global().trace_manager().print(
+            Some(&self.port),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            format_args!("SPiiPlusController:test: calling test function\n"),
+        );
+        let span = Span::one(0, 2);
+        let _ = self.comm.get_double_array("FAKE_VAR_1", span);
+        let _ = self.comm.get_double_array("FAKE_VAR_2", span);
+        self.comm.get_double_array("FAKE_VAR_3", span).map(|_| ())
+    }
+
     /// Send a set/motion command (C `writeReadAck`).
     fn command(&self, cmd: &str) -> AsynResult<()> {
         self.comm.write_read_ack(cmd)
@@ -775,8 +852,24 @@ impl AsynMotor for SpiiPlusAxis {
             )));
         }
         let ctrl = self.lock();
-        // C setPosition writes RPOS; the controller auto-updates APOS/FPOS.
         let rpos = self.units(position);
+        if ctrl.disable_set_pos[self.axis] {
+            PortManager::global().trace_manager().print(
+                Some(&ctrl.port),
+                Some(0),
+                0,
+                TraceMask::ERROR,
+                format_args!(
+                    "SPiiPlusController:setPosition: Changing the position of axis {} is disabled; Ignoring requested position: {rpos:.6}\n",
+                    self.axis
+                ),
+            );
+            return Err(spiiplus_err(format!(
+                "SPiiPlus: axis {} position change is disabled",
+                self.axis
+            )));
+        }
+        // C setPosition writes RPOS; the controller auto-updates APOS/FPOS.
         ctrl.command(&format!("SET RPOS({})={}", self.axis, fmt(rpos)))?;
         Ok(())
     }
@@ -938,12 +1031,26 @@ struct HomingParams {
     curr_limit: usize,
 }
 
+/// The controller action behind a float64 write C handles itself.
+type OwnFloat64 = fn(&SpiiPlusController, usize, f64) -> AsynResult<()>;
+
+/// The parameters C's `writeInt32` / `writeFloat64` act on themselves
+/// (SPiiPlusDriver.cpp:391-511), less the max params the poll also sets.
+#[derive(Clone, Copy, Debug)]
+struct Writes {
+    set_enc_offset: usize,
+    set_enc2_offset: usize,
+    disable_set_pos: usize,
+    test: usize,
+}
+
 /// C `SPiiPlusController`'s parameters and profile on the controller
 /// port: the homing parameters, stored per axis for `home()` to read, and
 /// the profile move.
 pub struct AcsMotionParams {
     controller: Arc<Mutex<SpiiPlusController>>,
     params: Option<HomingParams>,
+    writes: Option<Writes>,
     pub(crate) pulse: Option<PulseParams>,
     pub(crate) profile: SpiiProfile,
     run: RunControl,
@@ -957,6 +1064,7 @@ impl AcsMotionParams {
         let params = Self {
             controller,
             params: None,
+            writes: None,
             pulse: None,
             profile: SpiiProfile::default(),
             run,
@@ -1042,6 +1150,13 @@ impl ControllerParams for AcsMotionParams {
             base.set_float64_param(r.enc2_factor, addr, ctrl.encoder2_factor[a])?;
         }
         ctrl.readbacks = Some(r);
+        drop(ctrl);
+        self.writes = Some(Writes {
+            set_enc_offset: float(base, "SPIIPLUS_SET_ENC_OFFSET")?,
+            set_enc2_offset: float(base, "SPIIPLUS_SET_ENC2_OFFSET")?,
+            disable_set_pos: int(base, "SPIIPLUS_DISABLE_SET_POS")?,
+            test: int(base, "SPIIPLUS_TEST")?,
+        });
         Ok(())
     }
 
@@ -1107,6 +1222,12 @@ impl ControllerParams for AcsMotionParams {
         if !has_motor_axis(base, user) {
             return ParamWrite::PassToBase(Ok(()));
         }
+        if self.writes.is_some_and(|w| user.reason == w.test) {
+            return ParamWrite::Handled(self.handled(base, user, |base, ctrl| {
+                base.set_int32_param(user.reason, user.addr, value)?;
+                ctrl.test()
+            }));
+        }
         self.write_int32_own(base, user, value).into()
     }
 
@@ -1119,6 +1240,29 @@ impl ControllerParams for AcsMotionParams {
         // C returns asynError there (SPiiPlusDriver.cpp:471-472).
         if !has_motor_axis(base, user) {
             return ParamWrite::PassToBase(Ok(()));
+        }
+        let a = user.addr as usize;
+        let max = self
+            .lock()
+            .readbacks
+            .map(|r| (r.max_velocity, r.max_acceleration));
+        let offsets = self.writes.map(|w| (w.set_enc_offset, w.set_enc2_offset));
+        let own: Option<OwnFloat64> = match user.reason {
+            r if max.is_some_and(|m| r == m.0) => Some(|c, a, v| c.set_max(a, "XVEL", v)),
+            r if max.is_some_and(|m| r == m.1) => Some(|c, a, v| c.set_max(a, "XACC", v)),
+            r if offsets.is_some_and(|o| r == o.0) => {
+                Some(|c, a, v| c.set_encoder_offset(a, v, false))
+            }
+            r if offsets.is_some_and(|o| r == o.1) => {
+                Some(|c, a, v| c.set_encoder_offset(a, v, true))
+            }
+            _ => None,
+        };
+        if let Some(own) = own {
+            return ParamWrite::Handled(self.handled(base, user, |base, ctrl| {
+                base.set_float64_param(user.reason, user.addr, value)?;
+                own(ctrl, a, value)
+            }));
         }
         self.write_float64_own(base, user, value).into()
     }
@@ -1150,12 +1294,32 @@ impl AxisReport for SpiiPlusAxisReport {
 
 /// The driver's own write code, which then passes to the base.
 impl AcsMotionParams {
+    /// A write C's override finishes without the base: the parameter set
+    /// and its action, then `callParamCallbacks` (SPiiPlusDriver.cpp:
+    /// 400-437, 473-510).
+    fn handled(
+        &self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        act: impl FnOnce(&mut PortDriverBase, &SpiiPlusController) -> AsynResult<()>,
+    ) -> AsynResult<()> {
+        let status = act(base, &self.lock());
+        let _ = base.call_param_callbacks(user.addr);
+        status
+    }
+
     fn write_int32_own(
         &mut self,
         base: &mut PortDriverBase,
         user: &AsynUser,
         value: i32,
     ) -> AsynResult<()> {
+        if self
+            .writes
+            .is_some_and(|w| user.reason == w.disable_set_pos)
+        {
+            self.lock().disable_set_pos[user.addr as usize] = value != 0;
+        }
         if let Some(p) = self.params
             && user.reason == p.method
         {
@@ -1359,6 +1523,93 @@ mod tests {
             !reasons(servo.take_poll_params())
                 .iter()
                 .any(|r| max.contains(r))
+        );
+    }
+
+    /// The max writes go to the controller in its units through the
+    /// record's MRES, and wait for one (SPiiPlusDriver.cpp:924-957).
+    #[test]
+    fn max_writes_set_xvel_and_xacc_through_mres() {
+        let rig = rig("spiiMaxWrites", 2, SERVOS);
+        let resolution = rig.ctrl.lock().unwrap().setup[1].resolution;
+        rig.float(rig.param("SPIIPLUS_MAX_VELOCITY"), 1, 5.0);
+        rig.float(rig.param("SPIIPLUS_MAX_ACCELERATION"), 1, 7.0);
+        let sent = rig.sent();
+        assert_eq!(
+            sent,
+            [
+                format!("XVEL(1)={}", fmt(5.0 / 0.1 * resolution)),
+                format!("XACC(1)={}", fmt(7.0 / 0.1 * resolution)),
+            ]
+        );
+        rig.ctrl.lock().unwrap().rec_resolution[1] = None;
+        let reason = rig.param("SPIIPLUS_MAX_VELOCITY");
+        assert!(rig.port.write_float64_blocking(reason, 1, 5.0).is_err());
+        assert!(rig.sent().is_empty());
+    }
+
+    /// An encoder offset write moves the feedback by the offset change, is
+    /// logged either way, and is refused on a virtual axis
+    /// (SPiiPlusDriver.cpp:1046-1118).
+    #[test]
+    fn encoder_offset_writes_shift_the_feedback_and_are_logged() {
+        let rig = rig("spiiEncOffset", 2, SERVOS);
+        let path = std::env::temp_dir().join(format!("spii-offset-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_file(Some("spiiEncOffsetCtrl"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("spiiEncOffsetCtrl", 0, TraceFile::File(file));
+        rig.line.lock().unwrap().set("EOFFS", &[1.5, 0.0]);
+        rig.ctrl.lock().unwrap().poll().unwrap();
+        rig.sent();
+        rig.float(rig.param("SPIIPLUS_SET_ENC_OFFSET"), 0, -2.5);
+        rig.float(rig.param("SPIIPLUS_SET_ENC2_OFFSET"), 1, 3.0);
+        assert_eq!(
+            rig.sent(),
+            [
+                "SET FPOS(0)=FPOS(0)-EOFFS(0) -2.5",
+                "SET F2POS(1)=F2POS(1)-E2OFFS(1)+3"
+            ]
+        );
+        rig.ctrl.lock().unwrap().setup[0].is_virtual = true;
+        let reason = rig.param("SPIIPLUS_SET_ENC_OFFSET");
+        assert!(rig.port.write_float64_blocking(reason, 0, 1.0).is_err());
+        assert!(rig.sent().is_empty());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for line in [
+            "SPiiPlusController:setEncoderOffset: axis 0 encoder offset changed from 1.500000 to -2.500000\n",
+            "SPiiPlusController:setEncoder2Offset: axis 1 encoder 2 offset changed from 0.000000 to 3.000000\n",
+            "SPiiPlusController:setEncoderOffset: axis 0 encoder offset change not supported because axis is virtual\n",
+        ] {
+            assert!(text.contains(line), "{text}");
+        }
+    }
+
+    /// `SPIIPLUS_DISABLE_SET_POS` makes a set-position a refused no-op
+    /// (SPiiPlusDriver.cpp:1029-1042).
+    #[test]
+    fn disable_set_pos_refuses_a_set_position() {
+        let rig = rig("spiiDisableSetPos", 2, SERVOS);
+        let mut axis = SpiiPlusAxis::new(rig.ctrl.clone(), 1);
+        rig.int(rig.param("SPIIPLUS_DISABLE_SET_POS"), 1, 1);
+        assert!(axis.set_position(&AsynUser::default(), 4.0).is_err());
+        assert!(rig.sent().is_empty());
+        rig.int(rig.param("SPIIPLUS_DISABLE_SET_POS"), 1, 0);
+        axis.set_position(&AsynUser::default(), 4.0).unwrap();
+        assert_eq!(rig.sent().len(), 1);
+    }
+
+    /// C `test` reads three variables the controller does not have
+    /// (SPiiPlusDriver.cpp:3033-3036).
+    #[test]
+    fn a_test_write_reads_the_fake_variables() {
+        let rig = rig("spiiTestWrite", 1, SERVOS);
+        rig.int(rig.param("SPIIPLUS_TEST"), 0, 1);
+        assert_eq!(
+            rig.sent(),
+            ["FAKE_VAR_1", "FAKE_VAR_2", "FAKE_VAR_3"].map(|v| format!("BIN ??{v}(0,2)(0,0)"))
         );
     }
 
