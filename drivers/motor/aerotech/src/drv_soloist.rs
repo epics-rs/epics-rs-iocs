@@ -294,9 +294,10 @@ impl AsynMotor for DrvSoloistAxis {
         Ok(())
     }
 
-    /// `HomeDirection` set for `forward`, then `HOME`. C sends the PREM
-    /// with neither: restarting the transaction for `HOME` drops the PREM
-    /// line and the POST pointer with it.
+    /// `HomeDirection` set for `forward`, then the PREM line and `HOME`.
+    /// devSoloist.cc:240 overwrites the PREM it has just queued for
+    /// HOME_FOR/HOME_REV with `SETPARM 106` and hangs the POST on that
+    /// message, an accident not copied: PREM and POST go with `HOME`.
     fn home(
         &mut self,
         _user: &AsynUser,
