@@ -116,6 +116,7 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
 
             let shared = controller.poll_shared().clone();
             let controller = Arc::new(Mutex::new(controller));
+            let _ = report.controller.set(controller.clone());
             let axes = (0..total_axes)
                 .map(|axis| {
                     OmsAxis::new(controller.clone(), axis)

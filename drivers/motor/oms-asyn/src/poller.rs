@@ -116,7 +116,7 @@ impl PollShared {
     }
 
     /// C `waitInterruptible`: whether the event ended the wait.
-    fn wait(&self, timeout: Duration) -> bool {
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
         let set = self.event.lock().unwrap_or_else(|e| e.into_inner());
         let (mut set, _) = self
             .signal
@@ -540,7 +540,7 @@ fn strtol(s: &[u8]) -> Option<(i32, usize)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
 
     use epics_rs::asyn::exception::AsynException;
@@ -586,17 +586,17 @@ mod tests {
         }
     }
 
-    struct Rig {
-        controller: Arc<Mutex<OmsController>>,
-        axes: Vec<OmsAxis>,
+    pub(crate) struct Rig {
+        pub(crate) controller: Arc<Mutex<OmsController>>,
+        pub(crate) axes: Vec<OmsAxis>,
         port: PortHandle,
-        written: Arc<Mutex<Vec<String>>>,
+        pub(crate) written: Arc<Mutex<Vec<String>>>,
         replies: Replies,
     }
 
     /// A MAXnet on port `name` with an `=E`/`=h` X axis and an `=O`/`=l` Y
     /// axis, answering `replies` past their construction.
-    fn rig(name: &str, axes: usize, replies: &[(&str, &str)]) -> Rig {
+    pub(crate) fn rig(name: &str, axes: usize, replies: &[(&str, &str)]) -> Rig {
         let written = Arc::new(Mutex::new(Vec::new()));
         let table: HashMap<String, String> = [
             ("AX PS?", "=E"),
