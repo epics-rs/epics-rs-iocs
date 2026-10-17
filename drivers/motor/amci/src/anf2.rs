@@ -18,14 +18,11 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! `ANF2_RESET_ERRORS`/`ANF2_GET_INFO` are C custom asyn `Int32` params meant
-//! for `ao`/`longout` records outside the motor record (a controller
-//! `writeInt32` override) — there is no analogous generic-asyn-param-to-record
-//! binding at this port's [`AsynMotor`] boundary (mirrors the "not modeled"
-//! auxiliary parameters documented in `smaract::mcs2`). `resetErrors` is
-//! still wired internally: `poll` calls it automatically on a command-error
-//! bit, exactly as C does; only the *external*, user-triggered path is
-//! unmodeled. `has_encoder` is the only bit of `config` with a functional
+//! `ANF2_GET_INFO` is a C custom asyn `Int32` param meant for an
+//! `ao`/`longout` record outside the motor record (a controller `writeInt32`
+//! override); `ANF2_RESET_ERRORS` is ported in [`Anf2Params`]. `resetErrors`
+//! also runs from `poll` on a command-error bit, exactly as C does.
+//! `has_encoder` is the only bit of `config` with a functional
 //! effect on `AsynMotor`; the rest is decoded for the report alone.
 
 use std::collections::BTreeMap;
@@ -35,7 +32,10 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::controller_port::ParamWrite;
 
 use motor_common::util::nint;
 use motor_common::{AxisReport, ControllerParams, ControllerReport};
@@ -140,6 +140,13 @@ impl Anf2Controller {
             .write_array(axis_no * AXIS_REG_OFFSET, data.to_vec())
     }
 
+    /// C `ANF2Axis::resetErrors` (ANF2Driver.cpp:480-496).
+    fn reset_errors(&self, axis_no: i32) -> AsynResult<()> {
+        let mut reg = ZERO5;
+        reg[COMMAND] = 0x800 << 16;
+        self.write_array(axis_no, &reg)
+    }
+
     /// C `startPoller`'s periods, in seconds.
     pub fn set_poll_periods(&mut self, moving: f64, idle: f64) {
         self.poll_periods = (moving, idle);
@@ -232,13 +239,55 @@ impl Anf2Controller {
     }
 }
 
-/// The ANF2 controller's report on its asyn port.
-pub struct Anf2Params(pub Arc<Mutex<Anf2Controller>>);
+/// The ANF2 controller's own parameters and report on its asyn port.
+pub struct Anf2Params {
+    controller: Arc<Mutex<Anf2Controller>>,
+    /// C `ANF2ResetErrors_`, once created.
+    reset_errors: Option<usize>,
+}
+
+impl Anf2Params {
+    pub fn new(controller: Arc<Mutex<Anf2Controller>>) -> Self {
+        Self {
+            controller,
+            reset_errors: None,
+        }
+    }
+}
 
 impl ControllerParams for Anf2Params {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.reset_errors = Some(base.create_param("ANF2_RESET_ERRORS", ParamType::Int32)?);
+        Ok(())
+    }
+
+    /// C `ANF2Controller::writeInt32` (ANF2Driver.cpp:211-246): the value is
+    /// stored, and a 1 runs the axis's command. C dereferences a null axis
+    /// at an address `ANF2CreateAxis` never made; nothing runs there.
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> ParamWrite {
+        let addr = user.addr;
+        if Some(user.reason) != self.reset_errors {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        let _ = base.set_int32_param(user.reason, addr, value);
+        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        if value == 1 && ctrl.axes.contains_key(&addr) {
+            println!("ANF2Controller:writeInt32: Resetting errors for axis = {addr}");
+            let _ = ctrl.reset_errors(addr);
+        }
+        drop(ctrl);
+        let _ = base.call_param_callbacks(addr);
+        ParamWrite::Handled(Ok(()))
+    }
+
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         // Released before the base's report runs each axis's, which takes it.
-        self.0
+        self.controller
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .report(ctx.port_name(), out);
@@ -420,9 +469,7 @@ impl Anf2Axis {
     /// bit. Takes the already-locked controller to avoid re-locking from
     /// within `poll`.
     fn reset_errors(&self, ctrl: &Anf2Controller) -> AsynResult<()> {
-        let mut reg = ZERO5;
-        reg[COMMAND] = 0x800 << 16;
-        ctrl.write_array(self.axis_no, &reg)
+        ctrl.reset_errors(self.axis_no)
     }
 }
 

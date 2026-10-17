@@ -64,7 +64,7 @@ pub fn anf2_create_controller_command() -> CommandDef {
 
             let (controller, out_status) = Anf2Controller::new(&in_port, &out_port, num_axes);
             let controller = Arc::new(Mutex::new(controller));
-            let params = Anf2Params(controller.clone());
+            let params = Anf2Params::new(controller.clone());
             register_port_with(ctx, &port_name, num_axes as i32, params)?;
             if out_status.is_err() {
                 MotorTrace::new(port_name.clone(), 0).print_self(
@@ -387,6 +387,50 @@ mod tests {
         assert!(text.contains(&anf2_head("anf2Report0")), "{text}");
         assert!(!text.contains("Configuration for axis"), "{text}");
         assert!(text.ends_with(RULE), "{text}");
+    }
+
+    /// `cmd` on a thread of its own, awaited.
+    async fn on_shell<T: Send + 'static>(cmd: impl FnOnce() -> T + Send + 'static) -> T {
+        use epics_rs::base::runtime::task::sleep;
+        let shell = std::thread::spawn(cmd);
+        while !shell.is_finished() {
+            sleep(std::time::Duration::from_millis(5)).await;
+        }
+        shell.join().unwrap()
+    }
+
+    /// Write `value` to the port parameter `name` at `addr`, then read it
+    /// back.
+    async fn put_int32(port: &str, name: &'static str, addr: i32, value: i32) -> i32 {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::port::DrvUserRequest;
+        let port = port.to_string();
+        on_shell(move || {
+            let handle = PortManager::global().find_port_handle(&port).unwrap();
+            let reason = handle
+                .drv_user_create_blocking(&DrvUserRequest::new(name, addr))
+                .unwrap()
+                .reason;
+            handle.write_int32_blocking(reason, addr, value).unwrap();
+            handle.read_int32_blocking(reason, addr).unwrap()
+        })
+        .await
+    }
+
+    /// C `ANF2Controller::writeInt32` (ANF2Driver.cpp:211-246): a 1 on
+    /// `ANF2_RESET_ERRORS` sends the axis `resetErrors` command block
+    /// (:480-496); any value is stored.
+    #[epics_rs::base::epics_test]
+    async fn anf2_reset_errors_sends_the_reset_command_on_1() {
+        anf2_report("anf2Reset", 0).await;
+        crate::regs::fake::written("anf2ResetOut");
+        assert_eq!(put_int32("anf2Reset", "ANF2_RESET_ERRORS", 1, 0).await, 0);
+        assert_eq!(crate::regs::fake::written("anf2ResetOut"), []);
+        assert_eq!(put_int32("anf2Reset", "ANF2_RESET_ERRORS", 1, 1).await, 1);
+        assert_eq!(
+            crate::regs::fake::written("anf2ResetOut"),
+            [(10, vec![0x800 << 16, 0, 0, 0, 0])]
+        );
     }
 
     #[test]
