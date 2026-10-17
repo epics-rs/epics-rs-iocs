@@ -187,12 +187,13 @@ struct OmsWriteHook;
 
 impl WriteHook for OmsWriteHook {
     /// The writes C's branches take without calling the base, which
-    /// prints nothing for them (omsBaseController.cpp:262-292, 333-406).
+    /// prints nothing for them (omsBaseController.cpp:262-295, 333-406).
     fn handles(&self, function: usize) -> bool {
         matches!(
             function,
             index::DEFER_MOVES
                 | index::CLOSED_LOOP
+                | index::MOVE_TO_HOME
                 | index::ENCODER_POSITION
                 | index::RESOLUTION
                 | index::LOW_LIMIT
@@ -984,6 +985,19 @@ impl AsynMotor for OmsAxis {
         let moved = self.do_move(position, false, min_velocity, velocity, acceleration);
         self.poll_shared.moved(self.axis_index);
         moved
+    }
+
+    /// C keeps MOVE_TO_HOME from asynMotorController's move-to-home thread
+    /// (omsBaseController.cpp:293-295), so no move is made.
+    fn move_to_home(
+        &mut self,
+        _user: &AsynUser,
+        _position: f64,
+        _min_velocity: f64,
+        _velocity: f64,
+        _acceleration: f64,
+    ) -> AsynResult<()> {
+        Ok(())
     }
 
     fn move_relative(
