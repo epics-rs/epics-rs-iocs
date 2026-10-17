@@ -47,10 +47,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -186,9 +189,14 @@ impl SpiiPlusController {
     /// acknowledgment or value, so this is used for both queries and set
     /// commands (whose reply is discarded) to keep the stream synchronized.
     fn command(&self, cmd: &str) -> AsynResult<String> {
+        self.command_bytes(cmd.as_bytes())
+    }
+
+    /// [`command`](Self::command) for a record string's raw bytes.
+    fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
         // C send_mess/send_recv_mess flush the input before every write;
         // write_read is that flush, write and read as one exchange.
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd, READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
@@ -249,6 +257,7 @@ pub struct SpiiPlusAxis {
     axis: usize,
     prev_position: i32,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl SpiiPlusAxis {
@@ -264,6 +273,7 @@ impl SpiiPlusAxis {
                 gain_support: true,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         }
     }
 
@@ -273,27 +283,33 @@ impl SpiiPlusAxis {
 
     /// One record transaction as devSPiiPlus.cc builds it into one message:
     /// SET_VELOCITY's `VEL` when the record sends it, SET_ACCEL's `ACC` in
-    /// Buffer mode when the record sends it (`acc > 0`), then `body`. In
-    /// Buffer mode `start` follows alone, as GO or JOG end the message there.
+    /// Buffer mode when the record sends it (`acc > 0`), PREM and `;`
+    /// (devSPiiPlus.cc:187-203), then `body`. In Buffer mode `start` follows
+    /// alone, as GO or JOG end the message there.
     fn transaction(
-        &self,
+        &mut self,
         velocity: Option<f64>,
         acceleration: f64,
         body: &str,
         start: &str,
     ) -> AsynResult<()> {
+        let prem = self.strings.arm();
         let ctrl = self.lock();
         let a = self.axis;
         let buffer = matches!(ctrl.mode, CommandMode::Buffer);
-        let mut msg = String::new();
+        let mut msg = Vec::new();
         if let Some(v) = velocity {
-            msg += &format!("VEL{a}={};", nint(v));
+            msg.extend(format!("VEL{a}={};", nint(v)).into_bytes());
         }
         if buffer && acceleration > 0.0 {
-            msg += &format!("ACC{a}={};", nint(acceleration));
+            msg.extend(format!("ACC{a}={};", nint(acceleration)).into_bytes());
         }
-        msg += body;
-        ctrl.command(&msg)?;
+        if !prem.is_empty() {
+            msg.extend(prem);
+            msg.push(b';');
+        }
+        msg.extend(body.as_bytes());
+        ctrl.command_bytes(&msg)?;
         if buffer {
             ctrl.command(start)?;
         }
@@ -398,9 +414,14 @@ impl AsynMotor for SpiiPlusAxis {
                     &format!("start {a}, 1"),
                 )
             }
-            CommandMode::Connect | CommandMode::Direct => Err(spiiplus_err(
-                "SPiiPlus: homing is only available in Buffer command mode",
-            )),
+            // C sends VEL and PREM here and arms POST; PREM is dropped with
+            // the error, POST still follows the next done poll.
+            CommandMode::Connect | CommandMode::Direct => {
+                self.strings.arm();
+                Err(spiiplus_err(
+                    "SPiiPlus: homing is only available in Buffer command mode",
+                ))
+            }
         }
     }
 
@@ -440,8 +461,27 @@ impl AsynMotor for SpiiPlusAxis {
         Ok(())
     }
 
+    /// `PRIMITIVE`: INIT alone (devSPiiPlus.cc:181-185). C ends it with
+    /// `\r` ahead of the port's own, so an empty line follows it on the C
+    /// wire; that separator has nothing to separate here.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        self.lock().command_bytes(init)?;
+        Ok(())
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let a = self.axis;
         let mode = ctrl.mode;
 
@@ -463,9 +503,16 @@ impl AsynMotor for SpiiPlusAxis {
             ),
             _ => (0, 0),
         };
-        drop(ctrl);
 
         let d = decode_status(mode, mst, fault, done_val, opreq_val, velocity);
+        // drvSPiiPlus.cc:403-409.
+        let ls_active = (d.plus_ls && d.direction) || (d.minus_ls && !d.direction);
+        if (d.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.command_bytes(&post);
+        }
+        drop(ctrl);
 
         let position = nint(apos);
         self.prev_position = position;
@@ -605,5 +652,62 @@ mod tests {
         axis.move_velocity(&AsynUser::default(), 0.0, -20.0, 5.0)
             .unwrap();
         assert_eq!(line.sent(), ["jog/v (0), -20;"]);
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    #[test]
+    fn init_goes_out_alone() {
+        let (line, mut axis) = rig("spiiInit", CommandMode::Direct);
+        axis.primitive(&AsynUser::default(), b"enable(0)").unwrap();
+        assert_eq!(line.sent(), ["enable(0)"]);
+    }
+
+    /// devSPiiPlus.cc:187-203 and drvSPiiPlus.cc:403-409: PREM after the
+    /// record's VEL and ACC, POST once at the next done poll.
+    #[test]
+    fn prem_joins_the_move_message_and_post_follows_done() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        let (line, io) = LineRig::new("spiiPrem", move |last| match last {
+            "?VR" => "ACS SPiiPlus".into(),
+            "?APOS(0)" => "0".into(),
+            "?Done(0)" => u8::from(d.load(Ordering::SeqCst)).to_string(),
+            _ => String::new(),
+        });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Buffer).unwrap();
+        let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        let user = AsynUser::default();
+        let polled = |line: &LineRig| {
+            line.sent()
+                .into_iter()
+                .filter(|l| !l.starts_with('?'))
+                .collect::<Vec<_>>()
+        };
+
+        axis.set_move_strings(&user, b"P=1", Some(post(b"P=0")))
+            .unwrap();
+        axis.move_relative(&user, 5.0, 0.0, 100.0, 50.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL0=100;ACC0=50;P=1;Done(0)=0;target_pos(0)=5;opReq(0)=2;",
+                "start 0, 1"
+            ]
+        );
+        axis.poll(&user).unwrap();
+        assert!(polled(&line).is_empty());
+        done.store(true, Ordering::SeqCst);
+        axis.poll(&user).unwrap();
+        assert_eq!(polled(&line), ["P=0"]);
+        axis.poll(&user).unwrap();
+        assert!(polled(&line).is_empty());
     }
 }
