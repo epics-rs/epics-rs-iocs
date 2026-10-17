@@ -35,6 +35,8 @@ pub const CONFIGURE_HISTOGRAM_CHANNEL: &str =
     "asynStatus ADTimePix::configureHistogramChannel(json&)";
 pub const CONFIGURE_IMAGE_CHANNEL: &str =
     "asynStatus ADTimePix::configureImageChannel(const std::string&, json&)";
+pub const CONFIGURE_PREVIEW_SETTINGS: &str =
+    "asynStatus ADTimePix::configurePreviewSettings(json&)";
 pub const FILE_WRITER: &str = "asynStatus ADTimePix::fileWriter()";
 pub const GET_SERVER: &str = "asynStatus ADTimePix::getServer()";
 pub const INIT_ACQUISITION: &str = "asynStatus ADTimePix::initAcquisition()";

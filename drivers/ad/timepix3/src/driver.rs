@@ -1263,10 +1263,14 @@ impl TimePix3Driver {
     /// C `configurePreviewSettings` (serval_http.cpp:2063-2080).
     fn configure_preview_settings(&mut self, server: &mut Value) -> AsynResult<()> {
         let p = self.p;
-        let sampling_mode = self.int(p.prv_sampling_mode, 0);
-        let sampling = serval::enum_name(&serval::SAMPLING_MODES, sampling_mode)
-            .ok_or_else(|| Self::destination_refused(format!("sampling mode {sampling_mode}")))?;
         server["Preview"]["Period"] = json!(self.dbl(p.prv_period, 0));
+        let sampling_mode = self.int(p.prv_sampling_mode, 0);
+        let Some(sampling) = serval::enum_name(&serval::SAMPLING_MODES, sampling_mode) else {
+            return Err(self.configure_refused(
+                adlog::CONFIGURE_PREVIEW_SETTINGS,
+                format!("Invalid sampling mode index: {sampling_mode}"),
+            ));
+        };
         server["Preview"]["SamplingMode"] = json!(sampling);
         Ok(())
     }
@@ -3886,6 +3890,23 @@ mod tests {
         assert!(text.contains(&adlog::err(
             adlog::FILE_WRITER,
             "Failed to configure preview image channel 1"
+        )));
+
+        let (ok, _, text, _) = run("TPX_FW_SAMPLING", |d| {
+            let p = d.p;
+            enable(d, p.write_prv_img, p.prv_img_base);
+            d.ad.port_base
+                .set_int32_param(p.prv_sampling_mode, 0, 2)
+                .unwrap();
+        });
+        assert!(!ok);
+        assert!(text.contains(&adlog::err(
+            adlog::CONFIGURE_PREVIEW_SETTINGS,
+            "Invalid sampling mode index: 2"
+        )));
+        assert!(text.contains(&adlog::err(
+            adlog::FILE_WRITER,
+            "Failed to configure preview settings"
         )));
     }
 
