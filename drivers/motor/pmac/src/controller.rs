@@ -27,10 +27,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::motor::PortSets;
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::motor::controller_port::{
@@ -181,10 +180,8 @@ pub struct PmacController {
     /// The verdicts the last [`Self::poll`] read, for the axis polls after it.
     global_problem: bool,
     feed_rate_problem: bool,
-    /// The controller port's parameters and, once published, its handle, to
-    /// post what the poll reads.
+    /// The controller port's parameters, once published.
     params: Option<PmacParams>,
-    port: Option<PortHandle>,
     /// C's `pasynUserSelf` (the controller port, `portName`) and
     /// `lowLevelPortUser_`, which its error lines print through.
     own: MotorTrace,
@@ -210,7 +207,6 @@ impl PmacController {
             global_problem: false,
             feed_rate_problem: false,
             params: None,
-            port: None,
             own: MotorTrace::new(port, 0),
             low: MotorTrace::new(low_port, low_addr),
             throttle: ErrorThrottle::default(),
@@ -225,11 +221,6 @@ impl PmacController {
     /// C `portName`.
     pub(crate) fn port_name(&self) -> &str {
         self.own.port()
-    }
-
-    /// Post what the poll reads to the controller port from here on.
-    pub fn attach_port(&mut self, port: PortHandle) {
-        self.port = Some(port);
     }
 
     /// Whether the low-level port connected: C's `PMAC_C_COMMSERROR` at
@@ -414,9 +405,9 @@ impl PmacController {
 
     /// C `pmacController::poll`: `getGlobalStatus` and the
     /// `PMAC_C_GLOBALSTATUS` / `PMAC_C_FEEDRATE_PROBLEM` handling.
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> PortSets {
         if self.handle.is_none() {
-            return;
+            return PortSets::default();
         }
         let print_errors = self.throttle.print_errors();
         // An unread global status is 0, and with feed-rate polling on the `%`
@@ -451,7 +442,7 @@ impl PmacController {
             i32::from(self.global_problem),
             i32::from(self.feed_rate_problem),
         );
-        self.post(|p| {
+        let sets = self.post(|p| {
             let mut values = vec![
                 (p.global_status, global),
                 (p.comms_error, i32::from(!read_ok)),
@@ -468,6 +459,7 @@ impl PmacController {
                 format_args!("pmacController::poll: Error reading or setting params.\n"),
             );
         }
+        sets
     }
 
     /// One `getGlobalStatus` read, printing C's line for a failed transfer
@@ -498,33 +490,34 @@ impl PmacController {
     }
 
     /// Set address-0 parameters and run their callbacks.
-    fn post(&self, values: impl FnOnce(&PmacParams) -> Vec<(usize, i32)>) {
-        let (Some(port), Some(params)) = (&self.port, &self.params) else {
-            return;
+    fn post(&self, values: impl FnOnce(&PmacParams) -> Vec<(usize, i32)>) -> PortSets {
+        let mut sets = PortSets::default();
+        let Some(params) = &self.params else {
+            return sets;
         };
-        let updates = values(params)
-            .into_iter()
-            .map(|(reason, value)| ParamSetValue::new(reason, 0, ParamValue::Int32(value)))
-            .collect();
-        let _ = port.set_params_and_notify_blocking(0, updates);
+        for (reason, value) in values(params) {
+            sets.set(0, reason, ParamValue::Int32(value));
+        }
+        sets.call_param_callbacks(0);
+        sets
     }
 
-    /// C `getAxisInitialStatus`'s limit and gain sets on `axis` (pmacAxis.cpp:139-143).
-    pub(crate) fn post_initial_status(&self, axis: i32, status: &InitialStatus) {
-        let Some(port) = &self.port else {
-            return;
-        };
+    /// C `getAxisInitialStatus`'s limit and gain sets on `axis` and the
+    /// constructor's callParamCallbacks (pmacAxis.cpp:139-143, :97).
+    pub(crate) fn initial_status_sets(&self, axis: i32, status: &InitialStatus) -> PortSets {
         let scale = f64::from(self.axis_scale(axis));
-        let updates = [
+        let mut sets = PortSets::default();
+        for (reason, value) in [
             (index::LOW_LIMIT, status.low_limit * scale),
             (index::HIGH_LIMIT, status.high_limit * scale),
             (index::PGAIN, status.pgain),
             (index::IGAIN, status.igain),
             (index::DGAIN, status.dgain),
-        ]
-        .map(|(reason, value)| ParamSetValue::new(reason, axis, ParamValue::Float64(value)))
-        .to_vec();
-        let _ = port.set_params_and_notify_blocking(axis, updates);
+        ] {
+            sets.set(axis, reason, ParamValue::Float64(value));
+        }
+        sets.call_param_callbacks(axis);
+        sets
     }
 
     /// The last polled global feed rate (C `PMAC_C_FEEDRATE`), 0 when feed-rate
@@ -571,16 +564,9 @@ impl PmacController {
         release
     }
 
-    /// C's `setIntegerParam(PMAC_C_CommsError_, …)` from an axis's
-    /// release, to run once the controller lock is dropped: the port's own
-    /// writes take that lock.
-    pub(crate) fn comms_error_post(&self, value: i32) -> Option<impl FnOnce() + use<>> {
-        let port = self.port.clone()?;
-        let reason = self.params?.comms_error;
-        Some(move || {
-            let update = ParamSetValue::new(reason, 0, ParamValue::Int32(value));
-            let _ = port.set_params_and_notify_blocking(0, vec![update]);
-        })
+    /// C's `setIntegerParam(PMAC_C_CommsError_, …)` from an axis's release.
+    pub(crate) fn comms_error_sets(&self, value: i32) -> PortSets {
+        self.post(|p| vec![(p.comms_error, value)])
     }
 
     /// C `pmacController::writeInt32`, `PMAC_C_FeedRate_` branch: the PMAC

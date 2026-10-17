@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -50,6 +50,8 @@ pub struct PmacAxis {
     last: MotorStatus,
     /// C's per-axis `printErrors` / `printNextError_`.
     throttle: ErrorThrottle,
+    /// The controller-port steps not yet handed to the owner.
+    sets: PortSets,
 }
 
 /// Lock the shared controller. Taken as a free function on the field rather than
@@ -90,6 +92,7 @@ fn speed_preamble(axis: i32, scale: f64, velocity: f64, acceleration: f64) -> St
 impl PmacAxis {
     pub fn new(controller: Arc<Mutex<PmacController>>, axis: i32) -> Self {
         // C getAxisInitialStatus; axis 0 skips it.
+        let mut sets = PortSets::default();
         let has_encoder = axis != 0 && {
             let c = lock(&controller);
             let status = c
@@ -99,7 +102,7 @@ impl PmacAxis {
                 .ok()
                 .and_then(|resp| parse_initial_status(&resp));
             if let Some(status) = &status {
-                c.post_initial_status(axis, status);
+                sets = c.initial_status_sets(axis, status);
             } else {
                 c.trace().print_self(
                     TraceMask::ERROR,
@@ -130,6 +133,7 @@ impl PmacAxis {
             has_encoder,
             last: MotorStatus::default(),
             throttle: ErrorThrottle::default(),
+            sets,
         }
     }
 
@@ -289,6 +293,10 @@ impl AsynMotor for PmacAxis {
         PollFailure::NONE
     }
 
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -431,16 +439,10 @@ impl AsynMotor for PmacAxis {
     /// C `pmacController::writeInt32`, `motorDeferMoves_` branch, which C takes
     /// at every address: the motor record defers with 1, releases with 0.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
-        let (release, post) = {
-            let mut controller = lock(&self.controller);
-            let release = controller.set_moves_deferred(i32::from(defer));
-            let post = release
-                .comms_error
-                .and_then(|value| controller.comms_error_post(value));
-            (release, post)
-        };
-        if let Some(post) = post {
-            post();
+        let mut controller = lock(&self.controller);
+        let release = controller.set_moves_deferred(i32::from(defer));
+        if let Some(value) = release.comms_error {
+            self.sets.append(controller.comms_error_sets(value));
         }
         release.status
     }
