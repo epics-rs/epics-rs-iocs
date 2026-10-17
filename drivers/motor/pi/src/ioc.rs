@@ -625,6 +625,11 @@ static PIE816: Model1 = Model1::new(&DEV_PIE816, 10, SCAN_RATE);
 
 /// `PIE816Setup(num_cards, scan_rate)`.
 pub fn pie816_setup_command() -> CommandDef {
+    PIE816.register_report("drvPIE816", |cards| {
+        cards.report("PIE816", |card, line| {
+            format!("    PIE816 controller #{card}, {line} \n")
+        })
+    });
     PIE816.setup_command("PIE816Setup")
 }
 
@@ -655,6 +660,7 @@ pub fn pie816_config_command() -> CommandDef {
             let controller =
                 PIE816Controller::new(handle).map_err(|e| format!("PIE816Config: {e}"))?;
             let num_axes = controller.num_axes();
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
@@ -663,6 +669,7 @@ pub fn pie816_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                 PIE816.install(ctx, card, axis as i32, motor)?;
             }
+            PIE816.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -921,6 +928,33 @@ mod report {
             after,
             "    PIE710 controller 0 connection failed.\n    PIE710 controller #1, \
              port=e710RepLine, id: PI E-710 V5.000 \n"
+        );
+    }
+
+    /// drvPIE816.cc:149-174, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pie816_controller() {
+        let setup = pie816_setup_command();
+        let (_line, _io) = LineRig::new("e816RepLine", |last| match last {
+            "*IDN?" => "E-816".into(),
+            "SVO? A" => "1".into(),
+            "POS? A" => "0.000".into(),
+            _ => String::new(),
+        });
+        let (before, after) = reports(
+            "drvPIE816",
+            (setup, vec![int(2), int(10)]),
+            (
+                pie816_config_command(),
+                vec![int(1), port("e816RepLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIE816 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIE816 controller 0 connection failed.\n    PIE816 controller #1, \
+             port=e816RepLine, id: E-816 \n"
         );
     }
 }
