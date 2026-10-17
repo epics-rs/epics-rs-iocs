@@ -14,14 +14,10 @@
 //!
 //! ## Units
 //!
-//! The C driver's `axisRes` (`pitch/(4·polePairs)` for a stepper motor form, or
-//! `clPeriod` otherwise) only bridges the record's raw-step boundary to the
-//! controller's engineering units and cancels at the EGU boundary, so it is
-//! dropped: the driver boundary is controller-native units, and the record's
-//! `MRES` must carry `axisRes` as its step (raw counts are integers). The
-//! `SMChydraChangeResolution` iocsh command (a runtime `axisRes` override) is
-//! not ported — set the record `MRES` instead. The motor form is still read
-//! (`getmotor`) because it selects the `set_closed_loop` behaviour.
+//! As C, the record's steps are scaled by `axisRes` (`pitch/(4·polePairs)` for
+//! a stepper motor form, `clPeriod` otherwise) into the controller's units and
+//! divided back on poll; `SMChydraChangeResolution` overrides it. The motor
+//! form also selects the `set_closed_loop` behaviour.
 //!
 //! ## Deviations (documented)
 //!
@@ -101,6 +97,16 @@ impl HydraController {
     }
 }
 
+/// C `axisRes_` by motor form: a stepper's `pitch/(4·polePairs)`, else
+/// `clPeriod`.
+fn axis_res(motor_form: i32, pitch: f64, pole_pairs: i32, cl_period: f64) -> f64 {
+    if motor_form == 0 {
+        pitch / (4.0 * f64::from(pole_pairs))
+    } else {
+        cl_period
+    }
+}
+
 /// One hydra axis sharing a controller. Implements [`AsynMotor`].
 pub struct HydraAxis {
     controller: Arc<Mutex<HydraController>>,
@@ -109,23 +115,40 @@ pub struct HydraAxis {
     /// Motor form (`getmotor`): 0 stepper, 1 linear/torque, other. Selects the
     /// `set_closed_loop` behaviour.
     motor_form: i32,
+    /// C `axisRes_`: controller units per record step.
+    axis_res: f64,
 }
 
 impl HydraAxis {
-    /// Construct axis `axis_no` (0-based) and read its motor form. C ignores
-    /// the query's status (SMChydraAxis.cpp:15-17), so a controller that does
-    /// not answer leaves the form at `atoi("")`, 0.
+    /// Construct axis `axis_no` (0-based) and read its motor form, pitch,
+    /// pole pairs and closed-loop period for `axisRes`, as C's constructor.
+    /// C ignores the queries' status (SMChydraAxis.cpp:15-17), so a controller
+    /// that does not answer leaves each at `atoi("")`/`atof("")`, 0.
     pub fn new(controller: Arc<Mutex<HydraController>>, axis_no: usize) -> Self {
         let addr = axis_no + 1;
-        let motor_form = {
+        let (motor_form, axis_res) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            atoi(&ctrl.query(&format!("{addr} getmotor")).unwrap_or_default())
+            let read = |verb: &str| ctrl.query(&format!("{addr} {verb}")).unwrap_or_default();
+            let motor_form = atoi(&read("getmotor"));
+            let pitch = atof(&read("getpitch"));
+            let pole_pairs = atoi(&read("getpolepairs"));
+            let cl_period = atof(&read("getclperiod"));
+            (
+                motor_form,
+                axis_res(motor_form, pitch, pole_pairs, cl_period),
+            )
         };
         Self {
             controller,
             axis_no,
             motor_form,
+            axis_res,
         }
+    }
+
+    /// C `changeResolution`: replace `axisRes`.
+    pub fn change_resolution(&mut self, new_resolution: f64) {
+        self.axis_res = new_resolution;
     }
 
     fn addr(&self) -> usize {
@@ -144,8 +167,14 @@ impl HydraAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let addr = self.addr();
-        ctrl.write_only(&format!("{:.6} {addr} snv", velocity.abs()))?;
-        ctrl.write_only(&format!("{:.6} {addr} sna", acceleration.abs()))
+        ctrl.write_only(&format!(
+            "{:.6} {addr} snv",
+            (velocity * self.axis_res).abs()
+        ))?;
+        ctrl.write_only(&format!(
+            "{:.6} {addr} sna",
+            (acceleration * self.axis_res).abs()
+        ))
     }
 }
 
@@ -166,7 +195,11 @@ impl AsynMotor for HydraAxis {
     ) -> AsynResult<()> {
         let ctrl = self.lock();
         self.send_accel_velocity(&ctrl, velocity, acceleration)?;
-        ctrl.write_only(&format!("{position:.6} {} nm", self.addr()))
+        ctrl.write_only(&format!(
+            "{:.6} {} nm",
+            position * self.axis_res,
+            self.addr()
+        ))
     }
 
     fn move_relative(
@@ -179,7 +212,11 @@ impl AsynMotor for HydraAxis {
     ) -> AsynResult<()> {
         let ctrl = self.lock();
         self.send_accel_velocity(&ctrl, velocity, acceleration)?;
-        ctrl.write_only(&format!("{distance:.6} {} nr", self.addr()))
+        ctrl.write_only(&format!(
+            "{:.6} {} nr",
+            distance * self.axis_res,
+            self.addr()
+        ))
     }
 
     fn move_velocity(
@@ -227,7 +264,10 @@ impl AsynMotor for HydraAxis {
         let ctrl = self.lock();
         let addr = self.addr();
         // Set stop deceleration, then abort this axis.
-        ctrl.write_only(&format!("{:.6} {addr} ssd", acceleration.abs()))?;
+        ctrl.write_only(&format!(
+            "{:.6} {addr} ssd",
+            (acceleration * self.axis_res).abs()
+        ))?;
         ctrl.write_only(&format!("{addr} nabort"))
     }
 
@@ -235,7 +275,11 @@ impl AsynMotor for HydraAxis {
         let ctrl = self.lock();
         // setnpos takes the distance from the current position to the desired
         // origin, hence the negation (C multiplies by -1).
-        ctrl.write_only(&format!("{:.6} {} setnpos", -position, self.addr()))
+        ctrl.write_only(&format!(
+            "{:.6} {} setnpos",
+            -position * self.axis_res,
+            self.addr()
+        ))
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
@@ -298,12 +342,11 @@ impl AsynMotor for HydraAxis {
         drop(ctrl);
 
         Ok(MotorStatus {
-            position,
-            encoder_position: position,
+            position: position / self.axis_res,
+            encoder_position: position / self.axis_res,
             velocity: 0.0,
             done: !moving,
             moving,
-            has_encoder: true,
             gain_support: true,
             high_limit,
             low_limit,
@@ -317,10 +360,12 @@ impl AsynMotor for HydraAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     #[test]
     fn an_axis_of_an_unanswering_controller_is_still_built() {
-        let (handle, _) = SyncIOHandle::connect_port("HYDRA_NONE", 0, Duration::ZERO);
+        let (handle, _) =
+            SyncIOHandle::connect_port("HYDRA_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(HydraController::new(handle)));
         assert_eq!(HydraAxis::new(controller, 0).motor_form, 0);
     }
@@ -336,6 +381,12 @@ mod tests {
         assert!(powered(0x1));
         assert!(problem(0x200));
         assert!(!problem(0x1));
+    }
+
+    #[test]
+    fn axis_res_follows_the_motor_form() {
+        assert_eq!(axis_res(0, 1.0, 50, 0.0001), 0.005);
+        assert_eq!(axis_res(1, 1.0, 50, 0.0001), 0.0001);
     }
 
     #[test]

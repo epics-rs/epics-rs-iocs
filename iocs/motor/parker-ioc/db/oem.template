@@ -1,20 +1,38 @@
 # Parker OEM750: one motor record per axis. Load once per axis with ADDR = 0-based
 # axis index of port PORT; the controller unit address is ADDR + 1.
 #
-# The driver reports positions in controller counts (the motor resolution MR is
-# set to 1 and the velocity scale cancels), so MRES = 1 and EGU = counts. Done,
-# direction, limit and home status come from the R / W3 / IS queries; homing
-# zeroes the position at the home switch.
+# The record's steps are the controller's (D, PR, W3); RESOLUTION is the MR
+# steps/rev the driver divides the velocity by. MRES, RESOLUTION and the
+# motion fields are the C example's (motor.substitutions.oem).
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "asynMotor")
     field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
-    field(VELO, "$(VELO=10000)")
-    field(ACCL, "$(ACCL=0.5)")
-    field(DHLM, "$(HLM=10000000)")
-    field(DLLM, "$(LLM=-10000000)")
-    field(MRES, "$(MRES=1.0)")
-    field(EGU,  "$(EGU=counts)")
-    field(PREC, "$(PREC=0)")
+    field(VELO, "$(VELO=5)")
+    field(VBAS, "$(VBAS=1)")
+    field(ACCL, "$(ACCL=5)")
+    field(DHLM, "$(HLM=20)")
+    field(DLLM, "$(LLM=-20)")
+    field(MRES, "$(MRES=4.92125984e-5)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=5)")
+}
+
+# C OEMSupport.template's motor resolution records.
+record(longout, "$(P)$(M):Resolution") {
+    field(DESC, "Set the number of steps/revolution")
+    field(DTYP, "asynInt32")
+    field(VAL,  "$(RESOLUTION=50800)")
+    field(PINI, "YES")
+    field(EGU,  "step/rev")
+    field(OUT,  "@asyn($(PORT),$(ADDR))OEM_RESOLUTION")
+}
+
+record(longin, "$(P)$(M):Resolution_RBV") {
+    field(DESC, "Read the number of steps/revolution")
+    field(DTYP, "asynInt32")
+    field(EGU,  "step/rev")
+    field(INP,  "@asyn($(PORT),$(ADDR))OEM_RESOLUTION")
+    field(SCAN, "I/O Intr")
 }

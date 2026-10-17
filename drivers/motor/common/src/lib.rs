@@ -29,6 +29,8 @@ pub mod connect;
 pub mod iocsh;
 pub mod model1;
 pub mod model2;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod util;
 
 use std::sync::{Arc, Mutex};

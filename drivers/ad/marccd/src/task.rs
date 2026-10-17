@@ -5,7 +5,7 @@
 //! * `MarccdImageTask` is C's `getImageDataTask` — the overlapped
 //!   correction/readback path.
 //!
-//! Each thread holds the driver lock ([`Held`]) over exactly C's
+//! Each thread holds the driver lock (`Held`) over exactly C's
 //! spans, releasing it only where C calls `unlock()`: the start and image
 //! events, the exposure and acquire-period waits, `readTiff`'s waits and
 //! the image task's poll sleeps.
@@ -355,8 +355,15 @@ pub(crate) fn start_det_task(w: Worker) -> std::thread::JoinHandle<()> {
 
 /// C `marCCDTask`: it holds the lock except while waiting for a start.
 async fn det_loop(w: Worker) {
-    let Ok(mut l) = w.port.hold_driver_blocking::<MarccdDriver>() else {
-        return;
+    let mut l = match w.port.hold_driver_blocking::<MarccdDriver>() {
+        Ok(l) => l,
+        Err(e) => {
+            w.trace(
+                TraceMask::ERROR,
+                &format!("marCCD:marCCDTask: no driver lock: {e}"),
+            );
+            return;
+        }
     };
     loop {
         let acquire = l.step(|d| d.get_i32(d.ad.params.acquire));
@@ -756,8 +763,15 @@ pub(crate) fn start_image_task(w: Worker) -> std::thread::JoinHandle<()> {
 /// C `getImageDataTask`: it releases the lock for the image event and each
 /// poll sleep.
 async fn image_loop(w: Worker) {
-    let Ok(mut l) = w.port.hold_driver_blocking::<MarccdDriver>() else {
-        return;
+    let mut l = match w.port.hold_driver_blocking::<MarccdDriver>() {
+        Ok(l) => l,
+        Err(e) => {
+            w.trace(
+                TraceMask::ERROR,
+                &format!("marCCD:getImageDataTask: no driver lock: {e}"),
+            );
+            return;
+        }
     };
     loop {
         l.unlocked(|| w.image_event.wait());
@@ -789,6 +803,57 @@ mod tests {
     use epics_rs::ad_core::attributes::NDAttrValue;
     use epics_rs::ad_core::plugin::channel::ndarray_channel;
     use epics_rs::asyn::registry::claim_port;
+
+    /// A worker whose hold fails says so on the port trace instead of
+    /// exiting silently.
+    #[test]
+    fn a_task_without_the_driver_lock_traces_and_exits() {
+        use epics_rs::asyn::trace::TraceFile;
+
+        let name = "MARCCD_NOLOCK";
+        fake_server(name, |c| if c.starts_with("get_") { "0" } else { "" });
+        let det =
+            create_marccd_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        let h = det.port_handle().clone();
+        // The marServer port: its driver is no MarccdDriver, so no hold.
+        let ip = epics_rs::asyn::asyn_record::get_port(&format!("{name}_IP"))
+            .unwrap()
+            .handle
+            .clone();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        ip.trace().set_trace_file(
+            Some(ip.port_name()),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let worker = || Worker {
+            port: ip.clone(),
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            image_event: Arc::new(Event::new()),
+            acq_start: Arc::new(AtomicU64::new(0)),
+            output: ArrayPublisher::new(det.array_output().clone()),
+            pool: det.pool().clone(),
+            owner: h
+                .with_driver_blocking::<MarccdDriver, _>(|d| d.ad.owner.clone())
+                .unwrap(),
+        };
+        start_det_task(worker()).join().unwrap();
+        start_image_task(worker()).join().unwrap();
+        ip.trace()
+            .set_trace_file(Some(ip.port_name()), TraceFile::default());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains("marCCD:marCCDTask: no driver lock"),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("marCCD:getImageDataTask: no driver lock"),
+            "{text:?}"
+        );
+        std::mem::forget(det);
+    }
 
     /// marCCD.cpp:327-328 reads the driver's attributes into every frame.
     #[test]
@@ -864,7 +929,7 @@ mod tests {
     /// and its `goto done` closes the shutter (:1235).
     #[test]
     fn a_series_refused_for_its_frame_type_closes_the_shutter() {
-        use crate::driver::tests::sent_count;
+        use crate::driver::tests::wait_sent;
         use epics_rs::ad_core::driver::ShutterMode;
         use std::time::Duration;
 
@@ -908,7 +973,7 @@ mod tests {
             assert!(Instant::now() < deadline, "the series never finished");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(sent_count(&log, "shutter,0"), 1);
+        assert_eq!(wait_sent(&log, "shutter,0", 1), 1);
         std::mem::forget(det);
     }
 }

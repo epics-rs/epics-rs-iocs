@@ -79,7 +79,7 @@ impl Pcr4Driver {
         if let Err(e) = status {
             println!(
                 "drvPCR4::drvPCR4: error calling pasynOctetSyncIO->connect, status={}, error={}",
-                trace::status_code(&e),
+                e.c_status_code(),
                 e.message_display()
             );
             return Ok(unlinked(base, io));
@@ -341,7 +341,7 @@ impl QuadEmDevice for Pcr4Driver {
                                 self.base.port_base,
                                 ERROR,
                                 "drvPCR4::setAcquire error waiting for ACK response, status={}",
-                                trace::status_code(&e)
+                                e.c_status_code()
                             );
                             status = Err(e);
                             break;
@@ -350,11 +350,11 @@ impl QuadEmDevice for Pcr4Driver {
                 }
             }
 
-            let _ = self.base_set_acquire(0);
+            self.base_set_acquire(0);
             return status;
         }
 
-        let _ = self.base_set_acquire(1);
+        self.base_set_acquire(1);
         // Pushing the settings also flushes any stale input.
         let _ = self.set_acquire_params();
 

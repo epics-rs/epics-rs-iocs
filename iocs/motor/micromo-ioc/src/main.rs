@@ -1,8 +1,9 @@
 //! MicroMo MVP 2001 motor IOC.
 //!
 //! Assembles: a serial octet port (`drvAsynSerialPortConfigure`), the MVP2001
-//! iocsh commands (`MVP2001CreateController`, `MVP2001CreateAxis`), the motor
-//! record type, and the CA + PVA (QSRV) server.
+//! iocsh commands (`MVP2001CreateController`, `MVP2001CreateAxis`, and the
+//! model-1 `MicroMoSetup`, `MicroMoConfig`), the motor record type, and the
+//! CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p micromo-ioc -- st.cmd
@@ -12,7 +13,10 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_micromo::ioc::{mvp2001_create_axis_command, mvp2001_create_controller_command};
+use motor_micromo::ioc::{
+    micromo_config_command, micromo_setup_command, mvp2001_create_axis_command,
+    mvp2001_create_controller_command,
+};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -39,6 +43,8 @@ async fn main() -> CaResult<()> {
     // MVP2001 iocsh commands + motor device support.
     app = app.register_startup_command(mvp2001_create_controller_command());
     app = app.register_startup_command(mvp2001_create_axis_command());
+    app = app.register_startup_command(micromo_setup_command());
+    app = app.register_startup_command(micromo_config_command());
     app = app.register_dynamic_device_support(
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),

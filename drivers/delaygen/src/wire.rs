@@ -18,6 +18,27 @@ use crate::connect::OctetLink;
 /// `motor_common::connect`/`motor-mclennan`).
 const OCTET_REASON: usize = 0;
 
+/// None of the C delaygen drivers writes the record's
+/// `pasynUser->errorMessage`, so a failed transfer reaches the record as its
+/// status alone.
+pub(crate) fn record_error(status: AsynStatus) -> AsynError {
+    AsynError::Status {
+        status,
+        message: String::new(),
+    }
+}
+
+/// C's `if( pport->init==0 ) return asynError;` at the top of every
+/// DG645 and Coherent SDG transfer: a port whose constructor gave up after
+/// `registerPort` stays registered and refuses all I/O.
+pub(crate) fn require_init(init: bool) -> AsynResult<()> {
+    if init {
+        Ok(())
+    } else {
+        Err(record_error(AsynStatus::Error))
+    }
+}
+
 /// A failed C `pasynOctetSyncIO` transaction with the byte counts the C
 /// drivers' error lines print.
 #[derive(Debug)]

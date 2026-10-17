@@ -100,7 +100,7 @@ impl AhxxxDriver {
         if let Err(e) = status {
             println!(
                 "drvAHxxx:drvAHxxx: error calling pasynOctetSyncIO->connect, status={}, error={}",
-                trace::status_code(&e),
+                e.c_status_code(),
                 e.message_display()
             );
             return Ok(Self {
@@ -312,7 +312,7 @@ impl QuadEmDevice for AhxxxDriver {
                         self.base.port_base,
                         ERROR,
                         "drvAHxxx:setAcquire: error calling pasynOctetSyncIO->writeRead, status={}",
-                        trace::status_code(&e)
+                        e.c_status_code()
                     );
                     status = Err(e);
                     break;
@@ -325,11 +325,11 @@ impl QuadEmDevice for AhxxxDriver {
                     break;
                 }
             }
-            let _ = self.base_set_acquire(0);
+            self.base_set_acquire(0);
             return status;
         }
 
-        let _ = self.base_set_acquire(1);
+        self.base_set_acquire(1);
 
         let num_acquire = proto::naq_value(acquire_mode, num_average);
         let model = self.model;

@@ -14,6 +14,7 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use motor_common::connect::{EosRefusal, connect_with_eos, set_eos_ignored};
 use motor_common::iocsh::{
@@ -56,7 +57,8 @@ pub fn ims_create_controller_command() -> CommandDef {
             register_port(ctx, &motor_port, 1)?;
             // C prints and carries on with the user of a missing port
             // (ImsMDrivePlusMotorController.cpp:69-74).
-            let (handle, connected) = SyncIOHandle::connect_port(&io_port, 0, IMS_TIMEOUT);
+            let (handle, connected) =
+                SyncIOHandle::connect_port(&io_port, 0, IMS_TIMEOUT, InterfaceType::Octet);
             if connected.is_err() {
                 println!(
                     "\n\n{DRIVER_NAME}:ImsMDrivePlusMotorController(): ERROR connecting to \

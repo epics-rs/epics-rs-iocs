@@ -17,6 +17,7 @@ use std::time::Duration;
 use epics_rs::ad_core::driver::ADDriverBase;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -69,7 +70,8 @@ pub fn create_mythen_detector(
     max_memory: usize,
 ) -> AsynResult<MythenRuntime> {
     let port_name = claim.name();
-    let (meter, connected) = SyncIOHandle::connect_port(ip_port_name, 0, Duration::ZERO);
+    let (meter, connected) =
+        SyncIOHandle::connect_port(ip_port_name, 0, Duration::ZERO, InterfaceType::Octet);
     if let Err(e) = connected {
         // mythen.cpp:1300-1305 prints this on stdout and returns from the
         // constructor: the port exists with only ADDriver's parameters.

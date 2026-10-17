@@ -1,12 +1,9 @@
 # PI GCS2: one motor record per axis, ADDR the 0-based index of the axis in
 # SAI? order on controller port PORT, as in C's basic_asyn_motor.db.
 #
-# Positions/velocities/accelerations are the controller's native physical
-# units (GCS2 POS/MOV/VEL are already EGU on the controller), with no
-# resolution scaling in the driver, and EGU is the controller unit (typically
-# mm). MRES is the record's step (RRBV is an integer count), so set it to the
-# axis resolution; the default is the C example's (PI_GCS2.substitutions).
-# VELO/ACCL are in units/second and units/second^2.
+# The driver converts the record's steps by the axis counts-per-unit
+# (SPA? CPU Z/N) into the controller's units (typically mm), as C; MRES is the
+# C example's (PI_GCS2.substitutions).
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "asynMotor")

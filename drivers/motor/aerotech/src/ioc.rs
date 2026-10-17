@@ -8,15 +8,20 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
 use motor_common::connect::{EosRefusal, connect_with_eos};
-use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
-use motor_common::model1::c_int;
+use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_string};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1_device;
 use motor_common::model2::{Model2, Model2Axis};
 
 use crate::a3200::{self, A3200_MAX_AXES, A3200Axis, A3200Controller};
+use crate::drv_soloist::{self, DrvSoloistAxis, SOLOIST_NUM_CARDS, SoloistCard};
 use crate::ensemble::{self, ENSEMBLE_MAX_AXES, EnsembleAxis, EnsembleController};
 
 /// `TIMEOUT` of both drivers (drvEnsembleAsyn.cc:187, drvA3200Asyn.cc:86).
@@ -262,6 +267,59 @@ pub fn a3200_config_command() -> CommandDef {
                 .finalize()
                 .map_err(|e| format!("A3200AsynConfig: finalize failed: {e}"))?;
             MOTOR_A3200.set_card(card, axes);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `device(motor,VME_IO,devSoloist,"Soloist")` (devSoloist.dbd).
+static DEV_SOLOIST: DevSup = model1_device("devSoloist", "Soloist");
+
+static SOLOIST: Model1 = Model1::new(&DEV_SOLOIST, SOLOIST_NUM_CARDS, SCAN_RATE);
+
+/// `SoloistSetup(num_cards, scan_rate)`.
+pub fn soloist_setup_command() -> CommandDef {
+    SOLOIST.setup_command("SoloistSetup")
+}
+
+/// `SoloistConfig(card, name, addr)`. C registers the command with two
+/// arguments and reads the address past them; it is taken here, 0 when
+/// absent. Connects and probes the card at once, where C's `motor_init`
+/// does so at iocInit; a card that does not answer is left without its
+/// axis, as there.
+pub fn soloist_config_command() -> CommandDef {
+    CommandDef::new(
+        "SoloistConfig",
+        vec![
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_opt("asyn address (GPIB)"),
+        ],
+        "SoloistConfig(card, name, addr)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            if !SOLOIST.has_card(card) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            let addr = c_int(args, 2);
+            let (handle, connected) = SyncIOHandle::connect_port(
+                &asyn_port,
+                addr,
+                drv_soloist::TIMEOUT,
+                InterfaceType::Octet,
+            );
+            if connected.is_err() {
+                return Ok(CommandOutcome::Continue);
+            }
+            let controller = SoloistCard::new(handle, addr);
+            let Some(setup) = drv_soloist::motor_init(&controller) else {
+                return Ok(CommandOutcome::Continue);
+            };
+            let controller = Arc::new(Mutex::new(controller));
+            let motor: Arc<Mutex<dyn AsynMotor>> =
+                Arc::new(Mutex::new(DrvSoloistAxis::new(controller, setup)));
+            SOLOIST.install(ctx, card, 0, motor)?;
             Ok(CommandOutcome::Continue)
         },
     )

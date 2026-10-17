@@ -733,6 +733,7 @@ mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::registry::claim_port;
     use std::time::Duration;
 
@@ -764,7 +765,8 @@ mod tests {
     /// server port configured, getVersion fails and the port stays up.
     #[test]
     fn a_detector_whose_server_port_is_missing_still_boots() {
-        let (server, status) = SyncIOHandle::connect_port("PSL_NONE_IP", 0, Duration::ZERO);
+        let (server, status) =
+            SyncIOHandle::connect_port("PSL_NONE_IP", 0, Duration::ZERO, InterfaceType::Octet);
         assert!(status.is_err());
         let rt = create_psl_detector(&claim_port("PSL_NONE").unwrap(), server, 1 << 20)
             .expect("the detector port");

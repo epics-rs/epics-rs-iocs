@@ -78,10 +78,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -143,7 +146,15 @@ impl PIC844Controller {
     /// Write a command, no reply expected (C `send_mess`). No terminator (port
     /// output EOS) and no echo.
     fn send(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.send_bytes(cmd.as_bytes())
+    }
+
+    /// [`send`](Self::send) for raw bytes; an empty message is not sent.
+    fn send_bytes(&self, cmd: &[u8]) -> AsynResult<()> {
+        if cmd.is_empty() {
+            return Ok(());
+        }
+        self.handle.write_octet(0, cmd)?;
         Ok(())
     }
 
@@ -224,6 +235,7 @@ pub struct PIC844Axis {
     /// Wire axis number (`signal + 1`, i.e. `1`-`4`).
     n: u8,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl PIC844Axis {
@@ -241,6 +253,7 @@ impl PIC844Axis {
                 vbas_supported: false,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         };
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(polled) = ctrl.poll_status(signal) {
@@ -257,6 +270,20 @@ impl PIC844Axis {
     /// The `AXIS n;` fragment prefixed onto every command for this axis.
     fn prefix(&self) -> String {
         format!("AXIS {};", self.n)
+    }
+
+    /// One move transaction: the axis prefix and the record's earlier parts,
+    /// then PREM and a `;` ahead of the move's own command
+    /// (devPIC844.cc:188-197), whose POST waits for the move to end.
+    fn write_move(&mut self, parts: &str, command: &str) -> AsynResult<()> {
+        let mut line = format!("{}{parts}", self.prefix()).into_bytes();
+        let prem = self.strings.arm();
+        if !prem.is_empty() {
+            line.extend_from_slice(&prem);
+            line.push(b';');
+        }
+        line.extend_from_slice(command.as_bytes());
+        self.lock().send_bytes(&line)
     }
 
     /// The `MVEL {v};[ACC {a};]` move/home preamble (C `SET_VELOCITY` +
@@ -310,9 +337,8 @@ impl AsynMotor for PIC844Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let pre = self.prefix();
         let body = Self::move_preamble(velocity, acceleration);
-        self.lock().send(&format!("{pre}{body}TARG {position:.2}"))
+        self.write_move(&body, &format!("TARG {position:.2}"))
     }
 
     fn move_relative(
@@ -323,10 +349,8 @@ impl AsynMotor for PIC844Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let pre = self.prefix();
         let body = Self::move_preamble(velocity, acceleration);
-        self.lock()
-            .send(&format!("{pre}{body}TARG:RPOS {distance:+.2}"))
+        self.write_move(&body, &format!("TARG:RPOS {distance:+.2}"))
     }
 
     fn move_velocity(
@@ -337,10 +361,10 @@ impl AsynMotor for PIC844Axis {
         acceleration: f64,
     ) -> AsynResult<()> {
         // Jog: SET_ACCEL unconditional (motorRecord), then TARG:VEL (signed).
-        let pre = self.prefix();
-        self.lock().send(&format!(
-            "{pre}ACC {acceleration:.2};TARG:VEL {velocity:.2}"
-        ))
+        self.write_move(
+            &format!("ACC {acceleration:.2};"),
+            &format!("TARG:VEL {velocity:.2}"),
+        )
     }
 
     fn home(
@@ -351,10 +375,9 @@ impl AsynMotor for PIC844Axis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        let pre = self.prefix();
         let body = Self::move_preamble(velocity, acceleration);
         let dir = if forward { "POS" } else { "NEG" };
-        self.lock().send(&format!("{pre}{body}TARG:FIND {dir}"))
+        self.write_move(&body, &format!("TARG:FIND {dir}"))
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -385,12 +408,33 @@ impl AsynMotor for PIC844Axis {
         self.lock().send(&format!("{pre}{body}"))
     }
 
+    /// `PRIMITIVE`: INIT as its own message, behind the axis prefix
+    /// (devPIC844.cc:180-181).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        if init.is_empty() {
+            return Ok(());
+        }
+        let mut line = self.prefix().into_bytes();
+        line.extend_from_slice(init);
+        self.lock().send_bytes(&line)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let signal = self.n - 1;
-        let mut ctrl = self.lock();
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let polled = ctrl.poll_status(signal);
         let comm_err = ctrl.comm_state == CommState::CommErr;
-        drop(ctrl);
 
         let Some(polled) = polled else {
             if comm_err {
@@ -400,6 +444,17 @@ impl AsynMotor for PIC844Axis {
             return Ok(self.last_status.clone());
         };
         self.apply(polled);
+        // drvPIC844.cc:385-392: POST once done or stopped by a limit in the
+        // move's direction, with no axis prefix: the poll's `AXIS n;`
+        // query left this axis selected.
+        let s = &self.last_status;
+        let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
+        if (s.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.send_bytes(&post);
+        }
+        drop(ctrl);
         Ok(self.last_status.clone())
     }
 }
@@ -407,6 +462,110 @@ impl AsynMotor for PIC844Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// `MOT:COND?` for axis 1: done, moving, and moving into the -limit.
+    const DONE: u32 = 0;
+    const MOVING: u32 = 1;
+    const MOVING_LOW_LS: u32 = 1 | 1 << 12;
+
+    const QUERIES: [&str; 4] = ["AXIS 1;AXIS:STAT?", "MOT:COND?", "CURR:TPOS?", "AXIS:POS?"];
+
+    /// Axis 1 of a C-844 on a [`LineRig`] whose `MOT:COND?` reply follows
+    /// `cond`.
+    fn strings_rig(name: &str) -> (LineRig, PIC844Axis, Arc<AtomicU32>) {
+        let cond = Arc::new(AtomicU32::new(DONE));
+        let c = cond.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "*IDN?" => "C-844".into(),
+            "AXIS 1;AXIS:STAT?" => "ON".into(),
+            "MOT:COND?" => c.load(Ordering::SeqCst).to_string(),
+            _ => "0".into(),
+        });
+        let ctrl = PIC844Controller::new(io).unwrap();
+        let axis = PIC844Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        line.sent();
+        (line, axis, cond)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut PIC844Axis) -> Vec<String> {
+        axis.poll(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| !QUERIES.contains(&l.as_str()))
+            .collect()
+    }
+
+    /// devPIC844.cc:180-181: INIT as its own message, behind the axis prefix.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = strings_rig("pic844Init");
+        axis.primitive(&AsynUser::default(), b"PID 1,2,3").unwrap();
+        assert_eq!(line.sent(), ["AXIS 1;PID 1,2,3"]);
+    }
+
+    /// devPIC844.cc:188-197: PREM and a `;` ahead of the move's own command,
+    /// for that move only.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("pic844Prem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"AXIS:STAT ON", None).unwrap();
+        axis.move_absolute(&user, 5.0, 0.0, 1.0, 2.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            ["AXIS 1;MVEL 1.00;ACC 2.00;AXIS:STAT ON;TARG 5.00"]
+        );
+        axis.move_relative(&user, 5.0, 0.0, 1.0, 2.0).unwrap();
+        assert_eq!(line.sent(), ["AXIS 1;MVEL 1.00;ACC 2.00;TARG:RPOS +5.00"]);
+        axis.set_move_strings(&user, b"AXIS:STAT ON", None).unwrap();
+        axis.home(&user, 0.0, 1.0, 2.0, false).unwrap();
+        assert_eq!(
+            line.sent(),
+            ["AXIS 1;MVEL 1.00;ACC 2.00;AXIS:STAT ON;TARG:FIND NEG"]
+        );
+        axis.set_move_strings(&user, b"AXIS:STAT ON", None).unwrap();
+        axis.move_velocity(&user, 0.0, -1.0, 2.0).unwrap();
+        assert_eq!(line.sent(), ["AXIS 1;ACC 2.00;AXIS:STAT ON;TARG:VEL -1.00"]);
+    }
+
+    /// drvPIC844.cc:385-392: POST once the move is done, not while it runs,
+    /// and only once.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, cond) = strings_rig("pic844Post");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"AXIS:STAT OFF")))
+            .unwrap();
+        axis.move_absolute(&user, 5.0, 0.0, 1.0, 2.0).unwrap();
+        line.sent();
+        cond.store(MOVING, Ordering::SeqCst);
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        cond.store(DONE, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["AXIS:STAT OFF"]);
+        assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+    }
+
+    /// drvPIC844.cc:343-360: a limit in the move's direction ends it too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let (line, mut axis, cond) = strings_rig("pic844PostLs");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"AXIS:STAT OFF")))
+            .unwrap();
+        axis.move_absolute(&user, -5.0, 0.0, 1.0, 2.0).unwrap();
+        line.sent();
+        cond.store(MOVING_LOW_LS, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["AXIS:STAT OFF"]);
+    }
 
     #[test]
     fn cond_register_bit_positions_per_axis() {

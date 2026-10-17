@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::asyn_print;
-use crate::trace::{self, AsynPrint};
+use crate::trace::AsynPrint;
 use epics_rs::ad_core::driver::ndarray_driver::{ArrayOwner, handle_write_int32};
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
@@ -573,14 +573,15 @@ pub struct QuadEmShared {
 }
 
 /// C's `int status; status |= ...`: the OR of every step's `asynStatus`, so
-/// a timeout and an overflow return asynError's 3.
+/// a timeout and an overflow return asynError's 3 and a param-library
+/// refusal its own code.
 #[derive(Default)]
 struct StatusOr(i32);
 
 impl StatusOr {
     fn add<T>(&mut self, r: AsynResult<T>) {
         if let Err(e) = r {
-            self.0 |= trace::status_code(&e);
+            self.0 |= e.c_status_code();
         }
     }
 
@@ -590,21 +591,12 @@ impl StatusOr {
         self.add(r);
     }
 
-    /// C's `return (asynStatus)status` with the errorMessage it formats; an
-    /// OR no `asynStatus` names (6, 7) is returned as asynError.
+    /// C's `return (asynStatus)status` with the errorMessage it formats.
     fn into_result(self, message: impl FnOnce(i32) -> String) -> AsynResult<()> {
-        let status = match self.0 {
-            0 => return Ok(()),
-            1 => AsynStatus::Timeout,
-            2 => AsynStatus::Overflow,
-            4 => AsynStatus::Disconnected,
-            5 => AsynStatus::Disabled,
-            _ => AsynStatus::Error,
-        };
-        Err(AsynError::Status {
-            status,
-            message: message(self.0),
-        })
+        if self.0 == 0 {
+            return Ok(());
+        }
+        AsynError::from_c_status_code(self.0, message(self.0)).map_or(Ok(()), Err)
     }
 }
 
@@ -1006,14 +998,14 @@ pub trait QuadEmDevice {
     }
 
     /// `drvQuadEM::setAcquire`: starting an acquisition clears `NumAcquired`.
-    fn base_set_acquire(&mut self, value: i32) -> AsynResult<()> {
+    /// C discards both statuses and returns asynSuccess.
+    fn base_set_acquire(&mut self, value: i32) {
         if value == 1 {
             self.qe_shared().acq.lock().num_acquired = 0;
             let idx = self.qe_base().params.num_acquired;
-            self.qe_base().port_base.set_int32_param(idx, 0, 0)?;
-            self.qe_base().port_base.call_param_callbacks(0)?;
+            let _ = self.qe_base().port_base.set_int32_param(idx, 0, 0);
+            let _ = self.qe_base().port_base.call_param_callbacks(0);
         }
-        Ok(())
     }
 
     /// `drvQuadEM::reset`: push every cached EPICS setting back to the meter,
@@ -1112,6 +1104,13 @@ impl QuadEmBase {
         port_base.set_int32_param(params.read_format, 0, 0)?;
         for addr in 0..QE_MAX_DATA {
             port_base.set_float64_param(params.double_data, addr as i32, 0.0)?;
+        }
+
+        // No record queues on most addresses, so nothing would ever connect
+        // them; C exceptionConnects all twelve so asynReport shows them
+        // connected (drvQuadEM.cpp:142-152).
+        for addr in 0..=QE_MAX_DATA {
+            port_base.connect_addr(addr as i32);
         }
 
         let pool = DriverPool::for_driver(max_memory, &owner);
@@ -1532,11 +1531,10 @@ mod tests {
         }
     }
 
-    fn failed_with(r: AsynResult<()>) -> (AsynStatus, String) {
-        match r {
-            Err(AsynError::Status { status, message }) => (status, message),
-            other => panic!("expected a status error, got {other:?}"),
-        }
+    /// The status C's write returns, in its numbering, and its errorMessage.
+    fn failed_with(r: AsynResult<()>) -> (i32, String) {
+        let e = r.unwrap_err();
+        (e.c_status_code(), e.message())
     }
 
     #[test]
@@ -1546,7 +1544,7 @@ mod tests {
         assert_eq!(
             failed_with(m.qe_write_int32(&AsynUser::new(range).with_addr(0), 3)),
             (
-                AsynStatus::Disconnected,
+                4,
                 format!("drvQuadEM:writeInt32: status=4, function={range}, name=QE_RANGE, value=3")
             )
         );
@@ -1561,7 +1559,7 @@ mod tests {
         assert_eq!(
             failed_with(m.qe_write_float64(&AsynUser::new(bias_voltage).with_addr(0), 50.0)),
             (
-                AsynStatus::Timeout,
+                1,
                 format!(
                     "drvQuadEM:writeFloat64: status=1, function={bias_voltage}, \
                      name=QE_BIAS_VOLTAGE, value=50.000000"
@@ -1584,7 +1582,7 @@ mod tests {
         assert_eq!(
             failed_with(m.qe_write_int32(&AsynUser::new(acquire_mode).with_addr(0), single)),
             (
-                AsynStatus::Error,
+                3,
                 format!(
                     "drvQuadEM:writeInt32: status=3, function={acquire_mode}, \
                      name=QE_ACQUIRE_MODE, value={single}"
@@ -1681,9 +1679,9 @@ mod tests {
     }
 
     /// Overflow(2) | Disconnected(4) is 6, which no asynStatus names: the
-    /// message carries C's 6, the returned status is asynError.
+    /// message and the returned status both carry C's 6.
     #[test]
-    fn an_or_no_status_names_is_an_error() {
+    fn an_or_past_asyn_disabled_keeps_its_code() {
         let mut m = FakeMeter::new(&[
             ("set_range", AsynStatus::Overflow),
             ("read_status", AsynStatus::Disconnected),
@@ -1691,8 +1689,37 @@ mod tests {
         let range = m.base.params.range;
         let (status, message) =
             failed_with(m.qe_write_int32(&AsynUser::new(range).with_addr(0), 1));
-        assert_eq!(status, AsynStatus::Error);
+        assert_eq!(status, 6);
         assert!(message.contains("status=6,"), "{message}");
+    }
+
+    /// drvQuadEM.cpp:424 ORs setIntegerParam's asynParamInvalidList (11) for
+    /// an address past the port's lists.
+    #[test]
+    fn a_refused_param_set_carries_cs_param_status() {
+        let mut m = FakeMeter::new(&[]);
+        let geometry = m.base.params.geometry;
+        let list = QE_MAX_DATA as i32 + 1;
+        assert_eq!(
+            failed_with(m.qe_write_int32(&AsynUser::new(geometry).with_addr(list), 1)),
+            (
+                11,
+                format!(
+                    "drvQuadEM:writeInt32: status=11, function={geometry}, \
+                     name=QE_GEOMETRY, value=1"
+                )
+            )
+        );
+    }
+
+    /// drvQuadEM.cpp:148-152: every address 0-11 is connected at
+    /// construction, not only those a record later binds to.
+    #[test]
+    fn every_address_is_connected_at_construction() {
+        let base = QuadEmBase::new("QE_ADDR_CONNECT", 0).unwrap();
+        for addr in 0..=QE_MAX_DATA as i32 {
+            assert!(base.port_base.is_device_connected(addr), "addr {addr}");
+        }
     }
 
     fn acquire_busy(m: &FakeMeter) -> i32 {

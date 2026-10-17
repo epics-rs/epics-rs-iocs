@@ -1,19 +1,23 @@
 # Newport PM500: one motor record per axis, signal S of card C as in C's
 # basic_motor.db; signal 0,1,2,... is controller channel X,Y,Z,A,...
-# Positions travel the driver boundary in EGU (controller units: microns or
-# arc-sec) directly; MRES only sets the record's raw-count resolution
-# (display/deadband granularity). Velocities are EGU/sec — the driver
-# performs the wire's um/s -> mm/s conversion itself.
+# The driver boundary is raw steps of 0.01 controller units (microns or
+# arc-sec), C's drive_resolution, so MRES is 0.01 in those units. Defaults
+# are C's PM500.substitutions.
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "PM500")
     field(OUT,  "#C$(C) S$(S) @")
     field(SCAN, "Passive")
-    field(VELO, "$(VELO=100.0)")
-    field(ACCL, "$(ACCL=0.5)")
-    field(DHLM, "$(HLM=10000.0)")
-    field(DLLM, "$(LLM=-10000.0)")
-    field(MRES, "$(MRES=0.01)")
-    field(EGU,  "$(EGU=um)")
-    field(PREC, "$(PREC=3)")
+    field(DIR,  "$(DIR=Pos)")
+    field(VELO, "$(VELO=1)")
+    field(VBAS, "$(VBAS=.1)")
+    field(ACCL, "$(ACCL=.2)")
+    field(BDST, "$(BDST=0)")
+    field(BVEL, "$(BVEL=1)")
+    field(BACC, "$(BACC=.2)")
+    field(DHLM, "$(HLM=100)")
+    field(DLLM, "$(LLM=-100)")
+    field(MRES, "$(MRES=5e-5)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=5)")
 }

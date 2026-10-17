@@ -44,13 +44,12 @@
 //!
 //! ## Units
 //!
-//! `POS`/`MOV`/`TMN`/`TMX` are already physical EGU on the controller (unlike
-//! e.g. the SPiiPlus port). The C driver additionally carries a
-//! counts-per-unit (CPU) integer fraction (`PI_PARA_MOT_CPU_Z`/`_N`,
-//! `getResolution`) used only to convert between the record's raw-step frame
-//! and the controller's EGU — at the asyn-rs motor boundary (already EGU) that
-//! conversion cancels, so it is dropped here: no CPU query. The record's
-//! `MRES` must still be the axis resolution: raw counts are integers.
+//! `POS`/`MOV`/`TMN`/`TMX` are physical units on the controller. As C, the
+//! record's steps are converted by the axis counts-per-unit integer fraction
+//! (`PI_PARA_MOT_CPU_Z`/`_N`, `getResolution`): commands send
+//! `steps · N / Z`, the poll reports `position · Z / N`. C rounds that
+//! readback with `int(x + 0.5)`, which reads every negative position one count
+//! high; this port reports it unrounded.
 //!
 //! ## Config (single-step, matching upstream — not a two-step registry)
 //!
@@ -171,6 +170,12 @@ const PARA_MOT_CURR_ACCEL: i32 = 0x0B;
 const PARA_MOT_CURR_DECEL: i32 = 0x0C;
 const PARA_MOT_MAX_ACCEL: i32 = 0x4A;
 const PARA_MOT_MAX_DECEL: i32 = 0x4B;
+const PARA_MOT_CPU_Z: i32 = 0x0E;
+const PARA_MOT_CPU_N: i32 = 0x0F;
+
+/// C `PIasynAxis` CPU defaults, kept when the `SPA?` reads fail.
+const DEFAULT_CPU_Z: i32 = 1000;
+const DEFAULT_CPU_N: i32 = 1;
 
 /// Reference-velocity `SPA` parameter ID, written as the *literal hex text*
 /// `"0x50"` — the C `referenceVelCts` hardcodes `"SPA %s 0x50 %f"` directly in
@@ -209,6 +214,16 @@ fn get_value_bool(reply: &str) -> AsynResult<bool> {
     value_str(reply)
         .map(|v| atoi(v) != 0)
         .ok_or_else(|| pigcs2_err(format!("no '=' in reply {reply:?}")))
+}
+
+/// Counts per controller unit from C's integer `m_CPUnumerator`/
+/// `m_CPUdenominator`; a zero term is 1, as `getAxisPositionCts`.
+fn counts_per_unit(numerator: i32, denominator: i32) -> f64 {
+    if numerator == 0 || denominator == 0 {
+        1.0
+    } else {
+        f64::from(numerator) / f64::from(denominator)
+    }
 }
 
 /// `PIGCSController::getStatusFromBitMask`.
@@ -622,6 +637,9 @@ pub struct PIGCS2Axis {
     moving: bool,
     neg_limit: bool,
     pos_limit: bool,
+    /// Record steps per controller unit (C `m_CPUnumerator/m_CPUdenominator`).
+    cpu: f64,
+    /// Last polled position, in record steps.
     last_position: f64,
     last_direction: bool,
     low_limit: f64,
@@ -656,6 +674,7 @@ impl PIGCS2Axis {
             moving: false,
             neg_limit: false,
             pos_limit: false,
+            cpu: counts_per_unit(DEFAULT_CPU_Z, DEFAULT_CPU_N),
             last_position: 0.0,
             last_direction: false,
             low_limit: 0.0,
@@ -664,13 +683,23 @@ impl PIGCS2Axis {
         };
         let _ = axis.init_axis(port_name);
         let ctrl = axis.lock();
+        // C `getResolution` stops at the first failed read, keeps both
+        // defaults unless both succeed, and truncates the replies into ints.
+        let cpu = ctrl
+            .get_gcs_parameter(&axis.axis_name, PARA_MOT_CPU_Z)
+            .and_then(|num| {
+                let den = ctrl.get_gcs_parameter(&axis.axis_name, PARA_MOT_CPU_N)?;
+                Ok(counts_per_unit(num as i32, den as i32))
+            })
+            .unwrap_or(axis.cpu);
         let position = ctrl.get_axis_position(&axis.axis_name);
         let (mut low_limit, mut high_limit) = (axis.low_limit, axis.high_limit);
         let _ = ctrl.get_travel_limits(&axis.axis_name, &mut low_limit, &mut high_limit);
         let homed = ctrl.get_referenced_state(&axis.axis_name);
         drop(ctrl);
+        axis.cpu = cpu;
         if let Ok(position) = position {
-            axis.last_position = position;
+            axis.last_position = position * cpu;
         }
         (axis.low_limit, axis.high_limit) = (low_limit, high_limit);
         if let Ok(homed) = homed {
@@ -715,7 +744,7 @@ impl PIGCS2Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `setAccelerationCts`: lazily cache `min(MAX_ACCEL, MAX_DECEL)`, clamp
+    /// `setAccelerationCts`: convert the record's steps/s² by the CPU, lazily cache `min(MAX_ACCEL, MAX_DECEL)`, clamp
     /// the requested acceleration to it, and write `CURR_ACCEL`/`CURR_DECEL`.
     /// Gated on `knows_vel`, matching both `getMaxAcceleration` and
     /// `setAcceleration`'s own early return.
@@ -732,7 +761,9 @@ impl PIGCS2Axis {
                 .get_gcs_parameter(&self.axis_name, PARA_MOT_MAX_DECEL)?;
             self.max_acceleration = Some(max_acc.min(max_dec));
         }
-        let accel = acceleration.abs().min(self.max_acceleration.unwrap());
+        let accel = (acceleration / self.cpu)
+            .abs()
+            .min(self.max_acceleration.unwrap());
         let ctrl = self.lock();
         ctrl.set_gcs_parameter(&self.axis_name, PARA_MOT_CURR_ACCEL, accel)?;
         ctrl.set_gcs_parameter(&self.axis_name, PARA_MOT_CURR_DECEL, accel)?;
@@ -757,12 +788,13 @@ impl AsynMotor for PIGCS2Axis {
         // C `PIasynAxis::move`: VEL, then SPA accel/decel, then MOV — each an
         // independent command, no atomicity required between them.
         if velocity != 0.0 {
-            self.lock().set_velocity(&self.axis_name, velocity)?;
+            self.lock()
+                .set_velocity(&self.axis_name, velocity / self.cpu)?;
         }
         if acceleration != 0.0 {
             self.apply_acceleration(acceleration)?;
         }
-        self.lock().mov(&self.axis_name, position)?;
+        self.lock().mov(&self.axis_name, position / self.cpu)?;
         self.last_direction = position > self.last_position;
         Ok(())
     }
@@ -781,10 +813,11 @@ impl AsynMotor for PIGCS2Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         // C `moveVelocity`: VEL, then MOV toward whichever travel limit the
-        // sign of velocity selects. No acceleration write, and — unlike
-        // move_absolute — `m_lastDirection` is not updated here in C either.
+        // sign of velocity selects (TMN/TMX, already controller units). No
+        // acceleration write, and — unlike move_absolute — `m_lastDirection`
+        // is not updated here in C either.
         let ctrl = self.lock();
-        ctrl.set_velocity(&self.axis_name, velocity)?;
+        ctrl.set_velocity(&self.axis_name, velocity / self.cpu)?;
         let target = if velocity > 0.0 {
             self.high_limit
         } else {
@@ -808,7 +841,7 @@ impl AsynMotor for PIGCS2Axis {
         let ctrl = self.lock();
         ctrl.set_servo(&self.axis_name, true)?;
         if velocity != 0.0 {
-            ctrl.set_reference_velocity(&self.axis_name, velocity)?;
+            ctrl.set_reference_velocity(&self.axis_name, velocity / self.cpu)?;
         }
         ctrl.reference_axis(
             &self.axis_name,
@@ -827,7 +860,8 @@ impl AsynMotor for PIGCS2Axis {
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.lock().set_axis_position(&self.axis_name, position)
+        self.lock()
+            .set_axis_position(&self.axis_name, position / self.cpu)
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
@@ -863,7 +897,7 @@ impl AsynMotor for PIGCS2Axis {
             .flatten();
         let position = ctrl
             .get_axis_position(&self.axis_name)
-            .unwrap_or(self.last_position);
+            .map_or(self.last_position, |p| p * self.cpu);
         let (mut low_limit, mut high_limit) = (self.low_limit, self.high_limit);
         let _ = ctrl.get_travel_limits(&self.axis_name, &mut low_limit, &mut high_limit);
         drop(ctrl);
@@ -902,7 +936,6 @@ impl AsynMotor for PIGCS2Axis {
             powered: servo_control,
             problem: self.problem,
             homed: self.homed,
-            has_encoder: true,
             gain_support: true,
             ..MotorStatus::default()
         })
@@ -912,6 +945,14 @@ impl AsynMotor for PIGCS2Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_per_unit_treats_a_zero_term_as_one() {
+        assert_eq!(counts_per_unit(10000, 1), 10000.0);
+        assert_eq!(counts_per_unit(5, 2), 2.5);
+        assert_eq!(counts_per_unit(0, 1), 1.0);
+        assert_eq!(counts_per_unit(1000, 0), 1.0);
+    }
 
     #[test]
     fn value_str_extracts_after_equals() {
@@ -1093,6 +1134,7 @@ mod tests {
             moving: true,
             neg_limit: false,
             pos_limit: true,
+            cpu: 1.0,
             last_position: 0.0,
             last_direction: true,
             low_limit: 0.0,

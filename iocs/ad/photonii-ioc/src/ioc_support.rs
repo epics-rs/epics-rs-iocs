@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 
@@ -76,7 +77,12 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
                 // C ignores the connect status (PhotonII.cpp:112): a missing
                 // command port leaves a user whose every command fails.
-                let (cmd, _) = SyncIOHandle::connect_port(&command_port, 0, Duration::ZERO);
+                let (cmd, _) = SyncIOHandle::connect_port(
+                    &command_port,
+                    0,
+                    Duration::ZERO,
+                    InterfaceType::Octet,
+                );
 
                 let rt = create_photonii_detector(&claim, cmd, max_memory)
                     .map_err(|e| format!("failed to create the PhotonII detector: {e}"))?;

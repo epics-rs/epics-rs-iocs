@@ -124,10 +124,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{nint, parse_int_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -193,13 +194,18 @@ impl PIC630Controller {
     /// `\n` on the wire (see module docs). An empty command is a no-op, like
     /// C's `if (strlen(com) == 0) return OK;`.
     fn send(&self, cmd: &str) -> AsynResult<()> {
+        self.send_bytes(cmd.as_bytes())
+    }
+
+    /// [`send`](Self::send) for a record string's raw bytes.
+    fn send_bytes(&self, cmd: &[u8]) -> AsynResult<()> {
         if cmd.is_empty() {
             return Ok(());
         }
         // Consume + discard the echo. The exchange flushes stale input first,
         // so a stray line cannot be taken for the echo; C ignores the echo
         // read's outcome, and so does this.
-        let _ = self.handle.write_read(0, cmd.as_bytes(), READ_BUF);
+        let _ = self.handle.write_read(0, cmd, READ_BUF);
         Ok(())
     }
 
@@ -239,6 +245,7 @@ pub struct PIC630Axis {
     high_limit: Option<f64>,
     low_limit: Option<f64>,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl PIC630Axis {
@@ -262,6 +269,7 @@ impl PIC630Axis {
                 done: true,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         };
 
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -354,12 +362,15 @@ impl AsynMotor for PIC630Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        // devPIC630.cc:194-212: PREM as its own message ahead of the move.
+        let prem = self.strings.arm();
         let addr = self.addr;
         let ctrl = self.lock();
         ctrl.send(&format!("{addr}SV{}", Self::sv(velocity)))?;
         if acceleration > 0.0 {
             ctrl.send(&format!("{addr}SA{}", Self::sa(acceleration)))?;
         }
+        ctrl.send_bytes(&prem)?;
         ctrl.send(&format!("{addr}MA{}", nint(position)))
     }
 
@@ -371,12 +382,15 @@ impl AsynMotor for PIC630Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        // devPIC630.cc:194-212: PREM as its own message ahead of the move.
+        let prem = self.strings.arm();
         let addr = self.addr;
         let ctrl = self.lock();
         ctrl.send(&format!("{addr}SV{}", Self::sv(velocity)))?;
         if acceleration > 0.0 {
             ctrl.send(&format!("{addr}SA{}", Self::sa(acceleration)))?;
         }
+        ctrl.send_bytes(&prem)?;
         ctrl.send(&format!("{addr}MR{}", nint(distance)))
     }
 
@@ -395,9 +409,13 @@ impl AsynMotor for PIC630Axis {
             self.low_limit
         }
         .ok_or_else(|| pic630_err("PIC630: jog needs the record soft limits (none set yet)"))?;
+        // C's MA node replaces the SV node holding POST as the motion node,
+        // so C drops POST on a jog (devPIC630.cc:273-287); not copied.
+        let prem = self.strings.arm();
         let addr = self.addr;
         let ctrl = self.lock();
         ctrl.send(&format!("{addr}SA{}", Self::sa(acceleration)))?;
+        ctrl.send_bytes(&prem)?;
         ctrl.send(&format!("{addr}SV{}", Self::sv(velocity.abs())))?;
         ctrl.send(&format!("{addr}MA{}", nint(target)))
     }
@@ -411,12 +429,15 @@ impl AsynMotor for PIC630Axis {
         _forward: bool,
     ) -> AsynResult<()> {
         // HOME_FOR and HOME_REV both map to "{addr}MA0" (home = move to 0).
+        // devPIC630.cc:194-212: PREM as its own message ahead of the move.
+        let prem = self.strings.arm();
         let addr = self.addr;
         let ctrl = self.lock();
         ctrl.send(&format!("{addr}SV{}", Self::sv(velocity)))?;
         if acceleration > 0.0 {
             ctrl.send(&format!("{addr}SA{}", Self::sa(acceleration)))?;
         }
+        ctrl.send_bytes(&prem)?;
         ctrl.send(&format!("{addr}MA0"))
     }
 
@@ -445,11 +466,37 @@ impl AsynMotor for PIC630Axis {
         Ok(())
     }
 
+    /// `PRIMITIVE`: INIT as its own message (devPIC630.cc:186-192).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        self.lock().send_bytes(init)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let polled = self.poll_locked(&ctrl);
-        drop(ctrl);
         self.apply(polled);
+        // drvPIC630.cc:236-281: POST once done or stopped by a limit in the
+        // move's direction, then the reply to it.
+        let s = &self.last_status;
+        let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
+        if (s.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.send_bytes(&post);
+            ctrl.recv();
+        }
+        drop(ctrl);
         Ok(self.last_status.clone())
     }
 }
@@ -457,6 +504,105 @@ impl AsynMotor for PIC630Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// `TS` status bytes: done with no limit, moving, and moving into the
+    /// tripped -limit (0 = tripped).
+    const DONE: u8 = 0x0C;
+    const MOVING: u8 = 0x0D;
+    const MOVING_LOW_LS: u8 = 0x05;
+
+    /// Axis 1 of a C-630 on a [`LineRig`] whose `1TS` reply follows `state`;
+    /// every other command reads back its own echo.
+    fn strings_rig(name: &str) -> (LineRig, PIC630Axis, Arc<AtomicU8>) {
+        let state = Arc::new(AtomicU8::new(DONE));
+        let st = state.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "1TS" => format!("1TS:{}", st.load(Ordering::SeqCst)),
+            "1TP" => "1TP:0".into(),
+            c => c.into(),
+        });
+        let ctrl = PIC630Controller::new(io, 1).unwrap();
+        let mut axis = PIC630Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0).unwrap();
+        let user = AsynUser::default();
+        axis.set_high_limit(&user, 100.0).unwrap();
+        axis.set_low_limit(&user, -100.0).unwrap();
+        line.sent();
+        (line, axis, state)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut PIC630Axis) -> Vec<String> {
+        axis.poll(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| l != "1TS" && l != "1TP")
+            .collect()
+    }
+
+    /// devPIC630.cc:186-192: INIT as its own message.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = strings_rig("pic630Init");
+        axis.primitive(&AsynUser::default(), b"1DC3").unwrap();
+        assert_eq!(line.sent(), ["1DC3"]);
+    }
+
+    /// devPIC630.cc:194-212: PREM as its own message right ahead of each
+    /// move, for that move only.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("pic630Prem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"1DC5", None).unwrap();
+        axis.move_absolute(&user, 5.0, 0.0, 100.0, 50.0).unwrap();
+        assert_eq!(line.sent(), ["1SV100", "1SA50", "1DC5", "1MA5"]);
+        axis.move_relative(&user, 5.0, 0.0, 100.0, 50.0).unwrap();
+        assert_eq!(line.sent(), ["1SV100", "1SA50", "1MR5"]);
+        axis.set_move_strings(&user, b"1DC5", None).unwrap();
+        axis.home(&user, 0.0, 100.0, 50.0, true).unwrap();
+        assert_eq!(line.sent(), ["1SV100", "1SA50", "1DC5", "1MA0"]);
+        axis.set_move_strings(&user, b"1DC5", None).unwrap();
+        axis.move_velocity(&user, 0.0, -100.0, 50.0).unwrap();
+        assert_eq!(line.sent(), ["1SA50", "1DC5", "1SV100", "1MA-100"]);
+    }
+
+    /// drvPIC630.cc:271-281: POST once the move is done, not while it runs;
+    /// a jog's too (devPIC630.cc:273-287).
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, state) = strings_rig("pic630Post");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"1DC0")))
+            .unwrap();
+        axis.move_velocity(&user, 0.0, 100.0, 50.0).unwrap();
+        line.sent();
+        state.store(MOVING, Ordering::SeqCst);
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        state.store(DONE, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["1DC0"]);
+        assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+    }
+
+    /// drvPIC630.cc:236-252: a limit in the move's direction ends it too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let (line, mut axis, state) = strings_rig("pic630PostLs");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"1DC0")))
+            .unwrap();
+        axis.move_absolute(&user, -5.0, 0.0, 100.0, 50.0).unwrap();
+        line.sent();
+        state.store(MOVING_LOW_LS, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["1DC0"]);
+    }
 
     #[test]
     fn status_decode_matches_c_bit_layout() {

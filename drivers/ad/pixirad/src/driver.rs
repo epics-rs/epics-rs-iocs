@@ -622,6 +622,7 @@ pub fn create_pixirad_detector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::Duration;
@@ -696,7 +697,8 @@ mod tests {
     /// driver is built on a user with no port and each command fails.
     #[test]
     fn a_missing_command_port_fails_each_command() {
-        let (user, status) = SyncIOHandle::connect_port("PIXI_NONE_IP", 0, Duration::ZERO);
+        let (user, status) =
+            SyncIOHandle::connect_port("PIXI_NONE_IP", 0, Duration::ZERO, InterfaceType::Octet);
         assert!(status.is_err());
         let shared = Arc::new(SharedState {
             udp_buffers_read: AtomicI32::new(0),

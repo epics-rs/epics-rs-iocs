@@ -35,9 +35,8 @@ PM500Setup(1, 10)
 PM500Config(0, "$(SERIAL)")
 
 # One motor record per axis, signal S of card 0.
-# Positions travel the driver boundary in EGU (controller units: microns
-# or arc-sec) directly; MRES only sets the record's raw-count resolution.
-dbLoadRecords("$(PM500_IOC)/db/pm500.template", "P=$(P),M=m1,C=0,S=0,MRES=0.01,EGU=um")
+# The boundary is raw steps of 0.01 controller units (drive_resolution).
+dbLoadRecords("$(PM500_IOC)/db/pm500.template", "P=$(P),M=m1,C=0,S=0,VELO=100,VBAS=0,ACCL=.5,HLM=10000,LLM=-10000,MRES=0.01,EGU=um,PREC=3")
 
 iocInit()
 

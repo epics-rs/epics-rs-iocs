@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynError;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -103,7 +104,8 @@ fn connect_octet(port: &str, addr: i32) -> Result<SyncIOHandle, ConnectError> {
 /// still created.
 fn low_level_port_connect(self_port: &str, port: &str, addr: i32) -> Option<SyncIOHandle> {
     let trace = MotorTrace::new(self_port, 0);
-    let (handle, connected) = SyncIOHandle::connect_port(port, addr, PMAC_TIMEOUT);
+    let (handle, connected) =
+        SyncIOHandle::connect_port(port, addr, PMAC_TIMEOUT, InterfaceType::Octet);
     let kept = match connected.and_then(|()| handle.port()) {
         Err(_) => {
             trace.print_self(
@@ -642,11 +644,13 @@ mod tests {
         drop(rt);
     }
 
-    /// A PMAC that answers the global-status query and nothing else.
+    /// A PMAC that answers the global-status query and, once, the
+    /// initial-status query with `initial`.
     struct GlobalOnly {
         base: PortDriverBase,
         written: Arc<Mutex<Vec<String>>>,
         reply: Vec<u8>,
+        initial: Vec<u8>,
     }
 
     impl PortDriver for GlobalOnly {
@@ -667,7 +671,7 @@ mod tests {
             self.reply = if cmd == "???" {
                 b"000000000000".to_vec()
             } else {
-                Vec::new()
+                std::mem::take(&mut self.initial)
             };
             self.written.lock().unwrap().push(cmd);
             Ok(data.len())
@@ -687,6 +691,7 @@ mod tests {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             written: written.clone(),
             reply: Vec::new(),
+            initial: Vec::new(),
         };
         let claim = claim_port(name).unwrap();
         let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
@@ -694,12 +699,34 @@ mod tests {
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
         let controller = Arc::new(Mutex::new(controller_on(name)));
-        assert!(
-            PmacAxis::new(controller, 1)
-                .poll(&AsynUser::new(0).with_addr(1))
-                .is_err()
+        let mut axis = PmacAxis::new(controller, 1);
+        assert_eq!(
+            std::mem::take(&mut *written.lock().unwrap()),
+            ["I113 I114 I130 I131 I133"]
         );
+        assert!(!axis.has_encoder);
+        assert!(axis.poll(&AsynUser::new(0).with_addr(1)).is_err());
         assert_eq!(written.lock().unwrap()[0], "???");
+        drop(rt);
+    }
+
+    /// pmacAxis.cpp:133-145: only a parsed initial status sets HasEncoder.
+    #[test]
+    fn a_parsed_initial_status_reports_an_encoder() {
+        let name = "pmacInitialStatus";
+        let driver = GlobalOnly {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            written: Arc::new(Mutex::new(Vec::new())),
+            reply: Vec::new(),
+            initial: b"100\r-100\r2000\r1000\r500\r\x06".to_vec(),
+        };
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        let controller = Arc::new(Mutex::new(controller_on(name)));
+        assert!(PmacAxis::new(controller, 1).has_encoder);
         drop(rt);
     }
 

@@ -1,12 +1,9 @@
 # Aerotech A3200: one motor record per axis, ADDR the controller axis index
 # on the drvAsynMotorConfigure port PORT.
 #
-# The driver works in the A3200's user units (the C stepSize = 1/CountsPerUnit
-# scaling cancels at the EGU boundary) and EGU is whatever the controller's
-# CountsPerUnit is configured for (e.g. mm or deg). MRES is the record's step
-# (RRBV is an integer count and RDBD >= MRES), so set it to 1/CountsPerUnit;
-# the default is the C example's (a3.asyn.motor.substitutions). VELO/ACCL are in
-# those user units per second / per second^2.
+# The driver scales the record's steps by stepSize = 1/CountsPerUnit into the
+# controller's user units (e.g. mm or deg), as C; MRES is the C example's
+# (a3.asyn.motor.substitutions).
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "asynMotor")

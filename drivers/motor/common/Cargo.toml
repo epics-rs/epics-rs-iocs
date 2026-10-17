@@ -12,5 +12,9 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+# The recording line driver tests use.
+testing = []
+
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn", "motor"] }

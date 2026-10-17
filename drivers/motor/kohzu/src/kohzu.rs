@@ -40,10 +40,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::nint;
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -115,10 +116,9 @@ impl KohzuController {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + cmd.len());
-        out.push(STX);
-        out.extend_from_slice(cmd.as_bytes());
+    fn framed(cmd: impl AsRef<[u8]>) -> Vec<u8> {
+        let mut out = vec![STX];
+        out.extend_from_slice(cmd.as_ref());
         out
     }
 
@@ -126,6 +126,11 @@ impl KohzuController {
     /// command produces a `C\t…` reply, so this is used for both queries and
     /// set commands (whose reply is discarded) to keep the stream synchronized.
     fn command(&self, cmd: &str) -> AsynResult<String> {
+        self.command_bytes(cmd.as_bytes())
+    }
+
+    /// [`command`](Self::command) for a record string's raw bytes.
+    fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
         // C send_mess flushes the input before every write.
         let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
@@ -169,6 +174,7 @@ pub struct KohzuAxis {
     speeds: Speeds,
     prev_position: i32,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl KohzuAxis {
@@ -188,6 +194,7 @@ impl KohzuAxis {
                 gain_support: true,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         }
     }
 
@@ -199,6 +206,21 @@ impl KohzuAxis {
     /// acceleration parameter when it cannot be derived).
     fn set_speeds(&mut self, min_velocity: f64, velocity: f64, acceleration: f64) {
         self.speeds = compute_speeds(min_velocity, velocity, acceleration, self.speeds.accel);
+    }
+
+    /// A move: PREM as its own command, the axis speeds, then `command`. C puts
+    /// PREM ahead of `ASI` in one message that `write_parms` strcpy's `ASI`
+    /// over, and the move's message replaces the motion node holding POST,
+    /// so C sends neither (devSC800.cc:198-217, write_parms); not copied.
+    fn write_move(&mut self, command: &str) -> AsynResult<()> {
+        let prem = self.strings.arm();
+        let ctrl = self.lock();
+        if !prem.is_empty() {
+            ctrl.command_bytes(&prem)?;
+        }
+        self.program_speeds(&ctrl)?;
+        ctrl.command(command)?;
+        Ok(())
     }
 
     /// Program the axis speeds (C `write_parms` → `ASI`).
@@ -229,10 +251,7 @@ impl AsynMotor for KohzuAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         self.set_speeds(min_velocity, velocity, acceleration);
-        let ctrl = self.lock();
-        self.program_speeds(&ctrl)?;
-        ctrl.command(&format!("APS{}/2/0/0/{}/0/0/1", self.axis, nint(position)))?;
-        Ok(())
+        self.write_move(&format!("APS{}/2/0/0/{}/0/0/1", self.axis, nint(position)))
     }
 
     fn move_relative(
@@ -244,10 +263,7 @@ impl AsynMotor for KohzuAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         self.set_speeds(min_velocity, velocity, acceleration);
-        let ctrl = self.lock();
-        self.program_speeds(&ctrl)?;
-        ctrl.command(&format!("RPS{}/2/1/0/{}/0/0/1", self.axis, nint(distance)))?;
-        Ok(())
+        self.write_move(&format!("RPS{}/2/1/0/{}/0/0/1", self.axis, nint(distance)))
     }
 
     fn move_velocity(
@@ -265,10 +281,7 @@ impl AsynMotor for KohzuAxis {
         if self.speeds.base > self.speeds.slew {
             self.speeds.base = self.speeds.slew;
         }
-        let ctrl = self.lock();
-        self.program_speeds(&ctrl)?;
-        ctrl.command(&format!("FRP{}/2/0/0/{}/1", self.axis, polarity))?;
-        Ok(())
+        self.write_move(&format!("FRP{}/2/0/0/{}/1", self.axis, polarity))
     }
 
     fn home(
@@ -281,10 +294,7 @@ impl AsynMotor for KohzuAxis {
     ) -> AsynResult<()> {
         // C HOME_FOR/HOME_REV both emit the same ORG sequence.
         self.set_speeds(min_velocity, velocity, acceleration);
-        let ctrl = self.lock();
-        self.program_speeds(&ctrl)?;
-        ctrl.command(&format!("ORG{}/2/0/0/3/1", self.axis))?;
-        Ok(())
+        self.write_move(&format!("ORG{}/2/0/0/3/1", self.axis))
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -306,12 +316,30 @@ impl AsynMotor for KohzuAxis {
         Ok(())
     }
 
+    /// `PRIMITIVE`: INIT as its own command. C's PRIMITIVE falls to the
+    /// `send = false` default, so C never sends it (devSC800.cc:193-197,
+    /// 328-330); not copied.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        self.lock().command_bytes(init)?;
+        Ok(())
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let status_reply = ctrl.command(&format!("STR1/{}", self.axis));
         let pos_reply = ctrl.command(&format!("RDP{}/0", self.axis));
         let torque_reply = ctrl.command(&format!("RSY{}/21", self.axis));
-        drop(ctrl);
 
         // Status: "C\tSTR<a>\t1\t<move>\t<norg>\t<orgg>\t<cw>\t<ccw>\t<swng>\t<err>"
         let status_fields: Option<Vec<i32>> = status_reply.ok().and_then(|r| {
@@ -328,6 +356,7 @@ impl AsynMotor for KohzuAxis {
         });
 
         let Some(sf) = status_fields else {
+            drop(ctrl);
             // C: first failure after NORMAL is a silent RETRY; a repeat is a
             // hard comms error. Keep the last position, flag the error.
             self.last_status = MotorStatus {
@@ -367,6 +396,16 @@ impl AsynMotor for KohzuAxis {
             .map(|v| v == 0)
             .unwrap_or(false);
 
+        // drvSC800.cc:325-332, reading the reply C leaves for the next
+        // command's flush.
+        let ls_active = (plus_ls && direction) || (minus_ls && !direction);
+        if (done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.command_bytes(&post);
+        }
+        drop(ctrl);
+
         self.last_status = MotorStatus {
             position: position as f64,
             encoder_position: position as f64,
@@ -391,6 +430,120 @@ impl AsynMotor for KohzuAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// `STR` fields of the rig: moving, cw limit, ccw limit.
+    const MOVING: u8 = 1;
+    const CW: u8 = 2;
+    const CCW: u8 = 4;
+
+    /// An SC-200's axis 1 on a [`LineRig`] whose `STR` reply follows
+    /// `state`.
+    fn strings_rig(name: &str) -> (LineRig, KohzuAxis, Arc<AtomicU8>) {
+        let state = Arc::new(AtomicU8::new(0));
+        let st = state.clone();
+        let (line, io) = LineRig::new(name, move |last| {
+            let bit = |b: u8| u8::from(st.load(Ordering::SeqCst) & b != 0);
+            match last.trim_start_matches('\u{2}') {
+                "IDN" => "C\tIDN0\t200\t1.0".into(),
+                "STR1/1" => format!(
+                    "C\tSTR1\t1\t{}\t0\t0\t{}\t{}\t0\t0",
+                    bit(MOVING),
+                    bit(CW),
+                    bit(CCW)
+                ),
+                "RDP1/0" => "C\tRDP1\t0".into(),
+                "RSY1/21" => "C\tRSY1\t21\t0".into(),
+                c => format!("C\t{c}"),
+            }
+        });
+        let ctrl = KohzuController::new(io).unwrap();
+        let axis = KohzuAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        (line, axis, state)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// The commands a rig wrote, without their STX.
+    fn sent(line: &LineRig) -> Vec<String> {
+        line.sent()
+            .into_iter()
+            .map(|l| l.trim_start_matches('\u{2}').to_string())
+            .collect()
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut KohzuAxis) -> Vec<String> {
+        axis.poll(&AsynUser::default()).unwrap();
+        sent(line)
+            .into_iter()
+            .filter(|l| !["STR1/1", "RDP1/0", "RSY1/21"].contains(&l.as_str()))
+            .collect()
+    }
+
+    /// devSC800.cc:193-197: INIT as its own command.
+    #[test]
+    fn init_goes_out_as_its_own_command() {
+        let (line, mut axis, _) = strings_rig("sc800Init");
+        axis.primitive(&AsynUser::default(), b"COF1/0").unwrap();
+        assert_eq!(sent(&line), ["COF1/0"]);
+    }
+
+    /// devSC800.cc:198-217: PREM as its own command ahead of each move,
+    /// for that move only.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("sc800Prem");
+        let user = AsynUser::default();
+        let asi = "ASI1/10/100/10/10/0/0/0/0/0/0/0/0/0";
+        axis.set_move_strings(&user, b"COF1/0", None).unwrap();
+        axis.move_absolute(&user, 5.0, 10.0, 100.0, 1000.0).unwrap();
+        assert_eq!(sent(&line), ["COF1/0", asi, "APS1/2/0/0/5/0/0/1"]);
+        axis.move_relative(&user, 5.0, 10.0, 100.0, 1000.0).unwrap();
+        assert_eq!(sent(&line), [asi, "RPS1/2/1/0/5/0/0/1"]);
+        axis.set_move_strings(&user, b"COF1/0", None).unwrap();
+        axis.home(&user, 10.0, 100.0, 1000.0, true).unwrap();
+        assert_eq!(sent(&line), ["COF1/0", asi, "ORG1/2/0/0/3/1"]);
+        axis.set_move_strings(&user, b"COF1/0", None).unwrap();
+        axis.move_velocity(&user, 10.0, -100.0, 1000.0).unwrap();
+        assert_eq!(sent(&line), ["COF1/0", asi, "FRP1/2/0/0/0/1"]);
+    }
+
+    /// drvSC800.cc:325-332: POST once the move is done, not while it runs.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, state) = strings_rig("sc800Post");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"COF1/1")))
+            .unwrap();
+        axis.move_absolute(&user, 5.0, 10.0, 100.0, 1000.0).unwrap();
+        line.sent();
+        state.store(MOVING, Ordering::SeqCst);
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        state.store(0, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["COF1/1"]);
+        assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+    }
+
+    /// drvSC800.cc:293-308: a limit in the move's direction ends it too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let (line, mut axis, state) = strings_rig("sc800PostLs");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"COF1/1")))
+            .unwrap();
+        axis.move_absolute(&user, -5.0, 10.0, 100.0, 1000.0)
+            .unwrap();
+        line.sent();
+        state.store(MOVING | CCW, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["COF1/1"]);
+    }
 
     #[test]
     fn framed_prefixes_stx() {

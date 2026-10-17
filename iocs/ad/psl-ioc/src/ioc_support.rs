@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 
@@ -72,7 +73,8 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
             // C ignores the connect status (PSL.cpp:166-167): a missing server
             // port fails getVersion and leaves the port up.
-            let (server, _) = SyncIOHandle::connect_port(&server_port, 0, Duration::ZERO);
+            let (server, _) =
+                SyncIOHandle::connect_port(&server_port, 0, Duration::ZERO, InterfaceType::Octet);
 
             let rt = create_psl_detector(&claim, server, max_memory)
                 .map_err(|e| format!("failed to create the PSL detector: {e}"))?;

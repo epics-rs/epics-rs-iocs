@@ -15,13 +15,16 @@ use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
-use motor_common::connect::connect_controller;
+use motor_common::connect::{EosRefusal, connect_controller, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{asyn_user, install, register_port};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::{asyn_user, install, model1_device, register_port};
 
+use crate::drv_mvp2001::{self, DrvMvp2001Axis, MVP2001_NUM_CARDS, Mvp2001Chain};
 use crate::mvp2001::{Mvp2001Axis, Mvp2001Controller};
 
 /// Command timeout (C `DEFAULT_CONTROLLER_TIMEOUT`).
@@ -144,6 +147,59 @@ pub fn mvp2001_create_axis_command() -> CommandDef {
                 idle_poll_ms,
                 2, // C startPoller, MVP2001Driver.cpp:57
             )?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `device(motor,VME_IO,devMVP2001,"MVP2001")` (devMicroMo.dbd).
+static DEV_MVP2001: DevSup = model1_device("devMVP2001", "MVP2001");
+
+static MVP2001: Model1 = Model1::new(&DEV_MVP2001, MVP2001_NUM_CARDS, SCAN_RATE);
+
+/// `MicroMoSetup(num_cards, scan_rate)`, MicroMoRegister.cc's name for
+/// `MVP2001Setup`.
+pub fn micromo_setup_command() -> CommandDef {
+    MVP2001.setup_command("MicroMoSetup")
+}
+
+/// `MicroMoConfig(card, name)`, MicroMoRegister.cc's name for
+/// `MVP2001Config`. C never registers it, and devMicroMo.dbd never names
+/// `MicroMomotorRegister`, so neither command reaches C's iocsh. Connects and probes the chain at once, where
+/// C's `motor_init` does so at iocInit; a chain with no answering
+/// controller is left unconfigured, as there.
+pub fn micromo_config_command() -> CommandDef {
+    CommandDef::new(
+        "MicroMoConfig",
+        vec![
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+        ],
+        "MicroMoConfig(card, name)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            if !MVP2001.has_card(card) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                drv_mvp2001::COMM_TIMEOUT,
+                b"\n",
+                b"\r",
+                EosRefusal::Ignored,
+            )?;
+            let chain = Mvp2001Chain::new(handle);
+            let limits = drv_mvp2001::motor_init(&chain);
+            let chain = Arc::new(Mutex::new(chain));
+            for (signal, limits) in limits.into_iter().enumerate() {
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvMvp2001Axis::new(
+                    chain.clone(),
+                    signal,
+                    limits,
+                )));
+                MVP2001.install(ctx, card, signal as i32, motor)?;
+            }
             Ok(CommandOutcome::Continue)
         },
     )

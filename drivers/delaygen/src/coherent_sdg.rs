@@ -47,11 +47,6 @@
 //!   pair, so this is dead code in practice; this port makes the mismatch a
 //!   defined `AsynError::AddressOutOfRange` in every read/write override
 //!   below rather than reproducing the type confusion.
-//! - **This driver does not replicate `pport->init==0` guards** (checked at
-//!   the top of every C interface method) — `init` is set exactly once, at
-//!   the very end of `drvAsynCoherentSDG()`, and the port is registered
-//!   with `pasynManager` (making it reachable by any I/O request) only
-//!   *after* that assignment, so the guard can never observably fire.
 //! - **This driver does not replicate the C driver's process-wide singleton
 //!   restriction** (`if(pports) return -1`) — see the identical note in
 //!   [`crate::colby`]'s module doc for the rationale.
@@ -70,7 +65,7 @@ use epics_rs::asyn::trace::TraceMask;
 use crate::connect::OctetLink;
 use epics_rs::asyn::user::AsynUser;
 
-use crate::wire::{atof, atoi, write_read};
+use crate::wire::{self, atof, atoi, require_init, write_read};
 
 /// C `WRITEREADDELAY` (`0.100` seconds).
 const WRITEREADDELAY: Duration = Duration::from_millis(100);
@@ -265,14 +260,11 @@ fn parse_str_bin(reply: &str) -> u32 {
     k
 }
 
-fn ok_or_device_error(prefix: &str, reply: &str) -> AsynResult<()> {
+fn ok_or_device_error(reply: &str) -> AsynResult<()> {
     if is_ok_reply(reply) {
         Ok(())
     } else {
-        Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("{prefix}: device replied {reply:?} (expected \"OK\")"),
-        })
+        Err(wire::record_error(AsynStatus::Error))
     }
 }
 
@@ -302,14 +294,15 @@ fn device_write_read(port: &str, handle: &OctetLink, cmd: &str) -> AsynResult<St
 pub struct CoherentSdgDriver {
     base: PortDriverBase,
     handle: OctetLink,
+    /// C `pport->init`: every transfer refuses until [`Self::initialize`]
+    /// has had its `status?` answered.
+    init: bool,
 }
 
 impl CoherentSdgDriver {
-    /// C `drvAsynCoherentSDG(myport,ioport,ioaddr)`: queries `status?` once
-    /// as an init-time connectivity check (the C driver aborts driver
-    /// creation if this fails, storing `"*COMM FAILED*"` — moot here since a
-    /// failed `new()` never produces a driver instance to report through).
-    pub fn new(port_name: &str, handle: OctetLink) -> AsynResult<Self> {
+    /// C `drvAsynCoherentSDG(myport,ioport,ioaddr)` up to `registerPort`:
+    /// no traffic yet.
+    pub fn new(port_name: &str, handle: OctetLink) -> Self {
         let base = PortDriverBase::new(
             port_name,
             13,
@@ -320,9 +313,21 @@ impl CoherentSdgDriver {
             },
         );
 
-        device_write_read(port_name, &handle, "status?")?;
+        Self {
+            base,
+            handle,
+            init: false,
+        }
+    }
 
-        Ok(Self { base, handle })
+    /// The rest of C `drvAsynCoherentSDG`: the `status?` query. On failure
+    /// the port stays registered and uninitialised, and the error is C's
+    /// printf phrase.
+    pub fn initialize(&mut self) -> Result<(), &'static str> {
+        device_write_read(&self.base.port_name, &self.handle, "status?")
+            .map_err(|_| "failure to acquire status")?;
+        self.init = true;
+        Ok(())
     }
 }
 
@@ -335,10 +340,54 @@ impl PortDriver for CoherentSdgDriver {
         &mut self.base
     }
 
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        self.do_drv_user_create(req)
+            .map_err(|_| wire::record_error(AsynStatus::Error))
+    }
+
+    fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+        self.do_read_float64(user)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        self.do_write_float64(user, value)
+            .map_err(|_| wire::record_error(AsynStatus::Error))
+    }
+
+    fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
+        self.do_read_uint32_digital(user, mask)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    fn write_uint32_digital(
+        &mut self,
+        user: &mut AsynUser,
+        value: u32,
+        mask: u32,
+    ) -> AsynResult<()> {
+        self.do_write_uint32_digital(user, value, mask)
+            .map_err(|_| wire::record_error(AsynStatus::Error))
+    }
+
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        self.do_read_octet(user, buf)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.do_write_octet(user, data)
+            .map_err(|_| wire::record_error(AsynStatus::Error))
+    }
+}
+
+/// The C transfers; [`PortDriver`] hands their errors to the record as
+/// [`wire::record_error`].
+impl CoherentSdgDriver {
     /// C `create()` (asynDrvUser): `findCommand(addr)==NULL => asynError`
     /// — unlike Colby, CoherentSDG validates the address eagerly at
     /// record-bind time.
-    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+    fn do_drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
         let addr = req.addr;
         if find_spec(addr).is_some() {
             Ok(DrvUserInfo::from_reason(0))
@@ -347,7 +396,8 @@ impl PortDriver for CoherentSdgDriver {
         }
     }
 
-    fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+    fn do_read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+        require_init(self.init)?;
         let spec = find_spec(user.addr).ok_or(AsynError::AddressOutOfRange(user.addr))?;
         match spec.read_conv {
             ReadConv::StrFloat => {
@@ -358,19 +408,21 @@ impl PortDriver for CoherentSdgDriver {
         }
     }
 
-    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+    fn do_write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        require_init(self.init)?;
         let spec = find_spec(user.addr).ok_or(AsynError::AddressOutOfRange(user.addr))?;
         match spec.write {
             WriteKind::FloatFmt { prefix } => {
                 let cmd = format_float_write(prefix, value);
                 let reply = device_write_read(&self.base.port_name, &self.handle, &cmd)?;
-                ok_or_device_error(prefix, &reply)
+                ok_or_device_error(&reply)
             }
             _ => Err(AsynError::AddressOutOfRange(user.addr)),
         }
     }
 
-    fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
+    fn do_read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
+        require_init(self.init)?;
         let spec = find_spec(user.addr).ok_or(AsynError::AddressOutOfRange(user.addr))?;
         let raw = match spec.read_conv {
             ReadConv::StrInt => {
@@ -387,29 +439,31 @@ impl PortDriver for CoherentSdgDriver {
         Ok(raw & mask)
     }
 
-    fn write_uint32_digital(
+    fn do_write_uint32_digital(
         &mut self,
         user: &mut AsynUser,
         value: u32,
         _mask: u32,
     ) -> AsynResult<()> {
+        require_init(self.init)?;
         let spec = find_spec(user.addr).ok_or(AsynError::AddressOutOfRange(user.addr))?;
         match spec.write {
             WriteKind::IntFmt { prefix, width } => {
                 let cmd = format_int_write(prefix, width, value);
                 let reply = device_write_read(&self.base.port_name, &self.handle, &cmd)?;
-                ok_or_device_error(prefix, &reply)
+                ok_or_device_error(&reply)
             }
             WriteKind::CmdOnly(cmd) => {
                 let reply = device_write_read(&self.base.port_name, &self.handle, cmd)?;
-                ok_or_device_error(cmd, &reply)
+                ok_or_device_error(&reply)
             }
             WriteKind::Sink => Ok(()),
             WriteKind::FloatFmt { .. } => Err(AsynError::AddressOutOfRange(user.addr)),
         }
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn do_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        require_init(self.init)?;
         let spec = find_spec(user.addr).ok_or(AsynError::AddressOutOfRange(user.addr))?;
         match spec.read_conv {
             ReadConv::Ident => {
@@ -427,7 +481,8 @@ impl PortDriver for CoherentSdgDriver {
         }
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+    fn do_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        require_init(self.init)?;
         let spec = find_spec(user.addr).ok_or(AsynError::AddressOutOfRange(user.addr))?;
         match spec.write {
             // C: writeSink always succeeds, and writeOctet's caller reports
@@ -496,5 +551,46 @@ mod tests {
         assert_eq!(parse_str_bin(""), 0);
         // Non-'1' characters (including '0' and anything else) clear the bit.
         assert_eq!(parse_str_bin("1x1"), 0b101);
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+    use crate::connect::mute_link;
+
+    /// C leaves `init == 0` when `status?` fails, and every transfer refuses
+    /// without touching the device.
+    #[test]
+    fn a_failed_status_query_leaves_every_transfer_refusing() {
+        let mut sdg = CoherentSdgDriver::new("SDG_MUTE", mute_link("SDG_MUTE_IO"));
+        assert_eq!(sdg.initialize(), Err("failure to acquire status"));
+        assert!(sdg.read_float64(&AsynUser::default().with_addr(8)).is_err());
+        assert!(
+            sdg.read_uint32_digital(&AsynUser::default().with_addr(6), 1)
+                .is_err()
+        );
+    }
+
+    /// C's writes are asynError unless the reply is "OK", and nothing writes
+    /// the record's errorMessage.
+    #[test]
+    fn a_failed_transfer_reaches_the_record_without_text() {
+        let mut sdg = CoherentSdgDriver::new("SDG_MUTE2", mute_link("SDG_MUTE2_IO"));
+        sdg.init = true;
+        let e = sdg
+            .read_float64(&AsynUser::default().with_addr(8))
+            .unwrap_err();
+        assert_eq!(e.message(), "");
+        let addr = COMMANDS
+            .iter()
+            .find(|c| matches!(c.write, WriteKind::IntFmt { .. }))
+            .unwrap()
+            .addr;
+        let e = sdg
+            .write_uint32_digital(&mut AsynUser::default().with_addr(addr), 1, 1)
+            .unwrap_err();
+        assert_eq!(e.message(), "");
+        assert_eq!(e.status(), AsynStatus::Error);
     }
 }
