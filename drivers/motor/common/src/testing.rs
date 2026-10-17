@@ -165,7 +165,7 @@ pub async fn run_command(
     cmd: epics_rs::base::server::iocsh::registry::CommandDef,
     args: Vec<epics_rs::base::server::iocsh::registry::ArgValue>,
 ) {
-    use epics_rs::base::runtime::task::{BlockingBridge, sleep};
+    use epics_rs::base::runtime::task::{BlockingBridge, sleep, yield_now};
     use epics_rs::base::server::database::PvDatabase;
     use epics_rs::base::server::iocsh::registry::CommandContext;
 
@@ -180,6 +180,9 @@ pub async fn run_command(
         sleep(Duration::from_millis(5)).await;
     }
     shell.join().unwrap();
+    // A shell that finished before the first check never yielded: run what
+    // it spawned before the caller can block this runtime with a sync wait.
+    yield_now().await;
 }
 
 /// Run `cmd` with `args` as [`run_command`], and return the `motorPoller`
