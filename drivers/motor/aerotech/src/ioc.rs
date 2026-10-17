@@ -211,7 +211,7 @@ pub fn ensemble_config_command() -> CommandDef {
                     .unwrap_or_else(|e| e.into_inner())
                     .axis_exists(axis);
                 if exists {
-                    let ax = EnsembleAxis::new(controller.clone(), axis)
+                    let ax = EnsembleAxis::new(controller.clone(), axis, axes.len() as i32)
                         .map_err(|e| format!("EnsembleAsynConfig: axis {axis}: {e}"))?;
                     reports.push(ax.report());
                     logs.push(ax.log());

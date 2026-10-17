@@ -26,17 +26,13 @@
 //!   honouring the evident intent.
 //! - `home` requires the vendor `HomeAsync.bcx` program to be loaded on the
 //!   controller (task 5), exactly as the C driver does.
-//! - The C raises `motorAxisProblem` for any non-zero fault — including a
-//!   travel-limit fault — then clears it inside `DISABLE` so the user can jog
-//!   off the limit switch. This port instead excludes the travel-limit fault
-//!   bits from `problem` (the limit itself is reported through high/low limit),
-//!   which removes the `set_closed_loop`/`poll` coupling and matches the motor
-//!   record's limit semantics (a limit is not a fault that must be acknowledged).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -205,6 +201,14 @@ pub struct EnsembleAxis {
     controller: Arc<Mutex<EnsembleController>>,
     /// Controller axis number (the `@n` address).
     axis: i32,
+    /// The axis's place among the controller's, C `itera`.
+    index: i32,
+    /// C `lastFault`, the AXISFAULT word that last raised `problem`.
+    last_fault: i32,
+    /// C's stored `motorAxisProblem`: raised by a new fault, cleared by a
+    /// zero fault or by DISABLE after a travel-limit fault.
+    problem: bool,
+    status_writes: Vec<StatusWrite>,
     has_encoder: bool,
     /// `HomeSetup` word; bit 0 is the home direction, updated by [`Self::home`].
     home_direction: u32,
@@ -223,7 +227,11 @@ pub struct EnsembleAxis {
 impl EnsembleAxis {
     /// Construct axis `axis` and probe its feedback type, home/limit setup and
     /// reverse-direction parameters, then set `RAMP MODE RATE`.
-    pub fn new(controller: Arc<Mutex<EnsembleController>>, axis: i32) -> AsynResult<Self> {
+    pub fn new(
+        controller: Arc<Mutex<EnsembleController>>,
+        axis: i32,
+        index: i32,
+    ) -> AsynResult<Self> {
         let (has_encoder, step_size, home_preset, home_direction, reverse_direc, swconfig) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let has_encoder = ctrl
@@ -261,6 +269,10 @@ impl EnsembleAxis {
         Ok(Self {
             controller,
             axis,
+            index,
+            last_fault: 0,
+            problem: false,
+            status_writes: Vec::new(),
             has_encoder,
             home_direction,
             reverse_direc,
@@ -463,9 +475,18 @@ impl AsynMotor for EnsembleAxis {
             ctrl.command(&format!("ENABLE @{axis}"))?;
         } else {
             ctrl.command(&format!("DISABLE @{axis}"))?;
+            // C clears it so the user can jog off the limit (:434-435).
+            if self.last_fault & TRAVEL_LIMIT_FAULT_MASK != 0 {
+                self.problem = false;
+                self.status_writes.push(StatusWrite::Problem(false));
+            }
         }
         ctrl.wait_mode_nowait()?;
         Ok(())
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -481,6 +502,21 @@ impl AsynMotor for EnsembleAxis {
             let act_vel = atof(&ctrl.query(&format!("VFBK(@{axis})"))?);
             (axis_status, plane_active, enc_pos, cmd_pos, fault, act_vel)
         };
+
+        if fault == 0 {
+            self.last_fault = 0;
+            self.problem = false;
+        } else if fault != self.last_fault {
+            self.last_fault = fault;
+            self.problem = true;
+            self.log.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "EnsemblePoller: controller fault on axis={} fault=0x{fault:X}\n",
+                    self.index
+                ),
+            );
+        }
 
         let move_active = (axis_status & MOVE_ACTIVE) != 0 || plane_active;
         let done = !move_active;
@@ -517,8 +553,7 @@ impl AsynMotor for EnsembleAxis {
             home: at_home,
             homed,
             direction,
-            // Travel-limit faults are reported via high/low limit, not problem.
-            problem: (fault & !TRAVEL_LIMIT_FAULT_MASK) != 0,
+            problem: self.problem,
             powered,
             has_encoder: self.has_encoder,
             gain_support: true,
@@ -584,7 +619,7 @@ mod tests {
         static DRIVER: Model2 = Model2::new("ensLogTest", 0);
         let (_line, io) = LineRig::new("ensLogLine", |_| "%0".into());
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensLogLine", "0")));
-        let axis = EnsembleAxis::new(controller, 0).unwrap();
+        let axis = EnsembleAxis::new(controller, 0, 0).unwrap();
         let log = axis.log();
         let axis = Arc::new(Mutex::new(axis));
         let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
@@ -634,6 +669,67 @@ mod tests {
                 "Ensemble does not support setting proportional gain",
                 "Ensemble does not support setting integral gain",
                 "Ensemble does not support setting derivative gain",
+            ],
+            "{text}"
+        );
+    }
+
+    /// drvEnsembleAsyn.cc:800-833, 432-435: a new non-zero AXISFAULT,
+    /// travel-limit faults included, raises problem and prints once; DISABLE
+    /// clears it after a travel-limit fault; a zero fault clears it.
+    #[epics_rs::base::epics_test]
+    async fn a_new_fault_raises_problem_until_disable_or_clear() {
+        use epics_rs::asyn::interfaces::motor::StatusWrite;
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        use motor_common::testing::LineRig;
+
+        let fault = Arc::new(Mutex::new("%0".to_string()));
+        let reply = {
+            let fault = fault.clone();
+            move |cmd: &str| match cmd.trim_end() {
+                "AXISFAULT(@0)" => fault.lock().unwrap().clone(),
+                _ => "%0".into(),
+            }
+        };
+        let (_line, io) = LineRig::new("ensFaultLine", reply);
+        let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensFaultLine", "0")));
+        let mut axis = EnsembleAxis::new(controller, 0, 2).unwrap();
+        let path = std::env::temp_dir().join(format!("ens-fault-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(None, TraceMask::ERROR);
+        trace.set_trace_file(None, TraceFile::File(file));
+        let user = AsynUser::new(0);
+        let poll = |axis: &mut EnsembleAxis, reply: &str| {
+            *fault.lock().unwrap() = reply.into();
+            axis.poll(&user).unwrap().problem
+        };
+
+        assert!(!poll(&mut axis, "%0"));
+        assert!(poll(&mut axis, "%4"));
+        assert!(poll(&mut axis, "%4"));
+        axis.set_closed_loop(&user, false).unwrap();
+        assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(false)]);
+        assert!(!poll(&mut axis, "%4"));
+        assert!(!poll(&mut axis, "%0"));
+        assert!(poll(&mut axis, "%1"));
+        axis.set_closed_loop(&user, false).unwrap();
+        assert!(axis.take_status_writes().is_empty());
+        assert!(poll(&mut axis, "%1"));
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "EnsemblePoller: controller fault on axis=2 fault=0x4",
+                "EnsemblePoller: controller fault on axis=2 fault=0x1",
             ],
             "{text}"
         );
