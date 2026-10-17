@@ -145,7 +145,7 @@ pub fn octet_write_read(handle: &SyncIOHandle, command: &str) -> AsynResult<Stri
     )
 }
 
-fn checked_reply(command: &str, raw: Vec<u8>) -> AsynResult<String> {
+pub(crate) fn checked_reply(command: &str, raw: Vec<u8>) -> AsynResult<String> {
     if raw.first() == Some(&BELL) {
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_matches(|c: char| c.is_control() || c == '\0');

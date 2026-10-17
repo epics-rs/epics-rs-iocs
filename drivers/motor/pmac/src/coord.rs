@@ -45,7 +45,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
-use crate::controller::{octet_write_read, pmac_err};
+use crate::controller::{PMAC_MAXBUF, checked_reply, pmac_err};
 use crate::protocol::{
     CS_STATUS1_RUNNING_PROG, CS_STATUS2_AMP_FAULT, CS_STATUS2_FOLLOW_ERR, CS_STATUS2_IN_POSITION,
     CS_STATUS2_RUNTIME_ERR, CS_STATUS3_LIMIT, parse_cs_positions, parse_cs_status,
@@ -96,12 +96,15 @@ pub struct PmacCoordSystem {
     /// C `pDrv->pasynUser`'s trace, which every axis's `pasynUser` shares
     /// (pmacAsynCoord.c:812).
     trace: MotorTrace,
+    /// C `pDrv->ref`, the `pmacAsynCoordCreate` reference.
+    reference: i32,
 }
 
 impl PmacCoordSystem {
     pub fn new(
         handle: SyncIOHandle,
         trace: MotorTrace,
+        reference: i32,
         cs: i32,
         program: i32,
         poll_ttl: Duration,
@@ -109,6 +112,7 @@ impl PmacCoordSystem {
         Self {
             handle,
             trace,
+            reference,
             cs,
             program,
             moves_deferred: false,
@@ -144,16 +148,40 @@ impl PmacCoordSystem {
 
     /// The poll snapshot predates the command, so the next poll reads the
     /// system again (C signals its poller after a move).
-    fn command(&mut self, command: &str) -> AsynResult<()> {
+    fn command(&mut self, axis: usize, command: &str) -> AsynResult<()> {
         self.poll = None;
-        octet_write_read(&self.handle, command).map(|_| ())
+        self.write_read(axis, command).map(|_| ())
+    }
+
+    /// C `motorAxisWriteRead` for 1-based `axis`: a failed transfer prints
+    /// its line; a refused (BELL) reply is a successful transfer there.
+    fn write_read(&self, axis: usize, command: &str) -> AsynResult<String> {
+        let raw = self
+            .handle
+            .write_read(0, command.as_bytes(), PMAC_MAXBUF)
+            .inspect_err(|e| {
+                self.trace.print(
+                    TraceMask::ERROR,
+                    0,
+                    format_args!(
+                        "Read/write error to PMAC C.S. ref {}, axis {} command {command}. \
+                         Status={}, Error={}\n",
+                        self.reference,
+                        axis_name(axis).unwrap_or(' '),
+                        e.c_status_code(),
+                        e.message_display()
+                    ),
+                );
+            })?;
+        checked_reply(command, raw)
     }
 
     /// C `drvPmacGetAxesStatus`: `&{cs}??` for the status words, then one
     /// command carrying all nine `Q8{n}` readbacks.
     fn refresh(&mut self) -> AsynResult<CsPoll> {
         let cs = self.cs;
-        let response = octet_write_read(&self.handle, &format!("&{cs}??"))?;
+        // C `drvPmacGetCoordStatus(first_axis, ...)`.
+        let response = self.write_read(1, &format!("&{cs}??"))?;
         let status = parse_cs_status(&response)
             .ok_or_else(|| pmac_err(format!("could not parse CS {cs} status: {response:?}")))?;
 
@@ -161,7 +189,7 @@ impl PmacCoordSystem {
         for axis in 1..=CS_AXES {
             query.push_str(&format!("Q8{axis}"));
         }
-        let response = octet_write_read(&self.handle, &query)?;
+        let response = self.write_read(1, &query)?;
         let positions = parse_cs_positions(&response, CS_AXES);
         if positions.len() != CS_AXES {
             return Err(pmac_err(format!(
@@ -192,8 +220,9 @@ impl PmacCoordSystem {
         let cs = self.cs;
         let program = self.program;
         self.deferred = [false; CS_AXES];
-        self.command(&format!("&{cs}A"))?;
-        self.command(&format!("&{cs}AB{program}R"))
+        // C sends both on `&pDrv->axis[0]`.
+        self.command(1, &format!("&{cs}A"))?;
+        self.command(1, &format!("&{cs}AB{program}R"))
     }
 }
 
@@ -278,10 +307,10 @@ impl AsynMotor for PmacCsAxis {
             // Abort first so the motors are back in closed loop; then append the
             // program run to the demand, so the demand and its start are one
             // command.
-            system.command(&format!("&{cs}A"))?;
+            system.command(axis, &format!("&{cs}A"))?;
             command.push_str(&format!("B{}R", system.program));
         }
-        let sent = system.command(&command);
+        let sent = system.command(axis, &command);
         self.motion_sent = true;
         sent
     }
@@ -341,7 +370,7 @@ impl AsynMotor for PmacCsAxis {
         let mut system = lock(&self.system);
         let cs = system.cs;
         system.deferred[axis - 1] = false;
-        system.command(&format!("&{cs}A Q7{axis}=Q8{axis}"))
+        system.command(axis, &format!("&{cs}A Q7{axis}=Q8{axis}"))
     }
 
     /// C `motorAxisSetDouble`, `motorAxisPosition`: there is nothing to redefine
@@ -353,10 +382,10 @@ impl AsynMotor for PmacCsAxis {
         let (cs, step) = (system.cs, system.step_size[axis - 1]);
         // C rounds the record's steps to a whole step first.
         let position = (position + 0.5).floor() * step;
-        system.command(&format!(
-            "&{cs}Q7{axis}={position:.6}",
-            position = CFloat(position)
-        ))
+        system.command(
+            axis,
+            &format!("&{cs}Q7{axis}={position:.6}", position = CFloat(position)),
+        )
     }
 
     /// C `motorAxisSetDouble`, `motorAxisDeferMoves`: releasing the deferral runs
@@ -502,6 +531,7 @@ mod tests {
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
             MotorTrace::new(name, 0),
+            1,
             1,
             0,
             poll_ttl,

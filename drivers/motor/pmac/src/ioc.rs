@@ -559,6 +559,7 @@ fn coord_create(
     let system = Arc::new(Mutex::new(PmacCoordSystem::new(
         handle,
         MotorTrace::new(port, addr),
+        reference,
         cs,
         program,
         POLL_CACHE_TTL,
@@ -756,6 +757,7 @@ mod tests {
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
             MotorTrace::default(),
+            9103,
             3,
             0,
             POLL_CACHE_TTL,
@@ -1168,6 +1170,7 @@ mod tests {
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
             trace,
+            9105,
             2,
             0,
             POLL_CACHE_TTL,
@@ -1182,6 +1185,38 @@ mod tests {
             "motorAxisHome: not implemented for CS axes\n\
              motorAxisVelocityMove: not implemented for CS axes\n"
         );
+    }
+
+    /// pmacAsynCoord.c:335-342: a failed transfer prints the C.S. line with
+    /// the axis that sent it; a BELL reply is a transfer that worked.
+    #[test]
+    fn a_failed_cs_transfer_prints_the_c_line() {
+        let (rt, rig) = publish_scripted("pmacCsRw");
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let trace = MotorTrace::new("pmacCsRw", 0);
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(
+            io,
+            trace,
+            9106,
+            2,
+            0,
+            POLL_CACHE_TTL,
+        )));
+        let mut axis = PmacCsAxis::new(system, 4).unwrap();
+        let own = TraceCapture::on("pmacCsRw");
+        let user = AsynUser::new(0);
+        rig.silence("&2A Q74=Q84");
+        assert!(axis.stop(&user, 1.0).is_err());
+        let text = own.take();
+        assert!(
+            text.starts_with(
+                "Read/write error to PMAC C.S. ref 9106, axis U command &2A Q74=Q84. Status=1, Error="
+            ),
+            "{text}"
+        );
+        rig.answer("&2A Q74=Q84", b"\x07ERR003\r");
+        assert!(axis.stop(&user, 1.0).is_err());
+        assert_eq!(own.take(), "");
     }
 
     /// pmacController.cpp:457/463 `%f`: glibc's nan, sign bit included.
