@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -61,6 +62,11 @@ pub fn sc800_config_command() -> CommandDef {
                     OUTPUT_EOS,
                     EosRefusal::Ignored,
                 ) else {
+                    errlog_vprintf(format_args!(
+                        "\ndrvSC800.cc:motor_init() *** asyn connection error on port = \
+                         {asyn_port}, address = {address} ***\n\n"
+                    ));
+                    std::thread::sleep(Duration::from_secs(5));
                     return;
                 };
                 let Ok(controller) = KohzuController::new(handle) else {
@@ -82,7 +88,7 @@ pub fn sc800_config_command() -> CommandDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use motor_common::testing::{LineRig, drvsup_init, run_command};
+    use motor_common::testing::{LineRig, drvsup_init, ioc_init_errlog, run_command};
 
     /// drvSC800.cc:537-538 connects at the Config's `address`.
     #[epics_rs::base::epics_test]
@@ -101,5 +107,25 @@ mod tests {
         let addrs = line.addresses();
         assert!(!addrs.is_empty());
         assert!(addrs.iter().all(|&a| a == 5), "{addrs:?}");
+    }
+
+    /// drvSC800.cc:541-545: a connect refused at motor_init is the one card
+    /// failure C prints, then it sleeps 5 s.
+    #[epics_rs::base::epics_test]
+    async fn sc800_prints_a_connect_error_at_ioc_init() {
+        let int = ArgValue::Int;
+        run_command(sc800_setup_command(), vec![int(1), int(10)]).await;
+        let config = vec![int(0), ArgValue::String("sc800Nowhere".into()), int(3)];
+        run_command(sc800_config_command(), config).await;
+        let start = std::time::Instant::now();
+        let lines = ioc_init_errlog("").await;
+        assert!(start.elapsed() >= Duration::from_secs(5));
+        assert_eq!(
+            lines,
+            [
+                "\ndrvSC800.cc:motor_init() *** asyn connection error on port = sc800Nowhere, \
+              address = 3 ***"
+            ]
+        );
     }
 }
