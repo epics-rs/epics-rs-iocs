@@ -16,6 +16,8 @@ pub const UPDATE_DETECTOR_FAMILY: &str =
     "void ADTimePix::updateDetectorFamily(int, const std::string&, const std::string&)";
 pub const TIME_PIX_CALLBACK: &str = "void ADTimePix::timePixCallback()";
 pub const ACQUIRE_START: &str = "asynStatus ADTimePix::acquireStart()";
+pub const ROWS_COLS: &str = "asynStatus ADTimePix::rowsCols(int*, int*, int*, int*, int*)";
+pub const PEL_INDEX: &str = "int ADTimePix::pelIndex(int, int)";
 pub const PARSE_TCP_PATH: &str =
     "bool ADTimePix::parseTcpPath(const std::string&, std::string&, int&)";
 pub const ENSURE_PREVIEW_TCP_PORTS_FREE: &str =

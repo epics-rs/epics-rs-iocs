@@ -172,8 +172,6 @@ remain open upstream defects the port did not guess at.
 | 64 | `serval_http.cpp:1198` — `ADMaxSizeX = PixCount / NumberOfRows` unguarded → SIGFPE | fixed-in-port (guarded) |
 | 65 | `serval_http.cpp:1190` — `ADSerialNumber` set from the software version | fixed-in-port (`Info.Boards[0].ChipboardId`) |
 | 66 | `serval_http.cpp:1603/1881/image-channel` — three disagreeing "is this a stream" predicates; a `tcp://` image channel still gets a `FilePattern` | fixed-in-port (one `is_stream()` rule) |
-| 67 | `serval_http.cpp:1005` + `mask_io.cpp:529` — `bpc2ImgIndex()` is not the inverse of `pelIndex()` for all quad orientations (C's own comment concedes it) | fixed-in-port (inverse derived from the one forward map; bijection test) |
-| 68 | `mask_io.cpp:210-226` — `rowsCols` divides by `rowLength`, 0 before the first `/detector` reply | fixed-in-port (`Geometry::new` returns `None`) |
 | 69 | `mask_io.cpp:237,250,275` — `buf[j*ROWS + i]` stride in maskReset/Rectangle/Circle; every other site uses `j*COLS+i` | fixed-in-port (uniform `cols` stride) |
 | 70 | `mask_io.cpp:238` — `maskReset` *assigns* OnOff, wiping BPC bits 1 and 8 | fixed-in-port (touches only bit 0) |
 | 71 | `mask_io.cpp:159` — `bufBPC[pelIndex(i,j)] \|= 1` unchecked | fixed-in-port (bounds-checked, dropped count returned) |

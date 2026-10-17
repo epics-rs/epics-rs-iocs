@@ -1689,18 +1689,82 @@ impl TimePix3Driver {
 
     // -- Mask ----------------------------------------------------------------
 
-    /// The layout Serval reported, as the mask code needs it.
-    fn geometry(&self) -> AsynResult<Geometry> {
-        Geometry::new(
-            self.int(self.p.row_len, 0),
-            self.int(self.p.number_of_chips, 0),
-            self.int(self.p.number_of_rows, 0),
-            self.int(self.p.detector_orientation, 0),
-        )
-        .ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: "timepix3: the detector layout is not known yet (no /detector reply)".into(),
-        })
+    /// C `rowsCols` (mask_io.cpp:251-313), with its WriteMsg and WARN lines.
+    fn rows_cols(&mut self) -> Option<Geometry> {
+        let p = self.p;
+        let boards = [self.text(p.boards_id, 0), self.text(p.boards2_id, 0)];
+        let family = self.shared.family();
+        let layout = mask::Layout {
+            pix_count: self.int(p.pix_count, 0),
+            row_len: self.int(p.row_len, 0),
+            num_chips: self.int(p.number_of_chips, 0),
+            num_rows: self.int(p.number_of_rows, 0),
+            tpx3: family == DetectorFamily::Tpx3,
+            boards: [&boards[0], &boards[1]],
+        };
+        let (write_msg, warning) = match mask::rows_cols(&layout) {
+            Ok(geom) => return Some(geom),
+            Err(mask::RowsColsError::NoRowLength) => return None,
+            Err(mask::RowsColsError::EightChipLayout) => (
+                "Unsupported eight-chip mask layout: require two TPX3 quad boards".to_string(),
+                format!(
+                    "rowsCols: unsupported eight-chip mask layout (family={} board0={} board1={})",
+                    family.name(),
+                    boards[0],
+                    boards[1]
+                ),
+            ),
+            Err(mask::RowsColsError::Geometry(e)) => (
+                e.message().to_string(),
+                format!(
+                    "rowsCols: {} (pixels={} rowLength={} chips={} rows={})",
+                    e.message(),
+                    layout.pix_count,
+                    layout.row_len,
+                    layout.num_chips,
+                    layout.num_rows
+                ),
+            ),
+        };
+        let _ = self.set_text(p.write_msg, &write_msg);
+        self.ad.port_base.trace_print(
+            TraceMask::WARNING,
+            format_args!("{}", adlog::warn(adlog::ROWS_COLS, &warning)),
+        );
+        None
+    }
+
+    /// C `pelIndex` for every image pixel, row-major, printing its WARN
+    /// lines as C's per-pixel calls do.
+    fn pel_table(&mut self, geom: &Geometry) -> Vec<i32> {
+        let chips = self.int(self.p.number_of_chips, 0);
+        let orientation = self.int(self.p.detector_orientation, 0);
+        let mut table = Vec::with_capacity(geom.pixel_count());
+        for j in 0..geom.rows {
+            for i in 0..geom.cols {
+                let (index, warning) = mask::pel_index(geom, chips, orientation, i, j);
+                if let Some(warning) = warning {
+                    self.ad.port_base.trace_print(
+                        TraceMask::WARNING,
+                        format_args!("{}", adlog::warn(adlog::PEL_INDEX, &warning)),
+                    );
+                }
+                table.push(index);
+            }
+        }
+        table
+    }
+
+    /// The geometry the mask operations need, or the error C's zeroed
+    /// `rowsCols` outputs lead to.
+    fn geometry(&mut self) -> AsynResult<Geometry> {
+        self.rows_cols()
+            .filter(|g| g.pixel_count() > 0)
+            .ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Error,
+                message: "timepix3: the detector layout is not known yet (no /detector reply)"
+                    .into(),
+            })
     }
 
     /// The one mask drawing entry point (C's `readInt32Array` mask branch,
@@ -1737,10 +1801,12 @@ impl TimePix3Driver {
             );
         } else if self.int(self.p.mask_pel, 0) == 1 {
             let bpc = self.read_bpc()?;
-            mask::mask_from_bpc(&geom, &bpc, &mut mask);
+            let map = self.pel_table(&geom);
+            mask::mask_from_bpc(&map, &bpc, &mut mask);
         } else if self.int(self.p.mask_write, 0) == 1 {
             let mut bpc = self.read_bpc()?;
-            mask::apply_mask_to_bpc(&geom, &mask, &mut bpc);
+            let map = self.pel_table(&geom);
+            mask::apply_mask_to_bpc(&map, &mask, &mut bpc);
             self.write_mask_file(&bpc)?;
         }
 
@@ -1815,9 +1881,10 @@ impl TimePix3Driver {
     fn refresh_pixel_config(&mut self) -> AsynResult<()> {
         let geom = self.geometry()?;
         let bpc = self.read_bpc()?;
-        let mut serval_linear = vec![0u8; geom.num_chips * PIXEL_CONFIG_BYTES];
+        let num_chips = usize::try_from(self.int(self.p.number_of_chips, 0)).unwrap_or(0);
+        let mut serval_linear = vec![0u8; num_chips * PIXEL_CONFIG_BYTES];
 
-        for chip in 0..geom.num_chips {
+        for chip in 0..num_chips {
             let path = serval::chip_pixel_config(i32::try_from(chip).unwrap_or(0));
             let reply = self.http.get(&path, TIMEOUT_5000_MS).map_err(|e| {
                 let err = self.http_failed(&format!("GET {path}"), &e, HttpPrint::None);
@@ -1904,13 +1971,14 @@ impl TimePix3Driver {
         }
 
         let mut diff = vec![0i32; geom.pixel_count()];
-        mask::pixel_config_diff(&geom, &serval_linear, &bpc, &mut diff);
+        let map = self.pel_table(&geom);
+        mask::pixel_config_diff(&map, &serval_linear, &bpc, &mut diff);
         self.ad
             .port_base
             .params
             .set_int32_array(self.p.pixel_config_diff, 0, diff)?;
 
-        let masked = mask::masked_pixels(&geom, &bpc);
+        let masked = mask::masked_pixels(&geom, &map, &bpc);
         self.export_masked_pixels(&masked)?;
         Ok(())
     }
@@ -3187,6 +3255,42 @@ mod tests {
             det.text(p.calibration_policy, 0),
             "Blocked: calibration root is not absolute"
         );
+    }
+
+    /// C `rowsCols` refuses an eight-chip detector that is not two TPX3
+    /// quads with its WriteMsg (mask_io.cpp:258-279).
+    #[test]
+    fn rows_cols_refuses_an_eight_chip_layout_as_c() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let shared = Arc::new(Shared::new());
+        shared.note_family(DetectorFamily::Tpx3);
+        let mut det = TimePix3Driver::new(
+            "TPX_ROWS_COLS",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            shared,
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        for (param, v) in [
+            (p.pix_count, 8 * 65536),
+            (p.row_len, 4),
+            (p.number_of_chips, 8),
+            (p.number_of_rows, 512),
+        ] {
+            det.ad.port_base.set_int32_param(param, 0, v).unwrap();
+        }
+        det.set_text(p.boards_id, "4100").unwrap();
+        det.set_text(p.boards2_id, "4100").unwrap();
+        assert_eq!(det.rows_cols(), None);
+        assert_eq!(
+            det.text(p.write_msg, 0),
+            "Unsupported eight-chip mask layout: require two TPX3 quad boards"
+        );
+        det.set_text(p.boards2_id, "4101").unwrap();
+        let g = det.rows_cols().unwrap();
+        assert_eq!((g.rows, g.cols, g.x_chips, g.y_chips), (512, 1024, 4, 2));
     }
 
     /// The destination allowlist reads back at startup and refuses a
