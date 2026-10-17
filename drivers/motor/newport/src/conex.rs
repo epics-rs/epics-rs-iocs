@@ -417,6 +417,7 @@ impl ConexAxis {
     /// C `AG_CONEXAxis::getClosedLoop`.
     fn get_closed_loop(&self) -> AsynResult<bool> {
         let resp = self.write_read(&query(self.controller_id, "MM?"))?;
+        // AG_CONEX.cpp:430 reads an uninitialised status on a bad reply, a C defect.
         parse_closed_loop(&resp).ok_or_else(|| parse_error("MM?"))
     }
 
@@ -579,7 +580,8 @@ impl AsynMotor for ConexAxis {
             .ok_or_else(|| parse_error("TP"))?
             / step;
 
-        // Status (TS): done + limits (model-dependent parse).
+        // Status (TS): done + limits (model-dependent parse). AG_CONEX.cpp:530,534
+        // posts PROBLEM 0 on a bad reply, a C defect.
         let status = parse_ts(
             self.model,
             &self.write_read(&query(self.controller_id, "TS"))?,

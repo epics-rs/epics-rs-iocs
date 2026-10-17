@@ -142,6 +142,7 @@ impl AgapController {
     /// C `getClosedLoop`. Caller holds the controller lock.
     fn read_closed_loop(&self) -> AsynResult<bool> {
         let resp = self.write_read(&format!("{}MM?", self.controller_id))?;
+        // AGAP_CONEX.cpp:332 reads an uninitialised status on a bad reply, a C defect.
         parse_closed_loop(&resp).ok_or_else(|| parse_error("MM?"))
     }
 }
@@ -325,7 +326,8 @@ impl AsynMotor for AgapAxis {
             / STEP_SIZE;
 
         // Moving status (controller-wide TS) and power-on (controller-wide MM?)
-        // are shared by both axes.
+        // are shared by both axes. AGAP_CONEX.cpp:411 posts PROBLEM 0 on a bad
+        // TS reply, a C defect.
         let moving =
             parse_moving(&ctrl.write_read(&format!("{id}TS"))?).ok_or_else(|| parse_error("TS"))?;
         let powered = ctrl.read_closed_loop()?;
