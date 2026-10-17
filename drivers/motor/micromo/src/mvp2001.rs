@@ -428,7 +428,9 @@ impl AsynMotor for Mvp2001Axis {
         let controller = Arc::clone(&self.controller);
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Position (8 hex chars, signed via u32 wrap).
+        // Position (8 hex chars, signed via u32 wrap). An unparseable POS or
+        // ST reply raises PROBLEM on purpose: C's `parseReply` leaves the
+        // uninitialised `position` / `status` int as it was and uses it.
         let pos_reply = ctrl.query(&format!("{n} POS"))?;
         let position = parse_hex_reply(&pos_reply, 8)
             .ok_or_else(|| micromo_err(format!("MVP2001: unparseable POS reply {pos_reply:?}")))?;
