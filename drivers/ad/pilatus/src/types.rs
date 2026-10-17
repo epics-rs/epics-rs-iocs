@@ -64,34 +64,6 @@ impl TriggerMode {
     }
 }
 
-/// Subset of `asynStatus` the camserver helpers return, carrying C's numeric
-/// codes so the `status > 1` / `!status` tests in `pilatusTask` port directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CamStatus {
-    /// `asynSuccess` (0)
-    Success,
-    /// `asynTimeout` (1)
-    Timeout,
-    /// `asynError` (3)
-    Error,
-}
-
-impl CamStatus {
-    /// The `asynStatus` ordinal, so C's `if (status > 1)` ports verbatim.
-    pub fn code(self) -> i32 {
-        match self {
-            Self::Success => 0,
-            Self::Timeout => 1,
-            Self::Error => 3,
-        }
-    }
-
-    /// C's `if (status)` — anything but `asynSuccess`.
-    pub fn is_err(self) -> bool {
-        self != Self::Success
-    }
-}
-
 /// One entry of C's `badPixelMap[]`. Indices are computed at bad-pixel-file
 /// read time from the then-current `NDArraySizeX` / `NDArraySizeY`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,16 +133,6 @@ pub fn secs(v: f64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cam_status_codes_match_asyn_status() {
-        assert_eq!(CamStatus::Success.code(), 0);
-        assert_eq!(CamStatus::Timeout.code(), 1);
-        assert_eq!(CamStatus::Error.code(), 3);
-        // C: `if (status > 1) acquire = 0;` must fire for Error, not Timeout.
-        assert!(CamStatus::Error.code() > 1);
-        assert!(CamStatus::Timeout.code() <= 1);
-    }
 
     #[test]
     fn trigger_mode_commands() {
