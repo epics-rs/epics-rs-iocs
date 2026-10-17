@@ -270,8 +270,9 @@ impl CsGroups {
         for (q, value) in moves.values().chain(holds.values()) {
             move_str.push_str(&format!(" Q{q}={value:.6}"));
         }
+        // C's "Q70=%f %s" puts a space before a move string that starts with one.
         Ok(format!(
-            "&{coord_sys} Q{Q_MOVE_TIME}={max_time_ms:.6}{move_str} B{COORD_MOVE_PROG}R"
+            "&{coord_sys} Q{Q_MOVE_TIME}={max_time_ms:.6} {move_str} B{COORD_MOVE_PROG}R"
         ))
     }
 
@@ -445,7 +446,7 @@ mod tests {
         // X (Q77) moves; Y (Q78) and Z (Q79) hold. Q70 is the longest move time.
         assert_eq!(
             release.line.unwrap().unwrap(),
-            "&2 Q70=250.000000 Q77=10.000000 Q78=3.000000 Q79=-4.000000 B101R"
+            "&2 Q70=250.000000  Q77=10.000000 Q78=3.000000 Q79=-4.000000 B101R"
         );
     }
 

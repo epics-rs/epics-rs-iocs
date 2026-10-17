@@ -1186,7 +1186,7 @@ mod tests {
         assert!(c.set_moves_deferred(0).is_err());
         assert_eq!(rig.written(), ["&2A"]);
 
-        let line = "&2 Q70=0.000000 Q77=1.000000 B101R";
+        let line = "&2 Q70=0.000000  Q77=1.000000 B101R";
         rig.answer(line, b"\x06");
         c.set_moves_deferred(DEFERRED_COORDINATED_MOVES).unwrap();
         c.defer_move(1, to);
