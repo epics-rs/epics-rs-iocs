@@ -23,8 +23,8 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, ControllerReport, FinishedWrite, ParamWrite, WriteHook, WriteOutcome,
-    WriteValue, has_motor_axis,
+    AxisUser, ControllerParams, ControllerReport, FinishedWrite, ParamWrite, WriteHook,
+    WriteOutcome, WriteValue, has_motor_axis,
 };
 
 /// `LC400_TIMEOUT`.
@@ -698,7 +698,7 @@ impl Lc400ControllerParams {
 /// The channel registers of axis `addr`; C's `asynError` for an axis
 /// with none.
 fn axis_address(addr: i32) -> AsynResult<u32> {
-    base_address(addr.max(0) as usize).ok_or_else(|| lc400_err("no LC400 axis"))
+    base_address(addr as usize).ok_or_else(|| lc400_err("no LC400 axis"))
 }
 
 /// `writeInt32` / `writeFloat64`'s code around the base, which the
@@ -791,7 +791,7 @@ impl ControllerParams for Lc400ControllerParams {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         // C dereferences the null axis there (LC400MotorDriver.cpp:551-554); refused as the base does.
@@ -830,7 +830,7 @@ impl ControllerParams for Lc400ControllerParams {
     fn write_float64(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: f64,
     ) -> ParamWrite {
         // C dereferences the null axis there (LC400MotorDriver.cpp:593-601); refused as the base does.
@@ -923,6 +923,26 @@ mod tests {
         assert_eq!(refused.unwrap_err().status(), AsynStatus::Error);
         assert_eq!(lock(&controller).axes[1].max_pts, before);
         assert!(port.write_float64_blocking(p.p_gain, 1, 0.5).is_err());
+    }
+
+    /// A user at address -1 sets axis 0's W_MAXPTS, getAddress's axis for
+    /// it (asynPortDriver.cpp:1901-1914).
+    #[test]
+    fn a_write_at_address_minus_one_reaches_axis_0() {
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(None, 4)));
+        let params = Lc400ControllerParams::new(controller.clone(), 0.0, 0.0);
+        let name = "lc400AddrM1";
+        let port = register_controller_port(&open_owner(), name, 4, params).unwrap();
+        let motor: Arc<Mutex<dyn AsynMotor>> =
+            Arc::new(Mutex::new(Lc400Axis::new(controller.clone(), 0)));
+        let user = TraceUser::Asyn {
+            port: name.to_owned(),
+            addr: 0,
+        };
+        register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
+        let p = lock(&controller).params.unwrap();
+        port.write_int32_blocking(p.w_max_pts, -1, 77).unwrap();
+        assert_eq!(lock(&controller).axes[0].max_pts, 77);
     }
 
     #[test]
