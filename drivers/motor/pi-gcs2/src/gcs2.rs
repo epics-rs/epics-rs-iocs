@@ -91,10 +91,6 @@
 //!
 //! ## Not modeled (documented deviations from the full C module)
 //!
-//! - **Hexapod**: the `PIasynController` parameters that set and read back
-//!   the pivot point, the target mode and the coordinate systems are not
-//!   modeled, so a hexapod moves only with `MOV` and its pivot only reads
-//!   at init.
 //! - **Piezo**: `PIGCSPiezoController`, `PIGCS2PiezoCL` — closed-loop piezo
 //!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
 //!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
@@ -114,23 +110,52 @@
 //!   the `m_velocity` it seeds is never read back (not in `PIasynAxis::poll`),
 //!   so `MotorStatus::velocity` stays `0.0`.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::param::{ParamType, ParamValue};
+use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
-use motor_common::util::{atof, atoi};
+use epics_rs::motor::controller_port::{
+    AxisUser, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, index,
+};
+use epics_rs::motor::flags::{DriverCall, MotorCommand};
+use motor_common::util::{atof, atoi, nint};
 use motor_common::{ControllerParams, ControllerReport};
 
 /// Response buffer size for a single reply line.
 const READ_BUF: usize = 256;
+
+/// PIInterface's error prints: `ASYN_TRACE_ERROR|ASYN_TRACEIO_DRIVER`.
+const IO_ERROR: TraceMask = TraceMask::ERROR.union(TraceMask::IO_DRIVER);
+
+/// Appends a read's line to `reply`, or the bytes a failed read had
+/// transferred, which is what C's buffer holds after the call.
+fn append_read(reply: &mut Vec<u8>, read: AsynResult<Vec<u8>>) -> AsynResult<()> {
+    match read {
+        Ok(line) => {
+            reply.extend(line);
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(partial) = e.partial_read() {
+                reply.extend(&partial.data);
+            }
+            Err(e)
+        }
+    }
+}
 
 /// Output command terminator (C sets input EOS `"\n"` and appends a bare
 /// `"\n"` write after every command in `PIInterface::sendOnly`/
@@ -144,6 +169,11 @@ const PI_CNTR_STOP: i32 = 10;
 /// `PI_CNTR_UNKNOWN_COMMAND`: returned by `ERR?` when `HAR?` itself is
 /// unsupported (used to distinguish "no limit switches" from a real fault).
 const PI_CNTR_UNKNOWN_COMMAND: i32 = 2;
+
+/// `COM_ERROR` and `COM_TIMEOUT`: what C `getGCSError` returns when `ERR?`
+/// itself fails.
+const COM_ERROR: i32 = -1;
+const COM_TIMEOUT: i32 = -7;
 
 /// `PIGCSMotorController` GCS parameter IDs (`SPA`/`SPA?`), formatted as a
 /// plain decimal (`%d` in the C `sprintf`) — NOT hex, despite the hex-valued
@@ -233,6 +263,20 @@ fn counts_per_unit(numerator: i32, denominator: i32) -> f64 {
     } else {
         f64::from(numerator) / f64::from(denominator)
     }
+}
+
+/// A move target in whole counts. C defect not copied: C's `int` count
+/// (PIGCSController.h:53 `moveCts(PIasynAxis*, int)`, called with the
+/// record's double at PIasynAxis.cpp:263 and PIasynController.cpp:378, and
+/// `targetsCts[n] = deferred_position` at PIasynController.cpp:250)
+/// truncates toward zero; rs rounds with `NINT`, as the record's `RVAL`.
+fn target_counts(position: f64) -> f64 {
+    f64::from(nint(position))
+}
+
+/// The `int(status)` C's FLOW lines print.
+fn status_code(result: &AsynResult<()>) -> i32 {
+    result.as_ref().err().map_or(0, |e| e.status() as i32)
 }
 
 /// C `TranslatePIError(epicsInt32)`.
@@ -390,6 +434,16 @@ pub struct PIGCS2Controller {
     /// to, for its `m_lastDirection` against the position its next poll
     /// starts from (no poll ran in between, so C's `m_positionCts`).
     released: BTreeMap<usize, f64>,
+    /// The controller port and its `PIasynController` parameters, which
+    /// the poll posts.
+    port: Option<(PortHandle, PiParams)>,
+    /// `PIGCSController::m_LastError`: the last nonzero `ERR?` code.
+    last_error: Cell<i32>,
+    /// `PIHexapodController::m_PivotX/Y/Z`; `PIGCSController`'s `GetPivot*`
+    /// are 0.
+    pivot: [f64; 3],
+    /// `PIGCSController::m_targetMode`, `PI_CS_TARGETMODE`.
+    target_mode: i32,
 }
 
 /// `PIHexapodController`'s platform state, one for all its axes.
@@ -431,6 +485,10 @@ impl PIGCS2Controller {
             moves_deferred: false,
             deferred: BTreeMap::new(),
             released: BTreeMap::new(),
+            port: None,
+            last_error: Cell::new(0),
+            pivot: [0.0; 3],
+            target_mode: 0,
         }
     }
 
@@ -455,11 +513,35 @@ impl PIGCS2Controller {
         if self.model.is_hexapod() {
             let _ = self.get_global_state();
         }
+        // PICoordinateSystem::getActivate/getLink, which post their buffer
+        // whatever the status; every other class's leaves both empty. C
+        // defect not copied: a write that fails leaves the buffer
+        // uninitialized; rs posts it empty.
+        let (mut activate, mut link) = (String::new(), String::new());
         if self.model == Model::CoordinateSystem {
-            // PICoordinateSystem::getActivate/getLink, whose replies feed
-            // the PI_CS_ACTIVATE/PI_CS_LINK parameters, not modeled.
-            let _ = self.query("KEN?");
-            let _ = self.query("KLN?");
+            activate = self.query_buffer("KEN?").0.replace('\n', "");
+            link = self
+                .query_buffer("KLN?")
+                .0
+                .replace('\n', "")
+                .replace('\t', " ");
+        }
+        if let Some((port, params)) = &self.port {
+            let [x, y, z] = self.pivot;
+            let updates = vec![
+                ParamSetValue::new(params.rbpivot_x, 0, ParamValue::Float64(x)),
+                ParamSetValue::new(params.rbpivot_y, 0, ParamValue::Float64(y)),
+                ParamSetValue::new(params.rbpivot_z, 0, ParamValue::Float64(z)),
+                ParamSetValue::new(params.target_mode, 0, ParamValue::Int32(self.target_mode)),
+                ParamSetValue::new(params.last_err, 0, ParamValue::Int32(self.last_error.get())),
+                ParamSetValue::new(
+                    params.cs_activate,
+                    0,
+                    ParamValue::Octet(activate.as_bytes().into()),
+                ),
+                ParamSetValue::new(params.cs_link, 0, ParamValue::Octet(link.as_bytes().into())),
+            ];
+            let _ = port.set_params_and_notify_blocking(0, updates);
         }
     }
 
@@ -476,7 +558,7 @@ impl PIGCS2Controller {
         std::thread::sleep(Duration::from_millis(200));
         self.get_global_state()?;
         if !self.hexapod.moving {
-            let err = self.get_gcs_error()?;
+            let err = self.get_gcs_error();
             if err != 0 {
                 self.print(format_args!(
                     "PIHexapodController::moveCts() failed, GCS error {err}\n"
@@ -529,7 +611,7 @@ impl PIGCS2Controller {
         self.knows_vel = match self.query("VEL?") {
             Ok(_) => true,
             Err(_) => {
-                let _ = self.get_gcs_error();
+                self.get_gcs_error();
                 false
             }
         };
@@ -545,17 +627,73 @@ impl PIGCS2Controller {
         self.hexapod.reads_status = self.answers_char(4);
         self.hexapod.reads_position = self.answers_char(3);
         self.hexapod.homing = false;
-        // ReadPivotSettings: the R/S/T it parses feed only PIasynController's
-        // pivot readback parameters, which are not modeled.
-        // GetReadPivotCommand.
+        // ReadPivotSettings, with GetReadPivotCommand's query.
         let read_pivot = if self.model == Model::Hexapod {
             "SPI? RST"
         } else {
             "SPI? R S T"
         };
-        if self.query(read_pivot).is_ok() {
-            let _ = self.get_gcs_error();
+        let Ok(reply) = self.query(read_pivot) else {
+            return;
+        };
+        if self.get_gcs_error() != 0 {
+            return;
         }
+        // One "R = 1.0 " line per pivot coordinate; one unparsed keeps all.
+        let mut pivot = [0.0; 3];
+        for line in reply.split('\n').map(|line| line.trim_start_matches(' ')) {
+            let Ok(value) = get_value_f64(line) else {
+                return;
+            };
+            match line.bytes().next() {
+                Some(b'R') => pivot[0] = value,
+                Some(b'S') => pivot[1] = value,
+                Some(b'T') => pivot[2] = value,
+                _ => {}
+            }
+        }
+        self.pivot = pivot;
+    }
+
+    /// C `SetPivotX/Y/Z` for coordinate `index` (`R`/`S`/`T`): a hexapod
+    /// sends `SPI` + `ERR?` unless its platform moves (`SetPivot`); the
+    /// others only log it. C's FLOW lines have no newline.
+    fn set_pivot(&mut self, index: usize, value: f64) -> AsynResult<()> {
+        let xyz = ["X", "Y", "Z"][index];
+        if !self.model.is_hexapod() {
+            self.trace(
+                TraceMask::FLOW,
+                format_args!("PIGCSController::SetPivot{xyz}() ignored"),
+            );
+            return Ok(());
+        }
+        self.trace(
+            TraceMask::FLOW,
+            format_args!(
+                "PIHexapodController::SetPivot{xyz}() value {}",
+                CFloat(value)
+            ),
+        );
+        if self.hexapod.any_moving {
+            self.trace(
+                TraceMask::FLOW,
+                format_args!(
+                    "PIHexapodController::SetPivot() cannot change pivot point while platform is moving"
+                ),
+            );
+            return Err(pigcs2_err("platform is moving"));
+        }
+        let rst = ["R", "S", "T"][index];
+        self.send_only(&format!("SPI {rst} {}", CFloat(value)))?;
+        let err = self.get_gcs_error();
+        if err != 0 {
+            self.print(format_args!(
+                "PIHexapodController::SetPivot() failed, GCS error {err}\n"
+            ));
+            return Err(pigcs2_err(format!("SPI failed, GCS error {err}")));
+        }
+        self.pivot[index] = value;
+        Ok(())
     }
 
     /// Whether byte `c` is answered; a timeout's `ERR?` clears the unknown
@@ -566,7 +704,7 @@ impl PIGCS2Controller {
             Ok(_) => true,
             Err(e) => {
                 if e.status() == AsynStatus::Timeout {
-                    let _ = self.get_gcs_error();
+                    self.get_gcs_error();
                 }
                 false
             }
@@ -590,77 +728,124 @@ impl PIGCS2Controller {
     /// Write a command with no reply expected (C `sendOnly`): the command,
     /// then its `\n` as a second write whose status alone decides.
     fn send_only(&self, cmd: &str) -> AsynResult<()> {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("PIInterface::sendOnly() sending \"{cmd}\"\n"),
+        );
         let _ = self.handle.write_octet(0, cmd.as_bytes());
         let e = match self.handle.write_octet(0, TERMINATOR) {
             Ok(_) => return Ok(()),
             Err(e) => e,
         };
-        self.print(format_args!(
-            "PIGCSController:sendOnly: error sending command {cmd}, sent={}, status={}\n",
-            e.partial_write().unwrap_or(0),
-            e.status() as i32
-        ));
+        self.trace(
+            IO_ERROR,
+            format_args!(
+                "PIGCSController:sendOnly: error sending command {cmd}, sent={}, status={}\n",
+                e.partial_write().unwrap_or(0),
+                e.status() as i32
+            ),
+        );
         Err(e)
     }
 
     /// Write a command and read one reply line (C `sendAndReceive`),
     /// trimmed of any stray CR/NUL.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.send_and_receive(cmd)?;
-        Ok(String::from_utf8_lossy(&raw)
+        let (reply, status) = self.query_buffer(cmd);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::query`]'s text, kept when the exchange fails, as C's buffer
+    /// is.
+    fn query_buffer(&self, cmd: &str) -> (String, AsynResult<()>) {
+        let (raw, status) = self.send_and_receive_buffer(cmd);
+        let reply = String::from_utf8_lossy(&raw)
             .trim_end_matches(['\r', '\0'])
-            .to_string())
+            .to_string();
+        (reply, status)
     }
 
     /// C `sendAndReceive(const char*)`: the command, then a writeRead of its
     /// `\n`. Either write falling short is asynError. PI GCS marks a
     /// non-final reply line with a trailing space: each line after one is a
-    /// plain read, joined on `\n`, whose failure C does not print.
-    fn send_and_receive(&self, cmd: &str) -> AsynResult<Vec<u8>> {
+    /// plain read, joined on `\n`, whose failure C does not print. A failed
+    /// read still ends in the `received` line; the buffer comes back with
+    /// the last read's status.
+    fn send_and_receive_buffer(&self, cmd: &str) -> (Vec<u8>, AsynResult<()>) {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("PIInterface::sendAndReceive() sending \"{cmd}\"\n"),
+        );
         let short_write = |status: i32, message: &str| {
-            self.print(format_args!(
+            self.trace(IO_ERROR, format_args!(
                 "PIGCSController:sendAndReceive error calling write, output={cmd} status={status}, error={message}\n"
             ));
             pigcs2_err(message)
         };
         match self.handle.write_octet(0, cmd.as_bytes()) {
             Ok(n) if n == cmd.len() => {}
-            Ok(_) => return Err(short_write(0, "")),
-            Err(e) => return Err(short_write(e.status() as i32, &e.message())),
+            Ok(_) => return (Vec::new(), Err(short_write(0, ""))),
+            Err(e) => {
+                return (
+                    Vec::new(),
+                    Err(short_write(e.status() as i32, &e.message())),
+                );
+            }
         }
-        let mut reply = self
-            .handle
-            .write_read(0, TERMINATOR, READ_BUF)
-            .map_err(|e| match e.octet_step() {
-                Some(OctetStep::Read) => {
-                    self.print(format_args!(
-                        "PIGCSController:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
-                        e.status() as i32,
-                        e.message()
-                    ));
-                    e
-                }
-                _ => short_write(e.status() as i32, &e.message()),
-            })?;
+        let read = self.handle.write_read(0, TERMINATOR, READ_BUF);
+        if let Err(e) = &read {
+            if e.octet_step() != Some(OctetStep::Read) {
+                return (
+                    Vec::new(),
+                    Err(short_write(e.status() as i32, &e.message())),
+                );
+            }
+            self.trace(IO_ERROR, format_args!(
+                "PIGCSController:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
+                e.status() as i32,
+                e.message()
+            ));
+        }
+        let mut reply = Vec::new();
+        let mut status = append_read(&mut reply, read);
         while reply.last() == Some(&b' ') {
             reply.push(b'\n');
-            reply.extend(self.handle.read_octet(0, READ_BUF)?);
+            status = append_read(&mut reply, self.handle.read_octet(0, READ_BUF));
         }
-        Ok(reply)
+        self.trace_received(&reply);
+        (reply, status)
+    }
+
+    /// [`Self::send_and_receive_buffer`]'s reply, or its error.
+    fn send_and_receive(&self, cmd: &str) -> AsynResult<Vec<u8>> {
+        let (reply, status) = self.send_and_receive_buffer(cmd);
+        status.map(|()| reply)
     }
 
     /// `asynPrint(pAsynCom, ASYN_TRACE_ERROR, ...)`.
     pub fn print(&self, args: std::fmt::Arguments<'_>) {
+        self.trace(TraceMask::ERROR, args);
+    }
+
+    /// `asynPrint(m_pCurrentLogSink, mask, ...)`.
+    fn trace(&self, mask: TraceMask, args: std::fmt::Arguments<'_>) {
         let (port, addr) = match &self.log_sink {
             Some((port, addr)) => (port.as_str(), *addr),
             None => (self.serial_port.as_str(), 0),
         };
-        PortManager::global().trace_manager().print(
-            Some(port),
-            Some(addr),
-            0,
-            TraceMask::ERROR,
-            args,
+        PortManager::global()
+            .trace_manager()
+            .print(Some(port), Some(addr), 0, mask, args);
+    }
+
+    /// PIInterface's `sendAndReceive() received` line.
+    fn trace_received(&self, reply: &[u8]) {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "PIInterface::sendAndReceive() received \"{}\"\n",
+                String::from_utf8_lossy(reply)
+            ),
         );
     }
 
@@ -690,9 +875,17 @@ impl PIGCS2Controller {
     }
 
     /// C `getGCSError`: a non-zero code prints, with its message, once
-    /// there is a log sink.
-    fn get_gcs_error(&self) -> AsynResult<i32> {
-        let err = atoi(&self.query("ERR?")?);
+    /// there is a log sink. An `ERR?` that fails is a code too, neither
+    /// printed nor kept as the last error.
+    fn get_gcs_error(&self) -> i32 {
+        let err = match self.query("ERR?") {
+            Ok(reply) => atoi(&reply),
+            Err(e) if e.status() == AsynStatus::Timeout => return COM_TIMEOUT,
+            Err(_) => return COM_ERROR,
+        };
+        if err != 0 {
+            self.last_error.set(err);
+        }
         if err != 0 && self.log_sink.is_some() {
             self.print(format_args!(
                 "PIGCSController::getGCSError() GCS error code = {err}\n"
@@ -702,13 +895,13 @@ impl PIGCS2Controller {
                 error_message(err)
             ));
         }
-        Ok(err)
+        err
     }
 
     /// `ERR?` reading `expected`; any other code prints C's `failed` line
     /// for it and is an error.
     fn check(&self, expected: i32, failed: impl FnOnce(i32) -> String) -> AsynResult<()> {
-        let err = self.get_gcs_error()?;
+        let err = self.get_gcs_error();
         if err == expected {
             return Ok(());
         }
@@ -716,9 +909,19 @@ impl PIGCS2Controller {
         Err(pigcs2_err(format!("GCS error {err}")))
     }
 
-    /// `MOV {axis} {position}` + `ERR? == 0`.
-    fn mov(&self, axis: &str, position: f64) -> AsynResult<()> {
-        self.send_only(&format!("MOV {axis} {}", CFloat(position)))?;
+    /// C `move`'s `MOV {axis} {position}` and its FLOW line.
+    fn send_mov(&self, axis: &str, position: f64) -> AsynResult<()> {
+        let cmd = format!("MOV {axis} {}", CFloat(position));
+        self.send_only(&cmd)?;
+        self.trace(
+            TraceMask::FLOW,
+            format_args!("PIGCSController::move() sent \"{cmd}\"\n"),
+        );
+        Ok(())
+    }
+
+    /// C `move`'s `ERR? == 0`.
+    fn check_mov(&self) -> AsynResult<()> {
         self.check(0, |err| {
             format!("PIGCSController::move() failed, GCS error {err}\n")
         })
@@ -765,7 +968,7 @@ impl PIGCS2Controller {
             return self.hexapod_move(&cmd);
         }
         self.send_only(&cmd)?;
-        let err = self.get_gcs_error()?;
+        let err = self.get_gcs_error();
         if err != 0 {
             self.print(format_args!(
                 "PIGCSController::moveCts(array) failed, GCS error {err}\n"
@@ -805,18 +1008,30 @@ impl PIGCS2Controller {
         })
     }
 
-    /// C `sendOnly(char)`: the byte alone, no terminator.
+    /// C `sendOnly(char)`: the byte alone, no terminator; a byte not
+    /// written is asynError whatever the write returned.
     fn send_only_char(&self, c: u8) -> AsynResult<()> {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("PIInterface::sendOnly() sending \"#{c}\"\n"),
+        );
         let e = match self.handle.write_octet(0, &[c]) {
             Ok(1) => return Ok(()),
             Ok(n) => pigcs2_err(format!("{n} bytes written")).with_partial_write(n),
-            Err(e) => e,
+            Err(e) if e.partial_write() == Some(1) => e,
+            Err(e) => {
+                let sent = e.partial_write().unwrap_or(0);
+                pigcs2_err(e.to_string()).with_partial_write(sent)
+            }
         };
-        self.print(format_args!(
-            "PIGCSController:sendOnly: error sending command {c}, sent={}, status={}\n",
-            e.partial_write().unwrap_or(0),
-            e.status() as i32
-        ));
+        self.trace(
+            IO_ERROR,
+            format_args!(
+                "PIGCSController:sendOnly: error sending command {c}, sent={}, status={}\n",
+                e.partial_write().unwrap_or(0),
+                e.status() as i32
+            ),
+        );
         Err(e)
     }
 
@@ -832,7 +1047,7 @@ impl PIGCS2Controller {
     /// whatever the axis.
     fn init_platform(&mut self) -> AsynResult<()> {
         if let Err(e) = self.send_only("INI X") {
-            let _ = self.get_gcs_error();
+            self.get_gcs_error();
             self.print(format_args!(
                 "PIHexapodController::referenceVelCts() failed\n"
             ));
@@ -853,9 +1068,14 @@ impl PIGCS2Controller {
     /// `RON {axis} 0` / `POS {axis} {position}` / `RON {axis} 1`, one
     /// `ERR? == 0` after all three (C `setAxisPosition`).
     fn set_axis_position(&self, axis: &str, position: f64) -> AsynResult<()> {
-        self.send_only(&format!("RON {axis} 0"))?;
-        self.send_only(&format!("POS {axis} {}", CFloat(position)))?;
-        self.send_only(&format!("RON {axis} 1"))?;
+        let pos = format!("POS {axis} {}", CFloat(position));
+        for cmd in [&format!("RON {axis} 0"), &pos, &format!("RON {axis} 1")] {
+            self.send_only(cmd)?;
+            self.trace(
+                TraceMask::FLOW,
+                format_args!("PIGCSController::setAxisPosition() sent \"{cmd}\"\n"),
+            );
+        }
         self.check(0, |err| {
             format!("PIGCSController::setAxisPosition() failed, GCS error {err}\n")
         })
@@ -893,6 +1113,21 @@ impl PIGCS2Controller {
         get_value_f64(&self.query(&format!("POS? {axis}"))?)
     }
 
+    /// C `getAxisPositionCts`: the position as read and in whole counts,
+    /// logged. C
+    /// defect not copied: `int(x + 0.5)` (PIGCSController.cpp:485), and
+    /// `int(x)` on a zero CPU term (:481), round a negative position toward
+    /// zero; rs takes the nearest count, as `target_counts`.
+    fn get_axis_position_cts(&self, axis: &str, cpu: f64, last: f64) -> AsynResult<(f64, f64)> {
+        let position = self.get_axis_position(axis, last / cpu)?;
+        let counts = nint(position * cpu);
+        self.trace(
+            TraceMask::FLOW,
+            format_args!("PIGCSController::getAxisPositionCts() pos:{counts}\n"),
+        );
+        Ok((position, f64::from(counts)))
+    }
+
     /// `TMN? {axis}` / `TMX? {axis}` -> `(negLimit, posLimit)`.
     /// Each limit is stored as soon as it is read, so a failed `TMX?` keeps
     /// the `TMN?` value, as C's reference out-parameters do.
@@ -926,7 +1161,7 @@ impl PIGCS2Controller {
             // that returned partial bytes (EOS interpose installed) is still
             // recognized as "no limit switches" rather than a hard fault.
             Err(e) if e.status() == AsynStatus::Timeout => {
-                let err = self.get_gcs_error()?;
+                let err = self.get_gcs_error();
                 if err == PI_CNTR_UNKNOWN_COMMAND {
                     Ok(false)
                 } else {
@@ -1017,10 +1252,16 @@ impl PIGCS2Controller {
 
     /// C `sendAndReceive(char)`: a short write is asynError. The byte is
     /// written again for each line that ends in a space, whose failure C
-    /// does not print. C defect not copied: it appends each line with no
-    /// separator, so `PIHexapodController`'s `#3` parse sees only the first
-    /// line; rs joins them with `\n`, as the string `sendAndReceive` does.
+    /// does not print. Failures end as in
+    /// [`Self::send_and_receive_buffer`]. C defect not copied: it appends
+    /// each line with no separator, so `PIHexapodController`'s `#3` parse
+    /// sees only the first line; rs joins them with `\n`, as the string
+    /// `sendAndReceive` does.
     fn send_and_receive_char(&self, c: u8) -> AsynResult<Vec<u8>> {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("PIInterface::sendAndReceive() sending \"#{c}\"\n"),
+        );
         let write_read = || {
             self.handle
                 .write_read(0, &[c], READ_BUF)
@@ -1029,18 +1270,21 @@ impl PIGCS2Controller {
                     _ => pigcs2_err(e.message()),
                 })
         };
-        let mut reply = write_read().inspect_err(|e| {
-            self.print(format_args!(
+        let read = write_read().inspect_err(|e| {
+            self.trace(IO_ERROR, format_args!(
                 "PIInterface::sendAndReceive error calling writeRead, output={c} status={}, error={}\n",
                 e.status() as i32,
                 e.message()
             ));
-        })?;
+        });
+        let mut reply = Vec::new();
+        let mut status = append_read(&mut reply, read);
         while reply.last() == Some(&b' ') {
             reply.push(b'\n');
-            reply.extend(write_read()?);
+            status = append_read(&mut reply, write_read());
         }
-        Ok(reply)
+        self.trace_received(&reply);
+        status.map(|()| reply)
     }
 
     /// [`Self::send_and_receive_char`]'s reply line.
@@ -1070,26 +1314,81 @@ impl PIGCS2Controller {
     }
 
     /// `char(4)` -> `(homing, moving, negLimit, posLimit, servoControl)` for
-    /// `axis_no` (C `PIGCSMotorController::getStatus`).
-    fn get_status(&self, axis_no: usize) -> AsynResult<(bool, bool, bool, bool, bool)> {
+    /// `axis_no` (C `PIGCSMotorController::getStatus`, and
+    /// `PIC885Controller`'s, which differs only in its FLOW line).
+    fn get_status(&self, axis: &str, axis_no: usize) -> AsynResult<(bool, bool, bool, bool, bool)> {
         let reply = self.query_char(4)?;
         let mask = status_mask_at(&reply, axis_no).ok_or_else(|| {
             pigcs2_err(format!(
                 "status reply too short for axis {axis_no}: {reply:?}"
             ))
         })?;
-        Ok(status_from_bitmask(mask))
+        let status = status_from_bitmask(mask);
+        let (homing, moving, _, _, servo) = status;
+        // C cuts its buffer after the axis's word, then prints it.
+        let buf = reply.get(..2 + axis_no * 4 + 4).unwrap_or(&reply);
+        let (moving, servo, homing) = (i32::from(moving), i32::from(servo), i32::from(homing));
+        if self.model == Model::C885 {
+            self.trace(
+                TraceMask::FLOW,
+                format_args!(
+                    "PIC885Controller::getStatus() Axis: {axis}, buf:{buf} moving {moving}, svo: {servo}, homming: {homing}\n"
+                ),
+            );
+        } else {
+            self.trace(
+                TraceMask::FLOW,
+                format_args!(
+                    "PIGCSMotorController::getStatus() buf:{buf} moving {moving}, svo: {servo}\n"
+                ),
+            );
+        }
+        Ok(status)
     }
 }
 
-/// C `PIasynController::report` (PIasynController.cpp:196-221), over the
-/// axes `PI_GCS2_CreateController` created.
-#[derive(Clone, Default)]
-pub struct PIGCS2Report {
-    axes: Arc<Mutex<Vec<Arc<Mutex<PIGCS2Axis>>>>>,
+/// C `PIasynController`'s parameters (PIasynController.cpp:68-102).
+#[derive(Clone, Copy, Debug)]
+struct PiParams {
+    position: usize,
+    target: usize,
+    servo: usize,
+    last_err: usize,
+    clear_err: usize,
+    pivot_x: usize,
+    pivot_y: usize,
+    pivot_z: usize,
+    rbpivot_x: usize,
+    rbpivot_y: usize,
+    rbpivot_z: usize,
+    target_mode: usize,
+    cs_activate: usize,
+    cs_link: usize,
+    cs_kst: usize,
+    cs_ksw: usize,
 }
 
-impl PIGCS2Report {
+/// What C `PIasynController` adds to the `asynMotorController` port: its
+/// parameters and writes, and `report` (PIasynController.cpp:196-221) over
+/// the axes `PI_GCS2_CreateController` created.
+#[derive(Clone, Default)]
+pub struct PIGCS2Params {
+    axes: Arc<Mutex<Vec<Arc<Mutex<PIGCS2Axis>>>>>,
+    /// C `m_pGCSController`, NULL until the constructor makes one.
+    controller: Arc<OnceLock<Arc<Mutex<PIGCS2Controller>>>>,
+    params: Arc<OnceLock<PiParams>>,
+}
+
+impl PIGCS2Params {
+    /// C `m_pGCSController = CreateGCSController(...)`: `controller` takes
+    /// the port's writes and posts its poll to `port`.
+    pub fn attach(&self, controller: Arc<Mutex<PIGCS2Controller>>, port: PortHandle) {
+        if let Some(&params) = self.params.get() {
+            controller.lock().unwrap_or_else(|e| e.into_inner()).port = Some((port, params));
+        }
+        let _ = self.controller.set(controller);
+    }
+
     /// An axis the report lists, in creation order.
     pub fn add(&self, axis: Arc<Mutex<PIGCS2Axis>>) {
         self.axes
@@ -1099,7 +1398,252 @@ impl PIGCS2Report {
     }
 }
 
-impl ControllerParams for PIGCS2Report {
+/// C `PIasynController::writeInt32`/`writeFloat64` with no
+/// `m_pGCSController`: asynError before anything is stored.
+fn not_initialized(base: &PortDriverBase, user: &AxisUser<'_>, method: &str) -> ParamWrite {
+    PortManager::global().trace_manager().print(
+        Some(&base.port_name),
+        Some(user.asyn().addr),
+        user.reason as i32,
+        TraceMask::ERROR,
+        format_args!("PIasynController::{method}() GCS controller not initialized!\n"),
+    );
+    ParamWrite::Handled(Err(pigcs2_err("GCS controller not initialized")))
+}
+
+/// What `PIasynController::writeInt32`/`writeFloat64` do around
+/// `asynMotorController`'s.
+struct PiWriteHook(PiParams);
+
+impl WriteHook for PiWriteHook {
+    /// The functions C's writes take without calling the base
+    /// (PIasynController.cpp:294-322, :364-394).
+    fn handles(&self, function: usize) -> bool {
+        let p = &self.0;
+        [
+            index::CLOSED_LOOP,
+            index::DEFER_MOVES,
+            p.servo,
+            p.clear_err,
+            p.target_mode,
+            p.target,
+            p.pivot_x,
+            p.pivot_y,
+            p.pivot_z,
+        ]
+        .contains(&function)
+    }
+
+    /// The closing line; a servo or target write prints its own from the
+    /// axis call [`queue_axis_write`] runs.
+    fn after_write(&self, write: &FinishedWrite<'_>) -> WriteOutcome {
+        if write.function != self.0.servo && write.function != self.0.target {
+            write_trailer(
+                &|mask, args| write.print(mask, args),
+                write.function,
+                write.value,
+                write.status,
+            );
+        }
+        WriteOutcome::default()
+    }
+}
+
+/// `PIasynController::writeInt32`/`writeFloat64`'s closing line.
+fn write_trailer(
+    print: &dyn Fn(TraceMask, std::fmt::Arguments<'_>),
+    function: usize,
+    value: WriteValue,
+    status: &AsynResult<()>,
+) {
+    let (method, value) = match value {
+        WriteValue::Int32(v) => ("writeInt32", v.to_string()),
+        WriteValue::Float64(v) => ("writeFloat64", format!("{:.6}", CFloat(v))),
+    };
+    match status {
+        Err(e) => print(
+            TraceMask::ERROR,
+            format_args!(
+                "PIasynDriver:{method}: error, status={} function={function}, value={value}\n",
+                e.c_status_code()
+            ),
+        ),
+        Ok(()) => print(
+            TraceMask::IO_DRIVER,
+            format_args!("PIasynDriver:{method}: function={function}, value={value}\n"),
+        ),
+    }
+}
+
+/// A write C runs on the axis inside the port's write, queued to the
+/// axis's poller: `run`, then the write's closing line with its status.
+fn queue_axis_write(
+    base: &PortDriverBase,
+    user: AxisUser<'_>,
+    value: WriteValue,
+    run: impl Fn(&mut PIGCS2Axis, &AsynUser) -> AsynResult<()> + Send + Sync + 'static,
+) -> ParamWrite {
+    let port = base.port_name.to_string();
+    let addr = user.asyn().addr;
+    let function = user.reason;
+    let call = DriverCall::new(move |motor, asyn| {
+        let any: &mut dyn std::any::Any = motor;
+        let status = any
+            .downcast_mut::<PIGCS2Axis>()
+            .ok_or_else(|| pigcs2_err("a PI write on a non-PI axis"))
+            .and_then(|axis| run(axis, asyn));
+        let print = |mask, args: std::fmt::Arguments<'_>| {
+            PortManager::global().trace_manager().print(
+                Some(&port),
+                Some(addr),
+                function as i32,
+                mask,
+                args,
+            )
+        };
+        write_trailer(&print, function, value, &status);
+        status
+    });
+    ParamWrite::PassToBase(user.queue(base, MotorCommand::Driver(call)))
+}
+
+impl ControllerParams for PIGCS2Params {
+    fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
+        let params = *self.params.get()?;
+        Some(Arc::new(PiWriteHook(params)))
+    }
+
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        let mut create = |name, kind| base.create_param(name, kind);
+        let params = PiParams {
+            position: create("PI_SUP_POSITION", ParamType::Float64)?,
+            target: create("PI_SUP_TARGET", ParamType::Float64)?,
+            servo: create("PI_SUP_SERVO", ParamType::Int32)?,
+            last_err: create("PI_SUP_LAST_ERR", ParamType::Int32)?,
+            clear_err: create("PI_SUP_CLEAR_ERR", ParamType::Int32)?,
+            pivot_x: create("PI_SUP_PIVOT_X", ParamType::Float64)?,
+            pivot_y: create("PI_SUP_PIVOT_Y", ParamType::Float64)?,
+            pivot_z: create("PI_SUP_PIVOT_Z", ParamType::Float64)?,
+            rbpivot_x: create("PI_SUP_RBPIVOT_X", ParamType::Float64)?,
+            rbpivot_y: create("PI_SUP_RBPIVOT_Y", ParamType::Float64)?,
+            rbpivot_z: create("PI_SUP_RBPIVOT_Z", ParamType::Float64)?,
+            target_mode: create("PI_CS_TARGETMODE", ParamType::Int32)?,
+            cs_activate: create("PI_CS_ACTIVATE", ParamType::Octet)?,
+            cs_link: create("PI_CS_LINK", ParamType::Octet)?,
+            cs_kst: create("PI_CS_KST", ParamType::Octet)?,
+            cs_ksw: create("PI_CS_KSW", ParamType::Octet)?,
+        };
+        let _ = self.params.set(params);
+        Ok(())
+    }
+
+    /// C `PIasynController::writeInt32`'s own parameters; the base stores
+    /// the written value and runs the callbacks, as C's.
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        value: i32,
+    ) -> ParamWrite {
+        let Some(controller) = self.controller.get() else {
+            return not_initialized(base, &user, "writeInt32");
+        };
+        let Some(params) = self.params.get() else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        // C's sink is the asynUser itself, a `-1` address included.
+        ctrl.log_sink = Some((base.port_name.to_string(), user.asyn().addr));
+        if user.reason == params.servo {
+            drop(ctrl);
+            // As motorClosedLoop: the axis's set_closed_loop runs C's setServo.
+            return queue_axis_write(base, user, WriteValue::Int32(value), move |axis, asyn| {
+                axis.set_closed_loop(asyn, value != 0)
+            });
+        }
+        // Each also sets its address-0 value, as C's setIntegerParam(0, ...).
+        let (reason, value) = if user.reason == params.clear_err {
+            ctrl.last_error.set(0);
+            (params.last_err, 0)
+        } else if user.reason == params.target_mode {
+            ctrl.target_mode = value;
+            (params.target_mode, value)
+        } else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        ParamWrite::PassToBase(base.set_int32_param(reason, 0, value))
+    }
+
+    /// C `PIasynController::writeFloat64`'s own parameters.
+    fn write_float64(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        value: f64,
+    ) -> ParamWrite {
+        let Some(controller) = self.controller.get() else {
+            return not_initialized(base, &user, "writeFloat64");
+        };
+        let Some(params) = self.params.get() else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        // C's sink is the asynUser itself, a `-1` address included.
+        ctrl.log_sink = Some((base.port_name.to_string(), user.asyn().addr));
+        let pivots = [params.pivot_x, params.pivot_y, params.pivot_z];
+        let pivot = pivots.iter().position(|&r| r == user.reason);
+        if pivot.is_none() && user.reason != params.target {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        let Some(index) = pivot else {
+            drop(ctrl);
+            return queue_axis_write(base, user, WriteValue::Float64(value), move |axis, _| {
+                axis.move_cts(target_counts(value * axis.cpu))
+            });
+        };
+        ParamWrite::PassToBase(ctrl.set_pivot(index, value))
+    }
+
+    /// C `PIasynController::writeOctet`: the C-887's coordinate-system
+    /// commands. C ignores their status and, never calling the base, stores
+    /// no value for any parameter.
+    fn write_octet(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        data: &[u8],
+    ) -> ParamWrite {
+        // C's `const char *value`: the bytes up to a NUL.
+        let value = data.split(|&b| b == 0).next().unwrap_or_default();
+        let value = String::from_utf8_lossy(value);
+        if let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) {
+            let commands = [
+                (params.cs_activate, "KEN"),
+                (params.cs_link, "KLN"),
+                (params.cs_kst, "KST"),
+                (params.cs_ksw, "KSW"),
+            ];
+            if let Some(&(_, command)) = commands.iter().find(|(r, _)| *r == user.reason) {
+                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                if ctrl.model == Model::CoordinateSystem {
+                    let _ = ctrl.send_only(&format!("{command} {value}"));
+                }
+            }
+        }
+        // C's status is never set: the success line.
+        PortManager::global().trace_manager().print(
+            Some(&base.port_name),
+            Some(user.asyn().addr),
+            user.reason as i32,
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "PIasynDriver:writeOctet: function={}, value={value}\n",
+                user.reason
+            ),
+        );
+        ParamWrite::Handled(Ok(()))
+    }
+
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
             out,
@@ -1145,6 +1689,8 @@ pub struct PIGCS2Axis {
     cpu: f64,
     /// Last polled position, in record steps.
     last_position: f64,
+    /// The same position as read, in controller units (C `m_position`).
+    position: f64,
     last_direction: bool,
     low_limit: f64,
     high_limit: f64,
@@ -1153,6 +1699,9 @@ pub struct PIGCS2Axis {
     max_acceleration: Option<f64>,
     /// C `m_acceleration`: the clamped acceleration last set.
     acceleration: f64,
+    /// The `PIasynController` parameters the last poll set on the axis,
+    /// for that poll's `callParamCallbacks`.
+    poll_params: Vec<(usize, ParamValue)>,
 }
 
 impl PIGCS2Axis {
@@ -1183,11 +1732,13 @@ impl PIGCS2Axis {
             pos_limit: false,
             cpu: counts_per_unit(DEFAULT_CPU_Z, DEFAULT_CPU_N),
             last_position: 0.0,
+            position: 0.0,
             last_direction: false,
             low_limit: 0.0,
             high_limit: 0.0,
             max_acceleration: None,
             acceleration: 0.0,
+            poll_params: Vec::new(),
         };
         axis.log_here();
         let _ = axis.init_axis(port_name);
@@ -1206,14 +1757,15 @@ impl PIGCS2Axis {
                 .unwrap_or(axis.cpu)
         };
         let _ = ctrl.get_axis_velocity(&axis.axis_name);
-        let position = ctrl.get_axis_position(&axis.axis_name, axis.last_position / cpu);
+        let position = ctrl.get_axis_position_cts(&axis.axis_name, cpu, axis.last_position);
         let (mut low_limit, mut high_limit) = (axis.low_limit, axis.high_limit);
         let _ = ctrl.get_travel_limits(&axis.axis_name, &mut low_limit, &mut high_limit);
         let homed = ctrl.get_referenced_state(&axis.axis_name);
         drop(ctrl);
         axis.cpu = cpu;
-        if let Ok(position) = position {
-            axis.last_position = position * cpu;
+        if let Ok((position, counts)) = position {
+            axis.position = position;
+            axis.last_position = counts;
         }
         (axis.low_limit, axis.high_limit) = (low_limit, high_limit);
         if let Ok(homed) = homed {
@@ -1273,6 +1825,27 @@ impl PIGCS2Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// `PIasynController::writeInt32`'s FLOW line for a flag write. C
+    /// defect not copied: its format takes the verb first, printing
+    /// "Sett:PIasynDriver: writeInt32ing ...".
+    fn flag_write_flow(&self, verb: &str, flag: &str) {
+        self.flow(format_args!(
+            "PIasynDriver:writeInt32: {verb}ing {flag} flag on driver {}\n",
+            self.port_name
+        ));
+    }
+
+    /// `asynPrint(pasynUser_, ASYN_TRACE_FLOW, ...)`: the axis's own user.
+    fn flow(&self, args: std::fmt::Arguments<'_>) {
+        PortManager::global().trace_manager().print(
+            Some(&self.port_name),
+            Some(self.axis_no as i32),
+            0,
+            TraceMask::FLOW,
+            args,
+        );
+    }
+
     /// C `m_pCurrentLogSink = pasynUser_`, at the head of `Init` and of
     /// each axis entry point and controller write.
     fn log_here(&self) {
@@ -1298,7 +1871,7 @@ impl PIGCS2Axis {
             return Ok((ctrl.hexapod.homing, moving, false, false, self.servo_on));
         }
         if !matches!(ctrl.model, Model::E755 | Model::C702) {
-            return ctrl.get_status(self.axis_no);
+            return ctrl.get_status(&self.axis_name, self.axis_no);
         }
         // PIE755Controller::getStatus, and PIC702Controller's after the
         // first second of a REF: busy is homing and moving, no limits. C
@@ -1365,6 +1938,45 @@ impl PIGCS2Axis {
             ctrl.set_enable_axis(&self.axis_name, 1)?;
         }
         Ok(())
+    }
+
+    /// C `moveCts(pAxis, targetCts)`: the move to `counts`, by the
+    /// hexapod's target mode or a plain `MOV`.
+    fn move_cts(&mut self, counts: f64) -> AsynResult<()> {
+        let mut ctrl = self.lock();
+        if ctrl.model.is_hexapod() {
+            // PIHexapodController::moveCts by m_targetMode, the distance
+            // from the polled position. C defect not copied: another mode
+            // sends an uninitialized command; rs refuses the move.
+            let (cmd, value) = match ctrl.target_mode {
+                0 => ("MOV", counts),
+                1 => ("MRT", counts - self.last_position),
+                2 => ("MRW", counts - self.last_position),
+                mode => return Err(pigcs2_err(format!("target mode {mode}"))),
+            };
+            ctrl.hexapod_move(&format!(
+                "{cmd} {} {}",
+                self.axis_name,
+                CFloat(value / self.cpu)
+            ))?;
+            drop(ctrl);
+            self.last_direction = counts > self.last_position;
+            return Ok(());
+        }
+        ctrl.trace(
+            TraceMask::FLOW,
+            format_args!("PIGCSController::moveCts(, {counts}) \n"),
+        );
+        drop(ctrl);
+        self.move_to(counts / self.cpu)
+    }
+
+    /// C `PIGCSController::move(pAxis, target)`: the direction, against the
+    /// position in units, is set once `MOV` is sent, before its `ERR?`.
+    fn move_to(&mut self, target: f64) -> AsynResult<()> {
+        self.lock().send_mov(&self.axis_name, target)?;
+        self.last_direction = target > self.position;
+        self.lock().check_mov()
     }
 
     /// C `setServo`: a servo turned on clears the problem flag.
@@ -1456,8 +2068,9 @@ impl PIGCS2Axis {
     }
 
     /// C `PIasynAxis::poll`'s reads after the status, skipped while a
-    /// controller that cannot talk while homing homes.
-    fn poll_reads(&mut self, old_homing: bool, servo_control: bool) {
+    /// controller that cannot talk while homing homes; the
+    /// `PI_SUP_POSITION` read when it ran and answered.
+    fn poll_reads(&mut self, old_homing: bool, servo_control: bool) -> Option<f64> {
         let homing = self.is_homing;
         // C only re-queries FRF? (the homed flag) right when homing just
         // finished (oldHoming true, new homing false) — not every cycle.
@@ -1466,6 +2079,11 @@ impl PIGCS2Axis {
             if let Ok(homed) = homed {
                 self.homed = homed;
             }
+            self.flow(format_args!(
+                "PIasynAxis::poll() axis {} referencing state changed, homed = {}\n",
+                self.axis_no,
+                i32::from(self.homed)
+            ));
             // C m_bEnableAxisAfterHoming / m_bSetServoAfterHoming, set by
             // PIC885Controller::initAxis alone.
             if self.homed && self.lock().model == Model::C885 {
@@ -1482,16 +2100,24 @@ impl PIGCS2Axis {
         if !homing || self.lock().model.is_gcs2() {
             self.servo_on = servo_control;
             let ctrl = self.lock();
-            let position = ctrl
-                .get_axis_position(&self.axis_name, self.last_position / self.cpu)
-                .map_or(self.last_position, |p| p * self.cpu);
+            let (units, position) = ctrl
+                .get_axis_position_cts(&self.axis_name, self.cpu, self.last_position)
+                .unwrap_or((self.position, self.last_position));
+            // C defect not copied: a failed read posts C's uninitialized
+            // realPosition (PIasynAxis.cpp:163); rs posts nothing.
+            let real = ctrl
+                .get_axis_position(&self.axis_name, position / self.cpu)
+                .ok();
             let (mut low_limit, mut high_limit) = (self.low_limit, self.high_limit);
             let _ = ctrl.get_travel_limits(&self.axis_name, &mut low_limit, &mut high_limit);
             drop(ctrl);
+            self.position = units;
             self.last_position = position;
             self.low_limit = low_limit;
             self.high_limit = high_limit;
+            return real;
         }
+        None
     }
 
     /// C `PIGCSMotorController::referenceAxis`: servo on, then the
@@ -1508,6 +2134,10 @@ impl PIGCS2Axis {
 }
 
 impl AsynMotor for PIGCS2Axis {
+    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
+        std::mem::take(&mut self.poll_params)
+    }
+
     /// C `PIasynAxis::poll` ignores the controller's read status.
     fn poll_failure(&self) -> PollFailure {
         PollFailure::NONE
@@ -1517,7 +2147,7 @@ impl AsynMotor for PIGCS2Axis {
         &mut self,
         _user: &AsynUser,
         position: f64,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
@@ -1525,13 +2155,14 @@ impl AsynMotor for PIGCS2Axis {
         if !self.lock().accepts_new_target() {
             return Err(self.refuse_target("moveAxis", "\n"));
         }
+        let counts = target_counts(position);
         let mut ctrl = self.lock();
         if ctrl.moves_deferred {
             ctrl.deferred.insert(
                 self.axis_no,
                 DeferredMove {
                     axis: self.axis_name.clone(),
-                    counts: position,
+                    counts,
                     cpu: self.cpu,
                 },
             );
@@ -1547,19 +2178,19 @@ impl AsynMotor for PIGCS2Axis {
         if acceleration != 0.0 {
             self.apply_acceleration(acceleration)?;
         }
-        let mut ctrl = self.lock();
-        if ctrl.model.is_hexapod() {
-            ctrl.hexapod_move(&format!(
-                "MOV {} {}",
-                self.axis_name,
-                CFloat(position / self.cpu)
-            ))?;
-        } else {
-            ctrl.mov(&self.axis_name, position / self.cpu)?;
-        }
-        drop(ctrl);
-        self.last_direction = position > self.last_position;
-        Ok(())
+        let result = self.move_cts(counts);
+        // Only the undeferred move reaches here: movesDeferred is 0.
+        self.flow(format_args!(
+            "PIasynAxis:moveAxis: Set driver {}, axis {} move to {}, min vel={}, max_vel={}, accel={}, deffered=0 - status={}\n",
+            self.port_name,
+            self.axis_no,
+            CFloat(position),
+            CFloat(min_velocity),
+            CFloat(velocity),
+            CFloat(acceleration),
+            status_code(&result)
+        ));
+        result
     }
 
     // move_relative: C's own `move(position, relative, ...)` never branches
@@ -1573,32 +2204,49 @@ impl AsynMotor for PIGCS2Axis {
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
         self.log_here();
         if !self.lock().accepts_new_target() {
             return Err(self.refuse_target("moveVelocityAxis", ""));
         }
-        // C `moveVelocity`: VEL, then MOV toward whichever travel limit the
-        // sign of velocity selects (TMN/TMX, already controller units). No
-        // acceleration write, and — unlike move_absolute — `m_lastDirection`
-        // is not updated here in C either.
-        let ctrl = self.lock();
-        ctrl.set_velocity(&self.axis_name, velocity / self.cpu)?;
+        // C `moveVelocity`: VEL, then `move` toward whichever travel limit
+        // the sign of velocity selects (TMN/TMX, already controller units).
+        // No acceleration write.
         let target = if velocity > 0.0 {
             self.high_limit
         } else {
             self.low_limit
         };
-        ctrl.mov(&self.axis_name, target)
+        let line = |when| {
+            format!(
+                "PIasynAxis:moveVelocityAxis: Set port {}, axis {} move with velocity of {}, accel={} / target {} - {when} MOV\n",
+                self.port_name,
+                self.axis_no,
+                CFloat(velocity),
+                CFloat(acceleration),
+                CFloat(target)
+            )
+        };
+        let (before, after) = (line("BEFORE"), line("AFTER"));
+        self.flow(format_args!("{before}"));
+        // C ignores both statuses and returns its initial asynError
+        // whatever happened; that C defect is not copied: rs returns the
+        // move's.
+        let _ = self
+            .lock()
+            .set_velocity(&self.axis_name, velocity / self.cpu);
+        let result = self.move_to(target);
+        self.flow(format_args!("{after}"));
+        result
     }
 
     fn home(
         &mut self,
         _user: &AsynUser,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
         self.log_here();
@@ -1606,28 +2254,67 @@ impl AsynMotor for PIGCS2Axis {
         // command; on failure it is left set until the next poll's real
         // status bitmask corrects it, matching upstream.
         self.is_homing = true;
-        self.reference_vel_cts(velocity, forward)
+        self.reference_vel_cts(velocity, forward)?;
+        self.flow(format_args!(
+            "PIasynAxis:homeAxis: Set driver {}, axis {} to home {}, min vel={}, max_vel={}, accel={}",
+            self.port_name,
+            self.axis_no,
+            if forward { "FORWARDS" } else { "REVERSE" },
+            CFloat(min_velocity),
+            CFloat(velocity),
+            CFloat(acceleration)
+        ));
+        Ok(())
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
         self.log_here();
         let mut ctrl = self.lock();
         ctrl.deferred.remove(&self.axis_no);
-        match ctrl.model {
+        // C returns asynSuccess whatever haltAxis returned.
+        let _ = match ctrl.model {
             Model::C885 => ctrl.stop_all(),
             model if model.is_hexapod() => ctrl.halt_platform(),
             _ => ctrl.halt(&self.axis_name),
-        }
+        };
+        drop(ctrl);
+        self.flow(format_args!(
+            "PIasynAxis:stopAxis: Set axis {} to stop with accel={}",
+            self.axis_no,
+            CFloat(acceleration)
+        ));
+        Ok(())
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         self.log_here();
-        self.lock()
-            .set_axis_position(&self.axis_name, position / self.cpu)
+        let ctrl = self.lock();
+        // C setAxisPositionCts.
+        ctrl.trace(
+            TraceMask::FLOW,
+            format_args!(
+                "PIGCSController::setAxisPositionCts(, {}) \n",
+                CFloat(position)
+            ),
+        );
+        let result = ctrl.set_axis_position(&self.axis_name, position / self.cpu);
+        drop(ctrl);
+        self.flow(format_args!(
+            "PIasynAxis:setPositionAxis: Set driver {}, axis {} set position to {} - status={}\n",
+            self.port_name,
+            self.axis_no,
+            CFloat(position),
+            status_code(&result)
+        ));
+        result
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
         self.log_here();
+        self.flag_write_flow(
+            if enable { "Enabl" } else { "Disabl" },
+            "Closed-Loop Control",
+        );
         self.set_servo(enable)
     }
 
@@ -1635,19 +2322,7 @@ impl AsynMotor for PIGCS2Axis {
     /// deferral runs `processDeferredMoves`, whose status C ignores.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
         self.log_here();
-        // C defect not copied: its format puts the "Sett"/"Clear" argument
-        // first, printing "Sett:PIasynDriver: writeInt32ing ...".
-        PortManager::global().trace_manager().print(
-            Some(&self.port_name),
-            Some(self.axis_no as i32),
-            0,
-            TraceMask::FLOW,
-            format_args!(
-                "PIasynDriver:writeInt32: {}ing Deferred Move flag on driver {}\n",
-                if defer { "Sett" } else { "Clear" },
-                self.port_name
-            ),
-        );
+        self.flag_write_flow(if defer { "Sett" } else { "Clear" }, "Deferred Move");
         let mut ctrl = self.lock();
         if !defer && ctrl.moves_deferred {
             let _ = ctrl.process_deferred_moves();
@@ -1679,8 +2354,25 @@ impl AsynMotor for PIGCS2Axis {
         self.pos_limit = pos_limit;
         self.is_homing = homing;
         let model = self.lock().model;
-        if !homing || model.can_communicate_while_homing() {
-            self.poll_reads(old_homing, servo_control);
+        let real = if !homing || model.can_communicate_while_homing() {
+            self.poll_reads(old_homing, servo_control)
+        } else {
+            None
+        };
+        if homing {
+            self.flow(format_args!(
+                "PIasynAxis::poll() axis {} referencing ...\n",
+                self.axis_no
+            ));
+        }
+        let params = self.lock().port.as_ref().map(|&(_, params)| params);
+        if let Some(params) = params {
+            if let Some(real) = real {
+                self.poll_params
+                    .push((params.position, ParamValue::Float64(real)));
+            }
+            self.poll_params
+                .push((params.servo, ParamValue::Int32(self.servo_on.into())));
         }
         let position = self.last_position;
 
@@ -1780,10 +2472,11 @@ mod tests {
         assert_eq!(status_mask_at("01", 0), Some(0));
     }
 
-    /// Refuses the first write offered; records every write.
+    /// Refuses the first write offered with `status`; records every write.
     struct FirstWriteRefused {
         base: epics_rs::asyn::port::PortDriverBase,
         written: Arc<Mutex<Vec<String>>>,
+        status: AsynStatus,
     }
 
     impl epics_rs::asyn::port::PortDriver for FirstWriteRefused {
@@ -1797,11 +2490,52 @@ mod tests {
             let mut written = self.written.lock().unwrap();
             written.push(String::from_utf8_lossy(data).into_owned());
             if written.len() == 1 {
-                Err(pigcs2_err("refused"))
+                Err(AsynError::Status {
+                    status: self.status,
+                    message: "refused".into(),
+                })
             } else {
                 Ok(data.len())
             }
         }
+    }
+
+    /// `PIInterface::sendOnly(char)` (PIInterface.cpp:80-81): a byte not
+    /// written is asynError, whatever the write returned.
+    #[test]
+    fn a_char_not_written_is_an_asyn_error() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = FirstWriteRefused {
+            base: PortDriverBase::new("gcs2CharTimeout", 1, PortFlags::default()),
+            written: Arc::default(),
+            status: AsynStatus::Timeout,
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("gcs2CharTimeout").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl = PIGCS2Controller::new(
+            SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                std::time::Duration::from_secs(1),
+            ),
+            "gcs2CharTimeout",
+        );
+        let mut status = None;
+        let printed = traced("gcs2CharTimeout", || {
+            status = ctrl.send_only_char(24).err().map(|e| e.status());
+        });
+        assert_eq!(status, Some(AsynStatus::Error));
+        assert_eq!(
+            messages(&printed),
+            ["PIGCSController:sendOnly: error sending command 24, sent=0, status=3\n"]
+        );
     }
 
     #[test]
@@ -1814,6 +2548,7 @@ mod tests {
         let port = FirstWriteRefused {
             base: PortDriverBase::new("gcs2SendOnly", 1, PortFlags::default()),
             written: written.clone(),
+            status: AsynStatus::Error,
         };
         let (rt, _actor) = create_port_runtime(
             &claim_port("gcs2SendOnly").unwrap(),
@@ -1821,24 +2556,14 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let ctrl = PIGCS2Controller {
-            handle: SyncIOHandle::from_handle(
+        let ctrl = PIGCS2Controller::new(
+            SyncIOHandle::from_handle(
                 rt.port_handle().clone(),
                 0,
                 std::time::Duration::from_secs(1),
             ),
-            serial_port: "gcs2SendOnly".into(),
-            ident: String::new(),
-            model: Model::default(),
-            knows_vel: false,
-            axis_names: Vec::new(),
-            ref_started: None,
-            hexapod: HexapodState::default(),
-            log_sink: None,
-            moves_deferred: false,
-            deferred: BTreeMap::new(),
-            released: BTreeMap::new(),
-        };
+            "gcs2SendOnly",
+        );
         // C overwrites the refused command's status with the `\n` write's.
         assert!(ctrl.send_only("MOV 1 1").is_ok());
         assert_eq!(*written.lock().unwrap(), ["MOV 1 1", "\n"]);
@@ -1890,24 +2615,14 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let ctrl = PIGCS2Controller {
-            handle: SyncIOHandle::from_handle(
+        let ctrl = PIGCS2Controller::new(
+            SyncIOHandle::from_handle(
                 rt.port_handle().clone(),
                 0,
                 std::time::Duration::from_secs(1),
             ),
-            serial_port: "gcs2StatusRefused".into(),
-            ident: String::new(),
-            model: Model::default(),
-            knows_vel: false,
-            axis_names: Vec::new(),
-            ref_started: None,
-            hexapod: HexapodState::default(),
-            log_sink: None,
-            moves_deferred: false,
-            deferred: BTreeMap::new(),
-            released: BTreeMap::new(),
-        };
+            "gcs2StatusRefused",
+        );
         let mut axis = PIGCS2Axis {
             controller: Arc::new(Mutex::new(ctrl)),
             axis_name: "1".into(),
@@ -1924,14 +2639,17 @@ mod tests {
             pos_limit: true,
             cpu: 1.0,
             last_position: 0.0,
+            position: 0.0,
             last_direction: true,
             low_limit: 0.0,
             high_limit: 0.0,
             max_acceleration: None,
             acceleration: 0.0,
+            poll_params: Vec::new(),
         };
         let status = axis.poll(&AsynUser::new(0)).unwrap();
-        assert_eq!(status.position, 2.5);
+        // POS? 2.5 in whole counts.
+        assert_eq!(status.position, 3.0);
         assert!(status.moving && status.msta_moving && status.high_limit && status.powered);
         assert!(!status.problem);
         assert_eq!((axis.low_limit, axis.high_limit), (-10.0, 10.0));
@@ -1948,8 +2666,8 @@ mod tests {
         let mut ctrl = PIGCS2Controller::new(io, "gcs2CFloat");
         ctrl.knows_vel = true;
         let neg_nan = -f64::NAN;
-        let _ = ctrl.mov("1", f64::NAN);
-        let _ = ctrl.mov("1", neg_nan);
+        let _ = ctrl.send_mov("1", f64::NAN);
+        let _ = ctrl.send_mov("1", neg_nan);
         let _ = ctrl.set_velocity("1", f64::NAN);
         let _ = ctrl.set_axis_position("1", neg_nan);
         let _ = ctrl.set_reference_velocity("1", f64::NAN);
@@ -2117,7 +2835,7 @@ mod tests {
             sent_lines(&line),
             [
                 "\u{4}", "FRF? 1", "EAX? 1", "ERR?", "EAX 1 1", "ERR?", "SVO 1 1", "ERR?",
-                "POS? 1", "TMN? 1", "TMX? 1"
+                "POS? 1", "POS? 1", "TMN? 1", "TMX? 1"
             ]
         );
         assert!(status.homed && status.problem && !status.powered);
@@ -2190,7 +2908,7 @@ mod tests {
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         assert_eq!(
             sent_lines(&line),
-            ["\u{7}", "\u{5}", "POS? 1", "TMN? 1", "TMX? 1"]
+            ["\u{7}", "\u{5}", "POS? 1", "POS? 1", "TMN? 1", "TMX? 1"]
         );
         assert!(status.moving && !status.done && !status.high_limit && !status.low_limit);
         assert!(status.powered && !status.problem && !axis.is_homing);
@@ -2325,6 +3043,960 @@ mod tests {
         assert!(sent_lines(&line).is_empty());
     }
 
+    /// A port whose constructor returned before `m_pGCSController` was set
+    /// refuses an Int32/Float64 write with asynError, storing nothing
+    /// (PIasynController.cpp:276-283, :345-352).
+    #[test]
+    fn a_port_with_no_controller_refuses_its_writes() {
+        let name = "gcs2NoCtl";
+        let params = PIGCS2Params::default();
+        let port = motor_common::register_controller_port(
+            &epics_rs::asyn::registry::open_owner(),
+            name,
+            1,
+            params.clone(),
+        )
+        .unwrap();
+        let p = *params.params.get().unwrap();
+        let printed = traced(name, || {
+            assert!(port.write_int32_blocking(p.target_mode, 0, 2).is_err());
+            assert!(port.write_float64_blocking(p.pivot_x, 0, 1.5).is_err());
+        });
+        for line in [
+            "PIasynController::writeInt32() GCS controller not initialized!\n",
+            "PIasynController::writeFloat64() GCS controller not initialized!\n",
+        ] {
+            assert!(printed.contains(line), "{line:?} not in {printed}");
+        }
+        assert!(port.read_int32_blocking(p.target_mode, 0).is_err());
+        assert!(port.read_float64_blocking(p.pivot_x, 0).is_err());
+    }
+
+    /// `ctrl`'s `PIasynController` port `name` with axis `axis` at address
+    /// 0, as `PI_GCS2_CreateController` makes it.
+    fn controller_port(
+        name: &str,
+        ctrl: &Arc<Mutex<PIGCS2Controller>>,
+        axis: &str,
+    ) -> (
+        PortHandle,
+        PiParams,
+        epics_rs::motor::poll_loop::MotorPollLoop,
+    ) {
+        let params = PIGCS2Params::default();
+        let port = motor_common::register_controller_port(
+            &epics_rs::asyn::registry::open_owner(),
+            name,
+            1,
+            params.clone(),
+        )
+        .unwrap();
+        params.attach(ctrl.clone(), port.clone());
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(PIGCS2Axis::new(
+            ctrl.clone(),
+            axis.into(),
+            0,
+            name,
+        )));
+        let setup = epics_rs::motor::builder::MotorBuilder::new(motor)
+            .trace_user(motor_common::asyn_user(name, 0))
+            .build_axis();
+        epics_rs::motor::devices::register_axis(setup.axis).unwrap();
+        let params = *params.params.get().unwrap();
+        (port, params, setup.poll_loop)
+    }
+
+    /// `PIHexapodController::ReadPivotSettings` (PIHexapodController.cpp:
+    /// 370-425) keeps the init's `SPI?` point, `PIasynController::poll`
+    /// posts it as `PI_SUP_RBPIVOT_*` (PIasynController.cpp:583-585), and a
+    /// `PI_SUP_PIVOT_*` write sends `SPI` + `ERR?` (:381-392, :338-367)
+    /// unless the platform moves.
+    #[test]
+    fn a_hexapod_pivot_reads_back_and_takes_writes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let more = AtomicUsize::new(0);
+        let (line, ctrl) = hexapod("gcs2PivotLine", move |last| match last {
+            // The continuation reads see the command they follow.
+            "SPI? RST" => match more.fetch_add(1, Ordering::Relaxed) % 3 {
+                0 => "R=1.5 ",
+                1 => "S=2.5 ",
+                _ => "T=3.5",
+            }
+            .into(),
+            last => hexapod_reply(last),
+        });
+        let (port, p, _) = controller_port("gcs2Pivot", &ctrl, "X");
+        let read = |reason| port.read_float64_blocking(reason, 0).unwrap();
+        ctrl.lock().unwrap().poll();
+        assert_eq!(
+            [read(p.rbpivot_x), read(p.rbpivot_y), read(p.rbpivot_z)],
+            [1.5, 2.5, 3.5]
+        );
+        line.sent();
+        port.write_float64_blocking(p.pivot_y, 0, 4.0).unwrap();
+        assert_eq!(sent_lines(&line), ["SPI S 4.000000", "ERR?"]);
+        ctrl.lock().unwrap().poll();
+        assert_eq!(read(p.rbpivot_y), 4.0);
+        ctrl.lock().unwrap().hexapod.any_moving = true;
+        line.sent();
+        let printed = traced_mask("gcs2Pivot", TraceMask::FLOW, || {
+            assert!(port.write_float64_blocking(p.pivot_z, 0, 1.0).is_err());
+        });
+        assert!(sent_lines(&line).is_empty());
+        assert!(
+            printed.contains(
+                "PIHexapodController::SetPivot() cannot change pivot point while platform is moving"
+            ),
+            "{printed}"
+        );
+    }
+
+    /// `PIasynController::writeFloat64` makes the asynUser itself the log
+    /// sink (PIasynController.cpp:352), so a pivot write at address `-1`
+    /// prints on the port's trace, not on axis 0's.
+    #[test]
+    fn a_port_address_pivot_write_logs_on_the_port_trace() {
+        let (line, ctrl) = hexapod("gcs2PortSinkLine", hexapod_reply);
+        let (port, p, _) = controller_port("gcs2PortSink", &ctrl, "X");
+        ctrl.lock().unwrap().hexapod.any_moving = true;
+        line.sent();
+        let printed = traced_mask("gcs2PortSink", TraceMask::FLOW, || {
+            PortManager::global().trace_manager().set_device_trace_mask(
+                "gcs2PortSink",
+                0,
+                TraceMask::empty(),
+            );
+            assert!(port.write_float64_blocking(p.pivot_x, -1, 1.0).is_err());
+        });
+        assert!(
+            printed.contains(
+                "PIHexapodController::SetPivot() cannot change pivot point while platform is moving"
+            ),
+            "{printed}"
+        );
+    }
+
+    /// `PIasynController::writeInt32` switches the axis's servo on a
+    /// `PI_SUP_SERVO` write as on `motorClosedLoop` (PIasynController.cpp:
+    /// 294-300): `SVO` + `ERR?`, the written value kept.
+    #[test]
+    fn a_servo_write_switches_the_axis_servo() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2ServoLine", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2ServoLine")));
+        let (port, p, mut poll_loop) = controller_port("gcs2Servo", &ctrl, "1");
+        for value in [0, 1] {
+            line.sent();
+            port.write_int32_blocking(p.servo, 0, value).unwrap();
+            poll_loop.run_queued_commands();
+            assert_eq!(sent_lines(&line), [format!("SVO 1 {value}"), "ERR?".into()]);
+            assert_eq!(port.read_int32_blocking(p.servo, 0).unwrap(), value);
+        }
+    }
+
+    /// `PIasynController::writeFloat64`'s `PI_SUP_TARGET` (PIasynController
+    /// .cpp:375-378): `moveCts` to the written value in counts, whole as
+    /// [`target_counts`] makes them, `MOV` + `ERR?` (PIGCSController.cpp:
+    /// 230-257): no VEL/SPA, and no deferral.
+    #[test]
+    fn a_target_write_moves_the_axis_by_whole_counts() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2TargetLine", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2TargetLine")));
+        let (port, p, mut poll_loop) = controller_port("gcs2Target", &ctrl, "1");
+        ctrl.lock().unwrap().moves_deferred = true;
+        for (value, sent) in [(2.7, "MOV 1 3.000000"), (-2.7, "MOV 1 -3.000000")] {
+            line.sent();
+            port.write_float64_blocking(p.target, 0, value).unwrap();
+            poll_loop.run_queued_commands();
+            assert_eq!(sent_lines(&line), [sent, "ERR?"]);
+            assert_eq!(port.read_float64_blocking(p.target, 0).unwrap(), value);
+        }
+    }
+
+    /// `PIasynController::poll` (PIasynController.cpp:589-595) posts
+    /// `PICoordinateSystem::getActivate`/`getLink`: the `KEN?` and `KLN?`
+    /// replies less their line breaks, `KLN?`'s tabs as spaces
+    /// (PICoordinateSystem.cpp:54-91).
+    #[test]
+    fn a_coordinate_system_poll_posts_its_activate_and_link() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let more = AtomicUsize::new(0);
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2CsLine", move |last| {
+            match last {
+                "KEN?" => "KS1".into(),
+                // The continuation read sees the command it follows.
+                "KLN?" => match more.fetch_add(1, Ordering::Relaxed) % 2 {
+                    0 => "KS1\tKS2 ",
+                    _ => "ZERO",
+                }
+                .into(),
+                last => hexapod_reply(last),
+            }
+        });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2CsLine");
+        ctrl.set_model(Model::CoordinateSystem);
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let (port, p, _) = controller_port("gcs2Cs", &ctrl, "X");
+        ctrl.lock().unwrap().poll();
+        let read = |reason| port.get_string_param_blocking(reason, 0, 255).unwrap();
+        assert_eq!(read(p.cs_activate), b"KS1");
+        assert_eq!(read(p.cs_link), b"KS1 KS2 ZERO");
+    }
+
+    /// A failed `KEN?`/`KLN?` still posts what its buffer holds: here each
+    /// reply's first line, whose continuation read times out.
+    #[test]
+    fn a_failed_coordinate_system_query_posts_what_it_read() {
+        let (_line, io) =
+            motor_common::testing::LineRig::queued("gcs2CsCutLine", |cmd| match cmd {
+                "KEN?" => vec!["KS1 ".into()],
+                "KLN?" => vec!["KS1\tKS2 ".into()],
+                cmd => vec![hexapod_reply(cmd)],
+            });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2CsCutLine");
+        ctrl.set_model(Model::CoordinateSystem);
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let (port, p, _) = controller_port("gcs2CsCut", &ctrl, "X");
+        ctrl.lock().unwrap().poll();
+        let read = |reason| port.get_string_param_blocking(reason, 0, 255).unwrap();
+        assert_eq!(read(p.cs_activate), b"KS1 ");
+        assert_eq!(read(p.cs_link), b"KS1 KS2 ");
+    }
+
+    /// `PIasynController::writeOctet` (PIasynController.cpp:430-465): a
+    /// C-887 sends the value after `KEN`/`KLN`/`KST`/`KSW`
+    /// (PICoordinateSystem.cpp:38-139), every other class nothing; neither
+    /// stores it.
+    #[test]
+    fn a_coordinate_system_octet_write_sends_its_command() {
+        use epics_rs::asyn::request::RequestOp;
+        for (model, name) in [
+            (Model::CoordinateSystem, "gcs2CsW"),
+            (Model::Gcs2Hexapod, "gcs2HexW"),
+        ] {
+            let (line, io) =
+                motor_common::testing::LineRig::new(&format!("{name}Line"), hexapod_reply);
+            let mut ctrl = PIGCS2Controller::new(io, name);
+            ctrl.set_model(model);
+            let ctrl = Arc::new(Mutex::new(ctrl));
+            let (port, p, _) = controller_port(name, &ctrl, "X");
+            let mut sent = Vec::new();
+            for (reason, value) in [
+                (p.cs_activate, "KS1"),
+                (p.cs_link, "KS1 ZERO"),
+                (p.cs_kst, "KS1 X 1"),
+                (p.cs_ksw, "KS1 Z 2"),
+            ] {
+                line.sent();
+                let data = value.as_bytes().to_vec();
+                let user = AsynUser::new(reason).with_addr(0);
+                let done = port
+                    .submit_blocking(RequestOp::OctetWrite { data }, user)
+                    .unwrap();
+                assert_eq!(done.nbytes, value.len());
+                sent.extend(sent_lines(&line));
+                // Never set: C's asynParamUndefined.
+                assert!(port.get_string_param_blocking(reason, 0, 255).is_err());
+            }
+            let want: &[&str] = if model == Model::CoordinateSystem {
+                &["KEN KS1", "KLN KS1 ZERO", "KST KS1 X 1", "KSW KS1 Z 2"]
+            } else {
+                &[]
+            };
+            assert_eq!(sent, want, "{name}");
+        }
+    }
+
+    /// C `PIasynController::writeOctet` never calls the base, so no octet
+    /// write is stored: not the base's profile messages, and not a
+    /// coordinate-system parameter on a port with no controller, where C
+    /// dereferences its NULL `m_pGCSController` (a C defect not copied).
+    #[test]
+    fn an_octet_write_stores_nothing() {
+        use epics_rs::asyn::request::RequestOp;
+        use epics_rs::motor::controller_port::index::PROFILE_BUILD_MESSAGE;
+        let write = |port: &PortHandle, reason: usize| {
+            let data = b"text".to_vec();
+            let user = AsynUser::new(reason).with_addr(0);
+            let done = port
+                .submit_blocking(RequestOp::OctetWrite { data }, user)
+                .unwrap();
+            assert_eq!(done.nbytes, 4);
+            assert!(port.get_string_param_blocking(reason, 0, 255).is_err());
+        };
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2OctNoneLine", hexapod_reply);
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2OctNone")));
+        let (port, _, _) = controller_port("gcs2OctNone", &ctrl, "X");
+        write(&port, PROFILE_BUILD_MESSAGE);
+
+        let params = PIGCS2Params::default();
+        let port = motor_common::register_controller_port(
+            &epics_rs::asyn::registry::open_owner(),
+            "gcs2OctNoCtl",
+            1,
+            params.clone(),
+        )
+        .unwrap();
+        write(&port, params.params.get().unwrap().cs_activate);
+    }
+
+    /// The functions `PIasynController::writeInt32`/`writeFloat64` take
+    /// themselves never reach `asynMotorController`'s, so none of the
+    /// base's lines print for them (PIasynController.cpp:294-322, :364-394);
+    /// a function C passes on prints the base's.
+    #[test]
+    fn functions_pi_takes_print_no_base_lines() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2QuietLine", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2QuietLine")));
+        let (port, p, mut poll_loop) = controller_port("gcs2Quiet", &ctrl, "1");
+        let printed = traced_mask("gcs2Quiet", TraceMask::IO_DRIVER | TraceMask::FLOW, || {
+            for (reason, value) in [
+                (p.servo, 1),
+                (p.clear_err, 1),
+                (p.target_mode, 1),
+                (index::CLOSED_LOOP, 1),
+                (index::DEFER_MOVES, 1),
+                (index::DEFER_MOVES, 0),
+            ] {
+                let _ = port.write_int32_blocking(reason, 0, value);
+                poll_loop.run_queued_commands();
+            }
+            for reason in [p.target, p.pivot_x, p.pivot_y, p.pivot_z] {
+                let _ = port.write_float64_blocking(reason, 0, 1.0);
+                poll_loop.run_queued_commands();
+            }
+        });
+        assert!(!printed.contains("asynMotorController"), "{printed}");
+        let printed = traced_mask("gcs2Quiet", TraceMask::IO_DRIVER, || {
+            port.write_float64_blocking(index::VELOCITY, 0, 1.0)
+                .unwrap();
+            poll_loop.run_queued_commands();
+        });
+        assert!(
+            printed.contains("asynMotorController:writeFloat64"),
+            "{printed}"
+        );
+    }
+
+    /// Each `PIasynController` write closes with its status line
+    /// (PIasynController.cpp:327-334, :397-404, :433-440): asynError on
+    /// ASYN_TRACE_ERROR, else the function and value on
+    /// ASYN_TRACEIO_DRIVER; a queued servo or target write prints its
+    /// own function with the axis call's status.
+    #[test]
+    fn writes_print_their_c_trailers() {
+        use epics_rs::asyn::request::RequestOp;
+        for (name, err, ok) in [("gcs2Trail", "0", true), ("gcs2TrailErr", "5", false)] {
+            let (_line, io) =
+                motor_common::testing::LineRig::new(&format!("{name}Line"), move |last| {
+                    if last == "ERR?" { err } else { "1=1" }.into()
+                });
+            let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, name)));
+            let (port, p, mut poll_loop) = controller_port(name, &ctrl, "1");
+            let printed = traced_mask(name, TraceMask::IO_DRIVER | TraceMask::ERROR, || {
+                port.write_int32_blocking(p.target_mode, 0, 1).unwrap();
+                let _ = port.write_int32_blocking(p.servo, 0, 1);
+                poll_loop.run_queued_commands();
+                let _ = port.write_float64_blocking(p.target, 0, 2.7);
+                poll_loop.run_queued_commands();
+                let user = AsynUser::new(p.cs_activate).with_addr(0);
+                let data = b"KS1".to_vec();
+                port.submit_blocking(RequestOp::OctetWrite { data }, user)
+                    .unwrap();
+            });
+            let mut want = vec![
+                format!(
+                    "PIasynDriver:writeInt32: function={}, value=1\n",
+                    p.target_mode
+                ),
+                format!(
+                    "PIasynDriver:writeOctet: function={}, value=KS1\n",
+                    p.cs_activate
+                ),
+            ];
+            if ok {
+                want.push(format!(
+                    "PIasynDriver:writeInt32: function={}, value=1\n",
+                    p.servo
+                ));
+                want.push(format!(
+                    "PIasynDriver:writeFloat64: function={}, value=2.700000\n",
+                    p.target
+                ));
+            } else {
+                want.push(format!(" function={}, value=1\n", p.servo));
+                want.push(format!(" function={}, value=2.700000\n", p.target));
+            }
+            for line in &want {
+                assert!(
+                    printed.contains(line.as_str()),
+                    "{name}: {line:?} not in {printed}"
+                );
+            }
+            let trailers = printed.matches("PIasynDriver:write").count();
+            assert_eq!(trailers, 4, "{name}: one trailer per write in {printed}");
+            assert_eq!(
+                printed.matches(": error, status=").count(),
+                if ok { 0 } else { 2 },
+                "{name}: {printed}"
+            );
+            assert!(!printed.contains(&format!("function={}, value", index::CLOSED_LOOP)));
+        }
+    }
+
+    /// `PIasynController::writeInt32` and `writeFloat64` make the asynUser
+    /// the log sink for every parameter (PIasynController.cpp:283, :352),
+    /// so the controller's next print goes to that user's trace.
+    #[test]
+    fn every_write_makes_its_user_the_log_sink() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2AnySinkLine", |last| {
+            if last == "ERR?" { "2" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2AnySinkLine")));
+        let (port, p, _) = controller_port("gcs2AnySink", &ctrl, "1");
+        for kind in ["int32", "float64"] {
+            ctrl.lock().unwrap().log_sink = None;
+            let printed = traced_mask("gcs2AnySink", TraceMask::ERROR, || {
+                PortManager::global().trace_manager().set_device_trace_mask(
+                    "gcs2AnySink",
+                    0,
+                    TraceMask::empty(),
+                );
+                if kind == "int32" {
+                    port.write_int32_blocking(p.target_mode, -1, 0).unwrap();
+                } else {
+                    port.write_float64_blocking(p.rbpivot_x, -1, 1.0).unwrap();
+                }
+                ctrl.lock().unwrap().get_gcs_error();
+            });
+            assert!(
+                printed.contains("PIGCSController::getGCSError() GCS error code = 2"),
+                "{kind}: {printed}"
+            );
+        }
+    }
+
+    /// `PIGCSController::moveCts` and `move` (PIGCSController.cpp:230-257):
+    /// their FLOW lines, and `m_lastDirection` set once `MOV` is sent,
+    /// whatever `ERR?` then says, by `moveVelocity`'s move too
+    /// (PIasynAxis.cpp:296).
+    #[test]
+    fn a_move_prints_c_flow_lines_and_sets_its_direction_once_sent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fail = Arc::new(AtomicBool::new(false));
+        let reply = fail.clone();
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2MovFlowLine", move |last| {
+            match last {
+                "ERR?" if reply.load(Ordering::Relaxed) => "1",
+                "ERR?" => "0",
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2MovFlowLine")));
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2MovFlow");
+        let user = AsynUser::new(0);
+        let printed = traced_mask("gcs2MovFlow", TraceMask::FLOW, || {
+            axis.move_absolute(&user, 3000.0, 0.0, 0.0, 0.0).unwrap();
+        });
+        assert!(
+            printed.contains("PIGCSController::moveCts(, 3000) \n")
+                && printed.contains("PIGCSController::move() sent \"MOV 1 3000.000000\"\n"),
+            "{printed}"
+        );
+        fail.store(true, Ordering::Relaxed);
+        axis.last_direction = false;
+        assert!(axis.move_absolute(&user, 3000.0, 0.0, 0.0, 0.0).is_err());
+        assert!(axis.last_direction);
+        fail.store(false, Ordering::Relaxed);
+        axis.high_limit = 10.0;
+        axis.position = 20.0;
+        axis.move_velocity(&user, 0.0, 1.0, 0.0).unwrap();
+        assert!(!axis.last_direction);
+    }
+
+    /// C `move` sets the direction from the target against the position
+    /// `POS?` read, in units (PIGCSController.cpp:250, :478), not against
+    /// the whole counts it posts.
+    #[test]
+    fn a_move_direction_compares_units_with_the_read_position() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2DirUnitsLine", |last| {
+            match last {
+                "ERR?" => "0",
+                "POS? 1" => "1=1.00004",
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2DirUnitsLine")));
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2DirUnits");
+        let user = AsynUser::new(0);
+        axis.cpu = 10000.0;
+        let _ = axis.poll(&user);
+        assert_eq!(axis.last_position, 10000.0);
+        axis.high_limit = 1.00002;
+        axis.last_direction = true;
+        axis.move_velocity(&user, 0.0, 1.0, 0.0).unwrap();
+        assert!(!axis.last_direction, "1.00002 is below 1.00004");
+    }
+
+    /// `PIasynAxis`'s FLOW lines on its own user (PIasynAxis.cpp:131-133,
+    /// 188-189, 267-269, 294-305, 320-322, 346-348, 359-361).
+    #[test]
+    fn axis_entry_points_print_c_flow_lines() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let homing = Arc::new(AtomicBool::new(true));
+        let state = homing.clone();
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2AxFlowLine", move |last| {
+            match last {
+                "ERR?" => "0",
+                "\u{4}" if state.load(Ordering::Relaxed) => "015000",
+                "\u{4}" => "011000",
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2AxFlowLine")));
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2AxFlow");
+        axis.high_limit = 10.0;
+        let user = AsynUser::new(0);
+        let printed = traced_mask("gcs2AxFlow", TraceMask::FLOW, || {
+            axis.move_absolute(&user, 2.5, 0.5, 0.0, 0.0).unwrap();
+            axis.move_velocity(&user, 0.0, 2.0, 0.0).unwrap();
+            axis.stop(&user, 3.0).unwrap();
+            axis.set_position(&user, 7.0).unwrap();
+            axis.has_reference = true;
+            axis.home(&user, 0.5, 2.0, 1.5, true).unwrap();
+            axis.poll(&user).unwrap();
+            homing.store(false, Ordering::Relaxed);
+            axis.poll(&user).unwrap();
+        });
+        for line in [
+            "PIasynAxis:moveAxis: Set driver gcs2AxFlow, axis 0 move to 2.500000, min vel=0.500000, max_vel=0.000000, accel=0.000000, deffered=0 - status=0\n",
+            "PIasynAxis:moveVelocityAxis: Set port gcs2AxFlow, axis 0 move with velocity of 2.000000, accel=0.000000 / target 10.000000 - BEFORE MOV\n",
+            "PIasynAxis:moveVelocityAxis: Set port gcs2AxFlow, axis 0 move with velocity of 2.000000, accel=0.000000 / target 10.000000 - AFTER MOV\n",
+            "PIasynAxis:stopAxis: Set axis 0 to stop with accel=3.000000",
+            "PIasynAxis:setPositionAxis: Set driver gcs2AxFlow, axis 0 set position to 7.000000 - status=0\n",
+            "PIasynAxis:homeAxis: Set driver gcs2AxFlow, axis 0 to home FORWARDS, min vel=0.500000, max_vel=2.000000, accel=1.500000",
+            "PIasynAxis::poll() axis 0 referencing ...\n",
+            "PIasynAxis::poll() axis 0 referencing state changed, homed = 1\n",
+        ] {
+            assert!(printed.contains(line), "{line:?} not in {printed}");
+        }
+    }
+
+    /// `PIasynAxis::moveVelocity` sends `MOV` whatever `VEL` returned
+    /// (PIasynAxis.cpp:298-299), and `stop` returns asynSuccess whatever
+    /// `haltAxis` did (:316-323).
+    #[test]
+    fn move_velocity_and_stop_ignore_their_command_statuses() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // C sendOnly's status is its terminator write's.
+        let after_vel = AtomicBool::new(false);
+        let (line, io) = motor_common::testing::LineRig::failing(
+            "gcs2IgnoreLine",
+            |last| if last == "ERR?" { "0" } else { "1=1" }.into(),
+            move |cmd| match cmd {
+                "\n" => after_vel.swap(false, Ordering::Relaxed),
+                cmd => {
+                    after_vel.store(cmd.starts_with("VEL"), Ordering::Relaxed);
+                    false
+                }
+            },
+        );
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2IgnoreLine");
+        ctrl.knows_vel = true;
+        let mut axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "1".into(), 0, "gcs2Ignore");
+        axis.high_limit = 10.0;
+        let user = AsynUser::new(0);
+        line.sent();
+        axis.move_velocity(&user, 0.0, 2.0, 0.0).unwrap();
+        assert_eq!(
+            sent_lines(&line),
+            ["VEL 1 2.000000", "MOV 1 10.000000", "ERR?"]
+        );
+        // ERR? 0 after HLT is haltAxis's failure: it wants 10.
+        axis.stop(&user, 0.0).unwrap();
+        assert_eq!(sent_lines(&line), ["HLT 1", "ERR?"]);
+    }
+
+    /// `PIGCSController::setAxisPositionCts` and `setAxisPosition`'s FLOW
+    /// lines (PIGCSController.cpp:185-217), one per command sent.
+    #[test]
+    fn a_set_position_prints_c_flow_lines() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2SetPosFlowLine", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2SetPosFlowLine")));
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2SetPosFlow");
+        let printed = traced_mask("gcs2SetPosFlow", TraceMask::FLOW, || {
+            axis.set_position(&AsynUser::new(0), 7.0).unwrap();
+        });
+        let lines: Vec<_> = printed
+            .lines()
+            .filter_map(|l| l.split_once(" PIGCSController::"))
+            .map(|(_, rest)| rest)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "setAxisPositionCts(, 7.000000) ",
+                "setAxisPosition() sent \"RON 1 0\"",
+                "setAxisPosition() sent \"POS 1 7.000000\"",
+                "setAxisPosition() sent \"RON 1 1\"",
+            ],
+            "{printed}"
+        );
+    }
+
+    /// PIInterface.cpp prints each command it sends and each reply it reads
+    /// on ASYN_TRACEIO_DRIVER (:51, :75, :101, :142, :201, :228), and its
+    /// error lines on ASYN_TRACE_ERROR|ASYN_TRACEIO_DRIVER.
+    #[test]
+    fn interface_io_prints_its_c_traceio_driver_lines() {
+        let (_line, io) = motor_common::testing::LineRig::queued("gcs2IoTrace", |cmd| match cmd {
+            "SAI?" => vec!["1 ".into(), "2".into()],
+            _ => vec!["0".into()],
+        });
+        let ctrl = PIGCS2Controller::new(io, "gcs2IoTrace");
+        let printed = traced_mask("gcs2IoTrace", TraceMask::IO_DRIVER, || {
+            ctrl.send_only("MOV 1 1.000000").unwrap();
+            ctrl.send_only_char(24).unwrap();
+            ctrl.send_and_receive("SAI?").unwrap();
+            ctrl.send_and_receive_char(4).unwrap();
+        });
+        let want = [
+            "PIInterface::sendOnly() sending \"MOV 1 1.000000\"\n",
+            "PIInterface::sendOnly() sending \"#24\"\n",
+            "PIInterface::sendAndReceive() sending \"SAI?\"\n",
+            "PIInterface::sendAndReceive() received \"1 \n2\"\n",
+            "PIInterface::sendAndReceive() sending \"#4\"\n",
+            "PIInterface::sendAndReceive() received \"0\"\n",
+        ];
+        let mut rest = printed.as_str();
+        for line in want {
+            let at = rest
+                .find(line)
+                .unwrap_or_else(|| panic!("{line:?} not in {printed}"));
+            rest = &rest[at + line.len()..];
+        }
+
+        let (_line, io) =
+            motor_common::testing::LineRig::failing("gcs2IoTraceErr", |_| "0".into(), |_| true);
+        let ctrl = PIGCS2Controller::new(io, "gcs2IoTraceErr");
+        let printed = traced_mask("gcs2IoTraceErr", TraceMask::IO_DRIVER, || {
+            let _ = ctrl.send_only("MOV 1 1.000000");
+            let _ = ctrl.send_only_char(24);
+            let _ = ctrl.send_and_receive("ERR?");
+            let _ = ctrl.send_and_receive_char(4);
+        });
+        for line in [
+            "PIGCSController:sendOnly: error sending command MOV 1 1.000000",
+            "PIGCSController:sendOnly: error sending command 24",
+            "PIGCSController:sendAndReceive error calling write, output=ERR?",
+            "PIInterface::sendAndReceive error calling writeRead, output=4",
+        ] {
+            assert!(printed.contains(line), "{line:?} not in {printed}");
+        }
+    }
+
+    /// The `received` line of a failed `sendAndReceive` exchange, printed
+    /// with what C's buffer holds (PIInterface.cpp:127-143, :210-229).
+    fn received_after_failure(port: &str, run: impl FnOnce(&PIGCS2Controller) -> bool) -> String {
+        let (_line, io) = motor_common::testing::LineRig::queued(port, |cmd| match cmd {
+            "SAI?" => vec!["1 ".into()],
+            _ => vec![],
+        });
+        let ctrl = PIGCS2Controller::new(io, port);
+        let mut failed = false;
+        let printed = traced_mask(port, TraceMask::IO_DRIVER, || failed = run(&ctrl));
+        assert!(failed, "the exchange returns its error: {printed}");
+        printed
+    }
+
+    #[test]
+    fn a_query_with_no_reply_prints_an_empty_received_line() {
+        let printed =
+            received_after_failure("gcs2RecvNone", |c| c.send_and_receive("ERR?").is_err());
+        assert!(
+            printed.contains("PIInterface::sendAndReceive() received \"\"\n"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn a_failed_continuation_read_prints_the_lines_before_it() {
+        let printed =
+            received_after_failure("gcs2RecvCont", |c| c.send_and_receive("SAI?").is_err());
+        assert!(
+            printed.contains("PIInterface::sendAndReceive() received \"1 \n\"\n"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn a_char_query_with_no_reply_prints_an_empty_received_line() {
+        let printed =
+            received_after_failure("gcs2RecvChar", |c| c.send_and_receive_char(4).is_err());
+        assert!(
+            printed.contains("PIInterface::sendAndReceive() received \"\"\n"),
+            "{printed}"
+        );
+    }
+
+    /// Answers every read with `1=0` and then a timeout, as a line that
+    /// stops mid-reply does.
+    struct CutReply(epics_rs::asyn::port::PortDriverBase);
+
+    impl epics_rs::asyn::port::PortDriver for CutReply {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, epics_rs::asyn::interpose::EomReason)> {
+            use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+            buf[..3].copy_from_slice(b"1=0");
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".into(),
+            }
+            .with_partial_read(PartialOctetRead {
+                data: b"1=0".to_vec(),
+                eom_reason: EomReason::empty(),
+            }))
+        }
+    }
+
+    /// A read that times out mid-line leaves its bytes in C's buffer, so
+    /// the `received` line shows them.
+    #[test]
+    fn a_timed_out_read_prints_the_bytes_it_got() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("gcs2RecvCut").unwrap(),
+            CutReply(PortDriverBase::new("gcs2RecvCut", 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl = PIGCS2Controller::new(
+            SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                std::time::Duration::from_secs(1),
+            ),
+            "gcs2RecvCut",
+        );
+        let mut failed = (false, false);
+        let printed = traced_mask("gcs2RecvCut", TraceMask::IO_DRIVER, || {
+            failed = (
+                ctrl.send_and_receive("ERR?").is_err(),
+                ctrl.send_and_receive_char(4).is_err(),
+            );
+        });
+        assert_eq!(failed, (true, true), "{printed}");
+        let received = printed
+            .matches("PIInterface::sendAndReceive() received \"1=0\"\n")
+            .count();
+        assert_eq!(received, 2, "{printed}");
+    }
+
+    /// `PIGCSMotorController::getStatus` and `PIC885Controller::getStatus`
+    /// print the `#4` reply cut after the axis's word (PIGCSMotorController
+    /// .cpp:168-175, PIC885Controller.cpp:34-47).
+    #[test]
+    fn a_status_read_prints_its_c_flow_line() {
+        for (model, name, want) in [
+            (
+                Model::Motor,
+                "gcs2StatFlowM",
+                "PIGCSMotorController::getStatus() buf:011000 moving 0, svo: 1\n",
+            ),
+            (
+                Model::C885,
+                "gcs2StatFlowC",
+                "PIC885Controller::getStatus() Axis: 1, buf:011000 moving 0, svo: 1, homming: 0\n",
+            ),
+        ] {
+            let (_line, io) = motor_common::testing::LineRig::new(name, |_| "0110002000".into());
+            let mut ctrl = PIGCS2Controller::new(io, name);
+            ctrl.set_model(model);
+            let printed = traced_mask(name, TraceMask::FLOW, || {
+                ctrl.get_status("1", 0).unwrap();
+            });
+            assert!(printed.contains(want), "{want:?} not in {printed}");
+        }
+    }
+
+    /// `PI_CS_TARGETMODE` (PIasynController.cpp:320-324, 587) picks the
+    /// hexapod's move: `MOV` to the target, or `MRT`/`MRW` by the distance
+    /// from the position (PIHexapodController.cpp:151-165).
+    #[test]
+    fn a_hexapod_target_mode_picks_mov_mrt_or_mrw() {
+        let (line, ctrl) = hexapod("gcs2TModeLine", hexapod_reply);
+        let (port, p, _) = controller_port("gcs2TMode", &ctrl, "X");
+        let mut axis = PIGCS2Axis::new(ctrl.clone(), "X".into(), 0, "gcs2TMode");
+        let user = AsynUser::new(0);
+        let mut moves = Vec::new();
+        for mode in [1, 2, 0] {
+            port.write_int32_blocking(p.target_mode, 0, mode).unwrap();
+            assert_eq!(port.read_int32_blocking(p.target_mode, 0).unwrap(), mode);
+            ctrl.lock().unwrap().hexapod.any_moving = false;
+            axis.last_position = 5000.0;
+            line.sent();
+            axis.move_absolute(&user, 15000.0, 0.0, 0.0, 0.0).unwrap();
+            moves.push(sent_lines(&line)[0].clone());
+        }
+        assert_eq!(
+            moves,
+            ["MRT X 1.000000", "MRW X 1.000000", "MOV X 1.500000"]
+        );
+        port.write_int32_blocking(p.target_mode, 0, 2).unwrap();
+        ctrl.lock().unwrap().poll();
+        assert_eq!(port.read_int32_blocking(p.target_mode, 0).unwrap(), 2);
+    }
+
+    /// `PIGCSController::SetPivotX` (PIGCSController.cpp:768-776): a
+    /// controller with no pivot only logs the write.
+    #[test]
+    fn a_motor_controller_ignores_a_pivot_write() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2NoPivotLine", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2NoPivotLine")));
+        let (port, p, _) = controller_port("gcs2NoPivot", &ctrl, "1");
+        line.sent();
+        let printed = traced_mask("gcs2NoPivot", TraceMask::FLOW, || {
+            port.write_float64_blocking(p.pivot_x, 0, 4.0).unwrap();
+        });
+        assert!(sent_lines(&line).is_empty());
+        assert!(
+            printed.contains("PIGCSController::SetPivotX() ignored"),
+            "{printed}"
+        );
+        ctrl.lock().unwrap().poll();
+        assert_eq!(port.read_float64_blocking(p.rbpivot_x, 0).unwrap(), 0.0);
+    }
+
+    /// `PIGCSController::getGCSError` keeps the last nonzero `ERR?` code
+    /// (PIGCSController.cpp:274-276), `PIasynController::poll` posts it as
+    /// `PI_SUP_LAST_ERR` (PIasynController.cpp:612) and a `PI_SUP_CLEAR_ERR`
+    /// write zeroes it (:315-319).
+    #[test]
+    fn the_last_gcs_error_is_posted_and_cleared() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let code = Arc::new(AtomicI32::new(0));
+        let err = code.clone();
+        let (_line, io) =
+            motor_common::testing::LineRig::new("gcs2LastErrLine", move |last| match last {
+                "ERR?" => err.load(Ordering::Relaxed).to_string(),
+                _ => "1=1".into(),
+            });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2LastErrLine")));
+        let (port, p, _) = controller_port("gcs2LastErr", &ctrl, "1");
+        let poll = || ctrl.lock().unwrap().poll();
+        poll();
+        assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
+        code.store(5, Ordering::Relaxed);
+        assert_eq!(ctrl.lock().unwrap().get_gcs_error(), 5);
+        code.store(0, Ordering::Relaxed);
+        assert_eq!(ctrl.lock().unwrap().get_gcs_error(), 0);
+        poll();
+        assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 5);
+        port.write_int32_blocking(p.clear_err, 0, 1).unwrap();
+        assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
+        poll();
+        assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
+    }
+
+    /// `PIGCSController::getAxisPositionCts` (PIGCSController.cpp:485)
+    /// keeps a whole count and logs it (:487-491); rs rounds negatives to
+    /// the nearest count too, where C's `int(x + 0.5)` rounds toward zero.
+    #[test]
+    fn the_polled_position_is_the_nearest_whole_count() {
+        let pos = Arc::new(Mutex::new("1=0"));
+        let reply = pos.clone();
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2PosCts", move |last| {
+            match last {
+                "ERR?" => "0",
+                "POS? 1" => *reply.lock().unwrap(),
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2PosCts")));
+        *pos.lock().unwrap() = "1=2.5";
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2PosCts");
+        assert_eq!(axis.last_position, 3.0);
+        let user = AsynUser::new(0);
+        let mut polled = Vec::new();
+        let printed = traced_mask("gcs2PosCts", TraceMask::FLOW, || {
+            for reply in ["1=2.4", "1=-2.4", "1=-2.6"] {
+                *pos.lock().unwrap() = reply;
+                polled.push(axis.poll(&user).unwrap().position);
+            }
+        });
+        assert_eq!(polled, [2.0, -2.0, -3.0]);
+        let logged: Vec<_> = messages(&printed)
+            .into_iter()
+            .filter(|m| m.contains("getAxisPositionCts"))
+            .collect();
+        assert_eq!(
+            logged,
+            ["2", "-2", "-3"].map(|n| format!("PIGCSController::getAxisPositionCts() pos:{n}\n"))
+        );
+    }
+
+    /// `PIasynAxis::poll` sets the second position read as
+    /// `PI_SUP_POSITION` (PIasynAxis.cpp:162-165) and the servo state as
+    /// `PI_SUP_SERVO` (:204) for the poll's own `callParamCallbacks`; the
+    /// axis posts nothing itself.
+    #[test]
+    fn the_axis_poll_posts_its_position_and_servo() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2SupPosLine", |last| {
+            match last {
+                "ERR?" => "0",
+                "POS? 1" => "1=2.5",
+                // Servo on.
+                "\u{4}" => "001000",
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2SupPosLine")));
+        let (_port, p, _) = controller_port("gcs2SupPos", &ctrl, "1");
+        let mut axis = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, "gcs2SupPos");
+        axis.poll(&AsynUser::new(0)).unwrap();
+        let params = axis.take_poll_params();
+        assert!(
+            matches!(
+                params.as_slice(),
+                [
+                    (position, ParamValue::Float64(2.5)),
+                    (servo, ParamValue::Int32(1)),
+                ] if *position == p.position && *servo == p.servo
+            ),
+            "{params:?}"
+        );
+        assert!(axis.take_poll_params().is_empty());
+    }
+
     /// `PIasynController::writeInt32` (PIasynController.cpp:305-308) logs
     /// each write of the flag on the writer's user, with C's misordered
     /// arguments put back in place.
@@ -2341,6 +4013,74 @@ mod tests {
             [
                 "PIasynDriver:writeInt32: Setting Deferred Move flag on driver gcs2DeferLog\n",
                 "PIasynDriver:writeInt32: Clearing Deferred Move flag on driver gcs2DeferLog\n",
+            ]
+        );
+    }
+
+    /// C sends whole-count targets (`PIGCSController::moveCts(, int)`); rs
+    /// rounds them as the record's `RVAL = NINT(dval/mres)` does, on single
+    /// and deferred moves.
+    #[test]
+    fn move_targets_go_out_as_the_nearest_whole_count() {
+        let (line, mut first, mut second) = two_axes("gcs2Nint");
+        let user = AsynUser::new(0);
+        // MRES 0.1, DVAL 0.3 and -0.3: C truncates to 2 and -2.
+        first
+            .move_absolute(&user, 0.3 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        first
+            .move_absolute(&user, -0.3 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        // DVAL 0.25 and -0.25: half a count.
+        first
+            .move_absolute(&user, 0.25 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        first
+            .move_absolute(&user, -0.25 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        assert_eq!(
+            sent_lines(&line)
+                .into_iter()
+                .filter(|l| l.starts_with("MOV"))
+                .collect::<Vec<_>>(),
+            [
+                "MOV 1 3.000000",
+                "MOV 1 -3.000000",
+                "MOV 1 3.000000",
+                "MOV 1 -3.000000"
+            ]
+        );
+        first.set_deferred_moves(&user, true).unwrap();
+        first
+            .move_absolute(&user, 0.25 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        second
+            .move_absolute(&user, -0.25 / 0.1, 0.0, 0.0, 0.0)
+            .unwrap();
+        first.set_deferred_moves(&user, false).unwrap();
+        assert_eq!(sent_lines(&line)[0], "MOV 1 3.000000 2 -3.000000");
+    }
+
+    /// `PIasynController::writeInt32` (PIasynController.cpp:295-298) logs a
+    /// closed-loop write on the writer's user, its misordered arguments put
+    /// back in place.
+    #[test]
+    fn a_closed_loop_write_is_logged() {
+        let (_line, mut first, _second) = two_axes("gcs2ServoLog");
+        let user = AsynUser::new(0);
+        let printed = traced_mask("gcs2ServoLog", TraceMask::FLOW, || {
+            let _ = first.set_closed_loop(&user, true);
+            let _ = first.set_closed_loop(&user, false);
+        });
+        let mine: Vec<_> = messages(&printed)
+            .into_iter()
+            .filter(|m| m.contains("Closed-Loop"))
+            .collect();
+        assert_eq!(
+            mine,
+            [
+                "PIasynDriver:writeInt32: Enabling Closed-Loop Control flag on driver gcs2ServoLog\n",
+                "PIasynDriver:writeInt32: Disabling Closed-Loop Control flag on driver gcs2ServoLog\n",
             ]
         );
     }
@@ -2417,7 +4157,7 @@ mod tests {
         });
         let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2ErrLine")));
         let before = traced("gcs2ErrLine", || {
-            assert_eq!(ctrl.lock().unwrap().get_gcs_error().unwrap(), 2);
+            assert_eq!(ctrl.lock().unwrap().get_gcs_error(), 2);
         });
         assert_eq!(before, "");
         let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2ErrCtl");
@@ -2543,13 +4283,14 @@ mod tests {
         ctrl.lock().unwrap().poll();
         assert_eq!(sent_lines(&line), ["\u{5}"]);
         let status = axis.poll(&AsynUser::new(0)).unwrap();
-        assert_eq!(sent_lines(&line), ["\u{3}", "\u{3}"]);
+        // PIasynAxis::poll reads the position twice (PIasynAxis.cpp:162-164).
+        assert_eq!(sent_lines(&line), ["\u{3}", "\u{3}", "\u{3}", "\u{3}"]);
         assert!(status.moving && !status.done && status.powered);
         assert_eq!(status.position, 20000.0);
         moving.store(false, std::sync::atomic::Ordering::Relaxed);
         ctrl.lock().unwrap().poll();
         let status = axis.poll(&AsynUser::new(0)).unwrap();
-        assert_eq!(sent_lines(&line), ["\u{5}", "POS? Y"]);
+        assert_eq!(sent_lines(&line), ["\u{5}", "POS? Y", "POS? Y"]);
         assert!(status.done && !status.moving);
         assert_eq!(status.position, 30000.0);
     }
@@ -2580,7 +4321,7 @@ mod tests {
         moving.store(false, std::sync::atomic::Ordering::Relaxed);
         ctrl.lock().unwrap().poll();
         let status = axis.poll(&AsynUser::new(0)).unwrap();
-        assert_eq!(sent_lines(&line), ["\u{5}", "\u{4}", "POS? X"]);
+        assert_eq!(sent_lines(&line), ["\u{5}", "\u{4}", "POS? X", "POS? X"]);
         assert!(!axis.is_homing && status.done && status.homed);
     }
 
@@ -2707,6 +4448,39 @@ mod tests {
             .collect()
     }
 
+    /// An `ERR?` that times out reads as COM_TIMEOUT (-7) and one that fails
+    /// otherwise as COM_ERROR (-1), so the caller's `failed` line still
+    /// prints (PIGCSController.cpp:263-271).
+    #[test]
+    fn a_failed_error_query_reads_as_a_com_error_code() {
+        let (_line, io) = motor_common::testing::LineRig::queued("gcs2ErrTimeout", |_| vec![]);
+        let ctrl = PIGCS2Controller::new(io, "gcs2ErrTimeout");
+        let printed = traced("gcs2ErrTimeout", || {
+            assert!(ctrl.check_mov().is_err());
+            assert!(ctrl.halt("1").is_err());
+        });
+        for line in [
+            "PIGCSController::move() failed, GCS error -7\n",
+            "PIGCSController::haltAxis() failed, GCS error -7",
+        ] {
+            assert!(printed.contains(line), "{line:?} not in {printed}");
+        }
+
+        let (_line, io) = motor_common::testing::LineRig::failing(
+            "gcs2ErrFails",
+            |_| "0".into(),
+            |line| line == "ERR?",
+        );
+        let ctrl = PIGCS2Controller::new(io, "gcs2ErrFails");
+        let printed = traced("gcs2ErrFails", || {
+            assert!(ctrl.check_mov().is_err());
+        });
+        assert!(
+            printed.contains("PIGCSController::move() failed, GCS error -1\n"),
+            "{printed}"
+        );
+    }
+
     /// Each failed `ERR?` check prints C's line (PIGCSController.cpp:224,
     /// 256, 310, 537-538, 558, 586; PIGCSMotorController.cpp:67-68,
     /// 108-109, 126-127; PIC885Controller.cpp:87-88, 135-136, 150-151).
@@ -2715,7 +4489,7 @@ mod tests {
         let (_line, io) = motor_common::testing::LineRig::new("gcs2FailPrint", |_| "1=5".into());
         let mut ctrl = PIGCS2Controller::new(io, "gcs2FailPrint");
         let printed = traced("gcs2FailPrint", || {
-            assert!(ctrl.mov("1", 1.0).is_err());
+            assert!(ctrl.check_mov().is_err());
             assert!(ctrl.set_axis_position("1", 1.0).is_err());
             assert!(ctrl.halt("1").is_err());
             assert!(ctrl.set_enable_axis("1", 1).is_err());
@@ -2857,7 +4631,7 @@ mod tests {
             ["VLS 1.000000", "MOV Y 2.000000", "\u{5}"]
         );
         let status = axis.poll(&user).unwrap();
-        assert_eq!(sent_lines(&line), ["POS? Y"]);
+        assert_eq!(sent_lines(&line), ["POS? Y", "POS? Y"]);
         assert!(status.moving && status.position == 20000.0);
         axis.move_velocity(&user, 0.0, 10000.0, 0.0).unwrap();
         assert_eq!(
@@ -2939,7 +4713,14 @@ mod tests {
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         assert_eq!(
             sent_lines(&line),
-            ["\u{5}", "SVO? Y", "POS? Y", "TRA? Y -1", "TRA? Y 1"]
+            [
+                "\u{5}",
+                "SVO? Y",
+                "POS? Y",
+                "POS? Y",
+                "TRA? Y -1",
+                "TRA? Y 1"
+            ]
         );
         assert!(status.moving && !axis.is_homing && status.problem && !status.powered);
     }

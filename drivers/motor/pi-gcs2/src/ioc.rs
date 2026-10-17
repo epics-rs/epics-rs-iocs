@@ -22,9 +22,9 @@ use motor_common::connect::{EosConnectError, EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port_with};
+use motor_common::{Controller, asyn_user, register_controller_port};
 
-use crate::gcs2::{PIGCS2Axis, PIGCS2Controller, PIGCS2Report};
+use crate::gcs2::{PIGCS2Axis, PIGCS2Controller, PIGCS2Params};
 
 /// Command timeout (C `PIInterface::TIMEOUT` is 5.0 s).
 const PIGCS2_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,8 +56,10 @@ pub fn pigcs2_config_command() -> CommandDef {
 
             // C's asynMotorController base creates the port before any of the
             // constructor's early returns.
-            let report = PIGCS2Report::default();
-            register_port_with(ctx, &port_name, num_axes as i32, report.clone())?;
+            let report = PIGCS2Params::default();
+            let owner = ctx.db().scan_control().interrupt_gate();
+            let port =
+                register_controller_port(owner, &port_name, num_axes as i32, report.clone())?;
             let Some(handle) = connect(&asyn_port) else {
                 return Ok(CommandOutcome::Continue);
             };
@@ -83,10 +85,8 @@ pub fn pigcs2_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let controller = Arc::new(Mutex::new(controller));
-            // C startPoller, PIasynController.cpp:192. Of its poll()
-            // (PIasynController.cpp:579) only getGlobalState is modeled; the
-            // pivot, coordinate-system and last-error parameters it posts
-            // are not.
+            report.attach(controller.clone(), port);
+            // C startPoller, PIasynController.cpp:192.
             let polled = controller.clone();
             let poller = Controller::new().controller_poll(move || {
                 polled.lock().unwrap_or_else(|e| e.into_inner()).poll();
