@@ -38,6 +38,7 @@ use epics_rs::asyn::interfaces::motor::{
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::device_support::{BuildTrans, LimitBuild};
 
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -111,7 +112,8 @@ impl Mdt695Controller {
         let mut model = String::new();
         let mut found = false;
         for _ in 0..3 {
-            let reply = ctrl.query("D")?;
+            // drvMDT695.cc:566-569: a failed read is no match, retried.
+            let reply = ctrl.query("D").unwrap_or_default();
             if reply.contains("MDT") {
                 model = reply;
                 found = true;
@@ -128,23 +130,18 @@ impl Mdt695Controller {
 
         ctrl.num_axes = if model.contains("694") { 1 } else { 3 };
 
-        // Multi-line identification (Model / Version lines).
-        let mut ident_parts = Vec::new();
+        // drvMDT695.cc:590-606: read until a read fails; a Model line
+        // replaces the ident, a Version line appends to it.
         let mut next = ctrl.query("I");
         while let Ok(line) = next {
-            if line.is_empty() {
-                break;
-            }
-            if line.contains("Model") || line.contains("Version") {
-                ident_parts.push(line);
+            if line.contains("Model") {
+                ctrl.ident = line;
+            } else if line.contains("Version") {
+                ctrl.ident.push_str(", ");
+                ctrl.ident.push_str(&line);
             }
             next = ctrl.read_line();
         }
-        ctrl.ident = if ident_parts.is_empty() {
-            model
-        } else {
-            ident_parts.join(", ")
-        };
 
         Ok(ctrl)
     }
@@ -176,6 +173,16 @@ impl Mdt695Controller {
     fn query(&self, cmd: &str) -> AsynResult<String> {
         let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(trim_line(&raw))
+    }
+}
+
+/// devMDT695's `build_trans` as the record sees it.
+pub struct Mdt695Build;
+
+impl BuildTrans for Mdt695Build {
+    /// devMDT695.cc:273-276: SET_HIGH_LIMIT and SET_LOW_LIMIT are ERROR.
+    fn limit(&self, _high: bool, _raw: f64, _mres: f64) -> LimitBuild {
+        LimitBuild::Refused(None)
     }
 }
 
@@ -411,10 +418,10 @@ mod tests {
     use motor_common::testing::LineRig;
 
     fn rig(name: &str) -> (LineRig, Mdt695Axis) {
-        let (line, io) = LineRig::new(name, |last| match last {
-            "D" => "MDT695".into(),
-            "YR?" => "Y 1.5".into(),
-            _ => String::new(),
+        let (line, io) = LineRig::queued(name, |last| match last {
+            "D" => vec!["MDT695".into()],
+            "YR?" => vec!["Y 1.5".into()],
+            _ => Vec::new(),
         });
         let ctrl = Mdt695Controller::new(io).unwrap();
         let axis = Mdt695Axis::new(Arc::new(Mutex::new(ctrl)), 1);
@@ -428,6 +435,36 @@ mod tests {
         p
     }
 
+    /// drvMDT695.cc:563-578: a D that gets no reply is retried after `E`,
+    /// not the end of the probe.
+    #[test]
+    fn a_silent_device_probe_is_retried() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let answered = AtomicBool::new(false);
+        let (line, io) = LineRig::queued("mdt695Probe", move |last| match last {
+            "D" if answered.swap(true, Ordering::SeqCst) => vec!["MDT694".into()],
+            _ => Vec::new(),
+        });
+        let ctrl = Mdt695Controller::new(io).unwrap();
+        assert_eq!(ctrl.num_axes(), 1);
+        assert_eq!(line.sent(), ["D", "E", "D", "I"]);
+    }
+
+    /// drvMDT695.cc:590-606: an empty line does not end the I reply, and
+    /// the ident is the Model line with each Version line after it.
+    #[test]
+    fn the_ident_is_read_to_the_end_of_the_i_reply() {
+        let (_line, io) = LineRig::queued("mdt695Ident", |last| match last {
+            "D" => vec!["MDT694".into()],
+            "I" => ["", "Model MDT694B", "Firmware", "Version 1.08"]
+                .map(String::from)
+                .to_vec(),
+            _ => Vec::new(),
+        });
+        let ctrl = Mdt695Controller::new(io).unwrap();
+        assert_eq!(ctrl.ident(), "Model MDT694B, Version 1.08");
+    }
+
     /// drvMDT695.cc:250-283: a first missed `R?` is RETRY (nothing raised,
     /// nothing posted), the next COMM_ERR, and a reading clears it.
     #[test]
@@ -435,10 +472,10 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let quiet = Arc::new(AtomicBool::new(false));
         let q = quiet.clone();
-        let (line, io) = LineRig::new("mdt695Retry", move |last| match last {
-            "D" => "MDT695".into(),
-            "YR?" if !q.load(Ordering::SeqCst) => "Y 1.5".into(),
-            _ => String::new(),
+        let (line, io) = LineRig::queued("mdt695Retry", move |last| match last {
+            "D" => vec!["MDT695".into()],
+            "YR?" if !q.load(Ordering::SeqCst) => vec!["Y 1.5".into()],
+            _ => Vec::new(),
         });
         let ctrl = Mdt695Controller::new(io).unwrap();
         let mut axis = Mdt695Axis::new(Arc::new(Mutex::new(ctrl)), 1);
@@ -488,6 +525,42 @@ mod tests {
         assert_eq!(line.sent(), ["YR?", "#H"]);
         axis.poll(&user).unwrap();
         assert_eq!(line.sent(), ["YR?"]);
+    }
+
+    /// devMDT695.cc:273-276 with motorRecord.cc:4112-4121: a refused HLM or
+    /// LLM sends nothing and goes back to the dial limit.
+    #[test]
+    fn limits_are_refused_and_restored() {
+        use epics_rs::base::server::record::Record;
+        use epics_rs::base::types::EpicsValue;
+        use epics_rs::motor::MotorRecord;
+        use epics_rs::motor::device_support::CommandPort;
+        use epics_rs::motor::flags::MstaFlags;
+
+        let mut rec = MotorRecord::new();
+        let (port, mut rx) = CommandPort::capture();
+        rec.set_command_port(port.with_build_trans(Arc::new(Mdt695Build)));
+        rec.conv.mres = 1.0;
+        rec.stat.msta = MstaFlags::DONE;
+        rec.limits.dhlm = 100.0;
+        rec.limits.hlm = 100.0;
+        rec.limits.dllm = -100.0;
+        rec.limits.llm = -100.0;
+        rec.limits.rhlm = 100.0;
+        rec.limits.rllm = -100.0;
+        rec.internal.init_invariants_synced = true;
+        rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+        rec.put_field("LLM", EpicsValue::Double(-50.0)).unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            (
+                rec.limits.hlm,
+                rec.limits.dhlm,
+                rec.limits.llm,
+                rec.limits.dllm
+            ),
+            (100.0, 100.0, -100.0, -100.0)
+        );
     }
 
     /// MOVE_REL builds no command but still carries PREM.

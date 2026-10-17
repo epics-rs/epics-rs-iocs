@@ -16,7 +16,7 @@ use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 
-use crate::mdt695::{INPUT_EOS, Mdt695Axis, Mdt695Controller, OUTPUT_EOS};
+use crate::mdt695::{INPUT_EOS, Mdt695Axis, Mdt695Build, Mdt695Controller, OUTPUT_EOS};
 
 /// Serial command timeout (C `TIMEOUT` 2 s).
 const MDT695_TIMEOUT: Duration = Duration::from_secs(2);
@@ -72,7 +72,13 @@ pub fn mdt695_config_command() -> CommandDef {
             for index in 0..num_axes {
                 let ax = Mdt695Axis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                MDT695.install(ctx, card, index as i32, motor)?;
+                MDT695.install_with_build_trans(
+                    ctx,
+                    card,
+                    index as i32,
+                    motor,
+                    Arc::new(Mdt695Build),
+                )?;
             }
             MDT695.describe(card, line);
             Ok(CommandOutcome::Continue)
@@ -96,16 +102,16 @@ mod report {
         );
         let int = ArgValue::Int;
         run_command(setup, vec![int(2), int(10)]).await;
-        let (_line, _io) = LineRig::new("mdtRepLine", |cmd| match cmd.trim_end() {
-            "D" => "MDT694".into(),
-            _ => String::new(),
+        let (_line, _io) = LineRig::queued("mdtRepLine", |cmd| match cmd.trim_end() {
+            "D" => vec!["MDT694".into()],
+            _ => Vec::new(),
         });
         let config = vec![int(1), ArgValue::String("mdtRepLine".into())];
         run_command(mdt695_config_command(), config).await;
         assert_eq!(
             driver_report("drvMDT695", 0),
             "    MDT695 controller 0 connection failed.\n    MDT695 controller 1, \
-             port=mdtRepLine, address=0, id: MDT694 \n"
+             port=mdtRepLine, address=0, id:  \n"
         );
     }
 }

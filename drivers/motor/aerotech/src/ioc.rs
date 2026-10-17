@@ -194,7 +194,7 @@ pub fn ensemble_config_command() -> CommandDef {
                 &card.to_string(),
             )));
             let answered = {
-                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
                 (0..3).any(|_| ctrl.ping().is_ok())
             };
             if !answered {
@@ -213,7 +213,7 @@ pub fn ensemble_config_command() -> CommandDef {
                     .unwrap_or_else(|e| e.into_inner())
                     .axis_exists(axis);
                 if exists {
-                    let ax = EnsembleAxis::new(controller.clone(), axis, axes.len() as i32)
+                    let ax = EnsembleAxis::new(controller.clone(), card, axis, axes.len() as i32)
                         .map_err(|e| format!("EnsembleAsynConfig: axis {axis}: {e}"))?;
                     reports.push(ax.report());
                     logs.push(ax.log());
@@ -302,24 +302,30 @@ pub fn a3200_config_command() -> CommandDef {
             let mut axes = Vec::new();
             let mut reports: Vec<Arc<dyn AxisReport>> = Vec::new();
             let mut logs = Vec::new();
+            // C probes an axis only while the last reply is an ACK, and fails
+            // the config after the loop if it is not (drvA3200Asyn.cc:916-979).
+            let acked = || controller.lock().unwrap_or_else(|e| e.into_inner()).ack();
             for axis in 0..num_axes {
+                if !acked() {
+                    break;
+                }
                 let axis_name = controller
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .discover_axis_name(axis)
-                    .map_err(|e| format!("A3200AsynConfig: axis {axis}: name discovery: {e}"))?;
-                let ax = A3200Axis::new(controller.clone(), axis_name.clone())
-                    .map_err(|e| format!("A3200AsynConfig: axis {axis} ({axis_name}): {e}"))?;
+                    .discover_axis_name(axis);
+                let ax = A3200Axis::new(controller.clone(), card, axis, axis_name);
                 reports.push(ax.report());
                 logs.push(ax.log());
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 axes.push(motor);
             }
+            if !acked() {
+                return Ok(CommandOutcome::Continue);
+            }
             controller
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .finalize()
-                .map_err(|e| format!("A3200AsynConfig: finalize failed: {e}"))?;
+                .finalize();
             lock_cards(&A3200_CARDS)[card as usize].axes = reports;
             MOTOR_A3200.set_card(card, axes, moving_poll_ms, idle_poll_ms);
             MOTOR_A3200.set_axis_logs(card, logs);
@@ -511,6 +517,26 @@ mod report {
         run_command(drv_asyn_motor_configure_command(vec![&MOTOR_A3200]), args).await;
         let text = reported("motorA3200", 1, "axisStatus:  0x5\n").await;
         assert!(text.contains("Axis X\n   axisStatus:  0x5\n"), "{text}");
+    }
+
+    /// drvA3200Asyn.cc:912-979: a NAK'd `~STOPTASK` leaves no ACK in
+    /// `inputBuff`, so no axis is probed and the config fails.
+    #[epics_rs::base::epics_test]
+    async fn a_refused_stoptask_fails_the_a3200_config() {
+        run_command(a3200_setup_command(), vec![ArgValue::Int(1)]).await;
+        let (line, _io) = LineRig::new("a32StopLine", |cmd| {
+            if cmd.trim_end() == "~STOPTASK" {
+                "!"
+            } else {
+                "%X"
+            }
+            .into()
+        });
+        let mut args = config(0, "a32StopLine", 1);
+        args.extend([ArgValue::Int(1), ArgValue::Int(0)]);
+        run_command(a3200_config_command(), args).await;
+        assert_eq!(line.sent(), ["~TASK 1", "~STOPTASK"]);
+        assert!(!driver_report("motorA3200", 1).contains("Axis"));
     }
 
     /// drvSoloist.cc's drvet `report` (:148-172). A card that answered

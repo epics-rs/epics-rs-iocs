@@ -34,12 +34,13 @@ use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
 
 use motor_common::util::{atof, atoi};
 
-use crate::smc::{SmcMembers, SmcState, travel_limits};
+use crate::smc::{SmcMembers, SmcState, trace_axis_status, trace_move_velocity, travel_limits};
 
 /// Response buffer size.
 const READ_BUF: usize = 128;
@@ -111,6 +112,11 @@ pub struct HydraAxis {
     /// port's write sets. C reads it uninitialised before the first write;
     /// it is 0 here.
     regulator_mode: Arc<AtomicI32>,
+    /// What the last poll left: a failed exchange keeps every parameter
+    /// the poll did not reach.
+    last_status: MotorStatus,
+    /// C's `pasynUser_`, which the axis's lines print on.
+    trace: MotorTrace,
 }
 
 impl HydraAxis {
@@ -123,6 +129,7 @@ impl HydraAxis {
         controller: Arc<Mutex<HydraController>>,
         axis_no: usize,
         regulator_mode: Arc<AtomicI32>,
+        port: &str,
     ) -> Self {
         let addr = axis_no + 1;
         let (motor_form, members) = {
@@ -152,6 +159,11 @@ impl HydraAxis {
             members: Arc::new(members),
             motor_form,
             regulator_mode,
+            trace: MotorTrace::new(port, axis_no as i32),
+            last_status: MotorStatus {
+                gain_support: true,
+                ..MotorStatus::default()
+            },
         }
     }
 
@@ -232,10 +244,17 @@ impl AsynMotor for HydraAxis {
     fn move_velocity(
         &mut self,
         _user: &AsynUser,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        trace_move_velocity(
+            &self.trace,
+            "SMChydraAxis::moveVelocity",
+            min_velocity,
+            velocity,
+            acceleration,
+        );
         // No jog command: move to the travel limit the constructor read.
         let (neg, pos) = self.members.state().travel_limits;
         let target = if velocity > 0.0 { pos } else { neg };
@@ -309,21 +328,46 @@ impl AsynMotor for HydraAxis {
         Ok(())
     }
 
+    /// C `SMChydraAxis::poll`: a failed exchange skips the rest and sets
+    /// Problem, and the parameters set before it are still posted
+    /// (SMChydraAxis.cpp:247-362).
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        let mut status = self.last_status.clone();
+        if self.poll_into(&mut status).is_err() {
+            status.problem = true;
+        }
+        self.last_status = status.clone();
+        Ok(status)
+    }
+}
+
+impl HydraAxis {
+    /// Write each field as C sets its parameter, in C's order.
+    fn poll_into(&self, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
         let addr = self.addr();
 
-        let position = atof(&ctrl.query(&format!("{addr} np"))?);
+        let position = atof(&ctrl.query(&format!("{addr} np"))?) / self.axis_res();
+        status.position = position;
+        status.encoder_position = position;
 
-        let status = atoi(&ctrl.query(&format!("{addr} nst"))?);
-        let moving = (status & STATUS_MOVING) != 0;
-        let powered = (status & STATUS_POWER_OFF) == 0;
-        let problem = (status & STATUS_ESTOP_SWITCH) != 0;
+        let axis_status = atoi(&ctrl.query(&format!("{addr} nst"))?);
+        let moving = (axis_status & STATUS_MOVING) != 0;
+        status.done = !moving;
+        status.moving = moving;
+        // SMChydraAxis.cpp:273 motorStatusMoving_ = !done.
+        status.msta_moving = moving;
 
         // SMChydraAxis.cpp:276-281 reads the commanded velocity and
         // acceleration, ignoring the replies and their status.
         let _ = ctrl.query(&format!("{addr} gnv"));
         let _ = ctrl.query(&format!("{addr} gna"));
+        trace_axis_status(
+            &self.trace,
+            "SMChydraAxis::poll",
+            self.members.axis_no,
+            axis_status,
+        );
 
         // Switch config: bit 1 (0x2) masks (disables) the switch.
         let sw = ctrl.query(&format!("{addr} getsw"))?;
@@ -340,23 +384,14 @@ impl AsynMotor for HydraAxis {
             low_limit = !ignore_low && *low != 0;
             high_limit = !ignore_high && *high != 0;
         }
-        drop(ctrl);
+        status.low_limit = low_limit;
+        status.high_limit = high_limit;
 
-        Ok(MotorStatus {
-            position: position / self.axis_res(),
-            encoder_position: position / self.axis_res(),
-            velocity: 0.0,
-            done: !moving,
-            moving,
-            // SMChydraAxis.cpp:273 motorStatusMoving_ = !done.
-            msta_moving: moving,
-            gain_support: true,
-            high_limit,
-            low_limit,
-            powered,
-            problem,
-            ..MotorStatus::default()
-        })
+        status.powered = (axis_status & STATUS_POWER_OFF) == 0;
+        // C sets problem from 0x200 (SMChydraAxis.cpp:302-311), then
+        // overwrites it at :357 and :360, a dead store; not copied.
+        status.problem = (axis_status & STATUS_ESTOP_SWITCH) != 0;
+        Ok(())
     }
 }
 
@@ -365,12 +400,72 @@ mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
 
+    /// C's poll prints the `nst` limit, e-stop and busy bits, and
+    /// `moveVelocity` its FLOW line, on the axis's `pasynUser_`.
+    #[test]
+    fn the_status_bits_and_a_velocity_move_are_traced() {
+        use epics_rs::asyn::trace::TraceMask;
+        use motor_common::testing::LineRig;
+        let (_line, handle) = LineRig::new("hydraTraceLine", |cmd| match cmd.trim_end() {
+            "1 getmotor" => "1".into(),
+            "1 getclperiod" => "0.5".into(),
+            "1 nst" => "1728".into(),
+            _ => String::new(),
+        });
+        let controller = Arc::new(Mutex::new(HydraController::new(handle)));
+        let mut axis = HydraAxis::new(controller, 0, Arc::default(), "hydraTrace");
+        let mask = TraceMask::ERROR | TraceMask::IO_DRIVER | TraceMask::FLOW;
+        let lines = crate::smc::trace_lines("hydraTrace", mask, || {
+            let user = AsynUser::default();
+            axis.poll(&user).unwrap();
+            axis.move_velocity(&user, 1.0, 2.0, 4.0).unwrap();
+        });
+        assert_eq!(
+            lines,
+            [
+                "SMChydraAxis::poll: axis 1 limit indicator active.",
+                "SMChydraAxis::poll: axis 1 emergency stopped.",
+                "SMChydraAxis::poll: axis 1 emergency stop switch active.",
+                "SMChydraAxis::poll: axis 1 device is busy - move commands discarded.",
+                "SMChydraAxis::moveVelocity: baseVelocity=1.000000, slewVelocity=2.000000, \
+                 acceleration=4.000000",
+            ]
+        );
+    }
+
+    /// A failed `nst` skips the rest of C's poll, but the position it read
+    /// first is still posted, with Problem (SMChydraAxis.cpp:255-266).
+    #[test]
+    fn a_failed_status_read_still_posts_the_position() {
+        use motor_common::testing::LineRig;
+        let (_line, handle) = LineRig::failing(
+            "hydraNstFails",
+            |cmd| match cmd.trim_end() {
+                "1 getmotor" => "1".into(),
+                "1 getclperiod" => "0.5".into(),
+                "1 np" => "2.5".into(),
+                _ => String::new(),
+            },
+            |cmd| cmd.trim_end() == "1 nst",
+        );
+        let controller = Arc::new(Mutex::new(HydraController::new(handle)));
+        let mut axis = HydraAxis::new(controller, 0, Arc::default(), "");
+        let res = axis.axis_res();
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert_eq!(status.position, 2.5 / res);
+        assert_eq!(status.encoder_position, 2.5 / res);
+        assert!(status.problem);
+        assert!(status.gain_support);
+    }
     #[test]
     fn an_axis_of_an_unanswering_controller_is_still_built() {
         let (handle, _) =
             SyncIOHandle::connect_port("HYDRA_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(HydraController::new(handle)));
-        assert_eq!(HydraAxis::new(controller, 0, Arc::default()).motor_form, 0);
+        assert_eq!(
+            HydraAxis::new(controller, 0, Arc::default(), "").motor_form,
+            0
+        );
     }
 
     /// C `sprintf("%f %i nm")` of a NaN target sends glibc's `nan`.
@@ -393,6 +488,8 @@ mod tests {
             }),
             motor_form: 0,
             regulator_mode: Arc::default(),
+            last_status: MotorStatus::default(),
+            trace: MotorTrace::default(),
         };
         line.sent();
         axis.move_absolute(&AsynUser::default(), f64::NAN, 0.0, 2.0, 4.0)
@@ -482,6 +579,8 @@ mod tests {
             }),
             motor_form: 0,
             regulator_mode: Arc::default(),
+            last_status: MotorStatus::default(),
+            trace: MotorTrace::default(),
         };
         let user = AsynUser::default();
         axis.move_absolute(&user, 2.0, 0.0, 2.0, 4.0).unwrap();

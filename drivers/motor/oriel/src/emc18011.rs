@@ -13,18 +13,13 @@
 //!
 //! The controller selects one motor and holds it until motion completes: while
 //! a motor is moving, motor selection cannot change, and only the selected motor
-//! reports status/position. This port models that with an `active` slot on the
-//! controller. A move on an idle controller selects its motor (`M<n>`) and
-//! claims the slot; [`poll`](AsynMotor::poll) releases the slot when the
-//! selected motor stops (or hits a limit) and a valid position has been read.
-//!
-//! **Deviation from C:** the C driver defers a move requested while another
-//! motor is active by returning without sending and leaning on the motor
-//! record's retry loop to complete it later. The asyn-rs [`AsynMotor`] boundary
-//! has no equivalent deferred-retry queue, so this port instead rejects a move
-//! aimed at a non-active motor while another is in motion, with a "controller
-//! busy" error. Concurrent moves on this single-channel controller are a
-//! hardware impossibility either way; only the surfacing differs.
+//! reports status/position. C's `motorSelect` and `motorLock` are one
+//! [`Selection`]: a record's JOG, LOAD_POS, SET_VELOCITY or GET_INFO claims
+//! a free controller in `build_trans`, every command of a motor that does
+//! not hold it is deferred to the record's retries ([`Emc18011Build`]), and
+//! [`poll`](AsynMotor::poll) releases it when the motor stops (or hits a
+//! limit) and a valid position has been read. The `M<n>` C sends at the
+//! claim goes out ahead of the poller's first command for that motor.
 //!
 //! ## Position feedback only when stopped
 //!
@@ -46,9 +41,11 @@
 //!   [`poll`](AsynMotor::poll).
 //! - Homing, PID gains, torque enable/disable and travel-limit setting are
 //!   unsupported in C (`build_trans` returns `ERROR`); [`home`](AsynMotor::home)
-//!   returns an error and the others are no-ops.
+//!   returns an error, [`Emc18011Build`] refuses the limits, and the others
+//!   are no-ops.
 //! - `set_position` only supports zeroing (`CA`), matching C `LOAD_POS`.
 
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::Duration;
@@ -59,6 +56,8 @@ use epics_rs::asyn::interfaces::motor::{
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::device_support::{BuildTrans, LimitBuild};
+use epics_rs::motor::flags::MotorCommand;
 
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -73,6 +72,9 @@ const READ_BUF: usize = 120;
 
 /// C `MOTION_DELAY` (drvEMC18011.cc:72), slept on entering RETRY.
 const MOTION_DELAY: Duration = Duration::from_millis(100);
+
+/// C's sleep in an unselected motor's `set_status` (drvEMC18011.cc:291).
+const UNSELECTED_DELAY: Duration = Duration::from_millis(100);
 
 /// Fixed number of axes (C `EMC18011_MAX_MOTORS`).
 pub const MAX_MOTORS: usize = 3;
@@ -153,13 +155,50 @@ fn decode_z(c: char) -> ZStatus {
     }
 }
 
+/// C `cntrl->motorSelect` and `motorLock`: the 0-based motor holding the
+/// controller, or none. A record's `build_trans` claims it without the
+/// controller lock, as C's does.
+#[derive(Debug)]
+pub struct Selection(AtomicI32);
+
+impl Selection {
+    const NONE: i32 = -1;
+
+    fn new() -> Self {
+        Self(AtomicI32::new(Self::NONE))
+    }
+
+    /// C `motorLock->tryWait()` then `motorSelect = signal`: whether
+    /// `index` holds the controller now.
+    fn claim(&self, index: usize) -> bool {
+        let index = index as i32;
+        match self
+            .0
+            .compare_exchange(Self::NONE, index, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(holder) => holder == index,
+        }
+    }
+
+    fn holder(&self) -> Option<usize> {
+        usize::try_from(self.0.load(Ordering::Acquire)).ok()
+    }
+
+    fn holds(&self, index: usize) -> bool {
+        self.holder() == Some(index)
+    }
+}
+
 /// Shared controller endpoint: owns the serial handle and the single-motor
-/// selection slot.
+/// selection.
 pub struct Emc18011Controller {
     handle: SyncIOHandle,
     ident: String,
-    /// The 0-based index of the motor currently selected and in motion, if any.
-    active: Option<usize>,
+    selection: Arc<Selection>,
+    /// The holder the last `M<n>` selected; `None` until the holder's first
+    /// command, and again from its release, so a new claim sends `M<n>`.
+    wired: Option<usize>,
     comm_state: CommState,
 }
 
@@ -180,7 +219,8 @@ impl Emc18011Controller {
         let ctrl = Self {
             handle,
             ident: "Oriel Encoder Mike 18011".to_string(),
-            active: None,
+            selection: Arc::new(Selection::new()),
+            wired: None,
             comm_state: CommState::Normal,
         };
 
@@ -231,22 +271,64 @@ impl Emc18011Controller {
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
 
-    /// Acquire the selection slot for motor `index` (0-based), sending `M<n>`
-    /// (1-based) if it is not already selected. Returns a "busy" error if another
-    /// motor is currently in motion.
+    /// Hold the controller for motor `index` (0-based), claiming it if
+    /// free, and send the claim's `M<n>` (1-based) if not yet sent. A
+    /// "busy" error if another motor holds it.
     fn select(&mut self, index: usize) -> AsynResult<()> {
-        match self.active {
-            Some(a) if a == index => Ok(()),
-            Some(a) => Err(oriel_err(format!(
-                "EMC18011: controller busy (motor {} in motion)",
-                a + 1
-            ))),
-            None => {
-                self.send(format!("M{}", index + 1).as_bytes());
-                self.active = Some(index);
-                Ok(())
-            }
+        if !self.selection.claim(index) {
+            let holder = self.selection.holder().map_or(0, |h| h + 1);
+            return Err(oriel_err(format!(
+                "EMC18011: controller busy (motor {holder} in motion)"
+            )));
         }
+        if self.wired != Some(index) {
+            self.send(format!("M{}", index + 1).as_bytes());
+            self.wired = Some(index);
+        }
+        Ok(())
+    }
+
+    /// C `motorSelect = -1; motorLock->signal()` (drvEMC18011.cc:274-275).
+    fn release(&mut self) {
+        self.selection.0.store(Selection::NONE, Ordering::Release);
+        self.wired = None;
+    }
+}
+
+/// devEMC18011's `build_trans` for one motor: what it defers, and its
+/// refused soft limits.
+pub struct Emc18011Build {
+    selection: Arc<Selection>,
+    index: usize,
+}
+
+impl BuildTrans for Emc18011Build {
+    /// devEMC18011.cc:206-231: JOG, LOAD_POS, SET_VELOCITY (which leads
+    /// every move and home, motorRecord.cc:2052, 2527) and GET_INFO claim a
+    /// free controller; any command of a motor not holding it is deferred.
+    fn defers(&self, command: &MotorCommand) -> bool {
+        match command {
+            // What the record leads a transaction with, not build_trans calls.
+            MotorCommand::OutParm { .. }
+            | MotorCommand::MoveStrings { .. }
+            | MotorCommand::MoveDirection { .. }
+            | MotorCommand::RecordFields(_) => return false,
+            MotorCommand::MoveVelocity { .. }
+            | MotorCommand::SetPosition { .. }
+            | MotorCommand::InitPosition { .. }
+            | MotorCommand::SetVelocity { .. }
+            | MotorCommand::Poll => {
+                self.selection.claim(self.index);
+            }
+            _ => {}
+        }
+        !self.selection.holds(self.index)
+    }
+
+    /// devEMC18011.cc:390-394: SET_HIGH_LIMIT and SET_LOW_LIMIT are ERROR
+    /// once past the deferral, which the record asks first.
+    fn limit(&self, _high: bool, _raw: f64, _mres: f64) -> LimitBuild {
+        LimitBuild::Refused(None)
     }
 }
 
@@ -261,7 +343,6 @@ pub struct Emc18011Axis {
     /// `RA_PROBLEM` on the next (COMM_ERR, :306). Per axis, as the
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
-    last_status: MotorStatus,
     strings: MoveStrings,
 }
 
@@ -276,19 +357,38 @@ impl Emc18011Axis {
             index,
             prev_position: 0.0,
             failure: PollFailure::NONE,
-            last_status: MotorStatus {
-                done: true,
-                ..MotorStatus::default()
-            },
             strings: MoveStrings::default(),
         };
         {
+            // C sets motorSelect outright (drvEMC18011.cc:728).
             let mut ctrl = axis.lock();
-            ctrl.send(format!("M{}", index + 1).as_bytes());
-            ctrl.active = Some(index);
+            ctrl.selection.0.store(index as i32, Ordering::Release);
+            ctrl.wired = None;
+            let _ = ctrl.select(index);
         }
         let _ = axis.poll(&AsynUser::default());
         axis
+    }
+
+    /// The record side of this motor's devEMC18011 `build_trans`.
+    pub fn build_trans(&self) -> Arc<Emc18011Build> {
+        Arc::new(Emc18011Build {
+            selection: self.lock().selection.clone(),
+            index: self.index,
+        })
+    }
+
+    fn status(&self, z: &ZStatus) -> MotorStatus {
+        MotorStatus {
+            position: self.prev_position,
+            encoder_position: 0.0,
+            velocity: 0.0,
+            done: z.done,
+            high_limit: z.plus_ls,
+            low_limit: z.minus_ls,
+            direction: z.direction,
+            ..MotorStatus::default()
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Emc18011Controller> {
@@ -384,14 +484,22 @@ impl AsynMotor for Emc18011Axis {
         _acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
-        // C HOME_FOR/HOME_REV ERROR leaves the record DMOV=0 forever; not copied.
+        // C HOME_FOR/HOME_REV ERROR (devEMC18011.cc:298-301) leaves the
+        // record DMOV=0 forever; not copied. Its SET_VELOCITY claimed the
+        // controller, which C's GO poll releases; released here.
+        let mut ctrl = self.lock();
+        if ctrl.selection.holds(self.index) {
+            let _ = ctrl.select(self.index);
+            ctrl.release();
+        }
         Err(oriel_err("EMC18011: homing is not supported"))
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
         // Only the selected (moving) motor can be stopped; otherwise no-op.
-        if ctrl.active == Some(self.index) {
+        if ctrl.selection.holds(self.index) {
+            ctrl.select(self.index)?;
             ctrl.send(b"S");
         }
         Ok(())
@@ -404,7 +512,7 @@ impl AsynMotor for Emc18011Axis {
         }
         let mut ctrl = self.lock();
         // If another motor is active, defer (no-op), matching C's deferral.
-        if matches!(ctrl.active, Some(a) if a != self.index) {
+        if matches!(ctrl.selection.holder(), Some(a) if a != self.index) {
             return Ok(());
         }
         ctrl.select(self.index)?;
@@ -422,12 +530,12 @@ impl AsynMotor for Emc18011Axis {
         Ok(())
     }
 
-    /// `PRIMITIVE`: INIT as its own message, to this motor only. C sends
-    /// it only when this motor is already the selected one; here it is
-    /// selected, as for `set_position`.
+    /// `PRIMITIVE`: INIT as its own message, to this motor only; the
+    /// record's build_trans deferred it unless this motor holds the
+    /// controller (devEMC18011.cc:234-249).
     fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
         let mut ctrl = self.lock();
-        if matches!(ctrl.active, Some(a) if a != self.index) {
+        if matches!(ctrl.selection.holder(), Some(a) if a != self.index) {
             return Ok(());
         }
         ctrl.select(self.index)?;
@@ -449,10 +557,17 @@ impl AsynMotor for Emc18011Axis {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Only the selected motor yields fresh status; others report last state.
-        if ctrl.active != Some(self.index) {
-            return Ok(self.last_status.clone());
+        // Only the selected motor yields fresh status; C reports the others
+        // as Z_STOPPED at their last position after a 0.1 s "in-case of
+        // record retry loop", and the controller back in NORMAL
+        // (drvEMC18011.cc:286-297).
+        if !ctrl.selection.holds(self.index) {
+            ctrl.comm_state = CommState::Normal;
+            drop(ctrl);
+            sleep(UNSELECTED_DELAY);
+            return Ok(self.status(&decode_z(Z_STOPPED)));
         }
+        let _ = ctrl.select(self.index);
 
         // C drvEMC18011.cc:249-321: a missing or unknown `Z` reply fails the
         // poll raising nothing once (RETRY); a second in a row raises COMM_ERR.
@@ -487,7 +602,7 @@ impl AsynMotor for Emc18011Axis {
             // (drvEMC18011.cc:225, :270), which passes any reply.
             if let Some(reply) = ctrl.command("A").ok().filter(|r| !r.is_empty()) {
                 position = f64::from(nint(atof(&reply) / DRIVE_RESOLUTION));
-                ctrl.active = None;
+                ctrl.release();
             }
         }
         // drvEMC18011.cc:347, 379-386, reading the reply C leaves for the
@@ -500,19 +615,7 @@ impl AsynMotor for Emc18011Axis {
         drop(ctrl);
 
         self.prev_position = position;
-
-        let status = MotorStatus {
-            position,
-            encoder_position: 0.0,
-            velocity: 0.0,
-            done: z.done,
-            high_limit: z.plus_ls,
-            low_limit: z.minus_ls,
-            direction: z.direction,
-            ..MotorStatus::default()
-        };
-        self.last_status = status.clone();
-        Ok(status)
+        Ok(self.status(&z))
     }
 }
 
@@ -567,7 +670,7 @@ mod tests {
         line.sent();
         let mut axis = Emc18011Axis::new(ctrl.clone(), 1);
         assert_eq!(line.sent(), ["M2", "Z", "A"]);
-        assert_eq!(ctrl.lock().unwrap().active, None);
+        assert_eq!(ctrl.lock().unwrap().selection.holder(), None);
         assert_eq!(axis.poll(&AsynUser::default()).unwrap().position, 123.0);
     }
 
@@ -716,5 +819,237 @@ mod tests {
         *z.lock().unwrap() = 'x';
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// Motors 1 and 2 of one controller on a [`LineRig`] whose `Z` reply
+    /// is `z`, both released after init.
+    fn pair_rig(name: &str) -> (LineRig, [Emc18011Axis; 2], Arc<StdMutex<char>>) {
+        let z = Arc::new(StdMutex::new(Z_STOPPED));
+        let zr = z.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "R" => RTN_REMOTE.into(),
+            "Z" => zr.lock().unwrap().to_string(),
+            "A" => "1.0".into(),
+            _ => "OK".into(),
+        });
+        let ctrl = Arc::new(Mutex::new(Emc18011Controller::new(io).unwrap()));
+        let axes = [
+            Emc18011Axis::new(ctrl.clone(), 0),
+            Emc18011Axis::new(ctrl, 1),
+        ];
+        line.sent();
+        (line, axes, z)
+    }
+
+    /// drvEMC18011.cc:286-297: an unselected motor reads as stopped off
+    /// its limits at its last position, and resets the controller to
+    /// NORMAL, so the selected motor's next bad `Z` is RETRY again.
+    #[test]
+    fn an_unselected_motor_reads_stopped_and_resets_the_comm_state() {
+        let (_line, [mut a, mut b], z) = pair_rig("emcUnsel");
+        let user = AsynUser::default();
+        assert!(!b.build_trans().defers(&MotorCommand::Poll));
+        *z.lock().unwrap() = Z_LSUP;
+        assert!(b.poll(&user).unwrap().high_limit);
+
+        assert!(!a.build_trans().defers(&MotorCommand::Poll));
+        *z.lock().unwrap() = 'x';
+        assert!(a.poll(&user).is_err());
+        assert_eq!(a.poll_failure(), PollFailure::NONE);
+        let s = b.poll(&user).unwrap();
+        assert!(s.done && s.direction && !s.high_limit && !s.low_limit);
+        assert_eq!(s.position, 100.0);
+        assert!(a.poll(&user).is_err());
+        assert_eq!(a.poll_failure(), PollFailure::NONE);
+    }
+
+    /// devEMC18011.cc:206-231: SET_VELOCITY claims a free controller; the
+    /// other motor's commands defer until a stopped poll releases it.
+    #[test]
+    fn an_unselected_motors_commands_defer() {
+        let (_line, [a, b], z) = pair_rig("emcDefer");
+        let (ba, bb) = (a.build_trans(), b.build_trans());
+        let velocity = MotorCommand::SetVelocity { velocity: 1.0 };
+        let stop = MotorCommand::Stop { acceleration: 1.0 };
+        let closed = MotorCommand::SetClosedLoop { enable: true };
+
+        // A command that claims nothing defers on a free controller.
+        assert!(ba.defers(&closed));
+        assert!(!ba.defers(&velocity));
+        assert!(!ba.defers(&closed));
+        assert!(bb.defers(&velocity));
+        assert!(bb.defers(&stop));
+        assert!(bb.defers(&MotorCommand::Poll));
+        assert!(!bb.defers(&MotorCommand::OutParm {
+            parm: Default::default()
+        }));
+
+        let mut a = a;
+        *z.lock().unwrap() = Z_RUNUP;
+        a.poll(&AsynUser::default()).unwrap();
+        assert!(bb.defers(&MotorCommand::Poll));
+        *z.lock().unwrap() = Z_STOPPED;
+        a.poll(&AsynUser::default()).unwrap();
+        assert!(!bb.defers(&MotorCommand::Poll));
+        assert!(ba.defers(&velocity));
+    }
+
+    /// devEMC18011.cc:217-222: the claim's `M<n>` goes out ahead of the
+    /// claiming motor's first command, and its poll then reads it.
+    #[test]
+    fn a_claim_selects_the_motor_on_the_wire() {
+        let (line, [mut a, mut b], _) = pair_rig("emcClaim");
+        let user = AsynUser::default();
+        assert!(!b.build_trans().defers(&MotorCommand::Poll));
+        a.poll(&user).unwrap();
+        assert_eq!(line.sent(), Vec::<String>::new());
+        b.poll(&user).unwrap();
+        assert_eq!(line.sent(), ["M2", "Z", "A"]);
+
+        assert!(
+            !a.build_trans()
+                .defers(&MotorCommand::SetVelocity { velocity: 2.0 })
+        );
+        a.move_absolute(&user, 150.0, 0.0, 200.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["M1", "V2.00", "G1.5", "A"]);
+    }
+
+    /// devEMC18011.cc:390-394 with motorRecord.cc:4112-4121: the selected
+    /// motor's refused HLM/LLM go back to the dial limit; an unselected
+    /// motor's limit is deferred to a bare GET_INFO and kept.
+    #[test]
+    fn limits_refuse_when_selected_and_defer_otherwise() {
+        use epics_rs::base::server::record::Record;
+        use epics_rs::base::types::EpicsValue;
+        use epics_rs::motor::MotorRecord;
+        use epics_rs::motor::device_support::CommandPort;
+        use epics_rs::motor::flags::MstaFlags;
+
+        let (_line, [a, b], _) = pair_rig("emcLimit");
+        let record = |axis: &Emc18011Axis| {
+            let mut rec = MotorRecord::new();
+            let (port, rx) = CommandPort::capture();
+            rec.set_command_port(port.with_build_trans(axis.build_trans()));
+            rec.conv.mres = 1.0;
+            rec.stat.msta = MstaFlags::DONE;
+            rec.limits.dhlm = 100.0;
+            rec.limits.hlm = 100.0;
+            rec.limits.dllm = -100.0;
+            rec.limits.llm = -100.0;
+            rec.limits.rhlm = 100.0;
+            rec.limits.rllm = -100.0;
+            rec.internal.init_invariants_synced = true;
+            (rec, rx)
+        };
+        macro_rules! sent {
+            ($rx:expr) => {{
+                let mut commands = Vec::new();
+                while let Ok(batch) = $rx.try_recv() {
+                    commands.extend(batch.commands);
+                }
+                commands
+            }};
+        }
+        let (mut ra, mut rxa) = record(&a);
+        let (mut rb, mut rxb) = record(&b);
+        assert!(!a.build_trans().defers(&MotorCommand::Poll));
+
+        ra.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+        ra.put_field("LLM", EpicsValue::Double(-50.0)).unwrap();
+        assert_eq!(sent!(rxa), []);
+        assert_eq!(
+            (ra.limits.hlm, ra.limits.dhlm, ra.limits.rhlm),
+            (100.0, 100.0, 100.0)
+        );
+        assert_eq!(
+            (ra.limits.llm, ra.limits.dllm, ra.limits.rllm),
+            (-100.0, -100.0, -100.0)
+        );
+
+        rb.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+        assert_eq!(sent!(rxb), [MotorCommand::Poll]);
+        assert_eq!((rb.limits.hlm, rb.limits.dhlm), (50.0, 50.0));
+    }
+
+    /// A selection released between two of a move's commands, as the
+    /// holder's own stopped poll on the poller thread can: the commands
+    /// built before the deferred MOVE still go out, and the deferred last
+    /// one leaves a status query (motordrvCom.cc:441).
+    #[test]
+    fn commands_built_before_a_deferred_move_still_go_out() {
+        use epics_rs::base::server::record::Record;
+        use epics_rs::base::types::EpicsValue;
+        use epics_rs::motor::MotorRecord;
+        use epics_rs::motor::device_state::{StampedStatus, new_shared_state};
+        use epics_rs::motor::device_support::CommandPort;
+        use std::sync::atomic::AtomicUsize;
+
+        /// Oriel's build_trans with the controller released after the
+        /// first command it sees.
+        struct ReleasedMidBatch {
+            inner: Arc<Emc18011Build>,
+            seen: AtomicUsize,
+        }
+        impl BuildTrans for ReleasedMidBatch {
+            fn defers(&self, command: &MotorCommand) -> bool {
+                let deferred = self.inner.defers(command);
+                if self.seen.fetch_add(1, Ordering::Relaxed) == 0 {
+                    self.inner
+                        .selection
+                        .0
+                        .store(Selection::NONE, Ordering::Release);
+                }
+                deferred
+            }
+            fn limit(&self, high: bool, raw: f64, mres: f64) -> LimitBuild {
+                self.inner.limit(high, raw, mres)
+            }
+        }
+
+        let (_line, [a, _b], _) = pair_rig("emcMidBatch");
+        let device = Arc::new(ReleasedMidBatch {
+            inner: a.build_trans(),
+            seen: AtomicUsize::new(usize::MAX / 2),
+        });
+        let status = |seq| StampedStatus {
+            seq,
+            status: MotorStatus {
+                done: true,
+                ..MotorStatus::default()
+            },
+        };
+        let state = new_shared_state();
+        state.lock().unwrap().latest_status = Some(status(1));
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
+        rec.limits.dhlm = 100.0;
+        rec.limits.hlm = 100.0;
+        rec.limits.dllm = -100.0;
+        rec.limits.llm = -100.0;
+        rec.vel.velo = 10.0;
+        rec.vel.accl = 0.5;
+        rec.set_device_state(state.clone());
+        let (port, _rx) = CommandPort::capture();
+        rec.set_command_port(port.with_build_trans(device.clone()));
+        rec.process().unwrap();
+        state.lock().unwrap().pending_actions.take();
+
+        device.seen.store(0, Ordering::Relaxed);
+        rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+        rec.process().unwrap();
+        let commands = state
+            .lock()
+            .unwrap()
+            .pending_actions
+            .take()
+            .map(|a| a.commands)
+            .unwrap_or_default();
+        assert!(
+            matches!(
+                commands[..],
+                [MotorCommand::SetVelocity { .. }, MotorCommand::Poll]
+            ),
+            "{commands:?}"
+        );
     }
 }

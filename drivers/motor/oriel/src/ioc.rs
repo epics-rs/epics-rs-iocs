@@ -72,8 +72,9 @@ pub fn emc18011_config_command() -> CommandDef {
 
             for index in 0..num_axes {
                 let ax = Emc18011Axis::new(controller.clone(), index);
+                let build_trans = ax.build_trans();
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                EMC18011.install(ctx, card, index as i32, motor)?;
+                EMC18011.install_with_build_trans(ctx, card, index as i32, motor, build_trans)?;
             }
             EMC18011.describe(card, line);
             Ok(CommandOutcome::Continue)

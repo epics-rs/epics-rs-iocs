@@ -36,9 +36,9 @@
 //!   (`ACKNOWLEDGEALL` for codes 52/78 that need a task reset, else `FAULTACK`),
 //!   then clears `last_fault` and `problem`.
 //!
-//! `problem` is therefore a latched state cleared only by a successful enable,
-//! exactly as in C (the C poller never sets `motorAxisProblem` from the live
-//! fault either).
+//! `problem` is therefore a latched state cleared only by an enable that
+//! got past its TaskState query, exactly as in C (the C poller never sets
+//! `motorAxisProblem` from the live fault either).
 //!
 //! ## Deviations from C (documented)
 //!
@@ -54,9 +54,12 @@
 //!   commands. This port stores the last commanded direction and reports it.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -83,6 +86,10 @@ const FAULT: u8 = b'#';
 const AXISSTATUS_HOMED: u32 = 1 << 0;
 const AXISSTATUS_NOT_VIRTUAL: u32 = 1 << 13;
 const AXISSTATUS_MOVE_DONE: u32 = 1 << 22;
+
+/// C's delay after a move sets Done 0 "so controller has time to set
+/// MoveDone false" before the next poll (drvA3200Asyn.cc:553, :645).
+const MOVE_DONE_SETTLE: Duration = Duration::from_millis(10);
 
 /// Drive status word bits (C `DRIVESTATUS_*`).
 const DRIVESTATUS_ENABLED: u32 = 1 << 0;
@@ -117,7 +124,7 @@ fn fmt(v: f64, digits: usize) -> String {
 }
 
 /// C's `stepSize` from a `CountsPerUnit` reply, 1 when it was refused.
-fn step_size(counts_per_unit: AsynResult<String>) -> f64 {
+fn step_size(counts_per_unit: Option<String>) -> f64 {
     counts_per_unit.map_or(1.0, |s| 1.0 / atof(&s))
 }
 
@@ -133,6 +140,9 @@ pub struct A3200Controller {
     io: Exchange,
     task_number: u32,
     linear: bool,
+    /// C `inputBuff`: the last reply. A failed exchange leaves it, and C's
+    /// callers that ignore the status read it anyway.
+    input: String,
 }
 
 impl A3200Controller {
@@ -155,92 +165,81 @@ impl A3200Controller {
             ),
             task_number,
             linear,
+            input: String::new(),
         }
     }
 
-    fn read_line(&self) -> AsynResult<String> {
-        self.io.read_line()
+    /// C `sendAndReceive`: fails only on I/O; a NAK or fault reply is the
+    /// caller's to check. Its ACK-then-EOS re-read (drvA3200Asyn.cc:1049)
+    /// never matches a reply the input EOS already stripped.
+    pub fn send(&mut self, cmd: &str) -> AsynResult<()> {
+        self.input = self.io.write_read(cmd)?;
+        Ok(())
     }
 
-    fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.io.write_read(cmd)
+    /// Whether the last reply is an ACK.
+    pub fn ack(&self) -> bool {
+        self.input.as_bytes().first() == Some(&ACK)
     }
 
-    /// Send a command that returns only an ACK. Errors on fault/empty.
-    pub fn command(&self, cmd: &str) -> AsynResult<()> {
-        let reply = self.write_read(cmd)?;
-        match reply.as_bytes().first() {
-            Some(&ACK) => Ok(()),
-            _ => Err(a3200_err(format!(
-                "a3200: command '{cmd}' rejected: '{reply}'"
-            ))),
-        }
+    /// C `&inputBuff[1]`, whatever the status char.
+    fn rest(&self) -> &str {
+        self.input.get(1..).unwrap_or("")
     }
 
-    /// Send a value query and return the payload after the ACK char. A bare ACK
-    /// line (value on the next line) triggers one more read.
-    pub fn query(&self, cmd: &str) -> AsynResult<String> {
-        let mut reply = self.write_read(cmd)?;
-        let mut tries = 0;
-        while reply == "%" && tries < 3 {
-            reply = self.read_line()?;
-            tries += 1;
-        }
-        match reply.as_bytes().first() {
-            Some(&ACK) => Ok(reply[1..].to_string()),
-            _ => Err(a3200_err(format!(
-                "a3200: query '{cmd}' rejected: '{reply}'"
-            ))),
-        }
+    /// `Param.axisName`'s value when the reply is an ACK (C
+    /// `GET_PARAM_FORMAT_STRING`).
+    pub fn get_param(&mut self, param: &str, axis_name: &str) -> Option<String> {
+        let _ = self.send(&format!("{param}.{axis_name}"));
+        self.ack().then(|| self.rest().to_owned())
     }
 
-    /// `Param.axisName` parameter value (C `GET_PARAM_FORMAT_STRING`).
-    pub fn get_param(&self, param: &str, axis_name: &str) -> AsynResult<String> {
-        self.query(&format!("{param}.{axis_name}"))
-    }
-
-    /// Select the motion task and reset it (C config `~TASK` retry + `~STOPTASK`).
-    pub fn init_task(&self) -> AsynResult<()> {
-        let mut last = Err(a3200_err("a3200: no response to ~TASK"));
+    /// Select the motion task and reset it (C config `~TASK` retry +
+    /// `~STOPTASK`); the `~STOPTASK` reply is left for [`Self::ack`].
+    pub fn init_task(&mut self) -> AsynResult<()> {
+        let mut last = Ok(());
         for _ in 0..3 {
-            last = self.command(&format!("~TASK {}", self.task_number));
+            last = self.send(&format!("~TASK {}", self.task_number));
             if last.is_ok() {
                 break;
             }
         }
         last?;
-        // C ignores the ~STOPTASK reply.
-        let _ = self.command("~STOPTASK");
+        let _ = self.send("~STOPTASK");
         Ok(())
     }
 
-    /// Discover an axis's name string via `GETPARMSTRING` + `~GETVARIABLE`.
-    pub fn discover_axis_name(&self, axis: i32) -> AsynResult<String> {
-        self.command(&format!(
+    /// An axis's name string via `GETPARMSTRING` + `~GETVARIABLE`: C's
+    /// `strncpy(axisName, &inputBuff[1])` whatever either returned.
+    pub fn discover_axis_name(&mut self, axis: i32) -> String {
+        let _ = self.send(&format!(
             "$strtask0 = GETPARMSTRING {axis}, PARAMETERID_AxisName"
-        ))?;
-        let name = self.query("~GETVARIABLE $strtask0")?;
-        Ok(name.trim().to_string())
+        ));
+        let _ = self.send("~GETVARIABLE $strtask0");
+        self.rest().to_owned()
     }
 
     /// Final config housekeeping: init the queue and set `WAIT MODE AUTO` on both
-    /// the motion task and its `+1` companion (C config tail).
-    pub fn finalize(&self) -> AsynResult<()> {
-        self.command("~INITQUEUE")?;
-        self.command("WAIT MODE AUTO")?;
-        self.command(&format!("~TASK {}", self.task_number + 1))?;
-        self.command("WAIT MODE AUTO")?;
-        self.command(&format!("~TASK {}", self.task_number))?;
-        Ok(())
+    /// the motion task and its `+1` companion (C config tail, every status
+    /// ignored).
+    pub fn finalize(&mut self) {
+        let _ = self.send("~INITQUEUE");
+        let _ = self.send("WAIT MODE AUTO");
+        let _ = self.send(&format!("~TASK {}", self.task_number + 1));
+        let _ = self.send("WAIT MODE AUTO");
+        let _ = self.send(&format!("~TASK {}", self.task_number));
     }
 }
 
 /// One A3200 axis sharing a controller. Implements [`AsynMotor`].
 pub struct A3200Axis {
     controller: Arc<Mutex<A3200Controller>>,
+    /// C `pAxis->card`, the `A3200AsynConfig` card.
+    card: i32,
+    /// C `pAxis->axis`, the axis's place on the card.
+    axis: i32,
     /// Controller axis name string (the `X`/`Y`/… address).
     axis_name: String,
-    has_encoder: bool,
     /// `HomeSetup` word; bit 0 is the home direction, updated by [`Self::home`].
     home_direction: u32,
     /// `ReverseMotionDirection` parameter.
@@ -254,12 +253,16 @@ pub struct A3200Axis {
     /// Latched fault code awaiting acknowledgement (owner: move sets, poll
     /// refreshes, enable clears).
     last_fault: i32,
-    /// Latched controller-error state (owner: move sets, enable clears).
-    problem: bool,
     /// Last commanded position (for absolute-move direction; refreshed by poll).
     current_cmd_pos: f64,
-    /// Last commanded direction; the poller does not refresh it.
-    last_direction: bool,
+    /// C's motorParam view of the axis: the poller's sets, kept when a poll
+    /// bails; `problem` latched by a faulted move and cleared by enable,
+    /// `direction` set by the commands, never by the poller.
+    status: MotorStatus,
+    /// The status a failed poll left, for the next post.
+    failed: Option<MotorStatus>,
+    /// The sets a command made, for its callback.
+    status_writes: Vec<StatusWrite>,
     report: Arc<AxisMembers>,
     log: Arc<AxisLog>,
 }
@@ -267,31 +270,34 @@ pub struct A3200Axis {
 impl A3200Axis {
     /// Construct the named axis and probe its feedback type, home/limit setup and
     /// reverse-direction parameters, then set `RAMP MODE RATE`.
-    pub fn new(controller: Arc<Mutex<A3200Controller>>, axis_name: String) -> AsynResult<Self> {
+    pub fn new(
+        controller: Arc<Mutex<A3200Controller>>,
+        card: i32,
+        axis: i32,
+        axis_name: String,
+    ) -> Self {
         let (has_encoder, step_size, home_preset, home_direction, reverse_direc, swconfig) = {
-            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let has_encoder = ctrl
                 .get_param("PositionFeedbackType", &axis_name)
-                .map(|s| atoi(&s) > 0)
-                .unwrap_or(false);
+                .is_some_and(|s| atoi(&s) > 0);
             let step_size = step_size(ctrl.get_param("CountsPerUnit", &axis_name));
             let home_preset = ctrl
                 .get_param("HomeOffset", &axis_name)
-                .map(|s| atof(&s))
-                .unwrap_or(0.0);
+                .map_or(0.0, |s| atof(&s));
             let home_direction = ctrl
                 .get_param("HomeSetup", &axis_name)
-                .map(|s| atol(&s) as u32 & 0x1)
-                .unwrap_or(0);
+                .map_or(0, |s| atol(&s) as u32 & 0x1);
             let swconfig = ctrl
                 .get_param("EndOfTravelLimitSetup", &axis_name)
-                .map(|s| atol(&s) as u32)
-                .unwrap_or(0);
+                .map_or(0, |s| atol(&s) as u32);
+            let _ = ctrl.send(&format!("RAMP MODE RATE {axis_name}"));
+            // C builds this query and never sends it, reading the RAMP MODE
+            // RATE reply instead (drvA3200Asyn.cc:971-974); not copied, so
+            // the config's closing ACK check (:978) reads this reply.
             let reverse_direc = ctrl
                 .get_param("ReverseMotionDirection", &axis_name)
-                .map(|s| atoi(&s) != 0)
-                .unwrap_or(false);
-            ctrl.command(&format!("RAMP MODE RATE {axis_name}"))?;
+                .is_some_and(|s| atoi(&s) != 0);
             (
                 has_encoder,
                 step_size,
@@ -302,8 +308,10 @@ impl A3200Axis {
             )
         };
 
-        Ok(Self {
+        Self {
             controller,
+            card,
+            axis,
             report: Arc::new(AxisMembers::new(
                 axis_name.clone(),
                 step_size,
@@ -311,18 +319,22 @@ impl A3200Axis {
                 home_preset,
             )),
             axis_name,
-            has_encoder,
             home_direction,
             reverse_direc,
             swconfig,
             step: step_size.abs(),
             digits: max_digits(step_size),
             last_fault: 0,
-            problem: false,
             current_cmd_pos: 0.0,
-            last_direction: false,
+            status: MotorStatus {
+                has_encoder,
+                gain_support: true,
+                ..Default::default()
+            },
+            failed: None,
+            status_writes: Vec::new(),
             log: Arc::default(),
-        })
+        }
     }
 
     /// What C's `motorAxisReport` prints of this axis.
@@ -354,8 +366,9 @@ impl A3200Axis {
     }
 
     /// Issue the move command sequence. Returns `Ok(None)` on ACK, `Ok(Some(code))`
-    /// when the controller replies with a `#` fault (payload is the queried
-    /// `TaskErrorCode`), or `Err` on a comms/other-reply failure.
+    /// when the move command's reply is a `#` fault (the `TaskErrorCode`
+    /// C then reads from `inputBuff`), or `Err` when an exchange C checks
+    /// failed or the move was not ACKed (drvA3200Asyn.cc:497-543).
     fn move_io(
         &self,
         position: f64,
@@ -364,7 +377,7 @@ impl A3200Axis {
         accel: f64,
     ) -> AsynResult<Option<i32>> {
         let name = &self.axis_name;
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
         let linear = ctrl.linear;
         let task = ctrl.task_number;
         let mode = match (relative, linear) {
@@ -374,7 +387,7 @@ impl A3200Axis {
             (false, false) => "MOVEABS",
         };
         if linear {
-            ctrl.command(mode)?;
+            ctrl.send(mode)?;
         }
         if accel > 0.0 {
             let cmd = if linear {
@@ -382,7 +395,7 @@ impl A3200Axis {
             } else {
                 format!("RAMP RATE {name} {}", self.units(accel))
             };
-            ctrl.command(&cmd)?;
+            let _ = ctrl.send(&cmd);
         }
         let cmd = if linear {
             format!(
@@ -397,23 +410,50 @@ impl A3200Axis {
                 self.units(max_v)
             )
         };
-        let reply = ctrl.write_read(&cmd)?;
-        match reply.as_bytes().first() {
-            Some(&ACK) => Ok(None),
-            Some(&FAULT) => {
-                let taskerr = ctrl
-                    .query(&format!("~STATUS({task}, TaskErrorCode)"))
-                    .map(|s| atoi(&s))
-                    .unwrap_or(0);
-                Ok(Some(taskerr))
-            }
-            _ => Err(a3200_err(format!(
-                "a3200: move '{cmd}' rejected: '{reply}'"
-            ))),
+        let sent = ctrl.send(&cmd);
+        if sent.is_ok() && ctrl.ack() {
+            return Ok(None);
         }
+        if ctrl.input.as_bytes().first() == Some(&FAULT) {
+            let _ = ctrl.send(&format!("~STATUS({task}, TaskErrorCode)"));
+            return Ok(Some(atoi(ctrl.rest())));
+        }
+        sent.and(Err(a3200_err(format!(
+            "a3200: move '{cmd}' rejected: '{}'",
+            ctrl.input
+        ))))
     }
 
-    fn do_move(&mut self, position: f64, relative: bool, max_v: f64, accel: f64) -> AsynResult<()> {
+    /// `motorAxisDirection` and `motorAxisDone` 0, which a move, a home
+    /// and a velocity move set together before their callback, so the
+    /// record's next status update sees the motion started.
+    fn set_started(&mut self, direction: bool) {
+        self.status.direction = direction;
+        self.status.done = false;
+        self.status_writes
+            .extend([StatusWrite::Direction(direction), StatusWrite::Done(false)]);
+    }
+
+    fn do_move(
+        &mut self,
+        position: f64,
+        relative: bool,
+        min_v: f64,
+        max_v: f64,
+        accel: f64,
+    ) -> AsynResult<()> {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "Set card {}, axis {} move to {:.6}, min vel={:.6}, max_vel={:.6}, accel={:.6}\n",
+                self.card,
+                self.axis_name,
+                CFloat(position),
+                CFloat(min_v),
+                CFloat(max_v),
+                CFloat(accel)
+            ),
+        );
         let posdir = if relative {
             position >= 0.0
         } else {
@@ -421,17 +461,98 @@ impl A3200Axis {
         };
         match self.move_io(position, relative, max_v, accel)? {
             None => {
-                self.last_direction = posdir;
+                self.set_started(posdir);
+                std::thread::sleep(MOVE_DONE_SETTLE);
                 Ok(())
             }
             Some(taskerr) => {
-                self.problem = true;
+                self.status.problem = true;
                 if taskerr != 0 {
                     self.last_fault = taskerr;
                 }
                 Err(a3200_err("a3200: move rejected (controller fault)"))
             }
         }
+    }
+}
+
+impl A3200Axis {
+    /// One axis of C `A3200Poller` (drvA3200Asyn.cc:738-797), setting
+    /// [`Self::status`] in its order; an `Err` is its `continue` before
+    /// `callCallback`.
+    fn poll_status(&mut self) -> AsynResult<()> {
+        let name = &self.axis_name;
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = ctrl.send(&format!(
+            "~STATUS ({name}, AxisStatus) ({name}, DriveStatus) ({name}, AxisFault) \
+             ({name}, ProgramPositionFeedback) ({name}, ProgramPositionCommand) \
+             ({name}, ProgramVelocityFeedback)"
+        ));
+        if sent.is_err() || !ctrl.ack() {
+            self.status.comms_error = true;
+            return sent.and(Err(a3200_err(format!(
+                "a3200: ~STATUS refused: '{}'",
+                ctrl.input
+            ))));
+        }
+        let payload = ctrl.rest().to_owned();
+        drop(ctrl);
+
+        // C's sscanf leaves a field it could not parse at the value the
+        // previous axis left in the poller's local (:753); not copied, it
+        // is 0 here.
+        let mut it = payload.split_whitespace();
+        let axis_status = it.next().map(atol).unwrap_or(0) as u32;
+        let drive_status = it.next().map(atol).unwrap_or(0) as u32;
+        let axis_fault = it.next().map(atoi).unwrap_or(0);
+        let enc_pos = it.next().map(atof).unwrap_or(0.0);
+        let cmd_pos = it.next().map(atof).unwrap_or(0.0);
+        let act_vel = it.next().map(atof).unwrap_or(0.0);
+
+        let status = &mut self.status;
+        status.comms_error = false;
+        let move_active = (axis_status & AXISSTATUS_MOVE_DONE) == 0;
+        status.done = !move_active;
+        status.moving = move_active;
+        status.powered = (drive_status & DRIVESTATUS_ENABLED) != 0;
+        // C maps AXISSTATUS_Homed to the home-switch signal, not "homed".
+        status.home = (axis_status & AXISSTATUS_HOMED) != 0;
+        // Limit switches are only set on a physical (non-virtual) axis.
+        if (axis_status & AXISSTATUS_NOT_VIRTUAL) != 0 {
+            let cw_active = !(((drive_status & DRIVESTATUS_CW_EOT) != 0)
+                ^ ((self.swconfig & CW_EOT_SW_STATE) != 0));
+            let ccw_active = !(((drive_status & DRIVESTATUS_CCW_EOT) != 0)
+                ^ ((self.swconfig & CCW_EOT_SW_STATE) != 0));
+            (status.high_limit, status.low_limit) = if self.reverse_direc {
+                (ccw_active, cw_active)
+            } else {
+                (cw_active, ccw_active)
+            };
+        }
+        self.report.set_axis_status(axis_status);
+        status.encoder_position = enc_pos / self.step;
+        status.position = cmd_pos / self.step;
+        self.current_cmd_pos = status.position;
+        self.log.print(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "A3200Poller: axis {name} axisStatus={axis_status:x}, position={:.6}\n",
+                CFloat(self.current_cmd_pos)
+            ),
+        );
+        // Latch the newest non-zero fault; never clear it here (owner: enable).
+        if axis_fault != 0 && axis_fault != self.last_fault {
+            self.log.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "A3200Poller: controller fault on axis={name} fault=0x{axis_fault:X}\n"
+                ),
+            );
+            self.last_fault = axis_fault;
+        }
+        status.velocity = act_vel / self.step;
+        Ok(())
     }
 }
 
@@ -446,22 +567,22 @@ impl AsynMotor for A3200Axis {
         &mut self,
         _user: &AsynUser,
         position: f64,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(position, false, velocity, acceleration)
+        self.do_move(position, false, min_velocity, velocity, acceleration)
     }
 
     fn move_relative(
         &mut self,
         _user: &AsynUser,
         distance: f64,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(distance, true, velocity, acceleration)
+        self.do_move(distance, true, min_velocity, velocity, acceleration)
     }
 
     fn move_velocity(
@@ -471,16 +592,20 @@ impl AsynMotor for A3200Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.last_direction = velocity > 0.0;
         let name = self.axis_name.clone();
-        let ctrl = self.lock();
-        ctrl.command(&format!(
-            "AbortDecelRate.{name} = {}",
-            self.units(acceleration)
-        ))?;
-        ctrl.command(&format!("RAMP RATE {name} {}", self.units(acceleration)))?;
-        ctrl.command(&format!("FREERUN {name} {}", self.units(velocity)))?;
-        Ok(())
+        let sent = {
+            let mut ctrl = self.lock();
+            let _ = ctrl.send(&format!(
+                "AbortDecelRate.{name} = {}",
+                self.units(acceleration)
+            ));
+            let _ = ctrl.send(&format!("RAMP RATE {name} {}", self.units(acceleration)));
+            ctrl.send(&format!("FREERUN {name} {}", self.units(velocity)))
+        };
+        // C sets them whatever FREERUN returned (drvA3200Asyn.cc:639-645).
+        self.set_started(velocity > 0.0);
+        std::thread::sleep(MOVE_DONE_SETTLE);
+        sent
     }
 
     fn home(
@@ -491,6 +616,15 @@ impl AsynMotor for A3200Axis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "motorAxisHome: set card {}, axis {} to home, forwards = {}\n",
+                self.card,
+                self.axis,
+                i32::from(forward)
+            ),
+        );
         // Adjust home direction for the reverse-direction parameter (C posdir).
         let posdir = forward == self.reverse_direc;
         let hparam = if posdir {
@@ -499,39 +633,62 @@ impl AsynMotor for A3200Axis {
             self.home_direction & !1
         };
         self.home_direction = hparam;
-        // C sets motorAxisDirection to `forwards` (not posdir) for a home.
-        self.last_direction = forward;
-
         let name = self.axis_name.clone();
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
         if velocity > 0.0 {
-            ctrl.command(&format!("HomeSpeed.{name} = {}", self.units(velocity)))?;
+            let _ = ctrl.send(&format!("HomeSpeed.{name} = {}", self.units(velocity)));
         }
         if acceleration > 0.0 {
-            ctrl.command(&format!(
+            let _ = ctrl.send(&format!(
                 "HomeRampRate.{name} = {}",
                 self.units(acceleration)
-            ))?;
+            ));
         }
-        ctrl.command(&format!("HomeSetup.{name} = {hparam}"))?;
-        ctrl.command(&format!("HOME {name}"))?;
+        let _ = ctrl.send(&format!("HomeSetup.{name} = {hparam}"));
+        ctrl.send(&format!("HOME {name}"))?;
+        drop(ctrl);
+        // `forwards`, not posdir, once HOME was sent (drvA3200Asyn.cc:605-610).
+        self.set_started(forward);
         Ok(())
     }
 
+    /// `motorAxisforceCallback` (drvA3200Asyn.cc:688-700); the status update it asks for
+    /// is the poll that follows it.
+    fn force_callback(&mut self, _user: &AsynUser) {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "motorAxisforceCallback: request card {}, axis {} status update\n",
+                self.card, self.axis
+            ),
+        );
+    }
+
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!("Abort on card {}, axis {}\n", self.card, self.axis),
+        );
         let name = self.axis_name.clone();
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
         let task = ctrl.task_number;
-        ctrl.command(&format!("~TASK {}", task + 1))?;
-        ctrl.command(&format!("ABORT {name}"))?;
-        ctrl.command(&format!("~TASK {task}"))?;
-        Ok(())
+        // C returns only the last `~TASK`'s status (drvA3200Asyn.cc:680-685).
+        let _ = ctrl.send(&format!("~TASK {}", task + 1));
+        let _ = ctrl.send(&format!("ABORT {name}"));
+        ctrl.send(&format!("~TASK {task}"))
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let name = self.axis_name.clone();
-        self.lock()
-            .command(&format!("POSOFFSET SET {name} {}", self.units(position)))
+        let mut ctrl = self.lock();
+        let sent = ctrl.send(&format!("POSOFFSET SET {name} {}", self.units(position)));
+        if !ctrl.ack() {
+            return Err(a3200_err(format!(
+                "a3200: POSOFFSET refused: '{}'",
+                ctrl.input
+            )));
+        }
+        sent
     }
 
     fn set_encoder_ratio(&mut self, _user: &AsynUser, _ratio: f64) -> AsynResult<()> {
@@ -560,110 +717,69 @@ impl AsynMotor for A3200Axis {
 
     fn set_closed_loop(&mut self, _user: &AsynUser, closed_loop: bool) -> AsynResult<()> {
         let name = self.axis_name.clone();
-        let last_fault = self.last_fault;
-        {
-            let ctrl = self.lock();
-            let task = ctrl.task_number;
-            // If the motion task is idle, re-init its queue before enabling.
-            let states = ctrl.query(&format!(
-                "~STATUS ({task}, TaskState) ({}, TaskState)",
-                task + 1
-            ))?;
-            let taskn_state = states.split_whitespace().next().map(atoi).unwrap_or(0);
-            if taskn_state == TASKSTATE_IDLE {
-                ctrl.command(&format!("~INITQUEUE {task}"))?;
-            }
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let task = ctrl.task_number;
+        // C's status is TaskState's when it bails, a NAK being success
+        // (drvA3200Asyn.cc:414-420).
+        let sent = ctrl.send(&format!(
+            "~STATUS ({task}, TaskState) ({}, TaskState)",
+            task + 1
+        ));
+        if sent.is_err() || !ctrl.ack() {
+            self.status.comms_error = true;
+            self.status_writes.push(StatusWrite::CommsError(true));
+            return sent;
+        }
+        // If the motion task is idle, re-init its queue before enabling.
+        let taskn_state = ctrl.rest().split_whitespace().next().map_or(0, atoi);
+        if taskn_state == TASKSTATE_IDLE {
+            let _ = ctrl.send(&format!("~INITQUEUE {task}"));
+        }
 
-            if !closed_loop {
-                ctrl.command(&format!("DISABLE {name}"))?;
-            } else {
-                if last_fault != 0 {
-                    if FAULT_ACK_ALL_CODES.contains(&last_fault) {
-                        // These faults need a task reset before acknowledging.
-                        ctrl.command(&format!("~TASK {}", task + 1))?;
-                        ctrl.command("WAIT MODE AUTO")?;
-                        ctrl.command("ACKNOWLEDGEALL")?;
-                        ctrl.command(&format!("~TASK {task}"))?;
-                        ctrl.command("~INITQUEUE")?;
-                    } else {
-                        ctrl.command(&format!("FAULTACK {name}"))?;
-                    }
+        if !closed_loop {
+            let _ = ctrl.send(&format!("DISABLE {name}"));
+        } else {
+            if self.last_fault != 0 {
+                if FAULT_ACK_ALL_CODES.contains(&self.last_fault) {
+                    // These faults need a task reset before acknowledging.
+                    let _ = ctrl.send(&format!("~TASK {}", task + 1));
+                    let _ = ctrl.send("WAIT MODE AUTO");
+                    let _ = ctrl.send("ACKNOWLEDGEALL");
+                    let _ = ctrl.send(&format!("~TASK {task}"));
+                    let _ = ctrl.send("~INITQUEUE");
+                } else {
+                    let _ = ctrl.send(&format!("FAULTACK {name}"));
                 }
-                ctrl.command(&format!("ENABLE {name}"))?;
+                // Enable is the owner that clears the latched fault/problem
+                // state, whatever the acknowledgement returned.
+                self.last_fault = 0;
+                self.status.problem = false;
+                self.status_writes.push(StatusWrite::Problem(false));
             }
-            ctrl.command("WAIT MODE AUTO")?;
+            let _ = ctrl.send(&format!("ENABLE {name}"));
         }
-        // Enable is the owner that clears the latched fault/problem state.
-        if closed_loop && last_fault != 0 {
-            self.last_fault = 0;
-            self.problem = false;
-        }
-        Ok(())
+        // PowerOn follows the request even when ENABLE fails, and C calls
+        // back whatever WAIT MODE AUTO returns (:454-466).
+        self.status.powered = closed_loop;
+        self.status_writes.push(StatusWrite::PowerOn(closed_loop));
+        ctrl.send("WAIT MODE AUTO")
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let name = self.axis_name.clone();
-        let payload = {
-            let ctrl = self.lock();
-            ctrl.query(&format!(
-                "~STATUS ({name}, AxisStatus) ({name}, DriveStatus) ({name}, AxisFault) \
-                 ({name}, ProgramPositionFeedback) ({name}, ProgramPositionCommand) \
-                 ({name}, ProgramVelocityFeedback)"
-            ))?
-        };
-
-        let mut it = payload.split_whitespace();
-        let axis_status = it.next().map(atol).unwrap_or(0) as u32;
-        self.report.set_axis_status(axis_status);
-        let drive_status = it.next().map(atol).unwrap_or(0) as u32;
-        let axis_fault = it.next().map(atoi).unwrap_or(0);
-        let enc_pos = it.next().map(atof).unwrap_or(0.0);
-        let cmd_pos = it.next().map(atof).unwrap_or(0.0);
-        let act_vel = it.next().map(atof).unwrap_or(0.0);
-
-        self.current_cmd_pos = cmd_pos / self.step;
-        // Latch the newest non-zero fault; never clear it here (owner: enable).
-        if axis_fault != 0 && axis_fault != self.last_fault {
-            self.last_fault = axis_fault;
+        let polled = self.poll_status();
+        if polled.is_err() {
+            self.failed = Some(self.status.clone());
         }
+        polled.map(|()| self.status.clone())
+    }
 
-        let move_active = (axis_status & AXISSTATUS_MOVE_DONE) == 0;
-        let powered = (drive_status & DRIVESTATUS_ENABLED) != 0;
-        let at_home = (axis_status & AXISSTATUS_HOMED) != 0;
+    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+        self.failed.take()
+    }
 
-        // Limit switches are only meaningful on a physical (non-virtual) axis.
-        let (high_limit, low_limit) = if (axis_status & AXISSTATUS_NOT_VIRTUAL) != 0 {
-            let cw_active = !(((drive_status & DRIVESTATUS_CW_EOT) != 0)
-                ^ ((self.swconfig & CW_EOT_SW_STATE) != 0));
-            let ccw_active = !(((drive_status & DRIVESTATUS_CCW_EOT) != 0)
-                ^ ((self.swconfig & CCW_EOT_SW_STATE) != 0));
-            if self.reverse_direc {
-                (ccw_active, cw_active)
-            } else {
-                (cw_active, ccw_active)
-            }
-        } else {
-            (false, false)
-        };
-
-        Ok(MotorStatus {
-            position: cmd_pos / self.step,
-            encoder_position: enc_pos / self.step,
-            velocity: act_vel / self.step,
-            done: !move_active,
-            moving: move_active,
-            high_limit,
-            low_limit,
-            // C maps AXISSTATUS_Homed to the home-switch signal, not "homed".
-            home: at_home,
-            homed: false,
-            direction: self.last_direction,
-            problem: self.problem,
-            powered,
-            has_encoder: self.has_encoder,
-            gain_support: true,
-            ..Default::default()
-        })
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 }
 
@@ -678,7 +794,30 @@ mod tests {
         // C `%.*f` of a non-finite value.
         assert_eq!(fmt(f64::NAN, 5), "nan");
         assert_eq!(fmt(f64::INFINITY, 5), "inf");
-        assert_eq!(step_size(Err(a3200_err("refused"))), 1.0);
+        assert_eq!(step_size(None), 1.0);
+    }
+
+    /// drvA3200Asyn.cc:935-974: the axis probe in C's order, with the
+    /// ReverseMotionDirection query C builds after RAMP MODE RATE sent.
+    #[test]
+    fn the_axis_probe_reads_reverse_direction_after_ramp_mode() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::new("a32ProbeLine", |_| "%0".into());
+        let controller = A3200Controller::new(io, "a32ProbeLine", "0", 1, true);
+        line.sent();
+        A3200Axis::new(Arc::new(Mutex::new(controller)), 0, 0, "X".into());
+        assert_eq!(
+            line.sent(),
+            [
+                "PositionFeedbackType.X",
+                "CountsPerUnit.X",
+                "HomeOffset.X",
+                "HomeSetup.X",
+                "EndOfTravelLimitSetup.X",
+                "RAMP MODE RATE X",
+                "ReverseMotionDirection.X",
+            ]
+        );
     }
 
     /// drvA3200Asyn.cc:348-382: the setters the A3200 refuses print their
@@ -694,7 +833,7 @@ mod tests {
         static DRIVER: Model2 = Model2::new("a32LogTest", 0);
         let (_line, io) = LineRig::new("a32LogLine", |_| "%0".into());
         let controller = A3200Controller::new(io, "a32LogLine", "0", 1, true);
-        let axis = A3200Axis::new(Arc::new(Mutex::new(controller)), "X".into()).unwrap();
+        let axis = A3200Axis::new(Arc::new(Mutex::new(controller)), 0, 0, "X".into());
         let axis = Arc::new(Mutex::new(axis));
         let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
         DRIVER.set_card(0, vec![motor], 100, 1000);
@@ -748,6 +887,243 @@ mod tests {
         );
     }
 
+    /// Axis X of a task-1 controller, `linear` moves, on a line answering
+    /// `reply`, its writes `fails` picks refused.
+    fn rig_axis(
+        name: &str,
+        linear: bool,
+        reply: impl Fn(&str) -> String + Send + Sync + 'static,
+        fails: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (motor_common::testing::LineRig, A3200Axis) {
+        let (line, io) = motor_common::testing::LineRig::failing(name, reply, fails);
+        let controller = A3200Controller::new(io, name, "0", 1, linear);
+        let axis = A3200Axis::new(Arc::new(Mutex::new(controller)), 0, 0, "X".into());
+        line.sent();
+        (line, axis)
+    }
+
+    /// drvA3200Asyn.cc:1001-1059: `sendAndReceive` fails only on I/O; a NAK
+    /// fails only where the caller checks the ACK, the move command
+    /// (:530-531) and POSOFFSET (:343-345). A NAK'd TaskState sets the comm
+    /// error and returns its asyn status, success (:415-420).
+    #[test]
+    fn a_nak_fails_only_where_c_checks_the_ack() {
+        let user = AsynUser::new(0);
+        let nak = |cmd: &str| {
+            if cmd.starts_with("LINEAR") || cmd.starts_with("POSOFFSET") || cmd.ends_with(".X") {
+                "%0".into()
+            } else {
+                "!".into()
+            }
+        };
+        let (_line, mut axis) = rig_axis("a32NakLine", true, nak, |_| false);
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
+        axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
+        axis.stop(&user, 1.0).unwrap();
+        axis.set_closed_loop(&user, true).unwrap();
+        axis.set_closed_loop(&user, false).unwrap();
+        let (_line, mut axis) = rig_axis("a32NakMove", true, |_| "!".into(), |_| false);
+        assert!(axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).is_err());
+        assert!(axis.set_position(&user, 1.0).is_err());
+    }
+
+    /// drvA3200Asyn.cc:497-531, :596-606, :629-638, :680-685: a failed
+    /// exchange fails a move at its mode or move command, a home at HOME, a
+    /// velocity move at FREERUN, a stop at its last `~TASK`, an enable at
+    /// TaskState or WAIT MODE AUTO.
+    #[test]
+    fn an_io_failure_fails_only_the_checked_exchange() {
+        let user = AsynUser::new(0);
+        let unchecked = |cmd: &str| {
+            cmd.starts_with("RAMP")
+                || cmd.starts_with("Home")
+                || cmd.starts_with("AbortDecel")
+                || cmd.starts_with("ABORT")
+                || cmd.starts_with("ENABLE")
+                || cmd.starts_with("DISABLE")
+                || cmd.starts_with("~INITQUEUE")
+        };
+        let (_line, mut axis) = rig_axis("a32IoLine", true, |_| "%2 0".into(), unchecked);
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
+        axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
+        axis.stop(&user, 1.0).unwrap();
+        axis.set_closed_loop(&user, true).unwrap();
+        axis.set_closed_loop(&user, false).unwrap();
+
+        for (name, fails) in [
+            ("a32IoAbs", "ABSOLUTE"),
+            ("a32IoLin", "LINEAR"),
+            ("a32IoHome", "HOME"),
+            ("a32IoFree", "FREERUN"),
+            ("a32IoTask", "~TASK 1"),
+            ("a32IoState", "~STATUS"),
+            ("a32IoWait", "WAIT"),
+        ] {
+            let (_line, mut axis) =
+                rig_axis(name, true, |_| "%0".into(), move |c| c.starts_with(fails));
+            let result = match fails {
+                "ABSOLUTE" | "LINEAR" => axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0),
+                "HOME" => axis.home(&user, 0.0, 1.0, 1.0, true),
+                "FREERUN" => axis.move_velocity(&user, 0.0, 1.0, 1.0),
+                "~TASK 1" => axis.stop(&user, 1.0),
+                _ => axis.set_closed_loop(&user, true),
+            };
+            assert!(result.is_err(), "{fails}");
+        }
+    }
+
+    /// drvA3200Asyn.cc:531-543: a `#` reply to the move latches problem and
+    /// the TaskErrorCode, read from `inputBuff` whatever its query's status;
+    /// the next enable acknowledges it and clears both whatever FAULTACK
+    /// returned (:428-451).
+    #[test]
+    fn a_faulted_move_latches_until_the_next_enable() {
+        let user = AsynUser::new(0);
+        let reply = |cmd: &str| match cmd {
+            c if c.starts_with("LINEAR") => "#".into(),
+            c if c.starts_with("~STATUS(1, TaskErrorCode)") => "%17".into(),
+            _ => "%0 0".into(),
+        };
+        let fails = |cmd: &str| cmd.starts_with("FAULTACK");
+        let (line, mut axis) = rig_axis("a32FaultLine", true, reply, fails);
+        assert!(axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).is_err());
+        assert_eq!(axis.last_fault, 17);
+        assert!(axis.status.problem);
+        line.sent();
+        axis.set_closed_loop(&user, true).unwrap();
+        assert!(line.sent().iter().any(|c| c == "FAULTACK X"));
+        assert_eq!(axis.last_fault, 0);
+        assert!(!axis.status.problem);
+
+        // The TaskErrorCode query failing leaves the move's own `#` reply.
+        let fails = |cmd: &str| cmd.starts_with("~STATUS(1");
+        let reply = |cmd: &str| {
+            if cmd.starts_with("LINEAR") {
+                "#23".into()
+            } else {
+                "%0".into()
+            }
+        };
+        let (_line, mut axis) = rig_axis("a32FaultStale", true, reply, fails);
+        assert!(axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).is_err());
+        assert_eq!(axis.last_fault, 23);
+    }
+
+    /// drvA3200Asyn.cc:747-797: a failed or NAK'd `~STATUS` sets
+    /// motorAxisCommError and leaves the rest for the next post; a good one
+    /// clears it, and a virtual axis's limits keep their last value.
+    #[test]
+    fn a_failed_poll_leaves_comm_error_and_the_last_status() {
+        let user = AsynUser::new(0);
+        let reply = Arc::new(Mutex::new(String::new()));
+        let fail = Arc::new(Mutex::new(false));
+        let (_line, mut axis) = {
+            let (reply, fail) = (reply.clone(), fail.clone());
+            rig_axis(
+                "a32PollLine",
+                true,
+                move |cmd: &str| {
+                    if cmd.starts_with("~STATUS (X") {
+                        reply.lock().unwrap().clone()
+                    } else if cmd.starts_with("CountsPerUnit") {
+                        "%1".into()
+                    } else {
+                        "%0".into()
+                    }
+                },
+                move |cmd: &str| cmd.starts_with("~STATUS (X") && *fail.lock().unwrap(),
+            )
+        };
+        let set = |r: &str| *reply.lock().unwrap() = r.into();
+        // A real axis with its CW input active-high and the drive enabled.
+        set(&format!("%{} 3 0 5 6 0", AXISSTATUS_NOT_VIRTUAL));
+        let good = axis.poll(&user).unwrap();
+        assert!(good.powered && good.low_limit && !good.comms_error);
+        assert_eq!((good.position, good.encoder_position), (6.0, 5.0));
+
+        *fail.lock().unwrap() = true;
+        assert!(axis.poll(&user).is_err());
+        let left = axis.take_failed_poll_status().unwrap();
+        assert_eq!(
+            left,
+            MotorStatus {
+                comms_error: true,
+                ..good.clone()
+            }
+        );
+        *fail.lock().unwrap() = false;
+        set("!");
+        assert!(axis.poll(&user).is_err());
+        assert!(axis.take_failed_poll_status().unwrap().comms_error);
+
+        // A virtual axis: the limits stay where the real reading left them.
+        set("%0 0 0 7 8 0");
+        let virt = axis.poll(&user).unwrap();
+        assert!(!virt.comms_error && !virt.powered);
+        assert_eq!(
+            (virt.high_limit, virt.low_limit),
+            (good.high_limit, good.low_limit)
+        );
+        assert_eq!(virt.position, 8.0);
+    }
+
+    /// drvA3200Asyn.cc:414-466: enable and disable call back whatever
+    /// their status, with the comm error a refused TaskState set, the
+    /// cleared problem of an acknowledged fault, and the requested PowerOn.
+    #[test]
+    fn closed_loop_posts_what_it_set() {
+        use epics_rs::asyn::interfaces::motor::StatusWrite;
+        let user = AsynUser::new(0);
+        let state = Arc::new(Mutex::new("%0 0".to_string()));
+        let (_line, mut axis) = {
+            let state = state.clone();
+            rig_axis(
+                "a32PostLine",
+                true,
+                move |cmd: &str| {
+                    if cmd.starts_with("~STATUS (1, TaskState)") {
+                        state.lock().unwrap().clone()
+                    } else {
+                        "%0".into()
+                    }
+                },
+                |cmd: &str| cmd.starts_with("WAIT"),
+            )
+        };
+        axis.last_fault = 3;
+        assert!(axis.set_closed_loop(&user, true).is_err());
+        assert_eq!(
+            axis.take_status_writes(),
+            [StatusWrite::Problem(false), StatusWrite::PowerOn(true)]
+        );
+        assert!(axis.set_closed_loop(&user, false).is_err());
+        assert_eq!(axis.take_status_writes(), [StatusWrite::PowerOn(false)]);
+        *state.lock().unwrap() = "!".into();
+        axis.set_closed_loop(&user, true).unwrap();
+        assert_eq!(axis.take_status_writes(), [StatusWrite::CommsError(true)]);
+    }
+
+    /// drvA3200Asyn.cc:1049: a bare ACK is the reply, read once.
+    #[test]
+    fn a_bare_ack_is_a_zero_value() {
+        use motor_common::testing::LineRig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reply = {
+            let reads = reads.clone();
+            move |_: &str| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                "%".into()
+            }
+        };
+        let (_line, io) = LineRig::new("a32BareLine", reply);
+        let mut ctrl = A3200Controller::new(io, "a32BareLine", "0", 1, true);
+        assert_eq!(ctrl.get_param("HomeSetup", "X").as_deref(), Some(""));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn status_bit_positions() {
         assert_eq!(AXISSTATUS_HOMED, 0x0000_0001);
@@ -773,6 +1149,39 @@ mod tests {
         assert!(cw_active);
     }
 
+    /// drvA3200Asyn.cc:553, :645: a move and a velocity move wait for the
+    /// controller to clear MoveDone, so the poll after them is not done.
+    #[test]
+    fn the_poll_after_a_move_is_not_done_early() {
+        use std::time::Instant;
+        let started: Arc<Mutex<Option<Instant>>> = Arc::default();
+        let reply = {
+            let started = started.clone();
+            move |cmd: &str| {
+                let mut started = started.lock().unwrap();
+                if cmd.starts_with("LINEAR") || cmd.starts_with("FREERUN") {
+                    *started = Some(Instant::now());
+                }
+                // MoveDone stays set until 10 ms after the move command.
+                let settled = started.is_some_and(|t| t.elapsed() >= MOVE_DONE_SETTLE);
+                if cmd.starts_with("~STATUS") && !settled {
+                    format!("%{AXISSTATUS_MOVE_DONE} 0 0 0 0 0")
+                } else if cmd.starts_with("~STATUS") {
+                    "%0 0 0 0 0 0".into()
+                } else {
+                    "%0".into()
+                }
+            }
+        };
+        let (_line, mut axis) = rig_axis("a32SettleLine", true, reply, |_| false);
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        assert!(!axis.poll(&user).unwrap().done);
+        *started.lock().unwrap() = None;
+        axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
+        assert!(!axis.poll(&user).unwrap().done);
+    }
+
     #[test]
     fn move_done_clear_means_moving() {
         // MoveDone set -> not moving; clear -> moving.
@@ -786,5 +1195,167 @@ mod tests {
         assert!(FAULT_ACK_ALL_CODES.contains(&52));
         assert!(FAULT_ACK_ALL_CODES.contains(&78));
         assert!(!FAULT_ACK_ALL_CODES.contains(&1));
+    }
+
+    /// drvA3200Asyn.cc:488-489, :575-576, :675, :693: move, home, abort and
+    /// forceCallback print
+    /// their FLOW line with the card the config gave the axis; the move
+    /// names the axis, home and abort number it.
+    #[epics_rs::base::epics_test]
+    async fn commands_print_their_flow_line_with_the_card() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        use motor_common::testing::LineRig;
+
+        let (_line, io) = LineRig::new("a32FlowLine", |_| "%0".into());
+        let controller = A3200Controller::new(io, "a32FlowLine", "3", 1, true);
+        let mut axis = A3200Axis::new(Arc::new(Mutex::new(controller)), 3, 2, "Y".into());
+        let path = std::env::temp_dir().join(format!("a32-flow-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(None, TraceMask::FLOW);
+        trace.set_trace_file(None, TraceFile::File(file));
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 1.5, 0.5, 2.0, 3.0).unwrap();
+        axis.home(&user, 0.0, 1.0, 1.0, false).unwrap();
+        axis.stop(&user, 1.0).unwrap();
+        axis.force_callback(&user);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Set card 3, axis Y move to 1.500000, min vel=0.500000, max_vel=2.000000, accel=3.000000",
+                "motorAxisHome: set card 3, axis 2 to home, forwards = 0",
+                "Abort on card 3, axis 2",
+                "motorAxisforceCallback: request card 3, axis 2 status update",
+            ],
+            "{text}"
+        );
+    }
+
+    /// drvA3200Asyn.cc:789-790: a poll prints its IODRIVER line with the
+    /// status word and the commanded position.
+    #[epics_rs::base::epics_test]
+    async fn a_poll_prints_its_iodriver_line() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let reply = |cmd: &str| {
+            if cmd.starts_with("~STATUS (X") {
+                "%513 3 0 5 6.5 0".into()
+            } else if cmd.starts_with("CountsPerUnit") {
+                "%1".into()
+            } else {
+                "%0".into()
+            }
+        };
+        let (_line, mut axis) = rig_axis("a32IoDrvLine", true, reply, |_| false);
+        let path = std::env::temp_dir().join(format!("a32-iodrv-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(None, TraceMask::IO_DRIVER);
+        trace.set_trace_file(None, TraceFile::File(file));
+        axis.poll(&AsynUser::new(0)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            ["A3200Poller: axis X axisStatus=201, position=6.500000"],
+            "{text}"
+        );
+    }
+
+    /// drvA3200Asyn.cc:792-796: a new non-zero AxisFault prints its TERROR
+    /// line once, until the fault changes.
+    #[epics_rs::base::epics_test]
+    async fn a_new_fault_prints_once() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let fault = Arc::new(Mutex::new(0));
+        let reply = {
+            let fault = fault.clone();
+            move |cmd: &str| {
+                if cmd.starts_with("~STATUS (X") {
+                    format!("%0 0 {} 0 0 0", fault.lock().unwrap())
+                } else {
+                    "%0".into()
+                }
+            }
+        };
+        let (_line, mut axis) = rig_axis("a32FaultLine", true, reply, |_| false);
+        let path = std::env::temp_dir().join(format!("a32-fault-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(None, TraceMask::ERROR);
+        trace.set_trace_file(None, TraceFile::File(file));
+        let user = AsynUser::new(0);
+        for f in [0, 26, 26, 0, 26, 4] {
+            *fault.lock().unwrap() = f;
+            axis.poll(&user).unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "A3200Poller: controller fault on axis=X fault=0x1A",
+                "A3200Poller: controller fault on axis=X fault=0x4",
+            ],
+            "{text}"
+        );
+    }
+
+    /// drvA3200Asyn.cc:528-551, :601-612, :639-645: a move and a home set motorAxisDirection and
+    /// motorAxisDone 0 once their checked exchange succeeded, a velocity move
+    /// whatever FREERUN returned.
+    #[test]
+    fn commands_post_the_direction_they_set() {
+        use epics_rs::asyn::interfaces::motor::StatusWrite::{Direction, Done};
+        let failing = Arc::new(Mutex::new(String::new()));
+        let fails = {
+            let failing = failing.clone();
+            move |cmd: &str| {
+                let f = failing.lock().unwrap();
+                !f.is_empty() && cmd.starts_with(f.as_str())
+            }
+        };
+        let fail = |prefix: &str| *failing.lock().unwrap() = prefix.into();
+        let (_line, mut axis) = rig_axis("a32DirLine", true, |_| "%0".into(), fails);
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(true), Done(false)]);
+        axis.move_relative(&user, -1.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(false), Done(false)]);
+        axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(true), Done(false)]);
+        axis.home(&user, 0.0, 1.0, 1.0, false).unwrap();
+        assert_eq!(axis.take_status_writes(), [Direction(false), Done(false)]);
+
+        fail("LINEAR");
+        assert!(axis.move_absolute(&user, -1.0, 0.0, 1.0, 1.0).is_err());
+        assert_eq!(axis.take_status_writes(), []);
+        fail("FREERUN");
+        assert!(axis.move_velocity(&user, 0.0, -1.0, 1.0).is_err());
+        assert_eq!(axis.take_status_writes(), [Direction(false), Done(false)]);
+        fail("HOME");
+        assert!(axis.home(&user, 0.0, 1.0, 1.0, true).is_err());
+        assert_eq!(axis.take_status_writes(), []);
     }
 }

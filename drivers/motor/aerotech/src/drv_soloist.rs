@@ -294,9 +294,10 @@ impl AsynMotor for DrvSoloistAxis {
         Ok(())
     }
 
-    /// `HomeDirection` set for `forward`, then `HOME`. C sends the PREM
-    /// with neither: restarting the transaction for `HOME` drops the PREM
-    /// line and the POST pointer with it.
+    /// `HomeDirection` set for `forward`, then the PREM line and `HOME`.
+    /// devSoloist.cc:240 overwrites the PREM it has just queued for
+    /// HOME_FOR/HOME_REV with `SETPARM 106` and hangs the POST on that
+    /// message, an accident not copied: PREM and POST go with `HOME`.
     fn home(
         &mut self,
         _user: &AsynUser,
@@ -368,8 +369,7 @@ impl AsynMotor for DrvSoloistAxis {
 
     /// `set_status`: `AXISSTATUS()`, `AXISFAULT()` and `PFBKPROG()`. A first
     /// missed status fails the poll raising nothing; a second, or a reply
-    /// other than `%`, raises the comms error. C zeroes the position when `PFBKPROG()`
-    /// is not acknowledged; it is kept here.
+    /// other than `%`, raises the comms error.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let card = self.card.clone();
         let mut ctrl = card.lock().unwrap_or_else(|e| e.into_inner());
@@ -389,7 +389,8 @@ impl AsynMotor for DrvSoloistAxis {
         let axis_status = atoi(&String::from_utf8_lossy(&reply[1..]));
         let fault = ctrl.ask(b"AXISFAULT()");
         let fault = atoi(&String::from_utf8_lossy(fault.get(1..).unwrap_or_default()));
-        let pfbk = ctrl.query("PFBKPROG()").map(|v| atof(&v));
+        // drvSoloist.cc:294-303: anything but `%` is position 0.
+        let pfbk = ctrl.query("PFBKPROG()").map_or(0.0, |v| atof(&v));
         drop(ctrl);
 
         let status = &mut self.status;
@@ -406,16 +407,14 @@ impl AsynMotor for DrvSoloistAxis {
         status.low_limit = fault & CCW_FAULT_BIT != 0;
         let ls_active =
             (status.high_limit && status.direction) || (status.low_limit && !status.direction);
-        if let Some(pfbk) = pfbk {
-            let data = pfbk / self.setup.resolution;
-            if data != status.position {
-                status.position = f64::from(nint(data));
-                status.encoder_position = if self.setup.encoder {
-                    status.position
-                } else {
-                    0.0
-                };
-            }
+        let data = pfbk / self.setup.resolution;
+        if data != status.position {
+            status.position = f64::from(nint(data));
+            status.encoder_position = if self.setup.encoder {
+                status.position
+            } else {
+                0.0
+            };
         }
         status.velocity = 0.0;
         status.problem = false;
@@ -525,5 +524,42 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvSoloist.cc:294-303: a `PFBKPROG()` refused or unanswered reads
+    /// as position 0.
+    #[test]
+    fn an_unacknowledged_position_is_zero() {
+        use motor_common::testing::LineRig;
+        use std::sync::atomic::{AtomicU8, Ordering};
+        // 0: answer, 1: refuse, 2: no reply.
+        let mode = Arc::new(AtomicU8::new(0));
+        let m = mode.clone();
+        let (_line, io) = LineRig::new("soloistPfbk", move |sent| {
+            if sent.starts_with("PFBKPROG()") {
+                match m.load(Ordering::SeqCst) {
+                    0 => "%5".into(),
+                    1 => "!".into(),
+                    _ => String::new(),
+                }
+            } else {
+                "%0".into()
+            }
+        });
+        let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+        let setup = AxisSetup {
+            encoder: true,
+            gain: false,
+            resolution: 1.0,
+            digits: 0,
+            home_dparam: 0,
+        };
+        let mut axis = DrvSoloistAxis::new(card, setup);
+        let user = AsynUser::new(0);
+        for (m, want) in [(0, 5.0), (1, 0.0), (0, 5.0), (2, 0.0)] {
+            mode.store(m, Ordering::SeqCst);
+            let s = axis.poll(&user).unwrap();
+            assert_eq!((s.position, s.encoder_position), (want, want), "mode {m}");
+        }
     }
 }
