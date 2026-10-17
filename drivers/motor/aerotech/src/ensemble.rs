@@ -395,6 +395,13 @@ impl EnsembleAxis {
         status.encoder_position = encoder / self.step;
         let _ = ctrl.send(&format!("PCMDPROG(@{axis})"));
         status.position = atof(ctrl.rest()) / self.step;
+        self.log.print(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "EnsemblePoller: axis {axis} axisStatus={axis_status:x}, position={:.6}\n",
+                CFloat(status.position)
+            ),
+        );
 
         if let Err(e) = ctrl.send(&format!("AXISFAULT(@{axis})")) {
             status.comms_error = true;
@@ -1196,6 +1203,40 @@ mod tests {
                 "motorAxisHome: set card 3, axis 2 to home, forwards = 1",
                 "Abort on card 3, axis 2",
             ],
+            "{text}"
+        );
+    }
+
+    /// drvEnsembleAsyn.cc:797-798: a poll that reads both positions prints
+    /// its IODRIVER line with the status word and the commanded position.
+    #[epics_rs::base::epics_test]
+    async fn a_poll_prints_its_iodriver_line() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let user = AsynUser::new(0);
+        let (line, mut axis) = poll_axis("ensIoDrvLine");
+        set_reply(&line, "AXISSTATUS(@0)", "%513");
+        set_reply(&line, "PCMDPROG(@0)", "%6.5");
+        let path = std::env::temp_dir().join(format!("ens-iodrv-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(None, TraceMask::IO_DRIVER);
+        trace.set_trace_file(None, TraceFile::File(file));
+        axis.poll(&user).unwrap();
+        // A poll that bails before PCMDPROG prints nothing.
+        fail_write(&line, Some("PFBKPROG(@0)"));
+        assert!(axis.poll(&user).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            ["EnsemblePoller: axis 0 axisStatus=201, position=6.500000"],
             "{text}"
         );
     }

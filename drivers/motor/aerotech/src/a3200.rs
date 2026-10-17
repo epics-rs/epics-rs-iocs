@@ -518,6 +518,13 @@ impl A3200Axis {
         status.encoder_position = enc_pos / self.step;
         status.position = cmd_pos / self.step;
         self.current_cmd_pos = status.position;
+        self.log.print(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "A3200Poller: axis {name} axisStatus={axis_status:x}, position={:.6}\n",
+                CFloat(self.current_cmd_pos)
+            ),
+        );
         // Latch the newest non-zero fault; never clear it here (owner: enable).
         if axis_fault != 0 && axis_fault != self.last_fault {
             self.last_fault = axis_fault;
@@ -1152,6 +1159,43 @@ mod tests {
                 "motorAxisHome: set card 3, axis 2 to home, forwards = 0",
                 "Abort on card 3, axis 2",
             ],
+            "{text}"
+        );
+    }
+
+    /// drvA3200Asyn.cc:789-790: a poll prints its IODRIVER line with the
+    /// status word and the commanded position.
+    #[epics_rs::base::epics_test]
+    async fn a_poll_prints_its_iodriver_line() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let reply = |cmd: &str| {
+            if cmd.starts_with("~STATUS (X") {
+                "%513 3 0 5 6.5 0".into()
+            } else if cmd.starts_with("CountsPerUnit") {
+                "%1".into()
+            } else {
+                "%0".into()
+            }
+        };
+        let (_line, mut axis) = rig_axis("a32IoDrvLine", true, reply, |_| false);
+        let path = std::env::temp_dir().join(format!("a32-iodrv-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(None, TraceMask::IO_DRIVER);
+        trace.set_trace_file(None, TraceFile::File(file));
+        axis.poll(&AsynUser::new(0)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            ["A3200Poller: axis X axisStatus=201, position=6.500000"],
             "{text}"
         );
     }
