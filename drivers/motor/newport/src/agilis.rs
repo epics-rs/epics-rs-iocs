@@ -31,7 +31,7 @@
 //! - `AG_UC.cpp:242`: the reverse-amplitude default clobbers the *forward*
 //!   amplitude; not copied (see `setup_amplitudes`).
 //! - `AG_UC.cpp:383`: axis-2 limit test is `(lim == 3 || lim == 3)` — a
-//!   duplicated condition (see `ph_limit`).
+//!   duplicated condition; not copied (see `ph_limit`).
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -145,14 +145,11 @@ fn setup_amplitudes(forward_amplitude: i32, reverse_amplitude: i32) -> (i32, i32
 }
 
 /// C `AG_UCAxis::poll` limit test on the `PH` reply value.
-///
-/// Faithfully reproduces the C bug at `AG_UC.cpp:383`: the axis-2 test is
-/// `(lim == 3 || lim == 3)` — a duplicated condition, most likely intended to
-/// be `lim == 2 || lim == 3`.
 fn ph_limit(axis_id: i32, lim: i32) -> bool {
     match axis_id {
         1 => lim == 1 || lim == 3,
-        2 => lim == 3,
+        // AG_UC.cpp:383 tests `lim == 3 || lim == 3`, a C defect.
+        2 => lim == 2 || lim == 3,
         _ => false,
     }
 }
@@ -510,14 +507,13 @@ mod tests {
     }
 
     #[test]
-    fn ph_limit_replicates_axis2_duplicate_condition() {
-        // Axis 1: limit when lim is 1 or 3.
+    fn ph_reports_each_axis_by_its_own_bit() {
         assert!(ph_limit(1, 1));
         assert!(ph_limit(1, 3));
         assert!(!ph_limit(1, 2));
-        // Axis 2 (C bug): only lim == 3 triggers (duplicate condition).
+        assert!(ph_limit(2, 2));
         assert!(ph_limit(2, 3));
-        assert!(!ph_limit(2, 2));
         assert!(!ph_limit(2, 1));
+        assert!(!ph_limit(1, 0) && !ph_limit(2, 0));
     }
 }
