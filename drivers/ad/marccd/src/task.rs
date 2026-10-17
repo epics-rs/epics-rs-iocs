@@ -22,6 +22,7 @@ use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::{DriverHold, PortHandle};
 use epics_rs::asyn::trace::TraceMask;
@@ -33,7 +34,7 @@ use crate::protocol::{
     cmd_start_series_timed, cmd_start_series_triggered_itemp, cmd_start_series_triggered_timed,
 };
 use crate::types::{
-    CamStatus, Event, FILE_READ_DELAY, FrameType, ImageMode, MARCCD_POLL_DELAY, MAX_FILENAME_LEN,
+    Event, FILE_READ_DELAY, FrameType, ImageMode, MARCCD_POLL_DELAY, MAX_FILENAME_LEN,
     TASK_ACQUIRE, TASK_CORRECT, TASK_DEZINGER, TASK_STATE_BUSY, TASK_STATUS_EXECUTING,
     TASK_STATUS_QUEUED, TASK_WRITE, TriggerMode, secs, task_state, test_task_status,
 };
@@ -174,7 +175,7 @@ impl Worker {
     }
 
     /// C `getImageData`, entered and left with the lock held.
-    async fn get_image_data(&self, l: &mut Held) -> CamStatus {
+    async fn get_image_data(&self, l: &mut Held) -> AsynStatus {
         // Inquire about the image dimensions.
         let (full_file_name, nx, ny, image_counter, array_callbacks) = l.step(|d| {
             d.get_config();
@@ -222,7 +223,7 @@ impl Worker {
             }
             self.output.publish(array).await;
         }
-        CamStatus::Success
+        AsynStatus::Success
     }
 
     /// C `readTiff` — wait for a new file, then retry the decode until the
@@ -231,14 +232,14 @@ impl Worker {
     /// Fixed (upstream-c-defects.md #13): when the retry loop exhausts `timeout`
     /// without a successful decode, C falls through and returns `asynSuccess`
     /// with a buffer it never filled — the caller then publishes stale pixels.
-    /// This returns [`CamStatus::Error`] instead so no image is published.
+    /// This returns [`AsynStatus::Error`] instead so no image is published.
     fn read_tiff(
         &self,
         l: &mut Held,
         file: &str,
         nx: usize,
         ny: usize,
-    ) -> Result<Vec<u16>, CamStatus> {
+    ) -> Result<Vec<u16>, AsynStatus> {
         let timeout = l.step(|d| d.get_f64(d.p.tiff_timeout));
         let t_start = Instant::now();
         let start_time = epoch_secs(SystemTime::now());
@@ -263,7 +264,7 @@ impl Worker {
                                     e.raw_os_error().unwrap_or(0)
                                 ),
                             );
-                            return Err(CamStatus::Error);
+                            return Err(AsynStatus::Error);
                         }
                     };
                     // Allow up to 10 seconds of clock skew.
@@ -276,7 +277,7 @@ impl Worker {
                 }
             }
             if l.unlocked(|| self.stop.wait_timeout(secs(FILE_READ_DELAY))) {
-                return Err(CamStatus::Error);
+                return Err(AsynStatus::Error);
             }
             delta_time = t_start.elapsed().as_secs_f64();
         }
@@ -292,7 +293,7 @@ impl Worker {
                      synchronization problem\n",
                 );
             }
-            return Err(CamStatus::Error);
+            return Err(AsynStatus::Error);
         }
 
         // The file exists but may not be completely written; retry the decode.
@@ -330,7 +331,7 @@ impl Worker {
                 }
             }
             if l.unlocked(|| self.stop.wait_timeout(secs(FILE_READ_DELAY))) {
-                return Err(CamStatus::Error);
+                return Err(AsynStatus::Error);
             }
             delta_time = t_start.elapsed().as_secs_f64();
         }
@@ -339,7 +340,7 @@ impl Worker {
             // Fixed (upstream-c-defects.md #13): the retry loop timed out
             // without a valid frame. Do not fabricate a buffer or return it as
             // success.
-            return Err(CamStatus::Error);
+            return Err(AsynStatus::Error);
         };
         Ok(data)
     }
@@ -448,16 +449,15 @@ async fn collect_normal(w: &Worker, l: &mut Held) {
                 3
             };
             completed = l.step(move |d| {
-                !d.readout_frame(buffer_number, Some(&full_file_name), wait)
-                    .is_err()
+                d.readout_frame(buffer_number, Some(&full_file_name), wait) == AsynStatus::Success
             });
         }
         Some(FrameType::Background) => {
             w.acquire_frame(l, 0.001, false);
-            completed = l.step(|d| !d.readout_frame(1, None, true).is_err());
+            completed = l.step(|d| d.readout_frame(1, None, true) == AsynStatus::Success);
             if completed {
                 w.acquire_frame(l, 0.001, false);
-                completed = l.step(|d| !d.readout_frame(2, None, true).is_err());
+                completed = l.step(|d| d.readout_frame(2, None, true) == AsynStatus::Success);
             }
             if completed {
                 run_server_task(l, "dezinger,1", TASK_DEZINGER);
@@ -465,14 +465,14 @@ async fn collect_normal(w: &Worker, l: &mut Held) {
         }
         Some(FrameType::DoubleCorrelation) => {
             w.acquire_frame(l, acquire_time / 2.0, use_shutter);
-            completed = l.step(|d| !d.readout_frame(2, None, true).is_err());
+            completed = l.step(|d| d.readout_frame(2, None, true) == AsynStatus::Success);
             // If the user aborted then ADAcquire will be 0.
             if completed && l.step(|d| d.get_i32(d.ad.params.acquire)) == 0 {
                 completed = false;
             }
             if completed {
                 w.acquire_frame(l, acquire_time / 2.0, use_shutter);
-                completed = l.step(|d| !d.readout_frame(0, None, true).is_err());
+                completed = l.step(|d| d.readout_frame(0, None, true) == AsynStatus::Success);
             }
             if completed {
                 run_server_task(l, "dezinger,0", TASK_DEZINGER);
@@ -710,7 +710,7 @@ async fn collect_series(w: &Worker, l: &mut Held) {
             d.callbacks();
         });
         let status = w.get_image_data(l).await;
-        if status.is_err() {
+        if status != AsynStatus::Success {
             l.step(|d| {
                 d.write_server("abort");
             });
@@ -911,7 +911,7 @@ mod tests {
                 .await
                 .unwrap();
             let mut l = worker.port.hold_driver_blocking().unwrap();
-            assert_eq!(worker.get_image_data(&mut l).await, CamStatus::Success);
+            assert_eq!(worker.get_image_data(&mut l).await, AsynStatus::Success);
         })
         .join()
         .unwrap();

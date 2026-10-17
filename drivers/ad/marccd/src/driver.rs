@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -100,7 +100,7 @@ impl MarccdDriver {
     /// `getConfig`, `getState`, the `pData` allocation and the defaults.
     /// `false` where C returns before creating the threads.
     fn init(&mut self) -> bool {
-        if self.get_server_mode().is_err() {
+        if self.get_server_mode() != AsynStatus::Success {
             let msg = format!(
                 "marCCD:marCCD: error calling getServerMode for server port {}",
                 self.server.port().map_or("", PortHandle::port_name)
@@ -437,6 +437,74 @@ pub(crate) mod tests {
             stop: Arc::new(Event::new()),
         };
         MarccdDriver::new(name, 0, links).unwrap()
+    }
+
+    /// An octet port whose every write and read fails with `status`.
+    struct RefusingPort {
+        base: PortDriverBase,
+        status: AsynStatus,
+    }
+
+    impl PortDriver for RefusingPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
+            Err(AsynError::Status {
+                status: self.status,
+                message: "refused".into(),
+            })
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
+            Err(AsynError::Status {
+                status: self.status,
+                message: "refused".into(),
+            })
+        }
+    }
+
+    /// C `writeServer` / `readServer` return `pasynOctetSyncIO`'s own status
+    /// (marCCD.cpp:494-535), not a Timeout-or-Error subset.
+    #[test]
+    fn server_io_keeps_the_octet_ports_status() {
+        for status in [
+            AsynStatus::Timeout,
+            AsynStatus::Overflow,
+            AsynStatus::Error,
+            AsynStatus::Disconnected,
+            AsynStatus::Disabled,
+        ] {
+            let name = format!("MARCCD_REFUSING_{status:?}");
+            let (server, _) = create_port_runtime(
+                &claim_port(&name).unwrap(),
+                RefusingPort {
+                    base: PortDriverBase::new(&name, 1, Default::default()),
+                    status,
+                },
+                RuntimeConfig::default(),
+            )
+            .unwrap();
+            let links = DriverLinks {
+                server: SyncIOHandle::from_handle(server.port_handle().clone(), 0, Duration::ZERO),
+                start: Arc::new(Event::new()),
+                stop: Arc::new(Event::new()),
+            };
+            let mut det = MarccdDriver::new(&format!("{name}_DET"), 0, links).unwrap();
+            assert_eq!(
+                det.write_server("x") as i32,
+                status as i32,
+                "write {status:?}"
+            );
+            assert_eq!(
+                det.read_server(0.1) as i32,
+                status as i32,
+                "read {status:?}"
+            );
+            std::mem::forget(server);
+        }
     }
 
     /// marCCD.cpp:1261, :1336: setIntegerParam / setDoubleParam(function,

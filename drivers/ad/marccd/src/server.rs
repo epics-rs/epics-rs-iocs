@@ -9,7 +9,7 @@
 //! cannot interleave with another context's.
 
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::{AsynResult, AsynStatus};
 use epics_rs::asyn::request::{RequestOp, RequestResult};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -21,24 +21,14 @@ use crate::protocol::{
     parse_pair, parse_state,
 };
 use crate::types::{
-    CamStatus, MARCCD_POLL_DELAY, MARCCD_SERVER_TIMEOUT, MAX_FILENAME_LEN, MAX_MESSAGE_SIZE,
-    TASK_ACQUIRE, TASK_CORRECT, TASK_DEZINGER, TASK_READ, TASK_SERIES, TASK_STATE_BUSY,
-    TASK_STATE_ERROR, TASK_STATUS_ERROR, TASK_STATUS_EXECUTING, TASK_STATUS_QUEUED, TASK_WRITE,
-    secs, task_state, task_status, test_task_status,
+    MARCCD_POLL_DELAY, MARCCD_SERVER_TIMEOUT, MAX_FILENAME_LEN, MAX_MESSAGE_SIZE, TASK_ACQUIRE,
+    TASK_CORRECT, TASK_DEZINGER, TASK_READ, TASK_SERIES, TASK_STATE_BUSY, TASK_STATE_ERROR,
+    TASK_STATUS_ERROR, TASK_STATUS_EXECUTING, TASK_STATUS_QUEUED, TASK_WRITE, secs, task_state,
+    task_status, test_task_status,
 };
 
 /// asyn subaddress of the single-device marServer octet port.
 const SERVER_ADDR: i32 = 0;
-
-fn classify(err: &AsynError) -> CamStatus {
-    match err {
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        } => CamStatus::Timeout,
-        _ => CamStatus::Error,
-    }
-}
 
 impl MarccdDriver {
     // --- parameter library -------------------------------------------------
@@ -112,7 +102,7 @@ impl MarccdDriver {
 
     /// C `writeServer`: flush stale input, write with `MARCCD_SERVER_TIMEOUT`,
     /// then publish the command on `ADStringToServer`.
-    pub fn write_server(&mut self, output: &str) -> CamStatus {
+    pub fn write_server(&mut self, output: &str) -> AsynStatus {
         let _ = self.server_submit(RequestOp::Flush, AsynUser::default().with_addr(SERVER_ADDR));
 
         let user = AsynUser::default()
@@ -124,13 +114,13 @@ impl MarccdDriver {
             },
             user,
         ) {
-            Ok(_) => CamStatus::Success,
+            Ok(_) => AsynStatus::Success,
             Err(e) => {
                 self.trace_server_error(&format!(
                     "marCCD:writeServer, status={}, sent\n{output}\n",
                     e.status() as i32
                 ));
-                classify(&e)
+                e.status()
             }
         };
 
@@ -141,7 +131,7 @@ impl MarccdDriver {
 
     /// C `readServer`: a single read with the given timeout, then publish the
     /// reply on `ADStringFromServer`.
-    pub fn read_server(&mut self, timeout: f64) -> CamStatus {
+    pub fn read_server(&mut self, timeout: f64) -> AsynStatus {
         let user = AsynUser::default()
             .with_addr(SERVER_ADDR)
             .with_timeout(secs(timeout));
@@ -154,7 +144,7 @@ impl MarccdDriver {
             Ok(result) => {
                 let data = result.data.unwrap_or_default();
                 self.from = String::from_utf8_lossy(&data).into_owned();
-                CamStatus::Success
+                AsynStatus::Success
             }
             Err(e) => {
                 // C's asynOctetSyncIO null-terminates at nbytesTransfered,
@@ -164,7 +154,7 @@ impl MarccdDriver {
                     "marCCD:readServer, timeout={timeout:.6}, status={} received 0 bytes\n\n",
                     e.status() as i32
                 ));
-                classify(&e)
+                e.status()
             }
         };
 
@@ -176,9 +166,9 @@ impl MarccdDriver {
     }
 
     /// C `writeReadServer`.
-    pub fn write_read_server(&mut self, output: &str, timeout: f64) -> CamStatus {
+    pub fn write_read_server(&mut self, output: &str, timeout: f64) -> AsynStatus {
         let status = self.write_server(output);
-        if status.is_err() {
+        if status != AsynStatus::Success {
             return status;
         }
         self.read_server(timeout)
@@ -188,7 +178,7 @@ impl MarccdDriver {
     /// matching C returning the default `ADStatusIdle` ordinal).
     pub fn get_state(&mut self) -> i32 {
         let status = self.write_read_server("get_state", MARCCD_SERVER_TIMEOUT);
-        if status.is_err() {
+        if status != AsynStatus::Success {
             return ADStatus::Idle as i32;
         }
         let p = self.p;
@@ -240,9 +230,9 @@ impl MarccdDriver {
     }
 
     /// C `getServerMode`.
-    pub fn get_server_mode(&mut self) -> CamStatus {
+    pub fn get_server_mode(&mut self) -> AsynStatus {
         let status = self.write_read_server("get_mode", MARCCD_SERVER_TIMEOUT);
-        if status.is_err() {
+        if status != AsynStatus::Success {
             return status;
         }
         if let Some(v) = parse_int(&self.from) {
@@ -257,19 +247,19 @@ impl MarccdDriver {
                 ),
             );
             self.server_mode = 1;
-            return CamStatus::Error;
+            return AsynStatus::Error;
         }
         self.set_i32(self.p.server_mode, self.server_mode);
-        CamStatus::Success
+        AsynStatus::Success
     }
 
     /// C `getConfig`.
-    pub fn get_config(&mut self) -> CamStatus {
+    pub fn get_config(&mut self) -> AsynStatus {
         let ad = self.ad.params;
         let p = self.p;
         if self.server_mode == 2 {
             let status = self.write_read_server("get_readout_mode", MARCCD_SERVER_TIMEOUT);
-            if status.is_err() {
+            if status != AsynStatus::Success {
                 return status;
             }
             if let Some(v) = parse_int(&self.from) {
@@ -278,7 +268,7 @@ impl MarccdDriver {
         }
 
         let status = self.write_read_server("get_size", MARCCD_SERVER_TIMEOUT);
-        if status.is_err() {
+        if status != AsynStatus::Success {
             return status;
         }
         let (size_x, size_y) = parse_pair(&self.from).unwrap_or((0, 0));
@@ -286,7 +276,7 @@ impl MarccdDriver {
         self.set_i32(ad.base.array_size_y, size_y);
 
         let status = self.write_read_server("get_bin", MARCCD_SERVER_TIMEOUT);
-        if status.is_err() {
+        if status != AsynStatus::Success {
             return status;
         }
         let (bin_x, bin_y) = parse_pair(&self.from).unwrap_or((0, 0));
@@ -307,11 +297,11 @@ impl MarccdDriver {
             self.set_f64(p.stability, v);
         }
         self.callbacks();
-        CamStatus::Success
+        AsynStatus::Success
     }
 
     /// C `writeHeader` — two `header,...` writes, no reads.
-    pub fn write_header(&mut self) -> CamStatus {
+    pub fn write_header(&mut self) -> AsynStatus {
         let p = self.p;
         let detector_distance = self.get_f64(p.detector_distance);
         let beam_x = self.get_f64(p.beam_x);
@@ -371,16 +361,16 @@ impl MarccdDriver {
 
     /// [`Self::wait_state`] as `readoutFrame` polls: an error once marServer
     /// reports `TASK_STATE_ERROR`.
-    fn wait_state_or_error(&mut self, busy: impl Fn(i32) -> bool) -> CamStatus {
+    fn wait_state_or_error(&mut self, busy: impl Fn(i32) -> bool) -> AsynStatus {
         let mut s = self.get_state();
         while busy(s) {
             std::thread::sleep(secs(MARCCD_POLL_DELAY));
             s = self.get_state();
             if task_state(s) == TASK_STATE_ERROR {
-                return CamStatus::Error;
+                return AsynStatus::Error;
             }
         }
-        CamStatus::Success
+        AsynStatus::Success
     }
 
     /// C `readoutFrame`: all of it under the driver lock.
@@ -389,12 +379,12 @@ impl MarccdDriver {
         buffer_number: i32,
         file_name: Option<&str>,
         wait: bool,
-    ) -> CamStatus {
+    ) -> AsynStatus {
         let reading =
             |s| test_task_status(s, TASK_READ, TASK_STATUS_EXECUTING | TASK_STATUS_QUEUED) != 0;
         // Wait for the readout task to be done with the previous frame.
         let status = self.wait_state_or_error(|s| reading(s) || task_state(s) >= TASK_STATE_BUSY);
-        if status.is_err() {
+        if status != AsynStatus::Success {
             return status;
         }
         let file_name = file_name.filter(|n| !n.is_empty());
@@ -406,11 +396,11 @@ impl MarccdDriver {
 
         // Wait for the readout to start, then to complete.
         let status = self.wait_state_or_error(|s| !reading(s));
-        if status.is_err() {
+        if status != AsynStatus::Success {
             return status;
         }
         let status = self.wait_state_or_error(reading);
-        if status.is_err() || !wait {
+        if status != AsynStatus::Success || !wait {
             return status;
         }
 
@@ -418,7 +408,7 @@ impl MarccdDriver {
         let status = self.wait_state_or_error(|s| {
             test_task_status(s, TASK_CORRECT, TASK_STATUS_EXECUTING | TASK_STATUS_QUEUED) != 0
         });
-        if status.is_err() || file_name.is_none() {
+        if status != AsynStatus::Success || file_name.is_none() {
             return status;
         }
         // A file was named: wait for the write to complete.
