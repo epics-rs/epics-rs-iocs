@@ -165,28 +165,13 @@ remain open upstream defects the port did not guess at.
 
 | # | Defect | Port handling |
 |---|--------|---------------|
-| 56 | `serval_http.cpp:49` — base64 `strchr` matches the terminating NUL: byte 0 decodes as index 64 | fixed-in-port (strict decoder, `None` on non-alphabet byte) |
 | 57 | `serval_http.cpp:91` — `strip_quotes` drops first/last char unconditionally: `null` → `"ul"` | fixed-in-port (strings unquoted, everything else dumped) |
-| 58 | `serval_http.cpp:1296` — mangled name fed to `std::map::operator[]`, which inserts it and reports orientation UP | fixed-in-port (`orientation_index` returns `Option`) |
-| 59 | `serval_http.cpp:37` — every GET carries junk `?anon=true&key=value` | fixed-in-port (not sent) |
-| 60 | `serval_http.cpp:77-87` — Basic auth applied on GET but not PUT/getJson | fixed-in-port (every request) |
-| 61 | `serval_http.cpp:185,569,1490,2199,2254` — HTTP calls with no timeout | fixed-in-port (5 s poll / 10 s config) |
 | 62 | `serval_http.cpp:1518,1823,1930,2320,2367,2372` — booleans PUT as JSON strings, read back as bools at :1269 | fixed-in-port (JSON booleans) |
-| 63 | `serval_http.cpp:2286-2363` — enum index into a `json` array via `operator[]`: out-of-range grows the array with nulls, PUT carries `null` | fixed-in-port (`enum_name` errors on out-of-range) |
 | 64 | `serval_http.cpp:1198` — `ADMaxSizeX = PixCount / NumberOfRows` unguarded → SIGFPE | fixed-in-port (guarded) |
-| 65 | `serval_http.cpp:1190` — `ADSerialNumber` set from the software version | fixed-in-port (`Info.Boards[0].ChipboardId`) |
 | 66 | `serval_http.cpp:1603/1881/image-channel` — three disagreeing "is this a stream" predicates; a `tcp://` image channel still gets a `FilePattern` | fixed-in-port (one `is_stream()` rule) |
-| 67 | `serval_http.cpp:1005` + `mask_io.cpp:529` — `bpc2ImgIndex()` is not the inverse of `pelIndex()` for all quad orientations (C's own comment concedes it) | fixed-in-port (inverse derived from the one forward map; bijection test) |
-| 68 | `mask_io.cpp:210-226` — `rowsCols` divides by `rowLength`, 0 before the first `/detector` reply | fixed-in-port (`Geometry::new` returns `None`) |
-| 69 | `mask_io.cpp:237,250,275` — `buf[j*ROWS + i]` stride in maskReset/Rectangle/Circle; every other site uses `j*COLS+i` | fixed-in-port (uniform `cols` stride) |
-| 70 | `mask_io.cpp:238` — `maskReset` *assigns* OnOff, wiping BPC bits 1 and 8 | fixed-in-port (touches only bit 0) |
-| 71 | `mask_io.cpp:159` — `bufBPC[pelIndex(i,j)] \|= 1` unchecked | fixed-in-port (bounds-checked, dropped count returned) |
-| 72 | `serval_stream.cpp:524,1389`; `histogram_io.cpp:311` — leftover byte count computed against the wrong buffer base: heap over-read and permanent stream desync | fixed-in-port (decoder owns its buffer; offsets are indices) |
 | 73 | `serval_stream.cpp:487,1353` — `int` overflow before the range check | fixed-in-port (checked `usize` math + dimension caps) |
 | 74 | `serval_stream.cpp:568-1443`; `histogram_io.cpp:352` — unconditional `__builtin_bswap` (breaks on big-endian hosts) | fixed-in-port (`from_be_bytes`) |
-| 75 | `network_client.cpp:157` — blocking `recv` with no read timeout, "cancelled" by another thread closing the socket | fixed-in-port (2 s timeout; worker owns its socket) |
 | 76 | `acquire.cpp:514-518` — HTTP-error path busy-spins at 100% CPU | fixed-in-port (sleeps between retries) |
-| 77 | `acquire.cpp:625-628` — acquisition thread never joined: one leaked joinable thread per stop | fixed-in-port (persistent worker threads) |
 | 78 | `ADTimePix.cpp:1579` — `lastServalConnected_`/`lastDetConnected_` never initialised | fixed-in-port (edge starts from "down") |
 | 79 | `ADTimePix.cpp:791` — `writeFloat64` uses 2-arg `setDoubleParam` (addr 0) on a maxAddr=8 port | fixed-in-port (honours `user.addr`) |
 | 80 | `ADTimePix.cpp:371,409-411,448-450,505-506` — early returns skip `callParamCallbacks`, latching ADAcquire | fixed-in-port (callbacks always run) |

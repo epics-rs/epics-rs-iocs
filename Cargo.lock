@@ -4495,6 +4495,7 @@ name = "timepix3"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "libc",
  "parking_lot",
  "serde_json",
  "tokio",

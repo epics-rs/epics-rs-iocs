@@ -6,6 +6,7 @@ use std::sync::Arc;
 use epics_rs::ad_core::ioc::GenericDriverContext;
 use epics_rs::base::server::iocsh::registry::*;
 
+use timepix3::driver::MAX_ADDR;
 use timepix3::{TimePix3Runtime, create_timepix3_detector};
 
 /// Register the TimePix3 configure command on an `AdIoc`.
@@ -73,10 +74,19 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     runtime.pool.clone(),
-                    runtime.array_output().clone(),
+                    runtime.array_output(0).clone(),
                     &port_name,
                     mgr.wiring(),
                 )));
+                // C publishes NDArrays on addresses 1..maxAddr as well
+                // (ADTimePix.cpp:1424-1429).
+                for addr in 1..MAX_ADDR {
+                    mgr.wiring().register_output_at(
+                        &port_name,
+                        addr as i32,
+                        runtime.array_output(addr).clone(),
+                    );
+                }
 
                 rt.lock().unwrap().push(runtime);
                 Ok(CommandOutcome::Continue)

@@ -13,3 +13,7 @@ serde_json = { workspace = true }
 ureq = { version = "3.3", default-features = false }
 # The background threads run on the ad-core runtime's tokio threads.
 tokio = { version = "1", features = ["rt", "time", "macros"] }
+
+[target.'cfg(unix)'.dependencies]
+# close(2), whose error std's File drop discards.
+libc = "0.2"
