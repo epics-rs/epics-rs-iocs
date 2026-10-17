@@ -48,6 +48,7 @@ pub fn spiiplus_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let mode = CommandMode::parse(&opt_string(args, 2)?.unwrap_or_default());
+            ctx.println(&format!("SPiiPlus config mode = {}", mode as i32));
 
             SPIIPLUS.config(ctx, card, move |init| {
                 let Ok(handle) = connect_with_eos(
@@ -75,4 +76,37 @@ pub fn spiiplus_config_command() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::base::runtime::task::BlockingBridge;
+    use epics_rs::base::server::database::PvDatabase;
+    use epics_rs::base::server::iocsh::IocShell;
+    use motor_common::testing::run_command;
+
+    /// drvSPiiPlus.cc:638 prints the parsed mode at Config, BUFFER 0,
+    /// CONNECT 1, DIRECT 2 (drvSPiiPlus.h:79).
+    #[epics_rs::base::epics_test]
+    async fn config_prints_the_command_mode() {
+        let int = ArgValue::Int;
+        run_command(spiiplus_setup_command(), vec![int(3), int(10)]).await;
+        let out = std::env::temp_dir().join(format!("spiiplus-mode-{}", std::process::id()));
+        let shell = IocShell::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
+        shell.register(spiiplus_config_command());
+        for (card, mode) in [(0, "buffer"), (1, "con"), (2, "Dir")] {
+            let line = format!(
+                "SPiiPlusConfig({card}, \"spRig\", \"{mode}\") >> {}",
+                out.display()
+            );
+            shell.execute_line(line).unwrap();
+        }
+        let printed = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(
+            printed,
+            "SPiiPlus config mode = 0\nSPiiPlus config mode = 1\nSPiiPlus config mode = 2\n"
+        );
+    }
 }
