@@ -471,7 +471,7 @@ impl AmptekDriver {
             if addr > 0 {
                 return Err(protocol_error(""));
             }
-            if let Err(e) = self.connect_device() {
+            if let Err(e) = self.connect_device(user) {
                 self.target = None;
                 self.num_devices = 0;
                 return Err(e);
@@ -580,8 +580,9 @@ impl AmptekDriver {
         Some(packet)
     }
 
-    /// `drvAmptek::connectDevice` (`drvAmptek.cpp:279-359`).
-    fn connect_device(&mut self) -> AsynResult<()> {
+    /// `drvAmptek::connectDevice` (`drvAmptek.cpp:279-359`), tracing on the
+    /// caller's `pasynUser`, not `pasynUserSelf`.
+    fn connect_device(&mut self, user: &AsynUser) -> AsynResult<()> {
         let ip = resolve_ipv4(&self.address_info).ok_or_else(|| {
             protocol_error(format!("Cannot resolve address: {}", self.address_info))
         })?;
@@ -595,10 +596,17 @@ impl AmptekDriver {
                     self.address_info
                 )));
             }
-            self.trace_io(&format!(
-                "drvAmptek::connectDevice DPP device {} connected\n",
-                self.address_info
-            ));
+            self.base.trace_print_at(
+                user.addr,
+                user.reason as i32,
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!(
+                    "drvAmptek::connectDevice DPP device {} connected\n",
+                    self.address_info
+                ),
+            );
         } else {
             let (confirmed, num_devices) = self.transport.connect_default(ip)?;
             self.num_devices = num_devices;
@@ -608,10 +616,17 @@ impl AmptekDriver {
                     self.address_info, self.num_devices
                 )));
             }
-            self.trace_io(&format!(
-                "drvAmptek::connectDevice DPP device {} connected, total devices found={}\n",
-                self.address_info, self.num_devices
-            ));
+            self.base.trace_print_at(
+                user.addr,
+                user.reason as i32,
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!(
+                    "drvAmptek::connectDevice DPP device {} connected, total devices found={}\n",
+                    self.address_info, self.num_devices
+                ),
+            );
         }
 
         // `CH_.DP5Stat.m_DP5_Status.SerialNumber = 0;` before the status
@@ -1809,6 +1824,34 @@ mod tests {
         assert!(port.lock().unwrap().is_empty());
         assert!(!handle.connect_device(0).connected());
         assert!(handle.connect_device(-1).connected());
+    }
+
+    /// `connectDevice` traces its connected line on the caller's
+    /// `pasynUser`, not `pasynUserSelf` (`drvAmptek.cpp:311`).
+    #[test]
+    fn connect_device_traces_on_the_callers_user() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+
+        let path =
+            std::env::temp_dir().join(format!("mca-amptek-conn-{}.trace", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let services = PortServices::global();
+        let trace = services.trace();
+        trace.register_port("fake", true);
+        trace.set_trace_mask(Some("fake"), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        trace.set_trace_info_mask(Some("fake"), TraceInfoMask::PORT);
+        trace.set_trace_file(Some("fake"), TraceFile::File(file));
+
+        let status = [0u8; 64];
+        let (mut driver, _fake) = driver_with_fake(move |req| default_reply(req, &status));
+        driver.connect_addr(&AsynUser::new(5).with_addr(0)).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.contains("[fake,0,5] drvAmptek::connectDevice DPP device 127.0.0.1 connected\n"),
+            "{out}"
+        );
     }
 
     /// `checkFailedComm` disconnects `pasynUserSelf`, device 0.
