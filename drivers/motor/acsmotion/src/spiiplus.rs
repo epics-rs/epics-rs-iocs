@@ -375,7 +375,7 @@ pub struct SpiiPlusAxis {
     /// in C, independent of the dummy path).
     is_virtual: bool,
     /// Last non-zero feedback-velocity direction (C updates direction only while
-    /// the axis is moving).
+    /// the axis is moving); 0 until then, as asynMotorAxis's status starts.
     last_direction: bool,
 }
 
@@ -391,7 +391,7 @@ impl SpiiPlusAxis {
             dummy: setup.dummy,
             resolution: setup.resolution,
             is_virtual: setup.is_virtual,
-            last_direction: true,
+            last_direction: false,
         }
     }
 
@@ -898,6 +898,20 @@ mod tests {
         let mut axis = SpiiPlusAxis::new(ctrl, 0);
         let status = axis.poll(&AsynUser::default()).unwrap();
         assert_eq!((status.position, status.encoder_position), (0.5, 4.0));
+    }
+
+    #[test]
+    fn direction_is_zero_until_a_move_runs_forward() {
+        let (ctrl, line) = fake("spiiDir", 1, &[("EFAC", &[1.0]), ("FVEL", &[2.0])]);
+        let user = AsynUser::default();
+        let mut axis = SpiiPlusAxis::new(ctrl, 0);
+        // Stationary: C leaves motorStatusDirection_ unset.
+        assert!(!axis.poll(&user).unwrap().direction);
+        line.lock().unwrap().set("MST", &[f64::from(MST_MOTION)]);
+        assert!(axis.poll(&user).unwrap().direction);
+        line.lock().unwrap().set("MST", &[0.0]);
+        line.lock().unwrap().set("FVEL", &[-2.0]);
+        assert!(axis.poll(&user).unwrap().direction);
     }
 
     #[test]
