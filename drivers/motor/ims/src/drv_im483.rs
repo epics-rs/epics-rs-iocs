@@ -427,6 +427,7 @@ mod tests {
         let endless = sign_on_ident(|| Some(b"ab".to_vec())).unwrap();
         assert_eq!(endless, vec!["ab"; 17].join(" "));
     }
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -487,7 +488,13 @@ mod tests {
             let moving = Arc::new(AtomicBool::new(false));
             let limits = Arc::new(AtomicI32::new(0));
             let line = Line {
-                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 sent: sent.clone(),
                 moving: moving.clone(),
                 limits: limits.clone(),

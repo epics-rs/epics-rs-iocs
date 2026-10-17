@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -369,6 +370,8 @@ impl ControlDriver {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let params = ControlParams::create(&mut base)?;
 
@@ -1460,7 +1463,13 @@ mod tests {
     /// `caput Control:TeachMode 0` and strand the robot in teach mode.
     #[test]
     fn the_twelve_commands_are_commands_and_the_valued_writes_are_not() {
-        let mut base = PortDriverBase::new("ctrl_is_command", NUM_JOINTS, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "ctrl_is_command",
+            NUM_JOINTS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = ControlParams::create(&mut base).expect("params create");
 
         for reason in [
@@ -1499,7 +1508,13 @@ mod tests {
     /// staying NO_ALARM through an outage.
     #[test]
     fn alarm_set_is_every_device_readback() {
-        let mut base = PortDriverBase::new("ctrl_alarm_set", NUM_JOINTS, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "ctrl_alarm_set",
+            NUM_JOINTS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = ControlParams::create(&mut base).expect("params create");
 
         let targets = p.alarm_targets();

@@ -588,6 +588,7 @@ impl AsynMotor for AcrAxis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -641,7 +642,13 @@ mod tests {
         let name = "ACR_BARE";
         let written = Arc::new(Mutex::new(Vec::new()));
         let driver = Recorder {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: written.clone(),
         };
         let claim = claim_port(name).unwrap();
@@ -710,7 +717,13 @@ mod tests {
         let name = "ACR_REGS";
         let written = Arc::new(Mutex::new(Vec::new()));
         let driver = Registers {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: written.clone(),
             output: 6,
             reply: None,

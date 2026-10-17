@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
@@ -63,6 +64,8 @@ impl IoDriver {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let params = IoParams::create(&mut base)?;
         let mut me = Self {

@@ -194,6 +194,7 @@ fn connect_with_default_eos(port_name: &str, timeout: Duration, who: &str) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -213,7 +214,13 @@ mod tests {
     #[test]
     fn a_port_refusing_the_default_eos_still_connects() {
         let name = "omsEosRefused";
-        let base = PortDriverBase::new(name, 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let claim = claim_port(name).unwrap();
         let (rt, _actor) =
             create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();

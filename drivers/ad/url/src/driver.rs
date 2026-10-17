@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_NONE;
 use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -48,7 +49,16 @@ impl URLDriver {
         max_memory: usize,
         acq_tx: rt::CommandSender<AcqCommand>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_NONE)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            0,
+            0,
+            max_memory,
+            ASYN_NONE,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )?;
         let url_params = URLParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
@@ -64,7 +74,7 @@ impl URLDriver {
         base.set_string_param(ad.params.base.sdk_version, 0, "image 0.25 + ureq 2")?;
         // C++ explicitly overrides NDDriverVersion with its own DRIVER_VERSION.
         // DRIVER_REVISION.DRIVER_MODIFICATION, distinct from the ad-core-rs/
-        // Cargo package version ADDriverBase::new() defaults it to.
+        // Cargo package version ADDriverBase::new(, InterfaceMask::UNMIGRATED_SUBCLASS, InterfaceMask::UNMIGRATED_SUBCLASS) defaults it to.
         base.set_string_param(ad.params.base.driver_version, 0, DRIVER_VERSION_STRING)?;
 
         Ok(Self {

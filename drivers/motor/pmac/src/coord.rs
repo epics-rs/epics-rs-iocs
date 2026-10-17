@@ -808,6 +808,7 @@ mod tests {
 
     /// CS 1 axis A on an [`Idle`] line, its system and the wire log.
     fn idle_axis(name: &str, poll_ttl: Duration) -> Rig {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -815,7 +816,13 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let fail = Arc::new(Mutex::new(Vec::new()));
         let line = Idle {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             reply: Vec::new(),
             sent: sent.clone(),
             fail: fail.clone(),

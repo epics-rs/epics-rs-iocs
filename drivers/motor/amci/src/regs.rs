@@ -163,6 +163,7 @@ pub(crate) mod fake {
 
     use epics_rs::asyn::error::AsynResult;
     use epics_rs::asyn::param::ParamType;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -247,7 +248,13 @@ pub(crate) mod fake {
             multi_device: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(name, 100, flags);
+        let mut base = PortDriverBase::new(
+            name,
+            100,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param(MODBUS_DATA, ParamType::Int32).unwrap();
         let read_reason = base.create_param(MODBUS_READ, ParamType::Int32).unwrap();
         let taken = Taken::default();

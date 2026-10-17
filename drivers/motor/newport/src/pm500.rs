@@ -512,12 +512,19 @@ mod tests {
     /// (drvPM500.cc:577, :671-672).
     #[test]
     fn a_silent_ident_creates_no_controller() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
         use std::time::Duration;
 
-        let line = Silent(PortDriverBase::new("pm500_silent", 1, PortFlags::default()));
+        let line = Silent(PortDriverBase::new(
+            "pm500_silent",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        ));
         let (rt, _jh) = create_port_runtime(
             &claim_port("pm500_silent").unwrap(),
             line,
@@ -571,6 +578,7 @@ mod tests {
     /// drvPM500.cc motor_init for one controller and its `X` axis: the
     /// axis, the wire log, and the `XR` reply.
     fn pm500_axis(name: &str) -> Line {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -579,7 +587,13 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let xr = Arc::new(Mutex::new("XB+5.017"));
         let line = Scripted {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             reply: Vec::new(),
             sent: sent.clone(),
             xr: xr.clone(),

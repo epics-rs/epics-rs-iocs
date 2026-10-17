@@ -128,7 +128,7 @@ impl StatusExchange {
 mod tests {
     use std::sync::Arc;
 
-    use epics_rs::asyn::port::{PortDriver, PortFlags};
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortFlags};
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::create_port_runtime;
@@ -161,7 +161,13 @@ mod tests {
         let claim = claim_port(name).unwrap();
         let (runtime, _actor) = create_port_runtime(
             &claim,
-            Meter(PortDriverBase::new(name, 2, flags)),
+            Meter(PortDriverBase::new(
+                name,
+                2,
+                flags,
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .unwrap();

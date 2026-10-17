@@ -228,9 +228,20 @@ mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ADDriverBase;
     use epics_rs::ad_core::plugin::runtime::ASYN_NONE;
+    use epics_rs::asyn::port::InterfaceMask;
 
     fn fixture() -> (ADDriverBase, SimParams) {
-        let mut ad = ADDriverBase::new("SIMTEST", 1, 64, 64, 0, ASYN_NONE).unwrap();
+        let mut ad = ADDriverBase::new(
+            "SIMTEST",
+            1,
+            64,
+            64,
+            0,
+            ASYN_NONE,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let sim = SimParams::create(&mut ad.port_base).unwrap();
         (ad, sim)
     }

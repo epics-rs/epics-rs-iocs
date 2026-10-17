@@ -11,6 +11,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -82,6 +83,8 @@ impl XpsGpio {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         for (name, kind) in COMMANDS {
             base.create_param(name, kind)?;

@@ -605,12 +605,19 @@ mod tests {
     /// error, so every axis slot is counted and built.
     #[test]
     fn unanswered_axis_queries_count_every_axis_as_c_does() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let port = IdentOnly {
-            base: PortDriverBase::new("esp300IdentOnly", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "esp300IdentOnly",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             replies: &[],
             reply: Vec::new(),
             sent: Arc::default(),
@@ -636,12 +643,19 @@ mod tests {
     /// that commands refuse rather than sending `inf`, and polls flag.
     #[test]
     fn a_non_finite_resolution_never_reaches_the_wire() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let port = IdentOnly {
-            base: PortDriverBase::new("esp300ZeroQs", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "esp300ZeroQs",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             replies: &[
                 ("TB?", "9, 0, AXIS NUMBER OUT OF RANGE"),
                 ("01ZB?", "200"),
@@ -680,13 +694,20 @@ mod tests {
         name: &str,
         replies: &'static [(&'static str, &'static str)],
     ) -> (Esp300Controller, Arc<Mutex<Vec<String>>>) {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let port = IdentOnly {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             replies,
             reply: Vec::new(),
             sent: sent.clone(),

@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -86,6 +87,8 @@ impl PixiradDetector {
             max_size_y,
             max_memory,
             ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
         )?;
         let params = PixiradParams::create(&mut ad.port_base)?;
         let p = ad.params;

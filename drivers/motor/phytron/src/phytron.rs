@@ -1743,13 +1743,20 @@ mod tests {
 
     /// MCC axis 1 on a fresh [`Mcc`] port `name`, and its command log.
     fn mcc_axis(name: &str) -> (PhytronAxis, Arc<Mutex<Vec<String>>>) {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let written = Arc::new(Mutex::new(Vec::new()));
         let port = Mcc {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: written.clone(),
             reply: Vec::new(),
             crc: false,
@@ -1785,12 +1792,19 @@ mod tests {
 
     #[test]
     fn the_poll_reports_the_encoder_times_the_encoder_ratio() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let port = Mcc {
-            base: PortDriverBase::new("phytronEncoderPoll", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "phytronEncoderPoll",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: Arc::new(Mutex::new(Vec::new())),
             reply: Vec::new(),
             crc: false,

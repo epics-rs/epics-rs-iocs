@@ -10,6 +10,7 @@ use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -124,6 +125,8 @@ impl MythenDriver {
                 multi_device: true,
                 ..ASYN_CANBLOCK
             },
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
         )?;
         let p = MythenParams::create(&mut ad.port_base)?;
 

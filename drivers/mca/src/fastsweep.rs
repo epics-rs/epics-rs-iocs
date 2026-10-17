@@ -88,6 +88,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interrupt::{InterruptFilter, InterruptReceiver, InterruptSubscription};
 use epics_rs::asyn::param::{ParamType, ParamValue};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -357,6 +358,8 @@ impl FastSweepDriver {
                 can_block: false,
                 destructible: false,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let reasons = McaReason::create_params(&mut base)?;
         let max_channels_idx = base.create_param(FAST_SWEEP_MAX_CHANNELS, ParamType::Int32)?;

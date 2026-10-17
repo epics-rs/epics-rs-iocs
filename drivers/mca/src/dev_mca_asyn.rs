@@ -650,6 +650,7 @@ fn mca_device_support(ctx: &DeviceSupportContext) -> Option<Box<dyn DeviceSuppor
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -807,6 +808,8 @@ mod tests {
                 can_block,
                 destructible: false,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         if let Some(addr) = down {
             base.set_auto_connect_addr(addr, false);

@@ -10,6 +10,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -166,6 +167,8 @@ impl GripperDriver {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let params = GripperParams::create(&mut base)?;
 
@@ -596,7 +599,13 @@ mod tests {
     /// only the `SET_POSITION_RANGE` that applies them is a command.
     #[test]
     fn the_six_commands_are_commands_and_the_staged_range_is_not() {
-        let mut base = PortDriverBase::new("grip_is_command", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "grip_is_command",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = GripperParams::create(&mut base).expect("params create");
 
         for reason in [
@@ -783,7 +792,13 @@ mod tests {
     /// staying NO_ALARM through an outage.
     #[test]
     fn alarm_set_is_every_device_readback() {
-        let mut base = PortDriverBase::new("grip_alarm_set", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "grip_alarm_set",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = GripperParams::create(&mut base).expect("params create");
 
         let targets = p.alarm_targets();

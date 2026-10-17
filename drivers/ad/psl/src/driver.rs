@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::param::EnumEntry;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -82,7 +83,16 @@ impl PslDetector {
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<(Self, bool)> {
-        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            0,
+            0,
+            max_memory,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )?;
         // C PSL never sets NDDriverVersion: it keeps asynNDArrayDriver's
         // ADCore version string.
         let params = PslParams::create(&mut ad.port_base)?;
@@ -959,7 +969,13 @@ mod tests {
         let dir = std::env::temp_dir().display().to_string();
         let dir = dir.trim_end_matches('/').to_string();
         let ip = format!("{name}_IP");
-        let mut base = PortDriverBase::new(&ip, 1, Default::default());
+        let mut base = PortDriverBase::new(
+            &ip,
+            1,
+            Default::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.init_connected(true);
         let server = FakeServer {
             base,

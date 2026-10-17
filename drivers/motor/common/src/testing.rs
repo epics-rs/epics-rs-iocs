@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::registry::{claim_port, open_owner};
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -148,7 +149,13 @@ impl LineRig {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let addrs = Arc::new(Mutex::new(Vec::new()));
         let line = Line {
-            base: PortDriverBase::new(name, max_addr, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                max_addr,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             sent: sent.clone(),
             addrs: addrs.clone(),
             command: String::new(),

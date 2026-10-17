@@ -54,6 +54,8 @@ impl CtrDriver {
                 can_block: false,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let params = CtrParams::create(&mut base)?;
 

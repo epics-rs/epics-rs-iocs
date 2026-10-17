@@ -322,6 +322,7 @@ pub fn connect_octet(port_name: &str, timeout: Duration) -> (OctetIo, AsynResult
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriverBase, PortFlags};
 
     /// A registered octet port that refuses every input EOS.
@@ -343,7 +344,13 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn eos_refusing_port(name: &str) -> (OctetIo, PortRuntimeHandle) {
-        let driver = NoInputEos(PortDriverBase::new(name, 1, PortFlags::default()));
+        let driver = NoInputEos(PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        ));
         let claim = claim_port(name).unwrap();
         let (runtime, _actor) =
             create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();

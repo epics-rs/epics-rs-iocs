@@ -2731,6 +2731,7 @@ mod one_poller {
     use std::net::TcpListener;
 
     use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -2759,7 +2760,13 @@ mod one_poller {
                 Ok(n)
             }
         }
-        let base = PortDriverBase::new(name, 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let claim = claim_port(name).unwrap();
         let (rt, _actor) =
             create_port_runtime(&claim, Line(base, reply), RuntimeConfig::default()).unwrap();

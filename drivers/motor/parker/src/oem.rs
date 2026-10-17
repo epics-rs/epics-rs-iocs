@@ -512,6 +512,7 @@ fn switch_from_is(is: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::port::InterfaceMask;
     use std::collections::HashMap;
 
     use epics_rs::asyn::interfaces::InterfaceType;
@@ -571,7 +572,13 @@ mod tests {
         let name = "OEM_BOOT";
         let written = Arc::new(Mutex::new(Vec::new()));
         let driver = Acks {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: written.clone(),
         };
         let claim = claim_port(name).unwrap();
@@ -634,7 +641,13 @@ mod tests {
             ("IS", "*ABCD001"),
         ])));
         let driver = Polled {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             replies: replies.clone(),
             queued: Default::default(),
         };

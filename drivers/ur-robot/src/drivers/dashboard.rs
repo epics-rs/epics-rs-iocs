@@ -8,6 +8,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -153,6 +154,8 @@ impl DashboardDriver {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let params = DashboardParams::create(&mut base)?;
 
@@ -535,7 +538,13 @@ mod tests {
     /// reach the int32 gate anyway.
     #[test]
     fn the_thirteen_commands_are_commands_and_the_readbacks_are_not() {
-        let mut base = PortDriverBase::new("dash_is_command", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "dash_is_command",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = DashboardParams::create(&mut base).expect("params create");
 
         for reason in [
@@ -573,7 +582,13 @@ mod tests {
     /// staying NO_ALARM through an outage.
     #[test]
     fn alarm_set_is_every_poll_readback() {
-        let mut base = PortDriverBase::new("dash_alarm_set", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "dash_alarm_set",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = DashboardParams::create(&mut base).expect("params create");
 
         let targets = p.alarm_targets();

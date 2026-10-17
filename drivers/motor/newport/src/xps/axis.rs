@@ -1369,13 +1369,20 @@ mod tests {
 
     /// Two axes of one moving group; the first has sent a move.
     fn late_move_axes(port: &str, moving_mode: bool) -> (XpsAxis, XpsAxis, Arc<Mutex<bool>>) {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let answer = Arc::new(Mutex::new(false));
         let line = LateMoveXps {
-            base: PortDriverBase::new(port, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                port,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             reply: None,
             answer: answer.clone(),
         };

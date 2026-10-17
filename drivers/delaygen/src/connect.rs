@@ -78,6 +78,7 @@ pub fn connect_octet(port_name: &str, addr: i32, timeout: Duration) -> Result<Oc
 /// fails: a device that never answers.
 #[cfg(test)]
 pub(crate) fn mute_link(io: &str) -> OctetLink {
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 
     struct Mute(PortDriverBase);
@@ -91,7 +92,16 @@ pub(crate) fn mute_link(io: &str) -> OctetLink {
         }
     }
 
-    link_onto(io, Mute(PortDriverBase::new(io, 1, PortFlags::default())))
+    link_onto(
+        io,
+        Mute(PortDriverBase::new(
+            io,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        )),
+    )
 }
 
 /// An [`OctetLink`] onto a published port `io` that accepts every write and
@@ -99,6 +109,7 @@ pub(crate) fn mute_link(io: &str) -> OctetLink {
 #[cfg(test)]
 pub(crate) fn replying_link(io: &str, reply: &'static [u8]) -> OctetLink {
     use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::user::AsynUser;
 
@@ -123,7 +134,16 @@ pub(crate) fn replying_link(io: &str, reply: &'static [u8]) -> OctetLink {
 
     link_onto(
         io,
-        Replying(PortDriverBase::new(io, 1, PortFlags::default()), reply),
+        Replying(
+            PortDriverBase::new(
+                io,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
+            reply,
+        ),
     )
 }
 

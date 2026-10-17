@@ -18,6 +18,7 @@ use epics_rs::ad_core::driver::ADDriverBase;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -143,6 +144,8 @@ fn create_unconnected(claim: &PortClaim, max_memory: usize) -> AsynResult<Mythen
             multi_device: true,
             ..ASYN_CANBLOCK
         },
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
     )?;
     let pool = ad.pool.clone();
     let (runtime_handle, _) =

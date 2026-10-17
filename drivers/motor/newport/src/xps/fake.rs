@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
@@ -107,7 +108,13 @@ impl FakeLine {
         let firmware = Arc::new(Mutex::new("0"));
         let group_status = Arc::new(Mutex::new(12));
         let line = FakeXps {
-            base: PortDriverBase::new(port, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                port,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             reply: None,
             fail: fail.clone(),
             log: log.clone(),

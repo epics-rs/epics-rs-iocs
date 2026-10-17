@@ -64,6 +64,7 @@ use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interrupt::{InterruptManager, InterruptValue};
 use asyn_rs::param::{ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::runtime::config::RuntimeConfig;
@@ -1104,6 +1105,8 @@ impl AdsPortDriver {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
 
         // Reason 0 — the ASCII command channel (C constructor, :372).

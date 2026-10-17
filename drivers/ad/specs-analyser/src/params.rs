@@ -116,11 +116,18 @@ impl SpecsParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::PortFlags;
 
     #[test]
     fn creates_all_params_with_distinct_indices() {
-        let mut base = PortDriverBase::new("test-specs-params", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "test-specs-params",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = SpecsParams::create(&mut base).unwrap();
         assert_eq!(base.find_param("SPECS_CONNECT"), Some(p.connect));
         assert_eq!(

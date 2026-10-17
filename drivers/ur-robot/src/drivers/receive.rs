@@ -9,6 +9,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -253,6 +254,8 @@ impl ReceiveDriver {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let params = ReceiveParams::create(&mut base)?;
 
@@ -880,7 +883,13 @@ mod tests {
     /// `is_command` guard from `write_int32` and the first assertion fails.
     #[test]
     fn a_zero_write_to_a_command_is_a_no_op_and_a_one_still_acts() {
-        let mut base = PortDriverBase::new("recv_gate", NUM_JOINTS, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "recv_gate",
+            NUM_JOINTS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let params = ReceiveParams::create(&mut base).expect("params create");
         let mut driver = ReceiveDriver {
             base,
@@ -908,7 +917,13 @@ mod tests {
     /// silently staying NO_ALARM through an outage.
     #[test]
     fn alarm_set_is_every_readback() {
-        let mut base = PortDriverBase::new("recv_alarm_set", NUM_JOINTS, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "recv_alarm_set",
+            NUM_JOINTS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = ReceiveParams::create(&mut base).expect("params create");
 
         let targets = p.alarm_targets();
@@ -972,7 +987,13 @@ mod tests {
 
     #[test]
     fn the_two_link_commands_are_commands_and_the_readbacks_are_not() {
-        let mut base = PortDriverBase::new("recv_is_command", NUM_JOINTS, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "recv_is_command",
+            NUM_JOINTS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = ReceiveParams::create(&mut base).expect("params create");
 
         assert!(p.is_command(p.disconnect));

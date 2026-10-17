@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::registry::{claim_port, open_owner};
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -164,7 +165,13 @@ impl PortDriver for Line {
 pub fn line(name: &str) -> Arc<Mutex<Controller>> {
     let controller = Arc::new(Mutex::new(Controller::default()));
     let driver = Line {
-        base: PortDriverBase::new(name, 1, PortFlags::default()),
+        base: PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        ),
         controller: controller.clone(),
         reply: Vec::new(),
     };

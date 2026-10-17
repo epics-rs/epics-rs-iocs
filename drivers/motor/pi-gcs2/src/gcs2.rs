@@ -2863,13 +2863,20 @@ mod tests {
 
     #[test]
     fn send_only_status_is_the_terminator_write() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let written = Arc::new(Mutex::new(Vec::new()));
         let port = FirstWriteRefused {
-            base: PortDriverBase::new("gcs2SendOnly", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "gcs2SendOnly",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: written.clone(),
             status: AsynStatus::Error,
         };
@@ -2924,12 +2931,19 @@ mod tests {
 
     #[test]
     fn a_failed_status_read_keeps_the_last_bits_and_the_poll_goes_on() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let port = StatusRefused {
-            base: PortDriverBase::new("gcs2StatusRefused", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "gcs2StatusRefused",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             reply: Vec::new(),
         };
         let (rt, _actor) = create_port_runtime(
@@ -5627,11 +5641,18 @@ mod tests {
 
     #[test]
     fn a_silent_controller_reads_an_empty_idn_and_finds_no_axes() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
-        let port = Silent(PortDriverBase::new("gcs2Silent", 1, PortFlags::default()));
+        let port = Silent(PortDriverBase::new(
+            "gcs2Silent",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        ));
         let (rt, _actor) = create_port_runtime(
             &claim_port("gcs2Silent").unwrap(),
             port,
@@ -5651,6 +5672,7 @@ mod tests {
 
     #[test]
     fn an_axis_is_created_when_the_controller_does_not_answer() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -5659,6 +5681,8 @@ mod tests {
             "gcs2SilentAxis",
             1,
             PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         ));
         let (rt, _actor) = create_port_runtime(
             &claim_port("gcs2SilentAxis").unwrap(),

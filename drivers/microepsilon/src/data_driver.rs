@@ -90,6 +90,7 @@ use epics_rs::asyn::asyn_record;
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
@@ -294,6 +295,8 @@ impl DataDriver {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let disp_reason = base.create_param("DispChan", ParamType::Float64)?;
         Ok(Self {
@@ -817,7 +820,13 @@ mod tests {
             }
         }
         let dummy = DummyPort {
-            base: PortDriverBase::new("dummy_rbk_for_test", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "dummy_rbk_for_test",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
         };
         let claim = asyn_record::claim_port("dummy_rbk_for_test").unwrap();
         let (rbk_runtime, _jh) =

@@ -532,6 +532,7 @@ mod tests {
     /// not come back yet is sent, not failed.
     #[test]
     fn a_fire_command_with_no_reply_yet_succeeds() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -539,7 +540,13 @@ mod tests {
         let port = "xps_fire_silent";
         let (rt, _jh) = create_port_runtime(
             &claim_port(port).unwrap(),
-            Silent(PortDriverBase::new(port, 1, PortFlags::default())),
+            Silent(PortDriverBase::new(
+                port,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .unwrap();

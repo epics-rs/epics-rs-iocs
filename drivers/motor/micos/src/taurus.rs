@@ -533,13 +533,20 @@ mod tests {
     /// sends the command after it, and that command's status is returned.
     #[test]
     fn a_refused_setting_still_sends_the_command_after_it() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let written = Arc::new(Mutex::new(Vec::new()));
         let port = SettingsRefused {
-            base: PortDriverBase::new("taurusRefused", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "taurusRefused",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: written.clone(),
         };
         let (rt, _actor) = create_port_runtime(

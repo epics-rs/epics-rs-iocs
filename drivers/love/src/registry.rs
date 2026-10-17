@@ -94,6 +94,7 @@ pub fn lookup(port_name: &str) -> Option<ModelTable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -112,7 +113,13 @@ mod tests {
     #[test]
     fn lookup_ignores_case_like_epics_str_case_cmp() {
         let claim = claim_port("loveCaseS0").unwrap();
-        let base = PortDriverBase::new("loveCaseS0", 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            "loveCaseS0",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let (rt, _actor) =
             create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
         let follow = rt.port_handle().exception_callback_add(-1, |_| {});

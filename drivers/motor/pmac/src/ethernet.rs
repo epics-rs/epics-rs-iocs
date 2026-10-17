@@ -682,9 +682,16 @@ mod tests {
 
     #[test]
     fn a_connect_edge_drops_buffered_input() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
 
-        let mut base = PortDriverBase::new("pmacExc", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "pmacExc",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.install_octet_interpose(Box::new(PmacIpInterpose::new()));
         assert_eq!(base.exception_user_count(-1), 1);
 

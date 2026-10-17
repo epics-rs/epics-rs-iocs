@@ -37,6 +37,7 @@ use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -1086,6 +1087,8 @@ impl QuadEmBase {
                 multi_device: true,
                 ..Default::default()
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         )?;
         let params = QuadEmParams::create(&mut port_base)?;
 

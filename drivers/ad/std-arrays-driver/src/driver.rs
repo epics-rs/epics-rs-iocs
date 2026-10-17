@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -80,6 +81,8 @@ impl NdStdArraysDriver {
                 multi_device: false,
                 ..Default::default()
             },
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
         )?;
         let port_base = &mut ad.port_base;
         let params = ad.params;

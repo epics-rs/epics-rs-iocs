@@ -99,6 +99,7 @@ pub fn set_default_eos(
 mod tests {
     use super::*;
     use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -132,7 +133,13 @@ mod tests {
     }
 
     fn publish<D: PortDriver>(name: &str, driver: impl FnOnce(PortDriverBase) -> D) -> PortHandle {
-        let base = PortDriverBase::new(name, 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let claim = claim_port(name).unwrap();
         let (rt, _actor) =
             create_port_runtime(&claim, driver(base), RuntimeConfig::default()).unwrap();
@@ -203,6 +210,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let claim = claim_port("loveMultiSer").unwrap();
         let (rt, _actor) =

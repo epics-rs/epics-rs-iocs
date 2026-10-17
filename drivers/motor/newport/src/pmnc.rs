@@ -1127,12 +1127,19 @@ mod tests {
 
     #[test]
     fn a_port_refusing_every_eos_set_still_configures_and_reads_status() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let pmnc = Pmnc {
-            base: PortDriverBase::new("pmncEosRefused", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "pmncEosRefused",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             reply: Vec::new(),
         };
         let (rt, _actor) = create_port_runtime(

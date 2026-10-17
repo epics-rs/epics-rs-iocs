@@ -196,6 +196,8 @@ impl MultiFunctionDriver {
                 can_block: false,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let params = MultiFunctionParams::create(&mut base)?;
 

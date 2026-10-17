@@ -41,6 +41,7 @@ pub mod receive;
 pub mod runtime;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriverBase, PortFlags};
 
 /// The full asyn parameter table of every driver kind, keyed by the names
@@ -53,7 +54,13 @@ pub fn created_param_names() -> Vec<(&'static str, Vec<String>)> {
         max_addr: usize,
         create: impl FnOnce(&mut PortDriverBase) -> AsynResult<P>,
     ) -> Vec<String> {
-        let mut base = PortDriverBase::new("wiring-check", max_addr, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "wiring-check",
+            max_addr,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         create(&mut base).expect("a fresh parameter table accepts every create_param");
         (0..base.params.len())
             .map(|i| base.params.param_name(i).expect("index < len").to_string())

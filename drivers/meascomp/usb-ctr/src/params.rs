@@ -155,7 +155,13 @@ mod tests {
 
     #[test]
     fn the_mca_params_are_c_s_table() {
-        let mut base = PortDriverBase::new("ctr_params", MAX_MCS_COUNTERS, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "ctr_params",
+            MAX_MCS_COUNTERS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = CtrParams::create(&mut base).unwrap();
         // drvUSBCTR.cpp's createParam order: MCA_START_ACQUIRE is the 29th.
         assert_eq!(p.mca_start_acquire, 28);

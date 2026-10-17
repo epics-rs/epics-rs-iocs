@@ -747,6 +747,7 @@ mod tests {
     use epics_rs::asyn::error::{AsynResult, AsynStatus};
     use epics_rs::asyn::interfaces::motor::MotorStatus;
     use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
@@ -765,7 +766,13 @@ mod tests {
     }
 
     fn publish_bare(name: &str) -> PortRuntimeHandle {
-        let base = PortDriverBase::new(name, 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let claim = claim_port(name).unwrap();
         let (rt, _actor) =
             create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
@@ -871,7 +878,13 @@ mod tests {
     #[test]
     fn a_refused_eos_set_leaves_a_controller_whose_commands_fail() {
         let name = "pmacEosRefused";
-        let base = PortDriverBase::new(name, 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let claim = claim_port(name).unwrap();
         let (rt, _actor) =
             create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
@@ -928,7 +941,13 @@ mod tests {
         let name = "pmacGlobalFirst";
         let written = Arc::new(Mutex::new(Vec::new()));
         let driver = GlobalOnly {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: written.clone(),
             reply: Vec::new(),
             initial: Vec::new(),
@@ -957,7 +976,13 @@ mod tests {
     fn a_parsed_initial_status_reports_an_encoder() {
         let name = "pmacInitialStatus";
         let driver = GlobalOnly {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: Arc::new(Mutex::new(Vec::new())),
             reply: Vec::new(),
             initial: b"100\r-100\r2000\r1000\r500\r\x06".to_vec(),
@@ -1065,7 +1090,13 @@ mod tests {
     fn publish_scripted(name: &str) -> (PortRuntimeHandle, Rig) {
         let rig = Rig::default();
         let driver = Scripted {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             rig: rig.clone(),
             reply: None,
         };

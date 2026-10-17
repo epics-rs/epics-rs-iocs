@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_NONE;
 use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -59,8 +60,16 @@ impl SimDetector {
         start_tx: rt::CommandSender<Signal>,
         stop_tx: rt::CommandSender<Signal>,
     ) -> AsynResult<Self> {
-        let mut ad =
-            ADDriverBase::new(port_name, 1, max_size_x, max_size_y, max_memory, ASYN_NONE)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_size_x,
+            max_size_y,
+            max_memory,
+            ASYN_NONE,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )?;
         let sim = SimParams::create(&mut ad.port_base)?;
 
         let p = ad.params;

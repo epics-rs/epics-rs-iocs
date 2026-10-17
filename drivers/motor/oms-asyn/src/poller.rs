@@ -581,6 +581,7 @@ pub(crate) mod tests {
 
     use epics_rs::asyn::exception::AsynException;
     use epics_rs::asyn::interfaces::motor::AsynMotor;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::port_handle::PortHandle;
     use epics_rs::asyn::registry::claim_port;
@@ -672,7 +673,13 @@ pub(crate) mod tests {
         let unsolicited = Unsolicited::default();
         let reads = Arc::new(AtomicUsize::new(0));
         let driver = Scripted {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: written.clone(),
             replies: replies.clone(),
             reply: Vec::new(),

@@ -71,10 +71,17 @@ impl NdsaParams {
 mod tests {
     use super::*;
     use epics_rs::ad_core::params::ad_driver::ADDriverParams;
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::PortFlags;
 
     fn fixture() -> (PortDriverBase, ADDriverParams, NdsaParams) {
-        let mut base = PortDriverBase::new("NDSATEST", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "NDSATEST",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let (ad, _) = ADDriverParams::create(&mut base).unwrap();
         let ndsa = NdsaParams::create(&mut base).unwrap();
         (base, ad, ndsa)

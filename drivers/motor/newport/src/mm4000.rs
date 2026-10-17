@@ -1404,13 +1404,20 @@ mod tests {
     /// the commands the line ignores.
     fn model1_card(name: &str, silent: &'static [&'static str], cache_ttl: Duration) -> Card {
         let silent = Arc::new(Mutex::new(silent.to_vec()));
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let line = Scripted {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             silent: silent.clone(),
             tp: Arc::new(Mutex::new("1TP1.4990,2TP-2.2490")),
             reply: Vec::new(),
@@ -1672,6 +1679,7 @@ mod tests {
     /// (drvMM4000Asyn.c:653-657), so the readback keeps the last position.
     #[test]
     fn a_dead_line_keeps_the_last_position() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -1679,7 +1687,13 @@ mod tests {
         let dead = Arc::new(AtomicBool::new(false));
         let sent = Arc::new(Mutex::new(Vec::new()));
         let line = Line {
-            base: PortDriverBase::new("mm4000_dead", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "mm4000_dead",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             dead: dead.clone(),
             reply: Vec::new(),
             sent: sent.clone(),
@@ -1713,6 +1727,7 @@ mod tests {
     /// error over the last positions and bits.
     #[test]
     fn a_failed_te_reports_the_kept_parameters() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -1720,7 +1735,13 @@ mod tests {
         let silent = Arc::new(Mutex::new(Vec::new()));
         let tp = Arc::new(Mutex::new("1TP1.4990,2TP-2.2490"));
         let line = Scripted {
-            base: PortDriverBase::new("mm4000_te", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "mm4000_te",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             silent: silent.clone(),
             tp: tp.clone(),
             reply: Vec::new(),
@@ -1756,13 +1777,20 @@ mod tests {
     /// sets done from `MS;` alone (:661), the one after it is inside the TTL.
     #[test]
     fn the_poll_after_a_move_is_fresh_and_reads_ms() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let line = Line {
-            base: PortDriverBase::new("mm4000_moved", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "mm4000_moved",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             dead: Arc::new(AtomicBool::new(false)),
             reply: Vec::new(),
             sent: sent.clone(),
@@ -1804,13 +1832,20 @@ mod tests {
     /// (:853-857).
     #[test]
     fn config_refusals_create_no_controller() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         for (name, dead, num_axes) in [("mm4000_silent", true, 1), ("mm4000_short", false, 2)] {
             let line = Line {
-                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 dead: Arc::new(AtomicBool::new(dead)),
                 reply: Vec::new(),
                 sent: Arc::default(),

@@ -81,6 +81,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{
     DpCells, DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags,
 };
@@ -608,6 +609,8 @@ impl LoveDriver {
                 can_block: serial.can_block(),
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         base.set_auto_connect(serial.connect_device(ser_addr).auto_connect());
 
@@ -1088,6 +1091,8 @@ mod tests {
                     can_block: true,
                     destructible: true,
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ),
         };
         let love = love_on(serial, "LOVETESTTRCL");
@@ -1141,7 +1146,13 @@ mod tests {
     /// so it answers while the serial port is busy.
     #[test]
     fn connect_it_does_not_wait_on_a_busy_serial_port() {
-        let base = PortDriverBase::new("LOVETESTBSY", 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            "LOVETESTBSY",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let mut love = love_on(SlowSerial { base }, "LOVETESTBSYL");
         let serial = love.serial.clone();
         assert!(serial.is_connected_blocking(0).unwrap());
@@ -1178,6 +1189,8 @@ mod tests {
                     can_block,
                     destructible: true,
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.set_auto_connect(auto_connect);
             let love = love_on(TimeoutSerial { base }, &format!("{name}L"));
@@ -1204,6 +1217,8 @@ mod tests {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         base.set_auto_connect(false);
         base.init_connected(false);
@@ -1241,6 +1256,8 @@ mod tests {
                     can_block: true,
                     destructible: true,
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ),
         };
         let mut love = love_on(serial, "LOVETESTERRL");
@@ -1272,6 +1289,8 @@ mod tests {
                     can_block: true,
                     destructible: true,
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ),
         };
         let mut love = love_on(serial, "LOVETESTRPTL");
@@ -1297,6 +1316,8 @@ mod tests {
                     can_block: true,
                     destructible: true,
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ),
         };
         let love = love_on(serial, "LOVETESTTMOL");
@@ -1336,7 +1357,13 @@ mod tests {
     }
 
     fn reply_love(name: &str, eom: EomReason) -> LoveDriver {
-        let base = PortDriverBase::new(&format!("{name}SER"), 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            &format!("{name}SER"),
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         love_on(ReplySerial { base, eom }, name)
     }
 
@@ -1399,7 +1426,13 @@ mod tests {
     /// the port (drvLove.c:1223-1251, :879).
     #[test]
     fn a_read_prints_through_the_caller_device_and_the_port_user() {
-        let base = PortDriverBase::new("LOVETESTDEVSER", 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            "LOVETESTDEVSER",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let serial = ReplySerial {
             base,
             eom: EomReason::EOS,
@@ -1468,7 +1501,13 @@ mod tests {
     /// (drvLove.c:760).
     #[test]
     fn a_failed_reply_is_printed_raw() {
-        let base = PortDriverBase::new("LOVETESTRAWSER", 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            "LOVETESTRAWSER",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let (user, port_path, dev_path) = traced_love(BadReplySerial { base }, "LOVETESTRAW");
         assert!(user.read_int32(0).is_err());
         let _ = read_trace(&port_path);
@@ -1590,7 +1629,13 @@ mod tests {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (writing, love_writes) = std::sync::mpsc::sync_channel(1);
         let serial = LoggingSerial {
-            base: PortDriverBase::new("LOVETESTLCKSER", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "LOVETESTLCKSER",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             log: log.clone(),
             writing,
         };
@@ -1667,6 +1712,8 @@ mod tests {
                     can_block: true,
                     destructible: true,
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ),
             wrote: wrote.clone(),
         };
@@ -1753,6 +1800,8 @@ mod tests {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         base.set_auto_connect(false);
         let love = love_on(TimeoutSerial { base }, "LOVETESTBNDL");

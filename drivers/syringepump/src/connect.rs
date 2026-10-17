@@ -84,6 +84,7 @@ pub fn connect_octet(
 pub(crate) mod tests {
     use super::*;
     use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
     use std::sync::{Arc, Mutex};
@@ -120,7 +121,13 @@ pub(crate) mod tests {
     pub(crate) fn eos_refusing_port(name: &str) -> Arc<Mutex<Vec<u8>>> {
         let written = Arc::new(Mutex::new(Vec::new()));
         let driver = NoEos(
-            PortDriverBase::new(name, 1, PortFlags::default()),
+            PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written.clone(),
         );
         let claim = epics_rs::asyn::registry::claim_port(name).unwrap();

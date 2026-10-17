@@ -635,12 +635,19 @@ mod tests {
     /// failed one is an empty buffer and so no axes.
     #[test]
     fn an_unanswered_rc_keeps_the_controller_with_no_axes() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let port = IdentOnly {
-            base: PortDriverBase::new("mm3000IdentOnly", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "mm3000IdentOnly",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             replies: &[],
             reply: Vec::new(),
             sent: Arc::default(),
@@ -666,13 +673,20 @@ mod tests {
         name: &str,
         replies: &'static [(&'static str, &'static str)],
     ) -> (Mm3000Controller, Arc<Mutex<Vec<String>>>) {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let port = IdentOnly {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             replies,
             reply: Vec::new(),
             sent: sent.clone(),

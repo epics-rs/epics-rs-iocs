@@ -11,6 +11,7 @@ use std::time::Duration;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -72,6 +73,8 @@ impl PilatusDriver {
             max_size_y,
             max_memory,
             ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
         )?;
         let p = PilatusParams::create(&mut ad.port_base)?;
 

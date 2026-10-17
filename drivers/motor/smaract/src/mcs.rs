@@ -794,6 +794,7 @@ mod tests {
         }
     }
 
+    use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -838,7 +839,13 @@ mod tests {
     fn publish(name: &str, pending: &[u8]) -> Arc<Mutex<Vec<&'static str>>> {
         let log = Arc::new(Mutex::new(Vec::new()));
         let driver = Link {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             pending: pending.to_vec(),
             log: log.clone(),
         };

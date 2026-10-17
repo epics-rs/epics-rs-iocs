@@ -91,6 +91,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::claim_port;
@@ -272,6 +273,8 @@ impl RontecDriver {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let reasons = McaReason::create_params(&mut base)?;
 
@@ -784,6 +787,8 @@ mod tests {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let serial_base = PortDriverBase::new(
             "TESTRONTECSERIAL",
@@ -793,6 +798,8 @@ mod tests {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let (serial_runtime, _serial_thread) = create_port_runtime(
             &PortRegistry::new().claim("TESTRONTECSERIAL").unwrap(),
@@ -942,7 +949,13 @@ mod tests {
             let rontec_name = format!("RIGRON_{tag}");
             let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let serial = FakeSerial {
-                base: PortDriverBase::new(&serial_name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    &serial_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 reply,
                 pending: Vec::new(),
                 writes: writes.clone(),
@@ -1342,7 +1355,13 @@ mod tests {
     /// `RontecConfig` still yields its EOS (`drvMcaRontec.c:197`).
     #[test]
     fn config_on_a_down_serial_line_saves_its_input_eos() {
-        let mut base = PortDriverBase::new("DOWNSER", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "DOWNSER",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.set_auto_connect(false);
         base.init_connected(false);
         let (serial, _) = create_port_runtime(
@@ -1375,7 +1394,13 @@ mod tests {
         let (serial, _) = create_port_runtime(
             &PortRegistry::new().claim("DUPSER").unwrap(),
             FakeSerial {
-                base: PortDriverBase::new("DUPSER", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "DUPSER",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 reply: rontec_reply,
                 pending: Vec::new(),
                 writes: Default::default(),

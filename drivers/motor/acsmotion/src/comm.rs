@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::claim_port;
@@ -454,6 +455,8 @@ pub fn register_comm_port(
             can_block: true,
             destructible: true,
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
     );
     let claim = claim_port(name).map_err(|e| format!("{name}: {e}"))?;
     let (runtime, _actor) = create_port_runtime(&claim, CommPort(base), RuntimeConfig::default())

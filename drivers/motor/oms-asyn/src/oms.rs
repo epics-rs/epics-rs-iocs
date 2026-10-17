@@ -1240,6 +1240,8 @@ mod tests {
             name,
             1,
             epics_rs::asyn::port::PortFlags::default(),
+            epics_rs::asyn::port::InterfaceMask::UNMIGRATED_ALL,
+            epics_rs::asyn::port::InterfaceMask::UNMIGRATED_ALL,
         );
         let (rt, _jh) = epics_rs::asyn::runtime::create_port_runtime(
             &epics_rs::asyn::registry::claim_port(name).unwrap(),
@@ -1309,13 +1311,20 @@ mod tests {
 
     #[test]
     fn the_encoder_sync_before_a_move_divides_by_the_encoder_ratio() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let written = Arc::new(Mutex::new(Vec::new()));
         let port = EncoderAxis {
-            base: PortDriverBase::new("omsEncoderRatio", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "omsEncoderRatio",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: written.clone(),
             reply: Vec::new(),
         };
@@ -1345,12 +1354,19 @@ mod tests {
 
     #[test]
     fn the_axis_count_skips_empty_fields_as_strtok_does() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let port = EncoderAxis {
-            base: PortDriverBase::new("omsAxisCount", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "omsAxisCount",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: Arc::new(Mutex::new(Vec::new())),
             reply: Vec::new(),
         };
@@ -1389,13 +1405,20 @@ mod tests {
 
     #[test]
     fn init_sends_every_command_past_a_failed_send() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let written = Arc::new(Mutex::new(Vec::new()));
         let port = DeadLine {
-            base: PortDriverBase::new("omsDeadInit", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "omsDeadInit",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: written.clone(),
         };
         let (rt, _actor) = create_port_runtime(
@@ -1487,12 +1510,19 @@ mod tests {
 
     #[test]
     fn the_axis_count_reads_a_timed_out_reply_as_c_does() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let port = TimesOutMidReply {
-            base: PortDriverBase::new("omsPartialAxisCount", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "omsPartialAxisCount",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             partial: b"0,0",
         };
         let (rt, _actor) = create_port_runtime(
@@ -1509,12 +1539,19 @@ mod tests {
 
     #[test]
     fn a_failed_axis_query_counts_no_axes() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let port = DeadLine {
-            base: PortDriverBase::new("omsDeadAxisCount", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "omsDeadAxisCount",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: Arc::new(Mutex::new(Vec::new())),
         };
         let (rt, _actor) = create_port_runtime(
