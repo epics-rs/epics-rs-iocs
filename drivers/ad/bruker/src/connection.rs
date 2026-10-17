@@ -27,28 +27,38 @@ use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::types::MAX_MESSAGE_SIZE;
 
-/// What one exchange with BIS produced. C published both sides of it whether or
-/// not the write succeeded, so both are here whatever `result` says.
-pub struct Exchange {
-    pub reply: String,
-    pub result: Result<(), AsynError>,
+/// How C's `pasynOctetSyncIO->writeRead` in `writeBIS` left `fromBIS`.
+pub enum Exchange {
+    /// It failed before the read — not connected, flush or write — so
+    /// `fromBIS` keeps the previous reply.
+    NotSent(AsynError),
+    /// The read ran and `fromBIS` holds what it received: the reply, or the
+    /// bytes before a timeout or error (normally none).
+    Read {
+        reply: String,
+        status: Result<(), AsynError>,
+    },
 }
 
 fn failed(message: &str) -> Exchange {
-    Exchange {
-        reply: String::new(),
-        result: Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: message.into(),
-        }),
-    }
+    Exchange::NotSent(AsynError::Status {
+        status: AsynStatus::Error,
+        message: message.into(),
+    })
+}
+
+/// C posts `fromBIS` up to its first NUL, whitespace included
+/// (BISDetector.cpp:325).
+pub(crate) fn reply_text(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 struct Request {
@@ -103,12 +113,7 @@ impl BisServer {
 fn exchange(io: &SyncIOHandle, command: &str, timeout: Duration) -> Exchange {
     let handle = match io.port() {
         Ok(handle) => handle,
-        Err(e) => {
-            return Exchange {
-                reply: String::new(),
-                result: Err(e),
-            };
-        }
+        Err(e) => return Exchange::NotSent(e),
     };
     let user = AsynUser::new(0).with_addr(0).with_timeout(timeout);
     let op = RequestOp::OctetWriteRead {
@@ -118,17 +123,27 @@ fn exchange(io: &SyncIOHandle, command: &str, timeout: Duration) -> Exchange {
     };
 
     match handle.submit_blocking(op, user) {
-        Err(e) => Exchange {
-            reply: String::new(),
-            result: Err(e),
+        Ok(result) => Exchange::Read {
+            reply: reply_text(&result.data.unwrap_or_default()),
+            status: Ok(()),
         },
-        Ok(result) => {
-            let bytes = result.data.unwrap_or_default();
-            let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();
-            Exchange {
-                reply,
-                result: Ok(()),
-            }
-        }
+        Err(e) if e.octet_step() == Some(OctetStep::Read) => Exchange::Read {
+            reply: e
+                .partial_read()
+                .map(|p| reply_text(&p.data))
+                .unwrap_or_default(),
+            status: Err(e),
+        },
+        Err(e) => Exchange::NotSent(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_is_cut_at_its_first_nul_and_keeps_its_whitespace() {
+        assert_eq!(reply_text(b"[ACK] \r\n\0old"), "[ACK] \r\n");
     }
 }

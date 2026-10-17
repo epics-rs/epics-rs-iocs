@@ -5,7 +5,7 @@
 //! * `MarccdImageTask` is C's `getImageDataTask` — the overlapped
 //!   correction/readback path.
 //!
-//! Each thread holds the driver lock ([`Held`]) over exactly C's
+//! Each thread holds the driver lock (`Held`) over exactly C's
 //! spans, releasing it only where C calls `unlock()`: the start and image
 //! events, the exposure and acquire-period waits, `readTiff`'s waits and
 //! the image task's poll sleeps.

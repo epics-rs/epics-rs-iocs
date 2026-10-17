@@ -400,7 +400,12 @@ fn a_binning_write_does_not_depend_on_bis() {
 
     sync.write_int32(ad.bin_x, 2).expect("binning 2");
     assert_eq!(sync.read_int32(ad.bin_y).unwrap(), 2);
-    assert!(sync.write_int32(ad.bin_x, 3).is_err());
+    let e = sync.write_int32(ad.bin_x, 3).unwrap_err();
+    assert_eq!(
+        e.message(),
+        "",
+        "C sets no errorMessage for a refused binning"
+    );
 }
 
 /// BISDetector.cpp:668 hands base-class writes to ADDriver::writeInt32,
@@ -450,6 +455,68 @@ fn a_base_class_write_runs_both_base_class_write_int32s() {
     }
 }
 
+/// A detector whose BIS sockets refuse every connection.
+/// An IP port whose peer is gone.
+fn closed_port(name: &str) -> PortHandle {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    drop(listener);
+    let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
+    let (runtime, _) =
+        create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+            .expect("ip port runtime");
+    let handle = runtime.port_handle().clone();
+    std::mem::forget(runtime);
+    handle
+}
+
+fn dead_detector(name: &str) -> BrukerRuntime {
+    create_bruker_detector(
+        &claim_port(name).unwrap(),
+        user(closed_port(&format!("{name}_COMMAND"))),
+        user(closed_port(&format!("{name}_STATUS"))),
+        0,
+    )
+    .expect("the detector port")
+}
+
+/// BISDetector.cpp:639: setIntegerParam(function, value) is list 0 whatever
+/// the address.
+#[test]
+fn a_write_at_another_address_sets_list_zero() {
+    let detector = dead_detector("BISLIST0");
+    let h = detector.port_handle().clone();
+    let reason = detector.params.num_darks;
+    h.write_int32_blocking(reason, 1, 3).unwrap();
+    assert_eq!(h.read_int32_blocking(reason, 0).unwrap(), 3);
+}
+
+/// BISDetector.cpp:675-678 prints setIntegerParam's asynParamWrongType for
+/// an int written to BISSFRMTimeout.
+#[test]
+fn a_refused_write_prints_the_param_librarys_status() {
+    use epics_rs::asyn::trace::TraceFile;
+    let name = "BISSTATUS";
+    let detector = dead_detector(name);
+    let h = detector.port_handle().clone();
+    let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    h.trace().set_trace_file(
+        Some(name),
+        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+    );
+    let reason = detector.params.sfrm_timeout;
+    assert!(h.write_int32_blocking(reason, 0, 1).is_err());
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        text.contains(&format!(
+            "BISDetector:writeInt32: error, status=8 function={reason}, value=1"
+        )),
+        "{text}"
+    );
+}
+
 /// BISTask ignores its getDoubleParam status (BISDetector.cpp:498), so a scan
 /// with no ADAcquireTime ever written still goes out to BIS, as 0 s.
 #[test]
@@ -486,4 +553,82 @@ fn a_detector_whose_socket_ports_are_missing_still_boots() {
 
     sync.write_int32(ad.bin_x, 2).expect("binning 2");
     assert_eq!(sync.read_int32(ad.bin_y).unwrap(), 2);
+}
+
+/// BISDetector.cpp:316-327: writeBIS sets StringFromServer from `fromBIS`,
+/// which a writeRead that fails before its read leaves holding the last
+/// reply.
+#[test]
+fn an_exchange_that_never_reads_keeps_the_last_reply() {
+    let detector = dead_detector("BISSTALE");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let ad = detector.ad_params;
+    sync.write_octet(ad.string_from_server, b"old").unwrap();
+    sync.write_int32(ad.bin_x, 2).unwrap();
+    assert_eq!(
+        sync.read_octet(ad.string_from_server, 64).unwrap(),
+        b"old\0"
+    );
+    assert!(sync.read_octet(ad.string_to_server, 64).unwrap().len() > 1);
+}
+
+/// A read that times out leaves in `fromBIS` what it received: nothing.
+#[test]
+fn an_exchange_whose_read_times_out_publishes_what_it_read() {
+    let command = TcpListener::bind("127.0.0.1:0").expect("command listener");
+    let command_addr = format!("127.0.0.1:{}", command.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        let held: Vec<TcpStream> = command.incoming().filter_map(Result::ok).collect();
+        drop(held);
+    });
+    let detector = create_bruker_detector(
+        &claim_port("BISSILENT").unwrap(),
+        user(ip_port("BISSILENT_COMMAND", &command_addr, b"]", b"")),
+        user(closed_port("BISSILENT_STATUS")),
+        0,
+    )
+    .expect("the detector port");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let ad = detector.ad_params;
+    sync.write_octet(ad.string_from_server, b"old").unwrap();
+    sync.write_int32(ad.bin_x, 2).unwrap();
+    assert_eq!(sync.read_octet(ad.string_from_server, 64).unwrap(), b"\0");
+}
+
+/// BISDetector.cpp:404-434: statusTask posts every successful read as read,
+/// whitespace and empty reads included.
+#[test]
+fn every_status_read_is_posted_as_read() {
+    let status = TcpListener::bind("127.0.0.1:0").expect("status listener");
+    let status_addr = format!("127.0.0.1:{}", status.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        let (mut stream, _) = status.accept().expect("status connection");
+        stream
+            .write_all(b"[DETECTORSTATUS /FRAMESIZE=1024 /CCDTEMP=-40.5] \r\n\n")
+            .expect("status messages");
+        std::thread::sleep(Duration::from_secs(30));
+    });
+    let detector = create_bruker_detector(
+        &claim_port("BISPOSTED").unwrap(),
+        user(closed_port("BISPOSTED_COMMAND")),
+        user(ip_port("BISPOSTED_STATUS", &status_addr, b"\n", b"")),
+        0,
+    )
+    .expect("the detector port");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let (reason, size_x) = (detector.params.status, detector.ad_params.size_x);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let read = || {
+        (
+            sync.read_int32(size_x).unwrap(),
+            sync.read_octet(reason, 128).unwrap(),
+        )
+    };
+    let mut got = read();
+    while got != (1024, b"\0".to_vec()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+        got = read();
+    }
+    assert_eq!(got.0, 1024);
+    assert_eq!(String::from_utf8_lossy(&got.1), "\0");
 }

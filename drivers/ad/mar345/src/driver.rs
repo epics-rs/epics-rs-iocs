@@ -16,9 +16,9 @@ use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::driver::write_tail::{OwnList, WriteTail};
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode, ShutterMode};
 use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
@@ -29,6 +29,12 @@ use parking_lot::Mutex;
 use crate::params::Mar345Params;
 use crate::task::{Worker, start_task};
 use crate::types::{EraseMode, Event, Mode, Resolution, ScanSize, Status, TriggerMode};
+
+const INT32_TAIL: WriteTail = WriteTail {
+    error: "mar345:writeInt32: error, ",
+    done: "mar345:writeInt32: ",
+    list: OwnList::Zero,
+};
 
 /// The maximum image plate dimension (345 mm at 0.10 mm), C's `dims[0/1]` and
 /// the `ADMaxSizeX`/`ADMaxSizeY` the constructor writes.
@@ -129,64 +135,42 @@ impl PortDriver for Mar345Driver {
         let params = self.ad.params;
         let p = self.p;
 
-        // C: `setIntegerParam(function, value)` for every function.
-        self.ad
-            .port_base
-            .set_int32_param(function, user.addr, value)?;
-
-        let idle = self.mode.load(Ordering::SeqCst) == Mode::Idle as i32;
-        let mut status = Ok(());
-        if function == params.acquire {
-            if value != 0 && idle {
-                // Wake the mar345 task to acquire.
-                self.mode.store(Mode::Acquire as i32, Ordering::SeqCst);
-                self.start.signal();
+        INT32_TAIL.write_int32(self, user, value, |det, user, mut status| {
+            let idle = det.mode.load(Ordering::SeqCst) == Mode::Idle as i32;
+            if function == params.acquire {
+                if value != 0 && idle {
+                    // Wake the mar345 task to acquire.
+                    det.mode.store(Mode::Acquire as i32, Ordering::SeqCst);
+                    det.start.signal();
+                }
+                if value == 0 && !idle {
+                    // Stop acquiring (ends exposure, does not abort).
+                    det.stop.signal();
+                }
+            } else if function == p.erase {
+                if value != 0 && idle {
+                    det.mode.store(Mode::Erase as i32, Ordering::SeqCst);
+                    det.start.signal();
+                }
+            } else if function == p.change_mode {
+                if value != 0 && idle {
+                    det.mode.store(Mode::Change as i32, Ordering::SeqCst);
+                    det.start.signal();
+                }
+            } else if function == p.abort {
+                if value != 0 && !idle {
+                    // Abort operation.
+                    let _ =
+                        det.ad
+                            .port_base
+                            .set_int32_param(params.status, 0, Status::Aborting as i32);
+                    det.abort.signal();
+                }
+            } else if function < p.first() {
+                status = ADDriver::ad_write_int32(det, user, value);
             }
-            if value == 0 && !idle {
-                // Stop acquiring (ends exposure, does not abort).
-                self.stop.signal();
-            }
-        } else if function == p.erase {
-            if value != 0 && idle {
-                self.mode.store(Mode::Erase as i32, Ordering::SeqCst);
-                self.start.signal();
-            }
-        } else if function == p.change_mode {
-            if value != 0 && idle {
-                self.mode.store(Mode::Change as i32, Ordering::SeqCst);
-                self.start.signal();
-            }
-        } else if function == p.abort {
-            if value != 0 && !idle {
-                // Abort operation.
-                self.ad
-                    .port_base
-                    .set_int32_param(params.status, 0, Status::Aborting as i32)?;
-                self.abort.signal();
-            }
-        } else if function < p.first() {
-            status = ADDriver::ad_write_int32(self, user, value);
-        }
-
-        let _ = self.ad.port_base.call_param_callbacks(0);
-        match &status {
-            Err(e) => user.print(
-                TraceMask::ERROR,
-                file!(),
-                line!(),
-                format_args!(
-                    "mar345:writeInt32: error, status={} function={function}, value={value}",
-                    e.status() as i32
-                ),
-            ),
-            Ok(()) => user.print(
-                TraceMask::IO_DRIVER,
-                file!(),
-                line!(),
-                format_args!("mar345:writeInt32: function={function}, value={value}"),
-            ),
-        }
-        status
+            status
+        })
     }
 }
 
@@ -413,6 +397,50 @@ pub(crate) mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         std::mem::forget(det);
+    }
+
+    /// mar345.cpp:602: setIntegerParam(function, value) is list 0 whatever
+    /// the address.
+    #[test]
+    fn a_write_at_another_address_sets_list_zero() {
+        let mut d = driver("MAR345_LIST0", 0);
+        let reason = d.p.num_erase;
+        let mut user = AsynUser::new(reason).with_addr(1);
+        d.write_int32(&mut user, 3).unwrap();
+        assert_eq!(d.ad.port_base.get_int32_param(reason, 0).unwrap(), 3);
+    }
+
+    /// mar345.cpp:647-650 prints asynParamWrongType for an int written to
+    /// ADAcquireTime.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MAR345_STATUS";
+        let mut d = driver(port, 0);
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let reason = d.ad.params.acquire_time;
+        let mut user = AsynUser::new(reason);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        assert!(d.write_int32(&mut user, 1).is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(&format!(
+                "mar345:writeInt32: error, status=8 function={reason}, value=1"
+            )),
+            "{text}"
+        );
     }
 
     /// A non-detector mode is ADDriver::setShutter inside the write

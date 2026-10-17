@@ -3,7 +3,7 @@
 //!
 //! `mar345.cpp` runs all of this on one `mar345Task` thread under the driver
 //! lock, woken by the start event and told what to do by the shared `mode`.
-//! The worker holds the lock ([`Held`]) over exactly C's spans, releasing it
+//! The worker holds the lock (`Held`) over exactly C's spans, releasing it
 //! only where C calls `unlock()`: the start event, the exposure poll, the
 //! acquire-period wait and each `readServer` read.
 

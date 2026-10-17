@@ -20,6 +20,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::driver::write_tail::{OwnList, WriteTail};
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverPool, PersistentArray};
@@ -129,6 +130,18 @@ impl PilatusDriver {
     }
 }
 
+const INT32_TAIL: WriteTail = WriteTail {
+    error: "pilatusDetector:writeInt32: error, ",
+    done: "pilatusDetector:writeInt32: ",
+    list: OwnList::Zero,
+};
+
+const FLOAT64_TAIL: WriteTail = WriteTail {
+    error: "pilatusDetector:writeFloat64 error, ",
+    done: "pilatusDetector:writeFloat64: ",
+    list: OwnList::Zero,
+};
+
 impl PortDriver for PilatusDriver {
     fn base(&self) -> &PortDriverBase {
         &self.ad.port_base
@@ -176,63 +189,37 @@ impl PortDriver for PilatusDriver {
         }
         self.ad.port_base.call_param_callbacks(0)?;
 
-        let mut status = Ok(());
-        if function == params.acquire {
-            self.ad.set_acquire(value)?;
-        } else {
-            self.ad
-                .port_base
-                .set_int32_param(function, user.addr, value)?;
-        }
-
-        if function == params.acquire {
-            if value != 0 && can_start {
-                // Wake up the Pilatus task.
-                self.start.signal();
+        INT32_TAIL.write_int32(self, user, value, |det, user, mut status| {
+            if function == params.acquire {
+                if value != 0 && can_start {
+                    // Wake up the Pilatus task.
+                    det.start.signal();
+                }
+                if value == 0 && acquiring {
+                    det.stop.signal();
+                    det.send(Cmd::AbortAcquire);
+                }
+            } else if function == params.trigger_mode
+                || function == params.num_images
+                || function == params.num_exposures
+                || function == p.gap_fill
+            {
+                det.send(Cmd::SetAcquireParams);
+            } else if function == p.threshold_apply {
+                det.send(Cmd::SetThreshold);
+            } else if function == p.reset_power {
+                det.send(Cmd::ResetModulePower);
+            } else if function == p.num_oscill {
+                det.send(Cmd::Raw(cmd_mx_i32("N_oscillations", value)));
+            } else if function == params.read_status {
+                if !acquiring {
+                    det.send(Cmd::ReadStatus);
+                }
+            } else if function < p.first() {
+                status = ADDriver::ad_write_int32(det, user, value);
             }
-            if value == 0 && acquiring {
-                self.stop.signal();
-                self.send(Cmd::AbortAcquire);
-            }
-        } else if function == params.trigger_mode
-            || function == params.num_images
-            || function == params.num_exposures
-            || function == p.gap_fill
-        {
-            self.send(Cmd::SetAcquireParams);
-        } else if function == p.threshold_apply {
-            self.send(Cmd::SetThreshold);
-        } else if function == p.reset_power {
-            self.send(Cmd::ResetModulePower);
-        } else if function == p.num_oscill {
-            self.send(Cmd::Raw(cmd_mx_i32("N_oscillations", value)));
-        } else if function == params.read_status {
-            if !acquiring {
-                self.send(Cmd::ReadStatus);
-            }
-        } else if function < p.first() {
-            status = ADDriver::ad_write_int32(self, user, value);
-        }
-
-        let _ = self.ad.port_base.call_param_callbacks(0);
-        match &status {
-            Err(e) => user.print(
-                TraceMask::ERROR,
-                file!(),
-                line!(),
-                format_args!(
-                    "pilatusDetector:writeInt32: error, status={} function={function}, value={value}",
-                    e.status() as i32
-                ),
-            ),
-            Ok(()) => user.print(
-                TraceMask::IO_DRIVER,
-                file!(),
-                line!(),
-                format_args!("pilatusDetector:writeInt32: function={function}, value={value}"),
-            ),
-        }
-        status
+            status
+        })
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -246,130 +233,102 @@ impl PortDriver for PilatusDriver {
             .port_base
             .get_float64_param(function, 0)
             .unwrap_or(0.0);
-        let mut status = self
-            .ad
-            .port_base
-            .set_float64_param(function, user.addr, value);
-
-        if function == params.gain || function == p.energy || function == p.threshold {
-            let auto_apply = self
-                .ad
-                .port_base
-                .get_int32_param(p.threshold_auto_apply, 0)
-                .unwrap_or(0);
-            {
-                let mut shared = self.shared.lock();
-                if function == p.threshold {
-                    shared.demanded_threshold = value;
-                }
-                if function == p.energy {
-                    shared.demanded_energy = value;
-                }
-            }
-            if auto_apply != 0 {
-                let demanded = {
-                    let shared = self.shared.lock();
-                    if function == p.threshold {
-                        Some(shared.demanded_threshold)
-                    } else if function == p.energy {
-                        Some(shared.demanded_energy)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(v) = demanded {
-                    status = self.ad.port_base.set_float64_param(function, user.addr, v);
-                }
-                self.send(Cmd::SetThreshold);
-            } else {
-                // Put the old value back if we are deferring the threshold.
-                if function == p.threshold || function == p.energy {
-                    status = self
-                        .ad
-                        .port_base
-                        .set_float64_param(function, user.addr, old_value);
-                }
-            }
-        } else if function == params.acquire_time
-            || function == params.acquire_period
-            || function == p.delay_time
-        {
-            self.send(Cmd::SetAcquireParams);
-        } else if function == p.wavelength {
-            self.send(Cmd::Raw(cmd_mx_f64("Wavelength", value)));
-        } else if function == p.energy_low || function == p.energy_high {
-            // C ignores both statuses and gets 0 (pilatusDetector.cpp:1511-1512).
-            let low = self.f64_or_zero(p.energy_low);
-            let high = self.f64_or_zero(p.energy_high);
-            self.send(Cmd::Raw(cmd_mx_pair("Energy_range", low, high)));
-        } else if function == p.det_dist {
-            self.send(Cmd::Raw(cmd_mx_f64("Detector_distance", value / 1000.0)));
-        } else if function == p.det_voffset {
-            self.send(Cmd::Raw(cmd_mx_f64("Detector_Voffset", value / 1000.0)));
-        } else if function == p.beam_x || function == p.beam_y {
-            // As above (pilatusDetector.cpp:1523-1524).
-            let x = self.f64_or_zero(p.beam_x);
-            let y = self.f64_or_zero(p.beam_y);
-            self.send(Cmd::Raw(cmd_mx_pair("Beam_xy", x, y)));
-        } else if function == p.flux {
-            self.send(Cmd::Raw(cmd_mx_f64("Flux", value)));
-        } else if function == p.filter_transm {
-            self.send(Cmd::Raw(cmd_mx_f64("Filter_transmission", value)));
-        } else if function == p.start_angle {
-            self.send(Cmd::Raw(cmd_mx_f64("Start_angle", value)));
-        } else if function == p.angle_incr {
-            self.send(Cmd::Raw(cmd_mx_f64("Angle_increment", value)));
-        } else if function == p.det_2theta {
-            self.send(Cmd::Raw(cmd_mx_f64("Detector_2theta", value)));
-        } else if function == p.polarization {
-            self.send(Cmd::Raw(cmd_mx_f64("Polarization", value)));
-        } else if function == p.alpha {
-            self.send(Cmd::Raw(cmd_mx_f64("Alpha", value)));
-        } else if function == p.kappa {
-            self.send(Cmd::Raw(cmd_mx_f64("Kappa", value)));
-        } else if function == p.phi {
-            self.send(Cmd::Raw(cmd_mx_f64("Phi", value)));
-        } else if function == p.phi_incr {
-            self.send(Cmd::Raw(cmd_mx_f64("Phi_increment", value)));
-        } else if function == p.chi {
-            self.send(Cmd::Raw(cmd_mx_f64("Chi", value)));
-        } else if function == p.chi_incr {
-            self.send(Cmd::Raw(cmd_mx_f64("Chi_increment", value)));
-        } else if function == p.omega {
-            self.send(Cmd::Raw(cmd_mx_f64("Omega", value)));
-        } else if function == p.omega_incr {
-            self.send(Cmd::Raw(cmd_mx_f64("Omega_increment", value)));
-        } else if function < p.delay_time {
-            // ADDriver::writeFloat64 is asynPortDriver's (pilatusDetector.cpp:1571).
-            status = self.ad.port_base.write_float64_param(user, value);
-        }
-
-        match &status {
-            Err(e) => {
-                // C puts the old value back (pilatusDetector.cpp:1574-1580).
-                let _ = self
+        FLOAT64_TAIL.write_float64(self, user, value, |det, user, mut status| {
+            if function == params.gain || function == p.energy || function == p.threshold {
+                let auto_apply = det
                     .ad
                     .port_base
-                    .set_float64_param(function, user.addr, old_value);
-                user.print(
-                    TraceMask::ERROR,
-                    file!(),
-                    line!(),
-                    format_args!(
-                        "pilatusDetector:writeFloat64 error, status={} function={function}, value={value:.6}",
-                        e.status() as i32
-                    ),
-                );
+                    .get_int32_param(p.threshold_auto_apply, 0)
+                    .unwrap_or(0);
+                {
+                    let mut shared = det.shared.lock();
+                    if function == p.threshold {
+                        shared.demanded_threshold = value;
+                    }
+                    if function == p.energy {
+                        shared.demanded_energy = value;
+                    }
+                }
+                if auto_apply != 0 {
+                    let demanded = {
+                        let shared = det.shared.lock();
+                        if function == p.threshold {
+                            Some(shared.demanded_threshold)
+                        } else if function == p.energy {
+                            Some(shared.demanded_energy)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(v) = demanded {
+                        status = det.ad.port_base.set_float64_param(function, 0, v);
+                    }
+                    det.send(Cmd::SetThreshold);
+                } else {
+                    // Put the old value back if we are deferring the threshold.
+                    if function == p.threshold || function == p.energy {
+                        status = det.ad.port_base.set_float64_param(function, 0, old_value);
+                    }
+                }
+            } else if function == params.acquire_time
+                || function == params.acquire_period
+                || function == p.delay_time
+            {
+                det.send(Cmd::SetAcquireParams);
+            } else if function == p.wavelength {
+                det.send(Cmd::Raw(cmd_mx_f64("Wavelength", value)));
+            } else if function == p.energy_low || function == p.energy_high {
+                // C ignores both statuses and gets 0 (pilatusDetector.cpp:1511-1512).
+                let low = det.f64_or_zero(p.energy_low);
+                let high = det.f64_or_zero(p.energy_high);
+                det.send(Cmd::Raw(cmd_mx_pair("Energy_range", low, high)));
+            } else if function == p.det_dist {
+                det.send(Cmd::Raw(cmd_mx_f64("Detector_distance", value / 1000.0)));
+            } else if function == p.det_voffset {
+                det.send(Cmd::Raw(cmd_mx_f64("Detector_Voffset", value / 1000.0)));
+            } else if function == p.beam_x || function == p.beam_y {
+                // As above (pilatusDetector.cpp:1523-1524).
+                let x = det.f64_or_zero(p.beam_x);
+                let y = det.f64_or_zero(p.beam_y);
+                det.send(Cmd::Raw(cmd_mx_pair("Beam_xy", x, y)));
+            } else if function == p.flux {
+                det.send(Cmd::Raw(cmd_mx_f64("Flux", value)));
+            } else if function == p.filter_transm {
+                det.send(Cmd::Raw(cmd_mx_f64("Filter_transmission", value)));
+            } else if function == p.start_angle {
+                det.send(Cmd::Raw(cmd_mx_f64("Start_angle", value)));
+            } else if function == p.angle_incr {
+                det.send(Cmd::Raw(cmd_mx_f64("Angle_increment", value)));
+            } else if function == p.det_2theta {
+                det.send(Cmd::Raw(cmd_mx_f64("Detector_2theta", value)));
+            } else if function == p.polarization {
+                det.send(Cmd::Raw(cmd_mx_f64("Polarization", value)));
+            } else if function == p.alpha {
+                det.send(Cmd::Raw(cmd_mx_f64("Alpha", value)));
+            } else if function == p.kappa {
+                det.send(Cmd::Raw(cmd_mx_f64("Kappa", value)));
+            } else if function == p.phi {
+                det.send(Cmd::Raw(cmd_mx_f64("Phi", value)));
+            } else if function == p.phi_incr {
+                det.send(Cmd::Raw(cmd_mx_f64("Phi_increment", value)));
+            } else if function == p.chi {
+                det.send(Cmd::Raw(cmd_mx_f64("Chi", value)));
+            } else if function == p.chi_incr {
+                det.send(Cmd::Raw(cmd_mx_f64("Chi_increment", value)));
+            } else if function == p.omega {
+                det.send(Cmd::Raw(cmd_mx_f64("Omega", value)));
+            } else if function == p.omega_incr {
+                det.send(Cmd::Raw(cmd_mx_f64("Omega_increment", value)));
+            } else if function < p.delay_time {
+                // ADDriver::writeFloat64 is asynPortDriver's (pilatusDetector.cpp:1571).
+                status = det.ad.port_base.write_float64_param(user, value);
             }
-            Ok(()) => user.print(
-                TraceMask::IO_DRIVER,
-                file!(),
-                line!(),
-                format_args!("pilatusDetector:writeFloat64: function={function}, value={value:.6}"),
-            ),
-        }
-        let _ = self.ad.port_base.call_param_callbacks(0);
-        status
+            if status.is_err() {
+                // C puts the old value back (pilatusDetector.cpp:1574-1580).
+                let _ = det.ad.port_base.set_float64_param(function, 0, old_value);
+            }
+            status
+        })
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -381,11 +340,12 @@ impl PortDriver for PilatusDriver {
         let payload = data.split(|&b| b == 0).next().unwrap_or(&[]);
         let value = String::from_utf8_lossy(payload).into_owned();
 
-        self.ad
+        // C's setStringParam and ADDriver::writeOctet statuses are both
+        // overwritten by callParamCallbacks() (pilatusDetector.cpp:1630).
+        let _ = self
+            .ad
             .port_base
-            .set_string_param(function, user.addr, value.clone())?;
-
-        let mut status = Ok(());
+            .set_string_param(function, 0, value.clone());
         if function == p.bad_pixel_file {
             self.send(Cmd::ReadBadPixelFile(value.clone()));
         } else if function == p.flat_field_file {
@@ -396,17 +356,17 @@ impl PortDriver for PilatusDriver {
             self.send(Cmd::Raw(cmd_oscill_axis(&value)));
         } else if function == p.cbf_template_file {
             self.send(Cmd::Raw(cmd_cbf_template_file(&value)));
-        } else {
-            status = self.ad.write_octet(user, data).map(|_| ());
+        } else if function < p.first() {
+            let _ = self.ad.write_octet(user, data);
         }
 
-        let _ = self.ad.port_base.call_param_callbacks(0);
+        let status = self.ad.port_base.call_param_callbacks(0);
         if let Err(e) = status {
             return Err(AsynError::Status {
                 status: e.status(),
                 message: format!(
                     "pilatusDetector:writeOctet: status={}, function={function}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             });
         }
@@ -591,6 +551,77 @@ mod tests {
             1,
             "ADShutterControl did not reach ADDriver::setShutter"
         );
+    }
+
+    /// pilatusDetector.cpp:1399, :1471, :1606: the param sets are list 0
+    /// whatever the address.
+    #[test]
+    fn a_write_at_another_address_sets_list_zero() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let links = DriverLinks {
+            cmd_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        let mut det = PilatusDriver::new("PILATUS_LIST0", 8, 8, 0, links).unwrap();
+        let p = det.p;
+        det.write_int32(&mut AsynUser::new(p.pixel_cutoff).with_addr(1), 3)
+            .unwrap();
+        det.write_float64(&mut AsynUser::new(p.delay_time).with_addr(1), 2.5)
+            .unwrap();
+        det.write_octet(&mut AsynUser::new(p.header_string).with_addr(1), b"h")
+            .unwrap();
+        let base = &det.ad.port_base;
+        assert_eq!(base.get_int32_param(p.pixel_cutoff, 0).unwrap(), 3);
+        assert_eq!(base.get_float64_param(p.delay_time, 0).unwrap(), 2.5);
+        assert_eq!(base.get_string_param(p.header_string, 0).unwrap(), b"h");
+    }
+
+    /// pilatusDetector.cpp:1441, :1578 carry the param library's
+    /// asynParamWrongType for a write of the other type; writeOctet's is
+    /// overwritten by callParamCallbacks() (:1630), so it succeeds.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "PILATUS_STATUS";
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let links = DriverLinks {
+            cmd_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        let mut det = PilatusDriver::new(port, 8, 8, 0, links).unwrap();
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let user = |reason| {
+            let mut user = AsynUser::new(reason);
+            user.trace = Some(UserTrace {
+                manager: manager.clone(),
+                port: port.into(),
+            });
+            user
+        };
+        let (float, int) = (det.p.delay_time, det.p.pixel_cutoff);
+        assert!(det.write_int32(&mut user(float), 1).is_err());
+        assert!(det.write_float64(&mut user(int), 1.0).is_err());
+        assert_eq!(det.write_octet(&mut user(int), b"x").unwrap(), 1);
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        for line in [
+            format!("pilatusDetector:writeInt32: error, status=8 function={float}, value=1"),
+            format!("pilatusDetector:writeFloat64 error, status=8 function={int}, value=1.000000"),
+        ] {
+            assert!(text.contains(&line), "{line}: {text}");
+        }
     }
 
     #[test]
