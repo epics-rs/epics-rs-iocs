@@ -125,3 +125,39 @@ fn mpc_ai_takes_a_unit_slope_and_ao_rebases_eoff_only() {
         ]
     );
 }
+
+/// `TPG261Convert` is `MPCConvert`'s body, with the same ao cast.
+#[test]
+fn tpg261_ai_takes_a_unit_slope_and_ao_rebases_eoff_only() {
+    let factory = ip_devices::tpg261::device_support_factory;
+    let ai = linconv(
+        "LC:TPGAI",
+        "ai",
+        ip_devices::tpg261::DTYP,
+        "@asyn(P 1)GET_PRESSURE",
+        factory(),
+    );
+    assert_eq!(
+        ai,
+        [
+            [1.0, 5.0, 0.0, -7.0, 1.1],
+            [1.0, 5.0, 0.0, -7.0, 1.1],
+            [1.0, 1.0, 0.0, -7.0, 1.1],
+        ]
+    );
+    let ao = linconv(
+        "LC:TPGAO",
+        "ao",
+        ip_devices::tpg261::DTYP,
+        "@asyn(P 1)SET_SP1",
+        factory(),
+    );
+    assert_eq!(
+        ao,
+        [
+            [2.0, 5.0, 4.0, -7.0, 1.1],
+            [2.0, 5.0, 4.0, -7.0, 1.1],
+            [2.0, 1.0, 4.0, -7.0, 1.1],
+        ]
+    );
+}
