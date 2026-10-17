@@ -540,6 +540,8 @@ pub struct Mm4000Axis {
     high_limit: f64,
     /// What the C driver that created the axis posts on a failed poll.
     poll_failure: PollFailure,
+    /// The last poll failed on drvMM4000.cc's RETRY, which posts nothing.
+    retry_failed: bool,
     /// drvMM4000.cc `encoder_present`: `TC` reports a closed loop.
     encoder_present: bool,
     /// The status drvMM4000.cc's `set_status` starts from and RETRY keeps.
@@ -559,9 +561,8 @@ pub struct Mm4000Axis {
 }
 
 /// C model-1 `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-/// `RA_PROBLEM` (drvMM4000.cc; its first failure's silent RETRY is not
-/// modelled); model-2 `MM4000Poller` only `motorAxisCommError`
-/// (drvMM4000Asyn.c).
+/// `RA_PROBLEM` (drvMM4000.cc; its RETRY raises nothing); model-2
+/// `MM4000Poller` only `motorAxisCommError` (drvMM4000Asyn.c).
 pub const MODEL1_POLL_FAILURE: PollFailure = PollFailure::PROBLEM_AND_COMMS_ERROR;
 pub const MODEL2_POLL_FAILURE: PollFailure = PollFailure::COMMS_ERROR;
 
@@ -610,6 +611,7 @@ impl Mm4000Axis {
             low_limit,
             high_limit,
             poll_failure,
+            retry_failed: false,
             encoder_present,
             model1,
             jog_high: high_limit,
@@ -712,7 +714,10 @@ impl Mm4000Axis {
 
 impl AsynMotor for Mm4000Axis {
     fn poll_failure(&self) -> PollFailure {
-        self.poll_failure
+        match self.retry_failed {
+            true => PollFailure::NONE,
+            false => self.poll_failure,
+        }
     }
 
     fn move_absolute(
@@ -940,11 +945,18 @@ impl AsynMotor for Mm4000Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        self.retry_failed = false;
         let step = self.step_size()?;
         // drvMM4000.cc has no such hold; only the asyn poll reads it.
         let motion_sent = std::mem::take(&mut self.motion_sent);
         let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(poll) = ctrl.model1_poll() {
+            // drvMM4000.cc:341-353: RETRY goes to `exit` with 0, so nothing
+            // is posted: the poll fails.
+            if poll.comm == CommStatus::Retry {
+                self.retry_failed = true;
+                return Err(mm_err(format!("MM4000 axis {}: no MS; reply", self.axis)));
+            }
             let s = ctrl.set_status(&poll, self.axis - 1, self.encoder_present, step, &self.last);
             // drvMM4000.cc:495-501: POST once the move is done or stopped by
             // the limit in its direction, past an answered MS; and TE;.
@@ -1294,8 +1306,7 @@ mod tests {
     }
 
     /// An unanswered MS; is a RETRY, which asks TH; but no TP; or TE; and
-    /// leaves the status as it was; the second is COMM_ERR, and an answer
-    /// clears it.
+    /// posts nothing; the second is COMM_ERR, and an answer clears it.
     #[test]
     fn model1_poll_retries_once_then_flags_comm_error() {
         let (axes, sent, silent) = model1_card("mm4000_m1_retry", &[], Duration::ZERO);
@@ -1305,8 +1316,10 @@ mod tests {
 
         silent.lock().unwrap().push("MS;");
         sent.lock().unwrap().clear();
-        assert_eq!(axis.poll(&user).unwrap(), before);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
         let comm_err = axis.poll(&user).unwrap();
+        assert_eq!(axis.poll_failure(), MODEL1_POLL_FAILURE);
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TH;", "MS;", "TH;"]);
         assert!(comm_err.comms_error && comm_err.problem);
         assert_eq!(comm_err.position, before.position);
