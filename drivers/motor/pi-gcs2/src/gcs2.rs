@@ -36,11 +36,11 @@
 //! | `VEL` (set)    | none (`setVelocityCts` is fire-and-forget) |
 //! | `SPA` (accel/decel set) | none (`setGCSParameter` is fire-and-forget) |
 //!
-//! `SAI?` (axis discovery) is the one multi-line reply: PI GCS marks a
-//! non-final line with a trailing space before the EOS (`PIInterface::
-//! sendAndReceive`'s `while(inputBuff[strlen(inputBuff)-1]==' ')` continuation
-//! loop) — `PIGCS2Controller::find_connected_axes` replicates that instead
-//! of assuming one line per reply.
+//! A reply can run over several lines: PI GCS marks a non-final line with a
+//! trailing space before the EOS (`PIInterface::sendAndReceive`'s
+//! `while(inputBuff[strlen(inputBuff)-1]==' ')` continuation loop), which
+//! `PIGCS2Controller::send_and_receive` replicates instead of assuming one
+//! line per reply.
 //!
 //! ## Units
 //!
@@ -442,7 +442,9 @@ impl PIGCS2Controller {
     }
 
     /// C `sendAndReceive(const char*)`: the command, then a writeRead of its
-    /// `\n`. Either write falling short is asynError.
+    /// `\n`. Either write falling short is asynError. PI GCS marks a
+    /// non-final reply line with a trailing space: each line after one is a
+    /// plain read, joined on `\n`, whose failure C does not print.
     fn send_and_receive(&self, cmd: &str) -> AsynResult<Vec<u8>> {
         let short_write = |status: i32, message: &str| {
             self.print(format_args!(
@@ -455,7 +457,8 @@ impl PIGCS2Controller {
             Ok(_) => return Err(short_write(0, "")),
             Err(e) => return Err(short_write(e.status() as i32, &e.message())),
         }
-        self.handle
+        let mut reply = self
+            .handle
             .write_read(0, TERMINATOR, READ_BUF)
             .map_err(|e| match e.octet_step() {
                 Some(OctetStep::Read) => {
@@ -467,7 +470,12 @@ impl PIGCS2Controller {
                     e
                 }
                 _ => short_write(e.status() as i32, &e.message()),
-            })
+            })?;
+        while reply.last() == Some(&b' ') {
+            reply.push(b'\n');
+            reply.extend(self.handle.read_octet(0, READ_BUF)?);
+        }
+        Ok(reply)
     }
 
     /// `asynPrint(pAsynCom, ASYN_TRACE_ERROR, ...)`.
@@ -485,10 +493,8 @@ impl PIGCS2Controller {
         );
     }
 
-    /// `SAI?`: read every connected axis name. PI GCS marks a non-final reply
-    /// line with a trailing space (before the EOS strip); keep issuing plain
-    /// reads (no further write) while the previous line ended in a space,
-    /// then trim that marker off each line (C `findConnectedAxes`).
+    /// `SAI?`: every connected axis name, one per reply line less its
+    /// trailing spaces (C `findConnectedAxes`).
     fn find_connected_axes(&self) -> AsynResult<Vec<String>> {
         if self.model == Model::C702 {
             // PIC702Controller::findConnectedAxes: one word of one-char
@@ -499,23 +505,13 @@ impl PIGCS2Controller {
             }
             return Ok(word.chars().rev().map(String::from).collect());
         }
-        let mut raw = self.send_and_receive("SAI?")?;
-        let mut names = Vec::new();
-        loop {
-            let line = String::from_utf8_lossy(&raw)
-                .trim_end_matches(['\r', '\0'])
-                .to_string();
-            let continues = line.ends_with(' ');
-            let name = line.trim_end_matches(' ').to_string();
-            if !name.is_empty() {
-                names.push(name);
-            }
-            if !continues {
-                break;
-            }
-            raw = self.handle.read_octet(0, READ_BUF)?;
-        }
-        Ok(names)
+        let raw = self.send_and_receive("SAI?")?;
+        Ok(String::from_utf8_lossy(&raw)
+            .split('\n')
+            .map(|line| line.trim_end_matches(['\r', '\0', ' ']))
+            .filter(|name| !name.is_empty())
+            .map(String::from)
+            .collect())
     }
 
     /// C `getGCSError`: a non-zero code prints, with its message, once
@@ -2052,6 +2048,25 @@ mod tests {
         assert_eq!(error_message(10), "Controller was stopped by command");
         assert_eq!(error_message(-7), "Timeout error");
         assert_eq!(error_message(123456), "Unknown Error - number 123456");
+    }
+
+    /// `PIInterface::sendAndReceive` (PIInterface.cpp:133-141) reads, with
+    /// no further write, each line that follows one ending in a space, and
+    /// joins them with `\n`.
+    #[test]
+    fn a_query_reads_the_lines_that_follow_one_ending_in_a_space() {
+        let lines = std::sync::atomic::AtomicUsize::new(0);
+        let (line, io) = motor_common::testing::LineRig::new("gcs2QueryMore", move |_| {
+            match lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+                0 => "R=1 ",
+                1 => "S=2 ",
+                _ => "T=3",
+            }
+            .into()
+        });
+        let ctrl = PIGCS2Controller::new(io, "gcs2QueryMore");
+        assert_eq!(ctrl.query("SPI? RST").unwrap(), "R=1 \nS=2 \nT=3");
+        assert_eq!(line.sent(), ["SPI? RST", "\n"]);
     }
 
     /// `PIInterface::sendAndReceive(char)` (PIInterface.cpp:219-227)
