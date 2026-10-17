@@ -207,23 +207,6 @@ pub fn format_file_template(
     Some(out)
 }
 
-/// C `asynNDArrayDriver::checkPath` — strips one trailing separator and reports
-/// whether the result is an existing directory.
-pub fn check_path(file_path: &str) -> bool {
-    if file_path.is_empty() {
-        return false;
-    }
-    let trimmed = match file_path.chars().last() {
-        Some('/') | Some('\\') => &file_path[..file_path.len() - 1],
-        _ => file_path,
-    };
-    if trimmed.is_empty() {
-        // C stat("")s and fails.
-        return false;
-    }
-    std::path::Path::new(trimmed).is_dir()
-}
-
 // ---------------------------------------------------------------------------
 // makeMultipleFileFormat
 // ---------------------------------------------------------------------------
@@ -491,16 +474,5 @@ mod tests {
         let m = make_multiple_file_format("/data/alignment.tif", 1);
         assert_eq!(m.prefix, "/data/alignment_");
         assert_eq!(m.extension, ".tif");
-    }
-
-    #[test]
-    fn check_path_reports_directories() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().to_str().unwrap();
-        assert!(check_path(p));
-        assert!(check_path(&format!("{p}/")));
-        assert!(!check_path(&format!("{p}/nope")));
-        assert!(!check_path(""));
-        assert!(!check_path("/"));
     }
 }

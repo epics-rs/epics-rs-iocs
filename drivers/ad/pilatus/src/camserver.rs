@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::driver::{ADStatus, ShutterMode};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -24,7 +25,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use crate::params::PilatusParams;
 use crate::protocol::reply_is_ok;
-use crate::types::{ASYN_POLL_TIME, CamStatus, Event, MAX_MESSAGE_SIZE, secs};
+use crate::types::{ASYN_POLL_TIME, CamStatus, Event, MAX_FILENAME_LEN, MAX_MESSAGE_SIZE, secs};
 
 /// asyn subaddress of the single-device camserver octet port.
 const CAM_ADDR: i32 = 0;
@@ -176,6 +177,19 @@ impl Ctx {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(_) => String::new(),
         }
+    }
+
+    /// C `asynNDArrayDriver::checkPath()` (asynNDArrayDriver.cpp:98-111): an
+    /// empty FilePath leaves both parameters alone, any other is written back
+    /// with its separator next to whether it exists.
+    pub async fn check_path(&mut self) {
+        let mut path = self.get_str(self.ad.base.file_path, MAX_FILENAME_LEN).await;
+        if path.is_empty() {
+            return;
+        }
+        let exists = check_path_str(&mut path);
+        self.set_str(self.ad.base.file_path, path);
+        self.set_i32(self.ad.base.file_path_exists, i32::from(exists));
     }
 
     // --- camserver ---------------------------------------------------------
