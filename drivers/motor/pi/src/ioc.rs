@@ -567,6 +567,11 @@ static PIE710: Model1 = Model1::new(&DEV_PIE710, 8, SCAN_RATE);
 
 /// `PIE710Setup(num_cards, scan_rate)`.
 pub fn pie710_setup_command() -> CommandDef {
+    PIE710.register_report("drvPIE710", |cards| {
+        cards.report("PIE710", |card, line| {
+            format!("    PIE710 controller #{card}, {line} \n")
+        })
+    });
     PIE710.setup_command("PIE710Setup")
 }
 
@@ -597,6 +602,7 @@ pub fn pie710_config_command() -> CommandDef {
             let controller =
                 PIE710Controller::new(handle).map_err(|e| format!("PIE710Config: {e}"))?;
             let num_axes = controller.num_axes();
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
@@ -605,6 +611,7 @@ pub fn pie710_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                 PIE710.install(ctx, card, axis as i32, motor)?;
             }
+            PIE710.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -888,6 +895,32 @@ mod report {
             after,
             "    PIE517 controller 0 connection failed.\n    PIE517 controller #1, \
              port=e517RepLine, id:  \n"
+        );
+    }
+
+    /// drvPIE710.cc:132-157, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pie710_controller() {
+        let setup = pie710_setup_command();
+        let (_line, _io) = LineRig::new("e710RepLine", |last| match last {
+            "GI" => "PI E-710 V5.000".into(),
+            "1TP" => "0.0".into(),
+            _ => String::new(),
+        });
+        let (before, after) = reports(
+            "drvPIE710",
+            (setup, vec![int(2), int(10)]),
+            (
+                pie710_config_command(),
+                vec![int(1), port("e710RepLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIE710 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIE710 controller 0 connection failed.\n    PIE710 controller #1, \
+             port=e710RepLine, id: PI E-710 V5.000 \n"
         );
     }
 }
