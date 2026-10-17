@@ -750,20 +750,32 @@ impl PIGCS2Controller {
     /// `CST? {axis}` (C `initAxis`'s stage-configuration probe, logged only —
     /// C keeps it purely to surface mis/non-configured controllers in the
     /// log).
-    /// C `sendAndReceive(char)`: a short write is asynError.
+    /// C `sendAndReceive(char)`: a short write is asynError. The byte is
+    /// written again for each line that ends in a space, whose failure C
+    /// does not print. C defect not copied: it appends each line with no
+    /// separator, so `PIHexapodController`'s `#3` parse sees only the first
+    /// line; rs joins them with `\n`, as the string `sendAndReceive` does.
     fn send_and_receive_char(&self, c: u8) -> AsynResult<Vec<u8>> {
-        self.handle.write_read(0, &[c], READ_BUF).map_err(|e| {
-            let e = match e.octet_step() {
-                Some(OctetStep::Read) => e,
-                _ => pigcs2_err(e.message()),
-            };
+        let write_read = || {
+            self.handle
+                .write_read(0, &[c], READ_BUF)
+                .map_err(|e| match e.octet_step() {
+                    Some(OctetStep::Read) => e,
+                    _ => pigcs2_err(e.message()),
+                })
+        };
+        let mut reply = write_read().inspect_err(|e| {
             self.print(format_args!(
                 "PIInterface::sendAndReceive error calling writeRead, output={c} status={}, error={}\n",
                 e.status() as i32,
                 e.message()
             ));
-            e
-        })
+        })?;
+        while reply.last() == Some(&b' ') {
+            reply.push(b'\n');
+            reply.extend(write_read()?);
+        }
+        Ok(reply)
     }
 
     /// [`Self::send_and_receive_char`]'s reply line.
@@ -2040,6 +2052,25 @@ mod tests {
         assert_eq!(error_message(10), "Controller was stopped by command");
         assert_eq!(error_message(-7), "Timeout error");
         assert_eq!(error_message(123456), "Unknown Error - number 123456");
+    }
+
+    /// `PIInterface::sendAndReceive(char)` (PIInterface.cpp:219-227)
+    /// writes the byte again for each line that ends in a space; rs joins
+    /// the lines with `\n`.
+    #[test]
+    fn a_char_query_resends_its_byte_while_a_line_ends_in_a_space() {
+        let lines = std::sync::atomic::AtomicUsize::new(0);
+        let (line, io) = motor_common::testing::LineRig::new("gcs2CharMore", move |_| {
+            match lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+                0 => "X=1.5 ",
+                1 => "Y=2.5 ",
+                _ => "Z=3.5",
+            }
+            .into()
+        });
+        let ctrl = PIGCS2Controller::new(io, "gcs2CharMore");
+        assert_eq!(ctrl.query_char(3).unwrap(), "X=1.5 \nY=2.5 \nZ=3.5");
+        assert_eq!(line.sent(), ["\u{3}", "\u{3}", "\u{3}"]);
     }
 
     #[test]
