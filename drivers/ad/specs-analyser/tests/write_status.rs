@@ -515,3 +515,42 @@ fn an_abort_during_a_poll_lands_at_the_update_callbacks() {
         "{heard:?}"
     );
 }
+
+/// ADImageMode is re-read after the iteration loop (specsAnalyser.cpp:650-651),
+/// so a Continuous run switched to Single mid-image ends after that image.
+#[test]
+fn an_image_mode_written_mid_image_ends_the_run() {
+    let fake = Fake::start("SPECS_WS_MODE");
+    fake.answer(&[
+        ("ValidateSpectrum", Act::Say("OK Samples:2", 0)),
+        (
+            "GetAcquisitionStatus",
+            Act::Say("OK ControllerState:finished NumberOfAcquiredPoints:2", 300),
+        ),
+        ("GetAcquisitionData", Act::Say("OK Data:[1,2,3,4,5,6]", 0)),
+    ]);
+    let ad = &fake.runtime.ad_params;
+    fake.write_int32(ad.image_mode, 2).unwrap();
+    fake.write_int32(ad.acquire, 1).unwrap();
+    let mut heard = Vec::new();
+    while !heard.iter().any(|c: &String| c == "GetAcquisitionStatus") {
+        let (_, command) = fake
+            .heard
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the task never polled");
+        heard.push(command);
+    }
+    fake.write_int32(ad.image_mode, 0).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while fake.int32(ad.acquire) != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run never ended: {:?}",
+            fake.heard.try_iter().collect::<Vec<_>>()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    heard.extend(fake.heard.try_iter().map(|(_, command)| command));
+    let starts = heard.iter().filter(|c| c.starts_with("Start")).count();
+    assert_eq!(starts, 1, "{heard:?}");
+}

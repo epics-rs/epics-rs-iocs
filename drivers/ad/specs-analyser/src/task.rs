@@ -557,6 +557,9 @@ impl Task {
         }
         let _ = &last_data;
 
+        // C re-reads these after the loop (specsAnalyser.cpp:650-654).
+        self.l.num_images = self.get_i32(self.w.ad.num_images, self.l.num_images);
+        self.l.image_mode = self.get_i32(self.w.ad.image_mode, self.l.image_mode);
         self.l.array_callbacks =
             self.get_i32(self.w.ad.base.array_callbacks, self.l.array_callbacks);
         self.l.image_counter = self.get_i32(self.w.ad.base.array_counter, self.l.image_counter) + 1;
