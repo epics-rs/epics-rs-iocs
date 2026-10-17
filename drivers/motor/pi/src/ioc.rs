@@ -110,9 +110,7 @@ pub fn pic862_config_command() -> CommandDef {
                 let line = format!("port={asyn_port}, id: {}", controller.ident());
                 let controller = Arc::new(Mutex::new(controller));
 
-                let Ok(axis) = PIC862Axis::new(controller) else {
-                    return;
-                };
+                let axis = PIC862Axis::new(controller);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 init.axis(0, motor);
                 init.describe(line);
