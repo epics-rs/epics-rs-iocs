@@ -37,7 +37,7 @@ use motor_common::{Controller, asyn_user, register_controller_port};
 
 use crate::axis::PmacAxis;
 use crate::controller::{PMAC_TIMEOUT, PmacController, PmacControllerParams};
-use crate::coord::{CS_AXES, PmacCoordSystem, PmacCsAxis};
+use crate::coord::{CS_AXES, PmacCoordSystem, PmacCsAxis, axis_name};
 use crate::ethernet::pmac_asyn_ip_configure_command;
 
 /// How long a polled coordinate-system status (`&{cs}??`, `Q8{n}`) stays
@@ -431,15 +431,50 @@ fn pmac_cs_group_add_axis_command(registry: &Registry) -> CommandDef {
     )
 }
 
-/// What each `pmacAsynCoordCreate` made: `(reference, port, address, cs)`
-/// and the system.
-type CoordSystem = (i32, String, i32, i32, Arc<Mutex<PmacCoordSystem>>);
+/// What one `pmacAsynCoordCreate` made, C's `drvPmac_t`.
+struct CoordSystem {
+    reference: i32,
+    port: String,
+    addr: i32,
+    cs: i32,
+    system: Arc<Mutex<PmacCoordSystem>>,
+    /// Each axis's lock, whose address C's report prints as `axisMutex`.
+    axes: Vec<Arc<Mutex<dyn AsynMotor>>>,
+}
+
+/// C's `pFirstDrv` list, in creation order.
 static COORD_SYSTEMS: Mutex<Vec<CoordSystem>> = Mutex::new(Vec::new());
+
+/// pmacAsynCoord.c `motorAxisReport` (:164-186).
+fn coord_report(level: i32) -> String {
+    let mut out = String::new();
+    for c in COORD_SYSTEMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        out += &format!(
+            "Found driver for PMAC C.S. {} via {} (ref {})\n",
+            c.cs, c.port, c.reference
+        );
+        if level > 0 {
+            for (axis, motor) in c.axes.iter().enumerate() {
+                let name = axis_name(axis + 1).unwrap_or(' ');
+                out += &format!(
+                    "axis {name}:\ndrvPmac->axisMutex = {:p}\n",
+                    Arc::as_ptr(motor).cast::<()>()
+                );
+            }
+        }
+    }
+    out
+}
 
 /// C `pmacAsynCoordCreate(port, addr, cs, ref, program)`: card `ref` of
 /// [`PMAC_ASYN_COORD`], its nine axes polled at C's default periods until a
 /// `pmacSetCoord*PollPeriod` changes them.
 fn pmac_asyn_coord_create_command() -> CommandDef {
+    PMAC_ASYN_COORD.register_report(coord_report);
     CommandDef::new(
         "pmacAsynCoordCreate",
         vec![
@@ -479,7 +514,7 @@ fn coord_create(
     let mut systems = COORD_SYSTEMS.lock().unwrap_or_else(|e| e.into_inner());
     if systems
         .iter()
-        .any(|(r, p, a, c, _)| *r == reference || (p == port && *a == addr && *c == cs))
+        .any(|c| c.reference == reference || (c.port == port && c.addr == addr && c.cs == cs))
     {
         println!("C.S. reference {reference} already exists");
         return Ok(());
@@ -540,8 +575,20 @@ fn coord_create(
             Ok(motor)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    PMAC_ASYN_COORD.set_card(reference, axes, COORD_MOVING_POLL_MS, COORD_IDLE_POLL_MS);
-    systems.push((reference, port.to_string(), addr, cs, system));
+    PMAC_ASYN_COORD.set_card(
+        reference,
+        axes.clone(),
+        COORD_MOVING_POLL_MS,
+        COORD_IDLE_POLL_MS,
+    );
+    systems.push(CoordSystem {
+        reference,
+        port: port.to_string(),
+        addr,
+        cs,
+        system,
+        axes,
+    });
     Ok(())
 }
 
@@ -598,8 +645,8 @@ fn set_coord_steps_per_unit(reference: i32, axis: i32, steps_per_unit: f64) {
         return;
     };
     let systems = COORD_SYSTEMS.lock().unwrap_or_else(|e| e.into_inner());
-    for (.., system) in systems.iter().filter(|(r, ..)| *r == reference) {
-        lock_system(system).set_steps_per_unit(axis, steps_per_unit);
+    for c in systems.iter().filter(|c| c.reference == reference) {
+        lock_system(&c.system).set_steps_per_unit(axis, steps_per_unit);
         println!("  Setting axis {axis} scaling factor to {steps_per_unit:.6}.");
     }
 }
@@ -624,12 +671,15 @@ fn set_default_coord_steps(default_steps: f64) {
         return;
     }
     let systems = COORD_SYSTEMS.lock().unwrap_or_else(|e| e.into_inner());
-    for (reference, .., system) in systems.iter() {
-        let mut system = lock_system(system);
+    for c in systems.iter() {
+        let mut system = lock_system(&c.system);
         for axis in 0..CS_AXES {
             system.set_steps_per_unit(axis, default_steps);
         }
-        println!("  Set scaling factor to {default_steps:.6} for CS ref {reference}.");
+        println!(
+            "  Set scaling factor to {default_steps:.6} for CS ref {}.",
+            c.reference
+        );
     }
 }
 
@@ -679,7 +729,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .any(|(r, ..)| *r == reference)
+            .any(|c| c.reference == reference)
     }
 
     #[test]
@@ -697,10 +747,14 @@ mod tests {
         let rt = publish_bare("pmacCoordSteps");
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::ZERO);
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(io, 3, 0, POLL_CACHE_TTL)));
-        COORD_SYSTEMS
-            .lock()
-            .unwrap()
-            .push((9103, "pmacCoordSteps".into(), 0, 3, system.clone()));
+        COORD_SYSTEMS.lock().unwrap().push(CoordSystem {
+            reference: 9103,
+            port: "pmacCoordSteps".into(),
+            addr: 0,
+            cs: 3,
+            system: system.clone(),
+            axes: Vec::new(),
+        });
         let step = |axis| lock_system(&system).step_size(axis);
         assert_eq!(step(4), 1e-4);
         set_coord_steps_per_unit(9103, 4, 0.0);
@@ -713,6 +767,32 @@ mod tests {
         assert_eq!(step(5), 1e-4);
         set_default_coord_steps(1000.0);
         assert_eq!((step(0), step(4), step(8)), (0.001, 0.001, 0.001));
+    }
+
+    /// pmacAsynCoord.c `motorAxisReport` (:164-186): each system in
+    /// creation order, its nine axes above level 0.
+    #[test]
+    fn dbior_prints_each_coordinate_system() {
+        use motor_common::testing::driver_report;
+        let _cmd = pmac_asyn_coord_create_command();
+        let (_a, _) = publish_scripted("pmacCoordRepA");
+        let (_b, _) = publish_scripted("pmacCoordRepB");
+        coord_create("pmacCoordRepA", 0, 2, 9201, 10).unwrap();
+        coord_create("pmacCoordRepB", 0, 5, 9202, 10).unwrap();
+        let found = "Found driver for PMAC C.S. 2 via pmacCoordRepA (ref 9201)\n\
+                     Found driver for PMAC C.S. 5 via pmacCoordRepB (ref 9202)\n";
+        assert_eq!(driver_report("pmacAsynCoord", 0), found);
+        let text = driver_report("pmacAsynCoord", 1);
+        let names: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("axis "))
+            .collect();
+        assert_eq!(names.len(), 18, "{text}");
+        assert_eq!(
+            names[..9],
+            ["A:", "B:", "C:", "U:", "V:", "W:", "X:", "Y:", "Z:"]
+        );
+        assert!(text.starts_with("Found driver for PMAC C.S. 2 via pmacCoordRepA (ref 9201)\naxis A:\ndrvPmac->axisMutex = 0x"), "{text}");
     }
 
     #[test]
