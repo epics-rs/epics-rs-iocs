@@ -23,10 +23,11 @@
 //!
 //! ## Deviations (documented)
 //!
-//! - Relative moves send `0` for the non-moving axes (a true "stay put" delta).
-//!   The C code sends each non-moving axis' *current absolute position* as its
-//!   `rmove` delta, which would move them by that amount — a latent bug for
-//!   multi-axis relative moves; this port sends `0`.
+//! - Relative moves send `0` for the non-moving axes. C defect, not copied: C
+//!   (SMCcorvusDriver.cpp:253-272) fills those `rmove` slots with each idle
+//!   axis' absolute position from `pos`, so a relative move of one axis moves
+//!   the others by their own position; this port neither sends that `pos`
+//!   query nor moves the idle axes.
 //! - Limit and drive-power status are read only when the axis is done (matching
 //!   C, which avoids polling switches mid-move to keep the interpreter
 //!   responsive); while moving they are reported as not-triggered / powered.
@@ -240,7 +241,8 @@ impl AsynMotor for CorvusAxis {
     ) -> AsynResult<()> {
         let ctrl = self.lock();
         let _ = ctrl.write_all(self.accel_velocity(velocity, acceleration));
-        // Non-moving axes get a zero delta (stay put); see module deviations.
+        // Zero delta for the idle axes; C's absolute position there is a C
+        // defect (see module deviations).
         let mut targets = vec![0.0; self.num_axes];
         targets[self.axis_no] = distance * self.axis_res;
         ctrl.send_target_vector(&targets, "rmove")
