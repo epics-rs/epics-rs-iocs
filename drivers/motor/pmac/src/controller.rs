@@ -31,8 +31,11 @@ use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerParams, ParamWrite, index};
+use epics_rs::motor::controller_port::{
+    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteValue, index,
+};
 
 use crate::cs_groups::{AxisPoll, CsGroups, DeferredMove, fast_deferred_command};
 use crate::protocol::{HARDWARE_PROB, parse_feedrate, parse_global_status};
@@ -464,6 +467,21 @@ impl PmacControllerParams {
     }
 }
 
+/// `pmacController::writeInt32` / `writeFloat64`'s opening FLOW line,
+/// which the record's speed, accel and GET_INFO writes reach as well as
+/// the port's. It prints once the write is done, not before.
+struct PmacWriteHook;
+
+impl WriteHook for PmacWriteHook {
+    fn after_write(&self, write: &FinishedWrite<'_>) {
+        let method = match write.value {
+            WriteValue::Int32(_) => "writeInt32",
+            WriteValue::Float64(_) => "writeFloat64",
+        };
+        write.print(TraceMask::FLOW, format_args!("pmacController::{method}"));
+    }
+}
+
 fn lock(controller: &Mutex<PmacController>) -> std::sync::MutexGuard<'_, PmacController> {
     controller.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -494,6 +512,10 @@ impl ControllerParams for PmacControllerParams {
     /// Address 0 is C's `pAxisZero`, the axis that carries these parameters.
     fn is_controller_axis(&self, addr: i32) -> bool {
         addr == 0
+    }
+
+    fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
+        Some(Arc::new(PmacWriteHook))
     }
 
     fn write_int32(
@@ -535,7 +557,53 @@ impl PmacControllerParams {
 
 #[cfg(test)]
 mod tests {
+    use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::registry::open_owner;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::motor::devices::register_controller_port;
+
     use super::*;
+
+    /// `body`'s FLOW lines in `port`'s trace at address 0.
+    fn traced(port: &str, body: impl FnOnce()) -> Vec<String> {
+        let path = std::env::temp_dir().join(format!("pmac-trace-{port}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(port), TraceMask::FLOW);
+        trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+        // The writes go to address 0, whose device trace has its own file.
+        trace.set_device_trace_file(port, 0, TraceFile::File(file));
+        body();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        text.lines().map(str::to_owned).collect()
+    }
+
+    /// pmacController.cpp:396, 503: every write prints its method, the
+    /// speed, accel and GET_INFO writes the record now sends included.
+    #[test]
+    fn every_write_prints_pmac_controllers_flow_line() {
+        let ctrl = Arc::new(Mutex::new(PmacController::new(None, Duration::ZERO)));
+        let params = PmacControllerParams::new(ctrl);
+        let port = register_controller_port(&open_owner(), "pmacFlow", 2, params).unwrap();
+        let lines = traced("pmacFlow", || {
+            for reason in [index::VELOCITY, index::VEL_BASE, index::ACCEL] {
+                port.write_float64_blocking(reason, 0, 2.5).unwrap();
+            }
+            port.write_int32_blocking(index::UPDATE_STATUS, 0, 1)
+                .unwrap();
+        });
+        let mine: Vec<_> = lines
+            .iter()
+            .filter_map(|l| l.split_once("pmacController::").map(|(_, m)| m))
+            .collect();
+        assert_eq!(
+            mine,
+            ["writeFloat64", "writeFloat64", "writeFloat64", "writeInt32"],
+            "{lines:?}"
+        );
+    }
 
     #[test]
     fn defer_value_arms_the_mode_and_zero_releases_it() {
