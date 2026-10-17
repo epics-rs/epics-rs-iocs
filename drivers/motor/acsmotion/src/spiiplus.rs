@@ -27,9 +27,9 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! The aux asyn parameters (MFLAGS/MFLAGSX bit fields, safe-torque-off, encoder offsets
-//! and factors, reference position, PEG, disable-set-position guard, global
-//! variable read/write, ACSPL program start/stop).
+//! The written parameters: disable-set-position guard, encoder offset
+//! sets, max velocity/acceleration writes, global variable read/write and
+//! ACSPL program start/stop.
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::manager::PortManager;
-use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -73,6 +73,9 @@ const AST_PEG_READY: i32 = 1 << 4;
 /// to the older motorAcsTech80 module; follow this module's own definitions.
 const FAULT_HARD_RIGHT_LIMIT: i32 = 1 << 0;
 const FAULT_HARD_LEFT_LIMIT: i32 = 1 << 1;
+const FAULT_ENCODER_NC: i32 = 1 << 7;
+const FAULT_ENCODER_2_NC: i32 = 1 << 8;
+const FAULT_SAFE_TORQUE_OFF: i32 = 1 << 18;
 
 /// Motor-flags (`MFLAGS`) bit masks (C `SPIIPLUS_MFLAGS_*`).
 const MFLAGS_DUMMY: i32 = 1 << 0;
@@ -217,6 +220,8 @@ pub struct SpiiPlusController {
     port: String,
     ident: String,
     num_axes: usize,
+    /// C `stepperFactor_`.
+    stepper_factor: Vec<f64>,
     /// C `encoderFactor_`.
     encoder_factor: Vec<f64>,
     /// C `encoder2Factor_`.
@@ -232,7 +237,43 @@ pub struct SpiiPlusController {
     setup: Vec<AxisSetup>,
     motion: Vec<AxisMotion>,
     homing: Vec<Homing>,
+    /// Each axis's `motorRecResolution_`, as the record last wrote it.
+    rec_resolution: Vec<Option<f64>>,
+    /// The readback parameters, once the controller port has made them.
+    readbacks: Option<Readbacks>,
     polled: Polled,
+}
+
+/// C `SPiiPlusController`'s parameters the constructor and the axis polls
+/// set (SPiiPlusDriver.cpp:72-130).
+#[derive(Clone, Copy, Debug)]
+struct Readbacks {
+    max_velocity: usize,
+    max_acceleration: usize,
+    safe_torque_off: usize,
+    homing_done: usize,
+    step_factor: usize,
+    enc_type: usize,
+    enc2_type: usize,
+    enc_factor: usize,
+    enc2_factor: usize,
+    axis_pos: usize,
+    ref_pos: usize,
+    enc_pos: usize,
+    fdbk_pos: usize,
+    fdbk2_pos: usize,
+    vfdbk_pos: usize,
+    ref_offset: usize,
+    enc_offset: usize,
+    enc2_offset: usize,
+    abs_enc_offset: usize,
+    abs_enc2_offset: usize,
+    enc_fault: usize,
+    enc2_fault: usize,
+    fw_version: usize,
+    vfdbk_pos_support: usize,
+    mflags: usize,
+    mflagsx: usize,
 }
 
 /// The arrays C's controller `poll()` reads that the axis polls parse,
@@ -253,6 +294,8 @@ struct Polled {
     encoder_offset: Vec<f64>,
     /// `E2OFFS`, C `encoder2Offset_`.
     encoder2_offset: Vec<f64>,
+    /// `E_AOFFS`, C `absoluteEncoderOffset_`.
+    absolute_encoder_offset: Vec<f64>,
     /// `XVEL`, C `maxVelocity_`.
     max_velocity: Vec<f64>,
     /// `XACC`, C `maxAcceleration_`.
@@ -271,6 +314,8 @@ struct Polled {
     fault_status: Vec<i32>,
     /// `MFLAGS`, C `motorFlags_`.
     motor_flags: Vec<i32>,
+    /// `MFLAGSX`, C `motorFlagsX_`.
+    motor_flags_x: Vec<i32>,
 }
 
 impl SpiiPlusController {
@@ -328,6 +373,7 @@ impl SpiiPlusController {
             port: port.to_string(),
             ident,
             num_axes,
+            stepper_factor,
             encoder_factor,
             encoder2_factor,
             encoder_type,
@@ -337,6 +383,8 @@ impl SpiiPlusController {
             setup,
             motion: vec![AxisMotion::default(); num_axes],
             homing: vec![Homing::default(); num_axes],
+            rec_resolution: vec![None; num_axes],
+            readbacks: None,
             polled: Polled {
                 axis_position: vec![0.0; num_axes],
                 reference_position: vec![0.0; num_axes],
@@ -345,6 +393,7 @@ impl SpiiPlusController {
                 reference_offset: vec![0.0; num_axes],
                 encoder_offset: vec![0.0; num_axes],
                 encoder2_offset: vec![0.0; num_axes],
+                absolute_encoder_offset: vec![0.0; num_axes],
                 max_velocity: vec![0.0; num_axes],
                 max_acceleration: vec![0.0; num_axes],
                 feedback_position: vec![0.0; num_axes],
@@ -355,6 +404,7 @@ impl SpiiPlusController {
                 fault_status: vec![0; num_axes],
                 // C's poll reads into the array the constructor filled.
                 motor_flags,
+                motor_flags_x: vec![0; num_axes],
             },
         }
     }
@@ -362,8 +412,7 @@ impl SpiiPlusController {
     /// C `SPiiPlusController::poll` (SPiiPlusDriver.cpp:547-635): every
     /// axis's position, status and limits in one binary read each, for the
     /// axes' polls to parse. The first failed read ends the poll, leaving
-    /// it and the arrays after it as the last poll read them. The arrays
-    /// only C's parameters use are read and dropped.
+    /// it and the arrays after it as the last poll read them.
     pub fn poll(&mut self) -> AsynResult<()> {
         self.trace_flow(format_args!("POLL_START"));
         let span = Span::one(0, self.num_axes as i32 - 1);
@@ -381,12 +430,12 @@ impl SpiiPlusController {
         polled.reference_offset = comm.get_double_array("ROFFS", span)?;
         polled.encoder_offset = comm.get_double_array("EOFFS", span)?;
         polled.encoder2_offset = comm.get_double_array("E2OFFS", span)?;
-        comm.get_double_array("E_AOFFS", span)?;
+        polled.absolute_encoder_offset = comm.get_double_array("E_AOFFS", span)?;
         polled.axis_status = comm.get_integer_array("AST", span)?;
         polled.motor_status = comm.get_integer_array("MST", span)?;
         polled.fault_status = comm.get_integer_array("FAULT", span)?;
         polled.motor_flags = comm.get_integer_array("MFLAGS", span)?;
-        comm.get_integer_array("MFLAGSX", span)?;
+        polled.motor_flags_x = comm.get_integer_array("MFLAGSX", span)?;
         polled.max_velocity = comm.get_double_array("XVEL", span)?;
         polled.max_acceleration = comm.get_double_array("XACC", span)?;
         self.trace_flow(format_args!("POLL_END"));
@@ -579,6 +628,8 @@ pub struct SpiiPlusAxis {
     /// Last non-zero feedback-velocity direction (C updates direction only while
     /// the axis is moving); 0 until then, as asynMotorAxis's status starts.
     last_direction: bool,
+    /// The readbacks the last poll set, for the poller's callParamCallbacks.
+    poll_params: Vec<(usize, ParamValue)>,
 }
 
 impl SpiiPlusAxis {
@@ -594,6 +645,7 @@ impl SpiiPlusAxis {
             resolution: setup.resolution,
             is_virtual: setup.is_virtual,
             last_direction: false,
+            poll_params: Vec::new(),
         }
     }
 
@@ -779,6 +831,7 @@ impl AsynMotor for SpiiPlusAxis {
                 at(&polled.feedback_position) / ctrl.encoder_factor[a],
             )
         };
+        let readbacks = self.readbacks(&ctrl);
         // C stores the poller's `moving` from before this axis's poll, the
         // previous axis's; the profile thread's wait needs this axis's.
         ctrl.motion[a] = AxisMotion {
@@ -786,6 +839,7 @@ impl AsynMotor for SpiiPlusAxis {
             peg_ready: ast & AST_PEG_READY != 0,
         };
         drop(ctrl);
+        self.poll_params.extend(readbacks.into_iter().flatten());
 
         // C updates the direction bit only while moving and only on a non-zero
         // feedback velocity; otherwise it keeps the previous direction.
@@ -813,6 +867,63 @@ impl AsynMotor for SpiiPlusAxis {
             gain_support: true,
             ..MotorStatus::default()
         })
+    }
+
+    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
+        std::mem::take(&mut self.poll_params)
+    }
+}
+
+impl SpiiPlusAxis {
+    /// The parameters C's axis poll sets beyond the motor status, in its
+    /// order: the safe-torque-off and homed bits, MFLAGS/MFLAGSX,
+    /// `getMaxParams` and `updateFeedbackParams` (SPiiPlusDriver.cpp:
+    /// 790-806, 867-922). Each bit is C's masked value.
+    fn readbacks(&self, ctrl: &SpiiPlusController) -> Option<Vec<(usize, ParamValue)>> {
+        let r = ctrl.readbacks?;
+        let a = self.axis;
+        let p = &ctrl.polled;
+        let at = |values: &[f64]| ParamValue::Float64(values.get(a).copied().unwrap_or_default());
+        let bits = |values: &[i32]| values.get(a).copied().unwrap_or_default();
+        let fault = bits(&p.fault_status);
+        let mut params = Vec::new();
+        if !self.reduced {
+            params.push((
+                r.safe_torque_off,
+                ParamValue::Int32(fault & FAULT_SAFE_TORQUE_OFF),
+            ));
+            let home = bits(&p.motor_flags) & MFLAGS_HOME;
+            params.push((r.homing_done, ParamValue::Int32(home)));
+        }
+        params.push((r.mflags, ParamValue::Int32(bits(&p.motor_flags))));
+        params.push((r.mflagsx, ParamValue::Int32(bits(&p.motor_flags_x))));
+        // C reads motorRecResolution_ unchecked; before the record writes
+        // it that is an uninitialised local, so nothing is set here.
+        if let Some(mres) = ctrl.rec_resolution[a] {
+            let max = |values: &[f64]| {
+                let v = values.get(a).copied().unwrap_or_default();
+                ParamValue::Float64(v / self.resolution * mres)
+            };
+            params.push((r.max_velocity, max(&p.max_velocity)));
+            params.push((r.max_acceleration, max(&p.max_acceleration)));
+        }
+        params.extend([
+            (r.axis_pos, at(&p.axis_position)),
+            (r.ref_pos, at(&p.reference_position)),
+            (r.enc_pos, at(&p.encoder_position)),
+            (r.fdbk_pos, at(&p.feedback_position)),
+            (r.fdbk2_pos, at(&p.feedback2_position)),
+            (r.vfdbk_pos, at(&p.virtual_feedback_position)),
+            (r.ref_offset, at(&p.reference_offset)),
+            (r.enc_offset, at(&p.encoder_offset)),
+            (r.enc2_offset, at(&p.encoder2_offset)),
+            (r.abs_enc_offset, at(&p.absolute_encoder_offset)),
+            // C never reads E2_AOFFS and posts its uninitialised array.
+            (r.abs_enc2_offset, ParamValue::Float64(0.0)),
+            (r.enc_fault, ParamValue::Int32(fault & FAULT_ENCODER_NC)),
+            (r.enc2_fault, ParamValue::Int32(fault & FAULT_ENCODER_2_NC)),
+        ]);
+        Some(params)
     }
 }
 
@@ -888,6 +999,49 @@ impl ControllerParams for AcsMotionParams {
             pouts_bit_code: base.create_param("SPIIPLUS_POUTS_BIT_CODE", ParamType::Octet)?,
             pulse_width: base.create_param("SPIIPLUS_PULSE_WIDTH", ParamType::Float64)?,
         });
+        let float = |base: &mut PortDriverBase, name| base.create_param(name, ParamType::Float64);
+        let int = |base: &mut PortDriverBase, name| base.create_param(name, ParamType::Int32);
+        let r = Readbacks {
+            max_velocity: float(base, "SPIIPLUS_MAX_VELOCITY")?,
+            max_acceleration: float(base, "SPIIPLUS_MAX_ACCELERATION")?,
+            safe_torque_off: int(base, "SPIIPLUS_SAFE_TORQUE_OFF")?,
+            homing_done: int(base, "SPIIPLUS_HOMING_DONE")?,
+            step_factor: float(base, "SPIIPLUS_STEP_FACTOR")?,
+            enc_type: int(base, "SPIIPLUS_ENC_TYPE")?,
+            enc2_type: int(base, "SPIIPLUS_ENC2_TYPE")?,
+            enc_factor: float(base, "SPIIPLUS_ENC_FACTOR")?,
+            enc2_factor: float(base, "SPIIPLUS_ENC2_FACTOR")?,
+            axis_pos: float(base, "SPIIPLUS_AXIS_POS")?,
+            ref_pos: float(base, "SPIIPLUS_REF_POS")?,
+            enc_pos: float(base, "SPIIPLUS_ENC_POS")?,
+            fdbk_pos: float(base, "SPIIPLUS_FDBK_POS")?,
+            fdbk2_pos: float(base, "SPIIPLUS_FDBK2_POS")?,
+            vfdbk_pos: float(base, "SPIIPLUS_VFDBK_POS")?,
+            ref_offset: float(base, "SPIIPLUS_REF_OFFSET")?,
+            enc_offset: float(base, "SPIIPLUS_ENC_OFFSET")?,
+            enc2_offset: float(base, "SPIIPLUS_ENC2_OFFSET")?,
+            abs_enc_offset: float(base, "SPIIPLUS_ABS_ENC_OFFSET")?,
+            abs_enc2_offset: float(base, "SPIIPLUS_ABS_ENC2_OFFSET")?,
+            enc_fault: int(base, "SPIIPLUS_ENC_FAULT")?,
+            enc2_fault: int(base, "SPIIPLUS_ENC2_FAULT")?,
+            fw_version: base.create_param("SPIIPLUS_FW_VERSION", ParamType::Octet)?,
+            vfdbk_pos_support: int(base, "SPIIPLUS_VFDBK_POS_SUPPORT")?,
+            mflags: int(base, "SPIIPLUS_MFLAGS")?,
+            mflagsx: int(base, "SPIIPLUS_MFLAGSX")?,
+        };
+        // The constructor's values (SPiiPlusDriver.cpp:143-149, 225-229).
+        let mut ctrl = self.lock();
+        base.set_string_param(r.fw_version, 0, &ctrl.ident)?;
+        base.set_int32_param(r.vfdbk_pos_support, 0, i32::from(ctrl.vpos_supported))?;
+        for a in 0..ctrl.num_axes {
+            let addr = a as i32;
+            base.set_float64_param(r.step_factor, addr, ctrl.stepper_factor[a])?;
+            base.set_int32_param(r.enc_type, addr, ctrl.encoder_type[a])?;
+            base.set_int32_param(r.enc2_type, addr, ctrl.encoder2_type[a])?;
+            base.set_float64_param(r.enc_factor, addr, ctrl.encoder_factor[a])?;
+            base.set_float64_param(r.enc2_factor, addr, ctrl.encoder2_factor[a])?;
+        }
+        ctrl.readbacks = Some(r);
         Ok(())
     }
 
@@ -1023,6 +1177,9 @@ impl AcsMotionParams {
         user: &AsynUser,
         value: f64,
     ) -> AsynResult<()> {
+        if user.reason == index::REC_RESOLUTION {
+            self.lock().rec_resolution[user.addr as usize] = Some(value);
+        }
         let Some(p) = self.params else {
             return Ok(());
         };
@@ -1071,6 +1228,138 @@ mod tests {
             "{text}"
         );
         assert_eq!(rig.ctrl.lock().unwrap().homing(1).method, 3);
+    }
+
+    /// The constructor's own parameters: firmware version and VPOS support
+    /// at address 0, each axis's factors and encoder types
+    /// (SPiiPlusDriver.cpp:143-149, 225-229).
+    #[test]
+    fn construction_sets_the_version_factors_and_encoder_types() {
+        let rig = rig(
+            "spiiSetupParams",
+            2,
+            &[
+                ("STEPF", &[3.0, 4.0]),
+                ("EFAC", &[0.5, 0.25]),
+                ("E2FAC", &[7.0, 8.0]),
+                ("E_TYPE", &[1.0, 2.0]),
+                ("E2_TYPE", &[3.0, 4.0]),
+                ("VPOS", &[0.0, 0.0]),
+            ],
+        );
+        let float = |name, addr| {
+            rig.port
+                .read_float64_blocking(rig.param(name), addr)
+                .unwrap()
+        };
+        let int = |name, addr| rig.port.read_int32_blocking(rig.param(name), addr).unwrap();
+        assert_eq!(rig.message(rig.param("SPIIPLUS_FW_VERSION")), "v3.13");
+        assert_eq!(int("SPIIPLUS_VFDBK_POS_SUPPORT", 0), 1);
+        assert_eq!(float("SPIIPLUS_STEP_FACTOR", 1), 4.0);
+        assert_eq!(float("SPIIPLUS_ENC_FACTOR", 1), 0.25);
+        assert_eq!(float("SPIIPLUS_ENC2_FACTOR", 0), 7.0);
+        assert_eq!(int("SPIIPLUS_ENC_TYPE", 0), 1);
+        assert_eq!(int("SPIIPLUS_ENC2_TYPE", 1), 4);
+    }
+
+    /// The axis poll's readbacks, in C's order and with C's masked bits
+    /// (SPiiPlusDriver.cpp:790-806, 867-922).
+    #[test]
+    fn an_axis_poll_sets_cs_readbacks() {
+        let rig = rig("spiiReadbacks", 1, SERVOS);
+        let (sto, home) = (FAULT_SAFE_TORQUE_OFF, MFLAGS_HOME);
+        let fault = sto | FAULT_ENCODER_NC | FAULT_ENCODER_2_NC | FAULT_HARD_RIGHT_LIMIT;
+        for (var, value) in [
+            ("FAULT", fault as f64),
+            ("MFLAGS", home as f64),
+            ("MFLAGSX", 9.0),
+            ("APOS", 1.0),
+            ("RPOS", 2.0),
+            ("EPOS", 3.0),
+            ("FPOS", 4.0),
+            ("F2POS", 5.0),
+            ("ROFFS", 6.0),
+            ("EOFFS", 7.0),
+            ("E2OFFS", 8.0),
+            ("E_AOFFS", 9.5),
+        ] {
+            rig.line.lock().unwrap().set(var, &[value]);
+        }
+        let mut axis = SpiiPlusAxis::new(rig.ctrl.clone(), 0);
+        pass(&rig.ctrl, &mut axis);
+        let got: Vec<_> = axis
+            .take_poll_params()
+            .into_iter()
+            .map(|(reason, value)| (reason, format!("{value:?}")))
+            .collect();
+        let f = ParamValue::Float64;
+        let want = [
+            ("SPIIPLUS_SAFE_TORQUE_OFF", ParamValue::Int32(sto)),
+            ("SPIIPLUS_HOMING_DONE", ParamValue::Int32(home)),
+            ("SPIIPLUS_MFLAGS", ParamValue::Int32(home)),
+            ("SPIIPLUS_MFLAGSX", ParamValue::Int32(9)),
+            // XVEL 100 and XACC 1000 over EFAC 0.5, times MRES 0.1.
+            ("SPIIPLUS_MAX_VELOCITY", f(20.0)),
+            ("SPIIPLUS_MAX_ACCELERATION", f(200.0)),
+            ("SPIIPLUS_AXIS_POS", f(1.0)),
+            ("SPIIPLUS_REF_POS", f(2.0)),
+            ("SPIIPLUS_ENC_POS", f(3.0)),
+            ("SPIIPLUS_FDBK_POS", f(4.0)),
+            ("SPIIPLUS_FDBK2_POS", f(5.0)),
+            ("SPIIPLUS_VFDBK_POS", f(0.0)),
+            ("SPIIPLUS_REF_OFFSET", f(6.0)),
+            ("SPIIPLUS_ENC_OFFSET", f(7.0)),
+            ("SPIIPLUS_ENC2_OFFSET", f(8.0)),
+            ("SPIIPLUS_ABS_ENC_OFFSET", f(9.5)),
+            ("SPIIPLUS_ABS_ENC2_OFFSET", f(0.0)),
+            ("SPIIPLUS_ENC_FAULT", ParamValue::Int32(FAULT_ENCODER_NC)),
+            ("SPIIPLUS_ENC2_FAULT", ParamValue::Int32(FAULT_ENCODER_2_NC)),
+        ]
+        .map(|(n, v)| (rig.param(n), format!("{v:?}")));
+        assert_eq!(got, want);
+        assert!(axis.take_poll_params().is_empty());
+    }
+
+    /// A dummy axis has no fault or homed bits, and max velocity follows
+    /// the record's MRES only once the record has written it
+    /// (SPiiPlusDriver.cpp:761-768, 873-884).
+    #[test]
+    fn a_dummy_axis_skips_the_fault_bits_and_max_params_follow_mres() {
+        let rig = rig(
+            "spiiDummyReadbacks",
+            2,
+            &[
+                ("MFLAGS", &[MFLAGS_DUMMY as f64, 0.0]),
+                ("EFAC", &[0.5, 0.5]),
+                ("XVEL", &[100.0, 100.0]),
+            ],
+        );
+        let reasons = |params: Vec<(usize, ParamValue)>| -> Vec<usize> {
+            params.into_iter().map(|(reason, _)| reason).collect()
+        };
+        let mut dummy = SpiiPlusAxis::new(rig.ctrl.clone(), 0);
+        pass(&rig.ctrl, &mut dummy);
+        let got = reasons(dummy.take_poll_params());
+        let flags = [rig.param("SPIIPLUS_MFLAGS"), rig.param("SPIIPLUS_MFLAGSX")];
+        assert_eq!(got[..2], flags);
+
+        rig.float(index::REC_RESOLUTION, 1, 0.5);
+        let mut servo = SpiiPlusAxis::new(rig.ctrl.clone(), 1);
+        pass(&rig.ctrl, &mut servo);
+        let (reason, velocity) = servo.take_poll_params().swap_remove(4);
+        assert_eq!(reason, rig.param("SPIIPLUS_MAX_VELOCITY"));
+        assert_eq!(format!("{velocity:?}"), "Float64(100.0)");
+        rig.ctrl.lock().unwrap().rec_resolution[1] = None;
+        pass(&rig.ctrl, &mut servo);
+        let max = [
+            rig.param("SPIIPLUS_MAX_VELOCITY"),
+            rig.param("SPIIPLUS_MAX_ACCELERATION"),
+        ];
+        assert!(
+            !reasons(servo.take_poll_params())
+                .iter()
+                .any(|r| max.contains(r))
+        );
     }
 
     /// One poller pass over `axis`: the controller poll, then the axis's.
