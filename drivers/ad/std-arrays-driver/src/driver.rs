@@ -332,13 +332,14 @@ impl NdStdArraysDriver {
         // This port snapshots the buffer per publish, giving each queued frame
         // an independent copy (identical observable data, no shared-buffer race).
         // The copy comes from the pool so it is counted on this driver as
-        // `pArrays[0]` is; C allocates nothing here, so a snapshot the pool
-        // refuses is dropped uncounted after the pool's limit line.
+        // `pArrays[0]` is, under the pool's limit; C allocates nothing here,
+        // so a snapshot the pool refuses is dropped uncounted after the
+        // pool's limit line.
         let current = self.current.as_ref().unwrap();
         let Ok(mut snapshot) = self
             .ad
             .pool
-            .wrap(current.dims.clone(), current.data.clone())
+            .alloc_with(current.dims.clone(), current.data.clone())
         else {
             return Ok(());
         };
