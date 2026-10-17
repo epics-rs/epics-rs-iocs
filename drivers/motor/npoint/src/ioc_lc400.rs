@@ -68,11 +68,7 @@ fn lc400_create_controller_command(registry: &Registry) -> CommandDef {
                 idle_poll_ms as f64 / 1000.0,
             );
             let owner = ctx.db().scan_control().interrupt_gate();
-            let port = register_controller_port(owner, &port_name, num_axes, params)?;
-            controller
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .attach_port(port);
+            register_controller_port(owner, &port_name, num_axes, params)?;
             let poller = Controller::new();
             for axis in 0..num_axes {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Lc400Axis::new(

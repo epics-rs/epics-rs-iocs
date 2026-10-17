@@ -19,8 +19,6 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -129,7 +127,6 @@ impl AxisState {
 pub struct Lc400Controller {
     /// `None` when C's connect failed, which C reports and carries on from.
     handle: Option<SyncIOHandle>,
-    port: Option<PortHandle>,
     params: Option<Lc400Params>,
     firmware: Vec<u8>,
     axes: Vec<AxisState>,
@@ -141,7 +138,6 @@ impl Lc400Controller {
     pub fn new(handle: Option<SyncIOHandle>, num_axes: usize) -> Self {
         let mut controller = Self {
             handle,
-            port: None,
             params: None,
             firmware: Vec::new(),
             axes: (0..num_axes).map(|_| AxisState::default()).collect(),
@@ -169,11 +165,6 @@ impl Lc400Controller {
             controller.set_hard_limits(axis, 0.0, 0.0, 0.0);
         }
         controller
-    }
-
-    /// Post what a poll or move reads to the controller port from here on.
-    pub fn attach_port(&mut self, port: PortHandle) {
-        self.port = Some(port);
     }
 
     pub fn num_axes(&self) -> usize {
@@ -399,27 +390,16 @@ enum Target {
 pub struct Lc400Axis {
     controller: Arc<Mutex<Lc400Controller>>,
     axis: usize,
+    /// What the last poll or move set, for the poller's callParamCallbacks.
+    poll_params: Vec<(usize, ParamValue)>,
 }
 
 impl Lc400Axis {
     pub fn new(controller: Arc<Mutex<Lc400Controller>>, axis: usize) -> Self {
-        Self { controller, axis }
-    }
-
-    /// Post `updates` at this axis's address, as the next
-    /// `callParamCallbacks` would.
-    fn post(&self, updates: Vec<(usize, ParamValue)>) {
-        if updates.is_empty() {
-            return;
-        }
-        let port = lock(&self.controller).port.clone();
-        if let Some(port) = port {
-            let addr = self.axis as i32;
-            let updates = updates
-                .into_iter()
-                .map(|(reason, value)| ParamSetValue::new(reason, addr, value))
-                .collect();
-            let _ = port.set_params_and_notify_blocking(addr, updates);
+        Self {
+            controller,
+            axis,
+            poll_params: Vec::new(),
         }
     }
 
@@ -447,7 +427,7 @@ impl Lc400Axis {
         drop(ctrl);
         // C sets each readback as it reads it; whatever was read before a
         // failure reaches the next callParamCallbacks.
-        self.post(updates);
+        self.poll_params.extend(updates);
         result
     }
 }
@@ -689,8 +669,12 @@ impl AsynMotor for Lc400Axis {
             ..MotorStatus::default()
         };
         drop(ctrl);
-        self.post(updates);
+        self.poll_params.extend(updates);
         Ok(status)
+    }
+
+    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
+        std::mem::take(&mut self.poll_params)
     }
 }
 
@@ -876,6 +860,7 @@ mod tests {
     use std::sync::Mutex;
 
     use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::port_handle::PortHandle;
     use epics_rs::asyn::registry::open_owner;
     use epics_rs::asyn::trace::TraceFile;
     use epics_rs::motor::builder::MotorBuilder;
