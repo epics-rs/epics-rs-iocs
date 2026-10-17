@@ -220,6 +220,8 @@ pub struct ImageFrame {
     pub threshold_id: i32,
     pub integration_size: i32,
     pub pixels: Vec<u32>,
+    /// The parsed header line, for C's PrvImgLogHeaders log.
+    pub header: Value,
 }
 
 /// A decoded `jsonhisto` frame.
@@ -358,7 +360,7 @@ impl FrameDecoder {
             .drain(..newline + 1 + payload_len)
             .skip(newline + 1)
             .collect();
-        Ok(Some(frame.finish(&payload)))
+        Ok(Some(frame.finish(&payload, header)))
     }
 }
 
@@ -383,7 +385,7 @@ enum Pending {
 }
 
 impl Pending {
-    fn finish(self, payload: &[u8]) -> Frame {
+    fn finish(self, payload: &[u8], header: Value) -> Frame {
         match self {
             Self::Image {
                 width,
@@ -402,6 +404,7 @@ impl Pending {
                 threshold_id,
                 integration_size,
                 pixels: decode_be(payload, format),
+                header,
             }),
             Self::Histogram {
                 bin_size,

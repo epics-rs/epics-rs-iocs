@@ -145,6 +145,8 @@ pub struct Shared {
     pub prv_img_worker: WorkerState,
     pub img_worker: WorkerState,
     pub prv_hst_worker: WorkerState,
+    /// C `prvImgJsonHeadersRemaining_`: PrvImg headers still to log.
+    pub prv_img_json_headers: AtomicI32,
     orientation: AtomicI32,
     /// C `acquisitionCoordinator_`: the one owner of the acquisition phase.
     pub acquisition: Coordinator,
@@ -173,6 +175,7 @@ impl Shared {
             prv_img_worker: WorkerState::default(),
             img_worker: WorkerState::default(),
             prv_hst_worker: WorkerState::default(),
+            prv_img_json_headers: AtomicI32::new(0),
             orientation: AtomicI32::new(0),
             acquisition: Coordinator::default(),
             family: AtomicI32::new(DetectorFamily::Unknown as i32),

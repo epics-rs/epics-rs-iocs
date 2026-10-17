@@ -2075,7 +2075,11 @@ impl TimePix3Driver {
                 FAILED
             });
         }
-        // acquire.cpp:416.
+        // acquire.cpp:411-428.
+        let log_headers = self.int(self.p.prv_img_log_headers, 0).max(0);
+        self.shared
+            .prv_img_json_headers
+            .store(log_headers, std::sync::atomic::Ordering::Relaxed);
         self.shared.rates.lock().prv_img.restart();
         self.sync_stream_endpoints()?;
         self.start_stream_workers()?;

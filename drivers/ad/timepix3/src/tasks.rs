@@ -1759,6 +1759,41 @@ fn decode_failed(ctx: &Ctx, kind: StreamKind, e: &DecodeError) {
     }
 }
 
+/// C `processPreviewJsonimageLine`'s header log (serval_stream.cpp:142-151):
+/// the first PrvImgLogHeaders headers after a start, cut at 1024 bytes.
+fn log_json_header(ctx: &Ctx, header: &Value) {
+    use std::sync::atomic::Ordering;
+    let remaining = &ctx.shared.prv_img_json_headers;
+    let mut n = remaining.load(Ordering::Relaxed);
+    loop {
+        if n <= 0 {
+            return;
+        }
+        match remaining.compare_exchange_weak(n, n - 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(current) => n = current,
+        }
+    }
+    const MAX_HEADER_LOG: usize = 1024;
+    let mut text = serval::dump(header, None, false);
+    if text.len() > MAX_HEADER_LOG {
+        // C cuts bytes; a cut inside a UTF-8 character backs off to its start.
+        let mut cut = MAX_HEADER_LOG;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("...");
+    }
+    ctx.trace(
+        TraceMask::IO_DRIVER,
+        &adlog::log(
+            adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+            &format!("PrvImg jsonimage header: {text}"),
+        ),
+    );
+}
+
 /// C `strerror(errno)`: the OS text without Rust's " (os error N)" suffix.
 fn strerror(e: &std::io::Error) -> String {
     let text = e.to_string();
@@ -1771,6 +1806,7 @@ fn strerror(e: &std::io::Error) -> String {
 async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
     match (kind, frame) {
         (StreamKind::PrvImg, Frame::Image(mut f)) => {
+            log_json_header(ctx, &f.header);
             let pixels = std::mem::take(&mut f.pixels);
             let Some(mut array) = image_array(
                 ctx,
@@ -2873,6 +2909,7 @@ mod tests {
                 threshold_id: 0,
                 integration_size: 0,
                 pixels: vec![1, 2],
+                header: serde_json::Value::Null,
             });
             handle_frame(&ctx, kind, frame).await;
             let rx = match kind {
@@ -2937,6 +2974,7 @@ mod tests {
                     threshold_id: 0,
                     integration_size: 0,
                     pixels: vec![1, 200],
+                    header: serde_json::Value::Null,
                 });
                 handle_frame(&ctx, kind, frame).await;
                 let rx = match kind {
@@ -3005,6 +3043,7 @@ mod tests {
             threshold_id: 0,
             integration_size: 0,
             pixels: vec![1, 200],
+            header: serde_json::Value::Null,
         });
         handle_frame(&ctx, StreamKind::Img, frame).await;
 
@@ -3093,6 +3132,7 @@ mod tests {
                 threshold_id: 0,
                 integration_size: 0,
                 pixels: vec![1, 2],
+                header: serde_json::Value::Null,
             });
             handle_frame(&ctx, kind, frame).await;
             let rx = match kind {
@@ -3128,6 +3168,7 @@ mod tests {
                 threshold_id: 1,
                 integration_size: 7,
                 pixels: vec![1, 2],
+                header: serde_json::Value::Null,
             });
             handle_frame(&ctx, kind, frame).await;
             let rx = match kind {
@@ -3210,6 +3251,7 @@ mod tests {
                 threshold_id: 0,
                 integration_size: 0,
                 pixels: vec![1, 2, 3],
+                header: serde_json::Value::Null,
             })
         };
         let attr = |a: &epics_rs::ad_core::ndarray::NDArray, name| {
@@ -3321,6 +3363,7 @@ mod tests {
                 threshold_id: 0,
                 integration_size: 0,
                 pixels: vec![1, 2],
+                header: serde_json::Value::Null,
             });
             handle_frame(&ctx, StreamKind::Img, frame).await;
             let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -3350,6 +3393,7 @@ mod tests {
                 threshold_id,
                 integration_size: 0,
                 pixels: vec![1, 2],
+                header: serde_json::Value::Null,
             })
         };
         let total = || ctx.shared.img.lock().total_counts();
@@ -3482,6 +3526,7 @@ mod tests {
                     threshold_id: 0,
                     integration_size: 0,
                     pixels: vec![1, 2],
+                    header: serde_json::Value::Null,
                 });
                 handle_frame(&ctx, kind, frame).await;
             }
@@ -3735,6 +3780,7 @@ mod tests {
                 threshold_id: 0,
                 integration_size: 0,
                 pixels,
+                header: serde_json::Value::Null,
             });
             handle_frame(&ctx, StreamKind::Img, frame).await;
         }
@@ -3877,6 +3923,43 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The first PrvImgLogHeaders PrvImg headers are logged as nlohmann
+    /// `dump()`, cut at 1024 bytes (serval_stream.cpp:142-151).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_prv_img_headers_are_logged() {
+        let name = "TPX_HDR_LOG";
+        let ctx = idle_ctx(name);
+        let path = capture_errors(&ctx, name);
+        ctx.handle
+            .trace()
+            .set_trace_mask(Some(name), TraceMask::IO_DRIVER);
+        ctx.shared
+            .prv_img_json_headers
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let long = "x".repeat(2000);
+        log_json_header(
+            &ctx,
+            &json!({"width": 2, "frameNumber": 1, "timeAtFrame": 1e-5}),
+        );
+        log_json_header(&ctx, &json!({"a": long}));
+        log_json_header(&ctx, &json!({"never": true}));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let line = |h: &str| {
+            adlog::log(
+                adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+                &format!("PrvImg jsonimage header: {h}"),
+            )
+        };
+        assert!(
+            text.contains(&line(r#"{"frameNumber":1,"timeAtFrame":1e-05,"width":2}"#)),
+            "{text}"
+        );
+        let cut = format!("{{\"a\":\"{}...", "x".repeat(1024 - 6));
+        assert!(text.contains(&line(&cut)), "{text}");
+        assert!(!text.contains("never"), "{text}");
     }
 
     /// ERROR-mask trace output of the port `name` goes to the returned file.
