@@ -1770,12 +1770,12 @@ fn acquisition_error(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// How a failed write reaches the record. C writes `errorMessage` only at
-/// its BiasEnabled and MPX3 refusals and inside ADDriver's own writes
-/// (ADTimePix.cpp:502, :667); every other failure is its status alone.
+/// How a failed write reaches the record. C returns asynError for every
+/// failure, whatever status its ERR line prints (ADTimePix.cpp:870-873,
+/// :1108-1113), and writes `errorMessage` only at its BiasEnabled and MPX3
+/// refusals and inside ADDriver's own writes (ADTimePix.cpp:502, :667).
 enum Refusal {
-    /// The status alone, the param library's code kept for the ERR line;
-    /// the closing callbacks and ERR line follow.
+    /// The status alone; the closing callbacks and ERR line follow.
     Bare(AsynError),
     /// ADDriver's failure, its message kept; the closing callbacks follow.
     Base(AsynError),
@@ -1790,14 +1790,22 @@ impl From<AsynError> for Refusal {
 }
 
 impl Refusal {
-    fn into_record(self) -> AsynError {
+    /// The status C's ERR line prints.
+    fn c_status_code(&self) -> i32 {
         match self {
-            Refusal::Bare(e) => AsynError::from_c_status_code(e.c_status_code(), String::new())
-                .unwrap_or(AsynError::Status {
-                    status: e.status(),
-                    message: String::new(),
-                }),
-            Refusal::Base(e) | Refusal::Told(e) => e,
+            Refusal::Bare(e) | Refusal::Base(e) | Refusal::Told(e) => e.c_status_code(),
+        }
+    }
+
+    fn into_record(self) -> AsynError {
+        let message = match self {
+            Refusal::Told(e) => return e,
+            Refusal::Bare(_) => String::new(),
+            Refusal::Base(e) => e.message(),
+        };
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message,
         }
     }
 }
@@ -2240,16 +2248,15 @@ impl PortDriver for TimePix3Driver {
             });
         }
         let result = match self.write_int32_effect(user, value) {
-            Ok(()) => Ok(()),
             Err(Refusal::Told(e)) => return Err(e),
-            Err(refusal) => Err(refusal.into_record()),
+            r => r,
         };
 
         // The write's outcome is the record's, and it must survive the
         // callbacks (ADTimePix.cpp:866-873).
         let _ = self.ad.port_base.call_param_callbacks(addr);
         match &result {
-            Err(e) => self.ad.port_base.trace_print(
+            Err(refusal) => self.ad.port_base.trace_print(
                 TraceMask::ERROR,
                 format_args!(
                     "{}",
@@ -2257,7 +2264,7 @@ impl PortDriver for TimePix3Driver {
                         adlog::WRITE_INT32,
                         &format!(
                             "ERROR status={} function={reason}, value={value}",
-                            e.c_status_code()
+                            refusal.c_status_code()
                         ),
                     )
                 ),
@@ -2273,18 +2280,16 @@ impl PortDriver for TimePix3Driver {
                 ),
             ),
         }
-        result
+        result.map_err(Refusal::into_record)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let (reason, addr) = (user.reason, user.addr);
-        let result = self
-            .write_float64_effect(user, value)
-            .map_err(Refusal::into_record);
+        let result = self.write_float64_effect(user, value);
 
         let _ = self.ad.port_base.call_param_callbacks(addr);
         match &result {
-            Err(e) => self.ad.port_base.trace_print(
+            Err(refusal) => self.ad.port_base.trace_print(
                 TraceMask::ERROR,
                 format_args!(
                     "{}",
@@ -2292,7 +2297,7 @@ impl PortDriver for TimePix3Driver {
                         adlog::WRITE_FLOAT64,
                         &format!(
                             "ERROR status = {}, function ={reason}, value = {value:.6}",
-                            e.c_status_code()
+                            refusal.c_status_code()
                         ),
                     )
                 ),
@@ -2308,7 +2313,7 @@ impl PortDriver for TimePix3Driver {
                 ),
             ),
         }
-        result
+        result.map_err(Refusal::into_record)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -2558,32 +2563,78 @@ mod tests {
         assert_eq!(e.message(), "");
     }
 
-    /// A set the param library refuses closes with its own code, as C's
-    /// `status = setIntegerParam(...)` / `setDoubleParam` prints and returns
-    /// (ADTimePix.cpp:508, :866-873, :1093, :1108-1110).
+    /// Every failed write reaches the record as asynError, and the ERR line
+    /// prints the status C held: the param library's 11 for an address past
+    /// maxAddr (ADTimePix.cpp:866-873, :1106-1113).
     #[test]
-    fn a_refused_set_keeps_the_param_librarys_code() {
+    fn a_refused_write_is_asyn_error_and_the_line_keeps_the_code() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "TPX_SET_CODE";
         let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
-        let mut det = TimePix3Driver::new(
-            "TPX_SET_CODE",
+        let det = TimePix3Driver::new(
+            name,
             Arc::new(ServalHttp::new("http://127.0.0.1:1")),
             Arc::new(Shared::new()),
             0,
             cmd_tx,
         )
         .unwrap();
-        let p = det.p;
-        let e = det
-            .write_int32(
-                &mut AsynUser::new(p.processed_img_output_type).with_addr(20),
-                1,
-            )
+        let (p, ad) = (det.p, det.ad.params);
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace().set_trace_mask(Some(name), TraceMask::ERROR);
+
+        let refused = |e: AsynError| (e.c_status_code(), e.message());
+        let e = h
+            .write_int32_blocking(p.processed_img_output_type, 20, 1)
             .unwrap_err();
-        assert_eq!((e.c_status_code(), e.message()), (11, String::new()));
-        let e = det
-            .write_float64(&mut AsynUser::new(p.img_processing_time).with_addr(20), 1.0)
+        assert_eq!(refused(e), (3, String::new()));
+        let e = h
+            .write_float64_blocking(p.img_processing_time, 20, 1.0)
             .unwrap_err();
-        assert_eq!((e.c_status_code(), e.message()), (11, String::new()));
+        assert_eq!(refused(e), (3, String::new()));
+        // ADDriver's own write at a bad address: getAddress fails with
+        // asynError, which its line prints.
+        let e = h.write_int32_blocking(ad.num_exposures, 20, 1).unwrap_err();
+        assert_eq!(e.c_status_code(), 3);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for line in [
+            adlog::err(
+                adlog::WRITE_INT32,
+                &format!(
+                    "ERROR status=11 function={}, value=1",
+                    p.processed_img_output_type
+                ),
+            ),
+            adlog::err(
+                adlog::WRITE_FLOAT64,
+                &format!(
+                    "ERROR status = 11, function ={}, value = 1.000000",
+                    p.img_processing_time
+                ),
+            ),
+            adlog::err(
+                adlog::WRITE_INT32,
+                &format!("ERROR status=3 function={}, value=1", ad.num_exposures),
+            ),
+        ] {
+            assert!(text.contains(&line), "{line} not in {text}");
+        }
     }
 
     /// A channel Base PV reads back whether it names a reachable folder or
