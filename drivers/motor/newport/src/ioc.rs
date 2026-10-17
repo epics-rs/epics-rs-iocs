@@ -453,8 +453,8 @@ struct XpsRegistration {
     controller: Option<Arc<Mutex<XpsController>>>,
     /// The controller's `moveSocket_`, which runs profiles.
     profile_sock: Option<Arc<XpsSocket>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
+    /// The poller `XPSCreateController` starts; `XPSCreateAxis` joins it.
+    poller: Arc<Controller>,
     /// `XPSCreateProfile`'s FTP account.
     ftp_login: Option<(String, String)>,
 }
@@ -535,6 +535,9 @@ pub fn xps_create_controller_command() -> CommandDef {
                 ))),
                 None => None,
             };
+            // C starts the poller before any axis exists (XPSController.cpp:197).
+            let poller = Arc::new(Controller::new());
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 10);
             XPS_CONTROLLERS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -544,8 +547,7 @@ pub fn xps_create_controller_command() -> CommandDef {
                     ip_port,
                     controller,
                     profile_sock,
-                    moving_poll_ms,
-                    idle_poll_ms,
+                    poller,
                     ftp_login: None,
                 });
             Ok(CommandOutcome::Continue)
@@ -569,14 +571,13 @@ pub fn xps_create_axis_command() -> CommandDef {
             let port_name = req_string(args, 0, "Controller port name")?;
             let axis = c_int(args, 1);
             let positioner_name = req_string(args, 2, "Axis name")?;
-            let Some((controller, ip, ip_port, moving_poll_ms, idle_poll_ms)) =
+            let Some((controller, ip, ip_port, poller)) =
                 with_xps(&port_name, "XPSCreateAxis", |reg| {
                     (
                         reg.controller.clone(),
                         reg.ip.clone(),
                         reg.ip_port,
-                        reg.moving_poll_ms,
-                        reg.idle_poll_ms,
+                        reg.poller.clone(),
                     )
                 })
             else {
@@ -607,14 +608,7 @@ pub fn xps_create_axis_command() -> CommandDef {
                 1.0 / steps_per_unit,
             );
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            install(
-                ctx,
-                asyn_user(&port_name, axis),
-                motor,
-                moving_poll_ms,
-                idle_poll_ms,
-                10, // C startPoller, XPSController.cpp:197
-            )?;
+            poller.install(asyn_user(&port_name, axis), motor)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1941,5 +1935,41 @@ mod one_poller {
         ];
         let cmd = hxp_create_controller_command();
         assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// XPSController.cpp:197: the controller's poller, which every
+    /// XPSCreateAxis joins.
+    #[epics_rs::base::epics_test]
+    async fn xps_create_axis_joins_the_controller_poller() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(4).collect();
+            std::thread::park();
+            drop(held);
+        });
+        let args = vec![
+            ArgValue::String("xpsOnePoller".into()),
+            ArgValue::String("127.0.0.1".into()),
+            ArgValue::Int(port.into()),
+            ArgValue::Int(2),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+            ArgValue::Int(0),
+            ArgValue::Int(0),
+        ];
+        assert_eq!(
+            pollers_after(xps_create_controller_command(), args).await,
+            1
+        );
+        for (axis, name) in [(0, "G1.P1"), (1, "G1.P2")] {
+            let args = vec![
+                ArgValue::String("xpsOnePoller".into()),
+                ArgValue::Int(axis),
+                ArgValue::String(name.into()),
+                ArgValue::String("1000".into()),
+            ];
+            assert_eq!(pollers_after(xps_create_axis_command(), args).await, 1);
+        }
     }
 }
