@@ -425,10 +425,9 @@ pub struct ImsMDrivePlusAxis {
     /// The controller port's IMS_LOCKEDROTOR, which the poll sets
     /// (ImsMDrivePlusMotorAxis.cpp:484).
     locked_rotor: Option<usize>,
-    /// The controller-port steps of the last write, for the owner to apply.
+    /// The controller-port steps of the last write or poll, for the owner
+    /// to apply; a poll's params go out with its status.
     sets: PortSets,
-    /// The params the last poll set, posted with its status.
-    poll_params: Vec<(usize, ParamValue)>,
     /// C's status params as its polls left them, a failed poll's partial
     /// reads included.
     status: MotorStatus,
@@ -463,7 +462,6 @@ impl ImsMDrivePlusAxis {
             },
             failed: None,
             status_writes: Vec::new(),
-            poll_params: Vec::new(),
         };
         if axis.config_axis() == AsynStatus::Error {
             axis.line.print(
@@ -815,8 +813,7 @@ impl ImsMDrivePlusAxis {
         self.status.encoder_position = atof(&self.write_read("PR C2")?);
         let locked_rotor = atoi(&self.write_read("PR LR")?);
         if let Some(reason) = self.locked_rotor {
-            self.poll_params
-                .push((reason, ParamValue::Int32(locked_rotor)));
+            self.sets.axis(reason, ParamValue::Int32(locked_rotor));
         }
         Ok(())
     }
@@ -962,16 +959,15 @@ impl AsynMotor for ImsMDrivePlusAxis {
             // every good poll (:496-497); the problem bit a failed
             // IMS_* write set lives only in the params.
             self.line.take_comms_failed();
-            self.poll_params.extend([
-                (index::STATUS_COMMS_ERROR, ParamValue::Int32(0)),
-                (STATUS_PROBLEM, ParamValue::Int32(0)),
-            ]);
+            self.sets
+                .axis(index::STATUS_COMMS_ERROR, ParamValue::Int32(0));
+            self.sets.axis(STATUS_PROBLEM, ParamValue::Int32(0));
             self.failed = None;
         } else {
             self.failed = Some(self.status.clone());
             if self.handle_axis_error("poll()", "polling motor") {
-                self.poll_params
-                    .push((index::STATUS_COMMS_ERROR, ParamValue::Int32(1)));
+                self.sets
+                    .axis(index::STATUS_COMMS_ERROR, ParamValue::Int32(1));
             }
         }
         let mut word = MstaFlags::from_status(&self.status);
@@ -985,12 +981,6 @@ impl AsynMotor for ImsMDrivePlusAxis {
             ),
         );
         status
-    }
-
-    /// C's poll sets these and posts them in the callParamCallbacks that
-    /// posts its status (ImsMDrivePlusMotorAxis.cpp:484-501).
-    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
-        std::mem::take(&mut self.poll_params)
     }
 
     fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
@@ -1007,6 +997,25 @@ mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interfaces::motor::PortSet;
+
+    /// The steps one call left on the controller port, in the order made.
+    fn rendered(sets: PortSets) -> Vec<String> {
+        sets.into_iter()
+            .map(|set| match set {
+                PortSet::Set {
+                    addr,
+                    reason,
+                    value: ParamValue::Int32(v),
+                } => format!("set {addr} {reason} {v}"),
+                PortSet::Axis {
+                    reason,
+                    value: ParamValue::Int32(v),
+                } => format!("axis {reason} {v}"),
+                PortSet::Callbacks(addr) => format!("callbacks {addr}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
 
     /// ImsMDrivePlusMotorController.cpp:69-99: a missing IO port still builds
     /// the axis; configAxis and readHomeAndLimitConfig run on the dead user.
@@ -1126,19 +1135,7 @@ mod tests {
             |axis| {
                 let user = AsynUser::new(0);
                 assert!(axis.move_absolute(&user, 100.0, 0.0, 50.0, 0.0).is_err());
-                sets = axis
-                    .take_port_sets()
-                    .into_iter()
-                    .map(|set| match set {
-                        PortSet::Set {
-                            addr,
-                            reason,
-                            value: ParamValue::Int32(v),
-                        } => format!("set {addr} {reason} {v}"),
-                        PortSet::Set { .. } => "set other".into(),
-                        PortSet::Callbacks(addr) => format!("callbacks {addr}"),
-                    })
-                    .collect();
+                sets = rendered(axis.take_port_sets());
             },
         );
         assert_eq!(
@@ -1304,20 +1301,11 @@ mod tests {
         assert_eq!(sent.iter().filter(|s| *s == "R1=1").count(), 1, "{sent:?}");
     }
 
-    /// ImsMDrivePlusMotorAxis.cpp:494-501: a good poll's COMMS_ERROR and
-    /// PROBLEM resets, and a failed exchange's COMMS_ERROR, go out with the
-    /// poll's status rather than on their own.
+    /// ImsMDrivePlusMotorAxis.cpp:484-501: a good poll's IMS_LOCKEDROTOR,
+    /// COMMS_ERROR and PROBLEM, and a failed exchange's COMMS_ERROR, go out
+    /// on the axis with the poll's status, in the order C sets them.
     #[test]
     fn a_poll_hands_its_params_to_the_poller() {
-        let ints = |params: Vec<(usize, ParamValue)>| -> Vec<(usize, i32)> {
-            params
-                .into_iter()
-                .map(|(reason, value)| match value {
-                    ParamValue::Int32(v) => (reason, v),
-                    other => panic!("{other:?}"),
-                })
-                .collect()
-        };
         let mut taken = Vec::new();
         axis_error_lines(
             "imsPollParams",
@@ -1326,8 +1314,8 @@ mod tests {
             |axis| {
                 let user = AsynUser::new(0);
                 assert!(axis.poll(&user).is_err());
-                taken.push(ints(axis.take_poll_params()));
-                assert!(axis.take_poll_params().is_empty());
+                taken.push(rendered(axis.take_port_sets()));
+                assert!(axis.take_port_sets().is_empty());
             },
         );
         axis_error_lines(
@@ -1336,14 +1324,17 @@ mod tests {
             |_| false,
             |axis| {
                 axis.poll(&AsynUser::new(0)).unwrap();
-                taken.push(ints(axis.take_poll_params()));
+                taken.push(rendered(axis.take_port_sets()));
             },
         );
         assert_eq!(
             taken,
             [
-                vec![(index::STATUS_COMMS_ERROR, 1)],
-                vec![(index::STATUS_COMMS_ERROR, 0), (STATUS_PROBLEM, 0)],
+                vec![format!("axis {} 1", index::STATUS_COMMS_ERROR)],
+                vec![
+                    format!("axis {} 0", index::STATUS_COMMS_ERROR),
+                    format!("axis {STATUS_PROBLEM} 0"),
+                ],
             ]
         );
     }
