@@ -104,17 +104,17 @@ pub fn print(base: &PortDriverBase, mask: TraceMask, line: &str) {
 
 /// `ERR`/`ERR_ARGS`, at `ASYN_TRACE_ERROR`.
 pub fn err(func: &str, msg: &str) -> String {
-    format!("ERROR | ADTimePix::{func}: {msg}\n")
+    format!("ERROR | ADTimePix::{func}: {msg}")
 }
 
 /// `WARN`/`WARN_ARGS`, at `ASYN_TRACE_WARNING`.
 pub fn warn(func: &str, msg: &str) -> String {
-    format!("WARN | ADTimePix::{func}: {msg}\n")
+    format!("WARN | ADTimePix::{func}: {msg}")
 }
 
 /// `LOG`/`LOG_ARGS`, at `ASYN_TRACEIO_DRIVER`.
 pub fn log(func: &str, msg: &str) -> String {
-    format!("ADTimePix::{func}: {msg}\n")
+    format!("ADTimePix::{func}: {msg}")
 }
 
 /// C `trimHttpBodyForLog`: control characters become spaces, the body is cut
@@ -180,11 +180,11 @@ mod tests {
             http_failure("rotateLayout", "GET", "http://s/x", &e).unwrap(),
             "ERROR | ADTimePix::void ADTimePix::logHttpFailure(const char*, const char*, \
              const std::string&, long int, const std::string&): rotateLayout: GET http://s/x \
-             HTTP 404: no such\n"
+             HTTP 404: no such"
         );
         assert_eq!(
             http_failure("c", "GET", "u", &HttpError::Transport("x".into())).unwrap(),
-            format!("ERROR | ADTimePix::{LOG_HTTP_FAILURE}: c: GET u HTTP 0: \n")
+            format!("ERROR | ADTimePix::{LOG_HTTP_FAILURE}: c: GET u HTTP 0: ")
         );
         assert!(http_failure("c", "GET", "u", &HttpError::Parse("x".into())).is_none());
     }
