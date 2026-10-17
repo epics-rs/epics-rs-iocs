@@ -423,13 +423,15 @@ impl AsynMotor for FaulhaberAxis {
         let status_bytes = status_buff.as_bytes();
         let home = status_bytes.get(6) == Some(&b'1');
 
+        // drvMCDC2805.cc:263-281: the raw POS against the last rounded
+        // position; only a change moves it and sets the direction.
         let motor_data = pos.as_deref().map(atof).unwrap_or(0.0);
-        let new_position = nint(motor_data);
-        let direction = if new_position != self.prev_position {
-            new_position >= self.prev_position
-        } else {
-            self.last_status.direction
-        };
+        let mut direction = self.last_status.direction;
+        if motor_data != f64::from(self.prev_position) {
+            let new_position = nint(motor_data);
+            direction = new_position >= self.prev_position;
+            self.prev_position = new_position;
+        }
         let plusdir = direction;
 
         // Limit switches (GAST: byte 0 = plus, byte 1 = minus).
@@ -456,12 +458,12 @@ impl AsynMotor for FaulhaberAxis {
         }
         drop(ctrl);
 
-        self.prev_position = new_position;
         let signed_velocity = if plusdir { velocity } else { -velocity };
 
         self.last_status = MotorStatus {
-            position: motor_data,
-            encoder_position: motor_data,
+            position: f64::from(self.prev_position),
+            // C `(int) motorData`.
+            encoder_position: f64::from(motor_data as i32),
             velocity: signed_velocity as f64,
             direction,
             done,
@@ -490,6 +492,7 @@ mod tests {
         axis: FaulhaberAxis,
         moving: Arc<AtomicBool>,
         minus: Arc<AtomicBool>,
+        pos: Arc<Mutex<&'static str>>,
         user: AsynUser,
     }
 
@@ -498,12 +501,13 @@ mod tests {
         fn new(name: &str) -> Self {
             let moving = Arc::new(AtomicBool::new(false));
             let minus = Arc::new(AtomicBool::new(false));
-            let (m, l) = (moving.clone(), minus.clone());
+            let pos = Arc::new(Mutex::new("0"));
+            let (m, l, p) = (moving.clone(), minus.clone(), pos.clone());
             let (line, io) =
                 LineRig::new(name, move |last| match last.get(1..).unwrap_or_default() {
                     "VER" => "MCDC2805".into(),
                     "GST" => "0000000".into(),
-                    "POS" => "0".into(),
+                    "POS" => (*p.lock().unwrap()).into(),
                     "GAST" => if l.load(Ordering::SeqCst) { "01" } else { "00" }.into(),
                     "GV" => if m.load(Ordering::SeqCst) { "-60" } else { "0" }.into(),
                     _ => String::new(),
@@ -516,6 +520,7 @@ mod tests {
                 axis,
                 moving,
                 minus,
+                pos,
                 user: AsynUser::new(0),
             }
         }
@@ -699,5 +704,24 @@ mod tests {
                 "1M"
             ]
         );
+    }
+
+    /// drvMCDC2805.cc:263-281, 334-339: the position is NINT of POS, the
+    /// encoder its truncation, and a fraction off the last position still
+    /// sets the direction from the rounded one.
+    #[test]
+    fn position_rounds_encoder_truncates() {
+        let mut r = Rig::new("mcdc_pos");
+        *r.pos.lock().unwrap() = "-20";
+        assert!(!r.axis.poll(&r.user).unwrap().direction);
+        *r.pos.lock().unwrap() = "-20.4";
+        let s = r.axis.poll(&r.user).unwrap();
+        assert_eq!((s.position, s.encoder_position), (-20.0, -20.0));
+        assert!(s.direction, "-20 >= -20");
+        *r.pos.lock().unwrap() = "-20";
+        assert!(r.axis.poll(&r.user).unwrap().direction, "kept");
+        *r.pos.lock().unwrap() = "7.6";
+        let s = r.axis.poll(&r.user).unwrap();
+        assert_eq!((s.position, s.encoder_position), (8.0, 7.0));
     }
 }
