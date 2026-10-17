@@ -5,7 +5,7 @@
 //! consumer's own `ptr += 4`), or on a full raw binary frame (`FD1`/`FO1`,
 //! which indexes from the frame start).
 
-use epics_rs::base::calc::engine::cvt::fmt_g;
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::calc::engine::strtod::strtod;
 
 // ---------------------------------------------------------------------
@@ -104,7 +104,7 @@ pub fn cmd_bo1() -> String {
 
 /// C `sprintf("%G", value)` (`drvMW100.c:1265,1268`).
 pub fn format_g(value: f64) -> String {
-    fmt_g(value, 6, true, false)
+    CFloat(value).g().to_string().to_ascii_uppercase()
 }
 
 // ---------------------------------------------------------------------

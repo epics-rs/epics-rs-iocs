@@ -5376,6 +5376,7 @@ dependencies = [
 name = "yokogawa-mw100"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "log",
  "parking_lot",
