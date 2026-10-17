@@ -30,9 +30,8 @@ ESP300Setup(1, 10)
 ESP300Config(0, "$(SERIAL)")
 
 # One motor record per discovered axis, signal S of card 0.
-# Positions travel the driver boundary in EGU directly; MRES only sets the
-# record's raw-count resolution (display/deadband granularity).
-dbLoadRecords("$(ESP300_IOC)/db/esp300.template", "P=$(P),M=m1,C=0,S=0,MRES=0.0001,EGU=mm")
+# MRES must equal the axis drive resolution (the boundary is raw steps).
+dbLoadRecords("$(ESP300_IOC)/db/esp300.template", "P=$(P),M=m1,C=0,S=0,MRES=5e-5,EGU=mm")
 
 iocInit()
 

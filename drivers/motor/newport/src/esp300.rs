@@ -16,14 +16,12 @@
 //!
 //! ## Units
 //!
-//! The asyn-rs motor boundary is dial-frame EGU in both directions, and the
-//! ESP300 commands/readbacks are already in physical units (mm/deg per the
-//! stage's SN configuration) — so positions, velocities, and accelerations
-//! pass through unscaled. C's `cntrl_units = dval * drive_resolution` existed
-//! only because the C record boundary was raw steps. `drive_resolution` is
-//! still discovered per axis at startup (`ZB?` → `FR?`/`QS?` or `SU?`)
-//! because C scales PID gain writes by it (kept for wire parity) and the
-//! `ZB?` feedback bits drive encoder/gain-support status.
+//! The record boundary is raw steps, as in devESP300.cc: every command value
+//! is `steps * drive_resolution` (gains included) and `TP?` reads back as
+//! `NINT(TP / drive_resolution)` steps. `drive_resolution` comes per axis
+//! from `ZB?` → `FR?`/`QS?` or `SU?`. A resolution of 0 or a non-finite one
+//! (a failed `FR?`/`SU?`, a `QS?` of 0) refuses commands and flags the
+//! poll a problem, where C sends `0`/`inf` and reads back `inf`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -162,7 +160,7 @@ impl Esp300Controller {
 /// The velocity/acceleration preamble every motion transaction carries
 /// (record `SET_VEL_BASE`/`SET_VELOCITY`/`SET_ACCEL` before the move):
 /// `VB;VA;AC;AG` — the ESP300 takes acceleration and deceleration (`AG`)
-/// separately, C sends both. Values are already controller units.
+/// separately, C sends both. Values are controller units.
 fn motion_preamble(axis: usize, vel_base: f64, velocity: f64, acceleration: f64) -> String {
     format!(
         "{axis:02}VB{vel_base:.6};{axis:02}VA{velocity:.6};{axis:02}AC{acceleration:.6};{axis:02}AG{acceleration:.6}"
@@ -175,8 +173,7 @@ pub struct Esp300Axis {
     /// 1-based controller axis number, sent zero-padded (`%.2d`).
     axis: usize,
     /// Controller units per motor step (C `drive_resolution`), discovered at
-    /// construction from the feedback configuration. Used only to scale PID
-    /// gain writes for C wire parity (module Units note).
+    /// construction from the feedback configuration (module Units note).
     drive_resolution: f64,
     /// Stage has an encoder (`ZB?` feedback bits 8/9) — drives the
     /// gain-support/has-encoder status bits (C `EA_PRESENT`/`GAIN_SUPPORT`).
@@ -236,10 +233,32 @@ impl Esp300Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// [`motion_preamble`] for this axis. Values arrive in EGU/sec(²),
-    /// already controller units (module Units note).
-    fn motion_preamble(&self, min_velocity: f64, velocity: f64, acceleration: f64) -> String {
-        motion_preamble(self.axis, min_velocity, velocity, acceleration)
+    /// `drive_resolution`, refused at 0 or non-finite (module Units note).
+    fn resolution(&self) -> AsynResult<f64> {
+        let res = self.drive_resolution;
+        if res == 0.0 || !res.is_finite() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("ESP300 axis {}: drive resolution is {res}", self.axis),
+            });
+        }
+        Ok(res)
+    }
+
+    /// [`motion_preamble`] for this axis, steps scaled to controller units.
+    fn motion_preamble(
+        &self,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<String> {
+        let res = self.resolution()?;
+        Ok(motion_preamble(
+            self.axis,
+            min_velocity * res,
+            velocity * res,
+            acceleration * res,
+        ))
     }
 
     /// One move transaction: the record's earlier parts, then PREM and a
@@ -274,7 +293,8 @@ impl AsynMotor for Esp300Axis {
     ) -> AsynResult<()> {
         // One transaction: VB;VA;AC;AG;PA (the ESP300 starts moving on PA;
         // the record's GO is a no-op).
-        let parts = self.motion_preamble(min_velocity, velocity, acceleration);
+        let parts = self.motion_preamble(min_velocity, velocity, acceleration)?;
+        let position = position * self.resolution()?;
         self.write_move(&parts, &format!("{:02}PA{position:.6}", self.axis))
     }
 
@@ -286,7 +306,8 @@ impl AsynMotor for Esp300Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let parts = self.motion_preamble(min_velocity, velocity, acceleration);
+        let parts = self.motion_preamble(min_velocity, velocity, acceleration)?;
+        let distance = distance * self.resolution()?;
         self.write_move(&parts, &format!("{:02}PR{distance:.6}", self.axis))
     }
 
@@ -300,6 +321,8 @@ impl AsynMotor for Esp300Axis {
         // Record JOG transaction: SET_ACCEL then VA with the jog speed and a
         // signed MV (C `JOG` case).
         let a = self.axis;
+        let res = self.resolution()?;
+        let (velocity, acceleration) = (velocity * res, acceleration * res);
         let sign = if velocity > 0.0 { '+' } else { '-' };
         self.write_move(
             &format!("{a:02}AC{acceleration:.6};{a:02}AG{acceleration:.6}"),
@@ -317,7 +340,7 @@ impl AsynMotor for Esp300Axis {
     ) -> AsynResult<()> {
         // C sends the same `OR` for HOME_FOR and HOME_REV (direction ignored),
         // after the record's velocity/acceleration transaction parts.
-        let parts = self.motion_preamble(min_velocity, velocity, acceleration);
+        let parts = self.motion_preamble(min_velocity, velocity, acceleration)?;
         self.write_move(&parts, &format!("{:02}OR", self.axis))
     }
 
@@ -328,6 +351,7 @@ impl AsynMotor for Esp300Axis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         // C `LOAD_POS`: define home (DH) at the given position.
+        let position = position * self.resolution()?;
         let ctrl = self.lock();
         ctrl.write(&format!("{:02}DH{position:.6}", self.axis))
     }
@@ -343,11 +367,13 @@ impl AsynMotor for Esp300Axis {
     }
 
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        let position = position * self.resolution()?;
         let ctrl = self.lock();
         ctrl.write(&format!("{:02}SR{position:.6}", self.axis))
     }
 
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        let position = position * self.resolution()?;
         let ctrl = self.lock();
         ctrl.write(&format!("{:02}SL{position:.6}", self.axis))
     }
@@ -362,18 +388,7 @@ impl AsynMotor for Esp300Axis {
             PidGainKind::Integral => "KI",
             PidGainKind::Derivative => "KD",
         };
-        // C passes the gain through its uniform `dval * drive_resolution`
-        // conversion even though the gain is dimensionless; kept bug-for-bug
-        // so the wire bytes match.
-        // C's ESP300 axis divides FR? by a QS? that can read 0, so its gain
-        // write sends `inf`/`nan`; that C defect is not copied.
-        let value = gain * self.drive_resolution;
-        if !value.is_finite() {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("ESP300 axis {a}: drive resolution is not finite"),
-            });
-        }
+        let value = gain * self.resolution()?;
         let ctrl = self.lock();
         ctrl.write(&format!("{a}{cc}{value:.6};{a}UF"))
     }
@@ -436,8 +451,10 @@ impl Esp300Axis {
         }
         let done = md == "1";
 
-        // TP? reports controller units == record EGU (module Units note).
-        let position = atof(&read(&ctrl, &format!("{a:02}TP?")));
+        // TP? reports controller units; C NINTs them to steps.
+        let tp = atof(&read(&ctrl, &format!("{a:02}TP?")));
+        let steps = self.resolution().map(|res| (tp / res).round());
+        let position = steps.as_ref().copied().unwrap_or(self.last_status.position);
         // Direction from the position delta; only one position query exists,
         // so the encoder position is the same value (C set_status).
         if position != self.last_status.position {
@@ -455,8 +472,8 @@ impl Esp300Axis {
 
         let te = read(&ctrl, "TE?");
         let errcode = atoi(&te);
-        let problem = errcode != 0;
-        if problem {
+        let problem = errcode != 0 || steps.is_err();
+        if errcode != 0 {
             println!("ESP300 controller error = {errcode}.");
         }
         // drvESP300.cc:391-398; C ignores the write's status too.
@@ -565,7 +582,7 @@ mod tests {
     }
 
     /// A QS? of 0 keeps the axis, as C does, with an infinite resolution
-    /// that the gain write refuses rather than sending `inf`.
+    /// that commands refuse rather than sending `inf`, and polls flag.
     #[test]
     fn a_non_finite_resolution_never_reaches_the_wire() {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
@@ -602,6 +619,8 @@ mod tests {
             axis.set_pid_gain(&user, PidGainKind::Proportional, 0.5)
                 .is_err()
         );
+        assert!(axis.move_absolute(&user, 10.0, 0.0, 1.0, 1.0).is_err());
+        assert!(axis.poll(&user).unwrap().problem);
     }
 
     /// An ESP300 line answering `replies`: the controller and the wire log
@@ -645,7 +664,9 @@ mod tests {
                 "TB?" => "0, 0, NO ERROR",
                 "01MD" if m.load(Ordering::SeqCst) => "0",
                 "01MD" | "01MO?" => "1",
-                "TE?" | "01TP?" | "01ZB?" | "01FR?" => "0",
+                "TE?" | "01TP?" | "01ZB?" => "0",
+                // One controller unit per record step.
+                "01FR?" => "1",
                 _ => "",
             }
             .to_string()
@@ -726,6 +747,7 @@ mod tests {
             &[
                 ("TB?", "0, 0, NO ERROR DETECTED"),
                 ("01MD", "1"),
+                ("01FR?", "0.001"),
                 ("01TP?", "1.5"),
                 ("01ZH?", "24"),
                 ("01MO?", "1"),
@@ -740,7 +762,7 @@ mod tests {
             ]
         );
         let s = &axis.last_status;
-        assert_eq!(s.position, 1.5);
+        assert_eq!(s.position, 1500.0);
         assert!(s.done && s.powered && !s.problem && !s.comms_error);
     }
 
