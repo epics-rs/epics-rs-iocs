@@ -403,4 +403,18 @@ mod extra_params {
         assert_eq!(not_polled(line.sent()), ["AS"]);
         assert_eq!(io.read_int32(save).unwrap(), 1);
     }
+
+    /// ImsMDrivePlusMotorController.cpp:335-343 and
+    /// ImsMDrivePlusMotorAxis.cpp:542-563: IMS_CLEARLRERROR 1 sends `CF`.
+    #[epics_rs::base::epics_test]
+    async fn clear_lr_error_sends_cf_on_one() {
+        let (line, io) = controller("imsClrLr", "imsClrLrLine").await;
+        let clear = io.drv_user_create("IMS_CLEARLRERROR").unwrap();
+        line.sent();
+        io.write_int32(clear, 0).unwrap();
+        assert!(not_polled(line.sent()).is_empty());
+        io.write_int32(clear, 1).unwrap();
+        assert_eq!(not_polled(line.sent()), ["ACF"]);
+        assert_eq!(io.read_int32(clear).unwrap(), 1);
+    }
 }

@@ -26,9 +26,9 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! - **`clearLockedRotor` (`CF`) / locked-rotor readback (`PR LR`).** These
-//!   are asyn extra-parameter actions driven by separate PVs, outside the
-//!   motor record, so they are not part of the [`AsynMotor`] boundary.
+//! - **Locked-rotor readback (`PR LR`).** An asyn extra parameter read by a
+//!   separate PV, outside the motor record, so it is not part of the
+//!   [`AsynMotor`] boundary.
 //! - **Velocity / direction / power-on readback.** The C poller never sets
 //!   `motorStatusActualVelocity`, `motorStatusDirection` or `motorStatusPowerOn`,
 //!   so those are left at their defaults here too.
@@ -146,13 +146,38 @@ impl ImsLine {
 pub struct ImsParams {
     line: Arc<ImsLine>,
     save_to_nvm: Option<usize>,
+    clear_lr_error: Option<usize>,
 }
+
+/// One of C `writeInt32`'s own functions: the command a 1 sends, and the
+/// lines it prints.
+struct Action {
+    command: &'static str,
+    done: &'static str,
+    failed: &'static str,
+    not_one: &'static str,
+}
+
+const SAVE_TO_NVM: Action = Action {
+    command: "S",
+    done: "Successfully saved to NVM",
+    failed: "ERROR saving to NVM",
+    not_one: "ERROR, value of 1 to save to NVM",
+};
+
+const CLEAR_LR_ERROR: Action = Action {
+    command: "CF",
+    done: "Successfully cleared LR error",
+    failed: "ERROR clearing LR error",
+    not_one: "ERROR, value of 1 to clear LR error",
+};
 
 impl ImsParams {
     pub fn new(line: Arc<ImsLine>) -> Self {
         Self {
             line,
             save_to_nvm: None,
+            clear_lr_error: None,
         }
     }
 }
@@ -165,7 +190,7 @@ impl ControllerParams for ImsParams {
         base.create_param("IMS_LOADMCODE", ParamType::Octet)?;
         base.create_param("IMS_CLEARMCODE", ParamType::Octet)?;
         base.create_param("IMS_LOCKEDROTOR", ParamType::Int32)?;
-        base.create_param("IMS_CLEARLRERROR", ParamType::Int32)?;
+        self.clear_lr_error = Some(base.create_param("IMS_CLEARLRERROR", ParamType::Int32)?);
         Ok(())
     }
 
@@ -179,31 +204,29 @@ impl ControllerParams for ImsParams {
             TraceMask::IO_DRIVER,
             format_args!("{DRIVER_NAME}:writeInt32: val={value}\n"),
         );
-        if Some(user.reason) != self.save_to_nvm {
-            return ParamWrite::PassToBase(Ok(()));
-        }
+        let action = match Some(user.reason) {
+            r if r == self.save_to_nvm => SAVE_TO_NVM,
+            r if r == self.clear_lr_error => CLEAR_LR_ERROR,
+            _ => return ParamWrite::PassToBase(Ok(())),
+        };
         let addr = match base.get_address(user.addr, user.reason) {
             Ok(addr) => addr,
             Err(e) => return ParamWrite::Handled(Err(e)),
         };
         let _ = base.set_int32_param(user.reason, addr, value);
         let status = if value == 1 {
-            let status = self.line.write_only("S");
-            match &status {
-                Ok(()) => base.trace_print(
-                    TraceMask::FLOW,
-                    format_args!("{DRIVER_NAME}:writeInt32: Successfully saved to NVM\n"),
-                ),
-                Err(_) => base.trace_print(
-                    TraceMask::ERROR,
-                    format_args!("{DRIVER_NAME}:writeInt32: ERROR saving to NVM\n"),
-                ),
-            }
+            let status = self.line.write_only(action.command);
+            let (mask, line) = match &status {
+                Ok(()) => (TraceMask::FLOW, action.done),
+                Err(_) => (TraceMask::ERROR, action.failed),
+            };
+            base.trace_print(mask, format_args!("{DRIVER_NAME}:writeInt32: {line}\n"));
             status
         } else {
+            let not_one = action.not_one;
             base.trace_print(
                 TraceMask::ERROR,
-                format_args!("{DRIVER_NAME}:writeInt32: ERROR, value of 1 to save to NVM\n"),
+                format_args!("{DRIVER_NAME}:writeInt32: {not_one}\n"),
             );
             Ok(())
         };
