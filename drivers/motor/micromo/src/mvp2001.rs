@@ -41,7 +41,9 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::nint;
 use motor_common::{AxisReport, ControllerParams, ControllerReport};
@@ -209,6 +211,8 @@ impl AxisReport for Mvp2001AxisReport {
 /// One MVP 2001 axis sharing a controller. Implements [`AsynMotor`].
 pub struct Mvp2001Axis {
     controller: Arc<Mutex<Mvp2001Controller>>,
+    /// C `pasynUser_`.
+    trace: MotorTrace,
     /// 1-based wire axis index.
     axis_index: i32,
     encoder_lines_per_rev: i32,
@@ -227,6 +231,7 @@ impl Mvp2001Axis {
     /// `limit_polarity` is normalized to 0 (NC) or 1 (NO).
     pub fn new(
         controller: Arc<Mutex<Mvp2001Controller>>,
+        port_name: &str,
         axis_no: usize,
         encoder_lines_per_rev: i32,
         max_current_ma: i32,
@@ -255,6 +260,7 @@ impl Mvp2001Axis {
 
         Self {
             controller,
+            trace: MotorTrace::new(port_name, axis_no as i32),
             axis_index,
             encoder_lines_per_rev,
             max_current_ma,
@@ -336,10 +342,20 @@ impl AsynMotor for Mvp2001Axis {
     fn move_velocity(
         &mut self,
         _user: &AsynUser,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.trace.print(
+            TraceMask::FLOW,
+            0,
+            format_args!(
+                "MVP2001Axis::moveVelocity: minVelocity={:.6}, maxVelocity={:.6}, acceleration={:.6}\n",
+                CFloat(min_velocity),
+                CFloat(velocity),
+                CFloat(acceleration)
+            ),
+        );
         let n = self.axis_index;
         let ctrl = self.lock();
         self.send_accel_and_velocity(&ctrl, acceleration, velocity)?;
@@ -443,8 +459,35 @@ mod tests {
         let (handle, _) =
             SyncIOHandle::connect_port("MVP2001_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(Mvp2001Controller::new(handle, 1)));
-        let axis = Mvp2001Axis::new(controller, 0, 512, 500, 1);
+        let axis = Mvp2001Axis::new(controller, "MVP2001_NONE", 0, 512, 500, 1);
         assert_eq!(axis.sample_period, DEFAULT_SAMPLE_PERIOD);
+    }
+
+    /// MVP2001Driver.cpp:328: moveVelocity's FLOW line, on the axis's user
+    /// and before any command.
+    #[test]
+    fn move_velocity_traces_as_c() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+
+        let (handle, _) =
+            SyncIOHandle::connect_port("MVP2001_NONE", 0, Duration::ZERO, InterfaceType::Octet);
+        let controller = Arc::new(Mutex::new(Mvp2001Controller::new(handle, 2)));
+        let mut axis = Mvp2001Axis::new(controller, "MVP2001_FLOW", 1, 512, 500, 1);
+        let path = std::env::temp_dir().join(format!("mvp2001-flow-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_device_trace_mask("MVP2001_FLOW", 1, TraceMask::FLOW);
+        trace.set_device_trace_info_mask("MVP2001_FLOW", 1, TraceInfoMask::empty());
+        trace.set_device_trace_file("MVP2001_FLOW", 1, TraceFile::File(file));
+        let _ = axis.move_velocity(&AsynUser::new(1), 0.5, 100.0, 250.0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            text,
+            "MVP2001Axis::moveVelocity: minVelocity=0.500000, maxVelocity=100.000000, acceleration=250.000000\n"
+        );
     }
 
     #[test]

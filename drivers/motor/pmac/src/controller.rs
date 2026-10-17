@@ -41,7 +41,7 @@ use epics_rs::motor::controller_port::{
 use epics_rs::motor::trace::MotorTrace;
 
 use crate::cs_groups::{AxisPoll, CsGroups, DeferredMove, UNDEFINE_ALL, fast_deferred_command};
-use crate::protocol::{HARDWARE_PROB, parse_feedrate, parse_global_status};
+use crate::protocol::{HARDWARE_PROB, InitialStatus, parse_feedrate, parse_global_status};
 
 /// Response buffer size (C `PMAC_MAXBUF`).
 pub const PMAC_MAXBUF: usize = 1024;
@@ -131,8 +131,9 @@ pub fn pmac_err(message: impl Into<String>) -> AsynError {
 /// padding the read leaves behind (the input EOS has already taken the
 /// terminating `<ACK>`).
 ///
-/// **Upstream fix.** C `pmacController::lowLevelWriteRead` (and the CS driver's
-/// `motorAxisWriteRead`) report success for *any* reply the transport delivered,
+/// **Upstream fix.** C `pmacController::lowLevelWriteRead` (pmacController.cpp:308)
+/// and the CS driver's `motorAxisWriteRead` (pmacAsynCoord.c:345) report success
+/// for *any* reply the transport delivered,
 /// so a command the controller rejected — `<BELL>ERRxxx<CR>`, the error form its
 /// own `pmacAsynIPPort.c` header documents — is silently treated as done. Every
 /// move, stop, home and set-position goes through this path, so a rejected
@@ -507,6 +508,24 @@ impl PmacController {
             .map(|(reason, value)| ParamSetValue::new(reason, 0, ParamValue::Int32(value)))
             .collect();
         let _ = port.set_params_and_notify_blocking(0, updates);
+    }
+
+    /// C `getAxisInitialStatus`'s limit and gain sets on `axis` (pmacAxis.cpp:139-143).
+    pub(crate) fn post_initial_status(&self, axis: i32, status: &InitialStatus) {
+        let Some(port) = &self.port else {
+            return;
+        };
+        let scale = f64::from(self.axis_scale(axis));
+        let updates = [
+            (index::LOW_LIMIT, status.low_limit * scale),
+            (index::HIGH_LIMIT, status.high_limit * scale),
+            (index::PGAIN, status.pgain),
+            (index::IGAIN, status.igain),
+            (index::DGAIN, status.dgain),
+        ]
+        .map(|(reason, value)| ParamSetValue::new(reason, axis, ParamValue::Float64(value)))
+        .to_vec();
+        let _ = port.set_params_and_notify_blocking(axis, updates);
     }
 
     /// The last polled global feed rate (C `PMAC_C_FEEDRATE`), 0 when feed-rate

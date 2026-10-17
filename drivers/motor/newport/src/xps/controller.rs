@@ -173,6 +173,8 @@ pub struct XpsController {
     moving_mode: bool,
     /// C `movesDeferred_`.
     moves_deferred: bool,
+    /// C `useSFTP_`: set by the first XPS-D profile build.
+    use_sftp: bool,
     /// Each registered axis's `(positioner, group)`, in registration order —
     /// for group-membership counts (C `XPSAxis::isInGroup`) and for enumerating
     /// a group's positioners when building/executing a PVT profile.
@@ -208,6 +210,7 @@ impl XpsController {
             no_disable_error: false,
             moving_mode: false,
             moves_deferred: false,
+            use_sftp: false,
             axes: Vec::new(),
             referencing_groups: HashSet::new(),
             profile: None,
@@ -276,6 +279,16 @@ impl XpsController {
         });
     }
 
+    /// Whether profile builds upload over SFTP (C `useSFTP_`).
+    pub fn use_sftp(&self) -> bool {
+        self.use_sftp
+    }
+
+    /// An XPS-D profile build sets `useSFTP_`; nothing clears it.
+    pub fn set_use_sftp(&mut self) {
+        self.use_sftp = true;
+    }
+
     /// Whether moves are held for a group move (C `movesDeferred_`).
     pub fn moves_deferred(&self) -> bool {
         self.moves_deferred
@@ -302,8 +315,10 @@ impl XpsController {
                 TraceMask::FLOW,
                 format_args!("Processing deferred moves on XPS: {}\n", trace.port()),
             );
-            // C skips only a group equal to the previous axis's, so a group
-            // split by another moves twice, the second time to its setpoints.
+            // C's groupNames cache (XPSController.cpp:459-471) skips only a
+            // group equal to the previous axis's, so a group split by another
+            // moves twice, the second time to its setpoints; here each group
+            // moves once.
             if !done.contains(&a.group.as_str()) {
                 done.push(&a.group);
                 result = process_deferred_moves_in_group(&axes, &a.group, trace);
@@ -445,7 +460,10 @@ impl XpsController {
     /// Generate the trajectory-file text for the defined profile, reading each
     /// axis's controller max acceleration via `PositionerSGammaParametersGet`
     /// (C `buildProfile` uses these for the ramp times).
-    pub fn build_profile_text(&self) -> Result<TrajectoryFile, String> {
+    ///
+    /// C prints each axis's ramp line as it reads it, in axis order; here
+    /// the lines follow a successful generate, in axis order.
+    pub fn build_profile_text(&self, trace: &MotorTrace) -> Result<TrajectoryFile, String> {
         let profile = self
             .profile
             .as_ref()
@@ -465,7 +483,37 @@ impl XpsController {
                 })?;
             max_accels.push(accel);
         }
-        profile.generate(&max_accels).map_err(|e| e.to_string())
+        let built = profile.generate(&max_accels).map_err(|e| e.to_string())?;
+        // XPSController.cpp:624: the running maxima, in controller axis order.
+        let mut order: Vec<(i32, usize)> = profile
+            .axes
+            .iter()
+            .enumerate()
+            .filter_map(|(k, ax)| {
+                let axis = self.axes.iter().find(|a| a.positioner == ax.positioner)?;
+                Some((axis.axis_no, k))
+            })
+            .collect();
+        order.sort();
+        let (mut pre_time_max, mut post_time_max) = (0.0_f64, 0.0_f64);
+        for (axis_no, k) in order {
+            let (positions, ramp) = (&profile.axes[k].positions, built.ramps[k]);
+            pre_time_max = pre_time_max.max(ramp.pre_time);
+            post_time_max = post_time_max.max(ramp.post_time);
+            trace.print_self(
+                TraceMask::FLOW,
+                format_args!(
+                    "XPSController:buildProfile: axis {axis_no} profilePositions[0]={:.6}, profilePositions[{}]={:.6}, maxAcceleration={:.6}, preTimeMax={:.6}, postTimeMax={:.6}\n",
+                    CFloat(positions[0]),
+                    positions.len() - 1,
+                    CFloat(positions[positions.len() - 1]),
+                    CFloat(ramp.max_acceleration),
+                    CFloat(pre_time_max),
+                    CFloat(post_time_max)
+                ),
+            );
+        }
+        Ok(built)
     }
 
     /// Verify an uploaded trajectory against the group's dynamics and each
@@ -481,6 +529,7 @@ impl XpsController {
     /// [`build_profile_text`]: XpsController::build_profile_text
     pub fn verify_profile(
         &mut self,
+        trace: &MotorTrace,
         file_name: &str,
         built: &TrajectoryFile,
     ) -> Result<(), String> {
@@ -496,6 +545,13 @@ impl XpsController {
         let group = profile.group.clone();
         let move_mode = profile.move_mode;
 
+        trace.print_self(
+            TraceMask::FLOW,
+            format_args!(
+                "XPSController:buildProfile: calling MultipleAxesPVTVerification({}, {group}, {file_name})\n",
+                self.poll.index()
+            ),
+        );
         self.poll
             .multiple_axes_pvt_verification(&group, file_name)
             .map_err(|e| verify_message(e.code()))?;

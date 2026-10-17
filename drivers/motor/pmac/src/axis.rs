@@ -92,12 +92,15 @@ impl PmacAxis {
         // C getAxisInitialStatus; axis 0 skips it.
         let has_encoder = axis != 0 && {
             let c = lock(&controller);
-            let read = c
+            let status = c
                 .write_read(&format!(
                     "I{axis}13 I{axis}14 I{axis}30 I{axis}31 I{axis}33"
                 ))
-                .is_ok_and(|resp| parse_initial_status(&resp).is_some());
-            if !read {
+                .ok()
+                .and_then(|resp| parse_initial_status(&resp));
+            if let Some(status) = &status {
+                c.post_initial_status(axis, status);
+            } else {
                 c.trace().print_self(
                     TraceMask::ERROR,
                     format_args!(
@@ -114,7 +117,7 @@ impl PmacAxis {
                     ),
                 );
             }
-            read
+            status.is_some()
         };
         Self {
             controller,

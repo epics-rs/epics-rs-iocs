@@ -20,6 +20,7 @@ pub mod gpio;
 pub mod pco;
 pub mod profile;
 pub mod rpc;
+pub mod sftp;
 
 pub use axis::XpsAxis;
 pub use controller::{ExecutionPlan, SetPositionFailure, XpsController};
