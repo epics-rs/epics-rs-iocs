@@ -181,4 +181,28 @@ mod tests {
         let vr = line.sent().iter().filter(|c| c.trim_end() == "?VR").count();
         assert_eq!(vr, 4);
     }
+
+    /// drvSPiiPlus.cc:711-717: a `?APOS(0)` that errors only ends the axis
+    /// count; the card that answered `?VR` stays, with no axes.
+    #[epics_rs::base::epics_test]
+    async fn a_card_answering_vr_survives_an_apos_error() {
+        let int = ArgValue::Int;
+        run_command(spiiplus_setup_command(), vec![int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new("spNoApos", |cmd| match cmd.trim_end() {
+            "?VR" => "SPiiPlus 6.50".into(),
+            "?APOS(0)" => "?1033".into(),
+            _ => ":".into(),
+        });
+        let config = vec![
+            int(0),
+            ArgValue::String("spNoApos".into()),
+            ArgValue::String("BUF".into()),
+        ];
+        run_command(spiiplus_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvSPiiPlus", 0),
+            "    SPiiPlus controller 0, port=spNoApos, address=0, id: SPiiPlus 6.50 \n"
+        );
+    }
 }

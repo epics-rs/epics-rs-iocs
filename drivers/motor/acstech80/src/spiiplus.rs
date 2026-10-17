@@ -150,10 +150,12 @@ impl SpiiPlusController {
         let _ = ctrl.command("halt all");
         ctrl.ident = ctrl.command("?VR").unwrap_or_default();
 
-        // Auto-detect the axis count: ?APOS(n) succeeds until n is out of range.
+        // Auto-detect the axis count: ?APOS(n) succeeds until n is out of
+        // range. A failed one only ends the count (drvSPiiPlus.cc:711-717),
+        // so a card that answered ?VR stays, with no axes at worst.
         let mut n = 0usize;
         loop {
-            let reply = ctrl.command(&format!("?APOS({n})"))?;
+            let reply = ctrl.command(&format!("?APOS({n})")).unwrap_or_default();
             if reply.is_empty() || reply.contains('?') {
                 break;
             }
@@ -161,9 +163,6 @@ impl SpiiPlusController {
             if n > AXIS_LETTERS.len() {
                 break;
             }
-        }
-        if n == 0 {
-            return Err(spiiplus_err("SPiiPlus: no axes detected (?APOS(0) failed)"));
         }
         ctrl.num_axes = n;
         Ok(ctrl)
