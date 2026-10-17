@@ -4986,6 +4986,9 @@ mod tests {
         let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
         let trace = ctx.handle.trace();
+        // What registry::publish does for an IOC's port (registry.rs:108-111).
+        trace.register_port(name, true);
+        trace.connect_device(name, 0);
         trace.set_device_trace_file(
             name,
             0,
