@@ -23,6 +23,7 @@ use std::time::Duration;
 use epics_rs::base::runtime::task::BlockingBridge;
 use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::motor::builder::{ControllerAxis, MotorTaskBuilder};
+use epics_rs::motor::device_support::BuildTrans;
 
 use crate::{TraceUser, register_model1_device};
 
@@ -194,6 +195,30 @@ impl Model1 {
         signal: i32,
         motor: Arc<Mutex<dyn AsynMotor>>,
     ) -> Result<(), String> {
+        self.install_axis(ctx, card, signal, motor, None)
+    }
+
+    /// [`Self::install`] for a device whose `build_trans` decides from its
+    /// own state, as devEMC18011's does.
+    pub fn install_with_build_trans(
+        &'static self,
+        ctx: &CommandContext,
+        card: i32,
+        signal: i32,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+        build_trans: Arc<dyn BuildTrans>,
+    ) -> Result<(), String> {
+        self.install_axis(ctx, card, signal, motor, Some(build_trans))
+    }
+
+    fn install_axis(
+        &'static self,
+        ctx: &CommandContext,
+        card: i32,
+        signal: i32,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+        build_trans: Option<Arc<dyn BuildTrans>>,
+    ) -> Result<(), String> {
         let user = TraceUser::Model1 {
             device: self.row.choice,
             card,
@@ -224,6 +249,10 @@ impl Model1 {
             ));
         };
         let ControllerAxis { axis, .. } = builder.axis(motor, user);
+        let axis = match build_trans {
+            Some(build_trans) => axis.with_build_trans(build_trans),
+            None => axis,
+        };
         epics_rs::motor::devices::register_axis(axis)
     }
 
