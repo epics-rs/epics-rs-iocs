@@ -270,18 +270,18 @@ ssh2 = { version = "0.9", default-features = false }
 
 # epics-rs rt/iocs-base, the single base every iocs panel builds against.
 [patch.crates-io]
-ad-core-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-ad-plugins-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-asyn-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-epics-base-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-epics-bridge-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-epics-ca-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-epics-libcom-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-epics-macros-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-epics-modbus-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-epics-pva-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-epics-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-epics-rtems-boot = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-mca-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-motor-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
-scaler-rs = { git = "file:///home/stevek/work/epics-rs", rev = "747773557e133e7759eb0b40bbc0a852752788cc" }
+ad-core-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+ad-plugins-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+asyn-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+epics-base-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+epics-bridge-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+epics-ca-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+epics-libcom-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+epics-macros-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+epics-modbus-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+epics-pva-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+epics-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+epics-rtems-boot = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+mca-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+motor-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
+scaler-rs = { git = "file:///home/stevek/work/epics-rs", rev = "761d1dca0d9e6d1c2e2f9259041bb04b90641ac0" }
