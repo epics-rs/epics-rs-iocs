@@ -30,6 +30,7 @@ use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
+use crate::Unconnected;
 use crate::fmt::{c_literal, format_c_double, format_c_int};
 use crate::mpc::protocol::{c_atoi, c_strtod};
 use crate::user_param::{after, c_str, term, up_to_comma};
@@ -557,9 +558,10 @@ impl DeviceSupport for DevStrParm {
                 return Ok(bad(&name, &message));
             }
         };
-        let handle = match crate::connect_device(&link.port_name, link.addr) {
+        let handle = match crate::connect_octet(&link.port_name, link.addr) {
             Ok(handle) => handle,
-            Err(message) => return Ok(bad(&name, &message)),
+            Err(Unconnected::Device(message)) => return Ok(bad(&name, &message)),
+            Err(Unconnected::NoOctet) => return Ok(DeviceInitOutcome::dead()),
         };
         let desc = match record.get_field("DESC") {
             Some(EpicsValue::String(s)) => s.to_string(),
@@ -918,5 +920,15 @@ mod tests {
                 .ends_with(&format!("R:bl asynManager error {message}")),
             "{log:?}"
         );
+    }
+
+    /// A port without `asynOctet` fails `findInterface` with asynSuccess:
+    /// `bad:` prints nothing and sets `pact = 1` (devXxStrParm.c:145-146).
+    #[test]
+    fn a_port_without_octet_kills_the_record_silently() {
+        crate::no_octet_port("SP_INT32_ONLY");
+        let (outcome, log) = init_traced("@asyn(SP_INT32_ONLY 0)", "R:i32");
+        assert_eq!(outcome, DeviceInitOutcome::dead());
+        assert_eq!(log, "");
     }
 }
