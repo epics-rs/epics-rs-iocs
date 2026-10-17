@@ -1628,7 +1628,7 @@ fn model1_config_args() -> Vec<ArgDesc> {
 fn model1_config_command(
     name: &'static str,
     driver: &'static Model1,
-    build: fn(&CommandContext, i32, &str) -> Result<(), String>,
+    build: fn(&CommandContext, i32, &str, i32) -> Result<(), String>,
 ) -> CommandDef {
     CommandDef::new(
         name,
@@ -1640,7 +1640,7 @@ fn model1_config_command(
                 return Ok(CommandOutcome::Continue);
             }
             let port = req_string(args, 1, "asyn port name")?;
-            build(ctx, card, &port)?;
+            build(ctx, card, &port, c_int(args, 2))?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1660,7 +1660,7 @@ pub fn mm3000_setup_command() -> CommandDef {
 /// `MM3000Config(card, name, addr)`: one signal per axis slot the
 /// controller's `RC` reports, including the trailing `unused` slot C counts.
 pub fn mm3000_config_command() -> CommandDef {
-    model1_config_command("MM3000Config", &MM3000, |ctx, card, port| {
+    model1_config_command("MM3000Config", &MM3000, |ctx, card, port, _addr| {
         // C drops a card it cannot connect to without a word.
         let Ok(handle) = connect_serial(port, MM3000_TIMEOUT) else {
             return Ok(());
@@ -1713,7 +1713,7 @@ pub fn mm4000_setup_command() -> CommandDef {
 /// `MM4000Config(card, name, addr)`: one signal per axis the controller's
 /// `TH;` reports.
 pub fn mm4000_config_command() -> CommandDef {
-    model1_config_command("MM4000Config", &MM4000, |ctx, card, port| {
+    model1_config_command("MM4000Config", &MM4000, |ctx, card, port, _addr| {
         // C drops a card it cannot connect to without a word.
         let Ok(handle) = connect_serial(port, MM4000_TIMEOUT) else {
             return Ok(());
@@ -1861,7 +1861,7 @@ pub fn pm500_setup_command() -> CommandDef {
 /// scan finds. C `motor_init` drops a controller it cannot connect to or
 /// that leaves `SVN?` unanswered without a word (drvPM500.cc:577, :671-672).
 pub fn pm500_config_command() -> CommandDef {
-    model1_config_command("PM500Config", &PM500, |ctx, card, port| {
+    model1_config_command("PM500Config", &PM500, |ctx, card, port, _addr| {
         let Ok(handle) = connect_serial(port, PM500_TIMEOUT) else {
             return Ok(());
         };
@@ -1885,13 +1885,18 @@ static ESP300: Model1 = Model1::new(&DEV_ESP300, 4, SCAN_RATE);
 
 /// `ESP300Setup(num_cards, scan_rate)`.
 pub fn esp300_setup_command() -> CommandDef {
+    ESP300.register_report("drvESP300", |cards| {
+        cards.report("ESP300", |card, line| {
+            format!("    ESP300 controller {card} {line} \n")
+        })
+    });
     ESP300.setup_command("ESP300Setup")
 }
 
 /// `ESP300Config(card, name, addr)`: one signal per axis C `motor_init`
 /// finds (stop each axis until "axis number out of range").
 pub fn esp300_config_command() -> CommandDef {
-    model1_config_command("ESP300Config", &ESP300, |ctx, card, port| {
+    model1_config_command("ESP300Config", &ESP300, |ctx, card, port, addr| {
         const ERRMSG: &str = "drvESP300.c:motor_init: ASYN";
         let handle = match connect_with_eos(
             port,
@@ -1920,11 +1925,13 @@ pub fn esp300_config_command() -> CommandDef {
             return Ok(());
         };
         let num_axes = controller.num_axes();
+        let line = format!("port={port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
             let ax = Esp300Axis::new(controller.clone(), axis);
             ESP300.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
+        ESP300.describe(card, line);
         Ok(())
     })
 }
@@ -1958,7 +1965,7 @@ pub fn pmnc87xx_setup_command() -> CommandDef {
 /// modules found (`MPV` for the 8750, `DRT` for the 8752). The controller
 /// sets the port EOS itself, as C `motor_init` does.
 pub fn pmnc87xx_config_command() -> CommandDef {
-    model1_config_command("PMNC87xxConfig", &PMNC87XX, |ctx, card, port| {
+    model1_config_command("PMNC87xxConfig", &PMNC87XX, |ctx, card, port, _addr| {
         let asyn_port = get_port(port).ok_or_else(|| {
             format!("IP port '{port}' not found (call drvAsynIPPortConfigure first)")
         })?;
@@ -2580,6 +2587,33 @@ mod report {
         assert!(
             text.contains(&format!("{head}{}{axis}", detail("user", "pass", 1))),
             "{text}"
+        );
+    }
+
+    /// drvESP300.cc's drvet `report` (drvESP300.cc:153-178), which `dbior`
+    /// runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_esp300_controller() {
+        use motor_common::testing::{LineRig, driver_report};
+        let setup = esp300_setup_command();
+        let none = "    No ESP300 controllers configured.\n";
+        assert_eq!(driver_report("drvESP300", 0), none);
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("esp300RepLine", |last| {
+            match last {
+                "VE?" => "ESP300 Version 3.08",
+                "TB?" => "9, 0, AXIS NUMBER OUT OF RANGE",
+                _ => "",
+            }
+            .to_string()
+        });
+        let config = vec![int(1), ArgValue::String("esp300RepLine".into()), int(3)];
+        run_command(esp300_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvESP300", 0),
+            "    ESP300 controller 0 connection failed.\n    ESP300 controller 1 \
+             port=esp300RepLine, address=3, id: ESP300 Version 3.08 \n"
         );
     }
 
