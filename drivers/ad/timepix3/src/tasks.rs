@@ -21,9 +21,10 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{DriverCall, ParamSetValue, RequestOp};
-use epics_rs::asyn::trace::TraceMask;
+use epics_rs::asyn::trace::{TraceMask, TraceOut};
 use epics_rs::asyn::user::AsynUser;
 use serde_json::Value;
+use std::fmt::Write as _;
 
 use crate::accum::{RangeState, Update, clamp_average_to_u32};
 use crate::adlog;
@@ -178,12 +179,25 @@ impl Ctx {
 
     /// [`adlog::print`] off the port thread.
     fn trace(&self, mask: TraceMask, line: &str) {
-        self.handle.trace().print(
+        self.trace_with(mask, |out| out.write_str(line));
+    }
+
+    /// [`Self::trace`] with a body that writes the line, raw bytes included.
+    fn trace_with(
+        &self,
+        mask: TraceMask,
+        body: impl FnOnce(&mut TraceOut<'_>) -> std::fmt::Result,
+    ) {
+        self.handle.trace().print_with(
             Some(self.handle.port_name()),
             None,
             0,
             mask,
-            format_args!("{line}\n"),
+            ("", 0),
+            |out| {
+                body(out)?;
+                out.write_str("\n")
+            },
         );
     }
 
@@ -2193,23 +2207,21 @@ fn log_json_header(ctx: &Ctx, s: Preview, header: &Value) {
         state.json_headers -= 1;
     }
     const MAX_HEADER_LOG: usize = 1024;
-    let mut text = serval::dump(header, None, false);
-    if text.len() > MAX_HEADER_LOG {
-        // C cuts bytes; a cut inside a UTF-8 character backs off to its start.
-        let mut cut = MAX_HEADER_LOG;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        text.truncate(cut);
-        text.push_str("...");
-    }
-    ctx.trace(
-        TraceMask::IO_DRIVER,
-        &adlog::log(
+    let text = serval::dump(header, None, false);
+    // C `resize`s the bytes, mid-character or not, and prints them raw.
+    let (head, cut) = match text.as_bytes() {
+        b if b.len() > MAX_HEADER_LOG => (&b[..MAX_HEADER_LOG], "..."),
+        b => (b, ""),
+    };
+    ctx.trace_with(TraceMask::IO_DRIVER, |out| {
+        let prefix = adlog::log(
             adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
-            &format!("{} jsonimage header: {text}", s.tag),
-        ),
-    );
+            &format!("{} jsonimage header: ", s.tag),
+        );
+        out.write_str(&prefix)?;
+        out.write_bytes(head)?;
+        out.write_str(cut)
+    });
 }
 
 /// C `strerror(errno)`: the OS text without Rust's " (os error N)" suffix.
@@ -4867,7 +4879,22 @@ mod tests {
         );
         log_json_header(&ctx, PRV_IMG, &json!({"a": long}));
         log_json_header(&ctx, PRV_IMG, &json!({"never": true}));
-        let text = std::fs::read_to_string(&path).unwrap();
+        // Byte 1024 falls inside the two-byte "\u{e4}"; C keeps its lead byte.
+        ctx.shared.preview[0].lock().json_headers = 1;
+        log_json_header(
+            &ctx,
+            PRV_IMG,
+            &json!({"b": format!("{}\u{e4}", "y".repeat(1017))}),
+        );
+        let raw = std::fs::read(&path).unwrap();
+        let mut split = adlog::log(
+            adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+            &format!("PrvImg jsonimage header: {{\"b\":\"{}", "y".repeat(1017)),
+        )
+        .into_bytes();
+        split.extend_from_slice(b"\xc3...\n");
+        assert!(raw.windows(split.len()).any(|w| w == split), "{raw:?}");
+        let text = String::from_utf8_lossy(&raw).into_owned();
         let _ = std::fs::remove_file(&path);
         let line = |h: &str| {
             adlog::log(
