@@ -1296,13 +1296,16 @@ impl ControllerParams for PIGCS2Params {
         let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
             return ParamWrite::PassToBase(Ok(()));
         };
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        // C's sink is the asynUser itself, a `-1` address included.
+        ctrl.log_sink = Some((base.port_name.to_string(), user.asyn().addr));
         if user.reason == params.servo {
+            drop(ctrl);
             // As motorClosedLoop: the axis's set_closed_loop runs C's setServo.
             return ParamWrite::PassToBase(
                 user.queue(base, MotorCommand::SetClosedLoop { enable: value != 0 }),
             );
         }
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // Each also sets its address-0 value, as C's setIntegerParam(0, ...).
         let (reason, value) = if user.reason == params.clear_err {
             ctrl.last_error.set(0);
@@ -1326,14 +1329,14 @@ impl ControllerParams for PIGCS2Params {
         let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
             return ParamWrite::PassToBase(Ok(()));
         };
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        // C's sink is the asynUser itself, a `-1` address included.
+        ctrl.log_sink = Some((base.port_name.to_string(), user.asyn().addr));
         let pivots = [params.pivot_x, params.pivot_y, params.pivot_z];
         let pivot = pivots.iter().position(|&r| r == user.reason);
         if pivot.is_none() && user.reason != params.target {
             return ParamWrite::PassToBase(Ok(()));
         }
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        // C's sink is the asynUser itself, a `-1` address included.
-        ctrl.log_sink = Some((base.port_name.to_string(), user.asyn().addr));
         let Some(index) = pivot else {
             drop(ctrl);
             let call = DriverCall::new(move |motor, _user| {
@@ -2893,6 +2896,38 @@ mod tests {
                 &[]
             };
             assert_eq!(sent, want, "{name}");
+        }
+    }
+
+    /// `PIasynController::writeInt32` and `writeFloat64` make the asynUser
+    /// the log sink for every parameter (PIasynController.cpp:283, :352),
+    /// so the controller's next print goes to that user's trace.
+    #[test]
+    fn every_write_makes_its_user_the_log_sink() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2AnySinkLine", |last| {
+            if last == "ERR?" { "2" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2AnySinkLine")));
+        let (port, p, _) = controller_port("gcs2AnySink", &ctrl, "1");
+        for kind in ["int32", "float64"] {
+            ctrl.lock().unwrap().log_sink = None;
+            let printed = traced_mask("gcs2AnySink", TraceMask::ERROR, || {
+                PortManager::global().trace_manager().set_device_trace_mask(
+                    "gcs2AnySink",
+                    0,
+                    TraceMask::empty(),
+                );
+                if kind == "int32" {
+                    port.write_int32_blocking(p.target_mode, -1, 0).unwrap();
+                } else {
+                    port.write_float64_blocking(p.rbpivot_x, -1, 1.0).unwrap();
+                }
+                ctrl.lock().unwrap().get_gcs_error().unwrap();
+            });
+            assert!(
+                printed.contains("PIGCSController::getGCSError() GCS error code = 2"),
+                "{kind}: {printed}"
+            );
         }
     }
 
