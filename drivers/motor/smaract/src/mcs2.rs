@@ -44,6 +44,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::util::{atof, atoi};
 use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
@@ -160,8 +161,8 @@ impl ControllerParams for Mcs2Params {
             "MCS2 motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll,
-            self.idle_poll,
+            CFloat(self.moving_poll),
+            CFloat(self.idle_poll),
         );
         ctx.report(out, level);
     }
@@ -254,9 +255,15 @@ impl Mcs2Axis {
     ) -> AsynResult<()> {
         let c = self.channel;
         ctrl.write_only(&format!(":CHAN{c}:MMOD {}", if relative { 1 } else { 0 }))?;
-        ctrl.write_only(&format!(":CHAN{c}:ACC {}", acceleration * PULSES_PER_STEP))?;
-        ctrl.write_only(&format!(":CHAN{c}:VEL {}", velocity * PULSES_PER_STEP))?;
-        ctrl.write_only(&format!(":MOVE{c} {}", target * PULSES_PER_STEP))
+        ctrl.write_only(&format!(
+            ":CHAN{c}:ACC {:.6}",
+            CFloat(acceleration * PULSES_PER_STEP)
+        ))?;
+        ctrl.write_only(&format!(
+            ":CHAN{c}:VEL {:.6}",
+            CFloat(velocity * PULSES_PER_STEP)
+        ))?;
+        ctrl.write_only(&format!(":MOVE{c} {:.6}", CFloat(target * PULSES_PER_STEP)))
     }
 
     /// Open-loop step move: track the target in software and send the relative
@@ -266,7 +273,7 @@ impl Mcs2Axis {
         self.tracked_position += delta;
         let ctrl = self.lock();
         ctrl.write_only(&format!(":CHAN{c}:MMOD 4"))?;
-        ctrl.write_only(&format!(":MOVE{c} {delta}"))
+        ctrl.write_only(&format!(":MOVE{c} {:.6}", CFloat(delta)))
     }
 }
 
@@ -338,9 +345,15 @@ impl AsynMotor for Mcs2Axis {
         let ctrl = self.lock();
         ctrl.write_only(&format!(":CHAN{c}:REF:OPT {ref_opt}"))?;
         ctrl.clear_errors();
-        ctrl.write_only(&format!(":CHAN{c}:ACC {}", acceleration * PULSES_PER_STEP))?;
+        ctrl.write_only(&format!(
+            ":CHAN{c}:ACC {:.6}",
+            CFloat(acceleration * PULSES_PER_STEP)
+        ))?;
         ctrl.clear_errors();
-        ctrl.write_only(&format!(":CHAN{c}:VEL {}", velocity * PULSES_PER_STEP))?;
+        ctrl.write_only(&format!(
+            ":CHAN{c}:VEL {:.6}",
+            CFloat(velocity * PULSES_PER_STEP)
+        ))?;
         ctrl.clear_errors();
         ctrl.write_only(&format!(":REF{c}"))?;
         ctrl.clear_errors();
@@ -357,7 +370,10 @@ impl AsynMotor for Mcs2Axis {
         let c = self.channel;
         self.tracked_position = position;
         let ctrl = self.lock();
-        ctrl.write_only(&format!(":CHAN{c}:POS {}", position * PULSES_PER_STEP))
+        ctrl.write_only(&format!(
+            ":CHAN{c}:POS {:.6}",
+            CFloat(position * PULSES_PER_STEP)
+        ))
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
@@ -425,6 +441,37 @@ impl AsynMotor for Mcs2Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `sprintf(":CHAN%d:ACC %f")` and the like: six decimals, where
+    /// Rust's `{}` writes the shortest form.
+    #[test]
+    fn moves_are_written_with_c_s_percent_f() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("mcs2PercentF", |_| String::new());
+        let ctrl = Mcs2Controller::new(io, &MotorTrace::new("mcs2PercentF", 0));
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        rig.sent();
+        let user = AsynUser::default();
+        axis.home(&user, 0.0, 2.0, 3.0, true).unwrap();
+        axis.set_position(&user, 1.5).unwrap();
+        axis.move_absolute(&user, 2.0, 0.0, 1.0, 1.0).unwrap();
+        axis.has_encoder = true;
+        axis.move_relative(&user, 0.25, 0.0, 1.0, 1.0).unwrap();
+        let sent = rig.sent();
+        for want in [
+            ":CHAN0:ACC 3000.000000",
+            ":CHAN0:VEL 2000.000000",
+            ":CHAN0:POS 1500.000000",
+            ":MOVE0 0.500000",
+            ":CHAN0:ACC 1000.000000",
+            ":MOVE0 250.000000",
+        ] {
+            assert!(
+                sent.iter().any(|c| c.trim_end() == want),
+                "{want}: {sent:?}"
+            );
+        }
+    }
 
     #[test]
     fn status_bits_decode() {
