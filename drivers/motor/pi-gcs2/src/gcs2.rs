@@ -126,7 +126,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
-use motor_common::util::{atof, atoi, leading_hex};
+use motor_common::util::{atof, atoi};
 use motor_common::{ControllerParams, ControllerReport};
 
 /// Response buffer size for a single reply line.
@@ -261,12 +261,14 @@ fn status_from_bitmask(mask: u32) -> (bool, bool, bool, bool, bool) {
     (homing, moving, neg_limit, pos_limit, servo)
 }
 
-/// Extract axis `axis_no`'s 4 hex chars from a `char(4)` status reply
-/// (`PIGCSMotorController::getStatus`: `idx = 2 + axisNo*4`).
+/// `strtol` of axis `axis_no`'s 4 chars of a `char(4)` status reply
+/// (`PIGCSMotorController::getStatus`: `idx = 2 + axisNo*4`). C defect not
+/// copied: a reply ending before `idx` reads the buffer past it; rs has no
+/// mask.
 fn status_mask_at(reply: &str, axis_no: usize) -> Option<u32> {
     let idx = 2 + axis_no * 4;
-    let mask_str = reply.get(idx..idx + 4)?;
-    leading_hex(mask_str)
+    let mask_str = reply.get(idx..)?;
+    Some(strtol(mask_str.get(..4).unwrap_or(mask_str), 16) as u32)
 }
 
 /// The C controller class `PIGCSController::CreateGCSController`
@@ -1073,7 +1075,7 @@ impl PIGCS2Controller {
         let reply = self.query_char(4)?;
         let mask = status_mask_at(&reply, axis_no).ok_or_else(|| {
             pigcs2_err(format!(
-                "status reply too short/non-hex for axis {axis_no}: {reply:?}"
+                "status reply too short for axis {axis_no}: {reply:?}"
             ))
         })?;
         Ok(status_from_bitmask(mask))
@@ -1755,8 +1757,14 @@ mod tests {
         assert_eq!(status_mask_at(reply2, 0), Some(0x2000));
         assert_eq!(status_mask_at(reply2, 1), Some(0x4001));
 
+        // C's strtol over the 4 chars: none hex is 0, a reply ending
+        // inside the field reads what is there; only a reply ending before
+        // it (C reads past the reply) has no mask.
         assert_eq!(status_mask_at("short", 5), None);
-        assert_eq!(status_mask_at("01zzzz", 0), None);
+        assert_eq!(status_mask_at("01zzzz", 0), Some(0));
+        assert_eq!(status_mask_at("0120zz", 0), Some(0x20));
+        assert_eq!(status_mask_at("0120", 0), Some(0x20));
+        assert_eq!(status_mask_at("01", 0), Some(0));
     }
 
     /// Refuses the first write offered; records every write.
