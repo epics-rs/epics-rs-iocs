@@ -2163,8 +2163,8 @@ static PMNC87XX: Model1 = Model1::new(&DEV_PMNC87XX, 10, SCAN_RATE);
 /// are discovered, so `num_drivers` has no use.
 pub fn pmnc87xx_setup_command() -> CommandDef {
     PMNC87XX.register_row();
-    // C breaks out of the card loop after the first configured card
-    // (drvPMNC87xx.cc:233), leaving the rest unreported; not copied.
+    // The `break` at drvPMNC87xx.cc:233 ends C's card loop after the first
+    // configured card, leaving the rest unreported; a C defect not copied.
     PMNC87XX.register_report("drvPMNC87xx", |cards| {
         cards.report("PMNC87xx", |card, line| {
             format!("    PMNC87xx controller {card} asyn port= {line} \n")
