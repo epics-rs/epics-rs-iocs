@@ -15,12 +15,12 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! - Profile / trajectory moves (`motorAxisProfileMove` / `TriggerProfile`
-//!   return `MOTOR_AXIS_ERROR` in C too — unimplemented there.)
-//! - Encoder-ratio / resolution / limit / PID setters (the C `motorAxisSetDouble`
-//!   cases all just log "Ensemble does not support ..." — no-ops here.)
-//! - The async notification / forced-fast-poll machinery: replaced by periodic
-//!   polling.
+//! - Profile / trajectory moves: drvMotorAsyn never calls `profileMove` /
+//!   `triggerProfile`.
+//! - Encoder-ratio / resolution / limit / PID setters send nothing, as C's
+//!   `motorAxisSetDouble` cases do, but C also prints their TERROR line
+//!   ("Ensemble does not support ...") on the axis's drvAsynMotorConfigure
+//!   user, which this axis is never given.
 //!
 //! ## Deviations from C (documented)
 //!

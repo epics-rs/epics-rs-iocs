@@ -45,8 +45,8 @@
 //! - The C config builds the `ReverseMotionDirection` query string but never
 //!   sends it — it reads `reverseDirec` from the previous `RAMP MODE RATE` reply
 //!   (a `sprintf`-without-send bug). This port sends the query properly.
-//! - Profile / trajectory moves (`motorAxisProfileMove` / `TriggerProfile`)
-//!   return `MOTOR_AXIS_ERROR` in C — unimplemented there, so not modeled here.
+//! - Profile / trajectory moves are absent: drvMotorAsyn never calls
+//!   `profileMove` / `triggerProfile`.
 //! - The C maps `AXISSTATUS_Homed` to `motorAxisHomeSignal` (the home-switch
 //!   field) and never sets `motorAxisHomed`; this port reproduces that mapping
 //!   (`home` = Homed bit, `homed` left unset).
