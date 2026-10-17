@@ -270,15 +270,20 @@ impl Ctx {
 }
 
 /// Start every background thread. They run until the process exits.
+/// `connected` is what [`initial_server_check_connection`] found.
 pub fn start(
     ctx: Arc<Ctx>,
     cmd_rx: rt::CommandReceiver<Command>,
+    connected: bool,
 ) -> Vec<std::thread::JoinHandle<()>> {
     let (acq_tx, acq_rx) = rt::command_channel::<()>(1);
 
+    // The initial check already read the dashboard when a URL is set
+    // (ADTimePix.cpp:2065-2068).
+    let skip_once = !ctx.http.base_url().is_empty();
     let c = ctx.clone();
     let connection = rt::run_thread_named("tpx3ConnectionPoll", move || async move {
-        connection_poll(c, cmd_rx, acq_tx).await;
+        connection_poll(c, cmd_rx, acq_tx, connected, skip_once).await;
     });
 
     let c = ctx.clone();
@@ -308,8 +313,9 @@ async fn connection_poll(
     ctx: Arc<Ctx>,
     mut cmd_rx: rt::CommandReceiver<Command>,
     acq_tx: rt::CommandSender<()>,
+    mut was_up: bool,
+    mut skip_once: bool,
 ) {
-    let mut was_up = false;
     // C waits on an event only its destructor signals, so the poll runs a
     // period after the last one whatever the commands do
     // (serval_http.cpp:400-402).
@@ -319,7 +325,9 @@ async fn connection_poll(
             Ok(Some(command)) => command,
             Ok(None) => return,
             Err(_) => {
-                was_up = poll_connection(&ctx, was_up).await;
+                if !std::mem::take(&mut skip_once) {
+                    was_up = poll_connection(&ctx, was_up).await;
+                }
                 next_poll = tokio::time::Instant::now() + CONNECTION_POLL;
                 continue;
             }
@@ -451,10 +459,80 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
         0,
         ParamValue::Int32(reply.code),
     )];
-    log_dashboard_failure(ctx, adlog::CHECK_CONNECTION, "checkConnection", &reply);
+    log_dashboard_failure(
+        ctx,
+        adlog::CHECK_CONNECTION,
+        "checkConnection",
+        "checkConnection",
+        &reply,
+    );
     let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
     connection_status(ctx, serval_ok, det_ok, &mut updates);
     ctx.set(0, updates).await;
+    serval_ok && det_ok
+}
+
+/// C `initialServerCheckConnection` (serval_http.cpp:315-354), which the
+/// constructor runs before the connection poll starts
+/// (ADTimePix.cpp:2050-2058); returns whether Serval and the detector are
+/// connected.
+pub fn initial_server_check_connection(ctx: &Arc<Ctx>) -> bool {
+    let url = ctx.http.base_url();
+    if url.is_empty() {
+        ctx.trace(
+            TraceMask::ERROR,
+            &adlog::err(adlog::CONSTRUCTOR, "Connection failed, abort"),
+        );
+        return false;
+    }
+    let reply = match ctx.http.get("", TIMEOUT_POLL) {
+        Ok(_) => {
+            let reply = read_dashboard(ctx);
+            log_dashboard_failure(
+                ctx,
+                adlog::INITIAL_SERVER_CHECK_CONNECTION,
+                "initialServerCheckConnection",
+                "initialServerCheckConnection dashboard",
+                &reply,
+            );
+            reply
+        }
+        Err(e) => {
+            ctx.trace(
+                TraceMask::ERROR,
+                &adlog::http_failure_reply(
+                    "initialServerCheckConnection",
+                    "GET",
+                    url,
+                    e.code(),
+                    e.body(),
+                ),
+            );
+            // publishDashboardFailure(false)
+            DashboardReply {
+                code: e.code(),
+                body: e.body().to_string(),
+                parsed: Err(serval::DashboardError::HttpFailure),
+            }
+        }
+    };
+    let mut updates = vec![ParamSetValue::new(
+        ctx.p.http_code,
+        0,
+        ParamValue::Int32(reply.code),
+    )];
+    let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
+    connection_status(ctx, serval_ok, det_ok, &mut updates);
+    let _ = ctx.handle.set_params_and_notify_blocking(0, updates);
+    if !det_ok {
+        ctx.trace(
+            TraceMask::ERROR,
+            &adlog::err(
+                adlog::INITIAL_SERVER_CHECK_CONNECTION,
+                &format!("ERROR: Failed to connect to server {url}"),
+            ),
+        );
+    }
     serval_ok && det_ok
 }
 
@@ -476,12 +554,18 @@ fn read_dashboard(ctx: &Ctx) -> DashboardReply {
 
 /// C `logHttpFailure` plus `ERR_ARGS("<context>: %s", responseErrorMessage)`
 /// for a rejected dashboard reply (serval_http.cpp:382-384, :442-443).
-fn log_dashboard_failure(ctx: &Ctx, func: &str, context: &str, reply: &DashboardReply) {
+fn log_dashboard_failure(
+    ctx: &Ctx,
+    func: &str,
+    context: &str,
+    http_context: &str,
+    reply: &DashboardReply,
+) {
     let Err(error) = &reply.parsed else { return };
     let url = format!("{}{}", ctx.http.base_url(), serval::DASHBOARD);
     ctx.trace(
         TraceMask::ERROR,
-        &adlog::http_failure_reply(context, "GET", &url, reply.code, &reply.body),
+        &adlog::http_failure_reply(http_context, "GET", &url, reply.code, &reply.body),
     );
     ctx.trace(
         TraceMask::ERROR,
@@ -673,7 +757,13 @@ fn as_bool_or_int(v: &Value) -> Option<i32> {
 /// C `getDashboard` (serval_http.cpp:431-454).
 async fn refresh_dashboard(ctx: &Arc<Ctx>) {
     let reply = read_dashboard(ctx);
-    log_dashboard_failure(ctx, adlog::GET_DASHBOARD, "getDashboard", &reply);
+    log_dashboard_failure(
+        ctx,
+        adlog::GET_DASHBOARD,
+        "getDashboard",
+        "getDashboard",
+        &reply,
+    );
     let mut updates = Vec::new();
     let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
     connection_status(ctx, serval_ok, det_ok, &mut updates);
@@ -3842,6 +3932,138 @@ mod tests {
         }
     }
 
+    /// The startup check publishes the connection state and logs a failure
+    /// as C `initialServerCheckConnection` (serval_http.cpp:315-354).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_startup_check_publishes_the_connection_state() {
+        type Body = fn(&str) -> &'static str;
+        let ok: Body = |path| match path {
+            "/dashboard" => r#"{"Server":{},"Detector":{"DetectorType":"TPX3"}}"#,
+            _ => "{}",
+        };
+        let (url, _log) = logging_serval(&[], ok);
+        let ctx = Arc::new(idle_ctx_at("TPX_INIT_OK", &url, None));
+        let path = capture_errors(&ctx, "TPX_INIT_OK");
+        assert!(initial_server_check_connection(&ctx));
+        let (h, p) = (&ctx.handle, ctx.p);
+        assert_eq!(h.read_int32(p.http_code, 0).await.unwrap(), 200);
+        assert_eq!(h.read_int32(p.serval_connected, 0).await.unwrap(), 1);
+        assert_eq!(h.read_int32(p.det_connected, 0).await.unwrap(), 1);
+        assert_eq!(h.read_octet(p.det_type, 0, 64).await.unwrap(), b"TPX3\0");
+        assert_eq!(
+            h.read_int32(ctx.ad.status, 0).await.unwrap(),
+            ADStatus::Idle as i32
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        let _ = std::fs::remove_file(&path);
+
+        type Fail = &'static [&'static str];
+        let cases: [(&str, Fail, Body, i32, i32, &str); 2] = [
+            (
+                "TPX_INIT_ROOT",
+                &["/"],
+                ok,
+                500,
+                0,
+                "SERVAL and detector disconnected",
+            ),
+            (
+                "TPX_INIT_DASH",
+                &[],
+                |_| "{",
+                200,
+                1,
+                "Detector disconnected",
+            ),
+        ];
+        for (name, fail, body_for, code, serval, message) in cases {
+            let (url, _log) = logging_serval(fail, body_for);
+            let ctx = Arc::new(idle_ctx_at(name, &url, None));
+            let path = capture_errors(&ctx, name);
+            assert!(!initial_server_check_connection(&ctx), "{name}");
+            let (h, p) = (&ctx.handle, ctx.p);
+            assert_eq!(h.read_int32(p.http_code, 0).await.unwrap(), code, "{name}");
+            assert_eq!(
+                h.read_int32(p.serval_connected, 0).await.unwrap(),
+                serval,
+                "{name}"
+            );
+            assert_eq!(h.read_int32(p.det_connected, 0).await.unwrap(), 0, "{name}");
+            assert_eq!(
+                h.read_octet(p.det_type, 0, 64).await.unwrap(),
+                b"null\0",
+                "{name}"
+            );
+            assert_eq!(
+                h.read_octet(ctx.ad.status_message, 0, 64).await.unwrap(),
+                format!("{message}\0").as_bytes(),
+                "{name}"
+            );
+            assert_eq!(
+                h.read_int32(ctx.ad.status, 0).await.unwrap(),
+                ADStatus::Disconnected as i32,
+                "{name}"
+            );
+            let text = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let func = "asynStatus ADTimePix::initialServerCheckConnection()";
+            let mut lines = vec![adlog::err(
+                func,
+                &format!("ERROR: Failed to connect to server {url}"),
+            )];
+            if code == 200 {
+                lines.push(adlog::http_failure_reply(
+                    "initialServerCheckConnection dashboard",
+                    "GET",
+                    &format!("{url}/dashboard"),
+                    200,
+                    "{",
+                ));
+                lines.push(adlog::err(
+                    func,
+                    "initialServerCheckConnection: malformed dashboard JSON",
+                ));
+            } else {
+                lines.push(adlog::http_failure_reply(
+                    "initialServerCheckConnection",
+                    "GET",
+                    &url,
+                    500,
+                    "",
+                ));
+            }
+            for line in lines {
+                assert!(text.contains(&line), "{name}: {text}");
+            }
+        }
+    }
+
+    /// The poll starts from the startup check: its first period is skipped
+    /// and a detector found connected there is no reconnect edge
+    /// (ADTimePix.cpp:2065-2068, serval_http.cpp:404-416).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_poll_starts_from_the_startup_check() {
+        let (url, log) = logging_serval(&[], |path| match path {
+            "/dashboard" => r#"{"Server":{},"Detector":{"DetectorType":"TPX3"}}"#,
+            _ => "{}",
+        });
+        let ctx = Arc::new(idle_ctx_at("TPX_INIT_POLL", &url, None));
+        let (_cmd_tx, cmd_rx) = rt::command_channel::<Command>(8);
+        let (acq_tx, _acq_rx) = rt::command_channel::<()>(1);
+        tokio::spawn(connection_poll(ctx.clone(), cmd_rx, acq_tx, true, true));
+        let reads = |path: &str| {
+            log.lock()
+                .iter()
+                .filter(|r| r.starts_with(&format!("GET {path} ")))
+                .count()
+        };
+        tokio::time::sleep(CONNECTION_POLL + Duration::from_millis(500)).await;
+        assert_eq!(reads("/dashboard"), 0);
+        tokio::time::sleep(CONNECTION_POLL + Duration::from_millis(500)).await;
+        assert_eq!(reads("/dashboard"), 1);
+        assert_eq!(reads("/server/destination"), 0);
+    }
+
     /// A `/detector` reply that passes C `parseResponse`.
     const DETECTOR: &str = r#"{"Info":{"PixCount":65536,"RowLen":1,"NumberOfChips":1,
         "NumberOfRows":256,"MpxType":3},"Config":{}}"#;
@@ -4075,7 +4297,7 @@ mod tests {
         let (h, p) = (&ctx.handle, ctx.p);
         let (cmd_tx, cmd_rx) = rt::command_channel::<Command>(1);
         let (acq_tx, _acq_rx) = rt::command_channel::<()>(1);
-        tokio::spawn(connection_poll(ctx.clone(), cmd_rx, acq_tx));
+        tokio::spawn(connection_poll(ctx.clone(), cmd_rx, acq_tx, false, false));
 
         ctx.set_int(p.http_code, 0, 409).await;
         cmd_tx.send(Command::RefreshConnection).await.unwrap();
@@ -4129,7 +4351,7 @@ mod tests {
         let ctx = Arc::new(idle_ctx_at("TPX_POLL_TIMER", &url, None));
         let (cmd_tx, cmd_rx) = rt::command_channel::<Command>(1);
         let (acq_tx, _acq_rx) = rt::command_channel::<()>(1);
-        tokio::spawn(connection_poll(ctx.clone(), cmd_rx, acq_tx));
+        tokio::spawn(connection_poll(ctx.clone(), cmd_rx, acq_tx, false, false));
         // Only the poll's reconnect refresh reads the destination.
         let polled = || {
             log.lock()

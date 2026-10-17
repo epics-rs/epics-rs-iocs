@@ -93,7 +93,8 @@ pub fn create_timepix3_detector(
         outputs: outputs.clone(),
         pool: pool.clone(),
     });
-    let threads = tasks::start(ctx, cmd_rx);
+    let connected = tasks::initial_server_check_connection(&ctx);
+    let threads = tasks::start(ctx, cmd_rx, connected);
 
     Ok(TimePix3Runtime {
         runtime_handle,

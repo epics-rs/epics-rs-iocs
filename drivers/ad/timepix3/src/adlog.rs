@@ -40,6 +40,10 @@ pub const REFRESH_ON_RECONNECT: &str = "asynStatus ADTimePix::refreshOnReconnect
 pub const CHECK_CONNECTION: &str = "asynStatus ADTimePix::checkConnection(bool, bool)";
 pub const GET_DASHBOARD: &str = "asynStatus ADTimePix::getDashboard()";
 pub const GET_DETECTOR: &str = "asynStatus ADTimePix::getDetector(bool)";
+pub const INITIAL_SERVER_CHECK_CONNECTION: &str =
+    "asynStatus ADTimePix::initialServerCheckConnection()";
+pub const CONSTRUCTOR: &str = "ADTimePix::ADTimePix(const char*, const char*, int, size_t, int, \
+     int, int, const char*, const char*)";
 pub const WRITE_INT32: &str = "virtual asynStatus ADTimePix::writeInt32(asynUser*, epicsInt32)";
 pub const WRITE_FLOAT64: &str =
     "virtual asynStatus ADTimePix::writeFloat64(asynUser*, epicsFloat64)";
