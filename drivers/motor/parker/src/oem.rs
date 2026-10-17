@@ -205,13 +205,13 @@ impl WriteHook for OemWriteHook {
             Err(e) => write.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "OEMMotorDriver:{method}: error, status={} function={function}, value={value}",
+                    "OEMMotorDriver:{method}: error, status={} function={function}, value={value}\n",
                     e.c_status_code()
                 ),
             ),
             Ok(()) => write.print(
                 TraceMask::IO_DRIVER,
-                format_args!("OEMMotorDriver:{method}: function={function}, value={value}"),
+                format_args!("OEMMotorDriver:{method}: function={function}, value={value}\n"),
             ),
         }
     }

@@ -478,7 +478,7 @@ impl WriteHook for PmacWriteHook {
             WriteValue::Int32(_) => "writeInt32",
             WriteValue::Float64(_) => "writeFloat64",
         };
-        write.print(TraceMask::FLOW, format_args!("pmacController::{method}"));
+        write.print(TraceMask::FLOW, format_args!("pmacController::{method}\n"));
     }
 }
 
