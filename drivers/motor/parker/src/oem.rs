@@ -59,9 +59,8 @@ const TWO_POW_32: f64 = 4_294_967_296.0;
 const SELECT_SWITCH: i32 = 0;
 
 /// `pulsesPerUnit_` until `OEM_RESOLUTION` is written. C leaves the member
-/// uninitialised and sends it as `MR` from the constructor on; 1 is the
-/// controller's step unchanged.
-const DEFAULT_PULSES_PER_UNIT: f64 = 1.0;
+/// uninitialised in a fresh heap block, so its constructor sends `MR0`.
+const DEFAULT_PULSES_PER_UNIT: f64 = 0.0;
 
 /// Shared OEM750 controller endpoint owning the asyn octet handle.
 pub struct OemController {
@@ -451,6 +450,59 @@ mod tests {
         );
         let controller = Arc::new(Mutex::new(OemController::new(handle, 1)));
         assert_eq!(OemAxis::new(controller, 0).address, 1);
+    }
+
+    /// A port that acknowledges every command, recording it.
+    struct Acks {
+        base: PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Acks {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            self.written.lock().unwrap().push(cmd);
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            buf[0] = b'\r';
+            Ok(1)
+        }
+    }
+
+    /// OEMMotorDriver.cpp:208, 320: the constructor's configureController
+    /// sends `MR` from a `pulsesPerUnit_` no resolution write has set yet.
+    #[test]
+    fn boot_configuration_sends_mr0() {
+        use epics_rs::asyn::port::PortFlags;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let name = "OEM_BOOT";
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let driver = Acks {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            written: written.clone(),
+        };
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        let handle = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_secs(1),
+        );
+        let controller = Arc::new(Mutex::new(OemController::new(handle, 1)));
+        let _axis = OemAxis::new(controller, 0);
+        assert_eq!(*written.lock().unwrap(), ["1E", "1SSA0", "1MPA", "1MR0"]);
     }
 
     #[test]
