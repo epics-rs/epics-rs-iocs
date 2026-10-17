@@ -241,9 +241,6 @@ pub struct SmartMotorAxis {
     /// `RA_PROBLEM` on the next (COMM_ERR, :258). Per axis, as the
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
-    /// The record's `cdir` while C's motion node exists: from a move until a
-    /// status that is done, on the direction's limit, or a problem.
-    motion_dir: Option<bool>,
     last_status: MotorStatus,
 }
 
@@ -255,7 +252,6 @@ impl SmartMotorAxis {
             axis,
             prev_position: 0,
             failure: PollFailure::NONE,
-            motion_dir: None,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -293,7 +289,6 @@ impl AsynMotor for SmartMotorAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.motion_dir = Some(position >= f64::from(self.prev_position));
         let ctrl = self.lock();
         SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration);
         ctrl.send(self.axis, &format!("P={}", nint(position)));
@@ -309,7 +304,6 @@ impl AsynMotor for SmartMotorAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.motion_dir = Some(distance >= 0.0);
         let ctrl = self.lock();
         SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration);
         ctrl.send(self.axis, &format!("D={}", nint(distance)));
@@ -326,7 +320,6 @@ impl AsynMotor for SmartMotorAxis {
     ) -> AsynResult<()> {
         // The record's unguarded SET_ACCEL (motorRecord.cc:2141), then C JOG:
         // "MV\rV=<v>\rG" — velocity mode, set signed velocity, go.
-        self.motion_dir = Some(velocity >= 0.0);
         let ctrl = self.lock();
         ctrl.send(self.axis, &format!("A={}", clamped_accel(acceleration)));
         ctrl.send(self.axis, &format!("MV\rV={}\rG", nint(velocity * VCONFAC)));
@@ -384,6 +377,20 @@ impl AsynMotor for SmartMotorAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        self.poll_status(None)
+    }
+
+    /// drvSmartMotor.cc:287-291: a moving motor reports the record's CDIR.
+    /// The :384 write back to `mr->cdir` is dead, as the direction is already
+    /// CDIR here.
+    fn poll_in_motion(&mut self, _user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
+        self.poll_status(Some(*cdir))
+    }
+}
+
+impl SmartMotorAxis {
+    /// C `set_status`; `cdir` is the record's while its move is held.
+    fn poll_status(&mut self, cdir: Option<bool>) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -396,10 +403,6 @@ impl AsynMotor for SmartMotorAxis {
                 CommState::Normal => (CommState::Retry, PollFailure::NONE),
                 _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
             };
-            // motordrvCom.cc:335-343: COMM_ERR's RA_PROBLEM ends the motion.
-            if ctrl.comm_state == CommState::CommErr {
-                self.motion_dir = None;
-            }
             return Err(smartmotor_err(format!(
                 "SmartMotor axis {}: no RBt reply",
                 self.axis
@@ -439,14 +442,10 @@ impl AsynMotor for SmartMotorAxis {
             direction = position >= self.prev_position;
             self.prev_position = position;
         }
-        if let Some(cdir) = self.motion_dir {
+        if let Some(cdir) = cdir {
             direction = cdir;
         }
         let position = self.prev_position;
-        let ls_active = if direction { plus_ls } else { minus_ls };
-        if done || ls_active {
-            self.motion_dir = None;
-        }
 
         let velocity = if direction {
             velocity_raw as f64
@@ -778,7 +777,7 @@ mod tests {
     }
 
     /// drvSmartMotor.cc:271-291: an unchanged position keeps the direction,
-    /// and from a move until it is done the commanded one is reported.
+    /// and a held move reports its record's CDIR.
     #[test]
     fn direction_is_kept_at_rest_and_commanded_while_moving() {
         let (mut axis, replies, _, _rt) = single("smartDir");
@@ -792,35 +791,18 @@ mod tests {
         assert!(!axis.poll(&user).unwrap().direction);
         set("0", "-50");
         assert!(!axis.poll(&user).unwrap().direction, "kept at rest");
-        axis.move_absolute(&user, 100.0, 0.0, 1.0, 1.0).unwrap();
         set("1", "-60");
-        assert!(axis.poll(&user).unwrap().direction, "commanded");
+        let mut cdir = true;
+        let s = axis.poll_in_motion(&user, &mut cdir).unwrap();
+        assert!(s.direction && cdir, "the record's CDIR, left unchanged");
         set("0", "100");
-        assert!(axis.poll(&user).unwrap().direction);
+        let mut cdir = false;
+        assert!(!axis.poll_in_motion(&user, &mut cdir).unwrap().direction);
         set("0", "90");
-        assert!(!axis.poll(&user).unwrap().direction, "done clears it");
-    }
-
-    /// motordrvCom.cc:335-343: a COMM_ERR poll ends the motion too, so the
-    /// commanded direction is no longer reported.
-    #[test]
-    fn comm_error_ends_the_commanded_direction() {
-        use std::sync::atomic::Ordering;
-        let (mut axis, replies, quiet, _rt) = single("smartDirErr");
-        let user = AsynUser::new(0);
-        replies
-            .lock()
-            .unwrap()
-            .extend([("RBt", "1"), ("RP", "-50")]);
-        axis.poll(&user).unwrap();
-        axis.move_absolute(&user, 100.0, 0.0, 1.0, 1.0).unwrap();
-        quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
-        assert!(axis.poll(&user).is_err());
-        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
-        quiet.store(false, Ordering::SeqCst);
-        replies.lock().unwrap().insert("RP", "-60");
-        assert!(!axis.poll(&user).unwrap().direction);
+        assert!(
+            !axis.poll(&user).unwrap().direction,
+            "position delta at rest"
+        );
     }
 
     /// drvSmartMotor.cc:332-348: the encoder is its own RP after RBo,
