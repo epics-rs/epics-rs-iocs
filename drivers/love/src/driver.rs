@@ -76,6 +76,7 @@
 //!   prior to IOC initialization"), which every shipped startup script
 //!   (`st.cmd.linux`, `love.iocsh`) already follows.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -105,6 +106,43 @@ const OCTET_REASON: usize = 0;
 /// C `pport->inpMsg[20]` -- the fixed reply buffer size passed as
 /// `maxchars` to `pasynOctet->read`.
 const REPLY_BUF_SIZE: usize = 20;
+
+/// C's `pasynUser->reason` for every love user: `create` sets only
+/// `drvUser` (drvLove.c:1129), so devAsyn* leaves it 0.
+const C_REASON: i32 = 0;
+
+/// The address of C's `pport->pasynUser`, which `drvLoveInit` connects to
+/// the port itself (drvLove.c:434).
+const PORT_USER: i32 = -1;
+
+/// C `asynPrint(pasynUser, …)` for a love user at `$addr`.
+macro_rules! love_print {
+    ($self:expr, $addr:expr, $mask:ident, $($arg:tt)*) => {
+        $self.base.trace_print_at(
+            $addr,
+            C_REASON,
+            TraceMask::$mask,
+            file!(),
+            line!(),
+            format_args!($($arg)*),
+        )
+    };
+}
+
+/// [`love_print!`] for a line with a device buffer in it, which C prints
+/// with `%s`.
+macro_rules! love_write {
+    ($self:expr, $addr:expr, $mask:ident, $body:expr) => {
+        $self
+            .base
+            .trace_write_at($addr, C_REASON, TraceMask::$mask, file!(), line!(), $body)
+    };
+}
+
+/// What C's `%s` prints of a reply buffer: up to its first NUL.
+fn c_str(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())]
+}
 
 /// C `setDefaultEos`'s hardcoded input EOS: `'\006'` (ACK).
 pub const INPUT_EOS: &[u8] = &[0x06];
@@ -398,32 +436,65 @@ impl LoveDriver {
         })
     }
 
-    /// C `sendCommand` + `recvReply`, looped by C `executeCommand`, with
-    /// their `ASYN_TRACE_ERROR` lines (drvLove.c:573-608, :736-767, :817-866).
+    /// C `executeCommand` with its `sendCommand`, `recvReply` and
+    /// `evalMessage`, printing their lines for the caller at `addr`
+    /// (drvLove.c:564-623, :723-768, :790-867).
     fn execute_command(&self, addr: i32, body: &str) -> AsynResult<Vec<u8>> {
+        love_print!(self, addr, FLOW, "drvLove::executeCommand\n");
         let frame = build_frame(addr, body);
 
         for retry in 0..MAX_ATTEMPTS {
             std::thread::sleep(K_TUNE);
 
+            love_print!(
+                self,
+                addr,
+                FLOW,
+                "drvLove::sendCommand - retries({retry})\n"
+            );
             let write = RequestOp::OctetWrite {
                 data: frame.as_bytes().to_vec(),
             };
             if let Err(e) = self.serial.submit_blocking(write, self.serial_user()) {
-                self.trace_error(&format!(
+                love_print!(
+                    self,
+                    addr,
+                    ERROR,
                     "drvLove::sendCommand - retries({retry}) {}\n",
                     status_text(e.status())
-                ));
+                );
                 if is_timeout(&e) {
-                    self.trace_error("drvLove::executeCommand write timeout, retrying\n");
+                    love_print!(
+                        self,
+                        addr,
+                        ERROR,
+                        "drvLove::executeCommand write timeout, retrying\n"
+                    );
                     continue;
                 }
-                self.trace_error(&format!(
+                love_print!(
+                    self,
+                    addr,
+                    ERROR,
                     "drvLove::executeCommand write failure - Sent \"{frame}\" \n"
-                ));
+                );
                 return Err(e);
             }
+            // C's format has a second `"%s"` with no argument (drvLove.c:815).
+            love_print!(
+                self,
+                addr,
+                IO_FILTER,
+                "drvLove::sendCommand - retries({retry}),data \"{frame}\"\n"
+            );
+            love_print!(
+                self,
+                addr,
+                IO_FILTER,
+                "drvLove::executeCommand write \"{frame}\"\n"
+            );
 
+            love_print!(self, addr, FLOW, "drvLove::recvReplay\n");
             let read = RequestOp::OctetRead {
                 buf_size: REPLY_BUF_SIZE,
             };
@@ -431,36 +502,80 @@ impl LoveDriver {
                 Ok(result) => {
                     let raw = result.data.unwrap_or_default();
                     if EomReason::from_bits_truncate(result.eom_reason) != EomReason::EOS {
-                        self.trace_error("drvLove::recvReply eos failure\n");
-                        self.trace_read_failure(&frame, &raw);
+                        love_print!(self, addr, ERROR, "drvLove::recvReply eos failure\n");
+                        self.trace_read_failure(addr, &frame, &raw);
                         return Err(protocol_error("recvReply eos failure"));
                     }
                     raw
                 }
                 Err(e) => {
-                    self.trace_error(&format!("drvLove::recvReply {}\n", status_text(e.status())));
+                    love_print!(
+                        self,
+                        addr,
+                        ERROR,
+                        "drvLove::recvReply {}\n",
+                        status_text(e.status())
+                    );
                     if is_timeout(&e) {
-                        self.trace_error("drvLove::executeCommand read timeout, retrying\n");
+                        love_print!(
+                            self,
+                            addr,
+                            ERROR,
+                            "drvLove::executeCommand read timeout, retrying\n"
+                        );
                         continue;
                     }
                     // C prints whatever the failed read left in inpMsg.
                     let rcvd = e.partial_read().map(|p| p.data.as_slice()).unwrap_or(&[]);
-                    self.trace_read_failure(&frame, rcvd);
+                    self.trace_read_failure(addr, &frame, rcvd);
                     return Err(e);
                 }
             };
 
-            return match eval_message(&raw) {
-                Ok(payload) => Ok(payload.to_vec()),
+            love_print!(self, addr, FLOW, "drvLove::evalMessage\n");
+            let evaluated = eval_message(&raw);
+            // evalMessage rewrites inpMsg in place: the payload, or for a device
+            // error reply its 3 bytes after the header (drvLove.c:617-619).
+            let inp: &[u8] = match &evaluated {
+                Ok(payload) => {
+                    love_print!(self, addr, FLOW, "drvLove::evalMessage message received\n");
+                    payload
+                }
                 Err(e) => {
-                    self.trace_error(&eval_error_line(&e, raw.len()));
-                    self.trace_read_failure(&frame, &raw);
+                    love_print!(self, addr, ERROR, "{}", eval_error_line(e, raw.len()));
+                    match e {
+                        EvalError::DeviceError(_) => &raw[4..],
+                        _ => &raw,
+                    }
+                }
+            };
+            love_write!(self, addr, IO_FILTER, |out| {
+                write!(out, "drvLove::recvReply {} \"", inp.len())?;
+                out.write_bytes(c_str(inp))?;
+                out.write_str("\"\n")
+            });
+            return match evaluated {
+                Ok(payload) => {
+                    love_write!(self, addr, IO_FILTER, |out| {
+                        out.write_str("drvLove::executeCommand read \"")?;
+                        out.write_bytes(c_str(payload))?;
+                        out.write_str("\"\n")
+                    });
+                    Ok(payload.to_vec())
+                }
+                Err(e) => {
+                    self.trace_read_failure(addr, &frame, inp);
                     Err(eval_error_to_asyn(e))
                 }
             };
         }
 
-        self.trace_error("drvLove::executeCommand retries exceeded\n");
+        love_print!(
+            self,
+            addr,
+            ERROR,
+            "drvLove::executeCommand retries exceeded\n"
+        );
         // C returns asynError, not the last attempt's asynTimeout, so the
         // record alarms READ/WRITE rather than TIMEOUT.
         Err(protocol_error("executeCommand retries exceeded"))
@@ -474,21 +589,21 @@ impl LoveDriver {
             .locking_port(&self.serial)
     }
 
-    fn trace_error(&self, msg: &str) {
-        self.base
-            .trace_print(TraceMask::ERROR, format_args!("{msg}"));
-    }
-
-    fn trace_read_failure(&self, frame: &str, rcvd: &[u8]) {
-        self.trace_error(&format!(
-            "drvLove::executeCommand read failure - Sent \"{frame}\" Rcvd \"{}\" \n",
-            String::from_utf8_lossy(rcvd)
-        ));
+    fn trace_read_failure(&self, addr: i32, frame: &str, rcvd: &[u8]) {
+        love_write!(self, addr, ERROR, |out| {
+            write!(
+                out,
+                "drvLove::executeCommand read failure - Sent \"{frame}\" Rcvd \""
+            )?;
+            out.write_bytes(c_str(rcvd))?;
+            out.write_str("\" \n")
+        });
     }
 
     /// C `connectIt` (drvLove.c:993-1044).
     fn connect_it(&mut self, user: &AsynUser) -> AsynResult<()> {
         let addr = user.addr;
+        love_print!(self, addr, FLOW, "drvLove::connectIt\n");
         if !self.serial_dp.connected() {
             return Err(protocol_error(format!(
                 "port {} not connected to {}",
@@ -496,15 +611,20 @@ impl LoveDriver {
             )));
         }
         self.check_addr("connectIt", addr)?;
-        if addr > 0 {
-            if self.is_conn[(addr - 1) as usize] {
-                self.trace_error(&format!(
-                    "drvLove::connectIt {} device {addr} already connected\n",
-                    self.base.port_name
-                ));
-                return Err(protocol_error("already connected"));
-            }
-            self.is_conn[(addr - 1) as usize] = true;
+        let already = if addr > 0 {
+            std::mem::replace(&mut self.is_conn[(addr - 1) as usize], true)
+        } else {
+            self.base.dp_connected(addr)
+        };
+        if already {
+            love_print!(
+                self,
+                addr,
+                ERROR,
+                "drvLove::connectIt {} device {addr} already connected\n",
+                self.base.port_name
+            );
+            return Err(protocol_error("already connected"));
         }
         self.base.set_addr_connected(addr, true);
         Ok(())
@@ -513,6 +633,7 @@ impl LoveDriver {
     /// C `disconnectIt` (drvLove.c:1047-1095).
     fn disconnect_it(&mut self, user: &AsynUser) -> AsynResult<()> {
         let addr = user.addr;
+        love_print!(self, addr, FLOW, "drvLove::disconnectIt\n");
         self.check_addr("disconnectIt", addr)?;
         let conn = if addr < 0 {
             self.base.dp_connected(addr)
@@ -528,10 +649,13 @@ impl LoveDriver {
 
     fn check_addr(&self, func: &str, addr: i32) -> AsynResult<()> {
         if addr == 0 || addr > K_INSTRMAX as i32 {
-            self.trace_error(&format!(
+            love_print!(
+                self,
+                addr,
+                ERROR,
                 "drvLove::{func} {} illegal addr {addr}\n",
                 self.base.port_name
-            ));
+            );
             return Err(protocol_error(format!("illegal addr {addr}")));
         }
         Ok(())
@@ -559,12 +683,24 @@ impl LoveDriver {
         let model = self.model_for(addr);
         let read_cmd = spec.read[model as usize];
 
-        let payload = self.execute_command(addr, read_cmd)?;
+        let payload = self.locked_command(addr, read_cmd)?;
         Ok(match spec.read_conv {
-            ReadConv::Value => parse_value(&payload),
-            ReadConv::Status => parse_status(&payload),
-            ReadConv::SignedValue => parse_signed_value(&payload, model),
-            ReadConv::Data => parse_data(&payload),
+            ReadConv::Value => {
+                love_print!(self, PORT_USER, FLOW, "drvLove::getValue\n");
+                parse_value(&payload)
+            }
+            ReadConv::Status => {
+                love_print!(self, PORT_USER, FLOW, "drvLove::getStatus\n");
+                parse_status(&payload)
+            }
+            ReadConv::SignedValue => {
+                love_print!(self, PORT_USER, FLOW, "drvLove::getSignedValue\n");
+                parse_signed_value(&payload, model)
+            }
+            ReadConv::Data => {
+                love_print!(self, PORT_USER, FLOW, "drvLove::getData\n");
+                parse_data(&payload)
+            }
         })
     }
 
@@ -587,11 +723,27 @@ impl LoveDriver {
             }
         };
 
+        love_print!(self, PORT_USER, FLOW, "drvLove::putData\n");
         let body = format_put_data(write_cmd, value);
-        let payload = self.execute_command(addr, &body)?;
+        let payload = self.locked_command(addr, &body)?;
+        love_print!(self, PORT_USER, FLOW, "drvLove::processWriteResponse\n");
         process_write_response(&payload).inspect_err(|_| {
-            self.trace_error("drvLove::processWriteResponse write command failed\n")
+            love_print!(
+                self,
+                PORT_USER,
+                ERROR,
+                "drvLove::processWriteResponse write command failed\n"
+            )
         })
+    }
+
+    /// C's `lockPort` / `executeCommand` / `unlockPort` sequence in every
+    /// read and write (drvLove.c:1198-1200), with their trace lines.
+    fn locked_command(&self, addr: i32, body: &str) -> AsynResult<Vec<u8>> {
+        love_print!(self, addr, FLOW, "drvLove::lockPort\n");
+        let result = self.execute_command(addr, body);
+        love_print!(self, addr, FLOW, "drvLove::unlockPort\n");
+        result
     }
 }
 
@@ -637,6 +789,7 @@ impl PortDriver for LoveDriver {
     /// C `create()` (asynDrvUser, `drvLove.c:1106-1138`).
     fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
         let (drv_info, addr) = (req.drv_info.as_str(), req.addr);
+        love_print!(self, addr, FLOW, "drvLove::create\n");
         if !(1..=K_INSTRMAX as i32).contains(&addr) {
             return Err(AsynError::AddressOutOfRange(addr));
         }
@@ -651,11 +804,22 @@ impl PortDriver for LoveDriver {
     }
 
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
-        self.do_read(user.addr, user.reason)
-            .map_err(|e| self.record_error(e))
+        love_print!(self, user.addr, FLOW, "drvLove::readInt32\n");
+        let value = self
+            .do_read(user.addr, user.reason)
+            .map_err(|e| self.record_error(e))?;
+        love_print!(
+            self,
+            user.addr,
+            IO_FILTER,
+            "drvLove::readInt32 readback from {} is {value}\n",
+            self.base.port_name
+        );
+        Ok(value)
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        love_print!(self, user.addr, FLOW, "drvLove::writeInt32\n");
         self.do_write(user.addr, user.reason, value)
             .map_err(|e| self.record_error(e))
     }
@@ -668,10 +832,18 @@ impl PortDriver for LoveDriver {
     /// harmless here since the record layer re-applies (and shifts by) the
     /// same mask regardless.
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
+        love_print!(self, user.addr, FLOW, "drvLove::readUInt32\n");
         let value = self
             .do_read(user.addr, user.reason)
-            .map_err(|e| self.record_error(e))?;
-        Ok((value as u32) & mask)
+            .map_err(|e| self.record_error(e))? as u32;
+        love_print!(
+            self,
+            user.addr,
+            IO_FILTER,
+            "drvLove::readUInt32 readback from {} is 0x{value:X},mask=0x{mask:X}\n",
+            self.base.port_name
+        );
+        Ok(value & mask)
     }
 
     /// C `writeUInt32` (`drvLove.c:1260-1293`): `mask` is accepted but
@@ -683,6 +855,7 @@ impl PortDriver for LoveDriver {
         value: u32,
         _mask: u32,
     ) -> AsynResult<()> {
+        love_print!(self, user.addr, FLOW, "drvLove::writeUInt32\n");
         self.do_write(user.addr, user.reason, value as i32)
             .map_err(|e| self.record_error(e))
     }
@@ -1106,6 +1279,149 @@ mod tests {
     fn reply_love(name: &str, eom: EomReason) -> LoveDriver {
         let base = PortDriverBase::new(&format!("{name}SER"), 1, PortFlags::default());
         love_on(ReplySerial { base, eom }, name)
+    }
+
+    /// A love port on `serial` in its own runtime, with the port's trace
+    /// lines in one file and device 1's in another; returns the device
+    /// reader and the two files.
+    fn traced_love(
+        serial: impl PortDriver,
+        name: &str,
+    ) -> (SyncIOHandle, std::path::PathBuf, std::path::PathBuf) {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let love = love_on(serial, name);
+        let claim = claim_port(name).expect("love port name");
+        let (runtime, _thread) =
+            create_port_runtime(&claim, love, RuntimeConfig::default()).expect("love port runtime");
+        let handle = runtime.port_handle().clone();
+        claim
+            .publish(handle.clone(), &epics_rs::asyn::registry::open_owner())
+            .unwrap();
+        std::mem::forget(runtime);
+        let file = |what: &str| {
+            let path =
+                std::env::temp_dir().join(format!("love-{name}-{what}-{}.txt", std::process::id()));
+            let f = std::fs::File::create(&path).unwrap();
+            (
+                path,
+                TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(f))),
+            )
+        };
+        let (port_path, port_file) = file("port");
+        let (dev_path, dev_file) = file("dev");
+        let trace = handle.trace();
+        trace.set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::FLOW);
+        trace.set_trace_file(Some(name), port_file);
+        trace.set_device_trace_mask(
+            name,
+            1,
+            TraceMask::ERROR | TraceMask::FLOW | TraceMask::IO_FILTER,
+        );
+        trace.set_device_trace_file(name, 1, dev_file);
+        (
+            SyncIOHandle::from_handle(handle, 1, Duration::from_secs(5)),
+            port_path,
+            dev_path,
+        )
+    }
+
+    fn read_trace(path: &std::path::Path) -> Vec<u8> {
+        let out = std::fs::read(path).unwrap();
+        let _ = std::fs::remove_file(path);
+        out
+    }
+
+    /// C prints a request's lines with the caller's `pasynUser`, so through
+    /// its device, and the conversions with `pport->pasynUser`, so through
+    /// the port (drvLove.c:1223-1251, :879).
+    #[test]
+    fn a_read_prints_through_the_caller_device_and_the_port_user() {
+        let base = PortDriverBase::new("LOVETESTDEVSER", 1, PortFlags::default());
+        let serial = ReplySerial {
+            base,
+            eom: EomReason::EOS,
+        };
+        let (user, port_path, dev_path) = traced_love(serial, "LOVETESTDEV");
+        assert_eq!(user.read_int32(0).unwrap(), 0);
+
+        let port = String::from_utf8(read_trace(&port_path)).unwrap();
+        let dev = String::from_utf8(read_trace(&dev_path)).unwrap();
+        let mut at = 0;
+        for line in [
+            "drvLove::readInt32\n",
+            "drvLove::lockPort\n",
+            "drvLove::executeCommand\n",
+            "drvLove::sendCommand - retries(0)\n",
+            "drvLove::sendCommand - retries(0),data \"\u{2}L0100C1\"\n",
+            "drvLove::executeCommand write \"\u{2}L0100C1\"\n",
+            "drvLove::recvReplay\n",
+            "drvLove::evalMessage\n",
+            "drvLove::evalMessage message received\n",
+            "drvLove::recvReply 4 \"0000\"\n",
+            "drvLove::executeCommand read \"0000\"\n",
+            "drvLove::unlockPort\n",
+            "drvLove::readInt32 readback from LOVETESTDEV is 0\n",
+        ] {
+            let Some(i) = dev[at..].find(line) else {
+                panic!("missing {line:?} after {at} in {dev:?}");
+            };
+            at += i + line.len();
+        }
+        assert!(!dev.contains("getValue"), "{dev:?}");
+        assert!(port.contains("drvLove::getValue\n"), "{port:?}");
+        assert!(!port.contains("readInt32"), "{port:?}");
+    }
+
+    /// A reply whose checksum fails.
+    struct BadReplySerial {
+        base: PortDriverBase,
+    }
+
+    impl PortDriver for BadReplySerial {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+
+        fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, EomReason)> {
+            let reply = b"\x02L01\xff000000";
+            buf[..reply.len()].copy_from_slice(reply);
+            Ok((reply.len(), EomReason::EOS))
+        }
+    }
+
+    /// C prints the failed reply with `%s`, its bytes as they are
+    /// (drvLove.c:760).
+    #[test]
+    fn a_failed_reply_is_printed_raw() {
+        let base = PortDriverBase::new("LOVETESTRAWSER", 1, PortFlags::default());
+        let (user, port_path, dev_path) = traced_love(BadReplySerial { base }, "LOVETESTRAW");
+        assert!(user.read_int32(0).is_err());
+        let _ = read_trace(&port_path);
+        let dev = read_trace(&dev_path);
+        let want: &[u8] = b"drvLove::executeCommand read failure - Sent \"\x02L0100C1\" Rcvd \"\x02L01\xff000000\" \n";
+        assert!(
+            dev.windows(want.len()).any(|w| w == want),
+            "{}",
+            String::from_utf8_lossy(&dev)
+        );
+        let want: &[u8] = b"drvLove::evalMessage checksum failed\n";
+        assert!(dev.windows(want.len()).any(|w| w == want));
     }
 
     fn report_of(love: &mut LoveDriver) -> String {

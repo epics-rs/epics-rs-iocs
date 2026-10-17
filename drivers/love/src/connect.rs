@@ -51,11 +51,12 @@ pub fn follow_serial_port(
     let ser_name = serial.port_name().to_owned();
     let love = love.clone();
     serial.exception_callback_add(ser_addr, move |_| {
-        trace.print(
+        trace.print_source(
             Some(&ser_name),
             Some(ser_addr),
             0,
             TraceMask::FLOW,
+            (file!(), line!()),
             format_args!("drvLove::exceptionCallback\n"),
         );
         if under.connected() || !over.connected() {
