@@ -1480,7 +1480,7 @@ impl TimePix3Driver {
             return Ok(());
         }
         // C `sendConfiguration` (serval_http.cpp:2172-2190).
-        println!("server={}", serval::dump(&server, Some(3), true));
+        println!("{}", send_configuration_line(&server));
         let reply = self.http.put_json(
             serval::SERVER_DESTINATION,
             &serval::dump(&server, None, false),
@@ -3143,6 +3143,12 @@ impl TimePix3Driver {
         );
         Ok(())
     }
+}
+
+/// The stdout line C `sendConfiguration` prints before the PUT:
+/// `config.dump(3, ' ', true)` (serval_http.cpp:2176).
+fn send_configuration_line(server: &Value) -> String {
+    format!("server={}", serval::dump(server, Some(3), true))
 }
 
 fn acquisition_error(message: impl Into<String>) -> AsynError {
@@ -7698,6 +7704,17 @@ mod tests {
                 get("/measurement/stop", default),
                 get("/measurement", default),
             ]
+        );
+    }
+
+    /// The `server=` line is the destination dumped with a 3-space indent
+    /// and non-ASCII escaped, as C prints it (serval_http.cpp:2176).
+    #[test]
+    fn send_configuration_prints_the_destination_as_c() {
+        let server = json!({"Raw": [{"Base": "file:/d\u{e4}ta", "QueueSize": 16}]});
+        assert_eq!(
+            send_configuration_line(&server),
+            "server={\n   \"Raw\": [\n      {\n         \"Base\": \"file:/d\\u00e4ta\",\n         \"QueueSize\": 16\n      }\n   ]\n}"
         );
     }
 
