@@ -75,6 +75,17 @@ impl HydraController {
         Ok(())
     }
 
+    /// C's run of `status = writeController()`: every command is sent,
+    /// whatever the one before returned, and the last one's status is the
+    /// caller's.
+    fn write_all<const N: usize>(&self, cmds: [String; N]) -> AsynResult<()> {
+        let mut status = Ok(());
+        for cmd in &cmds {
+            status = self.write_only(cmd);
+        }
+        status
+    }
+
     /// Write a query and read one reply line.
     fn query(&self, cmd: &str) -> AsynResult<String> {
         // C writeReadController: pasynOctetSyncIO->writeRead.
@@ -161,22 +172,21 @@ impl HydraAxis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Send the per-axis velocity and acceleration (`snv`/`sna`).
-    fn send_accel_velocity(
+    /// C `sendAccelAndVelocity`'s `snv`/`sna`, then `cmd`, as one
+    /// [`HydraController::write_all`].
+    fn write_after_accel_velocity(
         &self,
         ctrl: &HydraController,
         velocity: f64,
         acceleration: f64,
+        cmd: String,
     ) -> AsynResult<()> {
         let addr = self.addr();
-        ctrl.write_only(&format!(
-            "{:.6} {addr} snv",
-            (velocity * self.axis_res).abs()
-        ))?;
-        ctrl.write_only(&format!(
-            "{:.6} {addr} sna",
-            (acceleration * self.axis_res).abs()
-        ))
+        ctrl.write_all([
+            format!("{:.6} {addr} snv", (velocity * self.axis_res).abs()),
+            format!("{:.6} {addr} sna", (acceleration * self.axis_res).abs()),
+            cmd,
+        ])
     }
 }
 
@@ -195,13 +205,8 @@ impl AsynMotor for HydraAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
-        ctrl.write_only(&format!(
-            "{:.6} {} nm",
-            position * self.axis_res,
-            self.addr()
-        ))
+        let cmd = format!("{:.6} {} nm", position * self.axis_res, self.addr());
+        self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
     fn move_relative(
@@ -212,13 +217,8 @@ impl AsynMotor for HydraAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
-        ctrl.write_only(&format!(
-            "{:.6} {} nr",
-            distance * self.axis_res,
-            self.addr()
-        ))
+        let cmd = format!("{:.6} {} nr", distance * self.axis_res, self.addr());
+        self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
     fn move_velocity(
@@ -228,12 +228,11 @@ impl AsynMotor for HydraAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
         // No jog command: move to the travel limit the constructor read.
-        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
         let (neg, pos) = self.travel_limits;
         let target = if velocity > 0.0 { pos } else { neg };
-        ctrl.write_only(&format!("{target:.6} {} nm", self.addr()))
+        let cmd = format!("{target:.6} {} nm", self.addr());
+        self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
     fn home(
@@ -244,21 +243,19 @@ impl AsynMotor for HydraAxis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
         let verb = if forward { "nrm" } else { "ncal" };
-        ctrl.write_only(&format!("{} {verb}", self.addr()))
+        let cmd = format!("{} {verb}", self.addr());
+        self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
     fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
         let ctrl = self.lock();
         let addr = self.addr();
         // Set stop deceleration, then abort this axis.
-        ctrl.write_only(&format!(
-            "{:.6} {addr} ssd",
-            (acceleration * self.axis_res).abs()
-        ))?;
-        ctrl.write_only(&format!("{addr} nabort"))
+        ctrl.write_all([
+            format!("{:.6} {addr} ssd", (acceleration * self.axis_res).abs()),
+            format!("{addr} nabort"),
+        ])
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
@@ -280,12 +277,14 @@ impl AsynMotor for HydraAxis {
         let ctrl = self.lock();
         let addr = self.addr();
         if enable {
-            ctrl.write_only(&format!("{REGULATOR_MODE_DEFAULT} {addr} setcloop"))?;
             // Reinit so the closed-loop setting takes effect (powers the motor);
             // the controller needs a delay after init.
-            ctrl.write_only(&format!("{addr} init"))?;
+            let status = ctrl.write_all([
+                format!("{REGULATOR_MODE_DEFAULT} {addr} setcloop"),
+                format!("{addr} init"),
+            ]);
             std::thread::sleep(INIT_DELAY);
-            Ok(())
+            status
         } else {
             ctrl.write_only(&format!("{addr} motoroff"))
         }
@@ -378,6 +377,98 @@ mod tests {
         assert!(powered(0x1));
         assert!(problem(0x200));
         assert!(!problem(0x1));
+    }
+
+    /// Refuses every setting write (`snv`, `sna`, `ssd`, `setcloop`);
+    /// records every write.
+    struct SettingsRefused {
+        base: epics_rs::asyn::port::PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for SettingsRefused {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let line = String::from_utf8_lossy(data).into_owned();
+            let refused = ["snv", "sna", "ssd", "setcloop"]
+                .iter()
+                .any(|verb| line.ends_with(verb));
+            self.written.lock().unwrap().push(line);
+            if refused {
+                Err(epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Error,
+                    message: "refused".into(),
+                })
+            } else {
+                Ok(data.len())
+            }
+        }
+    }
+
+    /// C overwrites each write's status with the next one's
+    /// (SMChydraAxis.cpp:95-177, :207-213), so a refused setting still
+    /// sends the command after it, and that command's status is returned.
+    #[test]
+    fn a_refused_setting_still_sends_the_command_after_it() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let port = SettingsRefused {
+            base: PortDriverBase::new("hydraRefused", 1, PortFlags::default()),
+            written: written.clone(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("hydraRefused").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let mut axis = HydraAxis {
+            controller: Arc::new(Mutex::new(HydraController::new(handle))),
+            axis_no: 0,
+            motor_form: 0,
+            axis_res: 0.5,
+            travel_limits: (-100.0, 100.0),
+        };
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 2.0, 0.0, 2.0, 4.0).unwrap();
+        axis.move_relative(&user, -2.0, 0.0, 2.0, 4.0).unwrap();
+        axis.move_velocity(&user, 0.0, 2.0, 4.0).unwrap();
+        axis.home(&user, 0.0, 2.0, 4.0, false).unwrap();
+        axis.stop(&user, 4.0).unwrap();
+        axis.set_closed_loop(&user, true).unwrap();
+        let tails: Vec<String> = written
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| {
+                !["snv", "sna", "ssd", "setcloop"]
+                    .iter()
+                    .any(|v| w.ends_with(v))
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            tails,
+            [
+                "1.000000 1 nm",
+                "-1.000000 1 nr",
+                "100.000000 1 nm",
+                "1 ncal",
+                "1 nabort",
+                "1 init"
+            ]
+        );
+        // Four moves of three writes, then stop's and closed-loop's two.
+        assert_eq!(written.lock().unwrap().len(), 4 * 3 + 2 + 2);
     }
 
     #[test]
