@@ -44,6 +44,7 @@ impl PortDriver for FakeXps {
                 digital = format!("0,{}", self.digital.lock().unwrap());
                 &digital
             }
+            "ErrorStringGet" => "0,Not allowed action",
             "GroupStatusGet" => "0,12",
             "GroupPositionCurrentGet" if cmd.contains(".P2,") => "0,2.5",
             "GroupPositionCurrentGet" => "0,1.5",

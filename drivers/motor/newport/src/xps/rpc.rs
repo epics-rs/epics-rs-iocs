@@ -225,9 +225,9 @@ impl XpsSocket {
 
     /// Send a marshalled command and return its reply. The socket's [`mode`]
     /// selects the C `SendAndReceive` path: [`Query`] waits for the framed
-    /// reply; [`Fire`] writes without waiting and synthesizes a `"0"` success
-    /// reply (so callers can uniformly `require_ok()`). Move completion on a
-    /// [`Fire`] socket is observed later by polling `GroupStatusGet`.
+    /// reply; [`Fire`] waits only its short timeout and returns what it read,
+    /// or a synthesized `"0"` success reply. Move completion on a [`Fire`]
+    /// socket is observed later by polling `GroupStatusGet`.
     ///
     /// [`mode`]: XpsSocket::mode
     /// [`Query`]: SocketMode::Query
@@ -235,10 +235,7 @@ impl XpsSocket {
     pub fn exec(&self, cmd: &str) -> XpsResult<XpsReply> {
         match self.mode {
             SocketMode::Query => self.query(cmd),
-            SocketMode::Fire => {
-                self.fire(cmd)?;
-                Ok(XpsReply("0".to_string()))
-            }
+            SocketMode::Fire => self.fire(cmd),
         }
     }
 
@@ -307,7 +304,8 @@ impl XpsSocket {
     ///
     /// The move handle's per-call timeout should be short (C sets `-0.1` s on
     /// the move socket) so the write returns promptly.
-    fn fire(&self, cmd: &str) -> XpsResult<()> {
+    fn fire(&self, cmd: &str) -> XpsResult<XpsReply> {
+        let synthesized = || XpsReply("0".to_string());
         for _ in 0..MOVE_MAX_RETRIES {
             // C writeRead (asynOctetSocket.cpp:189), so a late reply to the
             // previous move is flushed rather than read as this one's.
@@ -317,7 +315,7 @@ impl XpsSocket {
             {
                 // write_read wraps its failure in the step that failed, so
                 // the timeout is read through `status()`.
-                Err(e) if e.status() == AsynStatus::Timeout => return Ok(()),
+                Err(e) if e.status() == AsynStatus::Timeout => return Ok(synthesized()),
                 Err(e) => {
                     // C prints only for asynError (asynOctetSocket.cpp:197).
                     if e.status() == AsynStatus::Error {
@@ -330,7 +328,14 @@ impl XpsSocket {
                     return Err(XpsError::Transport(e));
                 }
                 Ok(raw) => {
-                    let reply = XpsReply(String::from_utf8_lossy(&raw).into_owned());
+                    // A reply in time is the caller's to parse, as C's
+                    // `ErrorStringGet` on HXP's move socket does.
+                    let text = String::from_utf8_lossy(&raw);
+                    let reply = XpsReply(
+                        text.strip_suffix(XPS_TERMINATOR)
+                            .unwrap_or(&text)
+                            .to_string(),
+                    );
                     // The retry test is C's `atoi(valueRtrn)`; the verdict is the
                     // caller's `sscanf` on the reply it was left with.
                     match atoi(&reply.0) {
@@ -342,14 +347,14 @@ impl XpsSocket {
                         )),
                     }
                     return match reply.code() {
-                        0 => Ok(()),
+                        0 => Ok(reply),
                         code => Err(XpsError::Api(code)),
                     };
                 }
             }
         }
         // C: after MAX_RETRIES with no clean response, forces "0" (success).
-        Ok(())
+        Ok(synthesized())
     }
 }
 
@@ -530,6 +535,15 @@ mod tests {
             Duration::from_millis(100),
         );
         sock.group_move_absolute("G1.P1", 1.0).unwrap();
+    }
+
+    /// asynOctetSocket.cpp:189-215: the move socket's writeRead leaves the
+    /// reply that came back in time for the caller to parse.
+    #[test]
+    fn a_fire_command_returns_the_reply_it_read() {
+        let line = super::super::fake::FakeLine::new("xps_fire_reply", "");
+        let sock = line.socket(SocketMode::Fire);
+        assert_eq!(sock.error_string_get(-22).unwrap(), "Not allowed action");
     }
 
     #[test]
