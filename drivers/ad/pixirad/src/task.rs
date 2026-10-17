@@ -1,7 +1,6 @@
 //! The three threads behind the driver (C `udpDataListenerTask`, `dataTask`
 //! and `statusTask`).
 
-use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -27,7 +26,7 @@ use crate::driver::SharedState;
 use crate::params::PixiradParams;
 use crate::protocol;
 use crate::types::{FrameType, MAX_UDP_DATA_BUFFER, MAX_UDP_PACKET_LEN, Sensor};
-use crate::udp::{Frame, FrameAssembler};
+use crate::udp::{self, Frame, FrameAssembler, strerror};
 
 /// The box sends the colours in the order thresh2, thresh1, thresh4, thresh3
 /// (C `colorOffsetMap`).
@@ -37,8 +36,7 @@ const COLOR_OFFSET_MAP: [usize; 4] = [1, 0, 3, 2];
 
 /// Read packets and hand complete frames on (C `udpDataListenerTask`).
 pub(crate) fn start_udp_listener(
-    socket: UdpSocket,
-    rcvbuf: usize,
+    data_port: u16,
     handle: PortHandle,
     sensor: Sensor,
     frames: SyncSender<Frame>,
@@ -55,6 +53,13 @@ pub(crate) fn start_udp_listener(
                     TraceMask::ERROR,
                     message,
                 );
+            };
+            let (socket, rcvbuf) = match udp::bind_data_socket(data_port) {
+                Ok(bound) => bound,
+                Err(e) => {
+                    trace_error(&format!("pixirad:udpDataListenerTask: {e}\n"));
+                    return;
+                }
             };
             if rcvbuf != MAX_UDP_DATA_BUFFER {
                 trace_error(&format!(
@@ -370,7 +375,7 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
 // ────────────────────────────────── status ───────────────────────────────────
 
 pub(crate) struct StatusContext {
-    pub socket: UdpSocket,
+    pub status_port: u16,
     pub server: PixiradServer,
     pub handle: PortHandle,
     pub ad_params: ADBaseParams,
@@ -389,15 +394,6 @@ impl StatusContext {
     }
 }
 
-/// C `strerror(errno)`: the OS text without Rust's " (os error N)" suffix.
-fn strerror(e: &std::io::Error) -> String {
-    let text = e.to_string();
-    match text.find(" (os error ") {
-        Some(end) => text[..end].to_string(),
-        None => text,
-    }
-}
-
 pub(crate) fn start_status_task(ctx: StatusContext) -> std::thread::JoinHandle<()> {
     rt::run_thread_named("PixiradStatusTask", move || status_loop(ctx))
 }
@@ -405,16 +401,25 @@ pub(crate) fn start_status_task(ctx: StatusContext) -> std::thread::JoinHandle<(
 /// Read the environmental broadcast, work out the dew point, and switch the
 /// cooling off if the box is in trouble (C `statusTask`).
 async fn status_loop(ctx: StatusContext) {
+    let socket = match udp::bind_status_socket(ctx.status_port) {
+        Ok(socket) => socket,
+        Err(e) => {
+            // C returns here still holding the port lock, which wedges the
+            // port; only the task stops.
+            ctx.trace_error(&format!("pixirad:statusTask: {e}\n"));
+            return;
+        }
+    };
     let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, Duration::from_secs(30));
     // C blocked in `recvfrom` for ever; a timeout keeps the loop alive when the
     // box stops broadcasting.
-    let _ = ctx.socket.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buffer = [0u8; 256];
 
     loop {
         rt::sleep(Duration::from_secs(1)).await;
 
-        let n = match ctx.socket.recv(&mut buffer) {
+        let n = match socket.recv(&mut buffer) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
