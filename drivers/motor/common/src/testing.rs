@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
-use epics_rs::asyn::registry::claim_port;
+use epics_rs::asyn::registry::{claim_port, open_owner};
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -65,9 +65,12 @@ impl LineRig {
             sent: sent.clone(),
             reply: Box::new(reply),
         };
-        let (rt, _jh) =
-            create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
-                .unwrap();
+        let claim = claim_port(name).unwrap();
+        let (rt, _jh) = create_port_runtime(&claim, line, RuntimeConfig::default()).unwrap();
+        // Published, so a driver that looks the port up by name finds it.
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         (Self { sent }, io)
     }
@@ -115,4 +118,18 @@ pub async fn pollers_after(
     }
     sleep(Duration::from_millis(200)).await;
     pollers()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_rig_s_port_is_found_by_name() {
+        let (rig, _io) = LineRig::new("lineRigByName", |_| "ok".into());
+        let port = epics_rs::asyn::asyn_record::get_port("lineRigByName").expect("published");
+        let io = SyncIOHandle::from_handle(port.handle.clone(), 0, Duration::from_secs(1));
+        io.write_octet(0, b"hello").unwrap();
+        assert_eq!(rig.sent(), ["hello"]);
+    }
 }
