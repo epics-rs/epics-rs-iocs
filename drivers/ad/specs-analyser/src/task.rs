@@ -529,7 +529,12 @@ impl Task {
                         * current_acquire_time;
                     self.set_f64(self.w.p.remaining_time, remaining_total);
 
-                    self.callbacks();
+                    // C unlock() … lock() around callParamCallbacks
+                    // (specsAnalyser.cpp:617-619).
+                    let handle = self.w.self_handle.clone();
+                    self.unlocked(|| {
+                        let _ = handle.call_param_callbacks_blocking(0);
+                    });
                 }
 
                 self.l.acquire = self.get_i32(self.w.ad.acquire, self.l.acquire);

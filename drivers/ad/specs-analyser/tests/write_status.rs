@@ -47,6 +47,8 @@ enum Act {
     Mute,
     /// The healthy reply, this many milliseconds late.
     Slow(u64),
+    /// This reply, this many milliseconds late.
+    Say(&'static str, u64),
 }
 
 type Rules = Vec<(&'static str, Act)>;
@@ -108,6 +110,10 @@ impl Fake {
                     Some((_, Act::Slow(ms))) => {
                         std::thread::sleep(std::time::Duration::from_millis(*ms));
                         healthy(&command)
+                    }
+                    Some((_, Act::Say(reply, ms))) => {
+                        std::thread::sleep(std::time::Duration::from_millis(*ms));
+                        reply.to_string()
                     }
                     None => healthy(&command),
                 };
@@ -462,4 +468,50 @@ fn an_acquire_before_the_first_wait_starts_the_acquisition() {
             break;
         }
     }
+}
+
+/// The task releases the driver around each update's callParamCallbacks
+/// (specsAnalyser.cpp:617-619), so an Acquire=0 written during a poll lands
+/// before the task re-reads ADAcquire and no further poll follows the Abort.
+#[test]
+fn an_abort_during_a_poll_lands_at_the_update_callbacks() {
+    let fake = Fake::start("SPECS_WS_UPDATE");
+    fake.answer(&[
+        ("ValidateSpectrum", Act::Say("OK Samples:2", 0)),
+        (
+            "GetAcquisitionStatus",
+            Act::Say("OK ControllerState:running NumberOfAcquiredPoints:1", 300),
+        ),
+        ("GetAcquisitionData", Act::Say("OK Data:[1,2,3]", 0)),
+    ]);
+    let acquire = fake.runtime.ad_params.acquire;
+    fake.write_int32(acquire, 1).unwrap();
+    let mut heard = Vec::new();
+    while heard
+        .iter()
+        .filter(|c: &&String| *c == "GetAcquisitionStatus")
+        .count()
+        < 2
+    {
+        let (_, command) = fake
+            .heard
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the task never polled");
+        heard.push(command);
+    }
+    fake.write_int32(acquire, 0).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while fake.status_message() != "Waiting for the acquire command" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the task never stopped"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    heard.extend(fake.heard.try_iter().map(|(_, command)| command));
+    let abort = heard.iter().position(|c| c == "Abort").expect("aborted");
+    assert!(
+        !heard[abort..].iter().any(|c| c == "GetAcquisitionStatus"),
+        "{heard:?}"
+    );
 }
