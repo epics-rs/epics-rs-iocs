@@ -606,9 +606,6 @@ pub struct Mm4000Axis {
     /// last limit the record wrote, the controller travel limit until then.
     jog_high: f64,
     jog_low: f64,
-    /// A move or home was sent since the last poll: drvMM4000Asyn.c clears
-    /// `motorAxisDone` so the record's next status update is not done.
-    motion_sent: bool,
     /// The model-1 record's PREM and POST.
     strings: MoveStrings,
     /// What the model-2 poll last read from `MS;`, for [`Mm4000AxisReport`].
@@ -684,7 +681,6 @@ impl Mm4000Axis {
                 vbas_supported: false,
                 ..MotorStatus::default()
             },
-            motion_sent: false,
             strings: MoveStrings::default(),
             status: Arc::default(),
             params: {
@@ -750,10 +746,9 @@ impl Mm4000Axis {
         }
     }
 
-    /// Send a move or home and mark the next status update not done.
+    /// Send a move or home and call back the done it clears.
     fn start_motion(&mut self, cmd: &str) -> AsynResult<()> {
         self.lock().write(cmd)?;
-        self.motion_sent = true;
         // drvMM4000Asyn.c:485-486, 518-519.
         let _ = self.params.set_integer(function::DONE, 0);
         self.params.call_callback();
@@ -1149,8 +1144,6 @@ impl AsynMotor for Mm4000Axis {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         self.retry_failed = false;
         let step = self.step_size()?;
-        // drvMM4000.cc has no such hold; only the asyn poll reads it.
-        let motion_sent = std::mem::take(&mut self.motion_sent);
         let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(poll) = ctrl.model1_poll() {
             // drvMM4000.cc:341-353: RETRY fails the poll raising nothing,
@@ -1205,7 +1198,7 @@ impl AsynMotor for Mm4000Axis {
             ),
         );
         let position = position / step;
-        let done = !motion_sent && byte & MM4000_MOVING == 0;
+        let done = byte & MM4000_MOVING == 0;
         self.set_poll_params(&data, byte, position);
         Ok(MotorStatus {
             position,
@@ -1729,11 +1722,11 @@ mod tests {
         assert!(status.done);
     }
 
-    /// drvMM4000Asyn.c motorAxisMove clears motorAxisDone and wakes the
-    /// poller: the poll after a move reads the wire and is not done, the one
-    /// after it reads the controller again.
+    /// drvMM4000Asyn.c:485-486 motorAxisMove clears motorAxisDone, calls it
+    /// back and wakes the poller: the poll after a move reads the wire and
+    /// sets done from `MS;` alone (:661), the one after it is inside the TTL.
     #[test]
-    fn the_poll_after_a_move_is_fresh_and_not_done() {
+    fn the_poll_after_a_move_is_fresh_and_reads_ms() {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -1764,12 +1757,13 @@ mod tests {
         assert!(sent.lock().unwrap().is_empty(), "inside the TTL");
 
         axis.move_absolute(&user, 1000.0, 0.0, 10.0, 20.0).unwrap();
+        assert_eq!(axis.params().get_integer(function::DONE), Ok(Some(0)));
         let after = axis.poll(&user).unwrap();
         assert_eq!(
             *sent.lock().unwrap(),
             ["1AC0.002000;1VA0.001000;1PA0.100000;", "MS;", "TP;", "TE;"]
         );
-        assert!(!after.done);
+        assert!(after.done, "the line's MS; reports the axis idle");
 
         sent.lock().unwrap().clear();
         assert!(axis.poll(&user).unwrap().done);
@@ -2038,7 +2032,7 @@ mod tests {
     }
 
     /// drvMM4000Asyn.c:671-678: motorAxisDone is the status byte's moving
-    /// bit, whatever the record's done holds back after a move.
+    /// bit, also on the poll after a move.
     #[epics_rs::base::epics_test]
     async fn the_done_parameter_is_the_moving_bit() {
         let (axes, _path) = traced_axes("mm4kDone", TraceMask::ERROR).await;
@@ -2046,7 +2040,7 @@ mod tests {
         let mut axis = axes[0].lock().unwrap();
         axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
         let status = axis.poll(&user).unwrap();
-        assert!(!status.done);
+        assert!(status.done);
         assert_eq!(axis.params().get_integer(function::DONE), Ok(Some(1)));
     }
 
