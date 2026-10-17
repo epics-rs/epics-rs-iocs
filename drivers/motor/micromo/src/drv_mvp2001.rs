@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -265,8 +265,8 @@ impl AsynMotor for DrvMvp2001Axis {
         self.failure
     }
 
-    fn set_record_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
-        self.record_velocity = velocity;
+    fn set_record_fields(&mut self, _user: &AsynUser, fields: &RecordFields) -> AsynResult<()> {
+        self.record_velocity = fields.velocity;
         Ok(())
     }
 
@@ -506,7 +506,14 @@ mod tests {
         let mut axis = DrvMvp2001Axis::new(chain, 0, (0, 0));
         let user = AsynUser::new(0);
         axis.set_out_parm(&user, b"4000,500").unwrap();
-        axis.set_record_velocity(&user, 1000.0).unwrap();
+        axis.set_record_fields(
+            &user,
+            &RecordFields {
+                velocity: 1000.0,
+                srev: 200,
+            },
+        )
+        .unwrap();
         axis.move_relative(&user, 10.0, 0.0, 2000.0, 1e6).unwrap();
         let sent = line.sent();
         let tail = &sent[sent.len() - 4..];
@@ -533,7 +540,14 @@ mod tests {
         let user = AsynUser::new(0);
         axis.set_out_parm(&user, b"4000,500").unwrap();
         axis.set_move_strings(&user, b"ZZ", None).unwrap();
-        axis.set_record_velocity(&user, 1000.0).unwrap();
+        axis.set_record_fields(
+            &user,
+            &RecordFields {
+                velocity: 1000.0,
+                srev: 200,
+            },
+        )
+        .unwrap();
         line.sent();
         axis.home(&user, 0.0, 1000.0, 1e3, true).unwrap();
         assert_eq!(line.sent(), ["1 SP 30", "1 AC 8", "1 M"]);
