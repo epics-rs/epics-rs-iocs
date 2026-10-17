@@ -274,12 +274,13 @@ impl PmncController {
         ctrl.model = model;
         ctrl.change_eos = change_eos;
 
-        // Axis enumeration.
+        // Axis enumeration. C reads the list without checking the exchange
+        // (drvPMNC87xx.cc:947-993): a silent one keeps the card with no axes.
         let mut axes = Vec::new();
         match model {
             PmncModel::Pmnc8750 => {
                 // Each MPV line is one 8753 channel.
-                let blob = ctrl.command("MPV")?;
+                let blob = ctrl.command("MPV").unwrap_or_default();
                 for line in blob.lines() {
                     if let Some((driver_num, motor_num)) = parse_mpv_line(line.trim()) {
                         axes.push(AxisDef {
@@ -293,7 +294,7 @@ impl PmncController {
             PmncModel::Pmnc8752 => {
                 // Each DRT line is a module; 8753 contributes 3 channels,
                 // 8751 one.
-                let blob = ctrl.command("DRT")?;
+                let blob = ctrl.command("DRT").unwrap_or_default();
                 for line in blob.lines() {
                     let Some((driver_num, driver_type)) = parse_drt_line(line.trim()) else {
                         continue;
@@ -317,9 +318,6 @@ impl PmncController {
                 }
             }
         }
-        if axes.is_empty() {
-            return Err(pmnc_err("PMNC: no axes discovered".into()));
-        }
         ctrl.axes = axes;
         Ok(ctrl)
     }
@@ -337,10 +335,6 @@ impl PmncController {
     /// Number of discovered axes.
     pub fn num_axes(&self) -> usize {
         self.axes.len()
-    }
-
-    fn axis_def(&self, index: usize) -> Option<AxisDef> {
-        self.axes.get(index).copied()
     }
 
     /// Write one command and read its one prompt-framed reply (C
@@ -406,16 +400,21 @@ pub struct PmncAxis {
 }
 
 impl PmncAxis {
-    /// Construct the axis at discovery index `index` (0-based across all
-    /// modules). No controller I/O beyond looking up the discovered
-    /// addressing.
-    pub fn new(controller: Arc<Mutex<PmncController>>, index: usize) -> AsynResult<Self> {
-        let def = {
-            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            ctrl.axis_def(index)
-                .ok_or_else(|| pmnc_err(format!("PMNC: axis index {index} out of range")))?
-        };
-        Ok(Self {
+    /// One axis per discovered channel, in discovery order. No controller
+    /// I/O.
+    pub fn all(controller: Arc<Mutex<PmncController>>) -> Vec<Self> {
+        let defs = controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .axes
+            .clone();
+        defs.into_iter()
+            .map(|def| Self::new(controller.clone(), def))
+            .collect()
+    }
+
+    fn new(controller: Arc<Mutex<PmncController>>, def: AxisDef) -> Self {
+        Self {
             controller,
             def,
             position: 0,
@@ -426,7 +425,7 @@ impl PmncAxis {
             left: None,
             last_status: MotorStatus::default(),
             strings: MoveStrings::default(),
-        })
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, PmncController> {
@@ -854,7 +853,7 @@ mod tests {
             _ => ">".into(),
         });
         let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
-        let axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
+        let axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(0);
         line.sent();
         (line, axis, sta)
     }
@@ -943,7 +942,7 @@ mod tests {
             _ => ">".into(),
         });
         let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
-        let mut axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 1).unwrap();
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(1);
         line.sent();
         axis.move_velocity(&AsynUser::default(), 50.0, -100.0, 200.0)
             .unwrap();
@@ -1167,7 +1166,7 @@ mod tests {
             _ => ">".into(),
         });
         let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
-        let mut axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
@@ -1204,7 +1203,7 @@ mod tests {
             _ => ">".into(),
         });
         let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
-        let mut axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());

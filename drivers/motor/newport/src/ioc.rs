@@ -2204,13 +2204,11 @@ pub fn pmnc87xx_config_command() -> CommandDef {
         else {
             return;
         };
-        let num_axes = controller.num_axes();
         let line = format!("{port}, address={addr}, id: {}", controller.ident());
-        let controller = Arc::new(Mutex::new(controller));
-        for index in 0..num_axes {
-            let Ok(ax) = PmncAxis::new(controller.clone(), index) else {
-                return;
-            };
+        for (index, ax) in PmncAxis::all(Arc::new(Mutex::new(controller)))
+            .into_iter()
+            .enumerate()
+        {
             init.axis(index as i32, Arc::new(Mutex::new(ax)));
         }
         init.describe(line);
@@ -3496,6 +3494,26 @@ mod report {
                 id(0, "pmncRepA"),
                 id(2, "pmncRepB")
             )
+        );
+    }
+
+    /// drvPMNC87xx.cc:944-993: once `VER` answered, a silent `DRT` leaves
+    /// the card with no axes; only an invalid model or driver drops it.
+    #[epics_rs::base::epics_test]
+    async fn pmnc87xx_card_answering_ver_survives_silent_drt() {
+        use motor_common::testing::{LineRig, driver_report};
+        let int = ArgValue::Int;
+        run_command(pmnc87xx_setup_command(), vec![int(1), int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new("pmncNoDrt", |last| match last {
+            "VER" => "Version 1.6.0".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("pmncNoDrt".into()), int(0)];
+        run_command(pmnc87xx_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvPMNC87xx", 0),
+            "    PMNC87xx controller 0 asyn port= pmncNoDrt, address=0, id: Version 1.6.0 \n"
         );
     }
 
