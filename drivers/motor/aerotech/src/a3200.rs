@@ -287,6 +287,8 @@ impl A3200Axis {
                 .get_param("EndOfTravelLimitSetup", &axis_name)
                 .map(|s| atol(&s) as u32)
                 .unwrap_or(0);
+            // C builds this query and never sends it, reading the RAMP MODE
+            // RATE reply instead (drvA3200Asyn.cc:971-974); not copied.
             let reverse_direc = ctrl
                 .get_param("ReverseMotionDirection", &axis_name)
                 .map(|s| atoi(&s) != 0)
