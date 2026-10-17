@@ -340,9 +340,7 @@ pub fn pic662_config_command() -> CommandDef {
                 let line = format!("port={asyn_port}, id: {}", controller.ident());
                 let controller = Arc::new(Mutex::new(controller));
 
-                let Ok(axis) = PIC662Axis::new(controller) else {
-                    return;
-                };
+                let axis = PIC662Axis::new(controller);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 init.axis(0, motor);
                 init.describe(line);
@@ -819,6 +817,30 @@ mod report {
             after,
             "    PIC662 controller 0 connection failed.\n    PIC662 controller #1, \
              port=c662RepLine, id: E-662 \n"
+        );
+    }
+
+    /// drvPIC662.cc:558-559: `REMOTE_MODE` is a bare send_mess once `*IDN?`
+    /// answered, so a refused one keeps the card.
+    #[epics_rs::base::epics_test]
+    async fn a_pic662_answering_idn_survives_a_refused_remote_mode() {
+        let (_line, _io) = LineRig::failing(
+            "c662NoRem",
+            |last| match last {
+                "*IDN?" => "E-662".into(),
+                _ => "0.000".into(),
+            },
+            |cmd| cmd.starts_with("DEV:CONT"),
+        );
+        let (_, after) = reports(
+            "drvPIC662",
+            (pic662_setup_command(), vec![int(1), int(10)]),
+            (pic662_config_command(), vec![int(0), port("c662NoRem")]),
+        )
+        .await;
+        assert_eq!(
+            after,
+            "    PIC662 controller #0, port=c662NoRem, id: E-662 \n"
         );
     }
 

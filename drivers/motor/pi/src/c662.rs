@@ -143,7 +143,8 @@ impl PIC662Controller {
             return Err(pic662_err("PIC662: no response to *IDN? (controller off?)"));
         }
 
-        ctrl.send("DEV:CONT REM")?;
+        // A bare send_mess in C (drvPIC662.cc:558-559).
+        let _ = ctrl.send("DEV:CONT REM");
         Ok(ctrl)
     }
 
@@ -241,7 +242,7 @@ impl PIC662Axis {
     /// Construct the controller's one axis, seeding the initial status (C
     /// `motor_init`'s `set_status(card, 0)`). A failed initial poll is not an
     /// error.
-    pub fn new(controller: Arc<Mutex<PIC662Controller>>) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<PIC662Controller>>) -> Self {
         let mut axis = Self {
             controller: controller.clone(),
             failure: PollFailure::NONE,
@@ -257,7 +258,7 @@ impl PIC662Axis {
             drop(ctrl);
             axis.apply(polled, false);
         }
-        Ok(axis)
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, PIC662Controller> {
@@ -469,7 +470,7 @@ mod tests {
             _ => "0.000".into(),
         });
         let ctrl = PIC662Controller::new(io).unwrap();
-        let axis = PIC662Axis::new(Arc::new(Mutex::new(ctrl))).unwrap();
+        let axis = PIC662Axis::new(Arc::new(Mutex::new(ctrl)));
         line.sent();
         (line, axis, esr)
     }
@@ -601,7 +602,7 @@ mod tests {
             }
         });
         let ctrl = PIC662Controller::new(io).unwrap();
-        let mut axis = PIC662Axis::new(Arc::new(Mutex::new(ctrl))).unwrap();
+        let mut axis = PIC662Axis::new(Arc::new(Mutex::new(ctrl)));
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
