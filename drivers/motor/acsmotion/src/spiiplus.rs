@@ -947,7 +947,7 @@ impl AsynMotor for SpiiPlusAxis {
         Ok(MotorStatus {
             position: apos,
             encoder_position: encoder,
-            velocity,
+            // C sets no motorVelocity_, so RVEL stays 0.
             done: !moving,
             moving,
             msta_moving: moving,
@@ -1482,6 +1482,15 @@ mod tests {
         .map(|(n, v)| (rig.param(n), format!("{v:?}")));
         assert_eq!(got, want);
         assert!(axis.take_poll_params().is_empty());
+    }
+
+    /// C SPiiPlusAxis::poll never sets motorVelocity_, so the record's RVEL
+    /// stays 0 whatever FVEL reads (SPiiPlusDriver.cpp:751-866).
+    #[test]
+    fn the_poll_reports_no_velocity() {
+        let rig = rig("spiiNoVel", 1, &[("EFAC", &[0.5]), ("FVEL", &[10.0])]);
+        let mut axis = SpiiPlusAxis::new(rig.ctrl.clone(), 0);
+        assert_eq!(pass(&rig.ctrl, &mut axis).velocity, 0.0);
     }
 
     /// A dummy axis has no fault or homed bits, and max velocity follows
