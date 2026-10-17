@@ -683,28 +683,23 @@ impl PIGCS2Controller {
         Ok(err)
     }
 
-    fn check_ok(&self) -> AsynResult<()> {
+    /// `ERR?` reading `expected`; any other code prints C's `failed` line
+    /// for it and is an error.
+    fn check(&self, expected: i32, failed: impl FnOnce(i32) -> String) -> AsynResult<()> {
         let err = self.get_gcs_error()?;
-        if err == 0 {
-            Ok(())
-        } else {
-            Err(pigcs2_err(format!("GCS error {err}")))
+        if err == expected {
+            return Ok(());
         }
-    }
-
-    fn check_stopped(&self) -> AsynResult<()> {
-        let err = self.get_gcs_error()?;
-        if err == PI_CNTR_STOP {
-            Ok(())
-        } else {
-            Err(pigcs2_err(format!("HLT failed, GCS error {err}")))
-        }
+        self.print(format_args!("{}", failed(err)));
+        Err(pigcs2_err(format!("GCS error {err}")))
     }
 
     /// `MOV {axis} {position}` + `ERR? == 0`.
     fn mov(&self, axis: &str, position: f64) -> AsynResult<()> {
         self.send_only(&format!("MOV {axis} {}", CFloat(position)))?;
-        self.check_ok()
+        self.check(0, |err| {
+            format!("PIGCSController::move() failed, GCS error {err}\n")
+        })
     }
 
     /// `VEL {axis} {|velocity|}`, gated on [`Self::knows_vel`]; no error
@@ -758,14 +753,19 @@ impl PIGCS2Controller {
     /// `PIC885Controller::haltAxis`).
     fn stop_all(&self) -> AsynResult<()> {
         self.send_only("STP")?;
-        self.check_stopped()
+        self.check(PI_CNTR_STOP, |err| {
+            format!("PIC885Controller::haltAxis() failed, GCS error {err}")
+        })
     }
 
     /// `EAX? {axis}`, then `ERR? == 0` before the value counts (C
     /// `getEnableAxis`).
     fn get_enable_axis(&self, axis: &str) -> AsynResult<i32> {
         let reply = self.query(&format!("EAX? {axis}"))?;
-        self.check_ok()?;
+        // C defect not copied: its line names setEnableAxis.
+        self.check(0, |err| {
+            format!("PIGCSController::getEnableAxis() failed, GCS error {err}\n")
+        })?;
         value_str(&reply)
             .map(atoi)
             .ok_or_else(|| pigcs2_err(format!("no '=' in reply {reply:?}")))
@@ -774,13 +774,17 @@ impl PIGCS2Controller {
     /// `EAX {axis} {state}` + `ERR? == 0` (C `PIGCSController::setEnableAxis`).
     fn set_enable_axis(&self, axis: &str, state: i32) -> AsynResult<()> {
         self.send_only(&format!("EAX {axis} {state}"))?;
-        self.check_ok()
+        self.check(0, |err| {
+            format!("PIGCSController::setEnableAxis() failed, GCS error {err}\n")
+        })
     }
 
     /// `HLT {axis}` + `ERR? == PI_CNTR_STOP`.
     fn halt(&self, axis: &str) -> AsynResult<()> {
         self.send_only(&format!("HLT {axis}"))?;
-        self.check_stopped()
+        self.check(PI_CNTR_STOP, |err| {
+            format!("PIGCSController::haltAxis() failed, GCS error {err}")
+        })
     }
 
     /// `RON {axis} 0` / `POS {axis} {position}` / `RON {axis} 1`, one
@@ -789,7 +793,9 @@ impl PIGCS2Controller {
         self.send_only(&format!("RON {axis} 0"))?;
         self.send_only(&format!("POS {axis} {}", CFloat(position)))?;
         self.send_only(&format!("RON {axis} 1"))?;
-        self.check_ok()
+        self.check(0, |err| {
+            format!("PIGCSController::setAxisPosition() failed, GCS error {err}\n")
+        })
     }
 
     /// C `getAxisVelocity`: `VEL? {axis}` on a controller that knows it.
@@ -891,21 +897,25 @@ impl PIGCS2Controller {
     /// `SVO {axis} {0|1}` + `ERR? == 0`.
     fn set_servo(&self, axis: &str, enable: bool) -> AsynResult<()> {
         self.send_only(&format!("SVO {axis} {}", enable as i32))?;
-        self.check_ok()
+        self.check(0, |_| "Could not set servo state!\n".into())
     }
 
     /// `SPA {axis} 0x50 {|velocity|}` + `ERR? == 0` (C `referenceVelCts`'s
     /// own inline error check, distinct from the unchecked
     /// [`Self::set_gcs_parameter`]).
+    /// C ignores the write's status.
     fn set_reference_velocity(&self, axis: &str, velocity: f64) -> AsynResult<()> {
-        self.send_only(&format!(
+        let _ = self.send_only(&format!(
             "SPA {axis} {REF_VEL_PARAM_HEX} {}",
             CFloat(velocity.abs())
-        ))?;
-        self.check_ok()
+        ));
+        self.check(0, |_| {
+            "PIGCSMotorController::referenceVelCts() failed\n".into()
+        })
     }
 
-    /// `FRF`/`FPL`/`FNL {axis}` + `ERR? == 0` (C `referenceAxis`).
+    /// `FRF`/`FPL`/`FNL {axis}` + `ERR? == 0` (C `referenceAxis`, and the
+    /// C-885's `referenceVelCts`).
     fn reference_axis(
         &self,
         axis: &str,
@@ -913,17 +923,25 @@ impl PIGCS2Controller {
         has_reference: bool,
         has_limit_switches: bool,
     ) -> AsynResult<()> {
+        let class = if self.model == Model::C885 {
+            "PIC885Controller"
+        } else {
+            "PIGCSMotorController"
+        };
         if has_reference {
             self.send_only(&format!("FRF {axis}"))?;
         } else if has_limit_switches {
             let cmd = if forward { "FPL" } else { "FNL" };
             self.send_only(&format!("{cmd} {axis}"))?;
         } else {
+            self.print(format_args!(
+                "{class}::referenceVelCts() failed - axis has no reference/limit switch\n"
+            ));
             return Err(pigcs2_err(format!(
                 "axis {axis} has no reference sensor or limit switch to home against"
             )));
         }
-        self.check_ok()
+        self.check(0, |_| format!("{class}::referenceVelCts() failed\n"))
     }
 
     /// C `sendAndReceive(char)`: a short write is asynError. The byte is
@@ -1313,12 +1331,18 @@ impl PIGCS2Axis {
         } else if self.has_limit_switches {
             if forward { "MPL" } else { "MNL" }
         } else {
+            self.lock().print(format_args!(
+                "PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch\n"
+            ));
             return Err(pigcs2_err(
                 "PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch",
             ));
         };
         let mut ctrl = self.lock();
-        ctrl.send_only(&format!("{cmd} {}", self.axis_name))?;
+        ctrl.send_only(&format!("{cmd} {}", self.axis_name))
+            .inspect_err(|_| {
+                ctrl.print(format_args!("PIC702Controller::referenceVelCts() failed\n"))
+            })?;
         ctrl.ref_started = Some(Instant::now());
         drop(ctrl);
         self.is_homing = true;
@@ -2524,6 +2548,86 @@ mod tests {
         y.set_deferred_moves(&user, false).unwrap();
         assert_eq!(sent_lines(&line), ["MOV X 1.000000 Y 2.000000", "\u{5}"]);
         assert!(ctrl.lock().unwrap().hexapod.any_moving);
+    }
+
+    /// The message of each trace line `printed` holds, less its
+    /// `yyyy/mm/dd hh:mm:ss.mmm ` stamp; a message without a newline runs
+    /// into the next stamp.
+    fn messages(printed: &str) -> Vec<String> {
+        const STAMP: &[u8] = b"dddd/dd/dd dd:dd:dd.ddd ";
+        let is_stamp = |at: &[u8]| {
+            at.len() >= STAMP.len()
+                && STAMP.iter().zip(at).all(|(want, got)| match want {
+                    b'd' => got.is_ascii_digit(),
+                    want => want == got,
+                })
+        };
+        let bytes = printed.as_bytes();
+        let starts: Vec<usize> = (0..bytes.len())
+            .filter(|&i| is_stamp(&bytes[i..]))
+            .collect();
+        starts
+            .iter()
+            .zip(starts.iter().skip(1).chain([&bytes.len()]))
+            .map(|(&from, &to)| printed[from + STAMP.len()..to].to_string())
+            .collect()
+    }
+
+    /// Each failed `ERR?` check prints C's line (PIGCSController.cpp:224,
+    /// 256, 310, 537-538, 558, 586; PIGCSMotorController.cpp:67-68,
+    /// 108-109, 126-127; PIC885Controller.cpp:87-88, 135-136, 150-151).
+    #[test]
+    fn a_failed_command_prints_its_c_failure_line() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2FailPrint", |_| "1=5".into());
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2FailPrint");
+        let printed = traced("gcs2FailPrint", || {
+            assert!(ctrl.mov("1", 1.0).is_err());
+            assert!(ctrl.set_axis_position("1", 1.0).is_err());
+            assert!(ctrl.halt("1").is_err());
+            assert!(ctrl.set_enable_axis("1", 1).is_err());
+            assert!(ctrl.get_enable_axis("1").is_err());
+            assert!(ctrl.set_servo("1", true).is_err());
+            assert!(ctrl.set_reference_velocity("1", 1.0).is_err());
+            assert!(ctrl.reference_axis("1", true, true, false).is_err());
+            assert!(ctrl.reference_axis("1", true, false, false).is_err());
+            ctrl.set_model(Model::C885);
+            assert!(ctrl.stop_all().is_err());
+            assert!(ctrl.reference_axis("1", true, true, false).is_err());
+            assert!(ctrl.reference_axis("1", true, false, false).is_err());
+        });
+        assert_eq!(
+            messages(&printed),
+            [
+                "PIGCSController::move() failed, GCS error 1\n",
+                "PIGCSController::setAxisPosition() failed, GCS error 1\n",
+                "PIGCSController::haltAxis() failed, GCS error 1",
+                "PIGCSController::setEnableAxis() failed, GCS error 1\n",
+                "PIGCSController::getEnableAxis() failed, GCS error 1\n",
+                "Could not set servo state!\n",
+                "PIGCSMotorController::referenceVelCts() failed\n",
+                "PIGCSMotorController::referenceVelCts() failed\n",
+                "PIGCSMotorController::referenceVelCts() failed - axis has no reference/limit switch\n",
+                "PIC885Controller::haltAxis() failed, GCS error 1",
+                "PIC885Controller::referenceVelCts() failed\n",
+                "PIC885Controller::referenceVelCts() failed - axis has no reference/limit switch\n",
+            ]
+        );
+    }
+
+    /// `PIC702Controller::referenceVelCts` (PIC702Controller.cpp:178-185)
+    /// prints when the axis has neither switch.
+    #[test]
+    fn a_c702_reference_without_a_switch_prints_its_c_line() {
+        let (_line, mut axis) = c702_axis("gcs2C702NoSwitch", true);
+        axis.has_reference = false;
+        axis.has_limit_switches = false;
+        let printed = traced("gcs2C702NoSwitch", || {
+            assert!(axis.reference_c702(1.0, true).is_err());
+        });
+        assert_eq!(
+            messages(&printed),
+            ["PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch\n"]
+        );
     }
 
     /// `PIInterface::sendAndReceive` (PIInterface.cpp:133-141) reads, with
