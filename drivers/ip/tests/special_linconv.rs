@@ -161,3 +161,23 @@ fn tpg261_ai_takes_a_unit_slope_and_ao_rebases_eoff_only() {
         ]
     );
 }
+
+/// `TelevacConvert` sets ESLO 1 and ROFF 0.
+#[test]
+fn televac_ai_takes_a_unit_slope() {
+    let got = linconv(
+        "LC:TV",
+        "ai",
+        ip_devices::televac::DTYP,
+        "@asyn(P 1)",
+        ip_devices::televac::device_support_factory(),
+    );
+    assert_eq!(
+        got,
+        [
+            [1.0, 5.0, 0.0, -7.0, 1.1],
+            [1.0, 5.0, 0.0, -7.0, 1.1],
+            [1.0, 1.0, 0.0, -7.0, 1.1],
+        ]
+    );
+}
