@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::asyn_record::PortClaim;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
@@ -26,6 +26,147 @@ fn device_addr(addr: i32) -> i32 {
     if addr == -1 { 0 } else { addr }
 }
 
+/// C `MAX_IO_PORTS`.
+const MAX_IO_PORTS: u32 = 8;
+
+/// What C's constructor reads of the board (drvMultiFunction.cpp:845-850,
+/// :1033-1077) for `report` and `getBounds`.
+struct BoardInfo {
+    board_type: u32,
+    board_name: String,
+    num_analog_in: i32,
+    num_analog_out: i32,
+    resolution: Resolution,
+    num_temperature_in: i32,
+    io_ports: Vec<IoPort>,
+}
+
+/// One digital I/O port as C's ulDIOGetInfo loop records it
+/// (drvMultiFunction.cpp:1055-1077).
+struct IoPort {
+    port_type: i32,
+    io_type: i32,
+    num_bits: i32,
+}
+
+impl BoardInfo {
+    /// C ignores the status of every one of these queries; a query that
+    /// fails reads 0 here (for a width, a degenerate getBounds range device
+    /// support leaves alone).
+    fn read(device: &DaqDevice) -> Self {
+        let ai = |item, index| device.ai_get_info(item, index).map_or(0, |v| v as i32);
+        let ao = |item, index| device.ao_get_info(item, index).map_or(0, |v| v as i32);
+        let dio = |item, index| device.dio_get_info(item, index).map_or(0, |v| v as i32);
+        let num_ports = (dio(uldaq_sys::DIO_INFO_NUM_PORTS, 0) as u32).min(MAX_IO_PORTS);
+        Self {
+            board_type: device.product_id(),
+            board_name: device.product_name(),
+            num_analog_in: ai(
+                uldaq_sys::AI_INFO_NUM_CHANS_BY_TYPE,
+                uldaq_sys::AI_VOLTAGE as u32,
+            ),
+            num_analog_out: ao(uldaq_sys::AO_INFO_NUM_CHANS, 0),
+            resolution: Resolution {
+                adc_bits: ai(uldaq_sys::AI_INFO_RESOLUTION, 0),
+                dac_bits: ao(uldaq_sys::AO_INFO_RESOLUTION, 0),
+            },
+            num_temperature_in: ai(
+                uldaq_sys::AI_INFO_NUM_CHANS_BY_TYPE,
+                uldaq_sys::AI_TC as u32,
+            ),
+            io_ports: (0..num_ports)
+                .map(|i| IoPort {
+                    port_type: dio(uldaq_sys::DIO_INFO_PORT_TYPE, i),
+                    io_type: dio(uldaq_sys::DIO_INFO_PORT_IO_TYPE, i),
+                    num_bits: dio(uldaq_sys::DIO_INFO_NUM_BITS, i),
+                })
+                .collect(),
+        }
+    }
+
+    /// C `MultiFunction::report` after `asynPortDriver::report`
+    /// (drvMultiFunction.cpp:2861-2892), for the USB-2408-2AO family: no
+    /// timers, `MAX_COUNTERS` counters from 0, and no port C marks
+    /// configurable (:1140-1146). `counts` is each counter's COUNTER_VALUE.
+    fn report(&self, out: &mut dyn std::fmt::Write, port_name: &str, level: i32, counts: &[i32]) {
+        let _ = writeln!(
+            out,
+            "  Port: {port_name}, board ID={}, board type={}",
+            self.board_type, self.board_name
+        );
+        if level < 1 {
+            return;
+        }
+        let _ = writeln!(out, "  analog inputs      = {}", self.num_analog_in);
+        let _ = writeln!(out, "  analog input bits  = {}", self.resolution.adc_bits);
+        let _ = writeln!(out, "  analog outputs     = {}", self.num_analog_out);
+        let _ = writeln!(out, "  analog output bits = {}", self.resolution.dac_bits);
+        let _ = writeln!(out, "  temperature inputs = {}", self.num_temperature_in);
+        let _ = writeln!(out, "  digital I/O ports  = {}", self.io_ports.len());
+        for (i, port) in self.io_ports.iter().enumerate() {
+            let mask = (0..port.num_bits).fold(0u32, |m, j| m | (1 << j));
+            let _ = writeln!(out, "  digital I/O port     {i}");
+            let _ = writeln!(out, "    I/O port              = {}", port.port_type);
+            let _ = writeln!(out, "    I/O bits              = {}", port.num_bits);
+            let _ = writeln!(
+                out,
+                "    I/O bit configurable  = {}",
+                i32::from(port.io_type == uldaq_sys::DPIOT_BITIO as i32)
+            );
+            let _ = writeln!(out, "    I/O port configurable = 0");
+            let _ = writeln!(
+                out,
+                "    I/O port read only    = {}",
+                i32::from(port.io_type == uldaq_sys::DPIOT_IN as i32)
+            );
+            let _ = writeln!(
+                out,
+                "    I/O port write only   = {}",
+                i32::from(port.io_type == uldaq_sys::DPIOT_OUT as i32)
+            );
+            let _ = writeln!(out, "    I/O port mask         = 0x{mask:x}");
+        }
+        let _ = writeln!(out, "  timers             = 0");
+        // C prints the three counter fields with no newline between them.
+        let _ = write!(
+            out,
+            "  # counters         = {}  first counter      = 0  counterCounts = ",
+            counts.len()
+        );
+        for count in counts {
+            let _ = write!(out, " {count}");
+        }
+        let _ = writeln!(out);
+    }
+}
+
+/// The converter widths C reads once at connect
+/// (drvMultiFunction.cpp:1045-1048).
+#[derive(Clone, Copy)]
+struct Resolution {
+    adc_bits: i32,
+    dac_bits: i32,
+}
+
+impl Resolution {
+    /// C `MultiFunction::getBounds` (drvMultiFunction.cpp:1920-1936): an
+    /// analog value's raw range is the converter's; any other parameter is
+    /// asynError.
+    fn bounds(self, params: &MultiFunctionParams, reason: usize) -> AsynResult<(i32, i32)> {
+        let bits = if reason == params.analog_out_value {
+            self.dac_bits
+        } else if reason == params.analog_in_value {
+            self.adc_bits
+        } else {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: String::new(),
+            });
+        };
+        Ok((0, (1 << bits) - 1))
+    }
+}
+
 /// USB-2408-2AO port driver.
 pub struct MultiFunctionDriver {
     base: PortDriverBase,
@@ -37,6 +178,7 @@ pub struct MultiFunctionDriver {
     /// Whether AUXPORT accepts a direction change at all (`DPIOT_IO` /
     /// `DPIOT_BITIO`). The USB-2408 reports `DPIOT_NONCONFIG`.
     dio_configurable: bool,
+    board: BoardInfo,
 }
 
 impl MultiFunctionDriver {
@@ -86,6 +228,8 @@ impl MultiFunctionDriver {
         base.set_string_param(params.ul_version, 0, ul_ver)?;
         base.set_string_param(params.driver_version, 0, "4.4")?;
 
+        let board = BoardInfo::read(&device);
+
         // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
         // ulDConfigPort and ulDConfigBit reject anything else outright, so ask
         // the device instead of assuming.
@@ -119,6 +263,7 @@ impl MultiFunctionDriver {
             max_input_points,
             max_output_points,
             dio_configurable,
+            board,
         })
     }
 }
@@ -471,6 +616,22 @@ impl PortDriver for MultiFunctionDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    fn get_bounds_int32(&self, user: &AsynUser) -> AsynResult<(i32, i32)> {
+        self.board.resolution.bounds(&self.params, user.reason)
+    }
+
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
+        self.asyn_port_driver_report(out, level);
+        let counts: Vec<i32> = (0..MAX_COUNTERS as i32)
+            .map(|ch| {
+                self.base
+                    .get_int32_param(self.params.counter_value, ch)
+                    .unwrap_or(0)
+            })
+            .collect();
+        self.board.report(out, &self.base.port_name, level, &counts);
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
@@ -920,4 +1081,77 @@ pub fn create_usb_2408(
         device,
         _poller_handle: poller_handle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_bounds_is_the_converter_range_of_an_analog_value() {
+        let mut base = PortDriverBase::new("MFBOUNDS", MAX_SIGNALS, PortFlags::default());
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let usb_2408 = Resolution {
+            adc_bits: 24,
+            dac_bits: 16,
+        };
+        assert_eq!(
+            usb_2408.bounds(&params, params.analog_out_value).unwrap(),
+            (0, 65535)
+        );
+        assert_eq!(
+            usb_2408.bounds(&params, params.analog_in_value).unwrap(),
+            (0, 16_777_215)
+        );
+        assert!(usb_2408.bounds(&params, params.counter_reset).is_err());
+    }
+
+    #[test]
+    fn report_prints_the_board_as_c_does() {
+        let board = BoardInfo {
+            board_type: 254,
+            board_name: "USB-2408-2AO".into(),
+            num_analog_in: 16,
+            num_analog_out: 2,
+            resolution: Resolution {
+                adc_bits: 24,
+                dac_bits: 16,
+            },
+            num_temperature_in: 8,
+            io_ports: vec![IoPort {
+                port_type: 1,
+                io_type: uldaq_sys::DPIOT_NONCONFIG as i32,
+                num_bits: 8,
+            }],
+        };
+        let mut brief = String::new();
+        board.report(&mut brief, "MF1", 0, &[5, 7]);
+        assert_eq!(
+            brief,
+            "  Port: MF1, board ID=254, board type=USB-2408-2AO\n"
+        );
+
+        let mut out = String::new();
+        board.report(&mut out, "MF1", 1, &[5, 7]);
+        assert_eq!(
+            out,
+            "  Port: MF1, board ID=254, board type=USB-2408-2AO\n\
+             \x20 analog inputs      = 16\n\
+             \x20 analog input bits  = 24\n\
+             \x20 analog outputs     = 2\n\
+             \x20 analog output bits = 16\n\
+             \x20 temperature inputs = 8\n\
+             \x20 digital I/O ports  = 1\n\
+             \x20 digital I/O port     0\n\
+             \x20   I/O port              = 1\n\
+             \x20   I/O bits              = 8\n\
+             \x20   I/O bit configurable  = 0\n\
+             \x20   I/O port configurable = 0\n\
+             \x20   I/O port read only    = 0\n\
+             \x20   I/O port write only   = 0\n\
+             \x20   I/O port mask         = 0xff\n\
+             \x20 timers             = 0\n\
+             \x20 # counters         = 2  first counter      = 0  counterCounts =  5 7\n"
+        );
+    }
 }

@@ -26,6 +26,13 @@ impl DaqDevice {
         error::check(unsafe { ulDConfigPort(self.handle(), port, direction) })
     }
 
+    /// Query DIO info (`DIO_INFO_*`) of port `index`.
+    pub fn dio_get_info(&self, info_item: i32, index: u32) -> Result<i64> {
+        let mut value: i64 = 0;
+        error::check(unsafe { ulDIOGetInfo(self.handle(), info_item, index, &mut value) })?;
+        Ok(value)
+    }
+
     /// `DPIOT_*` I/O type of port `index`.
     ///
     /// Only `DPIOT_IO` and `DPIOT_BITIO` ports accept `digital_config_port` /
