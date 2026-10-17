@@ -42,7 +42,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::calc::engine::cvt::{fmt_e, fmt_f, fmt_g};
 use epics_rs::motor::controller_port::{
-    ControllerCtx, ControllerParams, ControllerReport, PROFILE_EXECUTE_DONE, ParamWrite,
+    AxisUser, ControllerCtx, ControllerParams, ControllerReport, PROFILE_EXECUTE_DONE, ParamWrite,
     has_motor_axis, index,
 };
 use epics_rs::motor::device_support::AxisReport;
@@ -1163,7 +1163,7 @@ impl ControllerParams for AcsMotionParams {
     fn write_float64_array(
         &mut self,
         ctx: &mut ControllerCtx<'_>,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: &[f64],
     ) -> AsynResult<()> {
         if self.is_pulse_positions(user.reason) {
@@ -1215,7 +1215,7 @@ impl ControllerParams for AcsMotionParams {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         // C returns asynError there (SPiiPlusDriver.cpp:398-399).
@@ -1234,7 +1234,7 @@ impl ControllerParams for AcsMotionParams {
     fn write_float64(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: f64,
     ) -> ParamWrite {
         // C returns asynError there (SPiiPlusDriver.cpp:471-472).
@@ -1300,7 +1300,7 @@ impl AcsMotionParams {
     fn handled(
         &self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         act: impl FnOnce(&mut PortDriverBase, &SpiiPlusController) -> AsynResult<()>,
     ) -> AsynResult<()> {
         let status = act(base, &self.lock());
@@ -1311,7 +1311,7 @@ impl AcsMotionParams {
     fn write_int32_own(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> AsynResult<()> {
         if self
@@ -1338,7 +1338,7 @@ impl AcsMotionParams {
     fn write_float64_own(
         &mut self,
         _: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: f64,
     ) -> AsynResult<()> {
         if user.reason == index::REC_RESOLUTION {
@@ -1585,6 +1585,30 @@ mod tests {
         ] {
             assert!(text.contains(line), "{text}");
         }
+    }
+
+    /// A user at address -1 writes axis 0, getAddress's axis for it
+    /// (asynPortDriver.cpp:1901-1914), on every per-axis write.
+    #[test]
+    fn writes_at_address_minus_one_reach_axis_0() {
+        let rig = rig("spiiAddrM1", 2, SERVOS);
+        rig.float(index::REC_RESOLUTION, -1, 0.1);
+        rig.int(rig.param("SPIIPLUS_DISABLE_SET_POS"), -1, 1);
+        rig.int(rig.param("SPIIPLUS_HOMING_METHOD"), -1, 3);
+        rig.float(rig.param("SPIIPLUS_HOMING_MAX_DIST"), -1, 9.0);
+        {
+            let ctrl = rig.ctrl.lock().unwrap();
+            assert_eq!(ctrl.rec_resolution[0], Some(0.1));
+            assert!(ctrl.disable_set_pos[0]);
+            assert_eq!(ctrl.homing(0).method, 3);
+            assert_eq!(ctrl.homing(0).max_dist, 9.0);
+        }
+        rig.sent();
+        rig.float(rig.param("SPIIPLUS_MAX_VELOCITY"), -1, 5.0);
+        rig.float(rig.param("SPIIPLUS_SET_ENC_OFFSET"), -1, 1.0);
+        let sent = rig.sent();
+        assert!(sent[0].starts_with("XVEL(0)="), "{sent:?}");
+        assert!(sent[1].starts_with("SET FPOS(0)="), "{sent:?}");
     }
 
     /// `SPIIPLUS_DISABLE_SET_POS` makes a set-position a refused no-op

@@ -10,9 +10,8 @@ use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerCtx, PROFILE_BUILD_BUSY, PROFILE_BUILD_DONE, PROFILE_EXECUTE_MOVE_START,
+    AxisUser, ControllerCtx, PROFILE_BUILD_BUSY, PROFILE_BUILD_DONE, PROFILE_EXECUTE_MOVE_START,
     PROFILE_MOVE_MODE_ABSOLUTE, PROFILE_MOVE_MODE_RELATIVE, PROFILE_READBACK_BUSY,
     PROFILE_READBACK_DONE, PROFILE_STATUS_FAILURE, PROFILE_STATUS_SUCCESS,
     PROFILE_STATUS_UNDEFINED, index,
@@ -203,10 +202,10 @@ impl AcsMotionParams {
     pub(crate) fn write_pulse_positions(
         &mut self,
         ctx: &mut ControllerCtx<'_>,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: &[f64],
     ) -> AsynResult<()> {
-        let addr = ctx.base.get_address(user.addr, user.reason)?;
+        let addr = user.addr;
         if !ctx.axes().any(|a| a == addr) {
             return Err(spiiplus_err(format!(
                 "{} has no axis {addr}",
@@ -1008,6 +1007,7 @@ pub(crate) mod tests {
     use epics_rs::asyn::port::PortDriver;
     use epics_rs::asyn::port_handle::PortHandle;
     use epics_rs::asyn::registry::open_owner;
+    use epics_rs::asyn::user::AsynUser;
     use epics_rs::motor::builder::MotorBuilder;
     use epics_rs::motor::controller_port::ControllerPort;
     use epics_rs::motor::devices::{register_axis, register_controller_port};
