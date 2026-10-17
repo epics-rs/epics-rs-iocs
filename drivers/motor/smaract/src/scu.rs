@@ -47,7 +47,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -301,6 +303,8 @@ pub struct ScuAxis {
     /// Sensor-present flag probed at construction.
     has_encoder: bool,
     io: AxisIo,
+    /// The status bits the last failed command raised.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl ScuAxis {
@@ -330,6 +334,7 @@ impl ScuAxis {
                 addr: axis,
                 from_controller: String::new(),
             },
+            status_writes: Vec::new(),
         };
         let probed = ax.probe();
         (ax, probed)
@@ -383,8 +388,20 @@ impl ScuAxis {
             format!(":{mnem}{ch}P{:.3}H{hold}:GP{ch}", CFloat(rpos))
         };
 
-        lock(&self.controller).transact(&mut self.io, &cmd)?;
-        Ok(())
+        lock(&self.controller)
+            .transact(&mut self.io, &cmd)
+            .map(drop)
+    }
+
+    /// C's check after a command: a failure raises `motorStatusProblem_`
+    /// and `motorStatusCommsError_` (smarActSCUMotorDriver.cpp:446-450,
+    /// 467-471, 485-489).
+    fn bail(&mut self, result: AsynResult<()>) -> AsynResult<()> {
+        if result.is_err() {
+            self.status_writes
+                .extend([StatusWrite::Problem(true), StatusWrite::CommsError(true)]);
+        }
+        result
     }
 }
 
@@ -403,7 +420,8 @@ impl AsynMotor for ScuAxis {
         _velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(position, false)
+        let moved = self.do_move(position, false);
+        self.bail(moved)
     }
 
     fn move_relative(
@@ -414,7 +432,8 @@ impl AsynMotor for ScuAxis {
         _velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(distance, true)
+        let moved = self.do_move(distance, true);
+        self.bail(moved)
     }
 
     fn move_velocity(
@@ -429,7 +448,8 @@ impl AsynMotor for ScuAxis {
             return self.stop(user, acceleration);
         }
         let target = if velocity < 0.0 { -FAR_AWAY } else { FAR_AWAY };
-        self.do_move(target, true)
+        let moved = self.do_move(target, true);
+        self.bail(moved)
     }
 
     fn home(
@@ -444,14 +464,18 @@ impl AsynMotor for ScuAxis {
         self.hold_time = if self.closed_loop { HOLD_FOREVER } else { 0 };
         let hold = self.hold_time;
         let ch = self.channel;
-        lock(&self.controller).transact(&mut self.io, &format!(":MTR{ch}H{hold}Z0:GP{ch}"))?;
-        Ok(())
+        let homed = lock(&self.controller)
+            .transact(&mut self.io, &format!(":MTR{ch}H{hold}Z0:GP{ch}"))
+            .map(drop);
+        self.bail(homed)
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let ch = self.channel;
-        lock(&self.controller).transact(&mut self.io, &format!(":S{ch}:GP{ch}"))?;
-        Ok(())
+        let stopped = lock(&self.controller)
+            .transact(&mut self.io, &format!(":S{ch}:GP{ch}"))
+            .map(drop);
+        self.bail(stopped)
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
@@ -509,6 +533,10 @@ impl AsynMotor for ScuAxis {
             ..MotorStatus::default()
         })
     }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
+    }
 }
 
 #[cfg(test)]
@@ -534,6 +562,28 @@ mod tests {
         assert!(!axis.is_rot && !axis.has_encoder);
         assert_eq!(axis.hold_time, 0);
         assert!(axis.poll(&AsynUser::new(0)).is_err());
+    }
+
+    /// A failed move, home or stop raises Problem and CommsError
+    /// (smarActSCUMotorDriver.cpp:446-450, 467-471, 485-489).
+    #[test]
+    fn a_failed_command_raises_comms_error() {
+        let (handle, _) = SyncIOHandle::connect_port(
+            "scu-refusing-port",
+            0,
+            std::time::Duration::from_millis(10),
+            InterfaceType::Octet,
+        );
+        let controller = Arc::new(Mutex::new(ScuController::new(handle)));
+        let (mut axis, _) = ScuAxis::new(controller, 0, "scu-refusing", 0);
+        let user = AsynUser::new(0);
+        let raised = vec![StatusWrite::Problem(true), StatusWrite::CommsError(true)];
+        assert!(axis.move_absolute(&user, 1.0, 0.0, 1.0, 0.0).is_err());
+        assert_eq!(axis.take_status_writes(), raised);
+        assert!(axis.home(&user, 0.0, 1.0, 0.0, true).is_err());
+        assert_eq!(axis.take_status_writes(), raised);
+        assert!(axis.stop(&user, 0.0).is_err());
+        assert_eq!(axis.take_status_writes(), raised);
     }
 
     /// C `epicsSnprintf(":MPA%uP%.3fH%d:GP%u")` spells a NaN `nan`.

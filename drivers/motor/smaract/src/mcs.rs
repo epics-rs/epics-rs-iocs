@@ -44,7 +44,9 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{DrvUserRequest, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -437,6 +439,8 @@ pub struct McsAxis {
     /// What the constructor or the last poll set, for the poller's
     /// callParamCallbacks.
     poll_params: Vec<(usize, ParamValue)>,
+    /// The status bits the last failed command raised.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl McsAxis {
@@ -473,6 +477,7 @@ impl McsAxis {
             disable_speed,
             vel_cached: 0,
             poll_params: Vec::new(),
+            status_writes: Vec::new(),
         };
         let probed = axis.probe();
         (axis, probed)
@@ -510,6 +515,35 @@ impl McsAxis {
             ctrl.get_val("GP", channel).is_ok()
         };
         Ok(())
+    }
+
+    /// C's `bail` label after a command: a failure raises
+    /// `motorStatusProblem_` and `motorStatusCommsError_`
+    /// (smarActMCSMotorDriver.cpp:599-604, 624-628, 638-642, 665-669, 713-717).
+    fn bail(&mut self, result: AsynResult<()>) -> AsynResult<()> {
+        if result.is_err() {
+            self.status_writes
+                .extend([StatusWrite::Problem(true), StatusWrite::CommsError(true)]);
+        }
+        result
+    }
+
+    /// C `moveVelocity`'s relative move to a very-far target.
+    fn jog(&mut self, velocity: f64) -> AsynResult<()> {
+        self.set_speed(velocity)?;
+        let dir: i64 = if velocity < 0.0 { -1 } else { 1 };
+        let ctrl = self.lock();
+        let McsChannel {
+            channel: ch,
+            is_rot,
+            ..
+        } = *ctrl.axis(self.axis_no);
+        let cmd = if is_rot {
+            format!(":MAR{ch},0,{},0", FAR_AWAY_ROT * dir)
+        } else {
+            format!(":MPR{ch},{},0", FAR_AWAY_LIN * dir)
+        };
+        ctrl.command(&cmd)
     }
 
     fn lock(&self) -> MutexGuard<'_, McsController> {
@@ -578,7 +612,8 @@ impl AsynMotor for McsAxis {
         velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(position, false, velocity)
+        let moved = self.do_move(position, false, velocity);
+        self.bail(moved)
     }
 
     fn move_relative(
@@ -589,7 +624,8 @@ impl AsynMotor for McsAxis {
         velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(distance, true, velocity)
+        let moved = self.do_move(distance, true, velocity);
+        self.bail(moved)
     }
 
     fn move_velocity(
@@ -599,26 +635,15 @@ impl AsynMotor for McsAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        // No native jog: relative move to a very-far target (C moveVelocity).
-        // Speed 0 would mean "unlimited" on the MCS, so treat it as a stop.
+        // Speed 0 would mean "unlimited" on the MCS. C only sets the
+        // motorStop_ parameter there, which stops nothing
+        // (smarActMCSMotorDriver.cpp:684-694); this stops.
         let speed = velocity.abs().round() as i32;
         if speed == 0 {
             return self.stop(user, acceleration);
         }
-        self.set_speed(velocity)?;
-        let dir: i64 = if velocity < 0.0 { -1 } else { 1 };
-        let ctrl = self.lock();
-        let McsChannel {
-            channel: ch,
-            is_rot,
-            ..
-        } = *ctrl.axis(self.axis_no);
-        let cmd = if is_rot {
-            format!(":MAR{ch},0,{},0", FAR_AWAY_ROT * dir)
-        } else {
-            format!(":MPR{ch},{},0", FAR_AWAY_LIN * dir)
-        };
-        ctrl.command(&cmd)
+        let moved = self.jog(velocity);
+        self.bail(moved)
     }
 
     fn home(
@@ -629,19 +654,23 @@ impl AsynMotor for McsAxis {
         _acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        self.set_speed(velocity)?;
-        let ctrl = self.lock();
-        let c = ctrl.axis(self.axis_no);
-        let dir = if forward { 0 } else { 1 };
-        ctrl.command(&format!(
-            ":FRM{},{dir},{},{}",
-            c.channel, c.hold_time, c.auto_zero
-        ))
+        let homed = self.set_speed(velocity).and_then(|()| {
+            let ctrl = self.lock();
+            let c = ctrl.axis(self.axis_no);
+            let dir = if forward { 0 } else { 1 };
+            ctrl.command(&format!(
+                ":FRM{},{dir},{},{}",
+                c.channel, c.hold_time, c.auto_zero
+            ))
+        });
+        self.bail(homed)
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.command(&format!(":S{}", ctrl.axis(self.axis_no).channel))
+        let stopped = ctrl.command(&format!(":S{}", ctrl.axis(self.axis_no).channel));
+        drop(ctrl);
+        self.bail(stopped)
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
@@ -652,13 +681,16 @@ impl AsynMotor for McsAxis {
             ..
         } = *ctrl.axis(self.axis_no);
         let rpos = position.round() as i32;
-        if is_rot && !(0..UDEG_PER_REV as i32).contains(&rpos) {
-            // Rotary set-position is only valid within one revolution (C).
-            return Err(mcs_err(format!(
+        // Rotary set-position is only valid within one revolution (C).
+        let set = if is_rot && !(0..UDEG_PER_REV as i32).contains(&rpos) {
+            Err(mcs_err(format!(
                 "MCS: rotary set-position {rpos} out of [0, {UDEG_PER_REV})"
-            )));
-        }
-        ctrl.command(&format!(":SP{ch},{rpos}"))
+            )))
+        } else {
+            ctrl.command(&format!(":SP{ch},{rpos}"))
+        };
+        drop(ctrl);
+        self.bail(set)
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
@@ -713,6 +745,10 @@ impl AsynMotor for McsAxis {
 
     fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
         std::mem::take(&mut self.poll_params)
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 }
 
