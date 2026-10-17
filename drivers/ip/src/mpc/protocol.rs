@@ -143,16 +143,16 @@ pub fn c_strtod(s: &[u8]) -> f64 {
 /// least 4 bytes: an `OK` at offset 3 keeps the data between the 9-byte header
 /// and the trailing space and checksum, or `OK` for a reply shorter than 12;
 /// anything else leaves `recBuf` empty.
-pub fn strip_reply(read: &[u8]) -> String {
+pub fn strip_reply(read: &[u8]) -> Vec<u8> {
     if read.get(3) != Some(&b'O') || read.get(4) != Some(&b'K') {
-        return String::new();
+        return Vec::new();
     }
     if read.len() < 12 {
-        return "OK".to_owned();
+        return b"OK".to_vec();
     }
     let data = &read[9..9 + read.len() - 12];
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    String::from_utf8_lossy(&data[..end]).into_owned()
+    data[..end].to_vec()
 }
 
 #[cfg(test)]
@@ -186,11 +186,11 @@ mod tests {
     /// One case per `devMPCCallback` arm after the size checks.
     #[test]
     fn replies_strip_as_dev_mpc_callback_does() {
-        assert_eq!(strip_reply(b"05 OK 00 1.2E-09 MBAR 3B"), "1.2E-09 MBAR");
-        assert_eq!(strip_reply(b"05 OK 00 Y 3B"), "Y");
-        assert_eq!(strip_reply(b"05 OK 00 3B"), "OK");
-        assert_eq!(strip_reply(b"05 ER 00 SYNTAX 3B"), "");
-        assert_eq!(strip_reply(b"05 O"), "");
+        assert_eq!(strip_reply(b"05 OK 00 1.2E-09 MBAR 3B"), b"1.2E-09 MBAR");
+        assert_eq!(strip_reply(b"05 OK 00 Y 3B"), b"Y");
+        assert_eq!(strip_reply(b"05 OK 00 3B"), b"OK");
+        assert_eq!(strip_reply(b"05 ER 00 SYNTAX 3B"), b"");
+        assert_eq!(strip_reply(b"05 O"), b"");
     }
 
     #[test]

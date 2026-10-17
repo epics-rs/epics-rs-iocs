@@ -125,8 +125,8 @@ fn raise(alarm: &mut Option<(u16, AlarmSeverity)>, stat: u16, sevr: AlarmSeverit
 struct Exchange {
     /// `sendBuf`, which a pass that builds no command sends again.
     send: String,
-    /// `recBuf`.
-    rec_buf: String,
+    /// `recBuf`, as bytes: C's offsets and `strlen` count bytes.
+    rec_buf: Vec<u8>,
     /// `pPvt->status == asynSuccess`.
     ok: bool,
     /// `prevReadStatus`, as C's asynStatus number.
@@ -269,7 +269,7 @@ impl Job {
             TraceMask::IO_DEVICE,
             format_args!(
                 "devMPC: {name} command ({command}) received (after processing) |{}|\n",
-                ex.rec_buf
+                String::from_utf8_lossy(&ex.rec_buf)
             ),
         );
     }
@@ -460,9 +460,9 @@ impl DevMpc {
     }
 
     /// The exchange's outcome and `recBuf`, with its alarm taken.
-    fn outcome(&mut self) -> (bool, String) {
+    fn outcome(&mut self) -> (bool, Vec<u8>) {
         let Some(live) = self.live.as_ref() else {
-            return (false, String::new());
+            return (false, Vec::new());
         };
         let mut ex = live.job.exchange.lock().unwrap();
         self.alarm = ex.alarm.take();
@@ -476,13 +476,14 @@ impl DevMpc {
     }
 
     /// `checkRtnSize`.
-    fn short(&self, rec_buf: &str, min: usize) -> bool {
+    fn short(&self, rec_buf: &[u8], min: usize) -> bool {
         let short = rec_buf.len() < min;
         if short {
             self.error(format_args!(
-                "devMPC, {} rtnSize={}, should be >{min}, response={rec_buf}\n",
+                "devMPC, {} rtnSize={}, should be >{min}, response={}\n",
                 self.name,
-                rec_buf.len()
+                rec_buf.len(),
+                String::from_utf8_lossy(rec_buf)
             ));
         }
         short
@@ -499,14 +500,14 @@ impl DevMpc {
             return failed;
         }
         let cmd = self.live.as_ref().map(|l| l.job.command);
-        let bytes = buf.as_bytes();
+        let bytes = buf.as_slice();
         let head = |n: usize| &bytes[..n.min(bytes.len())];
         let (value, egu) = match cmd {
             Some(GetPres) => {
                 if self.short(&buf, 9) {
                     return failed;
                 }
-                (c_strtod(head(7)), buf[8..].to_owned())
+                (c_strtod(head(7)), text(&bytes[8..]))
             }
             Some(GetCur) => {
                 if self.short(&buf, 7) {
@@ -521,10 +522,11 @@ impl DevMpc {
                 (c_strtod(bytes), "VOLTS".to_owned())
             }
             Some(GetSize) => {
-                let Some(l) = buf.find('L') else {
+                let Some(l) = bytes.iter().position(|&b| b == b'L') else {
                     self.error(format_args!(
-                        "devMPC::readAi, {} cannot find L, response={buf}\n",
-                        self.name
+                        "devMPC::readAi, {} cannot find L, response={}\n",
+                        self.name,
+                        text(bytes)
                     ));
                     return failed;
                 };
@@ -558,10 +560,8 @@ impl DevMpc {
         }
         let value = match self.live.as_ref().map(|l| l.job.command) {
             // `sscanf(&recBuf[rtnSize-1], "%d", &value)`.
-            Some(GetSpS12 | GetSpS34 | GetSpS56 | GetSpS78) => {
-                c_atoi(&buf.as_bytes()[buf.len() - 1..])
-            }
-            Some(GetAutoRestart) => i32::from(buf == "YES"),
+            Some(GetSpS12 | GetSpS34 | GetSpS56 | GetSpS78) => c_atoi(&buf[buf.len() - 1..]),
+            Some(GetAutoRestart) => i32::from(buf == b"YES"),
             _ => {
                 if let Some(live) = &self.live {
                     self.wrong_type(live);
@@ -588,9 +588,14 @@ impl DevMpc {
             ));
             return Ok(DeviceReadOutcome::ok());
         }
-        record.put_field("VAL", EpicsValue::String(buf.as_str().into()))?;
+        record.put_field("VAL", EpicsValue::String(text(&buf).as_str().into()))?;
         Ok(DeviceReadOutcome::converted(DeviceUdf::Defined))
     }
+}
+
+/// `recBuf` text for a record field or a trace line.
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn yes_no(val: f64) -> String {
@@ -662,7 +667,7 @@ impl DeviceSupport for DevMpc {
             handle: handle.clone(),
             exchange: Mutex::new(Exchange {
                 send: String::new(),
-                rec_buf: String::new(),
+                rec_buf: Vec::new(),
                 ok: true,
                 prev_read_status: 0,
                 alarm: None,
@@ -765,7 +770,7 @@ mod tests {
             handle: handle.clone(),
             exchange: Mutex::new(Exchange {
                 send: String::new(),
-                rec_buf: String::new(),
+                rec_buf: Vec::new(),
                 ok: true,
                 prev_read_status: 0,
                 alarm: None,
@@ -782,12 +787,12 @@ mod tests {
         (dev, handle)
     }
 
-    fn landed(dev: &DevMpc, ok: bool, rec_buf: &str) {
+    fn landed(dev: &DevMpc, ok: bool, rec_buf: impl AsRef<[u8]>) {
         let mut ex = dev.live.as_ref().unwrap().job.exchange.lock().unwrap();
-        (ex.ok, ex.rec_buf) = (ok, rec_buf.to_owned());
+        (ex.ok, ex.rec_buf) = (ok, rec_buf.as_ref().to_vec());
     }
 
-    fn ai(dev: &mut DevMpc, ok: bool, rec_buf: &str) -> (f64, String) {
+    fn ai(dev: &mut DevMpc, ok: bool, rec_buf: impl AsRef<[u8]>) -> (f64, String) {
         landed(dev, ok, rec_buf);
         let mut rec = AiRecord::default();
         rec.val = 5.0;
@@ -814,6 +819,22 @@ mod tests {
         assert_eq!(ai(&mut dev, true, "2.0E-06"), (2e-6, "AMPS".into()));
     }
 
+    /// `recBuf` is bytes: C's offsets and `strlen` count bytes, so a reply
+    /// that is not ASCII neither panics at `&recBuf[8]` nor changes length.
+    #[test]
+    fn a_non_ascii_reply_slices_by_byte() {
+        let (mut dev, _h) = live_dev(Kind::Ai, Command::GetPres, "MPC_AI_BYTES");
+        assert_eq!(
+            ai(&mut dev, true, "1.2E-09é TORR"),
+            (1.2e-9, "\u{fffd} TORR".into())
+        );
+        let (mut dev, _h) = live_dev(Kind::Si, Command::GetStatus, "MPC_SI_BYTES");
+        let mut rec = StringinRecord::default();
+        landed(&dev, true, [0xff; 20]);
+        dev.read(&mut rec).unwrap();
+        assert!(dev.last_alarm().is_none(), "20 bytes is not > 39");
+    }
+
     #[test]
     fn bi_and_stringin_replies_decode_as_c_does() {
         let (mut dev, _h) = live_dev(Kind::Bi, Command::GetSpS12, "MPC_BI");
@@ -831,7 +852,7 @@ mod tests {
         dev.read(&mut rec).unwrap();
         assert_eq!(string(&rec, "VAL"), "RUNNING");
         assert!(dev.last_alarm().is_none());
-        landed(&dev, true, &"x".repeat(40));
+        landed(&dev, true, "x".repeat(40));
         dev.read(&mut rec).unwrap();
         assert_eq!(string(&rec, "VAL"), "");
         assert_eq!(dev.last_alarm().map(|a| a.stat), Some(READ_ALARM));
