@@ -361,8 +361,6 @@ impl AsynMotor for PmacAxis {
         let axis = self.axis;
         let mut controller = lock(&self.controller);
         let config = controller.axis_config(axis);
-        // C `pmacController::poll` reads the global status before any axis, and
-        // whether or not the axis reply then parses.
         let controller_problem = controller.controller_problem();
 
         // One round trip for the two status words, the following error and the

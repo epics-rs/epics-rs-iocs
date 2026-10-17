@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::{ParamType, ParamValue};
@@ -134,13 +134,9 @@ pub struct PmacController {
     feed_rate_poll: bool,
     feed_rate_limit: i32,
     feed_rate: i32,
-    /// Cached global-status verdict and when it was read. C polls `???` once per
-    /// controller poll cycle; the asyn-rs motor boundary polls per axis, so the
-    /// read is cached for one poll period to keep the traffic the same.
+    /// The verdicts the last [`Self::poll`] read, for the axis polls after it.
     global_problem: bool,
     feed_rate_problem: bool,
-    global_read_at: Option<Instant>,
-    global_ttl: Duration,
     /// The controller port's parameters and, once published, its handle, to
     /// post what the poll reads.
     params: Option<PmacParams>,
@@ -150,7 +146,7 @@ pub struct PmacController {
 impl PmacController {
     /// C's constructor: no deferral and no feed-rate poll until the
     /// template's records write them.
-    pub fn new(handle: Option<SyncIOHandle>, global_ttl: Duration) -> Self {
+    pub fn new(handle: Option<SyncIOHandle>) -> Self {
         Self {
             handle,
             axes: BTreeSet::new(),
@@ -164,8 +160,6 @@ impl PmacController {
             feed_rate: 0,
             global_problem: false,
             feed_rate_problem: false,
-            global_read_at: None,
-            global_ttl,
             params: None,
             port: None,
         }
@@ -276,22 +270,15 @@ impl PmacController {
 
     // ---- global status ----
 
-    /// C `pmacController::getGlobalStatus` + the `PMAC_C_GLOBALSTATUS` /
-    /// `PMAC_C_FEEDRATE_PROBLEM` handling in `pmacController::poll`, refreshed at
-    /// most once per poll period. Returns whether the controller has a problem
-    /// that must raise the axis PROBLEM bit.
-    pub fn controller_problem(&mut self) -> bool {
-        let fresh = self
-            .global_read_at
-            .is_some_and(|t| t.elapsed() < self.global_ttl);
-        if !fresh {
-            self.global_read_at = Some(Instant::now());
-            self.refresh_global();
-        }
+    /// Whether the last [`Self::poll`] found a problem that raises every axis
+    /// PROBLEM bit.
+    pub fn controller_problem(&self) -> bool {
         self.global_problem || self.feed_rate_problem
     }
 
-    fn refresh_global(&mut self) {
+    /// C `pmacController::poll`: `getGlobalStatus` and the
+    /// `PMAC_C_GLOBALSTATUS` / `PMAC_C_FEEDRATE_PROBLEM` handling.
+    pub fn poll(&mut self) {
         match self
             .write_read("???")
             .ok()
@@ -603,7 +590,7 @@ mod tests {
     /// speed, accel and GET_INFO writes the record now sends included.
     #[test]
     fn every_write_prints_pmac_controllers_flow_line() {
-        let ctrl = Arc::new(Mutex::new(PmacController::new(None, Duration::ZERO)));
+        let ctrl = Arc::new(Mutex::new(PmacController::new(None)));
         let params = PmacControllerParams::new(ctrl);
         let port = register_controller_port(&open_owner(), "pmacFlow", 2, params).unwrap();
         let lines = traced("pmacFlow", || {
@@ -626,7 +613,7 @@ mod tests {
 
     #[test]
     fn every_write_sets_motor_status_comms_error_from_its_status() {
-        let ctrl = Arc::new(Mutex::new(PmacController::new(None, Duration::ZERO)));
+        let ctrl = Arc::new(Mutex::new(PmacController::new(None)));
         let params = PmacControllerParams::new(ctrl.clone());
         let port = register_controller_port(&open_owner(), "pmacComms", 2, params).unwrap();
         let group = lock(&ctrl).params.unwrap().coord_sys_group;
@@ -648,7 +635,7 @@ mod tests {
 
     #[test]
     fn defer_value_arms_the_mode_and_zero_releases_it() {
-        let mut c = PmacController::new(None, Duration::ZERO);
+        let mut c = PmacController::new(None);
         c.set_moves_deferred(DEFERRED_COORDINATED_MOVES).unwrap();
         assert!(c.moves_deferred());
         c.set_moves_deferred(0).unwrap();

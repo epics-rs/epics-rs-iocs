@@ -33,16 +33,16 @@ use motor_common::iocsh::{
 };
 use motor_common::model1::c_int;
 use motor_common::model2::Model2;
-use motor_common::{asyn_user, install, register_controller_port};
+use motor_common::{Controller, asyn_user, register_controller_port};
 
 use crate::axis::PmacAxis;
 use crate::controller::{PMAC_TIMEOUT, PmacController, PmacControllerParams};
 use crate::coord::{CS_AXES, PmacCoordSystem, PmacCsAxis};
 use crate::ethernet::pmac_asyn_ip_configure_command;
 
-/// How long a polled global status (`???`, `%`) or coordinate-system status
-/// (`&{cs}??`, `Q8{n}`) stays fresh. One controller-wide read serves every axis
-/// polling within the window, which is what C's single poller thread does.
+/// How long a polled coordinate-system status (`&{cs}??`, `Q8{n}`) stays
+/// fresh. One read serves every axis polling within the window, which is what
+/// C's single poller thread does.
 const POLL_CACHE_TTL: Duration = Duration::from_millis(50);
 
 /// pmacAsynCoord.c's `motorAxisDrvSET_t`, its cards keyed by `reference`.
@@ -53,12 +53,11 @@ pub static PMAC_ASYN_COORD: Model2 = Model2::new("pmacAsynCoord", 0);
 const COORD_MOVING_POLL_MS: u64 = 100;
 const COORD_IDLE_POLL_MS: u64 = 500;
 
-/// A controller and the poll periods `pmacCreateController` gave it.
+/// A controller and the poller `pmacCreateController` started for it.
 struct ControllerReg {
     name: String,
     controller: Arc<Mutex<PmacController>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
+    poller: Controller,
 }
 
 type Registry = Arc<Mutex<Vec<ControllerReg>>>;
@@ -194,10 +193,11 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
             let num_axes = c_int(args, 3);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
 
-            let controller = Arc::new(Mutex::new(PmacController::new(
-                low_level_port_connect(&name, &low_level_port, low_level_addr),
-                POLL_CACHE_TTL,
-            )));
+            let controller = Arc::new(Mutex::new(PmacController::new(low_level_port_connect(
+                &name,
+                &low_level_port,
+                low_level_addr,
+            ))));
             let params = PmacControllerParams::new(controller.clone());
             let owner = ctx.db().scan_control().interrupt_gate();
             let handle = register_controller_port(owner, &name, num_axes + 1, params)?;
@@ -205,14 +205,19 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .attach_port(handle);
+            let polled = controller.clone();
+            let poller = Controller::new().controller_poll(move || {
+                polled.lock().unwrap_or_else(|e| e.into_inner()).poll();
+            });
+            // pmacController.cpp:201, before any axis exists.
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 10);
             registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(ControllerReg {
                     name,
                     controller,
-                    moving_poll_ms,
-                    idle_poll_ms,
+                    poller,
                 });
             Ok(CommandOutcome::Continue)
         },
@@ -220,12 +225,7 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
 }
 
 /// Create axis `axis` of controller `reg` as `@asyn(name,axis)`.
-fn create_axis(
-    reg: &ControllerReg,
-    ctx: &CommandContext,
-    command: &str,
-    axis: i32,
-) -> Result<(), String> {
+fn create_axis(reg: &ControllerReg, command: &str, axis: i32) -> Result<(), String> {
     reg.controller
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -233,14 +233,9 @@ fn create_axis(
         .map_err(|e| format!("{command}: {e}"))?;
     let motor: Arc<Mutex<dyn AsynMotor>> =
         Arc::new(Mutex::new(PmacAxis::new(reg.controller.clone(), axis)));
-    install(
-        ctx,
-        asyn_user(&reg.name, axis),
-        motor,
-        reg.moving_poll_ms,
-        reg.idle_poll_ms,
-        10, // C startPoller, tpmac pmacController.cpp:201
-    )
+    reg.poller
+        .install(asyn_user(&reg.name, axis), motor)
+        .map(drop)
 }
 
 /// C `pmacCreateAxis(pmacName, axis)`, printing what C's does.
@@ -253,7 +248,7 @@ fn pmac_create_axis_command(registry: &Registry) -> CommandDef {
             arg_int_req("Axis number"),
         ],
         "pmacCreateAxis(pmacName, axis)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let name = req_string(args, 0, "Controller port name")?;
             let axis = c_int(args, 1);
             let created = find(&registry, &name, |reg| {
@@ -264,7 +259,7 @@ fn pmac_create_axis_command(registry: &Registry) -> CommandDef {
                     );
                     return Ok(());
                 }
-                create_axis(reg, ctx, "pmacCreateAxis", axis)
+                create_axis(reg, "pmacCreateAxis", axis)
             });
             match created {
                 Some(result) => result?,
@@ -285,11 +280,11 @@ fn pmac_create_axes_command(registry: &Registry) -> CommandDef {
         "pmacCreateAxes",
         vec![arg_str_req("Controller port name"), arg_int_req("Num Axes")],
         "pmacCreateAxes(pmacName, numAxes)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let name = req_string(args, 0, "Controller port name")?;
             let num_axes = c_int(args, 1);
             let created = find(&registry, &name, |reg| {
-                (1..=num_axes).try_for_each(|axis| create_axis(reg, ctx, "pmacCreateAxes", axis))
+                (1..=num_axes).try_for_each(|axis| create_axis(reg, "pmacCreateAxes", axis))
             });
             match created {
                 Some(result) => result?,
@@ -730,7 +725,7 @@ mod tests {
     }
 
     fn controller_on(port: &str) -> PmacController {
-        PmacController::new(low_level_port_connect("pmacTest", port, 0), POLL_CACHE_TTL)
+        PmacController::new(low_level_port_connect("pmacTest", port, 0))
     }
 
     #[test]
@@ -786,8 +781,10 @@ mod tests {
         }
     }
 
+    /// pmacController.cpp:594-625: the global status is the controller
+    /// poll's, which the poller runs before every axis; the axis reads none.
     #[test]
-    fn an_axis_reply_that_does_not_parse_still_reads_the_global_status() {
+    fn the_controller_poll_reads_the_global_status_and_the_axis_does_not() {
         let name = "pmacGlobalFirst";
         let written = Arc::new(Mutex::new(Vec::new()));
         let driver = GlobalOnly {
@@ -802,14 +799,16 @@ mod tests {
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
         let controller = Arc::new(Mutex::new(controller_on(name)));
-        let mut axis = PmacAxis::new(controller, 1);
+        let mut axis = PmacAxis::new(controller.clone(), 1);
         assert_eq!(
             std::mem::take(&mut *written.lock().unwrap()),
             ["I113 I114 I130 I131 I133"]
         );
         assert!(!axis.has_encoder);
+        controller.lock().unwrap().poll();
+        assert_eq!(std::mem::take(&mut *written.lock().unwrap()), ["???"]);
         assert!(axis.poll(&AsynUser::new(0).with_addr(1)).is_err());
-        assert_eq!(written.lock().unwrap()[0], "???");
+        assert_eq!(*written.lock().unwrap(), ["#1 ? F P"]);
         drop(rt);
     }
 
@@ -857,5 +856,29 @@ mod tests {
             trace.contains("pmacController: unable to set input EOS on pmacTraceLow: "),
             "{trace:?}"
         );
+    }
+
+    /// pmacController.cpp:201: one poller from pmacCreateController, which
+    /// pmacCreateAxes joins.
+    #[epics_rs::base::epics_test]
+    async fn pmac_create_axes_joins_the_controller_poller() {
+        use motor_common::testing::pollers_after;
+
+        let commands = pmac_commands();
+        let command = |name: &str| commands.iter().find(|c| c.name == name).unwrap().clone();
+        let args = vec![
+            ArgValue::String("pmacOnePoller".into()),
+            ArgValue::String("pmacOnePollerNoLine".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(3),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+        ];
+        assert_eq!(
+            pollers_after(command("pmacCreateController"), args).await,
+            1
+        );
+        let args = vec![ArgValue::String("pmacOnePoller".into()), ArgValue::Int(3)];
+        assert_eq!(pollers_after(command("pmacCreateAxes"), args).await, 1);
     }
 }
