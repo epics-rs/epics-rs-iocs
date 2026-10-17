@@ -30,7 +30,7 @@ use crate::adlog;
 use crate::coordinator::Phase;
 use crate::driver::TimePix3Driver;
 use crate::family::DetectorFamily;
-use crate::http::{DEFAULT_TIMEOUT, ServalHttp, TIMEOUT_5000_MS};
+use crate::http::{DEFAULT_TIMEOUT, HttpError, ServalHttp, TIMEOUT_5000_MS};
 use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Mirrored, Shared};
@@ -768,280 +768,492 @@ async fn refresh_dashboard(ctx: &Arc<Ctx>) {
 /// C `getDetector` (serval_http.cpp:1293) from the task; false when
 /// `/detector` failed.
 async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
-    let read = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad);
-    for (mask, line) in &read.traces {
-        ctx.trace(*mask, line);
-    }
-    for (addr, updates) in read.updates {
-        ctx.set(addr, updates).await;
+    let read = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad, false);
+    for step in read.steps {
+        match step {
+            DetectorStep::Trace(mask, line) => ctx.trace(mask, &line),
+            DetectorStep::Post(addr, updates) => ctx.set(addr, updates).await,
+        }
     }
     read.ok
 }
 
-/// What C `getDetector` leaves: its trace lines and its param writes per
-/// address, in order, for the task or the port (initAcquisition) to apply.
-pub(crate) struct DetectorRead {
-    pub ok: bool,
-    pub traces: Vec<(TraceMask, String)>,
-    pub updates: Vec<(i32, Vec<ParamSetValue>)>,
+/// One step of C `getDetector`, in C order: a trace line, or the param
+/// writes made since the last `callParamCallbacks(addr)` and that call. A
+/// write may name another address; C stores it there and it goes out with
+/// that address's next callbacks.
+pub(crate) enum DetectorStep {
+    Trace(TraceMask, String),
+    Post(i32, Vec<ParamSetValue>),
 }
 
-/// C `getDetector`'s reading of `/detector`.
+/// What C `getDetector` leaves, for the task or the port (initAcquisition)
+/// to apply in order.
+pub(crate) struct DetectorRead {
+    pub ok: bool,
+    pub steps: Vec<DetectorStep>,
+}
+
+/// C's `set*Param` calls and trace lines; `callbacks` is
+/// `callParamCallbacks(addr)` over the writes made since the last one.
+#[derive(Default)]
+struct DetectorWrites {
+    pending: Vec<ParamSetValue>,
+    steps: Vec<DetectorStep>,
+}
+
+impl DetectorWrites {
+    /// C stores nothing for an address past the port's maxAddr.
+    fn set(&mut self, reason: usize, addr: i32, value: ParamValue) {
+        if usize::try_from(addr).is_ok_and(|a| a < crate::driver::MAX_ADDR) {
+            self.pending.push(ParamSetValue::new(reason, addr, value));
+        }
+    }
+
+    fn int(&mut self, reason: usize, addr: i32, v: i32) {
+        self.set(reason, addr, ParamValue::Int32(v));
+    }
+
+    fn float(&mut self, reason: usize, addr: i32, v: f64) {
+        self.set(reason, addr, ParamValue::Float64(v));
+    }
+
+    fn text(&mut self, reason: usize, addr: i32, v: &str) {
+        self.set(reason, addr, ParamValue::Octet(v.as_bytes().into()));
+    }
+
+    fn trace(&mut self, mask: TraceMask, line: String) {
+        self.steps.push(DetectorStep::Trace(mask, line));
+    }
+
+    fn callbacks(&mut self, addr: i32) {
+        if usize::try_from(addr).is_ok_and(|a| a < crate::driver::MAX_ADDR) {
+            let writes = std::mem::take(&mut self.pending);
+            self.steps.push(DetectorStep::Post(addr, writes));
+        }
+    }
+}
+
+static JSON_NULL: Value = Value::Null;
+
+/// A nlohmann `type_error`, as its `what()` reads.
+struct JsonTypeError(String);
+
+impl JsonTypeError {
+    fn new(id: u32, msg: &str, v: &Value) -> Self {
+        Self(format!(
+            "[json.exception.type_error.{id}] {msg}{}",
+            json_type_name(v)
+        ))
+    }
+}
+
+/// nlohmann `type_name()`.
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// nlohmann `get<int>()` of a number: a `static_cast<int>`.
+fn json_number_as_int(n: &serde_json::Number) -> i32 {
+    match (n.as_i64(), n.as_u64()) {
+        (Some(i), _) => i as i32,
+        (None, Some(u)) => u as i32,
+        _ => n.as_f64().unwrap_or(0.0) as i32,
+    }
+}
+
+/// nlohmann `get<int>()`, which also takes a boolean; an absent key reads
+/// as the null nlohmann's mutable `operator[]` inserts.
+fn json_get_int(v: Option<&Value>) -> Result<i32, JsonTypeError> {
+    match v.unwrap_or(&JSON_NULL) {
+        Value::Number(n) => Ok(json_number_as_int(n)),
+        Value::Bool(b) => Ok(i32::from(*b)),
+        other => Err(JsonTypeError::new(
+            302,
+            "type must be number, but is ",
+            other,
+        )),
+    }
+}
+
+/// nlohmann `value(key, json())`, which only an object has.
+fn json_value<'a>(obj: &'a Value, key: &str) -> Result<&'a Value, JsonTypeError> {
+    match obj {
+        Value::Object(o) => Ok(o.get(key).unwrap_or(&JSON_NULL)),
+        other => Err(JsonTypeError::new(306, "cannot use value() with ", other)),
+    }
+}
+
+/// C `jsonIntOr(j)` (serval_http.cpp:70-75).
+fn json_int_or(v: Option<&Value>) -> i32 {
+    match v {
+        Some(Value::Number(n)) => json_number_as_int(n),
+        Some(Value::Bool(b)) => i32::from(*b),
+        _ => 0,
+    }
+}
+
+/// C `jsonDoubleOr(j)` (serval_http.cpp:116-119).
+fn json_double_or(v: Option<&Value>) -> f64 {
+    v.and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+/// C `jsonBoolOr(j)` (serval_http.cpp:121-125): a number is `get<int>() != 0`.
+fn json_bool_or(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => json_number_as_int(n) != 0,
+        _ => false,
+    }
+}
+
+/// C `chipBoardEntryLabel` (serval_http.cpp:50-68).
+fn chip_board_entry_label(chip: &Value) -> String {
+    if let Value::Object(o) = chip {
+        if let Some(Value::String(name)) = o.get("Name") {
+            return name.clone();
+        }
+        match o.get("Id") {
+            Some(Value::Number(n)) if n.is_i64() || n.is_u64() => {
+                return json_number_as_int(n).to_string();
+            }
+            Some(Value::String(id)) => return id.clone(),
+            _ => {}
+        }
+    }
+    serval::json_to_string(chip)
+}
+
+/// C `getDetector` (serval_http.cpp:1293-1576); `publish_http_status` is its
+/// argument: false from the task, true from initAcquisition.
 pub(crate) fn read_detector(
     http: &ServalHttp,
     shared: &Shared,
     p: TimePixParams,
     ad: ADDriverParams,
+    publish_http_status: bool,
 ) -> DetectorRead {
-    let mut read = DetectorRead {
-        ok: false,
-        traces: Vec::new(),
-        updates: Vec::new(),
+    let mut w = DetectorWrites::default();
+    w.trace(
+        TraceMask::FLOW,
+        adlog::log(
+            adlog::GET_DETECTOR,
+            "Reading Detector Health, info, config, layout, chips",
+        ),
+    );
+    let failure = |w: &mut DetectorWrites, write_msg: &str, message: &str, status: ADStatus| {
+        w.int(p.det_connected, 0, 0);
+        w.text(p.write_msg, 0, write_msg);
+        w.text(ad.status_message, 0, message);
+        w.int(ad.status, 0, status as i32);
+        w.callbacks(0);
     };
-    let failure = |write_msg: String, message: &str, status: ADStatus| {
-        let octet = |s: &str| ParamValue::Octet(s.as_bytes().to_vec().into());
-        vec![
-            ParamSetValue::new(p.det_connected, 0, ParamValue::Int32(0)),
-            ParamSetValue::new(p.write_msg, 0, octet(&write_msg)),
-            ParamSetValue::new(ad.status_message, 0, octet(message)),
-            ParamSetValue::new(ad.status, 0, ParamValue::Int32(status as i32)),
-        ]
-    };
-    // C getDetector (serval_http.cpp:1300-1323).
-    let detector = match http
-        .get(serval::DETECTOR, TIMEOUT_5000_MS)
-        .map_err(|e| (e.body().to_string(), Some(e)))
-        .and_then(|body| {
-            serval::parse_detector_response(&body).map_err(|e| (e.message().to_string(), None))
-        }) {
-        Ok(d) => d,
-        Err((body, Some(e))) => {
+    let reply = http.get(serval::DETECTOR, TIMEOUT_5000_MS);
+    if publish_http_status {
+        w.int(
+            p.http_code,
+            0,
+            reply.as_ref().map_or_else(HttpError::code, |_| 200),
+        );
+    }
+    let body = match reply {
+        Ok(body) => body,
+        Err(e) => {
             let url = format!("{}{}", http.base_url(), serval::DETECTOR);
             if let Some(line) = adlog::http_failure("getDetector GET /detector", "GET", &url, &e) {
-                read.traces.push((TraceMask::ERROR, line));
+                w.trace(TraceMask::ERROR, line);
             }
-            let updates = failure(
-                body,
+            failure(
+                &mut w,
+                e.body(),
                 "Failed to read detector information",
                 ADStatus::Disconnected,
             );
-            read.updates.push((0, updates));
-            return read;
+            return DetectorRead {
+                ok: false,
+                steps: w.steps,
+            };
         }
-        Err((reason, None)) => {
-            let message = format!("Invalid detector response: {reason}");
-            read.traces.push((
+    };
+    let detector = match serval::parse_detector_response(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            let message = format!("Invalid detector response: {}", e.message());
+            w.trace(
                 TraceMask::ERROR,
                 adlog::err(adlog::GET_DETECTOR, &format!("getDetector: {message}")),
-            ));
-            let updates = failure(message.clone(), &message, ADStatus::Error);
-            read.updates.push((0, updates));
-            return read;
+            );
+            failure(&mut w, &message, &message, ADStatus::Error);
+            return DetectorRead {
+                ok: false,
+                steps: w.steps,
+            };
         }
     };
+    if let Err(e) = publish_detector(&mut w, shared, &p, &ad, &detector) {
+        w.trace(
+            TraceMask::ERROR,
+            adlog::err(
+                adlog::GET_DETECTOR,
+                &format!("getDetector JSON error: {}", e.0),
+            ),
+        );
+        let message = "Invalid detector response structure";
+        failure(&mut w, message, message, ADStatus::Error);
+        return DetectorRead {
+            ok: false,
+            steps: w.steps,
+        };
+    }
+    DetectorRead {
+        ok: true,
+        steps: w.steps,
+    }
+}
 
-    let mut updates = Vec::new();
-    let mut octet = |reason: usize, v: Option<&Value>| {
-        if let Some(v) = v {
-            updates.push(ParamSetValue::new(
-                reason,
-                0,
-                ParamValue::Octet(serval::json_to_string(v).into_bytes().into()),
-            ));
-        }
-    };
-    octet(p.iface_name, detector.pointer("/Info/IfaceName"));
-    octet(p.sw_version, detector.pointer("/Info/SW_version"));
-    octet(p.fw_version, detector.pointer("/Info/FW_version"));
-    octet(
-        ad.base.firmware_version,
-        detector.pointer("/Info/FW_version"),
-    );
+/// The `try` block of C `getDetector` (serval_http.cpp:1327-1557); an error
+/// is the `json::exception` its handler reports.
+fn publish_detector(
+    w: &mut DetectorWrites,
+    shared: &Shared,
+    p: &TimePixParams,
+    ad: &ADDriverParams,
+    detector: &Value,
+) -> Result<(), JsonTypeError> {
+    let (info, cfg) = (&detector["Info"], &detector["Config"]);
+    update_detector_health(w, p, detector);
+
+    let info_text = |key: &str| serval::json_to_string(info.get(key).unwrap_or(&JSON_NULL));
+    w.text(p.iface_name, 0, &info_text("IfaceName"));
+    w.text(p.sw_version, 0, &info_text("SW_version"));
+    w.text(p.fw_version, 0, &info_text("FW_version"));
     // UPSTREAM DEFECT (serval_http.cpp:1341-1342): C sets ADSerialNumber from
     // `Info.SW_version` — the Serval software version, not a serial number —
     // and the line that would have used the chipboard ID sits commented out
     // right above it. The chipboard ID is the detector's identity.
-    octet(
-        ad.base.serial_number,
-        detector.pointer("/Info/Boards/0/ChipboardId"),
-    );
-    octet(p.boards_id, detector.pointer("/Info/Boards/0/ChipboardId"));
-    octet(p.boards_ip, detector.pointer("/Info/Boards/0/IpAddress"));
-    octet(p.boards2_id, detector.pointer("/Info/Boards/1/ChipboardId"));
-    octet(p.boards2_ip, detector.pointer("/Info/Boards/1/IpAddress"));
-    for (n, reason) in [
-        (0, p.boards_ch1),
-        (1, p.boards_ch2),
-        (2, p.boards_ch3),
-        (3, p.boards_ch4),
-    ] {
-        octet(
-            reason,
-            detector.pointer(&format!("/Info/Boards/0/Chips/{n}")),
-        );
+    if let Some(id) = detector.pointer("/Info/Boards/0/ChipboardId") {
+        w.text(ad.base.serial_number, 0, &serval::json_to_string(id));
     }
-    for (n, reason) in [
-        (0, p.boards_ch5),
-        (1, p.boards_ch6),
-        (2, p.boards_ch7),
-        (3, p.boards_ch8),
-    ] {
-        octet(
-            reason,
-            detector.pointer(&format!("/Info/Boards/1/Chips/{n}")),
-        );
-    }
-    octet(p.tdc, detector.pointer("/Config/Tdc"));
+    w.text(ad.base.firmware_version, 0, &info_text("FW_version"));
 
-    let mut int = |reason: usize, v: Option<&Value>| {
-        if let Some(v) = v.and_then(as_bool_or_int) {
-            updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(v)));
+    // parse_detector_response checked these are ints and the rows positive.
+    let int = |key: &str| info.get(key).and_then(Value::as_i64).unwrap_or(0) as i32;
+    let (pix_count, rows, chips) = (int("PixCount"), int("NumberOfRows"), int("NumberOfChips"));
+    w.int(p.pix_count, 0, pix_count);
+    w.int(p.row_len, 0, int("RowLen"));
+    w.int(p.number_of_chips, 0, chips);
+    w.int(p.number_of_rows, 0, rows);
+    w.int(ad.max_size_y, 0, rows);
+    w.int(ad.max_size_x, 0, pix_count.checked_div(rows).unwrap_or(0));
+    w.int(p.mpx_type, 0, int("MpxType"));
+    update_detector_family(w, shared, p, detector);
+
+    let board0 = [p.boards_ch1, p.boards_ch2, p.boards_ch3, p.boards_ch4];
+    let board1 = [p.boards_ch5, p.boards_ch6, p.boards_ch7, p.boards_ch8];
+    let labels = |w: &mut DetectorWrites, reasons: [usize; 4], chips: Option<&Vec<Value>>| {
+        for (i, reason) in reasons.into_iter().enumerate() {
+            let label = chips.and_then(|c| c.get(i)).map(chip_board_entry_label);
+            w.text(reason, 0, &label.unwrap_or_default());
         }
     };
-    let pix_count = detector
-        .pointer("/Info/PixCount")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let rows = detector
-        .pointer("/Info/NumberOfRows")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    int(p.pix_count, detector.pointer("/Info/PixCount"));
-    int(p.row_len, detector.pointer("/Info/RowLen"));
-    int(p.number_of_chips, detector.pointer("/Info/NumberOfChips"));
-    int(p.number_of_rows, detector.pointer("/Info/NumberOfRows"));
-    int(p.mpx_type, detector.pointer("/Info/MpxType"));
-    int(p.supp_acq_modes, detector.pointer("/Info/SuppAcqModes"));
-    int(p.max_pulse_count, detector.pointer("/Info/MaxPulseCount"));
-    int(p.fan1_pw_m, detector.pointer("/Config/Fan1PWM"));
-    int(p.fan2_pw_m, detector.pointer("/Config/Fan2PWM"));
-    int(p.bias_volt, detector.pointer("/Config/BiasVoltage"));
-    int(p.bias_enable, detector.pointer("/Config/BiasEnabled"));
-    int(p.trigger_in, detector.pointer("/Config/TriggerIn"));
-    int(p.trigger_out, detector.pointer("/Config/TriggerOut"));
-    int(p.n_triggers, detector.pointer("/Config/nTriggers"));
-    int(p.periph_clk80, detector.pointer("/Config/PeriphClk80"));
-    int(
-        p.external_reference_clock,
-        detector.pointer("/Config/ExternalReferenceClock"),
-    );
-    int(p.log_level, detector.pointer("/Config/LogLevel"));
-
-    // serval_http.cpp:1349-1350; parse_detector_response made rows positive.
-    updates.push(ParamSetValue::new(
-        ad.max_size_x,
-        0,
-        ParamValue::Int32(i32::try_from(pix_count / rows).unwrap_or(0)),
-    ));
-    updates.push(ParamSetValue::new(
-        ad.max_size_y,
-        0,
-        ParamValue::Int32(i32::try_from(rows).unwrap_or(0)),
-    ));
-
-    let mut float = |reason: usize, v: Option<&Value>| {
-        if let Some(v) = v.and_then(Value::as_f64) {
-            updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(v)));
-        }
-    };
-    float(p.clock_readout, detector.pointer("/Info/ClockReadout"));
-    float(p.max_pulse_height, detector.pointer("/Info/MaxPulseHeight"));
-    float(p.max_pulse_period, detector.pointer("/Info/MaxPulsePeriod"));
-    float(p.timer_max_val, detector.pointer("/Info/TimerMaxVal"));
-    float(p.timer_min_val, detector.pointer("/Info/TimerMinVal"));
-    float(p.timer_step, detector.pointer("/Info/TimerStep"));
-    float(p.clock_timepix, detector.pointer("/Info/ClockTimepix"));
-    float(p.exposure_time, detector.pointer("/Config/ExposureTime"));
-    float(ad.acquire_time, detector.pointer("/Config/ExposureTime"));
-    float(p.trigger_period, detector.pointer("/Config/TriggerPeriod"));
-    float(ad.acquire_period, detector.pointer("/Config/TriggerPeriod"));
-    float(p.trigger_delay, detector.pointer("/Config/TriggerDelay"));
-    float(
-        p.global_timestamp_interval,
-        detector.pointer("/Config/GlobalTimestampInterval"),
-    );
-
-    update_detector_family(shared, p, &detector, &mut updates, &mut read.traces);
-
-    // The detector orientation drives the mask geometry, so it also goes into
-    // the shared state the mask code reads (serval_http.cpp:1514-1519).
-    if let Some(o) = detector
-        .pointer("/Layout/DetectorOrientation")
-        .map(|name| serval::orientation_index(&serval::json_to_string(name)))
+    match info
+        .get("Boards")
+        .and_then(Value::as_array)
+        .filter(|b| !b.is_empty())
     {
-        shared.set_orientation(o);
-        updates.push(ParamSetValue::new(
-            p.detector_orientation,
-            0,
-            ParamValue::Int32(o),
-        ));
-    }
-
-    health(p, &detector, &mut updates);
-    read.updates.push((0, updates));
-
-    // The per-address readbacks: the DACs, the chip temperature and the chip
-    // layout, one address per chip (C `fetchDacs`, serval_http.cpp:790), plus
-    // the VDD/AVDD rails — three per SPIDR board, so addresses 0-2 are the
-    // first board and 3-5 the second (serval_http.cpp:730-757).
-    let temps = chip_temperatures(&detector);
-    let rails = rail_voltages(&detector);
-    let chips = detector.pointer("/Chips").and_then(Value::as_array);
-    let layout = layout_chips(&detector, shared.family());
-    for chip in 0..crate::driver::MAX_ADDR {
-        let addr = i32::try_from(chip).unwrap_or(0);
-        let mut updates = Vec::new();
-        if let Some(c) = chips.and_then(|c| c.get(chip)) {
-            for (name, index) in crate::driver::dac_params(&p) {
-                if let Some(v) = c.pointer(&format!("/DACs/{name}")).and_then(Value::as_i64) {
-                    updates.push(ParamSetValue::new(
-                        index,
-                        addr,
-                        ParamValue::Int32(i32::try_from(v).unwrap_or(0)),
-                    ));
+        Some(boards) => {
+            let b0 = &boards[0];
+            w.text(
+                p.boards_id,
+                0,
+                &serval::json_to_string(json_value(b0, "ChipboardId")?),
+            );
+            w.text(
+                p.boards_ip,
+                0,
+                &serval::json_to_string(json_value(b0, "IpAddress")?),
+            );
+            let chips = b0.get("Chips").and_then(Value::as_array);
+            labels(w, board0, chips);
+            match boards.get(1) {
+                Some(b1) => {
+                    w.text(
+                        p.boards2_id,
+                        0,
+                        &serval::json_to_string(json_value(b1, "ChipboardId")?),
+                    );
+                    w.text(
+                        p.boards2_ip,
+                        0,
+                        &serval::json_to_string(json_value(b1, "IpAddress")?),
+                    );
+                    let chips = b1
+                        .get("Chips")
+                        .and_then(Value::as_array)
+                        .filter(|c| c.len() >= 4);
+                    labels(w, board1, chips);
+                }
+                None => {
+                    w.text(p.boards2_id, 0, "");
+                    w.text(p.boards2_ip, 0, "");
+                    labels(w, board1, None);
                 }
             }
-            updates.push(ParamSetValue::new(
-                p.adjust,
-                addr,
-                ParamValue::Int32(adjust_code(c)),
-            ));
-            updates.push(ParamSetValue::new(
-                p.chip_n_temperature,
-                addr,
-                ParamValue::Int32(temps.get(chip).copied().unwrap_or(0)),
-            ));
         }
-        if let Some(c) = layout.and_then(|l| chip_layout_entry(l, addr)) {
-            updates.push(ParamSetValue::new(
-                p.layout,
-                addr,
-                ParamValue::Octet(serval::json_to_string(c).into_bytes().into()),
-            ));
-        }
-        if let Some(&(vdd, avdd)) = rails.get(chip) {
-            updates.push(ParamSetValue::new(
-                p.chip_nv_dd,
-                addr,
-                ParamValue::Float64(vdd),
-            ));
-            updates.push(ParamSetValue::new(
-                p.chip_na_vd_d,
-                addr,
-                ParamValue::Float64(avdd),
-            ));
-        }
-        if !updates.is_empty() {
-            read.updates.push((addr, updates));
+        None => {
+            w.text(p.boards_id, 0, "");
+            w.text(p.boards_ip, 0, "");
+            labels(w, board0, None);
+            w.text(p.boards2_id, 0, "");
+            w.text(p.boards2_ip, 0, "");
+            labels(w, board1, None);
         }
     }
-    // C getDetector (serval_http.cpp:1556).
-    read.updates.push((
+
+    w.int(p.supp_acq_modes, 0, json_int_or(info.get("SuppAcqModes")));
+    w.float(p.clock_readout, 0, json_double_or(info.get("ClockReadout")));
+    w.int(p.max_pulse_count, 0, json_int_or(info.get("MaxPulseCount")));
+    for (key, reason) in [
+        ("MaxPulseHeight", p.max_pulse_height),
+        ("MaxPulsePeriod", p.max_pulse_period),
+        ("TimerMaxVal", p.timer_max_val),
+        ("TimerMinVal", p.timer_min_val),
+        ("TimerStep", p.timer_step),
+        ("ClockTimepix", p.clock_timepix),
+    ] {
+        w.float(reason, 0, json_double_or(info.get(key)));
+    }
+
+    // The Config readback (serval_http.cpp:1431-1508).
+    let c = |key: &str| cfg.get(key);
+    w.int(p.fan1_pw_m, 0, json_int_or(c("Fan1PWM")));
+    w.int(p.fan2_pw_m, 0, json_int_or(c("Fan2PWM")));
+    w.int(p.bias_volt, 0, json_int_or(c("BiasVoltage")));
+    w.int(p.bias_enable, 0, json_bool_or(c("BiasEnabled")).into());
+    w.int(p.trigger_in, 0, json_int_or(c("TriggerIn")));
+    w.int(p.trigger_out, 0, json_int_or(c("TriggerOut")));
+    if let Some(v) = c("Polarity") {
+        w.int(
+            p.polarity,
+            0,
+            (serval::json_to_string(v) == "Negative").into(),
+        );
+    }
+    if let Some(v) = c("ChainMode") {
+        let chain = match serval::json_to_string(v).as_str() {
+            "LEADER" => 1,
+            "FOLLOWER" => 2,
+            _ => 0,
+        };
+        w.int(p.chain_mode, 0, chain);
+    }
+    if let Some(v) = c("TriggerMode") {
+        let mode = serval::json_to_string(v);
+        w.text(p.trigger_mode, 0, &mode);
+        w.int(
+            ad.trigger_mode,
+            0,
+            serval::trigger_mode_index_from_serval(&mode),
+        );
+    }
+    let exposure = json_double_or(c("ExposureTime"));
+    w.float(p.exposure_time, 0, exposure);
+    w.float(ad.acquire_time, 0, exposure);
+    let period = json_double_or(c("TriggerPeriod"));
+    w.float(p.trigger_period, 0, period);
+    w.float(ad.acquire_period, 0, period);
+    let triggers = json_int_or(c("nTriggers"));
+    w.int(p.n_triggers, 0, triggers);
+    w.int(ad.num_images, 0, triggers);
+    w.int(p.periph_clk80, 0, json_bool_or(c("PeriphClk80")).into());
+    w.float(p.trigger_delay, 0, json_double_or(c("TriggerDelay")));
+    let tdc = c("Tdc").unwrap_or(&JSON_NULL);
+    w.text(p.tdc, 0, &serval::format_tdc(tdc));
+    if let Some((tdc0, tdc1)) = serval::parse_tdc(tdc) {
+        w.int(p.tdc0, 0, tdc0);
+        w.int(p.tdc1, 0, tdc1);
+    }
+    w.float(
+        p.global_timestamp_interval,
         0,
-        vec![ParamSetValue::new(p.det_connected, 0, ParamValue::Int32(1))],
-    ));
-    read.ok = true;
-    read
+        json_double_or(c("GlobalTimestampInterval")),
+    );
+    w.int(
+        p.external_reference_clock,
+        0,
+        json_bool_or(c("ExternalReferenceClock")).into(),
+    );
+    w.int(p.log_level, 0, json_int_or(c("LogLevel")));
+    if let Some(v) = c("BothCounters") {
+        w.int(p.both_counters, 0, json_bool_or(Some(v)).into());
+    }
+    if let Some(v) = c("GainMode") {
+        w.int(
+            p.gain_mode,
+            0,
+            serval::gain_mode_from_string(&serval::json_to_string(v)),
+        );
+    }
+    if let Some(v) = c("ChargeSumming") {
+        w.int(p.charge_summing, 0, json_bool_or(Some(v)).into());
+    }
+    if let Some(v) = c("Colour") {
+        w.int(p.colour, 0, json_bool_or(Some(v)).into());
+    }
+    if let Some(v) = c("PixelDepth") {
+        w.int(p.pixel_depth, 0, serval::pixel_depth_from_json(v));
+    }
+    if let Some(v) = c("CounterSelectIn") {
+        w.int(p.counter_select_in, 0, json_int_or(Some(v)));
+    }
+    if let Some(v) = c("CounterSelectOut") {
+        w.int(p.counter_select_out, 0, json_int_or(Some(v)));
+    }
+    if let Some(Value::Array(delays)) = c("IDelayConfig") {
+        for (reason, v) in [p.i_delay0, p.i_delay1, p.i_delay2, p.i_delay3]
+            .into_iter()
+            .zip(delays)
+        {
+            w.int(reason, 0, json_int_or(Some(v)));
+        }
+    }
+
+    let family = shared.family();
+    fetch_dacs(w, p, detector, 0, family)?;
+    // The detector orientation drives the mask geometry, so it also goes into
+    // the shared state the mask code reads.
+    if let Some(name) = detector
+        .get("Layout")
+        .filter(|l| l.is_object())
+        .and_then(|l| l.get("DetectorOrientation"))
+    {
+        let o = serval::orientation_index(&serval::json_to_string(name));
+        shared.set_orientation(o);
+        w.int(p.detector_orientation, 0, o);
+    }
+    let layout = layout_chips(detector, family);
+    let publish_layout = |w: &mut DetectorWrites, chip: i32| {
+        if let Some(entry) = layout.and_then(|l| chip_layout_entry(l, chip)) {
+            w.text(p.layout, chip, &serval::dump(entry, None, false));
+        }
+    };
+    publish_layout(w, 0);
+    w.callbacks(0);
+    for chip in 1..chips {
+        fetch_dacs(w, p, detector, chip, family)?;
+        publish_layout(w, chip);
+        w.callbacks(chip);
+    }
+    w.int(p.det_connected, 0, 1);
+    w.callbacks(0);
+    Ok(())
 }
 
 /// The chip layouts C getDetector publishes (serval_http.cpp:1525-1542):
@@ -1072,51 +1284,43 @@ fn chip_layout_entry(chips: &[Value], chip: i32) -> Option<&Value> {
     })
 }
 
-/// `Detector.Health` is a single object on Serval 3 and an array — one entry
-/// per SPIDR board — on Serval 4. Both shapes carry the same keys, so the
-/// scalars come from the first board.
-/// C `updateDetectorFamily` (ADTimePix.cpp:2107-2127), with the arguments
-/// `getDetector` passes it (serval_http.cpp:1351-1363).
+/// C `updateDetectorFamily` (ADTimePix.cpp:2107-2127), from getDetector's
+/// `Info` (serval_http.cpp:1353-1363).
 fn update_detector_family(
+    w: &mut DetectorWrites,
     shared: &Shared,
-    p: TimePixParams,
+    p: &TimePixParams,
     detector: &Value,
-    updates: &mut Vec<ParamSetValue>,
-    traces: &mut Vec<(TraceMask, String)>,
 ) {
-    let mpx_type = detector
-        .pointer("/Info/MpxType")
-        .and_then(Value::as_i64)
-        .and_then(|v| i32::try_from(v).ok())
-        .unwrap_or(0);
-    let chip_type = detector
-        .pointer("/Info/ChipType")
+    let info = &detector["Info"];
+    let mpx_type = info.get("MpxType").and_then(Value::as_i64).unwrap_or(0) as i32;
+    let chip_type = info
+        .get("ChipType")
         .map(serval::json_to_string)
         .unwrap_or_default();
-    let chipboard_id = detector
-        .pointer("/Info/Boards/0/ChipboardId")
+    let chipboard_id = info
+        .get("Boards")
+        .and_then(Value::as_array)
+        .and_then(|b| b.first())
+        .and_then(|b0| b0.get("ChipboardId"))
         .map(serval::json_to_string)
         .unwrap_or_default();
     let family = DetectorFamily::detect(mpx_type, &chip_type, &chipboard_id);
     let caps = family.capabilities();
-    let int = |reason: usize, v: i32| ParamSetValue::new(reason, 0, ParamValue::Int32(v));
-    updates.push(ParamSetValue::new(
-        p.chip_type,
-        0,
-        ParamValue::Octet(chip_type.as_bytes().into()),
-    ));
-    updates.push(int(p.detector_family, family as i32));
-    updates.push(int(p.cap_tdc, caps.supports_tdc.into()));
-    updates.push(int(p.cap_tof_hist, caps.supports_tof_histogram.into()));
-    updates.push(int(p.cap_dual_preview, caps.supports_dual_preview.into()));
-    updates.push(int(
+    w.text(p.chip_type, 0, &chip_type);
+    w.int(p.detector_family, 0, family as i32);
+    w.int(p.cap_tdc, 0, caps.supports_tdc.into());
+    w.int(p.cap_tof_hist, 0, caps.supports_tof_histogram.into());
+    w.int(p.cap_dual_preview, 0, caps.supports_dual_preview.into());
+    w.int(
         p.cap_img_thresholds,
+        0,
         caps.supports_image_thresholds.into(),
-    ));
+    );
 
     if shared.note_family(family) {
-        apply_family_defaults(&p, family, updates);
-        traces.push((
+        apply_family_defaults(p, family, &mut w.pending);
+        w.trace(
             TraceMask::FLOW,
             adlog::log(
                 adlog::UPDATE_DETECTOR_FAMILY,
@@ -1125,7 +1329,7 @@ fn update_detector_family(
                     family.name()
                 ),
             ),
-        ));
+        );
     }
 }
 
@@ -1160,117 +1364,223 @@ fn apply_family_defaults(
     }
 }
 
-fn health_blocks(detector: &Value) -> Vec<&Value> {
-    match detector.get("Health") {
-        Some(Value::Array(a)) => a.iter().collect(),
-        Some(h @ Value::Object(_)) => vec![h],
-        _ => Vec::new(),
+/// C `updateDetectorHealthFromJson` (serval_http.cpp:710-815): Serval 3
+/// sends `Health` as one object, Serval 4 as one object per SPIDR board.
+fn update_detector_health(w: &mut DetectorWrites, p: &TimePixParams, detector: &Value) {
+    const F: &str = adlog::UPDATE_DETECTOR_HEALTH_FROM_JSON;
+    let Some(root) = detector.get("Health") else {
+        return;
+    };
+    let dump = |v: &Value| serval::dump(v, None, false);
+    let scalars = |w: &mut DetectorWrites, h: &Value| {
+        for (key, reason) in [
+            ("LocalTemperature", p.local_temp),
+            ("FPGATemperature", p.fp_ga_temp),
+            ("Fan1Speed", p.fan1_speed),
+            ("Fan2Speed", p.fan2_speed),
+            ("BiasVoltage", p.bias_voltage),
+        ] {
+            w.float(reason, 0, json_double_or(h.get(key)));
+        }
+        // C's local jsonInt reads only an integer.
+        let humidity = match h.get("Humidity") {
+            Some(Value::Number(n)) if n.is_i64() || n.is_u64() => json_number_as_int(n),
+            _ => 0,
+        };
+        w.int(p.humidity, 0, humidity);
+    };
+    // Three rails per board: board 0 at addresses 0-2, board 1 at 3-5.
+    let rails = |w: &mut DetectorWrites, h: &Value, first: i32| {
+        for (i, addr) in (first..first + 3).enumerate() {
+            for (key, reason) in [("VDD", p.chip_nv_dd), ("AVDD", p.chip_na_vd_d)] {
+                let rail = h.get(key).and_then(Value::as_array).and_then(|a| a.get(i));
+                if let Some(v) = rail.and_then(Value::as_f64) {
+                    w.float(reason, addr, v);
+                }
+            }
+        }
+    };
+    match root {
+        Value::Array(blocks) => {
+            let Some(h0) = blocks.first() else {
+                w.trace(
+                    TraceMask::IO_DRIVER,
+                    adlog::log(F, "getDetector: Health array is empty"),
+                );
+                return;
+            };
+            if !h0.is_object() {
+                w.trace(
+                    TraceMask::IO_DRIVER,
+                    adlog::log(F, "getDetector: Health[0] is not an object"),
+                );
+                return;
+            }
+            scalars(w, h0);
+            let temps: Vec<Value> = blocks
+                .iter()
+                .filter_map(|b| b.get("ChipTemperatures")?.as_array())
+                .flatten()
+                .cloned()
+                .collect();
+            if !temps.is_empty() {
+                w.text(p.chip_temperature, 0, &dump(&Value::Array(temps)));
+            } else if let Some(t) = h0.get("ChipTemperatures") {
+                w.text(p.chip_temperature, 0, &dump(t));
+            }
+            for (key, reason) in [("VDD", p.vd_d), ("AVDD", p.av_dd)] {
+                if blocks.len() > 1 {
+                    let merged = blocks
+                        .iter()
+                        .filter_map(|b| b.get(key).filter(|v| v.is_array()))
+                        .cloned()
+                        .collect();
+                    w.text(reason, 0, &dump(&Value::Array(merged)));
+                } else if let Some(v) = h0.get(key) {
+                    w.text(reason, 0, &dump(v));
+                }
+            }
+            rails(w, h0, 0);
+            match blocks.get(1) {
+                Some(h1) => {
+                    if h1.is_object() {
+                        rails(w, h1, 3);
+                    }
+                }
+                None => {
+                    for addr in 3..6 {
+                        w.float(p.chip_nv_dd, addr, 0.0);
+                        w.float(p.chip_na_vd_d, addr, 0.0);
+                    }
+                }
+            }
+        }
+        Value::Object(_) => {
+            scalars(w, root);
+            for (key, reason) in [
+                ("ChipTemperatures", p.chip_temperature),
+                ("VDD", p.vd_d),
+                ("AVDD", p.av_dd),
+            ] {
+                if let Some(v) = root.get(key) {
+                    w.text(reason, 0, &dump(v));
+                }
+            }
+            rails(w, root, 0);
+        }
+        other => w.trace(
+            TraceMask::ERROR,
+            adlog::err(
+                F,
+                &format!(
+                    "getDetector: Health has unexpected JSON type ({})",
+                    json_type_name(other)
+                ),
+            ),
+        ),
     }
 }
 
-/// `Health[*].ChipTemperatures`, flattened: on a multi-board detector each
-/// board lists only its own chips, so board 1's first entry is global chip 4.
-fn chip_temperatures(detector: &Value) -> Vec<i32> {
-    health_blocks(detector)
-        .iter()
-        .filter_map(|b| b.get("ChipTemperatures").and_then(Value::as_array))
-        .flatten()
-        .map(|t| {
-            let v = t
-                .as_i64()
-                .unwrap_or_else(|| t.as_f64().unwrap_or(0.0).round() as i64);
-            i32::try_from(v).unwrap_or(0)
-        })
-        .collect()
-}
-
-/// The `(VDD, AVDD)` rails by asyn address: three rails per board, board 0 at
-/// addresses 0-2 and board 1 at 3-5. A board that is absent reads 0 V.
-fn rail_voltages(detector: &Value) -> Vec<(f64, f64)> {
-    let blocks = health_blocks(detector);
-    let rail = |board: usize, key: &str, i: usize| -> f64 {
-        blocks
-            .get(board)
-            .and_then(|b| b.get(key))
+/// C `chipTemperatureFromHealthV4` / `V3` (serval_http.cpp:671-703): on
+/// Serval 4 each board lists only its own chips, so board 1's first entry
+/// is global chip 4. A non-integer is truncated.
+fn chip_temperature(detector: &Value, chip: usize) -> i32 {
+    let entry = match detector.get("Health") {
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("ChipTemperatures")?.as_array())
+            .flatten()
+            .nth(chip),
+        Some(h @ Value::Object(_)) => h
+            .get("ChipTemperatures")
             .and_then(Value::as_array)
-            .and_then(|a| a.get(i))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0)
+            .and_then(|t| t.get(chip)),
+        _ => None,
     };
-    (0..6)
-        .map(|addr| {
-            let (board, i) = (addr / 3, addr % 3);
-            (rail(board, "VDD", i), rail(board, "AVDD", i))
-        })
-        .collect()
+    match entry {
+        Some(Value::Number(n)) => json_number_as_int(n),
+        _ => 0,
+    }
 }
 
-/// `Chips[n].Adjust`: absent on Serval 3, an array on Serval 4. C reports the
-/// shape rather than the value (serval_http.cpp:820-829) and so does this.
-fn adjust_code(chip: &Value) -> i32 {
-    match chip.get("Adjust") {
+/// C `fetchDacs`' DAC order (serval_http.cpp:854-871), which decides the
+/// DACs already stored when one is not a number.
+const FETCH_DACS_ORDER: [&str; 18] = [
+    "Ibias_CP_PLL",
+    "Ibias_DiscS1_OFF",
+    "Ibias_DiscS1_ON",
+    "Ibias_DiscS2_OFF",
+    "Ibias_DiscS2_ON",
+    "Ibias_Ikrum",
+    "Ibias_PixelDAC",
+    "Ibias_Preamp_OFF",
+    "Ibias_Preamp_ON",
+    "Ibias_TPbufferIn",
+    "Ibias_TPbufferOut",
+    "PLL_Vcntrl",
+    "VPreamp_NCAS",
+    "VTP_coarse",
+    "VTP_fine",
+    "Vfbk",
+    "Vthreshold_coarse",
+    "Vthreshold_fine",
+];
+
+/// C `fetchDacs` (serval_http.cpp:835-884): chip `chip`'s DACs, temperature
+/// and Adjust shape at address `chip`. Medipix3, or a chip without the
+/// Timepix3 DACs, gets only the temperature.
+fn fetch_dacs(
+    w: &mut DetectorWrites,
+    p: &TimePixParams,
+    detector: &Value,
+    chip: i32,
+    family: DetectorFamily,
+) -> Result<(), JsonTypeError> {
+    let index = usize::try_from(chip).unwrap_or(usize::MAX);
+    let Some(entry) = detector
+        .get("Chips")
+        .and_then(Value::as_array)
+        .and_then(|c| c.get(index))
+    else {
+        return Ok(());
+    };
+    // C reads `Chips[chip]["DACs"]` through the mutable operator[], which
+    // turns a null into an object and throws on any other non-object.
+    let dacs = match entry {
+        Value::Object(o) => o.get("DACs").and_then(Value::as_object),
+        Value::Null => None,
+        other => {
+            return Err(JsonTypeError::new(
+                305,
+                "cannot use operator[] with a string argument with ",
+                other,
+            ));
+        }
+    };
+    let temperature = chip_temperature(detector, index);
+    let dacs = match dacs.filter(|d| d.contains_key("Ibias_Preamp_ON")) {
+        Some(dacs) if family != DetectorFamily::Mpx3 => dacs,
+        _ => {
+            w.int(p.chip_n_temperature, chip, temperature);
+            w.int(p.adjust, chip, -1);
+            return Ok(());
+        }
+    };
+    let params = crate::driver::dac_params(p);
+    for name in FETCH_DACS_ORDER {
+        let value = json_get_int(dacs.get(name))?;
+        if let Some(&(_, reason)) = params.iter().find(|(n, _)| *n == name) {
+            w.int(reason, chip, value);
+        }
+    }
+    w.int(p.chip_n_temperature, chip, temperature);
+    let adjust = match entry.get("Adjust") {
         None | Some(Value::Null) => -1,
         Some(Value::Array(_)) => -2,
         Some(_) => -3,
-    }
-}
-
-/// The `Detector.Health` scalars, all at address 0.
-fn health(p: TimePixParams, detector: &Value, updates: &mut Vec<ParamSetValue>) {
-    let blocks = health_blocks(detector);
-    let Some(h) = blocks.first() else {
-        return;
     };
-    for (key, reason) in [
-        ("LocalTemperature", p.local_temp),
-        ("FPGATemperature", p.fp_ga_temp),
-        ("Fan1Speed", p.fan1_speed),
-        ("Fan2Speed", p.fan2_speed),
-        ("BiasVoltage", p.bias_voltage),
-    ] {
-        if let Some(v) = h.get(key).and_then(Value::as_f64) {
-            updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(v)));
-        }
-    }
-    if let Some(v) = h.get("Humidity").and_then(Value::as_i64) {
-        updates.push(ParamSetValue::new(
-            p.humidity,
-            0,
-            ParamValue::Int32(i32::try_from(v).unwrap_or(0)),
-        ));
-    }
-    // The JSON arrays, verbatim: one string per rail set, and one for the chip
-    // temperatures, merged across boards.
-    for (key, reason) in [("VDD", p.vd_d), ("AVDD", p.av_dd)] {
-        let merged: Vec<&Value> = blocks.iter().filter_map(|b| b.get(key)).collect();
-        if let Some(first) = merged.first() {
-            let value = if merged.len() > 1 {
-                serval::json_to_string(&Value::Array(merged.iter().map(|v| (*v).clone()).collect()))
-            } else {
-                serval::json_to_string(first)
-            };
-            updates.push(ParamSetValue::new(
-                reason,
-                0,
-                ParamValue::Octet(value.into_bytes().into()),
-            ));
-        }
-    }
-    let temps: Vec<Value> = chip_temperatures(detector)
-        .into_iter()
-        .map(Value::from)
-        .collect();
-    if !temps.is_empty() {
-        updates.push(ParamSetValue::new(
-            p.chip_temperature,
-            0,
-            ParamValue::Octet(
-                serval::json_to_string(&Value::Array(temps))
-                    .into_bytes()
-                    .into(),
-            ),
-        ));
-    }
+    w.int(p.adjust, chip, adjust);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2684,43 +2994,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn chip_temperatures_merge_across_boards() {
-        // Serval 4: Health is an array and each board lists only its own chips,
-        // so board 1's first temperature is global chip 4.
-        let d = json!({"Health": [
-            {"ChipTemperatures": [30, 31, 32, 33]},
-            {"ChipTemperatures": [40, 41, 42, 43]},
-        ]});
-        assert_eq!(chip_temperatures(&d), vec![30, 31, 32, 33, 40, 41, 42, 43]);
-
-        // Serval 3: Health is one object with a flat array.
-        let d = json!({"Health": {"ChipTemperatures": [30.4, 31.6]}});
-        assert_eq!(chip_temperatures(&d), vec![30, 32]);
-
-        assert!(chip_temperatures(&json!({})).is_empty());
-    }
-
-    #[test]
-    fn rails_map_three_per_board() {
-        let d = json!({"Health": [
-            {"VDD": [1.5, 4.0e-4, 0.6], "AVDD": [1.4, 3.0e-4, 0.5]},
-            {"VDD": [2.5, 5.0e-4, 0.7], "AVDD": [2.4, 6.0e-4, 0.8]},
-        ]});
-        let r = rail_voltages(&d);
-        assert_eq!(r.len(), 6);
-        assert_eq!(r[0], (1.5, 1.4));
-        assert_eq!(r[2], (0.6, 0.5));
-        assert_eq!(r[3], (2.5, 2.4));
-        assert_eq!(r[5], (0.7, 0.8));
-
-        // One board: the second board's addresses read 0 V.
-        let d = json!({"Health": {"VDD": [1.5, 4.0e-4, 0.6], "AVDD": [1.4, 3.0e-4, 0.5]}});
-        let r = rail_voltages(&d);
-        assert_eq!(r[0], (1.5, 1.4));
-        assert_eq!(r[3], (0.0, 0.0));
-    }
-
     /// A set the actor has stored once this returns, so a worker reading
     /// the mirror next sees it.
     async fn set_synced(ctx: &Ctx, reason: usize, addr: i32, value: i32) {
@@ -2785,6 +3058,18 @@ mod tests {
         })
     }
 
+    /// Every write `read` posts with `addr`'s callbacks, in order.
+    fn posted(read: &DetectorRead, addr: i32) -> Vec<ParamSetValue> {
+        read.steps
+            .iter()
+            .filter_map(|s| match s {
+                DetectorStep::Post(a, u) if *a == addr => Some(u.iter().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     fn octet_set(updates: &[ParamSetValue], reason: usize) -> Option<String> {
         updates.iter().rev().find_map(|u| match u {
             ParamSetValue::Value {
@@ -2839,22 +3124,24 @@ mod tests {
         let ctx = idle_ctx("TPX_FAMILY");
         let p = ctx.p;
         let mpx3 = serde_json::json!({"Info": {"MpxType": 5, "Boards": [{"ChipboardId": "41"}]}});
-        let mut u = Vec::new();
-        update_detector_family(&ctx.shared, p, &mpx3, &mut u, &mut Vec::new());
+        let family = |d: &Value| {
+            let mut w = DetectorWrites::default();
+            update_detector_family(&mut w, &ctx.shared, &p, d);
+            w.pending
+        };
+        let u = family(&mpx3);
         assert_eq!(int_set(&u, p.detector_family), Some(2));
         assert_eq!(int_set(&u, p.cap_img_thresholds), Some(1));
         assert_eq!(int_set(&u, p.cap_tdc), Some(0));
         assert_eq!(int_set(&u, p.pixel_depth), Some(12));
         assert_eq!(int_set(&u, p.i_delay3), Some(10));
 
-        let mut u = Vec::new();
-        update_detector_family(&ctx.shared, p, &mpx3, &mut u, &mut Vec::new());
+        let u = family(&mpx3);
         assert_eq!(int_set(&u, p.detector_family), Some(2));
         assert_eq!(int_set(&u, p.pixel_depth), None);
 
         let tpx3 = serde_json::json!({"Info": {"ChipType": "tpx3"}});
-        let mut u = Vec::new();
-        update_detector_family(&ctx.shared, p, &tpx3, &mut u, &mut Vec::new());
+        let u = family(&tpx3);
         assert_eq!(int_set(&u, p.detector_family), Some(1));
         assert_eq!(int_set(&u, p.cap_tdc), Some(1));
         assert_eq!(int_set(&u, p.pixel_depth), None);
@@ -2910,14 +3197,6 @@ mod tests {
         };
         assert_eq!(&a[..], [3, 1, 4]);
         assert_eq!(v.iface, Some(InterfaceType::Int64Array));
-    }
-
-    #[test]
-    fn adjust_reports_the_shape() {
-        assert_eq!(adjust_code(&json!({})), -1);
-        assert_eq!(adjust_code(&json!({"Adjust": null})), -1);
-        assert_eq!(adjust_code(&json!({"Adjust": [1, 2]})), -2);
-        assert_eq!(adjust_code(&json!({"Adjust": 7})), -3);
     }
 
     #[tokio::test]
@@ -4365,11 +4644,11 @@ mod tests {
         });
         let ctx = idle_ctx_at("TPX_DET_ORIENT", &url, None);
         ctx.shared.set_orientation(3);
-        let read = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad);
+        let read = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad, false);
         assert!(read.ok);
         assert_eq!(ctx.shared.orientation(), 0);
         assert_eq!(
-            int_set(&read.updates[0].1, ctx.p.detector_orientation),
+            int_set(&posted(&read, 0), ctx.p.detector_orientation),
             Some(0)
         );
     }
@@ -4381,16 +4660,10 @@ mod tests {
         fn read(name: &str, body_for: fn(&str) -> &'static str) -> Vec<String> {
             let (url, _log) = logging_serval(&[], body_for);
             let ctx = idle_ctx_at(name, &url, None);
-            let read = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad);
+            let read = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad, false);
             assert!(read.ok);
             (0..2)
-                .map(|chip| {
-                    read.updates
-                        .iter()
-                        .filter(|(addr, _)| *addr == chip)
-                        .find_map(|(_, u)| octet_set(u, ctx.p.layout))
-                        .unwrap_or_default()
-                })
+                .map(|chip| octet_set(&posted(&read, chip), ctx.p.layout).unwrap_or_default())
                 .collect()
         }
         let mpx3 = |path: &str| match path {
@@ -4427,6 +4700,225 @@ mod tests {
         assert_eq!(
             read("TPX_LAYOUT_ROT", rotated_only),
             ["", r#"{"Chip":1,"X":9}"#]
+        );
+    }
+
+    /// The steps of a detector read, with each post's writes as
+    /// `(reason, addr)` for the order checks.
+    fn step_shape(read: &DetectorRead) -> Vec<String> {
+        read.steps
+            .iter()
+            .map(|s| match s {
+                DetectorStep::Trace(mask, line) => format!("trace {mask:?} {line}"),
+                DetectorStep::Post(addr, _) => format!("post {addr}"),
+            })
+            .collect()
+    }
+
+    fn float_set(updates: &[ParamSetValue], reason: usize, addr: i32) -> Option<f64> {
+        updates.iter().rev().find_map(|u| match u {
+            ParamSetValue::Value {
+                reason: r,
+                addr: a,
+                value: ParamValue::Float64(v),
+            } if *r == reason && *a == addr => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// C getDetector's order and Config readback (serval_http.cpp:1293-1557):
+    /// the FLOW line, Health first, absent keys read as C's defaults, the
+    /// Medipix3 defaults before the readback, one post per chip up to
+    /// NumberOfChips with the board-1 rails stored for theirs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_detector_read_publishes_the_config_readback_in_c_order() {
+        let (url, _log) = logging_serval(&[], |path| match path {
+            "/detector" => {
+                r#"{"Info":{"PixCount":131072,"RowLen":2,"NumberOfChips":2,
+                "NumberOfRows":256,"MpxType":0,"ChipType":"MPX3",
+                "Boards":[{"ChipboardId":"B","IpAddress":"ip","Chips":[{"Name":"W1"},{"Id":7}]}]},
+                "Health":[{"VDD":[1.5,0.1,0.6],"ChipTemperatures":[30.9,41]},
+                          {"VDD":[2.5,0.2,0.7]}],
+                "Config":{"Fan1PWM":12.7,"Polarity":"Negative","ChainMode":"LEADER",
+                "TriggerMode":"SwReSt_SwReSp","nTriggers":5,"Tdc":["P0","PN0123"],
+                "BothCounters":true,"GainMode":"LGM","ChargeSumming":1,"Colour":false,
+                "PixelDepth":"24","CounterSelectIn":1,"IDelayConfig":[1,2,3,4]},
+                "Chips":[{},{}]}"#
+            }
+            _ => "{}",
+        });
+        let ctx = idle_ctx_at("TPX_DET_READBACK", &url, None);
+        let (p, ad) = (ctx.p, ctx.ad);
+        let read = read_detector(&ctx.http, &ctx.shared, p, ad, true);
+        assert!(read.ok);
+        let shape = step_shape(&read);
+        assert_eq!(
+            shape,
+            [
+                format!(
+                    "trace {:?} {}",
+                    TraceMask::FLOW,
+                    adlog::log(
+                        adlog::GET_DETECTOR,
+                        "Reading Detector Health, info, config, layout, chips"
+                    )
+                ),
+                format!(
+                    "trace {:?} {}",
+                    TraceMask::FLOW,
+                    adlog::log(
+                        adlog::UPDATE_DETECTOR_FAMILY,
+                        "Detector family MPX3 (MpxType=0 ChipType=MPX3 ChipboardId=B)"
+                    )
+                ),
+                "post 0".into(),
+                "post 1".into(),
+                "post 0".into(),
+            ]
+        );
+        let u = posted(&read, 0);
+        assert_eq!(int_set(&u, p.http_code), Some(200));
+        assert_eq!(int_set(&u, p.fan1_pw_m), Some(12));
+        assert_eq!(int_set(&u, p.bias_enable), Some(0));
+        assert_eq!(int_set(&u, p.polarity), Some(1));
+        assert_eq!(int_set(&u, p.chain_mode), Some(1));
+        assert_eq!(
+            octet_set(&u, p.trigger_mode).as_deref(),
+            Some("SwReSt_SwReSp")
+        );
+        assert_eq!(int_set(&u, ad.trigger_mode), Some(7));
+        assert_eq!(int_set(&u, ad.num_images), Some(5));
+        assert_eq!(octet_set(&u, p.tdc).as_deref(), Some(r#"["P0","PN0123"]"#));
+        assert_eq!(
+            (int_set(&u, p.tdc0), int_set(&u, p.tdc1)),
+            (Some(3), Some(2))
+        );
+        assert_eq!(int_set(&u, p.both_counters), Some(1));
+        assert_eq!(int_set(&u, p.gain_mode), Some(2));
+        assert_eq!(int_set(&u, p.charge_summing), Some(1));
+        assert_eq!(int_set(&u, p.colour), Some(0));
+        assert_eq!(int_set(&u, p.pixel_depth), Some(24));
+        assert_eq!(int_set(&u, p.counter_select_in), Some(1));
+        assert_eq!(int_set(&u, p.i_delay3), Some(4));
+        assert_eq!(octet_set(&u, p.boards_ch1).as_deref(), Some("W1"));
+        assert_eq!(octet_set(&u, p.boards_ch2).as_deref(), Some("7"));
+        assert_eq!(octet_set(&u, p.boards_ch3).as_deref(), Some(""));
+        assert_eq!(octet_set(&u, p.boards2_id).as_deref(), Some(""));
+        assert_eq!(octet_set(&u, p.iface_name).as_deref(), Some(""));
+        assert_eq!(
+            octet_set(&u, p.chip_temperature).as_deref(),
+            Some("[30.9,41]")
+        );
+        assert_eq!(
+            octet_set(&u, p.vd_d).as_deref(),
+            Some("[[1.5,0.1,0.6],[2.5,0.2,0.7]]")
+        );
+        // Medipix3 stores only the temperature, truncated, and Adjust -1.
+        assert_eq!(int_set(&u, p.chip_n_temperature), Some(30));
+        assert_eq!(int_set(&u, p.adjust), Some(-1));
+        // Board 1's rails are stored with chip 0's post and go out with
+        // their own address's callbacks.
+        assert_eq!(float_set(&u, p.chip_nv_dd, 3), Some(2.5));
+        assert_eq!(float_set(&u, p.chip_nv_dd, 1), Some(0.1));
+        assert_eq!(int_set(&posted(&read, 1), p.chip_n_temperature), Some(41));
+    }
+
+    /// A DAC that is not a number is C's json::exception: the chips before
+    /// it are posted, the failure goes out with address 0's callbacks and
+    /// the failing chip's partial writes are only stored
+    /// (serval_http.cpp:854, :1558-1566).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dac_that_is_not_a_number_fails_the_read_as_c() {
+        let (url, _log) = logging_serval(&[], |path| match path {
+            "/detector" => {
+                r#"{"Info":{"PixCount":131072,"RowLen":2,"NumberOfChips":2,
+                "NumberOfRows":256,"MpxType":6},"Config":{},
+                "Chips":[{},{"DACs":{"Ibias_Preamp_ON":1,"Ibias_CP_PLL":"x"}}]}"#
+            }
+            _ => "{}",
+        });
+        let ctx = idle_ctx_at("TPX_DET_DAC_TYPE", &url, None);
+        let (p, ad) = (ctx.p, ctx.ad);
+        let read = read_detector(&ctx.http, &ctx.shared, p, ad, false);
+        assert!(!read.ok);
+        let shape = step_shape(&read);
+        assert_eq!(
+            &shape[shape.len() - 3..],
+            [
+                "post 0".to_string(),
+                format!(
+                    "trace {:?} {}",
+                    TraceMask::ERROR,
+                    adlog::err(
+                        adlog::GET_DETECTOR,
+                        "getDetector JSON error: [json.exception.type_error.302] \
+                     type must be number, but is string"
+                    )
+                ),
+                "post 0".to_string(),
+            ]
+        );
+        let DetectorStep::Post(_, last) = read.steps.last().unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(int_set(last, p.det_connected), Some(0));
+        assert_eq!(
+            octet_set(last, ad.status_message).as_deref(),
+            Some("Invalid detector response structure")
+        );
+        assert_eq!(int_set(last, ad.status), Some(ADStatus::Error as i32));
+        assert!(posted(&read, 1).is_empty());
+    }
+
+    /// C updateDetectorHealthFromJson's lines come before any post
+    /// (serval_http.cpp:723-733, :803-805).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_malformed_health_is_traced_as_c() {
+        async fn first_trace(name: &str, body_for: fn(&str) -> &'static str) -> String {
+            let (url, _log) = logging_serval(&[], body_for);
+            let ctx = idle_ctx_at(name, &url, None);
+            ctx.shared.note_family(DetectorFamily::Tpx3);
+            let read = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad, false);
+            assert!(read.ok);
+            step_shape(&read).swap_remove(1)
+        }
+        let line = first_trace("TPX_HEALTH_EMPTY", |path| match path {
+            "/detector" => {
+                r#"{"Info":{"PixCount":65536,"RowLen":1,"NumberOfChips":1,
+                "NumberOfRows":256,"MpxType":6},"Config":{},"Health":[]}"#
+            }
+            _ => "{}",
+        })
+        .await;
+        assert_eq!(
+            line,
+            format!(
+                "trace {:?} {}",
+                TraceMask::IO_DRIVER,
+                adlog::log(
+                    adlog::UPDATE_DETECTOR_HEALTH_FROM_JSON,
+                    "getDetector: Health array is empty"
+                )
+            )
+        );
+        let line = first_trace("TPX_HEALTH_TYPE", |path| match path {
+            "/detector" => {
+                r#"{"Info":{"PixCount":65536,"RowLen":1,"NumberOfChips":1,
+                "NumberOfRows":256,"MpxType":6},"Config":{},"Health":"x"}"#
+            }
+            _ => "{}",
+        })
+        .await;
+        assert_eq!(
+            line,
+            format!(
+                "trace {:?} {}",
+                TraceMask::ERROR,
+                adlog::err(
+                    adlog::UPDATE_DETECTOR_HEALTH_FROM_JSON,
+                    "getDetector: Health has unexpected JSON type (string)"
+                )
+            )
         );
     }
 

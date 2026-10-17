@@ -184,6 +184,34 @@ pub const POLARITIES: [&str; 2] = ["Positive", "Negative"];
 /// `TPX3_TDC0` / `TPX3_TDC1`.
 pub const TDC_MODES: [&str; 6] = ["P0123", "N0123", "PN0123", "P0", "N0", "PN0"];
 
+/// C `triggerModeIndexFromServal` (ADTimePix.cpp:970-977): the index of a
+/// Serval name or a menu label, else 0.
+pub fn trigger_mode_index_from_serval(name: &str) -> i32 {
+    (0..)
+        .zip(TRIGGER_MODES.iter().zip(TRIGGER_MODE_LABELS))
+        .find(|(_, (serval, label))| **serval == name || *label == name)
+        .map_or(0, |(i, _)| i)
+}
+
+/// C `ADTimePix3ServalConfig::parseTdc` (serval_config.cpp:122-138): a pair
+/// of TDC mode names.
+pub fn parse_tdc(v: &Value) -> Option<(i32, i32)> {
+    let [Value::String(first), Value::String(second)] = v.as_array()?.as_slice() else {
+        return None;
+    };
+    let index = |s: &str| (0..).zip(TDC_MODES).find(|(_, m)| *m == s).map(|(i, _)| i);
+    Some((index(first)?, index(second)?))
+}
+
+/// C `formatTdc`: the pair's `dump()` when `parseTdc` takes it, else empty.
+pub fn format_tdc(v: &Value) -> String {
+    if parse_tdc(v).is_some() {
+        dump(v, None, false)
+    } else {
+        String::new()
+    }
+}
+
 /// The name behind an enum index; `None` out of range, which the callers
 /// refuse as C's range checks do (serval_http.cpp:1805-2146).
 pub fn enum_name(table: &[&'static str], index: i32) -> Option<&'static str> {

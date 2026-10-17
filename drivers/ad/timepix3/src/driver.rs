@@ -862,13 +862,17 @@ impl TimePix3Driver {
         // serval_http.cpp:2477-2479: the trigger and depth checks below need
         // the family.
         if self.shared.family() == DetectorFamily::Unknown {
-            let read = crate::tasks::read_detector(&self.http, &self.shared, p, ad);
+            let read = crate::tasks::read_detector(&self.http, &self.shared, p, ad, true);
             let base = &mut self.ad.port_base;
-            for (mask, line) in &read.traces {
-                base.trace_print(*mask, format_args!("{line}"));
-            }
-            for (addr, updates) in &read.updates {
-                crate::tasks::apply_updates(base, *addr, updates);
+            for step in &read.steps {
+                match step {
+                    crate::tasks::DetectorStep::Trace(mask, line) => {
+                        base.trace_print(*mask, format_args!("{line}"));
+                    }
+                    crate::tasks::DetectorStep::Post(addr, updates) => {
+                        crate::tasks::apply_updates(base, *addr, updates);
+                    }
+                }
             }
         }
 
@@ -5683,7 +5687,10 @@ mod tests {
             "GET /detector ",
             r#"{"Info":{"MpxType":6,"PixCount":65536,"RowLen":1,"NumberOfChips":1,"NumberOfRows":256},"Config":{}}"#,
         );
+        // A known family skips getDetector, whose readback would overwrite
+        // the setpoint (serval_http.cpp:2477-2479).
         let (ok, seen, _, _) = run("TPX_INIT_BIAS", "\0", &[DET], false, |d| {
+            d.shared.note_family(DetectorFamily::Tpx3);
             d.ad.port_base
                 .set_int32_param(d.p.bias_enable, 0, 2)
                 .unwrap();

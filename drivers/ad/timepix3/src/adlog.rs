@@ -16,6 +16,8 @@ pub const EXPORT_MASKED_PELS_JSON: &str =
     "void ADTimePix::exportMaskedPelsJsonFromBpcBuffer(const std::vector<unsigned char>&)";
 pub const READ_BPC_FILE: &str = "asynStatus ADTimePix::readBPCfile(std::vector<unsigned char>&)";
 pub const EXPECTED_BPC_SIZE: &str = "asynStatus ADTimePix::expectedBPCSize(std::size_t&)";
+pub const UPDATE_DETECTOR_HEALTH_FROM_JSON: &str =
+    "void ADTimePix::updateDetectorHealthFromJson(const json&)";
 pub const UPDATE_DETECTOR_FAMILY: &str =
     "void ADTimePix::updateDetectorFamily(int, const std::string&, const std::string&)";
 pub const TIME_PIX_CALLBACK: &str = "void ADTimePix::timePixCallback()";
