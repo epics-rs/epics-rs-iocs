@@ -176,18 +176,6 @@ impl EnsembleController {
     pub fn wait_mode_nowait(&mut self) -> AsynResult<()> {
         self.send("WAIT MODE NOWAIT")
     }
-
-    /// A poll query, failing on I/O or a reply other than an ACK.
-    fn query(&mut self, cmd: &str) -> AsynResult<String> {
-        self.send(cmd)?;
-        if !self.ack() {
-            return Err(ens_err(format!(
-                "ensemble: query '{cmd}' rejected: '{}'",
-                self.input
-            )));
-        }
-        Ok(self.rest().to_owned())
-    }
 }
 
 /// One Ensemble axis sharing a controller. Implements [`AsynMotor`].
@@ -199,11 +187,13 @@ pub struct EnsembleAxis {
     index: i32,
     /// C `lastFault`, the AXISFAULT word that last raised `problem`.
     last_fault: i32,
-    /// C's stored `motorAxisProblem`: raised by a new fault, cleared by a
-    /// zero fault or by DISABLE after a travel-limit fault.
-    problem: bool,
+    /// C's motorParam view of the axis: the poller's sets, kept when a poll
+    /// bails, and `motorAxisProblem` cleared by DISABLE after a travel-limit
+    /// fault.
+    status: MotorStatus,
+    /// The status a failed poll left, for the next post.
+    failed: Option<MotorStatus>,
     status_writes: Vec<StatusWrite>,
-    has_encoder: bool,
     /// `HomeSetup` word; bit 0 is the home direction, updated by [`Self::home`].
     home_direction: u32,
     /// `ReverseMotionDirection` parameter.
@@ -263,9 +253,13 @@ impl EnsembleAxis {
             axis,
             index,
             last_fault: 0,
-            problem: false,
+            status: MotorStatus {
+                has_encoder,
+                gain_support: true,
+                ..Default::default()
+            },
+            failed: None,
             status_writes: Vec::new(),
-            has_encoder,
             home_direction,
             reverse_direc,
             swconfig,
@@ -319,6 +313,101 @@ impl EnsembleAxis {
             self.units(position),
             self.units(max_v)
         ))
+    }
+}
+
+impl EnsembleAxis {
+    /// One axis of C `EnsemblePoller` (drvEnsembleAsyn.cc:713-848), setting
+    /// [`Self::status`] in its order; an `Err` is its `continue` before
+    /// `callCallback`.
+    fn poll_status(&mut self) -> AsynResult<()> {
+        let axis = self.axis;
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let status = &mut self.status;
+
+        let sent = ctrl.send(&format!("AXISSTATUS(@{axis})"));
+        if sent.is_err() || ctrl.input.len() <= 1 {
+            status.comms_error = true;
+            return sent.and(Err(ens_err("ensemble: AXISSTATUS reply too short")));
+        }
+        if !ctrl.ack() {
+            return Err(ens_err(format!(
+                "ensemble: AXISSTATUS refused: '{}'",
+                ctrl.input
+            )));
+        }
+        status.comms_error = false;
+        let axis_status = atol(ctrl.rest()) as u32;
+        let _ = ctrl.send("PLANESTATUS(0)");
+        let move_active = (atoi(ctrl.rest()) & 0x01) != 0 || (axis_status & MOVE_ACTIVE) != 0;
+        status.done = !move_active;
+        status.moving = move_active;
+        status.powered = (axis_status & AXIS_ENABLED) != 0;
+        status.homed = (axis_status & HOME_CYCLE_COMPLETE) != 0;
+        status.home = (axis_status & HOME_LIMIT) != 0;
+        let motion_ccw = (axis_status & MOTION_CCW) != 0;
+        status.direction = if self.reverse_direc {
+            motion_ccw
+        } else {
+            !motion_ccw
+        };
+        // Limit switches: XOR the raw limit bit against its configured active
+        // level, then map CW/CCW to high/low honouring the reverse-direction flag.
+        let cw_sw_active =
+            !(((axis_status & CW_LIMIT) != 0) ^ ((self.swconfig & CW_EOT_SW_STATE) != 0));
+        let ccw_sw_active =
+            !(((axis_status & CCW_LIMIT) != 0) ^ ((self.swconfig & CCW_EOT_SW_STATE) != 0));
+        (status.high_limit, status.low_limit) = if self.reverse_direc {
+            (ccw_sw_active, cw_sw_active)
+        } else {
+            (cw_sw_active, ccw_sw_active)
+        };
+        self.report.set_axis_status(axis_status);
+
+        if let Err(e) = ctrl.send(&format!("PFBKPROG(@{axis})")) {
+            status.comms_error = true;
+            return Err(e);
+        }
+        let encoder = if ctrl.ack() { atof(ctrl.rest()) } else { 0.0 };
+        status.encoder_position = encoder / self.step;
+        let _ = ctrl.send(&format!("PCMDPROG(@{axis})"));
+        status.position = atof(ctrl.rest()) / self.step;
+
+        if let Err(e) = ctrl.send(&format!("AXISFAULT(@{axis})")) {
+            status.comms_error = true;
+            return Err(e);
+        }
+        if !ctrl.ack() {
+            status.problem = true;
+            status.comms_error = true;
+            return Err(ens_err(format!(
+                "ensemble: AXISFAULT refused: '{}'",
+                ctrl.input
+            )));
+        }
+        let fault = atoi(ctrl.rest());
+        if fault == 0 {
+            self.last_fault = 0;
+            status.problem = false;
+        } else if fault != self.last_fault {
+            self.last_fault = fault;
+            status.problem = true;
+            self.log.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "EnsemblePoller: controller fault on axis={} fault=0x{fault:X}\n",
+                    self.index
+                ),
+            );
+        }
+
+        if let Err(e) = ctrl.send(&format!("VFBK(@{axis})")) {
+            status.comms_error = true;
+            return Err(e);
+        }
+        status.velocity = atof(ctrl.rest()) / self.step;
+        Ok(())
     }
 }
 
@@ -476,13 +565,14 @@ impl AsynMotor for EnsembleAxis {
         } else {
             // C clears it so the user can jog off the limit (:434-435).
             if self.last_fault & TRAVEL_LIMIT_FAULT_MASK != 0 {
-                self.problem = false;
+                self.status.problem = false;
                 self.status_writes.push(StatusWrite::Problem(false));
             }
             let _ = ctrl.send(&format!("DISABLE @{axis}"));
         }
         // C's status is WAIT MODE NOWAIT's; PowerOn follows the request even
         // when ENABLE fails, to force a status update (:461-476).
+        self.status.powered = closed_loop;
         ctrl.wait_mode_nowait()?;
         self.status_writes.push(StatusWrite::PowerOn(closed_loop));
         Ok(())
@@ -493,75 +583,15 @@ impl AsynMotor for EnsembleAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let axis = self.axis;
-        let (axis_status, plane_active, enc_pos, cmd_pos, fault, act_vel) = {
-            let mut ctrl = self.lock();
-            let axis_status = atol(&ctrl.query(&format!("AXISSTATUS(@{axis})"))?) as u32;
-            self.report.set_axis_status(axis_status);
-            let plane_active = (atoi(&ctrl.query("PLANESTATUS(0)")?) & 0x01) != 0;
-            let enc_pos = atof(&ctrl.query(&format!("PFBKPROG(@{axis})"))?);
-            let cmd_pos = atof(&ctrl.query(&format!("PCMDPROG(@{axis})"))?);
-            let fault = atoi(&ctrl.query(&format!("AXISFAULT(@{axis})"))?);
-            let act_vel = atof(&ctrl.query(&format!("VFBK(@{axis})"))?);
-            (axis_status, plane_active, enc_pos, cmd_pos, fault, act_vel)
-        };
-
-        if fault == 0 {
-            self.last_fault = 0;
-            self.problem = false;
-        } else if fault != self.last_fault {
-            self.last_fault = fault;
-            self.problem = true;
-            self.log.print(
-                TraceMask::ERROR,
-                format_args!(
-                    "EnsemblePoller: controller fault on axis={} fault=0x{fault:X}\n",
-                    self.index
-                ),
-            );
+        let polled = self.poll_status();
+        if polled.is_err() {
+            self.failed = Some(self.status.clone());
         }
+        polled.map(|()| self.status.clone())
+    }
 
-        let move_active = (axis_status & MOVE_ACTIVE) != 0 || plane_active;
-        let done = !move_active;
-        let powered = (axis_status & AXIS_ENABLED) != 0;
-        let homed = (axis_status & HOME_CYCLE_COMPLETE) != 0;
-        let at_home = (axis_status & HOME_LIMIT) != 0;
-        let motion_ccw = (axis_status & MOTION_CCW) != 0;
-        let direction = if self.reverse_direc {
-            motion_ccw
-        } else {
-            !motion_ccw
-        };
-
-        // Limit switches: XOR the raw limit bit against its configured active
-        // level, then map CW/CCW to high/low honouring the reverse-direction flag.
-        let cw_sw_active =
-            !(((axis_status & CW_LIMIT) != 0) ^ ((self.swconfig & CW_EOT_SW_STATE) != 0));
-        let ccw_sw_active =
-            !(((axis_status & CCW_LIMIT) != 0) ^ ((self.swconfig & CCW_EOT_SW_STATE) != 0));
-        let (high_limit, low_limit) = if self.reverse_direc {
-            (ccw_sw_active, cw_sw_active)
-        } else {
-            (cw_sw_active, ccw_sw_active)
-        };
-
-        Ok(MotorStatus {
-            position: cmd_pos / self.step,
-            encoder_position: enc_pos / self.step,
-            velocity: act_vel / self.step,
-            done,
-            moving: move_active,
-            high_limit,
-            low_limit,
-            home: at_home,
-            homed,
-            direction,
-            problem: self.problem,
-            powered,
-            has_encoder: self.has_encoder,
-            gain_support: true,
-            ..Default::default()
-        })
+    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+        self.failed.take()
     }
 }
 
@@ -949,6 +979,146 @@ mod tests {
         let mut text = String::new();
         motor_common::AxisReport::report(&*axis.report(), &mut text, 1);
         assert!(text.contains("home preset: 1000.000000"), "{text}");
+    }
+
+    /// The poll's replies by command and the commands whose write fails.
+    type PollLine = (
+        Arc<Mutex<std::collections::HashMap<String, String>>>,
+        Arc<Mutex<Vec<String>>>,
+    );
+
+    /// An axis 0 with CountsPerUnit 1 on a line `PollLine` steers; a poll
+    /// query it has no reply for answers `%0`.
+    fn poll_axis(name: &str) -> (PollLine, EnsembleAxis) {
+        let replies: PollLine = Default::default();
+        let reply = {
+            let replies = replies.0.clone();
+            move |cmd: &str| {
+                let cmd = cmd.trim_end();
+                if cmd == format!("GETPARM(@0, {PARAM_COUNTS_PER_UNIT})") {
+                    return "%1".into();
+                }
+                let replies = replies.lock().unwrap();
+                replies.get(cmd).cloned().unwrap_or_else(|| "%0".into())
+            }
+        };
+        let fails = {
+            let failing = replies.1.clone();
+            move |cmd: &str| failing.lock().unwrap().iter().any(|f| f == cmd.trim_end())
+        };
+        let (_line, axis) = rig_axis(name, reply, fails);
+        (replies, axis)
+    }
+
+    fn set_reply((replies, _): &PollLine, cmd: &str, reply: &str) {
+        replies.lock().unwrap().insert(cmd.into(), reply.into());
+    }
+
+    fn fail_write((_, failing): &PollLine, cmd: Option<&str>) {
+        *failing.lock().unwrap() = cmd.into_iter().map(String::from).collect();
+    }
+
+    /// drvEnsembleAsyn.cc:714-722, :773-778, :801-806, :837-842: a failed
+    /// exchange, or an AXISSTATUS reply of one char, sets motorAxisCommError
+    /// and leaves the poll's earlier sets for the next post; a good
+    /// AXISSTATUS clears it.
+    #[test]
+    fn a_failed_poll_exchange_leaves_comm_error_and_the_earlier_sets() {
+        let user = AsynUser::new(0);
+        let (line, mut axis) = poll_axis("ensPollIo");
+        set_reply(&line, "AXISSTATUS(@0)", "%1");
+        set_reply(&line, "PFBKPROG(@0)", "%5");
+        set_reply(&line, "PCMDPROG(@0)", "%6");
+        let good = axis.poll(&user).unwrap();
+        assert!(good.powered && !good.comms_error);
+        assert_eq!((good.position, good.encoder_position), (6.0, 5.0));
+
+        // AXISSTATUS fails: only the comm error changes.
+        fail_write(&line, Some("AXISSTATUS(@0)"));
+        assert!(axis.poll(&user).is_err());
+        let left = axis.take_failed_poll_status().unwrap();
+        assert!(left.comms_error);
+        assert_eq!(
+            MotorStatus {
+                comms_error: false,
+                ..left
+            },
+            good
+        );
+
+        // A one-char reply is a comm error too.
+        fail_write(&line, None);
+        set_reply(&line, "AXISSTATUS(@0)", "%");
+        assert!(axis.poll(&user).is_err());
+        assert!(axis.take_failed_poll_status().unwrap().comms_error);
+
+        // PFBKPROG fails after a new AXISSTATUS: its bits are left, positions
+        // are not.
+        set_reply(&line, "AXISSTATUS(@0)", "%0");
+        set_reply(&line, "PFBKPROG(@0)", "%7");
+        fail_write(&line, Some("PFBKPROG(@0)"));
+        assert!(axis.poll(&user).is_err());
+        let left = axis.take_failed_poll_status().unwrap();
+        assert!(left.comms_error && !left.powered);
+        assert_eq!((left.position, left.encoder_position), (6.0, 5.0));
+
+        // VFBK fails: the positions read before it are left.
+        fail_write(&line, Some("VFBK(@0)"));
+        assert!(axis.poll(&user).is_err());
+        let left = axis.take_failed_poll_status().unwrap();
+        assert!(left.comms_error);
+        assert_eq!((left.position, left.encoder_position), (6.0, 7.0));
+
+        // AXISFAULT fails: comm error, problem untouched.
+        fail_write(&line, Some("AXISFAULT(@0)"));
+        assert!(axis.poll(&user).is_err());
+        let left = axis.take_failed_poll_status().unwrap();
+        assert!(left.comms_error && !left.problem);
+
+        fail_write(&line, None);
+        assert!(!axis.poll(&user).unwrap().comms_error);
+    }
+
+    /// drvEnsembleAsyn.cc:725-730, :779-784, :807-814: a NAK'd AXISSTATUS
+    /// bails setting nothing, a NAK'd PFBKPROG is position 0, a NAK'd
+    /// AXISFAULT bails with problem and comm error.
+    #[test]
+    fn a_nak_in_the_poll_is_handled_where_c_checks_it() {
+        let user = AsynUser::new(0);
+        let (line, mut axis) = poll_axis("ensPollNak");
+        set_reply(&line, "PFBKPROG(@0)", "%5");
+        let good = axis.poll(&user).unwrap();
+
+        set_reply(&line, "AXISSTATUS(@0)", "!1");
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.take_failed_poll_status().unwrap(), good);
+
+        set_reply(&line, "AXISSTATUS(@0)", "%0");
+        set_reply(&line, "PFBKPROG(@0)", "!5");
+        assert_eq!(axis.poll(&user).unwrap().encoder_position, 0.0);
+
+        set_reply(&line, "AXISFAULT(@0)", "!");
+        assert!(axis.poll(&user).is_err());
+        let left = axis.take_failed_poll_status().unwrap();
+        assert!(left.problem && left.comms_error);
+    }
+
+    /// drvEnsembleAsyn.cc:740-741, :787-789: PLANESTATUS and PCMDPROG
+    /// ignore their status and read whatever `inputBuff` holds.
+    #[test]
+    fn unchecked_poll_exchanges_read_the_last_reply() {
+        let user = AsynUser::new(0);
+        let (line, mut axis) = poll_axis("ensPollStale");
+        set_reply(&line, "PFBKPROG(@0)", "%5");
+        set_reply(&line, "PCMDPROG(@0)", "!6");
+        // A NAK'd PCMDPROG is still read past its status char.
+        assert_eq!(axis.poll(&user).unwrap().position, 6.0);
+        fail_write(&line, Some("PCMDPROG(@0)"));
+        assert_eq!(axis.poll(&user).unwrap().position, 5.0);
+        // AXISSTATUS's reply, odd, stands in for a failed PLANESTATUS.
+        set_reply(&line, "AXISSTATUS(@0)", "%1");
+        fail_write(&line, Some("PLANESTATUS(0)"));
+        assert!(!axis.poll(&user).unwrap().done);
     }
 
     #[test]
