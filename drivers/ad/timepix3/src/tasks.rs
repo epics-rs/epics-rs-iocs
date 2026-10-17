@@ -35,9 +35,7 @@ use crate::http::{DEFAULT_TIMEOUT, HttpError, ServalHttp, TIMEOUT_5000_MS};
 use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Mirrored, Shared};
-use crate::stream::{
-    Channel, EndOfStream, Frame, FrameDecoder, FrameError, ImageLimits, parse_tcp_path,
-};
+use crate::stream::{Channel, EndOfStream, Frame, FrameDecoder, FrameError, ImageLimits};
 use crate::window::{Configuration, RollingSumStatus};
 use crate::worker::{Generation, WorkerState};
 
@@ -1863,13 +1861,13 @@ impl StreamKind {
         }
     }
 
-    fn path(self, s: &Shared) -> Option<String> {
-        let paths = s.stream_paths();
+    fn endpoint(self, s: &Shared) -> Option<(String, u16)> {
+        let endpoints = s.endpoints.lock();
         match self {
-            Self::PrvImg => paths.prv_img,
-            Self::PrvImg1 => paths.prv_img1,
-            Self::Img => paths.img,
-            Self::PrvHst => paths.prv_hst,
+            Self::PrvImg => endpoints.prv_img.clone(),
+            Self::PrvImg1 => endpoints.prv_img1.clone(),
+            Self::Img => endpoints.img.clone(),
+            Self::PrvHst => endpoints.prv_hst.clone(),
         }
     }
 }
@@ -1911,11 +1909,10 @@ async fn stream_run(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation) {
     let worker = kind.worker(&ctx.shared);
     let name = kind.name();
     while worker.running(run) {
-        // C parses the path at its check and skips the connect while the
-        // host is empty (serval_stream.cpp:548-550, histogram_io.cpp:1004-1008).
+        // C reads the target each pass and skips the connect while the host
+        // is empty (serval_stream.cpp:541-547, histogram_io.cpp:1001-1008).
         let Some((host, port)) = kind
-            .path(&ctx.shared)
-            .and_then(|p| parse_tcp_path(&p).ok())
+            .endpoint(&ctx.shared)
             .filter(|(host, _)| !host.is_empty())
         else {
             worker.wait_for_stop_for(run, RECONNECT_WAIT);
@@ -4197,17 +4194,51 @@ mod tests {
         assert_eq!(o.rate, 0.0);
     }
 
+    /// A Base write parses the target the worker connects to, and a Base
+    /// that does not parse keeps the last good one (ADTimePix.cpp:298-387,
+    /// serval_stream.cpp:541-547).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_connects_to_the_last_base_that_parsed() {
+        for kind in [StreamKind::PrvImg, StreamKind::PrvImg1, StreamKind::Img] {
+            let name = format!("TPX_LAST_GOOD_{}", kind.name());
+            let ctx = Arc::new(idle_ctx(&name));
+            let base = match kind {
+                StreamKind::PrvImg => ctx.p.prv_img_base,
+                StreamKind::PrvImg1 => ctx.p.prv_img1_base,
+                _ => ctx.p.img_base,
+            };
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let good = format!("tcp://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            ctx.handle
+                .write_octet(base, 0, good.into_bytes())
+                .await
+                .unwrap();
+            let bad = b"tcp://127.0.0.1:x1".to_vec();
+            assert!(ctx.handle.write_octet(base, 0, bad).await.is_err());
+
+            assert!(ctx.shared.acquisition.begin_start());
+            assert!(kind.worker(&ctx.shared).start());
+            let c = ctx.clone();
+            let _worker = rt::run_thread_named(&name, move || async move {
+                stream_worker(c, kind).await;
+            });
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while listener.accept().is_err() {
+                assert!(std::time::Instant::now() < deadline, "{name}: no connect");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
     /// A stream that ends ends the worker's run for the acquisition: C fails
     /// the state instead of reconnecting (serval_stream.cpp:563-585).
     #[test]
     fn a_stream_that_ends_is_not_reconnected() {
         let ctx = Arc::new(idle_ctx("TPX_ONE_SHOT"));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let path = format!("tcp://{}", listener.local_addr().unwrap());
-        ctx.shared.set_stream_paths(crate::state::StreamPaths {
-            prv_img: Some(path),
-            ..Default::default()
-        });
+        let port = listener.local_addr().unwrap().port();
+        ctx.shared.endpoints.lock().prv_img = Some(("127.0.0.1".into(), port));
         assert!(ctx.shared.acquisition.begin_start());
         assert!(ctx.shared.prv_img_worker.start());
         let c = ctx.clone();
@@ -4282,11 +4313,8 @@ mod tests {
             epics_rs::ad_core::plugin::channel::ndarray_channel("TPX_STOP_DRAIN_SINK", 4);
         ctx.outputs[PRV_IMG_ADDR].lock().add(tx);
         set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
-        let path = format!("tcp://{}", stream.local_addr().unwrap());
-        ctx.shared.set_stream_paths(crate::state::StreamPaths {
-            prv_img: Some(path),
-            ..Default::default()
-        });
+        let port = stream.local_addr().unwrap().port();
+        ctx.shared.endpoints.lock().prv_img = Some(("127.0.0.1".into(), port));
         let acquisition = &ctx.shared.acquisition;
         assert!(acquisition.begin_start());
         for resource in [Resource::RemoteMeasurement, Resource::MonitorThread] {
@@ -4761,10 +4789,7 @@ mod tests {
         set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        ctx.shared.set_stream_paths(crate::state::StreamPaths {
-            prv_img1: Some(format!("tcp://{addr}")),
-            ..Default::default()
-        });
+        ctx.shared.endpoints.lock().prv_img1 = Some(("127.0.0.1".into(), addr.port()));
         let worker = &ctx.shared.prv_img1_worker;
         assert!(worker.start());
         let c = ctx.clone();

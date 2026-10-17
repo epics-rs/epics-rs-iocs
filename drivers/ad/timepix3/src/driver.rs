@@ -25,7 +25,7 @@ use crate::http::{DEFAULT_TIMEOUT, HttpError, HttpResult, ServalHttp, TIMEOUT_50
 use crate::mask::{self, Geometry, PixelConfigError};
 use crate::params::TimePixParams;
 use crate::serval;
-use crate::state::{Command, Mirrored, Shared};
+use crate::state::{Command, Mirrored, Shared, StreamEndpoints};
 use crate::tasks::{self, Accum};
 use crate::window::{Configuration, RollingSumStatus};
 
@@ -100,10 +100,12 @@ struct ChannelPath {
     stream: Option<fn(&TimePixParams) -> usize>,
     exists: fn(&TimePixParams) -> usize,
     error_message: &'static str,
-    /// The channels whose `tcp://` path C parses into the stream target, and
-    /// the function name its lines carry.
-    tcp: Option<(&'static str, &'static str)>,
+    /// The channels whose `tcp://` path C parses into the stream target: the
+    /// name and function its lines carry, and the target.
+    tcp: Option<(&'static str, &'static str, EndpointOf)>,
 }
+
+type EndpointOf = fn(&mut StreamEndpoints) -> &mut Option<(String, u16)>;
 
 const CHANNEL_PATHS: [ChannelPath; 7] = [
     ChannelPath {
@@ -125,7 +127,7 @@ const CHANNEL_PATHS: [ChannelPath; 7] = [
         stream: None,
         exists: |p| p.img_file_path_exists,
         error_message: "Img file path must be file:/path_to_img_folder, http://localhost:8081, or tcp://listen@hostname:port",
-        tcp: Some(("Img", adlog::CHECK_IMG_PATH)),
+        tcp: Some(("Img", adlog::CHECK_IMG_PATH, |e| &mut e.img)),
     },
     ChannelPath {
         base: |p| p.img1_base,
@@ -139,14 +141,14 @@ const CHANNEL_PATHS: [ChannelPath; 7] = [
         stream: None,
         exists: |p| p.prv_img_file_path_exists,
         error_message: "PrvImg file path must be file:/path_to_img_folder, http://localhost:8081, or tcp://listen@hostname:port",
-        tcp: Some(("PrvImg", adlog::CHECK_PRV_IMG_PATH)),
+        tcp: Some(("PrvImg", adlog::CHECK_PRV_IMG_PATH, |e| &mut e.prv_img)),
     },
     ChannelPath {
         base: |p| p.prv_img1_base,
         stream: None,
         exists: |p| p.prv_img1_file_path_exists,
         error_message: "PrvImg1 file path must be file:/path_to_img_folder, http://localhost:8081, or tcp://listen@hostname:port",
-        tcp: Some(("PrvImg1", adlog::CHECK_PRV_IMG1_PATH)),
+        tcp: Some(("PrvImg1", adlog::CHECK_PRV_IMG1_PATH, |e| &mut e.prv_img1)),
     },
     ChannelPath {
         base: |p| p.prv_hst_base,
@@ -447,17 +449,16 @@ impl TimePix3Driver {
         if !found {
             return Err(refused());
         }
-        let Some((name, func)) = channel.tcp.filter(|_| path.starts_with("tcp://")) else {
+        let Some((name, func, endpoint)) = channel.tcp.filter(|_| path.starts_with("tcp://"))
+        else {
             return Ok(());
         };
         let (mask, line) = match self.parse_tcp_path(&path) {
-            Some((host, port)) => (
-                TraceMask::IO_DRIVER,
-                adlog::log(
-                    func,
-                    &format!("Parsed {name} TCP path: host={host}, port={port}"),
-                ),
-            ),
+            Some((host, port)) => {
+                let line = format!("Parsed {name} TCP path: host={host}, port={port}");
+                *endpoint(&mut self.shared.endpoints.lock()) = Some((host, port));
+                (TraceMask::IO_DRIVER, adlog::log(func, &line))
+            }
             None => {
                 self.ad.port_base.set_int32_param(exists, 0, 0)?;
                 (
@@ -2815,11 +2816,11 @@ impl TimePix3Driver {
                 && self.int(p.prv_hst_format, 0) == 4
                 && self.int(p.prv_hst_accumulation_enable, 0) != 0
         });
-        if prv_hst
-            .as_deref()
-            .is_some_and(|path| self.parse_tcp_path(path).is_none())
-        {
-            return Err("Histogram TCP path is invalid");
+        if let Some(path) = &prv_hst {
+            let Some(target) = self.parse_tcp_path(path) else {
+                return Err("Histogram TCP path is invalid");
+            };
+            self.shared.endpoints.lock().prv_hst = Some(target);
         }
         self.sync_tcp_stream_endpoints();
         self.shared.set_stream_paths(crate::state::StreamPaths {

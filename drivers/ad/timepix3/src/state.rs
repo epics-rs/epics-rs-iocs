@@ -45,6 +45,17 @@ pub struct StreamPaths {
     pub prv_hst: Option<String>,
 }
 
+/// C `prvImgHost_`/`prvImgPort_` .. `prvHstHost_`/`prvHstPort_`: the last
+/// `tcp://` target that parsed, which a worker connects to. A Base that does
+/// not parse leaves the previous one (ADTimePix.cpp:298-387, acquire.cpp:498-501).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamEndpoints {
+    pub prv_img: Option<(String, u16)>,
+    pub prv_img1: Option<(String, u16)>,
+    pub img: Option<(String, u16)>,
+    pub prv_hst: Option<(String, u16)>,
+}
+
 /// C `PreviewJsonimageStream`'s state (serval_stream.cpp:59-85) and the
 /// `pArrays` slots its band-pass reads: the last frame at each threshold's
 /// address and the last band-pass. Index 0 is PrvImg, 1 PrvImg1.
@@ -182,6 +193,7 @@ pub struct Shared {
     /// buffer; the driver owns it here).
     pub mask: Mutex<Vec<i32>>,
     pub streams: Mutex<StreamPaths>,
+    pub endpoints: Mutex<StreamEndpoints>,
     /// C `prvImgWorkerState_`, `prvImg1WorkerState_`, `imgWorkerState_`,
     /// `prvHstWorkerState_`.
     pub prv_img_worker: WorkerState,
@@ -215,6 +227,7 @@ impl Shared {
             rates: Mutex::new(Rates::default()),
             mask: Mutex::new(Vec::new()),
             streams: Mutex::new(StreamPaths::default()),
+            endpoints: Mutex::new(StreamEndpoints::default()),
             prv_img_worker: WorkerState::default(),
             prv_img1_worker: WorkerState::default(),
             img_worker: WorkerState::default(),
