@@ -33,6 +33,7 @@
 //! - `countsPerRev` is a config argument rather than the record's `SREV`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
@@ -43,6 +44,10 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, nint};
+
+/// Query read timeout (C `recv_mess` 1.0 s); writes use the caller's
+/// `COMM_TIMEOUT`.
+const RECV_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 128;
@@ -60,6 +65,7 @@ fn faulhaber_err(message: impl Into<String>) -> AsynError {
 /// Shared controller endpoint: owns the serial handle and node-prefixed framing.
 pub struct FaulhaberController {
     handle: SyncIOHandle,
+    reader: SyncIOHandle,
     ident: String,
     num_axes: usize,
     comm_state: CommState,
@@ -80,8 +86,10 @@ impl FaulhaberController {
     /// that never answers. The first node's reply becomes the identification.
     /// Performs blocking serial I/O.
     pub fn new(handle: SyncIOHandle, num_motors: usize) -> AsynResult<Self> {
+        let reader = SyncIOHandle::from_handle(handle.port()?.clone(), 0, RECV_TIMEOUT);
         let mut ctrl = Self {
             handle,
+            reader,
             ident: String::new(),
             num_axes: 0,
             comm_state: CommState::Normal,
@@ -147,7 +155,7 @@ impl FaulhaberController {
         // C send_mess/recv_mess write then read with no flush, so one stray
         // line shifts every later reply; write_read flushes first.
         let raw = self
-            .handle
+            .reader
             .write_read(0, &Self::framed(node, cmd), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text
@@ -684,6 +692,22 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvMCDC2805.cc:446 reads at 1.0 s while send_mess writes at
+    /// COMM_TIMEOUT, so a silent node fails a poll in 1 s.
+    #[test]
+    fn queries_read_at_one_second_and_writes_keep_the_comm_timeout() {
+        let (_line, io) = LineRig::new("faulhaberTimeout", |last| {
+            match last.get(1..).unwrap_or_default() {
+                "VER" => "MCDC2805".into(),
+                _ => String::new(),
+            }
+        });
+        let write_timeout = io.timeout();
+        let ctrl = FaulhaberController::new(io, 1).unwrap();
+        assert_eq!(ctrl.reader.timeout(), Duration::from_secs(1));
+        assert_eq!(ctrl.handle.timeout(), write_timeout);
     }
 
     /// motorRecord.cc:938-945 with devMCDC2805.cc:248-274: SP before AC,
