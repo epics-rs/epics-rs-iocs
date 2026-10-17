@@ -194,7 +194,7 @@ pub fn ensemble_config_command() -> CommandDef {
                 &card.to_string(),
             )));
             let answered = {
-                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
                 (0..3).any(|_| ctrl.ping().is_ok())
             };
             if !answered {

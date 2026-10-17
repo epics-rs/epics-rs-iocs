@@ -100,7 +100,7 @@ fn fmt(v: f64, digits: usize) -> String {
 }
 
 /// C's `stepSize` from a `CountsPerUnit` reply, 1 when it was refused.
-fn step_size(counts_per_unit: AsynResult<String>) -> f64 {
+fn step_size(counts_per_unit: Option<String>) -> f64 {
     counts_per_unit.map_or(1.0, |s| 1.0 / atof(&s))
 }
 
@@ -114,6 +114,9 @@ fn max_digits(step_size: f64) -> usize {
 /// `sendReceiveMutex`).
 pub struct EnsembleController {
     io: Exchange,
+    /// C `inputBuff`: the last reply. A failed exchange leaves it, and C's
+    /// callers that ignore the status read it anyway.
+    input: String,
 }
 
 impl EnsembleController {
@@ -129,71 +132,61 @@ impl EnsembleController {
                 serial_port,
                 motor_port,
             ),
+            input: String::new(),
         }
     }
 
-    fn read_line(&self) -> AsynResult<String> {
-        self.io.read_line()
+    /// C `sendAndReceive`: fails only on I/O; a NAK or fault reply is the
+    /// caller's to check. Its ACK-then-EOS re-read (drvEnsembleAsyn.cc:1083)
+    /// never matches a reply the input EOS already stripped.
+    pub fn send(&mut self, cmd: &str) -> AsynResult<()> {
+        self.input = self.io.write_read(cmd)?;
+        Ok(())
     }
 
-    fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.io.write_read(cmd)
+    /// Whether the last reply is an ACK.
+    fn ack(&self) -> bool {
+        self.input.as_bytes().first() == Some(&ACK)
     }
 
-    /// Send a command that returns only an ACK. Errors on NAK/fault/timeout/empty.
-    pub fn command(&self, cmd: &str) -> AsynResult<()> {
-        let reply = self.write_read(cmd)?;
-        match reply.as_bytes().first() {
-            Some(&ACK) => Ok(()),
-            _ => Err(ens_err(format!(
-                "ensemble: command '{cmd}' rejected: '{reply}'"
-            ))),
-        }
+    /// C `&inputBuff[1]`, whatever the status char.
+    fn rest(&self) -> &str {
+        self.input.get(1..).unwrap_or("")
     }
 
-    /// Send a value query and return the payload after the ACK char. A bare ACK
-    /// line (older firmware puts the value on the next line) triggers one more
-    /// read (C `sendAndReceive` re-read loop).
-    pub fn query(&self, cmd: &str) -> AsynResult<String> {
-        let mut reply = self.write_read(cmd)?;
-        let mut tries = 0;
-        while reply == "%" && tries < 3 {
-            reply = self.read_line()?;
-            tries += 1;
-        }
-        match reply.as_bytes().first() {
-            Some(&ACK) => Ok(reply[1..].to_string()),
-            _ => Err(ens_err(format!(
-                "ensemble: query '{cmd}' rejected: '{reply}'"
-            ))),
-        }
-    }
-
-    /// `GETPARM(@axis, param)` value.
-    pub fn get_param(&self, axis: i32, param: i32) -> AsynResult<String> {
-        self.query(&format!("GETPARM(@{axis}, {param})"))
+    /// `GETPARM(@axis, param)`'s value when the reply is an ACK.
+    pub fn get_param(&mut self, axis: i32, param: i32) -> Option<String> {
+        let _ = self.send(&format!("GETPARM(@{axis}, {param})"));
+        self.ack().then(|| self.rest().to_owned())
     }
 
     /// Whether an axis exists (its `AxisName` parameter ACKs).
-    pub fn axis_exists(&self, axis: i32) -> bool {
-        self.get_param(axis, PARAM_AXIS_NAME).is_ok()
+    pub fn axis_exists(&mut self, axis: i32) -> bool {
+        self.get_param(axis, PARAM_AXIS_NAME).is_some()
     }
 
-    /// Comms check: send an (invalid) `NONE` command and accept any reply
-    /// (C config `do { NONE } while` loop).
-    pub fn ping(&self) -> AsynResult<()> {
-        let reply = self.write_read("NONE")?;
-        if reply.is_empty() {
-            Err(ens_err("ensemble: no response to ping"))
-        } else {
-            Ok(())
-        }
+    /// Comms check: an (invalid) `NONE` command that any reply answers (C
+    /// config `do { NONE } while` loop).
+    pub fn ping(&mut self) -> AsynResult<()> {
+        self.send("NONE")
     }
 
     /// Prevent the ASCII interpreter from blocking during moves (C
     /// `WAIT MODE NOWAIT`, sent at config and on every enable).
-    pub fn wait_mode_nowait(&self) -> AsynResult<()> {
-        self.command("WAIT MODE NOWAIT")
+    pub fn wait_mode_nowait(&mut self) -> AsynResult<()> {
+        self.send("WAIT MODE NOWAIT")
+    }
+
+    /// A poll query, failing on I/O or a reply other than an ACK.
+    fn query(&mut self, cmd: &str) -> AsynResult<String> {
+        self.send(cmd)?;
+        if !self.ack() {
+            return Err(ens_err(format!(
+                "ensemble: query '{cmd}' rejected: '{}'",
+                self.input
+            )));
+        }
+        Ok(self.rest().to_owned())
     }
 }
 
@@ -234,11 +227,10 @@ impl EnsembleAxis {
         index: i32,
     ) -> AsynResult<Self> {
         let (has_encoder, step_size, home_preset, home_direction, reverse_direc, swconfig) = {
-            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let has_encoder = ctrl
                 .get_param(axis, PARAM_POSITION_FEEDBACK_TYPE)
-                .map(|s| atoi(&s) > 0)
-                .unwrap_or(false);
+                .is_some_and(|s| atoi(&s) > 0);
             let step_size = step_size(ctrl.get_param(axis, PARAM_COUNTS_PER_UNIT));
             let home_preset = ctrl
                 .get_param(axis, PARAM_HOME_OFFSET)
@@ -252,11 +244,10 @@ impl EnsembleAxis {
                 .get_param(axis, PARAM_END_OF_TRAVEL_LIMIT_SETUP)
                 .map(|s| atol(&s) as u32)
                 .unwrap_or(0);
-            ctrl.command(&format!("RAMP MODE @{axis} RATE"))?;
+            let _ = ctrl.send(&format!("RAMP MODE @{axis} RATE"));
             let reverse_direc = ctrl
                 .get_param(axis, PARAM_REVERSE_MOTION_DIRECTION)
-                .map(|s| atoi(&s) != 0)
-                .unwrap_or(false);
+                .is_some_and(|s| atoi(&s) != 0);
             (
                 has_encoder,
                 step_size,
@@ -318,19 +309,16 @@ impl EnsembleAxis {
     fn do_move(&mut self, position: f64, relative: bool, max_v: f64, accel: f64) -> AsynResult<()> {
         let axis = self.axis;
         let mode = if relative { "INC" } else { "ABS" };
-        {
-            let ctrl = self.lock();
-            ctrl.command(mode)?;
-            if accel > 0.0 {
-                ctrl.command(&format!("RAMP RATE {}", self.units(accel)))?;
-            }
-            ctrl.command(&format!(
-                "LINEAR @{axis} {} F{}",
-                self.units(position),
-                self.units(max_v)
-            ))?;
+        let mut ctrl = self.lock();
+        ctrl.send(mode)?;
+        if accel > 0.0 {
+            let _ = ctrl.send(&format!("RAMP RATE {}", self.units(accel)));
         }
-        Ok(())
+        ctrl.send(&format!(
+            "LINEAR @{axis} {} F{}",
+            self.units(position),
+            self.units(max_v)
+        ))
     }
 }
 
@@ -371,14 +359,13 @@ impl AsynMotor for EnsembleAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let axis = self.axis;
-        let ctrl = self.lock();
-        ctrl.command(&format!(
+        let mut ctrl = self.lock();
+        let _ = ctrl.send(&format!(
             "SETPARM @{axis}, {PARAM_ABORT_DECEL_RATE}, {}",
             self.units(acceleration)
-        ))?;
-        ctrl.command(&format!("RAMP RATE @{axis} {}", self.units(acceleration)))?;
-        ctrl.command(&format!("FREERUN @{axis} {}", self.units(velocity)))?;
-        Ok(())
+        ));
+        let _ = ctrl.send(&format!("RAMP RATE @{axis} {}", self.units(acceleration)));
+        ctrl.send(&format!("FREERUN @{axis} {}", self.units(velocity)))
     }
 
     fn home(
@@ -399,38 +386,44 @@ impl AsynMotor for EnsembleAxis {
         };
         self.home_direction = hparam;
 
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
         if velocity > 0.0 {
-            ctrl.command(&format!(
+            let _ = ctrl.send(&format!(
                 "SETPARM @{axis}, {PARAM_HOME_SPEED}, {}",
                 self.units(velocity)
-            ))?;
+            ));
         }
         if acceleration > 0.0 {
             // C builds this SETPARM and overwrites it unsent
             // (drvEnsembleAsyn.cc:572-574, :584); not copied.
-            ctrl.command(&format!(
+            let _ = ctrl.send(&format!(
                 "SETPARM @{axis}, {PARAM_HOME_RAMP_RATE}, {}",
                 self.units(acceleration)
-            ))?;
+            ));
         }
-        ctrl.command(&format!("SETPARM @{axis}, {PARAM_HOME_SETUP}, {hparam}"))?;
+        let _ = ctrl.send(&format!("SETPARM @{axis}, {PARAM_HOME_SETUP}, {hparam}"));
         // HomeAsync.bcx protocol: IGLOBAL(32)=1, IGLOBAL(33)=axis, run task 5.
-        ctrl.command("IGLOBAL(32) = 1")?;
-        ctrl.command(&format!("IGLOBAL(33) = {axis}"))?;
-        ctrl.command("PROGRAM RUN 5, \"HomeAsync.bcx\"")?;
-        Ok(())
+        let _ = ctrl.send("IGLOBAL(32) = 1");
+        let _ = ctrl.send(&format!("IGLOBAL(33) = {axis}"));
+        ctrl.send("PROGRAM RUN 5, \"HomeAsync.bcx\"")
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let axis = self.axis;
-        self.lock().command(&format!("ABORT @{axis}"))
+        self.lock().send(&format!("ABORT @{axis}"))
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
-        self.lock()
-            .command(&format!("POSOFFSET SET @{axis}, {}", self.units(position)))
+        let mut ctrl = self.lock();
+        let sent = ctrl.send(&format!("POSOFFSET SET @{axis}, {}", self.units(position)));
+        if !ctrl.ack() {
+            return Err(ens_err(format!(
+                "ensemble: POSOFFSET refused: '{}'",
+                ctrl.input
+            )));
+        }
+        sent
     }
 
     fn set_encoder_ratio(&mut self, _user: &AsynUser, _ratio: f64) -> AsynResult<()> {
@@ -459,32 +452,34 @@ impl AsynMotor for EnsembleAxis {
 
     fn set_closed_loop(&mut self, _user: &AsynUser, closed_loop: bool) -> AsynResult<()> {
         let axis = self.axis;
-        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         if closed_loop {
             // C refreshes stepSize on every enable (not maxDigits).
-            if let Ok(s) = ctrl.get_param(axis, PARAM_COUNTS_PER_UNIT) {
+            if let Some(s) = ctrl.get_param(axis, PARAM_COUNTS_PER_UNIT) {
                 self.step = (1.0 / atof(&s)).abs();
             }
             // Acknowledge any pending fault, then enable.
-            let fault = ctrl
-                .query(&format!("AXISFAULT @{axis}"))
-                .map(|s| atoi(&s))
-                .unwrap_or(0);
+            let sent = ctrl.send(&format!("AXISFAULT @{axis}"));
+            let fault = if sent.is_ok() && ctrl.ack() {
+                atoi(ctrl.rest())
+            } else {
+                0
+            };
             if fault != 0 {
                 self.log.print(
                     TraceMask::ERROR,
                     format_args!("motorAxisSetInteger: FAULTACK = {fault:X}\n"),
                 );
-                let _ = ctrl.command(&format!("FAULTACK @{axis}"));
+                let _ = ctrl.send(&format!("FAULTACK @{axis}"));
             }
-            let _ = ctrl.command(&format!("ENABLE @{axis}"));
+            let _ = ctrl.send(&format!("ENABLE @{axis}"));
         } else {
             // C clears it so the user can jog off the limit (:434-435).
             if self.last_fault & TRAVEL_LIMIT_FAULT_MASK != 0 {
                 self.problem = false;
                 self.status_writes.push(StatusWrite::Problem(false));
             }
-            let _ = ctrl.command(&format!("DISABLE @{axis}"));
+            let _ = ctrl.send(&format!("DISABLE @{axis}"));
         }
         // C's status is WAIT MODE NOWAIT's; PowerOn follows the request even
         // when ENABLE fails, to force a status update (:461-476).
@@ -500,7 +495,7 @@ impl AsynMotor for EnsembleAxis {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let axis = self.axis;
         let (axis_status, plane_active, enc_pos, cmd_pos, fault, act_vel) = {
-            let ctrl = self.lock();
+            let mut ctrl = self.lock();
             let axis_status = atol(&ctrl.query(&format!("AXISSTATUS(@{axis})"))?) as u32;
             self.report.set_axis_status(axis_status);
             let plane_active = (atoi(&ctrl.query("PLANESTATUS(0)")?) & 0x01) != 0;
@@ -588,8 +583,8 @@ mod tests {
 
     #[test]
     fn step_size_is_one_for_a_refused_counts_per_unit() {
-        assert_eq!(step_size(Ok("1000".into())), 0.001);
-        assert_eq!(step_size(Err(ens_err("refused"))), 1.0);
+        assert_eq!(step_size(Some("1000".into())), 0.001);
+        assert_eq!(step_size(None), 1.0);
     }
 
     #[test]
@@ -806,23 +801,26 @@ mod tests {
     }
 
     /// drvEnsembleAsyn.cc:458-476: enable and disable post the requested
-    /// PowerOn whether or not ENABLE or DISABLE was accepted; a failed
-    /// `WAIT MODE NOWAIT` posts nothing and fails the write.
+    /// PowerOn whether or not ENABLE or DISABLE was accepted; a NAK'd
+    /// `WAIT MODE NOWAIT` too, and only a failed one posts nothing and fails
+    /// the write.
     #[epics_rs::base::epics_test]
     async fn closed_loop_posts_power_on_unless_nowait_fails() {
         use epics_rs::asyn::interfaces::motor::StatusWrite;
         use motor_common::testing::LineRig;
 
-        let nowait = Arc::new(Mutex::new("%".to_string()));
-        let reply = {
-            let nowait = nowait.clone();
-            move |cmd: &str| match cmd.trim_end() {
-                "ENABLE @0" => "!".into(),
-                "WAIT MODE NOWAIT" => nowait.lock().unwrap().clone(),
-                _ => "%0".into(),
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reply = move |cmd: &str| match cmd.trim_end() {
+            "ENABLE @0" | "WAIT MODE NOWAIT" => "!".into(),
+            _ => "%0".into(),
+        };
+        let fails = {
+            let fail = fail.clone();
+            move |cmd: &str| {
+                cmd.starts_with("WAIT") && fail.load(std::sync::atomic::Ordering::SeqCst)
             }
         };
-        let (line, io) = LineRig::new("ensPowerLine", reply);
+        let (line, io) = LineRig::failing("ensPowerLine", reply, fails);
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensPowerLine", "0")));
         let mut axis = EnsembleAxis::new(controller, 0, 0).unwrap();
         let user = AsynUser::new(0);
@@ -832,9 +830,125 @@ mod tests {
         assert_eq!(axis.take_status_writes(), [StatusWrite::PowerOn(true)]);
         axis.set_closed_loop(&user, false).unwrap();
         assert_eq!(axis.take_status_writes(), [StatusWrite::PowerOn(false)]);
-        *nowait.lock().unwrap() = "!".into();
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(axis.set_closed_loop(&user, true).is_err());
         assert!(axis.take_status_writes().is_empty());
+    }
+
+    /// An axis 0 on a line answering `reply`, its writes `fails` picks
+    /// refused.
+    fn rig_axis(
+        name: &str,
+        reply: impl Fn(&str) -> String + Send + Sync + 'static,
+        fails: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (motor_common::testing::LineRig, EnsembleAxis) {
+        let (line, io) = motor_common::testing::LineRig::failing(name, reply, fails);
+        let controller = Arc::new(Mutex::new(EnsembleController::new(io, name, "0")));
+        let axis = EnsembleAxis::new(controller, 0, 0).unwrap();
+        line.sent();
+        (line, axis)
+    }
+
+    /// drvEnsembleAsyn.cc:1032-1093: `sendAndReceive` fails only on I/O, so
+    /// a NAK fails only the commands whose caller checks the ACK
+    /// (POSOFFSET, :358-361); RAMP RATE, the home SETPARMs and IGLOBALs,
+    /// AbortDecelRate and RAMP MODE are not checked at all.
+    #[test]
+    fn a_nak_fails_only_where_c_checks_the_ack() {
+        let user = AsynUser::new(0);
+        let nak = |cmd: &str| {
+            if cmd.starts_with("GETPARM") {
+                "%0".into()
+            } else {
+                "!".into()
+            }
+        };
+        let (line, mut axis) = rig_axis("ensNakLine", nak, |_| false);
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        axis.move_relative(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
+        axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
+        axis.stop(&user, 1.0).unwrap();
+        assert!(axis.set_position(&user, 1.0).is_err());
+        assert_eq!(line.sent().len(), 3 + 3 + 3 + 6 + 1 + 1);
+
+        // RAMP MODE's NAK does not refuse the axis.
+        let (_line, io) = motor_common::testing::LineRig::new("ensNakProbe", nak);
+        let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensNakProbe", "0")));
+        assert!(EnsembleAxis::new(controller, 0, 0).is_ok());
+    }
+
+    /// drvEnsembleAsyn.cc:510-533, :584-597, :619-629: a failed exchange
+    /// fails a move only at ABS/INC or LINEAR, a home only at PROGRAM RUN, a
+    /// velocity move only at FREERUN.
+    #[test]
+    fn an_io_failure_fails_only_the_checked_exchange() {
+        let user = AsynUser::new(0);
+        let unchecked = |cmd: &str| {
+            cmd.starts_with("RAMP") || cmd.starts_with("SETPARM") || cmd.starts_with("IGLOBAL")
+        };
+        let (_line, mut axis) = rig_axis("ensIoLine", |_| "%".into(), unchecked);
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
+        axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
+
+        let (_line, mut axis) =
+            rig_axis("ensIoLinear", |_| "%".into(), |c| c.starts_with("LINEAR"));
+        assert!(axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).is_err());
+        let (_line, mut axis) = rig_axis("ensIoRun", |_| "%".into(), |c| c.starts_with("PROGRAM"));
+        assert!(axis.home(&user, 0.0, 1.0, 1.0, true).is_err());
+        let (_line, mut axis) = rig_axis("ensIoFree", |_| "%".into(), |c| c.starts_with("FREERUN"));
+        assert!(axis.move_velocity(&user, 0.0, 1.0, 1.0).is_err());
+        let (_line, mut axis) = rig_axis("ensIoAbort", |_| "%".into(), |c| c.starts_with("ABORT"));
+        assert!(axis.stop(&user, 1.0).is_err());
+    }
+
+    /// drvEnsembleAsyn.cc:1050-1092: a bare ACK is the reply, read once (the
+    /// ACK-then-EOS re-read never matches a line the input EOS stripped),
+    /// and its value is `atoi("")`.
+    #[test]
+    fn a_bare_ack_is_a_zero_value() {
+        use motor_common::testing::LineRig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reply = {
+            let reads = reads.clone();
+            move |_: &str| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                "%".into()
+            }
+        };
+        let (_line, io) = LineRig::new("ensBareLine", reply);
+        let mut ctrl = EnsembleController::new(io, "ensBareLine", "0");
+        assert_eq!(ctrl.get_param(0, PARAM_HOME_SETUP).as_deref(), Some(""));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    /// drvEnsembleAsyn.cc:961-970: any reply to `NONE` answers the ping.
+    #[test]
+    fn any_reply_answers_the_ping() {
+        use motor_common::testing::LineRig;
+        let (_line, io) = LineRig::new("ensPingLine", |_| String::new());
+        let mut ctrl = EnsembleController::new(io, "ensPingLine", "0");
+        assert!(ctrl.ping().is_ok());
+    }
+
+    /// drvEnsembleAsyn.cc:972-1015: a probe whose exchange fails reads the
+    /// reply C's `inputBuff` still holds.
+    #[test]
+    fn a_failed_probe_reads_the_last_reply() {
+        let reply = |cmd: &str| {
+            if cmd.contains(&format!(", {PARAM_COUNTS_PER_UNIT})")) {
+                "%1000".into()
+            } else {
+                "%7".into()
+            }
+        };
+        let home = format!("GETPARM(@0, {PARAM_HOME_OFFSET})");
+        let (_line, axis) = rig_axis("ensStaleLine", reply, move |c| c == home);
+        let mut text = String::new();
+        motor_common::AxisReport::report(&*axis.report(), &mut text, 1);
+        assert!(text.contains("home preset: 1000.000000"), "{text}");
     }
 
     #[test]
