@@ -159,6 +159,27 @@ const CHANNEL_PATHS: [ChannelPath; 7] = [
 
 /// C `checkPath` (ADTimePix.cpp:115): one trailing '/' is dropped for the
 /// directory test and the path always comes back ending in '/'.
+/// C `NetworkClient::isTcpPortInUse` (network_client.cpp:177-198): a bind
+/// with SO_REUSEADDR to the host's IPv4 address fails with EADDRINUSE.
+fn tcp_port_in_use(host: &str, port: u32) -> bool {
+    use std::net::ToSocketAddrs;
+    let Ok(port) = u16::try_from(port) else {
+        return false;
+    };
+    let Some(addr) = (host, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.find(|a| a.is_ipv4()))
+    else {
+        return false;
+    };
+    // std sets SO_REUSEADDR before binding on Unix.
+    matches!(
+        std::net::TcpListener::bind(addr),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
+    )
+}
+
 fn check_path(path: &str) -> (String, bool) {
     if path.is_empty() {
         return (String::new(), false);
@@ -2010,6 +2031,9 @@ impl TimePix3Driver {
             }
         }
 
+        if !self.ensure_preview_tcp_ports_free(false) {
+            return Err("Failed to reassign occupied preview TCP ports");
+        }
         if !self
             .shared
             .acquisition
@@ -2017,7 +2041,26 @@ impl TimePix3Driver {
         {
             return Err("Acquisition start was cancelled");
         }
-        if let Err(e) = self.http.get(serval::MEASUREMENT_START, DEFAULT_TIMEOUT) {
+        const PORT_CONFLICT: &str = "Address already in use";
+        let mut started = self.http.get(serval::MEASUREMENT_START, DEFAULT_TIMEOUT);
+        if let Err(e) = &started
+            && e.body().contains(PORT_CONFLICT)
+        {
+            self.ad.port_base.trace_print(
+                TraceMask::WARNING,
+                format_args!(
+                    "{}",
+                    adlog::warn(
+                        adlog::ACQUIRE_START,
+                        "measurement/start failed with port conflict; rotating preview ports and retrying once",
+                    )
+                ),
+            );
+            if self.ensure_preview_tcp_ports_free(true) {
+                started = self.http.get(serval::MEASUREMENT_START, DEFAULT_TIMEOUT);
+            }
+        }
+        if let Err(e) = started {
             self.log_http(
                 &e,
                 HttpPrint::Failure(
@@ -2026,7 +2069,11 @@ impl TimePix3Driver {
                     serval::MEASUREMENT_START,
                 ),
             );
-            return Err(FAILED);
+            return Err(if e.body().contains(PORT_CONFLICT) {
+                "Preview TCP port in use (Serval did not release a prior listener)"
+            } else {
+                FAILED
+            });
         }
         // acquire.cpp:416.
         self.shared.rates.lock().prv_img.restart();
@@ -2066,14 +2113,23 @@ impl TimePix3Driver {
         {
             return Err("Histogram TCP path is invalid");
         }
+        self.sync_tcp_stream_endpoints();
+        self.shared.set_stream_paths(prv_img, img, prv_hst);
+        Ok(())
+    }
+
+    /// C `syncTcpStreamEndpoints` (acquire.cpp:201-223): re-check each
+    /// enabled preview path, and the image path when it is tcp://.
+    fn sync_tcp_stream_endpoints(&mut self) {
+        let p = self.p;
         let mut checked = vec![];
-        if prv_img.is_some() {
+        if self.int(p.write_prv_img, 0) != 0 {
             checked.push(p.prv_img_base);
         }
         if self.int(p.write_prv_img1, 0) != 0 {
             checked.push(p.prv_img1_base);
         }
-        if img.as_deref().is_some_and(|b| b.starts_with("tcp://")) {
+        if self.int(p.write_img, 0) != 0 && self.text(p.img_base, 0).starts_with("tcp://") {
             checked.push(p.img_base);
         }
         for base in checked {
@@ -2081,8 +2137,88 @@ impl TimePix3Driver {
                 let _ = self.check_channel_path(channel);
             }
         }
-        self.shared.set_stream_paths(prv_img, img, prv_hst);
-        Ok(())
+    }
+
+    /// C `ensurePreviewTcpPortsFree` (acquire.cpp:229-293): move each enabled
+    /// tcp:// channel whose port is bound locally (Serval keeps listeners
+    /// after a stop), or every one when `force_rotate`, to the next free port,
+    /// then re-send the destination. False is C's asynError.
+    fn ensure_preview_tcp_ports_free(&mut self, force_rotate: bool) -> bool {
+        let p = self.p;
+        let mut reserved = std::collections::BTreeSet::new();
+        let mut changed = false;
+        for (write, base) in [
+            (p.write_prv_img, p.prv_img_base),
+            (p.write_prv_img1, p.prv_img1_base),
+            (p.write_img, p.img_base),
+            (p.write_prv_hst, p.prv_hst_base),
+        ] {
+            if self.int(write, 0) == 0 {
+                continue;
+            }
+            let Some((host, port)) = crate::stream::parse_tcp_path(&self.text(base, 0)) else {
+                continue;
+            };
+            let port = u32::from(port);
+            reserved.insert(port);
+            let busy = tcp_port_in_use(&host, port);
+            if !force_rotate && !busy {
+                continue;
+            }
+            let search_from = port + 1;
+            let Some(candidate) = (search_from..=65535)
+                .find(|c| !reserved.contains(c) && !tcp_port_in_use(&host, *c))
+            else {
+                self.ad.port_base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{}",
+                        adlog::err(
+                            adlog::ENSURE_PREVIEW_TCP_PORTS_FREE,
+                            &format!(
+                                "No free TCP port found for preview channel (starting at {search_from})"
+                            ),
+                        )
+                    ),
+                );
+                let _ = self.ad.port_base.set_string_param(
+                    self.ad.params.status_message,
+                    0,
+                    "Preview TCP ports in use; restart Serval or choose different preview ports",
+                );
+                return false;
+            };
+            reserved.insert(candidate);
+            let _ = self.ad.port_base.set_string_param(
+                base,
+                0,
+                format!("tcp://listen@{host}:{candidate}"),
+            );
+            self.ad.port_base.trace_print(
+                TraceMask::IO_DRIVER,
+                format_args!(
+                    "{}",
+                    adlog::log(
+                        adlog::ENSURE_PREVIEW_TCP_PORTS_FREE,
+                        &format!(
+                            "Preview TCP port {port} -> {candidate} ({})",
+                            if force_rotate {
+                                "forced rotate"
+                            } else {
+                                "port in use"
+                            }
+                        ),
+                    )
+                ),
+            );
+            changed = true;
+        }
+        self.sync_tcp_stream_endpoints();
+        if !changed {
+            return true;
+        }
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        self.file_writer().is_ok()
     }
 
     /// acquire.cpp:428-503: every enabled TCP channel's worker must connect
@@ -4208,6 +4344,180 @@ mod tests {
         assert_eq!(det.int(p.dropped_frames, 0), 1);
         assert_eq!(det.text(p.status, 0), "DA_STOPPED");
         assert_eq!(det.int(p.pipeline_state, 0), 3);
+    }
+
+    /// A `/measurement/start` refused with "Address already in use" rotates
+    /// the preview ports and retries once; a second refusal fails with C's
+    /// port message (acquire.cpp:392-409).
+    #[test]
+    fn a_start_port_conflict_rotates_and_retries_once() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Serval refusing the first `refusals` starts; returns the trace,
+        // StatusMessage and the number of starts.
+        fn run(name: &'static str, refusals: usize) -> (String, String, usize) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let starts = Arc::new(AtomicUsize::new(0));
+            let seen = starts.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut reader = BufReader::new(stream);
+                    let (mut request, mut length) = (String::new(), 0);
+                    let _ = reader.read_line(&mut request);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(v) = lower.strip_prefix("content-length:") {
+                            length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    let _ = reader.read_exact(&mut body);
+                    let (status, reply) = if request.starts_with("GET /measurement/start") {
+                        if seen.fetch_add(1, Ordering::SeqCst) < refusals {
+                            ("500 Internal Server Error", "bind: Address already in use")
+                        } else {
+                            ("200 OK", "{}")
+                        }
+                    } else {
+                        ("200 OK", "{}")
+                    };
+                    let _ = reader.get_mut().write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                            reply.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+            let det = TimePix3Driver::new(
+                name,
+                Arc::new(ServalHttp::new(&url)),
+                Arc::new(Shared::new()),
+                0,
+                cmd_tx,
+            )
+            .unwrap();
+            let (acquire, message) = (det.ad.params.acquire, det.ad.params.status_message);
+            let (runtime, _) = create_port_runtime(
+                &epics_rs::asyn::registry::claim_port(name).unwrap(),
+                det,
+                RuntimeConfig::default(),
+            )
+            .unwrap();
+            let h = runtime.port_handle().clone();
+            let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let file = std::fs::File::create(&path).unwrap();
+            h.trace().set_trace_file(
+                Some(name),
+                TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+            h.trace()
+                .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::WARNING);
+            let _ = h.write_int32_blocking(acquire, 0, 1);
+            let message = h
+                .with_driver_blocking::<TimePix3Driver, _>(move |d| d.text(message, 0))
+                .unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            std::mem::forget(runtime);
+            (text, message, starts.load(Ordering::SeqCst))
+        }
+        let warn = adlog::warn(
+            adlog::ACQUIRE_START,
+            "measurement/start failed with port conflict; rotating preview ports and retrying once",
+        );
+
+        let (text, _, starts) = run("TPX_START_RETRY", 1);
+        assert_eq!(starts, 2);
+        assert!(text.contains(&warn), "{text}");
+        assert!(
+            !text.contains("acquireStart GET /measurement/start"),
+            "{text}"
+        );
+
+        let (text, message, starts) = run("TPX_START_CONFLICT", 2);
+        assert_eq!(starts, 2);
+        assert!(text.contains(&warn), "{text}");
+        assert_eq!(
+            message,
+            "Preview TCP port in use (Serval did not release a prior listener)"
+        );
+    }
+
+    /// An enabled tcp:// channel whose port is bound locally moves to the
+    /// next free port, logged, and the destination is re-sent
+    /// (acquire.cpp:229-293).
+    #[test]
+    fn a_busy_preview_port_moves_to_the_next_free_one() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "TPX_PORT_BUSY";
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = held.local_addr().unwrap().port();
+        let (url, rx) = capturing_serval();
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new(&url)),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let b = &mut det.ad.port_base;
+        b.set_int32_param(p.write_prv_img, 0, 1).unwrap();
+        b.set_string_param(p.prv_img_base, 0, format!("tcp://127.0.0.1:{busy}"))
+            .unwrap();
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace().set_trace_mask(Some(name), TraceMask::IO_DRIVER);
+        let (ok, base) = h
+            .with_driver_blocking::<TimePix3Driver, _>(move |d| {
+                (
+                    d.ensure_preview_tcp_ports_free(false),
+                    d.text(p.prv_img_base, 0),
+                )
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        std::mem::forget(runtime);
+        assert!(ok);
+        let (host, moved) = crate::stream::parse_tcp_path(&base).unwrap();
+        assert_eq!(base, format!("tcp://listen@{host}:{moved}"));
+        assert!(moved > busy);
+        assert!(text.contains(&adlog::log(
+            adlog::ENSURE_PREVIEW_TCP_PORTS_FREE,
+            &format!("Preview TCP port {busy} -> {moved} (port in use)")
+        )));
+        assert!(
+            rx.try_iter()
+                .any(|(line, _)| line.starts_with("PUT /server/destination "))
+        );
+        drop(held);
     }
 
     /// A `GET /measurement` reply that fails C `parseStatusResponse` is
