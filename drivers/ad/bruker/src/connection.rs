@@ -54,8 +54,11 @@ fn failed(message: &str) -> Exchange {
     })
 }
 
+/// C posts `fromBIS` up to its first NUL, whitespace included
+/// (BISDetector.cpp:325).
 fn reply_text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).trim_end().to_string()
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 struct Request {
@@ -132,5 +135,15 @@ fn exchange(io: &SyncIOHandle, command: &str, timeout: Duration) -> Exchange {
             status: Err(e),
         },
         Err(e) => Exchange::NotSent(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_is_cut_at_its_first_nul_and_keeps_its_whitespace() {
+        assert_eq!(reply_text(b"[ACK] \r\n\0old"), "[ACK] \r\n");
     }
 }
