@@ -3146,11 +3146,13 @@ async fn publish_img_sum(
         return;
     };
     array.unique_id = unique_id;
+    // serval_stream.cpp:1271-1275, :1301-1305: stamped before getAttributes.
+    array.time_stamp = EpicsTimestamp::now().as_f64();
+    array.timestamp = ctx.port_time_stamp().await;
     ctx.worker_attributes(&mut array).await;
     let saturated = Accum::Img.saturated(&ctx.shared);
     add_range_attributes(&mut array, "uint64", "counts", saturated);
-    ctx.publish_at(addr, array, EpicsTimestamp::now().as_f64())
-        .await;
+    ctx.publish_stamped(addr, array).await;
 }
 
 /// C `pushProcessedImgToPlugins` (serval_stream.cpp:1441): the accumulated
@@ -5868,6 +5870,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(posted.timestamp, EpicsTimestamp::from(fixed));
+    }
+
+    /// An Img sum is stamped before getAttributes (serval_stream.cpp:
+    /// 1271-1275), so a port busy when the attributes are read does not move
+    /// its timeStamp.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_img_sum_is_stamped_before_its_attributes() {
+        let ctx = Arc::new(idle_ctx_at(
+            "TPX_SUM_STAMP",
+            "http://127.0.0.1:1",
+            Some(br#"<Attributes><Attribute name="Exposure" type="PARAM" source="ACQ_TIME" datatype="DOUBLE"/></Attributes>"#),
+        ));
+        let (tx, mut rx) =
+            epics_rs::ad_core::plugin::channel::ndarray_channel("TPX_SUM_STAMP_SINK", 4);
+        ctx.outputs[2].lock().add(tx);
+        let before = EpicsTimestamp::now().as_f64();
+        let hold = ctx.handle.clone();
+        let held = tokio::spawn(async move {
+            hold.with_driver::<TimePix3Driver, _>(|_| {
+                std::thread::sleep(Duration::from_millis(500))
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let c = ctx.clone();
+        let sum = tokio::spawn(async move { publish_img_sum(&c, 2, 1, 1, vec![1], 1).await });
+        let posted = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        sum.await.unwrap();
+        held.await.unwrap().unwrap();
+        assert!(posted.attributes.get("Exposure").is_some());
+        assert!(
+            posted.time_stamp - before < 0.4,
+            "{}",
+            posted.time_stamp - before
+        );
     }
 
     /// serval_stream.cpp:177-183 allocates the frame with a NULL pData, so a
