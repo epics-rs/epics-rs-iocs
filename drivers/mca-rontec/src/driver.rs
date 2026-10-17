@@ -636,16 +636,26 @@ impl PortDriver for RontecDriver {
             .find(|r| r.drv_info().eq_ignore_ascii_case(&req.drv_info))
         {
             Some(r) => {
-                // C's own text: it names drvSweep, not drvMcaRontec.
-                self.base.trace_print(
+                let reason = self.reasons[r as usize];
+                // C's own text: it names drvSweep, not drvMcaRontec. C sets
+                // `pasynUser->reason` to the command before this print.
+                self.base.trace_print_at(
+                    req.addr,
+                    reason as i32,
                     TraceMask::FLOW,
+                    file!(),
+                    line!(),
                     format_args!("drvSweep::drvUserCreate, command={}\n", r.drv_info()),
                 );
-                Ok(DrvUserInfo::from_reason(self.reasons[r as usize]))
+                Ok(DrvUserInfo::from_reason(reason))
             }
             None => {
-                self.base.trace_print(
+                self.base.trace_print_at(
+                    req.addr,
+                    0,
                     TraceMask::ERROR,
+                    file!(),
+                    line!(),
                     format_args!(
                         "drvMcaRontec::drvUserCreate, unknown command={}\n",
                         req.drv_info
@@ -1243,6 +1253,43 @@ mod tests {
             "{}",
             rig.trace()
         );
+    }
+
+    /// C prints both drvUserCreate lines on the record's `pasynUser`: its
+    /// addr, and the command as reason once it is set (`drvMcaRontec.c:516,
+    /// 521`).
+    #[test]
+    fn drv_user_create_prints_on_the_records_addr_and_reason() {
+        use epics_rs::asyn::trace::TraceInfoMask;
+        let rig = Rig::new("drvuseraddr", rontec_reply);
+        rig.trace_on(TraceMask::ERROR | TraceMask::FLOW);
+        // What `register`'s publish records; the rig only claims.
+        rig.services.trace().register_port(&rig.names[1], true);
+        for name in &rig.names {
+            rig.services
+                .trace()
+                .set_trace_info_mask(Some(name), TraceInfoMask::PORT);
+        }
+        let handle = rig.rontec.port_handle();
+        handle
+            .drv_user_create_blocking(&DrvUserRequest::new("MCA_ERASE", 2))
+            .expect("known command");
+        assert!(
+            handle
+                .drv_user_create_blocking(&DrvUserRequest::new("NOT_A_COMMAND", 2))
+                .is_err()
+        );
+        let trace = rig.trace();
+        for line in [
+            format!(
+                "[RIGRON_drvuseraddr,2,{}] drvSweep::drvUserCreate, command=MCA_ERASE\n",
+                McaReason::Erase as usize
+            ),
+            "[RIGRON_drvuseraddr,2,0] drvMcaRontec::drvUserCreate, unknown command=NOT_A_COMMAND\n"
+                .to_owned(),
+        ] {
+            assert!(trace.contains(&line), "{line:?} not in\n{trace}");
+        }
     }
 
     /// C restores the input EOS `RontecConfig` saved, not the one in force
