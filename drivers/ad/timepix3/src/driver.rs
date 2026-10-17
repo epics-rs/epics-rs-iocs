@@ -2062,10 +2062,10 @@ impl TimePix3Driver {
             }
             set
         } else if reason == p.processed_img_output_type || reason == p.processed_hst_output_type {
-            // ADTimePix.cpp:593-597, :605-609.
-            if value != 0 && value != 1 {
-                self.ad.port_base.set_int32_param(reason, 0, 0)?;
-            }
+            // The addressed set, then always list 0 (ADTimePix.cpp:593-597,
+            // :605-609).
+            let output_type = if value == 0 || value == 1 { value } else { 0 };
+            let _ = self.ad.port_base.set_int32_param(reason, 0, output_type);
             set
         } else if reason == p.img_image_data_reset {
             if value == 1 {
@@ -4040,6 +4040,28 @@ mod tests {
         ] {
             let _ = det.write_int32(&mut AsynUser::new(reason), written);
             assert_eq!(det.int(reason, 0), stored, "reason {reason}");
+        }
+    }
+
+    /// A processed output type written at any address lands on list 0 as
+    /// well, and an unknown type is 0 there (ADTimePix.cpp:593-597, :605-609).
+    #[test]
+    fn a_processed_output_type_always_lands_on_list_zero() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_OUTPUT_TYPE",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        for reason in [p.processed_img_output_type, p.processed_hst_output_type] {
+            let _ = det.write_int32(&mut AsynUser::new(reason).with_addr(3), 1);
+            assert_eq!(det.int(reason, 0), 1, "reason {reason}");
+            let _ = det.write_int32(&mut AsynUser::new(reason).with_addr(3), 7);
+            assert_eq!(det.int(reason, 0), 0, "reason {reason}");
         }
     }
 
