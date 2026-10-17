@@ -69,7 +69,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -1203,7 +1203,7 @@ pub struct PhytronAxis {
     /// direction (1 = forward/high), bits>>1 = phase.
     home_state: i32,
     /// AXIS_STATUS as the last poll set it, for the poller to post.
-    poll_params: Vec<(usize, ParamValue)>,
+    sets: PortSets,
 }
 
 impl PhytronAxis {
@@ -1239,7 +1239,7 @@ impl PhytronAxis {
             axis_module_no,
             motor_enabled: false,
             home_state: 0,
-            poll_params: Vec::new(),
+            sets: PortSets::default(),
         })
     }
 
@@ -1410,7 +1410,7 @@ impl PhytronAxis {
 
         // phytronAxisMotor.cpp:2084
         if let Some(reason) = axis_status {
-            self.poll_params.push((reason, ParamValue::Int32(status)));
+            self.sets.axis(reason, ParamValue::Int32(status));
         }
 
         Ok(MotorStatus {
@@ -1432,8 +1432,8 @@ impl PhytronAxis {
 }
 
 impl AsynMotor for PhytronAxis {
-    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
-        std::mem::take(&mut self.poll_params)
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
     }
 
     /// C sets motorStatusProblem_ and returns asynSuccess on every failure:
@@ -1700,6 +1700,7 @@ fn mcc_status_word(axis_digit: u8, perr: &str, sui: &str, moving: bool) -> AsynR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::motor::PortSet;
 
     /// An MCC that ACKs every command, answering `P22R` with 1000 and the
     /// rest of a poll with an idle, fault-free axis; records each command
@@ -1809,9 +1810,24 @@ mod tests {
             0,
         )));
         controller.lock().unwrap().poll();
+        controller.lock().unwrap().set_axis_status_reason(99);
         let mut axis = PhytronAxis::new(controller.clone(), 0, 1).unwrap();
         let user = AsynUser::new(0);
         assert_eq!(axis.poll(&user).unwrap().encoder_position, 1000.0);
+        // AXIS_STATUS on the axis's own address, the poll's only step on
+        // the port (:2084).
+        let sets: Vec<_> = axis
+            .take_port_sets()
+            .into_iter()
+            .map(|set| match set {
+                PortSet::Axis {
+                    reason,
+                    value: ParamValue::Int32(_),
+                } => reason,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(sets, [99]);
         axis.set_encoder_ratio(&user, 0.5).unwrap();
         assert_eq!(axis.poll(&user).unwrap().encoder_position, 500.0);
         controller
