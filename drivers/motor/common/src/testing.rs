@@ -1,5 +1,6 @@
-//! A recording serial line for driver tests: every write is kept, and a read
-//! answers the last write through the test's `reply`.
+//! Driver test rigs: a recording serial line, where every write is kept and
+//! a read answers the last write through the test's `reply`, and a count of
+//! the process's `motorPoller` threads.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -75,4 +76,43 @@ impl LineRig {
     pub fn sent(&self) -> Vec<String> {
         std::mem::take(&mut *self.sent.lock().unwrap())
     }
+}
+
+/// The `motorPoller` threads of this process; nextest runs each test in its
+/// own.
+#[cfg(target_os = "linux")]
+pub fn pollers() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+        .filter(|name| name.trim_end() == "motorPoller")
+        .count()
+}
+
+/// Run `cmd` with `args` as the shell does, on a thread of its own, and
+/// return the `motorPoller` count once the first has started.
+#[cfg(target_os = "linux")]
+pub async fn pollers_after(
+    cmd: epics_rs::base::server::iocsh::registry::CommandDef,
+    args: Vec<epics_rs::base::server::iocsh::registry::ArgValue>,
+) -> usize {
+    use epics_rs::base::runtime::task::{BlockingBridge, sleep};
+    use epics_rs::base::server::database::PvDatabase;
+    use epics_rs::base::server::iocsh::registry::CommandContext;
+
+    let bridge = BlockingBridge::capture();
+    std::thread::spawn(move || {
+        let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
+        cmd.handler.call(&args, &ctx).unwrap();
+    })
+    .join()
+    .unwrap();
+    for _ in 0..100 {
+        if pollers() > 0 {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    sleep(Duration::from_millis(200)).await;
+    pollers()
 }

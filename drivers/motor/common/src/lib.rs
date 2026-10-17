@@ -249,3 +249,64 @@ mod tests {
         assert_eq!(passes[..4], [0, 1, 0, 1], "{passes:?}");
     }
 }
+
+#[cfg(all(test, feature = "testing", target_os = "linux"))]
+mod poller_count {
+    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::interfaces::motor::{MotorStatus, PollFailure};
+    use epics_rs::asyn::user::AsynUser;
+    use epics_rs::base::server::iocsh::registry::{ArgValue, CommandDef, CommandOutcome};
+
+    use super::*;
+    use crate::testing::pollers_after;
+
+    struct Idle;
+
+    impl AsynMotor for Idle {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            Ok(MotorStatus::default())
+        }
+    }
+
+    #[epics_rs::base::epics_test]
+    async fn a_controller_s_axes_share_one_motor_poller() {
+        let cmd = CommandDef::new(
+            "countPollers",
+            vec![],
+            "countPollers",
+            |_: &[ArgValue], ctx: &CommandContext| {
+                register_port(ctx, "countPollers", 3)?;
+                let controller = Controller::new();
+                for addr in 0..3 {
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Idle));
+                    controller.install(asyn_user("countPollers", addr), motor)?;
+                }
+                controller.start(ctx, 10, 10, 0);
+                Ok(CommandOutcome::Continue)
+            },
+        );
+        assert_eq!(pollers_after(cmd, vec![]).await, 1);
+    }
+}
