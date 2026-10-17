@@ -951,10 +951,10 @@ impl AsynMotor for Mm4000Axis {
         let motion_sent = std::mem::take(&mut self.motion_sent);
         let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(poll) = ctrl.model1_poll() {
-            // drvMM4000.cc:341-353: RETRY goes to `exit` with 0, so nothing
-            // is posted: the poll fails.
-            if poll.comm == CommStatus::Retry {
-                self.retry_failed = true;
+            // drvMM4000.cc:341-353: RETRY fails the poll raising nothing,
+            // COMM_ERR raising `poll_failure`'s bits.
+            if poll.comm != CommStatus::Normal {
+                self.retry_failed = poll.comm == CommStatus::Retry;
                 return Err(mm_err(format!("MM4000 axis {}: no MS; reply", self.axis)));
             }
             let s = ctrl.set_status(&poll, self.axis - 1, self.encoder_present, step, &self.last);
@@ -1318,11 +1318,9 @@ mod tests {
         sent.lock().unwrap().clear();
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        let comm_err = axis.poll(&user).unwrap();
+        assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), MODEL1_POLL_FAILURE);
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TH;", "MS;", "TH;"]);
-        assert!(comm_err.comms_error && comm_err.problem);
-        assert_eq!(comm_err.position, before.position);
 
         silent.lock().unwrap().clear();
         sent.lock().unwrap().clear();
