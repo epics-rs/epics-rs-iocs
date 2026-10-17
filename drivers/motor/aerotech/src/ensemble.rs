@@ -17,10 +17,6 @@
 //!
 //! - Profile / trajectory moves: drvMotorAsyn never calls `profileMove` /
 //!   `triggerProfile`.
-//! - Encoder-ratio / resolution / limit / PID setters send nothing, as C's
-//!   `motorAxisSetDouble` cases do, but C also prints their TERROR line
-//!   ("Ensemble does not support ...") on the axis's drvAsynMotorConfigure
-//!   user, which this axis is never given.
 //!
 //! ## Deviations from C (documented)
 //!
@@ -40,10 +36,12 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model2::AxisLog;
 use motor_common::util::{atof, atoi, atol};
 
 use crate::axis_report::AxisMembers;
@@ -219,6 +217,7 @@ pub struct EnsembleAxis {
     /// C `maxDigits`.
     digits: usize,
     report: Arc<AxisMembers>,
+    log: Arc<AxisLog>,
 }
 
 impl EnsembleAxis {
@@ -274,6 +273,7 @@ impl EnsembleAxis {
                 max_digits(step_size),
                 home_preset,
             )),
+            log: Arc::default(),
         })
     }
 
@@ -282,8 +282,19 @@ impl EnsembleAxis {
         self.report.clone()
     }
 
+    /// The user C's `PRINT(pAxis->logParam, ...)` lines go through.
+    pub fn log(&self) -> Arc<AxisLog> {
+        self.log.clone()
+    }
+
     fn lock(&self) -> MutexGuard<'_, EnsembleController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A `motorAxisSetDouble` case C answers with only a TERROR line
+    /// (drvEnsembleAsyn.cc:364-399).
+    fn refuse(&self, line: &str) {
+        self.log.print(TraceMask::ERROR, format_args!("{line}\n"));
     }
 
     /// A record step value in user units, formatted as C's `%.*f`.
@@ -407,6 +418,30 @@ impl AsynMotor for EnsembleAxis {
         let axis = self.axis;
         self.lock()
             .command(&format!("POSOFFSET SET @{axis}, {}", self.units(position)))
+    }
+
+    fn set_encoder_ratio(&mut self, _user: &AsynUser, _ratio: f64) -> AsynResult<()> {
+        self.refuse("motorAxisSetDouble: Ensemble does not support setting encoder ratio");
+        Ok(())
+    }
+
+    fn set_low_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        self.refuse("Driver does not set Ensemble's Low Limit");
+        Ok(())
+    }
+
+    fn set_high_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        self.refuse("Driver does not set Ensemble's High Limit");
+        Ok(())
+    }
+
+    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, _gain: f64) -> AsynResult<()> {
+        self.refuse(match kind {
+            PidGainKind::Proportional => "Ensemble does not support setting proportional gain",
+            PidGainKind::Integral => "Ensemble does not support setting integral gain",
+            PidGainKind::Derivative => "Ensemble does not support setting derivative gain",
+        });
+        Ok(())
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, closed_loop: bool) -> AsynResult<()> {
@@ -533,6 +568,75 @@ mod tests {
         let swconfig = CW_EOT_SW_STATE;
         let cw_active = !(((status & CW_LIMIT) != 0) ^ ((swconfig & CW_EOT_SW_STATE) != 0));
         assert!(cw_active);
+    }
+
+    /// drvEnsembleAsyn.cc:364-399: the setters the Ensemble refuses print
+    /// their TERROR line on the axis's drvAsynMotorConfigure user.
+    #[epics_rs::base::epics_test]
+    async fn refused_setters_print_on_the_axis_s_log_user() {
+        use epics_rs::asyn::interfaces::motor::PidGainKind;
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::testing::{LineRig, run_command};
+
+        static DRIVER: Model2 = Model2::new("ensLogTest", 0);
+        let (_line, io) = LineRig::new("ensLogLine", |_| "%0".into());
+        let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensLogLine", "0")));
+        let axis = EnsembleAxis::new(controller, 0).unwrap();
+        let log = axis.log();
+        let axis = Arc::new(Mutex::new(axis));
+        let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
+        DRIVER.set_card(0, vec![motor], 100, 1000);
+        DRIVER.set_axis_logs(0, vec![log]);
+        let args = vec![
+            ArgValue::String("ensLog".into()),
+            ArgValue::String("ensLogTest".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(1),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&DRIVER]), args).await;
+
+        let path = std::env::temp_dir().join(format!("ens-log-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("ensLog"), TraceMask::ERROR);
+        trace.set_trace_file(Some("ensLog"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("ensLog", 0, TraceFile::File(file.clone()));
+        let user = AsynUser::new(0);
+        {
+            let mut axis = axis.lock().unwrap();
+            axis.set_encoder_ratio(&user, 1.0).unwrap();
+            axis.set_low_limit(&user, -1.0).unwrap();
+            axis.set_high_limit(&user, 1.0).unwrap();
+            axis.set_pid_gain(&user, PidGainKind::Proportional, 1.0)
+                .unwrap();
+            axis.set_pid_gain(&user, PidGainKind::Integral, 1.0)
+                .unwrap();
+            axis.set_pid_gain(&user, PidGainKind::Derivative, 1.0)
+                .unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // Each line follows asynPrint's timestamp.
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "motorAxisSetDouble: Ensemble does not support setting encoder ratio",
+                "Driver does not set Ensemble's Low Limit",
+                "Driver does not set Ensemble's High Limit",
+                "Ensemble does not support setting proportional gain",
+                "Ensemble does not support setting integral gain",
+                "Ensemble does not support setting derivative gain",
+            ],
+            "{text}"
+        );
     }
 
     #[test]
