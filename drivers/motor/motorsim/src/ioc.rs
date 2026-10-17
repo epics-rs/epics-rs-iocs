@@ -6,7 +6,7 @@
 //! created, so [`MotorSimHolder`] keeps the concrete [`MotorSimAxis`]
 //! handles, the same allocations the pollers drive, keyed by port and axis.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
@@ -18,6 +18,8 @@ use epics_rs::motor::devices::{
 };
 use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_int, req_string};
 use motor_common::model1::c_int;
+use motor_common::model2::Model2;
+pub use motor_common::model2::drv_asyn_motor_configure_command;
 use motor_common::{TraceUser, asyn_user, install, register_port};
 
 use crate::motorsim::{
@@ -36,13 +38,21 @@ static DEV_MOTOR_SIM: DevSup = motor_interface_device("devMotorSim", "Motor Simu
 /// @motorSim"` names.
 const DRIVER: &str = "motorSim";
 
+/// The same drvMotorSim axes as a `motorAxisDrvSET_t`, for
+/// `drvAsynMotorConfigure(port, "motorSim", card, nAxes)` (drvMotorAsyn.c).
+/// motorProcTask has no forced polls.
+pub static MOTOR_SIM: Model2 = Model2::new(DRIVER, 0);
+
+/// The axes motorSimCreate built, by card and signal.
+type SimAxes = BTreeMap<(i32, i32), Arc<Mutex<dyn AsynMotor>>>;
+
 /// `motorSimCreate(card, signal, lowLimit, hiLimit, home, nCards, nSignals,
 /// startPosn)`: axes `signal..signal+nSignals` of cards `card..card+nCards`
 /// for `DTYP "Motor Simulation"`, `OUT "#C card S signal @motorSim"`.
 pub fn motor_sim_create_command() -> CommandDef {
     register_motor_interface_device(&DEV_MOTOR_SIM);
     register_motor_interface_driver(DRIVER);
-    let created: Mutex<HashSet<(i32, i32)>> = Mutex::new(HashSet::new());
+    let created: Mutex<SimAxes> = Mutex::new(BTreeMap::new());
     CommandDef::new(
         "motorSimCreate",
         vec![
@@ -73,13 +83,14 @@ pub fn motor_sim_create_command() -> CommandDef {
             let mut created = created.lock().unwrap_or_else(|e| e.into_inner());
             for c in card..card.saturating_add(num_cards) {
                 for s in signal..signal.saturating_add(num_signals) {
-                    if !created.insert((c, s)) {
+                    if created.contains_key(&(c, s)) {
                         println!("Motor for card {c}, signal {s} already exists");
                         continue;
                     }
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
                         DrvMotorSimAxis::new(low as f64, hi as f64, home as f64),
                     ));
+                    created.insert((c, s), motor.clone());
                     let user = TraceUser::MotorInterface {
                         device: DEV_MOTOR_SIM.choice,
                         driver: DRIVER,
@@ -94,6 +105,10 @@ pub fn motor_sim_create_command() -> CommandDef {
                     install(ctx, user, motor, POLL_MS, POLL_MS, 0)?;
                     println!("Created motor for card {c}, signal {s} OK");
                 }
+                // Model2::open indexes by axis, so a card serves the axes
+                // from 0 up to its first gap.
+                let axes = (0..).map_while(|s| created.get(&(c, s)).cloned()).collect();
+                MOTOR_SIM.set_card(c, axes, POLL_MS, POLL_MS);
             }
             Ok(CommandOutcome::Continue)
         },
