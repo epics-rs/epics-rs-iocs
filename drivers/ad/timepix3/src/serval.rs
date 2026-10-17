@@ -1268,17 +1268,29 @@ fn dump_double(out: &mut String, d: f64) {
     }
 }
 
-/// C `strip_quotes` (serval_http.cpp:91).
+/// C `strip_quotes(j.dump())` (serval_http.cpp:44-48): a JSON string keeps
+/// its `dump()` escaping (`a"b` reads `a\"b`).
 ///
 /// UPSTREAM DEFECT (serval_http.cpp:44-48): C removes the first and last
 /// character unconditionally, so a `dump()` of a non-string (`null`, a number,
-/// an array) is mangled — `null` becomes `ul`, `1234` becomes `23`. Here a
-/// JSON string yields its contents and anything else its compact encoding.
+/// an array) is mangled — `null` becomes `ul`, `1234` becomes `23`. Here
+/// anything but a string yields its compact encoding, `null` nothing.
 pub fn json_to_string(v: &Value) -> String {
     match v {
-        Value::String(s) => s.clone(),
+        Value::String(_) => {
+            let quoted = dump(v, None, false);
+            quoted[1..quoted.len() - 1].to_string()
+        }
         Value::Null => String::new(),
         other => dump(other, None, false),
+    }
+}
+
+/// C `jsonStringOr` (serval_http.cpp:127-131): a JSON string is taken raw.
+pub fn json_string_or(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => json_to_string(other),
     }
 }
 
@@ -2199,6 +2211,10 @@ mod tests {
     #[test]
     fn json_to_string_does_not_mangle_a_non_string() {
         assert_eq!(json_to_string(&json!("Cu")), "Cu");
+        // strip_quotes(dump()) keeps the escapes; jsonStringOr does not.
+        assert_eq!(json_to_string(&json!("a\"b\\c\n")), r#"a\"b\\c\n"#);
+        assert_eq!(json_string_or(&json!("a\"b\\c\n")), "a\"b\\c\n");
+        assert_eq!(json_string_or(&Value::Null), "");
         // C's strip_quotes turns `null` into "ul" (serval_http.cpp:91).
         assert_eq!(json_to_string(&Value::Null), "");
         assert_eq!(json_to_string(&json!(["a", "b"])), r#"["a","b"]"#);

@@ -993,7 +993,7 @@ impl TimePix3Driver {
             self.ad.port_base.set_int32_param(
                 self.p.gain_mode,
                 0,
-                serval::gain_mode_from_string(&serval::json_to_string(gain)),
+                serval::gain_mode_from_string(&serval::json_string_or(gain)),
             )?;
         }
         Ok(())

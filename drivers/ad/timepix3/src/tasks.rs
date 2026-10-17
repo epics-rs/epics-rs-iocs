@@ -1200,11 +1200,11 @@ fn publish_detector(
         w.int(
             p.polarity,
             0,
-            (serval::json_to_string(v) == "Negative").into(),
+            (serval::json_string_or(v) == "Negative").into(),
         );
     }
     if let Some(v) = c("ChainMode") {
-        let chain = match serval::json_to_string(v).as_str() {
+        let chain = match serval::json_string_or(v).as_str() {
             "LEADER" => 1,
             "FOLLOWER" => 2,
             _ => 0,
@@ -1212,7 +1212,7 @@ fn publish_detector(
         w.int(p.chain_mode, 0, chain);
     }
     if let Some(v) = c("TriggerMode") {
-        let mode = serval::json_to_string(v);
+        let mode = serval::json_string_or(v);
         w.text(p.trigger_mode, 0, &mode);
         w.int(
             ad.trigger_mode,
@@ -1255,7 +1255,7 @@ fn publish_detector(
         w.int(
             p.gain_mode,
             0,
-            serval::gain_mode_from_string(&serval::json_to_string(v)),
+            serval::gain_mode_from_string(&serval::json_string_or(v)),
         );
     }
     if let Some(v) = c("ChargeSumming") {
@@ -5202,7 +5202,7 @@ mod tests {
         let (url, _log) = logging_serval(&[], |path| match path {
             "/detector" => {
                 r#"{"Info":{"PixCount":131072,"RowLen":2,"NumberOfChips":2,
-                "NumberOfRows":256,"MpxType":0,"ChipType":"MPX3","SW_version":"3.3.2",
+                "NumberOfRows":256,"MpxType":0,"ChipType":"MPX3","SW_version":"3.3.2","FW_version":"f\"1",
                 "Boards":[{"ChipboardId":"B","IpAddress":"ip","Chips":[{"Name":"W1"},{"Id":7}]}]},
                 "Health":[{"VDD":[1.5,0.1,0.6],"ChipTemperatures":[30.9,41]},
                           {"VDD":[2.5,0.2,0.7]}],
@@ -5275,6 +5275,12 @@ mod tests {
         assert_eq!(
             octet_set(&u, ad.base.serial_number).as_deref(),
             Some("3.3.2")
+        );
+        // strip_quotes(dump()) keeps the escape (serval_http.cpp:1339, 1343).
+        assert_eq!(octet_set(&u, p.fw_version).as_deref(), Some(r#"f\"1"#));
+        assert_eq!(
+            octet_set(&u, ad.base.firmware_version).as_deref(),
+            Some(r#"f\"1"#)
         );
         assert_eq!(
             octet_set(&u, p.chip_temperature).as_deref(),
