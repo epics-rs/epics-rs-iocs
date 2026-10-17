@@ -488,6 +488,11 @@ impl PIE710Axis {
 }
 
 impl AsynMotor for PIE710Axis {
+    // devPIE710.cc:127 forces NTM to NO.
+    fn disables_ntm(&self) -> bool {
+        true
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }

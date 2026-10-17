@@ -16,9 +16,9 @@
 //! 1, and its `EGU` is counts. Velocities cross the boundary in counts/s and
 //! accelerations in counts/s²; the controller wants rev/min and rev/s², so they
 //! are converted with the axis's counts-per-rev, sent as `ENCRES` ahead of
-//! every `SP`/`AC`/`HOSP` as C does. C takes it from the record's `SREV`,
-//! which is not visible at the asyn-rs boundary; the IOC passes `SREV`'s
-//! default, 200.
+//! every `SP`/`AC`/`HOSP` as C does, from the record's `SREV`
+//! (devMCDC2805.cc:227), which arrives with
+//! [`set_record_fields`](AsynMotor::set_record_fields) ahead of each move.
 //!
 //! ## Done detection
 //!
@@ -30,15 +30,13 @@
 //!
 //! - The C poller is a background thread; here the `GST`/`POS`/`GAST`/`GV`
 //!   reads and the limit-switch hold run inside [`poll`](AsynMotor::poll).
-//! - counts-per-rev is fixed at `SREV`'s default rather than read from the
-//!   record.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -188,9 +186,8 @@ pub struct FaulhaberAxis {
     controller: Arc<Mutex<FaulhaberController>>,
     /// 0-based node number prefixed to this axis's commands.
     node: usize,
-    counts_per_rev: f64,
-    /// The record's VELO in counts/s, C `mr->velo` as HOME reads it.
-    record_velocity: f64,
+    /// The record's VELO (counts/s) and SREV, as C build_trans reads `mr`.
+    record: RecordFields,
     /// Last integer position (counts); C `motor_info->position`.
     prev_position: i32,
     /// What the last failed poll raises: nothing on C `set_status`'s first
@@ -206,11 +203,7 @@ impl FaulhaberAxis {
     /// Construct axis `node` (0-based) and run the C `motor_init` per-axis setup:
     /// RS-232 velocity source (`SOR 0`) and the limit-switch and homing
     /// configuration. Performs blocking serial I/O.
-    pub fn new(
-        controller: Arc<Mutex<FaulhaberController>>,
-        node: usize,
-        counts_per_rev: f64,
-    ) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<FaulhaberController>>, node: usize) -> AsynResult<Self> {
         {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // Velocity control source = RS-232.
@@ -227,8 +220,11 @@ impl FaulhaberAxis {
         Ok(Self {
             controller,
             node,
-            counts_per_rev,
-            record_velocity: 0.0,
+            // Read only by a move, which set_record_fields leads.
+            record: RecordFields {
+                velocity: 0.0,
+                srev: 0,
+            },
             prev_position: 0,
             failure: PollFailure::NONE,
             last_status: MotorStatus {
@@ -241,12 +237,16 @@ impl FaulhaberAxis {
         })
     }
 
+    fn counts_per_rev(&self) -> f64 {
+        f64::from(self.record.srev)
+    }
+
     fn lock(&self) -> MutexGuard<'_, FaulhaberController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn encres(&self) -> String {
-        format!("ENCRES{}", nint(self.counts_per_rev))
+        format!("ENCRES{}", self.record.srev)
     }
 
     /// The record's SET_VELOCITY, then SET_ACCEL unless the acceleration is
@@ -257,7 +257,7 @@ impl FaulhaberAxis {
         ctrl.write_cmd(self.node, &self.encres())?;
         ctrl.write_cmd(
             self.node,
-            &format!("SP {}", vel_to_rpm(velocity, self.counts_per_rev)),
+            &format!("SP {}", vel_to_rpm(velocity, self.counts_per_rev())),
         )?;
         if acceleration > 0.0 {
             self.set_accel(&ctrl, acceleration)?;
@@ -269,7 +269,7 @@ impl FaulhaberAxis {
         ctrl.write_cmd(self.node, &self.encres())?;
         ctrl.write_cmd(
             self.node,
-            &format!("AC {}", accel_to_rev(acceleration, self.counts_per_rev)),
+            &format!("AC {}", accel_to_rev(acceleration, self.counts_per_rev())),
         )
     }
 
@@ -331,7 +331,7 @@ impl AsynMotor for FaulhaberAxis {
         // C never sends that SP: its node keeps type UNDEFINED, which
         // motor_send (motordrvCom.cc:563-576) refuses; that defect is not copied.
         self.set_accel(&self.lock(), acceleration)?;
-        let rpm = vel_to_rpm(velocity, self.counts_per_rev);
+        let rpm = vel_to_rpm(velocity, self.counts_per_rev());
         self.lead_move(&self.encres())?;
         let ctrl = self.lock();
         ctrl.write_cmd(self.node, &format!("SP {}", rpm.abs()))?;
@@ -354,7 +354,7 @@ impl AsynMotor for FaulhaberAxis {
         self.program_motion(velocity, acceleration)?;
         // HOSP runs at VELO, not HVEL (devMCDC2805.cc:224); C divides VELO's
         // EGU/s by SREV without MRES, a unit mix not copied.
-        let mut rpm = vel_to_rpm(self.record_velocity, self.counts_per_rev);
+        let mut rpm = vel_to_rpm(self.record.velocity, self.counts_per_rev());
         if !forward {
             rpm = -rpm;
         }
@@ -365,8 +365,8 @@ impl AsynMotor for FaulhaberAxis {
         ctrl.write_cmd(self.node, "M")
     }
 
-    fn set_record_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
-        self.record_velocity = velocity;
+    fn set_record_fields(&mut self, _user: &AsynUser, fields: &RecordFields) -> AsynResult<()> {
+        self.record = *fields;
         Ok(())
     }
 
@@ -511,6 +511,14 @@ mod tests {
     use motor_common::testing::LineRig;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// A record's fields with SREV 1000.
+    fn fields(velocity: f64) -> RecordFields {
+        RecordFields {
+            velocity,
+            srev: 1000,
+        }
+    }
+
     struct Rig {
         line: LineRig,
         axis: FaulhaberAxis,
@@ -537,7 +545,9 @@ mod tests {
                     _ => String::new(),
                 });
             let controller = Arc::new(Mutex::new(FaulhaberController::new(io, 2).unwrap()));
-            let axis = FaulhaberAxis::new(controller, 1, 1000.0).unwrap();
+            let mut axis = FaulhaberAxis::new(controller, 1).unwrap();
+            let user = AsynUser::new(0);
+            axis.set_record_fields(&user, &fields(0.0)).unwrap();
             line.sent();
             Self {
                 line,
@@ -545,7 +555,7 @@ mod tests {
                 moving,
                 minus,
                 pos,
-                user: AsynUser::new(0),
+                user,
             }
         }
 
@@ -598,7 +608,7 @@ mod tests {
         r.axis
             .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
             .unwrap();
-        r.axis.set_record_velocity(&r.user, 2000.0).unwrap();
+        r.axis.set_record_fields(&r.user, &fields(2000.0)).unwrap();
         r.axis.home(&r.user, 0.0, 1000.0, 0.0, false).unwrap();
         assert_eq!(
             r.line.sent(),
@@ -696,7 +706,7 @@ mod tests {
             }
         });
         let controller = Arc::new(Mutex::new(FaulhaberController::new(io, 2).unwrap()));
-        let mut axis = FaulhaberAxis::new(controller, 1, 1000.0).unwrap();
+        let mut axis = FaulhaberAxis::new(controller, 1).unwrap();
         let user = AsynUser::new(0);
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
