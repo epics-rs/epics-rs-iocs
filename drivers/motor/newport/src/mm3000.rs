@@ -119,7 +119,8 @@ fn parse_rc_types(reply: &str) -> Vec<AxisType> {
 /// `SET_VEL_BASE`/`SET_VELOCITY`/`SET_ACCEL` before the move), with the C
 /// clamps: steppers floor `VB`/`VA` at 100 and `AC` at 15000, DC axes floor
 /// `AC` at 250; `VB` is emitted for steppers only. Values are integer steps
-/// (C `NINT`).
+/// (C `NINT`). The record sends no SET_ACCEL for a zero rate
+/// (motorRecord.cc:874, 940), so there is no `AC` then.
 fn motion_preamble(
     axis: usize,
     axis_type: AxisType,
@@ -140,7 +141,10 @@ fn motion_preamble(
     if axis_type == AxisType::Dc {
         ac = ac.max(250);
     }
-    out.push_str(&format!("{axis}VA{va};{axis}AC{ac}"));
+    out.push_str(&format!("{axis}VA{va}"));
+    if accel > 0.0 {
+        out.push_str(&format!(";{axis}AC{ac}"));
+    }
     out
 }
 
@@ -698,6 +702,16 @@ mod tests {
 
     /// devMM3000.cc:211-222: PREM and a `;` go ahead of each move's own
     /// command, for that move only.
+    #[test]
+    fn a_zero_rate_move_or_home_has_no_ac() {
+        let (line, mut axis, _) = strings_rig("mm3000ZeroAc");
+        let user = AsynUser::default();
+        line.sent();
+        axis.move_absolute(&user, 15.0, 0.0, 400.0, 0.0).unwrap();
+        axis.home(&user, 0.0, 400.0, 0.0, true).unwrap();
+        assert_eq!(line.sent(), ["1VA400;1PA15", "1VA400;1OR1"]);
+    }
+
     #[test]
     fn jog_truncates_the_soft_limit_as_c() {
         let (line, mut axis, _) = strings_rig("mm3000JogTrunc");
