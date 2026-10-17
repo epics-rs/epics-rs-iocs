@@ -21,9 +21,9 @@ use epics_rs::motor::trace::MotorTrace;
 use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{arg_double_req, arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
-use motor_common::{Controller, asyn_user, register_port, register_port_with};
+use motor_common::{Controller, ControllerParams, asyn_user, register_port_with};
 
-use crate::mcs::{self, McsAxis, McsController};
+use crate::mcs::{self, McsAxis, McsController, McsParams, McsReasons};
 use crate::mcs2::{self, Mcs2Axis, Mcs2AxisReport, Mcs2Controller, Mcs2Params, Mcs2Reasons};
 use crate::scu::{ScuAxis, ScuController};
 
@@ -144,18 +144,20 @@ fn create_axis_args() -> Vec<ArgDesc> {
     ]
 }
 
-/// Register `port_name`, then connect its controller on it, as C's
-/// asynMotorController base constructor runs before the driver's own, and
-/// start its poller, which the `CreateAxis` axes join.
+/// Register `port_name` with the driver's `params`, then connect its
+/// controller on it, as C's asynMotorController base constructor runs
+/// before the driver's own, and start its poller, which the `CreateAxis`
+/// axes join.
 fn register<C>(
     ctx: &CommandContext,
     registry: &Registry<C>,
     args: &[ArgValue],
+    params: impl ControllerParams,
     connect: impl FnOnce(&str) -> C,
-) -> Result<(), String> {
+) -> Result<Arc<Mutex<C>>, String> {
     let port_name = req_string(args, 0, "Port name [string]")?;
-    register_port(ctx, &port_name, c_int(args, 2))?;
-    let controller = connect(&port_name);
+    register_port_with(ctx, &port_name, c_int(args, 2), params)?;
+    let controller = Arc::new(Mutex::new(connect(&port_name)));
     let poller = Controller::new();
     // C startPoller, smarActSCUMotorDriver.cpp:114, smarActMCSMotorDriver.cpp:215
     poller.start(ctx, period_ms(args, 3), period_ms(args, 4), 0);
@@ -164,11 +166,11 @@ fn register<C>(
         .unwrap_or_else(|e| e.into_inner())
         .push(Registered {
             port_name,
-            controller: Arc::new(Mutex::new(controller)),
+            controller: controller.clone(),
             poller,
             axes: BTreeSet::new(),
         });
-    Ok(())
+    Ok(controller)
 }
 
 /// `smarAct{SCU,MCS}CreateAxis(controllerPortName, axisNumber, channel)`,
@@ -209,7 +211,7 @@ pub fn scu_create_controller_command() -> CommandDef {
          idlePollPeriod)",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let io_port = req_string(args, 1, "I/O port name [string]")?;
-            register(ctx, &SCU_CONTROLLERS, args, |port_name| {
+            register(ctx, &SCU_CONTROLLERS, args, (), |port_name| {
                 let (handle, connected) = connect_controller(
                     &io_port,
                     SCU_TIMEOUT,
@@ -280,10 +282,22 @@ pub fn mcs_create_controller_command() -> CommandDef {
                      been disabled for this controller\n"
                 ));
             }
-            register(ctx, &MCS_CONTROLLERS, args, |port_name| {
+            let params = McsParams::default();
+            let slot = params.controller_slot();
+            let controller = register(ctx, &MCS_CONTROLLERS, args, params, |port_name| {
                 let link = mcs::connect_link(port_name, &io_port, MCS_TIMEOUT);
                 McsController::new(link, disable_speed)
             })?;
+            let port = PortManager::global()
+                .find_port_handle(&port_name)
+                .map_err(|e| format!("smarActMCSCreateController: {e}"))?;
+            let reasons = McsReasons::lookup(&port)
+                .map_err(|e| format!("smarActMCSCreateController: {e}"))?;
+            controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_reasons(reasons);
+            let _ = slot.set(controller);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -302,7 +316,7 @@ pub fn mcs_create_axis_command() -> CommandDef {
                 "SmarActMCSCreateAxis",
                 args,
                 |controller, axis, channel| {
-                    let (ax, probed) = McsAxis::new(controller, channel);
+                    let (ax, probed) = McsAxis::new(controller, axis, channel);
                     if let Err(e) = probed {
                         errlog_vprintf(format_args!(
                             "SmarActMCSAxis::SmarActMCSAxis -- channel {axis} ASYN error {}\n",
