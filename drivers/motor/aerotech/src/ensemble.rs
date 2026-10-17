@@ -407,8 +407,8 @@ impl AsynMotor for EnsembleAxis {
             ))?;
         }
         if acceleration > 0.0 {
-            // C builds this SETPARM but never sends it (buffer overwritten); we
-            // send it to honour the intent.
+            // C builds this SETPARM and overwrites it unsent
+            // (drvEnsembleAsyn.cc:572-574, :584); not copied.
             ctrl.command(&format!(
                 "SETPARM @{axis}, {PARAM_HOME_RAMP_RATE}, {}",
                 self.units(acceleration)
