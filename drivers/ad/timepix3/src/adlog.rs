@@ -12,6 +12,8 @@ const LOG_HTTP_WARNING: &str = "void ADTimePix::logHttpWarning(const char*, cons
 pub const REFRESH_PIXEL_CONFIG: &str = "asynStatus ADTimePix::refreshPixelConfigFromServal()";
 pub const WRITE_BPC_FILE: &str =
     "asynStatus ADTimePix::writeBPCfile(const std::vector<unsigned char>&)";
+pub const READ_BPC_FILE: &str = "asynStatus ADTimePix::readBPCfile(std::vector<unsigned char>&)";
+pub const EXPECTED_BPC_SIZE: &str = "asynStatus ADTimePix::expectedBPCSize(std::size_t&)";
 pub const UPDATE_DETECTOR_FAMILY: &str =
     "void ADTimePix::updateDetectorFamily(int, const std::string&, const std::string&)";
 pub const TIME_PIX_CALLBACK: &str = "void ADTimePix::timePixCallback()";
@@ -76,6 +78,17 @@ pub const WRITE_FLOAT64: &str =
     "virtual asynStatus ADTimePix::writeFloat64(asynUser*, epicsFloat64)";
 pub const WRITE_OCTET: &str =
     "virtual asynStatus ADTimePix::writeOctet(asynUser*, const char*, size_t, size_t*)";
+
+/// `epicsSnprintf` into a `char[size]`: at most `size - 1` bytes, cut at a
+/// character boundary.
+pub fn snprintf(size: usize, mut text: String) -> String {
+    let mut end = text.len().min(size.saturating_sub(1));
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
 
 /// `ERR`/`ERR_ARGS`, at `ASYN_TRACE_ERROR`.
 pub fn err(func: &str, msg: &str) -> String {

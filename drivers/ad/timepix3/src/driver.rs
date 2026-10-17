@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::accum::{Accumulator, RangeState};
 use crate::adlog;
+use crate::bpc_file;
 use crate::calibration::{PathAccess, PathPolicy};
 use crate::coordinator::{Phase, Resource};
 use crate::destination;
@@ -1942,7 +1943,7 @@ impl TimePix3Driver {
                 );
                 return Err(Self::read_array_refused());
             }
-            let mut bpc = self.read_bpc()?;
+            let mut bpc = self.read_bpc().ok_or_else(Self::read_array_refused)?;
             let offsets = self
                 .bpc_image_byte_offsets()
                 .ok_or_else(Self::read_array_refused)?;
@@ -1997,22 +1998,81 @@ impl TimePix3Driver {
         );
     }
 
-    /// C `readBPCfile` (mask_io.cpp:586).
-    fn read_bpc(&mut self) -> AsynResult<Vec<u8>> {
+    /// C `expectedBPCSize` (mask_io.cpp:565-584).
+    fn expected_bpc_size(&mut self) -> Option<usize> {
+        let pixels = self.int(self.p.pix_count, 0);
+        let caps = self.shared.family().capabilities();
+        let size =
+            bpc_file::expected_size(pixels, caps.bpc_bytes_per_pel, caps.bpc_threshold_slices);
+        if size.is_none() {
+            let message = format!(
+                "Invalid BPC geometry: pixels={pixels} bytes/pixel={} slices={}",
+                caps.bpc_bytes_per_pel, caps.bpc_threshold_slices
+            );
+            self.refuse_bpc(adlog::EXPECTED_BPC_SIZE, adlog::snprintf(192, message));
+        }
+        size
+    }
+
+    /// C's WriteMsg, `ERR_ARGS("%s")` and `callParamCallbacks` on a refused
+    /// BPC file.
+    fn refuse_bpc(&mut self, func: &str, message: String) {
+        let _ = self.set_text(self.p.write_msg, &message);
+        self.ad.port_base.trace_print(
+            TraceMask::ERROR,
+            format_args!("{}", adlog::err(func, &message)),
+        );
+        let _ = self.ad.port_base.call_param_callbacks(0);
+    }
+
+    /// C `readBPCfile` (mask_io.cpp:586-634): the file at the geometry's
+    /// size, and BPCn its masked count (-1 for a family without a mask).
+    fn read_bpc(&mut self) -> Option<Vec<u8>> {
         let (dir, name) = (
             self.text(self.p.bp_c_file_path, 0),
             self.text(self.p.bp_c_file_name, 0),
         );
-        let path = self.resolve_calibration_file(&dir, &name, PathAccess::Read)?;
-        let bpc = std::fs::read(&path).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("timepix3: reading {}: {e}", path.display()),
-        })?;
-        let n = bpc.iter().filter(|&&b| b & 1 != 0).count();
-        self.ad
-            .port_base
-            .set_int32_param(self.p.bp_cn, 0, i32::try_from(n).unwrap_or(i32::MAX))?;
-        Ok(bpc)
+        let path = self
+            .resolve_calibration_file(&dir, &name, PathAccess::Read)
+            .ok()?;
+        let expected = self.expected_bpc_size()?;
+        let data = match bpc_file::read_exact(&path, expected) {
+            Ok(data) => data,
+            Err(status) => {
+                let message = format!("ReadBPC: {}: {}", status.message(), path.display());
+                self.refuse_bpc(adlog::READ_BPC_FILE, adlog::snprintf(256, message));
+                return None;
+            }
+        };
+        let family = self.shared.family();
+        let supported = mask::operator_mask_supported(family);
+        let masked = if supported {
+            i32::try_from(mask::count_masked(family, &data)).unwrap_or(i32::MAX)
+        } else {
+            -1
+        };
+        let _ = self.ad.port_base.set_int32_param(self.p.bp_cn, 0, masked);
+        let line = if supported {
+            format!(
+                "ReadBPC: file=\"{}\" bytes={} masked {} pixels={masked}",
+                path.display(),
+                data.len(),
+                family.name()
+            )
+        } else {
+            format!(
+                "ReadBPC: file=\"{}\" bytes={}; mask count unavailable for family {}",
+                path.display(),
+                data.len(),
+                family.name()
+            )
+        };
+        self.ad.port_base.trace_print(
+            TraceMask::IO_DRIVER,
+            format_args!("{}", adlog::log(adlog::READ_BPC_FILE, &line)),
+        );
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        Some(data)
     }
 
     /// C `writeBPCfile` (mask_io.cpp:639-720): write the edited BPC to the
@@ -2057,7 +2117,12 @@ impl TimePix3Driver {
     /// C `refreshPixelConfigFromServal` (serval_http.cpp:1000).
     fn refresh_pixel_config(&mut self) -> AsynResult<()> {
         let geom = self.geometry()?;
-        let bpc = self.read_bpc()?;
+        let Some(bpc) = self.read_bpc() else {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "ReadBPC failed".into(),
+            });
+        };
         let num_chips = usize::try_from(self.int(self.p.number_of_chips, 0)).unwrap_or(0);
         let mut serval_linear = vec![0u8; num_chips * PIXEL_CONFIG_BYTES];
 
@@ -3364,7 +3429,7 @@ impl PortDriver for TimePix3Driver {
             // C mask_io.cpp:209-237: the packed pixel, with bit 8 (TPX3) or
             // bit 16 (MPX3) marking a masked one; an empty file leaves the
             // waveform as it was.
-            let bpc = self.read_bpc()?;
+            let bpc = self.read_bpc().ok_or_else(Self::read_array_refused)?;
             if !bpc.is_empty() {
                 let family = self.shared.family();
                 let width = mask::bytes_per_pixel(family);
@@ -5660,12 +5725,19 @@ mod tests {
         bpc[(4 * 256 + 3) * 2 + 1] = 1;
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         std::fs::write(dir.join("cal.bpc"), &bpc).unwrap();
+        // readBPCfile runs first, and its size needs PixCount.
+        let (r, msg) = read(&mut det);
+        assert_eq!(r, Err("asynPortDriver:readArray not implemented".into()));
+        assert_eq!(msg, "Invalid BPC geometry: pixels=0 bytes/pixel=2 slices=1");
+        det.ad
+            .port_base
+            .set_int32_param(p.pix_count, 0, 65536)
+            .unwrap();
         let (r, msg) = read(&mut det);
         assert_eq!(r, Err("asynPortDriver:readArray not implemented".into()));
         assert_eq!(msg, "Invalid BPC image geometry");
 
         for (reason, v) in [
-            (p.pix_count, 65536),
             (p.row_len, 1),
             (p.number_of_chips, 1),
             (p.number_of_rows, 256),
@@ -5731,21 +5803,37 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         std::fs::write(dir.join("cal.bpc"), [0x81, 0x01, 0x00, 0x02]).unwrap();
         let p = det.p;
-        let mut read = |family| {
+        let mut read = |family, pixels| {
             shared.note_family(family);
+            det.ad
+                .port_base
+                .set_int32_param(p.pix_count, 0, pixels)
+                .unwrap();
             let mut buf = vec![-1i32; 5];
             det.read_int32_array(&AsynUser::new(p.bp_c), &mut buf)
                 .unwrap();
-            buf
+            (buf, det.int(p.bp_cn, 0))
         };
-        assert_eq!(read(DetectorFamily::Unknown), vec![0; 5]);
+        assert_eq!(read(DetectorFamily::Unknown, 4), (vec![0; 5], -1));
         assert_eq!(
-            read(DetectorFamily::Tpx3),
-            vec![0x81 | 1 << 8, 0x01 | 1 << 8, 0, 2, 0]
+            read(DetectorFamily::Tpx3, 4),
+            (vec![0x81 | 1 << 8, 0x01 | 1 << 8, 0, 2, 0], 2)
         );
         assert_eq!(
-            read(DetectorFamily::Mpx3),
-            vec![0x8101 | 1 << 16, 0x0002, 0, 0, 0]
+            read(DetectorFamily::Mpx3, 2),
+            (vec![0x8101 | 1 << 16, 0x0002, 0, 0, 0], 1)
+        );
+
+        // mask_io.cpp:601-611: a file off the geometry's size is refused.
+        det.ad.port_base.set_int32_param(p.pix_count, 0, 3).unwrap();
+        let r = det.read_int32_array(&AsynUser::new(p.bp_c), &mut [0i32; 5]);
+        assert!(r.is_err());
+        assert_eq!(
+            det.text(p.write_msg, 0),
+            format!(
+                "ReadBPC: BPC file size does not match detector geometry: {}",
+                dir.join("cal.bpc").display()
+            )
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
