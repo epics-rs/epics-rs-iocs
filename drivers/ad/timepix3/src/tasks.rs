@@ -1823,12 +1823,11 @@ async fn publish_accumulation(
     }
 }
 
-/// An accumulation as the asynInt64Array interface carries it.
+/// An accumulation as the asynInt64Array interface carries it: C's
+/// `static_cast<epicsInt64>` (serval_stream.cpp:1012, :1099,
+/// histogram_io.cpp:537), so a sum past `i64::MAX` wraps.
 pub(crate) fn int64_array(values: &[u64]) -> Vec<i64> {
-    values
-        .iter()
-        .map(|&v| i64::try_from(v).unwrap_or(i64::MAX))
-        .collect()
+    values.iter().map(|&v| v as i64).collect()
 }
 
 /// What the PrvHst NDArrays on addresses 4-7 are built from, copied out of
@@ -2314,7 +2313,17 @@ async fn publish_image(ctx: &Ctx, addr: usize, array: DriverArray) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use serde_json::json;
+
+    /// A u64 sum reaches the Int64Array as C's cast leaves it.
+    #[test]
+    fn int64_array_casts_like_c() {
+        assert_eq!(
+            int64_array(&[0, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX]),
+            vec![0, i64::MAX, i64::MIN, -1]
+        );
+    }
 
     #[test]
     fn chip_temperatures_merge_across_boards() {
