@@ -6,14 +6,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::connect::{EosRefusal, connect_with_eos};
-use motor_common::drv_motor_asyn::{DrvGet, DrvSet};
 use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
 use motor_common::model1::c_int;
-use motor_common::model2::Model2;
+use motor_common::model2::{Model2, Model2Axis};
 
 use crate::anc150::{Anc150Axis, Anc150Controller, INPUT_EOS, OUTPUT_EOS};
 
@@ -100,22 +98,15 @@ pub fn anc150_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             let controller = Arc::new(Mutex::new(controller));
-            let (mut logs, mut setters, mut getters) = (Vec::new(), Vec::new(), Vec::new());
             let axes = (0..num_axes as usize)
                 .map(|axis| {
                     let ax = Anc150Axis::new(controller.clone(), card, axis)
                         .map_err(|e| format!("ANC150AsynConfig: axis {axis}: {e}"))?;
-                    logs.push(ax.log());
-                    getters.push(ax.params() as Arc<dyn DrvGet>);
-                    let ax = Arc::new(Mutex::new(ax));
-                    setters.push(ax.clone() as Arc<Mutex<dyn DrvSet>>);
-                    Ok(ax as Arc<Mutex<dyn AsynMotor>>)
+                    let (getter, log) = (ax.params(), ax.log());
+                    Ok(Model2Axis::new(Arc::new(Mutex::new(ax)), getter, log))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             MOTOR_ANC150.set_card(card, axes, moving_poll_ms, idle_poll_ms);
-            MOTOR_ANC150.set_axis_logs(card, logs);
-            MOTOR_ANC150.set_axis_setters(card, setters);
-            MOTOR_ANC150.set_axis_getters(card, getters);
             Ok(CommandOutcome::Continue)
         },
     )

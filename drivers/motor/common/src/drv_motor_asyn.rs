@@ -156,10 +156,8 @@ fn lock<T: ?Sized>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// An opened axis: C `drvmotorAxisPvt`.
 pub(crate) struct Axis {
     pub motor: Arc<Mutex<dyn AsynMotor>>,
-    /// `None` for a driver whose port has not registered its setters.
-    pub setter: Option<Arc<Mutex<dyn DrvSet>>>,
-    /// `None` for a driver whose port has not registered its getters.
-    getter: Option<Arc<dyn DrvGet>>,
+    pub setter: Arc<Mutex<dyn DrvSet>>,
+    getter: Arc<dyn DrvGet>,
     /// The axis' poller, which the driver's own task stands for in C.
     pub poller: mpsc::Sender<PollCommand>,
     max_velocity: f64,
@@ -172,8 +170,8 @@ pub(crate) struct Axis {
 impl Axis {
     pub fn new(
         motor: Arc<Mutex<dyn AsynMotor>>,
-        setter: Option<Arc<Mutex<dyn DrvSet>>>,
-        getter: Option<Arc<dyn DrvGet>>,
+        setter: Arc<Mutex<dyn DrvSet>>,
+        getter: Arc<dyn DrvGet>,
         poller: mpsc::Sender<PollCommand>,
     ) -> Self {
         Self {
@@ -188,34 +186,17 @@ impl Axis {
         }
     }
 
-    fn getter(&self, what: &str, command: usize) -> AsynResult<&Arc<dyn DrvGet>> {
-        self.getter.as_ref().ok_or_else(|| {
-            refuse(format!(
-                "drvMotorAsyn::{what} driver has no getter for reason={command}"
-            ))
-        })
-    }
-
     /// C's `getInteger` into a caller's value it leaves untouched for an
     /// undefined or out-of-range parameter; that value is 0 here.
-    fn get_integer(&self, what: &str, command: usize) -> AsynResult<i32> {
-        let getter = self.getter(what, command)?;
-        Ok(i32::try_from(command)
+    fn get_integer(&self, command: usize) -> i32 {
+        i32::try_from(command)
             .ok()
-            .and_then(|f| getter.get_integer(f))
-            .unwrap_or(0))
-    }
-
-    fn setter(&self, what: &str, command: usize) -> AsynResult<&Arc<Mutex<dyn DrvSet>>> {
-        self.setter.as_ref().ok_or_else(|| {
-            refuse(format!(
-                "drvMotorAsyn::{what} driver has no setter for reason={command}"
-            ))
-        })
+            .and_then(|f| self.getter.get_integer(f))
+            .unwrap_or(0)
     }
 
     fn set_integer(&self, user: &AsynUser, command: usize, value: i32) -> AsynResult<()> {
-        lock(self.setter("writeInt32", command)?).set_integer(user, command as i32, value)
+        lock(&self.setter).set_integer(user, command as i32, value)
     }
 
     /// The driver's own task wakes on a move it was given
@@ -311,12 +292,7 @@ impl DrvMotorAsyn {
             },
         );
         for (addr, axis) in axes.iter().enumerate() {
-            let Some(Axis {
-                getter: Some(getter),
-                status,
-                ..
-            }) = axis
-            else {
+            let Some(Axis { getter, status, .. }) = axis else {
                 continue;
             };
             let interrupts = InterruptManager::from_shared_state(base.interrupts.shared_state());
@@ -408,7 +384,7 @@ impl PortDriver for DrvMotorAsyn {
         let axis = self.axis(user, "readInt32")?;
         let value = match command {
             STATUS => axis.status.load(Ordering::Relaxed) as i32,
-            _ => axis.get_integer("readInt32", command)?,
+            _ => axis.get_integer(command),
         };
         user.print(
             TraceMask::IO_DRIVER,
@@ -424,7 +400,7 @@ impl PortDriver for DrvMotorAsyn {
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
         let command = user.reason;
         let axis = self.axis(user, "readInt32")?;
-        let value = axis.get_integer("readUInt32Digital", command)? as u32 & mask;
+        let value = axis.get_integer(command) as u32 & mask;
         user.print(
             TraceMask::IO_DRIVER,
             file!(),
@@ -445,13 +421,10 @@ impl PortDriver for DrvMotorAsyn {
             VELOCITY => axis.max_velocity,
             VEL_BASE => axis.min_velocity,
             ACCEL => axis.accel,
-            _ => {
-                let getter = axis.getter("readFloat64", command)?;
-                i32::try_from(command)
-                    .ok()
-                    .and_then(|f| getter.get_double(f))
-                    .unwrap_or(0.0)
-            }
+            _ => i32::try_from(command)
+                .ok()
+                .and_then(|f| axis.getter.get_double(f))
+                .unwrap_or(0.0),
         };
         user.print(
             TraceMask::IO_DRIVER,
@@ -487,7 +460,7 @@ impl PortDriver for DrvMotorAsyn {
     ) -> AsynResult<()> {
         let command = user.reason;
         let axis = self.axis(user, "writeInt32")?;
-        let old = axis.get_integer("writeUInt32Digital", command)? as u32;
+        let old = axis.get_integer(command) as u32;
         let temp = (old & !mask) | (value & mask);
         let status = axis.set_integer(user, command, temp as i32);
         user.print(
@@ -575,9 +548,7 @@ impl PortDriver for DrvMotorAsyn {
                 axis.accel = value;
                 Ok(())
             }
-            _ => {
-                lock(axis.setter("writeFloat64", command)?).set_double(user, command as i32, value)
-            }
+            _ => lock(&axis.setter).set_double(user, command as i32, value),
         };
         user.print(
             TraceMask::IO_DRIVER,

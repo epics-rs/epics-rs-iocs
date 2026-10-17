@@ -27,12 +27,12 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::trace::MotorTrace;
 
-use motor_common::drv_motor_asyn::{DrvGet, DrvSet};
+use motor_common::drv_motor_asyn::DrvSet;
 use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_req, opt_double, poll_intervals, req_string,
 };
 use motor_common::model1::c_int;
-use motor_common::model2::Model2;
+use motor_common::model2::{Model2, Model2Axis};
 use motor_common::{Controller, asyn_user, register_controller_port};
 
 use crate::axis::PmacAxis;
@@ -612,19 +612,22 @@ fn coord_create(
             Ok(motor)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    PMAC_ASYN_COORD.set_card(
-        reference,
-        axes.clone(),
-        COORD_MOVING_POLL_MS,
-        COORD_IDLE_POLL_MS,
-    );
-    PMAC_ASYN_COORD.set_axis_logs(reference, lock_system(&system).logs());
-    PMAC_ASYN_COORD.set_axis_setters(reference, setters);
-    let getters = lock_system(&system).getters();
-    PMAC_ASYN_COORD.set_axis_getters(
-        reference,
-        getters.into_iter().map(|g| g as Arc<dyn DrvGet>).collect(),
-    );
+    let (logs, getters) = {
+        let system = lock_system(&system);
+        (system.logs(), system.getters())
+    };
+    let model2 = axes
+        .iter()
+        .zip(setters)
+        .zip(logs.into_iter().zip(getters))
+        .map(|((motor, setter), (log, getter))| Model2Axis {
+            motor: motor.clone(),
+            setter,
+            getter,
+            log,
+        })
+        .collect();
+    PMAC_ASYN_COORD.set_card(reference, model2, COORD_MOVING_POLL_MS, COORD_IDLE_POLL_MS);
     systems.push(CoordSystem {
         reference,
         port: port.to_string(),

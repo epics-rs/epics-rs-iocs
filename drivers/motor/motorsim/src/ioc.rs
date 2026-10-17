@@ -23,7 +23,7 @@ use motor_common::drv_motor_asyn::{DrvGet, DrvSet};
 use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_int, req_string};
 use motor_common::model1::c_int;
 pub use motor_common::model2::drv_asyn_motor_configure_command;
-use motor_common::model2::{AxisLog, Model2};
+use motor_common::model2::{AxisLog, Model2, Model2Axis};
 use motor_common::{
     Controller, ControllerParams, ControllerReport, TraceUser, asyn_user, register_port_with,
 };
@@ -93,6 +93,18 @@ fn find<A>(created: &[SimAxis<A>], card: i32, signal: i32) -> Option<&SimAxis<A>
     created
         .iter()
         .find(|a| a.card == card && a.signal == signal)
+}
+
+impl<A: AsynMotor + 'static> SimAxis<A> {
+    /// The axis as drvAsynMotorConfigure serves it.
+    fn model2(&self) -> Model2Axis {
+        Model2Axis {
+            motor: self.motor.clone(),
+            setter: self.setter.clone(),
+            getter: self.getter.clone(),
+            log: self.log.clone(),
+        }
+    }
 }
 
 impl<A: AsynMotor + 'static> SimDriver<A> {
@@ -241,17 +253,10 @@ pub fn motor_sim_create_command() -> CommandDef {
                 // Model2::open indexes by axis, so a card serves the axes
                 // from 0 up to its first gap; drvAsynMotorConfigure installs
                 // them on the driver's poller.
-                let axes: Vec<_> = (0..).map_while(|s| find(&created, c, s)).collect();
-                MOTOR_SIM.set_card_on(
-                    c,
-                    axes.iter()
-                        .map(|a| a.motor.clone() as Arc<Mutex<dyn AsynMotor>>)
-                        .collect(),
-                    driver.poller.clone(),
-                );
-                MOTOR_SIM.set_axis_logs(c, axes.iter().map(|a| a.log.clone()).collect());
-                MOTOR_SIM.set_axis_getters(c, axes.iter().map(|a| a.getter.clone()).collect());
-                MOTOR_SIM.set_axis_setters(c, axes.iter().map(|a| a.setter.clone()).collect());
+                let axes: Vec<_> = (0..)
+                    .map_while(|s| find(&created, c, s).map(SimAxis::model2))
+                    .collect();
+                MOTOR_SIM.set_card_on(c, axes, driver.poller.clone());
             }
             Ok(CommandOutcome::Continue)
         },
@@ -771,7 +776,6 @@ mod one_poller {
         static ONCE: Model2 = Model2::new("onceSim", 0);
         let polls = Arc::new(Mutex::new(Vec::new()));
         let counted = Arc::new(Mutex::new(Counted(polls.clone())));
-        let motor: Arc<Mutex<dyn AsynMotor>> = counted.clone();
         let driver = Arc::new(SimDriver::<Counted>::new());
         // devMotorSim's open reaches only the axis' motor.
         let unused = DrvMotorSimAxis::new(0, 0, 0.0, 0.0, 0.0, Arc::default());
@@ -785,13 +789,14 @@ mod one_poller {
         };
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
         driver.poller.start(&ctx, POLL_MS, POLL_MS, 0);
+        let model2 = axis.model2();
         let creator = driver.clone();
         let create = std::thread::spawn(move || creator.create(axis));
         while !create.is_finished() {
             sleep(Duration::from_millis(5)).await;
         }
         create.join().unwrap().unwrap();
-        ONCE.set_card_on(0, vec![motor], driver.poller.clone());
+        ONCE.set_card_on(0, vec![model2], driver.poller.clone());
         let args = vec![
             ArgValue::String("onceP".into()),
             ArgValue::String("onceSim".into()),

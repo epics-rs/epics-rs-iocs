@@ -17,11 +17,10 @@ use epics_rs::base::server::record::DevSup;
 use epics_libcom_rs::cfmt::CFloat;
 use motor_common::AxisReport;
 use motor_common::connect::{EosRefusal, connect_with_eos};
-use motor_common::drv_motor_asyn::{DrvGet, DrvSet};
 use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_string};
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
-use motor_common::model2::Model2;
+use motor_common::model2::{Model2, Model2Axis};
 
 use crate::a3200::{self, A3200_MAX_AXES, A3200Axis, A3200Controller};
 use crate::drv_soloist::{self, DrvSoloistAxis, SOLOIST_NUM_CARDS, SoloistCard};
@@ -204,8 +203,6 @@ pub fn ensemble_config_command() -> CommandDef {
 
             let mut axes = Vec::new();
             let mut reports: Vec<Arc<dyn AxisReport>> = Vec::new();
-            let mut logs = Vec::new();
-            let (mut setters, mut getters) = (Vec::new(), Vec::new());
             for axis in 0..ENSEMBLE_MAX_AXES {
                 if axes.len() as i32 == num_axes {
                     break;
@@ -218,11 +215,8 @@ pub fn ensemble_config_command() -> CommandDef {
                     let ax = EnsembleAxis::new(controller.clone(), card, axis, axes.len() as i32)
                         .map_err(|e| format!("EnsembleAsynConfig: axis {axis}: {e}"))?;
                     reports.push(ax.report());
-                    logs.push(ax.log());
-                    getters.push(ax.params() as Arc<dyn DrvGet>);
-                    let ax = Arc::new(Mutex::new(ax));
-                    setters.push(ax.clone() as Arc<Mutex<dyn DrvSet>>);
-                    axes.push(ax as Arc<Mutex<dyn AsynMotor>>);
+                    let (getter, log) = (ax.params(), ax.log());
+                    axes.push(Model2Axis::new(Arc::new(Mutex::new(ax)), getter, log));
                 }
             }
             // C ignores the reply.
@@ -232,9 +226,6 @@ pub fn ensemble_config_command() -> CommandDef {
                 .wait_mode_nowait();
             lock_cards(&ENSEMBLE_CARDS)[card as usize].axes = reports;
             MOTOR_ENSEMBLE.set_card(card, axes, moving_poll_ms, idle_poll_ms);
-            MOTOR_ENSEMBLE.set_axis_logs(card, logs);
-            MOTOR_ENSEMBLE.set_axis_setters(card, setters);
-            MOTOR_ENSEMBLE.set_axis_getters(card, getters);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -307,8 +298,6 @@ pub fn a3200_config_command() -> CommandDef {
 
             let mut axes = Vec::new();
             let mut reports: Vec<Arc<dyn AxisReport>> = Vec::new();
-            let mut logs = Vec::new();
-            let (mut setters, mut getters) = (Vec::new(), Vec::new());
             // C probes an axis only while the last reply is an ACK, and fails
             // the config after the loop if it is not (drvA3200Asyn.cc:916-979).
             let acked = || controller.lock().unwrap_or_else(|e| e.into_inner()).ack();
@@ -322,11 +311,8 @@ pub fn a3200_config_command() -> CommandDef {
                     .discover_axis_name(axis);
                 let ax = A3200Axis::new(controller.clone(), card, axis, axis_name);
                 reports.push(ax.report());
-                logs.push(ax.log());
-                getters.push(ax.params() as Arc<dyn DrvGet>);
-                let ax = Arc::new(Mutex::new(ax));
-                setters.push(ax.clone() as Arc<Mutex<dyn DrvSet>>);
-                axes.push(ax as Arc<Mutex<dyn AsynMotor>>);
+                let (getter, log) = (ax.params(), ax.log());
+                axes.push(Model2Axis::new(Arc::new(Mutex::new(ax)), getter, log));
             }
             if !acked() {
                 return Ok(CommandOutcome::Continue);
@@ -337,9 +323,6 @@ pub fn a3200_config_command() -> CommandDef {
                 .finalize();
             lock_cards(&A3200_CARDS)[card as usize].axes = reports;
             MOTOR_A3200.set_card(card, axes, moving_poll_ms, idle_poll_ms);
-            MOTOR_A3200.set_axis_logs(card, logs);
-            MOTOR_A3200.set_axis_setters(card, setters);
-            MOTOR_A3200.set_axis_getters(card, getters);
             Ok(CommandOutcome::Continue)
         },
     )

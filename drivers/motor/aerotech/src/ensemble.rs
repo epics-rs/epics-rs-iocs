@@ -765,7 +765,7 @@ mod tests {
     async fn the_port_writes_go_through_the_c_set_switch() {
         use epics_rs::asyn::manager::PortManager;
         use epics_rs::base::server::iocsh::registry::ArgValue;
-        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::model2::{Model2, Model2Axis, drv_asyn_motor_configure_command};
         use motor_common::testing::{LineRig, run_command};
 
         static DRIVER: Model2 = Model2::new("ensSetTest", 0);
@@ -781,9 +781,9 @@ mod tests {
         let axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
         let params = axis.params();
         let axis = Arc::new(Mutex::new(axis));
-        DRIVER.set_card(0, vec![axis.clone()], 3_600_000, 3_600_000);
-        DRIVER.set_axis_setters(0, vec![axis.clone()]);
-        DRIVER.set_axis_getters(0, vec![params.clone()]);
+        let log = axis.lock().unwrap().log();
+        let axes = vec![Model2Axis::new(axis.clone(), params.clone(), log)];
+        DRIVER.set_card(0, axes, 3_600_000, 3_600_000);
         let args = vec![
             ArgValue::String("ensSet".into()),
             ArgValue::String("ensSetTest".into()),
@@ -847,18 +847,21 @@ mod tests {
         use epics_rs::asyn::manager::PortManager;
         use epics_rs::asyn::trace::{TraceFile, TraceMask};
         use epics_rs::base::server::iocsh::registry::ArgValue;
-        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::model2::{Model2, Model2Axis, drv_asyn_motor_configure_command};
         use motor_common::testing::{LineRig, run_command};
 
         static DRIVER: Model2 = Model2::new("ensLogTest", 0);
         let (_line, io) = LineRig::new("ensLogLine", |_| "%0".into());
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensLogLine", "0")));
         let axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
-        let log = axis.log();
+        let (getter, log) = (axis.params(), axis.log());
         let axis = Arc::new(Mutex::new(axis));
-        let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
-        DRIVER.set_card(0, vec![motor], 100, 1000);
-        DRIVER.set_axis_logs(0, vec![log]);
+        DRIVER.set_card(
+            0,
+            vec![Model2Axis::new(axis.clone(), getter, log)],
+            100,
+            1000,
+        );
         let args = vec![
             ArgValue::String("ensLog".into()),
             ArgValue::String("ensLogTest".into()),

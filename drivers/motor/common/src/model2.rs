@@ -17,15 +17,38 @@ use crate::iocsh::{arg_int_req, arg_str_req};
 use crate::model1::c_int;
 use crate::{Controller, TraceUser, register_drv_motor_asyn_port};
 
-/// The axes a card's `Config` built, the poller they go on, and the log
-/// users `drvAsynMotorConfigure` connects them.
+/// The axes a card's `Config` built and the poller they go on.
 struct Card {
     card: i32,
-    axes: Vec<Arc<Mutex<dyn AsynMotor>>>,
+    axes: Vec<Model2Axis>,
     poller: Poller,
-    logs: Vec<Arc<AxisLog>>,
-    setters: Vec<Arc<Mutex<dyn DrvSet>>>,
-    getters: Vec<Arc<dyn DrvGet>>,
+}
+
+/// One axis a driver's `Config` built: C's `AXIS_HDL` with the
+/// `motorAxisSet*`, `motorAxisGet*`/`motorAxisSetCallback` and `logParam`
+/// every `motorAxisDrvSET_t` gives drvMotorAsyn for it.
+#[derive(Clone)]
+pub struct Model2Axis {
+    pub motor: Arc<Mutex<dyn AsynMotor>>,
+    pub setter: Arc<Mutex<dyn DrvSet>>,
+    pub getter: Arc<dyn DrvGet>,
+    pub log: Arc<AxisLog>,
+}
+
+impl Model2Axis {
+    /// An axis that is its own setter.
+    pub fn new<T: AsynMotor + DrvSet + 'static>(
+        axis: Arc<Mutex<T>>,
+        getter: Arc<dyn DrvGet>,
+        log: Arc<AxisLog>,
+    ) -> Self {
+        Self {
+            motor: axis.clone(),
+            setter: axis,
+            getter,
+            log,
+        }
+    }
 }
 
 /// The `print`/`logParam` pair a driver keeps for an axis, or for itself,
@@ -146,7 +169,7 @@ impl Model2 {
     pub fn set_card(
         &self,
         card: i32,
-        axes: Vec<Arc<Mutex<dyn AsynMotor>>>,
+        axes: Vec<Model2Axis>,
         moving_poll_ms: u64,
         idle_poll_ms: u64,
     ) {
@@ -157,75 +180,17 @@ impl Model2 {
                 moving_poll_ms,
                 idle_poll_ms,
             },
-            logs: Vec::new(),
-            setters: Vec::new(),
-            getters: Vec::new(),
         });
     }
 
     /// What `Config` built for `card`, polled by the driver's own `poller`,
     /// replacing an earlier `Config` of it.
-    pub fn set_card_on(
-        &self,
-        card: i32,
-        axes: Vec<Arc<Mutex<dyn AsynMotor>>>,
-        poller: Arc<Controller>,
-    ) {
+    pub fn set_card_on(&self, card: i32, axes: Vec<Model2Axis>, poller: Arc<Controller>) {
         self.put_card(Card {
             card,
             axes,
             poller: Poller::Driver(poller),
-            logs: Vec::new(),
-            setters: Vec::new(),
-            getters: Vec::new(),
         });
-    }
-
-    /// The log user of each of `card`'s axes, by axis; set after
-    /// `set_card`/`set_card_on`.
-    pub fn set_axis_logs(&self, card: i32, logs: Vec<Arc<AxisLog>>) {
-        let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = cards.iter_mut().find(|c| c.card == card) {
-            c.logs = logs;
-        }
-    }
-
-    /// The `motorAxisSetInteger`/`motorAxisSetDouble` of each of `card`'s
-    /// axes, by axis, for the port's writes; set after
-    /// `set_card`/`set_card_on`.
-    pub fn set_axis_setters(&self, card: i32, setters: Vec<Arc<Mutex<dyn DrvSet>>>) {
-        let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = cards.iter_mut().find(|c| c.card == card) {
-            c.setters = setters;
-        }
-    }
-
-    /// The `motorAxisGet*`/`motorAxisSetCallback` of each of `card`'s axes,
-    /// by axis, for the port's reads and interrupts; set after
-    /// `set_card`/`set_card_on`.
-    pub fn set_axis_getters(&self, card: i32, getters: Vec<Arc<dyn DrvGet>>) {
-        let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = cards.iter_mut().find(|c| c.card == card) {
-            c.getters = getters;
-        }
-    }
-
-    fn axis_getter(&self, card: i32, axis: i32) -> Option<Arc<dyn DrvGet>> {
-        let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
-        let card = cards.iter().find(|c| c.card == card)?;
-        card.getters.get(usize::try_from(axis).ok()?).cloned()
-    }
-
-    fn axis_setter(&self, card: i32, axis: i32) -> Option<Arc<Mutex<dyn DrvSet>>> {
-        let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
-        let card = cards.iter().find(|c| c.card == card)?;
-        card.setters.get(usize::try_from(axis).ok()?).cloned()
-    }
-
-    fn axis_log(&self, card: i32, axis: i32) -> Option<Arc<AxisLog>> {
-        let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
-        let card = cards.iter().find(|c| c.card == card)?;
-        card.logs.get(usize::try_from(axis).ok()?).cloned()
     }
 
     fn put_card(&self, card: Card) {
@@ -266,7 +231,7 @@ impl Model2 {
 
     /// The driver's `open(card, axis)`: `None` for an unconfigured card or an
     /// axis it does not have.
-    fn open(&self, card: i32, axis: i32) -> Option<Arc<Mutex<dyn AsynMotor>>> {
+    fn open(&self, card: i32, axis: i32) -> Option<Model2Axis> {
         let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
         let card = cards.iter().find(|c| c.card == card)?;
         card.axes.get(usize::try_from(axis).ok()?).cloned()
@@ -308,7 +273,7 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
             let controller = poller.as_ref().map(Poller::controller);
             let mut axes = Vec::new();
             for addr in 0..num_axes {
-                let (Some(controller), Some(motor)) = (&controller, driver.open(card, addr)) else {
+                let (Some(controller), Some(axis)) = (&controller, driver.open(card, addr)) else {
                     println!("drvAsynMotorConfigure: Failed to open axis {addr}");
                     axes.push(None);
                     continue;
@@ -317,16 +282,14 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                     port: port_name.clone(),
                     addr,
                 };
-                let wakeup = controller.install(user, motor.clone())?;
+                let wakeup = controller.install(user, axis.motor.clone())?;
+                axis.log.attach(&port_name, addr);
                 axes.push(Some(Axis::new(
-                    motor,
-                    driver.axis_setter(card, addr),
-                    driver.axis_getter(card, addr),
+                    axis.motor,
+                    axis.setter,
+                    axis.getter,
                     wakeup,
                 )));
-                if let Some(log) = driver.axis_log(card, addr) {
-                    log.attach(&port_name, addr);
-                }
             }
             if let Some(log) = &*driver.log.lock().unwrap_or_else(|e| e.into_inner()) {
                 log.set(LogUser::Default);
@@ -355,10 +318,41 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
     )
 }
 
+/// A SimMotor axis whose driver knows no set function.
+#[cfg(test)]
+fn sim_axis(log: Arc<AxisLog>) -> Model2Axis {
+    use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+    use epics_rs::asyn::user::AsynUser;
+
+    struct Unknown;
+
+    fn refuse() -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: String::new(),
+        })
+    }
+
+    impl DrvSet for Unknown {
+        fn set_integer(&mut self, _: &AsynUser, _: i32, _: i32) -> AsynResult<()> {
+            refuse()
+        }
+        fn set_double(&mut self, _: &AsynUser, _: i32, _: f64) -> AsynResult<()> {
+            refuse()
+        }
+    }
+
+    Model2Axis {
+        motor: Arc::new(Mutex::new(epics_rs::motor::sim_motor::SimMotor::default())),
+        setter: Arc::new(Mutex::new(Unknown)),
+        getter: Arc::new(crate::param_lib::Params::default()),
+        log,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::motor::sim_motor::SimMotor;
 
     static DRIVER: Model2 = Model2::new("test", 0);
 
@@ -373,13 +367,14 @@ mod tests {
         assert_eq!(drvet.report(1).unwrap(), "level 1\n");
     }
 
-    fn axis() -> Arc<Mutex<dyn AsynMotor>> {
-        Arc::new(Mutex::new(SimMotor::default()))
-    }
-
     #[test]
     fn open_finds_only_built_axes_and_takes_later_poll_periods() {
-        DRIVER.set_card(3, vec![axis(), axis()], 100, 500);
+        DRIVER.set_card(
+            3,
+            vec![sim_axis(Arc::default()), sim_axis(Arc::default())],
+            100,
+            500,
+        );
         assert!(DRIVER.open(3, 1).is_some());
         assert!(DRIVER.open(3, 2).is_none());
         assert!(DRIVER.open(3, -1).is_none());
@@ -401,16 +396,13 @@ mod tests {
 mod one_task {
     use super::*;
     use crate::testing::pollers_after;
-    use epics_rs::motor::sim_motor::SimMotor;
 
     static DRIVER: Model2 = Model2::new("oneTask", 0);
 
     /// drvMotorAsyn's driver task polls every axis of the card in turn.
     #[epics_rs::base::epics_test]
     async fn drv_asyn_motor_configure_polls_the_card_s_axes_on_one_poller() {
-        let axes = (0..3)
-            .map(|_| Arc::new(Mutex::new(SimMotor::default())) as Arc<Mutex<dyn AsynMotor>>)
-            .collect();
+        let axes = (0..3).map(|_| sim_axis(Arc::default())).collect();
         DRIVER.set_card(0, axes, 100, 1000);
         let args = vec![
             ArgValue::String("oneTaskPort".into()),
@@ -435,9 +427,7 @@ mod one_task {
             |_: &[ArgValue], ctx: &CommandContext| {
                 let poller = Arc::new(Controller::new());
                 poller.start(ctx, 100, 1000, 0);
-                let axes = (0..2)
-                    .map(|_| Arc::new(Mutex::new(SimMotor::default())) as Arc<Mutex<dyn AsynMotor>>)
-                    .collect();
+                let axes = (0..2).map(|_| sim_axis(Arc::default())).collect();
                 OWN.set_card_on(0, axes, poller);
                 Ok(CommandOutcome::Continue)
             },
@@ -460,7 +450,6 @@ mod axis_log {
     use super::*;
     use crate::testing::run_command;
     use epics_rs::asyn::trace::TraceFile;
-    use epics_rs::motor::sim_motor::SimMotor;
 
     static LOGGED: Model2 = Model2::new("logged", 0);
 
@@ -469,9 +458,8 @@ mod axis_log {
     #[epics_rs::base::epics_test]
     async fn configure_hands_each_opened_axis_its_log_user() {
         let logs: Vec<Arc<AxisLog>> = (0..3).map(|_| Arc::default()).collect();
-        let axis = || -> Arc<Mutex<dyn AsynMotor>> { Arc::new(Mutex::new(SimMotor::default())) };
-        LOGGED.set_card(0, vec![axis(), axis()], 100, 1000);
-        LOGGED.set_axis_logs(0, logs.clone());
+        let axes = logs[..2].iter().map(|log| sim_axis(log.clone())).collect();
+        LOGGED.set_card(0, axes, 100, 1000);
         let args = vec![
             ArgValue::String("loggedPort".into()),
             ArgValue::String("logged".into()),
@@ -509,9 +497,7 @@ mod axis_log {
     async fn configure_replaces_the_driver_s_own_print() {
         let logs: Vec<Arc<AxisLog>> = (0..2).map(|_| Arc::new(AxisLog::with_own(own))).collect();
         let driver_log = Arc::new(AxisLog::with_own(own));
-        let axis = || -> Arc<Mutex<dyn AsynMotor>> { Arc::new(Mutex::new(SimMotor::default())) };
-        OWNED.set_card(0, vec![axis()], 100, 1000);
-        OWNED.set_axis_logs(0, logs.clone());
+        OWNED.set_card(0, vec![sim_axis(logs[0].clone())], 100, 1000);
         OWNED.set_driver_log(driver_log.clone());
         for log in [&logs[0], &logs[1], &driver_log] {
             log.print(TraceMask::FLOW, format_args!("before"));
@@ -622,9 +608,13 @@ mod asyn_writes {
     async fn the_port_s_writes_reach_the_driver() {
         let recorder = Arc::new(Mutex::new(Recorder::default()));
         let log: Arc<AxisLog> = Arc::default();
-        WRITTEN.set_card(0, vec![recorder.clone()], 100, 1000);
-        WRITTEN.set_axis_logs(0, vec![log.clone()]);
-        WRITTEN.set_axis_setters(0, vec![Arc::new(Mutex::new(Unknown(log)))]);
+        let axis = Model2Axis {
+            motor: recorder.clone(),
+            setter: Arc::new(Mutex::new(Unknown(log.clone()))),
+            getter: Arc::new(crate::param_lib::Params::default()),
+            log,
+        };
+        WRITTEN.set_card(0, vec![axis], 100, 1000);
         let args = vec![
             ArgValue::String("writtenPort".into()),
             ArgValue::String("written".into()),
@@ -782,9 +772,12 @@ mod asyn_reads {
     async fn the_port_reads_the_driver_and_calls_back_what_changed() {
         let params = Arc::new(Params::default());
         let axis = Arc::new(Mutex::new(Stored(params.clone())));
-        READ.set_card(0, vec![axis.clone()], 100, 1000);
-        READ.set_axis_setters(0, vec![axis]);
-        READ.set_axis_getters(0, vec![params.clone()]);
+        READ.set_card(
+            0,
+            vec![Model2Axis::new(axis, params.clone(), Arc::default())],
+            100,
+            1000,
+        );
         let args = vec![
             ArgValue::String("readPort".into()),
             ArgValue::String("read".into()),

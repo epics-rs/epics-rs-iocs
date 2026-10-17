@@ -175,12 +175,12 @@ impl PmacCoordSystem {
         }
     }
 
-    /// The axes' logs, A first, for `Model2::set_axis_logs`.
+    /// The axes' logs, A first, for their `Model2Axis`.
     pub fn logs(&self) -> Vec<Arc<AxisLog>> {
         self.logs.to_vec()
     }
 
-    /// The axes' getters, A first, for `Model2::set_axis_getters`.
+    /// The axes' getters, A first, for their `Model2Axis`.
     pub fn getters(&self) -> Vec<Arc<CoordGet>> {
         self.gets.to_vec()
     }

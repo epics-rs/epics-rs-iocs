@@ -277,7 +277,7 @@ impl Anc150Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The log `Model2::set_axis_logs` attaches.
+    /// The log `drvAsynMotorConfigure` attaches.
     pub fn log(&self) -> Arc<AxisLog> {
         self.log.clone()
     }
@@ -712,7 +712,7 @@ mod tests {
     async fn force_callback_prints_the_c_flow_line() {
         use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
         use epics_rs::base::server::iocsh::registry::ArgValue;
-        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::model2::{Model2, Model2Axis, drv_asyn_motor_configure_command};
         use motor_common::testing::{LineRig, run_command};
 
         static DRIVER: Model2 = Model2::new("ancForceTest", 0);
@@ -727,14 +727,18 @@ mod tests {
         let axes: Vec<_> = (0..2)
             .map(|axis| Anc150Axis::new(ctrl.clone(), 1, axis).unwrap())
             .collect();
-        let logs = axes.iter().map(Anc150Axis::log).collect();
         let axes: Vec<_> = axes.into_iter().map(|a| Arc::new(Mutex::new(a))).collect();
-        let motors = axes
+        let model2 = axes
             .iter()
-            .map(|a| a.clone() as Arc<Mutex<dyn AsynMotor>>)
+            .map(|a| {
+                let (getter, log) = {
+                    let a = a.lock().unwrap();
+                    (a.params(), a.log())
+                };
+                Model2Axis::new(a.clone(), getter, log)
+            })
             .collect();
-        DRIVER.set_card(1, motors, 100, 1000);
-        DRIVER.set_axis_logs(1, logs);
+        DRIVER.set_card(1, model2, 100, 1000);
         let args = vec![
             ArgValue::String("ancForce".into()),
             ArgValue::String("ancForceTest".into()),
@@ -769,7 +773,7 @@ mod tests {
     ) -> (Vec<Arc<Mutex<Anc150Axis>>>, std::path::PathBuf) {
         use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
         use epics_rs::base::server::iocsh::registry::ArgValue;
-        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::model2::{Model2, Model2Axis, drv_asyn_motor_configure_command};
         use motor_common::testing::{LineRig, run_command};
 
         let driver: &'static Model2 = Box::leak(Box::new(Model2::new(port, 0)));
@@ -785,25 +789,19 @@ mod tests {
             .map(|axis| Anc150Axis::new(ctrl.clone(), 1, axis).unwrap())
             .collect();
         axes[1].set_position(&AsynUser::default(), 12.5).unwrap();
-        let logs = axes.iter().map(Anc150Axis::log).collect();
         let axes: Vec<_> = axes.into_iter().map(|a| Arc::new(Mutex::new(a))).collect();
-        let motors = axes
+        let model2 = axes
             .iter()
-            .map(|a| a.clone() as Arc<Mutex<dyn AsynMotor>>)
+            .map(|a| {
+                let (getter, log) = {
+                    let a = a.lock().unwrap();
+                    (a.params(), a.log())
+                };
+                Model2Axis::new(a.clone(), getter, log)
+            })
             .collect();
         // Idle polls an hour apart: past the startup poll only the test's.
-        driver.set_card(1, motors, 3_600_000, 3_600_000);
-        driver.set_axis_logs(1, logs);
-        let setters = axes
-            .iter()
-            .map(|a| a.clone() as Arc<Mutex<dyn DrvSet>>)
-            .collect();
-        driver.set_axis_setters(1, setters);
-        let getters = axes
-            .iter()
-            .map(|a| a.lock().unwrap().params() as Arc<dyn motor_common::drv_motor_asyn::DrvGet>)
-            .collect();
-        driver.set_axis_getters(1, getters);
+        driver.set_card(1, model2, 3_600_000, 3_600_000);
         let args = vec![
             ArgValue::String(port.into()),
             ArgValue::String(port.into()),
