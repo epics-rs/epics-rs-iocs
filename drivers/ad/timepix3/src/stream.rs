@@ -423,7 +423,7 @@ pub enum Channel {
 /// `prvHstWorkerThread` (histogram_io.cpp:973-996).
 pub struct FrameDecoder {
     channel: Channel,
-    buffer: FrameBuffer<(Pending, Value)>,
+    buffer: FrameBuffer<(Pending, Value, bool)>,
     limits: ImageLimits,
 }
 
@@ -461,23 +461,51 @@ impl FrameDecoder {
     /// The next complete frame, or `None` when more bytes are needed.
     pub fn next_frame(&mut self) -> Result<Option<Frame>, FrameError> {
         let (channel, limits) = (self.channel, &self.limits);
-        let resolved = self.buffer.next(|line| {
-            let header = serde_json::from_slice::<Value>(line)
-                .ok()
-                .filter(Value::is_object);
-            let (payload, pending) = match channel {
-                Channel::Image => {
-                    let header = header
-                        .as_ref()
-                        .ok_or("malformed or non-object jsonimage header")?;
-                    image_header(header, limits).map_err(|e| e.to_string())?
+        loop {
+            let resolved = self.buffer.next(|line| {
+                let header = nlohmann_parse(line).filter(Value::is_object);
+                let (payload, pending) = match channel {
+                    Channel::Image => {
+                        let header = header
+                            .as_ref()
+                            .ok_or("malformed or non-object jsonimage header")?;
+                        image_header(header, limits).map_err(|e| e.to_string())?
+                    }
+                    Channel::Histogram => histogram_header(header.as_ref())?,
+                };
+                Ok((
+                    payload,
+                    (pending, header.unwrap_or_default(), line_has_json(line)),
+                ))
+            })?;
+            match resolved {
+                None => return Ok(None),
+                Some(((pending, header, true), payload)) => {
+                    return Ok(Some(pending.finish(&payload, header)));
                 }
-                Channel::Histogram => histogram_header(header.as_ref())?,
-            };
-            Ok((payload, (pending, header.unwrap_or_default())))
-        })?;
-        Ok(resolved.map(|((pending, header), payload)| pending.finish(&payload, header)))
+                // C's line handler returns true without touching the frame.
+                Some(((_, _, false), _)) => continue,
+            }
+        }
     }
+}
+
+/// `json::parse`: nlohmann skips a UTF-8 BOM at the very start, which
+/// serde_json refuses.
+fn nlohmann_parse(line: &[u8]) -> Option<Value> {
+    let line = line.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(line);
+    serde_json::from_slice(line).ok()
+}
+
+/// The line handlers' rescan of an accepted header (serval_stream.cpp:94-101,
+/// :732-741, histogram_io.cpp:185-192): skip non-printable bytes (a byte past
+/// 0x7f is a negative `char`, so below 32), and find a `{` where it stops. A
+/// leading space is printable, so such a header passes the resolver and the
+/// frame is dropped here.
+fn line_has_json(line: &[u8]) -> bool {
+    line.iter()
+        .find(|&&b| b == b'{' || (32..=126).contains(&b))
+        .is_some_and(|&b| b == b'{')
 }
 
 /// A frame whose header is decoded and whose payload is still to come.
@@ -765,6 +793,48 @@ mod tests {
             ]
         );
         assert_eq!(d.buffered(), 0);
+    }
+
+    /// The resolver parses as nlohmann (a leading BOM accepted); the line
+    /// handler then drops a frame whose header starts with a printable
+    /// non-`{`, such as a space (serval_stream.cpp:94-101, :732-741,
+    /// histogram_io.cpp:185-192).
+    #[test]
+    fn a_header_prefix_is_handled_as_c_line_handlers() {
+        let prefixed = |prefix: &[u8], frame: i32| {
+            let mut b = prefix.to_vec();
+            b.extend(image_bytes(1, 1, frame, &[frame as u16]));
+            b
+        };
+        let mut bytes = prefixed(b" ", 1);
+        bytes.extend(prefixed(b"\xEF\xBB\xBF", 2));
+        bytes.extend(prefixed(b"\t", 3));
+        bytes.extend(prefixed(b"\xEF\xBB\xBF ", 4));
+        bytes.extend(prefixed(b"", 5));
+        let mut d = FrameDecoder::new(Channel::Image);
+        d.push(&bytes).unwrap();
+        let mut seen = Vec::new();
+        while let Some(Frame::Image(f)) = d.next_frame().unwrap() {
+            seen.push(f.frame_number);
+        }
+        assert_eq!(seen, vec![2, 3, 5]);
+        assert_eq!(d.buffered(), 0);
+
+        let histogram = |prefix: &str, frame: i32| {
+            let mut b = format!(r#"{prefix}{{"binSize":1,"frameNumber":{frame}}}"#).into_bytes();
+            b.push(b'\n');
+            b.extend_from_slice(&1u32.to_be_bytes());
+            b.push(b'\n');
+            b
+        };
+        let mut d = FrameDecoder::new(Channel::Histogram);
+        d.push(&[histogram(" ", 1), histogram("\u{feff}", 2)].concat())
+            .unwrap();
+        let Some(Frame::Histogram(h)) = d.next_frame().unwrap() else {
+            panic!("no histogram frame")
+        };
+        assert_eq!(h.frame_number, 2);
+        assert_eq!(d.next_frame().unwrap(), None);
     }
 
     #[test]
