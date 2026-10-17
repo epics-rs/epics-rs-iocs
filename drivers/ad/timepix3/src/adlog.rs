@@ -10,7 +10,8 @@ const LOG_HTTP_WARNING: &str = "void ADTimePix::logHttpWarning(const char*, cons
                                 const std::string&, long int, const std::string&)";
 
 pub const REFRESH_PIXEL_CONFIG: &str = "asynStatus ADTimePix::refreshPixelConfigFromServal()";
-pub const WRITE_BPC_FILE: &str = "asynStatus ADTimePix::writeBPCfile(char**, int*)";
+pub const WRITE_BPC_FILE: &str =
+    "asynStatus ADTimePix::writeBPCfile(const std::vector<unsigned char>&)";
 pub const UPDATE_DETECTOR_FAMILY: &str =
     "void ADTimePix::updateDetectorFamily(int, const std::string&, const std::string&)";
 pub const TIME_PIX_CALLBACK: &str = "void ADTimePix::timePixCallback()";
@@ -141,6 +142,17 @@ mod tests {
             format!("ERROR | ADTimePix::{LOG_HTTP_FAILURE}: c: GET u HTTP 0: \n")
         );
         assert!(http_failure("c", "GET", "u", &HttpError::Parse("x".into())).is_none());
+    }
+
+    /// `writeBPCfile` takes the BPC bytes since 99d2321 (ADTimePix.h), and
+    /// GCC prints `std::uint8_t` as `unsigned char`.
+    #[test]
+    fn write_bpc_file_lines_carry_the_vector_signature() {
+        assert_eq!(
+            err(WRITE_BPC_FILE, "WriteBPC: uploadBPC to SERVAL failed"),
+            "ERROR | ADTimePix::asynStatus ADTimePix::writeBPCfile(const \
+             std::vector<unsigned char>&): WriteBPC: uploadBPC to SERVAL failed"
+        );
     }
 
     #[test]
