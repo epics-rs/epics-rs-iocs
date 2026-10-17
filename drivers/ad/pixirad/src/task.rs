@@ -406,11 +406,7 @@ async fn status_loop(ctx: StatusContext) {
         Err(e) => {
             // C returns here still holding the port lock, which wedges the
             // port; only the task stops.
-            ctx.trace_error(&format!(
-                "pixirad:statusTask: Error in binding port {}: {}\n",
-                ctx.status_port,
-                strerror(&e)
-            ));
+            ctx.trace_error(&format!("pixirad:statusTask: {e}\n"));
             return;
         }
     };

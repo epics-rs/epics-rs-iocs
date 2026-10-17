@@ -157,9 +157,15 @@ pub fn bind_data_socket(port: u16) -> Result<(UdpSocket, usize), String> {
     Ok((socket.into(), actual))
 }
 
-/// Bind the status broadcast socket.
-pub fn bind_status_socket(port: u16) -> io::Result<UdpSocket> {
-    UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+/// Bind the status broadcast socket. The error is C `statusTask`'s text for
+/// the step that failed.
+pub fn bind_status_socket(port: u16) -> Result<UdpSocket, String> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|e| format!("Can't create socket: {}", strerror(&e)))?;
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())
+        .map_err(|e| format!("Error in binding port {port}: {}", strerror(&e)))?;
+    Ok(socket.into())
 }
 
 /// C `strerror(errno)`: the OS text without Rust's " (os error N)" suffix.
@@ -175,6 +181,18 @@ pub(crate) fn strerror(e: &io::Error) -> String {
 mod tests {
     use super::*;
     use crate::types::{Asic, Build};
+
+    /// pixirad.cpp:1295-1302: statusTask's bind line names the port.
+    #[test]
+    fn a_status_port_in_use_is_c_s_bind_line() {
+        let busy = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let e = bind_status_socket(port).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            format!("Error in binding port {port}: Address already in use")
+        );
+    }
 
     fn sensor(packets: usize) -> Sensor {
         Sensor {
