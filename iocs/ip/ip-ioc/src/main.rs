@@ -8,7 +8,6 @@
 //! `drvAsynIPPortConfigure`:
 //!
 //! ```text
-//! MPCConfig(port, octetPort, address, [pollPeriod])
 //! TPG261Config(port, octetPort, [pollPeriod])
 //! TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
 //! ND261Config(port, octetPort, [pollPeriod])
@@ -26,23 +25,87 @@ use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use ip_devices::eurotherm::create_eurotherm;
-use ip_devices::mpc::create_mpc;
 use ip_devices::nd261::create_nd261;
 use ip_devices::runtime::IpPortRuntime;
 use ip_devices::televac::create_televac;
 use ip_devices::tpg261::create_tpg261;
 
-/// `ipSupport.dbd`'s `device(ai,INST_IO,devAiMKS,"HPS SensaVac 937")`; its dset
-/// is `{6, 0, 0, initAi, 0, readAi, convertAi}`.
-static DEVICES: &[(&str, &[DevSup])] = &[(
-    "ai",
-    &[DevSup {
-        name: "devAiMKS",
-        choice: ip_devices::mks::DTYP,
-        link_type: DbLinkType::InstIo,
-        dset: Dset::new(6, &[2, 4, 5], false),
-    }],
-)];
+/// `ipSupport.dbd`'s `devAiMKS` (`"HPS SensaVac 937"`) and `dev<Type>MPC`
+/// (`"asyn MPC"`) rows; their dsets are `{6, 0, 0, init, 0, read/write,
+/// convert}`, with no convert on the non-analog MPC types.
+static DEVICES: &[(&str, &[DevSup])] = &[
+    (
+        "ai",
+        &[
+            DevSup {
+                name: "devAiMKS",
+                choice: ip_devices::mks::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4, 5], false),
+            },
+            DevSup {
+                name: "devAiMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4, 5], false),
+            },
+        ],
+    ),
+    (
+        "ao",
+        &[DevSup {
+            name: "devAoMPC",
+            choice: ip_devices::mpc::DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4, 5], false),
+        }],
+    ),
+    (
+        "bi",
+        &[DevSup {
+            name: "devBiMPC",
+            choice: ip_devices::mpc::DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }],
+    ),
+    (
+        "bo",
+        &[DevSup {
+            name: "devBoMPC",
+            choice: ip_devices::mpc::DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }],
+    ),
+    (
+        "mbbo",
+        &[DevSup {
+            name: "devMbboMPC",
+            choice: ip_devices::mpc::DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }],
+    ),
+    (
+        "stringin",
+        &[DevSup {
+            name: "devSiMPC",
+            choice: ip_devices::mpc::DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }],
+    ),
+    (
+        "stringout",
+        &[DevSup {
+            name: "devSoMPC",
+            choice: ip_devices::mpc::DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }],
+    ),
+];
 
 /// Every port the startup script creates, kept alive for the life of the IOC.
 type Ports = Arc<Mutex<Vec<IpPortRuntime>>>;
@@ -113,53 +176,10 @@ async fn main() -> CaResult<()> {
         Box::new(epics_rs::base::server::records::scalcout::ScalcoutRecord::default())
     });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
-    // devAiMKS: per-record ai device support, bound by DTYP.
-    app = app.register_dynamic_device_support(DEVICES, ip_devices::mks::device_support_factory());
-
-    // MPCConfig(port, octetPort, address, [pollPeriod])
-    {
-        let ports = ports.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "MPCConfig",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "octetPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "address",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "pollPeriod",
-                    arg_type: ArgType::Double,
-                },
-            ],
-            "MPCConfig portName octetPort address [pollPeriod] - MPC/Digitel ion-pump controller",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let name = string_arg(args, 0)?;
-                let octet = string_arg(args, 1)?;
-                let address = int_arg(args, 2)?;
-                let address = u8::try_from(address)
-                    .map_err(|_| format!("MPCConfig: address {address} is not 0..255"))?;
-                let poll = poll_arg(args, 3, 1.0)?;
-                let claim = claim_port(&name).map_err(|e| format!("MPCConfig failed: {e}"))?;
-                let port = create_mpc(&claim, &octet, address, poll)
-                    .map_err(|e| format!("MPCConfig failed: {e}"))?;
-                register(
-                    &ports,
-                    claim,
-                    ctx.db().scan_control().interrupt_gate(),
-                    port,
-                )?;
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
+    // devAiMKS and devMPC: per-record device support, bound by DTYP.
+    let mks = ip_devices::mks::device_support_factory();
+    let mpc = ip_devices::mpc::device_support_factory();
+    app = app.register_dynamic_device_support(DEVICES, move |ctx| mks(ctx).or_else(|| mpc(ctx)));
 
     // TPG261Config(port, octetPort, [pollPeriod])
     {

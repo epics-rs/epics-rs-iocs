@@ -18,13 +18,11 @@ asynSetOption("SerialMPC", 0, "stop", "1")
 asynOctetSetInputEos("SerialMPC", 0, "\r")
 asynOctetSetOutputEos("SerialMPC", 0, "\r")
 
-# MPCConfig(portName, octetPort, controllerAddress, pollPeriodSeconds)
-MPCConfig("MPC1", "SerialMPC", 5, 1.0)
-
-# Supply 1 is asyn address 0, supply 2 is address 1.
-dbLoadRecords("$(IP)/db/mpc.db", "P=$(PREFIX),PUMP=ip1,PORT=MPC1,ADDR=0")
-dbLoadRecords("$(IP)/db/mpc.db", "P=$(PREFIX),PUMP=ip2,PORT=MPC1,ADDR=1")
-dbLoadRecords("$(IP)/db/tsp.db", "P=$(PREFIX),TSP=tsp1,PORT=MPC1")
+# devMPC takes the controller address (PA) and supply (PN) from each record's
+# INP/OUT, on the octet port itself.
+dbLoadRecords("$(IP)/db/MPC.db", "P=$(PREFIX),PUMP=ip1,PORT=SerialMPC,PA=5,PN=1")
+dbLoadRecords("$(IP)/db/MPC.db", "P=$(PREFIX),PUMP=ip2,PORT=SerialMPC,PA=5,PN=2")
+dbLoadRecords("$(IP)/db/TSP.db", "P=$(PREFIX),TSP=tsp1,PORT=SerialMPC,PA=5")
 
 # --- Pfeiffer TPG261 / TPG262 gauge controller ------------------------------
 # 9600 8N1; the controller frames every line with CR/LF and expects a bare CR.

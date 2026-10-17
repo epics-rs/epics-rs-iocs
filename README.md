@@ -886,15 +886,17 @@ bit addressing (`B <bit>`), and I/O-Intr driven records.
 as an asyn **port driver**: the record link binds to a port parameter
 instead of embedding the raw command text, and each port drives its device
 over a pre-configured serial/IP octet port on its own worker thread. The
-exception is `devAiMKS.c`, kept as per-record ai device support
-(DTYP `HPS SensaVac 937`) on the upstream `MKS.db`.
+exceptions are `devAiMKS.c`, kept as per-record ai device support
+(DTYP `HPS SensaVac 937`) on the upstream `MKS.db`, and `devMPC.c`, kept as
+per-record device support (DTYP `asyn MPC`) on the upstream `MPC.db` and
+`TSP.db`.
 
 **Build/run:** `cargo run -p ip-ioc --release -- iocs/ip/ip-ioc/st.cmd`
 
 | Device | db template | Records |
 |---|---|---|
-| Gamma Vacuum MPC / Digitel ion pump | `mpc.db` | `STAT`, `PRES`, `PRESEGU`, `CUR`, `VOLT`, `SIZE`, `SP1V`-`SP4V`, `SP1S`-`SP4S`, `GAUTOS`, `TSPSTAT`, `DIS`, `UNIT`, `SSIZE`, `SET1`-`SET4`, `STOP`, `ULCK`, `SAUTOS` (26 records) |
-| Titanium sublimation pump (same controller) | `tsp.db` | `TSP_STAT`, `TSP_REMAINING`, `TSP_MIN1`-`MIN4`, `SEND_TIMED`, `TSP_OFF`, `TSP_FIL`, `TSP_CLEAR`, `TSP_AUTO_ADV`, `TSP_CONTINUOUS`, `SEND_SUBLIMATION`, `TSP_DEGAS`, `TSP_MODE`, `TSP_SUBLIMATION`, `TSP_SUB2`, `TSP_SETMODE`, `TSP_TIMED`, `TSP_VALUE`, `TSP_UNITS`, `TSP_SECONDS`, `TSP_MINUTES`, `TSP_NCYCLES`, `TSP_MIN_PRESS` (25 records) |
+| Gamma Vacuum MPC / Digitel ion pump | `MPC.db` (upstream) | `STAT`, `PRES`, `CUR`, `VOLT`, `SIZE`, `SP1V`-`SP4V`, `SP1S`-`SP4S`, `GAUTOS`, `DIS`, `SSIZE`, `SET1`-`SET4`, `STOP`, `ULCK`, `SAUTOS` (23 records) |
+| Titanium sublimation pump (same controller) | `TSP.db` (upstream) | `TSP_STAT`, `TSP_REMAINING`, `TSP_MIN1`-`MIN4`, `SEND_TIMED`, `TSP_OFF`, `TSP_FIL`, `TSP_CLEAR`, `TSP_AUTO_ADV`, `TSP_CONTINUOUS`, `SEND_SUBLIMATION`, `TSP_DEGAS`, `TSP_MODE`, `TSP_SUBLIMATION`, `TSP_SUB2`, `TSP_SETMODE`, `TSP_TIMED`, `TSP_VALUE`, `TSP_UNITS`, `TSP_SECONDS`, `TSP_MINUTES`, `TSP_NCYCLES`, `TSP_MIN_PRESS` (25 records) |
 | Pfeiffer TPG261/TPG262 gauge controller | `tpg261.db` | `ID`, `UNIT`, `PRES`, `GSTATUS`, `STATUS`, `SP1S`, `SP2S`, `SP1V`, `SP2V`, `START`, `SUNIT`, `SET1`, `SET2` (13 records) |
 | Televac vacuum gauge | `televac.db` | `PRES` (1 record) |
 | Televac relay outputs | `televac_relay.db` | `ON`, `OFF`, `STATE` (3 records) |
