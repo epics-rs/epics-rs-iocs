@@ -73,6 +73,8 @@ fn unpack1000(upper: i16, lower: i16) -> i32 {
 
 /// Shared controller state: the in/out Modbus register handles.
 pub struct Ang1Controller {
+    /// The controller port, whose pasynUserSelf C traces on.
+    port: String,
     /// C `inputDriver_`, which each axis connects its force-read user to.
     in_port: String,
     in_regs: ModbusRegs,
@@ -83,10 +85,11 @@ impl Ang1Controller {
     /// Connect the In/Out Modbus ports previously created by
     /// `drvModbusAsynConfigure`. C keeps the controller either way; the
     /// output connect's status, the only one C checks, is returned.
-    pub fn new(in_port: &str, out_port: &str) -> (Self, AsynResult<()>) {
+    pub fn new(port: &str, in_port: &str, out_port: &str) -> (Self, AsynResult<()>) {
         let (in_regs, _) = ModbusRegs::connect(in_port, TIMEOUT);
         let (out_regs, out_status) = ModbusRegs::connect(out_port, TIMEOUT);
         let ctrl = Self {
+            port: port.to_string(),
             in_port: in_port.to_string(),
             in_regs,
             out_regs,
@@ -110,6 +113,10 @@ impl Ang1Controller {
     /// every ANG1 register write (unlike ANF2, which has no per-write
     /// delay).
     fn write16(&self, reg: i32, value: i32) -> AsynResult<()> {
+        MotorTrace::new(self.port.clone(), 0).print_self(
+            TraceMask::IO_DRIVER,
+            format_args!("writeReg16: writing {value} to register {reg}\n"),
+        );
         self.out_regs.write16(reg, value)?;
         sleep(Duration::from_millis(10));
         Ok(())
@@ -489,10 +496,43 @@ mod tests {
 
     #[test]
     fn a_controller_of_missing_ports_keeps_its_axes() {
-        let (ctrl, out_status) = Ang1Controller::new("ang1MissingIn", "ang1MissingOut");
+        let (ctrl, out_status) =
+            Ang1Controller::new("ang1Missing", "ang1MissingIn", "ang1MissingOut");
         assert!(out_status.is_err());
         let ax = Ang1Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         assert!(ax.lock().read16(STATUS_1).is_err());
+    }
+
+    /// C `writeReg16` prints each register write on pasynUserSelf before it
+    /// is tried (ANG1Driver.cpp:203).
+    #[test]
+    fn a_register_write_prints_its_traceio_driver_line() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        let port = "ang1RegTrace";
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(port), TraceMask::IO_DRIVER);
+        trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+        trace.set_device_trace_file(port, 0, TraceFile::File(file));
+        let (ctrl, _) = Ang1Controller::new(port, "ang1RegTraceIn", "ang1RegTraceOut");
+        assert!(ctrl.write32(SPD_UPR, 12_345).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            text.matches("writeReg16: writing 12 to register 4\n")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("writeReg16: writing 345 to register 5\n")
+                .count(),
+            1,
+            "{text}"
+        );
     }
 
     #[test]

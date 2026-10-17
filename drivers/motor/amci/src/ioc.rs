@@ -224,7 +224,7 @@ pub fn ang1_create_controller_command() -> CommandDef {
 
             // Connected ahead of the port, which writes through it; nothing
             // shows before the port exists.
-            let (controller, out_status) = Ang1Controller::new(&in_port, &out_port);
+            let (controller, out_status) = Ang1Controller::new(&port_name, &in_port, &out_port);
             let controller = Arc::new(Mutex::new(controller));
             let params = Ang1Params::new(
                 controller.clone(),
