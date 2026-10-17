@@ -195,12 +195,12 @@ impl Pm304Controller {
     }
 
     /// C `send_mess`: each `;`-separated piece of `msg` is its own command,
-    /// its reply read and dropped.
-    fn send_mess(&self, msg: &[u8]) -> AsynResult<()> {
+    /// its reply read and dropped, and its status too, so every piece goes
+    /// out (drvPM304.cc:367-376).
+    fn send_mess(&self, msg: &[u8]) {
         for piece in msg.split(|&b| b == b';').filter(|p| !p.is_empty()) {
-            self.handle.write_read(0, &Self::framed(piece), READ_BUF)?;
+            let _ = self.handle.write_read(0, &Self::framed(piece), READ_BUF);
         }
-        Ok(())
     }
 }
 
@@ -283,28 +283,22 @@ impl Pm304Axis {
 
     /// PREM, which devPM304.cc puts just ahead of the motion command; it
     /// goes out piece by piece like the rest of the message.
-    fn send_prem(&mut self, ctrl: &Pm304Controller) -> AsynResult<()> {
+    fn send_prem(&mut self, ctrl: &Pm304Controller) {
         let prem = self.strings.arm();
-        ctrl.send_mess(&prem)
+        ctrl.send_mess(&prem);
     }
 
     /// Program the speeds before a move or home (C sends `SV`/`SA`/`SD` as
     /// separate transactions ahead of the motion command). SV goes out
     /// whatever its value, as SET_VELOCITY always does; the record sends
     /// SET_ACCEL only for a positive rate (motorRecord.cc:874, 940).
-    fn program_speeds(
-        ctrl: &Pm304Controller,
-        axis: u32,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        ctrl.command(&format!("{axis}SV{}", nint(velocity)))?;
+    fn program_speeds(ctrl: &Pm304Controller, axis: u32, velocity: f64, acceleration: f64) {
+        ctrl.send_mess(format!("{axis}SV{}", nint(velocity)).as_bytes());
         if acceleration > 0.0 {
             let accel = nint(acceleration);
-            ctrl.command(&format!("{axis}SA{accel}"))?;
-            ctrl.command(&format!("{axis}SD{accel}"))?;
+            ctrl.send_mess(format!("{axis}SA{accel}").as_bytes());
+            ctrl.send_mess(format!("{axis}SD{accel}").as_bytes());
         }
-        Ok(())
     }
 }
 
@@ -324,9 +318,9 @@ impl AsynMotor for Pm304Axis {
     ) -> AsynResult<()> {
         let controller = self.controller.clone();
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
-        self.send_prem(&ctrl)?;
-        ctrl.command(&format!("{}MA{}", self.axis, nint(position)))?;
+        Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration);
+        self.send_prem(&ctrl);
+        ctrl.send_mess(format!("{}MA{}", self.axis, nint(position)).as_bytes());
         Ok(())
     }
 
@@ -340,9 +334,9 @@ impl AsynMotor for Pm304Axis {
     ) -> AsynResult<()> {
         let controller = self.controller.clone();
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
-        self.send_prem(&ctrl)?;
-        ctrl.command(&format!("{}MR{}", self.axis, nint(distance)))?;
+        Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration);
+        self.send_prem(&ctrl);
+        ctrl.send_mess(format!("{}MR{}", self.axis, nint(distance)).as_bytes());
         Ok(())
     }
 
@@ -358,21 +352,21 @@ impl AsynMotor for Pm304Axis {
         // The record's jog sends SET_ACCEL whatever the rate
         // (motorRecord.cc:2141), so SA/SD always lead.
         let accel = nint(acceleration);
-        ctrl.command(&format!("{}SA{accel}", self.axis))?;
-        ctrl.command(&format!("{}SD{accel}", self.axis))?;
-        self.send_prem(&ctrl)?;
+        ctrl.send_mess(format!("{}SA{accel}", self.axis).as_bytes());
+        ctrl.send_mess(format!("{}SD{accel}", self.axis).as_bytes());
+        self.send_prem(&ctrl);
         match ctrl.model {
             Model::Pm304 => {
                 // PM304: the signed speed as SV, then CV1 only for a
                 // positive one (devPM304.cc JOG case).
                 let speed = nint(velocity);
-                ctrl.command(&format!("{}SV{speed}", self.axis))?;
+                ctrl.send_mess(format!("{}SV{speed}", self.axis).as_bytes());
                 let dir = if speed > 0 { 1 } else { -1 };
-                ctrl.command(&format!("{}CV{dir}", self.axis))?;
+                ctrl.send_mess(format!("{}CV{dir}", self.axis).as_bytes());
             }
             Model::Pm600 => {
                 // PM600: signed continuous velocity in one command.
-                ctrl.command(&format!("{}CV{}", self.axis, nint(velocity)))?;
+                ctrl.send_mess(format!("{}CV{}", self.axis, nint(velocity)).as_bytes());
             }
         }
         Ok(())
@@ -388,21 +382,21 @@ impl AsynMotor for Pm304Axis {
     ) -> AsynResult<()> {
         let controller = self.controller.clone();
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
-        self.send_prem(&ctrl)?;
+        Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration);
+        self.send_prem(&ctrl);
         let cmd = match (ctrl.model, forward) {
             (Model::Pm304, true) => format!("{}IX", self.axis),
             (Model::Pm304, false) => format!("{}IX-1", self.axis),
             (Model::Pm600, true) => format!("{}HD", self.axis),
             (Model::Pm600, false) => format!("{}HD-1", self.axis),
         };
-        ctrl.command(&cmd)?;
+        ctrl.send_mess(cmd.as_bytes());
         Ok(())
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.command(&format!("{}ST", self.axis))?;
+        ctrl.send_mess(format!("{}ST", self.axis).as_bytes());
         Ok(())
     }
 
@@ -413,7 +407,7 @@ impl AsynMotor for Pm304Axis {
         } else {
             format!("{}CP{}", self.axis, nint(position))
         };
-        ctrl.command(&cmd)?;
+        ctrl.send_mess(cmd.as_bytes());
         Ok(())
     }
 
@@ -421,7 +415,8 @@ impl AsynMotor for Pm304Axis {
     fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
         let mut msg = init.to_vec();
         msg.push(b'\r');
-        self.lock().send_mess(&msg)
+        self.lock().send_mess(&msg);
+        Ok(())
     }
 
     fn set_move_strings(
@@ -457,7 +452,7 @@ impl AsynMotor for Pm304Axis {
             && let Some(mut post) = self.strings.post_due()
         {
             post.push(b'\r');
-            let _ = ctrl.send_mess(&post);
+            ctrl.send_mess(&post);
         }
         drop(ctrl);
 
@@ -611,6 +606,26 @@ mod tests {
 
         let (_line, io) = LineRig::new("pm304Absent", |_| String::new());
         assert!(Pm304Controller::new(io, 1).is_err());
+    }
+
+    /// drvPM304.cc:367-376: send_mess ignores each piece's status, so a
+    /// refused SV does not keep the move from going out.
+    #[test]
+    fn a_refused_piece_does_not_stop_the_move() {
+        let (line, io) = LineRig::failing(
+            "pm304Refused",
+            |last| match last {
+                "1ID\r" => "Mclennan PM304".into(),
+                _ => "OK".into(),
+            },
+            |sent| sent == "1SV400\r",
+        );
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        axis.move_absolute(&AsynUser::default(), 50.0, 0.0, 400.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["1SV400\r", "1MA50\r"]);
     }
 
     #[test]
