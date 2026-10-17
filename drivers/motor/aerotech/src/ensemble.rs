@@ -471,6 +471,10 @@ impl AsynMotor for EnsembleAxis {
                 .map(|s| atoi(&s))
                 .unwrap_or(0);
             if fault != 0 {
+                self.log.print(
+                    TraceMask::ERROR,
+                    format_args!("motorAxisSetInteger: FAULTACK = {fault:X}\n"),
+                );
                 ctrl.command(&format!("FAULTACK @{axis}"))?;
             }
             ctrl.command(&format!("ENABLE @{axis}"))?;
@@ -737,6 +741,39 @@ mod tests {
             ],
             "{text}"
         );
+    }
+
+    /// drvEnsembleAsyn.cc:451-456: an enable that finds a fault prints it
+    /// in hex before its FAULTACK.
+    #[epics_rs::base::epics_test]
+    async fn an_enable_prints_the_fault_it_acknowledges() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        use motor_common::testing::LineRig;
+
+        let (line, io) = LineRig::new("ensAckLine", |cmd: &str| match cmd.trim_end() {
+            "AXISFAULT @0" => "%26".into(),
+            _ => "%0".into(),
+        });
+        let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensAckLine", "0")));
+        let mut axis = EnsembleAxis::new(controller, 0, 0).unwrap();
+        let path = std::env::temp_dir().join(format!("ens-ack-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(None, TraceMask::ERROR);
+        trace.set_trace_file(None, TraceFile::File(file));
+        line.sent();
+        axis.set_closed_loop(&AsynUser::new(0), true).unwrap();
+        let sent = line.sent();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(lines, ["motorAxisSetInteger: FAULTACK = 1A"], "{text}");
+        assert!(sent.iter().any(|s| s == "FAULTACK @0"), "{sent:?}");
     }
 
     #[test]
