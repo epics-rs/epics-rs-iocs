@@ -61,7 +61,10 @@ pub struct PixiradDetector {
     pub ad: ADDriverBase,
     pub params: PixiradParams,
     server: PixiradServer,
-    sensor: Sensor,
+    /// `None` for a `maxSizeX` C does not know.
+    asic: Option<Asic>,
+    /// `None` for a size C does not know; it then has no frames to read.
+    sensor: Option<Sensor>,
     /// Set by `pixiradAutoCal`; only the Pixie-III sends it.
     vbg_mcal_dac: i32,
     shared: Arc<SharedState>,
@@ -71,7 +74,6 @@ impl PixiradDetector {
     fn new(
         port_name: &str,
         server: PixiradServer,
-        sensor: Sensor,
         max_size_x: i32,
         max_size_y: i32,
         max_memory: usize,
@@ -90,7 +92,6 @@ impl PixiradDetector {
 
         let base = &mut ad.port_base;
         base.set_string_param(p.base.manufacturer, 0, "Pixirad")?;
-        base.set_string_param(p.base.model, 0, sensor.build.model_name())?;
         base.set_string_param(p.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
         base.set_int32_param(p.size_x, 0, max_size_x)?;
         base.set_int32_param(p.size_y, 0, max_size_y)?;
@@ -129,7 +130,8 @@ impl PixiradDetector {
             ad,
             params,
             server,
-            sensor,
+            asic: Asic::from_size_x(max_size_x),
+            sensor: Sensor::from_size(max_size_x, max_size_y),
             vbg_mcal_dac: 0,
             shared,
         };
@@ -144,6 +146,20 @@ impl PixiradDetector {
         let _ = det.set_cooling_and_hv();
 
         det.identify()?;
+        match det.sensor {
+            Some(sensor) => {
+                let model = det.ad.params.base.model;
+                det.ad
+                    .port_base
+                    .set_string_param(model, 0, sensor.build.model_name())?;
+            }
+            // C then names the model from an uninitialised build; it stays
+            // empty here.
+            None if det.asic.is_none() => {
+                println!("pixirad::pixirad Illegal maxSizeX={max_size_x}")
+            }
+            None => println!("pixirad::pixirad Illegal maxSizeY={max_size_y}"),
+        }
         det.ad.port_base.call_param_callbacks(0)?;
         Ok(det)
     }
@@ -245,7 +261,12 @@ impl PixiradDetector {
             self.get_f64(self.params.threshold[3]),
             self.get_f64(self.params.hit_threshold),
         ];
-        let t = thresholds::calculate(self.sensor.asic, &energies);
+        // C picks a register layout from an uninitialised ASIC.
+        let asic = self.asic.ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: "pixirad: no ASIC is known for this maxSizeX".into(),
+        })?;
+        let t = thresholds::calculate(asic, &energies);
 
         for i in 0..4 {
             self.set_float64(self.params.threshold_actual[i], t.actual_energy[i])?;
@@ -253,7 +274,7 @@ impl PixiradDetector {
         self.set_float64(self.params.hit_threshold_actual, t.actual_energy[4])?;
 
         let readout_mode = self.frame_type().readout_mode();
-        let command = match self.sensor.asic {
+        let command = match asic {
             Asic::PIII => {
                 let count_mode = CountMode::from_i32(self.get_i32(self.params.count_mode))
                     .unwrap_or(CountMode::Normal);
@@ -537,13 +558,6 @@ pub fn create_pixirad_detector(
     max_memory: usize,
 ) -> AsynResult<PixiradRuntime> {
     let port_name = claim.name();
-    // C printed a message for a size it did not know and then decoded frames
-    // with an uninitialised sensor description.
-    let sensor = Sensor::from_size(max_size_x, max_size_y).ok_or_else(|| AsynError::Status {
-        status: AsynStatus::Error,
-        message: format!("pixirad: no Pixirad detector is {max_size_x} x {max_size_y}"),
-    })?;
-
     let max_buffers = max_data_port_buffers.max(1);
     let shared = Arc::new(SharedState {
         udp_buffers_read: AtomicI32::new(0),
@@ -556,7 +570,6 @@ pub fn create_pixirad_detector(
     let det = PixiradDetector::new(
         port_name,
         server.clone(),
-        sensor,
         max_size_x,
         max_size_y,
         max_memory,
@@ -565,20 +578,29 @@ pub fn create_pixirad_detector(
     let ad_params = det.ad.params;
     let params = det.params;
     let pool = det.ad.pool.clone();
+    let sensor = det.sensor;
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
 
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(max_buffers);
-
-    let threads = vec![
-        task::start_udp_listener(
+    let mut threads = vec![task::start_status_task(StatusContext {
+        status_port,
+        server,
+        handle: runtime_handle.port_handle().clone(),
+        ad_params,
+        params,
+    })];
+    // C starts the data tasks on an uninitialised sensor; without one there is
+    // no frame to read.
+    if let Some(sensor) = sensor {
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(max_buffers);
+        threads.push(task::start_udp_listener(
             data_port,
             runtime_handle.port_handle().clone(),
             sensor,
             frame_tx,
             shared.clone(),
-        ),
-        task::start_data_task(DataContext {
+        ));
+        threads.push(task::start_data_task(DataContext {
             handle: runtime_handle.port_handle().clone(),
             output: ArrayPublisher::new(array_output.clone()),
             pool: pool.clone(),
@@ -587,15 +609,8 @@ pub fn create_pixirad_detector(
             sensor,
             shared: shared.clone(),
             frames: frame_rx,
-        }),
-        task::start_status_task(StatusContext {
-            status_port,
-            server,
-            handle: runtime_handle.port_handle().clone(),
-            ad_params,
-            params,
-        }),
-    ];
+        }));
+    }
 
     Ok(PixiradRuntime {
         runtime_handle,
@@ -668,11 +683,9 @@ mod tests {
             max_buffers: 1,
             udp_speed: AtomicU64::new(0),
         });
-        let sensor = Sensor::from_size(476, 512).unwrap();
         PixiradDetector::new(
             name,
             PixiradServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO)),
-            sensor,
             476,
             512,
             max_memory,
@@ -697,7 +710,6 @@ mod tests {
         let mut det = PixiradDetector::new(
             "PIXI_NONE",
             PixiradServer::new(user),
-            Sensor::from_size(476, 512).unwrap(),
             476,
             512,
             1 << 20,
@@ -785,8 +797,12 @@ mod tests {
     impl DataTask {
         fn start(name: &str, max_memory: usize) -> Self {
             let det = detector_sized(name, Some("NEVER"), max_memory);
-            let (ad, params, pool, sensor) =
-                (det.ad.params, det.params, det.ad.pool.clone(), det.sensor);
+            let (ad, params, pool, sensor) = (
+                det.ad.params,
+                det.params,
+                det.ad.pool.clone(),
+                det.sensor.unwrap(),
+            );
             let shared = det.shared.clone();
             let (runtime, _) =
                 create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
@@ -979,5 +995,35 @@ mod tests {
         )
         .expect("C builds the driver before its tasks bind");
         assert_eq!(rt.port_handle().port_name(), "PIXI_BUSY");
+    }
+
+    /// pixirad.cpp:510-517, :574-631: C sets the size parameters before it
+    /// looks the size up, prints an illegal one and goes on.
+    #[test]
+    fn an_unknown_size_still_makes_the_port() {
+        for (name, x, y) in [("PIXI_ODD_X", 1024, 1024), ("PIXI_ODD_Y", 476, 640)] {
+            let (command, _) = SyncIOHandle::connect_port(
+                &format!("{name}_IP"),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            );
+            let rt = create_pixirad_detector(
+                &claim_port(name).unwrap(),
+                command,
+                0,
+                0,
+                1,
+                x,
+                y,
+                1 << 20,
+            )
+            .expect("C makes the port whatever the size");
+            let read = |reason| rt.port_handle().read_int32_blocking(reason, 0).unwrap();
+            assert_eq!(read(rt.ad_params.max_size_x), x);
+            assert_eq!(read(rt.ad_params.max_size_y), y);
+            assert_eq!(read(rt.ad_params.size_x), x);
+            assert_eq!(read(rt.ad_params.base.array_size_y), y);
+        }
     }
 }
