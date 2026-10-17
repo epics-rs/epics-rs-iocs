@@ -63,6 +63,11 @@ static PIC862: Model1 = Model1::new(&DEV_PIC862, 8, SCAN_RATE);
 
 /// `PIC862Setup(num_cards, scan_rate)`.
 pub fn pic862_setup_command() -> CommandDef {
+    PIC862.register_report("drvPIC862", |cards| {
+        cards.report("PIC862", |card, line| {
+            format!("    PIC862 controller #{card}, {line} \n")
+        })
+    });
     PIC862.setup_command("PIC862Setup")
 }
 
@@ -97,11 +102,13 @@ pub fn pic862_config_command() -> CommandDef {
             )?;
             let controller = PIC862Controller::new(handle, addr as u8)
                 .map_err(|e| format!("PIC862Config: {e}"))?;
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             let axis = PIC862Axis::new(controller).map_err(|e| format!("PIC862Config: {e}"))?;
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             PIC862.install(ctx, card, 0, motor)?;
+            PIC862.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -788,6 +795,31 @@ mod report {
             after,
             "    PIC848 controller 0 connection failed.\n    PIC848 controller #1, \
              port=c848RepLine, id: C-848 \n"
+        );
+    }
+
+    /// drvPIC862.cc:117-142, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic862_controller() {
+        let setup = pic862_setup_command();
+        let (_line, _io) = LineRig::new("c862RepLine", |last| match last {
+            "TP" => "P:0\r".into(),
+            _ => "C-862\r".into(),
+        });
+        let (before, after) = reports(
+            "drvPIC862",
+            (setup, vec![int(2), int(10)]),
+            (
+                pic862_config_command(),
+                vec![int(1), port("c862RepLine"), int(1)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIC862 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC862 controller 0 connection failed.\n    PIC862 controller #1, \
+             port=c862RepLine, id: C-862 \n"
         );
     }
 }
