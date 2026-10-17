@@ -46,6 +46,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{ControllerParams, ParamWrite, index};
 use epics_rs::motor::trace::MotorTrace;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::util::{atof, atoi};
 
 /// Reply read buffer size (C `MAX_BUFF_LEN`).
@@ -601,6 +602,26 @@ impl ImsMDrivePlusAxis {
         )
     }
 
+    /// C's "base velocity cannot be greater than max velocity" check, which
+    /// prints in the function that makes it (ImsMDrivePlusMotorAxis.cpp:127,
+    /// :310).
+    fn check_base_velocity(&self, function: &str, min: f64, max: f64) -> AsynResult<()> {
+        if min <= max {
+            return Ok(());
+        }
+        self.trace.print_self(
+            TraceMask::ERROR,
+            format_args!(
+                "{DRIVER_NAME}:{function}: base velocity={:.6} cannot be greater than max velocity={:.6}\n",
+                CFloat(min),
+                CFloat(max)
+            ),
+        );
+        Err(ims_err(
+            "ims: base velocity cannot be greater than max velocity",
+        ))
+    }
+
     fn send_move_params(
         &self,
         min_velocity: f64,
@@ -608,11 +629,7 @@ impl ImsMDrivePlusAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         if min_velocity > 0.0 {
-            if min_velocity > max_velocity {
-                return Err(ims_err(
-                    "ims: base velocity cannot be greater than max velocity",
-                ));
-            }
+            self.check_base_velocity("setAxisMoveParameters()", min_velocity, max_velocity)?;
             self.write_only(&format!("VI={}", min_velocity as i64))?;
         }
         self.write_only(&format!("VM={}", max_velocity as i64))?;
@@ -773,8 +790,13 @@ impl AsynMotor for ImsMDrivePlusAxis {
         // HM 3 homes in the plus direction, HM 1 in the minus direction.
         let direction = if forward { 3 } else { 1 };
         // R1=0 resets the "homed" latch; poll sets it once the move completes.
-        let status = self
-            .set_move_params(min_velocity, velocity, acceleration)
+        let checked = if min_velocity > 0.0 {
+            self.check_base_velocity("home()", min_velocity, velocity)
+        } else {
+            Ok(())
+        };
+        let status = checked
+            .and_then(|()| self.set_move_params(min_velocity, velocity, acceleration))
             .and_then(|()| self.write_only(&format!("HM {direction}")))
             .and_then(|()| self.write_only("R1=0"));
         self.bail("home()", "homing motor", status)?;
@@ -955,6 +977,54 @@ mod tests {
         );
         assert_eq!(sent, ["PR P", "PR ER"]);
         assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:126-130, 309-313: a base velocity above
+    /// the max prints its ERROR line in the function that checks it; home
+    /// checks it itself and never reaches setAxisMoveParameters.
+    #[test]
+    fn a_base_velocity_above_the_max_is_reported_where_checked() {
+        let base = |function: &str| {
+            format!(
+                "{DRIVER_NAME}:{function}: base velocity=60.000000 cannot be greater than max \
+                 velocity=50.000000"
+            )
+        };
+        let (sent, lines) = axis_error_lines(
+            "imsVbMove",
+            "imsVbMoveLine",
+            |_| false,
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.move_absolute(&user, 1.0, 60.0, 50.0, 0.0).is_err());
+            },
+        );
+        assert_eq!(sent, ["PR ER", "PR ER"]);
+        assert_eq!(
+            lines,
+            [
+                base("setAxisMoveParameters()"),
+                error_line(
+                    "setAxisMoveParameters()",
+                    "setting motor velocity and acceleration"
+                ),
+                error_line("move()", "moving motor"),
+            ]
+        );
+        let (sent, lines) = axis_error_lines(
+            "imsVbHome",
+            "imsVbHomeLine",
+            |_| false,
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.home(&user, 60.0, 50.0, 0.0, true).is_err());
+            },
+        );
+        assert_eq!(sent, ["PR ER"]);
+        assert_eq!(
+            lines,
+            [base("home()"), error_line("home()", "homing motor")]
+        );
     }
 
     /// The other axis bail sites: stop (:274-279), home (:344-349),
