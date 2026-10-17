@@ -9,9 +9,12 @@
 
 use std::sync::Arc;
 
+use epics_rs::ad_core::driver::ADDriverBase;
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
-use epics_rs::asyn::error::AsynError;
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
+use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -29,7 +32,7 @@ pub mod tasks;
 pub mod tiff;
 pub mod trace;
 
-use crate::driver::EigerDriver;
+use crate::driver::{EigerDriver, MAX_ASYN_ADDRESS};
 use crate::params::Model;
 use crate::rest::RestApi;
 use crate::tasks::{Outputs, Signals};
@@ -43,6 +46,10 @@ pub struct EigerRuntime {
     pub pool: DriverPool,
     pub outputs: Outputs,
     pub signals: Signals,
+    /// What C's `RestAPI` constructor threw (restApi.cpp:244-275), after the
+    /// `ADDriver` base had registered the port; iocsh prints it as
+    /// `C++ error: ...`. The port then has ADDriver's parameters only.
+    pub thrown: Option<&'static str>,
     task_handles: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -61,36 +68,12 @@ impl EigerRuntime {
     }
 }
 
-/// Why `eigerDetectorConfig` made no port.
-#[derive(Debug)]
-pub enum ConfigError {
-    /// What C's `RestAPI` constructor throws (restApi.cpp:244-275); iocsh
-    /// prints it as `C++ error: ...`.
-    Rest(&'static str),
-    Asyn(AsynError),
-}
-
-impl std::fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Rest(what) => f.write_str(what),
-            Self::Asyn(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl From<AsynError> for ConfigError {
-    fn from(e: AsynError) -> Self {
-        Self::Asyn(e)
-    }
-}
-
 /// Create an Eiger detector port (C `eigerDetectorConfig`).
 pub fn create_eiger_detector(
     claim: &PortClaim,
     hostname: &str,
     max_memory: usize,
-) -> Result<EigerRuntime, ConfigError> {
+) -> AsynResult<EigerRuntime> {
     create_eiger_detector_on_port(claim, hostname, REST_PORT, max_memory)
 }
 
@@ -104,11 +87,14 @@ pub fn create_eiger_detector_on_port(
     hostname: &str,
     rest_port: u16,
     max_memory: usize,
-) -> Result<EigerRuntime, ConfigError> {
+) -> AsynResult<EigerRuntime> {
     let port_name = claim.name();
-    // C builds `mApi` before its constructor body runs, so a detector that
-    // cannot say which API it speaks leaves no driver at all.
-    let rest = RestApi::open(hostname, rest_port).map_err(ConfigError::Rest)?;
+    // C builds `mApi` after the ADDriver base constructor has registered the
+    // port, and nothing unregisters it when `mApi` throws.
+    let rest = match RestApi::open(hostname, rest_port) {
+        Ok(rest) => rest,
+        Err(thrown) => return create_inert(claim, max_memory, thrown),
+    };
     let api = rest.api_version();
 
     // The model decides which parameters exist, so it has to be known before any
@@ -169,6 +155,51 @@ pub fn create_eiger_detector_on_port(
         pool,
         outputs,
         signals,
+        thrown: None,
         task_handles,
+    })
+}
+
+/// The port of a constructor that threw: the ADDriver base alone.
+struct InertDriver {
+    ad: ADDriverBase,
+}
+
+impl PortDriver for InertDriver {
+    fn base(&self) -> &PortDriverBase {
+        &self.ad.port_base
+    }
+
+    fn base_mut(&mut self) -> &mut PortDriverBase {
+        &mut self.ad.port_base
+    }
+}
+
+fn create_inert(
+    claim: &PortClaim,
+    max_memory: usize,
+    thrown: &'static str,
+) -> AsynResult<EigerRuntime> {
+    let ad = ADDriverBase::new(
+        claim.name(),
+        MAX_ASYN_ADDRESS,
+        0,
+        0,
+        max_memory,
+        PortFlags {
+            multi_device: true,
+            ..ASYN_CANBLOCK
+        },
+    )?;
+    let pool = ad.pool.clone();
+    let (runtime_handle, _) =
+        create_port_runtime(claim, InertDriver { ad }, RuntimeConfig::default())?;
+    Ok(EigerRuntime {
+        runtime_handle,
+        pool,
+        outputs: Outputs::new(),
+        signals: tasks::signals().0,
+        thrown: Some(thrown),
+        task_handles: Vec::new(),
     })
 }
