@@ -39,7 +39,9 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::iocsh::registry::CommandContext;
-use epics_rs::motor::builder::{AxisSetup, ControllerAxis, ControllerBuilder, MotorBuilder};
+use epics_rs::motor::builder::{
+    AxisSetup, ControllerAxes, ControllerAxis, ControllerBuilder, MotorBuilder,
+};
 pub use epics_rs::motor::devices::{
     device_support_factory, devices, model1_device, register_controller_port,
     register_drv_motor_asyn_port, register_model1_device,
@@ -64,11 +66,23 @@ pub fn asyn_user(port: &str, addr: i32) -> TraceUser {
 
 /// A C `asynMotorController`'s axes and its one poller thread
 /// (asynMotorController.cpp:567-575, :615-695): each pass runs the
-/// controller poll, then every axis in the order [`Self::install`] added
-/// them, so a slow axis delays the rest as in C.
-#[derive(Default)]
+/// controller poll, then every axis in address order, so a slow axis delays
+/// the rest as in C. An axis installed after [`Self::start`] joins the
+/// running poller, as C's reads the axis list on every pass.
 pub struct Controller {
-    builder: ControllerBuilder,
+    /// Until the poller starts.
+    builder: Mutex<Option<ControllerBuilder>>,
+    axes: ControllerAxes,
+}
+
+impl Default for Controller {
+    fn default() -> Self {
+        let builder = ControllerBuilder::new();
+        Self {
+            axes: builder.axes(),
+            builder: Mutex::new(Some(builder)),
+        }
+    }
 }
 
 impl Controller {
@@ -77,36 +91,47 @@ impl Controller {
     }
 
     /// The driver's `asynMotorController::poll` override.
-    pub fn controller_poll(mut self, poll: impl FnMut() + Send + 'static) -> Self {
-        self.builder = self.builder.controller_poll(poll);
-        self
+    pub fn controller_poll(self, poll: impl FnMut() + Send + 'static) -> Self {
+        let builder = self.builder.into_inner().unwrap_or_else(|e| e.into_inner());
+        Self {
+            builder: Mutex::new(builder.map(|b| b.controller_poll(poll))),
+            axes: self.axes,
+        }
     }
 
-    /// Register `motor` as the next axis, under `user`; the sender reaches
-    /// its poller, for a driver thread's [`PollCommand::Post`] or wakeup.
+    /// Register `motor` as the axis at `user`; the sender reaches its
+    /// poller, for a driver thread's [`PollCommand::Post`] or wakeup.
     pub fn install(
-        &mut self,
+        &self,
         user: TraceUser,
         motor: Arc<Mutex<dyn AsynMotor>>,
     ) -> Result<mpsc::Sender<PollCommand>, String> {
-        let ControllerAxis { axis, poll_cmd_tx } = self.builder.axis(motor, user);
+        let ControllerAxis { axis, poll_cmd_tx } = self.axes.add(motor, user)?;
         epics_rs::motor::devices::register_axis(axis)?;
         Ok(poll_cmd_tx)
     }
 
     /// C `startPoller(movingPollPeriod, idlePollPeriod, forcedFastPolls)`:
-    /// the startup pass over the axes, then the poller thread.
+    /// the startup pass over the axes so far, then the poller thread.
     /// `forced_fast_polls` is the driver's own, C has no default
     /// (asynMotorController.cpp:567). A constructor that returns before it
-    /// leaves its axes unpolled, as C's does.
+    /// leaves its axes unpolled, as C's does. The poller starts once.
     pub fn start(
-        self,
+        &self,
         ctx: &CommandContext,
         moving_poll_ms: u64,
         idle_poll_ms: u64,
         forced_fast_polls: u32,
     ) {
-        let poller = self.builder.build(
+        let builder = self
+            .builder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(builder) = builder else {
+            return;
+        };
+        let poller = builder.build(
             Duration::from_millis(moving_poll_ms),
             Duration::from_millis(idle_poll_ms),
             forced_fast_polls,
@@ -142,4 +167,85 @@ pub fn install(
     epics_rs::motor::devices::register_axis(axis)?;
     ctx.bridge().spawn(poll_loop.run());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::interfaces::motor::{MotorStatus, PollFailure};
+    use epics_rs::asyn::user::AsynUser;
+    use epics_rs::base::runtime::task::BlockingBridge;
+    use epics_rs::base::server::database::PvDatabase;
+
+    use super::*;
+
+    type Log = Arc<Mutex<Vec<i32>>>;
+
+    struct Polled {
+        addr: i32,
+        log: Log,
+    }
+
+    impl AsynMotor for Polled {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            self.log.lock().unwrap().push(self.addr);
+            Ok(MotorStatus::default())
+        }
+    }
+
+    /// SmarAct's constructor starts the poller and `*CreateAxis` adds the
+    /// axes later; ANF2StartPoller starts it after iocInit.
+    #[test]
+    fn an_axis_installed_after_start_joins_the_poller() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _entered = rt.enter();
+        let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
+        let log = Log::default();
+        let motor = |addr| -> Arc<Mutex<dyn AsynMotor>> {
+            Arc::new(Mutex::new(Polled {
+                addr,
+                log: log.clone(),
+            }))
+        };
+        register_port(&ctx, "joinAfterStart", 2).unwrap();
+        let controller = Controller::new();
+        let _a1 = controller
+            .install(asyn_user("joinAfterStart", 1), motor(1))
+            .unwrap();
+        controller.start(&ctx, 5, 5, 0);
+        let _a0 = controller
+            .install(asyn_user("joinAfterStart", 0), motor(0))
+            .unwrap();
+        let joined = log.lock().unwrap().len();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while log.lock().unwrap()[joined..].len() < 4 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let passes = log.lock().unwrap()[joined..].to_vec();
+        assert_eq!(passes[..4], [0, 1, 0, 1], "{passes:?}");
+    }
 }

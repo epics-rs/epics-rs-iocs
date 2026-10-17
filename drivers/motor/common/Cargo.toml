@@ -20,4 +20,4 @@ testing = []
 epics-rs = { workspace = true, features = ["asyn", "motor"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }

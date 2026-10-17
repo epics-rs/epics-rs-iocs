@@ -94,7 +94,7 @@ pub fn acsmotion_config_command() -> CommandDef {
             }
             let polled = controller.clone();
             // C startPoller, SPiiPlusDriver.cpp:269
-            let mut poller = Controller::new().controller_poll(move || {
+            let poller = Controller::new().controller_poll(move || {
                 // C's poller ignores poll()'s status.
                 let _ = polled.lock().unwrap_or_else(|e| e.into_inner()).poll();
             });

@@ -119,10 +119,9 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
             register_drv_motor_asyn_port(&port_name, num_axes)?;
             // The driver's one task polls the card's axes in turn.
             let periods = driver.periods(card);
-            let mut controller = periods.map(|_| Controller::new());
+            let controller = periods.map(|_| Controller::new());
             for addr in 0..num_axes {
-                let (Some(controller), Some(motor)) = (&mut controller, driver.open(card, addr))
-                else {
+                let (Some(controller), Some(motor)) = (&controller, driver.open(card, addr)) else {
                     println!("drvAsynMotorConfigure: Failed to open axis {addr}");
                     continue;
                 };

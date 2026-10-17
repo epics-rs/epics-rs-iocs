@@ -123,7 +123,7 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
             let mut posters = Vec::with_capacity(total_axes);
             // No timed pass: the OMS poller posts (zero periods wait on
             // events alone).
-            let mut axes_poller = Controller::new();
+            let axes_poller = Controller::new();
             for (axis, axis_dev) in axes.into_iter().enumerate() {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_dev));
                 posters.push(axes_poller.install(asyn_user(&port_name, axis as i32), motor)?);
