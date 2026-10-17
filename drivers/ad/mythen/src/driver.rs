@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
@@ -12,7 +13,6 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::base::server::records::printf::format_g;
 
 use crate::detector::{Detector, Settings};
 use crate::protocol::CHANNELS_PER_MODULE;
@@ -521,7 +521,8 @@ impl PortDriver for MythenDriver {
 
         status.or(self.refresh_settings());
         status.or(self.ad.port_base.call_param_callbacks(0));
-        let g = format_g(value, 6);
+        // C prints `value=%g` (mythen.cpp:1221,1225).
+        let g = CFloat(value).g();
         if status.bits != 0 {
             user.print(
                 TraceMask::ERROR,
