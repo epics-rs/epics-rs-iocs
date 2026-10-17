@@ -571,6 +571,23 @@ mod extra_params {
         until(0);
     }
 
+    /// ImsMDrivePlusMotorController.cpp:403-406, ImsMDrivePlusMotorAxis.cpp:
+    /// 504: a first poll that fails posts COMMS_ERROR 1 with its problem
+    /// bit, in the same callParamCallbacks.
+    #[epics_rs::base::epics_test]
+    async fn a_failed_first_poll_leaves_comms_error_set() {
+        let (_line, io) =
+            failing_controller("imsComms1", "imsComms1Line", 3.6e6, |l| l == "APR P").await;
+        let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
+        let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while io.read_int32(problem).unwrap_or(0) != 1 {
+            assert!(std::time::Instant::now() < deadline, "problem never 1");
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(io.read_int32(comms).unwrap(), 1);
+    }
+
     /// ImsMDrivePlusMotorController.cpp:335-343 and
     /// ImsMDrivePlusMotorAxis.cpp:542-563: IMS_CLEARLRERROR 1 sends `CF`.
     #[epics_rs::base::epics_test]
