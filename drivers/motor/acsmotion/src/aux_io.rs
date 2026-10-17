@@ -86,7 +86,8 @@ impl PortDriver for SpiiPlusAuxIo {
         // written; the base posts the channel's.
         self.base.write_uint32_digital_param(user, value, mask)?;
         if user.reason == self.params.digital_output {
-            self.write_bits(user.addr, mask, value)?;
+            let chan = self.base.get_address(user.addr, user.reason)?;
+            self.write_bits(chan, mask, value)?;
         }
         Ok(())
     }
@@ -94,7 +95,8 @@ impl PortDriver for SpiiPlusAuxIo {
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         self.base.write_float64_param(user, value)?;
         if user.reason == self.params.analog_output {
-            self.write_analog(user.addr, value)?;
+            let chan = self.base.get_address(user.addr, user.reason)?;
+            self.write_analog(chan, value)?;
         }
         Ok(())
     }
@@ -285,4 +287,46 @@ pub fn config(
         })
         .map_err(|e| format!("{port}: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use epics_rs::asyn::port::DrvUserRequest;
+    use epics_rs::asyn::registry::open_owner;
+    use epics_rs::asyn::request::RequestOp;
+
+    use super::*;
+
+    /// A write at address -1 goes to channel 0, getAddress's channel for it
+    /// (SPiiPlusAuxDriver.cpp:135, :186).
+    #[test]
+    fn writes_at_address_minus_one_reach_channel_0() {
+        let line = crate::fake::line("spiiAuxM1");
+        config(&open_owner(), "spiiAuxM1Io", "spiiAuxM1", 2, 1000.0).unwrap();
+        let port = PortManager::global()
+            .find_port_handle("spiiAuxM1Io")
+            .unwrap();
+        let reason = |name: &str| {
+            port.drv_user_create_blocking(&DrvUserRequest::new(name, 0))
+                .unwrap()
+                .reason
+        };
+        port.write_float64_blocking(reason("ANALOG_OUTPUT"), -1, 5.0)
+            .unwrap();
+        let digital = AsynUser::new(reason("DIGITAL_OUTPUT")).with_addr(-1);
+        let write = RequestOp::UInt32DigitalWrite {
+            value: 1,
+            mask: u32::MAX,
+        };
+        port.submit_blocking(write, digital).unwrap();
+        let sent: Vec<String> = line
+            .lock()
+            .unwrap()
+            .sent
+            .iter()
+            .filter(|c| c.contains("OUT(") && !c.starts_with("BIN"))
+            .cloned()
+            .collect();
+        assert_eq!(sent, ["AOUT(0) = 5", "OUT(0) = 1"]);
+    }
 }
