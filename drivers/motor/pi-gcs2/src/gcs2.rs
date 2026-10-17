@@ -247,6 +247,11 @@ fn target_counts(position: f64) -> f64 {
     f64::from(nint(position))
 }
 
+/// The `int(status)` C's FLOW lines print.
+fn status_code(result: &AsynResult<()>) -> i32 {
+    result.as_ref().err().map_or(0, |e| e.status() as i32)
+}
+
 /// C `TranslatePIError(epicsInt32)`.
 fn error_message(error: i32) -> std::borrow::Cow<'static, str> {
     match crate::pi_errors::message(error) {
@@ -1571,15 +1576,20 @@ impl PIGCS2Axis {
     /// defect not copied: its format takes the verb first, printing
     /// "Sett:PIasynDriver: writeInt32ing ...".
     fn flag_write_flow(&self, verb: &str, flag: &str) {
+        self.flow(format_args!(
+            "PIasynDriver:writeInt32: {verb}ing {flag} flag on driver {}\n",
+            self.port_name
+        ));
+    }
+
+    /// `asynPrint(pasynUser_, ASYN_TRACE_FLOW, ...)`: the axis's own user.
+    fn flow(&self, args: std::fmt::Arguments<'_>) {
         PortManager::global().trace_manager().print(
             Some(&self.port_name),
             Some(self.axis_no as i32),
             0,
             TraceMask::FLOW,
-            format_args!(
-                "PIasynDriver:writeInt32: {verb}ing {flag} flag on driver {}\n",
-                self.port_name
-            ),
+            args,
         );
     }
 
@@ -1817,6 +1827,11 @@ impl PIGCS2Axis {
             if let Ok(homed) = homed {
                 self.homed = homed;
             }
+            self.flow(format_args!(
+                "PIasynAxis::poll() axis {} referencing state changed, homed = {}\n",
+                self.axis_no,
+                i32::from(self.homed)
+            ));
             // C m_bEnableAxisAfterHoming / m_bSetServoAfterHoming, set by
             // PIC885Controller::initAxis alone.
             if self.homed && self.lock().model == Model::C885 {
@@ -1879,7 +1894,7 @@ impl AsynMotor for PIGCS2Axis {
         &mut self,
         _user: &AsynUser,
         position: f64,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
@@ -1887,14 +1902,14 @@ impl AsynMotor for PIGCS2Axis {
         if !self.lock().accepts_new_target() {
             return Err(self.refuse_target("moveAxis", "\n"));
         }
-        let position = target_counts(position);
+        let counts = target_counts(position);
         let mut ctrl = self.lock();
         if ctrl.moves_deferred {
             ctrl.deferred.insert(
                 self.axis_no,
                 DeferredMove {
                     axis: self.axis_name.clone(),
-                    counts: position,
+                    counts,
                     cpu: self.cpu,
                 },
             );
@@ -1910,7 +1925,19 @@ impl AsynMotor for PIGCS2Axis {
         if acceleration != 0.0 {
             self.apply_acceleration(acceleration)?;
         }
-        self.move_cts(position)
+        let result = self.move_cts(counts);
+        // Only the undeferred move reaches here: movesDeferred is 0.
+        self.flow(format_args!(
+            "PIasynAxis:moveAxis: Set driver {}, axis {} move to {}, min vel={}, max_vel={}, accel={}, deffered=0 - status={}\n",
+            self.port_name,
+            self.axis_no,
+            CFloat(position),
+            CFloat(min_velocity),
+            CFloat(velocity),
+            CFloat(acceleration),
+            status_code(&result)
+        ));
+        result
     }
 
     // move_relative: C's own `move(position, relative, ...)` never branches
@@ -1924,7 +1951,7 @@ impl AsynMotor for PIGCS2Axis {
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
         self.log_here();
         if !self.lock().accepts_new_target() {
@@ -1933,22 +1960,36 @@ impl AsynMotor for PIGCS2Axis {
         // C `moveVelocity`: VEL, then `move` toward whichever travel limit
         // the sign of velocity selects (TMN/TMX, already controller units).
         // No acceleration write.
-        self.lock()
-            .set_velocity(&self.axis_name, velocity / self.cpu)?;
         let target = if velocity > 0.0 {
             self.high_limit
         } else {
             self.low_limit
         };
-        self.move_to(target)
+        let line = |when| {
+            format!(
+                "PIasynAxis:moveVelocityAxis: Set port {}, axis {} move with velocity of {}, accel={} / target {} - {when} MOV\n",
+                self.port_name,
+                self.axis_no,
+                CFloat(velocity),
+                CFloat(acceleration),
+                CFloat(target)
+            )
+        };
+        let (before, after) = (line("BEFORE"), line("AFTER"));
+        self.flow(format_args!("{before}"));
+        self.lock()
+            .set_velocity(&self.axis_name, velocity / self.cpu)?;
+        let result = self.move_to(target);
+        self.flow(format_args!("{after}"));
+        result
     }
 
     fn home(
         &mut self,
         _user: &AsynUser,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
         self.log_here();
@@ -1956,24 +1997,50 @@ impl AsynMotor for PIGCS2Axis {
         // command; on failure it is left set until the next poll's real
         // status bitmask corrects it, matching upstream.
         self.is_homing = true;
-        self.reference_vel_cts(velocity, forward)
+        self.reference_vel_cts(velocity, forward)?;
+        self.flow(format_args!(
+            "PIasynAxis:homeAxis: Set driver {}, axis {} to home {}, min vel={}, max_vel={}, accel={}",
+            self.port_name,
+            self.axis_no,
+            if forward { "FORWARDS" } else { "REVERSE" },
+            CFloat(min_velocity),
+            CFloat(velocity),
+            CFloat(acceleration)
+        ));
+        Ok(())
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
         self.log_here();
         let mut ctrl = self.lock();
         ctrl.deferred.remove(&self.axis_no);
-        match ctrl.model {
+        let result = match ctrl.model {
             Model::C885 => ctrl.stop_all(),
             model if model.is_hexapod() => ctrl.halt_platform(),
             _ => ctrl.halt(&self.axis_name),
-        }
+        };
+        drop(ctrl);
+        self.flow(format_args!(
+            "PIasynAxis:stopAxis: Set axis {} to stop with accel={}",
+            self.axis_no,
+            CFloat(acceleration)
+        ));
+        result
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         self.log_here();
-        self.lock()
-            .set_axis_position(&self.axis_name, position / self.cpu)
+        let result = self
+            .lock()
+            .set_axis_position(&self.axis_name, position / self.cpu);
+        self.flow(format_args!(
+            "PIasynAxis:setPositionAxis: Set driver {}, axis {} set position to {} - status={}\n",
+            self.port_name,
+            self.axis_no,
+            CFloat(position),
+            status_code(&result)
+        ));
+        result
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
@@ -2026,6 +2093,12 @@ impl AsynMotor for PIGCS2Axis {
         } else {
             None
         };
+        if homing {
+            self.flow(format_args!(
+                "PIasynAxis::poll() axis {} referencing ...\n",
+                self.axis_no
+            ));
+        }
         let params = self.lock().port.as_ref().map(|&(_, params)| params);
         if let Some(params) = params {
             if let Some(real) = real {
@@ -2990,6 +3063,52 @@ mod tests {
         axis.last_position = 20000.0;
         axis.move_velocity(&user, 0.0, 1.0, 0.0).unwrap();
         assert!(!axis.last_direction);
+    }
+
+    /// `PIasynAxis`'s FLOW lines on its own user (PIasynAxis.cpp:131-133,
+    /// 188-189, 267-269, 294-305, 320-322, 346-348, 359-361).
+    #[test]
+    fn axis_entry_points_print_c_flow_lines() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let homing = Arc::new(AtomicBool::new(true));
+        let state = homing.clone();
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2AxFlowLine", move |last| {
+            match last {
+                "ERR?" => "0",
+                "\u{4}" if state.load(Ordering::Relaxed) => "015000",
+                "\u{4}" => "011000",
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2AxFlowLine")));
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2AxFlow");
+        axis.high_limit = 10.0;
+        let user = AsynUser::new(0);
+        let printed = traced_mask("gcs2AxFlow", TraceMask::FLOW, || {
+            axis.move_absolute(&user, 2.5, 0.5, 0.0, 0.0).unwrap();
+            axis.move_velocity(&user, 0.0, 2.0, 0.0).unwrap();
+            // C prints the line whatever haltAxis returns.
+            let _ = axis.stop(&user, 3.0);
+            axis.set_position(&user, 7.0).unwrap();
+            axis.has_reference = true;
+            axis.home(&user, 0.5, 2.0, 1.5, true).unwrap();
+            axis.poll(&user).unwrap();
+            homing.store(false, Ordering::Relaxed);
+            axis.poll(&user).unwrap();
+        });
+        for line in [
+            "PIasynAxis:moveAxis: Set driver gcs2AxFlow, axis 0 move to 2.500000, min vel=0.500000, max_vel=0.000000, accel=0.000000, deffered=0 - status=0\n",
+            "PIasynAxis:moveVelocityAxis: Set port gcs2AxFlow, axis 0 move with velocity of 2.000000, accel=0.000000 / target 10.000000 - BEFORE MOV\n",
+            "PIasynAxis:moveVelocityAxis: Set port gcs2AxFlow, axis 0 move with velocity of 2.000000, accel=0.000000 / target 10.000000 - AFTER MOV\n",
+            "PIasynAxis:stopAxis: Set axis 0 to stop with accel=3.000000",
+            "PIasynAxis:setPositionAxis: Set driver gcs2AxFlow, axis 0 set position to 7.000000 - status=0\n",
+            "PIasynAxis:homeAxis: Set driver gcs2AxFlow, axis 0 to home FORWARDS, min vel=0.500000, max_vel=2.000000, accel=1.500000",
+            "PIasynAxis::poll() axis 0 referencing ...\n",
+            "PIasynAxis::poll() axis 0 referencing state changed, homed = 1\n",
+        ] {
+            assert!(printed.contains(line), "{line:?} not in {printed}");
+        }
     }
 
     /// `PI_CS_TARGETMODE` (PIasynController.cpp:320-324, 587) picks the
