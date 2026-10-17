@@ -379,7 +379,22 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
             let serial_port = req_string(args, 1, "Serial port name")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, c_int(args, 2))?;
+            // Filled once the constructor has read the model and version.
+            let model_version = Arc::new(Mutex::new((0, String::new())));
+            let (moving_s, idle_s) = (period_s(moving_poll_ms), period_s(idle_poll_ms));
+            let shown = model_version.clone();
+            // AG_UCController::report (AG_UC.cpp:192-201).
+            let head = ControllerHead(move |ctx: &ControllerReport<'_>, out: &mut dyn Write| {
+                let (model, version) = &*shown.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = write!(
+                    out,
+                    "Agilis UC motor driver {}, model={model}, numAxes={}, moving poll \
+                     period={moving_s:.6}, idle poll period={idle_s:.6}\ncontroller version {version}\n",
+                    ctx.port_name(),
+                    ctx.num_axes()
+                );
+            });
+            register_port_with(ctx, &port_name, c_int(args, 2), head)?;
             // C goes on to RS/MR/VE on the unconnected user; VE then fails and
             // the controller is left without a poller.
             let (handle, _) = connect_controller(
@@ -391,6 +406,12 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
                 ),
             );
             let controller = AgUcController::new(handle, &MotorTrace::new(&port_name, 0));
+            // C prints an unset `AG_UCModel_` when VE failed or named no
+            // model; 0 stands for it.
+            *model_version.lock().unwrap_or_else(|e| e.into_inner()) = (
+                controller.model().map_or(0, |model| model as i32),
+                controller.version().to_string(),
+            );
             // C's constructor returns before startPoller without a model
             // (AG_UC.cpp:79, :96, :99); the axes created later stay unpolled.
             let poller = Arc::new(Controller::new());
@@ -442,8 +463,9 @@ pub fn ag_uc_create_axis_command() -> CommandDef {
                 c_int(args, 3),
                 c_int(args, 4),
             );
+            let report = Arc::new(ax.report());
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            poller.install(asyn_user(&port_name, axis), motor)?;
+            poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -2152,6 +2174,56 @@ mod one_poller {
 mod report {
     use super::*;
     use motor_common::testing::{port_report, run_command};
+
+    /// AG_UCController::report then AG_UCAxis::report (AG_UC.cpp:192-201,
+    /// :255-267); currentPosition is the last poll's.
+    #[epics_rs::base::epics_test]
+    async fn ag_uc_report_prints_the_controller_then_each_axis_above_level_0() {
+        use motor_common::testing::LineRig;
+        let (_line, _io) = LineRig::new("agucRepLine", |cmd| {
+            match cmd.trim_end() {
+                "VE" => "AG-UC8 v2.2.1",
+                "1TP" => "1TP42",
+                "1TS" => "1TS0",
+                "PH" => "PH0",
+                _ => "",
+            }
+            .into()
+        });
+        let args = vec![
+            ArgValue::String("agucRep".into()),
+            ArgValue::String("agucRepLine".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(100),
+            ArgValue::Int(100),
+        ];
+        run_command(ag_uc_create_controller_command(), args).await;
+        let int = ArgValue::Int;
+        let axis = vec![
+            ArgValue::String("agucRep".into()),
+            int(0),
+            int(1),
+            int(30),
+            int(-20),
+        ];
+        run_command(ag_uc_create_axis_command(), axis).await;
+        let head = "Agilis UC motor driver agucRep, model=1, numAxes=2, moving poll \
+                    period=0.100000, idle poll period=0.100000\ncontroller version AG-UC8 v2.2.1\n";
+        let text = port_report("agucRep", 0);
+        assert!(text.contains(&format!("{head}Port: agucRep\n")), "{text}");
+        let axis = "  axisID=1, channelID=1, hasLimits=1\n  forwardAmplitude=30, \
+                    reverseAmplitude=-20\n  currentPosition=42, positionOffset=0\n";
+        let want = format!("{head}{axis}Port: agucRep\n");
+        let mut text = String::new();
+        for _ in 0..300 {
+            text = port_report("agucRep", 1);
+            if text.contains(&want) {
+                break;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(text.contains(&want), "{text}");
+    }
 
     /// SMC100Controller::report then SMC100Axis::report
     /// (SMC100Driver.cpp:103-110, :150-159).

@@ -44,6 +44,8 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
+use motor_common::AxisReport;
+
 use crate::util::{nint, parse_int_at};
 
 /// Response buffer size for a single controller reply.
@@ -58,7 +60,7 @@ const RESET_SETTLE: Duration = Duration::from_millis(500);
 /// C default forward step amplitude when the configured value is non-positive.
 const DEFAULT_FORWARD_AMPLITUDE: i32 = 50;
 
-/// Agilis controller model (C `AG_UCModel_t`).
+/// Agilis controller model (C `AG_UCModel_t`, in its order: `as i32` is C's value).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgUcModel {
     /// AG-UC2 — single channel (channel 0), two axes.
@@ -177,6 +179,9 @@ pub struct AgUcController {
     /// `None` when C returns before `startPoller` (VE failed or the model is
     /// unknown): the axes are still created but never polled.
     model: Option<AgUcModel>,
+    /// C `controllerVersion_`, the `VE` reply; C leaves it unset when `VE`
+    /// failed, empty here.
+    version: String,
 }
 
 impl AgUcController {
@@ -201,7 +206,7 @@ impl AgUcController {
             "Agilis controller firmware version = {}",
             version.as_deref().unwrap_or("")
         );
-        let model = match version {
+        let model = match &version {
             Err(_) => {
                 trace.print_self(
                     TraceMask::ERROR,
@@ -212,7 +217,7 @@ impl AgUcController {
                 None
             }
             Ok(version) => {
-                let model = AgUcModel::from_version(&version);
+                let model = AgUcModel::from_version(version);
                 if model.is_none() {
                     trace.print_self(
                         TraceMask::ERROR,
@@ -224,11 +229,20 @@ impl AgUcController {
                 model
             }
         };
-        Self { handle, model }
+        Self {
+            handle,
+            model,
+            version: version.unwrap_or_default(),
+        }
     }
 
     pub fn model(&self) -> Option<AgUcModel> {
         self.model
+    }
+
+    /// C `controllerVersion_`.
+    pub fn version(&self) -> &str {
+        &self.version
     }
 
     fn write(&self, cmd: &str) -> AsynResult<()> {
@@ -264,11 +278,51 @@ pub struct AgUcAxis {
     channel_id: i32,
     /// Whether the actuator has limit switches (C `hasLimits_`).
     has_limits: bool,
+    /// C `forwardAmplitude_`/`reverseAmplitude_`, as sent with `SU`.
+    forward_amplitude: i32,
+    reverse_amplitude: i32,
+    /// Shared with the axis's [`AgUcAxisReport`].
+    steps: Arc<Mutex<Steps>>,
+}
+
+/// The step counts `AG_UCAxis::poll` and `setPosition` keep.
+#[derive(Default)]
+struct Steps {
     /// Accumulated step position last read from `TP`, plus offset (C
     /// `currentPosition_`).
-    current_position: i32,
+    current: i32,
     /// Offset applied by `set_position` (C `positionOffset_`).
-    position_offset: i32,
+    offset: i32,
+}
+
+/// C `AG_UCAxis::report` (AG_UC.cpp:255-267).
+pub struct AgUcAxisReport {
+    axis_id: i32,
+    channel_id: i32,
+    has_limits: bool,
+    forward_amplitude: i32,
+    reverse_amplitude: i32,
+    steps: Arc<Mutex<Steps>>,
+}
+
+impl AxisReport for AgUcAxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let steps = self.steps.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = write!(
+                out,
+                "  axisID={}, channelID={}, hasLimits={}\n  forwardAmplitude={}, \
+                 reverseAmplitude={}\n  currentPosition={}, positionOffset={}\n",
+                self.axis_id,
+                self.channel_id,
+                i32::from(self.has_limits),
+                self.forward_amplitude,
+                self.reverse_amplitude,
+                steps.current,
+                steps.offset
+            );
+        }
+    }
 }
 
 impl AgUcAxis {
@@ -282,14 +336,14 @@ impl AgUcAxis {
         forward_amplitude: i32,
         reverse_amplitude: i32,
     ) -> Self {
-        let (axis_id, channel_id) = {
+        let (axis_id, channel_id, forward_amplitude, reverse_amplitude) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let id = axis_id(axis_no);
             let ch = channel_id(ctrl.model, axis_no);
             let (forward, reverse) = setup_amplitudes(forward_amplitude, reverse_amplitude);
             let _ = ctrl.write_on_channel(ch, &format!("{id}SU{forward}"));
             let _ = ctrl.write_on_channel(ch, &format!("{id}SU{reverse}"));
-            (id, ch)
+            (id, ch, forward, reverse)
         };
 
         Self {
@@ -297,9 +351,26 @@ impl AgUcAxis {
             axis_id,
             channel_id,
             has_limits,
-            current_position: 0,
-            position_offset: 0,
+            forward_amplitude,
+            reverse_amplitude,
+            steps: Arc::default(),
         }
+    }
+
+    /// The axis's `report`.
+    pub fn report(&self) -> AgUcAxisReport {
+        AgUcAxisReport {
+            axis_id: self.axis_id,
+            channel_id: self.channel_id,
+            has_limits: self.has_limits,
+            forward_amplitude: self.forward_amplitude,
+            reverse_amplitude: self.reverse_amplitude,
+            steps: self.steps.clone(),
+        }
+    }
+
+    fn steps(&self) -> std::sync::MutexGuard<'_, Steps> {
+        self.steps.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, AgUcController> {
@@ -323,7 +394,7 @@ impl AsynMotor for AgUcAxis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         // Open-loop: absolute move is a relative PR from the tracked position.
-        let steps = nint(position - self.current_position as f64);
+        let steps = nint(position - self.steps().current as f64);
         let ctrl = self.lock();
         ctrl.write_on_channel(self.channel_id, &format!("{}PR{steps}", self.axis_id))
     }
@@ -379,15 +450,13 @@ impl AsynMotor for AgUcAxis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         // C `setPosition`: rebase the tracked position via an offset.
-        self.position_offset = nint(position) - self.current_position;
+        let mut steps = self.steps();
+        steps.offset = nint(position) - steps.current;
         Ok(())
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        // Clone the Arc into a local so the guard borrows it rather than
-        // `self`, leaving `self.current_position` free to update below.
-        let controller = self.controller.clone();
-        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let ctrl = self.lock();
         // C never starts the poller: the axis reports its initial status only.
         if ctrl.model.is_none() {
             return Ok(MotorStatus::default());
@@ -400,7 +469,11 @@ impl AsynMotor for AgUcAxis {
         // Position (TP): accumulated step count at offset 3 ("1TP").
         let position = parse_int_at(&ctrl.write_read(&format!("{}TP", self.axis_id))?, 3)
             .ok_or_else(|| parse_error("TP"))?;
-        self.current_position = position + self.position_offset;
+        let current = {
+            let mut steps = self.steps();
+            steps.current = position + steps.offset;
+            steps.current
+        };
 
         // Moving status (TS): state char at index 3; '0' means done.
         let ts = ctrl.write_read(&format!("{}TS", self.axis_id))?;
@@ -412,7 +485,7 @@ impl AsynMotor for AgUcAxis {
         let limit = ph_limit(self.axis_id, lim);
 
         Ok(MotorStatus {
-            position: self.current_position as f64,
+            position: current as f64,
             done: !moving,
             moving,
             // C sets both low and high limit to the same flag.
