@@ -13,12 +13,7 @@
 
 use epics_rs::asyn::interfaces::motor::PidGainKind;
 
-use super::rpc::{XpsError, XpsResult, XpsSocket, format_g};
-
-/// `%.13g` double format used on the wire.
-fn g(value: f64) -> String {
-    format_g(value, 13)
-}
+use super::rpc::{XpsError, XpsResult, XpsSocket, g13 as g};
 
 /// The XPS corrector type in use for a positioner (`XPSController.cpp`
 /// `CorrectorTypes`).

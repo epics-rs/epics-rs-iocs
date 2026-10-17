@@ -30,6 +30,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -404,61 +405,10 @@ impl XpsSocket {
     }
 }
 
-/// Format `value` like C `printf("%.*g", precision, value)`, used to marshal
-/// doubles into XPS command strings (the vendor library uses `%.13g`), so the
-/// wire bytes match. C `%g` rules: let `p` be the precision (min 1) and `x` the
-/// decimal exponent; use `%e` with precision `p-1` when `x < -4 || x >= p`,
-/// else `%f` with precision `p-1-x`; then strip trailing fractional zeros and a
-/// trailing decimal point.
-pub(crate) fn format_g(value: f64, precision: usize) -> String {
-    let p = precision.max(1);
-
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value < 0.0 { "-inf" } else { "inf" }.to_string();
-    }
-
-    // Extract the rounded decimal exponent via a scientific formatting at the
-    // target precision (rounding may bump the exponent, so read it back).
-    let sci = format!("{:.*e}", p - 1, value);
-    let exp: i32 = sci
-        .rsplit_once('e')
-        .and_then(|(_, e)| e.parse().ok())
-        .unwrap_or(0);
-
-    if exp < -4 || exp >= p as i32 {
-        // Scientific style, %e with precision p-1, mantissa zero-stripped.
-        let (mantissa, _) = sci.split_once('e').unwrap_or((sci.as_str(), ""));
-        let mantissa = strip_trailing_zeros(mantissa);
-        format!("{mantissa}e{}", format_exponent(exp))
-    } else {
-        // Fixed style, %f with precision p-1-exp, zero-stripped.
-        let frac_digits = (p as i32 - 1 - exp).max(0) as usize;
-        let fixed = format!("{value:.frac_digits$}");
-        strip_trailing_zeros(&fixed).to_string()
-    }
-}
-
-/// Strip trailing fractional zeros and a dangling decimal point from a decimal
-/// string (no exponent). Leaves integers untouched.
-fn strip_trailing_zeros(s: &str) -> &str {
-    if s.contains('.') {
-        s.trim_end_matches('0').trim_end_matches('.')
-    } else {
-        s
-    }
-}
-
-/// Format an exponent C-style: always a sign, at least two digits
-/// (`e+05`, `e-13`, `e+100`).
-fn format_exponent(exp: i32) -> String {
-    let sign = if exp < 0 { '-' } else { '+' };
-    format!("{sign}{:02}", exp.abs())
+/// C `%.13g`, the format XPS_C8_drivers.cpp and hxp_drivers.cpp write every
+/// double with.
+pub(crate) fn g13(value: f64) -> String {
+    format!("{:.13}", CFloat(value).g())
 }
 
 /// C `atoi` widened to `i64`: parse the leading (optionally signed) integer
@@ -530,20 +480,23 @@ mod tests {
     }
 
     #[test]
-    fn format_g_matches_c_printf() {
+    fn g13_matches_c_printf() {
         // Reference values from C printf("%.13g", x).
-        assert_eq!(format_g(0.0, 13), "0");
-        assert_eq!(format_g(50.0, 13), "50");
-        assert_eq!(format_g(-50.0, 13), "-50");
-        assert_eq!(format_g(0.1, 13), "0.1");
-        assert_eq!(format_g(-0.5, 13), "-0.5");
-        assert_eq!(format_g(1.5e-3, 13), "0.0015");
-        assert_eq!(format_g(1234567890123.0, 13), "1234567890123");
+        assert_eq!(g13(0.0), "0");
+        assert_eq!(g13(50.0), "50");
+        assert_eq!(g13(-50.0), "-50");
+        assert_eq!(g13(0.1), "0.1");
+        assert_eq!(g13(-0.5), "-0.5");
+        assert_eq!(g13(1.5e-3), "0.0015");
+        assert_eq!(g13(1234567890123.0), "1234567890123");
         // exp -5 < -4 → scientific.
-        assert_eq!(format_g(1e-5, 13), "1e-05");
+        assert_eq!(g13(1e-5), "1e-05");
         // exp 20 >= 13 → scientific.
-        assert_eq!(format_g(1e20, 13), "1e+20");
-        assert_eq!(format_g(1.25, 13), "1.25");
+        assert_eq!(g13(1e20), "1e+20");
+        assert_eq!(g13(1.25), "1.25");
+        assert_eq!(g13(-0.0), "-0");
+        assert_eq!(g13(-f64::NAN), "-nan");
+        assert_eq!(g13(f64::NAN), "nan");
     }
 
     /// An XPS that takes every command and never answers.
@@ -610,8 +563,8 @@ mod tests {
     }
 
     #[test]
-    fn format_g_rounds_to_precision() {
+    fn g13_rounds_to_precision() {
         // 1/3 at 13 significant digits.
-        assert_eq!(format_g(1.0 / 3.0, 13), "0.3333333333333");
+        assert_eq!(g13(1.0 / 3.0), "0.3333333333333");
     }
 }

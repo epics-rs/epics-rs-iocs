@@ -9,6 +9,8 @@
 //! can enumerate siblings sharing an XPS group — the single owner of that
 //! cross-axis state.
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -400,14 +402,16 @@ impl XpsController {
                 return Err(format!(
                     "Low soft limit violation for axis {}, position={:.6}, limit={low:.6}\n",
                     ax.positioner,
-                    start + min_pos,
+                    CFloat(start + min_pos),
+                    low = CFloat(low)
                 ));
             }
             if start + max_pos > high {
                 return Err(format!(
                     "High soft limit violation for axis {}, position={:.6}, limit={high:.6}\n",
                     ax.positioner,
-                    start + max_pos,
+                    CFloat(start + max_pos),
+                    high = CFloat(high)
                 ));
             }
             // The execute-time move places the motor one pre-ramp distance

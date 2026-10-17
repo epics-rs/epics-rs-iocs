@@ -7,15 +7,7 @@
 //! `GroupMoveAbort`, `GroupMotionEnable`/`Disable`, `FirmwareVersionGet`) are
 //! wire-identical to their XPS counterparts and reused from there.
 
-use crate::xps::rpc::{XpsResult, XpsSocket, format_g};
-
-/// Double precision used by the vendor library (`%.13g`).
-const G13: usize = 13;
-
-/// Format a double for the wire exactly as `hxp_drivers.cpp` (`%.13g`).
-fn g(value: f64) -> String {
-    format_g(value, G13)
-}
+use crate::xps::rpc::{XpsResult, XpsSocket, g13 as g};
 
 /// Join six coordinates as `%.13g` fields.
 fn g6(p: &[f64; 6]) -> String {

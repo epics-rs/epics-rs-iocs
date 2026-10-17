@@ -45,6 +45,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
@@ -555,10 +556,10 @@ impl Mm4000AxisReport {
                  home preset: {:.6}\n   step size:   {:.6}\n   max digits:  {}\n",
                 self.axis,
                 self.status.load(Ordering::Relaxed),
-                self.high_limit,
-                self.low_limit,
-                self.home_preset,
-                self.step_size,
+                CFloat(self.high_limit),
+                CFloat(self.low_limit),
+                CFloat(self.home_preset),
+                CFloat(self.step_size),
                 self.digits
             );
         }
@@ -977,7 +978,9 @@ impl AsynMotor for Mm4000Axis {
                 PidGainKind::Integral => "KI",
                 PidGainKind::Derivative => "KD",
             };
-            return self.lock().write(&format!("{a}{cc}{gain:.6};{a}UF;"));
+            return self
+                .lock()
+                .write(&format!("{a}{cc}{gain:.6};{a}UF;", gain = CFloat(gain)));
         }
         Err(mm_err(format!(
             "MM4000 does not support setting {kind:?} gain"

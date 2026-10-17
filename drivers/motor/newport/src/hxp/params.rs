@@ -4,6 +4,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
@@ -118,8 +119,8 @@ impl ControllerParams for HxpControllerParams {
              period={:.6}, coordSys={}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll_s,
-            self.idle_poll_s,
+            CFloat(self.moving_poll_s),
+            CFloat(self.idle_poll_s),
             self.coord_sys
         );
         ctx.report(out, level);

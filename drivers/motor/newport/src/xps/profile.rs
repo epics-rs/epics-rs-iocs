@@ -20,6 +20,8 @@
 //! defines exactly the participating positioners and their position arrays — so
 //! the `useAxis==0` zero-fill path is not modelled.
 
+use epics_libcom_rs::cfmt::CFloat;
+
 /// Minimum acceleration/deceleration ramp time, seconds (C
 /// `XPS_MIN_PROFILE_ACCEL_TIME`). Small scan velocities would otherwise ask the
 /// XPS to accelerate almost instantly and trip a roundoff "acceleration too
@@ -245,9 +247,16 @@ impl Profile {
         let mut text = String::new();
 
         // Leading acceleration element.
-        text.push_str(&format!("{pre_time_max:.6}"));
+        text.push_str(&format!(
+            "{pre_time_max:.6}",
+            pre_time_max = CFloat(pre_time_max)
+        ));
         for (pd, pv) in pre_distance.iter().zip(&pre_velocity) {
-            text.push_str(&format!(", {pd:.6}, {pv:.6}"));
+            text.push_str(&format!(
+                ", {pd:.6}, {pv:.6}",
+                pd = CFloat(*pd),
+                pv = CFloat(*pv)
+            ));
         }
         text.push('\n');
 
@@ -260,7 +269,7 @@ impl Profile {
             } else {
                 t0
             };
-            text.push_str(&format!("{:.6}", self.times[i]));
+            text.push_str(&format!("{:.6}", CFloat(self.times[i])));
             for axis in &self.axes {
                 let d0 = axis.positions[i + 1] - axis.positions[i];
                 let d1 = if i < num_elements - 1 {
@@ -270,15 +279,22 @@ impl Profile {
                 };
                 // Velocity is the displacement averaged either side of the point.
                 let traj_vel = (d0 + d1) / (t0 + t1);
-                text.push_str(&format!(", {d0:.6}, {traj_vel:.6}"));
+                text.push_str(&format!(
+                    ", {d0:.6}, {traj_vel:.6}",
+                    d0 = CFloat(d0),
+                    traj_vel = CFloat(traj_vel)
+                ));
             }
             text.push('\n');
         }
 
         // Trailing deceleration element; final velocity is zero.
-        text.push_str(&format!("{post_time_max:.6}"));
+        text.push_str(&format!(
+            "{post_time_max:.6}",
+            post_time_max = CFloat(post_time_max)
+        ));
         for pd in &post_distance {
-            text.push_str(&format!(", {pd:.6}, {:.6}", 0.0));
+            text.push_str(&format!(", {pd:.6}, {:.6}", CFloat(0.0), pd = CFloat(*pd)));
         }
         text.push('\n');
 

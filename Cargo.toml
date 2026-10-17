@@ -253,6 +253,7 @@ members = [
 # Cargo.lock pins the exact patch release.
 epics-rs = "0.32.0"
 asyn-rs = "0.32.0"
+epics-libcom-rs = "0.32.0"
 ad-core-rs = "0.32.0"
 ad-plugins-rs = "0.32.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).

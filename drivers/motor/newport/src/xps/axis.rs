@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::trace::TraceMask;
@@ -24,7 +25,7 @@ use epics_rs::motor::trace::MotorTrace;
 
 use super::controller::{SetPositionFailure, XpsController};
 use super::corrector::{self, CorrectorType, PidFailure};
-use super::rpc::{XpsError, XpsResult, XpsSocket, format_g};
+use super::rpc::{XpsError, XpsResult, XpsSocket};
 
 /// C `driverName` in XPSAxis.cpp.
 const DRIVER_NAME: &str = "XPSAxis";
@@ -78,7 +79,7 @@ impl motor_common::AxisReport for XpsAxisReport {
             "  axis {}\n    name = {}\n    step size = {}\n    poll socket = {}, moveSocket = {}\n    status = {}\n",
             self.axis_no,
             self.positioner_name,
-            format_g(self.step_size, 6),
+            CFloat(self.step_size).g(),
             self.poll_socket,
             self.move_socket,
             self.axis_status.load(Ordering::Relaxed)
@@ -768,7 +769,7 @@ impl AsynMotor for XpsAxis {
                         "[{},{}]: error performing PositionerUserTravelLimitsSet for highLim={device_value:.6} status={}\n",
                         self.port(),
                         self.axis_no(),
-                        e.code()
+                        e.code(), device_value = CFloat(device_value)
                     ),
                 )
             })?;
@@ -792,7 +793,7 @@ impl AsynMotor for XpsAxis {
                         "[{},{}]: error performing PositionerUserTravelLimitsSet for lowLim={device_value:.6} status={}\n",
                         self.port(),
                         self.axis_no(),
-                        e.code()
+                        e.code(), device_value = CFloat(device_value)
                     ),
                 )
             })?;

@@ -25,6 +25,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
@@ -166,9 +167,16 @@ impl Esp300Controller {
 /// SET_ACCEL for a zero rate (motorRecord.cc:874, 940). Values are
 /// controller units.
 fn motion_preamble(axis: usize, vel_base: f64, velocity: f64, acceleration: f64) -> String {
-    let mut msg = format!("{axis:02}VA{velocity:.6};{axis:02}VB{vel_base:.6}");
+    let mut msg = format!(
+        "{axis:02}VA{velocity:.6};{axis:02}VB{vel_base:.6}",
+        velocity = CFloat(velocity),
+        vel_base = CFloat(vel_base)
+    );
     if acceleration > 0.0 {
-        msg += &format!(";{axis:02}AC{acceleration:.6};{axis:02}AG{acceleration:.6}");
+        msg += &format!(
+            ";{axis:02}AC{acceleration:.6};{axis:02}AG{acceleration:.6}",
+            acceleration = CFloat(acceleration)
+        );
     }
     msg
 }
@@ -304,7 +312,14 @@ impl AsynMotor for Esp300Axis {
         // the record's GO is a no-op).
         let parts = self.motion_preamble(min_velocity, velocity, acceleration)?;
         let position = position * self.resolution()?;
-        self.write_move(&parts, &format!("{:02}PA{position:.6}", self.axis))
+        self.write_move(
+            &parts,
+            &format!(
+                "{:02}PA{position:.6}",
+                self.axis,
+                position = CFloat(position)
+            ),
+        )
     }
 
     fn move_relative(
@@ -317,7 +332,14 @@ impl AsynMotor for Esp300Axis {
     ) -> AsynResult<()> {
         let parts = self.motion_preamble(min_velocity, velocity, acceleration)?;
         let distance = distance * self.resolution()?;
-        self.write_move(&parts, &format!("{:02}PR{distance:.6}", self.axis))
+        self.write_move(
+            &parts,
+            &format!(
+                "{:02}PR{distance:.6}",
+                self.axis,
+                distance = CFloat(distance)
+            ),
+        )
     }
 
     fn move_velocity(
@@ -335,8 +357,12 @@ impl AsynMotor for Esp300Axis {
             (min_velocity * res, velocity * res, acceleration * res);
         let sign = if velocity > 0.0 { '+' } else { '-' };
         self.write_move(
-            &format!("{a:02}VB{vel_base:.6};{a:02}AC{acceleration:.6};{a:02}AG{acceleration:.6}"),
-            &format!("{a:02}VA{:.6};{a:02}MV{sign}", velocity.abs()),
+            &format!(
+                "{a:02}VB{vel_base:.6};{a:02}AC{acceleration:.6};{a:02}AG{acceleration:.6}",
+                vel_base = CFloat(vel_base),
+                acceleration = CFloat(acceleration)
+            ),
+            &format!("{a:02}VA{:.6};{a:02}MV{sign}", CFloat(velocity.abs())),
         )
     }
 
@@ -363,7 +389,11 @@ impl AsynMotor for Esp300Axis {
         // C `LOAD_POS`: define home (DH) at the given position.
         let position = position * self.resolution()?;
         let ctrl = self.lock();
-        ctrl.write(&format!("{:02}DH{position:.6}", self.axis))
+        ctrl.write(&format!(
+            "{:02}DH{position:.6}",
+            self.axis,
+            position = CFloat(position)
+        ))
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
@@ -379,13 +409,21 @@ impl AsynMotor for Esp300Axis {
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let position = position * self.resolution()?;
         let ctrl = self.lock();
-        ctrl.write(&format!("{:02}SR{position:.6}", self.axis))
+        ctrl.write(&format!(
+            "{:02}SR{position:.6}",
+            self.axis,
+            position = CFloat(position)
+        ))
     }
 
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let position = position * self.resolution()?;
         let ctrl = self.lock();
-        ctrl.write(&format!("{:02}SL{position:.6}", self.axis))
+        ctrl.write(&format!(
+            "{:02}SL{position:.6}",
+            self.axis,
+            position = CFloat(position)
+        ))
     }
 
     fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
@@ -400,7 +438,7 @@ impl AsynMotor for Esp300Axis {
         };
         let value = gain * self.resolution()?;
         let ctrl = self.lock();
-        ctrl.write(&format!("{a}{cc}{value:.6};{a}UF"))
+        ctrl.write(&format!("{a}{cc}{value:.6};{a}UF", value = CFloat(value)))
     }
 
     /// `PRIMITIVE`: INIT and a CR, its own transaction.

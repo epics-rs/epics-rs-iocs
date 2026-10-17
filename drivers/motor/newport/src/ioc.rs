@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::asyn_record::{claim_port, get_port};
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::AsynStatus;
@@ -205,7 +206,9 @@ pub fn smc100_create_controller_command() -> CommandDef {
                     "SMC100 motor driver {}, numAxes={}, moving poll period={moving_s:.6}, \
                      idle poll period={idle_s:.6}",
                     ctx.port_name(),
-                    ctx.num_axes()
+                    ctx.num_axes(),
+                    moving_s = CFloat(moving_s),
+                    idle_s = CFloat(idle_s)
                 );
             });
             register_port_with(ctx, &port_name, num_axes, head)?;
@@ -278,7 +281,9 @@ fn conex_head(
             out,
             "CONEX motor driver {}, controllerID={controller_id}, version=\"{version}\n  \
              moving poll period={moving_s:.6}, idle poll period={idle_s:.6}\n",
-            ctx.port_name()
+            ctx.port_name(),
+            moving_s = CFloat(moving_s),
+            idle_s = CFloat(idle_s)
         );
     });
     (version, head)
@@ -425,7 +430,9 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
                     "Agilis UC motor driver {}, model={model}, numAxes={}, moving poll \
                      period={moving_s:.6}, idle poll period={idle_s:.6}\ncontroller version {version}\n",
                     ctx.port_name(),
-                    ctx.num_axes()
+                    ctx.num_axes(),
+                    moving_s = CFloat(moving_s),
+                    idle_s = CFloat(idle_s)
                 );
             });
             register_port_with(ctx, &port_name, c_int(args, 2), head)?;
@@ -568,8 +575,8 @@ impl ControllerParams for XpsHead {
                 ctx.port_name(),
                 ctx.num_axes(),
                 ctrl.firmware(),
-                self.moving_s,
-                self.idle_s
+                CFloat(self.moving_s),
+                CFloat(self.idle_s)
             );
             if level > 0 {
                 // glibc prints a NULL %s, C's ftpUsername_ before
@@ -586,7 +593,7 @@ impl ControllerParams for XpsHead {
                      \x20                useSFTP: false\n           movesDeferred: 0\n\
                      \x20             autoEnable: {}\n          noDisableError: {}\n",
                     i32::from(self.enable_set_position),
-                    self.settling_s,
+                    CFloat(self.settling_s),
                     i32::from(ctrl.auto_enable()),
                     i32::from(ctrl.no_disable_error())
                 );
@@ -1790,7 +1797,9 @@ fn mm4000_asyn_report(level: i32) -> String {
         if level != 0 {
             out.push_str(&format!(
                 "    model: {}\n    moving poll period: {:.6}\n    idle poll period: {:.6}\n",
-                card.model, card.moving_s, card.idle_s
+                card.model,
+                CFloat(card.moving_s),
+                CFloat(card.idle_s)
             ));
             out.push_str(&firmware);
         }
