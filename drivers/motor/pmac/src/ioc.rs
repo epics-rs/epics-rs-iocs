@@ -1159,6 +1159,41 @@ mod tests {
 
     /// pmacAxis.cpp:96, 136, 243-305, 497, 585: C's axis error lines on the
     /// controller's trace, the limits warning throttled as the feed rate's.
+    /// pmacCsGroups.cpp:228-233: the release aborts the first deferred
+    /// axis's CS before it validates the rest, and drops the abort's status.
+    #[test]
+    fn coordinated_release_aborts_first_and_ignores_the_abort_status() {
+        use crate::controller::DEFERRED_COORDINATED_MOVES;
+        use crate::cs_groups::DeferredMove;
+
+        let (_rt, rig) = publish_scripted("pmacCsAbortLow");
+        let (controller, _io) = controller_port("pmacCsAbortCtl", "pmacCsAbortLow");
+        let mut c = controller.lock().unwrap();
+        let groups = c.cs_groups_mut();
+        groups.add_group(1, "g");
+        groups.add_axis(1, 1, "X", 2).unwrap();
+        groups.add_axis(1, 3, "Y", 3).unwrap();
+        groups.switch_commands(1).unwrap();
+        let to = DeferredMove {
+            position: 1.0,
+            relative: false,
+            time_ms: 0.0,
+        };
+        rig.written();
+        c.set_moves_deferred(DEFERRED_COORDINATED_MOVES).unwrap();
+        c.defer_move(1, to);
+        c.defer_move(3, to);
+        assert!(c.set_moves_deferred(0).is_err());
+        assert_eq!(rig.written(), ["&2A"]);
+
+        let line = "&2 Q70=0.000000 Q77=1.000000 B101R";
+        rig.answer(line, b"\x06");
+        c.set_moves_deferred(DEFERRED_COORDINATED_MOVES).unwrap();
+        c.defer_move(1, to);
+        c.set_moves_deferred(0).unwrap();
+        assert_eq!(rig.written(), ["&2A", line]);
+    }
+
     /// pmacCsGroups.cpp:149, 237-261, 305, 323: the group switch and the
     /// coordinated release print C's lines on the controller's trace.
     #[test]

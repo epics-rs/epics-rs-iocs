@@ -175,35 +175,44 @@ impl CsGroups {
         }
     }
 
-    /// The commands for a coordinated deferred move through PROG 101
+    /// A coordinated deferred move through PROG 101
     /// (C `pmacCsGroups::processDeferredCoordMoves`).
     ///
     /// Every axis with a pending move must be in the same coordinate system and
     /// map one-to-one onto a CS axis letter; every *other* axis in that CS is
     /// commanded to hold its last polled position, and must not already be
-    /// moving. Returns the abort command followed by the PROG 101 move.
+    /// moving. C aborts the first deferred axis's CS before it checks the rest,
+    /// so the abort stands whether or not the move is refused.
     pub fn coord_move_commands(
         &self,
         deferred: &BTreeMap<i32, DeferredMove>,
         poll: &BTreeMap<i32, AxisPoll>,
-    ) -> Result<Vec<String>, String> {
-        if deferred.is_empty() {
-            return Ok(Vec::new());
-        }
+    ) -> CoordRelease {
+        let abort = deferred
+            .keys()
+            .next()
+            .and_then(|&axis| self.abort_command(axis));
+        let line = if deferred.is_empty() {
+            Ok(None)
+        } else {
+            self.coord_move_line(deferred, poll).map(Some)
+        };
+        CoordRelease { abort, line }
+    }
 
+    fn coord_move_line(
+        &self,
+        deferred: &BTreeMap<i32, DeferredMove>,
+        poll: &BTreeMap<i32, AxisPoll>,
+    ) -> Result<String, String> {
         let mut coord_sys = 0;
         let mut max_time_ms = 0.0f64;
         // CS axis letter -> (Q variable, demand), ordered by letter as C's
         // std::map<char,int> moveList is.
         let mut moves: BTreeMap<char, (u32, f64)> = BTreeMap::new();
-        let mut cmds = Vec::new();
 
         for (&axis, move_) in deferred {
             if coord_sys == 0 {
-                // C aborts the CS before validating the rest of the group.
-                if let Some(abort) = self.abort_command(axis) {
-                    cmds.push(abort);
-                }
                 coord_sys = self.axis_coord_sys(axis);
                 if coord_sys == 0 {
                     return Err(format!(
@@ -261,10 +270,9 @@ impl CsGroups {
         for (q, value) in moves.values().chain(holds.values()) {
             move_str.push_str(&format!(" Q{q}={value:.6}"));
         }
-        cmds.push(format!(
+        Ok(format!(
             "&{coord_sys} Q{Q_MOVE_TIME}={max_time_ms:.6}{move_str} B{COORD_MOVE_PROG}R"
-        ));
-        Ok(cmds)
+        ))
     }
 
     fn current_defs(&self) -> impl Iterator<Item = (&i32, &CsAxisDef)> {
@@ -281,6 +289,13 @@ impl CsGroups {
             .get(&axis)
             .map(|d| d.definition.clone())
     }
+}
+
+/// What a coordinated release sends: the abort, then the PROG 101 line,
+/// `Ok(None)` when no axis is deferred.
+pub struct CoordRelease {
+    pub abort: Option<String>,
+    pub line: Result<Option<String>, String>,
 }
 
 /// The CS axis letter of a definition that is exactly one character, else
@@ -425,11 +440,11 @@ mod tests {
             },
         );
 
-        let cmds = g.coord_move_commands(&deferred, &poll).unwrap();
-        assert_eq!(cmds[0], "&2A");
+        let release = g.coord_move_commands(&deferred, &poll);
+        assert_eq!(release.abort.unwrap(), "&2A");
         // X (Q77) moves; Y (Q78) and Z (Q79) hold. Q70 is the longest move time.
         assert_eq!(
-            cmds[1],
+            release.line.unwrap().unwrap(),
             "&2 Q70=250.000000 Q77=10.000000 Q78=3.000000 Q79=-4.000000 B101R"
         );
     }
@@ -451,6 +466,7 @@ mod tests {
         }
         let err = g
             .coord_move_commands(&deferred, &BTreeMap::new())
+            .line
             .unwrap_err();
         assert!(err.contains("multiple coordinate systems"));
     }
@@ -469,6 +485,7 @@ mod tests {
         );
         let err = g
             .coord_move_commands(&deferred, &BTreeMap::new())
+            .line
             .unwrap_err();
         assert!(err.contains("not in a coordinate system"));
     }
@@ -488,6 +505,7 @@ mod tests {
         );
         let err = g
             .coord_move_commands(&deferred, &BTreeMap::new())
+            .line
             .unwrap_err();
         assert!(err.contains("illegal deferred coordinated move"));
     }
@@ -513,7 +531,7 @@ mod tests {
                 moving: true,
             },
         );
-        let err = g.coord_move_commands(&deferred, &poll).unwrap_err();
+        let err = g.coord_move_commands(&deferred, &poll).line.unwrap_err();
         assert!(err.contains("already moving"));
     }
 }

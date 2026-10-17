@@ -533,23 +533,27 @@ impl PmacController {
 
     fn process_deferred_coord_moves(&mut self) -> AsynResult<()> {
         const FUNCTION: &str = "pmacCsGroups::processDeferredCoordMoves";
-        let cmds = self
+        let release = self
             .cs_groups
-            .coord_move_commands(&self.deferred, &self.poll_cache)
-            .inspect_err(|e| {
-                self.own
-                    .print_self(TraceMask::ERROR, format_args!("{FUNCTION} Error: {e}\n"))
-            })
-            .map_err(pmac_err)?;
-        for cmd in cmds {
-            self.command(&cmd).inspect_err(|_| {
-                self.own.print_self(
-                    TraceMask::ERROR,
-                    format_args!("{FUNCTION} ERROR Sending Deferred Move Command.\n"),
-                )
-            })?;
+            .coord_move_commands(&self.deferred, &self.poll_cache);
+        if let Some(abort) = &release.abort {
+            // C's abortMotion status is dropped (pmacCsGroups.cpp:232).
+            let _ = self.command(abort);
         }
-        Ok(())
+        let line = release.line.map_err(|e| {
+            self.own
+                .print_self(TraceMask::ERROR, format_args!("{FUNCTION} Error: {e}\n"));
+            pmac_err(e)
+        })?;
+        let Some(line) = line else {
+            return Ok(());
+        };
+        self.command(&line).inspect_err(|_| {
+            self.own.print_self(
+                TraceMask::ERROR,
+                format_args!("{FUNCTION} ERROR Sending Deferred Move Command.\n"),
+            )
+        })
     }
 
     // ---- coordinate-system groups ----
