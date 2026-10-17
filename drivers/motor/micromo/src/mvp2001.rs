@@ -43,6 +43,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::nint;
+use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 32;
@@ -145,6 +146,65 @@ impl Mvp2001Controller {
     }
 }
 
+/// `MVP2001Controller`'s `report` override.
+pub struct Mvp2001Params {
+    /// C's `movingPollPeriod_`/`idlePollPeriod_`, in seconds.
+    moving_poll_s: f64,
+    idle_poll_s: f64,
+}
+
+impl Mvp2001Params {
+    pub fn new(moving_poll_ms: u64, idle_poll_ms: u64) -> Self {
+        Self {
+            moving_poll_s: moving_poll_ms as f64 / 1000.0,
+            idle_poll_s: idle_poll_ms as f64 / 1000.0,
+        }
+    }
+}
+
+impl ControllerParams for Mvp2001Params {
+    /// C `MVP2001Controller::report` (MVP2001Driver.cpp:85-92).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "MVP 2001 motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll_s,
+            self.idle_poll_s
+        );
+        ctx.report(out, level);
+    }
+}
+
+/// C `MVP2001Axis::report` (MVP2001Driver.cpp:235-248): the axis's
+/// constructor settings.
+pub struct Mvp2001AxisReport {
+    axis_index: i32,
+    encoder_lines_per_rev: i32,
+    max_current_ma: i32,
+    sample_period: i32,
+    limit_polarity: i32,
+}
+
+impl AxisReport for Mvp2001AxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let _ = write!(
+                out,
+                "  axis {}\n  axis index {}\n  encoderLinesPerRev {}\n  maxCurrent {} (mA)\n  \
+                 samplePeriod {} (us)\n  limitPolarity {}\n",
+                self.axis_index - 1,
+                self.axis_index,
+                self.encoder_lines_per_rev,
+                self.max_current_ma,
+                self.sample_period,
+                self.limit_polarity
+            );
+        }
+    }
+}
+
 /// One MVP 2001 axis sharing a controller. Implements [`AsynMotor`].
 pub struct Mvp2001Axis {
     controller: Arc<Mutex<Mvp2001Controller>>,
@@ -153,6 +213,7 @@ pub struct Mvp2001Axis {
     encoder_lines_per_rev: i32,
     max_current_ma: i32,
     sample_period: i32,
+    limit_polarity: i32,
 }
 
 impl Mvp2001Axis {
@@ -197,6 +258,18 @@ impl Mvp2001Axis {
             encoder_lines_per_rev,
             max_current_ma,
             sample_period,
+            limit_polarity,
+        }
+    }
+
+    /// The axis's `report`.
+    pub fn report(&self) -> Mvp2001AxisReport {
+        Mvp2001AxisReport {
+            axis_index: self.axis_index,
+            encoder_lines_per_rev: self.encoder_lines_per_rev,
+            max_current_ma: self.max_current_ma,
+            sample_period: self.sample_period,
+            limit_polarity: self.limit_polarity,
         }
     }
 
