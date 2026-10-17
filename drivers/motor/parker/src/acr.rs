@@ -40,12 +40,12 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::{PortDriverBase, param_list};
+use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue,
+    AxisUser, ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue,
 };
 
 use motor_common::util::{atof, atoi};
@@ -250,14 +250,13 @@ impl ControllerParams for AcrParams {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         let Some(ids) = self.ids.filter(|ids| user.reason == ids.read_binary_io) else {
             return ParamWrite::PassToBase(Ok(()));
         };
-        // C getAxis: getAddress resolves -1 to 0.
-        let addr = param_list(base.flags.multi_device, user.addr);
+        let addr = user.addr;
         let _ = base.set_int32_param(user.reason, addr, value);
         let _ = self.lock().read_binary_io(base, &ids);
         let _ = base.call_param_callbacks(addr);
@@ -268,13 +267,13 @@ impl ControllerParams for AcrParams {
     fn write_float64(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: f64,
     ) -> ParamWrite {
         if self.ids.is_none_or(|ids| user.reason != ids.jerk) {
             return ParamWrite::PassToBase(Ok(()));
         }
-        let addr = param_list(base.flags.multi_device, user.addr);
+        let addr = user.addr;
         let _ = base.set_float64_param(user.reason, addr, value);
         let status = self.lock().write_only(&format!(
             "AXIS{addr} JOG JRK {value:.6}",
@@ -289,7 +288,7 @@ impl ControllerParams for AcrParams {
     fn write_uint32_digital(
         &mut self,
         base: &mut PortDriverBase,
-        _user: &AsynUser,
+        _user: AxisUser<'_>,
         value: u32,
         mask: u32,
     ) -> ParamWrite {
