@@ -56,7 +56,9 @@ use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::motor::controller_port::{ParamWrite, index};
+use epics_rs::motor::controller_port::{
+    FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, index,
+};
 use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::atoi;
@@ -151,6 +153,59 @@ struct OmsReasons {
     receive: usize,
 }
 
+/// `omsBaseController::writeInt32` / `writeFloat64`'s closing line
+/// (omsBaseController.cpp:306-313, 409-416).
+fn closing_trace(
+    print: impl Fn(TraceMask, std::fmt::Arguments<'_>),
+    function: usize,
+    value: WriteValue,
+    status: &AsynResult<()>,
+) {
+    let (method, value) = match value {
+        WriteValue::Int32(v) => ("writeInt32", v.to_string()),
+        WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}")),
+    };
+    match status {
+        Err(e) => print(
+            TraceMask::ERROR,
+            format_args!(
+                "omsBaseDriver:{method}: error, status={} function={function}, value={value}\n",
+                e.c_status_code()
+            ),
+        ),
+        Ok(()) => print(
+            TraceMask::IO_DRIVER,
+            format_args!("omsBaseDriver:{method}: function={function}, value={value}\n"),
+        ),
+    }
+}
+
+/// The closing line of every writeFloat64, and of the writeInt32s C
+/// handles itself rather than returning the base's (omsBaseController.cpp:
+/// 266-305); OMS_POLL prints its own in [`OmsParams::write_int32`].
+struct OmsWriteHook;
+
+impl WriteHook for OmsWriteHook {
+    fn after_write(&self, write: &FinishedWrite<'_>) -> WriteOutcome {
+        let own = match write.value {
+            WriteValue::Int32(_) => matches!(
+                write.function,
+                index::DEFER_MOVES | index::CLOSED_LOOP | index::MOVE_TO_HOME
+            ),
+            WriteValue::Float64(_) => true,
+        };
+        if own {
+            closing_trace(
+                |mask, args| write.print(mask, args),
+                write.function,
+                write.value,
+                write.status,
+            );
+        }
+        WriteOutcome::default()
+    }
+}
+
 /// C `MAX_STRING_SIZE`, the size of writeOctet's reply buffer.
 const MAX_STRING_SIZE: usize = 40;
 
@@ -220,7 +275,25 @@ impl ControllerParams for OmsParams {
             axes.wakeup();
         }
         let _ = base.call_param_callbacks(axis);
+        closing_trace(
+            |mask, args| {
+                PortManager::global().trace_manager().print(
+                    Some(&base.port_name),
+                    Some(user.addr),
+                    user.reason as i32,
+                    mask,
+                    args,
+                )
+            },
+            user.reason,
+            WriteValue::Int32(value),
+            &set,
+        );
         ParamWrite::Handled(set)
+    }
+
+    fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
+        Some(Arc::new(OmsWriteHook))
     }
 
     /// C `omsBaseController::writeOctet` (omsBaseController.cpp:178-219):
@@ -1040,6 +1113,42 @@ mod tests {
         assert!(io.read_octet(receive, 40).is_err());
         let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
         assert_eq!(io.read_octet(receive, 40).unwrap(), b"\0");
+    }
+
+    /// OMS_POLL's closing line: IO_DRIVER on success, ERROR with the
+    /// status of the set that failed past address 0
+    /// (omsBaseController.cpp:306-313).
+    #[test]
+    fn an_oms_poll_write_prints_c_s_closing_line() {
+        use epics_rs::asyn::trace::TraceFile;
+        let name = "omsPollTrace";
+        let (port, _rig) = params_port(name, 2, &[]);
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        // Each address shows one mask: the success line, then the error's.
+        for (addr, mask) in [(0, TraceMask::IO_DRIVER), (1, TraceMask::ERROR)] {
+            trace.set_device_trace_mask(name, addr, mask);
+            trace.set_device_trace_file(name, addr, TraceFile::File(file.clone()));
+        }
+        let poll = reason(&port, "OMS_POLL");
+        port.write_int32_blocking(poll, 0, 0).unwrap();
+        assert!(port.write_int32_blocking(poll, 1, 1).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("omsBaseDriver"))
+            .collect();
+        let expected = [
+            format!("omsBaseDriver:writeInt32: function={poll}, value=0"),
+            format!("omsBaseDriver:writeInt32: error, status=9 function={poll}, value=1"),
+        ];
+        assert_eq!(lines.len(), expected.len(), "{text}");
+        for (line, want) in lines.iter().zip(&expected) {
+            assert!(line.ends_with(want.as_str()), "{line:?} vs {want:?}");
+        }
     }
 
     #[test]

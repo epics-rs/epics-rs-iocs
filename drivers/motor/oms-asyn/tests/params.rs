@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::trace::{TraceFile, TraceMask};
 use epics_rs::base::runtime::task::{BlockingBridge, sleep};
 use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::iocsh::registry::{ArgValue, CommandContext};
@@ -195,4 +196,50 @@ async fn old_firmware_takes_the_older_command_forms() {
     let (status, writes): (Vec<_>, Vec<_>) = sent.iter().partition(|c| *c == "AX ?PM");
     assert_eq!(writes, ["AX HN", "AX HF"], "{sent:?}");
     assert!(!status.is_empty(), "{sent:?}");
+}
+
+/// C's closing line ends every writeFloat64 and the writeInt32s it
+/// handles itself; one it returns to the base prints none
+/// (omsBaseController.cpp:266-313, 409-416).
+#[epics_rs::base::epics_test]
+async fn writes_print_c_s_closing_line() {
+    let name = "omsClosingTrace";
+    let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+    let text = on_maxnet(name, move |port, _| {
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_device_trace_mask(name, 0, TraceMask::ERROR | TraceMask::IO_DRIVER);
+        trace.set_device_trace_file(name, 0, TraceFile::File(file));
+        port.write_int32_blocking(index::STOP, 0, 1).unwrap();
+        port.write_int32_blocking(index::CLOSED_LOOP, 0, 1).unwrap();
+        port.write_int32_blocking(index::DEFER_MOVES, 0, 0).unwrap();
+        port.write_float64_blocking(index::ENCODER_POSITION, 0, 12.7)
+            .unwrap();
+        port.write_float64_blocking(index::VELOCITY, 0, 2.0)
+            .unwrap();
+        // The axis's writes print on its poller.
+        std::thread::sleep(Duration::from_millis(300));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        text
+    })
+    .await;
+    let mut lines: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.split_once("omsBaseDriver:write").map(|(_, tail)| tail))
+        .filter(|tail| tail.starts_with("Int32: ") || tail.starts_with("Float64: "))
+        .collect();
+    lines.sort_unstable();
+    let mut expected = [
+        format!("Int32: function={}, value=1", index::CLOSED_LOOP),
+        format!("Int32: function={}, value=0", index::DEFER_MOVES),
+        format!(
+            "Float64: function={}, value=12.700000",
+            index::ENCODER_POSITION
+        ),
+        format!("Float64: function={}, value=2.000000", index::VELOCITY),
+    ];
+    expected.sort_unstable();
+    assert_eq!(lines, expected, "{text}");
 }
