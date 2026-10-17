@@ -32,7 +32,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerParams, index};
+use epics_rs::motor::controller_port::{ControllerParams, ParamWrite, index};
 
 use crate::cs_groups::{AxisPoll, CsGroups, DeferredMove, fast_deferred_command};
 use crate::protocol::{HARDWARE_PROB, parse_feedrate, parse_global_status};
@@ -497,6 +497,18 @@ impl ControllerParams for PmacControllerParams {
     }
 
     fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> ParamWrite {
+        self.write_int32_own(base, user, value).into()
+    }
+}
+
+/// The driver's own write code, which then passes to the base.
+impl PmacControllerParams {
+    fn write_int32_own(
         &mut self,
         _base: &mut PortDriverBase,
         user: &AsynUser,

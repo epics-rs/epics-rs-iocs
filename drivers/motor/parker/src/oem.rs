@@ -41,7 +41,7 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::ControllerParams;
+use epics_rs::motor::controller_port::{ControllerParams, ParamWrite};
 
 use motor_common::util::{atof, leading_hex};
 
@@ -193,19 +193,14 @@ impl ControllerParams for OemParams {
         Ok(())
     }
 
-    fn write_int32(
-        &mut self,
-        _: &mut PortDriverBase,
-        user: &AsynUser,
-        value: i32,
-    ) -> AsynResult<()> {
+    fn write_int32(&mut self, _: &mut PortDriverBase, user: &AsynUser, value: i32) -> ParamWrite {
         if self.resolution != Some(user.reason) {
-            return Ok(());
+            return Ok(()).into();
         }
         let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         let status = ctrl.command(&format!("{}MR{value}", user.addr + 1));
         ctrl.pulses_per_unit[user.addr as usize] = f64::from(value);
-        status
+        status.into()
     }
 }
 
