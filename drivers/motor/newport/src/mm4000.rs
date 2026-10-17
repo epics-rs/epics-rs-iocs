@@ -318,7 +318,7 @@ impl Mm4000Controller {
     /// The model-1 strings for this poll cycle, running `start_status` at
     /// most once per TTL; `None` on the asyn driver.
     fn model1_poll(&mut self) -> Option<Model1Poll> {
-        if !matches!(self.driver, Mm4000Driver::Model1(_)) {
+        if !self.is_model1() {
             return None;
         }
         if !self
@@ -384,6 +384,11 @@ impl Mm4000Controller {
         if matches!(self.driver, Mm4000Driver::Asyn) {
             print_error(port, addr, args);
         }
+    }
+
+    /// The controller follows drvMM4000.cc / devMM4000.cc.
+    fn is_model1(&self) -> bool {
+        matches!(self.driver, Mm4000Driver::Model1(_))
     }
 
     /// The axes this controller serves.
@@ -726,7 +731,13 @@ impl AsynMotor for Mm4000Axis {
     }
 
     fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
-        let (a, d, step) = (self.axis, self.digits, self.step_size()?);
+        let a = self.axis;
+        // devMM4000.cc STOP_AXIS is `ST;` alone; only drvMM4000Asyn.c
+        // motorAxisStop sets the deceleration first.
+        if self.lock().is_model1() {
+            return self.lock().write(&format!("{a}ST;"));
+        }
+        let (d, step) = (self.digits, self.step_size()?);
         let acceleration = acceleration * step;
         let mut ctrl = self.lock();
         ctrl.write(&format!("{a}AC{acceleration:.d$};{a}ST;"))
@@ -999,6 +1010,16 @@ mod tests {
         assert_eq!((two.position, two.encoder_position), (-2250.0, -2249.0));
         assert!(two.moving && !two.done && two.direction && two.high_limit);
         assert!(two.has_encoder && !two.low_limit && !two.home);
+    }
+
+    /// devMM4000.cc STOP_AXIS sends `ST;` with no deceleration.
+    #[test]
+    fn model1_stop_is_st_alone() {
+        let (axes, sent, _) = model1_card("mm4000_m1_stop", &[], Duration::ZERO);
+        let mut axes = axes.unwrap();
+        sent.lock().unwrap().clear();
+        axes[0].stop(&AsynUser::default(), 0.0).unwrap();
+        assert_eq!(*sent.lock().unwrap(), ["1ST;"]);
     }
 
     /// An unanswered MS; is a RETRY, which asks TH; but no TP; or TE; and
