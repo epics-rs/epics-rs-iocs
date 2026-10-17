@@ -170,25 +170,6 @@ pub const READOUT_MODE_STRINGS: [&str; 6] = [
 /// C `numReadoutModes[]`.
 pub const NUM_READOUT_MODES: [usize; 3] = [0, 0, 6];
 
-/// Subset of `asynStatus` the server helpers return, carrying C's numeric codes
-/// so the `if (status)` tests port directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CamStatus {
-    /// `asynSuccess` (0)
-    Success,
-    /// `asynTimeout` (1)
-    Timeout,
-    /// `asynError` (3)
-    Error,
-}
-
-impl CamStatus {
-    /// C's `if (status)` — anything but `asynSuccess`.
-    pub fn is_err(self) -> bool {
-        self != Self::Success
-    }
-}
-
 /// Binary event with the semantics of `epicsEvent` created `epicsEventEmpty`:
 /// `signal` sets the flag, a wait consumes it.
 #[derive(Default)]

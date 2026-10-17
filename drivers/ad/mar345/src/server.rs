@@ -6,7 +6,7 @@
 //! parameter access run on [`Mar345Driver`], inline or through the worker's
 //! `task::Held`, and the worker reads with the hold released.
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::{AsynResult, AsynStatus};
 use epics_rs::asyn::request::{RequestOp, RequestResult};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -15,20 +15,10 @@ use epics_rs::asyn::user::AsynUser;
 use crate::driver::Mar345Driver;
 use crate::file_name::format_file_template;
 use crate::protocol::{CMD_SHUTTER_CLOSE, CMD_SHUTTER_OPEN};
-use crate::types::{CamStatus, MAR345_SOCKET_TIMEOUT, MAX_FILENAME_LEN, secs};
+use crate::types::{MAR345_SOCKET_TIMEOUT, MAX_FILENAME_LEN, secs};
 
 /// asyn subaddress of the single-device marServer octet port.
 pub(crate) const SERVER_ADDR: i32 = 0;
-
-pub(crate) fn classify(err: &AsynError) -> CamStatus {
-    match err {
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        } => CamStatus::Timeout,
-        _ => CamStatus::Error,
-    }
-}
 
 /// One request on C `pasynUserServer`, which has no port when the startup
 /// script named a marServer port that does not exist: then it fails.
@@ -110,7 +100,7 @@ impl Mar345Driver {
 
     /// C `writeServer`: flush stale input, write with `MAR345_SOCKET_TIMEOUT`,
     /// then publish the command on `ADStringToServer`.
-    pub fn write_server(&mut self, output: &str) -> CamStatus {
+    pub fn write_server(&mut self, output: &str) -> AsynStatus {
         let _ = server_submit(
             &self.server,
             RequestOp::Flush,
@@ -127,7 +117,7 @@ impl Mar345Driver {
             },
             user,
         ) {
-            Ok(_) => CamStatus::Success,
+            Ok(_) => AsynStatus::Success,
             Err(e) => {
                 // On pasynUserServer, so the server port's trace mask gates it.
                 self.server.print(
@@ -138,7 +128,7 @@ impl Mar345Driver {
                         e.status() as i32
                     ),
                 );
-                classify(&e)
+                e.status()
             }
         };
 
