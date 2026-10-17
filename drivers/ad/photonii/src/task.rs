@@ -391,7 +391,7 @@ async fn publish_frame(
     let data_type = data.data_type();
     // C dereferences a refused alloc unchecked (PhotonII.cpp:416); here the frame
     // is dropped after the pool's limit line.
-    let Ok(mut array) = ctx.pool.wrap(
+    let Ok(mut array) = ctx.pool.alloc_with(
         vec![NDDimension::new(PII_SIZE_X), NDDimension::new(PII_SIZE_Y)],
         data,
     ) else {
