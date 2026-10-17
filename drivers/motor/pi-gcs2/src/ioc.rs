@@ -24,7 +24,7 @@ use motor_common::iocsh::{
 };
 use motor_common::{Controller, asyn_user, register_port_with};
 
-use crate::gcs2::{Model, PIGCS2Axis, PIGCS2Controller, PIGCS2Report};
+use crate::gcs2::{PIGCS2Axis, PIGCS2Controller, PIGCS2Report};
 
 /// Command timeout (C `PIInterface::TIMEOUT` is 5.0 s).
 const PIGCS2_TIMEOUT: Duration = Duration::from_secs(5);
@@ -65,7 +65,7 @@ pub fn pigcs2_config_command() -> CommandDef {
             let idn = controller.read_idn().to_string();
             controller.print(format_args!("read from {asyn_port}: {idn}\n"));
             let idn = idn.to_ascii_uppercase();
-            let Some(model) = Model::from_idn(&idn) else {
+            let Some(model) = controller.create_model(&idn) else {
                 controller.print(format_args!(
                     "PIasynController: unknown controller type {asyn_port}: {idn}\n"
                 ));
@@ -83,12 +83,14 @@ pub fn pigcs2_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let controller = Arc::new(Mutex::new(controller));
-            // C startPoller, PIasynController.cpp:192. Its poll()
-            // (PIasynController.cpp:579) reads nothing on a motor controller:
-            // getGlobalState is PIGCSController's no-op, and the pivot,
-            // coordinate-system and last-error parameters it posts are not
-            // modeled here.
-            let poller = Controller::new();
+            // C startPoller, PIasynController.cpp:192. Of its poll()
+            // (PIasynController.cpp:579) only getGlobalState is modeled; the
+            // pivot, coordinate-system and last-error parameters it posts
+            // are not.
+            let polled = controller.clone();
+            let poller = Controller::new().controller_poll(move || {
+                polled.lock().unwrap_or_else(|e| e.into_inner()).poll();
+            });
             for (index, axis_name) in found.into_iter().take(num_axes).enumerate() {
                 let axis = PIGCS2Axis::new(controller.clone(), axis_name, index, &port_name);
                 let axis = Arc::new(Mutex::new(axis));
