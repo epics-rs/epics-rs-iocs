@@ -119,7 +119,7 @@ impl Anc150Controller {
         };
         // C formats the command pointer with %d; the text is printed instead.
         self.print_error(format_args!(
-            "drvANC150Asyn:sendOnly: error sending command {cmd}, sent={sent}, status={}",
+            "drvANC150Asyn:sendOnly: error sending command {cmd}, sent={sent}, status={}\n",
             e.status() as i32
         ));
         Err(e)
@@ -141,7 +141,7 @@ impl Anc150Controller {
             Err(e) => e,
         };
         self.print_error(format_args!(
-            "drvANC150Asyn:sendAndReceive error calling writeRead, output={cmd} status={}, error={}",
+            "drvANC150Asyn:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
             e.status() as i32,
             e.message()
         ));

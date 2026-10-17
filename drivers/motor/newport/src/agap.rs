@@ -116,7 +116,7 @@ impl AgapController {
             ctrl.trace.print_self(
                 TraceMask::ERROR,
                 format_args!(
-                    "AGAP_CONEXController::AGAP_CONEXController: cannot read version information from AGAP_CONEX controller"
+                    "AGAP_CONEXController::AGAP_CONEXController: cannot read version information from AGAP_CONEX controller\n"
                 ),
             );
             return None;
@@ -176,7 +176,7 @@ impl AgapAxis {
                 ctrl.trace.print_self(
                     TraceMask::ERROR,
                     format_args!(
-                        "AGAP_CONEXAxis::AGAP_CONEXAxis: unknown model, firmware string={}",
+                        "AGAP_CONEXAxis::AGAP_CONEXAxis: unknown model, firmware string={}\n",
                         ctrl.version
                     ),
                 );

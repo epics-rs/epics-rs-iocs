@@ -72,7 +72,7 @@ impl Exchange {
                         && matches!(&result, Err(e) if e.status() == AsynStatus::Timeout)
                     {
                         self.print_axis0(format_args!(
-                            "{driver}:sendAndReceive: Retrying read, retry# = {retry}."
+                            "{driver}:sendAndReceive: Retrying read, retry# = {retry}.\n"
                         ));
                         result = self.handle.read_octet(0, self.read_buf);
                         retry += 1;
@@ -80,12 +80,12 @@ impl Exchange {
                     // C counts a success on the third retry as exhausted.
                     if retry > 3 {
                         self.print_axis0(format_args!(
-                            "{driver}:sendAndReceive: Retries exhausted on response to command = {cmd}."
+                            "{driver}:sendAndReceive: Retries exhausted on response to command = {cmd}.\n"
                         ));
                     } else {
                         let reply = result.as_deref().map(trim_line).unwrap_or_default();
                         self.print_axis0(format_args!(
-                            "{driver}:sendAndReceive: Retry succeeded for command = {cmd} with response = {reply}"
+                            "{driver}:sendAndReceive: Retry succeeded for command = {cmd} with response = {reply}\n"
                         ));
                     }
                 }
@@ -93,7 +93,7 @@ impl Exchange {
             Ok(raw) => {
                 if self.fault.is_some() && raw.first() == self.fault.as_ref() {
                     self.print_axis0(format_args!(
-                        "{driver}:sendAndReceive: Error returned for command = {cmd} with response = {}",
+                        "{driver}:sendAndReceive: Error returned for command = {cmd} with response = {}\n",
                         trim_line(raw)
                     ));
                 }
@@ -108,7 +108,7 @@ impl Exchange {
                     0,
                     TraceMask::ERROR,
                     format_args!(
-                        "{driver}:sendAndReceive writeRead error, output={cmd} status={}, error={}",
+                        "{driver}:sendAndReceive writeRead error, output={cmd} status={}, error={}\n",
                         e.status() as i32,
                         e.message()
                     ),

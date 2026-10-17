@@ -140,7 +140,7 @@ impl ImsMDrivePlusAxis {
             trace.print_self(
                 TraceMask::ERROR,
                 format_args!(
-                    "{DRIVER_NAME}:ImsMDrivePlusMotorAxis(): controller config failed for motor port={motor_name}"
+                    "{DRIVER_NAME}:ImsMDrivePlusMotorAxis(): controller config failed for motor port={motor_name}\n"
                 ),
             );
         }
@@ -175,7 +175,7 @@ impl ImsMDrivePlusAxis {
                 Err(e) if e.status() == AsynStatus::Error => {
                     trace.print_self(
                         TraceMask::ERROR,
-                        format_args!("{DRIVER_NAME}:configAxis(): Version inquiry FAILED."),
+                        format_args!("{DRIVER_NAME}:configAxis(): Version inquiry FAILED.\n"),
                     );
                     continue;
                 }
@@ -187,7 +187,7 @@ impl ImsMDrivePlusAxis {
                 trace.print_self(
                     TraceMask::ERROR,
                     format_args!(
-                        "{DRIVER_NAME}:configAxis(): Version inquiry FAILED version={}.",
+                        "{DRIVER_NAME}:configAxis(): Version inquiry FAILED version={}.\n",
                         String::from_utf8_lossy(resp)
                     ),
                 );
