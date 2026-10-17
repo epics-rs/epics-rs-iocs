@@ -531,6 +531,20 @@ impl AsynMotor for PmacCsAxis {
         Ok(())
     }
 
+    /// C `motorAxisforceCallback`; the poll that follows is the poller's.
+    fn force_callback(&mut self, _user: &AsynUser) {
+        let system = lock(&self.system);
+        system.flow(
+            self.axis,
+            format_args!(
+                "motorAxisforceCallback: request ref {}, cs {}, axis {} status update\n",
+                system.reference,
+                system.cs,
+                axis_name(self.axis).unwrap_or(' ')
+            ),
+        );
+    }
+
     /// C `drvPmacGetAxesStatus`, for this axis's share of the system poll.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let axis = self.axis;

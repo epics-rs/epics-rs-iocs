@@ -1252,21 +1252,30 @@ mod tests {
         assert_eq!(own.take(), "");
     }
 
-    /// pmacAsynCoord.c:320-332: a command prints what it sends and what came
-    /// back on its axis's drvAsynMotorConfigure user; the poll's reads
-    /// (logGlobal) do not.
-    #[epics_rs::base::epics_test]
-    async fn a_cs_command_traces_on_the_axis_s_log_user() {
+    /// CS 3 on scripted port `low`, opened by drvAsynMotorConfigure as
+    /// `motor`, with `mask` traced on axis A's user: the rig, the capture
+    /// and axis A.
+    async fn configured_cs(
+        low: &str,
+        motor: &str,
+        reference: i32,
+        mask: TraceMask,
+    ) -> (
+        PortRuntimeHandle,
+        Rig,
+        TraceCapture,
+        Arc<Mutex<dyn AsynMotor>>,
+    ) {
         use epics_rs::base::server::iocsh::registry::ArgValue;
         use motor_common::model2::drv_asyn_motor_configure_command;
         use motor_common::testing::run_command;
 
-        let (_rt, rig) = publish_scripted("pmacCsLog");
-        coord_create("pmacCsLog", 0, 3, 9301, 10).unwrap();
+        let (rt, rig) = publish_scripted(low);
+        coord_create(low, 0, 3, reference, 10).unwrap();
         let args = vec![
-            ArgValue::String("pmacCsLogM".into()),
+            ArgValue::String(motor.into()),
             ArgValue::String("pmacAsynCoord".into()),
-            ArgValue::Int(9301),
+            ArgValue::Int(reference.into()),
             ArgValue::Int(9),
         ];
         run_command(
@@ -1274,20 +1283,47 @@ mod tests {
             args,
         )
         .await;
-        let own = TraceCapture::on("pmacCsLogM");
+        let own = TraceCapture::on(motor);
         let manager = PortManager::global();
         let trace = manager.trace_manager();
-        let mask = TraceMask::ERROR | TraceMask::IO_DRIVER;
-        trace.set_trace_mask(Some("pmacCsLogM"), mask);
-        trace.set_device_trace_mask("pmacCsLogM", 0, mask);
+        trace.set_trace_mask(Some(motor), mask);
+        trace.set_device_trace_mask(motor, 0, mask);
         let axis = COORD_SYSTEMS
             .lock()
             .unwrap()
             .iter()
-            .find(|c| c.reference == 9301)
+            .find(|c| c.reference == reference)
             .unwrap()
             .axes[0]
             .clone();
+        (rt, rig, own, axis)
+    }
+
+    /// pmacAsynCoord.c:566-569: a GET_INFO's motorAxisforceCallback prints
+    /// its FLOW line on the axis's log.
+    #[epics_rs::base::epics_test]
+    async fn cs_force_callback_prints_the_c_flow_line() {
+        let (_rt, _rig, own, axis) =
+            configured_cs("pmacCsForce", "pmacCsForceM", 9303, TraceMask::FLOW).await;
+        axis.lock().unwrap().force_callback(&AsynUser::new(0));
+        assert_eq!(
+            own.take(),
+            "motorAxisforceCallback: request ref 9303, cs 3, axis A status update\n"
+        );
+    }
+
+    /// pmacAsynCoord.c:320-332: a command prints what it sends and what came
+    /// back on its axis's drvAsynMotorConfigure user; the poll's reads
+    /// (logGlobal) do not.
+    #[epics_rs::base::epics_test]
+    async fn a_cs_command_traces_on_the_axis_s_log_user() {
+        let (_rt, rig, own, axis) = configured_cs(
+            "pmacCsLog",
+            "pmacCsLogM",
+            9301,
+            TraceMask::ERROR | TraceMask::IO_DRIVER,
+        )
+        .await;
         let user = AsynUser::new(0);
         rig.answer("&3A Q71=Q81", b"\x06");
         axis.lock().unwrap().stop(&user, 1.0).unwrap();
@@ -1307,37 +1343,14 @@ mod tests {
     #[epics_rs::base::epics_test]
     async fn cs_setters_print_c_flow_lines_on_the_axis_s_log_user() {
         use epics_rs::asyn::interfaces::motor::PidGainKind;
-        use epics_rs::base::server::iocsh::registry::ArgValue;
-        use motor_common::model2::drv_asyn_motor_configure_command;
-        use motor_common::testing::run_command;
 
-        let (_rt, rig) = publish_scripted("pmacCsFlow");
-        coord_create("pmacCsFlow", 0, 3, 9302, 10).unwrap();
-        let args = vec![
-            ArgValue::String("pmacCsFlowM".into()),
-            ArgValue::String("pmacAsynCoord".into()),
-            ArgValue::Int(9302),
-            ArgValue::Int(9),
-        ];
-        run_command(
-            drv_asyn_motor_configure_command(vec![&PMAC_ASYN_COORD]),
-            args,
+        let (_rt, rig, own, axis) = configured_cs(
+            "pmacCsFlow",
+            "pmacCsFlowM",
+            9302,
+            TraceMask::ERROR | TraceMask::FLOW,
         )
         .await;
-        let own = TraceCapture::on("pmacCsFlowM");
-        let manager = PortManager::global();
-        let trace = manager.trace_manager();
-        let mask = TraceMask::ERROR | TraceMask::FLOW;
-        trace.set_trace_mask(Some("pmacCsFlowM"), mask);
-        trace.set_device_trace_mask("pmacCsFlowM", 0, mask);
-        let axis = COORD_SYSTEMS
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|c| c.reference == 9302)
-            .unwrap()
-            .axes[0]
-            .clone();
         for command in ["&3Q71=0.001200", "&3A", "&3AB10R"] {
             rig.answer(command, b"\x06");
         }
