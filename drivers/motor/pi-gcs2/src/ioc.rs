@@ -24,7 +24,7 @@ use motor_common::iocsh::{
 };
 use motor_common::{Controller, asyn_user, register_port_with};
 
-use crate::gcs2::{PIGCS2Axis, PIGCS2Controller, PIGCS2Report, is_known_controller};
+use crate::gcs2::{Model, PIGCS2Axis, PIGCS2Controller, PIGCS2Report};
 
 /// Command timeout (C `PIInterface::TIMEOUT` is 5.0 s).
 const PIGCS2_TIMEOUT: Duration = Duration::from_secs(5);
@@ -65,12 +65,13 @@ pub fn pigcs2_config_command() -> CommandDef {
             let idn = controller.read_idn().to_string();
             controller.print(format_args!("read from {asyn_port}: {idn}\n"));
             let idn = idn.to_ascii_uppercase();
-            if !is_known_controller(&idn) {
+            let Some(model) = Model::from_idn(&idn) else {
                 controller.print(format_args!(
                     "PIasynController: unknown controller type {asyn_port}: {idn}\n"
                 ));
                 return Ok(CommandOutcome::Continue);
-            }
+            };
+            controller.set_model(model);
             controller.init();
             let found: Vec<String> = controller.axis_names().to_vec();
             if found.len() < num_axes {
