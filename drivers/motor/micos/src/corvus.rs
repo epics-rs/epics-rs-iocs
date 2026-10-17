@@ -74,6 +74,17 @@ impl CorvusController {
         Ok(())
     }
 
+    /// C's run of `status = writeController()`: every command is sent,
+    /// whatever the one before returned, and the last one's status is the
+    /// caller's.
+    fn write_all<const N: usize>(&self, cmds: [String; N]) -> AsynResult<()> {
+        let mut status = Ok(());
+        for cmd in &cmds {
+            status = self.write_only(cmd);
+        }
+        status
+    }
+
     /// Write a query and read one reply line.
     fn query(&self, cmd: &str) -> AsynResult<String> {
         // C writeReadController: pasynOctetSyncIO->writeRead.
@@ -181,21 +192,22 @@ impl CorvusAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.send_accel_velocity(ctrl, velocity, acceleration)?;
+        // C overwrites sv/sa's status with the pos read's.
+        let _ = ctrl.write_all(self.accel_velocity(velocity, acceleration));
+        // C sends the move with pos1..3 uninitialized when pos fails
+        // (SMCcorvusDriver.cpp:257-264); refusing it is a C defect not copied.
         let mut targets = ctrl.read_positions()?;
         targets[self.axis_no] = target * self.axis_res;
         ctrl.send_target_vector(&targets, "move")
     }
 
-    /// C `sendAccelAndVelocity`: `sv`/`sa` for all axes, in controller units.
-    fn send_accel_velocity(
-        &self,
-        ctrl: &CorvusController,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        ctrl.write_only(&format!("{:.6} sv", (velocity * self.axis_res).abs()))?;
-        ctrl.write_only(&format!("{:.6} sa", (acceleration * self.axis_res).abs()))
+    /// C `sendAccelAndVelocity`'s `sv`/`sa` for all axes, in controller
+    /// units.
+    fn accel_velocity(&self, velocity: f64, acceleration: f64) -> [String; 2] {
+        [
+            format!("{:.6} sv", (velocity * self.axis_res).abs()),
+            format!("{:.6} sa", (acceleration * self.axis_res).abs()),
+        ]
     }
 }
 
@@ -227,7 +239,7 @@ impl AsynMotor for CorvusAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
+        let _ = ctrl.write_all(self.accel_velocity(velocity, acceleration));
         // Non-moving axes get a zero delta (stay put); see module deviations.
         let mut targets = vec![0.0; self.num_axes];
         targets[self.axis_no] = distance * self.axis_res;
@@ -259,12 +271,12 @@ impl AsynMotor for CorvusAxis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
         // Forward homes to the range-measure switch (nrm); reverse calibrates
         // to the low switch (ncal).
         let verb = if forward { "nrm" } else { "ncal" };
-        ctrl.write_only(&format!("{} {verb}", self.axis_no + 1))
+        let [sv, sa] = self.accel_velocity(velocity, acceleration);
+        self.lock()
+            .write_all([sv, sa, format!("{} {verb}", self.axis_no + 1)])
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -275,6 +287,8 @@ impl AsynMotor for CorvusAxis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
+        // As in absolute_move: C sends setpos with pos1..3 uninitialized when
+        // pos fails (SMCcorvusDriver.cpp:339-346); not copied.
         let mut targets = ctrl.read_positions()?;
         // setpos takes the distance from the current position to the desired
         // origin, hence the negation (C multiplies by -1).
@@ -375,6 +389,93 @@ impl CorvusAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Refuses `sv` and `sa`, answers `pos`; records every write.
+    struct SettingsRefused {
+        base: epics_rs::asyn::port::PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for SettingsRefused {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let line = String::from_utf8_lossy(data).into_owned();
+            let refused = line.ends_with(" sv") || line.ends_with(" sa");
+            self.written.lock().unwrap().push(line);
+            if refused {
+                Err(corvus_err("refused"))
+            } else {
+                Ok(data.len())
+            }
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = b"1.0 2.0";
+            buf[..reply.len()].copy_from_slice(reply);
+            Ok(reply.len())
+        }
+    }
+
+    /// C overwrites sv/sa's status with what follows
+    /// (SMCcorvusDriver.cpp:220-292), so a refused setting still
+    /// moves or homes, and that command's status is returned.
+    #[test]
+    fn a_refused_setting_still_sends_the_command_after_it() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let port = SettingsRefused {
+            base: PortDriverBase::new("corvusRefused", 1, PortFlags::default()),
+            written: written.clone(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("corvusRefused").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_secs(1),
+        );
+        let mut axis = CorvusAxis {
+            controller: Arc::new(Mutex::new(CorvusController::new(handle, 2))),
+            axis_no: 1,
+            num_axes: 2,
+            last_status: MotorStatus::default(),
+            axis_res: 0.5,
+            high_limit: 10.0,
+            low_limit: -10.0,
+        };
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 6.0, 0.0, 2.0, 4.0).unwrap();
+        axis.move_relative(&user, -2.0, 0.0, 2.0, 4.0).unwrap();
+        axis.move_velocity(&user, 0.0, 2.0, 4.0).unwrap();
+        axis.home(&user, 0.0, 2.0, 4.0, true).unwrap();
+        let written = written.lock().unwrap();
+        let tails: Vec<&String> = written
+            .iter()
+            .filter(|w| !w.ends_with(" sv") && !w.ends_with(" sa"))
+            .collect();
+        assert_eq!(
+            tails,
+            [
+                "pos",
+                "1.000000 3.000000 move",
+                "0.000000 -1.000000 rmove",
+                "pos",
+                "1.000000 5.000000 move",
+                "2 nrm"
+            ]
+        );
+    }
 
     #[test]
     fn status_moving_bit() {
