@@ -61,9 +61,9 @@ use crate::xps::{
     XpsController, XpsError, XpsSocket, ftp, gathering, gpio, pco, profile,
 };
 
-/// Per-command serial I/O timeout: SMC100 (`from_handle` default) and CONEX /
-/// AGAP (`CONEX_TIMEOUT`).
-const SMC100_TIMEOUT: Duration = Duration::from_secs(1);
+/// Per-command serial I/O timeout: SMC100 (asynMotorController's
+/// `DEFAULT_CONTROLLER_TIMEOUT`) and CONEX / AGAP (`CONEX_TIMEOUT`).
+const SMC100_TIMEOUT: Duration = Duration::from_secs(2);
 const CONEX_TIMEOUT: Duration = Duration::from_secs(2);
 const AGAP_TIMEOUT: Duration = Duration::from_secs(2);
 const AG_UC_TIMEOUT: Duration = Duration::from_secs(2);
