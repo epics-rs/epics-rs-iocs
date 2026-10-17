@@ -20,18 +20,17 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
 };
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{Controller, asyn_user, register_port};
 
 use crate::phytron::{CtrlType, PhytronAxis, PhytronController};
 
 /// Default communication timeout when the `timeoutMs` arg is omitted.
 const DEFAULT_TIMEOUT_MS: f64 = 1000.0;
 
-/// A registered controller plus the poll periods to install its axes with.
+/// A registered controller and the started poller its axes join.
 struct ControllerReg {
     controller: Arc<Mutex<PhytronController>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
+    poller: Arc<Controller>,
 }
 
 /// Shared name -> controller registry for the three commands.
@@ -178,12 +177,23 @@ fn register_controller(
         controller.reset_at_boot(&name);
     }
     let controller = Arc::new(Mutex::new(controller));
+    let poller = Controller::new().controller_poll({
+        let controller = controller.clone();
+        let name = name.clone();
+        move || {
+            controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poll(&name)
+        }
+    });
+    // C startPoller, phytronAxisMotor.cpp:240
+    poller.start(ctx, moving_poll_ms, idle_poll_ms, 5);
     registry_lock(registry).insert(
         name.clone(),
         ControllerReg {
             controller,
-            moving_poll_ms,
-            idle_poll_ms,
+            poller: Arc::new(poller),
         },
     );
     Ok(CommandOutcome::Continue)
@@ -200,7 +210,7 @@ fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
             arg_int_req("Axis index"),
         ],
         "phytronCreateAxis(controllerName, module, index)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let name = req_string(args, 0, "Controller Name")?;
             let module = req_int(args, 1, "Module index")?;
             let index = req_int(args, 2, "Axis index")?;
@@ -215,21 +225,13 @@ fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             let controller = entry.controller.clone();
-            let moving_poll_ms = entry.moving_poll_ms;
-            let idle_poll_ms = entry.idle_poll_ms;
+            let poller = entry.poller.clone();
             drop(reg);
 
             let axis = PhytronAxis::new(controller, module as i32, index as i32)
                 .map_err(|e| format!("phytronCreateAxis: {e}"))?;
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            install(
-                ctx,
-                asyn_user(&name, (module * 10 + index) as i32),
-                motor,
-                moving_poll_ms,
-                idle_poll_ms,
-                5, // C startPoller, phytronAxisMotor.cpp:240
-            )?;
+            poller.install(asyn_user(&name, (module * 10 + index) as i32), motor)?;
             Ok(CommandOutcome::Continue)
         },
     )

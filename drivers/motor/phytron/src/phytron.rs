@@ -67,10 +67,6 @@
 //!   default `pollMethodSerial`.
 //! - The auto status-reset-on-error option (`SEC` via the `statusResetTime`
 //!   option): dormant by default, so `clearAxisError` is a no-op here.
-//! - The MCC `SUI` limit-switch word is re-read once per axis poll rather than
-//!   once per controller poll (the C controller-poll cache is not shared across
-//!   the per-axis `AsynMotor::poll` boundary); same values, slightly more
-//!   traffic on multi-axis MCC controllers.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -211,6 +207,8 @@ pub struct PhytronController {
     ctrl_type: CtrlType,
     /// Controller address 0..=15 (one hex digit in the frame).
     address: u8,
+    /// The MCC `SUI` reply of this poll pass, ACK stripped (C `sLastSUI_`).
+    last_sui: String,
 }
 
 impl PhytronController {
@@ -221,6 +219,27 @@ impl PhytronController {
             handle,
             ctrl_type,
             address: address.min(15),
+            last_sui: String::new(),
+        }
+    }
+
+    /// C `phytronController::poll` with the serial poll method: an MCC reads
+    /// the `SUI` limit-switch word once for every axis's poll to parse; a
+    /// phyMOTION sends nothing.
+    pub fn poll(&mut self, name: &str) {
+        if self.ctrl_type != CtrlType::Mcc {
+            return;
+        }
+        self.last_sui.clear();
+        match self.command("SUI") {
+            Ok(sui) => self.last_sui = sui,
+            Err(e) => MotorTrace::new(name, 0).print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "phytronController::poll({name}) error {}\n",
+                    e.status() as i32
+                ),
+            ),
         }
     }
 
@@ -531,9 +550,8 @@ impl AsynMotor for PhytronAxis {
                     let perr = ctrl.command(&format!("{m}=E"))?;
                     let pos = atof(&ctrl.command(&format!("{m}P20R"))?);
                     let enc = atof(&ctrl.command(&format!("{m}P22R"))?);
-                    let sui = ctrl.command("SUI")?;
                     let moving = idle.as_bytes().first() != Some(&b'E');
-                    let status = self.mcc_status_word(&perr, &sui, moving)?;
+                    let status = self.mcc_status_word(&perr, &ctrl.last_sui, moving)?;
                     (pos, enc, moving, status)
                 }
             }
@@ -769,6 +787,7 @@ mod tests {
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let controller = Arc::new(Mutex::new(PhytronController::new(io, CtrlType::Mcc, 0)));
+        controller.lock().unwrap().poll("phytronEncoderPoll");
         let mut axis = PhytronAxis::new(controller, 0, 1).unwrap();
         let user = AsynUser::new(0);
         assert_eq!(axis.poll(&user).unwrap().encoder_position, 1000.0);
