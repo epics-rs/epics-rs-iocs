@@ -376,6 +376,7 @@ pub const AO_INFO_RESOLUTION: i32 = 1;
 
 // DioInfoItem
 pub const DIO_INFO_NUM_PORTS: i32 = 1;
+pub const DIO_INFO_PORT_TYPE: i32 = 2;
 pub const DIO_INFO_PORT_IO_TYPE: i32 = 3;
 pub const DIO_INFO_NUM_BITS: i32 = 4;
 
