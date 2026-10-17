@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -141,6 +141,27 @@ impl PmacCoordSystem {
         self.trace
             .print(TraceMask::ERROR, 0, format_args!("{line}\n"));
         pmac_err(line)
+    }
+
+    /// C `pAxis->print(pAxis->logParam, TRACE_FLOW, ...)` for 1-based `axis`.
+    fn flow(&self, axis: usize, args: std::fmt::Arguments<'_>) {
+        self.logs[axis - 1].print(TraceMask::FLOW, args);
+    }
+
+    /// C `motorAxisSetDouble` for a value the CS cannot set: its FLOW line,
+    /// then success.
+    fn ignore(&self, axis: usize, verb: &str, what: &str, value: f64) -> AsynResult<()> {
+        self.flow(
+            axis,
+            format_args!(
+                "{verb} PMAC ref {}, cs {}, axis {} {what} ({:.6})\n",
+                self.reference,
+                self.cs,
+                axis_name(axis).unwrap_or(' '),
+                CFloat(value)
+            ),
+        );
+        Ok(())
     }
 
     /// C `pAxis->stepSize = 1.0 / stepsPerUnit` for 0-based `axis`, which
@@ -434,6 +455,15 @@ impl AsynMotor for PmacCsAxis {
         let axis = self.axis;
         let mut system = lock(&self.system);
         let (cs, step) = (system.cs, system.step_size[axis - 1]);
+        system.flow(
+            axis,
+            format_args!(
+                "Set ref {}, axis {} to position {:.6}\n",
+                system.reference,
+                axis_name(axis).unwrap_or(' '),
+                CFloat(position)
+            ),
+        );
         // C rounds the record's steps to a whole step first.
         let position = (position + 0.5).floor() * step;
         system.command(
@@ -447,11 +477,55 @@ impl AsynMotor for PmacCsAxis {
     /// axis whose demand was written while it was armed.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
         let mut system = lock(&self.system);
+        system.flow(
+            self.axis,
+            format_args!(
+                "{}ing Deferred Move flag on PMAC ref {}, cs {}\n",
+                if defer { "Sett" } else { "Clear" },
+                system.reference,
+                system.cs
+            ),
+        );
         let release = !defer && system.moves_deferred;
         system.moves_deferred = defer;
         if release {
             system.process_deferred_moves()?;
         }
+        Ok(())
+    }
+
+    fn set_encoder_ratio(&mut self, _user: &AsynUser, ratio: f64) -> AsynResult<()> {
+        lock(&self.system).ignore(self.axis, "Cannot set", "encoder ratio", ratio)
+    }
+
+    fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        lock(&self.system).ignore(self.axis, "Ignoring", "low limit", position)
+    }
+
+    fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        lock(&self.system).ignore(self.axis, "Ignoring", "high limit", position)
+    }
+
+    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
+        let what = match kind {
+            PidGainKind::Proportional => "pgain",
+            PidGainKind::Integral => "igain",
+            PidGainKind::Derivative => "dgain",
+        };
+        lock(&self.system).ignore(self.axis, "Ignoring", what, gain)
+    }
+
+    fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
+        let system = lock(&self.system);
+        system.flow(
+            self.axis,
+            format_args!(
+                "Cannot set PMAC ref {}, axis {} closed loop ({})\n",
+                system.reference,
+                axis_name(self.axis).unwrap_or(' '),
+                if enable { "ON" } else { "OFF" }
+            ),
+        );
         Ok(())
     }
 

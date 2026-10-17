@@ -1302,6 +1302,86 @@ mod tests {
         assert_eq!(own.take(), "");
     }
 
+    /// pmacAsynCoord.c:386-437: every motorAxisSetDouble case prints its FLOW
+    /// line on the axis's log; the ones C cannot set still succeed.
+    #[epics_rs::base::epics_test]
+    async fn cs_setters_print_c_flow_lines_on_the_axis_s_log_user() {
+        use epics_rs::asyn::interfaces::motor::PidGainKind;
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::model2::drv_asyn_motor_configure_command;
+        use motor_common::testing::run_command;
+
+        let (_rt, rig) = publish_scripted("pmacCsFlow");
+        coord_create("pmacCsFlow", 0, 3, 9302, 10).unwrap();
+        let args = vec![
+            ArgValue::String("pmacCsFlowM".into()),
+            ArgValue::String("pmacAsynCoord".into()),
+            ArgValue::Int(9302),
+            ArgValue::Int(9),
+        ];
+        run_command(
+            drv_asyn_motor_configure_command(vec![&PMAC_ASYN_COORD]),
+            args,
+        )
+        .await;
+        let own = TraceCapture::on("pmacCsFlowM");
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        let mask = TraceMask::ERROR | TraceMask::FLOW;
+        trace.set_trace_mask(Some("pmacCsFlowM"), mask);
+        trace.set_device_trace_mask("pmacCsFlowM", 0, mask);
+        let axis = COORD_SYSTEMS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.reference == 9302)
+            .unwrap()
+            .axes[0]
+            .clone();
+        for command in ["&3Q71=0.001200", "&3A", "&3AB10R"] {
+            rig.answer(command, b"\x06");
+        }
+        let user = AsynUser::new(0);
+        {
+            let mut axis = axis.lock().unwrap();
+            axis.set_position(&user, 12.4).unwrap();
+            axis.set_encoder_ratio(&user, 1.5).unwrap();
+            axis.set_low_limit(&user, -1.0).unwrap();
+            axis.set_high_limit(&user, 2.0).unwrap();
+            axis.set_pid_gain(&user, PidGainKind::Proportional, 0.1)
+                .unwrap();
+            axis.set_pid_gain(&user, PidGainKind::Integral, 0.2)
+                .unwrap();
+            axis.set_pid_gain(&user, PidGainKind::Derivative, 0.3)
+                .unwrap();
+            axis.set_closed_loop(&user, true).unwrap();
+            axis.set_closed_loop(&user, false).unwrap();
+            axis.set_deferred_moves(&user, true).unwrap();
+            axis.set_deferred_moves(&user, false).unwrap();
+        }
+        assert_eq!(
+            own.take(),
+            "Set ref 9302, axis A to position 12.400000\n\
+             Cannot set PMAC ref 9302, cs 3, axis A encoder ratio (1.500000)\n\
+             Ignoring PMAC ref 9302, cs 3, axis A low limit (-1.000000)\n\
+             Ignoring PMAC ref 9302, cs 3, axis A high limit (2.000000)\n\
+             Ignoring PMAC ref 9302, cs 3, axis A pgain (0.100000)\n\
+             Ignoring PMAC ref 9302, cs 3, axis A igain (0.200000)\n\
+             Ignoring PMAC ref 9302, cs 3, axis A dgain (0.300000)\n\
+             Cannot set PMAC ref 9302, axis A closed loop (ON)\n\
+             Cannot set PMAC ref 9302, axis A closed loop (OFF)\n\
+             Setting Deferred Move flag on PMAC ref 9302, cs 3\n\
+             Clearing Deferred Move flag on PMAC ref 9302, cs 3\n"
+        );
+        // The configured poller's reads interleave.
+        let written: Vec<_> = rig
+            .written()
+            .into_iter()
+            .filter(|c| c != "&3??" && !c.starts_with("&3Q81"))
+            .collect();
+        assert_eq!(written, ["&3Q71=0.001200", "&3A", "&3AB10R"]);
+    }
+
     /// pmacAsynCoord.c:584-592: an unparsed or failed `&{cs}??` prints
     /// cmdStatus (0, or MOTOR_AXIS_ERROR) and the response buffer; :625-634
     /// still read the positions over the status words sscanf left.
