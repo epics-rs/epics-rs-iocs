@@ -4,18 +4,8 @@
 //! `HAVE_LIBSSH2`, and otherwise a `curl` command line. The `sftp` feature is
 //! the libssh2 build; without it the upload runs C's `curl` command. Both
 //! answer C's status: 0 on success, the libssh2 body's -1, or the `curl`
-//! command's `system()` status.
-
-/// The upload's local file: C's `buildProfile` writes the trajectory into
-/// the working directory under its bare name, and both bodies read it there
-/// (xpsSFTPUpload.cpp:127, 188).
-fn write_local(file_name: &str, contents: &str) -> bool {
-    if std::fs::write(file_name, contents).is_err() {
-        eprintln!("Can't open local file {file_name}");
-        return false;
-    }
-    true
-}
+//! command's `system()` status. Both upload the file `buildProfile` wrote
+//! under `file_name` in the working directory.
 
 /// xpsSFTPUpload.cpp:183-192, C's build with neither library.
 #[cfg(not(feature = "sftp"))]
@@ -23,14 +13,10 @@ pub fn xps_sftp_upload(
     ip_address: &str,
     trajectory_directory: &str,
     file_name: &str,
-    contents: &str,
     user_name: &str,
     password: &str,
     verbose: bool,
 ) -> i32 {
-    if !write_local(file_name, contents) {
-        return -1;
-    }
     let (command, args) = curl_command(
         ip_address,
         trajectory_directory,
@@ -87,7 +73,6 @@ pub fn xps_sftp_upload(
     ip_address: &str,
     trajectory_directory: &str,
     file_name: &str,
-    contents: &str,
     user_name: &str,
     password: &str,
     _verbose: bool,
@@ -140,9 +125,10 @@ pub fn xps_sftp_upload(
             eprintln!("Authentication by password failed.");
             return -1;
         }
-        if !write_local(file_name, contents) {
+        let Ok(contents) = std::fs::read(file_name) else {
+            eprintln!("Can't open local file {file_name}");
             return -1;
-        }
+        };
         let Ok(sftp) = session.sftp() else {
             eprintln!("Unable to init SFTP session");
             return -1;
@@ -157,7 +143,7 @@ pub fn xps_sftp_upload(
             return -1;
         };
         // C answers 0 after a failed write.
-        if remote.write_all(contents.as_bytes()).is_err() {
+        if remote.write_all(&contents).is_err() {
             return -1;
         }
         0

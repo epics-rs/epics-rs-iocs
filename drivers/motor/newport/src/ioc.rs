@@ -2124,10 +2124,10 @@ struct TrajectoryUpload<'a> {
     password: &'a str,
 }
 
-/// C `buildProfile` from the trajectory text to the verify: the firmware
-/// picks the folder (unless `ftp_dir` names one) and `useSFTP_` the
-/// transport, and `upload` sends it with the controller unlocked.
-/// Answers the folder.
+/// C `buildProfile` from the trajectory text to the verify: the text goes
+/// to `file_name` in the working directory, the firmware picks the folder
+/// (unless `ftp_dir` names one) and `useSFTP_` the transport, and `upload`
+/// sends it with the controller unlocked. Answers the folder.
 fn xps_build_profile(
     controller: &Mutex<XpsController>,
     target: &TrajectoryUpload<'_>,
@@ -2137,6 +2137,13 @@ fn xps_build_profile(
     let (built, directory, use_sftp) = {
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let built = ctrl.build_profile_text()?;
+        std::fs::write(target.file_name, &built.text).map_err(|e| {
+            format!(
+                "Error creating trajectory file {}, error={}\n",
+                target.file_name,
+                strerror(&e)
+            )
+        })?;
         let (directory, sftp) = trajectory_upload(ctrl.firmware())?;
         if sftp {
             ctrl.set_use_sftp();
@@ -2152,6 +2159,18 @@ fn xps_build_profile(
     Ok(directory)
 }
 
+/// C `strerror(errno)`: the OS text without Rust's ` (os error N)`.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(code) => text
+            .strip_suffix(&format!(" (os error {code})"))
+            .unwrap_or(&text)
+            .to_string(),
+        None => text,
+    }
+}
+
 /// XPSController.cpp:709-747: SFTP when `useSFTP_`, else FTP.
 fn upload_trajectory(
     target: &TrajectoryUpload<'_>,
@@ -2160,7 +2179,7 @@ fn upload_trajectory(
     use_sftp: bool,
 ) -> Result<(), String> {
     if use_sftp {
-        xps_sftp_upload_traced(target, directory, contents)
+        xps_sftp_upload_traced(target, directory)
     } else {
         ftp::upload_trajectory(
             target.host,
@@ -2175,11 +2194,7 @@ fn upload_trajectory(
 
 /// XPSController.cpp:710-720: `xpsSFTPUpload` between C's FLOW lines,
 /// verbose when the controller's own user traces IO_DRIVER.
-fn xps_sftp_upload_traced(
-    target: &TrajectoryUpload<'_>,
-    directory: &str,
-    contents: &str,
-) -> Result<(), String> {
+fn xps_sftp_upload_traced(target: &TrajectoryUpload<'_>, directory: &str) -> Result<(), String> {
     let trace = MotorTrace::new(target.motor_port, 0);
     let verbose = PortManager::global().trace_manager().is_enabled_device(
         target.motor_port,
@@ -2194,7 +2209,6 @@ fn xps_sftp_upload_traced(
         target.host,
         directory,
         target.file_name,
-        contents,
         target.user,
         target.password,
         verbose,
@@ -2224,50 +2238,107 @@ mod tests {
     /// XPSController.cpp:695-747: XPSBuildProfile uploads to the firmware's
     /// folder, over SFTP once an XPS-D build sets `useSFTP_` and over FTP
     /// otherwise; an ftpDir names the folder instead.
+    /// XPSController.cpp:642-648: the build writes the trajectory file under
+    /// its name in the working directory before the upload, and fails when
+    /// it cannot.
+    #[test]
+    fn the_build_writes_the_trajectory_file() {
+        let dir = std::env::temp_dir().join(format!("xps-traj-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("traj.trj");
+        let file = file.to_str().unwrap();
+        let (sent, _) = build_with("xpsBuildFile", "XPS-C8 V2", None, file);
+        assert_eq!(sent.len(), 1);
+        let text = std::fs::read_to_string(file).unwrap();
+        assert!(text.starts_with("0.") && text.ends_with('\n'), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let missing = "/nonexistent-xps-dir/traj.trj";
+        assert_eq!(
+            build_result("xpsBuildNoFile", "XPS-C8 V2", missing),
+            Err(format!(
+                "Error creating trajectory file {missing}, error=No such file or directory\n"
+            ))
+        );
+    }
+
+    /// A controller over a fake XPS with one G1 axis and a three-point
+    /// profile.
+    fn profiled(port: &str, firmware: &'static str) -> Mutex<XpsController> {
+        let line = FakeLine::new(port, "");
+        *line.firmware.lock().unwrap() = firmware;
+        let mut ctrl =
+            XpsController::new(line.socket(SocketMode::Query), false, Duration::ZERO).unwrap();
+        ctrl.register_axis(
+            0,
+            "G1.P1",
+            "G1",
+            Arc::new(line.socket(SocketMode::Fire)),
+            Default::default(),
+        );
+        ctrl.define_profile(Profile {
+            group: "G1".into(),
+            move_mode: MoveMode::Absolute,
+            times: vec![1.0, 1.0, 1.0],
+            axes: vec![crate::xps::ProfileAxis {
+                positioner: "G1.P1".into(),
+                positions: vec![0.0, 1.0, 2.0],
+            }],
+        })
+        .unwrap();
+        Mutex::new(ctrl)
+    }
+
+    /// Run the build to `file_name` with a recording uploader; answer the
+    /// uploads and the controller's `useSFTP_`.
+    fn build_with(
+        port: &str,
+        firmware: &'static str,
+        ftp_dir: Option<&str>,
+        file_name: &str,
+    ) -> (Vec<(String, String, bool)>, bool) {
+        let controller = profiled(port, firmware);
+        let target = TrajectoryUpload {
+            motor_port: port,
+            host: "10.0.0.5",
+            file_name,
+            user: "u",
+            password: "p",
+        };
+        let sent = Mutex::new(Vec::new());
+        let _ = xps_build_profile(&controller, &target, ftp_dir, |t, dir, _text, sftp| {
+            sent.lock()
+                .unwrap()
+                .push((t.file_name.to_string(), dir.to_string(), sftp));
+            Ok(())
+        });
+        let use_sftp = controller.lock().unwrap().use_sftp();
+        (sent.into_inner().unwrap(), use_sftp)
+    }
+
+    /// The build's verdict, the upload always succeeding.
+    fn build_result(port: &str, firmware: &'static str, file_name: &str) -> Result<(), String> {
+        let controller = profiled(port, firmware);
+        let target = TrajectoryUpload {
+            motor_port: port,
+            host: "10.0.0.5",
+            file_name,
+            user: "u",
+            password: "p",
+        };
+        xps_build_profile(&controller, &target, None, |_, _, _, _| Ok(())).map(|_| ())
+    }
+
     #[test]
     fn the_build_uploads_by_the_firmwares_transport() {
+        let dir = std::env::temp_dir().join(format!("xps-transport-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("traj.trj");
+        let file = file.to_str().unwrap().to_string();
         let build = |port: &str, firmware: &'static str, ftp_dir: Option<&str>| {
-            let line = FakeLine::new(port, "");
-            *line.firmware.lock().unwrap() = firmware;
-            let mut ctrl =
-                XpsController::new(line.socket(SocketMode::Query), false, Duration::ZERO).unwrap();
-            ctrl.register_axis(
-                0,
-                "G1.P1",
-                "G1",
-                Arc::new(line.socket(SocketMode::Fire)),
-                Default::default(),
-            );
-            ctrl.define_profile(Profile {
-                group: "G1".into(),
-                move_mode: MoveMode::Absolute,
-                times: vec![1.0, 1.0, 1.0],
-                axes: vec![crate::xps::ProfileAxis {
-                    positioner: "G1.P1".into(),
-                    positions: vec![0.0, 1.0, 2.0],
-                }],
-            })
-            .unwrap();
-            let controller = Mutex::new(ctrl);
-            let target = TrajectoryUpload {
-                motor_port: port,
-                host: "10.0.0.5",
-                file_name: "traj.trj",
-                user: "u",
-                password: "p",
-            };
-            let sent = Mutex::new(Vec::new());
-            let _ = xps_build_profile(&controller, &target, ftp_dir, |t, dir, text, sftp| {
-                assert!(!text.is_empty());
-                sent.lock()
-                    .unwrap()
-                    .push((t.file_name.to_string(), dir.to_string(), sftp));
-                Ok(())
-            });
-            let use_sftp = controller.lock().unwrap().use_sftp();
-            (sent.into_inner().unwrap(), use_sftp)
+            build_with(port, firmware, ftp_dir, &file)
         };
-        let upload = |dir: &str, sftp| vec![("traj.trj".to_string(), dir.to_string(), sftp)];
+        let upload = |d: &str, sftp| vec![(file.clone(), d.to_string(), sftp)];
         assert_eq!(
             build("xpsBuildC", "XPS-C8 V2", None),
             (upload("/Admin/Public/Trajectories", false), false)
@@ -2285,6 +2356,7 @@ mod tests {
             (upload("/Mine", true), true)
         );
         assert_eq!(build("xpsBuildNone", "0", None), (vec![], false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// XPSController.cpp:695-706: the trajectory folder and transport follow
