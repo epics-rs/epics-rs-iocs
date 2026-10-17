@@ -400,7 +400,9 @@ impl Reads {
     /// `pasynInt32Array->read(..., pPvt->data, pmca->nuse, &pPvt->nread)`.
     fn read_spectrum(&self, port: &mut dyn PortCalls) {
         let max_elements = self.nuse.load(Ordering::Relaxed).max(0) as usize;
-        let op = RequestOp::Int32ArrayRead { max_elements };
+        // C reads into its kept `data`, so the driver sees the last read.
+        let buf = self.data.lock().unwrap().clone();
+        let op = RequestOp::Int32ArrayRead { buf, max_elements };
         if let Ok(got) = port.call(&op, self.user(McaReason::Data)) {
             *self.data.lock().unwrap() = got.int32_array.unwrap_or_default();
         }
