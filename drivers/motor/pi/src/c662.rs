@@ -70,16 +70,12 @@
 //!   ±1e9.)
 //!
 //! ## Not modeled (documented deviations)
-//! - **`no_motion_count` "no done indicator" fallback**: C also declares done
-//!   after the position is stable for `> 1` poll *while a move node is active* —
-//!   record-layer state this interface does not carry. `OpComplete`/`ExeError`
-//!   (the primary done signal) is honored; the stability fallback is omitted,
-//!   matching the C-862 port's treatment of `no_motion_count`.
 //! - **`recv_mess(..., FLUSH)`**: replaced by a flush before every query
 //!   (`exchange`), a superset of C's error-path flush.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -236,6 +232,9 @@ pub struct PIC662Axis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// C `no_motion_count`: polls the position sat still while a move was
+    /// held; a MOTION command restarts it (motordrvCom.cc:435).
+    no_motion_count: u32,
 }
 
 impl PIC662Axis {
@@ -251,11 +250,12 @@ impl PIC662Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            no_motion_count: 0,
         };
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(polled) = ctrl.poll_status() {
             drop(ctrl);
-            axis.apply(polled);
+            axis.apply(polled, false);
         }
         Ok(axis)
     }
@@ -277,18 +277,26 @@ impl PIC662Axis {
 
     /// Fold a fresh poll into `last_status`, deriving direction from the
     /// count delta (held across polls when the position is unchanged).
-    fn apply(&mut self, polled: PolledStatus) {
+    fn apply(&mut self, polled: PolledStatus, in_motion: bool) {
         let prev = self.last_status.position as i32;
+        let mut done = polled.done;
         let direction = if polled.position != prev {
+            self.no_motion_count = 0;
             polled.position >= prev
         } else {
+            // drvPIC662.cc:280-282: no done indicator, so a held move still
+            // past two polls is done.
+            if in_motion {
+                done |= self.no_motion_count > 1;
+                self.no_motion_count += 1;
+            }
             self.last_status.direction
         };
         self.last_status = MotorStatus {
             position: polled.position as f64,
             encoder_position: polled.position as f64,
             velocity: 0.0,
-            done: polled.done,
+            done,
             // E-662: no limit/home/encoder/gain feedback; piezo servo powers
             // its stage continuously. No base velocity (`SET_VEL_BASE` no-op).
             direction,
@@ -315,7 +323,8 @@ impl AsynMotor for PIC662Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let um = position * DRIVE_RESOLUTION;
-        self.write_move(&format!("DEV:CONT REM\nPOS {um:.3}"))
+        self.no_motion_count = 0;
+        self.write_move(&format!("DEV:CONT REM\nPOS {:.3}", CFloat(um)))
     }
 
     fn move_relative(
@@ -327,7 +336,8 @@ impl AsynMotor for PIC662Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let um = distance * DRIVE_RESOLUTION;
-        self.write_move(&format!("DEV:CONT REM\nPOS:REL {um:.3}"))
+        self.no_motion_count = 0;
+        self.write_move(&format!("DEV:CONT REM\nPOS:REL {:.3}", CFloat(um)))
     }
 
     fn move_velocity(
@@ -352,7 +362,9 @@ impl AsynMotor for PIC662Axis {
         _forward: bool,
     ) -> AsynResult<()> {
         // C-662 HOME_FOR/HOME_REV: send = false, so only PREM goes out;
-        // POST follows the next done poll.
+        // POST follows the next done poll. Still a MOTION node, which
+        // restarts the count.
+        self.no_motion_count = 0;
         self.write_move("")
     }
 
@@ -384,6 +396,17 @@ impl AsynMotor for PIC662Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        self.poll_status(false)
+    }
+
+    fn poll_in_motion(&mut self, _user: &AsynUser, _cdir: &mut bool) -> AsynResult<MotorStatus> {
+        self.poll_status(true)
+    }
+}
+
+impl PIC662Axis {
+    /// C `set_status`; `in_motion` is its `nodeptr != 0`.
+    fn poll_status(&mut self, in_motion: bool) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let polled = ctrl.poll_status();
@@ -397,7 +420,7 @@ impl AsynMotor for PIC662Axis {
             };
             return Err(pic662_err("no status reply"));
         };
-        self.apply(polled);
+        self.apply(polled, in_motion);
         // drvPIC662.cc:338-344: POST once done; the E-662 has no limits.
         if self.last_status.done
             && let Some(post) = self.strings.post_due()
@@ -414,6 +437,27 @@ mod tests {
     use super::*;
     use motor_common::testing::LineRig;
     use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
+    /// `-nan`, `+nan`.
+    #[test]
+    fn floats_go_out_as_c_sprintf() {
+        let nan = f64::NAN;
+        let neg = -f64::NAN;
+        let (line, mut axis, _) = strings_rig("c662CFloat");
+        let user = AsynUser::default();
+        let mut sent = String::new();
+        let mut run = |f: &mut dyn FnMut(&mut PIC662Axis)| {
+            f(&mut axis);
+            sent.extend(line.sent().into_iter().map(|w| w + "|"));
+        };
+        run(&mut |a| drop(a.move_absolute(&user, nan, 0.0, 1.0, 1.0)));
+        run(&mut |a| drop(a.move_relative(&user, neg, 0.0, 1.0, 1.0)));
+        assert!(!sent.contains("NaN"), "{sent}");
+        for want in ["POS nan", "POS:REL -nan"] {
+            assert!(sent.contains(want), "{want}: {sent}");
+        }
+    }
 
     /// An E-662 on a [`LineRig`] whose `*ESR?` reply follows `esr`.
     fn strings_rig(name: &str) -> (LineRig, PIC662Axis, Arc<AtomicU8>) {
@@ -487,6 +531,28 @@ mod tests {
         esr.store(1, Ordering::SeqCst);
         assert_eq!(poll_extra(&line, &mut axis), ["VOLT 0"]);
         assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+    }
+
+    /// drvPIC662.cc:278-283: with no done indicator, a held move whose
+    /// position sits still is done at the third still poll
+    /// (`no_motion_count++ > 1`); the count runs only while a move is held
+    /// and a MOTION command restarts it (motordrvCom.cc:435).
+    #[test]
+    fn a_held_move_still_for_three_polls_is_done() {
+        let (_line, mut axis, esr) = strings_rig("pic662Settle");
+        let user = AsynUser::default();
+        esr.store(0, Ordering::SeqCst);
+        for _ in 0..5 {
+            assert!(!axis.poll(&user).unwrap().done);
+        }
+        let mut cdir = true;
+        for _ in 0..2 {
+            axis.move_absolute(&user, 0.0, 0.0, 1.0, 1.0).unwrap();
+            let done: Vec<bool> = (0..4)
+                .map(|_| axis.poll_in_motion(&user, &mut cdir).unwrap().done)
+                .collect();
+            assert_eq!(done, [false, false, true, true]);
+        }
     }
 
     #[test]

@@ -2818,6 +2818,7 @@ dependencies = [
 name = "motor-pi"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2826,6 +2827,7 @@ dependencies = [
 name = "motor-pi-gcs2"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]

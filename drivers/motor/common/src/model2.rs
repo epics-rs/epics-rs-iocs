@@ -9,6 +9,8 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::motor::device_state::Model2Params;
+use epics_rs::motor::devices::{model2_params, motor_interface_params};
 
 use crate::iocsh::{arg_int_req, arg_str_req};
 use crate::model1::c_int;
@@ -21,6 +23,8 @@ struct Card {
     axes: Vec<Arc<Mutex<dyn AsynMotor>>>,
     poller: Poller,
     logs: Vec<Arc<AxisLog>>,
+    /// The drvAsynMotorConfigure ports that opened the card.
+    ports: Vec<String>,
 }
 
 /// The `logFunc`/`logParam` pair an axis's `motorAxisSetLog` keeps
@@ -119,6 +123,7 @@ impl Model2 {
                 idle_poll_ms,
             },
             logs: Vec::new(),
+            ports: Vec::new(),
         });
     }
 
@@ -135,6 +140,7 @@ impl Model2 {
             axes,
             poller: Poller::Driver(poller),
             logs: Vec::new(),
+            ports: Vec::new(),
         });
     }
 
@@ -189,6 +195,24 @@ impl Model2 {
         Some(cards.iter().find(|c| c.card == card)?.poller.clone())
     }
 
+    /// The paramLib of `card`'s axis `axis`, which the driver's report dumps:
+    /// the one table whether a devMotorSim-style record or
+    /// drvAsynMotorConfigure opened the axis, `None` until one did.
+    pub fn params(&self, card: i32, axis: i32) -> Option<Model2Params> {
+        motor_interface_params(self.name, card, axis).or_else(|| {
+            let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
+            let card = cards.iter().find(|c| c.card == card)?;
+            card.ports.iter().find_map(|port| model2_params(port, axis))
+        })
+    }
+
+    fn add_port(&self, card: i32, port: &str) {
+        let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(card) = cards.iter_mut().find(|c| c.card == card) {
+            card.ports.push(port.to_owned());
+        }
+    }
+
     /// The driver's `open(card, axis)`: `None` for an unconfigured card or an
     /// axis it does not have.
     fn open(&self, card: i32, axis: i32) -> Option<Arc<Mutex<dyn AsynMotor>>> {
@@ -241,6 +265,7 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                     log.attach(&port_name, addr);
                 }
             }
+            driver.add_port(card, &port_name);
             if let (
                 Some(controller),
                 Some(Poller::Configured {

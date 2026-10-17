@@ -109,6 +109,33 @@ impl MotorSimAxis {
         self.homed = false;
     }
 
+    /// The level-1 lines C `motorSimController::report` prints for this
+    /// axis (motorSimDriver.cpp:122-141), with the port's soft limits.
+    pub fn report(&self, out: &mut dyn std::fmt::Write, (low_soft, hi_soft): (f64, f64)) {
+        let (next, end) = (self.nextpoint, self.endpoint);
+        let _ = writeln!(
+            out,
+            "  Current position = {:.6}, velocity = {:.6} at current time: {:.6}",
+            next.p, next.v, next.t
+        );
+        let _ = writeln!(
+            out,
+            "  Destination posn = {:.6}, velocity = {:.6} at desination time:  {:.6}",
+            end.p, end.v, end.t
+        );
+        let _ = writeln!(
+            out,
+            "    Hard limits: {:.6}, {:.6}",
+            self.low_hard_limit, self.hi_hard_limit
+        );
+        let _ = writeln!(out, "           Home: {:.6}", self.home);
+        let _ = writeln!(out, "    Enc. offset: {:.6}", self.enc_offset);
+        let _ = writeln!(out, "    Soft limits: {low_soft:.6}, {hi_soft:.6}");
+        if self.homing {
+            let _ = writeln!(out, "    Currently homing axis");
+        }
+    }
+
     /// Shared body of the absolute/relative move (C `motorSimAxis::move`).
     fn do_move(
         &mut self,
@@ -349,11 +376,38 @@ pub struct DrvMotorSimAxis {
 
 impl DrvMotorSimAxis {
     /// `motorSimCreateAxis(..., lowLimit, hiLimit, home, start)`, which
-    /// overwrites `start` with 0 before using it.
+    /// overwrites `start` with 0 before using it and sets it as the
+    /// paramLib's Position (drvMotorSim.c:739).
     pub fn new(low_hard_limit: f64, hi_hard_limit: f64, home: f64) -> Self {
         Self {
             axis: MotorSimAxis::new(low_hard_limit, hi_hard_limit, home, DEFAULT_START),
-            writes: Vec::new(),
+            writes: vec![StatusWrite::Position(DEFAULT_START)],
+        }
+    }
+
+    /// The lines C `motorAxisReportAxis` prints for this axis at level 1
+    /// (drvMotorSim.c:136-157), before its paramLib dump.
+    pub fn report(&self, out: &mut dyn std::fmt::Write, (low_soft, hi_soft): (f64, f64)) {
+        let axis = &self.axis;
+        let (next, end) = (axis.nextpoint, axis.endpoint);
+        let _ = writeln!(
+            out,
+            "Current position = {:.6}, velocity = {:.6} at current time: {:.6}",
+            next.p, next.v, next.t
+        );
+        let _ = writeln!(
+            out,
+            "Destination posn = {:.6}, velocity = {:.6} at desination time:  {:.6}",
+            end.p, end.v, end.t
+        );
+        let _ = writeln!(
+            out,
+            "Hard limits: {:.6}, {:.6}",
+            axis.low_hard_limit, axis.hi_hard_limit
+        );
+        let _ = writeln!(out, "Soft limits: {low_soft:.6}, {hi_soft:.6}");
+        if axis.homing {
+            let _ = writeln!(out, "Currently homing axis");
         }
     }
 
@@ -437,6 +491,17 @@ impl AsynMotor for DrvMotorSimAxis {
 
     fn poll(&mut self, user: &AsynUser) -> AsynResult<MotorStatus> {
         let status = self.axis.poll(user)?;
+        // motorSimProcess's paramLib sets (drvMotorSim.c:646-653).
+        self.writes.extend([
+            StatusWrite::Position(status.position),
+            StatusWrite::EncoderPosition(status.encoder_position),
+            StatusWrite::Direction(status.direction),
+            StatusWrite::Done(status.done),
+            StatusWrite::HighHardLimit(status.high_limit),
+            StatusWrite::HomeSignal(status.encoder_home),
+            StatusWrite::Moving(!status.done),
+            StatusWrite::LowHardLimit(status.low_limit),
+        ]);
         Ok(MotorStatus {
             home: status.encoder_home,
             encoder_home: false,
@@ -557,9 +622,33 @@ mod tests {
         assert!(!status.encoder_home && !status.homed);
     }
 
+    /// drvMotorSim's paramLib sets: Position at create (drvMotorSim.c:739),
+    /// then the eight of each motorSimProcess (:646-653).
+    #[test]
+    fn drv_motor_sim_sets_its_parameters_at_create_and_each_update() {
+        let mut axis = DrvMotorSimAxis::new(-10.0, 10.0, 0.0);
+        assert_eq!(axis.take_status_writes(), vec![StatusWrite::Position(0.0)]);
+        axis.axis.process(0.05);
+        axis.poll(&user()).unwrap();
+        assert_eq!(
+            axis.take_status_writes(),
+            vec![
+                StatusWrite::Position(0.0),
+                StatusWrite::EncoderPosition(0.0),
+                StatusWrite::Direction(false),
+                StatusWrite::Done(true),
+                StatusWrite::HighHardLimit(false),
+                StatusWrite::HomeSignal(true),
+                StatusWrite::Moving(false),
+                StatusWrite::LowHardLimit(false),
+            ]
+        );
+    }
+
     #[test]
     fn drv_motor_sim_posts_not_done_when_motion_starts() {
         let mut axis = DrvMotorSimAxis::new(DEFAULT_LOW_LIMIT, DEFAULT_HI_LIMIT, 0.0);
+        axis.take_status_writes();
         axis.move_velocity(&user(), 0.0, 1.0, 1.0).unwrap();
         assert_eq!(axis.take_status_writes(), vec![StatusWrite::Done(false)]);
         axis.stop(&user(), 1.0).unwrap();

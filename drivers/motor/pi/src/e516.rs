@@ -109,6 +109,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -164,17 +165,17 @@ struct AxisReading {
 /// `VEL {label}{value}` fragment. `SET_VELOCITY` scales the record value by
 /// `res`; `JOG` passes it raw — the caller supplies the already-scaled value.
 fn vel_cmd(label: &str, value: f64) -> String {
-    format!("VEL {label}{value:.*}", MAX_DIGITS)
+    format!("VEL {label}{:.*}", MAX_DIGITS, CFloat(value))
 }
 
 /// `MOV {label}{p·res}` absolute-move fragment.
 fn mov_cmd(label: &str, position: f64) -> String {
-    format!("MOV {label}{:.*}", MAX_DIGITS, position * POS_RES)
+    format!("MOV {label}{:.*}", MAX_DIGITS, CFloat(position * POS_RES))
 }
 
 /// `MVR {label}{d·res}` relative-move fragment.
 fn mvr_cmd(label: &str, distance: f64) -> String {
-    format!("MVR {label}{:.*}", MAX_DIGITS, distance * POS_RES)
+    format!("MVR {label}{:.*}", MAX_DIGITS, CFloat(distance * POS_RES))
 }
 
 /// Fold one raw reading into a [`MotorStatus`] (C `set_status` tail). Updates
@@ -585,6 +586,17 @@ mod tests {
     use super::*;
     use motor_common::testing::LineRig;
     use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
+    /// `-nan`, `+nan`.
+    #[test]
+    fn floats_go_out_as_c_sprintf() {
+        let nan = f64::NAN;
+        let neg = -f64::NAN;
+        assert_eq!(vel_cmd("A", nan), "VEL Anan");
+        assert_eq!(mov_cmd("A", neg), "MOV A-nan");
+        assert_eq!(mvr_cmd("A", nan), "MVR Anan");
+    }
 
     const QUERIES: [&str; 5] = ["ONL?", "ONT? A", "OVF? A", "SVO? A", "POS? A"];
 

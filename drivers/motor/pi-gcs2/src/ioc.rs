@@ -22,9 +22,9 @@ use motor_common::connect::{EosConnectError, EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port};
+use motor_common::{Controller, asyn_user, register_port_with};
 
-use crate::gcs2::{PIGCS2Axis, PIGCS2Controller, is_known_controller};
+use crate::gcs2::{PIGCS2Axis, PIGCS2Controller, PIGCS2Report, is_known_controller};
 
 /// Command timeout (C `PIInterface::TIMEOUT` is 5.0 s).
 const PIGCS2_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,7 +56,8 @@ pub fn pigcs2_config_command() -> CommandDef {
 
             // C's asynMotorController base creates the port before any of the
             // constructor's early returns.
-            register_port(ctx, &port_name, num_axes as i32)?;
+            let report = PIGCS2Report::default();
+            register_port_with(ctx, &port_name, num_axes as i32, report.clone())?;
             let Some(handle) = connect(&asyn_port) else {
                 return Ok(CommandOutcome::Continue);
             };
@@ -89,7 +90,9 @@ pub fn pigcs2_config_command() -> CommandDef {
             let poller = Controller::new();
             for (index, axis_name) in found.into_iter().take(num_axes).enumerate() {
                 let axis = PIGCS2Axis::new(controller.clone(), axis_name, index, &port_name);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                let axis = Arc::new(Mutex::new(axis));
+                report.add(axis.clone());
+                let motor: Arc<Mutex<dyn AsynMotor>> = axis;
                 poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 10);
@@ -173,5 +176,47 @@ mod one_poller {
         let cmd = pigcs2_config_command();
         assert_eq!(pollers_after(cmd, args).await, 1);
         assert!(line.sent().iter().any(|w| w == "SAI?"));
+    }
+
+    /// C `PIasynController::report` (PIasynController.cpp:196-221): the
+    /// driver line, each axis, and at level 1 the homing axis, before the
+    /// base report.
+    #[epics_rs::base::epics_test]
+    async fn the_port_report_prints_the_pigcs2_lines() {
+        let sai_left = AtomicBool::new(false);
+        let (_line, _io) = LineRig::new("c863rLine", move |command| {
+            match command {
+                "*IDN?" => "(c)2026 Physik Instrumente (PI) GmbH & Co. KG, C-863.11, 0, 1.0",
+                "SAI?" if !sai_left.swap(true, Ordering::Relaxed) => "1 ",
+                "SAI?" => "2",
+                // `#4`: axis 0 homing (0x4000), axis 1 idle.
+                "\u{4}" => "0140000000",
+                _ => "1=0",
+            }
+            .into()
+        });
+        let args = vec![
+            ArgValue::String("c863r".into()),
+            ArgValue::String("c863rLine".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(0),
+            ArgValue::Int(0),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ];
+        pollers_after(pigcs2_config_command(), args).await;
+        let port = PortManager::global().find_port_handle("c863r").unwrap();
+        let text = port.report_blocking(0).unwrap();
+        assert!(
+            text.contains("PIGCS2 motor driver c863r, numAxes=2\n  axis 0\n  axis 1\n"),
+            "{text}"
+        );
+        let text = port.report_blocking(1).unwrap();
+        assert!(
+            text.contains(
+                "PIGCS2 motor driver c863r, numAxes=2\n  axis 0\n    Currently homing axis\n  axis 1\n"
+            ),
+            "{text}"
+        );
     }
 }

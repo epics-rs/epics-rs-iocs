@@ -85,22 +85,19 @@
 //!   `SET_ENC_RATIO` — no wire command (DC servo / not supported).
 //!
 //! ## Not modeled (documented deviations)
-//! - **`no_motion_count` motion-timeout**: C, after the target is stable for
-//!   `> motionTO` (10) polls *while a move is active*, sets `RA_PROBLEM` and
-//!   sends `HLT  #`. That depends on record-layer move state this interface does
-//!   not carry; the `Done`-bit primary done signal is honored, the timeout
-//!   `HLT` is omitted (as the C-862 port omits its `no_motion_count`).
 //! - **`recv_mess(FLUSH)`** on comm recovery: replaced by a flush before every
 //!   query (`exchange`), a superset of C's error-path flush.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
 
 use motor_common::model1::MoveStrings;
 use motor_common::util::{nint, parse_int_at, parse_value_at};
@@ -113,6 +110,9 @@ pub const PIC848_MAX_AXES: u8 = 4;
 
 /// Position resolution (C `drvPIC848.h` `POS_RES`).
 const POS_RES: f64 = 0.000001;
+
+/// C `motionTO`: still polls of a held move before it is halted.
+const MOTION_TO: u32 = 10;
 
 fn pic848_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
@@ -303,6 +303,8 @@ struct PolledStatus {
 /// One axis (`A`-`D`) of a C-848 controller. Implements [`AsynMotor`].
 pub struct PIC848Axis {
     controller: Arc<Mutex<PIC848Controller>>,
+    /// The `PIC848Config` card, named in the motion-timeout message.
+    card: i32,
     signal: u8,
     /// Axis letter (`A`-`D`), byte 5 of every command for this axis.
     letter: char,
@@ -315,19 +317,27 @@ pub struct PIC848Axis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// C `no_motion_count`: polls the position sat still while a move was
+    /// held; a MOTION command restarts it (motordrvCom.cc:435).
+    no_motion_count: u32,
 }
 
 impl PIC848Axis {
     /// Construct axis `signal` (0-based; wire letter `A`+`signal`), seeding the
     /// initial status (C `motor_init`'s `set_status`). A failed initial poll is
     /// not an error.
-    pub fn new(controller: Arc<Mutex<PIC848Controller>>, signal: u8) -> AsynResult<Self> {
+    pub fn new(
+        controller: Arc<Mutex<PIC848Controller>>,
+        card: i32,
+        signal: u8,
+    ) -> AsynResult<Self> {
         let reference = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             ctrl.reference(signal)
         };
         let mut axis = Self {
             controller: controller.clone(),
+            card,
             signal,
             letter: axis_letter(signal),
             reference,
@@ -340,11 +350,12 @@ impl PIC848Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            no_motion_count: 0,
         };
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(polled) = ctrl.poll_status(signal) {
             drop(ctrl);
-            axis.apply(polled);
+            axis.apply(polled, false);
         }
         Ok(axis)
     }
@@ -378,11 +389,15 @@ impl PIC848Axis {
         line
     }
 
-    fn apply(&mut self, polled: PolledStatus) {
+    fn apply(&mut self, polled: PolledStatus, in_motion: bool) {
         let prev = self.last_status.position as i32;
         let direction = if polled.position != prev {
+            self.no_motion_count = 0;
             polled.position >= prev
         } else {
+            if in_motion {
+                self.no_motion_count += 1;
+            }
             self.last_status.direction
         };
         self.last_status = MotorStatus {
@@ -416,10 +431,11 @@ impl AsynMotor for PIC848Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let l = self.letter;
-        let line = self.move_line(&format!("MOV  {l}{:.5}", position * POS_RES));
+        self.no_motion_count = 0;
+        let line = self.move_line(&format!("MOV  {l}{:.5}", CFloat(position * POS_RES)));
         let ctrl = self.lock();
         // SET_VELOCITY ("VEL  L {v}") then MOVE_ABS ("MOV  L{p}") — two writes.
-        ctrl.send(&format!("VEL  {l} {:.5}", velocity * POS_RES))?;
+        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
         ctrl.send_bytes(&line)
     }
 
@@ -432,9 +448,10 @@ impl AsynMotor for PIC848Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let l = self.letter;
-        let line = self.move_line(&format!("MVR  {l}{:+.5}", distance * POS_RES));
+        self.no_motion_count = 0;
+        let line = self.move_line(&format!("MVR  {l}{:+.5}", CFloat(distance * POS_RES)));
         let ctrl = self.lock();
-        ctrl.send(&format!("VEL  {l} {:.5}", velocity * POS_RES))?;
+        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
         ctrl.send_bytes(&line)
     }
 
@@ -447,7 +464,7 @@ impl AsynMotor for PIC848Axis {
     ) -> AsynResult<()> {
         // JOG: "VEL  L{v}" (no space after L, signed value). No SET_VELOCITY.
         let l = self.letter;
-        let line = self.move_line(&format!("VEL  {l}{:.5}", velocity * POS_RES));
+        let line = self.move_line(&format!("VEL  {l}{:.5}", CFloat(velocity * POS_RES)));
         self.lock().send_bytes(&line)
     }
 
@@ -461,9 +478,10 @@ impl AsynMotor for PIC848Axis {
     ) -> AsynResult<()> {
         // Both HOME_FOR/HOME_REV send "REF  L" after SET_VELOCITY.
         let l = self.letter;
+        self.no_motion_count = 0;
         let line = self.move_line(&format!("REF  {l}"));
         let ctrl = self.lock();
-        ctrl.send(&format!("VEL  {l} {:.5}", velocity * POS_RES))?;
+        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
         ctrl.send_bytes(&line)
     }
 
@@ -485,7 +503,7 @@ impl AsynMotor for PIC848Axis {
             }
         } else {
             self.lock()
-                .send(&format!("POS  {l}{:+.5}", position * POS_RES))
+                .send(&format!("POS  {l}{:+.5}", CFloat(position * POS_RES)))
         }
     }
 
@@ -507,9 +525,9 @@ impl AsynMotor for PIC848Axis {
         let l = self.letter;
         let g = gain * 32767.0;
         let body = match kind {
-            PidGainKind::Proportional => format!("SPA  {l}1 {g:.5}"),
-            PidGainKind::Integral => format!("SPA  {l}2 {g:.5}"),
-            PidGainKind::Derivative => format!("SPA  {l}3 {g:.5}"),
+            PidGainKind::Proportional => format!("SPA  {l}1 {:.5}", CFloat(g)),
+            PidGainKind::Integral => format!("SPA  {l}2 {:.5}", CFloat(g)),
+            PidGainKind::Derivative => format!("SPA  {l}3 {:.5}", CFloat(g)),
         };
         self.lock().send(&body)
     }
@@ -532,6 +550,17 @@ impl AsynMotor for PIC848Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        self.poll_status(false)
+    }
+
+    fn poll_in_motion(&mut self, _user: &AsynUser, _cdir: &mut bool) -> AsynResult<MotorStatus> {
+        self.poll_status(true)
+    }
+}
+
+impl PIC848Axis {
+    /// C `set_status`; `in_motion` is its `nodeptr != 0`.
+    fn poll_status(&mut self, in_motion: bool) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let polled = ctrl.poll_status(self.signal);
@@ -545,7 +574,21 @@ impl AsynMotor for PIC848Axis {
             };
             return Err(pic848_err("no status reply"));
         };
-        self.apply(polled);
+        self.apply(polled, in_motion);
+        // drvPIC848.cc:291-299: a held move still for more than motionTO
+        // polls is halted and raises RA_PROBLEM.
+        if self.no_motion_count > MOTION_TO {
+            self.last_status.problem = true;
+            let _ = ctrl.send(&format!("HLT  {}", self.letter));
+            self.no_motion_count = 0;
+            errlog_sev_vprintf(
+                ErrlogSevEnum::Minor,
+                format_args!(
+                    "Motor motion timeout ERROR on card: {}, signal: {}\n",
+                    self.card, self.signal
+                ),
+            );
+        }
         // drvPIC848.cc:302-346: POST once done or stopped by a limit in the
         // move's direction.
         let s = &self.last_status;
@@ -565,6 +608,43 @@ mod tests {
     use super::*;
     use motor_common::testing::LineRig;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
+    /// `-nan`, `+nan`.
+    #[test]
+    fn floats_go_out_as_c_sprintf() {
+        let nan = f64::NAN;
+        let neg = -f64::NAN;
+        let (line, mut axis, _) = strings_rig("c848CFloat");
+        let user = AsynUser::default();
+        let mut sent = String::new();
+        let mut run = |f: &mut dyn FnMut(&mut PIC848Axis)| {
+            f(&mut axis);
+            sent.extend(line.sent().into_iter().map(|w| w + "|"));
+        };
+        run(&mut |a| drop(a.move_absolute(&user, nan, 0.0, neg, 0.0)));
+        run(&mut |a| drop(a.move_relative(&user, nan, 0.0, 1.0, 0.0)));
+        run(&mut |a| drop(a.move_velocity(&user, 0.0, neg, 0.0)));
+        run(&mut |a| drop(a.home(&user, 0.0, nan, 0.0, true)));
+        run(&mut |a| drop(a.set_position(&user, neg)));
+        run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Proportional, nan)));
+        run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Integral, neg)));
+        run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Derivative, nan)));
+        assert!(!sent.contains("NaN"), "{sent}");
+        for want in [
+            "VEL  A -nan",
+            "MOV  Anan",
+            "MVR  A+nan",
+            "VEL  A-nan",
+            "VEL  A nan",
+            "POS  A-nan",
+            "SPA  A1 nan",
+            "SPA  A2 -nan",
+            "SPA  A3 nan",
+        ] {
+            assert!(sent.contains(want), "{want}: {sent}");
+        }
+    }
 
     /// `STA? A` registers, torque on: done, moving, and moving into the
     /// -limit.
@@ -586,7 +666,7 @@ mod tests {
             _ => "A=0".into(),
         });
         let ctrl = PIC848Controller::new(io).unwrap();
-        let axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0).unwrap();
         line.sent();
         (line, axis, sta)
     }
@@ -742,6 +822,38 @@ mod tests {
         assert_eq!(format!("SPA  A1 {g:.5}"), "SPA  A1 16383.50000");
     }
 
+    /// drvPIC848.cc:278-299: a held move whose position sits still for more
+    /// than `motionTO` (10) polls raises RA_PROBLEM and is halted; the
+    /// count runs only while a move is held and restarts with the next.
+    #[test]
+    fn a_held_move_that_never_ends_times_out_with_hlt() {
+        let (line, mut axis, sta) = strings_rig("pic848MotionTo");
+        let user = AsynUser::default();
+        sta.store(MOVING, Ordering::SeqCst);
+        for _ in 0..20 {
+            assert!(poll_extra(&line, &mut axis).is_empty());
+        }
+        axis.move_absolute(&user, 0.0, 0.0, 1.0, 0.0).unwrap();
+        line.sent();
+        let mut cdir = true;
+        for poll in 1..=11 {
+            let s = axis.poll_in_motion(&user, &mut cdir).unwrap();
+            let extra: Vec<String> = line
+                .sent()
+                .into_iter()
+                .filter(|l| l != "STA? A" && l != "POS? A")
+                .collect();
+            if poll < 11 {
+                assert!(!s.problem && extra.is_empty(), "poll {poll}: {extra:?}");
+            } else {
+                assert!(s.problem, "poll {poll}");
+                assert_eq!(extra, ["HLT  A"]);
+            }
+        }
+        let s = axis.poll_in_motion(&user, &mut cdir).unwrap();
+        assert!(!s.problem);
+    }
+
     /// drvPIC848.cc:244-265: a first failed status read is RETRY (nothing raised,
     /// nothing posted), the next COMM_ERR, and a good read clears it.
     #[test]
@@ -763,7 +875,7 @@ mod tests {
             }
         });
         let ctrl = PIC848Controller::new(io).unwrap();
-        let mut axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let mut axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0).unwrap();
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
