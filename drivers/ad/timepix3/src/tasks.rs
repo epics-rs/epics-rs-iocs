@@ -154,9 +154,10 @@ pub(crate) fn apply_updates(base: &mut PortDriverBase, addr: i32, updates: &[Par
             } => base.set_param_status(*reason, *addr, *status, *alarm_status, *alarm_severity),
         };
         if let Err(e) = outcome {
-            base.trace_print(
+            adlog::print(
+                base,
                 TraceMask::ERROR,
-                format_args!("callParamCallbacks: param set failed: {e}"),
+                &format!("callParamCallbacks: param set failed: {e}"),
             );
         }
     }
@@ -175,10 +176,15 @@ impl Ctx {
         let _ = self.handle.set_params_and_notify(addr, updates).await;
     }
 
+    /// [`adlog::print`] off the port thread.
     fn trace(&self, mask: TraceMask, line: &str) {
-        self.handle
-            .trace()
-            .output(self.handle.port_name(), mask, line);
+        self.handle.trace().print(
+            Some(self.handle.port_name()),
+            None,
+            0,
+            mask,
+            format_args!("{line}\n"),
+        );
     }
 
     async fn set_int(&self, reason: usize, addr: i32, value: i32) {
@@ -4869,12 +4875,11 @@ mod tests {
                 &format!("PrvImg jsonimage header: {h}"),
             )
         };
-        assert!(
-            text.contains(&line(r#"{"frameNumber":1,"timeAtFrame":1e-05,"width":2}"#)),
-            "{text}"
-        );
+        // Each line ends in the C macros' `\n` (ADTimePixLog.h:41-71).
+        let first = line(r#"{"frameNumber":1,"timeAtFrame":1e-05,"width":2}"#);
+        assert!(text.contains(&format!("{first}\n")), "{text:?}");
         let cut = format!("{{\"a\":\"{}...", "x".repeat(1024 - 6));
-        assert!(text.contains(&line(&cut)), "{text}");
+        assert!(text.contains(&format!("{}\n", line(&cut))), "{text:?}");
         assert!(!text.contains("never"), "{text}");
     }
 

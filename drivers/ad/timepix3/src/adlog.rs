@@ -3,6 +3,8 @@
 //! function part is GCC's `__PRETTY_FUNCTION__`, which C builds by default.
 
 use crate::http::HttpError;
+use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::trace::TraceMask;
 
 const LOG_HTTP_FAILURE: &str = "void ADTimePix::logHttpFailure(const char*, const char*, \
                                 const std::string&, long int, const std::string&)";
@@ -92,6 +94,12 @@ pub fn snprintf(size: usize, mut text: String) -> String {
     }
     text.truncate(end);
     text
+}
+
+/// One trace line on the port thread. Every C macro (ADTimePixLog.h:41-71)
+/// ends its format in `\n`, so the terminator is added here, never by a site.
+pub fn print(base: &PortDriverBase, mask: TraceMask, line: &str) {
+    base.trace_print(mask, format_args!("{line}\n"));
 }
 
 /// `ERR`/`ERR_ARGS`, at `ASYN_TRACE_ERROR`.

@@ -389,9 +389,10 @@ impl TimePix3Driver {
             format!("Destination blocked by startup allowlist: {destination}"),
         );
         self.set_text(self.p.write_msg, &message)?;
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::ERROR,
-            format_args!("{}", adlog::err(adlog::VALIDATE_DESTINATION, &message)),
+            &adlog::err(adlog::VALIDATE_DESTINATION, &message),
         );
         self.ad.port_base.call_param_callbacks(0)?;
         Err(AsynError::Status {
@@ -465,9 +466,7 @@ impl TimePix3Driver {
                 )
             }
         };
-        self.ad
-            .port_base
-            .trace_print(mask, format_args!("{}", line));
+        adlog::print(&self.ad.port_base, mask, &line);
         if mask == TraceMask::ERROR {
             return Err(refused());
         }
@@ -480,9 +479,10 @@ impl TimePix3Driver {
             Ok(endpoint) => Some(endpoint),
             Err(line) => {
                 if let Some(line) = line {
-                    self.ad.port_base.trace_print(
+                    adlog::print(
+                        &self.ad.port_base,
                         TraceMask::ERROR,
-                        format_args!("{}", adlog::err(adlog::PARSE_TCP_PATH, &line)),
+                        &adlog::err(adlog::PARSE_TCP_PATH, &line),
                     );
                 }
                 None
@@ -513,12 +513,10 @@ impl TimePix3Driver {
             verdict.err().map_or("ok", |e| e.message())
         );
         self.set_text(self.p.write_msg, &message)?;
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::ERROR,
-            format_args!(
-                "{}",
-                adlog::err(func, &format!("{message} (directory=\"{normalized}\")"))
-            ),
+            &adlog::err(func, &format!("{message} (directory=\"{normalized}\")")),
         );
         self.ad.port_base.call_param_callbacks(0)?;
         Err(AsynError::Status {
@@ -541,14 +539,12 @@ impl TimePix3Driver {
         };
         let message = format!("Calibration path blocked: {}", e.message());
         self.set_text(self.p.write_msg, &message)?;
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::ERROR,
-            format_args!(
-                "{}",
-                adlog::err(
-                    adlog::RESOLVE_CALIBRATION_FILE,
-                    &format!("{message} (directory=\"{directory}\", name=\"{file_name}\")"),
-                )
+            &adlog::err(
+                adlog::RESOLVE_CALIBRATION_FILE,
+                &format!("{message} (directory=\"{directory}\", name=\"{file_name}\")"),
             ),
         );
         self.ad.port_base.call_param_callbacks(0)?;
@@ -683,9 +679,7 @@ impl TimePix3Driver {
             Some(c) => {
                 let report = which.window_report(&c);
                 if let Some(warning) = &report.warning {
-                    self.ad
-                        .port_base
-                        .trace_print(TraceMask::WARNING, format_args!("{warning}"));
+                    adlog::print(&self.ad.port_base, TraceMask::WARNING, warning);
                 }
                 (report.effective, report.status)
             }
@@ -752,9 +746,7 @@ impl TimePix3Driver {
             }
         };
         if let Some((mask, line)) = line {
-            self.ad
-                .port_base
-                .trace_print(mask, format_args!("{}", line));
+            adlog::print(&self.ad.port_base, mask, &line);
         }
     }
 
@@ -792,9 +784,10 @@ impl TimePix3Driver {
 
     /// C `LOG`/`LOG_ARGS` in `writeInt32`.
     fn log_write_int32(&self, msg: &str) {
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::IO_DRIVER,
-            format_args!("{}", adlog::log(adlog::WRITE_INT32, msg)),
+            &adlog::log(adlog::WRITE_INT32, msg),
         );
     }
 
@@ -845,14 +838,12 @@ impl TimePix3Driver {
                 // serval_http.cpp:2466-2477.
                 let message = format!("Invalid detector configuration response: {}", e.message());
                 let base = &mut self.ad.port_base;
-                base.trace_print(
+                adlog::print(
+                    base,
                     TraceMask::ERROR,
-                    format_args!(
-                        "{}",
-                        adlog::err(
-                            adlog::INIT_ACQUISITION,
-                            &format!("initAcquisition: {message}")
-                        )
+                    &adlog::err(
+                        adlog::INIT_ACQUISITION,
+                        &format!("initAcquisition: {message}"),
                     ),
                 );
                 base.set_int32_param(p.http_code, 0, 200)?;
@@ -870,7 +861,7 @@ impl TimePix3Driver {
             for step in &read.steps {
                 match step {
                     crate::tasks::DetectorStep::Trace(mask, line) => {
-                        base.trace_print(*mask, format_args!("{line}"));
+                        adlog::print(base, *mask, line);
                     }
                     crate::tasks::DetectorStep::Post(addr, updates) => {
                         crate::tasks::apply_updates(base, *addr, updates);
@@ -887,9 +878,10 @@ impl TimePix3Driver {
         if self.mpx3_trigger_conflict(trigger_mode) {
             // serval_http.cpp:2488-2493.
             let base = &mut self.ad.port_base;
-            base.trace_print(
+            adlog::print(
+                base,
                 TraceMask::ERROR,
-                format_args!("{}", adlog::err(adlog::INIT_ACQUISITION, MPX3_TRIGGER_MSG)),
+                &adlog::err(adlog::INIT_ACQUISITION, MPX3_TRIGGER_MSG),
             );
             base.set_string_param(p.write_msg, 0, MPX3_TRIGGER_MSG)?;
             base.set_int32_param(p.http_code, 0, 400)?;
@@ -1044,14 +1036,12 @@ impl TimePix3Driver {
             Err(message) => {
                 self.http_ok();
                 self.set_text(self.p.write_msg, message)?;
-                self.ad.port_base.trace_print(
+                adlog::print(
+                    &self.ad.port_base,
                     TraceMask::ERROR,
-                    format_args!(
-                        "{}",
-                        adlog::err(
-                            adlog::SEND_MEASUREMENT_CONFIG,
-                            &format!("sendMeasurementConfig GET /measurement/config: {message}"),
-                        )
+                    &adlog::err(
+                        adlog::SEND_MEASUREMENT_CONFIG,
+                        &format!("sendMeasurementConfig GET /measurement/config: {message}"),
                     ),
                 );
                 return Err(refused(message));
@@ -1089,14 +1079,12 @@ impl TimePix3Driver {
             ),
         );
         if self.get_measurement_config().is_err() {
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::WARNING,
-                format_args!(
-                    "{}",
-                    adlog::warn(
-                        adlog::SEND_MEASUREMENT_CONFIG,
-                        "Failed to restore measurement configuration after rejected PUT",
-                    )
+                &adlog::warn(
+                    adlog::SEND_MEASUREMENT_CONFIG,
+                    "Failed to restore measurement configuration after rejected PUT",
                 ),
             );
         }
@@ -1142,9 +1130,7 @@ impl TimePix3Driver {
                         ),
                     ),
                 ] {
-                    self.ad
-                        .port_base
-                        .trace_print(mask, format_args!("{}", line));
+                    adlog::print(&self.ad.port_base, mask, &line);
                 }
                 return Err(AsynError::Status {
                     status: AsynStatus::Error,
@@ -1189,9 +1175,10 @@ impl TimePix3Driver {
 
     /// A channel builder's `ERR_ARGS` refusal.
     fn configure_refused(&mut self, func: &str, message: String) -> AsynError {
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::ERROR,
-            format_args!("{}", adlog::err(func, &message)),
+            &adlog::err(func, &message),
         );
         Self::destination_refused(message)
     }
@@ -1329,17 +1316,15 @@ impl TimePix3Driver {
                 (true, 0) => "Preview",
                 (true, _) => "Preview[1]",
             };
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::IO_DRIVER,
-                format_args!(
-                    "{}",
-                    adlog::log(
-                        adlog::CONFIGURE_IMAGE_CHANNEL,
-                        &format!(
-                            "TCP channel {path}: format index {} invalid for tcp; using jsonimage (3)",
-                            c.format
-                        )
-                    )
+                &adlog::log(
+                    adlog::CONFIGURE_IMAGE_CHANNEL,
+                    &format!(
+                        "TCP channel {path}: format index {} invalid for tcp; using jsonimage (3)",
+                        c.format
+                    ),
                 ),
             );
             self.ad.port_base.set_int32_param(params[2], 0, format)?;
@@ -1415,12 +1400,10 @@ impl TimePix3Driver {
     /// C `fileWriter` (serval_http.cpp:2333-2425): every channel in C's
     /// order, each at its own index, and nothing sent when none is enabled.
     fn file_writer(&mut self) -> AsynResult<()> {
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::FLOW,
-            format_args!(
-                "{}",
-                adlog::log(adlog::FILE_WRITER, "Configuring file writer channels")
-            ),
+            &adlog::log(adlog::FILE_WRITER, "Configuring file writer channels"),
         );
         type Step = fn(&mut TimePix3Driver, &mut Value) -> AsynResult<()>;
         let steps: [(&str, Step); 7] = [
@@ -1459,22 +1442,21 @@ impl TimePix3Driver {
             .chain([("Failed to configure preview settings", preview)])
         {
             if let Err(e) = step(self, &mut server) {
-                self.ad.port_base.trace_print(
+                adlog::print(
+                    &self.ad.port_base,
                     TraceMask::ERROR,
-                    format_args!("{}", adlog::err(adlog::FILE_WRITER, failed)),
+                    &adlog::err(adlog::FILE_WRITER, failed),
                 );
                 return Err(e);
             }
         }
         if server.as_object().is_none_or(|o| o.is_empty()) {
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::IO_DRIVER,
-                format_args!(
-                    "{}",
-                    adlog::log(
-                        adlog::FILE_WRITER,
-                        "No channels are enabled. Skipping file writer configuration."
-                    )
+                &adlog::log(
+                    adlog::FILE_WRITER,
+                    "No channels are enabled. Skipping file writer configuration.",
                 ),
             );
             return Ok(());
@@ -1536,7 +1518,7 @@ impl TimePix3Driver {
                     adlog::err(adlog::GET_SERVER, &format!("getServer: {}", e.message()))
                 };
                 let base = &mut self.ad.port_base;
-                base.trace_print(TraceMask::ERROR, format_args!("{line}"));
+                adlog::print(base, TraceMask::ERROR, &line);
                 base.call_param_callbacks(0)?;
                 return Err(AsynError::Status {
                     status: AsynStatus::Error,
@@ -1607,14 +1589,12 @@ impl TimePix3Driver {
                 base.set_int32_param(param, chip, previous)?;
                 base.set_int32_param(p.http_code, 0, 200)?;
                 base.set_string_param(p.write_msg, 0, e.message())?;
-                base.trace_print(
+                adlog::print(
+                    base,
                     TraceMask::ERROR,
-                    format_args!(
-                        "{}",
-                        adlog::err(
-                            adlog::WRITE_DAC,
-                            &format!("writeDac GET chip {chip}: {}", e.message())
-                        )
+                    &adlog::err(
+                        adlog::WRITE_DAC,
+                        &format!("writeDac GET chip {chip}: {}", e.message()),
                     ),
                 );
                 base.call_param_callbacks(0)?;
@@ -1654,17 +1634,15 @@ impl TimePix3Driver {
         {
             Some((_, refreshed)) => refreshed,
             None => {
-                self.ad.port_base.trace_print(
+                adlog::print(
+                    &self.ad.port_base,
                     TraceMask::WARNING,
-                    format_args!(
-                        "{}",
-                        adlog::warn(
-                            adlog::WRITE_DAC,
-                            &format!(
-                                "writeDac: failed to refresh {name} after rejected PUT; \
+                    &adlog::warn(
+                        adlog::WRITE_DAC,
+                        &format!(
+                            "writeDac: failed to refresh {name} after rejected PUT; \
                                  using pre-PUT value"
-                            )
-                        )
+                        ),
                     ),
                 );
                 accepted
@@ -1704,14 +1682,12 @@ impl TimePix3Driver {
     fn config_load(&mut self, format: &str, path: usize, name: usize) -> AsynResult<()> {
         // mask_io.cpp:535-539: the BPC is checked against the geometry first.
         if format != "dacs" && self.read_bpc().is_none() {
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::ERROR,
-                format_args!(
-                    "{}",
-                    adlog::err(
-                        adlog::UPLOAD_BPC,
-                        "uploadBPC: local BPC validation failed; request not sent"
-                    )
+                &adlog::err(
+                    adlog::UPLOAD_BPC,
+                    "uploadBPC: local BPC validation failed; request not sent",
                 ),
             );
             return Err(AsynError::Status {
@@ -1734,9 +1710,7 @@ impl TimePix3Driver {
                         "uploadBPC: calibration path validation failed; request not sent",
                     )
                 };
-                self.ad
-                    .port_base
-                    .trace_print(TraceMask::ERROR, format_args!("{}", adlog::err(func, msg)));
+                adlog::print(&self.ad.port_base, TraceMask::ERROR, &adlog::err(func, msg));
                 return Err(e);
             }
         };
@@ -1760,14 +1734,12 @@ impl TimePix3Driver {
             println!("Text dacs_file: {text}");
         } else {
             // mask_io.cpp:557.
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::IO_DRIVER,
-                format_args!(
-                    "{}",
-                    adlog::log(
-                        adlog::UPLOAD_BPC,
-                        &format!("uploadBPC: http_code={code} file={}", file.display())
-                    )
+                &adlog::log(
+                    adlog::UPLOAD_BPC,
+                    &format!("uploadBPC: http_code={code} file={}", file.display()),
                 ),
             );
         }
@@ -1822,9 +1794,10 @@ impl TimePix3Driver {
             ),
         };
         let _ = self.set_text(p.write_msg, &write_msg);
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::WARNING,
-            format_args!("{}", adlog::warn(adlog::ROWS_COLS, &warning)),
+            &adlog::warn(adlog::ROWS_COLS, &warning),
         );
         None
     }
@@ -1839,9 +1812,10 @@ impl TimePix3Driver {
             for i in 0..geom.cols {
                 let (index, warning) = mask::pel_index(geom, chips, orientation, i, j);
                 if let Some(warning) = warning {
-                    self.ad.port_base.trace_print(
+                    adlog::print(
+                        &self.ad.port_base,
                         TraceMask::WARNING,
-                        format_args!("{}", adlog::warn(adlog::PEL_INDEX, &warning)),
+                        &adlog::warn(adlog::PEL_INDEX, &warning),
                     );
                 }
                 table.push(index);
@@ -1893,9 +1867,10 @@ impl TimePix3Driver {
                 for x in 0..g.cols {
                     let (logical, warning) = mask::pel_index(&g, chips, orientation, x, y);
                     if let Some(warning) = warning {
-                        self.ad.port_base.trace_print(
+                        adlog::print(
+                            &self.ad.port_base,
                             TraceMask::WARNING,
-                            format_args!("{}", adlog::warn(adlog::PEL_INDEX, &warning)),
+                            &adlog::warn(adlog::PEL_INDEX, &warning),
                         );
                     }
                     let image = y as usize * cols + x as usize;
@@ -1937,9 +1912,10 @@ impl TimePix3Driver {
             if let Err(e) = mapped {
                 let msg = format!("MPX3 chip {chip} layout unavailable: {e}");
                 let _ = self.set_text(p.write_msg, &msg);
-                self.ad.port_base.trace_print(
+                adlog::print(
+                    &self.ad.port_base,
                     TraceMask::ERROR,
-                    format_args!("{}", adlog::err(adlog::BPC_IMAGE_BYTE_OFFSETS, &msg)),
+                    &adlog::err(adlog::BPC_IMAGE_BYTE_OFFSETS, &msg),
                 );
                 let _ = self.ad.port_base.call_param_callbacks(0);
                 return None;
@@ -1992,14 +1968,12 @@ impl TimePix3Driver {
                     .port_base
                     .set_param_status(p.mask_bp_c, 0, AsynStatus::Error, 0, 0)?;
                 self.ad.port_base.call_param_callbacks(0)?;
-                self.ad.port_base.trace_print(
+                adlog::print(
+                    &self.ad.port_base,
                     TraceMask::ERROR,
-                    format_args!(
-                        "{}",
-                        adlog::err(
-                            adlog::READ_INT32_ARRAY,
-                            &format!("MaskBPC: refusing unsupported detector-family mask {op}")
-                        )
+                    &adlog::err(
+                        adlog::READ_INT32_ARRAY,
+                        &format!("MaskBPC: refusing unsupported detector-family mask {op}"),
                     ),
                 );
                 return Err(Self::read_array_refused());
@@ -2054,9 +2028,10 @@ impl TimePix3Driver {
     }
 
     fn mask_flow(&self, msg: &str) {
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::FLOW,
-            format_args!("{}", adlog::log(adlog::READ_INT32_ARRAY, msg)),
+            &adlog::log(adlog::READ_INT32_ARRAY, msg),
         );
     }
 
@@ -2080,9 +2055,10 @@ impl TimePix3Driver {
     /// BPC file.
     fn refuse_bpc(&mut self, func: &str, message: String) {
         let _ = self.set_text(self.p.write_msg, &message);
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::ERROR,
-            format_args!("{}", adlog::err(func, &message)),
+            &adlog::err(func, &message),
         );
         let _ = self.ad.port_base.call_param_callbacks(0);
     }
@@ -2129,9 +2105,10 @@ impl TimePix3Driver {
                 family.name()
             )
         };
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::IO_DRIVER,
-            format_args!("{}", adlog::log(adlog::READ_BPC_FILE, &line)),
+            &adlog::log(adlog::READ_BPC_FILE, &line),
         );
         let _ = self.ad.port_base.call_param_callbacks(0);
         Some(data)
@@ -2151,14 +2128,12 @@ impl TimePix3Driver {
                     family.name()
                 ),
             );
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::ERROR,
-                format_args!(
-                    "{}",
-                    adlog::err(
-                        adlog::WRITE_BPC_FILE,
-                        "WriteBPC: refusing unsupported detector-family mask write"
-                    )
+                &adlog::err(
+                    adlog::WRITE_BPC_FILE,
+                    "WriteBPC: refusing unsupported detector-family mask write",
                 ),
             );
             let _ = self.ad.port_base.call_param_callbacks(0);
@@ -2186,17 +2161,15 @@ impl TimePix3Driver {
                     format!("Mask: BPC file path is not a directory: {dir}"),
                 ),
             );
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::ERROR,
-                format_args!(
-                    "{}",
-                    adlog::err(
-                        adlog::WRITE_BPC_FILE,
-                        &format!(
-                            "Mask: BPCFilePath is not a directory (pathExists={path_kind}), \
+                &adlog::err(
+                    adlog::WRITE_BPC_FILE,
+                    &format!(
+                        "Mask: BPCFilePath is not a directory (pathExists={path_kind}), \
                              aborting write to \"{dir}\""
-                        )
-                    )
+                    ),
                 ),
             );
             let _ = self.ad.port_base.call_param_callbacks(0);
@@ -2230,14 +2203,12 @@ impl TimePix3Driver {
         let _ = self.set_text(p.bp_c_file_name, &bpc_name);
         let _ = self.ad.port_base.call_param_callbacks(0);
         if status.is_err() {
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::ERROR,
-                format_args!(
-                    "{}",
-                    adlog::err(
-                        adlog::WRITE_BPC_FILE,
-                        "WriteBPC: uploadBPC to SERVAL failed"
-                    )
+                &adlog::err(
+                    adlog::WRITE_BPC_FILE,
+                    "WriteBPC: uploadBPC to SERVAL failed",
                 ),
             );
             return None;
@@ -2246,23 +2217,22 @@ impl TimePix3Driver {
     }
 
     fn write_bpc_log(&self, line: &str) {
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::IO_DRIVER,
-            format_args!("{}", adlog::log(adlog::WRITE_BPC_FILE, line)),
+            &adlog::log(adlog::WRITE_BPC_FILE, line),
         );
     }
 
     /// C `refreshPixelConfigFromServal` (serval_http.cpp:1074-1290).
     fn refresh_pixel_config(&mut self) -> AsynResult<()> {
         let p = self.p;
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::FLOW,
-            format_args!(
-                "{}",
-                adlog::log(
-                    adlog::REFRESH_PIXEL_CONFIG,
-                    "fetch per chip, compare to BPC on disk"
-                )
+            &adlog::log(
+                adlog::REFRESH_PIXEL_CONFIG,
+                "fetch per chip, compare to BPC on disk",
             ),
         );
         let bpc = self.read_bpc();
@@ -2314,14 +2284,12 @@ impl TimePix3Driver {
                         -1
                     };
                     self.set_pixel_config_status(chip, 0, match_code, 0, &status)?;
-                    self.ad.port_base.trace_print(
+                    adlog::print(
+                        &self.ad.port_base,
                         TraceMask::ERROR,
-                        format_args!(
-                            "{}",
-                            adlog::err(
-                                adlog::REFRESH_PIXEL_CONFIG,
-                                &format!("chip {chip} PixelConfig failed: {status}"),
-                            )
+                        &adlog::err(
+                            adlog::REFRESH_PIXEL_CONFIG,
+                            &format!("chip {chip} PixelConfig failed: {status}"),
                         ),
                     );
                     continue;
@@ -2428,9 +2396,10 @@ impl TimePix3Driver {
                             )
                         }
                     };
-                    self.ad.port_base.trace_print(
+                    adlog::print(
+                        &self.ad.port_base,
                         TraceMask::WARNING,
-                        format_args!("{}", adlog::warn(adlog::REFRESH_PIXEL_CONFIG, &warning)),
+                        &adlog::warn(adlog::REFRESH_PIXEL_CONFIG, &warning),
                     );
                 }
             } else {
@@ -2591,14 +2560,12 @@ impl TimePix3Driver {
                 .port_base
                 .set_int32_param(p.masked_pels_count, 0, 0)?;
             self.set_text(p.masked_pels_export_status, &message)?;
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::ERROR,
-                format_args!(
-                    "{}",
-                    adlog::err(
-                        adlog::EXPORT_MASKED_PELS_JSON,
-                        &format!("exportMaskedPelsJson: {message}")
-                    )
+                &adlog::err(
+                    adlog::EXPORT_MASKED_PELS_JSON,
+                    &format!("exportMaskedPelsJson: {message}"),
                 ),
             );
             return self.ad.port_base.call_param_callbacks(0);
@@ -2612,14 +2579,12 @@ impl TimePix3Driver {
             p.masked_pels_export_status,
             &format!("OK: wrote {counter} masked pels"),
         )?;
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::FLOW,
-            format_args!(
-                "{}",
-                adlog::log(
-                    adlog::EXPORT_MASKED_PELS_JSON,
-                    &format!("masked pels JSON {out} ({counter} entries)")
-                )
+            &adlog::log(
+                adlog::EXPORT_MASKED_PELS_JSON,
+                &format!("masked pels JSON {out} ({counter} entries)"),
             ),
         );
         self.ad.port_base.call_param_callbacks(0)
@@ -2678,9 +2643,10 @@ impl TimePix3Driver {
         self.shared
             .stop_and_join_stream_workers(&mut self.ad.port_base);
         if self.mpx3_trigger_conflict(self.int(self.ad.params.trigger_mode, 0)) {
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::ERROR,
-                format_args!("{}", adlog::err(adlog::ACQUIRE_START, MPX3_TRIGGER_MSG)),
+                &adlog::err(adlog::ACQUIRE_START, MPX3_TRIGGER_MSG),
             );
             return Err(MPX3_TRIGGER_MSG);
         }
@@ -2701,17 +2667,15 @@ impl TimePix3Driver {
             Ok(body) if !body.is_empty() => match serval::parse_status_response(&body) {
                 Ok(m) => Some(m),
                 Err(e) => {
-                    self.ad.port_base.trace_print(
+                    adlog::print(
+                        &self.ad.port_base,
                         TraceMask::WARNING,
-                        format_args!(
-                            "{}",
-                            adlog::warn(
-                                adlog::ACQUIRE_START,
-                                &format!(
-                                    "Failed to validate measurement status: {}, continuing after prior stop",
-                                    e.message()
-                                ),
-                            )
+                        &adlog::warn(
+                            adlog::ACQUIRE_START,
+                            &format!(
+                                "Failed to validate measurement status: {}, continuing after prior stop",
+                                e.message()
+                            ),
                         ),
                     );
                     None
@@ -2723,14 +2687,12 @@ impl TimePix3Driver {
             && measurement.is_running()
         {
             let status = measurement.status.unwrap_or_default();
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::IO_DRIVER,
-                format_args!(
-                    "{}",
-                    adlog::log(
-                        adlog::ACQUIRE_START,
-                        &format!("Measurement is running (status: {status}), stopping it first"),
-                    )
+                &adlog::log(
+                    adlog::ACQUIRE_START,
+                    &format!("Measurement is running (status: {status}), stopping it first"),
                 ),
             );
             if let Err(e) = self.http.get(serval::MEASUREMENT_STOP, DEFAULT_TIMEOUT) {
@@ -2753,14 +2715,12 @@ impl TimePix3Driver {
         if let Err(e) = &started
             && e.body().contains(PORT_CONFLICT)
         {
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::WARNING,
-                format_args!(
-                    "{}",
-                    adlog::warn(
-                        adlog::ACQUIRE_START,
-                        "measurement/start failed with port conflict; rotating preview ports and retrying once",
-                    )
+                &adlog::warn(
+                    adlog::ACQUIRE_START,
+                    "measurement/start failed with port conflict; rotating preview ports and retrying once",
                 ),
             );
             if self.ensure_preview_tcp_ports_free(true) {
@@ -2890,16 +2850,14 @@ impl TimePix3Driver {
             let Some(candidate) = (search_from..=65535)
                 .find(|c| !reserved.contains(c) && !tcp_port_in_use(&host, *c))
             else {
-                self.ad.port_base.trace_print(
+                adlog::print(
+                    &self.ad.port_base,
                     TraceMask::ERROR,
-                    format_args!(
-                        "{}",
-                        adlog::err(
-                            adlog::ENSURE_PREVIEW_TCP_PORTS_FREE,
-                            &format!(
-                                "No free TCP port found for preview channel (starting at {search_from})"
-                            ),
-                        )
+                    &adlog::err(
+                        adlog::ENSURE_PREVIEW_TCP_PORTS_FREE,
+                        &format!(
+                            "No free TCP port found for preview channel (starting at {search_from})"
+                        ),
                     ),
                 );
                 let _ = self.ad.port_base.set_string_param(
@@ -2915,21 +2873,19 @@ impl TimePix3Driver {
                 0,
                 format!("tcp://listen@{host}:{candidate}"),
             );
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::IO_DRIVER,
-                format_args!(
-                    "{}",
-                    adlog::log(
-                        adlog::ENSURE_PREVIEW_TCP_PORTS_FREE,
-                        &format!(
-                            "Preview TCP port {port} -> {candidate} ({})",
-                            if force_rotate {
-                                "forced rotate"
-                            } else {
-                                "port in use"
-                            }
-                        ),
-                    )
+                &adlog::log(
+                    adlog::ENSURE_PREVIEW_TCP_PORTS_FREE,
+                    &format!(
+                        "Preview TCP port {port} -> {candidate} ({})",
+                        if force_rotate {
+                            "forced rotate"
+                        } else {
+                            "port in use"
+                        }
+                    ),
                 ),
             );
             changed = true;
@@ -3068,17 +3024,15 @@ impl TimePix3Driver {
                             let _ = self.ad.port_base.set_param_value(reason, 0, value);
                         }
                     }
-                    Err(e) => self.ad.port_base.trace_print(
+                    Err(e) => adlog::print(
+                        &self.ad.port_base,
                         TraceMask::ERROR,
-                        format_args!(
-                            "{}",
-                            adlog::err(
-                                adlog::STOP_ACQUISITION,
-                                &format!(
-                                    "transactional stop: invalid measurement response: {}",
-                                    e.message()
-                                ),
-                            )
+                        &adlog::err(
+                            adlog::STOP_ACQUISITION,
+                            &format!(
+                                "transactional stop: invalid measurement response: {}",
+                                e.message()
+                            ),
                         ),
                     ),
                 },
@@ -3134,12 +3088,10 @@ impl TimePix3Driver {
                 "Acquisition stopped (remote state reconciled)"
             },
         );
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::FLOW,
-            format_args!(
-                "{}",
-                adlog::log(adlog::STOP_ACQUISITION, "Stopping Image Acquisition")
-            ),
+            &adlog::log(adlog::STOP_ACQUISITION, "Stopping Image Acquisition"),
         );
         Ok(())
     }
@@ -3226,9 +3178,10 @@ impl TimePix3Driver {
                 self.int(self.ad.params.status, 0)
             );
             let flow = |d: &mut Self, msg: &str| {
-                d.ad.port_base.trace_print(
+                adlog::print(
+                    &d.ad.port_base,
                     TraceMask::FLOW,
-                    format_args!("{}", adlog::log(adlog::WRITE_INT32, msg)),
+                    &adlog::log(adlog::WRITE_INT32, msg),
                 )
             };
             if value != 0 && !active {
@@ -3352,9 +3305,10 @@ impl TimePix3Driver {
                 self.set_text(p.write_msg, MPX3_PIXEL_DEPTH_MSG)?;
                 self.ad.port_base.set_int32_param(p.http_code, 0, 400)?;
                 let _ = self.ad.port_base.call_param_callbacks(addr);
-                self.ad.port_base.trace_print(
+                adlog::print(
+                    &self.ad.port_base,
                     TraceMask::ERROR,
-                    format_args!("{}", adlog::err(adlog::WRITE_INT32, MPX3_PIXEL_DEPTH_MSG)),
+                    &adlog::err(adlog::WRITE_INT32, MPX3_PIXEL_DEPTH_MSG),
                 );
                 return Err(Refusal::Told(AsynError::Status {
                     status: AsynStatus::Error,
@@ -3635,27 +3589,23 @@ impl PortDriver for TimePix3Driver {
         // callbacks (ADTimePix.cpp:866-873).
         let _ = self.ad.port_base.call_param_callbacks(addr);
         match &result {
-            Err(refusal) => self.ad.port_base.trace_print(
+            Err(refusal) => adlog::print(
+                &self.ad.port_base,
                 TraceMask::ERROR,
-                format_args!(
-                    "{}",
-                    adlog::err(
-                        adlog::WRITE_INT32,
-                        &format!(
-                            "ERROR status={} function={reason}, value={value}",
-                            refusal.c_status_code()
-                        ),
-                    )
+                &adlog::err(
+                    adlog::WRITE_INT32,
+                    &format!(
+                        "ERROR status={} function={reason}, value={value}",
+                        refusal.c_status_code()
+                    ),
                 ),
             ),
-            Ok(()) => self.ad.port_base.trace_print(
+            Ok(()) => adlog::print(
+                &self.ad.port_base,
                 TraceMask::IO_DRIVER,
-                format_args!(
-                    "{}",
-                    adlog::log(
-                        adlog::WRITE_INT32,
-                        &format!("function={reason} value={value}"),
-                    )
+                &adlog::log(
+                    adlog::WRITE_INT32,
+                    &format!("function={reason} value={value}"),
                 ),
             ),
         }
@@ -3668,27 +3618,23 @@ impl PortDriver for TimePix3Driver {
 
         let _ = self.ad.port_base.call_param_callbacks(addr);
         match &result {
-            Err(refusal) => self.ad.port_base.trace_print(
+            Err(refusal) => adlog::print(
+                &self.ad.port_base,
                 TraceMask::ERROR,
-                format_args!(
-                    "{}",
-                    adlog::err(
-                        adlog::WRITE_FLOAT64,
-                        &format!(
-                            "ERROR status = {}, function ={reason}, value = {value:.6}",
-                            refusal.c_status_code()
-                        ),
-                    )
+                &adlog::err(
+                    adlog::WRITE_FLOAT64,
+                    &format!(
+                        "ERROR status = {}, function ={reason}, value = {value:.6}",
+                        refusal.c_status_code()
+                    ),
                 ),
             ),
-            Ok(()) => self.ad.port_base.trace_print(
+            Ok(()) => adlog::print(
+                &self.ad.port_base,
                 TraceMask::IO_DRIVER,
-                format_args!(
-                    "{}",
-                    adlog::log(
-                        adlog::WRITE_FLOAT64,
-                        &format!("function={reason} value={value:.6}"),
-                    )
+                &adlog::log(
+                    adlog::WRITE_FLOAT64,
+                    &format!("function={reason} value={value:.6}"),
                 ),
             ),
         }
@@ -3720,14 +3666,12 @@ impl PortDriver for TimePix3Driver {
         if [p.img_ths, p.img1_ths, p.prv_img_ths, p.prv_img1_ths].contains(&reason)
             && value.trim_start_matches([' ', '\t']).is_empty()
         {
-            self.ad.port_base.trace_print(
+            adlog::print(
+                &self.ad.port_base,
                 TraceMask::IO_DRIVER,
-                format_args!(
-                    "{}",
-                    adlog::log(
-                        adlog::WRITE_OCTET,
-                        &format!("Ignoring empty threshold list write for paramName={name}"),
-                    )
+                &adlog::log(
+                    adlog::WRITE_OCTET,
+                    &format!("Ignoring empty threshold list write for paramName={name}"),
                 ),
             );
             return Ok(data.len());
@@ -3774,14 +3718,12 @@ impl PortDriver for TimePix3Driver {
         ) {
             return Err(e);
         }
-        self.ad.port_base.trace_print(
+        adlog::print(
+            &self.ad.port_base,
             TraceMask::IO_DRIVER,
-            format_args!(
-                "{}",
-                adlog::log(
-                    adlog::WRITE_OCTET,
-                    &format!("function={reason}, paramName={name}, value={value}"),
-                )
+            &adlog::log(
+                adlog::WRITE_OCTET,
+                &format!("function={reason}, paramName={name}, value={value}"),
             ),
         );
         Ok(data.len())
@@ -4641,10 +4583,9 @@ mod tests {
         let (ok, value, code, msg, text, _) = run("TPX_DAC_MISSING", &[(OK, r#"{"Vfbk": 5}"#)]);
         let missing = "DAC response is missing the requested field";
         assert_eq!((ok, value, code, msg.as_str()), (false, 3, 200, missing));
-        assert!(text.contains(&adlog::err(
-            adlog::WRITE_DAC,
-            &format!("writeDac GET chip 0: {missing}")
-        )));
+        // Each line ends in the C macros' `\n` (ADTimePixLog.h:41-71).
+        let err = adlog::err(adlog::WRITE_DAC, &format!("writeDac GET chip 0: {missing}"));
+        assert!(text.contains(&format!("{err}\n")), "{text:?}");
 
         let (ok, value, code, msg, _, _) = run("TPX_DAC_OK", &[(OK, HELD), (OK, "")]);
         assert_eq!(
