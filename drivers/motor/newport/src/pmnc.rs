@@ -368,6 +368,9 @@ pub struct PmncAxis {
     last_reading: i64,
     /// Consecutive polls without a position change (C `no_motion_count`).
     no_motion_count: u32,
+    /// What the last failed poll raises: nothing on C's first missed reply
+    /// (RETRY), `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next (COMM_ERR).
+    failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
 }
@@ -389,6 +392,7 @@ impl PmncAxis {
             encoder_position: 0,
             last_reading: 0,
             no_motion_count: 0,
+            failure: PollFailure::NONE,
             last_status: MotorStatus::default(),
             strings: MoveStrings::default(),
         })
@@ -455,9 +459,8 @@ impl PmncAxis {
 }
 
 impl AsynMotor for PmncAxis {
-    /// C `set_status` ignores `send_recv_mess`'s result (drvPMNC87xx.cc).
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::NONE
+        self.failure
     }
 
     fn move_absolute(
@@ -650,14 +653,16 @@ impl AsynMotor for PmncAxis {
                         s
                     }
                     _ => {
-                        if ctrl.comm_state == CommState::Normal {
-                            ctrl.comm_state = CommState::Retry;
-                            return Ok(self.last_status.clone());
-                        }
-                        ctrl.comm_state = CommState::CommErr;
-                        self.last_status.comms_error = true;
-                        self.last_status.problem = true;
-                        return Ok(self.last_status.clone());
+                        // drvPMNC87xx.cc:283-292: RETRY fails the poll
+                        // raising nothing, COMM_ERR raising both bits.
+                        (ctrl.comm_state, self.failure) = match ctrl.comm_state {
+                            CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                            _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
+                        };
+                        return Err(AsynError::Status {
+                            status: AsynStatus::Error,
+                            message: format!("PMNC87xx driver {d}: no reply"),
+                        });
                     }
                 }
             };
@@ -1078,5 +1083,37 @@ mod tests {
         assert!(ctrl.change_eos);
         assert_eq!(ctrl.num_axes(), 3);
         assert_eq!(ctrl.status(0).unwrap(), "A0=0x05");
+    }
+
+    /// drvPMNC87xx.cc:277-294: a first missed `STA` is RETRY (nothing
+    /// raised, nothing posted), the next COMM_ERR, and a reply clears it.
+    #[test]
+    fn a_missed_status_is_retry_then_comm_error() {
+        use std::sync::atomic::AtomicBool;
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("pmncRetry", move |last| match last {
+            "VER" => "Version 1.6.0>".into(),
+            "DRT" => "A0=2>".into(),
+            "STA 0" if q.load(Ordering::SeqCst) => String::new(),
+            "STA 0" => format!("A0=0x{:02x}>", S8751_MOVE_DONE | S8751_POWER_ON),
+            "DIAG 0" => "A0=0x04>".into(),
+            "POS 0" => "A0=0>".into(),
+            _ => ">".into(),
+        });
+        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
+        let mut axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

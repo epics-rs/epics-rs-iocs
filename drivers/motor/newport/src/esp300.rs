@@ -185,6 +185,9 @@ pub struct Esp300Axis {
     /// Last polled status, reused on the early-exit poll paths where C leaves
     /// the record's other bits stale (TB?/MD errors).
     last_status: MotorStatus,
+    /// What the last failed poll raises: nothing on C's first missed reply
+    /// (RETRY), `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next (COMM_ERR).
+    failure: PollFailure,
     strings: MoveStrings,
 }
 
@@ -222,6 +225,7 @@ impl Esp300Axis {
             encoder_present,
             // C clears the status, then sets EA_PRESENT and GAIN_SUPPORT
             // for an encoder.
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 gain_support: encoder_present,
                 has_encoder: encoder_present,
@@ -229,7 +233,8 @@ impl Esp300Axis {
             },
             strings: MoveStrings::default(),
         };
-        ax.set_status();
+        // C motor_init ignores set_status's verdict.
+        let _ = ax.set_status();
         ax
     }
 
@@ -281,10 +286,8 @@ impl Esp300Axis {
 }
 
 impl AsynMotor for Esp300Axis {
-    /// C `set_status` raises only `RA_PROBLEM` when its first exchange
-    /// (`TB?`) fails (drvESP300.cc).
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM
+        self.failure
     }
 
     fn move_absolute(
@@ -416,7 +419,7 @@ impl AsynMotor for Esp300Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(self.set_status())
+        self.set_status()
     }
 }
 
@@ -424,8 +427,9 @@ impl Esp300Axis {
     /// Port of C `set_status`, one exchange sequence per axis under the
     /// controller lock: TB? (clear/check errors), MD (done), TP?
     /// (position), ZH?, MO? (power), TE? (error code). C ignores every read
-    /// status: a failed read is an empty reply.
-    fn set_status(&mut self) -> MotorStatus {
+    /// status: a failed read is an empty reply. RETRY goes to C's `exit`
+    /// with `rtn_state` 0, which posts nothing: the poll fails.
+    fn set_status(&mut self) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let read = |ctrl: &Esp300Controller, cmd: &str| ctrl.write_read(cmd).unwrap_or_default();
@@ -435,7 +439,7 @@ impl Esp300Axis {
         if !tb.starts_with('0') {
             println!("ESP300 status error: {tb}.");
             self.last_status.problem = true;
-            return self.last_status.clone();
+            return Ok(self.last_status.clone());
         }
         self.last_status.problem = false;
 
@@ -443,16 +447,15 @@ impl Esp300Axis {
         if md == "0" || md == "1" {
             ctrl.comm_state = CommState::Normal;
             self.last_status.comms_error = false;
-        } else if ctrl.comm_state == CommState::Normal {
-            // One garbled reply: retry silently next poll (C RETRY state),
-            // leaving the record's bits stale.
-            ctrl.comm_state = CommState::Retry;
-            return self.last_status.clone();
         } else {
-            ctrl.comm_state = CommState::CommErr;
-            self.last_status.comms_error = true;
-            self.last_status.problem = true;
-            return self.last_status.clone();
+            (ctrl.comm_state, self.failure) = match ctrl.comm_state {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
+            };
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("ESP300 axis {a}: MD reply {md:?}"),
+            });
         }
         let done = md == "1";
 
@@ -504,7 +507,7 @@ impl Esp300Axis {
             has_encoder: self.encoder_present,
             ..MotorStatus::default()
         };
-        self.last_status.clone()
+        Ok(self.last_status.clone())
     }
 }
 
@@ -804,5 +807,39 @@ mod tests {
             motion_preamble(3, 0.5, 2.0, 0.0),
             "03VA2.000000;03VB0.500000"
         );
+    }
+
+    /// drvESP300.cc:241-266: a first bad `MD` is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good one clears it.
+    #[test]
+    fn a_bad_md_is_retry_then_comm_error() {
+        let user = AsynUser::default();
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("esp300Retry", move |last| {
+            match last {
+                "VE?" => "ESP300 Version 3.08",
+                "TB?" => "0, 0, NO ERROR",
+                "01MD" if q.load(Ordering::SeqCst) => "",
+                "01MD" | "01MO?" => "1",
+                "TE?" | "01TP?" | "01ZB?" => "0",
+                "01FR?" => "1",
+                _ => "",
+            }
+            .to_string()
+        });
+        let ctrl = Esp300Controller::new(io).unwrap();
+        let mut axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }
