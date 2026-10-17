@@ -9,8 +9,8 @@
 //! [`devices`] binds them at `init_record`. This crate factors out everything
 //! that is not protocol-specific:
 //!
-//! - [`install`] — wires one axis through motor-rs's [`MotorBuilder`],
-//!   registers it and starts its poller.
+//! - [`Controller`] — an asyn controller's axes and the one poller that
+//!   polls them in turn; [`install`] is a controller of one axis.
 //! - [`model1::Model1`] — a model-1 driver's `Setup` and card table.
 //! - [`model2::Model2`] — a model-2 driver's cards, opened by
 //!   `drvAsynMotorConfigure`.
@@ -37,12 +37,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::iocsh::registry::CommandContext;
-use epics_rs::motor::builder::{AxisSetup, MotorBuilder};
+use epics_rs::motor::builder::{AxisSetup, ControllerAxis, ControllerBuilder, MotorBuilder};
 pub use epics_rs::motor::devices::{
     device_support_factory, devices, model1_device, register_controller_port,
     register_drv_motor_asyn_port, register_model1_device,
 };
+use epics_rs::motor::poll_loop::PollCommand;
 pub use epics_rs::motor::trace::TraceUser;
 
 /// Create C `asynMotorController` port `port` with axes `0..num_axes` for a
@@ -57,6 +59,54 @@ pub fn asyn_user(port: &str, addr: i32) -> TraceUser {
     TraceUser::Asyn {
         port: port.into(),
         addr,
+    }
+}
+
+/// A C `asynMotorController`'s axes and its one poller thread
+/// (asynMotorController.cpp:567-575, :615-695): each pass runs the
+/// controller poll, then every axis in the order [`Self::install`] added
+/// them, so a slow axis delays the rest as in C.
+pub struct Controller {
+    builder: ControllerBuilder,
+}
+
+impl Controller {
+    /// C `startPoller(movingPollPeriod, idlePollPeriod, forcedFastPolls)`'s
+    /// periods; `forced_fast_polls` is the driver's own, C has no default
+    /// (asynMotorController.cpp:567).
+    pub fn new(moving_poll_ms: u64, idle_poll_ms: u64, forced_fast_polls: u32) -> Self {
+        Self {
+            builder: ControllerBuilder::new(
+                Duration::from_millis(moving_poll_ms),
+                Duration::from_millis(idle_poll_ms),
+                forced_fast_polls,
+            ),
+        }
+    }
+
+    /// The driver's `asynMotorController::poll` override.
+    pub fn controller_poll(mut self, poll: impl FnMut() + Send + 'static) -> Self {
+        self.builder = self.builder.controller_poll(poll);
+        self
+    }
+
+    /// Register `motor` as the next axis, under `user`; the sender reaches
+    /// its poller, for a driver thread's [`PollCommand::Post`] or wakeup.
+    pub fn install(
+        &mut self,
+        user: TraceUser,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+    ) -> Result<mpsc::Sender<PollCommand>, String> {
+        let ControllerAxis { axis, poll_cmd_tx } = self.builder.axis(motor, user);
+        epics_rs::motor::devices::register_axis(axis)?;
+        Ok(poll_cmd_tx)
+    }
+
+    /// C `startPoller`: the startup pass over the axes, then the poller
+    /// thread. A constructor that returns before it leaves its axes unpolled,
+    /// as C's does.
+    pub fn start(self, ctx: &CommandContext) {
+        ctx.bridge().spawn(self.builder.build().run());
     }
 }
 
