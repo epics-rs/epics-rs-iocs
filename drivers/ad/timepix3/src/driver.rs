@@ -2166,10 +2166,11 @@ impl TimePix3Driver {
     /// the closing callbacks (ADTimePix.cpp:1090-1105).
     fn write_float64_effect(&mut self, user: &mut AsynUser, value: f64) -> Result<(), Refusal> {
         let reason = user.reason;
-        // UPSTREAM DEFECT (ADTimePix.cpp:791): C's writeFloat64 calls
+        // UPSTREAM DEFECT (ADTimePix.cpp:1093): C's writeFloat64 calls
         // `setDoubleParam(function, value)` — the two-argument form, which
-        // always writes address 0 — on a maxAddr=8 multi-device port, so every
-        // per-chip float write lands on chip 0. The address is honoured here.
+        // always writes address 0 — on a multi-device port, so every
+        // per-address float write lands on address 0. The address is honoured
+        // here.
         let addr = user.addr;
         let acquiring = self.int(self.ad.params.acquire, 0) != 0;
 
