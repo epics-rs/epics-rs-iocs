@@ -1252,7 +1252,8 @@ mod tests {
     }
 
     /// pmacAsynCoord.c:584-592: an unparsed or failed `&{cs}??` prints
-    /// cmdStatus (0, or MOTOR_AXIS_ERROR) and the response buffer.
+    /// cmdStatus (0, or MOTOR_AXIS_ERROR) and the response buffer; :625-634
+    /// still read the positions over the status words sscanf left.
     #[test]
     fn a_bad_cs_status_read_prints_the_c_line() {
         let (rt, rig) = publish_scripted("pmacCsStat");
@@ -1269,15 +1270,27 @@ mod tests {
         let mut axis = PmacCsAxis::new(system, 1).unwrap();
         let own = TraceCapture::on("pmacCsStat");
         let user = AsynUser::new(0);
-        rig.answer("&2??", b"zz\r");
-        assert!(axis.poll(&user).is_err());
+        let q8 = "&2Q81Q82Q83Q84Q85Q86Q87Q88Q89";
+        rig.answer(q8, b"0.25\r0.5\r");
+        rig.answer("&2??", b"000000\r020000\r000000\r");
+        assert!(axis.poll(&user).unwrap().done);
+        rig.written();
+
+        // One word read: it runs a program; the in-position word is stale.
+        rig.answer("&2??", b"000001\rzz\r");
+        let status = axis.poll(&user).unwrap();
+        assert!(!status.done && !status.msta_moving);
+        assert_eq!(status.position, 2500.0);
+        assert_eq!(rig.written(), ["&2??", q8]);
         assert_eq!(
             own.take(),
             "drvPmacAxisGetStatus: not all status values returned. Status: 0\n\
-             Command :&2??\nResponse:zz\r"
+             Command :&2??\nResponse:000001\rzz\r"
         );
+
         rig.silence("&2??");
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.poll(&user).is_ok());
+        assert_eq!(rig.written(), ["&2??", q8]);
         let text = own.take();
         assert!(
             text.ends_with(
@@ -1286,6 +1299,27 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    /// pmacAsynCoord.c:636-648: strtod reads 0 past the end of a short
+    /// position reply, and the poll still posts.
+    #[test]
+    fn a_short_cs_position_reply_reads_zero_for_the_rest() {
+        let (rt, rig) = publish_scripted("pmacCsShort");
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let trace = MotorTrace::new("pmacCsShort", 0);
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(
+            io,
+            trace,
+            9108,
+            2,
+            0,
+            Duration::ZERO,
+        )));
+        let mut axis = PmacCsAxis::new(system, 3).unwrap();
+        rig.answer("&2??", b"000000\r020000\r000000\r");
+        rig.answer("&2Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"0.25\r0.5\r");
+        assert_eq!(axis.poll(&AsynUser::new(0)).unwrap().position, 0.0);
     }
 
     /// pmacController.cpp:457/463 `%f`: glibc's nan, sign bit included.

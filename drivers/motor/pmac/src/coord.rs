@@ -48,7 +48,7 @@ use epics_rs::motor::trace::MotorTrace;
 use crate::controller::{PMAC_MAXBUF, checked_reply, pmac_err};
 use crate::protocol::{
     CS_STATUS1_RUNNING_PROG, CS_STATUS2_AMP_FAULT, CS_STATUS2_FOLLOW_ERR, CS_STATUS2_IN_POSITION,
-    CS_STATUS2_RUNTIME_ERR, CS_STATUS3_LIMIT, parse_cs_positions, parse_cs_status,
+    CS_STATUS2_RUNTIME_ERR, CS_STATUS3_LIMIT, parse_cs_positions, scan_cs_status,
 };
 
 /// The nine kinematic axes of a coordinate system (C `NAXES`).
@@ -90,6 +90,8 @@ pub struct PmacCoordSystem {
     /// `motorAxis::deferred_move`).
     deferred: [bool; CS_AXES],
     poll: Option<CsPoll>,
+    /// C `drvPmacTask`'s `status[3]`: the words a failed read leaves.
+    status: [u32; 3],
     poll_ttl: Duration,
     /// C `motorAxis::stepSize` of each CS axis: EGU per record step.
     step_size: [f64; CS_AXES],
@@ -118,6 +120,7 @@ impl PmacCoordSystem {
             moves_deferred: false,
             deferred: [false; CS_AXES],
             poll: None,
+            status: [0; 3],
             poll_ttl,
             step_size: [DEFAULT_STEP_SIZE; CS_AXES],
         }
@@ -194,8 +197,9 @@ impl PmacCoordSystem {
                 String::from_utf8_lossy(&raw).trim_matches('\0').to_string(),
             ),
         };
-        let status = parse_cs_status(&response).filter(|_| cmd_status == 0);
-        let Some(status) = status else {
+        // C goes on to the positions whatever the status read gave.
+        let nvals = scan_cs_status(&response, &mut self.status);
+        if cmd_status != 0 || nvals != 3 {
             self.trace.print(
                 TraceMask::ERROR,
                 0,
@@ -204,26 +208,23 @@ impl PmacCoordSystem {
                      {cmd_status}\nCommand :{command}\nResponse:{response}"
                 ),
             );
-            return Err(pmac_err(format!(
-                "could not parse CS {cs} status: {response:?}"
-            )));
-        };
+        }
 
         let mut query = format!("&{cs}");
         for axis in 1..=CS_AXES {
             query.push_str(&format!("Q8{axis}"));
         }
-        let response = self.write_read(1, &query)?;
-        let positions = parse_cs_positions(&response, CS_AXES);
-        if positions.len() != CS_AXES {
-            return Err(pmac_err(format!(
-                "CS {cs} returned {} of {CS_AXES} readbacks: {response:?}",
-                positions.len()
-            )));
-        }
+        // A failed read leaves C's position buffer uninitialised; that
+        // garbage is not posted here.
+        let raw = self.transfer(1, &query)?;
+        let response = String::from_utf8_lossy(&raw);
+        // strtod reads 0 past the end of a short reply, which C posts.
+        let mut positions = parse_cs_positions(response.trim_matches('\0'), CS_AXES);
+        positions.resize(CS_AXES, 0.0);
 
+        let [s0, s1, s2] = self.status;
         let poll = CsPoll {
-            status,
+            status: (s0, s1, s2),
             positions,
             read_at: Instant::now(),
         };
