@@ -129,7 +129,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
-use epics_rs::motor::controller_port::ParamWrite;
+use epics_rs::motor::controller_port::{AxisUser, ParamWrite};
 use motor_common::util::{atof, atoi, nint};
 use motor_common::{ControllerParams, ControllerReport};
 
@@ -1269,7 +1269,7 @@ impl ControllerParams for PIGCS2Params {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
@@ -1293,7 +1293,7 @@ impl ControllerParams for PIGCS2Params {
     fn write_float64(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: f64,
     ) -> ParamWrite {
         let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
@@ -1304,7 +1304,8 @@ impl ControllerParams for PIGCS2Params {
             return ParamWrite::PassToBase(Ok(()));
         };
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        ctrl.log_sink = Some((base.port_name.to_string(), user.addr));
+        // C's sink is the asynUser itself, a `-1` address included.
+        ctrl.log_sink = Some((base.port_name.to_string(), user.asyn().addr));
         ParamWrite::PassToBase(ctrl.set_pivot(index, value))
     }
 
@@ -2673,6 +2674,31 @@ mod tests {
             assert!(port.write_float64_blocking(p.pivot_z, 0, 1.0).is_err());
         });
         assert!(sent_lines(&line).is_empty());
+        assert!(
+            printed.contains(
+                "PIHexapodController::SetPivot() cannot change pivot point while platform is moving"
+            ),
+            "{printed}"
+        );
+    }
+
+    /// `PIasynController::writeFloat64` makes the asynUser itself the log
+    /// sink (PIasynController.cpp:352), so a pivot write at address `-1`
+    /// prints on the port's trace, not on axis 0's.
+    #[test]
+    fn a_port_address_pivot_write_logs_on_the_port_trace() {
+        let (line, ctrl) = hexapod("gcs2PortSinkLine", hexapod_reply);
+        let (port, p) = controller_port("gcs2PortSink", &ctrl, "X");
+        ctrl.lock().unwrap().hexapod.any_moving = true;
+        line.sent();
+        let printed = traced_mask("gcs2PortSink", TraceMask::FLOW, || {
+            PortManager::global().trace_manager().set_device_trace_mask(
+                "gcs2PortSink",
+                0,
+                TraceMask::empty(),
+            );
+            assert!(port.write_float64_blocking(p.pivot_x, -1, 1.0).is_err());
+        });
         assert!(
             printed.contains(
                 "PIHexapodController::SetPivot() cannot change pivot point while platform is moving"
