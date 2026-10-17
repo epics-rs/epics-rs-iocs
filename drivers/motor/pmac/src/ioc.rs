@@ -1299,6 +1299,37 @@ mod tests {
         (rt, rig, own, axis)
     }
 
+    /// drvMotorAsyn.c:413: before drvAsynMotorConfigure an axis logs through
+    /// the unconnected defaultAsynUser, so its line lands on the global trace.
+    #[test]
+    fn a_cs_print_before_configure_goes_to_the_unconnected_user() {
+        use epics_rs::asyn::trace::TraceInfoMask;
+        let (_rt, _rig) = publish_scripted("pmacCsUnconf");
+        coord_create("pmacCsUnconf", 0, 4, 9304, 10).unwrap();
+        let path = std::env::temp_dir().join(format!("pmac-unconf-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(None, TraceMask::FLOW);
+        trace.set_trace_info_mask(None, TraceInfoMask::empty());
+        trace.set_trace_file(None, TraceFile::File(file));
+        let axis = COORD_SYSTEMS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.reference == 9304)
+            .unwrap()
+            .axes[1]
+            .clone();
+        axis.lock().unwrap().force_callback(&AsynUser::new(0));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            text,
+            "motorAxisforceCallback: request ref 9304, cs 4, axis B status update\n"
+        );
+    }
+
     /// pmacAsynCoord.c:566-569: a GET_INFO's motorAxisforceCallback prints
     /// its FLOW line on the axis's log.
     #[epics_rs::base::epics_test]
