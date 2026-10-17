@@ -838,12 +838,17 @@ impl PIGCS2Controller {
         })
     }
 
-    /// C `sendOnly(char)`: the byte alone, no terminator.
+    /// C `sendOnly(char)`: the byte alone, no terminator; a byte not
+    /// written is asynError whatever the write returned.
     fn send_only_char(&self, c: u8) -> AsynResult<()> {
         let e = match self.handle.write_octet(0, &[c]) {
             Ok(1) => return Ok(()),
             Ok(n) => pigcs2_err(format!("{n} bytes written")).with_partial_write(n),
-            Err(e) => e,
+            Err(e) if e.partial_write() == Some(1) => e,
+            Err(e) => {
+                let sent = e.partial_write().unwrap_or(0);
+                pigcs2_err(e.to_string()).with_partial_write(sent)
+            }
         };
         self.print(format_args!(
             "PIGCSController:sendOnly: error sending command {c}, sent={}, status={}\n",
@@ -1864,10 +1869,11 @@ mod tests {
         assert_eq!(status_mask_at("01", 0), Some(0));
     }
 
-    /// Refuses the first write offered; records every write.
+    /// Refuses the first write offered with `status`; records every write.
     struct FirstWriteRefused {
         base: epics_rs::asyn::port::PortDriverBase,
         written: Arc<Mutex<Vec<String>>>,
+        status: AsynStatus,
     }
 
     impl epics_rs::asyn::port::PortDriver for FirstWriteRefused {
@@ -1881,11 +1887,52 @@ mod tests {
             let mut written = self.written.lock().unwrap();
             written.push(String::from_utf8_lossy(data).into_owned());
             if written.len() == 1 {
-                Err(pigcs2_err("refused"))
+                Err(AsynError::Status {
+                    status: self.status,
+                    message: "refused".into(),
+                })
             } else {
                 Ok(data.len())
             }
         }
+    }
+
+    /// `PIInterface::sendOnly(char)` (PIInterface.cpp:80-81): a byte not
+    /// written is asynError, whatever the write returned.
+    #[test]
+    fn a_char_not_written_is_an_asyn_error() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = FirstWriteRefused {
+            base: PortDriverBase::new("gcs2CharTimeout", 1, PortFlags::default()),
+            written: Arc::default(),
+            status: AsynStatus::Timeout,
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("gcs2CharTimeout").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl = PIGCS2Controller::new(
+            SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                std::time::Duration::from_secs(1),
+            ),
+            "gcs2CharTimeout",
+        );
+        let mut status = None;
+        let printed = traced("gcs2CharTimeout", || {
+            status = ctrl.send_only_char(24).err().map(|e| e.status());
+        });
+        assert_eq!(status, Some(AsynStatus::Error));
+        assert_eq!(
+            messages(&printed),
+            ["PIGCSController:sendOnly: error sending command 24, sent=0, status=3\n"]
+        );
     }
 
     #[test]
@@ -1898,6 +1945,7 @@ mod tests {
         let port = FirstWriteRefused {
             base: PortDriverBase::new("gcs2SendOnly", 1, PortFlags::default()),
             written: written.clone(),
+            status: AsynStatus::Error,
         };
         let (rt, _actor) = create_port_runtime(
             &claim_port("gcs2SendOnly").unwrap(),
