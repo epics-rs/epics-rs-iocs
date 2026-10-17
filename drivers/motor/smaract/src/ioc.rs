@@ -20,7 +20,7 @@ use epics_rs::motor::trace::MotorTrace;
 use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{arg_double_req, arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{Controller, asyn_user, install, register_port};
 
 use crate::mcs::{self, McsAxis, McsController};
 use crate::mcs2::{self, Mcs2Axis, Mcs2Controller};
@@ -81,21 +81,17 @@ pub fn mcs2_create_controller_command() -> CommandDef {
                 handle,
                 &MotorTrace::new(&port_name, 0),
             )));
+            let poller = Controller::new();
             for axis in 0..num_axes {
                 if unused_mask & (1 << axis) != 0 {
                     continue;
                 }
                 let motor: Arc<Mutex<dyn AsynMotor>> =
                     Arc::new(Mutex::new(Mcs2Axis::new(controller.clone(), axis as usize)));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, smarActMCS2MotorDriver.cpp:95
-                )?;
+                poller.install(asyn_user(&port_name, axis), motor)?;
             }
+            // C startPoller, smarActMCS2MotorDriver.cpp:95
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
