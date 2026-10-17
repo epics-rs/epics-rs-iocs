@@ -2,9 +2,10 @@
 # drvAsynMotorConfigure made over pmacAsynCoord (0=A 1=B 2=C 3=U 4=V 5=W 6=X
 # 7=Y 8=Z).
 #
-# A CS axis is driven in the EGU the coordinate system's position-reporting PLC
-# publishes on Q8n. MRES is the record's step (RRBV is an integer count), so it
-# keeps the C default stepSize, 1e-4 (pmacAsynCoord.c).
+# A CS axis is driven in record steps of stepSize EGU, the EGU the coordinate
+# system's position-reporting PLC publishes on Q8n, so MRES must equal stepSize:
+# the C default 1e-4 unless pmacSetCoordStepsPerUnit/pmacSetDefaultCoordSteps
+# changes it (pmacAsynCoord.c).
 #
 # Homing and jogging are not defined for a kinematic axis: HOMF/HOMR/JOGF/JOGR
 # return an error, as they do in the C driver.

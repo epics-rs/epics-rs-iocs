@@ -14,14 +14,15 @@
 //!
 //! ## Units
 //!
-//! The asyn-rs motor boundary is dial-frame EGU in both directions (the
-//! record converts EGU ↔ raw counts itself), and CONEX commands/readbacks
-//! are already in physical units (mm/deg) — so positions and velocities pass
-//! through unscaled. C's `stepSize_` conversion existed only because the C
-//! record boundary was raw steps; applying it here would move the stage by
-//! the wrong factor. `step_size` is still computed from the model-specific
-//! queries because C uses it as the one-step offset from the soft limit in
-//! `moveVelocity`.
+//! The record boundary is raw steps, as in AG_CONEX.cpp: moves, velocities
+//! and accelerations are `steps * stepSize_` (computed per model from the
+//! constructor's queries) and the `TP` readback is `position / stepSize_`,
+//! so the record's `MRES` must equal `stepSize_`. The jog target (soft limit
+//! ∓ one `stepSize_`) and the CONEX-PP home velocity go out unscaled, as C
+//! sends them.
+//!
+//! C divides by a `stepSize_` of 0 or infinity (an `IF?`/`FRM?` reply of 0);
+//! this port refuses the axis's moves and polls instead.
 //!
 //! ## Parity notes
 //!
@@ -299,8 +300,7 @@ pub struct ConexAxis {
     /// Numeric controller ID prefixed on every command (C `controllerID_`).
     controller_id: i32,
     model: ConexModel,
-    /// Physical size of one motor step (C `stepSize_`), used only as the
-    /// one-step jog offset from the soft limits (see module Units note).
+    /// Controller units per record step (C `stepSize_`).
     step_size: f64,
     /// Soft travel limits in controller EGU (C `lowLimit_`/`highLimit_`).
     low_limit: f64,
@@ -412,12 +412,28 @@ impl ConexAxis {
         parse_closed_loop(&resp).ok_or_else(|| parse_error("MM?"))
     }
 
-    /// C `AG_CONEXAxis::move` velocity/accel preamble (model-gated). Values
-    /// arrive in EGU/sec(²) — already controller units (module Units note).
+    /// `stepSize_`, refused at 0 or non-finite (module Units note).
+    fn step(&self) -> AsynResult<f64> {
+        let step = self.step_size;
+        if step == 0.0 || !step.is_finite() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("CONEX {}: step size is {step}", self.controller_id),
+            });
+        }
+        Ok(step)
+    }
+
+    /// C `AG_CONEXAxis::move` velocity/accel preamble (model-gated), in
+    /// steps times `stepSize_`.
     fn send_accel_and_velocity(&self, acceleration: f64, velocity: f64) -> AsynResult<()> {
+        let step = self.step()?;
         if self.model.supports_velocity() {
-            self.write(&cmd_set_acceleration(self.controller_id, acceleration))?;
-            self.write(&cmd_set_velocity(self.controller_id, velocity))?;
+            self.write(&cmd_set_acceleration(
+                self.controller_id,
+                acceleration * step,
+            ))?;
+            self.write(&cmd_set_velocity(self.controller_id, velocity * step))?;
         }
         Ok(())
     }
@@ -439,6 +455,7 @@ impl AsynMotor for ConexAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         self.send_accel_and_velocity(acceleration, velocity)?;
+        let position = position * self.step()?;
         self.write(&cmd_move_absolute(self.controller_id, position))
     }
 
@@ -453,6 +470,7 @@ impl AsynMotor for ConexAxis {
         // C `move()` has a native relative branch (PR); override the trait's
         // poll-then-absolute default to match.
         self.send_accel_and_velocity(acceleration, velocity)?;
+        let distance = distance * self.step()?;
         self.write(&cmd_move_relative(self.controller_id, distance))
     }
 
@@ -547,9 +565,11 @@ impl AsynMotor for ConexAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        // Position (TP): controller units == record EGU, reported directly.
+        // Position (TP): controller units to record steps.
+        let step = self.step()?;
         let position = parse_value_at(&self.write_read(&query(self.controller_id, "TP"))?, 3)
-            .ok_or_else(|| parse_error("TP"))?;
+            .ok_or_else(|| parse_error("TP"))?
+            / step;
 
         // Status (TS): done + limits (model-dependent parse).
         let status = parse_ts(
@@ -578,6 +598,49 @@ impl AsynMotor for ConexAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+
+    /// AG_CONEX.cpp: a CONEX-CC's stepSize_ is SU? / 1; moves, VA and AC
+    /// are steps * stepSize_, TP / stepSize_, the jog target the soft limit
+    /// less one stepSize_, unscaled.
+    #[test]
+    fn record_steps_scale_by_step_size() {
+        let (line, io) = LineRig::new("conex_steps", |last| {
+            match last {
+                "1VE" => "1VE CONEX-CC 2.0",
+                "1SU?" => "1SU0.0001",
+                "1SL?" => "1SL-12.5",
+                "1SR?" => "1SR12.5",
+                "1TP" => "1TP2.5",
+                "1TS" => "1TS000033",
+                "1MM?" => "1MM33",
+                _ => "",
+            }
+            .to_string()
+        });
+        let trace = MotorTrace::new("conex_steps", 0);
+        let mut axis = ConexAxis::new(io, 1, &trace).unwrap();
+        line.sent();
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 20000.0, 0.0, 5000.0, 10000.0)
+            .unwrap();
+        axis.move_relative(&user, -100.0, 0.0, 5000.0, 10000.0)
+            .unwrap();
+        axis.move_velocity(&user, 0.0, 5000.0, 10000.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "1AC1.000000",
+                "1VA0.500000",
+                "1PA2.000000",
+                "1AC1.000000",
+                "1VA0.500000",
+                "1PR-0.010000",
+                "1PA12.499900"
+            ]
+        );
+        assert_eq!(axis.poll(&user).unwrap().position, 25000.0);
+    }
 
     #[test]
     fn model_detected_from_firmware_string() {

@@ -7,9 +7,8 @@
 //! go out the axis's own move socket without waiting for completion — the poll
 //! observes when the move finishes via `GroupStatusGet`.
 //!
-//! Positions pass through `step_size` as a record-EGU → positioner-units
-//! wire scale (1.0 in the normal configuration; C's `stepSize_` instead
-//! converted its raw-step record boundary — the asyn-rs boundary is EGU).
+//! Record steps cross the motor boundary and `step_size` (C `stepSize_`,
+//! `1 / stepsPerUnit`) converts them to positioner units, as in C.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1069,6 +1068,39 @@ mod tests {
             })
             .collect();
         (axes, line.fail.clone(), line.log.clone())
+    }
+
+    /// XPSAxis.cpp:267, 718, 706: record steps times stepSize_ go out, and
+    /// the readbacks come back divided by it.
+    #[test]
+    fn record_steps_scale_by_step_size() {
+        let line = FakeLine::new("xps_steps", "");
+        let controller = Arc::new(Mutex::new(
+            XpsController::new(line.socket(SocketMode::Query), false, Duration::ZERO).unwrap(),
+        ));
+        let mut axis = XpsAxis::new(
+            controller,
+            line.socket(SocketMode::Fire),
+            "MOTOR_T",
+            0,
+            "G1.P1",
+            0.5,
+        );
+        let user = AsynUser::new(0);
+        line.log.lock().unwrap().clear();
+        axis.move_absolute(&user, 4.0, 0.0, 6.0, 8.0).unwrap();
+        axis.move_relative(&user, -3.0, 0.0, 6.0, 8.0).unwrap();
+        let log = std::mem::take(&mut *line.log.lock().unwrap());
+        assert!(
+            log.iter().any(|c| c == "GroupMoveAbsolute (G1.P1,2)"),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|c| c == "GroupMoveRelative (G1.P1,-1.5)"),
+            "{log:?}"
+        );
+        let status = axis.poll(&user).unwrap();
+        assert_eq!((status.position, status.encoder_position), (2.5, 3.0));
     }
 
     /// A group in state 44 (moving) whose move replies wait until `answer`.

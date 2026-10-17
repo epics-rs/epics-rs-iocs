@@ -10,9 +10,10 @@
 //! [`PMAC_ASYN_COORD`], which `drvAsynMotorConfigure(port, "pmacAsynCoord",
 //! reference, 9)` opens as axes 0..8 (A..Z).
 //!
-//! `pmacSetAxisScale`, `pmacSetCoordStepsPerUnit` and
-//! `pmacSetDefaultCoordSteps` are not provided: the driver speaks controller
-//! counts and the record's `MRES` does the scaling (see [`crate::axis`]).
+//! `pmacSetCoordStepsPerUnit` and `pmacSetDefaultCoordSteps` are
+//! pmacAsynCoord.c's, setting a coordinate-system axis's `stepSize`.
+//! `pmacSetAxisScale` is not provided: the driver speaks controller counts
+//! and the record's `MRES` does the scaling (see [`crate::axis`]).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,7 +28,9 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::trace::MotorTrace;
 
-use motor_common::iocsh::{arg_int_req, arg_str_req, poll_intervals, req_string};
+use motor_common::iocsh::{
+    arg_double_opt, arg_int_req, arg_str_req, opt_double, poll_intervals, req_string,
+};
 use motor_common::model1::c_int;
 use motor_common::model2::{Model2, Model2Axis};
 use motor_common::{asyn_user, install, register_controller_port};
@@ -162,6 +165,8 @@ pub fn pmac_commands() -> Vec<CommandDef> {
         pmac_asyn_coord_create_command(),
         pmac_set_coord_poll_period_command("pmacSetCoordMovingPollPeriod", "Moving poll period"),
         pmac_set_coord_poll_period_command("pmacSetCoordIdlePollPeriod", "Idle poll period"),
+        pmac_set_coord_steps_per_unit_command(),
+        pmac_set_default_coord_steps_command(),
     ]
 }
 
@@ -438,8 +443,10 @@ fn pmac_cs_group_add_axis_command(registry: &Registry) -> CommandDef {
     )
 }
 
-/// What each `pmacAsynCoordCreate` made: `(reference, port, address, cs)`.
-static COORD_SYSTEMS: Mutex<Vec<(i32, String, i32, i32)>> = Mutex::new(Vec::new());
+/// What each `pmacAsynCoordCreate` made: `(reference, port, address, cs)`
+/// and the system.
+type CoordSystem = (i32, String, i32, i32, Arc<Mutex<PmacCoordSystem>>);
+static COORD_SYSTEMS: Mutex<Vec<CoordSystem>> = Mutex::new(Vec::new());
 
 /// C `pmacAsynCoordCreate(port, addr, cs, ref, program)`: card `ref` of
 /// [`PMAC_ASYN_COORD`], its nine axes polled at C's default periods until a
@@ -484,7 +491,7 @@ fn coord_create(
     let mut systems = COORD_SYSTEMS.lock().unwrap_or_else(|e| e.into_inner());
     if systems
         .iter()
-        .any(|(r, p, a, c)| *r == reference || (p == port && *a == addr && *c == cs))
+        .any(|(r, p, a, c, _)| *r == reference || (p == port && *a == addr && *c == cs))
     {
         println!("C.S. reference {reference} already exists");
         return Ok(());
@@ -550,7 +557,7 @@ fn coord_create(
         })
         .collect::<Result<Vec<_>, String>>()?;
     PMAC_ASYN_COORD.set_card(reference, axes);
-    systems.push((reference, port.to_string(), addr, cs));
+    systems.push((reference, port.to_string(), addr, cs, system));
     Ok(())
 }
 
@@ -570,6 +577,80 @@ fn pmac_set_coord_poll_period_command(name: &'static str, period: &'static str) 
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// The `drvPrint` refusal both step commands share (pmacAsynCoord.c:883).
+const STEPS_NOT_POSITIVE: &str = "ERROR: Scaling factor has to be positive.";
+
+/// C `pmacSetCoordStepsPerUnit(ref, axis, stepsPerUnit)`: `stepSize` of
+/// 0-based `axis` on coordinate system `ref`.
+fn pmac_set_coord_steps_per_unit_command() -> CommandDef {
+    CommandDef::new(
+        "pmacSetCoordStepsPerUnit",
+        vec![
+            arg_int_req("CS Ref"),
+            arg_int_req("Axis number"),
+            arg_double_opt("Steps per unit"),
+        ],
+        "pmacSetCoordStepsPerUnit(CS Ref, Axis number, Steps per unit)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let steps = opt_double(args, 2, 0.0, "Steps per unit")?;
+            set_coord_steps_per_unit(c_int(args, 0), c_int(args, 1), steps);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+fn set_coord_steps_per_unit(reference: i32, axis: i32, steps_per_unit: f64) {
+    if steps_per_unit <= 0.0 {
+        println!("{STEPS_NOT_POSITIVE}");
+        return;
+    }
+    let Some(axis) = usize::try_from(axis).ok().filter(|a| *a < CS_AXES) else {
+        println!(
+            "ERROR: axis number has to be between 0 and {}.",
+            CS_AXES - 1
+        );
+        return;
+    };
+    let systems = COORD_SYSTEMS.lock().unwrap_or_else(|e| e.into_inner());
+    for (.., system) in systems.iter().filter(|(r, ..)| *r == reference) {
+        lock_system(system).set_steps_per_unit(axis, steps_per_unit);
+        println!("  Setting axis {axis} scaling factor to {steps_per_unit:.6}.");
+    }
+}
+
+/// C `pmacSetDefaultCoordSteps(defaultSteps)`: `stepSize` of every axis of
+/// every coordinate system made so far.
+fn pmac_set_default_coord_steps_command() -> CommandDef {
+    CommandDef::new(
+        "pmacSetDefaultCoordSteps",
+        vec![arg_double_opt("Default Steps")],
+        "pmacSetDefaultCoordSteps(Default Steps)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            set_default_coord_steps(opt_double(args, 0, 0.0, "Default Steps")?);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+fn set_default_coord_steps(default_steps: f64) {
+    if default_steps <= 0.0 {
+        println!("{STEPS_NOT_POSITIVE}");
+        return;
+    }
+    let systems = COORD_SYSTEMS.lock().unwrap_or_else(|e| e.into_inner());
+    for (reference, .., system) in systems.iter() {
+        let mut system = lock_system(system);
+        for axis in 0..CS_AXES {
+            system.set_steps_per_unit(axis, default_steps);
+        }
+        println!("  Set scaling factor to {default_steps:.6} for CS ref {reference}.");
+    }
+}
+
+fn lock_system(system: &Mutex<PmacCoordSystem>) -> std::sync::MutexGuard<'_, PmacCoordSystem> {
+    system.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -618,6 +699,32 @@ mod tests {
         let _rt = publish_bare("pmacCoordEosRefused");
         coord_create("pmacCoordEosRefused", 0, 2, 9101, 10).unwrap();
         assert!(!coord_exists(9101));
+    }
+
+    /// pmacAsynCoord.c pmacSetCoordStepsPerUnit / pmacSetDefaultCoordSteps:
+    /// a non-positive factor or an axis past 8 changes nothing, the default
+    /// reaches every axis of every system.
+    #[test]
+    fn step_commands_set_step_size_as_c() {
+        let rt = publish_bare("pmacCoordSteps");
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::ZERO);
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(io, 3, 0, POLL_CACHE_TTL)));
+        COORD_SYSTEMS
+            .lock()
+            .unwrap()
+            .push((9103, "pmacCoordSteps".into(), 0, 3, system.clone()));
+        let step = |axis| lock_system(&system).step_size(axis);
+        assert_eq!(step(4), 1e-4);
+        set_coord_steps_per_unit(9103, 4, 0.0);
+        set_coord_steps_per_unit(9103, 9, 50.0);
+        set_coord_steps_per_unit(9104, 4, 50.0);
+        assert_eq!(step(4), 1e-4);
+        set_coord_steps_per_unit(9103, 4, 50.0);
+        assert_eq!((step(4), step(5)), (0.02, 1e-4));
+        set_default_coord_steps(-1.0);
+        assert_eq!(step(5), 1e-4);
+        set_default_coord_steps(1000.0);
+        assert_eq!((step(0), step(4), step(8)), (0.001, 0.001, 0.001));
     }
 
     #[test]

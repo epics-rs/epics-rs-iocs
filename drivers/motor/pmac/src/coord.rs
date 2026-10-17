@@ -17,15 +17,16 @@
 //! ([`AsynMotor`]) like the real-axis driver, so the poll loop comes from
 //! motor-rs. Everything on the wire is unchanged.
 //!
-//! ## Units (deviation, deliberate)
+//! ## Units
 //!
-//! C multiplies every demand by `stepSize` (default 1e-4, i.e. 10000 steps per
-//! EGU) and divides every readback by it, with `MRES` set to the reciprocal —
-//! the same raw-steps round trip the real-axis driver does with `scale_`, and it
-//! cancels at the record boundary for the same reason (see [`crate::axis`]).
-//! This port speaks the PLC's EGU directly, so `pmacSetCoordStepsPerUnit` /
-//! `pmacSetDefaultCoordSteps` are not provided. The records still take
-//! `MRES = stepSize` (1e-4): raw counts are integers, so `MRES` is the step.
+//! The record boundary is raw steps, as in C: every demand and feed rate is
+//! `steps * stepSize` (default 1e-4, i.e. 10000 steps per EGU, set by
+//! `pmacSetDefaultCoordSteps` / `pmacSetCoordStepsPerUnit`) and every readback
+//! is `Q8{n} / stepSize`, so the record's `MRES` is `stepSize`.
+//!
+//! C's direction test compares the new readback in steps with the previous one
+//! scaled back to EGU (pmacAsynCoord.c:649-655); this port compares steps with
+//! steps.
 //!
 //! ## Not supported by the hardware path
 //!
@@ -52,6 +53,9 @@ pub const CS_AXES: usize = 9;
 
 /// C `axisName[]`: the CS axis letters, indexed 1..=9.
 const AXIS_NAMES: [char; CS_AXES] = ['A', 'B', 'C', 'U', 'V', 'W', 'X', 'Y', 'Z'];
+
+/// C `drvPmacCreate`'s `stepSize` for every axis: 10000 steps per EGU.
+const DEFAULT_STEP_SIZE: f64 = 0.0001;
 
 /// The letter of a 1-based CS axis number, for messages.
 pub fn axis_name(axis: usize) -> Option<char> {
@@ -84,6 +88,8 @@ pub struct PmacCoordSystem {
     deferred: [bool; CS_AXES],
     poll: Option<CsPoll>,
     poll_ttl: Duration,
+    /// C `motorAxis::stepSize` of each CS axis: EGU per record step.
+    step_size: [f64; CS_AXES],
 }
 
 impl PmacCoordSystem {
@@ -96,7 +102,19 @@ impl PmacCoordSystem {
             deferred: [false; CS_AXES],
             poll: None,
             poll_ttl,
+            step_size: [DEFAULT_STEP_SIZE; CS_AXES],
         }
+    }
+
+    /// C `pAxis->stepSize = 1.0 / stepsPerUnit` for 0-based `axis`, which
+    /// the iocsh commands have range-checked and kept positive.
+    pub fn set_steps_per_unit(&mut self, axis: usize, steps_per_unit: f64) {
+        self.step_size[axis] = 1.0 / steps_per_unit;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn step_size(&self, axis: usize) -> f64 {
+        self.step_size[axis]
     }
 
     pub fn coord_system(&self) -> i32 {
@@ -214,12 +232,13 @@ impl AsynMotor for PmacCsAxis {
     ) -> AsynResult<()> {
         let axis = self.axis;
         let mut system = lock(&self.system);
-        let cs = system.cs;
+        let (cs, step) = (system.cs, system.step_size[axis - 1]);
         let csvar = cs + 50;
+        let position = position * step;
 
         let mut command = format!("&{cs}");
         if velocity != 0.0 {
-            command.push_str(&format!("I{csvar}89={:.6} ", velocity.abs()));
+            command.push_str(&format!("I{csvar}89={:.6} ", velocity * step));
             if acceleration != 0.0 {
                 command.push_str(&format!(
                     "I{csvar}87={:.6} ",
@@ -311,7 +330,9 @@ impl AsynMotor for PmacCsAxis {
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
         let mut system = lock(&self.system);
-        let cs = system.cs;
+        let (cs, step) = (system.cs, system.step_size[axis - 1]);
+        // C rounds the record's steps to a whole step first.
+        let position = (position + 0.5).floor() * step;
         system.command(&format!("&{cs}Q7{axis}={position:.6}"))
     }
 
@@ -334,7 +355,7 @@ impl AsynMotor for PmacCsAxis {
         let mut system = lock(&self.system);
         let poll = system.poll_system()?;
         let (status1, status2, status3) = poll.status;
-        let position = poll.positions[axis - 1];
+        let position = poll.positions[axis - 1] / system.step_size[axis - 1];
 
         let direction = if position > self.previous_position {
             true
@@ -429,30 +450,64 @@ mod tests {
         }
     }
 
-    /// pmacAsynCoord.c motorAxisMove clears motorAxisDone and wakes the
-    /// poller: the poll after a move reads the system and is not done, the
-    /// one after it is served from that read again.
-    #[test]
-    fn the_poll_after_a_move_is_fresh_and_not_done() {
+    type Rig = (
+        PmacCsAxis,
+        Arc<Mutex<PmacCoordSystem>>,
+        Arc<Mutex<Vec<String>>>,
+    );
+
+    /// CS 1 axis A on an [`Idle`] line, its system and the wire log.
+    fn idle_axis(name: &str, poll_ttl: Duration) -> Rig {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let line = Idle {
-            base: PortDriverBase::new("pmac_cs_moved", 1, PortFlags::default()),
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
             reply: Vec::new(),
             sent: sent.clone(),
         };
-        let (rt, _jh) = create_port_runtime(
-            &claim_port("pmac_cs_moved").unwrap(),
-            line,
-            RuntimeConfig::default(),
-        )
-        .unwrap();
+        let (rt, _jh) =
+            create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
+                .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        let system = PmacCoordSystem::new(io, 1, 0, Duration::from_secs(3600));
-        let mut axis = PmacCsAxis::new(Arc::new(Mutex::new(system)), 1).unwrap();
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(io, 1, 0, poll_ttl)));
+        let axis = PmacCsAxis::new(system.clone(), 1).unwrap();
+        (axis, system, sent)
+    }
+
+    /// pmacAsynCoord.c: demand and feed rate are steps * stepSize, the
+    /// readback Q8n / stepSize, a set position rounds to a whole step first.
+    #[test]
+    fn record_steps_scale_by_step_size() {
+        let (mut axis, system, sent) = idle_axis("pmac_cs_steps", Duration::ZERO);
+        let user = AsynUser::default();
+        assert_eq!(axis.poll(&user).unwrap().position, 15000.0);
+        sent.lock().unwrap().clear();
+        axis.move_absolute(&user, 20000.0, 0.0, 5000.0, 10000.0)
+            .unwrap();
+        axis.set_position(&user, 1234.6).unwrap();
+        lock(&system).set_steps_per_unit(0, 100.0);
+        axis.move_absolute(&user, 250.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(axis.poll(&user).unwrap().position, 150.0);
+        let wire = sent.lock().unwrap().clone();
+        assert_eq!(
+            wire[..3],
+            [
+                "&1I5189=0.500000 I5187=500.000000 Q71=2.000000000000",
+                "&1Q71=0.123500",
+                "&1Q71=2.500000000000"
+            ]
+        );
+    }
+
+    /// pmacAsynCoord.c motorAxisMove clears motorAxisDone and wakes the
+    /// poller: the poll after a move reads the system and is not done, the
+    /// one after it is served from that read again.
+    #[test]
+    fn the_poll_after_a_move_is_fresh_and_not_done() {
+        let (mut axis, _, sent) = idle_axis("pmac_cs_moved", Duration::from_secs(3600));
         let user = AsynUser::default();
         assert!(axis.poll(&user).unwrap().done);
         sent.lock().unwrap().clear();

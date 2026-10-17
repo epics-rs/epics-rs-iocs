@@ -1,19 +1,22 @@
 # Newport New Focus PMNC 8750/8752: one motor record per discovered channel,
 # signal S of card C as in C's basic_motor.db; the driver maps the signal onto
 # the discovered (driver module, channel).
-# Picomotor moves are integer steps: positions travel the driver boundary in
-# EGU (= steps), so MRES=1 (EGU identical to raw counts). Velocity is
-# steps/sec (clamped to 2000), acceleration steps/sec^2 (clamped 16..32000).
+# Values from C's PMNC87xx.substitutions. The driver clamps velocity to
+# 2000 steps/sec and acceleration to 16..32000 steps/sec^2.
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "PMNC87xx")
     field(OUT,  "#C$(C) S$(S) @")
     field(SCAN, "Passive")
-    field(VELO, "$(VELO=1000)")
-    field(ACCL, "$(ACCL=0.5)")
-    field(DHLM, "$(HLM=1000000)")
-    field(DLLM, "$(LLM=-1000000)")
-    field(MRES, "$(MRES=1)")
-    field(EGU,  "$(EGU=steps)")
-    field(PREC, "$(PREC=0)")
+    field(VELO, "$(VELO=1)")
+    field(VBAS, "$(VBAS=0.1)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(BDST, "$(BDST=0)")
+    field(BVEL, "$(BVEL=1)")
+    field(BACC, "$(BACC=0.2)")
+    field(DHLM, "$(HLM=100)")
+    field(DLLM, "$(LLM=-100)")
+    field(MRES, "$(MRES=2.5e-4)")
+    field(EGU,  "$(EGU=degrees)")
+    field(PREC, "$(PREC=5)")
 }

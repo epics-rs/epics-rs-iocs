@@ -36,12 +36,11 @@
 //!
 //! Each is argued where it lives; in summary:
 //!
-//! - **Raw-step scaling is gone.** `pmacSetAxisScale` /
-//!   `pmacSetCoordStepsPerUnit` configure a driver-side multiplier whose inverse
-//!   the IOC must put in the record's `MRES`. The two cancel, and the motor
-//!   record already does the division, so this port speaks controller counts
-//!   (real axes, `MRES = 1`) and PLC EGU (CS axes, `MRES` = the C 1e-4
-//!   `stepSize`, since raw counts are integers). See [`axis`].
+//! - **Real-axis raw-step scaling is gone.** `pmacSetAxisScale` configures a
+//!   driver-side multiplier whose inverse the IOC must put in the record's
+//!   `MRES`. The two cancel, and the motor record already does the division,
+//!   so this port speaks controller counts (real axes, `MRES = 1`). See
+//!   [`axis`]. CS axes keep C's `stepSize` (see [`coord`]).
 //! - **Deferred moves live on the controller,** not on each axis. See
 //!   [`controller`].
 //!
