@@ -534,9 +534,7 @@ pub fn pie516_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
 
                 for axis in 0..num_axes {
-                    let Ok(axis_obj) = PIE516Axis::new(controller.clone(), axis) else {
-                        return;
-                    };
+                    let axis_obj = PIE516Axis::new(controller.clone(), axis);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                     init.axis(axis as i32, motor);
                 }
@@ -971,6 +969,35 @@ mod report {
             after,
             "    PIE516 controller 0 connection failed.\n    PIE516 controller #1, \
              port=e516RepLine, id: E-516 \n"
+        );
+    }
+
+    /// drvPIE516.cc:584-628: `ONL 1` and `VCO A1 B1 C1` are bare send_mess,
+    /// so refused ones keep the card that reported online.
+    #[epics_rs::base::epics_test]
+    async fn a_pie516_reporting_online_survives_refused_sets() {
+        let (_line, _io) = LineRig::failing(
+            "e516NoSet",
+            |last| match last {
+                "ONL?" | "SVO? A" => "1".into(),
+                "VER?" => "E-516".into(),
+                "POS? A" => "0.000".into(),
+                _ => String::new(),
+            },
+            |cmd| cmd.starts_with("ONL 1") || cmd.starts_with("VCO"),
+        );
+        let (_, after) = reports(
+            "drvPIE516",
+            (pie516_setup_command(), vec![int(1), int(10)]),
+            (
+                pie516_config_command(),
+                vec![int(0), port("e516NoSet"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(
+            after,
+            "    PIE516 controller #0, port=e516NoSet, id: E-516 \n"
         );
     }
 
