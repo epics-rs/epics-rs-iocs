@@ -5,9 +5,9 @@
 
 use std::path::Path;
 
-/// st.cmd's PREFIX, ioc_support's QUADEM, and the ADCORE and AUTOSAVE that
-/// ad-core-rs and epics-base-rs export.
-const DEFINED: &[&str] = &["PREFIX", "QUADEM", "ADCORE", "AUTOSAVE"];
+/// st.cmd's PREFIX, ioc_support's QUADEM, and the ADCORE, AUTOSAVE and CALC
+/// that ad-core-rs and epics-base-rs export.
+const DEFINED: &[&str] = &["PREFIX", "QUADEM", "ADCORE", "AUTOSAVE", "CALC"];
 
 #[test]
 fn save_restore_reads_only_defined_macros() {
@@ -54,6 +54,34 @@ fn save_restore_repeats_nothing_common_plugins_sets() {
     assert!(
         repeated.is_empty(),
         "{} repeats {repeated:?}",
+        path.display()
+    );
+}
+
+/// NDStats_settings.req includes calc's sseq_settings.req, which C finds on
+/// saveRestore.cmd's `$(CALC)/calcApp/Db` path (`$(CALC)/db` here).
+#[test]
+fn save_restore_finds_calc_sseq_settings() {
+    // SAFETY: nextest gives each test its own process, and this runs before
+    // any thread is spawned.
+    unsafe { std::env::remove_var("CALC") };
+    let _app = epics_rs::base::server::ioc_app::IocApplication::new().autosave_startup(
+        std::sync::Arc::new(std::sync::Mutex::new(
+            epics_rs::base::server::autosave::AutosaveStartupConfig::new(),
+        )),
+    );
+    let calc = std::env::var("CALC").expect("epics-base-rs exports CALC");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../saveRestore.cmd");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let found = text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("set_requestfile_path(\""))
+        .filter_map(|l| l.split('"').next())
+        .map(|p| p.replace("$(CALC)", &calc))
+        .any(|p| Path::new(&p).join("sseq_settings.req").is_file());
+    assert!(
+        found,
+        "{} sets no path holding sseq_settings.req",
         path.display()
     );
 }
