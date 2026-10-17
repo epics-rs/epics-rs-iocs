@@ -244,7 +244,6 @@ fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
             let axis = PhytronAxis::new(controller.clone(), module as i32, index as i32)
                 .map_err(|e| format!("phytronCreateAxis: {e}"))?;
             let axis_no = (module * 10 + index) as i32;
-            let module_no = axis.module_no().to_owned();
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             poller.install_with_report(
                 asyn_user(&name, axis_no),
@@ -254,7 +253,7 @@ fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
             controller
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .add_axis(axis_no, &module_no);
+                .add_axis(axis_no);
             Ok(CommandOutcome::Continue)
         },
     )
