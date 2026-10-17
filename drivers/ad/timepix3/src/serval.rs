@@ -1204,8 +1204,8 @@ fn dump_string(out: &mut String, text: &str, ascii: bool) {
     out.push('"');
 }
 
-/// nlohmann `serializer::dump_float`: the shortest round-trip digits, laid
-/// out by `dtoa_impl::format_buffer` (min_exp -4, max_exp 15).
+/// nlohmann `serializer::dump_float`: `dtoa_impl::grisu2` digits, laid out
+/// by `dtoa_impl::format_buffer` (min_exp -4, max_exp 15).
 fn dump_double(out: &mut String, d: f64) {
     if !d.is_finite() {
         out.push_str("null");
@@ -1218,11 +1218,10 @@ fn dump_double(out: &mut String, d: f64) {
         out.push_str("0.0");
         return;
     }
-    let sci = format!("{:e}", d.abs());
-    let (mantissa, exponent) = sci.split_once('e').expect("{:e} has an exponent");
-    let digits: String = mantissa.chars().filter(|&c| c != '.').collect();
+    let (digits, exponent) = crate::dtoa::grisu2(d.abs());
+    let digits = String::from_utf8(digits).expect("ASCII digits");
     let k = digits.len() as i32;
-    let n = exponent.parse::<i32>().expect("{:e} exponent") + 1;
+    let n = k + exponent;
     if k <= n && n <= 15 {
         out.push_str(&digits);
         out.push_str(&"0".repeat((n - k) as usize));
@@ -1786,7 +1785,9 @@ mod tests {
     /// (-4, 15], a `.0` on an integral double, a two-digit signed exponent.
     #[test]
     fn a_double_is_written_as_nlohmann() {
-        let cases: [(f64, &str); 15] = [
+        // Grisu2 is not always the shortest form: the last five are where
+        // it differs (json.hpp 3.12.0 output).
+        let cases: [(f64, &str); 20] = [
             (1e-5, "1e-05"),
             (1.5625e-9, "1.5625e-09"),
             (0.0001, "0.0001"),
@@ -1802,6 +1803,14 @@ mod tests {
             (1e16, "1e+16"),
             (1.5e300, "1.5e+300"),
             (0.1, "0.1"),
+            (f64::from_bits(0xc0b780f38304d715), "-6016.9512179398635"),
+            (f64::from_bits(0xc2ef781148b33d2c), "-276804372109801.37"),
+            (f64::from_bits(0x40b28bc6e81aaf18), "4747.7769791295505"),
+            (
+                f64::from_bits(0xc31ac6cb76be8709),
+                "-1.8842316418339222e+15",
+            ),
+            (f64::from_bits(0x439faf4bc7aac34e), "5.7078171425890803e+17"),
         ];
         for (d, text) in cases {
             assert_eq!(dump(&json!(d), None, false), text, "{d:e}");
