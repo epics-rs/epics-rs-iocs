@@ -747,9 +747,6 @@ impl PIGCS2Controller {
         self.check_ok()
     }
 
-    /// `CST? {axis}` (C `initAxis`'s stage-configuration probe, logged only —
-    /// C keeps it purely to surface mis/non-configured controllers in the
-    /// log).
     /// C `sendAndReceive(char)`: a short write is asynError. The byte is
     /// written again for each line that ends in a space, whose failure C
     /// does not print. C defect not copied: it appends each line with no
@@ -798,6 +795,9 @@ impl PIGCS2Controller {
         Ok(state & (1 << axis_no) != 0)
     }
 
+    /// `CST? {axis}` (C `initAxis`'s stage-configuration probe, logged only —
+    /// C keeps it purely to surface mis/non-configured controllers in the
+    /// log).
     fn stage_id(&self, axis: &str) -> AsynResult<String> {
         self.query(&format!("CST? {axis}"))
     }
