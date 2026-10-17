@@ -238,12 +238,29 @@ impl Ctx {
         .await;
     }
 
-    /// C `doCallbacksGenericPointer(pArray, NDArrayData, addr)`: stamp the
-    /// array's epicsTS (`updateTimeStamp`), then hand it to the plugins on
-    /// `addr`.
+    /// C `updateTimeStamp`: the port's stamp, which a registered timestamp
+    /// source moves. A port job, as a stop holding the port waits for this
+    /// frame.
+    async fn port_time_stamp(&self) -> EpicsTimestamp {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.shared.port_jobs.push(move |base| {
+            let _ = tx.send(base.update_time_stamp());
+        });
+        self.flush_jobs();
+        rx.await.unwrap_or_else(|_| SystemTime::now()).into()
+    }
+
+    /// C `updateTimeStamp(&pArray->epicsTS)` and
+    /// `doCallbacksGenericPointer(pArray, NDArrayData, addr)`.
     async fn publish_at(&self, addr: usize, mut array: DriverArray, time_stamp: f64) {
         array.time_stamp = time_stamp;
-        array.timestamp = EpicsTimestamp::now();
+        array.timestamp = self.port_time_stamp().await;
+        self.publish_stamped(addr, array).await;
+    }
+
+    /// C `doCallbacksGenericPointer(pArray, NDArrayData, addr)` of a stamped
+    /// array.
+    async fn publish_stamped(&self, addr: usize, array: DriverArray) {
         ArrayPublisher::new(self.outputs[addr].clone())
             .publish(array)
             .await;
@@ -3176,11 +3193,11 @@ async fn push_processed_img(ctx: &Ctx) {
     )
     .await;
     if let Ok(mut array) = ctx.pool.alloc_with(dims(), data) {
+        wall_clock_stamp(&mut array);
         let _ = ctx.pool.owner().get_attributes(&mut array).await;
         let saturated = Accum::Img.saturated(&ctx.shared);
         add_range_attributes(&mut array, range, units, saturated);
-        ctx.publish_at(2, array, EpicsTimestamp::now().as_f64())
-            .await;
+        ctx.publish_stamped(2, array).await;
     }
 
     if let Some((window, frames)) = window.filter(|(w, _)| w.len() >= running.len()) {
@@ -3194,13 +3211,20 @@ async fn push_processed_img(ctx: &Ctx) {
         )
         .await;
         if let Ok(mut array) = ctx.pool.alloc_with(dims(), data) {
+            wall_clock_stamp(&mut array);
             let _ = ctx.pool.owner().get_attributes(&mut array).await;
             let saturated = Accum::Img.saturated(&ctx.shared);
             add_range_attributes(&mut array, range, units, saturated);
-            ctx.publish_at(3, array, EpicsTimestamp::now().as_f64())
-                .await;
+            ctx.publish_stamped(3, array).await;
         }
     }
+}
+
+/// pushProcessedImgToPlugins reads the clock into epicsTS itself, not
+/// through updateTimeStamp (serval_stream.cpp:1490-1491, :1525-1526).
+fn wall_clock_stamp(array: &mut DriverArray) {
+    array.timestamp = EpicsTimestamp::now();
+    array.time_stamp = array.timestamp.as_f64();
 }
 
 /// Push a preview frame down the plugin chain as an NDArray. C stamps it with
@@ -3265,8 +3289,10 @@ fn image_array(
 /// :942-947); C ignores the getAttributes status.
 async fn attach_attributes(ctx: &Ctx, array: &mut DriverArray, f: &crate::stream::ImageFrame) {
     array.unique_id = f.frame_number;
-    array.timestamp = EpicsTimestamp::now();
-    array.time_stamp = array.timestamp.as_f64();
+    // serval_stream.cpp:237-240, :886-890: the clock for timeStamp, then the
+    // port's stamp for epicsTS.
+    array.time_stamp = EpicsTimestamp::now().as_f64();
+    array.timestamp = ctx.port_time_stamp().await;
     ctx.worker_attributes(array).await;
     array.attributes.add(NDAttribute::new_static(
         "ThresholdID",
@@ -5796,6 +5822,52 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         assert!(polled());
+    }
+
+    /// A frame's and a sum's epicsTS are the port's updateTimeStamp, which
+    /// a registered timestamp source sets (serval_stream.cpp:237-240,
+    /// histogram_io.cpp:750-751).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrays_take_the_port_time_stamp() {
+        let ctx = idle_ctx("TPX_TS_SOURCE");
+        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        ctx.handle
+            .with_driver::<TimePix3Driver, _>(move |d| {
+                d.ad.port_base.register_timestamp_source(move || fixed)
+            })
+            .await
+            .unwrap();
+        let frame = crate::stream::ImageFrame {
+            width: 1,
+            height: 1,
+            format: crate::stream::PixelFormat::UInt32,
+            frame_number: 1,
+            time_at_frame: 0.0,
+            threshold_id: 0,
+            integration_size: 0,
+            pixels: Vec::new(),
+            header: serde_json::Value::Null,
+        };
+        let dims = || vec![NDDimension::new(1)];
+        let mut array = ctx
+            .pool
+            .alloc_with(dims(), NDDataBuffer::U32(vec![1]))
+            .unwrap();
+        attach_attributes(&ctx, &mut array, &frame).await;
+        assert_eq!(array.timestamp, EpicsTimestamp::from(fixed));
+
+        let (tx, mut rx) = epics_rs::ad_core::plugin::channel::ndarray_channel("TPX_TS_SINK", 4);
+        ctx.outputs[4].lock().add(tx);
+        let array = ctx
+            .pool
+            .alloc_with(dims(), NDDataBuffer::U32(vec![1]))
+            .unwrap();
+        ctx.publish_at(4, array, 1.0).await;
+        let posted = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(posted.timestamp, EpicsTimestamp::from(fixed));
     }
 
     /// serval_stream.cpp:177-183 allocates the frame with a NULL pData, so a
