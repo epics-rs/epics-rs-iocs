@@ -99,15 +99,18 @@ pub fn anc150_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             let controller = Arc::new(Mutex::new(controller));
+            let mut logs = Vec::new();
             let axes = (0..num_axes as usize)
                 .map(|axis| {
-                    let ax = Anc150Axis::new(controller.clone(), axis)
+                    let ax = Anc150Axis::new(controller.clone(), card, axis)
                         .map_err(|e| format!("ANC150AsynConfig: axis {axis}: {e}"))?;
+                    logs.push(ax.log());
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     Ok(motor)
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             MOTOR_ANC150.set_card(card, axes, moving_poll_ms, idle_poll_ms);
+            MOTOR_ANC150.set_axis_logs(card, logs);
             Ok(CommandOutcome::Continue)
         },
     )

@@ -42,6 +42,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model2::AxisLog;
 use motor_common::util::nint;
 
 /// Response buffer size (C `BUFFER_SIZE` 100, padded for the multi-line reply).
@@ -198,6 +199,10 @@ fn slew(current: f64, target: f64, time_remaining: f64, move_interval: f64) -> (
 /// One ANC150 axis sharing a controller. Implements [`AsynMotor`].
 pub struct Anc150Axis {
     controller: Arc<Mutex<Anc150Controller>>,
+    /// C `pAxis->card`.
+    card: i32,
+    /// C `pAxis->logParam`.
+    log: Arc<AxisLog>,
     /// 0-based axis index; the wire axis number is `axis + 1`.
     axis: usize,
     current_position: f64,
@@ -217,7 +222,11 @@ pub struct Anc150Axis {
 impl Anc150Axis {
     /// Construct axis `axis` (0-based): read its step frequency (`getf`) and put
     /// it in stepping mode (`setm N stp`). Performs blocking serial I/O.
-    pub fn new(controller: Arc<Mutex<Anc150Controller>>, axis: usize) -> AsynResult<Self> {
+    pub fn new(
+        controller: Arc<Mutex<Anc150Controller>>,
+        card: i32,
+        axis: usize,
+    ) -> AsynResult<Self> {
         let mut frequency = 0;
         {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -228,6 +237,8 @@ impl Anc150Axis {
         }
         Ok(Self {
             controller,
+            card,
+            log: Arc::default(),
             axis,
             current_position: 0.0,
             target_position: 0.0,
@@ -247,6 +258,11 @@ impl Anc150Axis {
 
     fn lock(&self) -> MutexGuard<'_, Anc150Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The log `Model2::set_axis_logs` attaches.
+    pub fn log(&self) -> Arc<AxisLog> {
+        self.log.clone()
     }
 
     /// The jog limit fields (kept for parity with C's non-storing behaviour).
@@ -363,6 +379,17 @@ impl AsynMotor for Anc150Axis {
         let mode = if enable { "stp" } else { "gnd" };
         ctrl.send_only(&format!("setm {} {}", self.axis + 1, mode))?;
         Ok(())
+    }
+
+    /// C `motorAxisforceCallback`; the poll that follows is the poller's.
+    fn force_callback(&mut self, _user: &AsynUser) {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "motorAxisforceCallback: request card {}, axis {} status update\n",
+                self.card, self.axis
+            ),
+        );
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -504,5 +531,59 @@ mod tests {
         assert_eq!(parse_frequency("frequency = 400"), Some(400));
         assert_eq!(parse_frequency("frequency = 1000 "), Some(1000));
         assert_eq!(parse_frequency("mode = stp"), None);
+    }
+
+    /// drvANC150Asyn.cc:532-546: a GET_INFO's motorAxisforceCallback prints
+    /// its FLOW line, 0-based axis, on the axis's log.
+    #[epics_rs::base::epics_test]
+    async fn force_callback_prints_the_c_flow_line() {
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::testing::{LineRig, run_command};
+
+        static DRIVER: Model2 = Model2::new("ancForceTest", 0);
+        let (_line, io) = LineRig::new("ancForceLine", |last| match last {
+            "ver" => "ver\r\nattocube ANC150\r\nOK\r\n".into(),
+            c if c.starts_with("getf") => format!("{c}\r\nfrequency = 1000\r\nOK\r\n"),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(
+            Anc150Controller::new(io, "ancForceLine").unwrap(),
+        ));
+        let axes: Vec<_> = (0..2)
+            .map(|axis| Anc150Axis::new(ctrl.clone(), 1, axis).unwrap())
+            .collect();
+        let logs = axes.iter().map(Anc150Axis::log).collect();
+        let axes: Vec<_> = axes.into_iter().map(|a| Arc::new(Mutex::new(a))).collect();
+        let motors = axes
+            .iter()
+            .map(|a| a.clone() as Arc<Mutex<dyn AsynMotor>>)
+            .collect();
+        DRIVER.set_card(1, motors, 100, 1000);
+        DRIVER.set_axis_logs(1, logs);
+        let args = vec![
+            ArgValue::String("ancForce".into()),
+            ArgValue::String("ancForceTest".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(2),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&DRIVER]), args).await;
+
+        let path = std::env::temp_dir().join(format!("anc-force-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("ancForce"), TraceMask::FLOW);
+        trace.set_device_trace_mask("ancForce", 1, TraceMask::FLOW);
+        trace.set_device_trace_info_mask("ancForce", 1, TraceInfoMask::empty());
+        trace.set_device_trace_file("ancForce", 1, TraceFile::File(file));
+        axes[1].lock().unwrap().force_callback(&AsynUser::default());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            text,
+            "motorAxisforceCallback: request card 1, axis 1 status update\n"
+        );
     }
 }
