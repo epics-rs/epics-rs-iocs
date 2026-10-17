@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -265,8 +265,8 @@ impl AsynMotor for DrvMvp2001Axis {
         self.failure
     }
 
-    fn set_record_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
-        self.record_velocity = velocity;
+    fn set_record_fields(&mut self, _user: &AsynUser, fields: &RecordFields) -> AsynResult<()> {
+        self.record_velocity = fields.velocity;
         Ok(())
     }
 
@@ -309,19 +309,20 @@ impl AsynMotor for DrvMvp2001Axis {
         Ok(())
     }
 
-    /// The MVP 2001 cannot home. C's record still sends the SET_VELOCITY,
-    /// SET_ACCEL and GO around the empty HOME, and that GO's `M` starts the
-    /// last loaded move again; nothing is sent here.
+    /// The MVP 2001 cannot home: HOME sends nothing, but the record's
+    /// SET_VELOCITY, SET_ACCEL and GO around it go out, and GO's `M` starts
+    /// the last loaded move again (devMVP2001.cc:323,332). No PREM or POST.
     fn home(
         &mut self,
         _user: &AsynUser,
         _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
+        velocity: f64,
+        acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
         self.strings = None;
-        self.post = None;
+        let setup = self.speed_and_accel(velocity, acceleration);
+        self.send_move(&setup, &["M".into()]);
         Ok(())
     }
 
@@ -505,7 +506,14 @@ mod tests {
         let mut axis = DrvMvp2001Axis::new(chain, 0, (0, 0));
         let user = AsynUser::new(0);
         axis.set_out_parm(&user, b"4000,500").unwrap();
-        axis.set_record_velocity(&user, 1000.0).unwrap();
+        axis.set_record_fields(
+            &user,
+            &RecordFields {
+                velocity: 1000.0,
+                srev: 200,
+            },
+        )
+        .unwrap();
         axis.move_relative(&user, 10.0, 0.0, 2000.0, 1e6).unwrap();
         let sent = line.sent();
         let tail = &sent[sent.len() - 4..];
@@ -513,5 +521,35 @@ mod tests {
         axis.move_relative(&user, 10.0, 0.0, 2000.0, 1e3).unwrap();
         let sent = line.sent();
         assert_eq!(sent[sent.len() - 3], "1 AC 8");
+    }
+
+    /// devMVP2001.cc:323-345: HOME itself sends nothing, the SET_VELOCITY,
+    /// SET_ACCEL and GO the record sends around it do; PREM stays unsent.
+    /// SET_ACCEL caps at VELO as for a move (:373), which the record hands
+    /// over ahead of the transaction.
+    #[test]
+    fn home_sends_speed_accel_and_go() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::new("mvp2001Home", |last| match last {
+            "1 ST" => "0001 0000".into(),
+            "1 POS" => "0001 00000000".into(),
+            _ => String::new(),
+        });
+        let chain = Arc::new(Mutex::new(Mvp2001Chain::new(io)));
+        let mut axis = DrvMvp2001Axis::new(chain, 0, (0, 0));
+        let user = AsynUser::new(0);
+        axis.set_out_parm(&user, b"4000,500").unwrap();
+        axis.set_move_strings(&user, b"ZZ", None).unwrap();
+        axis.set_record_fields(
+            &user,
+            &RecordFields {
+                velocity: 1000.0,
+                srev: 200,
+            },
+        )
+        .unwrap();
+        line.sent();
+        axis.home(&user, 0.0, 1000.0, 1e3, true).unwrap();
+        assert_eq!(line.sent(), ["1 SP 30", "1 AC 8", "1 M"]);
     }
 }
