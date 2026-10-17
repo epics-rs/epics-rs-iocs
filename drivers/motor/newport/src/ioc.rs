@@ -316,18 +316,13 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             let controller = Arc::new(Mutex::new(controller));
+            let poller = Controller::new();
             for axis in 0..agap::NUM_AXES {
                 let motor: Arc<Mutex<dyn AsynMotor>> =
                     Arc::new(Mutex::new(AgapAxis::new(controller.clone(), axis)));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, AGAP_CONEX.cpp:79
-                )?;
+                poller.install(asyn_user(&port_name, axis as i32), motor)?;
             }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // AGAP_CONEX.cpp:79
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1906,10 +1901,44 @@ mod tests {
 mod one_poller {
     use std::net::TcpListener;
 
+    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::user::AsynUser;
     use epics_rs::base::server::iocsh::registry::ArgValue;
     use motor_common::testing::pollers_after;
 
     use super::*;
+
+    /// A serial port under `name` that answers every read with `reply`.
+    fn publish_line(name: &str, reply: &'static str) {
+        struct Line(PortDriverBase, &'static str);
+        impl PortDriver for Line {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+                let n = self.1.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.1.as_bytes()[..n]);
+                Ok(n)
+            }
+        }
+        let base = PortDriverBase::new(name, 1, PortFlags::default());
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Line(base, reply), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        std::mem::forget(rt);
+    }
 
     /// HXPDriver.cpp:116: one startPoller for the six axes.
     #[epics_rs::base::epics_test]
@@ -1945,6 +1974,21 @@ mod one_poller {
             ArgValue::String("0.001".into()),
         ];
         let cmd = smc100_create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// AGAP_CONEX.cpp:79: one startPoller for axes U and V.
+    #[epics_rs::base::epics_test]
+    async fn agap_conex_create_controller_polls_its_axes_on_one_poller() {
+        publish_line("agapOnePollerLine", "1VE CONEX-AGAP");
+        let args = vec![
+            ArgValue::String("agapOnePoller".into()),
+            ArgValue::String("agapOnePollerLine".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+        ];
+        let cmd = agap_conex_create_controller_command();
         assert_eq!(pollers_after(cmd, args).await, 1);
     }
 
