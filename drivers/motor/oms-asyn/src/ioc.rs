@@ -13,9 +13,9 @@ use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::iocsh::{arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
-use motor_common::{Controller, asyn_user, register_port};
+use motor_common::{Controller, asyn_user, register_port_with};
 
-use crate::oms::{OmsAxis, OmsController};
+use crate::oms::{OmsAxis, OmsController, OmsParams};
 
 /// C `OMS_MAX_AXES`.
 const OMS_MAX_AXES: usize = 10;
@@ -59,7 +59,8 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
             let init_string = req_string(args, 5, "initstring").unwrap_or_default();
             let who = format!("{controller_type}Config");
 
-            register_port(ctx, &port_name, num_axes)?;
+            let (params, report) = OmsParams::new(controller_type);
+            register_port_with(ctx, &port_name, num_axes, params)?;
             // On each early return C still runs startPoller on the half-built
             // controller and crashes (a C bug); the port keeps no axes here.
             let Some(handle) = connect_with_default_eos(&serial_port, TIMEOUT, &who) else {
@@ -85,6 +86,7 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                     return Ok(CommandOutcome::Continue);
                 }
             };
+            let _ = report.fw.set(fw);
             if fw.minor < min_fw_minor {
                 println!(
                     "{}",
@@ -112,6 +114,7 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                 return Ok(CommandOutcome::Continue);
             }
 
+            let shared = controller.poll_shared().clone();
             let controller = Arc::new(Mutex::new(controller));
             let axes = (0..total_axes)
                 .map(|axis| {
@@ -119,6 +122,7 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                         .map_err(|e| format!("{cmd_name}: axis {axis}: {e}"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let _ = report.axes.set(shared);
             crate::poller::init_positions(&controller);
             let mut posters = Vec::with_capacity(total_axes);
             // No timed pass: the OMS poller posts (zero periods wait on

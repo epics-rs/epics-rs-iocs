@@ -50,7 +50,7 @@
 //!   the version.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -64,6 +64,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use motor_common::util::atoi;
+use motor_common::{ControllerParams, ControllerReport};
 
 use crate::poller::PollShared;
 
@@ -83,7 +84,7 @@ const MAX_ACCEL: i32 = 8_000_000;
 const MAX_POSITION: i32 = 67_000_000;
 
 /// C `fwMajor`, `fwMinor`, `fwRevision`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FirmwareVersion {
     pub major: i32,
     pub minor: i32,
@@ -125,6 +126,81 @@ fn oms_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
         message: message.into(),
+    }
+}
+
+/// What C `omsBaseController::report` prints from the controller: the
+/// version once read and the axes once Init has created them.
+#[derive(Default)]
+pub struct OmsReportState {
+    pub(crate) fw: OnceLock<FirmwareVersion>,
+    pub(crate) axes: OnceLock<Arc<PollShared>>,
+}
+
+/// The controller's report: its type and the state the Config command fills.
+pub struct OmsParams {
+    controller_type: &'static str,
+    state: Arc<OmsReportState>,
+}
+
+impl OmsParams {
+    pub fn new(controller_type: &'static str) -> (Self, Arc<OmsReportState>) {
+        let state = Arc::new(OmsReportState::default());
+        let params = Self {
+            controller_type,
+            state: state.clone(),
+        };
+        (params, state)
+    }
+}
+
+impl ControllerParams for OmsParams {
+    /// C `omsBaseController::report` (omsBaseController.cpp:130-161). C
+    /// dereferences a null `pAxes` on a controller whose Init failed; here
+    /// it has no axis lines.
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        use epics_rs::motor::controller_port::index;
+        // MOTOR_STATUS_HAS_ENCODER, MSTA bit 8.
+        const HAS_ENCODER: usize = index::STATUS_DIRECTION + 8;
+
+        let fw = self.state.fw.get().copied().unwrap_or_default();
+        let axes = self.state.axes.get();
+        let _ = writeln!(
+            out,
+            "Oms {} motor driver {}, numAxes={}; Firmware: {}.{}.{}",
+            self.controller_type,
+            ctx.port_name(),
+            axes.map_or(ctx.num_axes(), |a| a.axis_count()),
+            fw.major,
+            fw.minor,
+            fw.revision,
+        );
+        for axis in 0..axes.map_or(0, |a| a.axis_count()) {
+            let _ = writeln!(out, "  axis {axis}");
+            if level > 0 {
+                let addr = axis as i32;
+                // An unset parameter prints 0, where C prints an
+                // uninitialised local.
+                let float = |reason| ctx.float64_param(addr, reason).unwrap_or(0.0);
+                let _ = writeln!(
+                    out,
+                    "    Current position = {:.6}, velocity = {:.6}",
+                    float(index::POSITION),
+                    float(index::VELOCITY),
+                );
+                if ctx.int32_param(addr, HAS_ENCODER).unwrap_or(0) != 0 {
+                    let _ = writeln!(
+                        out,
+                        "    Encoder position {:.6}",
+                        float(index::ENCODER_POSITION)
+                    );
+                }
+                if axes.is_some_and(|a| a.homing(axis)) {
+                    let _ = writeln!(out, "    Currently homing axis");
+                }
+            }
+        }
+        ctx.report(out, level);
     }
 }
 
@@ -536,6 +612,7 @@ impl AsynMotor for OmsAxis {
         self.last_min_velo = minvelo;
         let moved = self.lock().send_only(&cmd);
         self.poll_shared.moved(self.axis_index);
+        self.poll_shared.homed(self.axis_index);
         moved
     }
 
