@@ -153,6 +153,8 @@ pub struct DrvMvp2001Axis {
     limits: (i32, i32),
     /// The record's OUT parm, `"ENC_CPR,MAX_mA"`.
     parm: String,
+    /// The record's VELO in steps/s, `mr->velo / fabs(mr->mres)`.
+    record_velocity: f64,
     /// What the last failed poll raises: nothing on C `set_status`'s first
     /// missed `ST` (RETRY, drvMVP2001.cc:320), `CNTRL_COMM_ERR` and
     /// `RA_PROBLEM` on the next (COMM_ERR, :326). Per axis, as the chain's
@@ -179,6 +181,7 @@ impl DrvMvp2001Axis {
             addr: signal + 1,
             limits,
             parm: String::new(),
+            record_velocity: 0.0,
             failure: PollFailure::NONE,
             status: MotorStatus {
                 gain_support: true,
@@ -217,14 +220,14 @@ impl DrvMvp2001Axis {
         })
     }
 
-    /// `SET_VELOCITY` and `SET_ACCEL` of a move. C works SET_ACCEL's speed
-    /// out from the record's VELO; the record hands the driver the move's
-    /// own speed, which is VELO for every move but a backlash or jog.
+    /// `SET_VELOCITY` and `SET_ACCEL` of a move. SET_ACCEL caps at the
+    /// record's VELO, not the move's speed (devMVP2001.cc:373), which
+    /// differs for a backlash or jog.
     fn speed_and_accel(&self, velocity: f64, acceleration: f64) -> [String; 2] {
-        let sp = nint(velocity * 0.03);
+        let sp = nint(self.record_velocity * 0.03);
         let ac = nint(acceleration * 0.03 * f64::from(self.encoder_cpr()) * 0.0000625);
         let ac = if ac < sp { ac.max(1) } else { sp };
-        [format!("SP {sp}"), format!("AC {ac}")]
+        [format!("SP {}", nint(velocity * 0.03)), format!("AC {ac}")]
     }
 
     /// A move or jog: its PREM, if any, goes between the set-up and the
@@ -260,6 +263,11 @@ fn refused(message: &str) -> AsynError {
 impl AsynMotor for DrvMvp2001Axis {
     fn poll_failure(&self) -> PollFailure {
         self.failure
+    }
+
+    fn set_record_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.record_velocity = velocity;
+        Ok(())
     }
 
     fn move_absolute(
@@ -481,5 +489,29 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// devMVP2001.cc:373-386: SET_ACCEL caps at `mr->velo / mres`, so a
+    /// backlash move at BVEL above VELO still takes VELO's AC.
+    #[test]
+    fn set_accel_caps_at_the_record_velocity() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::new("mvp2001Accel", |last| match last {
+            "1 ST" => "0001 0000".into(),
+            "1 POS" => "0001 00000000".into(),
+            _ => String::new(),
+        });
+        let chain = Arc::new(Mutex::new(Mvp2001Chain::new(io)));
+        let mut axis = DrvMvp2001Axis::new(chain, 0, (0, 0));
+        let user = AsynUser::new(0);
+        axis.set_out_parm(&user, b"4000,500").unwrap();
+        axis.set_record_velocity(&user, 1000.0).unwrap();
+        axis.move_relative(&user, 10.0, 0.0, 2000.0, 1e6).unwrap();
+        let sent = line.sent();
+        let tail = &sent[sent.len() - 4..];
+        assert_eq!(tail, ["1 SP 60", "1 AC 30", "1 LR 10", "1 M"]);
+        axis.move_relative(&user, 10.0, 0.0, 2000.0, 1e3).unwrap();
+        let sent = line.sent();
+        assert_eq!(sent[sent.len() - 3], "1 AC 8");
     }
 }
