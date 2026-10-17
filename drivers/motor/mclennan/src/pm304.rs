@@ -115,6 +115,8 @@ impl Pm304Controller {
         } else {
             Model::Pm600
         };
+        // C reads 1ID still assuming a PM304 (drvPM304.cc:583) and so keeps a
+        // PM600's echo in the ident it reports (:663); a C defect not copied.
         ctrl.ident = ctrl.strip_echo(&ident).trim().to_string();
 
         for axis in 1..=n_axes {
