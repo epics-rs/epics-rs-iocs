@@ -31,11 +31,10 @@ asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 # ---- SMC100 controller ----
 # SMC100CreateController(portName, SMC100PortName, numAxes, movingPollPeriod,
 #                        idlePollPeriod, eguPerStep)
-SMC100CreateController("$(PORT)", "$(SERIAL)", 1, 100, 1000, "1.0")
+SMC100CreateController("$(PORT)", "$(SERIAL)", 1, 100, 1000, "0.00005")
 
-# MRES only sets the record's raw-count resolution (display/deadband
-# granularity); positions travel the driver boundary in EGU directly.
-dbLoadRecords("$(SMC100_IOC)/db/smc100.template", "P=$(P),M=$(M),PORT=$(PORT),ADDR=0,MRES=0.001,EGU=mm")
+# The boundary is raw steps: MRES must equal eguPerStep above.
+dbLoadRecords("$(SMC100_IOC)/db/smc100.template", "P=$(P),M=$(M),PORT=$(PORT),ADDR=0,MRES=0.00005")
 
 iocInit()
 

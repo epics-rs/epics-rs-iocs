@@ -13,14 +13,13 @@
 //!
 //! ## Units
 //!
-//! The asyn-rs motor boundary is dial-frame EGU in both directions (the
-//! record converts EGU ↔ raw counts itself), and SMC100 commands/readbacks
-//! are already in physical units (mm) — so the correct wire scale is 1.0 in
-//! the normal record-EGU-equals-controller-units configuration. `step_size`
-//! is kept as a record-EGU → controller-units conversion factor for records
-//! deliberately using a different unit (e.g. µm records on an mm
-//! controller). C's `stepSize_` (`eguPerStep`) converted its raw-step record
-//! boundary instead; passing that C value here would scale moves wrongly.
+//! The record boundary is raw steps, as in SMC100Driver.cpp: every value is
+//! `steps * stepSize_` (the `eguPerStep` of `SMC100CreateController`) and the
+//! `TP` readback is `position / stepSize_`, so the record's `MRES` must equal
+//! `eguPerStep`. The jog targets (`SR?`/`SL?`) are controller units already.
+//!
+//! C creates the controller with an `eguPerStep` of 0 and divides by it at
+//! every poll; `SMC100CreateController` refuses it here.
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
@@ -40,15 +39,13 @@ pub struct Smc100Axis {
     /// 1-based controller axis number sent as the command prefix (C
     /// `axisNo_ + 1`). The SMC100 supports a single axis, addressed as `1`.
     axis: u8,
-    /// Controller units per record EGU (wire scale; 1.0 in the normal
-    /// configuration — see the module Units note).
+    /// Controller units per record step (C `stepSize_`, `eguPerStep`).
     step_size: f64,
 }
 
 impl Smc100Axis {
     /// Create a driver for `axis` (1-based) over the given serial-port handle.
-    /// `step_size` is the controller-units-per-record-EGU wire scale
-    /// (normally 1.0; see the module Units note).
+    /// `step_size` is C's `eguPerStep` (module Units note).
     pub fn new(handle: SyncIOHandle, axis: u8, step_size: f64) -> Self {
         Self {
             handle,
@@ -70,8 +67,8 @@ impl Smc100Axis {
         Ok(String::from_utf8_lossy(&reply).into_owned())
     }
 
-    /// C `SMC100Axis::sendAccelAndVelocity`: send `VA` then `AC`, through the
-    /// wire scale (identity in the normal configuration).
+    /// C `SMC100Axis::sendAccelAndVelocity`: send `VA` then `AC`, in steps
+    /// times `stepSize_`.
     fn send_accel_and_velocity(&self, acceleration: f64, velocity: f64) -> AsynResult<()> {
         self.write(&protocol::cmd_set_velocity(
             self.axis,
@@ -178,8 +175,7 @@ impl AsynMotor for Smc100Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        // Position (TP): controller units -> record EGU via the wire scale
-        // (identity in the normal configuration).
+        // Position (TP): controller units to record steps.
         let position_units =
             protocol::parse_value(&self.write_read(&protocol::cmd_query_position(self.axis))?)
                 .ok_or_else(|| parse_error("TP"))?;
@@ -204,5 +200,51 @@ impl AsynMotor for Smc100Axis {
             vbas_supported: false,
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use motor_common::testing::LineRig;
+
+    /// SMC100Driver.cpp: values go out as steps * stepSize_, TP comes back
+    /// / stepSize_, and the jog targets SR?/SL? are sent unscaled.
+    #[test]
+    fn record_steps_scale_by_egu_per_step() {
+        let (line, io) = LineRig::new("smc100_steps", |last| {
+            match last {
+                "1TP" => "1TP2.5",
+                "1TS" => "1TS000033",
+                "1SR?" => "1SR25",
+                "1SL?" => "1SL-5",
+                _ => "",
+            }
+            .to_string()
+        });
+        let mut axis = Smc100Axis::new(io, 1, 0.00005);
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 20000.0, 0.0, 2000.0, 4000.0)
+            .unwrap();
+        axis.move_relative(&user, -100.0, 0.0, 2000.0, 4000.0)
+            .unwrap();
+        axis.move_velocity(&user, 0.0, 2000.0, 4000.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "1VA0.100000",
+                "1AC0.200000",
+                "1PA1.000000",
+                "1VA0.100000",
+                "1AC0.200000",
+                "1PR-0.005000",
+                "1VA0.100000",
+                "1AC0.200000",
+                "1SR?",
+                "1SL?",
+                "1PA25.000000"
+            ]
+        );
+        assert_eq!(axis.poll(&user).unwrap().position, 50000.0);
     }
 }
