@@ -23,7 +23,8 @@ epicsEnvSet("IP",    "192.168.0.254")
 #                     idlePollPeriod, enableSetPosition, setPositionSettlingTime)
 XPSCreateController("$(PORT)", "$(IP)", 5001, 1, 100, 1000, 0, 0)
 # XPSCreateAxis(portName, axis, positionerName, stepsPerUnit)
-XPSCreateAxis("$(PORT)", 0, "GROUP1.POSITIONER", "1")
+# stepsPerUnit is 1/MRES of the axis record.
+XPSCreateAxis("$(PORT)", 0, "GROUP1.POSITIONER", "20480")
 # XPSCreateProfile(portName, maxPoints, ftpUsername, ftpPassword)
 XPSCreateProfile("$(PORT)", 2000, "Administrator", "Administrator")
 
