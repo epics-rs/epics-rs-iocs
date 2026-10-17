@@ -384,7 +384,10 @@ impl TimePix3Driver {
         if self.destinations.allows(destination) {
             return Ok(());
         }
-        let message = format!("Destination blocked by startup allowlist: {destination}");
+        let message = adlog::snprintf(
+            384,
+            format!("Destination blocked by startup allowlist: {destination}"),
+        );
         self.set_text(self.p.write_msg, &message)?;
         self.ad.port_base.trace_print(
             TraceMask::ERROR,
@@ -3988,6 +3991,19 @@ mod tests {
             det.text(p.write_msg, 0),
             "Destination blocked by startup allowlist: file:/data"
         );
+        // C formats it into a char[384] (ADTimePix.cpp:176-178).
+        let long = format!("file:/{}", "d".repeat(500));
+        det.ad
+            .port_base
+            .set_string_param(p.raw_base, 0, long.as_str())
+            .unwrap();
+        assert!(
+            det.write_int32(&mut AsynUser::new(p.write_data), 1)
+                .is_err()
+        );
+        let msg = det.text(p.write_msg, 0);
+        assert_eq!(msg.len(), 383);
+        assert!(msg.starts_with("Destination blocked by startup allowlist: file:/ddd"));
         det.configure_destinations("tcp://*x").unwrap();
         assert_eq!(
             det.text(p.destination_policy, 0),
