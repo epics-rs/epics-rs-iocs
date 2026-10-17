@@ -343,7 +343,6 @@ pub struct Emc18011Axis {
     /// `RA_PROBLEM` on the next (COMM_ERR, :306). Per axis, as the
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
-    last_status: MotorStatus,
     strings: MoveStrings,
 }
 
@@ -358,10 +357,6 @@ impl Emc18011Axis {
             index,
             prev_position: 0.0,
             failure: PollFailure::NONE,
-            last_status: MotorStatus {
-                done: true,
-                ..MotorStatus::default()
-            },
             strings: MoveStrings::default(),
         };
         {
@@ -381,6 +376,19 @@ impl Emc18011Axis {
             selection: self.lock().selection.clone(),
             index: self.index,
         })
+    }
+
+    fn status(&self, z: &ZStatus) -> MotorStatus {
+        MotorStatus {
+            position: self.prev_position,
+            encoder_position: 0.0,
+            velocity: 0.0,
+            done: z.done,
+            high_limit: z.plus_ls,
+            low_limit: z.minus_ls,
+            direction: z.direction,
+            ..MotorStatus::default()
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Emc18011Controller> {
@@ -549,13 +557,15 @@ impl AsynMotor for Emc18011Axis {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Only the selected motor yields fresh status; others report last
-        // state after C's 0.1 s "in-case of record retry loop"
-        // (drvEMC18011.cc:288-292).
+        // Only the selected motor yields fresh status; C reports the others
+        // as Z_STOPPED at their last position after a 0.1 s "in-case of
+        // record retry loop", and the controller back in NORMAL
+        // (drvEMC18011.cc:286-297).
         if !ctrl.selection.holds(self.index) {
+            ctrl.comm_state = CommState::Normal;
             drop(ctrl);
             sleep(UNSELECTED_DELAY);
-            return Ok(self.last_status.clone());
+            return Ok(self.status(&decode_z(Z_STOPPED)));
         }
         let _ = ctrl.select(self.index);
 
@@ -605,19 +615,7 @@ impl AsynMotor for Emc18011Axis {
         drop(ctrl);
 
         self.prev_position = position;
-
-        let status = MotorStatus {
-            position,
-            encoder_position: 0.0,
-            velocity: 0.0,
-            done: z.done,
-            high_limit: z.plus_ls,
-            low_limit: z.minus_ls,
-            direction: z.direction,
-            ..MotorStatus::default()
-        };
-        self.last_status = status.clone();
-        Ok(status)
+        Ok(self.status(&z))
     }
 }
 
@@ -841,6 +839,28 @@ mod tests {
         ];
         line.sent();
         (line, axes, z)
+    }
+
+    /// drvEMC18011.cc:286-297: an unselected motor reads as stopped off
+    /// its limits at its last position, and resets the controller to
+    /// NORMAL, so the selected motor's next bad `Z` is RETRY again.
+    #[test]
+    fn an_unselected_motor_reads_stopped_and_resets_the_comm_state() {
+        let (_line, [mut a, mut b], z) = pair_rig("emcUnsel");
+        let user = AsynUser::default();
+        assert!(!b.build_trans().defers(&MotorCommand::Poll));
+        *z.lock().unwrap() = Z_LSUP;
+        assert!(b.poll(&user).unwrap().high_limit);
+
+        assert!(!a.build_trans().defers(&MotorCommand::Poll));
+        *z.lock().unwrap() = 'x';
+        assert!(a.poll(&user).is_err());
+        assert_eq!(a.poll_failure(), PollFailure::NONE);
+        let s = b.poll(&user).unwrap();
+        assert!(s.done && s.direction && !s.high_limit && !s.low_limit);
+        assert_eq!(s.position, 100.0);
+        assert!(a.poll(&user).is_err());
+        assert_eq!(a.poll_failure(), PollFailure::NONE);
     }
 
     /// devEMC18011.cc:206-231: SET_VELOCITY claims a free controller; the
