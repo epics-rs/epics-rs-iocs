@@ -17,7 +17,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue,
+    AxisUser, ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue,
     has_motor_axis, index,
 };
 
@@ -433,7 +433,7 @@ impl Nf874xControllerParams {
 
     /// Send `mnemonic value` to the axis at `user`. C dereferences the null
     /// axis at address 0; this refuses it.
-    fn send(&self, user: &AsynUser, mnemonic: &str, value: String) -> AsynResult<()> {
+    fn send(&self, user: AxisUser<'_>, mnemonic: &str, value: String) -> AsynResult<()> {
         if user.addr < 1 {
             return Err(nf_err("nf874x has no axis 0"));
         }
@@ -504,7 +504,7 @@ impl ControllerParams for Nf874xControllerParams {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         // C dereferences the null axis there (874xMotorDriver.cpp:152-157); refused as the base does.
@@ -529,7 +529,7 @@ impl ControllerParams for Nf874xControllerParams {
     fn write_float64(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: f64,
     ) -> ParamWrite {
         // C dereferences the null axis there (874xMotorDriver.cpp:193-197); refused as the base does.
