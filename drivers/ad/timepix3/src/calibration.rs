@@ -46,8 +46,32 @@ pub struct PathPolicy {
     root: Option<PathBuf>,
 }
 
+/// C `fs::canonical`. Rust's Windows form is a verbatim `\\?\` path, which
+/// MSVC's `canonical` strips back to `C:\…` or `\\server\share\…`.
+pub fn canonical(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    let canonical = without_verbatim_prefix(canonical);
+    Ok(canonical)
+}
+
+#[cfg(windows)]
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    use std::path::Prefix;
+    let kind = match path.components().next() {
+        Some(Component::Prefix(p)) => Some(p.kind()),
+        _ => None,
+    };
+    let text = path.to_string_lossy();
+    match kind {
+        Some(Prefix::VerbatimDisk(_)) => PathBuf::from(&text[4..]),
+        Some(Prefix::VerbatimUNC(..)) => PathBuf::from(format!("\\\\{}", &text[8..])),
+        _ => path.clone(),
+    }
+}
+
 fn canonical_dir(path: &Path) -> Option<PathBuf> {
-    let canonical = std::fs::canonicalize(path).ok()?;
+    let canonical = canonical(path).ok()?;
     canonical.is_dir().then_some(canonical)
 }
 
@@ -95,8 +119,7 @@ impl PathPolicy {
         }
         let requested = self.validate_directory(directory)?.join(file_name);
         let target = if access == PathAccess::Read || requested.exists() {
-            let target =
-                std::fs::canonicalize(&requested).map_err(|_| PathError::TargetUnavailable)?;
+            let target = canonical(&requested).map_err(|_| PathError::TargetUnavailable)?;
             if access == PathAccess::Read && !target.is_file() {
                 return Err(PathError::TargetNotRegular);
             }
@@ -144,6 +167,20 @@ mod tests {
         dir
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_canonical_path_has_no_verbatim_prefix() {
+        for (raw, plain) in [
+            (r"\\?\C:\cal\a.bpc", r"C:\cal\a.bpc"),
+            (r"\\?\UNC\host\share\a.bpc", r"\\host\share\a.bpc"),
+            (r"C:\cal\a.bpc", r"C:\cal\a.bpc"),
+        ] {
+            assert_eq!(without_verbatim_prefix(raw.into()), PathBuf::from(plain));
+        }
+        let tmp = canonical(&std::env::temp_dir()).unwrap();
+        assert!(!tmp.to_string_lossy().starts_with(r"\\?\"), "{tmp:?}");
+    }
+
     #[test]
     fn an_unconfigured_or_relative_root_refuses() {
         let mut p = PathPolicy::default();
@@ -167,7 +204,7 @@ mod tests {
         let sub = t.join("root/sub/");
         assert_eq!(
             p.validate_directory(sub.to_str().unwrap()),
-            Ok(t.join("root/sub").canonicalize().unwrap())
+            Ok(canonical(&t.join("root/sub")).unwrap())
         );
         let escape = t.join("root/../outside");
         assert_eq!(
