@@ -1106,6 +1106,13 @@ impl QuadEmBase {
             port_base.set_float64_param(params.double_data, addr as i32, 0.0)?;
         }
 
+        // No record queues on most addresses, so nothing would ever connect
+        // them; C exceptionConnects all twelve so asynReport shows them
+        // connected (drvQuadEM.cpp:142-152).
+        for addr in 0..=QE_MAX_DATA {
+            port_base.connect_addr(addr as i32);
+        }
+
         let pool = DriverPool::for_driver(max_memory, &owner);
 
         let outputs = (0..=QE_MAX_DATA)
@@ -1703,6 +1710,16 @@ mod tests {
                 )
             )
         );
+    }
+
+    /// drvQuadEM.cpp:148-152: every address 0-11 is connected at
+    /// construction, not only those a record later binds to.
+    #[test]
+    fn every_address_is_connected_at_construction() {
+        let base = QuadEmBase::new("QE_ADDR_CONNECT", 0).unwrap();
+        for addr in 0..=QE_MAX_DATA as i32 {
+            assert!(base.port_base.is_device_connected(addr), "addr {addr}");
+        }
     }
 
     fn acquire_busy(m: &FakeMeter) -> i32 {
