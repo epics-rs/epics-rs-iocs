@@ -414,16 +414,17 @@ pub struct ImsMDrivePlusAxis {
     pos_limit_switch: Option<i32>,
     /// I/O input number configured as the negative-limit switch.
     neg_limit_switch: Option<i32>,
-    has_encoder: bool,
     /// True between a `home` command and the move completing (drives the
     /// `R1=1` "homed" latch in [`Self::poll`]).
     homing: bool,
     /// The controller port and its IMS_LOCKEDROTOR, which the poll sets
     /// (ImsMDrivePlusMotorAxis.cpp:484), as it does the port's COMMS_ERROR.
     port: Option<(PortHandle, usize)>,
-    /// The MSTA word C's poll line reads back: the last poll's, with the
-    /// problem bit of a failed one.
-    word: u32,
+    /// C's status params as its polls left them, a failed poll's partial
+    /// reads included.
+    status: MotorStatus,
+    /// The status a failed poll left, for the poller to post.
+    failed: Option<MotorStatus>,
     /// The `motorStatusProblem_` sets of the last write.
     status_writes: Vec<StatusWrite>,
 }
@@ -443,10 +444,14 @@ impl ImsMDrivePlusAxis {
             home_switch: None,
             pos_limit_switch: None,
             neg_limit_switch: None,
-            has_encoder: false,
             homing: false,
             port: None,
-            word: 0,
+            status: MotorStatus {
+                // IMS honours a base velocity (VI).
+                vbas_supported: true,
+                ..Default::default()
+            },
+            failed: None,
             status_writes: Vec::new(),
         };
         if axis.config_axis() == AsynStatus::Error {
@@ -524,7 +529,8 @@ impl ImsMDrivePlusAxis {
         match self.write_read("PR EE") {
             Ok(resp) => {
                 let val = atoi(&resp);
-                self.has_encoder = val != 0;
+                self.status.has_encoder = val != 0;
+                self.status.gain_support = val != 0;
                 self.line.print(
                     TraceMask::IO_DRIVER,
                     format_args!(
@@ -760,12 +766,17 @@ impl ImsMDrivePlusAxis {
         status
     }
 
-    /// C `poll` up to its bail label; `position` is what it read of
-    /// `PR P`, which its trace line prints even when a later read fails.
-    fn poll_status(&mut self, position: &mut f64) -> AsynResult<MotorStatus> {
+    /// C `poll` up to its bail label, setting [`Self::status`] field by
+    /// field as C sets its params; `position` is what it read of `PR P`,
+    /// which its trace line prints even when a later read fails.
+    fn poll_status(&mut self, position: &mut f64) -> AsynResult<()> {
         *position = atof(&self.write_read("PR P")?);
-        let position = *position;
+        // C updates the encoder position too, even without an encoder.
+        self.status.position = *position;
+        self.status.encoder_position = *position;
         let moving = atoi(&self.write_read("PR MV")?) != 0;
+        self.status.moving = moving;
+        self.status.done = !moving;
 
         // On the falling edge of a home move, latch R1 = 1 (homed).
         if self.homing && !moving {
@@ -774,46 +785,27 @@ impl ImsMDrivePlusAxis {
         }
 
         // Home / limit switch inputs (only those configured on this drive).
-        let encoder_home = match self.home_switch {
-            Some(n) => atoi(&self.write_read(&format!("PR I{n}"))?) != 0,
-            None => false,
-        };
-        let high_limit = match self.pos_limit_switch {
-            Some(n) => atoi(&self.write_read(&format!("PR I{n}"))?) != 0,
-            None => false,
-        };
-        let low_limit = match self.neg_limit_switch {
-            Some(n) => atoi(&self.write_read(&format!("PR I{n}"))?) != 0,
-            None => false,
-        };
+        // C sets motorStatusHome_ (EA_HOME) from the home switch input.
+        if let Some(n) = self.home_switch {
+            self.status.encoder_home = atoi(&self.write_read(&format!("PR I{n}"))?) != 0;
+        }
+        if let Some(n) = self.pos_limit_switch {
+            self.status.high_limit = atoi(&self.write_read(&format!("PR I{n}"))?) != 0;
+        }
+        if let Some(n) = self.neg_limit_switch {
+            self.status.low_limit = atoi(&self.write_read(&format!("PR I{n}"))?) != 0;
+        }
 
-        let homed = atoi(&self.write_read("PR R1")?) > 0;
+        self.status.homed = atoi(&self.write_read("PR R1")?) > 0;
         // ST is the stall flag; C maps it to both following-error and slip. Only
         // slip/stall has a MotorStatus field, so both fold into slip_stall.
-        let stall = atoi(&self.write_read("PR ST")?) > 0;
-        let encoder_position = atof(&self.write_read("PR C2")?);
+        self.status.slip_stall = atoi(&self.write_read("PR ST")?) > 0;
+        self.status.encoder_position = atof(&self.write_read("PR C2")?);
         let locked_rotor = atoi(&self.write_read("PR LR")?);
         if let Some(&(_, reason)) = self.port.as_ref() {
             self.post(reason, locked_rotor);
         }
-
-        Ok(MotorStatus {
-            position,
-            encoder_position,
-            done: !moving,
-            moving,
-            high_limit,
-            low_limit,
-            // C sets motorStatusHome_ (EA_HOME) from the home switch input.
-            encoder_home,
-            homed,
-            slip_stall: stall,
-            has_encoder: self.has_encoder,
-            gain_support: self.has_encoder,
-            // IMS honours a base velocity (VI).
-            vbas_supported: true,
-            ..Default::default()
-        })
+        Ok(())
     }
 }
 
@@ -938,20 +930,24 @@ impl AsynMotor for ImsMDrivePlusAxis {
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let mut position = 0.0;
-        let status = self.poll_status(&mut position);
-        if let Ok(polled) = &status {
+        let status = self
+            .poll_status(&mut position)
+            .map(|()| self.status.clone());
+        if status.is_ok() {
             // C resets motorStatusCommsError_ and motorStatusProblem_ on
             // every good poll (:496-497); the problem bit a failed
             // IMS_* write set lives only in the params.
             self.line.take_comms_failed();
             self.post(index::STATUS_COMMS_ERROR, 0);
             self.post(STATUS_PROBLEM, 0);
-            self.word = MstaFlags::from_status(polled).bits();
+            self.failed = None;
         } else {
-            self.word |= MstaFlags::PROBLEM.bits();
+            self.failed = Some(self.status.clone());
         }
         let status = self.bail("poll()", "polling motor", status);
-        let word = self.word;
+        let mut word = MstaFlags::from_status(&self.status);
+        word.set(MstaFlags::PROBLEM, status.is_err());
+        let word = word.bits();
         self.line.print(
             TraceMask::IO_DRIVER,
             format_args!(
@@ -960,6 +956,10 @@ impl AsynMotor for ImsMDrivePlusAxis {
             ),
         );
         status
+    }
+
+    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+        self.failed.take()
     }
 
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
@@ -987,7 +987,7 @@ mod tests {
             ImsLine::new(handle, String::new(), "IMS_MOTOR"),
             "IMS_MOTOR",
         );
-        assert!(!axis.has_encoder);
+        assert!(!axis.status.has_encoder);
         assert_eq!(
             (
                 axis.home_switch,
@@ -1189,9 +1189,45 @@ mod tests {
             w("R1=1"),
             wr("PR R1", ""),
             wr("PR ER", "86"),
-            own("poll(): POS=0.000000, MSTAT=512"),
+            own("poll(): POS=0.000000, MSTAT=514"),
         ]);
         assert_eq!(lines, want);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:407-427, 486-503: a poll that bails keeps
+    /// the params it set first, here RA_DONE from `PR MV`; a good poll
+    /// leaves nothing to take.
+    #[test]
+    fn a_failed_poll_keeps_what_it_set_before_the_bail() {
+        let mut failed = None;
+        let mut after_good = Some(MotorStatus::default());
+        axis_error_lines(
+            "imsPartial",
+            "imsPartialLine",
+            |l| l == "PR R1",
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.poll(&user).is_err());
+                failed = axis.take_failed_poll_status();
+                assert_eq!(axis.take_failed_poll_status(), None);
+            },
+        );
+        let failed = failed.expect("a failed poll leaves its status");
+        assert!(
+            failed.done && !failed.moving && !failed.problem,
+            "{failed:?}"
+        );
+        assert!(failed.vbas_supported);
+        axis_error_lines(
+            "imsPartialOk",
+            "imsPartialOkLine",
+            |_| false,
+            |axis| {
+                axis.poll(&AsynUser::new(0)).unwrap();
+                after_good = axis.take_failed_poll_status();
+            },
+        );
+        assert_eq!(after_good, None);
     }
 
     /// ImsMDrivePlusMotorAxis.cpp:126-130, 309-313: a base velocity above
