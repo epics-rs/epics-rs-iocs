@@ -91,10 +91,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, nint};
 
 use crate::scan_int;
@@ -340,7 +341,15 @@ impl PIE710Controller {
 
     /// Write a command, no terminator (the port's output EOS adds `"\n"`).
     fn send(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.send_bytes(cmd.as_bytes())
+    }
+
+    /// [`send`](Self::send) for raw bytes; an empty message is not sent.
+    fn send_bytes(&self, cmd: &[u8]) -> AsynResult<()> {
+        if cmd.is_empty() {
+            return Ok(());
+        }
+        self.handle.write_octet(0, cmd)?;
         Ok(())
     }
 
@@ -410,6 +419,7 @@ pub struct PIE710Axis {
     axis: usize,
     prev_position: i32,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl PIE710Axis {
@@ -427,6 +437,7 @@ impl PIE710Axis {
                 vbas_supported: false,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         };
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(reading) = ctrl.poll_axis(axis) {
@@ -442,6 +453,30 @@ impl PIE710Axis {
 
     fn lock(&self) -> MutexGuard<'_, PIE710Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A record string with the axis digit over its first byte, as C's
+    /// `send_mess` addresses a message (drvPIE710.cc:399).
+    fn addressed(&self, text: &[u8]) -> Vec<u8> {
+        let mut text = text.to_vec();
+        if let Some(b) = text.first_mut() {
+            *b = self.label().as_bytes()[0];
+        }
+        text
+    }
+
+    /// A move's own message: PREM and a `,` ahead of its command
+    /// (devPIE710.cc:196-205), whose POST waits for the move to end. C
+    /// addresses only the first byte of the whole message, so behind a PREM
+    /// the command keeps its `#`; not copied.
+    fn move_line(&mut self, command: &str) -> Vec<u8> {
+        let prem = self.strings.arm();
+        let mut line = self.addressed(&prem);
+        if !line.is_empty() {
+            line.push(b',');
+        }
+        line.extend_from_slice(command.as_bytes());
+        line
     }
 }
 
@@ -462,9 +497,10 @@ impl AsynMotor for PIE710Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let label = self.label();
+        let line = self.move_line(&ma_msg(label, position * POS_RES));
         let ctrl = self.lock();
         ctrl.send(&sv_msg(label, velocity * POS_RES))?;
-        ctrl.send(&ma_msg(label, position * POS_RES))
+        ctrl.send_bytes(&line)
     }
 
     fn move_relative(
@@ -476,9 +512,10 @@ impl AsynMotor for PIE710Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let label = self.label();
+        let line = self.move_line(&mr_msg(label, distance * POS_RES));
         let ctrl = self.lock();
         ctrl.send(&sv_msg(label, velocity * POS_RES))?;
-        ctrl.send(&mr_msg(label, distance * POS_RES))
+        ctrl.send_bytes(&line)
     }
 
     fn move_velocity(
@@ -489,8 +526,8 @@ impl AsynMotor for PIE710Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         // JOG: raw velocity, no `res` scaling, signed; single command.
-        let msg = sv_msg(self.label(), velocity);
-        self.lock().send(&msg)
+        let line = self.move_line(&sv_msg(self.label(), velocity));
+        self.lock().send_bytes(&line)
     }
 
     fn home(
@@ -503,9 +540,10 @@ impl AsynMotor for PIE710Axis {
     ) -> AsynResult<()> {
         // C sends #GH regardless of direction, after the velocity.
         let label = self.label();
+        let line = self.move_line(&substitute_axis("#GH,", label));
         let ctrl = self.lock();
         ctrl.send(&sv_msg(label, velocity * POS_RES))?;
-        ctrl.send(&substitute_axis("#GH,", label))
+        ctrl.send_bytes(&line)
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -526,11 +564,28 @@ impl AsynMotor for PIE710Axis {
         self.lock().send(&msg)
     }
 
+    /// `PRIMITIVE`: INIT as its own message, addressed
+    /// (devPIE710.cc:188-189).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let line = self.addressed(init);
+        self.lock().send_bytes(&line)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let mut ctrl = self.lock();
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let reading = ctrl.poll_axis(self.axis);
         let comm_err = ctrl.comm_state == CommState::CommErr;
-        drop(ctrl);
 
         let Some(reading) = reading else {
             if comm_err {
@@ -541,6 +596,16 @@ impl AsynMotor for PIE710Axis {
         };
         let last_direction = self.last_status.direction;
         self.last_status = fold_reading(&mut self.prev_position, last_direction, &reading);
+        // drvPIE710.cc:310-356: POST, unaddressed, once done or stopped by a
+        // limit in the move's direction.
+        let s = &self.last_status;
+        let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
+        if (s.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.send_bytes(&post);
+        }
+        drop(ctrl);
         Ok(self.last_status.clone())
     }
 }
@@ -549,26 +614,96 @@ impl AsynMotor for PIE710Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// Axis 1 of a one-axis E-710 on a [`LineRig`], done (firmware V5).
-    fn rig(name: &str) -> (LineRig, PIE710Axis) {
-        let (line, io) = LineRig::new(name, |last| match last {
+    /// `#GI8` status words (no shift, firmware V5): done, and moving.
+    const DONE: u32 = 0;
+    const MOVING: u32 = 1 << 10;
+
+    /// Axis 1 of a one-axis E-710 on a [`LineRig`] whose `1GI8` reply
+    /// follows `gi8`.
+    fn rig(name: &str) -> (LineRig, PIE710Axis, Arc<AtomicU32>) {
+        let gi8 = Arc::new(AtomicU32::new(DONE));
+        let g = gi8.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
             "GI" => "PI E-710 V5.000".into(),
             "1TP" => "0.0".into(),
-            "1GI8" => "A B 0".into(),
+            "1GI8" => format!("A B {}", g.load(Ordering::SeqCst)),
             _ => String::new(),
         });
         let ctrl = PIE710Controller::new(io).unwrap();
         let axis = PIE710Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
         line.sent();
-        (line, axis)
+        (line, axis, gi8)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut PIE710Axis) -> Vec<String> {
+        axis.poll(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| l != "1GI8" && l != "1TP")
+            .collect()
+    }
+
+    /// devPIE710.cc:188-189: INIT as its own message, addressed.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = rig("pie710Init");
+        axis.primitive(&AsynUser::default(), b"#SL1,").unwrap();
+        assert_eq!(line.sent(), ["1SL1,"]);
+    }
+
+    /// devPIE710.cc:196-205: PREM and a `,` ahead of the move's own command,
+    /// both addressed, for that move only.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = rig("pie710Prem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"#SL1", None).unwrap();
+        axis.move_absolute(&user, 10000.0, 0.0, 5000.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["1SV0.50000,", "1SL1,1MA1.00000,"]);
+        axis.move_relative(&user, 10000.0, 0.0, 5000.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["1SV0.50000,", "1MR+1.00000,"]);
+        axis.set_move_strings(&user, b"#SL1", None).unwrap();
+        axis.home(&user, 0.0, 3000.0, 0.0, true).unwrap();
+        assert_eq!(line.sent(), ["1SV0.30000,", "1SL1,1GH,"]);
+        axis.set_move_strings(&user, b"#SL1", None).unwrap();
+        axis.move_velocity(&user, 0.0, -2.5, 0.0).unwrap();
+        assert_eq!(line.sent(), ["1SL1,1SV-2.50000,"]);
+    }
+
+    /// drvPIE710.cc:349-356: POST, unaddressed, once the move is done, not
+    /// while it runs, and only once.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, gi8) = rig("pie710Post");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"1SL0,")))
+            .unwrap();
+        axis.move_absolute(&user, 10000.0, 0.0, 5000.0, 0.0)
+            .unwrap();
+        line.sent();
+        gi8.store(MOVING, Ordering::SeqCst);
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        gi8.store(DONE, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["1SL0,"]);
+        assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
     }
 
     /// devPIE710.cc's build_trans opens and ends a transaction per command,
     /// so the velocity and the move are two messages, each addressed.
     #[test]
     fn velocity_and_move_are_two_messages() {
-        let (line, mut axis) = rig("pie710Split");
+        let (line, mut axis, _) = rig("pie710Split");
         let user = AsynUser::default();
         axis.move_absolute(&user, 10000.0, 0.0, 5000.0, 0.0)
             .unwrap();
