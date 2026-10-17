@@ -161,10 +161,11 @@ fn ph_limit(axis_id: i32, lim: i32) -> bool {
 
 // --- Raw serial I/O, each followed by WRITE_DELAY (C spacing).
 
+/// C `writeAgilis` / `setChannel` sleep after the write whatever its status.
 fn write_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
-    handle.write_octet(0, cmd.as_bytes())?;
+    let status = handle.write_octet(0, cmd.as_bytes()).map(drop);
     thread::sleep(WRITE_DELAY);
-    Ok(())
+    status
 }
 
 fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
@@ -196,6 +197,11 @@ impl AgUcController {
         let _ = write_raw(&handle, "MR");
         // Firmware version → model.
         let version = write_read_raw(&handle, "VE");
+        // C sleeps after VE before testing its status (AG_UC.cpp:71-74);
+        // write_read_raw slept only on success.
+        if version.is_err() {
+            thread::sleep(WRITE_DELAY);
+        }
         println!(
             "Agilis controller firmware version = {}",
             version.as_deref().unwrap_or("")
@@ -449,10 +455,13 @@ mod tests {
             InterfaceType::Octet,
         );
         assert!(status.is_err());
+        let start = std::time::Instant::now();
         let controller = Arc::new(Mutex::new(AgUcController::new(
             handle,
             &MotorTrace::new("AG_UC_SELF", 0),
         )));
+        // RS, MR and VE all fail and each still waits WRITE_DELAY, as in C.
+        assert!(start.elapsed() >= RESET_SETTLE + 3 * WRITE_DELAY);
         assert_eq!(controller.lock().unwrap().model(), None);
         let mut axis = AgUcAxis::new(controller, 0, true, 50, -50);
         let status = axis.poll(&AsynUser::new(0)).unwrap();
