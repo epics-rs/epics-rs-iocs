@@ -32,6 +32,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::util::{atof, atoi};
 use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
@@ -144,8 +145,8 @@ impl ControllerParams for Mmc200Params {
              idle poll period={:.6}\n  ignore limits={}\n",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll,
-            self.idle_poll,
+            CFloat(self.moving_poll),
+            CFloat(self.idle_poll),
             i32::from(self.ignore_limits),
         );
         ctx.report(out, level);
@@ -184,9 +185,9 @@ impl AxisReport for Mmc200AxisReport {
                 self.closed_loop,
                 self.rez,
                 self.micro_steps,
-                self.encoder_resolution,
-                self.resolution,
-                self.max_velocity,
+                CFloat(self.encoder_resolution),
+                CFloat(self.resolution),
+                CFloat(self.max_velocity),
             );
         }
     }
@@ -328,9 +329,9 @@ impl Mmc200Axis {
     ) -> AsynResult<()> {
         let axis = self.axis_index;
         let res = self.resolution;
-        ctrl.write(&format!("{axis}VEL{:.3}", velocity * res))?;
-        ctrl.write(&format!("{axis}ACC{:.3}", acceleration * res))?;
-        ctrl.write(&format!("{axis}DEC{:.3}", acceleration * res))?;
+        ctrl.write(&format!("{axis}VEL{:.3}", CFloat(velocity * res)))?;
+        ctrl.write(&format!("{axis}ACC{:.3}", CFloat(acceleration * res)))?;
+        ctrl.write(&format!("{axis}DEC{:.3}", CFloat(acceleration * res)))?;
         Ok(())
     }
 
@@ -358,7 +359,7 @@ impl AsynMotor for Mmc200Axis {
         let n = self.axis_index;
         let ctrl = self.lock();
         self.send_accel_vel(&ctrl, acceleration, velocity)?;
-        ctrl.write(&format!("{n}MVA{:.6}", position * self.resolution))?;
+        ctrl.write(&format!("{n}MVA{:.6}", CFloat(position * self.resolution)))?;
         Ok(())
     }
 
@@ -373,7 +374,7 @@ impl AsynMotor for Mmc200Axis {
         let n = self.axis_index;
         let ctrl = self.lock();
         self.send_accel_vel(&ctrl, acceleration, velocity)?;
-        ctrl.write(&format!("{n}MVR{:.6}", distance * self.resolution))?;
+        ctrl.write(&format!("{n}MVR{:.6}", CFloat(distance * self.resolution)))?;
         Ok(())
     }
 
@@ -390,8 +391,11 @@ impl AsynMotor for Mmc200Axis {
         let jog_percent =
             (velocity * self.resolution / self.max_velocity * 100.0).clamp(-100.0, 100.0);
         let ctrl = self.lock();
-        ctrl.write(&format!("{n}JAC{:.3}", acceleration * self.resolution))?;
-        ctrl.write(&format!("{n}JOG{jog_percent:.3}"))?;
+        ctrl.write(&format!(
+            "{n}JAC{:.3}",
+            CFloat(acceleration * self.resolution)
+        ))?;
+        ctrl.write(&format!("{n}JOG{:.3}", CFloat(jog_percent)))?;
         Ok(())
     }
 
@@ -515,6 +519,31 @@ mod tests {
         let axis = Mmc200Axis::new(controller, 0, false);
         assert_eq!(axis.model, -1);
         assert!(axis.last_status.problem);
+    }
+
+    /// C `sprintf("%dVEL%.3f")` / `"%dMVA%.6f"` spell a non-finite value
+    /// `inf` / `nan`, where Rust writes `NaN`.
+    #[test]
+    fn a_non_finite_move_is_written_as_c_prints_it() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("mmc200NonFinite", |cmd| {
+            match cmd.trim_end() {
+                "1VER?" => "#MMC-200 v4.1",
+                "1REZ?" => "#1000",
+                "1UST?" => "#8",
+                "1VMX?" => "#2.5",
+                _ => "#0",
+            }
+            .into()
+        });
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
+        let mut axis = Mmc200Axis::new(controller, 0, false);
+        rig.sent();
+        axis.move_absolute(&AsynUser::default(), f64::NAN, 0.0, f64::INFINITY, 1.0)
+            .unwrap();
+        let sent: Vec<String> = rig.sent().iter().map(|c| c.trim_end().to_owned()).collect();
+        assert!(sent.contains(&"1VELinf".to_owned()), "{sent:?}");
+        assert!(sent.contains(&"1MVAnan".to_owned()), "{sent:?}");
     }
 
     #[test]
