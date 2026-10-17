@@ -36,11 +36,13 @@ enum HttpPrint<'a> {
     Warning(&'a str, &'a str, &'a str),
 }
 
-/// C's `maxAddr` (ADTimePix.cpp:1069): 0 = PrvImg, 1 = Img, 2 = Img running
-/// sum, 3 = Img sum-of-N, 4 = PrvHst sum-of-N, 5 = PrvHst running sum,
-/// 6 = PrvHst frame, 7 = PrvHst ToF axis. The chip DACs bind addresses 0-7 and
-/// the voltage rails 0-5 on the same port.
-pub const MAX_ADDR: usize = 8;
+/// C's `NDARRAY_MAX_ADDR` (ADTimePix.h:923, ADTimePix.cpp:1424-1429): 0 =
+/// PrvImg, 1 = Img, 2 = Img running sum, 3 = Img sum-of-N, 4 = PrvHst
+/// sum-of-N, 5 = PrvHst running sum, 6 = PrvHst frame, 7 = PrvHst ToF axis,
+/// 8-9 = PrvImg threshold 1 and T0-T1 band, 10-12 = PrvImg1 threshold 0, 1
+/// and band, 13 = Img threshold 1. The chip DACs and voltage rails bind the
+/// low addresses of the same port.
+pub const MAX_ADDR: usize = 14;
 
 /// ADTIMEPIX_VERSION.REVISION.MODIFICATION (ADTimePix.h:20-22).
 const DRIVER_VERSION: &str = "1.6.4";
@@ -3007,6 +3009,25 @@ mod tests {
         det.write_int32(&mut AsynUser::new(ad.image_mode).with_addr(20), 0)
             .unwrap();
         assert_eq!(det.int(ad.num_images, 0), 1);
+    }
+
+    /// C's port has 14 addresses (ADTimePix.h:923), so a record on
+    /// address 13 has a parameter list.
+    #[test]
+    fn the_port_has_fourteen_addresses() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_MAX_ADDR",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        det.ad.port_base.set_int32_param(p.adjust, 13, 1).unwrap();
+        assert!(det.ad.port_base.set_int32_param(p.adjust, 14, 1).is_err());
+        assert_eq!(tasks::new_outputs().len(), 14);
     }
 
     fn status_of(det: &TimePix3Driver) -> (i32, i32, String) {
