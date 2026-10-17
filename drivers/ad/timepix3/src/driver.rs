@@ -4455,6 +4455,11 @@ mod tests {
         );
     }
 
+    /// A stream path on TEST-NET-1, never a local address: acquireStart's
+    /// bind probe cannot find it busy, as it can a shared localhost port
+    /// that a concurrent test is probing.
+    const UNBOUND_TCP: &str = "tcp://192.0.2.1:8089";
+
     /// A Serval that answers `{}` to everything but a request line holding
     /// `fail`, which gets a 500.
     fn fake_serval(fail: &'static str) -> String {
@@ -5355,8 +5360,7 @@ mod tests {
         ] {
             det.ad.port_base.set_int32_param(reason, 0, v).unwrap();
         }
-        det.set_text(p.prv_img_base, "tcp://localhost:8089")
-            .unwrap();
+        det.set_text(p.prv_img_base, UNBOUND_TCP).unwrap();
         det.set_text(p.prv_hst_base, "tcp://h:0").unwrap();
         let (runtime, _) = create_port_runtime(
             &epics_rs::asyn::registry::claim_port(name).unwrap(),
@@ -5387,7 +5391,7 @@ mod tests {
         assert_eq!(status, "Histogram TCP path is invalid");
         let parsed = adlog::log(
             adlog::CHECK_PRV_IMG_PATH,
-            "Parsed PrvImg TCP path: host=localhost, port=8089",
+            "Parsed PrvImg TCP path: host=192.0.2.1, port=8089",
         );
         let err = adlog::err(
             adlog::PARSE_TCP_PATH,
@@ -6864,7 +6868,7 @@ mod tests {
                 (p.write_prv_img, p.prv_img_base)
             };
             det.ad.port_base.set_int32_param(write, 0, 1).unwrap();
-            det.set_text(base, "tcp://localhost:8089").unwrap();
+            det.set_text(base, UNBOUND_TCP).unwrap();
             let started = det
                 .write_int32(&mut AsynUser::new(det.ad.params.acquire), 1)
                 .is_ok();
@@ -6925,6 +6929,7 @@ mod tests {
     /// channels' Base PVs (acquire.cpp:313-535, :201-223).
     #[test]
     fn a_start_sends_no_configuration_and_syncs_the_streams() {
+        let path = format!("tcp://listen@{}", &UNBOUND_TCP["tcp://".len()..]);
         let shared = Arc::new(Shared::new());
         serve_workers(&shared, true);
         let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
@@ -6941,15 +6946,11 @@ mod tests {
             .port_base
             .set_int32_param(p.write_prv_img, 0, 1)
             .unwrap();
-        det.set_text(p.prv_img_base, "tcp://listen@localhost:8089")
-            .unwrap();
+        det.set_text(p.prv_img_base, &path).unwrap();
         det.write_int32(&mut AsynUser::new(det.ad.params.acquire), 1)
             .unwrap();
         let paths = shared.stream_paths();
-        assert_eq!(
-            paths.prv_img.as_deref(),
-            Some("tcp://listen@localhost:8089")
-        );
+        assert_eq!(paths.prv_img.as_deref(), Some(path.as_str()));
         assert_eq!(paths.img, None);
     }
 
@@ -6981,7 +6982,7 @@ mod tests {
             ] {
                 det.ad.port_base.set_int32_param(reason, 0, v).unwrap();
             }
-            det.set_text(p.img_base, "tcp://localhost:8088").unwrap();
+            det.set_text(p.img_base, UNBOUND_TCP).unwrap();
             det.set_text(p.prv_hst_base, hst).unwrap();
             let started = det
                 .write_int32(&mut AsynUser::new(det.ad.params.acquire), 1)
@@ -6989,7 +6990,7 @@ mod tests {
             let paths = shared.stream_paths();
             (started, paths.img.is_some(), paths.prv_hst.is_some())
         };
-        let tcp = "tcp://localhost:8451";
+        let tcp = "tcp://192.0.2.1:8451";
         assert_eq!(start("TPX_GATE_ALL", 1, 4, 1, tcp), (true, true, true));
         assert_eq!(start("TPX_GATE_IMG", 0, 4, 1, tcp), (true, false, true));
         assert_eq!(start("TPX_GATE_FMT", 1, 3, 1, tcp), (true, true, false));
