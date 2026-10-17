@@ -131,7 +131,7 @@ fn set_message(ctx: &mut ControllerCtx<'_>, index: usize, message: &str) {
 /// `asynPrint(pasynUserSelf, mask, "SPiiPlusController:func: ...")`.
 fn print(ctx: &ControllerCtx<'_>, mask: TraceMask, func: &str, args: std::fmt::Arguments<'_>) {
     ctx.base
-        .trace_print(mask, format_args!("SPiiPlusController:{func}:{args}"));
+        .trace_print(mask, format_args!("SPiiPlusController:{func}:{args}\n"));
 }
 
 /// The acceleration and deceleration every profile axis shares.
@@ -824,7 +824,7 @@ impl AcsMotionParams {
                 0,
                 TraceMask::FLOW,
                 format_args!(
-                    "SPiiPlusController:readbackProfile: axis={addr}, resolution={resolution:.6}"
+                    "SPiiPlusController:readbackProfile: axis={addr}, resolution={resolution:.6}\n"
                 ),
             );
             // SPiiPlusAxis::readbackProfile: controller units to steps.
@@ -1226,6 +1226,33 @@ pub(crate) mod tests {
         // Each acceleration segment is its own displacement.
         let accel: f64 = path.accel_positions.iter().sum();
         assert!(close(accel, 0.5));
+    }
+
+    #[test]
+    fn every_build_trace_line_ends_as_cs_does() {
+        use epics_rs::asyn::trace::TraceFile;
+        let rig = rig("spiiPTrace", 1, SERVOS);
+        rig.define(&[0], &[0.0, 1.0, 2.0, 3.0], 0);
+        let path = std::env::temp_dir().join(format!("spii-ptrace-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("spiiPTraceCtrl"), TraceMask::ERROR | TraceMask::FLOW);
+        trace.set_trace_file(Some("spiiPTraceCtrl"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("spiiPTraceCtrl", 0, TraceFile::File(file));
+        rig.int(index::PROFILE_BUILD, 0, 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines = text
+            .lines()
+            .filter(|l| l.contains("SPiiPlusController:buildProfile:"))
+            .count();
+        assert!(lines > 0, "{text}");
+        assert_eq!(
+            text.matches("SPiiPlusController:buildProfile:").count(),
+            lines,
+            "one C line per print: {text}"
+        );
     }
 
     #[test]

@@ -499,7 +499,7 @@ impl AsynMotor for SpiiPlusAxis {
                 Some(0),
                 0,
                 TraceMask::ERROR,
-                format_args!("SPiiPlusController:home: No homing method selected for axis {a}"),
+                format_args!("SPiiPlusController:home: No homing method selected for axis {a}\n"),
             );
             return Ok(());
         };
