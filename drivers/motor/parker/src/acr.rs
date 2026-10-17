@@ -40,7 +40,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{PortDriverBase, param_list};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -256,9 +256,11 @@ impl ControllerParams for AcrParams {
         let Some(ids) = self.ids.filter(|ids| user.reason == ids.read_binary_io) else {
             return ParamWrite::PassToBase(Ok(()));
         };
-        let _ = base.set_int32_param(user.reason, user.addr, value);
+        // C getAxis: getAddress resolves -1 to 0.
+        let addr = param_list(base.flags.multi_device, user.addr);
+        let _ = base.set_int32_param(user.reason, addr, value);
         let _ = self.lock().read_binary_io(base, &ids);
-        let _ = base.call_param_callbacks(user.addr);
+        let _ = base.call_param_callbacks(addr);
         ParamWrite::Handled(Ok(()))
     }
 
@@ -272,13 +274,13 @@ impl ControllerParams for AcrParams {
         if self.ids.is_none_or(|ids| user.reason != ids.jerk) {
             return ParamWrite::PassToBase(Ok(()));
         }
-        let _ = base.set_float64_param(user.reason, user.addr, value);
+        let addr = param_list(base.flags.multi_device, user.addr);
+        let _ = base.set_float64_param(user.reason, addr, value);
         let status = self.lock().write_only(&format!(
-            "AXIS{} JOG JRK {value:.6}",
-            user.addr,
+            "AXIS{addr} JOG JRK {value:.6}",
             value = CFloat(value)
         ));
-        let _ = base.call_param_callbacks(user.addr);
+        let _ = base.call_param_callbacks(addr);
         ParamWrite::Handled(status)
     }
 
@@ -775,6 +777,9 @@ mod tests {
         port.write_float64_blocking(jerk, 0, 2.5).unwrap();
         assert_eq!(sent(), ["AXIS0 JOG JRK 2.500000"]);
         assert_eq!(port.read_float64_blocking(jerk, 0).unwrap(), 2.5);
+        // C getAxis resolves address -1 to axis 0.
+        port.write_float64_blocking(jerk, -1, 1.0).unwrap();
+        assert_eq!(sent(), ["AXIS0 JOG JRK 1.000000"]);
     }
 
     /// ACRMotorDriver.cpp:168-175, 210-217: every write ends on C's line,
