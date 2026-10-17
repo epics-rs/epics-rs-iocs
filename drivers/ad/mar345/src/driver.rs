@@ -305,6 +305,7 @@ pub fn create_mar345_detector(
 pub(crate) mod tests {
     use super::*;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::error::{AsynError, AsynStatus};
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::base::runtime::interrupt_accept::InterruptGate;
     use std::io::Read;
@@ -363,6 +364,69 @@ pub(crate) mod tests {
             },
         )
         .unwrap()
+    }
+
+    struct RefusingPort {
+        base: PortDriverBase,
+        status: AsynStatus,
+    }
+
+    impl PortDriver for RefusingPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
+            Err(AsynError::Status {
+                status: self.status,
+                message: "refused".into(),
+            })
+        }
+    }
+
+    /// C `writeServer` returns `pasynOctetSyncIO->write`'s own status
+    /// (mar345.cpp:236-248), so a disconnected marServer port is
+    /// asynDisconnected, not asynError.
+    #[test]
+    fn a_server_write_keeps_the_octet_ports_status() {
+        for status in [
+            AsynStatus::Timeout,
+            AsynStatus::Overflow,
+            AsynStatus::Error,
+            AsynStatus::Disconnected,
+            AsynStatus::Disabled,
+        ] {
+            let name = format!("MAR345_REFUSING_{status:?}");
+            let (server, _) = create_port_runtime(
+                &claim_port(&name).unwrap(),
+                RefusingPort {
+                    base: PortDriverBase::new(&name, 1, Default::default()),
+                    status,
+                },
+                RuntimeConfig::default(),
+            )
+            .unwrap();
+            let mut det = Mar345Driver::new(
+                &format!("{name}_DET"),
+                0,
+                DriverLinks {
+                    start: Arc::new(Event::new()),
+                    stop: Arc::new(Event::new()),
+                    abort: Arc::new(Event::new()),
+                    mode: Arc::new(AtomicI32::new(0)),
+                    server: Arc::new(SyncIOHandle::from_handle(
+                        server.port_handle().clone(),
+                        0,
+                        Duration::ZERO,
+                    )),
+                },
+            )
+            .unwrap();
+            assert_eq!(det.write_server("x") as i32, status as i32, "{status:?}");
+            std::mem::forget(server);
+        }
     }
 
     /// ADDriver.cpp:96-98 calls the virtual setShutter, which mar345

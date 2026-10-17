@@ -19,6 +19,7 @@ use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::{DriverHold, PortHandle};
 use epics_rs::asyn::request::RequestOp;
@@ -33,10 +34,10 @@ use crate::protocol::{
     CMD_ERASE, DONE_MODE_CHANGE, DONE_SCAN_DATA, cmd_change, cmd_scan, full_file_name,
     response_done,
 };
-use crate::server::{SERVER_ADDR, classify, server_submit};
+use crate::server::{SERVER_ADDR, server_submit};
 use crate::types::{
-    CamStatus, EraseMode, Event, IMAGE_SIZES, MAR345_COMMAND_TIMEOUT, MAR345_POLL_DELAY,
-    MAX_FILENAME_LEN, MAX_MESSAGE_SIZE, Mode, Status, secs,
+    EraseMode, Event, IMAGE_SIZES, MAR345_COMMAND_TIMEOUT, MAR345_POLL_DELAY, MAX_FILENAME_LEN,
+    MAX_MESSAGE_SIZE, Mode, Status, secs,
 };
 
 /// C `imageSizes[res][size]` with C's out-of-bounds index made safe: an
@@ -131,7 +132,7 @@ impl Worker {
     /// released around it. Only a non-empty read publishes
     /// `ADStringFromServer` (C returns before `setStringParam` when
     /// `nread == 0`).
-    fn read_server(&mut self, l: &mut Held, timeout: f64) -> CamStatus {
+    fn read_server(&mut self, l: &mut Held, timeout: f64) -> AsynStatus {
         let user = AsynUser::default()
             .with_addr(SERVER_ADDR)
             .with_timeout(secs(timeout));
@@ -150,7 +151,7 @@ impl Worker {
                 if data.is_empty() {
                     // C: `if (nread == 0) return status` without publishing.
                     self.from.clear();
-                    return CamStatus::Success;
+                    return AsynStatus::Success;
                 }
                 self.from = String::from_utf8_lossy(&data).into_owned();
                 let (reason, from) = (self.ad.string_from_server, self.from.clone());
@@ -158,29 +159,29 @@ impl Worker {
                     d.set_str(reason, &from);
                     d.callbacks();
                 });
-                CamStatus::Success
+                AsynStatus::Success
             }
             Err(e) => {
                 self.from.clear();
-                classify(&e)
+                e.status()
             }
         }
     }
 
     /// C `waitForCompletion`: poll `readServer` at `MAR345_POLL_DELAY` until the
     /// reply contains `done`, or `timeout` elapses.
-    fn wait_for_completion(&mut self, l: &mut Held, done: &str, timeout: f64) -> CamStatus {
+    fn wait_for_completion(&mut self, l: &mut Held, done: &str, timeout: f64) -> AsynStatus {
         let start = Instant::now();
         loop {
             let status = self.read_server(l, MAR345_POLL_DELAY);
-            if status == CamStatus::Success && response_done(&self.from, done) {
-                return CamStatus::Success;
+            if status == AsynStatus::Success && response_done(&self.from, done) {
+                return AsynStatus::Success;
             }
             if start.elapsed().as_secs_f64() > timeout {
                 self.trace_error(
                     "mar345:waitForCompletion: error waiting for response from marServer\n",
                 );
-                return CamStatus::Error;
+                return AsynStatus::Error;
             }
         }
     }
@@ -190,7 +191,7 @@ impl Worker {
     // -----------------------------------------------------------------------
 
     /// C `erase`.
-    fn erase(&mut self, l: &mut Held) -> CamStatus {
+    fn erase(&mut self, l: &mut Held) -> AsynStatus {
         let (ad, p) = (self.ad, self.p);
         let num_erase = l.step(move |d| {
             let num_erase = d.get_i32(p.num_erase).max(1);
@@ -200,17 +201,17 @@ impl Worker {
             num_erase
         });
 
-        let mut status = CamStatus::Success;
+        let mut status = AsynStatus::Success;
         for i in 0..num_erase {
             if self.abort.try_wait() {
-                status = CamStatus::Error;
+                status = AsynStatus::Error;
                 break;
             }
             l.step(|d| {
                 d.write_server(CMD_ERASE);
             });
             status = self.wait_for_completion(l, DONE_SCAN_DATA, MAR345_COMMAND_TIMEOUT);
-            if status.is_err() {
+            if status != AsynStatus::Success {
                 break;
             }
             l.step(move |d| {
@@ -228,7 +229,7 @@ impl Worker {
     }
 
     /// C `changeMode`.
-    fn change_mode(&mut self, l: &mut Held) -> CamStatus {
+    fn change_mode(&mut self, l: &mut Held) -> AsynStatus {
         let (ad, p) = (self.ad, self.p);
         l.step(move |d| {
             d.set_i32(ad.status, Status::ChangeMode as i32);
@@ -252,9 +253,9 @@ impl Worker {
         status
     }
 
-    /// C `acquireFrame`. Returns [`CamStatus::Error`] on an abort or a failed
+    /// C `acquireFrame`. Returns [`AsynStatus::Error`] on an abort or a failed
     /// erase / scan (C's `return asynError` paths).
-    async fn acquire_frame(&mut self, l: &mut Held) -> CamStatus {
+    async fn acquire_frame(&mut self, l: &mut Held) -> AsynStatus {
         let (ad, p) = (self.ad, self.p);
 
         // C stores acqStartTime here (used later for the NDArray timestamp).
@@ -274,7 +275,7 @@ impl Worker {
         // Erase before exposure if set.
         if erase_mode == EraseMode::Before as i32 {
             let status = self.erase(l);
-            if status.is_err() {
+            if status != AsynStatus::Success {
                 return status;
             }
         }
@@ -293,10 +294,10 @@ impl Worker {
         });
         let deadline = Instant::now() + secs(acquire_time);
 
-        let mut status = CamStatus::Success;
+        let mut status = AsynStatus::Success;
         loop {
             if self.abort.try_wait() {
-                status = CamStatus::Error;
+                status = AsynStatus::Error;
                 break;
             }
             let now = Instant::now();
@@ -325,7 +326,7 @@ impl Worker {
             d.set_i32(ad.status, Status::Idle as i32);
             d.callbacks();
             // If the exposure was aborted return error.
-            if status.is_err() {
+            if status != AsynStatus::Success {
                 return false;
             }
             d.set_i32(ad.status, Status::Scan as i32);
@@ -336,11 +337,11 @@ impl Worker {
             true
         });
         if !scan {
-            return CamStatus::Error;
+            return AsynStatus::Error;
         }
         let status = self.wait_for_completion(l, DONE_SCAN_DATA, MAR345_COMMAND_TIMEOUT);
-        if status.is_err() {
-            return CamStatus::Error;
+        if status != AsynStatus::Success {
+            return AsynStatus::Error;
         }
 
         l.step(move |d| {
@@ -358,7 +359,7 @@ impl Worker {
         if erase_mode == EraseMode::After as i32 {
             return self.erase(l);
         }
-        CamStatus::Success
+        AsynStatus::Success
     }
 
     /// C `getImageData` — read the `.mar` file, decode the pck stream, publish.
@@ -442,7 +443,7 @@ impl Worker {
                 d.callbacks();
             });
             let status = self.acquire_frame(l).await;
-            if status.is_err() {
+            if status != AsynStatus::Success {
                 break;
             }
             // We get out of the loop in single-shot mode or if acquire was set
