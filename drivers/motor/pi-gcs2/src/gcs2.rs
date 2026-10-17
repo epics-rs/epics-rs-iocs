@@ -91,8 +91,6 @@
 //!
 //! ## Not modeled (documented deviations from the full C module)
 //!
-//! - **Hexapod**: the `PIasynController` coordinate-system parameters
-//!   (`PI_CS_ACTIVATE`/`LINK`/`KST`/`KSW`, octet writes) are not modeled.
 //! - **Piezo**: `PIGCSPiezoController`, `PIGCS2PiezoCL` — closed-loop piezo
 //!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
 //!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
@@ -1228,6 +1226,8 @@ struct PiParams {
     target_mode: usize,
     cs_activate: usize,
     cs_link: usize,
+    cs_kst: usize,
+    cs_ksw: usize,
 }
 
 /// What C `PIasynController` adds to the `asynMotorController` port: its
@@ -1278,6 +1278,8 @@ impl ControllerParams for PIGCS2Params {
             target_mode: create("PI_CS_TARGETMODE", ParamType::Int32)?,
             cs_activate: create("PI_CS_ACTIVATE", ParamType::Octet)?,
             cs_link: create("PI_CS_LINK", ParamType::Octet)?,
+            cs_kst: create("PI_CS_KST", ParamType::Octet)?,
+            cs_ksw: create("PI_CS_KSW", ParamType::Octet)?,
         };
         let _ = self.params.set(params);
         Ok(())
@@ -1344,6 +1346,35 @@ impl ControllerParams for PIGCS2Params {
             return ParamWrite::PassToBase(user.queue(base, MotorCommand::Driver(call)));
         };
         ParamWrite::PassToBase(ctrl.set_pivot(index, value))
+    }
+
+    /// C `PIasynController::writeOctet`: the C-887's coordinate-system
+    /// commands. C ignores their status and stores no value.
+    fn write_octet(
+        &mut self,
+        _base: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        data: &[u8],
+    ) -> ParamWrite {
+        let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        let commands = [
+            (params.cs_activate, "KEN"),
+            (params.cs_link, "KLN"),
+            (params.cs_kst, "KST"),
+            (params.cs_ksw, "KSW"),
+        ];
+        let Some(&(_, command)) = commands.iter().find(|(r, _)| *r == user.reason) else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        if ctrl.model == Model::CoordinateSystem {
+            // C's `const char *value`: the bytes up to a NUL.
+            let value = data.split(|&b| b == 0).next().unwrap_or_default();
+            let _ = ctrl.send_only(&format!("{command} {}", String::from_utf8_lossy(value)));
+        }
+        ParamWrite::Handled(Ok(()))
     }
 
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
@@ -2819,6 +2850,50 @@ mod tests {
         let read = |reason| port.get_string_param_blocking(reason, 0, 255).unwrap();
         assert_eq!(read(p.cs_activate), b"KS1");
         assert_eq!(read(p.cs_link), b"KS1 KS2 ZERO");
+    }
+
+    /// `PIasynController::writeOctet` (PIasynController.cpp:430-465): a
+    /// C-887 sends the value after `KEN`/`KLN`/`KST`/`KSW`
+    /// (PICoordinateSystem.cpp:38-139), every other class nothing; neither
+    /// stores it.
+    #[test]
+    fn a_coordinate_system_octet_write_sends_its_command() {
+        use epics_rs::asyn::request::RequestOp;
+        for (model, name) in [
+            (Model::CoordinateSystem, "gcs2CsW"),
+            (Model::Gcs2Hexapod, "gcs2HexW"),
+        ] {
+            let (line, io) =
+                motor_common::testing::LineRig::new(&format!("{name}Line"), hexapod_reply);
+            let mut ctrl = PIGCS2Controller::new(io, name);
+            ctrl.set_model(model);
+            let ctrl = Arc::new(Mutex::new(ctrl));
+            let (port, p, _) = controller_port(name, &ctrl, "X");
+            let mut sent = Vec::new();
+            for (reason, value) in [
+                (p.cs_activate, "KS1"),
+                (p.cs_link, "KS1 ZERO"),
+                (p.cs_kst, "KS1 X 1"),
+                (p.cs_ksw, "KS1 Z 2"),
+            ] {
+                line.sent();
+                let data = value.as_bytes().to_vec();
+                let user = AsynUser::new(reason).with_addr(0);
+                let done = port
+                    .submit_blocking(RequestOp::OctetWrite { data }, user)
+                    .unwrap();
+                assert_eq!(done.nbytes, value.len());
+                sent.extend(sent_lines(&line));
+                // Never set: C's asynParamUndefined.
+                assert!(port.get_string_param_blocking(reason, 0, 255).is_err());
+            }
+            let want: &[&str] = if model == Model::CoordinateSystem {
+                &["KEN KS1", "KLN KS1 ZERO", "KST KS1 X 1", "KSW KS1 Z 2"]
+            } else {
+                &[]
+            };
+            assert_eq!(sent, want, "{name}");
+        }
     }
 
     /// `PI_CS_TARGETMODE` (PIasynController.cpp:320-324, 587) picks the
