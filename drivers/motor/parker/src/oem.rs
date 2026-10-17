@@ -79,6 +79,8 @@ impl OemController {
         Self {
             handle,
             pulses_per_unit: vec![DEFAULT_PULSES_PER_UNIT; num_axes],
+            // C reads OEM_SELECT_SWITCH unset (OEMMotorDriver.cpp:397) and
+            // polls on an uninitialised `selectSwitch` (:338); rs starts at 0.
             select_switch: vec![0; num_axes],
             switch_detected: None,
             port: None,
