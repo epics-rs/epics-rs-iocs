@@ -128,4 +128,49 @@ mod tests {
             ]
         );
     }
+
+    /// drvSC800.cc:557-578: IDN goes out up to 3 times, until a reply names
+    /// an SC-800, 400 or 200.
+    #[epics_rs::base::epics_test]
+    async fn sc800_sends_idn_up_to_three_times() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let int = ArgValue::Int;
+        run_command(sc800_setup_command(), vec![int(2), int(10)]).await;
+        let idn = |name: &str, good_on: usize| {
+            let seen = AtomicUsize::new(0);
+            LineRig::new(name, move |cmd| {
+                match cmd.trim_start_matches('\u{2}').trim_end() {
+                    "IDN" if seen.fetch_add(1, Ordering::SeqCst) + 1 == good_on => {
+                        "C\tIDN0\t200\t1".into()
+                    }
+                    "IDN" => "C\tIDN0\t?".into(),
+                    c => format!("C\t{c}"),
+                }
+            })
+        };
+        let (third, _io3) = idn("sc800Third", 3);
+        let (never, _io0) = idn("sc800Never", 0);
+        for (card, port) in [(0, "sc800Third"), (1, "sc800Never")] {
+            let config = vec![int(card), ArgValue::String(port.into()), int(0)];
+            run_command(sc800_config_command(), config).await;
+        }
+        let db = r##"record(motor, "sc800:m0") {
+            field(DTYP, "SC-800")
+            field(OUT, "#C0 S0 @")
+        }
+        record(motor, "sc800:m1") {
+            field(DTYP, "SC-800")
+            field(OUT, "#C1 S0 @")
+        }"##;
+        assert_eq!(
+            ioc_init_errlog(db).await,
+            [
+                "recGblRecordError: motor_init_record_com(): card does not exist! \
+              Illegal field value PV: sc800:m1"
+            ]
+        );
+        let idns = |sent: Vec<String>| sent.iter().filter(|c| c.contains("IDN")).count();
+        assert_eq!(idns(third.sent()), 3);
+        assert_eq!(idns(never.sent()), 3);
+    }
 }

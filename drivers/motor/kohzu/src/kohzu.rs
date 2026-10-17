@@ -86,6 +86,19 @@ enum CommState {
     CommErr,
 }
 
+/// The model and version an IDN reply `C\tIDN0\t<model>\t<version>` names.
+fn identify(reply: &str) -> AsynResult<(i32, String)> {
+    let fields: Vec<&str> = reply.split('\t').collect();
+    match fields.get(2).and_then(|s| s.trim().parse::<i32>().ok()) {
+        Some(model @ (800 | 400 | 200)) => {
+            Ok((model, fields.get(3).map_or("", |s| s.trim()).to_owned()))
+        }
+        _ => Err(kohzu_err(format!(
+            "SC800: unrecognized IDN reply '{reply}'"
+        ))),
+    }
+}
+
 impl KohzuController {
     /// Connect and identify a Kohzu controller (C `motor_init`): `IDN` reports
     /// the model (SC-800/400/200), which fixes the axis count (8/4/2). Performs
@@ -97,23 +110,23 @@ impl KohzuController {
             num_axes: 0,
             comm_state: CommState::Normal,
         };
-        let reply = ctrl.command("IDN")?;
-        // "C\tIDN0\t<model>\t<version>"
-        let fields: Vec<&str> = reply.split('\t').collect();
-        let model = fields.get(2).and_then(|s| s.trim().parse::<i32>().ok());
-        let num_axes = match model {
-            Some(800) => 8,
-            Some(400) => 4,
-            Some(200) => 2,
-            _ => {
-                return Err(kohzu_err(format!(
-                    "SC800: unrecognized IDN reply '{reply}'"
-                )));
+        // C sends IDN up to 3 times, until a reply names a model
+        // (drvSC800.cc:557-578).
+        let mut tries = 0;
+        let (model, version) = loop {
+            tries += 1;
+            match ctrl.command("IDN").and_then(|reply| identify(&reply)) {
+                Ok(id) => break id,
+                Err(e) if tries == 3 => return Err(e),
+                Err(_) => {}
             }
         };
-        let version = fields.get(3).map(|s| s.trim()).unwrap_or("");
-        ctrl.ident = format!("SC-{} Ver{}", model.unwrap(), version);
-        ctrl.num_axes = num_axes;
+        ctrl.ident = format!("SC-{model} Ver{version}");
+        ctrl.num_axes = match model {
+            800 => 8,
+            400 => 4,
+            _ => 2,
+        };
         Ok(ctrl)
     }
 
