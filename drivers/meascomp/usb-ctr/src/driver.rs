@@ -278,7 +278,9 @@ impl PortDriver for CtrDriver {
                 _ => {
                     trace.print(
                         TraceMask::ERROR,
-                        format_args!("USBCTR::writeInt32 error unsupported trigger value={value}"),
+                        format_args!(
+                            "USBCTR::writeInt32 error unsupported trigger value={value}\n"
+                        ),
                     );
                     uldaq_sys::TRIG_LOW
                 }
@@ -289,7 +291,7 @@ impl PortDriver for CtrDriver {
                 trace.print(
                     TraceMask::ERROR,
                     format_args!(
-                        "USBCTR::writeInt32 error calling cbDaqSetTrigger status={}, error={}",
+                        "USBCTR::writeInt32 error calling cbDaqSetTrigger status={}, error={}\n",
                         e.code, e.message
                     ),
                 );
@@ -366,7 +368,7 @@ impl PortDriver for CtrDriver {
                 TraceMask::FLOW,
                 file!(),
                 line!(),
-                format_args!("USBCTR:writeInt32: [{port} addr={addr}]: erased"),
+                format_args!("USBCTR:writeInt32: [{port} addr={addr}]: erased\n"),
             );
             self.erase_mcs()?;
         } else if reason == self.params.mca_num_channels && value > self.max_time_points as i32 {
@@ -377,7 +379,7 @@ impl PortDriver for CtrDriver {
                 TraceMask::ERROR,
                 file!(),
                 line!(),
-                format_args!("USBCTR:writeInt32:  # channels={value} too large, max={max}"),
+                format_args!("USBCTR:writeInt32:  # channels={value} too large, max={max}\n"),
             );
         }
 
@@ -388,14 +390,14 @@ impl PortDriver for CtrDriver {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("USBCTR:writeInt32, port {port}, function={reason}, wrote {value} to address {addr}"),
+                format_args!("USBCTR:writeInt32, port {port}, function={reason}, wrote {value} to address {addr}\n"),
             );
         } else {
             user.print(
                 TraceMask::ERROR,
                 file!(),
                 line!(),
-                format_args!("USBCTR:writeInt32, port {port}, function={reason}, ERROR writing {value} to address {addr}, status={status}"),
+                format_args!("USBCTR:writeInt32, port {port}, function={reason}, ERROR writing {value} to address {addr}, status={status}\n"),
             );
         }
         trace::asyn_status(status)
@@ -410,7 +412,7 @@ impl PortDriver for CtrDriver {
             file!(),
             line!(),
             format_args!(
-                "USBCTR:readInt32Array: entry, command={}, signal={}, numRead={}, &data={:p}",
+                "USBCTR:readInt32Array: entry, command={}, signal={}, numRead={}, &data={:p}\n",
                 user.reason,
                 user.addr,
                 buf.len(),
@@ -422,7 +424,10 @@ impl PortDriver for CtrDriver {
                 TraceMask::ERROR,
                 file!(),
                 line!(),
-                format_args!("USBCTR:readInt32Array: got illegal command {}", user.reason),
+                format_args!(
+                    "USBCTR:readInt32Array: got illegal command {}\n",
+                    user.reason
+                ),
             );
             trace::asyn_status(-1)?;
         }
@@ -443,7 +448,7 @@ impl PortDriver for CtrDriver {
             file!(),
             line!(),
             format_args!(
-                "USBCTR:readInt32Array: [signal={counter}]: read {num_actual} chans (numRead={}, numCopy={num_copy}, currentPoint={current_point}, nChans={num_channels})",
+                "USBCTR:readInt32Array: [signal={counter}]: read {num_actual} chans (numRead={}, numCopy={num_copy}, currentPoint={current_point}, nChans={num_channels})\n",
                 buf.len()
             ),
         );
@@ -458,7 +463,7 @@ impl PortDriver for CtrDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "USBCTR:readFloat32Array: ERROR: unknown function={}",
+                    "USBCTR:readFloat32Array: ERROR: unknown function={}\n",
                     user.reason
                 ),
             );
@@ -484,7 +489,7 @@ impl PortDriver for CtrDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "USBCTR:readFloat6Array: ERROR: unknown function={}",
+                    "USBCTR:readFloat6Array: ERROR: unknown function={}\n",
                     user.reason
                 ),
             );
@@ -537,7 +542,7 @@ impl PortDriver for CtrDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "USBCTR:writeFloat64, port {port}, wrote {value:.6} to address {addr}"
+                    "USBCTR:writeFloat64, port {port}, wrote {value:.6} to address {addr}\n"
                 ),
             );
         } else {
@@ -545,7 +550,7 @@ impl PortDriver for CtrDriver {
                 TraceMask::ERROR,
                 file!(),
                 line!(),
-                format_args!("USBCTR:writeFloat64, port {port}, ERROR writing {value:.6} to address {addr}, status={status}"),
+                format_args!("USBCTR:writeFloat64, port {port}, ERROR writing {value:.6} to address {addr}, status={status}\n"),
             );
         }
         trace::asyn_status(status)
@@ -607,14 +612,14 @@ impl PortDriver for CtrDriver {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("USBCTR:writeUInt32Digital, port {port}, wrote outValue=0x{out_value:x}, value=0x{value:x}, mask=0x{mask:x}, direction=0x{direction:x}"),
+                format_args!("USBCTR:writeUInt32Digital, port {port}, wrote outValue=0x{out_value:x}, value=0x{value:x}, mask=0x{mask:x}, direction=0x{direction:x}\n"),
             );
         } else {
             user.print(
                 TraceMask::ERROR,
                 file!(),
                 line!(),
-                format_args!("USBCTR:writeUInt32Digital, port {port}, ERROR writing outValue=0x{out_value:x}, value=0x{value:x}, mask=0x{mask:x}, direction=0x{direction:x}, status={status}"),
+                format_args!("USBCTR:writeUInt32Digital, port {port}, ERROR writing outValue=0x{out_value:x}, value=0x{value:x}, mask=0x{mask:x}, direction=0x{direction:x}, status={status}\n"),
             );
         }
         trace::asyn_status(status)

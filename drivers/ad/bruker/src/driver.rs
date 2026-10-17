@@ -124,7 +124,7 @@ impl BrukerDetector {
         };
         if let Err(e) = status {
             self.trace_error(&format!(
-                "BISDetector:writeBIS, status={}, sent\n{command}",
+                "BISDetector:writeBIS, status={}, sent\n{command}\n",
                 e.c_status_code()
             ));
         }
@@ -241,7 +241,7 @@ impl PortDriver for BrukerDetector {
                     );
                 } else {
                     det.trace_error(&format!(
-                        "BISDetector:writeInt32: invalid binning={value}, must be 1,2,4 or 8"
+                        "BISDetector:writeInt32: invalid binning={value}, must be 1,2,4 or 8\n"
                     ));
                     // C sets no errorMessage (BISDetector.cpp:660-664).
                     return Err(AsynError::Status {

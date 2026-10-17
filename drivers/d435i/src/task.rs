@@ -144,7 +144,7 @@ fn build_config(
         trace::print(
             port,
             TraceMask::FLOW,
-            "D435i: no IMU on this camera; streaming colour and depth only",
+            "D435i: no IMU on this camera; streaming colour and depth only\n",
         );
     }
 
@@ -172,7 +172,7 @@ fn set_sensor_option(
         trace::print(
             port,
             TraceMask::WARNING,
-            &format!("D435i: this camera has no {option:?} option; ignoring"),
+            &format!("D435i: this camera has no {option:?} option; ignoring\n"),
         );
         return;
     }
@@ -180,7 +180,7 @@ fn set_sensor_option(
         trace::print(
             port,
             TraceMask::WARNING,
-            &format!("D435i: camera refused {option:?}={value}: {e}"),
+            &format!("D435i: camera refused {option:?}={value}: {e}\n"),
         );
     }
 }
@@ -757,7 +757,7 @@ impl DepthFilterChain {
                             trace::print(
                                 &self.port,
                                 TraceMask::WARNING,
-                                &format!("D435i: {} wait failed: {e}", $name),
+                                &format!("D435i: {} wait failed: {e}\n", $name),
                             );
                         })
                         .ok()?;
@@ -810,13 +810,13 @@ async fn try_connect_pipeline(
                 if retry_count == 1 || retry_count.is_multiple_of(5) {
                     ctx.trace(
                         TraceMask::WARNING,
-                        &format!("D435i: connection attempt {retry_count} failed: {e}"),
+                        &format!("D435i: connection attempt {retry_count} failed: {e}\n"),
                     );
                 }
                 if retry_count >= MAX_CONNECT_RETRIES {
                     ctx.trace(
                         TraceMask::ERROR,
-                        &format!("D435i: giving up after {retry_count} connection attempts"),
+                        &format!("D435i: giving up after {retry_count} connection attempts\n"),
                     );
                     write_string(
                         &ctx.color_handle,
@@ -894,7 +894,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             Err(e) => {
                 ctx.trace(
                     TraceMask::ERROR,
-                    &format!("D435i: failed to read config: {e}"),
+                    &format!("D435i: failed to read config: {e}\n"),
                 );
                 ctx.end_acquisition().await;
                 continue;
@@ -932,7 +932,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             Err(e) => {
                 ctx.trace(
                     TraceMask::ERROR,
-                    &format!("D435i: failed to create depth filters: {e}"),
+                    &format!("D435i: failed to create depth filters: {e}\n"),
                 );
                 ctx.end_acquisition().await;
                 continue;
@@ -945,7 +945,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             Err(e) => {
                 ctx.trace(
                     TraceMask::ERROR,
-                    &format!("D435i: failed to create align block: {e}"),
+                    &format!("D435i: failed to create align block: {e}\n"),
                 );
                 ctx.end_acquisition().await;
                 continue;
@@ -957,7 +957,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             Err(e) => {
                 ctx.trace(
                     TraceMask::ERROR,
-                    &format!("D435i: failed to create pointcloud block: {e}"),
+                    &format!("D435i: failed to create pointcloud block: {e}\n"),
                 );
                 ctx.end_acquisition().await;
                 continue;
@@ -999,7 +999,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                         // only give up if that fails too.
                         ctx.trace(
                             TraceMask::ERROR,
-                            &format!("D435i: stream mode refused by the camera: {e}"),
+                            &format!("D435i: stream mode refused by the camera: {e}\n"),
                         );
                         write_string(
                             &ctx.color_handle,
@@ -1026,7 +1026,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                                 ctx.trace(
                                     TraceMask::ERROR,
                                     &format!(
-                                        "D435i: could not fall back to the previous mode: {e}"
+                                        "D435i: could not fall back to the previous mode: {e}\n"
                                     ),
                                 );
                                 write_string(
@@ -1101,18 +1101,18 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     if consecutive_errors == 1 || consecutive_errors.is_multiple_of(10) {
                         ctx.trace(
                             TraceMask::WARNING,
-                            &format!("D435i: frame wait error ({consecutive_errors}x): {e}"),
+                            &format!("D435i: frame wait error ({consecutive_errors}x): {e}\n"),
                         );
                     }
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                         ctx.trace(
                             TraceMask::ERROR,
-                            &format!("D435i: {consecutive_errors} consecutive frame errors"),
+                            &format!("D435i: {consecutive_errors} consecutive frame errors\n"),
                         );
 
                         // Continuous mode: attempt reconnection
                         if config.image_mode == ImageMode::Continuous {
-                            ctx.trace(TraceMask::FLOW, "D435i: attempting reconnection...");
+                            ctx.trace(TraceMask::FLOW, "D435i: attempting reconnection...\n");
                             write_string(
                                 &ctx.color_handle,
                                 ctx.color_ad.status_message,

@@ -60,7 +60,7 @@ pub fn start(
         trace.print(
             TraceMask::ERROR,
             format_args!(
-                "USBCTR::startPulseGenerator error calling cbPulseOutStart timerNum={timer} frequency={:.6}, dutyCycle={:.6}, count={count}, delay={:.6}, idleState={idle_state}, status={}, error={}",
+                "USBCTR::startPulseGenerator error calling cbPulseOutStart timerNum={timer} frequency={:.6}, dutyCycle={:.6}, count={count}, delay={:.6}, idleState={idle_state}, status={}, error={}\n",
                 timing.frequency, timing.duty_cycle, timing.initial_delay, e.code, e.message
             ),
         );
@@ -72,7 +72,7 @@ pub fn start(
     trace.print(
         TraceMask::FLOW,
         format_args!(
-            "USBCTR:startPulseGenerator: started pulse generator {timer} actual frequency={:.6}, actual period={actual_period:.6}, actual duty cycle={:.6}, actual delay={:.6}",
+            "USBCTR:startPulseGenerator: started pulse generator {timer} actual frequency={:.6}, actual period={actual_period:.6}, actual duty cycle={:.6}, actual delay={:.6}\n",
             timing.frequency, timing.duty_cycle, timing.initial_delay
         ),
     );
@@ -86,7 +86,7 @@ pub fn stop(trace: &SelfTrace, device: &DaqDevice, timer: i32) -> Result<()> {
         trace.print(
             TraceMask::ERROR,
             format_args!(
-                "USBCTR::stopPulseGenerator error calling cbPulseOutStop timerNum={timer}, status={}, error={}",
+                "USBCTR::stopPulseGenerator error calling cbPulseOutStop timerNum={timer}, status={}, error={}\n",
                 e.code, e.message
             ),
         );

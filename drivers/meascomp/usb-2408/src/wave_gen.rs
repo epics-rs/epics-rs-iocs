@@ -284,7 +284,7 @@ pub fn start_wave_gen(
     trace.print(
         TraceMask::FLOW,
         format_args!(
-            "{DRIVER_NAME}:{FUNCTION}: called cbAOutScan, firstChan={first_chan}, lastChan={last_chan}, numPoints*numWaveGenChans_={}, dwell={:.6}, options=0x{options:x}",
+            "{DRIVER_NAME}:{FUNCTION}: called cbAOutScan, firstChan={first_chan}, lastChan={last_chan}, numPoints*numWaveGenChans_={}, dwell={:.6}, options=0x{options:x}\n",
             num_chans * num_points,
             state.dwell_actual
         ),
@@ -304,7 +304,7 @@ pub fn read_wave_gen(
     trace.print(
         TraceMask::IO_DRIVER,
         format_args!(
-            "{DRIVER_NAME}::pollerThread waveform generator status, aoStatus={status}, aoCount={}, aoIndex={}",
+            "{DRIVER_NAME}::pollerThread waveform generator status, aoStatus={status}, aoCount={}, aoIndex={}\n",
             xfer.current_total_count, xfer.current_index
         ),
     );

@@ -259,7 +259,7 @@ impl Worker {
                             self.trace(
                                 TraceMask::ERROR,
                                 &format!(
-                                    "marCCD::readTiff error calling fstat, errno={} {file}",
+                                    "marCCD::readTiff error calling fstat, errno={} {file}\n",
                                     e.raw_os_error().unwrap_or(0)
                                 ),
                             );
@@ -283,13 +283,13 @@ impl Worker {
         if !opened {
             self.trace(
                 TraceMask::ERROR,
-                &format!("marCCD::readTiff timeout waiting for file to be created {file}"),
+                &format!("marCCD::readTiff timeout waiting for file to be created {file}\n"),
             );
             if file_exists {
                 self.trace(
                     TraceMask::ERROR,
                     "  file exists but is more than 10 seconds old, possible clock \
-                     synchronization problem",
+                     synchronization problem\n",
                 );
             }
             return Err(CamStatus::Error);
@@ -308,7 +308,7 @@ impl Worker {
                     self.trace(
                         TraceMask::ERROR,
                         &format!(
-                            "marCCD::readTiff, image width incorrect ={}, should be {nx}",
+                            "marCCD::readTiff, image width incorrect ={}, should be {nx}\n",
                             img.width
                         ),
                     );
@@ -317,7 +317,7 @@ impl Worker {
                     self.trace(
                         TraceMask::ERROR,
                         &format!(
-                            "marCCD::readTiff, image length incorrect ={}, should be {ny}",
+                            "marCCD::readTiff, image length incorrect ={}, should be {ny}\n",
                             img.height
                         ),
                     );
@@ -325,7 +325,7 @@ impl Worker {
                 Err(_) => {
                     self.trace(
                         TraceMask::FLOW,
-                        &format!("marCCD::readTiff, error reading TIFF file {file}"),
+                        &format!("marCCD::readTiff, error reading TIFF file {file}\n"),
                     );
                 }
             }
@@ -360,7 +360,7 @@ async fn det_loop(w: Worker) {
         Err(e) => {
             w.trace(
                 TraceMask::ERROR,
-                &format!("marCCD:marCCDTask: no driver lock: {e}"),
+                &format!("marCCD:marCCDTask: no driver lock: {e}\n"),
             );
             return;
         }
@@ -607,7 +607,7 @@ async fn collect_series(w: &Worker, l: &mut Held) {
     if frame_type != FrameType::Normal as i32 {
         w.trace(
             TraceMask::ERROR,
-            "marCCD:collectSeries: error, frame type must be Normal",
+            "marCCD:collectSeries: error, frame type must be Normal\n",
         );
         finish_series(l, tiff_timeout, use_shutter, auto_increment, file_number);
         return;
@@ -620,7 +620,7 @@ async fn collect_series(w: &Worker, l: &mut Held) {
             None => {
                 w.trace(
                     TraceMask::ERROR,
-                    "marCCD:collectSeries: error creating base file name",
+                    "marCCD:collectSeries: error creating base file name\n",
                 );
                 // C returns here without restoring state, which spins the task;
                 // this port cleans up and stops instead.
@@ -768,7 +768,7 @@ async fn image_loop(w: Worker) {
         Err(e) => {
             w.trace(
                 TraceMask::ERROR,
-                &format!("marCCD:getImageDataTask: no driver lock: {e}"),
+                &format!("marCCD:getImageDataTask: no driver lock: {e}\n"),
             );
             return;
         }

@@ -341,7 +341,7 @@ impl RontecDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "drvMcaRontec::sendMessage: error {}, status={}, nbytesOut={nbytes_out}, nbytesIn={}",
+                    "drvMcaRontec::sendMessage: error {}, status={}, nbytesOut={nbytes_out}, nbytesIn={}\n",
                     String::from_utf8_lossy(input),
                     status as i32,
                     input.len()
@@ -407,7 +407,7 @@ impl RontecDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "drvMcaRontec::int32ArrayRead: error reading MCA data, nbytesIn={nbytes_in}, should be {nread}"
+                    "drvMcaRontec::int32ArrayRead: error reading MCA data, nbytesIn={nbytes_in}, should be {nread}\n"
                 ),
             );
         }
@@ -527,7 +527,7 @@ impl RontecDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "drvMcaRontec::RontecWrite port {} got illegal command {}",
+                    "drvMcaRontec::RontecWrite port {} got illegal command {}\n",
                     self.base.port_name, user.reason
                 ),
             ),
@@ -541,7 +541,7 @@ impl RontecDriver {
             file!(),
             line!(),
             format_args!(
-                "drvMcaRontec::RontecRead got illegal command {}",
+                "drvMcaRontec::RontecRead got illegal command {}\n",
                 user.reason
             ),
         );
@@ -580,7 +580,7 @@ impl PortDriver for RontecDriver {
                 self.base.trace_print(
                     TraceMask::ERROR,
                     format_args!(
-                        "drvMcaRontec::drvUserCreate, unknown command={}",
+                        "drvMcaRontec::drvUserCreate, unknown command={}\n",
                         req.drv_info
                     ),
                 );
@@ -635,7 +635,7 @@ impl PortDriver for RontecDriver {
             TraceMask::ERROR,
             file!(),
             line!(),
-            format_args!("drvMcaRontec::int32ArrayWrite, write to Rontec not implemented"),
+            format_args!("drvMcaRontec::int32ArrayWrite, write to Rontec not implemented\n"),
         );
         Ok(())
     }

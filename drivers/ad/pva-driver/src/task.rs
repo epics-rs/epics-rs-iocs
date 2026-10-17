@@ -124,7 +124,7 @@ fn connect_error(handle: &PortHandle, e: &impl std::fmt::Display) {
         Some(0),
         0,
         TraceMask::ERROR,
-        &format!("pvaDriver::connectPv exception initializing monitor: {e}"),
+        &format!("pvaDriver::connectPv exception initializing monitor: {e}\n"),
     );
 }
 
@@ -301,7 +301,7 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
             ctx.handle.trace().output_device(ctx.handle.port_name(), Some(0), 0,
                 TraceMask::ERROR,
                 &format!(
-                    "pvaDriver::monitorEvent failed to alloc new NDArray - memory pool exhausted? (free: {})",
+                    "pvaDriver::monitorEvent failed to alloc new NDArray - memory pool exhausted? (free: {})\n",
                     ctx.pool.num_free_buffers()
                 ),
             );
@@ -313,7 +313,7 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
                 Some(0),
                 0,
                 TraceMask::ERROR,
-                &format!("pvaDriver::monitorEvent failed to convert NTNDArray into NDArray: {e}"),
+                &format!("pvaDriver::monitorEvent failed to convert NTNDArray into NDArray: {e}\n"),
             );
             return;
         }

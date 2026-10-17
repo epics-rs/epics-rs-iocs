@@ -113,7 +113,7 @@ impl PortDriver for PvaDriver {
             TraceMask::IO_DRIVER,
             file!(),
             line!(),
-            format_args!("pvaDriver:writeInt32: function={reason}, value={value}"),
+            format_args!("pvaDriver:writeInt32: function={reason}, value={value}\n"),
         );
         Ok(())
     }
@@ -166,7 +166,7 @@ fn trace_octet(user: &AsynUser, value: &[u8]) {
         file!(),
         line!(),
         format_args!(
-            "pvaDriver:writeOctet: function={}, value={}",
+            "pvaDriver:writeOctet: function={}, value={}\n",
             user.reason,
             String::from_utf8_lossy(value)
         ),

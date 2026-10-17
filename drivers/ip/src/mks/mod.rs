@@ -79,7 +79,7 @@ fn write_read_once(port: &str, data: &[u8]) -> Result<Vec<u8>, ()> {
         io.print(
             0,
             TraceMask::ERROR,
-            format_args!("asynOctetSyncIO connect failed {}", e.message()),
+            format_args!("asynOctetSyncIO connect failed {}\n", e.message()),
         );
         return Err(());
     }
@@ -87,7 +87,7 @@ fn write_read_once(port: &str, data: &[u8]) -> Result<Vec<u8>, ()> {
         io.print(
             0,
             TraceMask::ERROR,
-            format_args!("asynOctetSyncIO writeReadOnce failed {}", e.message()),
+            format_args!("asynOctetSyncIO writeReadOnce failed {}\n", e.message()),
         );
     })
 }
@@ -152,7 +152,7 @@ impl CellBody for Job {
             &self.handle,
             TraceMask::IO_DEVICE,
             format_args!(
-                "devAiMKS record={}, len={}, response=\n{}",
+                "devAiMKS record={}, len={}, response=\n{}\n",
                 self.name,
                 data.len(),
                 String::from_utf8_lossy(&data)
@@ -229,7 +229,7 @@ impl DevAiMks {
                 handle,
                 TraceMask::ERROR,
                 format_args!(
-                    "devAiMKS ERROR, record={}, nread={}, response=\n{text}",
+                    "devAiMKS ERROR, record={}, nread={}, response=\n{text}\n",
                     self.name,
                     reply.len()
                 ),
@@ -240,7 +240,7 @@ impl DevAiMks {
             handle,
             TraceMask::IO_DEVICE,
             format_args!(
-                "devAiMKS::initAi record={}, nread={}, response=\n{text}",
+                "devAiMKS::initAi record={}, nread={}, response=\n{text}\n",
                 self.name,
                 reply.len()
             ),
@@ -324,7 +324,7 @@ impl DeviceSupport for DevAiMks {
                 print(
                     &handle,
                     TraceMask::ERROR,
-                    format_args!("devAiMKS, unknown gauge type {code}"),
+                    format_args!("devAiMKS, unknown gauge type {code}\n"),
                 );
                 self.init_alarm = true;
             }
@@ -340,7 +340,7 @@ impl DeviceSupport for DevAiMks {
             &handle,
             TraceMask::IO_DEVICE,
             format_args!(
-                "devAiMKS record={name}, gauge_str={code}, lopr={:.6}, hopr={:.6}",
+                "devAiMKS record={name}, gauge_str={code}, lopr={:.6}, hopr={:.6}\n",
                 double(record, "LOPR"),
                 double(record, "HOPR")
             ),
@@ -424,7 +424,7 @@ impl DeviceSupport for DevAiMks {
                 print(
                     &handle,
                     TraceMask::FLOW,
-                    format_args!("devAiMKS record={name}, no gauge, etc."),
+                    format_args!("devAiMKS record={name}, no gauge, etc.\n"),
                 );
                 self.raise(AlarmSeverity::Major);
                 Some(0.0)
@@ -433,7 +433,7 @@ impl DeviceSupport for DevAiMks {
                 print(
                     &handle,
                     TraceMask::FLOW,
-                    format_args!("devAiMKS record={name}, SYNTAX or NotCMD response."),
+                    format_args!("devAiMKS record={name}, SYNTAX or NotCMD response.\n"),
                 );
                 None
             }
@@ -442,7 +442,7 @@ impl DeviceSupport for DevAiMks {
                     &handle,
                     TraceMask::ERROR,
                     format_args!(
-                        "devAiMKS record={name}, unknown response len={} response={text}",
+                        "devAiMKS record={name}, unknown response len={} response={text}\n",
                         text.len()
                     ),
                 );

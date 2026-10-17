@@ -59,7 +59,7 @@ pub(crate) fn start_udp_listener(
             if rcvbuf != MAX_UDP_DATA_BUFFER {
                 trace_error(&format!(
                     "pixirad:udpDataListenerTask: Unable to set requested buffer size for \
-                     SO_RCVBUF, actual={rcvbuf}"
+                     SO_RCVBUF, actual={rcvbuf}\n"
                 ));
             }
             let mut assembler = FrameAssembler::new(sensor);
@@ -71,7 +71,7 @@ pub(crate) fn start_udp_listener(
                     Ok(n) => n,
                     Err(e) => {
                         trace_error(&format!(
-                            "pixirad:udpDataListenerTask: Error calling recvfrom = {}",
+                            "pixirad:udpDataListenerTask: Error calling recvfrom = {}\n",
                             strerror(&e)
                         ));
                         continue;
@@ -161,7 +161,7 @@ async fn data_loop(ctx: DataContext) {
                 Some(0),
                 0,
                 TraceMask::ERROR,
-                "pixirad:dataTask: frame has alignment errors",
+                "pixirad:dataTask: frame has alignment errors\n",
             );
         }
 
@@ -420,7 +420,7 @@ async fn status_loop(ctx: StatusContext) {
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(e) => {
                 ctx.trace_error(&format!(
-                    "pixirad:statusTask: error reading status broadcast message: {}",
+                    "pixirad:statusTask: error reading status broadcast message: {}\n",
                     strerror(&e)
                 ));
                 continue;
@@ -446,7 +446,7 @@ async fn status_loop(ctx: StatusContext) {
         for (key, reason) in readings {
             let Some(value) = protocol::status_value(&message, key) else {
                 ctx.trace_error(&format!(
-                    "pixirad:statusTask: {} {key} in status broadcast message={message}",
+                    "pixirad:statusTask: {} {key} in status broadcast message={message}\n",
                     if message.contains(key) {
                         "error parsing"
                     } else {

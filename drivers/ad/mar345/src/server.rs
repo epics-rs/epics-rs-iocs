@@ -134,7 +134,7 @@ impl Mar345Driver {
                     0,
                     TraceMask::ERROR,
                     format_args!(
-                        "mar345:writeServer, status={}, sent\n{output}",
+                        "mar345:writeServer, status={}, sent\n{output}\n",
                         e.status() as i32
                     ),
                 );

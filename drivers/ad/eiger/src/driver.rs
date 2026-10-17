@@ -664,7 +664,7 @@ impl PortDriver for EigerDriver {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
                 format_args!(
-                    "eigerDetector::writeInt32: error status={} function={function}, value={value}",
+                    "eigerDetector::writeInt32: error status={} function={function}, value={value}\n",
                     e.c_status_code()
                 ),
             );
@@ -675,7 +675,7 @@ impl PortDriver for EigerDriver {
             TraceMask::IO_DRIVER,
             file!(),
             line!(),
-            format_args!("eigerDetector:writeInt32: function={function}, value={value}"),
+            format_args!("eigerDetector:writeInt32: function={function}, value={value}\n"),
         );
         Ok(())
     }
@@ -689,7 +689,7 @@ impl PortDriver for EigerDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "eigerDetector:writeFloat64 error, status={} function={function}, value={value:.6}",
+                    "eigerDetector:writeFloat64 error, status={} function={function}, value={value:.6}\n",
                     e.c_status_code()
                 ),
             ),
@@ -698,7 +698,7 @@ impl PortDriver for EigerDriver {
                     TraceMask::IO_DRIVER,
                     file!(),
                     line!(),
-                    format_args!("eigerDetector:writeFloat64: function={function}, value={value:.6}"),
+                    format_args!("eigerDetector:writeFloat64: function={function}, value={value:.6}\n"),
                 );
                 let _ = self.ad.port_base.call_param_callbacks(0);
             }
@@ -728,7 +728,7 @@ impl PortDriver for EigerDriver {
                     TraceMask::IO_DRIVER,
                     file!(),
                     line!(),
-                    format_args!("eigerDetector:writeOctet: function={function}, value={value}"),
+                    format_args!("eigerDetector:writeOctet: function={function}, value={value}\n"),
                 );
                 let _ = self.ad.port_base.call_param_callbacks(0);
             }

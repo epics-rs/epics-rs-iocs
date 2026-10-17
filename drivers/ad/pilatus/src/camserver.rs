@@ -210,7 +210,7 @@ impl Ctx {
                 self.trace(
                     TraceMask::ERROR,
                     &format!(
-                        "pilatusDetector:writeCamserver, status={}, sent\n{cmd}",
+                        "pilatusDetector:writeCamserver, status={}, sent\n{cmd}\n",
                         status.code()
                     ),
                 );
@@ -285,14 +285,14 @@ impl Ctx {
         };
         if status != CamStatus::Success {
             cam_trace(&format!(
-                "pilatusDetector:readCamserver, timeout={timeout:.6}, status={} received {} bytes\n{}",
+                "pilatusDetector:readCamserver, timeout={timeout:.6}, status={} received {} bytes\n{}\n",
                 status.code(),
                 self.from.len(),
                 self.from
             ));
         } else if !reply_is_ok(&self.from) {
             cam_trace(&format!(
-                "pilatusDetector:readCamserver unexpected response from camserver, no OK, response={}",
+                "pilatusDetector:readCamserver unexpected response from camserver, no OK, response={}\n",
                 self.from
             ));
             self.set_str(self.ad.status_message, "Error from camserver");

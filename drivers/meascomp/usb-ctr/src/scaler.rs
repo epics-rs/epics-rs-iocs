@@ -81,7 +81,7 @@ pub fn start_scaler(
             trace.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "USBCTR::startScaler error calling ulCConfigScan, counter={i}, mode=0x{mode:x}, status={}, error={}",
+                    "USBCTR::startScaler error calling ulCConfigScan, counter={i}, mode=0x{mode:x}, status={}, error={}\n",
                     e.code, e.message
                 ),
             );
@@ -103,7 +103,7 @@ pub fn start_scaler(
         trace.print(
             TraceMask::ERROR,
             format_args!(
-                "USBCTR::startScaler error calling ulCInScan, firstCounter={}, lastCounter={}, samplesPerCounter={}, rate={}, options=0x{:x}, flags=0x{:x}, status={}, error={}",
+                "USBCTR::startScaler error calling ulCInScan, firstCounter={}, lastCounter={}, samplesPerCounter={}, rate={}, options=0x{:x}, flags=0x{:x}, status={}, error={}\n",
                 config.low_counter,
                 config.high_counter,
                 config.samples_per_counter,
@@ -136,7 +136,7 @@ fn set_scaler_presets(
             trace.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "USBCTR::setScalerPresets error calling cbCLoad32, counter={i}, presetCounts={}, status={}, error={}",
+                    "USBCTR::setScalerPresets error calling cbCLoad32, counter={i}, presetCounts={}, status={}, error={}\n",
                     preset as i32, e.code, e.message
                 ),
             );
@@ -146,7 +146,7 @@ fn set_scaler_presets(
         trace.print(
             TraceMask::ERROR,
             format_args!(
-                "USBCTR::setScalerPresets error calling cbCLoad32, reg=OUTPUTVAL0REG0, value=0, status={}, error={}",
+                "USBCTR::setScalerPresets error calling cbCLoad32, reg=OUTPUTVAL0REG0, value=0, status={}, error={}\n",
                 e.code, e.message
             ),
         );
@@ -156,7 +156,7 @@ fn set_scaler_presets(
         trace.print(
             TraceMask::ERROR,
             format_args!(
-                "USBCTR::setScalerPresets error calling cbCLoad32, reg=OUTPUTVAL1REG0, value={}, status={}, error={}",
+                "USBCTR::setScalerPresets error calling cbCLoad32, reg=OUTPUTVAL1REG0, value={}, status={}, error={}\n",
                 preset0 as i32, e.code, e.message
             ),
         );
@@ -221,7 +221,7 @@ pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState, trace: &SelfTrac
             trace.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "USBCTR::stopScaler ERROR calling cbStopBackground(CTRFUNCTION), status={}, error={}",
+                    "USBCTR::stopScaler ERROR calling cbStopBackground(CTRFUNCTION), status={}, error={}\n",
                     e.code, e.message
                 ),
             );
@@ -264,7 +264,7 @@ pub fn print_get_status(
     trace.print(
         TraceMask::FLOW,
         format_args!(
-            "USBCTR::{function_name} getStatus returned status={status}, ctrStatus={scan}, ctrCount={count}, ctrIndex={index}"
+            "USBCTR::{function_name} getStatus returned status={status}, ctrStatus={scan}, ctrCount={count}, ctrIndex={index}\n"
         ),
     );
 }

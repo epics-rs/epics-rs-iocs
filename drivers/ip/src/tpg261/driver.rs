@@ -193,7 +193,7 @@ impl TpgWorker {
             Err(TpgError::Nak) => {
                 self.transport.print(
                     TraceMask::ERROR,
-                    format_args!("devTPG261::devTPG261Callback Cmd {who} message Error "),
+                    format_args!("devTPG261::devTPG261Callback Cmd {who} message Error \n"),
                 );
                 return Err(());
             }
@@ -221,7 +221,7 @@ impl TpgWorker {
     fn print_too_small(&self, stage: &str, who: &str) {
         self.transport.print(
             TraceMask::ERROR,
-            format_args!("devTPG261::devTPG261Callback {stage} {who} message too small=0"),
+            format_args!("devTPG261::devTPG261Callback {stage} {who} message too small=0\n"),
         );
     }
 
@@ -245,7 +245,7 @@ impl TpgWorker {
                 GaugeStatus::Error(other) => {
                     self.transport.print(
                         TraceMask::ERROR,
-                        format_args!("devTPG261::readAi Gauge error {who} status =[{other}] "),
+                        format_args!("devTPG261::readAi Gauge error {who} status =[{other}] \n"),
                     );
                     other
                 }

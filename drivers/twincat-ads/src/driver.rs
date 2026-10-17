@@ -304,20 +304,20 @@ impl AdsShared {
         const FUNCTION: &str = "adsGetSymInfoByName";
         self.print(
             TraceMask::FLOW,
-            format_args!("{DRIVER_NAME}:{FUNCTION}: Variable name: {name}, amsPort: {ams_port}."),
+            format_args!("{DRIVER_NAME}:{FUNCTION}: Variable name: {name}, amsPort: {ams_port}.\n"),
         );
         client.get_symbol_info(ams_port, name).inspect_err(|e| {
             self.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "{DRIVER_NAME}:{FUNCTION}: Get symbolic information failed for {name} with: {}",
+                    "{DRIVER_NAME}:{FUNCTION}: Get symbolic information failed for {name} with: {}\n",
                     CStatus(e)
                 ),
             );
             if e.code() == Some(GLOBALERR_TARGET_PORT) {
                 self.print(
                     TraceMask::ERROR,
-                    format_args!("{DRIVER_NAME}:{FUNCTION}: Port error, giving up!"),
+                    format_args!("{DRIVER_NAME}:{FUNCTION}: Port error, giving up!\n"),
                 );
                 std::process::exit(1);
             }
@@ -391,7 +391,7 @@ impl AdsShared {
                         self.print(
                             TraceMask::ERROR,
                             format_args!(
-                                "{DRIVER_NAME}:adsUpdateParameter: Type combination not supported. PLC type = {}, ASYN type= {}",
+                                "{DRIVER_NAME}:adsUpdateParameter: Type combination not supported. PLC type = {}, ASYN type= {}\n",
                                 plc.as_str(),
                                 asyn_type_to_string(asyn)
                             ),
@@ -512,7 +512,7 @@ impl AdsShared {
                 self.print(
                     TraceMask::ERROR,
                     format_args!(
-                        "{DRIVER_NAME}:adsDelSymbolsChangedCallback: Delete device notification failed with: {}",
+                        "{DRIVER_NAME}:adsDelSymbolsChangedCallback: Delete device notification failed with: {}\n",
                         CStatus(&e)
                     ),
                 );
@@ -520,7 +520,7 @@ impl AdsShared {
         }
         self.print(
             TraceMask::FLOW,
-            format_args!("{DRIVER_NAME}:adsAddSymbolsChangedCallback: Ams-port {ams_port}."),
+            format_args!("{DRIVER_NAME}:adsAddSymbolsChangedCallback: Ams-port {ams_port}.\n"),
         );
         match client.add_notification(
             ams_port,
@@ -539,7 +539,7 @@ impl AdsShared {
             Err(e) => self.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "{DRIVER_NAME}:adsAddSymbolsChangedCallback: Add device notification failed with: {}",
+                    "{DRIVER_NAME}:adsAddSymbolsChangedCallback: Add device notification failed with: {}\n",
                     CStatus(&e)
                 ),
             ),
@@ -597,7 +597,7 @@ impl AdsShared {
                 self.print(
                     TraceMask::ERROR,
                     format_args!(
-                        "{DRIVER_NAME}:adsGetSymHandleByName: Create handle for {name} failed with: {}",
+                        "{DRIVER_NAME}:adsGetSymHandleByName: Create handle for {name} failed with: {}\n",
                         CStatus(e)
                     ),
                 )
@@ -689,19 +689,19 @@ impl AdsShared {
                 AdsError::ShortRead { need, got } => self.print(
                     TraceMask::ERROR,
                     format_args!(
-                        "{DRIVER_NAME}:adsReadParam: Read bytes differ from parameter plc size ({got} vs {need})."
+                        "{DRIVER_NAME}:adsReadParam: Read bytes differ from parameter plc size ({got} vs {need}).\n"
                     ),
                 ),
                 AdsError::Ads(code) => self.print(
                     TraceMask::ERROR,
                     format_args!(
-                        "{DRIVER_NAME}:adsReadParam: AdsSyncReadReqEx2 failed: {} ({code}).",
+                        "{DRIVER_NAME}:adsReadParam: AdsSyncReadReqEx2 failed: {} ({code}).\n",
                         error_to_string(*code)
                     ),
                 ),
                 other => self.print(
                     TraceMask::ERROR,
-                    format_args!("{DRIVER_NAME}:adsReadParam: AdsSyncReadReqEx2 failed: {other}."),
+                    format_args!("{DRIVER_NAME}:adsReadParam: AdsSyncReadReqEx2 failed: {other}.\n"),
                 ),
             })
     }
@@ -727,7 +727,7 @@ impl AdsShared {
                 self.print(
                     TraceMask::ERROR,
                     format_args!(
-                        "{DRIVER_NAME}:adsAddDataCallback: Add device notification failed with: {}",
+                        "{DRIVER_NAME}:adsAddDataCallback: Add device notification failed with: {}\n",
                         CStatus(e)
                     ),
                 )
@@ -917,7 +917,7 @@ impl AdsShared {
                     self.print(
                         TraceMask::ERROR,
                         format_args!(
-                            "{DRIVER_NAME}:bulkReadThread: getAdsParamInfo() for hUser {reason} failed"
+                            "{DRIVER_NAME}:bulkReadThread: getAdsParamInfo() for hUser {reason} failed\n"
                         ),
                     );
                     continue;
@@ -930,7 +930,7 @@ impl AdsShared {
                     Err(_) => self.print(
                         TraceMask::ERROR,
                         format_args!(
-                            "{DRIVER_NAME}:bulkReadThread: bulk read for {drv_info} ({slot}) failed"
+                            "{DRIVER_NAME}:bulkReadThread: bulk read for {drv_info} ({slot}) failed\n"
                         ),
                     ),
                 }
@@ -950,7 +950,7 @@ impl AdsShared {
             self.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "{DRIVER_NAME}:adsDataCallback: getAdsParamInfo() for hUser {reason} failed"
+                    "{DRIVER_NAME}:adsDataCallback: getAdsParamInfo() for hUser {reason} failed\n"
                 ),
             );
         }
@@ -972,7 +972,7 @@ impl AdsShared {
         self.print(
             TRACE_INFO,
             format_args!(
-                "{DRIVER_NAME}:adsSymbolsChangedCallback: Symbols changed for Ams-port {ams_port}."
+                "{DRIVER_NAME}:adsSymbolsChangedCallback: Symbols changed for Ams-port {ams_port}.\n"
             ),
         );
     }
@@ -1818,7 +1818,7 @@ pub fn create_ads_port(claim: &PortClaim, cfg: AdsConfig) -> AsynResult<AdsRunti
     if connect(&shared).is_err() {
         shared.print(
             TraceMask::ERROR,
-            format_args!("{DRIVER_NAME}:{DRIVER_NAME}: connect failed for port {port_name}."),
+            format_args!("{DRIVER_NAME}:{DRIVER_NAME}: connect failed for port {port_name}.\n"),
         );
     } else {
         match shared
@@ -1828,7 +1828,7 @@ pub fn create_ads_port(claim: &PortClaim, cfg: AdsConfig) -> AsynResult<AdsRunti
             Ok((AdsState::Run, _)) => shared.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "{DRIVER_NAME}:{DRIVER_NAME}: connection established for port '{port_name}'"
+                    "{DRIVER_NAME}:{DRIVER_NAME}: connection established for port '{port_name}'\n"
                 ),
             ),
             Ok(_) => {}
@@ -1840,7 +1840,7 @@ pub fn create_ads_port(claim: &PortClaim, cfg: AdsConfig) -> AsynResult<AdsRunti
                 shared.print(
                     TraceMask::ERROR,
                     format_args!(
-                        "{DRIVER_NAME}:{DRIVER_NAME}: adsReadStateLock failed for port '{port_name}' error={error}"
+                        "{DRIVER_NAME}:{DRIVER_NAME}: adsReadStateLock failed for port '{port_name}' error={error}\n"
                     ),
                 );
                 disconnect(&shared);
@@ -1968,7 +1968,7 @@ fn cyclic_thread(shared: &Arc<AdsShared>) {
                 shared.print(
                     TraceMask::FLOW,
                     format_args!(
-                        "{DRIVER_NAME}:cyclicThread: Not connected counter: {not_connected}."
+                        "{DRIVER_NAME}:cyclicThread: Not connected counter: {not_connected}.\n"
                     ),
                 );
             }
@@ -1977,7 +1977,9 @@ fn cyclic_thread(shared: &Arc<AdsShared>) {
             if one_ok_old {
                 shared.print(
                     TraceMask::ERROR,
-                    format_args!("{DRIVER_NAME}:cyclicThread: No connection! Try to reconnect..."),
+                    format_args!(
+                        "{DRIVER_NAME}:cyclicThread: No connection! Try to reconnect...\n"
+                    ),
                 );
             }
             // The socket may be up with no runtime behind it; C drops it on
@@ -1985,7 +1987,7 @@ fn cyclic_thread(shared: &Arc<AdsShared>) {
             if not_connected & 2 == 2 {
                 shared.print(
                     TraceMask::ERROR,
-                    format_args!("cyclicThread: forcing disconnect."),
+                    format_args!("cyclicThread: forcing disconnect.\n"),
                 );
                 disconnect(shared);
             }
@@ -2047,7 +2049,7 @@ fn cyclic_pass(shared: &Arc<AdsShared>) -> bool {
             shared.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "{DRIVER_NAME}:{FUNCTION}: connection failed for port {}.",
+                    "{DRIVER_NAME}:{FUNCTION}: connection failed for port {}.\n",
                     shared.cfg.port_name
                 ),
             );
@@ -2061,7 +2063,7 @@ fn cyclic_pass(shared: &Arc<AdsShared>) -> bool {
             shared.print(
                 TRACE_INFO,
                 format_args!(
-                    "{DRIVER_NAME}:{FUNCTION}: Ams-port, {ams_port}, state change: \"{}\" -> \"{}\".",
+                    "{DRIVER_NAME}:{FUNCTION}: Ams-port, {ams_port}, state change: \"{}\" -> \"{}\".\n",
                     old_state.as_str(),
                     state.as_str()
                 ),

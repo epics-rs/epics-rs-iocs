@@ -576,7 +576,7 @@ impl PortDriver for MerlinDetector {
                 file!(),
                 line!(),
                 format_args!(
-                    "merlinDetector:writeInt32: error, status={}, reason={reason} value={value}",
+                    "merlinDetector:writeInt32: error, status={}, reason={reason} value={value}\n",
                     e.status() as i32
                 ),
             ),
@@ -584,7 +584,7 @@ impl PortDriver for MerlinDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("merlinDetector:writeInt32: reason={reason}, value={value}"),
+                format_args!("merlinDetector:writeInt32: reason={reason}, value={value}\n"),
             ),
         }
         status
@@ -643,7 +643,7 @@ impl PortDriver for MerlinDetector {
                     file!(),
                     line!(),
                     format_args!(
-                        "merlinDetector:writeFloat64 error, status={} function={reason}, value={value:.6}",
+                        "merlinDetector:writeFloat64 error, status={} function={reason}, value={value:.6}\n",
                         e.status() as i32
                     ),
                 );
@@ -652,7 +652,7 @@ impl PortDriver for MerlinDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("merlinDetector:writeFloat64: function={reason}, value={value:.6}"),
+                format_args!("merlinDetector:writeFloat64: function={reason}, value={value:.6}\n"),
             ),
         }
         let _ = self.ad.port_base.call_param_callbacks(0);

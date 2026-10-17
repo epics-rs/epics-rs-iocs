@@ -165,7 +165,7 @@ impl MultiFunctionDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "{DRIVER_NAME}:writeInt32, port {port}, wrote {value} to address {addr}"
+                    "{DRIVER_NAME}:writeInt32, port {port}, wrote {value} to address {addr}\n"
                 ),
             );
         } else {
@@ -174,7 +174,7 @@ impl MultiFunctionDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "{DRIVER_NAME}:writeInt32, port {port}, function={}, ERROR writing {value} to address {addr}, status={status}",
+                    "{DRIVER_NAME}:writeInt32, port {port}, function={}, ERROR writing {value} to address {addr}, status={status}\n",
                     user.reason
                 ),
             );
@@ -206,7 +206,7 @@ impl MultiFunctionDriver {
             trace.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "{DRIVER_NAME}:defineWaveform: ERROR numPoints={num_points} must be less than maxOutputPoints={}",
+                    "{DRIVER_NAME}:defineWaveform: ERROR numPoints={num_points} must be less than maxOutputPoints={}\n",
                     self.max_output_points
                 ),
             );
@@ -255,7 +255,7 @@ impl MultiFunctionDriver {
             if let Some(msg) = msg {
                 trace.print(
                     TraceMask::ERROR,
-                    format_args!("{DRIVER_NAME}:startWaveGen: {msg}"),
+                    format_args!("{DRIVER_NAME}:startWaveGen: {msg}\n"),
                 );
             }
             Ok(-1)
@@ -488,7 +488,7 @@ impl PortDriver for MultiFunctionDriver {
                 trace.print(
                     TraceMask::ERROR,
                     format_args!(
-                        "{DRIVER_NAME}::{FUNCTION} error WaveDigNumPoints={value} must be less than MaxInputPoints={}",
+                        "{DRIVER_NAME}::{FUNCTION} error WaveDigNumPoints={value} must be less than MaxInputPoints={}\n",
                         self.max_input_points
                     ),
                 );
@@ -694,7 +694,7 @@ impl PortDriver for MultiFunctionDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "{DRIVER_NAME}:writeFloat64, port {port}, wrote {value:.6} to address {addr}"
+                    "{DRIVER_NAME}:writeFloat64, port {port}, wrote {value:.6} to address {addr}\n"
                 ),
             );
         } else {
@@ -703,7 +703,7 @@ impl PortDriver for MultiFunctionDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "{DRIVER_NAME}:writeFloat64, port {port}, ERROR writing {value:.6} to address {addr}, status={status}"
+                    "{DRIVER_NAME}:writeFloat64, port {port}, ERROR writing {value:.6} to address {addr}, status={status}\n"
                 ),
             );
         }
@@ -723,7 +723,7 @@ impl PortDriver for MultiFunctionDriver {
                 TraceMask::ERROR,
                 file!(),
                 line!(),
-                format_args!("{DRIVER_NAME}:{FUNCTION}: ERROR: {msg}"),
+                format_args!("{DRIVER_NAME}:{FUNCTION}: ERROR: {msg}\n"),
             );
             trace::asyn_status(-1).map(|()| 0)
         };
@@ -765,7 +765,7 @@ impl PortDriver for MultiFunctionDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "{DRIVER_NAME}:{FUNCTION}: ERROR: unknown function={}",
+                    "{DRIVER_NAME}:{FUNCTION}: ERROR: unknown function={}\n",
                     user.reason
                 ),
             );
@@ -780,7 +780,7 @@ impl PortDriver for MultiFunctionDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "{DRIVER_NAME}:{FUNCTION}: ERROR: addr={addr} max={}, nElements={} max={max_points}",
+                    "{DRIVER_NAME}:{FUNCTION}: ERROR: addr={addr} max={}, nElements={} max={max_points}\n",
                     MAX_ANALOG_OUT - 1,
                     data.len()
                 ),
@@ -856,7 +856,7 @@ impl PortDriver for MultiFunctionDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "{DRIVER_NAME}:{FUNCTION}, port {}, function={reason}, wrote value=0x{value:x}, mask=0x{mask:x}, direction=0x{direction:x}",
+                    "{DRIVER_NAME}:{FUNCTION}, port {}, function={reason}, wrote value=0x{value:x}, mask=0x{mask:x}, direction=0x{direction:x}\n",
                     self.base.port_name
                 ),
             );

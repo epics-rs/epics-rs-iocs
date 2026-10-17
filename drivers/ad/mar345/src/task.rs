@@ -178,7 +178,7 @@ impl Worker {
             }
             if start.elapsed().as_secs_f64() > timeout {
                 self.trace_error(
-                    "mar345:waitForCompletion: error waiting for response from marServer",
+                    "mar345:waitForCompletion: error waiting for response from marServer\n",
                 );
                 return CamStatus::Error;
             }
@@ -382,7 +382,7 @@ impl Worker {
                 let error = e.to_string();
                 let error = error.split(" (os error").next().unwrap_or(&error);
                 self.trace_error(&format!(
-                    "mar345getImageData: unable to open input file {full}, error={error}"
+                    "mar345getImageData: unable to open input file {full}, error={error}\n"
                 ));
                 return;
             }
@@ -486,7 +486,7 @@ impl Worker {
         let mut l = match self.port.hold_driver_blocking::<Mar345Driver>() {
             Ok(l) => l,
             Err(e) => {
-                self.trace_error(&format!("mar345:mar345Task: no driver lock: {e}"));
+                self.trace_error(&format!("mar345:mar345Task: no driver lock: {e}\n"));
                 return;
             }
         };

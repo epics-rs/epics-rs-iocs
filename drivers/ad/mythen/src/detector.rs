@@ -116,7 +116,7 @@ impl Detector {
         *self.out_string.lock() = what.to_string();
         let result = self.io(what, exchange);
         if result.is_err() {
-            self.trace_error("mythen:writeReadMeter: error!");
+            self.trace_error("mythen:writeReadMeter: error!\n");
         }
         result
     }
@@ -171,7 +171,7 @@ impl Detector {
         *self.out_string.lock() = "-get version".to_string();
         let version = self
             .exchange(Transport::get_version)
-            .inspect_err(|_| self.trace_error("mythen:writeReadMeter: error!"))?;
+            .inspect_err(|_| self.trace_error("mythen:writeReadMeter: error!\n"))?;
         self.store_firmware(&version);
         Ok(version)
     }
@@ -201,7 +201,7 @@ impl Detector {
         let value = self.meter(command, |t| t.send_command(command))?;
         if value < 0 {
             self.trace_error(&format!(
-                "mythen:sendCommand: error, expected 0, received {value}"
+                "mythen:sendCommand: error, expected 0, received {value}\n"
             ));
         }
         Ok(())
@@ -284,7 +284,7 @@ impl Detector {
         // C sends `-stop` straight through pasynOctetSyncIO, not
         // writeReadMeter, and prints its own line.
         self.io("-stop", |t| t.send_command("-stop"))
-            .inspect_err(|_| self.trace_error("mythen:setAcquire: error!"))?;
+            .inspect_err(|_| self.trace_error("mythen:setAcquire: error!\n"))?;
         Ok(())
     }
 
@@ -533,7 +533,7 @@ impl Detector {
     /// C `getSettings`' `goto error`, mythen.cpp:791.
     fn settings_error(&self, command: &str, got: String) -> AsynError {
         self.trace_error(&format!(
-            "mythen:getSettings: error, outString={command}, inString={got}"
+            "mythen:getSettings: error, outString={command}, inString={got}\n"
         ));
         AsynError::Status {
             status: AsynStatus::Error,
