@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
@@ -18,7 +19,6 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::exit::at_exit;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
-use epics_rs::base::server::records::printf::format_g;
 
 use crate::bincomm::Span;
 use crate::comm::SpiiPlusComm;
@@ -63,7 +63,7 @@ impl SpiiPlusAuxIo {
     fn write_analog(&self, chan: i32, value: f64) -> AsynResult<()> {
         let value = value.clamp(-100.0, 100.0);
         self.comm
-            .write_read_ack(&format!("AOUT({chan}) = {}", format_g(value, 6)))
+            .write_read_ack(&format!("AOUT({chan}) = {}", CFloat(value).g()))
     }
 }
 

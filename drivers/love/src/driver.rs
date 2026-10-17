@@ -777,8 +777,7 @@ impl LoveDriver {
     /// C's `lockPort` / `executeCommand` / `unlockPort` in every read and
     /// write (drvLove.c:1198-1200): the serial port stays locked from before
     /// the write until after the read, so no other serial user's request
-    /// lands between a command and its reply. C ignores `lockPort`'s status;
-    /// here a port that refuses the lock (shut down) fails the command.
+    /// lands between a command and its reply.
     fn locked_command(
         &self,
         trace: Option<UserTrace>,
@@ -788,9 +787,19 @@ impl LoveDriver {
         let command = self.command(trace, addr, body);
         let caller = command.trace.clone();
         caller_print!(caller, FLOW, "drvLove::lockPort\n");
+        // A shut-down serial port refuses the lock (asynManager.c:1790-1795),
+        // and C's lockPort (drvLove.c:698-700) copies that into the error
+        // text. C then runs executeCommand anyway, which writes through the
+        // pasynOctetPvt cached at init (:544, :813) into the driver its
+        // shutdown deleted (asynPortDriver.cpp:3980): a use-after-free. The
+        // write and read are refused here instead.
         let result = self
             .serial
-            .lock_port_blocking(move |calls| command.execute(calls));
+            .lock_port_blocking(move |calls| command.execute(calls))
+            .map_err(|e| AsynError::Status {
+                status: e.status(),
+                message: format!("{} error {}", self.ser_name, e.message()),
+            });
         caller_print!(caller, FLOW, "drvLove::unlockPort\n");
         result.and_then(|r| r)
     }
@@ -1608,5 +1617,123 @@ mod tests {
                 "write \"other\"".to_owned(),
             ]
         );
+    }
+
+    /// A serial port that records whether a write reached it.
+    struct ShutSerial {
+        base: PortDriverBase,
+        wrote: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl PortDriver for ShutSerial {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+
+        fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.wrote.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(data.len())
+        }
+    }
+
+    /// C on a shut-down serial port: both lockPort lines print, lockPort's
+    /// refusal is copied into the error text (drvLove.c:690-700), and
+    /// readInt32 then reports `"<port> error "` (:1237-1240). No write
+    /// reaches the shut-down driver.
+    #[test]
+    fn a_shut_down_serial_port_refuses_the_command() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serial = ShutSerial {
+            base: PortDriverBase::new(
+                "LOVETESTSHDSER",
+                1,
+                PortFlags {
+                    multi_device: false,
+                    can_block: true,
+                    destructible: true,
+                },
+            ),
+            wrote: wrote.clone(),
+        };
+        let mut love = love_on(serial, "LOVETESTSHD");
+        let serial = love.serial.clone();
+        let file = |what: &str| {
+            let path =
+                std::env::temp_dir().join(format!("love-shd-{what}-{}.txt", std::process::id()));
+            let f = std::fs::File::create(&path).unwrap();
+            (
+                path,
+                TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(f))),
+            )
+        };
+        let (ser_path, ser_file) = file("ser");
+        serial
+            .trace()
+            .set_trace_mask(Some("LOVETESTSHDSER"), TraceMask::ERROR | TraceMask::FLOW);
+        serial
+            .trace()
+            .set_trace_file(Some("LOVETESTSHDSER"), ser_file);
+        serial
+            .submit_blocking(RequestOp::ShutdownPort, AsynUser::default())
+            .unwrap();
+
+        let e = love.locked_command(None, 1, "00").unwrap_err();
+        assert_eq!(e.status(), AsynStatus::Disabled);
+        assert_eq!(
+            e.message(),
+            "SER error asynManager:lockPort: port has been shut down"
+        );
+        let e = love.read_int32(&AsynUser::new(0).with_addr(1)).unwrap_err();
+        assert_eq!(e.status(), AsynStatus::Disabled);
+        assert_eq!(e.message(), "LOVETESTSHD error ");
+        assert!(!wrote.load(std::sync::atomic::Ordering::SeqCst));
+
+        let ser = String::from_utf8(read_trace(&ser_path)).unwrap();
+        assert_eq!(
+            ser.matches("LOVETESTSHDSER lockPort\n").count(),
+            2,
+            "{ser:?}"
+        );
+        assert!(!ser.contains("unlockPort"), "{ser:?}");
+
+        // The love port's own lines, through the caller's device.
+        let claim = claim_port("LOVETESTSHD").expect("love port name");
+        let (runtime, _thread) =
+            create_port_runtime(&claim, love, RuntimeConfig::default()).expect("love port runtime");
+        let handle = runtime.port_handle().clone();
+        claim
+            .publish(handle.clone(), &epics_rs::asyn::registry::open_owner())
+            .unwrap();
+        let (dev_path, dev_file) = file("dev");
+        handle
+            .trace()
+            .set_device_trace_mask("LOVETESTSHD", 1, TraceMask::ERROR | TraceMask::FLOW);
+        handle
+            .trace()
+            .set_device_trace_file("LOVETESTSHD", 1, dev_file);
+        let user = SyncIOHandle::from_handle(handle, 1, Duration::from_secs(5));
+        assert!(user.read_int32(0).is_err());
+        let dev = String::from_utf8(read_trace(&dev_path)).unwrap();
+        let mut at = 0;
+        for line in [
+            "drvLove::readInt32\n",
+            "drvLove::lockPort\n",
+            "drvLove::unlockPort\n",
+        ] {
+            let found = dev[at..]
+                .find(line)
+                .unwrap_or_else(|| panic!("{line:?} in {dev:?}"));
+            at += found + line.len();
+        }
+        assert!(!dev.contains("drvLove::executeCommand"), "{dev:?}");
     }
 }

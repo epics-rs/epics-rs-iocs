@@ -5,6 +5,7 @@
 //! notes, and [`ioc`] for the iocsh configuration commands.
 
 pub mod a3200;
+mod axis_report;
 pub mod drv_soloist;
 pub mod ensemble;
 mod exchange;

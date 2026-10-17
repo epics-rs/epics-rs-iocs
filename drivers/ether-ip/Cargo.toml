@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 chrono = "0.4"
+epics-libcom-rs = { workspace = true }
 epics-rs = { workspace = true }
 parking_lot = "0.12"
 thiserror = "2"

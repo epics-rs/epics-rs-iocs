@@ -44,7 +44,9 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
-use motor_common::util::atof;
+use epics_libcom_rs::cfmt::CFloat;
+use motor_common::util::{atof, atoi};
+use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
 /// Response buffer size.
 const READ_BUF: usize = 128;
@@ -145,6 +147,72 @@ impl Mcs2Controller {
     }
 }
 
+/// The MCS2 controller's poll periods, in seconds, for its report.
+pub struct Mcs2Params {
+    pub moving_poll: f64,
+    pub idle_poll: f64,
+}
+
+impl ControllerParams for Mcs2Params {
+    /// C `MCS2Controller::report` (smarActMCS2MotorDriver.cpp:177-184).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "MCS2 motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            CFloat(self.moving_poll),
+            CFloat(self.idle_poll),
+        );
+        ctx.report(out, level);
+    }
+}
+
+/// C `MCS2Axis::report` (smarActMCS2MotorDriver.cpp:287-349) for channel
+/// `channel`, which queries the controller at level > 0.
+pub struct Mcs2AxisReport {
+    pub controller: Arc<Mutex<Mcs2Controller>>,
+    pub channel: i32,
+}
+
+impl AxisReport for Mcs2AxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level == 0 {
+            return;
+        }
+        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let c = self.channel;
+        let query = |what: &str| ctrl.query(&format!(":CHAN{c}:{what}?"));
+        let int = |what: &str| atoi(&query(what).unwrap_or_default());
+        let pcode = int("PTYP");
+        // C copies its uninitialised `pname` over the reply
+        // (`strcpy(pC_->inString_, pname)`), a bug; the reply is printed.
+        let pname = query("PTYP:NAME").unwrap_or_default();
+        let (state, vel, acc, mclf, ferr, error) = (
+            int("STAT"),
+            int("VEL"),
+            int("ACC"),
+            int("MCLF"),
+            int("FERR"),
+            int("ERR"),
+        );
+        // C reports only the last query's status.
+        let temp = query("TEMP");
+        if let Err(e) = &temp {
+            let _ = writeln!(out, "  axis {c} -> asyn status error {}", e.status() as i32);
+        }
+        let temp = atoi(&temp.unwrap_or_default());
+        let _ = write!(
+            out,
+            "  axis {c}\n    positioner type {pcode}\n    positioner name {pname}\n    \
+             state {state}\n    velocity {vel}\n    acceleration {acc}\n    \
+             max closed loop frequency {mclf}\n    following error {ferr}\n    \
+             error {error}\n    temp {temp}\n",
+        );
+        ctrl.clear_errors();
+    }
+}
+
 /// One MCS2 channel sharing a controller. Implements [`AsynMotor`].
 pub struct Mcs2Axis {
     controller: Arc<Mutex<Mcs2Controller>>,
@@ -187,9 +255,15 @@ impl Mcs2Axis {
     ) -> AsynResult<()> {
         let c = self.channel;
         ctrl.write_only(&format!(":CHAN{c}:MMOD {}", if relative { 1 } else { 0 }))?;
-        ctrl.write_only(&format!(":CHAN{c}:ACC {}", acceleration * PULSES_PER_STEP))?;
-        ctrl.write_only(&format!(":CHAN{c}:VEL {}", velocity * PULSES_PER_STEP))?;
-        ctrl.write_only(&format!(":MOVE{c} {}", target * PULSES_PER_STEP))
+        ctrl.write_only(&format!(
+            ":CHAN{c}:ACC {:.6}",
+            CFloat(acceleration * PULSES_PER_STEP)
+        ))?;
+        ctrl.write_only(&format!(
+            ":CHAN{c}:VEL {:.6}",
+            CFloat(velocity * PULSES_PER_STEP)
+        ))?;
+        ctrl.write_only(&format!(":MOVE{c} {:.6}", CFloat(target * PULSES_PER_STEP)))
     }
 
     /// Open-loop step move: track the target in software and send the relative
@@ -199,7 +273,7 @@ impl Mcs2Axis {
         self.tracked_position += delta;
         let ctrl = self.lock();
         ctrl.write_only(&format!(":CHAN{c}:MMOD 4"))?;
-        ctrl.write_only(&format!(":MOVE{c} {delta}"))
+        ctrl.write_only(&format!(":MOVE{c} {:.6}", CFloat(delta)))
     }
 }
 
@@ -271,9 +345,15 @@ impl AsynMotor for Mcs2Axis {
         let ctrl = self.lock();
         ctrl.write_only(&format!(":CHAN{c}:REF:OPT {ref_opt}"))?;
         ctrl.clear_errors();
-        ctrl.write_only(&format!(":CHAN{c}:ACC {}", acceleration * PULSES_PER_STEP))?;
+        ctrl.write_only(&format!(
+            ":CHAN{c}:ACC {:.6}",
+            CFloat(acceleration * PULSES_PER_STEP)
+        ))?;
         ctrl.clear_errors();
-        ctrl.write_only(&format!(":CHAN{c}:VEL {}", velocity * PULSES_PER_STEP))?;
+        ctrl.write_only(&format!(
+            ":CHAN{c}:VEL {:.6}",
+            CFloat(velocity * PULSES_PER_STEP)
+        ))?;
         ctrl.clear_errors();
         ctrl.write_only(&format!(":REF{c}"))?;
         ctrl.clear_errors();
@@ -290,7 +370,10 @@ impl AsynMotor for Mcs2Axis {
         let c = self.channel;
         self.tracked_position = position;
         let ctrl = self.lock();
-        ctrl.write_only(&format!(":CHAN{c}:POS {}", position * PULSES_PER_STEP))
+        ctrl.write_only(&format!(
+            ":CHAN{c}:POS {:.6}",
+            CFloat(position * PULSES_PER_STEP)
+        ))
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
@@ -358,6 +441,37 @@ impl AsynMotor for Mcs2Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `sprintf(":CHAN%d:ACC %f")` and the like: six decimals, where
+    /// Rust's `{}` writes the shortest form.
+    #[test]
+    fn moves_are_written_with_c_s_percent_f() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("mcs2PercentF", |_| String::new());
+        let ctrl = Mcs2Controller::new(io, &MotorTrace::new("mcs2PercentF", 0));
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        rig.sent();
+        let user = AsynUser::default();
+        axis.home(&user, 0.0, 2.0, 3.0, true).unwrap();
+        axis.set_position(&user, 1.5).unwrap();
+        axis.move_absolute(&user, 2.0, 0.0, 1.0, 1.0).unwrap();
+        axis.has_encoder = true;
+        axis.move_relative(&user, 0.25, 0.0, 1.0, 1.0).unwrap();
+        let sent = rig.sent();
+        for want in [
+            ":CHAN0:ACC 3000.000000",
+            ":CHAN0:VEL 2000.000000",
+            ":CHAN0:POS 1500.000000",
+            ":MOVE0 0.500000",
+            ":CHAN0:ACC 1000.000000",
+            ":MOVE0 250.000000",
+        ] {
+            assert!(
+                sent.iter().any(|c| c.trim_end() == want),
+                "{want}: {sent:?}"
+            );
+        }
+    }
 
     #[test]
     fn status_bits_decode() {

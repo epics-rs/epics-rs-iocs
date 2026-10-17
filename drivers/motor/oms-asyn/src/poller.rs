@@ -38,6 +38,8 @@ struct AxisState {
     move_delay: i32,
     /// C `invertLimit`, from `LT?`.
     invert_limit: bool,
+    /// C `homing`: a home was sent and the axis has not read done since.
+    homing: bool,
 }
 
 /// What the poller shares with the axes: their status parameters, guarded as
@@ -65,6 +67,7 @@ impl PollShared {
             },
             move_delay: 0,
             invert_limit,
+            homing: false,
         });
     }
 
@@ -79,6 +82,21 @@ impl PollShared {
     /// ran a second controller read per move.
     pub(crate) fn moved(&self, axis: usize) {
         self.axes()[axis].status.done = false;
+    }
+
+    /// C home()'s `homing = 1`.
+    pub(crate) fn homed(&self, axis: usize) {
+        self.axes()[axis].homing = true;
+    }
+
+    /// C `homing`, for the report.
+    pub fn homing(&self, axis: usize) -> bool {
+        self.axes()[axis].homing
+    }
+
+    /// C `numAxes` once Init has created the axes.
+    pub fn axis_count(&self) -> usize {
+        self.axes().len()
     }
 
     /// `writeFloat64`'s `setDoubleParam(motorPosition_, value)` ahead of
@@ -310,6 +328,7 @@ impl OmsPoller {
                 axis.move_delay = 0;
                 st.done = true;
                 st.moving = false;
+                axis.homing = false;
             } else if velocities.is_some_and(|v| v[i] == 0) {
                 if st.moving {
                     if flag(2) == Some(b'L') {
@@ -317,6 +336,7 @@ impl OmsPoller {
                         axis.move_delay = 0;
                         st.done = true;
                         st.moving = false;
+                        axis.homing = false;
                         if flag(0) == Some(b'P') {
                             st.high_limit = true;
                         } else {
@@ -329,6 +349,7 @@ impl OmsPoller {
                             st.moving = false;
                             st.problem = true;
                             axis.move_delay = 0;
+                            axis.homing = false;
                         }
                     }
                 }
@@ -703,6 +724,22 @@ mod tests {
         let user = AsynUser::default();
         assert_eq!(rig.axes[0].poll(&user).unwrap().position, 3000.0);
         assert_eq!(rig.axes[1].poll(&user).unwrap().position, -5.0);
+    }
+
+    /// C `homing`: set by home(), cleared by the loop that finds the axis
+    /// done (omsBaseAxis.cpp:150, omsBaseController.cpp:737).
+    #[test]
+    fn a_home_holds_homing_until_the_loop_finds_the_axis_done() {
+        let mut rig = rig("omsPollerHoming", 2, &HEALTHY);
+        let shared = rig.controller.lock().unwrap().poll_shared().clone();
+        let user = AsynUser::default();
+        for axis in &mut rig.axes {
+            axis.home(&user, 1.0, 100.0, 1000.0, true).unwrap();
+        }
+        assert!(shared.homing(0) && shared.homing(1));
+        poller(&rig).pass();
+        assert!(shared.homing(0), "X is still moving");
+        assert!(!shared.homing(1), "Y reads done");
     }
 
     /// A move signals the poller once, through the poll that follows it.

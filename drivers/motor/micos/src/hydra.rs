@@ -21,15 +21,12 @@
 //!
 //! ## Deviations (documented)
 //!
-//! - The regulator-mode aux parameter (`SMCHYDRA_REGULATOR_MODE`, driven by a
-//!   separate PV in C) is not modeled; `set_closed_loop(true)` uses the C startup
-//!   default of `0`. Configuring a non-default regulator mode would require
-//!   modeling that PV.
 //! - The C poll computes an e-stop-switch problem flag from status bit `0x200`
 //!   but then unconditionally overwrites the problem flag to `0` a few lines
 //!   later (a latent bug that discards it). This port honours the intent and
 //!   reports bit `0x200` as a problem.
 
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -37,6 +34,8 @@ use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+
+use epics_libcom_rs::cfmt::CFloat;
 
 use motor_common::util::{atof, atoi};
 
@@ -49,10 +48,6 @@ const READ_BUF: usize = 128;
 const STATUS_MOVING: i32 = 0x1; // axis in motion
 const STATUS_POWER_OFF: i32 = 0x100; // drive power disabled
 const STATUS_ESTOP_SWITCH: i32 = 0x200; // e-stop switch active
-
-/// Regulator mode used when enabling closed loop (C startup default, unmodeled
-/// aux parameter `SMCHYDRA_REGULATOR_MODE`).
-const REGULATOR_MODE_DEFAULT: i32 = 0;
 
 /// Delay required by the controller after an `init` command.
 const INIT_DELAY: Duration = Duration::from_millis(200);
@@ -112,6 +107,10 @@ pub struct HydraAxis {
     /// Motor form (`getmotor`): 0 stepper, 1 linear/torque, other. Selects the
     /// `set_closed_loop` behaviour.
     motor_form: i32,
+    /// The axis's `SMCHYDRA_REGULATOR_MODE`, which only the controller
+    /// port's write sets. C reads it uninitialised before the first write;
+    /// it is 0 here.
+    regulator_mode: Arc<AtomicI32>,
 }
 
 impl HydraAxis {
@@ -120,7 +119,11 @@ impl HydraAxis {
     /// limits, as C's constructor.
     /// C ignores the queries' status (SMChydraAxis.cpp:15-17), so a controller
     /// that does not answer leaves each at `atoi("")`/`atof("")`, 0.
-    pub fn new(controller: Arc<Mutex<HydraController>>, axis_no: usize) -> Self {
+    pub fn new(
+        controller: Arc<Mutex<HydraController>>,
+        axis_no: usize,
+        regulator_mode: Arc<AtomicI32>,
+    ) -> Self {
         let addr = axis_no + 1;
         let (motor_form, members) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -148,6 +151,7 @@ impl HydraAxis {
             controller,
             members: Arc::new(members),
             motor_form,
+            regulator_mode,
         }
     }
 
@@ -184,8 +188,11 @@ impl HydraAxis {
     ) -> AsynResult<()> {
         let addr = self.addr();
         ctrl.write_all([
-            format!("{:.6} {addr} snv", (velocity * self.axis_res()).abs()),
-            format!("{:.6} {addr} sna", (acceleration * self.axis_res()).abs()),
+            format!("{} {addr} snv", CFloat((velocity * self.axis_res()).abs())),
+            format!(
+                "{} {addr} sna",
+                CFloat((acceleration * self.axis_res()).abs())
+            ),
             cmd,
         ])
     }
@@ -206,7 +213,7 @@ impl AsynMotor for HydraAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let cmd = format!("{:.6} {} nm", position * self.axis_res(), self.addr());
+        let cmd = format!("{} {} nm", CFloat(position * self.axis_res()), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -218,7 +225,7 @@ impl AsynMotor for HydraAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let cmd = format!("{:.6} {} nr", distance * self.axis_res(), self.addr());
+        let cmd = format!("{} {} nr", CFloat(distance * self.axis_res()), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -232,7 +239,7 @@ impl AsynMotor for HydraAxis {
         // No jog command: move to the travel limit the constructor read.
         let (neg, pos) = self.members.state().travel_limits;
         let target = if velocity > 0.0 { pos } else { neg };
-        let cmd = format!("{target:.6} {} nm", self.addr());
+        let cmd = format!("{} {} nm", CFloat(target), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -254,7 +261,10 @@ impl AsynMotor for HydraAxis {
         let addr = self.addr();
         // Set stop deceleration, then abort this axis.
         ctrl.write_all([
-            format!("{:.6} {addr} ssd", (acceleration * self.axis_res()).abs()),
+            format!(
+                "{} {addr} ssd",
+                CFloat((acceleration * self.axis_res()).abs())
+            ),
             format!("{addr} nabort"),
         ])
     }
@@ -264,8 +274,8 @@ impl AsynMotor for HydraAxis {
         // setnpos takes the distance from the current position to the desired
         // origin, hence the negation (C multiplies by -1).
         ctrl.write_only(&format!(
-            "{:.6} {} setnpos",
-            -position * self.axis_res(),
+            "{} {} setnpos",
+            CFloat(-position * self.axis_res()),
             self.addr()
         ))
     }
@@ -281,7 +291,10 @@ impl AsynMotor for HydraAxis {
             // Reinit so the closed-loop setting takes effect (powers the motor);
             // the controller needs a delay after init.
             let status = ctrl.write_all([
-                format!("{REGULATOR_MODE_DEFAULT} {addr} setcloop"),
+                format!(
+                    "{} {addr} setcloop",
+                    self.regulator_mode.load(Ordering::Relaxed)
+                ),
                 format!("{addr} init"),
             ]);
             std::thread::sleep(INIT_DELAY);
@@ -357,7 +370,35 @@ mod tests {
         let (handle, _) =
             SyncIOHandle::connect_port("HYDRA_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(HydraController::new(handle)));
-        assert_eq!(HydraAxis::new(controller, 0).motor_form, 0);
+        assert_eq!(HydraAxis::new(controller, 0, Arc::default()).motor_form, 0);
+    }
+
+    /// C `sprintf("%f %i nm")` of a NaN target sends glibc's `nan`.
+    #[test]
+    fn a_nan_target_goes_out_as_c_printf_spells_it() {
+        use motor_common::testing::LineRig;
+        let (line, handle) = LineRig::new("hydraNan", |_| String::new());
+        let mut axis = HydraAxis {
+            controller: Arc::new(Mutex::new(HydraController::new(handle))),
+            members: Arc::new(SmcMembers {
+                axis_no: 0,
+                motor_form: Some(0),
+                pitch: Some(0.0),
+                pole_pairs: Some(0),
+                cl_period: 0.0,
+                state: Mutex::new(SmcState {
+                    axis_res: 0.5,
+                    ..SmcState::default()
+                }),
+            }),
+            motor_form: 0,
+            regulator_mode: Arc::default(),
+        };
+        line.sent();
+        axis.move_absolute(&AsynUser::default(), f64::NAN, 0.0, 2.0, 4.0)
+            .unwrap();
+        let sent = line.sent();
+        assert!(sent.iter().any(|s| s.trim_end() == "nan 1 nm"), "{sent:?}");
     }
 
     #[test]
@@ -440,6 +481,7 @@ mod tests {
                 }),
             }),
             motor_form: 0,
+            regulator_mode: Arc::default(),
         };
         let user = AsynUser::default();
         axis.move_absolute(&user, 2.0, 0.0, 2.0, 4.0).unwrap();

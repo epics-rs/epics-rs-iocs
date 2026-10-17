@@ -20,9 +20,9 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port};
+use motor_common::{Controller, asyn_user, register_port_with};
 
-use crate::phytron::{CtrlType, PhytronAxis, PhytronController};
+use crate::phytron::{CtrlType, PhytronAxis, PhytronAxisReport, PhytronController, PhytronParams};
 
 /// Default communication timeout when the `timeoutMs` arg is omitted.
 const DEFAULT_TIMEOUT_MS: f64 = 1000.0;
@@ -160,7 +160,9 @@ fn register_controller(
             "{cmd_name}: controller '{name}' already registered"
         ));
     }
-    register_port(ctx, &name, PHYTRON_PORT_AXES)?;
+    let params = PhytronParams::new(moving_poll_ms as f64 / 1000.0, idle_poll_ms as f64 / 1000.0);
+    let slot = params.controller_slot();
+    register_port_with(ctx, &name, PHYTRON_PORT_AXES, params)?;
     // C leaves a controller that misses its port out of the list
     // phytronCreateAxis searches, and skips the reset; its port stays.
     let (handle, connected) = connect_controller(
@@ -177,6 +179,7 @@ fn register_controller(
         controller.reset_at_boot(&name);
     }
     let controller = Arc::new(Mutex::new(controller));
+    let _ = slot.set(controller.clone());
     let poller = Controller::new().controller_poll({
         let controller = controller.clone();
         let name = name.clone();
@@ -228,10 +231,20 @@ fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
             let poller = entry.poller.clone();
             drop(reg);
 
-            let axis = PhytronAxis::new(controller, module as i32, index as i32)
+            let axis = PhytronAxis::new(controller.clone(), module as i32, index as i32)
                 .map_err(|e| format!("phytronCreateAxis: {e}"))?;
+            let axis_no = (module * 10 + index) as i32;
+            let module_no = axis.module_no().to_owned();
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            poller.install(asyn_user(&name, (module * 10 + index) as i32), motor)?;
+            poller.install_with_report(
+                asyn_user(&name, axis_no),
+                motor,
+                Arc::new(PhytronAxisReport(axis_no)),
+            )?;
+            controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .add_axis(axis_no, &module_no);
             Ok(CommandOutcome::Continue)
         },
     )

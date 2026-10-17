@@ -50,7 +50,7 @@
 //!   the version.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -64,6 +64,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use motor_common::util::atoi;
+use motor_common::{ControllerParams, ControllerReport};
 
 use crate::poller::PollShared;
 
@@ -82,15 +83,31 @@ const MAX_HOME_VELOCITY: i32 = 1_000_000;
 const MAX_ACCEL: i32 = 8_000_000;
 const MAX_POSITION: i32 = 67_000_000;
 
+/// C `fwMajor`, `fwMinor`, `fwRevision`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FirmwareVersion {
+    pub major: i32,
+    pub minor: i32,
+    pub revision: i32,
+}
+
 /// `sscanf(p, "ver:%d.%d.%d,")` after C's `ver:B`, `ver:S`, `ver:` search,
-/// needing the first two numbers.
-fn parse_firmware_version(reply: &str) -> Option<(i32, i32)> {
+/// needing the first two numbers; the revision stays 0 when absent.
+fn parse_firmware_version(reply: &str) -> Option<FirmwareVersion> {
     let at = ["ver:B", "ver:S", "ver:"]
         .iter()
         .find_map(|tag| reply.find(tag).map(|i| i + tag.len()))?;
     let (major, rest) = scan_int(&reply[at..])?;
-    let (minor, _) = scan_int(rest.strip_prefix('.')?)?;
-    Some((major, minor))
+    let (minor, rest) = scan_int(rest.strip_prefix('.')?)?;
+    let revision = rest
+        .strip_prefix('.')
+        .and_then(scan_int)
+        .map_or(0, |(revision, _)| revision);
+    Some(FirmwareVersion {
+        major,
+        minor,
+        revision,
+    })
 }
 
 /// `sscanf`'s `%d`: blanks, an optional sign, at least one digit.
@@ -109,6 +126,81 @@ fn oms_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
         message: message.into(),
+    }
+}
+
+/// What C `omsBaseController::report` prints from the controller: the
+/// version once read and the axes once Init has created them.
+#[derive(Default)]
+pub struct OmsReportState {
+    pub(crate) fw: OnceLock<FirmwareVersion>,
+    pub(crate) axes: OnceLock<Arc<PollShared>>,
+}
+
+/// The controller's report: its type and the state the Config command fills.
+pub struct OmsParams {
+    controller_type: &'static str,
+    state: Arc<OmsReportState>,
+}
+
+impl OmsParams {
+    pub fn new(controller_type: &'static str) -> (Self, Arc<OmsReportState>) {
+        let state = Arc::new(OmsReportState::default());
+        let params = Self {
+            controller_type,
+            state: state.clone(),
+        };
+        (params, state)
+    }
+}
+
+impl ControllerParams for OmsParams {
+    /// C `omsBaseController::report` (omsBaseController.cpp:130-161). C
+    /// dereferences a null `pAxes` on a controller whose Init failed; here
+    /// it has no axis lines.
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        use epics_rs::motor::controller_port::index;
+        // MOTOR_STATUS_HAS_ENCODER, MSTA bit 8.
+        const HAS_ENCODER: usize = index::STATUS_DIRECTION + 8;
+
+        let fw = self.state.fw.get().copied().unwrap_or_default();
+        let axes = self.state.axes.get();
+        let _ = writeln!(
+            out,
+            "Oms {} motor driver {}, numAxes={}; Firmware: {}.{}.{}",
+            self.controller_type,
+            ctx.port_name(),
+            axes.map_or(ctx.num_axes(), |a| a.axis_count()),
+            fw.major,
+            fw.minor,
+            fw.revision,
+        );
+        for axis in 0..axes.map_or(0, |a| a.axis_count()) {
+            let _ = writeln!(out, "  axis {axis}");
+            if level > 0 {
+                let addr = axis as i32;
+                // An unset parameter prints 0, where C prints an
+                // uninitialised local.
+                let float = |reason| ctx.float64_param(addr, reason).unwrap_or(0.0);
+                let _ = writeln!(
+                    out,
+                    "    Current position = {:.6}, velocity = {:.6}",
+                    float(index::POSITION),
+                    float(index::VELOCITY),
+                );
+                if ctx.int32_param(addr, HAS_ENCODER).unwrap_or(0) != 0 {
+                    let _ = writeln!(
+                        out,
+                        "    Encoder position {:.6}",
+                        float(index::ENCODER_POSITION)
+                    );
+                }
+                if axes.is_some_and(|a| a.homing(axis)) {
+                    let _ = writeln!(out, "    Currently homing axis");
+                }
+            }
+        }
+        ctx.report(out, level);
     }
 }
 
@@ -289,10 +381,10 @@ impl OmsController {
     }
 
     /// C `omsBaseController::getFirmwareVersion`: up to three `WY` tries a
-    /// second apart, each reply logged, then `(major, minor)` from its `ver:`
+    /// second apart, each reply logged, then the version from its `ver:`
     /// field. An unparsable reply fails with an empty message, as C's caller
     /// prints the user's untouched `errorMessage`.
-    pub fn firmware_version(&self) -> AsynResult<(i32, i32)> {
+    pub fn firmware_version(&self) -> AsynResult<FirmwareVersion> {
         let (mut reply, mut status) = (String::new(), Err(oms_err("")));
         for _ in 0..3 {
             std::thread::sleep(Duration::from_secs(1));
@@ -520,6 +612,7 @@ impl AsynMotor for OmsAxis {
         self.last_min_velo = minvelo;
         let moved = self.lock().send_only(&cmd);
         self.poll_shared.moved(self.axis_index);
+        self.poll_shared.homed(self.axis_index);
         moved
     }
 
@@ -753,12 +846,20 @@ mod tests {
 
     #[test]
     fn the_firmware_version_is_read_as_c_sscanf_reads_it() {
+        let v = |major, minor, revision| {
+            Some(FirmwareVersion {
+                major,
+                minor,
+                revision,
+            })
+        };
         assert_eq!(
             parse_firmware_version("MAXnet ver:1.33.4, s/n:1"),
-            Some((1, 33))
+            v(1, 33, 4)
         );
-        assert_eq!(parse_firmware_version("MAXnet ver:B1.29.0,"), Some((1, 29)));
-        assert_eq!(parse_firmware_version("MXA ver:S2.0"), Some((2, 0)));
+        assert_eq!(parse_firmware_version("MAXnet ver:B1.29.7,"), v(1, 29, 7));
+        assert_eq!(parse_firmware_version("MXA ver:S2.0"), v(2, 0, 0));
+        assert_eq!(parse_firmware_version("MXA ver:2.1.x"), v(2, 1, 0));
         assert_eq!(parse_firmware_version("MAXnet ver:1"), None);
         assert_eq!(parse_firmware_version("garbage"), None);
     }

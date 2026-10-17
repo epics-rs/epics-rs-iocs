@@ -45,11 +45,9 @@
 //! boundary and are intentionally not ported; the driver runs with their C
 //! defaults:
 //!
-//! - The 33 auxiliary controller/axis parameters (run/stop/boost currents,
-//!   encoder type/resolution/direction, step resolution, power-stage mode,
-//!   temperatures, mechanical-offset positions, the `AXIS_STATUS`/
-//!   `CONTROLLER_STATUS` records, the direct-command passthrough, ...). They are
-//!   `readInt32`/`writeInt32`/`readFloat64` parameters, not motor fields.
+//! - The auxiliary controller/axis parameters other than the P registers
+//!   (the `AXIS_STATUS`/`CONTROLLER_STATUS` records, the resets, the
+//!   direct-command passthrough, ...).
 //! - The `phytronIO` digital/analog I/O subsystem (`phytronIOctrl.cpp`).
 //! - The brake output + idle-motor-disable feature (`phytronBrakeOutput`): with
 //!   the default (no brake, keep motor enabled) a move only needs to enable the
@@ -68,17 +66,23 @@
 //! - The auto status-reset-on-error option (`SEC` via the `statusResetTime`
 //!   option): dormant by default, so `clearAxisError` is a no-op here.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::controller_port::ParamWrite;
 use epics_rs::motor::trace::MotorTrace;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::util::{atof, atoi, nint};
+use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
 /// Reply read buffer size (C expects up to ~2010 bytes: 2000 data + framing).
 const READ_BUF: usize = 2048;
@@ -111,6 +115,56 @@ fn phytron_err(message: impl Into<String>) -> AsynError {
     }
 }
 
+/// C `phyToAsyn`: the two phytron codes past the asyn ones
+/// (`phytronInvalidReturn` 6, `phytronInvalidCommand` 7) are an asyn error.
+fn phy_to_asyn(code: i32) -> AsynError {
+    let status = match code {
+        1 => AsynStatus::Timeout,
+        2 => AsynStatus::Overflow,
+        4 => AsynStatus::Disconnected,
+        5 => AsynStatus::Disabled,
+        _ => AsynStatus::Error,
+    };
+    AsynError::Status {
+        status,
+        message: format!("phytron: error code {code}"),
+    }
+}
+
+/// The axis parameters on a P register, in C's createParam order
+/// (phytronAxisMotor.cpp:144-165); the map of readInt32 (:331-350) and
+/// writeInt32 (:397-450).
+const AXIS_P_PARAMS: [(&str, u32); 20] = [
+    ("AXIS_MODE", 1),
+    ("MOP_POS", 11),
+    ("MOP_NEG", 12),
+    ("STEP_RES", 45),
+    ("STOP_CURRENT", 40),
+    ("RUN_CURRENT", 41),
+    ("BOOST_CURRENT", 42),
+    ("ENCODER_TYP", 34),
+    ("INIT_TIME", 13),
+    ("POSITION_TIME", 16),
+    ("BOOST", 17),
+    ("ENC_RATE", 26),
+    ("SWITCH_TYP", 27),
+    ("PWR_STAGE_MODE", 28),
+    ("ENC_RESOLUTION", 35),
+    ("ENC_FUNCTION", 36),
+    ("ENC_SFI_WIDTH", 37),
+    ("ENC_DIRECTION", 38),
+    ("PS_MONITOR", 53),
+    ("CURRENT_DELAY_TIME", 43),
+];
+
+/// The temperatures readFloat64 asks in 0.1 °C (:487-490).
+const AXIS_TEMP_PARAMS: [(&str, u32); 2] = [("PS_TEMPERATURE", 49), ("MOTOR_TEMP", 54)];
+
+/// The current registers count 10 mA; their records' EGU is mA.
+fn is_current(p: u32) -> bool {
+    matches!(p, 40..=42)
+}
+
 /// Uppercase hex digit for a nibble/address value in 0..=15.
 fn hex_upper(v: u8) -> u8 {
     if v > 9 { b'A' + (v - 10) } else { b'0' + v }
@@ -119,7 +173,7 @@ fn hex_upper(v: u8) -> u8 {
 /// Format a value the way C `std::to_string(double)` does (six decimals), used
 /// for the `=`/`S` parameter writes.
 fn fmt6(v: f64) -> String {
-    format!("{v:.6}")
+    format!("{:.6}", CFloat(v))
 }
 
 /// Clamp a (base, max) velocity pair into the controller range, taking the
@@ -200,6 +254,166 @@ fn parse_reply(raw: &[u8]) -> AsynResult<String> {
     }
 }
 
+/// The controller's poll periods, in seconds, for its report, and its
+/// axis parameters.
+pub struct PhytronParams {
+    moving_poll: f64,
+    idle_poll: f64,
+    /// Set once the controller connects; C's axis lookup fails before.
+    controller: Arc<OnceLock<Arc<Mutex<PhytronController>>>>,
+    /// Reason -> P register.
+    p_regs: HashMap<usize, u32>,
+    temps: HashMap<usize, u32>,
+}
+
+impl PhytronParams {
+    pub fn new(moving_poll: f64, idle_poll: f64) -> Self {
+        Self {
+            moving_poll,
+            idle_poll,
+            controller: Arc::new(OnceLock::new()),
+            p_regs: HashMap::new(),
+            temps: HashMap::new(),
+        }
+    }
+
+    /// The slot the create command fills with the connected controller.
+    pub fn controller_slot(&self) -> Arc<OnceLock<Arc<Mutex<PhytronController>>>> {
+        self.controller.clone()
+    }
+
+    /// C `getAxis` plus the "Axis not found" line `func` prints on
+    /// pasynUserSelf.
+    fn axis_controller(
+        &self,
+        port: &str,
+        func: &str,
+        addr: i32,
+    ) -> AsynResult<(MutexGuard<'_, PhytronController>, String)> {
+        if let Some(ctrl) = self.controller.get() {
+            let ctrl = ctrl.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(m) = ctrl.axes.get(&addr).cloned() {
+                return Ok((ctrl, m));
+            }
+        }
+        MotorTrace::new(port, 0).print_self(
+            TraceMask::ERROR,
+            format_args!("{func}: Axis not found on the controller {port}\n"),
+        );
+        Err(phytron_err(format!("{func}: Axis not found")))
+    }
+}
+
+impl ControllerParams for PhytronParams {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        for (name, p) in AXIS_P_PARAMS {
+            self.p_regs
+                .insert(base.create_param(name, ParamType::Int32)?, p);
+        }
+        for (name, p) in AXIS_TEMP_PARAMS {
+            self.temps
+                .insert(base.create_param(name, ParamType::Float64)?, p);
+        }
+        Ok(())
+    }
+
+    /// C `phytronController::writeInt32` (phytronAxisMotor.cpp:365-466):
+    /// the register is set after the base stores the value; `ENC_FUNCTION`
+    /// sets `P36` to 1 for any positive value.
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> ParamWrite {
+        let Some(&p) = self.p_regs.get(&user.reason) else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        let port = base.port_name.clone();
+        let (mut ctrl, m) = match self.axis_controller(&port, "phytronAxis::writeInt32", user.addr)
+        {
+            Ok(found) => found,
+            Err(e) => return ParamWrite::PassToBase(Err(e)),
+        };
+        let value = match p {
+            36 => i32::from(value > 0),
+            p if is_current(p) => value / 10,
+            _ => value,
+        };
+        let cmd = format!("{m}P{p:02}{}{value}", ctrl.set_char());
+        let sent = ctrl.axis_command(&port, "writeInt32", "Writing parameter", user.addr, &cmd);
+        ParamWrite::PassToBase(sent.map(|_| ()))
+    }
+
+    /// C `phytronController::readInt32` (phytronAxisMotor.cpp:285-357): the
+    /// base value, unless the reason is a P register, which is asked.
+    fn read_int32(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<i32> {
+        let value = base.read_int32_param(user).unwrap_or(0);
+        let port = base.port_name.clone();
+        let (mut ctrl, m) =
+            self.axis_controller(&port, "phytronController::readInt32", user.addr)?;
+        let Some(&p) = self.p_regs.get(&user.reason) else {
+            return Ok(value);
+        };
+        let reply = ctrl.axis_command(
+            &port,
+            "readInt32",
+            "Reading parameter",
+            user.addr,
+            &format!("{m}P{p}R"),
+        )?;
+        let value = atoi(&reply);
+        Ok(if is_current(p) { value * 10 } else { value })
+    }
+
+    /// C `phytronController::readFloat64` (phytronAxisMotor.cpp:472-512),
+    /// which looks the axis up before the base.
+    fn read_float64(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<f64> {
+        let port = base.port_name.clone();
+        let (mut ctrl, m) =
+            self.axis_controller(&port, "phytronController::readFloat64", user.addr)?;
+        let value = base.read_float64_param(user).unwrap_or(0.0);
+        let Some(&p) = self.temps.get(&user.reason) else {
+            return Ok(value);
+        };
+        let reply = ctrl.axis_command(
+            &port,
+            "readFloat64",
+            "Reading parameter",
+            user.addr,
+            &format!("{m}P{p}R"),
+        )?;
+        Ok(atof(&reply) / 10.)
+    }
+
+    /// C `phytronController::report` (phytronAxisMotor.cpp:836-843), which
+    /// says phyMOTION for an MCC too.
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "Phytron phyMOTION motor driver {}, numAxes={}, moving poll period={:.6}, \
+             idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            CFloat(self.moving_poll),
+            CFloat(self.idle_poll),
+        );
+        ctx.report(out, level);
+    }
+}
+
+/// C `phytronAxis::report` (phytronAxisMotor.cpp:1377-1384): the axis
+/// number, `module*10 + index`.
+pub struct PhytronAxisReport(pub i32);
+
+impl AxisReport for PhytronAxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let _ = writeln!(out, "  axis {}", self.0);
+        }
+    }
+}
+
 /// A Phytron controller endpoint owning the asyn octet handle. Shared by all of
 /// its axes behind a mutex so command/reply pairs stay atomic.
 pub struct PhytronController {
@@ -209,6 +423,10 @@ pub struct PhytronController {
     address: u8,
     /// The MCC `SUI` reply of this poll pass, ACK stripped (C `sLastSUI_`).
     last_sui: String,
+    /// Each created axis's command prefix by axis number (C `getAxis`).
+    axes: BTreeMap<i32, String>,
+    /// C `lastStatus_`, the controller-wide status `CHECK_AXIS` compares.
+    last_status: i32,
 }
 
 impl PhytronController {
@@ -220,7 +438,15 @@ impl PhytronController {
             ctrl_type,
             address: address.min(15),
             last_sui: String::new(),
+            axes: BTreeMap::new(),
+            last_status: 0,
         }
+    }
+
+    /// Make axis `axis_no` (`PhytronAxis::module_no`) one the parameter
+    /// reads and writes find.
+    pub fn add_axis(&mut self, axis_no: i32, module_no: &str) {
+        self.axes.insert(axis_no, module_no.to_owned());
     }
 
     /// C `phytronController::poll` with the serial poll method: an MCC reads
@@ -257,6 +483,46 @@ impl PhytronController {
         let frame = build_frame(self.ctrl_type, self.address, cmd);
         let raw = self.handle.write_read(0, &frame, READ_BUF)?;
         parse_reply(&raw)
+    }
+
+    /// C `sendPhytronCommand` with its status code: the asyn status of a
+    /// failed transfer, `phytronInvalidReturn` (6) for a reply that is not
+    /// an ACK, `phytronInvalidCommand` (7) past 994 bytes.
+    fn phy_command(&self, cmd: &str) -> Result<String, i32> {
+        if cmd.len() > 994 {
+            return Err(7);
+        }
+        let frame = build_frame(self.ctrl_type, self.address, cmd);
+        let raw = self
+            .handle
+            .write_read(0, &frame, READ_BUF)
+            .map_err(|e| e.status() as i32)?;
+        parse_reply(&raw).map_err(|_| 6)
+    }
+
+    /// `cmd` for axis `axis_no` under C `CHECK_AXIS`, which prints a failure
+    /// on the axis only when it differs from the last status.
+    fn axis_command(
+        &mut self,
+        port: &str,
+        func: &str,
+        txt: &str,
+        axis_no: i32,
+        cmd: &str,
+    ) -> AsynResult<String> {
+        let result = self.phy_command(cmd);
+        let code = result.as_ref().err().copied().unwrap_or(0);
+        if code != 0 && code != self.last_status {
+            MotorTrace::new(port, axis_no).print(
+                TraceMask::ERROR,
+                0,
+                format_args!(
+                    "phytronAxis::{func}: ({port}) {txt} for axis {axis_no} failed with error code: {code}\n"
+                ),
+            );
+        }
+        self.last_status = code;
+        result.map_err(phy_to_asyn)
     }
 
     /// Reset the controller at boot (C constructor, unless `noResetAtBoot`):
@@ -326,7 +592,7 @@ impl PhytronAxis {
         let axis_no = module * 10 + index;
         let axis_module_no = match ctrl_type {
             // C: epicsSnprintf(..., "M%.1f", iAxisNo / 10.)
-            CtrlType::Phymotion => format!("M{:.1}", axis_no as f64 / 10.0),
+            CtrlType::Phymotion => format!("M{:.1}", CFloat(axis_no as f64 / 10.0)),
             CtrlType::Mcc => {
                 let n = axis_no % 10;
                 if !(1..=8).contains(&n) {
@@ -343,6 +609,11 @@ impl PhytronAxis {
             home_state: 0,
             encoder_ratio: 1.0,
         })
+    }
+
+    /// The command prefix, `M<mod>.<idx>` or the MCC digit.
+    pub fn module_no(&self) -> &str {
+        &self.axis_module_no
     }
 
     fn lock(&self) -> MutexGuard<'_, PhytronController> {
@@ -412,7 +683,7 @@ impl AsynMotor for PhytronAxis {
             .trim()
             .parse::<f64>()
             .map_err(|_| phytron_err("phytron: setEncoderRatio: invalid encoder position"))?;
-        ctrl.command(&format!("{m}P39{set}{:.6}", 1.0 / ratio))?;
+        ctrl.command(&format!("{m}P39{set}{}", fmt6(1.0 / ratio)))?;
         Ok(())
     }
 
@@ -743,29 +1014,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn set_encoder_ratio_reads_the_encoder_then_sets_p39_to_its_inverse() {
+    /// MCC axis 1 on a fresh [`Mcc`] port `name`, and its command log.
+    fn mcc_axis(name: &str) -> (PhytronAxis, Arc<Mutex<Vec<String>>>) {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let written = Arc::new(Mutex::new(Vec::new()));
         let port = Mcc {
-            base: PortDriverBase::new("phytronEncoderRatio", 1, PortFlags::default()),
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
             written: written.clone(),
             reply: Vec::new(),
         };
-        let (rt, _actor) = create_port_runtime(
-            &claim_port("phytronEncoderRatio").unwrap(),
-            port,
-            RuntimeConfig::default(),
-        )
-        .unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
+                .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let controller = Arc::new(Mutex::new(PhytronController::new(io, CtrlType::Mcc, 0)));
-        let mut axis = PhytronAxis::new(controller, 0, 1).unwrap();
+        (PhytronAxis::new(controller, 0, 1).unwrap(), written)
+    }
+
+    #[test]
+    fn set_encoder_ratio_reads_the_encoder_then_sets_p39_to_its_inverse() {
+        let (mut axis, written) = mcc_axis("phytronEncoderRatio");
         axis.set_encoder_ratio(&AsynUser::new(0), 0.5).unwrap();
         assert_eq!(*written.lock().unwrap(), ["1P22R", "1P39S2.000000"]);
+    }
+
+    /// C `std::to_string(double)` is `%f`, which spells a NaN `nan`.
+    #[test]
+    fn a_non_finite_parameter_is_written_as_c_prints_it() {
+        let (mut axis, written) = mcc_axis("phytronNonFinite");
+        axis.set_encoder_ratio(&AsynUser::new(0), f64::NAN).unwrap();
+        assert_eq!(*written.lock().unwrap(), ["1P22R", "1P39Snan"]);
+        assert_eq!(fmt6(f64::NAN), "nan");
     }
 
     #[test]

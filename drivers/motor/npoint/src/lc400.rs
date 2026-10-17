@@ -25,7 +25,8 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue,
+    ControllerParams, ControllerReport, FinishedWrite, ParamWrite, WriteHook, WriteOutcome,
+    WriteValue,
 };
 
 /// `LC400_TIMEOUT`.
@@ -693,14 +694,20 @@ impl AsynMotor for Lc400Axis {
     }
 }
 
-/// `LC400Controller`'s parameters and its `writeInt32` / `writeFloat64`.
+/// `LC400Controller`'s parameters, its `writeInt32` / `writeFloat64` and
+/// its report.
 pub struct Lc400ControllerParams {
     controller: Arc<Mutex<Lc400Controller>>,
+    /// C `movingPollPeriod_` / `idlePollPeriod_`, in seconds.
+    poll_periods: (f64, f64),
 }
 
 impl Lc400ControllerParams {
-    pub fn new(controller: Arc<Mutex<Lc400Controller>>) -> Self {
-        Self { controller }
+    pub fn new(controller: Arc<Mutex<Lc400Controller>>, moving_poll: f64, idle_poll: f64) -> Self {
+        Self {
+            controller,
+            poll_periods: (moving_poll, idle_poll),
+        }
     }
 }
 
@@ -775,6 +782,24 @@ impl ControllerParams for Lc400ControllerParams {
 
     fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
         Some(Arc::new(Lc400WriteHook))
+    }
+
+    /// C `LC400Controller::report` (LC400MotorDriver.cpp:181-199).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let (moving, idle) = self.poll_periods;
+        let _ = writeln!(
+            out,
+            "LC400 motor driver {}, numAxes={}, moving poll period={moving:.6}, \
+             idle poll period={idle:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+        );
+        if level > 0 {
+            for axis in 0..ctx.num_axes() {
+                let _ = writeln!(out, " axis {axis}");
+            }
+        }
+        ctx.report(out, level);
     }
 
     /// C `writeInt32`: the controller's own registers are written here and
@@ -856,7 +881,7 @@ mod tests {
     /// address, and the controller's own registers fail to write.
     fn port(name: &str) -> (PortHandle, Lc400Params) {
         let controller = Arc::new(Mutex::new(Lc400Controller::new(None, 4)));
-        let params = Lc400ControllerParams::new(controller.clone());
+        let params = Lc400ControllerParams::new(controller.clone(), 0.0, 0.0);
         let port = register_controller_port(&open_owner(), name, 4, params).unwrap();
         for addr in 0..4 {
             let motor: Arc<Mutex<dyn AsynMotor>> =

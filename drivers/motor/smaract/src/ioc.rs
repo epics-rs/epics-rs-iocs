@@ -20,10 +20,10 @@ use epics_rs::motor::trace::MotorTrace;
 use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{arg_double_req, arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
-use motor_common::{Controller, asyn_user, register_port};
+use motor_common::{Controller, asyn_user, register_port, register_port_with};
 
 use crate::mcs::{self, McsAxis, McsController};
-use crate::mcs2::{self, Mcs2Axis, Mcs2Controller};
+use crate::mcs2::{self, Mcs2Axis, Mcs2AxisReport, Mcs2Controller, Mcs2Params};
 use crate::scu::{ScuAxis, ScuController};
 
 /// Command timeout (C `DEFAULT_CONTROLLER_TIMEOUT` = 2.0 s).
@@ -67,7 +67,11 @@ pub fn mcs2_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
             let unused_mask = c_int(args, 5);
 
-            register_port(ctx, &port_name, num_axes)?;
+            let params = Mcs2Params {
+                moving_poll: moving_poll_ms as f64 / 1000.0,
+                idle_poll: idle_poll_ms as f64 / 1000.0,
+            };
+            register_port_with(ctx, &port_name, num_axes, params)?;
             let (handle, _) = connect_controller(
                 &mcs2_port,
                 MCS2_TIMEOUT,
@@ -88,7 +92,11 @@ pub fn mcs2_create_controller_command() -> CommandDef {
                 }
                 let motor: Arc<Mutex<dyn AsynMotor>> =
                     Arc::new(Mutex::new(Mcs2Axis::new(controller.clone(), axis as usize)));
-                poller.install(asyn_user(&port_name, axis), motor)?;
+                let report = Arc::new(Mcs2AxisReport {
+                    controller: controller.clone(),
+                    channel: axis,
+                });
+                poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
             }
             // C startPoller, smarActMCS2MotorDriver.cpp:95
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
