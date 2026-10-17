@@ -116,18 +116,14 @@ pub const ORIENTATIONS: [&str; 8] = [
     "LEFT_MIRRORED",
 ];
 
-/// The `TPX3_DET_ORIENTATION` index of `Layout.DetectorOrientation`.
-///
-/// UPSTREAM DEFECT (serval_http.cpp:1296): C looks the name up in a
-/// `std::map` with `operator[]`, which *inserts* an unknown name with value 0
-/// and so silently reports orientation UP — and the name it looks up has been
-/// through `strip_quotes`, which mangles anything that is not a quoted string.
-/// An unknown name leaves the parameter alone here.
-pub fn orientation_index(name: &str) -> Option<i32> {
+/// C `detOrientationIndexFromName(name, def = 0)` (ADTimePix.cpp:943,
+/// ADTimePix.h:844): an unknown name is UP.
+pub fn orientation_index(name: &str) -> i32 {
     ORIENTATIONS
         .iter()
         .position(|o| *o == name)
         .and_then(|i| i32::try_from(i).ok())
+        .unwrap_or(0)
 }
 
 /// `TPX3_IMG_IMGFORMAT` and friends.
@@ -2128,11 +2124,10 @@ mod tests {
 
     #[test]
     fn orientation_index_maps_the_menu() {
-        assert_eq!(orientation_index("UP"), Some(0));
-        assert_eq!(orientation_index("LEFT"), Some(3));
-        assert_eq!(orientation_index("LEFT_MIRRORED"), Some(7));
-        // C's std::map::operator[] would insert this and report UP (0).
-        assert_eq!(orientation_index("ul"), None);
+        assert_eq!(orientation_index("UP"), 0);
+        assert_eq!(orientation_index("LEFT"), 3);
+        assert_eq!(orientation_index("LEFT_MIRRORED"), 7);
+        assert_eq!(orientation_index("SIDEWAYS"), 0);
     }
 
     #[test]

@@ -963,11 +963,10 @@ pub(crate) fn read_detector(
     update_detector_family(shared, p, &detector, &mut updates, &mut read.traces);
 
     // The detector orientation drives the mask geometry, so it also goes into
-    // the shared state the mask code reads.
+    // the shared state the mask code reads (serval_http.cpp:1514-1519).
     if let Some(o) = detector
         .pointer("/Layout/DetectorOrientation")
-        .and_then(Value::as_str)
-        .and_then(serval::orientation_index)
+        .map(|name| serval::orientation_index(&serval::json_to_string(name)))
     {
         shared.set_orientation(o);
         updates.push(ParamSetValue::new(
@@ -4177,6 +4176,29 @@ mod tests {
     /// A `/detector` reply that passes C `parseResponse`.
     const DETECTOR: &str = r#"{"Info":{"PixCount":65536,"RowLen":1,"NumberOfChips":1,
         "NumberOfRows":256,"MpxType":3},"Config":{}}"#;
+
+    /// An orientation name C does not know reads as UP
+    /// (detOrientationIndexFromName's default, serval_http.cpp:1514-1519).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_orientation_reads_as_up() {
+        let (url, _log) = logging_serval(&[], |path| match path {
+            "/detector" => {
+                r#"{"Info":{"PixCount":65536,"RowLen":1,"NumberOfChips":1,
+                "NumberOfRows":256,"MpxType":3},"Config":{},
+                "Layout":{"DetectorOrientation":"SIDEWAYS"}}"#
+            }
+            _ => "{}",
+        });
+        let ctx = idle_ctx_at("TPX_DET_ORIENT", &url, None);
+        ctx.shared.set_orientation(3);
+        let read = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad);
+        assert!(read.ok);
+        assert_eq!(ctx.shared.orientation(), 0);
+        assert_eq!(
+            int_set(&read.updates[0].1, ctx.p.detector_orientation),
+            Some(0)
+        );
+    }
 
     /// A good detector read reconnects the detector (serval_http.cpp:1556).
     #[tokio::test(flavor = "multi_thread")]
