@@ -72,11 +72,13 @@ impl PollShared {
         self.axes()[axis].status.clone()
     }
 
-    /// A move's `setIntegerParam(motorStatusDone_, 0)` and `wakeupPoller`
-    /// (asynMotorController.cpp:300-357), whatever the move returned.
+    /// A move's `setIntegerParam(motorStatusDone_, 0)`
+    /// (asynMotorController.cpp:300-357), whatever the move returned. Its
+    /// `wakeupPoller` is the motor poll loop's pass after the move, whose
+    /// `OmsAxis::poll` signals; a second signal here
+    /// ran a second controller read per move.
     pub(crate) fn moved(&self, axis: usize) {
         self.axes()[axis].status.done = false;
-        self.wakeup();
     }
 
     /// `writeFloat64`'s `setDoubleParam(motorPosition_, value)` ahead of
@@ -667,6 +669,20 @@ mod tests {
         }
         assert!(poller.shared.wait(Duration::ZERO));
         assert!(!poller.shared.wait(Duration::ZERO));
+    }
+
+    /// A move signals the poller once, through the poll that follows it.
+    #[test]
+    fn a_move_wakes_the_poller_only_through_its_poll() {
+        let mut rig = rig("omsPollerMoveWake", 1, &HEALTHY);
+        let shared = rig.controller.lock().unwrap().poll_shared().clone();
+        let user = AsynUser::default();
+        rig.axes[0]
+            .move_absolute(&user, 10.0, 1.0, 100.0, 1000.0)
+            .unwrap();
+        assert!(!shared.wait(Duration::ZERO));
+        rig.axes[0].poll(&user).unwrap();
+        assert!(shared.wait(Duration::ZERO));
     }
 
     /// A status that never comes: six `RI` reads for the whole controller,
