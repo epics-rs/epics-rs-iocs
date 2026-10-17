@@ -107,6 +107,7 @@ impl FakeLine {
     pub fn socket(&self, mode: SocketMode) -> XpsSocket {
         XpsSocket::new(
             self.rt.port_handle().clone(),
+            0,
             &self.port,
             mode,
             Duration::from_secs(1),

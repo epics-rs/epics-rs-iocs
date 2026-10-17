@@ -46,7 +46,7 @@ use motor_common::model2::Model2;
 use motor_common::util::atof;
 use motor_common::{
     Controller, ControllerParams, ControllerReport, asyn_user, install_with_report,
-    register_controller_port, register_port, register_port_with,
+    register_controller_port, register_port_with,
 };
 
 use crate::agap::{self, AgapAxis, AgapController};
@@ -123,8 +123,8 @@ static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
 
 /// C `ConnectToServer` (asynOctetSocket.cpp:60): asyn IP port
 /// `ip:port:N` from `drvAsynIPPortConfigure(name, "ip:port TCP", 0, 0, 1)`.
-/// `None` is C's -1, printed as C prints it.
-fn connect_to_server(ctx: &CommandContext, ip: &str, ip_port: i32) -> Option<PortHandle> {
+/// The socket index and its port; `None` is C's -1, printed as C prints it.
+fn connect_to_server(ctx: &CommandContext, ip: &str, ip_port: i32) -> Option<(i32, PortHandle)> {
     let socket = NEXT_SOCKET.load(Ordering::Relaxed);
     if socket >= MAX_SOCKETS {
         println!("ConnectToServer: too many open sockets, max={MAX_SOCKETS}");
@@ -163,7 +163,7 @@ fn connect_to_server(ctx: &CommandContext, ip: &str, ip_port: i32) -> Option<Por
         return None;
     };
     NEXT_SOCKET.store(socket + 1, Ordering::Relaxed);
-    Some(handle.port_handle().clone())
+    Some((socket as i32, handle.port_handle().clone()))
 }
 
 /// `SMC100CreateController(portName, SMC100PortName, numAxes,
@@ -539,6 +539,63 @@ fn with_xps<R>(
     }
 }
 
+/// `XPSController::report` (XPSController.cpp:222-246); the rest comes
+/// from the registration `XPSCreateController` pushes after the port.
+struct XpsHead {
+    moving_s: f64,
+    idle_s: f64,
+    enable_set_position: bool,
+    settling_s: f64,
+}
+
+impl ControllerParams for XpsHead {
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn Write, level: i32) {
+        let found = XPS_CONTROLLERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|r| r.port_name == ctx.port_name())
+            .map(|r| {
+                let ip = (r.ip.clone(), r.ip_port);
+                (r.controller.clone(), ip, r.ftp_login.clone())
+            });
+        if let Some((controller, (ip, ip_port), ftp_login)) = found {
+            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = write!(
+                out,
+                "XPS motor driver: {}\n                 numAxes: {}\n        firmware version: \
+                 {}\n      moving poll period: {:.6}\n        idle poll period: {:.6}\n",
+                ctx.port_name(),
+                ctx.num_axes(),
+                ctrl.firmware(),
+                self.moving_s,
+                self.idle_s
+            );
+            if level > 0 {
+                // glibc prints a NULL %s, C's ftpUsername_ before
+                // XPSCreateProfile, as "(null)".
+                let (user, password) =
+                    ftp_login.unwrap_or_else(|| ("(null)".into(), "(null)".into()));
+                // useSFTP_ and movesDeferred_ are set only by an XPS-D profile
+                // build and by deferred moves, neither of which this port has.
+                let _ = write!(
+                    out,
+                    "       enableSetPosition: {}\n setPositionSettlingTime: {:.6}\n\
+                     \x20              IPAddress: {ip}\n                  IPPort: {ip_port}\n\
+                     \x20            ftpUserName: {user}\n         ftpUserPassword: {password}\n\
+                     \x20                useSFTP: false\n           movesDeferred: 0\n\
+                     \x20             autoEnable: {}\n          noDisableError: {}\n",
+                    i32::from(self.enable_set_position),
+                    self.settling_s,
+                    i32::from(ctrl.auto_enable()),
+                    i32::from(ctrl.no_disable_error())
+                );
+            }
+        }
+        ctx.report(out, level);
+    }
+}
+
 /// `XPSCreateController(portName, IPAddress, IPPort, numAxes,
 /// movingPollPeriod, idlePollPeriod, enableSetPosition,
 /// setPositionSettlingTime)`; the axes come from `XPSCreateAxis`.
@@ -565,13 +622,23 @@ pub fn xps_create_controller_command() -> CommandDef {
             let enable_set_position = c_int(args, 6) != 0;
             let settling = Duration::from_millis(c_int(args, 7).max(0) as u64);
 
-            register_port(ctx, &port_name, c_int(args, 3))?;
+            let head = XpsHead {
+                moving_s: period_s(moving_poll_ms),
+                idle_s: period_s(idle_poll_ms),
+                enable_set_position,
+                settling_s: f64::from(c_int(args, 7)) / 1000.0,
+            };
+            register_port_with(ctx, &port_name, c_int(args, 3), head)?;
             // C goes on with socket -1 for either socket
             // (XPSController.cpp:179-193).
             let poll = match connect_to_server(ctx, &ip, ip_port) {
-                Some(handle) => {
-                    XpsSocket::new(handle, &port_name, SocketMode::Query, XPS_POLL_TIMEOUT)
-                }
+                Some((index, handle)) => XpsSocket::new(
+                    handle,
+                    index,
+                    &port_name,
+                    SocketMode::Query,
+                    XPS_POLL_TIMEOUT,
+                ),
                 None => {
                     println!(
                         "XPSController:XPSController: error calling TCP_ConnectToServer for pollSocket"
@@ -580,9 +647,13 @@ pub fn xps_create_controller_command() -> CommandDef {
                 }
             };
             let profile_sock = Arc::new(match connect_to_server(ctx, &ip, ip_port) {
-                Some(handle) => {
-                    XpsSocket::new(handle, &port_name, SocketMode::Query, XPS_PVT_EXEC_TIMEOUT)
-                }
+                Some((index, handle)) => XpsSocket::new(
+                    handle,
+                    index,
+                    &port_name,
+                    SocketMode::Query,
+                    XPS_PVT_EXEC_TIMEOUT,
+                ),
                 None => {
                     println!(
                         "XPSController:XPSController: error calling TCP_ConnectToServer for moveSocket"
@@ -653,9 +724,13 @@ pub fn xps_create_axis_command() -> CommandDef {
             // C goes on with socket -1, whose TCP_SetTimeout prints
             // (XPSAxis.cpp:146-152).
             let move_sock = match connect_to_server(ctx, &ip, ip_port) {
-                Some(handle) => {
-                    XpsSocket::new(handle, &port_name, SocketMode::Fire, XPS_MOVE_TIMEOUT)
-                }
+                Some((index, handle)) => XpsSocket::new(
+                    handle,
+                    index,
+                    &port_name,
+                    SocketMode::Fire,
+                    XPS_MOVE_TIMEOUT,
+                ),
                 None => {
                     println!("XPSAxis:XPSAxis: error calling TCP_ConnectToServer for move socket");
                     println!(
@@ -673,8 +748,9 @@ pub fn xps_create_axis_command() -> CommandDef {
                 &positioner_name,
                 1.0 / steps_per_unit,
             );
+            let report = Arc::new(ax.report());
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            poller.install(asyn_user(&port_name, axis), motor)?;
+            poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -832,9 +908,9 @@ pub fn tclcall_command() -> CommandDef {
                 _ => Ok("(null)".to_owned()),
             };
             println!("XPS ip = {TCLCALL_IP}");
-            let socket = connect_to_server(ctx, TCLCALL_IP, TCLCALL_PORT).map(|handle| {
+            let socket = connect_to_server(ctx, TCLCALL_IP, TCLCALL_PORT).map(|(index, handle)| {
                 let port = handle.port_name().to_owned();
-                XpsSocket::new(handle, &port, SocketMode::Query, TCLCALL_TIMEOUT)
+                XpsSocket::new(handle, index, &port, SocketMode::Query, TCLCALL_TIMEOUT)
             });
             if socket.is_none() {
                 println!(" Error TCP_ConnectToServer");
@@ -861,13 +937,14 @@ pub fn xps_aux_config_command() -> CommandDef {
         move |args: &[ArgValue], ctx: &CommandContext| {
             let port_name = opt_string(args, 0)?.unwrap_or_default();
             let ip = opt_string(args, 1)?.unwrap_or_default();
-            let Some(handle) = connect_to_server(ctx, &ip, c_int(args, 2)) else {
+            let Some((index, handle)) = connect_to_server(ctx, &ip, c_int(args, 2)) else {
                 println!("drvXPSAsynAuxConfig: error calling TCP_ConnectToServer");
                 return Ok(CommandOutcome::Continue);
             };
             let period = Duration::from_millis(c_int(args, 3).max(0) as u64);
             let socket = XpsSocket::new(
                 handle.clone(),
+                index,
                 handle.port_name(),
                 SocketMode::Query,
                 gpio::TCP_TIMEOUT,
@@ -1465,9 +1542,13 @@ pub fn hxp_create_controller_command() -> CommandDef {
             // C goes on with socket -1 for either socket (HXPDriver.cpp:106-116,
             // 559-562).
             let poll_sock = match connect_to_server(ctx, &ip, ip_port) {
-                Some(handle) => {
-                    XpsSocket::new(handle, &port_name, SocketMode::Query, HXP_POLL_TIMEOUT)
-                }
+                Some((index, handle)) => XpsSocket::new(
+                    handle,
+                    index,
+                    &port_name,
+                    SocketMode::Query,
+                    HXP_POLL_TIMEOUT,
+                ),
                 None => {
                     println!(
                         "HXPDriver:HXPController::HXPController: error calling TCP_ConnectToServer for pollSocket"
@@ -1494,9 +1575,13 @@ pub fn hxp_create_controller_command() -> CommandDef {
 
             for axis_no in 0..NUM_HXP_AXES {
                 let move_sock = match connect_to_server(ctx, &ip, ip_port) {
-                    Some(handle) => {
-                        XpsSocket::new(handle, &port_name, SocketMode::Fire, HXP_MOVE_TIMEOUT)
-                    }
+                    Some((index, handle)) => XpsSocket::new(
+                        handle,
+                        index,
+                        &port_name,
+                        SocketMode::Fire,
+                        HXP_MOVE_TIMEOUT,
+                    ),
                     None => {
                         println!(
                             "SetTCPTimeout, SocketIndex=-1, must be >=0 and < {}",
@@ -2418,6 +2503,82 @@ mod report {
         let text = port_report("hxpRep", 1);
         assert!(
             text.contains(&format!("{}{axes}Port: hxpRep\n", head(2))),
+            "{text}"
+        );
+    }
+
+    /// XPSController::report then XPSAxis::report (XPSController.cpp:222-246,
+    /// XPSAxis.cpp:207-219); the axis prints at every level.
+    #[epics_rs::base::epics_test]
+    async fn xps_report_prints_the_controller_then_each_axis() {
+        let first = NEXT_SOCKET.load(Ordering::Relaxed);
+        let args = vec![
+            ArgValue::String("xpsRep".into()),
+            ArgValue::String("127.0.0.1".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(2),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+            ArgValue::Int(1),
+            ArgValue::Int(500),
+        ];
+        run_command(xps_create_controller_command(), args).await;
+        let args = vec![
+            ArgValue::String("xpsRep".into()),
+            ArgValue::Int(0),
+            ArgValue::String("G1.P1".into()),
+            ArgValue::String("1000".into()),
+        ];
+        run_command(xps_create_axis_command(), args).await;
+        let head = "XPS motor driver: xpsRep\n\
+                    \x20                numAxes: 2\n\
+                    \x20       firmware version: \n\
+                    \x20     moving poll period: 0.100000\n\
+                    \x20       idle poll period: 1.000000\n";
+        let axis = format!(
+            "  axis 0\n    name = G1.P1\n    step size = 0.001\n    \
+             poll socket = {first}, moveSocket = {}\n    status = 0\n",
+            first + 2
+        );
+        let text = port_report("xpsRep", 0);
+        assert!(
+            text.contains(&format!("{head}{axis}Port: xpsRep\n")),
+            "{text}"
+        );
+        let detail = |user: &str, password: &str, no_disable_error: i32| {
+            format!(
+                "       enableSetPosition: 1\n\
+                 \x20setPositionSettlingTime: 0.500000\n\
+                 \x20              IPAddress: 127.0.0.1\n\
+                 \x20                 IPPort: 1\n\
+                 \x20            ftpUserName: {user}\n\
+                 \x20        ftpUserPassword: {password}\n\
+                 \x20                useSFTP: false\n\
+                 \x20          movesDeferred: 0\n\
+                 \x20             autoEnable: 1\n\
+                 \x20         noDisableError: {no_disable_error}\n"
+            )
+        };
+        let text = port_report("xpsRep", 1);
+        assert!(
+            text.contains(&format!("{head}{}{axis}", detail("(null)", "(null)", 0))),
+            "{text}"
+        );
+        let args = vec![
+            ArgValue::String("xpsRep".into()),
+            ArgValue::Int(100),
+            ArgValue::String("user".into()),
+            ArgValue::String("pass".into()),
+        ];
+        run_command(xps_create_profile_command(), args).await;
+        run_command(
+            xps_no_disable_error_command(),
+            vec![ArgValue::String("xpsRep".into())],
+        )
+        .await;
+        let text = port_report("xpsRep", 1);
+        assert!(
+            text.contains(&format!("{head}{}{axis}", detail("user", "pass", 1))),
             "{text}"
         );
     }

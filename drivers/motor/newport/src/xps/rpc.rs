@@ -193,6 +193,8 @@ pub enum SocketMode {
 pub struct XpsSocket {
     /// `None` is C's socket index -1, from a failed `ConnectToServer`.
     link: Option<Link>,
+    /// C's socket index, `ConnectToServer`'s return.
+    index: i32,
     /// The asyn port `handle` is connected to: C prints its `SendAndReceive`
     /// errors on that port's user.
     port: String,
@@ -206,10 +208,17 @@ struct Link {
 }
 
 impl XpsSocket {
-    /// Wrap the connected octet port `handle`, named `port`, with the given
-    /// send mode and per-call timeout.
-    pub fn new(handle: PortHandle, port: &str, mode: SocketMode, timeout: Duration) -> Self {
+    /// Wrap the connected octet port `handle`, C socket `index`, named
+    /// `port`, with the given send mode and per-call timeout.
+    pub fn new(
+        handle: PortHandle,
+        index: i32,
+        port: &str,
+        mode: SocketMode,
+        timeout: Duration,
+    ) -> Self {
         Self {
+            index,
             link: Some(Link {
                 pending: SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO),
                 handle: SyncIOHandle::from_handle(handle, 0, timeout),
@@ -224,6 +233,7 @@ impl XpsSocket {
     pub fn invalid(port: &str, mode: SocketMode) -> Self {
         Self {
             link: None,
+            index: -1,
             port: port.to_string(),
             mode,
         }
@@ -284,6 +294,11 @@ impl XpsSocket {
             }
         }
         buf.len()
+    }
+
+    /// C's socket index, -1 when `ConnectToServer` failed.
+    pub fn index(&self) -> i32 {
+        self.index
     }
 
     /// This socket's send mode.
@@ -577,6 +592,7 @@ mod tests {
         .unwrap();
         let sock = XpsSocket::new(
             rt.port_handle().clone(),
+            0,
             port,
             SocketMode::Fire,
             Duration::from_millis(100),

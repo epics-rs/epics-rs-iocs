@@ -11,6 +11,7 @@
 //! `1 / stepsPerUnit`) converts them to positioner units, as in C.
 
 use std::fmt;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -23,7 +24,7 @@ use epics_rs::motor::trace::MotorTrace;
 
 use super::controller::{SetPositionFailure, XpsController};
 use super::corrector::{self, CorrectorType, PidFailure};
-use super::rpc::{XpsError, XpsResult, XpsSocket};
+use super::rpc::{XpsError, XpsResult, XpsSocket, format_g};
 
 /// C `driverName` in XPSAxis.cpp.
 const DRIVER_NAME: &str = "XPSAxis";
@@ -60,6 +61,31 @@ const XPS_REFERENCING_POLL: Duration = Duration::from_millis(200);
 /// that is never reached cannot hang the async worker. 300 × 0.2 s = 60 s.
 const XPS_REFERENCING_MAX_POLLS: u32 = 300;
 
+/// `XPSAxis::report` (XPSAxis.cpp:207-219), at every level.
+pub struct XpsAxisReport {
+    axis_no: i32,
+    positioner_name: String,
+    step_size: f64,
+    poll_socket: i32,
+    move_socket: i32,
+    axis_status: Arc<AtomicI32>,
+}
+
+impl motor_common::AxisReport for XpsAxisReport {
+    fn report(&self, out: &mut dyn fmt::Write, _level: i32) {
+        let _ = write!(
+            out,
+            "  axis {}\n    name = {}\n    step size = {}\n    poll socket = {}, moveSocket = {}\n    status = {}\n",
+            self.axis_no,
+            self.positioner_name,
+            format_g(self.step_size, 6),
+            self.poll_socket,
+            self.move_socket,
+            self.axis_status.load(Ordering::Relaxed)
+        );
+    }
+}
+
 /// One XPS positioner as an asyn motor axis.
 pub struct XpsAxis {
     controller: Arc<Mutex<XpsController>>,
@@ -72,8 +98,9 @@ pub struct XpsAxis {
     min_jerk: f64,
     max_jerk: f64,
     /// Last group status code seen by [`poll`](AsynMotor::poll); `move` reads it
-    /// to decide whether to auto-enable a disabled axis.
-    axis_status: i32,
+    /// to decide whether to auto-enable a disabled axis. Shared with
+    /// [`XpsAxisReport`].
+    axis_status: Arc<AtomicI32>,
     /// C `moving_`: set by a move this axis sent; in moving mode only the
     /// move socket's answer or a stopped group clears it.
     moving: bool,
@@ -128,7 +155,7 @@ impl XpsAxis {
             step_size,
             min_jerk,
             max_jerk,
-            axis_status: 0,
+            axis_status: Arc::new(AtomicI32::new(0)),
             moving: false,
             last_status: MotorStatus {
                 gain_support: true,
@@ -170,6 +197,18 @@ impl XpsAxis {
             .unwrap_or_default()
     }
 
+    /// C `XPSAxis::report`'s view of this axis.
+    pub fn report(&self) -> XpsAxisReport {
+        XpsAxisReport {
+            axis_no: self.axis_no(),
+            positioner_name: self.positioner_name.clone(),
+            step_size: self.step_size,
+            poll_socket: self.lock_controller().poll_socket().index(),
+            move_socket: self.move_sock.index(),
+            axis_status: self.axis_status.clone(),
+        }
+    }
+
     fn lock_controller(&self) -> MutexGuard<'_, XpsController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -209,7 +248,7 @@ impl XpsAxis {
     ) -> AsynResult<()> {
         let sock = ctrl.poll_socket();
         // Disabled state (20..=36): auto-enable, or refuse the move.
-        if (20..=36).contains(&self.axis_status) {
+        if (20..=36).contains(&self.axis_status.load(Ordering::Relaxed)) {
             if ctrl.auto_enable() {
                 sock.group_motion_enable(&self.group_name)
                     .inspect_err(|e| {
@@ -580,7 +619,6 @@ impl AsynMotor for XpsAxis {
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
-        // Captures only `trace`, so `axis_status` stays assignable below.
         let stop_error = |command: &str, e: &XpsError| {
             trace_error(
                 &self.trace,
@@ -600,7 +638,7 @@ impl AsynMotor for XpsAxis {
                 .group_status_get(&self.group_name)
                 .inspect_err(|e| stop_error("GroupStatusGet", e))?
         };
-        self.axis_status = status;
+        self.axis_status.store(status, Ordering::Relaxed);
         if (status == 44 || status == 45 || status == 47)
             && let Err(e) = self.move_sock.group_move_abort(&self.group_name)
         {
@@ -959,7 +997,7 @@ impl XpsAxis {
         // C prints the GroupStatusGet line for a failed GroupStatusStringGet too.
         let axis_status = sock
             .group_status_get(&self.group_name)
-            .inspect(|&code| self.axis_status = code)
+            .inspect(|&code| self.axis_status.store(code, Ordering::Relaxed))
             .and_then(|code| sock.group_status_string_get(code).map(|_| code))
             .inspect_err(|e| poll_error("GroupStatusGet", e))?;
         let flags = StatusFlags::from_status(axis_status);
@@ -1162,6 +1200,7 @@ mod tests {
         let socket = |mode| {
             XpsSocket::new(
                 rt.port_handle().clone(),
+                0,
                 port,
                 mode,
                 Duration::from_millis(100),
