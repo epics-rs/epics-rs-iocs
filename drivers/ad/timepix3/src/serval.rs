@@ -222,12 +222,17 @@ pub struct ImageChannel {
     pub mode: i32,
     pub integration_size: i32,
     pub integration_mode: i32,
-    pub stop_on_disk_limit: bool,
+    /// An index into [`STOP_ON_DISK_LIMIT`].
+    pub stop_on_disk_limit: i32,
     pub queue_size: i32,
 }
 
+/// C `STOP_ON_DISK_LIMIT` (serval_http.cpp:1700): Serval is sent the
+/// string, not a JSON boolean.
+pub const STOP_ON_DISK_LIMIT: [&str; 2] = ["false", "true"];
+
 /// The one histogram channel (C `configureHistogramChannel`,
-/// serval_http.cpp:1867).
+/// serval_http.cpp:2085-2168).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistogramChannel {
     pub image: ImageChannel,
@@ -285,7 +290,7 @@ pub fn image_body(c: &ImageChannel) -> Result<Value, String> {
         // UPSTREAM DEFECT (serval_http.cpp:1518): C sends this as the *string*
         // "true"/"false" while Serval reports it back as a JSON boolean
         // (serval_http.cpp:1361). Sent as a boolean.
-        body["StopMeasurementOnDiskLimit"] = json!(c.stop_on_disk_limit);
+        body["StopMeasurementOnDiskLimit"] = json!(c.stop_on_disk_limit != 0);
     }
     Ok(body)
 }
@@ -308,9 +313,48 @@ pub fn raw_body(c: &RawChannel) -> Result<Value, String> {
     Ok(body)
 }
 
-/// The histogram channel's body (C `configureHistogramChannel`).
+/// The histogram channel's body (C `configureHistogramChannel`): an
+/// `http://` or `tcp://` Base streams, and carries no FilePattern and no
+/// StopMeasurementOnDiskLimit; the error is C's `ERR_ARGS` message.
 pub fn histogram_body(h: &HistogramChannel) -> Result<Value, String> {
-    let mut body = image_body(&h.image)?;
+    let c = &h.image;
+    let stream = c.base.starts_with("http://") || c.base.starts_with("tcp://");
+    let mut body = json!({ "Base": c.base });
+    if !stream {
+        body["FilePattern"] = json!(c.file_pattern);
+    }
+    let format = enum_name(&FORMATS, c.format)
+        .ok_or_else(|| format!("Invalid histogram format index: {}", c.format))?;
+    body["Format"] = json!(format);
+    let mode = enum_name(&MODES, c.mode)
+        .ok_or_else(|| format!("Invalid histogram mode index: {}", c.mode))?;
+    body["Mode"] = json!(mode);
+    if !(-1..=32).contains(&c.integration_size) {
+        return Err(format!(
+            "Invalid histogram integration size: {}",
+            c.integration_size
+        ));
+    }
+    body["IntegrationSize"] = json!(c.integration_size);
+    if c.integration_size != 0 && c.integration_size != 1 {
+        let m = enum_name(&INTEGRATION_MODES, c.integration_mode).ok_or_else(|| {
+            format!(
+                "Invalid histogram integration mode index: {}",
+                c.integration_mode
+            )
+        })?;
+        body["IntegrationMode"] = json!(m);
+    }
+    if !stream {
+        let stop = enum_name(&STOP_ON_DISK_LIMIT, c.stop_on_disk_limit).ok_or_else(|| {
+            format!(
+                "Invalid histogram stop on disk limit index: {}",
+                c.stop_on_disk_limit
+            )
+        })?;
+        body["StopMeasurementOnDiskLimit"] = json!(stop);
+    }
+    body["QueueSize"] = json!(c.queue_size);
     body["NumberOfBins"] = json!(h.number_of_bins);
     body["BinWidth"] = json!(h.bin_width);
     body["Offset"] = json!(h.offset);
@@ -1363,7 +1407,7 @@ mod tests {
             mode: 0,   // count
             integration_size: 0,
             integration_mode: 0,
-            stop_on_disk_limit: true,
+            stop_on_disk_limit: 1,
             queue_size: 1024,
         }
     }
@@ -1441,6 +1485,70 @@ mod tests {
         assert_eq!(
             raw("file:/data", 0, 2),
             Err("Invalid split strategy index: 2".into())
+        );
+    }
+
+    #[test]
+    fn a_histogram_channel_is_built_as_c() {
+        let hist = |base: &str| HistogramChannel {
+            image: image(base),
+            number_of_bins: 16,
+            bin_width: 1.5,
+            offset: 2.0,
+        };
+        assert_eq!(
+            histogram_body(&hist("file:/data")),
+            Ok(json!({
+                "Base": "file:/data",
+                "FilePattern": "f%d",
+                "Format": "jsonimage",
+                "Mode": "count",
+                "IntegrationSize": 0,
+                "StopMeasurementOnDiskLimit": "true",
+                "QueueSize": 1024,
+                "NumberOfBins": 16,
+                "BinWidth": 1.5,
+                "Offset": 2.0,
+            }))
+        );
+        for base in ["http://localhost:8452", "tcp://localhost:8452"] {
+            let mut h = hist(base);
+            h.image.stop_on_disk_limit = 7;
+            let body = histogram_body(&h).unwrap();
+            assert!(body.get("FilePattern").is_none(), "{base}");
+            assert!(body.get("StopMeasurementOnDiskLimit").is_none(), "{base}");
+        }
+        type Bad = (fn(&mut ImageChannel), &'static str);
+        let bad: [Bad; 5] = [
+            (|c| c.format = 5, "Invalid histogram format index: 5"),
+            (|c| c.mode = -1, "Invalid histogram mode index: -1"),
+            (
+                |c| c.integration_size = 33,
+                "Invalid histogram integration size: 33",
+            ),
+            (
+                |c| {
+                    c.integration_size = 4;
+                    c.integration_mode = 3;
+                },
+                "Invalid histogram integration mode index: 3",
+            ),
+            (
+                |c| c.stop_on_disk_limit = 2,
+                "Invalid histogram stop on disk limit index: 2",
+            ),
+        ];
+        for (set, want) in bad {
+            let mut h = hist("file:/data");
+            set(&mut h.image);
+            assert_eq!(histogram_body(&h), Err(want.to_owned()));
+        }
+        let mut h = hist("file:/data");
+        h.image.integration_size = -1;
+        h.image.integration_mode = 2;
+        assert_eq!(
+            histogram_body(&h).unwrap()["IntegrationMode"],
+            json!("last")
         );
     }
 

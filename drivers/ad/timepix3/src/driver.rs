@@ -1112,7 +1112,7 @@ impl TimePix3Driver {
             mode: self.int(mode, 0),
             integration_size: self.int(size, 0),
             integration_mode: self.int(int_mode, 0),
-            stop_on_disk_limit: self.int(stop, 0) != 0,
+            stop_on_disk_limit: self.int(stop, 0),
             queue_size: self.int(queue, 0),
         }
     }
@@ -1217,7 +1217,8 @@ impl TimePix3Driver {
             offset: self.dbl(p.prv_hst_offset, 0),
         };
         self.validate_destination(&h.image.base)?;
-        let body = serval::histogram_body(&h).map_err(Self::destination_refused)?;
+        let body = serval::histogram_body(&h)
+            .map_err(|m| self.configure_refused(adlog::CONFIGURE_HISTOGRAM_CHANNEL, m))?;
         *serval::channel_slot(&mut server["Preview"]["HistogramChannels"], 0) = body;
         Ok(())
     }
@@ -3783,6 +3784,24 @@ mod tests {
         assert!(text.contains(&adlog::err(
             adlog::FILE_WRITER,
             "Failed to configure raw channel 0"
+        )));
+
+        let (ok, put, text) = run("TPX_FW_HST", |d| {
+            let p = d.p;
+            enable(d, p.write_prv_hst, p.prv_hst_base);
+            d.ad.port_base
+                .set_int32_param(p.prv_hst_format, 0, 9)
+                .unwrap();
+        });
+        assert!(!ok);
+        assert_eq!(put, None);
+        assert!(text.contains(&adlog::err(
+            adlog::CONFIGURE_HISTOGRAM_CHANNEL,
+            "Invalid histogram format index: 9"
+        )));
+        assert!(text.contains(&adlog::err(
+            adlog::FILE_WRITER,
+            "Failed to configure histogram channel"
         )));
     }
 
