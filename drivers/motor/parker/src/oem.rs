@@ -126,6 +126,19 @@ pub struct OemAxis {
     position: f64,
     /// Last polled travel direction (persisted while stopped).
     direction: bool,
+    /// The switch flags as C's parameter library holds them.
+    switches: SwitchFlags,
+}
+
+/// The poll's switch-driven status bits. C sets each only where the switch
+/// names it and leaves the rest at their last value (OEMMotorDriver.cpp:
+/// 398-419); nothing clears `homed` (:404).
+#[derive(Clone, Copy, Default)]
+struct SwitchFlags {
+    high_limit: bool,
+    low_limit: bool,
+    home: bool,
+    homed: bool,
 }
 
 impl OemAxis {
@@ -140,6 +153,7 @@ impl OemAxis {
             encoder_base: 0.0,
             position: 0.0,
             direction: false,
+            switches: SwitchFlags::default(),
         };
         // C ignores configureController's status (OEMMotorDriver.cpp:208).
         let _ = axis.lock().configure(axis.axis_no);
@@ -431,21 +445,22 @@ impl AsynMotor for OemAxis {
         let select_switch = ctrl.select_switch[self.axis_no];
         let post = ctrl.port.clone().zip(ctrl.switch_detected);
 
-        let mut high_limit = false;
-        let mut low_limit = false;
-        let mut home = false;
-        let mut homed_status = false;
+        let mut switches = self.switches;
         if switch_detected > 0 {
             if select_switch == switch_detected - 1 {
                 if self.homed {
                     ctrl.command(&format!("{addr}PZ"))?;
-                    homed_status = true;
+                    switches.homed = true;
                 }
-                low_limit = true;
-                home = true;
+                switches.low_limit = true;
+                switches.home = true;
             } else {
-                high_limit = true;
+                switches.high_limit = true;
             }
+        } else {
+            switches.high_limit = false;
+            switches.low_limit = false;
+            switches.home = false;
         }
         drop(ctrl);
         // Posted with the controller unlocked: the port's write hook locks it.
@@ -458,6 +473,7 @@ impl AsynMotor for OemAxis {
         self.encoder_base = new_base;
         self.position = new_position;
         self.direction = new_direction;
+        self.switches = switches;
 
         Ok(MotorStatus {
             position: new_position,
@@ -466,12 +482,12 @@ impl AsynMotor for OemAxis {
             done,
             moving: !done,
             direction: new_direction,
-            high_limit,
-            low_limit,
+            high_limit: switches.high_limit,
+            low_limit: switches.low_limit,
             // C sets motorStatusAtHome_ and motorStatusHome_ together.
-            home,
-            encoder_home: home,
-            homed: homed_status,
+            home: switches.home,
+            encoder_home: switches.home,
+            homed: switches.homed,
             ..MotorStatus::default()
         })
     }
@@ -574,7 +590,7 @@ mod tests {
     /// queries (`R`, `PR`, `IS`) with an echo line then `replies`' line.
     struct Polled {
         base: PortDriverBase,
-        replies: HashMap<&'static str, &'static str>,
+        replies: Arc<Mutex<HashMap<&'static str, &'static str>>>,
         queued: std::collections::VecDeque<String>,
     }
 
@@ -588,7 +604,7 @@ mod tests {
         fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data).into_owned();
             self.queued.push_back("\r".into());
-            if let Some(reply) = self.replies.get(&cmd[1..]) {
+            if let Some(reply) = self.replies.lock().unwrap().get(&cmd[1..]) {
                 self.queued.push_back(format!("{reply}\r"));
             }
             Ok(data.len())
@@ -609,9 +625,14 @@ mod tests {
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let name = "OEM_SWITCH_LINE";
+        let replies = Arc::new(Mutex::new(HashMap::from([
+            ("R", "*R"),
+            ("PR", "*+0"),
+            ("IS", "*ABCD001"),
+        ])));
         let driver = Polled {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
-            replies: HashMap::from([("R", "*R"), ("PR", "*+0"), ("IS", "*ABCD001")]),
+            replies: replies.clone(),
             queued: Default::default(),
         };
         let claim = claim_port(name).unwrap();
@@ -652,9 +673,29 @@ mod tests {
         assert_eq!(port.read_int32_blocking(detected, 0).unwrap(), 2);
         assert!(status.high_limit && !status.low_limit && !status.home);
 
+        // C writes only the flags the switch names; the rest keep their
+        // last value (OEMMotorDriver.cpp:398-419).
         port.write_int32_blocking(select, 0, 1).unwrap();
         let status = poll();
-        assert!(!status.high_limit && status.low_limit && status.home);
+        assert!(status.high_limit && status.low_limit && status.home);
+        assert!(!status.homed);
+
+        // A home that ends on the switch latches homed: C never clears
+        // motorStatusHomed_ (:404).
+        axis.lock()
+            .unwrap()
+            .home(&AsynUser::new(0), 0.0, 1.0, 1.0, true)
+            .unwrap();
+        assert!(poll().homed);
+        replies.lock().unwrap().insert("IS", "*ABCD000");
+        let status = poll();
+        assert!(!status.high_limit && !status.low_limit && !status.home);
+        assert!(status.homed);
+        axis.lock()
+            .unwrap()
+            .move_absolute(&AsynUser::new(0), 5.0, 0.0, 1.0, 1.0)
+            .unwrap();
+        assert!(poll().homed);
     }
 
     #[test]
