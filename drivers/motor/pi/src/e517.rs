@@ -166,6 +166,7 @@ fn fold_reading(
         problem: false,
         direction,
         slip_stall: false,
+        slip: false,
         comms_error: false,
         homed: false,
         gain_support: true,
