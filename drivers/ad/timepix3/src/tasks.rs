@@ -451,6 +451,7 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
         0,
         ParamValue::Int32(reply.code),
     )];
+    log_dashboard_failure(ctx, "checkConnection", &reply);
     let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
     connection_status(ctx, serval_ok, det_ok, &mut updates);
     ctx.set(0, updates).await;
@@ -460,6 +461,7 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
 /// One `GET /dashboard`: cpr's status code and C `parseResponse`'s verdict.
 struct DashboardReply {
     code: i32,
+    body: String,
     parsed: Result<serval::Dashboard, serval::DashboardError>,
 }
 
@@ -468,10 +470,23 @@ fn read_dashboard(ctx: &Ctx) -> DashboardReply {
         Ok(body) => (200, body),
         Err(e) => (e.code(), e.body().to_string()),
     };
-    DashboardReply {
-        code,
-        parsed: serval::parse_dashboard_response(code, &body),
-    }
+    let parsed = serval::parse_dashboard_response(code, &body);
+    DashboardReply { code, body, parsed }
+}
+
+/// C `logHttpFailure` plus `ERR_ARGS("<context>: %s", responseErrorMessage)`
+/// for a rejected dashboard reply (serval_http.cpp:382-384, :442-443).
+fn log_dashboard_failure(ctx: &Ctx, context: &str, reply: &DashboardReply) {
+    let Err(error) = &reply.parsed else { return };
+    let url = format!("{}{}", ctx.http.base_url(), serval::DASHBOARD);
+    ctx.trace(
+        TraceMask::ERROR,
+        &adlog::http_failure_reply(context, "GET", &url, reply.code, &reply.body),
+    );
+    ctx.trace(
+        TraceMask::ERROR,
+        &adlog::err(context, &format!("{context}: {}", error.message())),
+    );
 }
 
 /// C `publishDashboardSnapshot` and `publishDashboardFailure`
@@ -658,6 +673,7 @@ fn as_bool_or_int(v: &Value) -> Option<i32> {
 /// C `getDashboard` (serval_http.cpp:431-454).
 async fn refresh_dashboard(ctx: &Arc<Ctx>) {
     let reply = read_dashboard(ctx);
+    log_dashboard_failure(ctx, "getDashboard", &reply);
     let mut updates = Vec::new();
     let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
     connection_status(ctx, serval_ok, det_ok, &mut updates);
@@ -3765,6 +3781,58 @@ mod tests {
                 ADStatus::Disconnected as i32,
                 "{name}"
             );
+        }
+    }
+
+    /// ERROR-mask trace output of the port `name` goes to the returned file.
+    fn capture_errors(ctx: &Ctx, name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        ctx.handle.trace().set_trace_file(
+            Some(name),
+            epics_rs::asyn::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        ctx.handle
+            .trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR);
+        path
+    }
+
+    /// A rejected dashboard read logs the HTTP reply and the parse verdict,
+    /// except on the background poll (serval_http.cpp:380-385, :441-444).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rejected_dashboard_read_is_logged_except_by_the_poll() {
+        let (url, _log) = logging_serval(&[], |_| "{");
+        let ctx = Arc::new(idle_ctx_at("TPX_DASH_LOG", &url, None));
+        let path = capture_errors(&ctx, "TPX_DASH_LOG");
+        poll_connection(&ctx, false).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        check_connection(&ctx).await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let dashboard = format!("{url}/dashboard");
+        for line in [
+            adlog::http_failure_reply("checkConnection", "GET", &dashboard, 200, "{"),
+            adlog::err(
+                "checkConnection",
+                "checkConnection: malformed dashboard JSON",
+            ),
+        ] {
+            assert!(text.contains(&line), "{text}");
+        }
+
+        let (url, _log) = logging_serval(&["/dashboard"], |_| "{}");
+        let ctx = Arc::new(idle_ctx_at("TPX_DASH_LOG500", &url, None));
+        let path = capture_errors(&ctx, "TPX_DASH_LOG500");
+        refresh_dashboard(&ctx).await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let dashboard = format!("{url}/dashboard");
+        for line in [
+            adlog::http_failure_reply("getDashboard", "GET", &dashboard, 500, ""),
+            adlog::err("getDashboard", "getDashboard: dashboard GET failed"),
+        ] {
+            assert!(text.contains(&line), "{text}");
         }
     }
 

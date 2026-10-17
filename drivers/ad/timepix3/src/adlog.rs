@@ -77,16 +77,28 @@ pub fn trim_body(body: &str) -> String {
 /// request got a 200 and only its body failed to parse, where C prints no
 /// HTTP line. A request that never reached Serval is cpr's status 0.
 fn http_line(context: &str, method: &str, url: &str, e: &HttpError) -> Option<String> {
-    let (code, body) = match e {
-        HttpError::Status { code, body, .. } => (i64::from(*code), trim_body(body)),
-        HttpError::Transport(_) => (0, String::new()),
+    let code = match e {
+        HttpError::Status { code, .. } => i32::from(*code),
+        HttpError::Transport(_) => 0,
         HttpError::Parse(_) => return None,
     };
-    Some(format!("{context}: {method} {url} HTTP {code}: {body}"))
+    Some(status_line(context, method, url, code, e.body()))
+}
+
+fn status_line(context: &str, method: &str, url: &str, code: i32, body: &str) -> String {
+    format!("{context}: {method} {url} HTTP {code}: {}", trim_body(body))
 }
 
 pub fn http_failure(context: &str, method: &str, url: &str, e: &HttpError) -> Option<String> {
     http_line(context, method, url, e).map(|m| err(LOG_HTTP_FAILURE, &m))
+}
+
+/// C `logHttpFailure` for a reply whose status and body the caller holds.
+pub fn http_failure_reply(context: &str, method: &str, url: &str, code: i32, body: &str) -> String {
+    err(
+        LOG_HTTP_FAILURE,
+        &status_line(context, method, url, code, body),
+    )
 }
 
 pub fn http_warning(context: &str, method: &str, url: &str, e: &HttpError) -> Option<String> {
