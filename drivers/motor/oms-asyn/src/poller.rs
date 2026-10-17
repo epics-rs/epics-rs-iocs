@@ -380,27 +380,8 @@ impl OmsPoller {
             .then_some(status)
     }
 
-    /// C `getAxesArray`: one value per axis from a comma-separated reply.
-    /// A failed read fails silently, a bad reply with a line.
     fn axes_array(&self, cmd: &str) -> Option<[i32; OMS_MAX_AXES]> {
-        let reply = self.send_receive(cmd).ok()?;
-        if reply.len() < self.num_axes.wrapping_sub(1) {
-            errlog_vprintf(format_args!(
-                "{DRIVER}:getAxesArray:{}: read string too short {}\n",
-                self.port_name,
-                reply.len()
-            ));
-            return None;
-        }
-        let (values, count) = parse_axes_array(&reply);
-        if count != self.num_axes {
-            errlog_vprintf(format_args!(
-                "{DRIVER}:getAxesArray:{}: array string conversion error, count: {count}, axes: {}, input: >{reply}<\n",
-                self.port_name, self.num_axes
-            ));
-            return None;
-        }
-        Some(values)
+        axes_array(&self.lock(), self.num_axes, cmd)
     }
 
     /// C `getClosedLoopStatus` in the `CL?` form this port assumes. C sets 1
@@ -436,6 +417,43 @@ impl OmsPoller {
                 self.port_name
             ));
             self.enabled = false;
+        }
+    }
+}
+
+/// C `getAxesArray`: one value per axis from a comma-separated reply.
+/// A failed read fails silently, a bad reply with a line.
+fn axes_array(ctrl: &OmsController, num_axes: usize, cmd: &str) -> Option<[i32; OMS_MAX_AXES]> {
+    let reply = ctrl.send_receive(cmd).ok()?;
+    if reply.len() < num_axes.wrapping_sub(1) {
+        errlog_vprintf(format_args!(
+            "{DRIVER}:getAxesArray:{}: read string too short {}\n",
+            ctrl.port_name(),
+            reply.len()
+        ));
+        return None;
+    }
+    let (values, count) = parse_axes_array(&reply);
+    if count != num_axes {
+        errlog_vprintf(format_args!(
+            "{DRIVER}:getAxesArray:{}: array string conversion error, count: {count}, axes: {num_axes}, input: >{reply}<\n",
+            ctrl.port_name()
+        ));
+        return None;
+    }
+    Some(values)
+}
+
+/// The end of C `Init` (omsBaseController.cpp:565-568): every axis's
+/// position from one `AM PP;`, so a record initialised before the poller's
+/// first good loop starts from the controller, not from 0.
+pub(crate) fn init_positions(controller: &Mutex<OmsController>) {
+    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+    let shared = ctrl.poll_shared();
+    let num_axes = shared.axes().len();
+    if let Some(positions) = axes_array(&ctrl, num_axes, "AM PP;") {
+        for (axis, position) in positions.iter().take(num_axes).enumerate() {
+            shared.set_position(axis, f64::from(*position));
         }
     }
 }
@@ -669,6 +687,17 @@ mod tests {
         }
         assert!(poller.shared.wait(Duration::ZERO));
         assert!(!poller.shared.wait(Duration::ZERO));
+    }
+
+    /// Init's `AM PP;` positions stand until the poller's first good loop.
+    #[test]
+    fn init_reads_every_axis_position() {
+        let mut rig = rig("omsInitPositions", 2, &[("AM PP;", "3000,-5")]);
+        init_positions(&rig.controller);
+        assert_eq!(*rig.written.lock().unwrap(), ["AM PP;"]);
+        let user = AsynUser::default();
+        assert_eq!(rig.axes[0].poll(&user).unwrap().position, 3000.0);
+        assert_eq!(rig.axes[1].poll(&user).unwrap().position, -5.0);
     }
 
     /// A move signals the poller once, through the poll that follows it.

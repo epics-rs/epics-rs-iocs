@@ -114,10 +114,15 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
             }
 
             let controller = Arc::new(Mutex::new(controller));
+            let axes = (0..total_axes)
+                .map(|axis| {
+                    OmsAxis::new(controller.clone(), axis)
+                        .map_err(|e| format!("{cmd_name}: axis {axis}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            crate::poller::init_positions(&controller);
             let mut posters = Vec::with_capacity(total_axes);
-            for axis in 0..total_axes {
-                let axis_dev = OmsAxis::new(controller.clone(), axis)
-                    .map_err(|e| format!("{cmd_name}: axis {axis}: {e}"))?;
+            for (axis, axis_dev) in axes.into_iter().enumerate() {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_dev));
                 // No timed pass: the OMS poller posts (zero periods wait on
                 // events alone).
