@@ -647,7 +647,10 @@ fn lock_system(system: &Mutex<PmacCoordSystem>) -> std::sync::MutexGuard<'_, Pma
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::asyn::error::AsynResult;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use epics_rs::asyn::error::{AsynResult, AsynStatus};
     use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
@@ -856,6 +859,92 @@ mod tests {
             trace.contains("pmacController: unable to set input EOS on pmacTraceLow: "),
             "{trace:?}"
         );
+    }
+
+    /// A PMAC that answers the commands in `replies` and times out on any
+    /// other, counting the disconnects its port is asked for.
+    struct Scripted {
+        base: PortDriverBase,
+        rig: Rig,
+        reply: Option<Vec<u8>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Rig {
+        replies: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        written: Arc<Mutex<Vec<String>>>,
+        disconnects: Arc<AtomicUsize>,
+    }
+
+    impl Rig {
+        fn answer(&self, command: &str, reply: &[u8]) {
+            let mut replies = self.replies.lock().unwrap();
+            replies.insert(command.into(), reply.into());
+        }
+        fn disconnects(&self) -> usize {
+            self.disconnects.load(Ordering::SeqCst)
+        }
+    }
+
+    impl PortDriver for Scripted {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn set_input_eos(&mut self, _: &AsynUser, _: &[u8]) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_output_eos(&mut self, _: &AsynUser, _: &[u8]) -> AsynResult<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self, _: &AsynUser) -> AsynResult<()> {
+            self.rig.disconnects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            self.reply = self.rig.replies.lock().unwrap().get(&cmd).cloned();
+            self.rig.written.lock().unwrap().push(cmd);
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = self.reply.take().ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "timeout".into(),
+            })?;
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    fn publish_scripted(name: &str) -> (PortRuntimeHandle, Rig) {
+        let rig = Rig::default();
+        let driver = Scripted {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            rig: rig.clone(),
+            reply: None,
+        };
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        (rt, rig)
+    }
+
+    /// pmacController.cpp:335-343: a failed transfer disconnects the port; a
+    /// reply the PMAC rejected is a transfer that worked.
+    #[test]
+    fn a_failed_transfer_disconnects_the_low_level_port() {
+        let (_rt, rig) = publish_scripted("pmacDisconnect");
+        rig.answer("I100", b"\x07ERR003\r");
+        let controller = controller_on("pmacDisconnect");
+        assert!(controller.write_read("I100").is_err());
+        assert_eq!(rig.disconnects(), 0);
+        assert!(controller.write_read("I200").is_err());
+        assert_eq!(rig.disconnects(), 1);
     }
 
     /// pmacController.cpp:201: one poller from pmacCreateController, which

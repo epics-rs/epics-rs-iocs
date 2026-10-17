@@ -102,7 +102,13 @@ pub fn pmac_err(message: impl Into<String>) -> AsynError {
 /// command left the record believing it had been accepted. Here a `<BELL>` reply
 /// is an error.
 pub fn octet_write_read(handle: &SyncIOHandle, command: &str) -> AsynResult<String> {
-    let raw = handle.write_read(0, command.as_bytes(), PMAC_MAXBUF)?;
+    checked_reply(
+        command,
+        handle.write_read(0, command.as_bytes(), PMAC_MAXBUF)?,
+    )
+}
+
+fn checked_reply(command: &str, raw: Vec<u8>) -> AsynResult<String> {
     if raw.first() == Some(&BELL) {
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_matches(|c: char| c.is_control() || c == '\0');
@@ -176,13 +182,23 @@ impl PmacController {
         self.handle.is_some()
     }
 
-    /// C `pmacController::lowLevelWriteRead`; see [`octet_write_read`].
+    /// C `pmacController::lowLevelWriteRead`; see [`octet_write_read`]. A
+    /// failed transfer disconnects the low-level port (pmacController.cpp:
+    /// 335-343): the rest of the pass fails at once instead of timing out
+    /// command by command, and the port's autoconnect brings the line back.
     pub fn write_read(&self, command: &str) -> AsynResult<String> {
         let handle = self
             .handle
             .as_ref()
             .ok_or_else(|| pmac_err("no low level asynOctetSyncIO port"))?;
-        octet_write_read(handle, command)
+        let raw = handle
+            .write_read(0, command.as_bytes(), PMAC_MAXBUF)
+            .inspect_err(|_| {
+                if let Ok(port) = handle.port() {
+                    let _ = port.disconnect_blocking();
+                }
+            })?;
+        checked_reply(command, raw)
     }
 
     /// Send a command whose reply carries no value (moves, jogs, set-position).
