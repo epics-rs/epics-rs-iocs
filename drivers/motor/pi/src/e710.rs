@@ -12,9 +12,7 @@
 //! `PIE710_axis[] = {"1".."6"}`, `MAX_AXES = 6`. C `send_mess` overwrites only
 //! `local_buff[0]` with `*name`, so the leading `#` placeholder of a command
 //! becomes the axis digit (`#GI8` → `1GI8`, `#TP` → `1TP`). `substitute_axis`
-//! reproduces this exactly — including the consequence that when the record
-//! concatenates two commands into one transaction (velocity + move), **only the
-//! first command's `#` is replaced; an inner `#` stays literal** (see Motion).
+//! reproduces this.
 //!
 //! ## EOS ownership
 //! C `motor_init` sets output and input EOS to `"\n"` itself, so the asyn port
@@ -67,13 +65,14 @@
 //! status; the second consecutive failure flags `comms_error` + `problem`).
 //!
 //! ## Motion (C `devPIE710_build_trans`, `maxdigits = 5`)
-//! The record concatenates `SET_VELOCITY` ahead of a move/home in one
-//! transaction; C emits that as a single `send_mess`, substituting only the
-//! leading axis digit. This port reproduces the exact wire bytes, so a move is
-//! **one** write with an inner literal `#`:
-//! - `MOVE_ABS` → `{axis}SV{v·res},#MA{p·res},` (`%.5f`).
-//! - `MOVE_REL` → `{axis}SV{v·res},#MR{d·res},` (`%+.5f` on `MR`, forced sign).
-//! - `HOME_FOR`/`HOME_REV` → `{axis}SV{v·res},#GH,` (both directions send `GH`).
+//! `PIE710_build_trans` starts and ends a transaction of its own for every
+//! command, so the record's `SET_VELOCITY` ahead of a move/home goes out as
+//! its own message, each with its leading `#` addressed:
+//! - `MOVE_ABS` → `{axis}SV{v·res},` then `{axis}MA{p·res},` (`%.5f`).
+//! - `MOVE_REL` → `{axis}SV{v·res},` then `{axis}MR{d·res},` (`%+.5f` on `MR`,
+//!   forced sign).
+//! - `HOME_FOR`/`HOME_REV` → `{axis}SV{v·res},` then `{axis}GH,` (both
+//!   directions send `GH`).
 //! - `JOG`/`JOG_VELOCITY` (`move_velocity`) → `{axis}SV{velocity},` — raw
 //!   velocity, no `res` scaling, single command (the C JOG asymmetry).
 //! - `STOP_AXIS` → `{axis}MR0,` (no stop command; a zero relative move).
@@ -127,8 +126,7 @@ enum CommState {
 }
 
 /// Substitute the axis digit for the leading command character, reproducing C
-/// `send_mess`'s `local_buff[0] = *name`. Only the first byte is replaced; any
-/// later `#` in a concatenated message stays literal (matching C).
+/// `send_mess`'s `local_buff[0] = *name`.
 fn substitute_axis(msg: &str, label: &str) -> String {
     let mut s = String::with_capacity(msg.len());
     s.push_str(label);
@@ -222,32 +220,20 @@ struct AxisReading {
     position: i32,
 }
 
-/// `{axis}SV{v},#MA{p},` absolute-move message (velocity prefix + move, one
-/// write; inner `#` literal per C `send_mess`). `velocity`/`position` are the
-/// already-`res`-scaled controller units.
-fn move_abs_msg(label: &str, velocity: f64, position: f64) -> String {
-    substitute_axis(
-        &format!("#SV{velocity:.MAX_DIGITS$},#MA{position:.MAX_DIGITS$},"),
-        label,
-    )
-}
-
-/// `{axis}SV{v},#MR{d},` relative-move message (`MR` forces a sign, C `%+.*f`).
-fn move_rel_msg(label: &str, velocity: f64, distance: f64) -> String {
-    substitute_axis(
-        &format!("#SV{velocity:.MAX_DIGITS$},#MR{distance:+.MAX_DIGITS$},"),
-        label,
-    )
-}
-
-/// `{axis}SV{v},#GH,` home message (both directions send `GH`).
-fn home_msg(label: &str, velocity: f64) -> String {
-    substitute_axis(&format!("#SV{velocity:.MAX_DIGITS$},#GH,"), label)
-}
-
-/// `{axis}SV{velocity},` jog message — raw velocity, no `res` scaling.
-fn jog_msg(label: &str, velocity: f64) -> String {
+/// `{axis}SV{v},` velocity message; a move scales `velocity` by `res`, a jog
+/// sends it raw.
+fn sv_msg(label: &str, velocity: f64) -> String {
     substitute_axis(&format!("#SV{velocity:.MAX_DIGITS$},"), label)
+}
+
+/// `{axis}MA{p},` absolute-move message (`res`-scaled controller units).
+fn ma_msg(label: &str, position: f64) -> String {
+    substitute_axis(&format!("#MA{position:.MAX_DIGITS$},"), label)
+}
+
+/// `{axis}MR{d},` relative-move message (`MR` forces a sign, C `%+.*f`).
+fn mr_msg(label: &str, distance: f64) -> String {
+    substitute_axis(&format!("#MR{distance:+.MAX_DIGITS$},"), label)
 }
 
 /// Fold one raw reading into a [`MotorStatus`] (C `set_status` tail). Updates
@@ -475,8 +461,10 @@ impl AsynMotor for PIE710Axis {
         velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        let msg = move_abs_msg(self.label(), velocity * POS_RES, position * POS_RES);
-        self.lock().send(&msg)
+        let label = self.label();
+        let ctrl = self.lock();
+        ctrl.send(&sv_msg(label, velocity * POS_RES))?;
+        ctrl.send(&ma_msg(label, position * POS_RES))
     }
 
     fn move_relative(
@@ -487,8 +475,10 @@ impl AsynMotor for PIE710Axis {
         velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        let msg = move_rel_msg(self.label(), velocity * POS_RES, distance * POS_RES);
-        self.lock().send(&msg)
+        let label = self.label();
+        let ctrl = self.lock();
+        ctrl.send(&sv_msg(label, velocity * POS_RES))?;
+        ctrl.send(&mr_msg(label, distance * POS_RES))
     }
 
     fn move_velocity(
@@ -499,7 +489,7 @@ impl AsynMotor for PIE710Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         // JOG: raw velocity, no `res` scaling, signed; single command.
-        let msg = jog_msg(self.label(), velocity);
+        let msg = sv_msg(self.label(), velocity);
         self.lock().send(&msg)
     }
 
@@ -511,9 +501,11 @@ impl AsynMotor for PIE710Axis {
         _acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
-        // C sends #GH regardless of direction; the velocity prefix precedes it.
-        let msg = home_msg(self.label(), velocity * POS_RES);
-        self.lock().send(&msg)
+        // C sends #GH regardless of direction, after the velocity.
+        let label = self.label();
+        let ctrl = self.lock();
+        ctrl.send(&sv_msg(label, velocity * POS_RES))?;
+        ctrl.send(&substitute_axis("#GH,", label))
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -556,42 +548,58 @@ impl AsynMotor for PIE710Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+
+    /// Axis 1 of a one-axis E-710 on a [`LineRig`], done (firmware V5).
+    fn rig(name: &str) -> (LineRig, PIE710Axis) {
+        let (line, io) = LineRig::new(name, |last| match last {
+            "GI" => "PI E-710 V5.000".into(),
+            "1TP" => "0.0".into(),
+            "1GI8" => "A B 0".into(),
+            _ => String::new(),
+        });
+        let ctrl = PIE710Controller::new(io).unwrap();
+        let axis = PIE710Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        line.sent();
+        (line, axis)
+    }
+
+    /// devPIE710.cc's build_trans opens and ends a transaction per command,
+    /// so the velocity and the move are two messages, each addressed.
+    #[test]
+    fn velocity_and_move_are_two_messages() {
+        let (line, mut axis) = rig("pie710Split");
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 10000.0, 0.0, 5000.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["1SV0.50000,", "1MA1.00000,"]);
+        axis.move_relative(&user, -2500.0, 0.0, 1000.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["1SV0.10000,", "1MR-0.25000,"]);
+        axis.home(&user, 0.0, 3000.0, 0.0, false).unwrap();
+        assert_eq!(line.sent(), ["1SV0.30000,", "1GH,"]);
+    }
 
     #[test]
     fn substitute_axis_replaces_only_the_first_char() {
         assert_eq!(substitute_axis("#GI8", "1"), "1GI8");
         assert_eq!(substitute_axis("#TP", "3"), "3TP");
-        // Inner '#' stays literal (C send_mess replaces local_buff[0] only).
-        assert_eq!(substitute_axis("#SV1,#MA2,", "2"), "2SV1,#MA2,");
     }
 
     #[test]
     fn move_messages_scale_by_res_and_use_five_decimals() {
         // POS_RES = 0.0001, so 10000 steps -> 1.00000 um.
-        assert_eq!(
-            move_abs_msg("1", 5000.0 * POS_RES, 10000.0 * POS_RES),
-            "1SV0.50000,#MA1.00000,"
-        );
+        assert_eq!(sv_msg("1", 5000.0 * POS_RES), "1SV0.50000,");
+        assert_eq!(ma_msg("1", 10000.0 * POS_RES), "1MA1.00000,");
         // MR forces a sign; SV does not.
-        assert_eq!(
-            move_rel_msg("2", 1000.0 * POS_RES, 2500.0 * POS_RES),
-            "2SV0.10000,#MR+0.25000,"
-        );
-        assert_eq!(
-            move_rel_msg("2", 1000.0 * POS_RES, -2500.0 * POS_RES),
-            "2SV0.10000,#MR-0.25000,"
-        );
-    }
-
-    #[test]
-    fn home_message_sends_gh_after_velocity() {
-        assert_eq!(home_msg("4", 3000.0 * POS_RES), "4SV0.30000,#GH,");
+        assert_eq!(mr_msg("2", 2500.0 * POS_RES), "2MR+0.25000,");
+        assert_eq!(mr_msg("2", -2500.0 * POS_RES), "2MR-0.25000,");
     }
 
     #[test]
     fn jog_velocity_is_raw_not_res_scaled() {
-        assert_eq!(jog_msg("1", 5.0), "1SV5.00000,");
-        assert_eq!(jog_msg("6", -2.5), "6SV-2.50000,");
+        assert_eq!(sv_msg("1", 5.0), "1SV5.00000,");
+        assert_eq!(sv_msg("6", -2.5), "6SV-2.50000,");
     }
 
     #[test]
