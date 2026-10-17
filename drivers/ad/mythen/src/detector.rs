@@ -349,15 +349,18 @@ impl Detector {
     ///
     /// Refuses when the module count is unknown rather than looping zero times:
     /// a silent no-op here is a threshold the operator believes was applied.
+    /// Like C it carries on past a failed command and returns the last
+    /// command's status.
     fn for_each_module(&self, command: &str) -> AsynResult<()> {
         let nmodules = self
             .nmodules()
             .ok_or_else(|| unknown_nmodules(&format!("send [{command}] to every module")))?;
+        let mut status = Ok(());
         for module in 0..nmodules {
-            self.send(&format!("-module {module}"))?;
-            self.send(command)?;
+            let _ = self.send(&format!("-module {module}"));
+            status = self.send(command);
         }
-        Ok(())
+        status
     }
 
     pub fn set_exposure_time(&self, seconds: f64) -> AsynResult<()> {

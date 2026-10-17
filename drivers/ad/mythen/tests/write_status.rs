@@ -24,6 +24,15 @@ use mythen::transport::Transport;
 /// every per-module command is refused without touching the wire while the
 /// `getSettings` queries still succeed.
 fn fake_detector(name: &str) -> (PortHandle, mpsc::Receiver<String>) {
+    fake_detector_with(name, -1, None)
+}
+
+/// The same detector with `nmodules` modules, hanging up on `hang_up_at`.
+fn fake_detector_with(
+    name: &str,
+    nmodules: i32,
+    hang_up_at: Option<&'static str>,
+) -> (PortHandle, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
     let (sent, received) = mpsc::channel();
@@ -36,9 +45,12 @@ fn fake_detector(name: &str) -> (PortHandle, mpsc::Receiver<String>) {
                 break;
             }
             let command = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+            if Some(command.as_str()) == hang_up_at {
+                break;
+            }
             let reply: Vec<u8> = match command.as_str() {
                 "-get version" => b"M3.0.0\0".to_vec(),
-                "-get nmodules" => (-1i32).to_le_bytes().to_vec(),
+                "-get nmodules" => nmodules.to_le_bytes().to_vec(),
                 "-get status" => (1i32 << 16).to_le_bytes().to_vec(),
                 "-get nbits" => 24i32.to_le_bytes().to_vec(),
                 "-get time" => 10_000_000i32.to_le_bytes().to_vec(),
@@ -66,7 +78,13 @@ fn fake_detector(name: &str) -> (PortHandle, mpsc::Receiver<String>) {
 }
 
 fn driver(name: &str) -> (MythenDriver, mpsc::Receiver<String>) {
-    let (handle, received) = fake_detector(name);
+    driver_on(name, fake_detector(name))
+}
+
+fn driver_on(
+    name: &str,
+    (handle, received): (PortHandle, mpsc::Receiver<String>),
+) -> (MythenDriver, mpsc::Receiver<String>) {
     let det = Arc::new(Detector::new(Transport::new(handle), name));
     let (start_tx, _start_rx) = rt::command_channel::<()>(1);
     let driver = MythenDriver::new(name, det, 0, start_tx).expect("driver");
@@ -388,4 +406,31 @@ fn a_failed_threshold_or_energy_prints_the_refusal() {
         );
     }
     let _ = std::fs::remove_file(&log);
+}
+
+/// mythen.cpp:377-382: C's module loop carries on past a failed command and
+/// returns the last one's status, so outString_ ends on the last command.
+#[test]
+fn a_module_loop_runs_to_its_last_command() {
+    use epics_rs::asyn::services::PortServices;
+    use epics_rs::asyn::trace::TraceFile;
+    let port = "MYTHEN_WS_LOOP";
+    let (mut driver, _received) = driver_on(port, fake_detector_with(port, 2, Some("-module 1")));
+    let manager = PortServices::global().trace().clone();
+    let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+    let file = std::fs::File::create(&log).unwrap();
+    manager.set_trace_file(
+        Some(port),
+        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+    );
+    let e = driver
+        .write_float64(&mut AsynUser::new(driver.p.threshold), 7.0)
+        .unwrap_err();
+    let text = std::fs::read_to_string(&log).unwrap();
+    let _ = std::fs::remove_file(&log);
+    assert_eq!(e.c_status_code(), 3);
+    assert!(
+        text.contains("error check if value > 0 (outString = -kthresh 7.000000)"),
+        "{text}"
+    );
 }
