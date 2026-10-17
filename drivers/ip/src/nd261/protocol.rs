@@ -30,13 +30,12 @@ pub const INVALID_VALUE: f64 = 99999.0;
 
 /// Decode one reply (`nread` bytes, EOS stripped) into a position.
 ///
-/// `devAiHeidND261.c:229-231` chops two more characters off the reply
-/// (`inbuf[sz - termlen] = '\0'`) *after* asyn has already stripped the `\n\n`
-/// terminator, so it always dropped the last two characters of the data. Whether
-/// those are digits of the number or trailing unit/status characters is not
-/// derivable from the C, and the ND261 manual is not available, so this port
-/// does not chop them: `sscanf("%lf")` stops at the first non-numeric character
-/// either way, and the chop can only ever have truncated the number.
+/// `devAiHeidND261.c:229-231` cuts two more characters ("remove delimiter")
+/// after asyn has already stripped the `\n\n` EOS; the code predates asyn's
+/// EOS handling (its log entry .01). The cut is not ported: when those two
+/// characters are a terminator the EOS did not match, or unit text,
+/// `sscanf("%lf")` stops before them and VAL is the same either way; VAL
+/// differs only when they are digits of the number, which C drops.
 ///
 /// C leaves `x` uninitialised when `sscanf` matches nothing and stores that
 /// garbage in VAL with no alarm; here a reply with no number is a failed read.
@@ -73,5 +72,14 @@ mod tests {
         assert_eq!(parse_position(b"+ 12.3"), None);
         assert_eq!(parse_position(b"+ no number here"), None);
         assert_eq!(parse_position(b"+ \xff\xfe number here"), None);
+    }
+
+    /// C's cut reads the same VAL for a trailing terminator or unit text, and
+    /// drops the last two digits of a number that fills the reply.
+    #[test]
+    fn the_two_characters_c_cuts_change_val_only_when_they_are_digits() {
+        assert_eq!(parse_position(b"+ 0012.34567\r\n"), Some(12.34567));
+        assert_eq!(parse_position(b"+ 0012.3456 mm"), Some(12.3456));
+        assert_eq!(parse_position(b"+  0012.345678"), Some(12.345678));
     }
 }
