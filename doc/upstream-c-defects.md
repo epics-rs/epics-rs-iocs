@@ -170,7 +170,6 @@ remain open upstream defects the port did not guess at.
 | 64 | `serval_http.cpp:1198` — `ADMaxSizeX = PixCount / NumberOfRows` unguarded → SIGFPE | fixed-in-port (guarded) |
 | 65 | `serval_http.cpp:1190` — `ADSerialNumber` set from the software version | fixed-in-port (`Info.Boards[0].ChipboardId`) |
 | 66 | `serval_http.cpp:1603/1881/image-channel` — three disagreeing "is this a stream" predicates; a `tcp://` image channel still gets a `FilePattern` | fixed-in-port (one `is_stream()` rule) |
-| 71 | `mask_io.cpp:159` — `bufBPC[pelIndex(i,j)] \|= 1` unchecked | fixed-in-port (bounds-checked, dropped count returned) |
 | 73 | `serval_stream.cpp:487,1353` — `int` overflow before the range check | fixed-in-port (checked `usize` math + dimension caps) |
 | 74 | `serval_stream.cpp:568-1443`; `histogram_io.cpp:352` — unconditional `__builtin_bswap` (breaks on big-endian hosts) | fixed-in-port (`from_be_bytes`) |
 | 76 | `acquire.cpp:514-518` — HTTP-error path busy-spins at 100% CPU | fixed-in-port (sleeps between retries) |

@@ -217,6 +217,12 @@ pub struct TimePix3Driver {
     destinations: destination::Policy,
 }
 
+/// nlohmann 3.12's `json::parse("")` message, as the vendored json.hpp
+/// prints it.
+const NLOHMANN_EMPTY_INPUT: &str = "[json.exception.parse_error.101] parse error at line 1, \
+     column 1: attempting to parse an empty input; check that your input string or stream \
+     contains the expected JSON";
+
 impl TimePix3Driver {
     pub fn new(
         port_name: &str,
@@ -1755,6 +1761,122 @@ impl TimePix3Driver {
         table
     }
 
+    /// C `bpcImageByteOffsets` (mask_io.cpp:318-422): the slice-0 BPC byte
+    /// of every image pixel, through `pelIndex`, or through the per-chip
+    /// Layout on an MPX3.
+    fn bpc_image_byte_offsets(&mut self) -> Option<Vec<Option<usize>>> {
+        let p = self.p;
+        let g = self.rows_cols().unwrap_or_default();
+        let refuse = |d: &mut Self, msg: &str| {
+            let _ = d.set_text(p.write_msg, msg);
+            let _ = d.ad.port_base.call_param_callbacks(0);
+            None
+        };
+        if g.rows <= 0 || g.cols <= 0 || g.pel_width <= 0 {
+            return refuse(self, "Invalid BPC image geometry");
+        }
+        let (rows, cols, width) = (g.rows as usize, g.cols as usize, g.pel_width as usize);
+        let mut offsets = vec![None; rows * cols];
+        let per_chip = width * width;
+        let family = self.shared.family();
+        let caps = family.capabilities();
+        let store = |offsets: &mut [Option<usize>], image: usize, logical: usize| {
+            let byte = mask::selected_slice_index(
+                logical,
+                per_chip,
+                caps.bpc_bytes_per_pel,
+                caps.bpc_threshold_slices,
+                0,
+            );
+            match (offsets.get_mut(image), byte) {
+                (Some(slot @ None), Some(byte)) => {
+                    *slot = Some(byte);
+                    true
+                }
+                _ => false,
+            }
+        };
+
+        if family != DetectorFamily::Mpx3 {
+            let chips = self.int(p.number_of_chips, 0);
+            let orientation = self.int(p.detector_orientation, 0);
+            for y in 0..g.rows {
+                for x in 0..g.cols {
+                    let (logical, warning) = mask::pel_index(&g, chips, orientation, x, y);
+                    if let Some(warning) = warning {
+                        self.ad.port_base.trace_print(
+                            TraceMask::WARNING,
+                            format_args!("{}", adlog::warn(adlog::PEL_INDEX, &warning)),
+                        );
+                    }
+                    let image = y as usize * cols + x as usize;
+                    if !usize::try_from(logical).is_ok_and(|l| store(&mut offsets, image, l)) {
+                        return refuse(self, "BPC image mapping is incomplete");
+                    }
+                }
+            }
+            return Some(offsets);
+        }
+
+        for chip in 0..self.int(p.number_of_chips, 0) {
+            let layout = self.text(p.layout, chip);
+            let mapped = (|| {
+                let entry: Value = if layout.is_empty() {
+                    return Err(NLOHMANN_EMPTY_INPUT.to_string());
+                } else {
+                    serde_json::from_str(&layout).map_err(|e| e.to_string())?
+                };
+                let int = |key| match entry.get(key) {
+                    Some(Value::Number(n)) if !n.is_f64() => n
+                        .as_i64()
+                        .or_else(|| n.as_u64().map(|v| v as i64))
+                        .map(|v| v as i32),
+                    _ => None,
+                };
+                let (Some(id), Some(ox), Some(oy), Some(Value::String(orientation))) =
+                    (int("Chip"), int("X"), int("Y"), entry.get("Orientation"))
+                else {
+                    return Err("incomplete chip layout".to_string());
+                };
+                if id != chip {
+                    return Err("incomplete chip layout".to_string());
+                }
+                for ly in 0..g.pel_width {
+                    for lx in 0..g.pel_width {
+                        let (ix, iy) = mask::mpx3_layout_coordinates(
+                            (lx, ly),
+                            g.pel_width,
+                            (ox, oy),
+                            g.rows,
+                            orientation,
+                        )
+                        .filter(|&(ix, iy)| (0..g.cols).contains(&ix) && (0..g.rows).contains(&iy))
+                        .ok_or("unsupported or out-of-range chip layout")?;
+                        let logical = chip as usize * per_chip + ly as usize * width + lx as usize;
+                        if !store(&mut offsets, iy as usize * cols + ix as usize, logical) {
+                            return Err("duplicate chip layout coordinate".to_string());
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = mapped {
+                let msg = format!("MPX3 chip {chip} layout unavailable: {e}");
+                let _ = self.set_text(p.write_msg, &msg);
+                self.ad.port_base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!("{}", adlog::err(adlog::BPC_IMAGE_BYTE_OFFSETS, &msg)),
+                );
+                let _ = self.ad.port_base.call_param_callbacks(0);
+                return None;
+            }
+        }
+        if offsets.contains(&None) {
+            return refuse(self, "MPX3 chip layout does not cover the full image");
+        }
+        Some(offsets)
+    }
+
     /// The geometry the mask operations need, or the error C's zeroed
     /// `rowsCols` outputs lead to.
     fn geometry(&mut self) -> AsynResult<Geometry> {
@@ -1790,18 +1912,46 @@ impl TimePix3Driver {
             let radius = self.int(p.mask_radius, 0);
             let image = self.mask_image();
             mask::circle(mask, image, x, y, radius, on_off != 0)
-        } else if flag(self, p.mask_pel) {
-            let geom = self.geometry()?;
-            let bpc = self.read_bpc()?;
-            let map = self.pel_table(&geom);
-            mask::mask_from_bpc(&map, &bpc, mask);
-            Ok(())
-        } else if flag(self, p.mask_write) {
-            let geom = self.geometry()?;
+        } else if flag(self, p.mask_pel) || flag(self, p.mask_write) {
+            let write = !flag(self, p.mask_pel);
+            let family = self.shared.family();
+            if !mask::operator_mask_supported(family) {
+                let (what, op) = if write {
+                    ("write blocked", "write")
+                } else {
+                    ("read unavailable", "read")
+                };
+                let msg = format!(
+                    "{} mask {what}: pixel mask encoding is not documented",
+                    family.name()
+                );
+                self.set_text(p.write_msg, &msg)?;
+                self.ad
+                    .port_base
+                    .set_param_status(p.mask_bp_c, 0, AsynStatus::Error, 0, 0)?;
+                self.ad.port_base.call_param_callbacks(0)?;
+                self.ad.port_base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{}",
+                        adlog::err(
+                            adlog::READ_INT32_ARRAY,
+                            &format!("MaskBPC: refusing unsupported detector-family mask {op}")
+                        )
+                    ),
+                );
+                return Err(Self::read_array_refused());
+            }
             let mut bpc = self.read_bpc()?;
-            let map = self.pel_table(&geom);
-            mask::apply_mask_to_bpc(&map, mask, &mut bpc);
-            self.write_mask_file(&bpc)?;
+            let offsets = self
+                .bpc_image_byte_offsets()
+                .ok_or_else(Self::read_array_refused)?;
+            if write {
+                mask::apply_mask_to_bpc(family, &offsets, mask, &mut bpc);
+                self.write_mask_file(&bpc)?;
+            } else {
+                mask::mask_from_bpc(family, &offsets, &bpc, mask);
+            }
             Ok(())
         } else {
             self.mask_flow(&format!("MaskBPC: no draw op (nElements={n})"));
@@ -1820,12 +1970,16 @@ impl TimePix3Driver {
         self.ad.port_base.call_param_callbacks(0)?;
         match status {
             AsynStatus::Success => Ok(()),
-            // C returns with the message ADDriver::readInt32Array left in the
-            // asynUser (asynPortDriver.cpp:1815-1816).
-            _ => Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "asynPortDriver:readArray not implemented".into(),
-            }),
+            _ => Err(Self::read_array_refused()),
+        }
+    }
+
+    /// A refused readInt32Array carries the message ADDriver::readInt32Array
+    /// left in the asynUser (asynPortDriver.cpp:1815-1816).
+    fn read_array_refused() -> AsynError {
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynPortDriver:readArray not implemented".into(),
         }
     }
 
@@ -5445,6 +5599,107 @@ mod tests {
             assert!(text.contains(&line), "{line}: {text:?}");
         }
         std::mem::forget(runtime);
+    }
+
+    /// MaskPel reads the family's mask bit through bpcImageByteOffsets: an
+    /// MPX3 through its per-chip Layout, an undocumented family refused, and
+    /// every mapping failure with C's WriteMsg (mask_io.cpp:131-151, :318-422).
+    #[test]
+    fn mask_pel_maps_the_bpc_through_bpc_image_byte_offsets_as_c() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let shared = Arc::new(Shared::new());
+        let name = "TPX_MASK_PEL";
+        let mut det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            shared.clone(),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        calibration_files(&mut det, name);
+        let p = det.p;
+        det.ad.port_base.set_int32_param(p.mask_pel, 0, 1).unwrap();
+        let read = |det: &mut TimePix3Driver| {
+            let mut buf = vec![0i32; 65536];
+            let r = det
+                .read_int32_array(&AsynUser::new(p.mask_bp_c), &mut buf)
+                .map(|_| buf)
+                .map_err(|e| e.message());
+            (r, det.text(p.write_msg, 0))
+        };
+
+        let (r, msg) = read(&mut det);
+        assert!(r.is_err());
+        assert_eq!(
+            msg,
+            "UNKNOWN mask read unavailable: pixel mask encoding is not documented"
+        );
+        assert_eq!(
+            det.ad
+                .port_base
+                .params
+                .get_param_status(p.mask_bp_c, 0)
+                .unwrap()
+                .0,
+            AsynStatus::Error
+        );
+
+        shared.note_family(DetectorFamily::Mpx3);
+        let mut bpc = vec![0u8; 65536 * 2];
+        bpc[(4 * 256 + 3) * 2 + 1] = 1;
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        std::fs::write(dir.join("cal.bpc"), &bpc).unwrap();
+        let (r, msg) = read(&mut det);
+        assert_eq!(r, Err("asynPortDriver:readArray not implemented".into()));
+        assert_eq!(msg, "Invalid BPC image geometry");
+
+        for (reason, v) in [
+            (p.pix_count, 65536),
+            (p.row_len, 1),
+            (p.number_of_chips, 1),
+            (p.number_of_rows, 256),
+        ] {
+            det.ad.port_base.set_int32_param(reason, 0, v).unwrap();
+        }
+        let (r, msg) = read(&mut det);
+        assert!(r.is_err());
+        assert_eq!(
+            msg,
+            format!("MPX3 chip 0 layout unavailable: {NLOHMANN_EMPTY_INPUT}")
+        );
+        for (layout, want) in [
+            (
+                r#"{"Chip":1,"X":0,"Y":0,"Orientation":"LtRTtB"}"#,
+                "incomplete chip layout",
+            ),
+            (
+                r#"{"Chip":0,"X":0,"Y":0,"Orientation":"Up"}"#,
+                "unsupported or out-of-range chip layout",
+            ),
+        ] {
+            det.ad
+                .port_base
+                .set_string_param(p.layout, 0, layout)
+                .unwrap();
+            let (r, msg) = read(&mut det);
+            assert!(r.is_err());
+            assert_eq!(msg, format!("MPX3 chip 0 layout unavailable: {want}"));
+        }
+
+        det.ad
+            .port_base
+            .set_string_param(
+                p.layout,
+                0,
+                r#"{"Chip":0,"X":0,"Y":0,"Orientation":"LtRTtB"}"#,
+            )
+            .unwrap();
+        let (r, _) = read(&mut det);
+        let buf = r.unwrap();
+        assert_eq!(buf[4 * 256 + 3], 1 << 1);
+        assert_eq!(buf.iter().filter(|&&v| v != 0).count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The mask write uploads through uploadBPC, so its reply is HttpCode

@@ -6,6 +6,8 @@
 //! holds one element per pixel in *image* order. `pel_index` is the map between
 //! them, and it depends on the chip count and the detector orientation.
 
+use crate::family::DetectorFamily;
+
 /// One chip's pixel-config bytes (C `kPixelConfigBytes`, serval_http.cpp:1011).
 pub const PIXEL_CONFIG_BYTES: usize = 65536;
 
@@ -404,33 +406,168 @@ pub fn circle(
     Ok(())
 }
 
-/// The mask waveform Serval's BPC file implies: bit 1 set wherever the file has
-/// its mask bit set (C mask_io.cpp:131-146). `map` is `pel_index` per image
-/// pixel, negative where C has none.
-pub fn mask_from_bpc(map: &[i32], bpc: &[u8], out: &mut [i32]) {
+/// C `ADTimePix3BpcMask::operatorMaskSupported`: the families whose
+/// per-pixel mask bit is documented.
+pub fn operator_mask_supported(family: DetectorFamily) -> bool {
+    matches!(family, DetectorFamily::Tpx3 | DetectorFamily::Mpx3)
+}
+
+/// C `ADTimePix3BpcMask::bytesPerPixel`; zero for an unsupported family.
+pub fn bytes_per_pixel(family: DetectorFamily) -> usize {
+    match family {
+        DetectorFamily::Tpx3 => 1,
+        DetectorFamily::Mpx3 => 2,
+        DetectorFamily::Unknown => 0,
+    }
+}
+
+/// C `ADTimePix3BpcMask::pixelValue`: the packed pixel at `offset`, MPX3 words
+/// big-endian.
+pub fn pixel_value(family: DetectorFamily, bytes: &[u8], offset: usize) -> Option<u16> {
+    let width = bytes_per_pixel(family);
+    let pixel = bytes.get(offset..offset.checked_add(width)?)?;
+    match *pixel {
+        [b] => Some(u16::from(b)),
+        [hi, lo] => Some(u16::from_be_bytes([hi, lo])),
+        _ => None,
+    }
+}
+
+/// C `ADTimePix3BpcMask::isMasked`: bit 0 of the packed pixel.
+pub fn is_masked(family: DetectorFamily, bytes: &[u8], offset: usize) -> bool {
+    pixel_value(family, bytes, offset).is_some_and(|v| v & 1 != 0)
+}
+
+/// C `ADTimePix3BpcMask::countMasked`.
+pub fn count_masked(family: DetectorFamily, bytes: &[u8]) -> usize {
+    match bytes_per_pixel(family) {
+        0 => 0,
+        width => (0..bytes.len() / width)
+            .filter(|&k| is_masked(family, bytes, k * width))
+            .count(),
+    }
+}
+
+/// C `ADTimePix3BpcMask::setMasked`: bit 0 of the pixel's last byte, every
+/// other bit kept.
+pub fn set_masked(family: DetectorFamily, bytes: &mut [u8], offset: usize, masked: bool) -> bool {
+    let width = bytes_per_pixel(family);
+    let Some(last) = offset
+        .checked_add(width)
+        .filter(|&end| width != 0 && end <= bytes.len())
+        .map(|end| end - 1)
+    else {
+        return false;
+    };
+    if masked {
+        bytes[last] |= 1;
+    } else {
+        bytes[last] &= !1;
+    }
+    true
+}
+
+/// C `ADTimePix3ServalPixelConfig::bytesPerChip`; zero for an invalid or
+/// overflowing geometry.
+pub fn bytes_per_chip(pixels_per_chip: usize, bytes_per_pixel: i32, slices: i32) -> usize {
+    if pixels_per_chip == 0 || bytes_per_pixel <= 0 || slices <= 0 {
+        return 0;
+    }
+    (bytes_per_pixel as usize)
+        .checked_mul(slices as usize)
+        .and_then(|m| pixels_per_chip.checked_mul(m))
+        .unwrap_or(0)
+}
+
+/// C `ADTimePix3ServalPixelConfig::selectedSliceIndex`: the first byte of
+/// logical pixel `logical` in threshold slice `selected`.
+pub fn selected_slice_index(
+    logical: usize,
+    pixels_per_chip: usize,
+    bytes_per_pixel: i32,
+    slices: i32,
+    selected: i32,
+) -> Option<usize> {
+    let chip_bytes = bytes_per_chip(pixels_per_chip, bytes_per_pixel, slices);
+    if chip_bytes == 0 || selected < 0 || selected >= slices {
+        return None;
+    }
+    let bpp = bytes_per_pixel as usize;
+    let (chip, local) = (logical / pixels_per_chip, logical % pixels_per_chip);
+    chip.checked_mul(chip_bytes)?
+        .checked_add(selected as usize * pixels_per_chip * bpp)?
+        .checked_add(local * bpp)
+}
+
+/// C `ADTimePix3ServalPixelConfig::mpx3LayoutCoordinates`: a chip-local
+/// pixel through one Serval Layout chip entry, whose origin is bottom-left,
+/// to top-left image coordinates; an unknown orientation is refused.
+pub fn mpx3_layout_coordinates(
+    (local_x, local_y): (i32, i32),
+    width: i32,
+    (origin_x, origin_y): (i32, i32),
+    image_height: i32,
+    orientation: &str,
+) -> Option<(i32, i32)> {
+    if width <= 0
+        || !(0..width).contains(&local_x)
+        || !(0..width).contains(&local_y)
+        || origin_x < 0
+        || origin_y < 0
+        || image_height < width
+        || origin_y > image_height - width
+    {
+        return None;
+    }
+    let (fx, fy) = (width - 1 - local_x, width - 1 - local_y);
+    let (x, y) = match orientation {
+        "RtLBtT" => (fx, fy),
+        "LtRTtB" => (local_x, local_y),
+        "BtTLtR" => (local_y, fx),
+        "TtBRtL" => (fy, local_x),
+        "LtRBtT" => (local_x, fy),
+        "RtLTtB" => (fx, local_y),
+        "TtBLtR" => (local_y, local_x),
+        "BtTRtL" => (fy, fx),
+        _ => return None,
+    };
+    Some((origin_x + x, image_height - width - origin_y + y))
+}
+
+/// C `readInt32Array`'s MaskPel loop (mask_io.cpp:139-151): bit 1 wherever
+/// the BPC pixel is masked; an empty BPC leaves the waveform untouched.
+pub fn mask_from_bpc(
+    family: DetectorFamily,
+    offsets: &[Option<usize>],
+    bpc: &[u8],
+    out: &mut [i32],
+) {
+    if bpc.is_empty() {
+        return;
+    }
     out.fill(0);
-    for (dst, &k) in map.iter().enumerate() {
-        let Ok(k) = usize::try_from(k) else { continue };
-        if dst < out.len() && bpc.get(k).is_some_and(|b| b & 1 != 0) {
-            out[dst] |= 1 << 1;
+    for (dst, offset) in out.iter_mut().zip(offsets) {
+        if offset.is_some_and(|k| is_masked(family, bpc, k)) {
+            *dst |= 1 << 1;
         }
     }
 }
 
-/// Apply the mask waveform to a BPC buffer, ready to be written back (C
-/// mask_io.cpp:153-161). Out-of-range indices are skipped and counted.
-pub fn apply_mask_to_bpc(map: &[i32], mask: &[i32], bpc: &mut [u8]) -> usize {
-    let mut dropped = 0;
-    for (src, &k) in map.iter().enumerate() {
-        if src >= mask.len() || mask[src] & 1 == 0 {
-            continue;
-        }
-        match usize::try_from(k) {
-            Ok(k) if k < bpc.len() => bpc[k] |= 1,
-            _ => dropped += 1,
+/// C `readInt32Array`'s MaskWrite loop (mask_io.cpp:174-182): masks the BPC
+/// pixel of every waveform element with bit 0; it never unmasks.
+pub fn apply_mask_to_bpc(
+    family: DetectorFamily,
+    offsets: &[Option<usize>],
+    mask: &[i32],
+    bpc: &mut [u8],
+) {
+    for (&v, offset) in mask.iter().zip(offsets) {
+        if let Some(k) = *offset
+            && v & 1 != 0
+        {
+            set_masked(family, bpc, k, true);
         }
     }
-    dropped
 }
 
 /// `|SERVAL − BPC|` per image pixel (C serval_http.cpp:1120-1142).
@@ -770,36 +907,95 @@ mod tests {
         circle(&mut buf, image(&g), i32::MAX, i32::MIN, i32::MAX, true).unwrap();
     }
 
+    fn offsets(map: &[i32], width: usize) -> Vec<Option<usize>> {
+        map.iter()
+            .map(|&k| usize::try_from(k).ok().map(|k| k * width))
+            .collect()
+    }
+
     #[test]
     fn the_mask_round_trips_through_a_bpc_buffer() {
         let g = quad();
         let mut mask = vec![0i32; g.pixel_count()];
         rectangle(&mut mask, image(&g), 300, 2, 100, 2, true).unwrap();
-        let mut bpc = vec![0u8; 4 * PIXEL_CONFIG_BYTES];
-        let map = table(&g, 4, 0);
-        assert_eq!(apply_mask_to_bpc(&map, &mask, &mut bpc), 0);
-        assert_eq!(bpc.iter().filter(|&&b| b & 1 != 0).count(), 4);
+        for (family, width) in [(DetectorFamily::Tpx3, 1), (DetectorFamily::Mpx3, 2)] {
+            let mut bpc = vec![0u8; 4 * PIXEL_CONFIG_BYTES * width];
+            let at = offsets(&table(&g, 4, 0), width);
+            apply_mask_to_bpc(family, &at, &mask, &mut bpc);
+            // MPX3 masks the low byte of the big-endian word.
+            assert_eq!(
+                bpc.iter()
+                    .enumerate()
+                    .filter(|&(k, &b)| b != 0 && k % width == width - 1)
+                    .count(),
+                4
+            );
+            assert_eq!(count_masked(family, &bpc), 4);
 
-        let mut back = vec![0i32; g.pixel_count()];
-        mask_from_bpc(&map, &bpc, &mut back);
-        for j in 100..102 {
-            for i in 300..302 {
-                assert_eq!(back[j * 512 + i], 1 << 1, "({i},{j})");
+            let mut back = vec![7i32; g.pixel_count()];
+            mask_from_bpc(family, &at, &bpc, &mut back);
+            for j in 100..102 {
+                for i in 300..302 {
+                    assert_eq!(back[j * 512 + i], 1 << 1, "({i},{j})");
+                }
             }
+            assert_eq!(back.iter().filter(|&&v| v != 0).count(), 4);
         }
-        assert_eq!(back.iter().filter(|&&v| v != 0).count(), 4);
     }
 
     #[test]
-    fn a_bpc_buffer_too_small_for_the_mask_drops_pixels_instead_of_overflowing() {
-        let g = quad();
-        let mut mask = vec![0i32; g.pixel_count()];
-        reset(&mut mask, image(&g), 1).unwrap();
-        // Only one chip's worth of file for a four-chip mask.
-        let mut bpc = vec![0u8; PIXEL_CONFIG_BYTES];
-        let dropped = apply_mask_to_bpc(&table(&g, 4, 0), &mask, &mut bpc);
-        assert_eq!(dropped, 3 * PIXEL_CONFIG_BYTES);
-        assert!(bpc.iter().all(|&b| b & 1 != 0));
+    fn the_bpc_mask_bit_is_read_and_set_per_family_as_c() {
+        let (t, m) = (DetectorFamily::Tpx3, DetectorFamily::Mpx3);
+        let bytes = [0x81u8, 0x01, 0x00];
+        assert_eq!(pixel_value(t, &bytes, 0), Some(0x81));
+        assert_eq!(pixel_value(m, &bytes, 0), Some(0x8101));
+        assert_eq!(pixel_value(m, &bytes, 2), None);
+        assert_eq!(pixel_value(DetectorFamily::Unknown, &bytes, 0), None);
+        assert!(is_masked(m, &bytes, 0) && !is_masked(m, &bytes, 1));
+        assert_eq!(count_masked(t, &bytes), 2);
+        assert_eq!(count_masked(m, &bytes), 1);
+        let mut b = [0xfeu8, 0xfe];
+        assert!(set_masked(m, &mut b, 0, true));
+        assert_eq!(b, [0xfe, 0xff]);
+        assert!(set_masked(m, &mut b, 0, false));
+        assert_eq!(b, [0xfe, 0xfe]);
+        assert!(!set_masked(m, &mut b, 1, true));
+        assert!(!set_masked(DetectorFamily::Unknown, &mut b, 0, true));
+        // An empty BPC leaves the waveform as it was.
+        let mut out = [5i32; 2];
+        mask_from_bpc(t, &[Some(0), Some(1)], &[], &mut out);
+        assert_eq!(out, [5, 5]);
+        assert!(operator_mask_supported(t) && !operator_mask_supported(DetectorFamily::Unknown));
+    }
+
+    #[test]
+    fn a_slice_index_and_a_layout_coordinate_are_c_serval_pixel_config() {
+        assert_eq!(bytes_per_chip(65536, 2, 2), 262144);
+        assert_eq!(bytes_per_chip(65536, 0, 1), 0);
+        assert_eq!(
+            selected_slice_index(65536 + 3, 65536, 2, 2, 1),
+            Some(262144 + 131072 + 6)
+        );
+        assert_eq!(selected_slice_index(3, 65536, 2, 2, 2), None);
+        assert_eq!(selected_slice_index(3, 65536, 1, 1, 0), Some(3));
+        let at = |o| mpx3_layout_coordinates((1, 2), 4, (4, 0), 8, o);
+        assert_eq!(at("LtRTtB"), Some((5, 6)));
+        assert_eq!(at("RtLBtT"), Some((6, 5)));
+        assert_eq!(at("BtTLtR"), Some((6, 6)));
+        assert_eq!(at("TtBRtL"), Some((5, 5)));
+        assert_eq!(at("LtRBtT"), Some((5, 5)));
+        assert_eq!(at("RtLTtB"), Some((6, 6)));
+        assert_eq!(at("TtBLtR"), Some((6, 5)));
+        assert_eq!(at("BtTRtL"), Some((5, 6)));
+        assert_eq!(at("Up"), None);
+        assert_eq!(
+            mpx3_layout_coordinates((0, 0), 4, (0, 5), 8, "LtRTtB"),
+            None
+        );
+        assert_eq!(
+            mpx3_layout_coordinates((4, 0), 4, (0, 0), 8, "LtRTtB"),
+            None
+        );
     }
 
     #[test]
@@ -829,7 +1025,7 @@ mod tests {
             let mut mask = vec![0i32; g.pixel_count()];
             rectangle(&mut mask, image(&g), 10, 1, 400, 1, true).unwrap();
             let mut bpc = vec![0u8; 4 * PIXEL_CONFIG_BYTES];
-            apply_mask_to_bpc(&map, &mask, &mut bpc);
+            apply_mask_to_bpc(DetectorFamily::Tpx3, &offsets(&map, 1), &mask, &mut bpc);
             assert_eq!(
                 masked_pixels(&g, &map, &bpc),
                 vec![(10, 400)],
