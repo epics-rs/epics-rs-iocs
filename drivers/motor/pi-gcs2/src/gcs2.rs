@@ -91,8 +91,8 @@
 //!
 //! ## Not modeled (documented deviations from the full C module)
 //!
-//! - **Hexapod**: the `PIasynController` target-mode and coordinate-system
-//!   parameters are not modeled, so a hexapod moves only with `MOV`.
+//! - **Hexapod**: the `PIasynController` coordinate-system parameters
+//!   (`PI_CS_ACTIVATE`/`LINK`/`KST`/`KSW`, octet writes) are not modeled.
 //! - **Piezo**: `PIGCSPiezoController`, `PIGCS2PiezoCL` — closed-loop piezo
 //!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
 //!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
@@ -411,6 +411,8 @@ pub struct PIGCS2Controller {
     /// `PIHexapodController::m_PivotX/Y/Z`; `PIGCSController`'s `GetPivot*`
     /// are 0.
     pivot: [f64; 3],
+    /// `PIGCSController::m_targetMode`, `PI_CS_TARGETMODE`.
+    target_mode: i32,
 }
 
 /// `PIHexapodController`'s platform state, one for all its axes.
@@ -455,6 +457,7 @@ impl PIGCS2Controller {
             port: None,
             last_error: Cell::new(0),
             pivot: [0.0; 3],
+            target_mode: 0,
         }
     }
 
@@ -491,6 +494,7 @@ impl PIGCS2Controller {
                 ParamSetValue::new(params.rbpivot_x, 0, ParamValue::Float64(x)),
                 ParamSetValue::new(params.rbpivot_y, 0, ParamValue::Float64(y)),
                 ParamSetValue::new(params.rbpivot_z, 0, ParamValue::Float64(z)),
+                ParamSetValue::new(params.target_mode, 0, ParamValue::Int32(self.target_mode)),
                 ParamSetValue::new(params.last_err, 0, ParamValue::Int32(self.last_error.get())),
             ];
             let _ = port.set_params_and_notify_blocking(0, updates);
@@ -1192,6 +1196,7 @@ struct PiParams {
     rbpivot_x: usize,
     rbpivot_y: usize,
     rbpivot_z: usize,
+    target_mode: usize,
 }
 
 /// What C `PIasynController` adds to the `asynMotorController` port: its
@@ -1236,6 +1241,7 @@ impl ControllerParams for PIGCS2Params {
             rbpivot_x: create("PI_SUP_RBPIVOT_X", ParamType::Float64)?,
             rbpivot_y: create("PI_SUP_RBPIVOT_Y", ParamType::Float64)?,
             rbpivot_z: create("PI_SUP_RBPIVOT_Z", ParamType::Float64)?,
+            target_mode: create("PI_CS_TARGETMODE", ParamType::Int32)?,
         };
         let _ = self.params.set(params);
         Ok(())
@@ -1247,19 +1253,23 @@ impl ControllerParams for PIGCS2Params {
         &mut self,
         base: &mut PortDriverBase,
         user: &AsynUser,
-        _value: i32,
+        value: i32,
     ) -> ParamWrite {
         let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
             return ParamWrite::PassToBase(Ok(()));
         };
-        if user.reason == params.clear_err {
-            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        // Each also sets its address-0 value, as C's setIntegerParam(0, ...).
+        let (reason, value) = if user.reason == params.clear_err {
             ctrl.last_error.set(0);
-            if let Err(e) = base.set_int32_param(params.last_err, 0, 0) {
-                return ParamWrite::PassToBase(Err(e));
-            }
-        }
-        ParamWrite::PassToBase(Ok(()))
+            (params.last_err, 0)
+        } else if user.reason == params.target_mode {
+            ctrl.target_mode = value;
+            (params.target_mode, value)
+        } else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        ParamWrite::PassToBase(base.set_int32_param(reason, 0, value))
     }
 
     /// C `PIasynController::writeFloat64`'s own parameters.
@@ -1749,10 +1759,19 @@ impl AsynMotor for PIGCS2Axis {
         }
         let mut ctrl = self.lock();
         if ctrl.model.is_hexapod() {
+            // PIHexapodController::moveCts by m_targetMode, the distance
+            // from the polled position. C defect not copied: another mode
+            // sends an uninitialized command; rs refuses the move.
+            let (cmd, value) = match ctrl.target_mode {
+                0 => ("MOV", position),
+                1 => ("MRT", position - self.last_position),
+                2 => ("MRW", position - self.last_position),
+                mode => return Err(pigcs2_err(format!("target mode {mode}"))),
+            };
             ctrl.hexapod_move(&format!(
-                "MOV {} {}",
+                "{cmd} {} {}",
                 self.axis_name,
-                CFloat(position / self.cpu)
+                CFloat(value / self.cpu)
             ))?;
         } else {
             ctrl.mov(&self.axis_name, position / self.cpu)?;
@@ -2616,6 +2635,34 @@ mod tests {
             ),
             "{printed}"
         );
+    }
+
+    /// `PI_CS_TARGETMODE` (PIasynController.cpp:320-324, 587) picks the
+    /// hexapod's move: `MOV` to the target, or `MRT`/`MRW` by the distance
+    /// from the position (PIHexapodController.cpp:151-165).
+    #[test]
+    fn a_hexapod_target_mode_picks_mov_mrt_or_mrw() {
+        let (line, ctrl) = hexapod("gcs2TModeLine", hexapod_reply);
+        let (port, p) = controller_port("gcs2TMode", &ctrl, "X");
+        let mut axis = PIGCS2Axis::new(ctrl.clone(), "X".into(), 0, "gcs2TMode");
+        let user = AsynUser::new(0);
+        let mut moves = Vec::new();
+        for mode in [1, 2, 0] {
+            port.write_int32_blocking(p.target_mode, 0, mode).unwrap();
+            assert_eq!(port.read_int32_blocking(p.target_mode, 0).unwrap(), mode);
+            ctrl.lock().unwrap().hexapod.any_moving = false;
+            axis.last_position = 5000.0;
+            line.sent();
+            axis.move_absolute(&user, 15000.0, 0.0, 0.0, 0.0).unwrap();
+            moves.push(sent_lines(&line)[0].clone());
+        }
+        assert_eq!(
+            moves,
+            ["MRT X 1.000000", "MRW X 1.000000", "MOV X 1.500000"]
+        );
+        port.write_int32_blocking(p.target_mode, 0, 2).unwrap();
+        ctrl.lock().unwrap().poll();
+        assert_eq!(port.read_int32_blocking(p.target_mode, 0).unwrap(), 2);
     }
 
     /// `PIGCSController::SetPivotX` (PIGCSController.cpp:768-776): a
