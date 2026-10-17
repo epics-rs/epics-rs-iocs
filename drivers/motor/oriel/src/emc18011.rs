@@ -372,7 +372,7 @@ impl AsynMotor for Emc18011Axis {
         _acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
-        // C: HOME_FOR/HOME_REV return ERROR (unsupported).
+        // C HOME_FOR/HOME_REV ERROR leaves the record DMOV=0 forever; not copied.
         Err(oriel_err("EMC18011: homing is not supported"))
     }
 
