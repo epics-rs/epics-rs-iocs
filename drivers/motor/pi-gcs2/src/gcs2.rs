@@ -130,6 +130,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::motor::controller_port::{AxisUser, ParamWrite};
+use epics_rs::motor::flags::MotorCommand;
 use motor_common::util::{atof, atoi, nint};
 use motor_common::{ControllerParams, ControllerReport};
 
@@ -1275,6 +1276,12 @@ impl ControllerParams for PIGCS2Params {
         let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
             return ParamWrite::PassToBase(Ok(()));
         };
+        if user.reason == params.servo {
+            // As motorClosedLoop: the axis's set_closed_loop runs C's setServo.
+            return ParamWrite::PassToBase(
+                user.queue(base, MotorCommand::SetClosedLoop { enable: value != 0 }),
+            );
+        }
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // Each also sets its address-0 value, as C's setIntegerParam(0, ...).
         let (reason, value) = if user.reason == params.clear_err {
@@ -2610,7 +2617,11 @@ mod tests {
         name: &str,
         ctrl: &Arc<Mutex<PIGCS2Controller>>,
         axis: &str,
-    ) -> (PortHandle, PiParams) {
+    ) -> (
+        PortHandle,
+        PiParams,
+        epics_rs::motor::poll_loop::MotorPollLoop,
+    ) {
         let params = PIGCS2Params::default();
         let port = motor_common::register_controller_port(
             &epics_rs::asyn::registry::open_owner(),
@@ -2626,15 +2637,12 @@ mod tests {
             0,
             name,
         )));
-        epics_rs::motor::devices::register_axis(
-            epics_rs::motor::builder::MotorBuilder::new(motor)
-                .trace_user(motor_common::asyn_user(name, 0))
-                .build_axis()
-                .axis,
-        )
-        .unwrap();
+        let setup = epics_rs::motor::builder::MotorBuilder::new(motor)
+            .trace_user(motor_common::asyn_user(name, 0))
+            .build_axis();
+        epics_rs::motor::devices::register_axis(setup.axis).unwrap();
         let params = *params.params.get().unwrap();
-        (port, params)
+        (port, params, setup.poll_loop)
     }
 
     /// `PIHexapodController::ReadPivotSettings` (PIHexapodController.cpp:
@@ -2656,7 +2664,7 @@ mod tests {
             .into(),
             last => hexapod_reply(last),
         });
-        let (port, p) = controller_port("gcs2Pivot", &ctrl, "X");
+        let (port, p, _) = controller_port("gcs2Pivot", &ctrl, "X");
         let read = |reason| port.read_float64_blocking(reason, 0).unwrap();
         ctrl.lock().unwrap().poll();
         assert_eq!(
@@ -2688,7 +2696,7 @@ mod tests {
     #[test]
     fn a_port_address_pivot_write_logs_on_the_port_trace() {
         let (line, ctrl) = hexapod("gcs2PortSinkLine", hexapod_reply);
-        let (port, p) = controller_port("gcs2PortSink", &ctrl, "X");
+        let (port, p, _) = controller_port("gcs2PortSink", &ctrl, "X");
         ctrl.lock().unwrap().hexapod.any_moving = true;
         line.sent();
         let printed = traced_mask("gcs2PortSink", TraceMask::FLOW, || {
@@ -2707,13 +2715,32 @@ mod tests {
         );
     }
 
+    /// `PIasynController::writeInt32` switches the axis's servo on a
+    /// `PI_SUP_SERVO` write as on `motorClosedLoop` (PIasynController.cpp:
+    /// 294-300): `SVO` + `ERR?`, the written value kept.
+    #[test]
+    fn a_servo_write_switches_the_axis_servo() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2ServoLine", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2ServoLine")));
+        let (port, p, mut poll_loop) = controller_port("gcs2Servo", &ctrl, "1");
+        for value in [0, 1] {
+            line.sent();
+            port.write_int32_blocking(p.servo, 0, value).unwrap();
+            poll_loop.run_queued_commands();
+            assert_eq!(sent_lines(&line), [format!("SVO 1 {value}"), "ERR?".into()]);
+            assert_eq!(port.read_int32_blocking(p.servo, 0).unwrap(), value);
+        }
+    }
+
     /// `PI_CS_TARGETMODE` (PIasynController.cpp:320-324, 587) picks the
     /// hexapod's move: `MOV` to the target, or `MRT`/`MRW` by the distance
     /// from the position (PIHexapodController.cpp:151-165).
     #[test]
     fn a_hexapod_target_mode_picks_mov_mrt_or_mrw() {
         let (line, ctrl) = hexapod("gcs2TModeLine", hexapod_reply);
-        let (port, p) = controller_port("gcs2TMode", &ctrl, "X");
+        let (port, p, _) = controller_port("gcs2TMode", &ctrl, "X");
         let mut axis = PIGCS2Axis::new(ctrl.clone(), "X".into(), 0, "gcs2TMode");
         let user = AsynUser::new(0);
         let mut moves = Vec::new();
@@ -2743,7 +2770,7 @@ mod tests {
             if last == "ERR?" { "0" } else { "1=1" }.into()
         });
         let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2NoPivotLine")));
-        let (port, p) = controller_port("gcs2NoPivot", &ctrl, "1");
+        let (port, p, _) = controller_port("gcs2NoPivot", &ctrl, "1");
         line.sent();
         let printed = traced_mask("gcs2NoPivot", TraceMask::FLOW, || {
             port.write_float64_blocking(p.pivot_x, 0, 4.0).unwrap();
@@ -2772,7 +2799,7 @@ mod tests {
                 _ => "1=1".into(),
             });
         let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2LastErrLine")));
-        let (port, p) = controller_port("gcs2LastErr", &ctrl, "1");
+        let (port, p, _) = controller_port("gcs2LastErr", &ctrl, "1");
         let poll = || ctrl.lock().unwrap().poll();
         poll();
         assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
@@ -2843,7 +2870,7 @@ mod tests {
             .into()
         });
         let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2SupPosLine")));
-        let (_port, p) = controller_port("gcs2SupPos", &ctrl, "1");
+        let (_port, p, _) = controller_port("gcs2SupPos", &ctrl, "1");
         let mut axis = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, "gcs2SupPos");
         axis.poll(&AsynUser::new(0)).unwrap();
         let params = axis.take_poll_params();
