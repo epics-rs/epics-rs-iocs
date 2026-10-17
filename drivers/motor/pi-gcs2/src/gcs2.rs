@@ -99,9 +99,8 @@
 //!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
 //! - **Per-model controllers**: `PIE517Controller`, `PIE727Controller`,
 //!   `PIE755Controller`, `PIC702Controller`, `PIC885Controller` (each has its
-//!   own init quirks/enable-after-homing behavior), and
-//!   `PIGCSMotorControllerNoRefVel` (the `E-873.3QTU` variant that skips the
-//!   reference-velocity `SPA 0x50` write).
+//!   own init quirks/enable-after-homing behavior); those controllers run
+//!   on [`Model::Motor`].
 //! - **`TranslatePIError`**: the 2172-line errcode→string table
 //!   (`TranslatePIError.cpp`/`picontrollererrors.h`) is not ported; only the
 //!   numeric `ERR?` code (`atoi`) is surfaced, in error messages.
@@ -240,36 +239,34 @@ fn status_mask_at(reply: &str, axis_no: usize) -> Option<u32> {
     leading_hex(mask_str)
 }
 
-/// C `PIGCSController::CreateGCSController`: whether the upper-cased `*IDN?`
-/// names a controller C creates a driver for.
-pub fn is_known_controller(idn: &str) -> bool {
-    const MODELS: [&str; 24] = [
-        "E-873.3QTU",
-        "C-663",
-        "C-863",
-        "C-867",
-        "C-884",
-        "E-861",
-        "E-871",
-        "E-873",
-        "E-517",
-        "E-518",
-        "C-885",
-        "E-753",
-        "E-754",
-        "E-709",
-        "E-712",
-        "E-725",
-        "E-727",
-        "E-755",
-        "C-702",
-        "HEXAPOD",
-        "F-HEX",
-        "F-206",
-        "M-8",
-        "C-887",
-    ];
-    MODELS.iter().any(|m| idn.contains(m))
+/// The C controller class `PIGCSController::CreateGCSController`
+/// (PIGCSController.cpp:42-112) instantiates for an upper-cased `*IDN?`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Model {
+    /// `PIGCSMotorController`. The controllers whose own C class is not
+    /// ported yet run on it too.
+    #[default]
+    Motor,
+    /// `PIGCSMotorControllerNoRefVel` (E-873.3QTU).
+    MotorNoRefVel,
+}
+
+impl Model {
+    /// `None` where C creates no controller.
+    pub fn from_idn(idn: &str) -> Option<Self> {
+        let any = |models: &[&str]| models.iter().any(|m| idn.contains(m));
+        if idn.contains("E-873.3QTU") {
+            Some(Self::MotorNoRefVel)
+        } else if any(&[
+            "C-663", "C-863", "C-867", "C-884", "E-861", "E-871", "E-873", "E-517", "E-518",
+            "C-885", "E-753", "E-754", "E-709", "E-712", "E-725", "E-727", "E-755", "C-702",
+            "HEXAPOD", "F-HEX", "F-206", "M-8", "C-887",
+        ]) {
+            Some(Self::Motor)
+        } else {
+            None
+        }
+    }
 }
 
 /// Shared controller endpoint: owns the octet handle, identification,
@@ -279,6 +276,7 @@ pub struct PIGCS2Controller {
     /// The octet port C's `m_pAsynInterface` (the default log sink) prints on.
     serial_port: String,
     ident: String,
+    model: Model,
     knows_vel: bool,
     axis_names: Vec<String>,
 }
@@ -291,9 +289,15 @@ impl PIGCS2Controller {
             handle,
             serial_port: serial_port.to_owned(),
             ident: String::new(),
+            model: Model::default(),
             knows_vel: false,
             axis_names: Vec::new(),
         }
+    }
+
+    /// The class C's `CreateGCSController` picked from the `*IDN?`.
+    pub fn set_model(&mut self, model: Model) {
+        self.model = model;
     }
 
     /// The constructor's `*IDN?` into an emptied buffer: empty when the
@@ -836,10 +840,12 @@ impl PIGCS2Axis {
         Ok(())
     }
 
-    /// C `PIGCSMotorController::referenceVelCts`: the reference velocity,
-    /// then `referenceAxis`.
+    /// C `referenceVelCts`: `PIGCSMotorController`'s writes the reference
+    /// velocity, then `referenceAxis`; `PIGCSMotorControllerNoRefVel`'s
+    /// skips the velocity.
     fn reference_vel_cts(&mut self, velocity: f64, forward: bool) -> AsynResult<()> {
-        if velocity != 0.0 {
+        let model = self.lock().model;
+        if model == Model::Motor && velocity != 0.0 {
             self.lock()
                 .set_reference_velocity(&self.axis_name, velocity / self.cpu)?;
         }
@@ -1127,6 +1133,7 @@ mod tests {
             ),
             serial_port: "gcs2SendOnly".into(),
             ident: String::new(),
+            model: Model::default(),
             knows_vel: false,
             axis_names: Vec::new(),
         };
@@ -1189,6 +1196,7 @@ mod tests {
             ),
             serial_port: "gcs2StatusRefused".into(),
             ident: String::new(),
+            model: Model::default(),
             knows_vel: false,
             axis_names: Vec::new(),
         };
@@ -1345,14 +1353,33 @@ mod tests {
     }
 
     #[test]
-    fn known_controllers_are_c_create_gcs_controllers_list() {
-        assert!(is_known_controller(
-            "(C)2015 PHYSIK INSTRUMENTE, C-863.11, 0, 1.0"
-        ));
-        assert!(is_known_controller("PI E-873.3QTU"));
-        assert!(is_known_controller("PI M-824"));
-        assert!(!is_known_controller("PI E-665"));
-        assert!(!is_known_controller(""));
+    fn models_are_c_create_gcs_controllers_classes() {
+        assert_eq!(
+            Model::from_idn("(C)2015 PHYSIK INSTRUMENTE, C-863.11, 0, 1.0"),
+            Some(Model::Motor)
+        );
+        assert_eq!(Model::from_idn("PI E-873.3QTU"), Some(Model::MotorNoRefVel));
+        assert_eq!(Model::from_idn("PI E-873.1AT"), Some(Model::Motor));
+        assert_eq!(Model::from_idn("PI M-824"), Some(Model::Motor));
+        assert_eq!(Model::from_idn("PI E-665"), None);
+        assert_eq!(Model::from_idn(""), None);
+    }
+
+    /// C `PIGCSMotorControllerNoRefVel::referenceVelCts`
+    /// (PIGCSMotorControllerNoRefVel.cpp:27-30) goes straight to
+    /// `referenceAxis`: no `SPA 0x50` for the E-873.3QTU.
+    #[test]
+    fn a_no_ref_vel_controller_homes_without_the_reference_velocity() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2NoRefVel", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2NoRefVel");
+        ctrl.set_model(Model::MotorNoRefVel);
+        let mut axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "1".into(), 0, "gcs2NoRefVel");
+        line.sent();
+        axis.home(&AsynUser::new(0), 0.0, 2.0, 0.0, true).unwrap();
+        let sent: Vec<String> = line.sent().into_iter().filter(|w| w != "\n").collect();
+        assert_eq!(sent, ["SVO 1 1", "ERR?", "FRF 1", "ERR?"]);
     }
 
     /// Takes every write and never replies.
