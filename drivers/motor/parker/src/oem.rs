@@ -35,6 +35,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::param::ParamType;
@@ -152,9 +153,9 @@ impl OemAxis {
         let ctrl = self.lock();
         let v = velocity / ctrl.pulses_per_unit[self.axis_no];
         ctrl.command(&format!("{addr}MN"))?;
-        ctrl.command(&format!("{addr}A{a:.2}"))?;
-        ctrl.command(&format!("{addr}V{v:.2}"))?;
-        ctrl.command(&format!("{addr}D{target:.0}"))?;
+        ctrl.command(&format!("{addr}A{a:.2}", a = CFloat(a)))?;
+        ctrl.command(&format!("{addr}V{v:.2}", v = CFloat(v)))?;
+        ctrl.command(&format!("{addr}D{target:.0}", target = CFloat(target)))?;
         ctrl.command(&format!("{addr}G"))?;
         drop(ctrl);
         self.homed = false;
@@ -211,7 +212,7 @@ impl WriteHook for OemWriteHook {
         let function = write.function;
         let (method, value, mr) = match write.value {
             WriteValue::Int32(v) => ("writeInt32", v.to_string(), Some(v)),
-            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}"), None),
+            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}", v = CFloat(v)), None),
         };
         let status = match mr.filter(|_| self.resolution == Some(function)) {
             Some(v) => {
@@ -251,8 +252,8 @@ impl ControllerParams for OemParams {
             "OEM motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll_s,
-            self.idle_poll_s
+            CFloat(self.moving_poll_s),
+            CFloat(self.idle_poll_s)
         );
         ctx.report(out, level);
     }
@@ -334,7 +335,7 @@ impl AsynMotor for OemAxis {
         let ctrl = self.lock();
         let v = velocity / ctrl.pulses_per_unit[self.axis_no];
         ctrl.command(&format!("{addr}MC"))?;
-        ctrl.command(&format!("{addr}V{v:.2}"))?;
+        ctrl.command(&format!("{addr}V{v:.2}", v = CFloat(v)))?;
         // C maps forward -> H-, reverse -> H+.
         ctrl.command(&format!("{addr}H{}", if forward { '-' } else { '+' }))?;
         ctrl.command(&format!("{addr}G"))?;
@@ -602,6 +603,40 @@ mod tests {
         for (line, want) in mine.iter().zip(&want) {
             assert!(line.ends_with(want.as_str()), "{line:?} vs {want:?}");
         }
+    }
+
+    /// OEMMotorDriver.cpp:188 `value=%f`: glibc's -nan, sign bit included.
+    #[test]
+    fn a_nan_write_traces_as_c_prints_it() {
+        let (handle, _) = SyncIOHandle::connect_port(
+            "OEM_NONE",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let ctrl = Arc::new(Mutex::new(OemController::new(handle, 2)));
+        let port = register_controller_port(
+            &open_owner(),
+            "oemNanTrace",
+            2,
+            OemParams::new(ctrl.clone(), 100, 1000),
+        )
+        .unwrap();
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(OemAxis::new(ctrl, 1)));
+        let user = TraceUser::Asyn {
+            port: "oemNanTrace".into(),
+            addr: 1,
+        };
+        register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
+        let lines = traced("oemNanTrace", || {
+            port.write_float64_blocking(index::VELOCITY, 1, -f64::NAN)
+                .unwrap();
+        });
+        let want = format!(
+            "OEMMotorDriver:writeFloat64: function={}, value=-nan",
+            index::VELOCITY
+        );
+        assert!(lines.iter().any(|l| l.ends_with(&want)), "{lines:?}");
     }
 
     #[test]

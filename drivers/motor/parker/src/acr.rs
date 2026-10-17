@@ -36,6 +36,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::param::ParamType;
@@ -181,7 +182,7 @@ impl WriteHook for AcrWriteHook {
         let function = write.function;
         let (method, value) = match write.value {
             WriteValue::Int32(v) => ("writeInt32", v.to_string()),
-            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}")),
+            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}", v = CFloat(v))),
         };
         match write.status {
             Err(e) => write.print(
@@ -208,8 +209,8 @@ impl ControllerParams for AcrParams {
             "ACR motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll_s,
-            self.idle_poll_s
+            CFloat(self.moving_poll_s),
+            CFloat(self.idle_poll_s)
         );
         if level > 0 {
             let ctrl = self.lock();
@@ -272,9 +273,11 @@ impl ControllerParams for AcrParams {
             return ParamWrite::PassToBase(Ok(()));
         }
         let _ = base.set_float64_param(user.reason, user.addr, value);
-        let status = self
-            .lock()
-            .write_only(&format!("AXIS{} JOG JRK {value:.6}", user.addr));
+        let status = self.lock().write_only(&format!(
+            "AXIS{} JOG JRK {value:.6}",
+            user.addr,
+            value = CFloat(value)
+        ));
         let _ = base.call_param_callbacks(user.addr);
         ParamWrite::Handled(status)
     }
@@ -332,9 +335,9 @@ impl AxisReport for AcrAxisReport {
                 "  axis {}\n    pulsesPerUnit_ = {:.6}\n    encoder position={:.6}\n    \
                  theory position={:.6}\n    limits=0x{:x}\n    flags=0x{:x}\n",
                 self.axis_no,
-                self.pulses_per_unit,
-                s.encoder_position,
-                s.theory_position,
+                CFloat(self.pulses_per_unit),
+                CFloat(s.encoder_position),
+                CFloat(s.theory_position),
                 s.limits,
                 s.flags
             );
@@ -422,12 +425,12 @@ impl AcrAxis {
         ctrl.write_only(&format!(
             "{} JOG ACC {:.6}",
             self.name,
-            self.scaled(acceleration)?
+            CFloat(self.scaled(acceleration)?)
         ))?;
         ctrl.write_only(&format!(
             "{} JOG VEL {:.6}",
             self.name,
-            self.scaled(velocity)?
+            CFloat(self.scaled(velocity)?)
         ))
     }
 }
@@ -452,7 +455,7 @@ impl AsynMotor for AcrAxis {
         ctrl.write_only(&format!(
             "{CTL_Y}:{} JOG ABS {:.6}",
             self.name,
-            self.scaled(position)?
+            CFloat(self.scaled(position)?)
         ))
     }
 
@@ -469,7 +472,7 @@ impl AsynMotor for AcrAxis {
         ctrl.write_only(&format!(
             "{CTL_Y}:{} JOG INC {:.6}",
             self.name,
-            self.scaled(distance)?
+            CFloat(self.scaled(distance)?)
         ))
     }
 
@@ -518,7 +521,11 @@ impl AsynMotor for AcrAxis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.write_only(&format!("{} RES {:.6}", self.name, self.scaled(position)?))?;
+        ctrl.write_only(&format!(
+            "{} RES {:.6}",
+            self.name,
+            CFloat(self.scaled(position)?)
+        ))?;
         ctrl.write_only(&format!("{} JOG REN", self.name))
     }
 
