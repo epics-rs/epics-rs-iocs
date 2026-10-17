@@ -153,6 +153,17 @@ static MVP2001: Model1 = Model1::new(&DEV_MVP2001, MVP2001_NUM_CARDS, SCAN_RATE)
 /// `MicroMoSetup(num_cards, scan_rate)`, MicroMoRegister.cc's name for
 /// `MVP2001Setup`.
 pub fn micromo_setup_command() -> CommandDef {
+    MVP2001.register_report("drvMVP2001", |cards| {
+        if cards.num_cards() <= 0 {
+            return "    No MVP2001 CHAINS configured.\n".into();
+        }
+        (0..cards.num_cards())
+            .map(|card| match cards.card(card) {
+                Some(line) => format!("    MVP2001 controller chain #{card}, {line} \n"),
+                None => format!("    MVP2001 controller chain #{card} connection failed.\n"),
+            })
+            .collect()
+    });
     MVP2001.setup_command("MicroMoSetup")
 }
 
@@ -184,6 +195,10 @@ pub fn micromo_config_command() -> CommandDef {
             )?;
             let chain = Mvp2001Chain::new(handle);
             let limits = drv_mvp2001::motor_init(&chain);
+            // drvMVP2001.cc:725: a chain with no controller is NULL again.
+            if limits.is_empty() {
+                return Ok(CommandOutcome::Continue);
+            }
             let chain = Arc::new(Mutex::new(chain));
             for (signal, limits) in limits.into_iter().enumerate() {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvMvp2001Axis::new(
@@ -193,6 +208,8 @@ pub fn micromo_config_command() -> CommandDef {
                 )));
                 MVP2001.install(ctx, card, signal as i32, motor)?;
             }
+            // C's `motor_init` clears `ident` and never fills it.
+            MVP2001.describe(card, format!("port={asyn_port}, id: "));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -233,7 +250,41 @@ mod one_poller {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{LineRig, port_report, run_command};
+    use motor_common::testing::{LineRig, driver_report, port_report, run_command};
+
+    /// drvMVP2001.cc's drvet `report` (drvMVP2001.cc:207-231), which `dbior`
+    /// runs; `motor_init` leaves `ident` empty.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mvp2001_chain() {
+        let setup = micromo_setup_command();
+        assert_eq!(
+            driver_report("drvMVP2001", 0),
+            "    No MVP2001 CHAINS configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        // Each command answers once, terminator then reply, so a flush ends.
+        let reads = Mutex::new((String::new(), 0));
+        let (_line, _io) = LineRig::new("mvpChainLine", move |cmd| {
+            let mut reads = reads.lock().unwrap();
+            if reads.0 != cmd {
+                *reads = (cmd.to_string(), 0);
+            }
+            reads.1 += 1;
+            match (cmd.trim_end(), reads.1) {
+                ("1 ST", 1) => "\r".into(),
+                ("1 ST", 2) => "0001 0000".into(),
+                _ => String::new(),
+            }
+        });
+        let config = vec![int(1), ArgValue::String("mvpChainLine".into())];
+        run_command(micromo_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvMVP2001", 0),
+            "    MVP2001 controller chain #0 connection failed.\n    MVP2001 controller \
+             chain #1, port=mvpChainLine, id:  \n"
+        );
+    }
 
     /// MVP2001Controller::report then MVP2001Axis::report
     /// (MVP2001Driver.cpp:85-92, :235-248).
