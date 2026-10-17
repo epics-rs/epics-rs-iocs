@@ -1198,28 +1198,11 @@ impl AsynMotor for Mm4000Axis {
             ),
         );
         let position = position / step;
-        let done = byte & MM4000_MOVING == 0;
         self.set_poll_params(&data, byte, position);
+        // The MM4000 move transaction has no base-velocity (VB) command.
         Ok(MotorStatus {
-            position,
-            encoder_position: position,
-            velocity: 0.0, // C: no way to query the actual velocity
-            done,
-            moving: byte & MM4000_MOVING != 0,
-            direction: byte & MM4000_DIRECTION != 0,
-            high_limit: byte & MM4000_HIGH_LIMIT != 0,
-            low_limit: byte & MM4000_LOW_LIMIT != 0,
-            home: byte & MM4000_HOME != 0,
-            powered: byte & MM4000_POWER_OFF == 0,
-            problem: data.problem,
-            comms_error: data.comms_error,
-            // C motorAxisInit defaults motorAxisHasClosedLoop on for every
-            // axis and never sets motorAxisHasEncoder; the TC closed-loop
-            // probe result is stored but unused.
-            gain_support: true,
-            // The MM4000 move transaction has no base-velocity (VB) command.
             vbas_supported: false,
-            ..MotorStatus::default()
+            ..self.params.motor_status()
         })
     }
 }
@@ -1363,6 +1346,8 @@ mod tests {
     struct Scripted {
         base: epics_rs::asyn::port::PortDriverBase,
         silent: Arc<Mutex<Vec<&'static str>>>,
+        /// The `TP;` reply.
+        tp: Arc<Mutex<&'static str>>,
         reply: Vec<u8>,
         sent: Arc<Mutex<Vec<String>>>,
     }
@@ -1381,7 +1366,7 @@ mod tests {
                 c if self.silent.lock().unwrap().contains(&c) => Vec::new(),
                 "VE;" => b"VEMM4005 Version 2.04".to_vec(),
                 "TH;" => b"1TH1.5000,2TH-2.2500".to_vec(),
-                "TP;" => b"1TP1.4990,2TP-2.2490".to_vec(),
+                "TP;" => self.tp.lock().unwrap().as_bytes().to_vec(),
                 // Axis 2 moving in the plus direction, on its plus limit.
                 "MS;" => b"1MS@,2MSM".to_vec(),
                 "TE;" => b"TE@".to_vec(),
@@ -1427,6 +1412,7 @@ mod tests {
         let line = Scripted {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             silent: silent.clone(),
+            tp: Arc::new(Mutex::new("1TP1.4990,2TP-2.2490")),
             reply: Vec::new(),
             sent: sent.clone(),
         };
@@ -1720,6 +1706,49 @@ mod tests {
         assert!(status.comms_error);
         assert_eq!(status.position, 50000.0, "a dead line reads back as 0");
         assert!(status.done);
+    }
+
+    /// drvMM4000Asyn.c:653-718: the record sees `pAxis->params`, so a poll
+    /// whose `TE;` fails after `MS;` and `TP;` answered reports the comm
+    /// error over the last positions and bits.
+    #[test]
+    fn a_failed_te_reports_the_kept_parameters() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let silent = Arc::new(Mutex::new(Vec::new()));
+        let tp = Arc::new(Mutex::new("1TP1.4990,2TP-2.2490"));
+        let line = Scripted {
+            base: PortDriverBase::new("mm4000_te", 1, PortFlags::default()),
+            silent: silent.clone(),
+            tp: tp.clone(),
+            reply: Vec::new(),
+            sent: Arc::default(),
+        };
+        let (rt, _jh) = create_port_runtime(
+            &claim_port("mm4000_te").unwrap(),
+            line,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
+        let ctrl = Mm4000Controller::new(io, "mm4000_te", "mm4000_te_motor", 2, Duration::ZERO)
+            .ok()
+            .unwrap();
+        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
+        let user = AsynUser::default();
+        let good = axis.poll(&user).unwrap();
+        silent.lock().unwrap().push("TE;");
+        *tp.lock().unwrap() = "1TP3.0000,2TP-2.2490";
+        let failed = axis.poll(&user).unwrap();
+        assert_eq!(
+            failed,
+            MotorStatus {
+                comms_error: true,
+                ..good
+            }
+        );
     }
 
     /// drvMM4000Asyn.c:485-486 motorAxisMove clears motorAxisDone, calls it
