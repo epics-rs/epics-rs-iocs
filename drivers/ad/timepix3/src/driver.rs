@@ -1766,8 +1766,9 @@ fn acquisition_error(message: impl Into<String>) -> AsynError {
 /// its BiasEnabled and MPX3 refusals and inside ADDriver's own writes
 /// (ADTimePix.cpp:502, :667); every other failure is its status alone.
 enum Refusal {
-    /// The status alone; the closing callbacks and ERR line follow.
-    Bare(AsynStatus),
+    /// The status alone, the param library's code kept for the ERR line;
+    /// the closing callbacks and ERR line follow.
+    Bare(AsynError),
     /// ADDriver's failure, its message kept; the closing callbacks follow.
     Base(AsynError),
     /// C returns at once with its message.
@@ -1776,17 +1777,18 @@ enum Refusal {
 
 impl From<AsynError> for Refusal {
     fn from(e: AsynError) -> Self {
-        Refusal::Bare(e.status())
+        Refusal::Bare(e)
     }
 }
 
 impl Refusal {
     fn into_record(self) -> AsynError {
         match self {
-            Refusal::Bare(status) => AsynError::Status {
-                status,
-                message: String::new(),
-            },
+            Refusal::Bare(e) => AsynError::from_c_status_code(e.c_status_code(), String::new())
+                .unwrap_or(AsynError::Status {
+                    status: e.status(),
+                    message: String::new(),
+                }),
             Refusal::Base(e) | Refusal::Told(e) => e,
         }
     }
@@ -2241,7 +2243,7 @@ impl PortDriver for TimePix3Driver {
                         adlog::WRITE_INT32,
                         &format!(
                             "ERROR status={} function={reason}, value={value}",
-                            e.status() as i32
+                            e.c_status_code()
                         ),
                     )
                 ),
@@ -2276,7 +2278,7 @@ impl PortDriver for TimePix3Driver {
                         adlog::WRITE_FLOAT64,
                         &format!(
                             "ERROR status = {}, function ={reason}, value = {value:.6}",
-                            e.status() as i32
+                            e.c_status_code()
                         ),
                     )
                 ),
@@ -2540,6 +2542,34 @@ mod tests {
             .write_float64(&mut AsynUser::new(ad.acquire_time), 0.5)
             .unwrap_err();
         assert_eq!(e.message(), "");
+    }
+
+    /// A set the param library refuses closes with its own code, as C's
+    /// `status = setIntegerParam(...)` / `setDoubleParam` prints and returns
+    /// (ADTimePix.cpp:508, :866-873, :1093, :1108-1110).
+    #[test]
+    fn a_refused_set_keeps_the_param_librarys_code() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_SET_CODE",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let e = det
+            .write_int32(
+                &mut AsynUser::new(p.processed_img_output_type).with_addr(20),
+                1,
+            )
+            .unwrap_err();
+        assert_eq!((e.c_status_code(), e.message()), (11, String::new()));
+        let e = det
+            .write_float64(&mut AsynUser::new(p.img_processing_time).with_addr(20), 1.0)
+            .unwrap_err();
+        assert_eq!((e.c_status_code(), e.message()), (11, String::new()));
     }
 
     /// A channel Base PV reads back whether it names a reachable folder or
