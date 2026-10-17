@@ -324,6 +324,8 @@ impl AsynMotor for FaulhaberAxis {
         // The record's unguarded SET_ACCEL (motorRecord.cc:2141), then C JOG:
         // ENCRES, the speed, and velocity mode at the signed rate. C's SP is
         // signed too; a maximum speed is not, so that is not copied.
+        // C never sends that SP: its node keeps type UNDEFINED, which
+        // motor_send (motordrvCom.cc:563-576) refuses; that defect is not copied.
         self.set_accel(&self.lock(), acceleration)?;
         let rpm = vel_to_rpm(velocity, self.counts_per_rev);
         self.lead_move(&self.encres())?;
@@ -343,6 +345,8 @@ impl AsynMotor for FaulhaberAxis {
         // The record's SET_VELOCITY/SET_ACCEL (motorRecord.cc:872-875), then C
         // HOME_*: ENCRES, the homing speed signed by direction, the homing
         // sequence, and GO's `M`.
+        // C never sends HOSP: its node keeps type UNDEFINED, which motor_send
+        // (motordrvCom.cc:563-576) refuses; that defect is not copied.
         self.program_motion(velocity, acceleration)?;
         let mut rpm = vel_to_rpm(velocity, self.counts_per_rev);
         if !forward {
