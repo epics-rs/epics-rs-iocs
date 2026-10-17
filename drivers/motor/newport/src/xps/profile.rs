@@ -69,6 +69,17 @@ pub struct TrajectoryFile {
     pub text: String,
     pub pre_distance: Vec<f64>,
     pub post_distance: Vec<f64>,
+    /// Per axis, the reduced max acceleration and this axis's own ramp
+    /// times, before the running maximum and `XPS_MIN_PROFILE_ACCEL_TIME`.
+    pub ramps: Vec<Ramp>,
+}
+
+/// One axis's ramp sizing in [`TrajectoryFile::ramps`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ramp {
+    pub max_acceleration: f64,
+    pub pre_time: f64,
+    pub post_time: f64,
 }
 
 /// Why a profile could not be turned into a trajectory file.
@@ -219,6 +230,7 @@ impl Profile {
         let mut post_velocity = vec![0.0_f64; self.axes.len()];
         let mut pre_time_max = 0.0_f64;
         let mut post_time_max = 0.0_f64;
+        let mut ramps = Vec::with_capacity(self.axes.len());
         for (j, axis) in self.axes.iter().enumerate() {
             let max_accel = max_acceleration[j] * XPS_ACCEL_ROUNDOFF_MARGIN;
             if max_accel <= 0.0 {
@@ -228,9 +240,15 @@ impl Profile {
                 )));
             }
             pre_velocity[j] = (axis.positions[1] - axis.positions[0]) / self.times[0];
-            pre_time_max = pre_time_max.max(pre_velocity[j].abs() / max_accel);
             post_velocity[j] = (axis.positions[n - 1] - axis.positions[n - 2]) / self.times[n - 1];
-            post_time_max = post_time_max.max(post_velocity[j].abs() / max_accel);
+            let ramp = Ramp {
+                max_acceleration: max_accel,
+                pre_time: pre_velocity[j].abs() / max_accel,
+                post_time: post_velocity[j].abs() / max_accel,
+            };
+            pre_time_max = pre_time_max.max(ramp.pre_time);
+            post_time_max = post_time_max.max(ramp.post_time);
+            ramps.push(ramp);
         }
         pre_time_max = pre_time_max.max(XPS_MIN_PROFILE_ACCEL_TIME);
         post_time_max = post_time_max.max(XPS_MIN_PROFILE_ACCEL_TIME);
@@ -302,6 +320,7 @@ impl Profile {
             text,
             pre_distance,
             post_distance,
+            ramps,
         })
     }
 }
