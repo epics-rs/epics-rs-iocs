@@ -150,4 +150,35 @@ mod tests {
             );
         }
     }
+
+    /// drvSPiiPlus.cc:692-701: any non-empty `?VR` reply makes the card
+    /// present, an ACSPL error reply such as `?2001` included; only an empty
+    /// one is sent again, up to 3 times.
+    #[epics_rs::base::epics_test]
+    async fn a_question_mark_probe_reply_still_makes_the_card() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let int = ArgValue::Int;
+        run_command(spiiplus_setup_command(), vec![int(1), int(10)]).await;
+        let probes = AtomicUsize::new(0);
+        let (line, _io) = LineRig::new("spErrVr", move |cmd| match cmd.trim_end() {
+            "?VR" if probes.fetch_add(1, Ordering::SeqCst) < 2 => String::new(),
+            "?VR" => "?2001".into(),
+            "?APOS(0)" => "0".into(),
+            "?APOS(1)" => "?1033".into(),
+            _ => ":".into(),
+        });
+        let config = vec![
+            int(0),
+            ArgValue::String("spErrVr".into()),
+            ArgValue::String("BUF".into()),
+        ];
+        run_command(spiiplus_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvSPiiPlus", 0),
+            "    SPiiPlus controller 0, port=spErrVr, address=0, id: ?2001 \n"
+        );
+        let vr = line.sent().iter().filter(|c| c.trim_end() == "?VR").count();
+        assert_eq!(vr, 4);
+    }
 }

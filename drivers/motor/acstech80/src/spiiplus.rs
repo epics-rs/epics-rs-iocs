@@ -136,20 +136,19 @@ impl SpiiPlusController {
             num_axes: 0,
         };
 
-        // Probe the controller (retry up to 3 times), then stop all motion.
-        let mut probed = false;
-        for _ in 0..3 {
-            let reply = ctrl.command("?VR")?;
-            if !reply.is_empty() && !reply.contains('?') {
-                probed = true;
-                break;
-            }
+        // C's send_recv_mess returns the bytes read, so any reply makes the
+        // card present and only a silent one is probed again
+        // (drvSPiiPlus.cc:692-701); halt and ident statuses are ignored.
+        let answered = (0..3).any(|_| {
+            ctrl.handle
+                .write_read(0, b"?VR", READ_BUF)
+                .is_ok_and(|reply| !reply.is_empty())
+        });
+        if !answered {
+            return Err(spiiplus_err("SPiiPlus: no response to ?VR probe"));
         }
-        if !probed {
-            return Err(spiiplus_err("SPiiPlus: no valid response to ?VR probe"));
-        }
-        ctrl.command("halt all")?;
-        ctrl.ident = ctrl.command("?VR")?;
+        let _ = ctrl.command("halt all");
+        ctrl.ident = ctrl.command("?VR").unwrap_or_default();
 
         // Auto-detect the axis count: ?APOS(n) succeeds until n is out of range.
         let mut n = 0usize;
