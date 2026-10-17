@@ -187,7 +187,12 @@ impl Axis {
     }
 
     /// C's `getInteger` into a caller's value it leaves untouched for an
-    /// undefined or out-of-range parameter; that value is 0 here.
+    /// undefined or out-of-range parameter, and readInt32/readFloat64 still
+    /// return asynSuccess. That value is 0 here, which is what the PV shows in
+    /// C: devAsynInt32's result is calloc'd (devAsynInt32.c:208) and a
+    /// successful read stores it with udf 0 (:848-851). initAo reads into an
+    /// uninitialised `epicsInt32 value` instead (:934, :954); that C defect
+    /// is not copied.
     fn get_integer(&self, command: usize) -> i32 {
         i32::try_from(command)
             .ok()
@@ -421,6 +426,7 @@ impl PortDriver for DrvMotorAsyn {
             VELOCITY => axis.max_velocity,
             VEL_BASE => axis.min_velocity,
             ACCEL => axis.accel,
+            // 0 for an undefined parameter, as at `Axis::get_integer`.
             _ => i32::try_from(command)
                 .ok()
                 .and_then(|f| axis.getter.get_double(f))
