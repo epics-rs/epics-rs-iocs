@@ -15,8 +15,11 @@ use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerParams, ParamWrite, index};
+use epics_rs::motor::controller_port::{
+    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteValue, index,
+};
 
 use motor_common::util::{atof, atoi};
 
@@ -385,6 +388,34 @@ impl Nf874xControllerParams {
     }
 }
 
+/// `writeInt32` / `writeFloat64`'s closing line, which the record's writes
+/// reach as well as the port's.
+struct Nf874xWriteHook;
+
+impl WriteHook for Nf874xWriteHook {
+    /// C traces every write at its end, the base's included.
+    fn after_write(&self, write: &FinishedWrite<'_>) {
+        let function = write.function;
+        let (method, value) = match write.value {
+            WriteValue::Int32(v) => ("writeInt32", v.to_string()),
+            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}")),
+        };
+        match write.status {
+            Err(e) => write.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "nf874xMotorDriver:{method}: error, status={} function={function}, value={value}",
+                    e.c_status_code()
+                ),
+            ),
+            Ok(()) => write.print(
+                TraceMask::IO_DRIVER,
+                format_args!("nf874xMotorDriver:{method}: function={function}, value={value}"),
+            ),
+        }
+    }
+}
+
 impl ControllerParams for Nf874xControllerParams {
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let params = Nf874xParams {
@@ -394,6 +425,10 @@ impl ControllerParams for Nf874xControllerParams {
         };
         lock(&self.controller).params = Some(params);
         Ok(())
+    }
+
+    fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
+        Some(Arc::new(Nf874xWriteHook))
     }
 
     fn write_int32(
@@ -450,6 +485,13 @@ impl Nf874xControllerParams {
 
 #[cfg(test)]
 mod tests {
+    use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::registry::open_owner;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::motor::builder::MotorBuilder;
+    use epics_rs::motor::devices::{register_axis, register_controller_port};
+    use epics_rs::motor::trace::TraceUser;
+
     use super::*;
 
     fn controller(closed_loop: bool) -> Nf874xController {
@@ -476,5 +518,52 @@ mod tests {
     fn reply_skips_the_chain_prefix() {
         assert_eq!(skip("2>-150", "2>1"), "-150");
         assert_eq!(skip("-150", "1"), "-150");
+    }
+
+    /// `body`'s lines in `port`'s trace at C's error and IO_DRIVER masks.
+    fn traced(port: &str, body: impl FnOnce()) -> Vec<String> {
+        let path = std::env::temp_dir().join(format!("nf874x-trace-{port}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+        body();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        text.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn every_write_ends_on_cs_line_the_base_included() {
+        let ctrl = Arc::new(Mutex::new(controller(false)));
+        let params = Nf874xControllerParams::new(ctrl.clone());
+        let port = register_controller_port(&open_owner(), "nf874xTrace", 2, params).unwrap();
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Nf874xAxis::new(ctrl, 1)));
+        let user = TraceUser::Asyn {
+            port: "nf874xTrace".into(),
+            addr: 1,
+        };
+        register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
+        let lines = traced("nf874xTrace", || {
+            port.write_float64_blocking(index::VELOCITY, 1, 2.5)
+                .unwrap();
+            port.write_int32_blocking(index::REC_DIRECTION, 1, 1)
+                .unwrap();
+        });
+        let mine: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("nf874xMotorDriver"))
+            .collect();
+        let velocity = index::VELOCITY;
+        let direction = index::REC_DIRECTION;
+        let want = [
+            format!("nf874xMotorDriver:writeFloat64: function={velocity}, value=2.500000"),
+            format!("nf874xMotorDriver:writeInt32: function={direction}, value=1"),
+        ];
+        assert_eq!(mine.len(), want.len(), "{lines:?}");
+        for (line, want) in mine.iter().zip(&want) {
+            assert!(line.ends_with(want.as_str()), "{line:?} vs {want:?}");
+        }
     }
 }
