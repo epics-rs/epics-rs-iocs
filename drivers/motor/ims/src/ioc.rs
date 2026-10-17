@@ -200,6 +200,11 @@ static MDRIVE: Model1 = Model1::new(&DEV_MDRIVE, MDRIVE_NUM_CARDS, SCAN_RATE);
 
 /// `MDriveSetup(num_cards, scan_rate)`.
 pub fn mdrive_setup_command() -> CommandDef {
+    MDRIVE.register_report("drvMDrive", |cards| {
+        cards.report("MDrive", |card, line| {
+            format!("    MDrive controller #{card}, {line} \n")
+        })
+    });
     MDRIVE.setup_command("MDriveSetup")
 }
 
@@ -224,7 +229,10 @@ pub fn mdrive_config_command() -> CommandDef {
                 EosRefusal::Ignored,
             )?;
             let controller = MDriveController::new(handle);
-            let drives = mdrive_probe(&controller, card);
+            let (ident, drives) = mdrive_probe(&controller, card);
+            if !drives.is_empty() {
+                MDRIVE.describe(card, format!("port={asyn_port}, id: {ident}"));
+            }
             let controller = Arc::new(Mutex::new(controller));
             for (signal, drive) in drives.into_iter().enumerate() {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvMDriveAxis::new(
@@ -290,6 +298,29 @@ mod report {
             driver_report("drvIM483PL", 0),
             "    IM483PL controller 0 connection failed.\n    IM483PL controller #1, \
              port=im483plRepLine, id:  \n"
+        );
+    }
+
+    /// drvMDrive.cc's drvet `report` (drvMDrive.cc:162-186), which `dbior`
+    /// runs, naming the chain by its first drive's `PR VR`.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mdrive_chain() {
+        let setup = mdrive_setup_command();
+        assert_eq!(
+            driver_report("drvMDrive", 0),
+            "    No MDrive controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("mdriveRepLine", |cmd| {
+            if cmd.ends_with("PR VR") { "3.009" } else { "0" }.into()
+        });
+        let config = vec![int(1), ArgValue::String("mdriveRepLine".into())];
+        run_command(mdrive_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvMDrive", 0),
+            "    MDrive controller 0 connection failed.\n    MDrive controller #1, \
+             port=mdriveRepLine, id: 3.009 \n"
         );
     }
 
