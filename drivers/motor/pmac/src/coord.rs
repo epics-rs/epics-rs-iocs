@@ -382,9 +382,6 @@ pub struct PmacCsAxis {
     axis: usize,
     previous_position: f64,
     previous_direction: bool,
-    /// A move was sent since the last poll: C `motorAxisMove` clears
-    /// `motorAxisDone` so the record's next status update is not done.
-    motion_sent: bool,
 }
 
 fn lock(system: &Arc<Mutex<PmacCoordSystem>>) -> std::sync::MutexGuard<'_, PmacCoordSystem> {
@@ -406,7 +403,6 @@ impl PmacCsAxis {
             axis,
             previous_position: 0.0,
             previous_direction: false,
-            motion_sent: false,
         })
     }
 }
@@ -465,7 +461,6 @@ impl AsynMotor for PmacCsAxis {
             command.push_str(&format!("B{}R", system.program));
         }
         let sent = system.command(axis, &command);
-        self.motion_sent = true;
         // Whatever the write gave (pmacAsynCoord.c:520-523).
         let params = system.params(axis);
         let _ = params.set_integer(function::DONE, 0);
@@ -647,7 +642,6 @@ impl AsynMotor for PmacCsAxis {
 
         let flags = decode_cs_status((status1, status2, status3), system.deferred[axis - 1]);
 
-        let done = flags.done && !std::mem::take(&mut self.motion_sent);
         // C's setInteger block (pmacAsynCoord.c:650-671), with the problem the
         // record sees.
         let params = system.params(axis);
@@ -669,10 +663,10 @@ impl AsynMotor for PmacCsAxis {
         Ok(MotorStatus {
             position,
             encoder_position: position,
-            done,
-            // C paces on motorAxisDone (pmacAsynCoord.c:719-724) and sets
-            // motorAxisMoving from in-position alone (659).
-            moving: !done,
+            done: flags.done,
+            // C's poller paces on the motorAxisDone this sets (pmacAsynCoord.c:
+            // 719-724); motorAxisMoving is in-position alone (:659).
+            moving: !flags.done,
             msta_moving: flags.moving,
             high_limit: flags.limit,
             low_limit: flags.limit,
@@ -883,15 +877,15 @@ mod tests {
         axis.move_absolute(&user, 1.0, 0.0, 0.0, 0.0).unwrap();
         assert_eq!(get.get_integer(function::DONE), Some(0));
         // pmacAsynCoord.c:660-665: done is the system's status alone.
-        assert!(!axis.poll(&user).unwrap().done);
+        assert!(axis.poll(&user).unwrap().done);
         assert_eq!(get.get_integer(function::DONE), Some(1));
     }
 
-    /// pmacAsynCoord.c motorAxisMove clears motorAxisDone and wakes the
-    /// poller: the poll after a move reads the system and is not done, the
-    /// one after it is served from that read again.
+    /// pmacAsynCoord.c motorAxisMove wakes the poller: the poll after a move
+    /// reads the system, and its done is the status words' (:665-670) — the
+    /// move's done=0 (:522) is the motor layer's, not a held poll.
     #[test]
-    fn the_poll_after_a_move_is_fresh_and_not_done() {
+    fn the_poll_after_a_move_is_fresh() {
         let (mut axis, _, sent, _) = idle_axis("pmac_cs_moved", Duration::from_secs(3600));
         let user = AsynUser::default();
         assert!(axis.poll(&user).unwrap().done);
@@ -903,9 +897,7 @@ mod tests {
         let after = axis.poll(&user).unwrap();
         let wire = sent.lock().unwrap().clone();
         assert_eq!(wire.len(), 3, "{wire:?}");
-        assert!(!after.done);
-        // In position yet not done: C paces fast, motorAxisMoving stays 0.
-        assert!(after.moving && !after.msta_moving);
+        assert!(after.done && !after.moving && !after.msta_moving);
 
         sent.lock().unwrap().clear();
         assert!(axis.poll(&user).unwrap().done);
