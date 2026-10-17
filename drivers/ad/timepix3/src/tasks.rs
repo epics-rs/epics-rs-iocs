@@ -1014,6 +1014,12 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
             ctx.set(addr, updates).await;
         }
     }
+    // C getDetector (serval_http.cpp:1556).
+    ctx.set(
+        0,
+        vec![ParamSetValue::new(p.det_connected, 0, ParamValue::Int32(1))],
+    )
+    .await;
     true
 }
 
@@ -4061,6 +4067,30 @@ mod tests {
     /// A `/detector` reply that passes C `parseResponse`.
     const DETECTOR: &str = r#"{"Info":{"PixCount":65536,"RowLen":1,"NumberOfChips":1,
         "NumberOfRows":256,"MpxType":3},"Config":{}}"#;
+
+    /// A good detector read reconnects the detector (serval_http.cpp:1556).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_good_detector_read_sets_det_connected() {
+        let (url, _log) = logging_serval(&[], |path| match path {
+            "/detector" => DETECTOR,
+            _ => "{}",
+        });
+        let ctx = Arc::new(idle_ctx_at("TPX_DET_OK", &url, None));
+        ctx.set(
+            0,
+            vec![ParamSetValue::new(
+                ctx.p.det_connected,
+                0,
+                ParamValue::Int32(0),
+            )],
+        )
+        .await;
+        assert!(refresh_detector(&ctx).await);
+        assert_eq!(
+            ctx.handle.read_int32(ctx.p.det_connected, 0).await.unwrap(),
+            1
+        );
+    }
 
     /// A failed or invalid detector read is published as C getDetector
     /// does: DetConnected 0, WriteMsg, StatusMessage, ADStatus and an ERR
