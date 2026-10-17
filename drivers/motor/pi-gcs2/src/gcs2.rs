@@ -483,11 +483,17 @@ impl PIGCS2Controller {
         if self.model.is_hexapod() {
             let _ = self.get_global_state();
         }
+        // PICoordinateSystem::getActivate/getLink; every other class's
+        // leaves both empty. C defect not copied: a failed query hands on
+        // its uninitialized reply buffer; rs posts it empty.
+        let (mut activate, mut link) = (String::new(), String::new());
         if self.model == Model::CoordinateSystem {
-            // PICoordinateSystem::getActivate/getLink, whose replies feed
-            // the PI_CS_ACTIVATE/PI_CS_LINK parameters, not modeled.
-            let _ = self.query("KEN?");
-            let _ = self.query("KLN?");
+            activate = self.query("KEN?").unwrap_or_default().replace('\n', "");
+            link = self
+                .query("KLN?")
+                .unwrap_or_default()
+                .replace('\n', "")
+                .replace('\t', " ");
         }
         if let Some((port, params)) = &self.port {
             let [x, y, z] = self.pivot;
@@ -497,6 +503,12 @@ impl PIGCS2Controller {
                 ParamSetValue::new(params.rbpivot_z, 0, ParamValue::Float64(z)),
                 ParamSetValue::new(params.target_mode, 0, ParamValue::Int32(self.target_mode)),
                 ParamSetValue::new(params.last_err, 0, ParamValue::Int32(self.last_error.get())),
+                ParamSetValue::new(
+                    params.cs_activate,
+                    0,
+                    ParamValue::Octet(activate.as_bytes().into()),
+                ),
+                ParamSetValue::new(params.cs_link, 0, ParamValue::Octet(link.as_bytes().into())),
             ];
             let _ = port.set_params_and_notify_blocking(0, updates);
         }
@@ -1214,6 +1226,8 @@ struct PiParams {
     rbpivot_y: usize,
     rbpivot_z: usize,
     target_mode: usize,
+    cs_activate: usize,
+    cs_link: usize,
 }
 
 /// What C `PIasynController` adds to the `asynMotorController` port: its
@@ -1262,6 +1276,8 @@ impl ControllerParams for PIGCS2Params {
             rbpivot_y: create("PI_SUP_RBPIVOT_Y", ParamType::Float64)?,
             rbpivot_z: create("PI_SUP_RBPIVOT_Z", ParamType::Float64)?,
             target_mode: create("PI_CS_TARGETMODE", ParamType::Int32)?,
+            cs_activate: create("PI_CS_ACTIVATE", ParamType::Octet)?,
+            cs_link: create("PI_CS_LINK", ParamType::Octet)?,
         };
         let _ = self.params.set(params);
         Ok(())
@@ -2773,6 +2789,36 @@ mod tests {
             assert_eq!(sent_lines(&line), [sent, "ERR?"]);
             assert_eq!(port.read_float64_blocking(p.target, 0).unwrap(), value);
         }
+    }
+
+    /// `PIasynController::poll` (PIasynController.cpp:589-595) posts
+    /// `PICoordinateSystem::getActivate`/`getLink`: the `KEN?` and `KLN?`
+    /// replies less their line breaks, `KLN?`'s tabs as spaces
+    /// (PICoordinateSystem.cpp:54-91).
+    #[test]
+    fn a_coordinate_system_poll_posts_its_activate_and_link() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let more = AtomicUsize::new(0);
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2CsLine", move |last| {
+            match last {
+                "KEN?" => "KS1".into(),
+                // The continuation read sees the command it follows.
+                "KLN?" => match more.fetch_add(1, Ordering::Relaxed) % 2 {
+                    0 => "KS1\tKS2 ",
+                    _ => "ZERO",
+                }
+                .into(),
+                last => hexapod_reply(last),
+            }
+        });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2CsLine");
+        ctrl.set_model(Model::CoordinateSystem);
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let (port, p, _) = controller_port("gcs2Cs", &ctrl, "X");
+        ctrl.lock().unwrap().poll();
+        let read = |reason| port.get_string_param_blocking(reason, 0, 255).unwrap();
+        assert_eq!(read(p.cs_activate), b"KS1");
+        assert_eq!(read(p.cs_link), b"KS1 KS2 ZERO");
     }
 
     /// `PI_CS_TARGETMODE` (PIasynController.cpp:320-324, 587) picks the
