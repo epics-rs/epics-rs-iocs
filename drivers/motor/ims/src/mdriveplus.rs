@@ -801,9 +801,11 @@ impl ImsMDrivePlusAxis {
         }
 
         self.status.homed = atoi(&self.write_read("PR R1")?) > 0;
-        // ST is the stall flag; C maps it to both following-error and slip. Only
-        // slip/stall has a MotorStatus field, so both fold into slip_stall.
-        self.status.slip_stall = atoi(&self.write_read("PR ST")?) > 0;
+        // ST is the stall flag: C sets both motorStatusFollowingError_ (MSTA
+        // bit 6) and motorStatusSlip_ (bit 4) from it.
+        let stalled = atoi(&self.write_read("PR ST")?) > 0;
+        self.status.slip_stall = stalled;
+        self.status.slip = stalled;
         self.status.encoder_position = atof(&self.write_read("PR C2")?);
         let locked_rotor = atoi(&self.write_read("PR LR")?);
         if let Some(&(_, reason)) = self.port.as_ref() {
@@ -1113,6 +1115,24 @@ mod tests {
                 error_line("move()", "moving motor"),
             ]
         );
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:464-470: the stall flag sets both
+    /// motorStatusFollowingError_ and motorStatusSlip_, MSTA bits 6 and 4.
+    #[test]
+    fn a_stall_sets_following_error_and_slip() {
+        use epics_rs::motor::flags::MstaFlags;
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("imsStallLine", |last| match last.trim_end() {
+            "PR VR" => "1.000".into(),
+            "PR ST" => "1".into(),
+            _ => "0".into(),
+        });
+        let mut axis =
+            ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), "imsStall"), "imsStall");
+        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let bits = MstaFlags::from_status(&status).bits();
+        assert_eq!(bits & 0x50, 0x50, "{bits:#x}");
     }
 
     /// ImsMDrivePlusMotorAxis.cpp:487-492: a failed poll reports through
