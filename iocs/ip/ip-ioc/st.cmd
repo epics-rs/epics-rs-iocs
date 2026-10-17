@@ -38,23 +38,8 @@ dbLoadRecords("$(IP)/db/TPG261.db", "P=$(PREFIX),GAUGE=gauge1,PORT=SerialTPG,ADD
 dbLoadRecords("$(IP)/db/TPG261.db", "P=$(PREFIX),GAUGE=gauge2,PORT=SerialTPG,ADDR=1")
 
 # --- Televac vacuum gauge controller ----------------------------------------
-# The controller answers with a CR-terminated line; devTelevac.c relied on the
-# port's EOS for both directions.
-drvAsynSerialPortConfigure("SerialTVAC", "/dev/ttyS2", 0, 0, 0)
-asynSetOption("SerialTVAC", 0, "baud", "9600")
-asynSetOption("SerialTVAC", 0, "bits", "8")
-asynSetOption("SerialTVAC", 0, "parity", "none")
-asynSetOption("SerialTVAC", 0, "stop", "1")
-asynOctetSetInputEos("SerialTVAC", 0, "\r")
-asynOctetSetOutputEos("SerialTVAC", 0, "\r")
-
-# TelevacConfig(portName, octetPort, numStations, numRelays, pollPeriodSeconds)
-TelevacConfig("TVAC1", "SerialTVAC", 2, 2, 1.0)
-
-dbLoadRecords("$(IP)/db/televac.db", "P=$(PREFIX),GAUGE=tv1,PORT=TVAC1,ADDR=0")
-dbLoadRecords("$(IP)/db/televac.db", "P=$(PREFIX),GAUGE=tv2,PORT=TVAC1,ADDR=1")
-dbLoadRecords("$(IP)/db/televac_relay.db", "P=$(PREFIX),RELAY=tvrly1,PORT=TVAC1,ADDR=0")
-dbLoadRecords("$(IP)/db/televac_relay.db", "P=$(PREFIX),RELAY=tvrly2,PORT=TVAC1,ADDR=1")
+# devTelevac.c ("asyn Televac" ai/bi) is built in, but ipApp ships no database
+# for it, so nothing is loaded.
 
 # --- MKS / HPS SensaVac 937 gauge controller --------------------------------
 # devAiMKS.c: "set the serial port settings ... to use the correct baud rate and
@@ -72,35 +57,26 @@ asynOctetSetOutputEos("SerialMKS", 0, "\r")
 dbLoadRecords("$(IP)/db/MKS.db", "P=$(PREFIX),PORT=SerialMKS,CC1=cc1,CC2=cc2,PR1=pr1,PR2=pr2")
 
 # --- Heidenhain ND261 display unit ------------------------------------------
-# devAiHeidND261.c set the input EOS to "\n\n" itself; the port carries it here.
-# The readout request is the two bytes ^B LF, written by the driver, so the port
-# must NOT append an output EOS.
+# devAiHeidND261.c sets the input EOS to "\n\n" itself on every read, and
+# writes the bare ^B LF request, so the port must NOT append an output EOS.
 drvAsynSerialPortConfigure("SerialND261", "/dev/ttyS4", 0, 0, 0)
 asynSetOption("SerialND261", 0, "baud", "9600")
 asynSetOption("SerialND261", 0, "bits", "8")
 asynSetOption("SerialND261", 0, "parity", "none")
 asynSetOption("SerialND261", 0, "stop", "1")
-asynOctetSetInputEos("SerialND261", 0, "\n\n")
 
-# ND261Config(portName, octetPort, pollPeriodSeconds)
-ND261Config("ND261", "SerialND261", 1.0)
-
-dbLoadRecords("$(IP)/db/nd261.db", "P=$(PREFIX),AXIS=nd1,PORT=ND261")
+dbLoadRecords("$(IP)/db/heidND261.db", "P=$(PREFIX)nd1:,PORT=SerialND261")
 
 # --- Eurotherm 800/2000 temperature controller ------------------------------
-# The bisync frames carry their own EOT/STX/ETX/ENQ bytes and a block check
-# character, so the port must NOT append an EOS in either direction.
-# devXxEurotherm.c never reads the reply, so there is no input EOS either.
+# The ao/stringout records write bisync frames that carry their own
+# EOT/STX/ETX/ENQ bytes and block check character; the stringParm records
+# reading the reply set their own input EOS per request (TERM=).
 drvAsynSerialPortConfigure("SerialEuro", "/dev/ttyS5", 0, 0, 0)
 asynSetOption("SerialEuro", 0, "baud", "9600")
 asynSetOption("SerialEuro", 0, "bits", "7")
 asynSetOption("SerialEuro", 0, "parity", "even")
 asynSetOption("SerialEuro", 0, "stop", "1")
 
-# EurothermConfig(portName, octetPort, groupAddress). The asyn address of each
-# record is the controller's local address on the line (the C link's LAD=).
-EurothermConfig("EURO1", "SerialEuro", 0)
-
-dbLoadRecords("$(IP)/db/eurotherm.db", "P=$(PREFIX),ET=et1,PORT=EURO1,LADDR=1")
+dbLoadRecords("$(IP)/db/Eurotherm.db", "P=$(PREFIX)et1:,PORT=SerialEuro")
 
 iocInit()

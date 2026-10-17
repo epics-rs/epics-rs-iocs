@@ -19,7 +19,7 @@ pub fn exp_c(value: f64, precision: usize) -> String {
     format!("{mantissa}E{sign}{:02}", exponent.abs())
 }
 
-/// One `printf` conversion of a `double`, as parsed out of a C format string.
+/// One `printf` conversion, as parsed out of a C format string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Spec {
     left: bool,
@@ -32,14 +32,18 @@ struct Spec {
     conversion: char,
 }
 
+/// The conversions that take a `double`, and those that take an `int`.
+const DOUBLE_CONVERSIONS: &str = "fFeEgG";
+const INT_CONVERSIONS: &str = "diuxXo";
+
 /// Split a C format string into `(prefix, spec, suffix)`.
 ///
 /// `devXxEurotherm.c` takes the payload format from the record link (`FMT=`,
 /// default `%f`), so the format is data, not a literal: `SL%4.0lf` must produce
 /// the same bytes C's `sprintf` would. Exactly one conversion is allowed and it
-/// must take a `double` — the C passes `pr->val`, so `%d` and friends would be
-/// undefined behaviour there and are rejected here.
-fn parse_format(format: &str) -> Result<(String, Spec, String), String> {
+/// must be one of `conversions`, the ones that take the argument C passes;
+/// any other is undefined behaviour there and is rejected here.
+fn parse_format(format: &str, conversions: &str) -> Result<(String, Spec, String), String> {
     let mut prefix = String::new();
     let mut chars = format.chars().peekable();
 
@@ -101,10 +105,10 @@ fn parse_format(format: &str) -> Result<(String, Spec, String), String> {
         }
     }
     spec.conversion = match chars.next() {
-        Some(c @ ('f' | 'F' | 'e' | 'E' | 'g' | 'G')) => c,
+        Some(c) if conversions.contains(c) => c,
         Some(c) => {
             return Err(format!(
-                "format {format:?} converts a double with %{c}, which takes another type"
+                "format {format:?} has %{c}, which takes another type"
             ));
         }
         None => return Err(format!("format {format:?} ends inside its conversion")),
@@ -166,8 +170,13 @@ fn g_format(magnitude: f64, precision: usize, alt: bool) -> String {
 /// Format `value` with the C format string `format`, which must carry exactly
 /// one `double` conversion (`%f`, `%e`, `%E`, `%g`, `%G`, with the usual flags,
 /// width, precision and `l` modifier).
+/// `sprintf` of a format with no conversion: its text, `%%` printed as `%`.
+pub fn c_literal(format: &str) -> Option<String> {
+    (!format.replace("%%", "").contains('%')).then(|| format.replace("%%", "%"))
+}
+
 pub fn format_c_double(format: &str, value: f64) -> Result<String, String> {
-    let (prefix, spec, suffix) = parse_format(format)?;
+    let (prefix, spec, suffix) = parse_format(format, DOUBLE_CONVERSIONS)?;
 
     let magnitude = value.abs();
     let mut body = if !value.is_finite() {
@@ -205,6 +214,58 @@ pub fn format_c_double(format: &str, value: f64) -> Result<String, String> {
         format!("{sign}{}{body}", "0".repeat(width))
     } else {
         format!("{}{sign}{body}", " ".repeat(width))
+    };
+    Ok(format!("{prefix}{padded}{suffix}"))
+}
+
+/// Format `value` with the C format string `format`, which must carry exactly
+/// one `int` conversion (`%d`, `%i`, `%u`, `%x`, `%X`, `%o`, with the usual
+/// flags, width, precision and length modifiers).
+pub fn format_c_int(format: &str, value: i32) -> Result<String, String> {
+    let (prefix, spec, suffix) = parse_format(format, INT_CONVERSIONS)?;
+    let unsigned = value as u32;
+    let (mut digits, sign) = match spec.conversion {
+        'd' | 'i' => (
+            value.unsigned_abs().to_string(),
+            if value < 0 {
+                "-"
+            } else if spec.plus {
+                "+"
+            } else if spec.space {
+                " "
+            } else {
+                ""
+            },
+        ),
+        'u' => (unsigned.to_string(), ""),
+        'x' => (format!("{unsigned:x}"), ""),
+        'X' => (format!("{unsigned:X}"), ""),
+        _ => (format!("{unsigned:o}"), ""),
+    };
+    // A precision is the minimum digit count, and `%.0d` of 0 prints nothing.
+    if let Some(precision) = spec.precision {
+        if precision == 0 && unsigned == 0 {
+            digits.clear();
+        } else if digits.len() < precision {
+            digits = "0".repeat(precision - digits.len()) + &digits;
+        }
+    }
+    let alt = match spec.conversion {
+        'x' if spec.alt && unsigned != 0 => "0x",
+        'X' if spec.alt && unsigned != 0 => "0X",
+        'o' if spec.alt && !digits.starts_with('0') => "0",
+        _ => "",
+    };
+    let head = format!("{sign}{alt}");
+    let width = spec.width.saturating_sub(head.len() + digits.len());
+    let padded = if width == 0 {
+        format!("{head}{digits}")
+    } else if spec.left {
+        format!("{head}{digits}{}", " ".repeat(width))
+    } else if spec.zero && spec.precision.is_none() {
+        format!("{head}{}{digits}", "0".repeat(width))
+    } else {
+        format!("{}{head}{digits}", " ".repeat(width))
     };
     Ok(format!("{prefix}{padded}{suffix}"))
 }
@@ -263,6 +324,33 @@ mod tests {
         // "%%" is a literal percent, not a conversion.
         assert!(format_c_double("100%%", 1.0).is_err());
         assert_eq!(format_c_double("%.0f%%", 12.0).unwrap(), "12%");
+    }
+
+    /// Each expectation is gcc's `printf` of the same call on this host.
+    #[test]
+    fn matches_c_printf_of_an_int() {
+        let cases = [
+            ("%d", -42, "-42"),
+            ("%5d", 7, "    7"),
+            ("%-5d|", 7, "7    |"),
+            ("%05d", -42, "-0042"),
+            ("%+d", 5, "+5"),
+            ("% d", 5, " 5"),
+            ("%.3d", 7, "007"),
+            ("%.0d", 0, ""),
+            ("%x", 255, "ff"),
+            ("%#X", 255, "0XFF"),
+            ("%o", 8, "10"),
+            ("%#o", 8, "010"),
+            ("%ld", 3, "3"),
+            ("%u", -1, "4294967295"),
+            ("SET%dX", 1, "SET1X"),
+            ("%08.3d", 12, "     012"),
+        ];
+        for (format, value, want) in cases {
+            assert_eq!(format_c_int(format, value).unwrap(), want, "{format}");
+        }
+        assert!(format_c_int("%f", 1).is_err());
     }
 
     #[test]

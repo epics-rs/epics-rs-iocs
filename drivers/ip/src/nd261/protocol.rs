@@ -1,47 +1,53 @@
 //! Heidenhain ND261 display unit protocol (`devAiHeidND261.c`).
 //!
-//! One transaction: write `^B\n` (`STX` + LF), read the reply the ND261 pushes
-//! back, terminated by `\n\n` (the C set that terminator as the port's input EOS
-//! itself, `devAiHeidND261.c:167`; here `st.cmd` sets it with
-//! `asynOctetSetInputEos`).
+//! One transaction: write `^B\n` (`STX` + LF), set the input EOS to `\n\n`,
+//! and read the reply the ND261 pushes back (`devAiHeidND261.c:164-168`).
 //!
 //! The reply is a sign character followed by the number:
 //! `pai->val = sscanf(&inbuf[1], "%lf") * (inbuf[0] == '-' ? -1 : 1)`
 //! (`devAiHeidND261.c:233-234`).
 
-use crate::fmt::scan_f64;
+use epics_rs::base::calc::engine::scanf::sscanf;
+use epics_rs::base::calc::engine::value::StackValue;
+
+use crate::user_param::c_str;
 
 /// `^B` then LF — the readout request (`devAiHeidND261.c:104-105`).
 pub const READ_COMMAND: [u8; 2] = [0x02, b'\n'];
 
+/// The terminator the ND261 appends (`devAiHeidND261.c:100`).
+pub const TERM: &[u8] = b"\n\n";
+
+/// `pPvt->nchar`, the read size (`devAiHeidND261.c:103`).
+pub const NCHAR: usize = 18;
+
 /// The C rejected any reply shorter than this (`devAiHeidND261.c:222`).
 pub const MIN_REPLY_LEN: usize = 14;
 
-/// The value the C forced into the record when the read failed
+/// The value the C forces into the record when the read fails
 /// (`devAiHeidND261.c:223`).
 pub const INVALID_VALUE: f64 = 99999.0;
 
-/// Decode one reply into a position.
+/// Decode one reply (`nread` bytes, EOS stripped) into a position.
 ///
-/// `devAiHeidND261.c:229-231` chops two more characters off the reply
-/// (`inbuf[sz - termlen] = '\0'`) *after* asyn has already stripped the `\n\n`
-/// terminator, so it always dropped the last two characters of the data. Whether
-/// those two characters are digits of the number or trailing unit/status
-/// characters is not derivable from the C, and the ND261 manual is not
-/// available, so this port does not chop them: `sscanf("%lf")` stops at the
-/// first non-numeric character either way, and the chop can only ever have
-/// truncated the number. See the module docs.
-pub fn parse_position(reply: &str) -> Result<f64, String> {
+/// `devAiHeidND261.c:229-231` cuts two more characters ("remove delimiter")
+/// after asyn has already stripped the `\n\n` EOS; the code predates asyn's
+/// EOS handling (its log entry .01). The cut is not ported: when those two
+/// characters are a terminator the EOS did not match, or unit text,
+/// `sscanf("%lf")` stops before them and VAL is the same either way; VAL
+/// differs only when they are digits of the number, which C drops.
+///
+/// C leaves `x` uninitialised when `sscanf` matches nothing and stores that
+/// garbage in VAL with no alarm; here a reply with no number is a failed read.
+pub fn parse_position(reply: &[u8]) -> Option<f64> {
     if reply.len() < MIN_REPLY_LEN {
-        return Err(format!(
-            "reply is {} bytes, the ND261 sends at least {MIN_REPLY_LEN}: {reply:?}",
-            reply.len()
-        ));
+        return None;
     }
-    let (sign, rest) = reply.split_at(1);
-    let magnitude = scan_f64(rest).ok_or_else(|| format!("reply carries no number: {reply:?}"))?;
-    let sign = if sign == "-" { -1.0 } else { 1.0 };
-    Ok(sign * magnitude)
+    let Ok(StackValue::Double(magnitude)) = sscanf(c_str(&reply[1..]), b"%lf") else {
+        return None;
+    };
+    let sign = if reply[0] == b'-' { -1.0 } else { 1.0 };
+    Some(sign * magnitude)
 }
 
 #[cfg(test)]
@@ -55,15 +61,25 @@ mod tests {
 
     #[test]
     fn the_sign_comes_from_the_first_character() {
-        assert_eq!(parse_position("+ 0012.3456 mm").unwrap(), 12.3456);
-        assert_eq!(parse_position("- 0012.3456 mm").unwrap(), -12.3456);
+        assert_eq!(parse_position(b"+ 0012.3456 mm"), Some(12.3456));
+        assert_eq!(parse_position(b"- 0012.3456 mm"), Some(-12.3456));
         // The C treats every character that is not '-' as a plus sign.
-        assert_eq!(parse_position("  0012.3456 mm").unwrap(), 12.3456);
+        assert_eq!(parse_position(b"  0012.3456 mm"), Some(12.3456));
     }
 
     #[test]
     fn short_and_numberless_replies_are_rejected() {
-        assert!(parse_position("+ 12.3").is_err());
-        assert!(parse_position("+ no number  ").is_err());
+        assert_eq!(parse_position(b"+ 12.3"), None);
+        assert_eq!(parse_position(b"+ no number here"), None);
+        assert_eq!(parse_position(b"+ \xff\xfe number here"), None);
+    }
+
+    /// C's cut reads the same VAL for a trailing terminator or unit text, and
+    /// drops the last two digits of a number that fills the reply.
+    #[test]
+    fn the_two_characters_c_cuts_change_val_only_when_they_are_digits() {
+        assert_eq!(parse_position(b"+ 0012.34567\r\n"), Some(12.34567));
+        assert_eq!(parse_position(b"+ 0012.3456 mm"), Some(12.3456));
+        assert_eq!(parse_position(b"+  0012.345678"), Some(12.345678));
     }
 }

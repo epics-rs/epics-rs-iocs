@@ -32,7 +32,8 @@ use epics_rs::base::server::recgbl::alarm_status::READ_ALARM;
 use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
-use protocol::{Command, ENQ, NAK, Scan};
+use crate::scan::Scan;
+use protocol::{Command, ENQ, NAK};
 
 /// `device(<type>,INST_IO,dev<Type>TPG261,"asyn TPG261")` (`ipSupport.dbd`).
 pub const DTYP: &str = "asyn TPG261";
@@ -412,7 +413,7 @@ impl DevTpg261 {
     /// `readAi` with `pact == 1`; returns 2, so VAL is the float it scanned.
     fn read_ai(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let buf = self.rec_buf();
-        let mut scan = Scan::new(&buf);
+        let mut scan = Scan::new(buf.as_bytes());
         let value = match self.command_of() {
             Some(Command::GetPressure) => {
                 let status = scan.int().unwrap_or(0);
@@ -448,7 +449,7 @@ impl DevTpg261 {
         let buf = self.rec_buf();
         let a = self.address();
         let ints = |n: usize| {
-            let mut scan = Scan::new(&buf);
+            let mut scan = Scan::new(buf.as_bytes());
             let mut vals = vec![scan.int()];
             for _ in 1..n {
                 vals.push(scan.comma().int());
