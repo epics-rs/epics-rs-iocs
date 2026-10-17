@@ -61,7 +61,7 @@ use epics_rs::motor::controller_port::{
 };
 use epics_rs::motor::trace::MotorTrace;
 
-use motor_common::util::atoi;
+use motor_common::util::{atoi, atol};
 use motor_common::{ControllerParams, ControllerReport};
 
 use crate::poller::PollShared;
@@ -223,6 +223,9 @@ impl WriteHook for OmsWriteHook {
     }
 }
 
+/// MOTOR_STATUS_HAS_ENCODER, MSTA bit 8.
+const HAS_ENCODER: usize = index::STATUS_DIRECTION + 8;
+
 /// C `MAX_STRING_SIZE`, the size of writeOctet's reply buffer.
 const MAX_STRING_SIZE: usize = 40;
 
@@ -307,6 +310,37 @@ impl ControllerParams for OmsParams {
         ParamWrite::Handled(set)
     }
 
+    /// C `omsBaseController::readInt32` (omsBaseController.cpp:225-254):
+    /// the position, and an encoder axis's encoder position, read from the
+    /// controller.
+    fn read_int32(&mut self, base: &mut PortDriverBase, user: AxisUser<'_>) -> AsynResult<i32> {
+        let Some(axis) = self.axis(user) else {
+            return Err(oms_err("oms: no axis at this address"));
+        };
+        let query = match user.reason {
+            index::POSITION => "RP",
+            index::ENCODER_POSITION => {
+                if base.get_int32_param(HAS_ENCODER, axis).unwrap_or(0) == 0 {
+                    // C answers asynSuccess without touching *value; the
+                    // stored encoder position stands in for that value.
+                    return Ok(base.get_float64_param(index::ENCODER_POSITION, axis)? as i32);
+                }
+                "RE"
+            }
+            _ => return base.read_int32_param(user.asyn()),
+        };
+        let Some(controller) = self.state.controller.get() else {
+            return Err(oms_err("oms: controller not connected"));
+        };
+        // C ignores sendReceiveReplace's status and converts whatever
+        // inputBuffer holds.
+        let (reply, _) = controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send_receive_buffer(&format!("A{} {query}", AXIS_CHARS[axis as usize]));
+        Ok(atol(&reply) as i32)
+    }
+
     fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
         Some(Arc::new(OmsWriteHook))
     }
@@ -376,9 +410,6 @@ impl ControllerParams for OmsParams {
     /// dereferences a null `pAxes` on a controller whose Init failed; here
     /// it has no axis lines.
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
-        // MOTOR_STATUS_HAS_ENCODER, MSTA bit 8.
-        const HAS_ENCODER: usize = index::STATUS_DIRECTION + 8;
-
         let fw = self.state.fw.get().copied().unwrap_or_default();
         let axes = self.state.axes.get();
         let _ = writeln!(
