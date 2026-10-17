@@ -257,6 +257,7 @@ pub fn smc100_create_controller_command() -> CommandDef {
                     handle,
                     (axis + 1) as u8,
                     step_size,
+                    MotorTrace::new(&port_name, axis),
                 )));
                 // SMC100Axis::report (SMC100Driver.cpp:150-159).
                 let report = Arc::new(AxisLines(move |out: &mut dyn Write, level| {
