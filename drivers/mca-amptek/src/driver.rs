@@ -1202,7 +1202,7 @@ impl PortDriver for AmptekDriver {
 
     /// `drvAmptek::readOption` (`drvAmptek.cpp:200-219`): only `"hostInfo"`
     /// is recognized.
-    fn get_option(&self, key: &str) -> AsynResult<String> {
+    fn get_option(&self, _user: &AsynUser, key: &str) -> AsynResult<String> {
         if key.eq_ignore_ascii_case("hostInfo") {
             // glibc's `%s` of C's NULL `addressInfo_`.
             Ok(self.address_info.clone().unwrap_or_else(|| "(null)".into()))
@@ -1896,11 +1896,17 @@ mod tests {
         );
         assert!(driver.base.is_connected());
         assert_eq!(err_message(&connect(&mut driver).unwrap_err()), "");
-        assert_eq!(driver.get_option("hostInfo").unwrap(), "(null)");
+        assert_eq!(
+            driver.get_option(&AsynUser::new(0), "hostInfo").unwrap(),
+            "(null)"
+        );
         driver
             .set_option(&mut AsynUser::new(0), "hostInfo", "192.168.0.2")
             .unwrap();
-        assert_eq!(driver.get_option("hostInfo").unwrap(), "192.168.0.2");
+        assert_eq!(
+            driver.get_option(&AsynUser::new(0), "hostInfo").unwrap(),
+            "192.168.0.2"
+        );
     }
 
     /// C's port is connected by the base asynPortDriver::connect at
