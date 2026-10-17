@@ -1,19 +1,27 @@
-//! drvMotorAsyn.c's asyn write interfaces on a model-2 port: the int32 and
-//! float64 writes a record makes through
+//! drvMotorAsyn.c's asyn interfaces on a model-2 port: the int32,
+//! uint32Digital and float64 reads and writes a record makes through
 //! `@asyn(port,axis)MOTOR_*`, which reach the driver's move, home and stop
-//! or its `motorAxisSetInteger`/`motorAxisSetDouble`.
+//! or its `motorAxisGet*`/`motorAxisSet*`, and `intCallback`, which turns
+//! the driver's parameter callbacks into the port's interrupts.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::SystemTime;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interrupt::{InterruptManager, InterruptValue};
 use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::motor::poll_loop::PollCommand;
+
+use crate::param_lib::Params;
 
 /// `motorAxisParam_t` (motor_interface.h:301-333): the functions a driver's
 /// [`DrvSet`] takes.
@@ -27,6 +35,23 @@ pub mod function {
     pub const I_GAIN: i32 = 6;
     pub const D_GAIN: i32 = 7;
     pub const CLOSED_LOOP: i32 = 8;
+    pub const ENCODER_POSN: i32 = 9;
+    pub const ACTUAL_VEL: i32 = 10;
+    pub const DIRECTION: i32 = 11;
+    pub const DONE: i32 = 12;
+    pub const HIGH_HARD_LIMIT: i32 = 13;
+    pub const HOME_SIGNAL: i32 = 14;
+    pub const SLIP: i32 = 15;
+    pub const POWER_ON: i32 = 16;
+    pub const FOLLOWING_ERROR: i32 = 17;
+    pub const HOME_ENCODER: i32 = 18;
+    pub const HAS_ENCODER: i32 = 19;
+    pub const PROBLEM: i32 = 20;
+    pub const MOVING: i32 = 21;
+    pub const HAS_CLOSED_LOOP: i32 = 22;
+    pub const COMM_ERROR: i32 = 23;
+    pub const LOW_HARD_LIMIT: i32 = 24;
+    pub const HOMED: i32 = 25;
     pub const DEFER_MOVES: i32 = 26;
     pub const MOVE_TO_HOME: i32 = 27;
 }
@@ -36,6 +61,30 @@ pub mod function {
 pub trait DrvSet: Send {
     fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()>;
     fn set_double(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()>;
+}
+
+/// The driver's `motorAxisGetInteger`/`motorAxisGetDouble` and
+/// `motorAxisSetCallback`: the axis' [`Params`], which a driver overrides for
+/// a value it keeps elsewhere. `None` is a parameter the driver never set,
+/// whose read C leaves untouched. It is called from the parameter callback,
+/// so it must not take the axis' own lock.
+pub trait DrvGet: Send + Sync {
+    fn params(&self) -> &Params;
+
+    fn get_integer(&self, function: i32) -> Option<i32> {
+        self.params().get_integer(function).ok().flatten()
+    }
+
+    fn get_double(&self, function: i32) -> Option<f64> {
+        self.params().get_double(function).ok().flatten()
+    }
+}
+
+/// A driver whose getters are its paramLib store alone.
+impl DrvGet for Params {
+    fn params(&self) -> &Params {
+        self
+    }
 }
 
 // drvMotorAsyn.c's `motorCommand` beyond the parameters (:101-106).
@@ -109,27 +158,52 @@ pub(crate) struct Axis {
     pub motor: Arc<Mutex<dyn AsynMotor>>,
     /// `None` for a driver whose port has not registered its setters.
     pub setter: Option<Arc<Mutex<dyn DrvSet>>>,
+    /// `None` for a driver whose port has not registered its getters.
+    getter: Option<Arc<dyn DrvGet>>,
     /// The axis' poller, which the driver's own task stands for in C.
     pub poller: mpsc::Sender<PollCommand>,
     max_velocity: f64,
     min_velocity: f64,
     accel: f64,
+    /// `status.status`, the MSTA-ordered bits `intCallback` keeps.
+    status: Arc<AtomicU32>,
 }
 
 impl Axis {
     pub fn new(
         motor: Arc<Mutex<dyn AsynMotor>>,
         setter: Option<Arc<Mutex<dyn DrvSet>>>,
+        getter: Option<Arc<dyn DrvGet>>,
         poller: mpsc::Sender<PollCommand>,
     ) -> Self {
         Self {
             motor,
             setter,
+            getter,
             poller,
             max_velocity: 0.0,
             min_velocity: 0.0,
             accel: 0.0,
+            status: Arc::default(),
         }
+    }
+
+    fn getter(&self, what: &str, command: usize) -> AsynResult<&Arc<dyn DrvGet>> {
+        self.getter.as_ref().ok_or_else(|| {
+            refuse(format!(
+                "drvMotorAsyn::{what} driver has no getter for reason={command}"
+            ))
+        })
+    }
+
+    /// C's `getInteger` into a caller's value it leaves untouched for an
+    /// undefined or out-of-range parameter; that value is 0 here.
+    fn get_integer(&self, what: &str, command: usize) -> AsynResult<i32> {
+        let getter = self.getter(what, command)?;
+        Ok(i32::try_from(command)
+            .ok()
+            .and_then(|f| getter.get_integer(f))
+            .unwrap_or(0))
     }
 
     fn setter(&self, what: &str, command: usize) -> AsynResult<&Arc<Mutex<dyn DrvSet>>> {
@@ -151,6 +225,70 @@ impl Axis {
     }
 }
 
+/// C `intCallback` (drvMotorAsyn.c:822-920) for the axis at `addr`: fold
+/// the changed status bits into `status`, then call back the float64
+/// clients of each changed parameter and the int32 clients of each changed
+/// status bit, of `MOTOR_STATUS`, and of every other reason. A value goes
+/// only to the clients of its reason and interface, which is C's walk of
+/// each interface's list. C's genericPointer clients are the motor record's
+/// devMotorAsyn, which here reads the axis itself.
+fn int_callback(
+    interrupts: &InterruptManager,
+    getter: &dyn DrvGet,
+    addr: i32,
+    status: &AtomicU32,
+    changed: &[i32],
+) {
+    let bits = function::DIRECTION..=function::HOMED;
+    for &c in changed.iter().filter(|c| bits.contains(c)) {
+        let bit = 1u32 << (c - function::DIRECTION);
+        if getter.get_integer(c).unwrap_or(0) != 0 {
+            status.fetch_or(bit, Ordering::Relaxed);
+        } else {
+            status.fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
+    let fire = |iface, reason: usize, value| {
+        interrupts.notify(InterruptValue {
+            reason,
+            addr,
+            value,
+            timestamp: SystemTime::now(),
+            iface: Some(iface),
+            ..InterruptValue::default()
+        })
+    };
+    for &c in changed {
+        let value = getter.get_double(c).unwrap_or(0.0);
+        fire(
+            InterfaceType::Float64,
+            c as usize,
+            ParamValue::Float64(value),
+        );
+    }
+    for &c in changed.iter().filter(|c| bits.contains(c)) {
+        let value = getter.get_integer(c).unwrap_or(0);
+        fire(InterfaceType::Int32, c as usize, ParamValue::Int32(value));
+    }
+    let word = status.load(Ordering::Relaxed) as i32;
+    fire(InterfaceType::Int32, STATUS, ParamValue::Int32(word));
+    // Every other int32 client, changed or not. C sends its uninitialised
+    // `ivalue` for a reason past the store (:905-909); here 0.
+    for (reason, _) in interrupts
+        .subscribed_bindings()
+        .into_iter()
+        .filter(|&(r, a)| a == addr && r != STATUS)
+    {
+        let Ok(function) = i32::try_from(reason) else {
+            continue;
+        };
+        if !bits.contains(&function) {
+            let value = getter.get_integer(function).unwrap_or(0);
+            fire(InterfaceType::Int32, reason, ParamValue::Int32(value));
+        }
+    }
+}
+
 /// The `drvAsynMotorConfigure` port: C `drvmotorPvt`.
 pub(crate) struct DrvMotorAsyn {
     base: PortDriverBase,
@@ -160,7 +298,8 @@ pub(crate) struct DrvMotorAsyn {
 
 impl DrvMotorAsyn {
     /// C registers the port `ASYN_MULTIDEVICE | ASYN_CANBLOCK`
-    /// (drvMotorAsyn.c:313-317).
+    /// (drvMotorAsyn.c:313-317), then gives each opened axis `intCallback`
+    /// (:411).
     pub fn new(port_name: &str, axes: Vec<Option<Axis>>) -> Self {
         let base = PortDriverBase::new_exact_flags(
             port_name,
@@ -171,6 +310,29 @@ impl DrvMotorAsyn {
                 destructible: false,
             },
         );
+        for (addr, axis) in axes.iter().enumerate() {
+            let Some(Axis {
+                getter: Some(getter),
+                status,
+                ..
+            }) = axis
+            else {
+                continue;
+            };
+            let interrupts = InterruptManager::from_shared_state(base.interrupts.shared_state());
+            // The store holds its callback, so the callback holds the getter
+            // weakly.
+            let weak: Weak<dyn DrvGet> = Arc::downgrade(getter);
+            let status = status.clone();
+            let addr = addr as i32;
+            getter
+                .params()
+                .set_callback(Arc::new(move |changed: &[i32]| {
+                    if let Some(getter) = weak.upgrade() {
+                        int_callback(&interrupts, &*getter, addr, &status, changed);
+                    }
+                }));
+        }
         Self { base, axes }
     }
 
@@ -238,6 +400,106 @@ impl PortDriver for DrvMotorAsyn {
             format_args!("drvMotorAsyn::drvUserCreate, command={name}\n"),
         );
         Ok(DrvUserInfo::from_reason(reason))
+    }
+
+    /// C `readInt32` (drvMotorAsyn.c:439-482).
+    fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+        let command = user.reason;
+        let axis = self.axis(user, "readInt32")?;
+        let value = match command {
+            STATUS => axis.status.load(Ordering::Relaxed) as i32,
+            _ => axis.get_integer("readInt32", command)?,
+        };
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("drvMotorAsyn::readInt32, reason={command}, value={value}\n"),
+        );
+        Ok(value)
+    }
+
+    /// C `readUInt32Digital` (drvMotorAsyn.c:484-522), whose errors name
+    /// readInt32.
+    fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
+        let command = user.reason;
+        let axis = self.axis(user, "readInt32")?;
+        let value = axis.get_integer("readUInt32Digital", command)? as u32 & mask;
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!(
+                "drvMotorAsyn::readUInt32Digital, reason={command}, value={}\n",
+                value as i32
+            ),
+        );
+        Ok(value)
+    }
+
+    /// C `readFloat64` (drvMotorAsyn.c:524-574).
+    fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+        let command = user.reason;
+        let axis = self.axis(user, "readFloat64")?;
+        let value = match command {
+            VELOCITY => axis.max_velocity,
+            VEL_BASE => axis.min_velocity,
+            ACCEL => axis.accel,
+            _ => {
+                let getter = axis.getter("readFloat64", command)?;
+                i32::try_from(command)
+                    .ok()
+                    .and_then(|f| getter.get_double(f))
+                    .unwrap_or(0.0)
+            }
+        };
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!(
+                "drvMotorAsyn::readFloat64, reason={command}, value={}\n",
+                CFloat(value)
+            ),
+        );
+        Ok(value)
+    }
+
+    /// C `getBounds` (drvMotorAsyn.c:566-574).
+    fn get_bounds_int32(&self, user: &AsynUser) -> AsynResult<(i32, i32)> {
+        let (low, high) = (0, 65535);
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("drvMotorAsyn::getBounds,low={low}, high={high}\n"),
+        );
+        Ok((low, high))
+    }
+
+    /// C `writeUInt32Digital` (drvMotorAsyn.c:631-672): the masked bits into
+    /// the driver's value, whose errors name writeInt32.
+    fn write_uint32_digital(
+        &mut self,
+        user: &mut AsynUser,
+        value: u32,
+        mask: u32,
+    ) -> AsynResult<()> {
+        let command = user.reason;
+        let axis = self.axis(user, "writeInt32")?;
+        let old = axis.get_integer("writeUInt32Digital", command)? as u32;
+        let temp = (old & !mask) | (value & mask);
+        let status = axis.set_integer(user, command, temp as i32);
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!(
+                "drvMotorAsyn::writeUInt32Digital, reason={command}, value={}\n",
+                temp as i32
+            ),
+        );
+        status
     }
 
     /// C `writeInt32` (drvMotorAsyn.c:576-629).

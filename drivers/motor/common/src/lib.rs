@@ -30,6 +30,7 @@ pub mod drv_motor_asyn;
 pub mod iocsh;
 pub mod model1;
 pub mod model2;
+pub mod param_lib;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod util;

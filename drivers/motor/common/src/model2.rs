@@ -14,7 +14,7 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::device_state::Model2Params;
 use epics_rs::motor::devices::{model2_params, motor_interface_params};
 
-use crate::drv_motor_asyn::{Axis, DrvMotorAsyn, DrvSet};
+use crate::drv_motor_asyn::{Axis, DrvGet, DrvMotorAsyn, DrvSet};
 use crate::iocsh::{arg_int_req, arg_str_req};
 use crate::model1::c_int;
 use crate::{Controller, TraceUser, register_drv_motor_asyn_port};
@@ -29,6 +29,7 @@ struct Card {
     /// The drvAsynMotorConfigure ports that opened the card.
     ports: Vec<String>,
     setters: Vec<Arc<Mutex<dyn DrvSet>>>,
+    getters: Vec<Arc<dyn DrvGet>>,
 }
 
 /// The `print`/`logParam` pair a driver keeps for an axis, or for itself,
@@ -163,6 +164,7 @@ impl Model2 {
             logs: Vec::new(),
             ports: Vec::new(),
             setters: Vec::new(),
+            getters: Vec::new(),
         });
     }
 
@@ -181,6 +183,7 @@ impl Model2 {
             logs: Vec::new(),
             ports: Vec::new(),
             setters: Vec::new(),
+            getters: Vec::new(),
         });
     }
 
@@ -201,6 +204,22 @@ impl Model2 {
         if let Some(c) = cards.iter_mut().find(|c| c.card == card) {
             c.setters = setters;
         }
+    }
+
+    /// The `motorAxisGet*`/`motorAxisSetCallback` of each of `card`'s axes,
+    /// by axis, for the port's reads and interrupts; set after
+    /// `set_card`/`set_card_on`.
+    pub fn set_axis_getters(&self, card: i32, getters: Vec<Arc<dyn DrvGet>>) {
+        let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cards.iter_mut().find(|c| c.card == card) {
+            c.getters = getters;
+        }
+    }
+
+    fn axis_getter(&self, card: i32, axis: i32) -> Option<Arc<dyn DrvGet>> {
+        let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
+        let card = cards.iter().find(|c| c.card == card)?;
+        card.getters.get(usize::try_from(axis).ok()?).cloned()
     }
 
     fn axis_setter(&self, card: i32, axis: i32) -> Option<Arc<Mutex<dyn DrvSet>>> {
@@ -326,6 +345,7 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                 axes.push(Some(Axis::new(
                     motor,
                     driver.axis_setter(card, addr),
+                    driver.axis_getter(card, addr),
                     wakeup,
                 )));
                 if let Some(log) = driver.axis_log(card, addr) {
@@ -705,5 +725,172 @@ mod asyn_writes {
         ] {
             assert!(text.contains(line), "{line:?} not in {text}");
         }
+    }
+}
+
+#[cfg(all(test, feature = "testing", target_os = "linux"))]
+mod asyn_reads {
+    use super::*;
+    use crate::drv_motor_asyn::function;
+    use crate::param_lib::Params;
+    use crate::testing::run_command;
+    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::interfaces::motor::{MotorStatus, PollFailure};
+    use epics_rs::asyn::interrupt::{InterruptFilter, InterruptReceiver, InterruptValue};
+    use epics_rs::asyn::param::ParamValue;
+    use epics_rs::asyn::user::AsynUser;
+
+    /// A drvMotorSim-shaped axis: its sets go into its paramLib store and
+    /// run the callback (drvMotorSim.c:366-367, :426-427).
+    struct Stored(Arc<Params>);
+
+    impl AsynMotor for Stored {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            Ok(MotorStatus::default())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::NONE
+        }
+    }
+
+    impl DrvSet for Stored {
+        fn set_integer(&mut self, _: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+            let _ = self.0.set_integer(function, value);
+            self.0.call_callback();
+            Ok(())
+        }
+        fn set_double(&mut self, _: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+            let _ = self.0.set_double(function, value);
+            self.0.call_callback();
+            Ok(())
+        }
+    }
+
+    /// The value already in `rx`'s mailbox, without waiting.
+    fn now(rx: &mut InterruptReceiver) -> Option<InterruptValue> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(rx.recv()).poll(&mut cx) {
+            std::task::Poll::Ready(v) => v,
+            std::task::Poll::Pending => None,
+        }
+    }
+
+    use std::future::Future;
+
+    static READ: Model2 = Model2::new("read", 0);
+
+    /// drvMotorAsyn.c:439-574, :631-672, :822-920: the port reads the
+    /// driver's parameters and the velocities written to it, folds the
+    /// status bits into MOTOR_STATUS, read-modify-writes a uint32Digital
+    /// write, and turns each callback into the interrupts of what changed.
+    #[epics_rs::base::epics_test]
+    async fn the_port_reads_the_driver_and_calls_back_what_changed() {
+        let params = Arc::new(Params::default());
+        let axis = Arc::new(Mutex::new(Stored(params.clone())));
+        READ.set_card(0, vec![axis.clone()], 100, 1000);
+        READ.set_axis_setters(0, vec![axis]);
+        READ.set_axis_getters(0, vec![params.clone()]);
+        let args = vec![
+            ArgValue::String("readPort".into()),
+            ArgValue::String("read".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(1),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&READ]), args).await;
+        let port = PortManager::global().find_port_handle("readPort").unwrap();
+        let subscribe = |reason: usize, iface| {
+            port.interrupts().register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    iface: Some(iface),
+                    ..InterruptFilter::default()
+                },
+                0,
+            )
+        };
+        let (_p, mut position) = subscribe(0, InterfaceType::Float64);
+        let (_d, mut done) = subscribe(12, InterfaceType::Int32);
+        let (_s, mut status) = subscribe(108, InterfaceType::Int32);
+        let (_g, mut gain) = subscribe(5, InterfaceType::Int32);
+
+        // The driver's poll.
+        params.set_double(function::POSITION, 2.5).unwrap();
+        params.set_integer(function::DONE, 1).unwrap();
+        params.call_callback();
+        let value = |rx: &mut InterruptReceiver| now(rx).map(|v| v.value);
+        assert!(matches!(value(&mut position), Some(ParamValue::Float64(v)) if v == 2.5));
+        assert!(matches!(value(&mut done), Some(ParamValue::Int32(1))));
+        assert!(matches!(value(&mut status), Some(ParamValue::Int32(2))));
+        // An undefined parameter's client is called back too.
+        assert!(matches!(value(&mut gain), Some(ParamValue::Int32(0))));
+        params.call_callback();
+        assert!(value(&mut done).is_none());
+
+        let reads = std::thread::spawn({
+            let port = port.clone();
+            move || {
+                port.write_float64_blocking(100, 0, 3.0).unwrap();
+                port.write_float64_blocking(5, 0, 0.75).unwrap();
+                (
+                    port.read_int32_blocking(12, 0).unwrap(),
+                    port.read_int32_blocking(108, 0).unwrap(),
+                    port.read_float64_blocking(0, 0).unwrap(),
+                    port.read_float64_blocking(100, 0).unwrap(),
+                    port.read_float64_blocking(5, 0).unwrap(),
+                    port.read_int32_blocking(0, 0).unwrap(),
+                    port.read_int32_blocking(13, 0).unwrap(),
+                    port.get_bounds_int32_blocking(12, 0).unwrap(),
+                    port.read_int32_blocking(12, 1)
+                        .unwrap_err()
+                        .message()
+                        .to_string(),
+                )
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            reads,
+            (
+                1,
+                2,
+                2.5,
+                3.0,
+                0.75,
+                3,
+                0,
+                (0, 65535),
+                "drvMotorAsyn::readInt32 Invalid axis 1".to_string()
+            )
+        );
+        assert!(matches!(value(&mut gain), Some(ParamValue::Int32(1))));
+
+        params.set_integer(function::DEFER_MOVES, 1).unwrap();
+        port.write_uint32_digital(26, 0, 0b110, 0b010)
+            .await
+            .unwrap();
+        assert_eq!(params.get_integer(function::DEFER_MOVES), Ok(Some(3)));
+        assert_eq!(port.read_uint32_digital(26, 0, 0b101).await.unwrap(), 1);
     }
 }
