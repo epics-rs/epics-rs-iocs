@@ -22,11 +22,18 @@
 //! - The post-move delay (`motorPostMoveDelay_`) is owned by the record layer
 //!   in this stack, so the axis reports `done` as soon as it stops.
 
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, StatusWrite};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use motor_common::drv_motor_asyn::{DrvSet, function};
+use motor_common::model2::AxisLog;
 
 use crate::route::{Demand, Reroute, Route};
 
@@ -251,6 +258,21 @@ impl MotorSimAxis {
         self.last_status = self.snapshot(done);
     }
 
+    /// processDeferredMoves for this axis: take up its deferred move unless
+    /// that pushes past a hard limit; whether it did.
+    fn release_deferred(&mut self) -> bool {
+        let position = self.deferred_position;
+        let blocked = (self.nextpoint.p >= self.hi_hard_limit && position > self.nextpoint.p)
+            || (self.nextpoint.p <= self.low_hard_limit && position < self.nextpoint.p);
+        if !self.deferred_move || blocked {
+            return false;
+        }
+        self.endpoint.p = position - self.enc_offset;
+        self.endpoint.v = 0.0;
+        self.deferred_move = false;
+        true
+    }
+
     /// Build the reported [`MotorStatus`] from the current point (C's
     /// `setDoubleParam`/`setIntegerParam` block at the end of `process`).
     fn snapshot(&self, done: bool) -> MotorStatus {
@@ -345,15 +367,8 @@ impl AsynMotor for MotorSimAxis {
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
         self.advance(Instant::now());
         // C processDeferredMoves, reduced to this axis (module Deviations).
-        if !defer && self.moves_deferred && self.deferred_move {
-            let position = self.deferred_position;
-            let blocked = (self.nextpoint.p >= self.hi_hard_limit && position > self.nextpoint.p)
-                || (self.nextpoint.p <= self.low_hard_limit && position < self.nextpoint.p);
-            if !blocked {
-                self.endpoint.p = position - self.enc_offset;
-                self.endpoint.v = 0.0;
-                self.deferred_move = false;
-            }
+        if !defer && self.moves_deferred {
+            self.release_deferred();
         }
         self.moves_deferred = defer;
         Ok(())
@@ -365,6 +380,34 @@ impl AsynMotor for MotorSimAxis {
     }
 }
 
+/// C `motorSimLogMsg`, drvMotorSim's print until drvAsynMotorConfigure
+/// sets another: stdout and a newline, whatever the mask.
+pub fn sim_log(_: TraceMask, args: std::fmt::Arguments<'_>) {
+    println!("{args}");
+}
+
+/// drvMotorSim's `drv.movesDeferred`, one flag for every axis, and the
+/// number of times it was cleared with moves deferred, each of which runs
+/// processDeferredMoves over the axes. An axis takes up a release on its
+/// next call, which the poller makes within `DELTA`, as C's motorProcTask
+/// only moves it then.
+#[derive(Debug, Default)]
+pub struct Deferral(Mutex<(bool, u64)>);
+
+impl Deferral {
+    fn get(&self) -> (bool, u64) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set(&self, defer: bool) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !defer && state.0 {
+            state.1 += 1;
+        }
+        state.0 = defer;
+    }
+}
+
 /// An axis of drvMotorSim.c, the model-2 simulator `motorSimCreate` builds
 /// for `DTYP "Motor Simulation"`: the same trajectory as [`MotorSimAxis`],
 /// reported through its motorAxis status bits, where the home sensor is
@@ -372,16 +415,35 @@ impl AsynMotor for MotorSimAxis {
 pub struct DrvMotorSimAxis {
     axis: MotorSimAxis,
     writes: Vec<StatusWrite>,
+    card: i32,
+    signal: i32,
+    log: Arc<AxisLog>,
+    deferral: Arc<Deferral>,
+    /// The releases of `deferral` this axis has taken up.
+    releases: u64,
 }
 
 impl DrvMotorSimAxis {
-    /// `motorSimCreateAxis(..., lowLimit, hiLimit, home, start)`, which
-    /// overwrites `start` with 0 before using it and sets it as the
+    /// `motorSimCreateAxis(card, axis, lowLimit, hiLimit, home, start)`,
+    /// which overwrites `start` with 0 before using it and sets it as the
     /// paramLib's Position (drvMotorSim.c:739).
-    pub fn new(low_hard_limit: f64, hi_hard_limit: f64, home: f64) -> Self {
+    pub fn new(
+        card: i32,
+        signal: i32,
+        low_hard_limit: f64,
+        hi_hard_limit: f64,
+        home: f64,
+        deferral: Arc<Deferral>,
+    ) -> Self {
+        let releases = deferral.get().1;
         Self {
             axis: MotorSimAxis::new(low_hard_limit, hi_hard_limit, home, DEFAULT_START),
             writes: vec![StatusWrite::Position(DEFAULT_START)],
+            card,
+            signal,
+            log: Arc::new(AxisLog::with_own(sim_log)),
+            deferral,
+            releases,
         }
     }
 
@@ -411,10 +473,83 @@ impl DrvMotorSimAxis {
         }
     }
 
+    /// The axis' `print`/`logParam`, which drvAsynMotorConfigure sets.
+    pub fn log(&self) -> Arc<AxisLog> {
+        self.log.clone()
+    }
+
+    fn flow(&self, args: std::fmt::Arguments<'_>) {
+        self.log.print(TraceMask::FLOW, args);
+    }
+
     /// `motorParam->setInteger(motorAxisDone, 0)` + `callCallback`, which
     /// drvMotorSim.c's move, home and velocity move post before returning.
     fn started(&mut self) {
         self.writes.push(StatusWrite::Done(false));
+    }
+
+    /// The driver's deferral as of now: a release since the last call
+    /// first moves the axis to its deferred position, setting Done 0 as
+    /// processDeferredMoves does. C returns at the first axis a hard limit
+    /// blocks, leaving every later axis deferred (drvMotorSim.c:274); here
+    /// each axis is released on its own.
+    fn sync(&mut self) {
+        let (deferred, releases) = self.deferral.get();
+        if releases != self.releases {
+            self.releases = releases;
+            self.axis.advance(Instant::now());
+            if self.axis.release_deferred() {
+                self.started();
+            }
+        }
+        self.axis.moves_deferred = deferred;
+    }
+
+    /// C motorAxisDeferMoves in setDouble/setInteger (drvMotorSim.c:351-357,
+    /// :409-416). C stores `(int)value`, so a fraction clears the flag
+    /// without releasing the moves (:357); here any nonzero value defers.
+    fn defer(&mut self, defer: bool) {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "{}ing Deferred Move flag on PMAC card {}\n",
+                if defer { "Sett" } else { "Clear" },
+                self.card
+            ),
+        );
+        self.deferral.set(defer);
+        self.sync();
+    }
+
+    fn move_to(
+        &mut self,
+        position: f64,
+        relative: bool,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        self.sync();
+        self.axis.advance(Instant::now());
+        // C prints the absolute target (drvMotorSim.c:440).
+        let target = if relative {
+            position + self.axis.endpoint.p + self.axis.enc_offset
+        } else {
+            position
+        };
+        self.axis
+            .do_move(position, relative, velocity, acceleration)?;
+        self.started();
+        self.flow(format_args!(
+            "Set card {}, axis {} move to {}, min vel={}, max_vel={}, accel={}",
+            self.card,
+            self.signal,
+            CFloat(target),
+            CFloat(min_velocity),
+            CFloat(velocity),
+            CFloat(acceleration)
+        ));
+        Ok(())
     }
 }
 
@@ -426,30 +561,24 @@ impl AsynMotor for DrvMotorSimAxis {
 
     fn move_absolute(
         &mut self,
-        user: &AsynUser,
+        _user: &AsynUser,
         position: f64,
         min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.axis
-            .move_absolute(user, position, min_velocity, velocity, acceleration)?;
-        self.started();
-        Ok(())
+        self.move_to(position, false, min_velocity, velocity, acceleration)
     }
 
     fn move_relative(
         &mut self,
-        user: &AsynUser,
+        _user: &AsynUser,
         distance: f64,
         min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.axis
-            .move_relative(user, distance, min_velocity, velocity, acceleration)?;
-        self.started();
-        Ok(())
+        self.move_to(distance, true, min_velocity, velocity, acceleration)
     }
 
     fn move_velocity(
@@ -459,10 +588,18 @@ impl AsynMotor for DrvMotorSimAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.sync();
         let status = self
             .axis
             .move_velocity(user, min_velocity, velocity, acceleration);
         self.started();
+        self.flow(format_args!(
+            "Set card {}, axis {} move with velocity of {}, accel={}",
+            self.card,
+            self.signal,
+            CFloat(velocity),
+            CFloat(acceleration)
+        ));
         status
     }
 
@@ -474,22 +611,104 @@ impl AsynMotor for DrvMotorSimAxis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
+        self.sync();
         let status = self
             .axis
             .home(user, min_velocity, velocity, acceleration, forward);
         self.started();
+        self.flow(format_args!(
+            "Set card {}, axis {} to home {}, min vel={}, max_vel={}, accel={}",
+            self.card,
+            self.signal,
+            if forward { "FORWARDS" } else { "REVERSE" },
+            CFloat(min_velocity),
+            CFloat(velocity),
+            CFloat(acceleration)
+        ));
         status
     }
 
     fn stop(&mut self, user: &AsynUser, acceleration: f64) -> AsynResult<()> {
-        self.axis.stop(user, acceleration)
+        self.sync();
+        self.axis.stop(user, acceleration)?;
+        self.flow(format_args!(
+            "Set card {}, axis {} to stop with accel={}",
+            self.card,
+            self.signal,
+            CFloat(acceleration)
+        ));
+        Ok(())
     }
 
     fn set_position(&mut self, user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.axis.set_position(user, position)
+        self.sync();
+        self.axis.set_position(user, position)?;
+        self.flow(format_args!(
+            "Set card {}, axis {} to position {}",
+            self.card,
+            self.signal,
+            CFloat(position)
+        ));
+        Ok(())
+    }
+
+    fn set_encoder_ratio(&mut self, _user: &AsynUser, ratio: f64) -> AsynResult<()> {
+        self.flow(format_args!(
+            "Set card {}, axis {} to enc. ratio to {}",
+            self.card,
+            self.signal,
+            CFloat(ratio)
+        ));
+        Ok(())
+    }
+
+    fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.flow(format_args!(
+            "Set card {}, axis {} low limit to {}",
+            self.card,
+            self.signal,
+            CFloat(position)
+        ));
+        Ok(())
+    }
+
+    fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.flow(format_args!(
+            "Set card {}, axis {} high limit to {}",
+            self.card,
+            self.signal,
+            CFloat(position)
+        ));
+        Ok(())
+    }
+
+    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
+        let which = match kind {
+            PidGainKind::Proportional => "p",
+            PidGainKind::Integral => "i",
+            PidGainKind::Derivative => "d",
+        };
+        self.flow(format_args!(
+            "Set card {}, axis {} {which}gain to {}",
+            self.card,
+            self.signal,
+            CFloat(gain)
+        ));
+        Ok(())
+    }
+
+    fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
+        self.flow(format_args!(
+            "Set card {}, axis {} closed loop to {}",
+            self.card,
+            self.signal,
+            if enable { "ON" } else { "OFF" }
+        ));
+        Ok(())
     }
 
     fn poll(&mut self, user: &AsynUser) -> AsynResult<MotorStatus> {
+        self.sync();
         let status = self.axis.poll(user)?;
         // motorSimProcess's paramLib sets (drvMotorSim.c:646-653).
         self.writes.extend([
@@ -512,6 +731,61 @@ impl AsynMotor for DrvMotorSimAxis {
 
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
         std::mem::take(&mut self.writes)
+    }
+}
+
+/// C `motorAxisSetDouble`/`motorAxisSetInteger` (drvMotorSim.c:292-432):
+/// each function they know prints its FLOW line and succeeds; any other
+/// fails with none.
+impl DrvSet for DrvMotorSimAxis {
+    fn set_double(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+        match function {
+            function::POSITION => self.set_position(user, value),
+            function::RESOLUTION => {
+                self.flow(format_args!(
+                    "Set card {}, axis {} resolution to {}",
+                    self.card,
+                    self.signal,
+                    CFloat(value)
+                ));
+                Ok(())
+            }
+            function::ENCODER_RATIO => self.set_encoder_ratio(user, value),
+            function::LOW_LIMIT => self.set_low_limit(user, value),
+            function::HIGH_LIMIT => self.set_high_limit(user, value),
+            function::P_GAIN => self.set_pid_gain(user, PidGainKind::Proportional, value),
+            function::I_GAIN => self.set_pid_gain(user, PidGainKind::Integral, value),
+            function::D_GAIN => self.set_pid_gain(user, PidGainKind::Derivative, value),
+            function::CLOSED_LOOP => self.set_closed_loop(user, value != 0.0),
+            function::DEFER_MOVES => {
+                self.defer(value != 0.0);
+                Ok(())
+            }
+            _ => Err(sim_err(format!("motorSim: no double function {function}"))),
+        }
+    }
+
+    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+        let what = match function {
+            function::POSITION => {
+                self.sync();
+                self.axis.set_position(user, f64::from(value))?;
+                "to position"
+            }
+            function::LOW_LIMIT => "low limit to",
+            function::HIGH_LIMIT => "high limit to",
+            function::CLOSED_LOOP => return self.set_closed_loop(user, value != 0),
+            function::DEFER_MOVES => {
+                self.defer(value != 0);
+                return Ok(());
+            }
+            _ => return Err(sim_err(format!("motorSim: no integer function {function}"))),
+        };
+        self.flow(format_args!(
+            "Set card {}, axis {} {what} {value}",
+            self.card, self.signal
+        ));
+        Ok(())
     }
 }
 
@@ -615,7 +889,14 @@ mod tests {
 
     #[test]
     fn drv_motor_sim_reports_home_signal_as_at_home() {
-        let mut axis = DrvMotorSimAxis::new(DEFAULT_LOW_LIMIT, DEFAULT_HI_LIMIT, 0.0);
+        let mut axis = DrvMotorSimAxis::new(
+            0,
+            0,
+            DEFAULT_LOW_LIMIT,
+            DEFAULT_HI_LIMIT,
+            0.0,
+            Arc::default(),
+        );
         axis.axis.process(0.05);
         let status = axis.poll(&user()).unwrap();
         assert!(status.home, "RA_HOME not set at the home position");
@@ -626,7 +907,7 @@ mod tests {
     /// then the eight of each motorSimProcess (:646-653).
     #[test]
     fn drv_motor_sim_sets_its_parameters_at_create_and_each_update() {
-        let mut axis = DrvMotorSimAxis::new(-10.0, 10.0, 0.0);
+        let mut axis = DrvMotorSimAxis::new(0, 0, -10.0, 10.0, 0.0, Arc::default());
         assert_eq!(axis.take_status_writes(), vec![StatusWrite::Position(0.0)]);
         axis.axis.process(0.05);
         axis.poll(&user()).unwrap();
@@ -647,12 +928,59 @@ mod tests {
 
     #[test]
     fn drv_motor_sim_posts_not_done_when_motion_starts() {
-        let mut axis = DrvMotorSimAxis::new(DEFAULT_LOW_LIMIT, DEFAULT_HI_LIMIT, 0.0);
+        let mut axis = DrvMotorSimAxis::new(
+            0,
+            0,
+            DEFAULT_LOW_LIMIT,
+            DEFAULT_HI_LIMIT,
+            0.0,
+            Arc::default(),
+        );
         axis.take_status_writes();
         axis.move_velocity(&user(), 0.0, 1.0, 1.0).unwrap();
         assert_eq!(axis.take_status_writes(), vec![StatusWrite::Done(false)]);
         axis.stop(&user(), 1.0).unwrap();
         assert!(axis.take_status_writes().is_empty());
+    }
+
+    /// drvMotorSim.c:259-287, 351-357: the deferral is the driver's: a move
+    /// on one axis waits until a write to another clears it, and a function
+    /// the driver does not set fails.
+    #[test]
+    fn drv_motor_sim_deferral_is_driver_wide() {
+        let deferral = Arc::new(Deferral::default());
+        let new = |signal| {
+            DrvMotorSimAxis::new(
+                0,
+                signal,
+                DEFAULT_LOW_LIMIT,
+                DEFAULT_HI_LIMIT,
+                0.0,
+                deferral.clone(),
+            )
+        };
+        let (mut a, mut b) = (new(0), new(1));
+        a.set_integer(&user(), function::DEFER_MOVES, 1).unwrap();
+        b.move_absolute(&user(), 4.0, 0.0, 2.0, 1.0).unwrap();
+        for _ in 0..20 {
+            b.axis.process(0.05);
+        }
+        assert!(b.axis.last_status.position.abs() < 1e-6);
+        a.set_double(&user(), function::DEFER_MOVES, 0.0).unwrap();
+        b.poll(&user()).unwrap();
+        assert_eq!(
+            b.take_status_writes()[..3],
+            [
+                StatusWrite::Position(0.0),
+                StatusWrite::Done(false),
+                StatusWrite::Done(false)
+            ]
+        );
+        let (pos, done) = run_to_done(&mut b.axis, 0.05, 1000);
+        assert!(done);
+        assert!((pos - 4.0).abs() < 1e-3, "final position {pos}");
+        assert!(a.set_integer(&user(), 12, 1).is_err());
+        assert!(a.set_double(&user(), function::MOVE_TO_HOME, 1.0).is_err());
     }
 
     #[test]
