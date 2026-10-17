@@ -2059,6 +2059,17 @@ static PM500: Model1 = Model1::new(&DEV_PM500, 4, SCAN_RATE);
 
 /// `PM500Setup(num_cards, scan_rate)`.
 pub fn pm500_setup_command() -> CommandDef {
+    PM500.register_report("drvPM500", |cards| {
+        if cards.num_cards() <= 0 {
+            return "    No PM500 controllers configured.\n".into();
+        }
+        (0..cards.num_cards())
+            .map(|card| match cards.card(card) {
+                Some(line) => format!("    PM500 controller {card} {line} \n"),
+                None => format!("    PM500 controller #{card} connection failed.\n"),
+            })
+            .collect()
+    });
     PM500.setup_command("PM500Setup")
 }
 
@@ -2074,11 +2085,13 @@ pub fn pm500_config_command() -> CommandDef {
             return;
         };
         let num_axes = controller.num_axes();
+        let line = format!("port={port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for index in 0..num_axes {
             let ax = Pm500Axis::new(controller.clone(), index);
             init.axis(index as i32, Arc::new(Mutex::new(ax)));
         }
+        init.describe(line);
     })
 }
 
@@ -3316,6 +3329,38 @@ mod report {
             driver_report("drvMM4000", 0),
             "    MM4000 controller 0, port=mm4000RepLine, address=0, id: MM4005 Version 2.0 \n"
         );
+    }
+
+    /// drvPM500.cc's drvet `report` (drvPM500.cc:163-189), which `dbior`
+    /// runs at every level; `strncpy` keeps 50 bytes of the ident (:584).
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pm500_controller() {
+        use motor_common::testing::{LineRig, driver_report, drvsup_init};
+        let setup = pm500_setup_command();
+        let none = "    No PM500 controllers configured.\n";
+        assert_eq!(driver_report("drvPM500", 0), none);
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let ident = format!("PM500 {}", "v".repeat(50));
+        let svn = format!("XD{ident}");
+        let (_line, _io) = LineRig::new("pm500RepLine", move |last| match last.trim_end() {
+            "SVN?" => svn.clone(),
+            "XSTAT?" => "XB".into(),
+            _ => "YE".into(),
+        });
+        let config = vec![int(1), ArgValue::String("pm500RepLine".into()), int(3)];
+        run_command(pm500_config_command(), config).await;
+        drvsup_init().await;
+        for level in [0, 1, 2] {
+            assert_eq!(
+                driver_report("drvPM500", level),
+                format!(
+                    "    PM500 controller #0 connection failed.\n    PM500 controller 1 \
+                     port=pm500RepLine, address=3, id: {} \n",
+                    &ident[..50]
+                )
+            );
+        }
     }
 
     /// drvESP300.cc:671-676, now at motor_init rather than ESP300Config.
