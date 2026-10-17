@@ -442,10 +442,11 @@ impl AsynMotor for FaulhaberAxis {
         let ls_active = (plus_ls && plusdir) || (minus_ls && !plusdir);
 
         // If an active limit switch stopped motion, hold position with an
-        // absolute move to the current position (C set_status).
+        // absolute move to the current position (C set_status). C's
+        // send_mess status is not checked here or for POST.
         if ls_active {
-            ctrl.write_cmd(self.node, &format!("LA {}", nint(motor_data)))?;
-            ctrl.write_cmd(self.node, "M")?;
+            let _ = ctrl.write_cmd(self.node, &format!("LA {}", nint(motor_data)));
+            let _ = ctrl.write_cmd(self.node, "M");
         }
 
         // Actual velocity → done (reliable across jog and velocity=0 stops).
@@ -454,7 +455,7 @@ impl AsynMotor for FaulhaberAxis {
         if (done || ls_active)
             && let Some(post) = self.strings.post_due()
         {
-            ctrl.write_bytes(self.node, &post)?;
+            let _ = ctrl.write_bytes(self.node, &post);
         }
         drop(ctrl);
 
