@@ -32,6 +32,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, Pol
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::nint;
+use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
 use crate::regs::{ForceRead, ModbusRegs};
 
@@ -120,6 +121,38 @@ impl Ang1Controller {
         // second's status; a failed MSW write does not suppress the LSW write.
         let _ = self.write16(reg, upper);
         self.write16(reg + 1, lower)
+    }
+}
+
+/// The ANG1 controller's poll periods, in seconds, for its report.
+pub struct Ang1Params {
+    pub moving_poll: f64,
+    pub idle_poll: f64,
+}
+
+impl ControllerParams for Ang1Params {
+    /// C `ANG1Controller::report` (ANG1Driver.cpp:127-134).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "ANG1 motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll,
+            self.idle_poll,
+        );
+        ctx.report(out, level);
+    }
+}
+
+/// C `ANG1Axis::report` (ANG1Driver.cpp:313-322) for axis `.0`.
+pub struct Ang1AxisReport(pub i32);
+
+impl AxisReport for Ang1AxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let _ = writeln!(out, "  axis {}", self.0);
+        }
     }
 }
 

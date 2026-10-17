@@ -18,10 +18,10 @@ use epics_rs::motor::trace::MotorTrace;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port, register_port_with};
+use motor_common::{Controller, asyn_user, register_port_with};
 
 use crate::anf2::{Anf2Axis, Anf2AxisReport, Anf2Controller, Anf2Params, MAX_AXES};
-use crate::ang1::{Ang1Axis, Ang1Controller};
+use crate::ang1::{Ang1Axis, Ang1AxisReport, Ang1Controller, Ang1Params};
 
 /// An `ANF2CreateController` controller and its poller, which
 /// `ANF2StartPoller` starts.
@@ -222,7 +222,11 @@ pub fn ang1_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
 
-            register_port(ctx, &port_name, num_axes as i32)?;
+            let params = Ang1Params {
+                moving_poll: moving_poll_ms as f64 / 1000.0,
+                idle_poll: idle_poll_ms as f64 / 1000.0,
+            };
+            register_port_with(ctx, &port_name, num_axes as i32, params)?;
             let (controller, out_status) = Ang1Controller::new(&in_port, &out_port);
             if out_status.is_err() {
                 MotorTrace::new(port_name.clone(), 0).print_self(
@@ -240,7 +244,8 @@ pub fn ang1_create_controller_command() -> CommandDef {
                 // initial setPosition status and never aborts this command.
                 let ax = Ang1Axis::new(controller.clone(), axis as i32);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                poller.install(asyn_user(&port_name, axis as i32), motor)?;
+                let report = Arc::new(Ang1AxisReport(axis as i32));
+                poller.install_with_report(asyn_user(&port_name, axis as i32), motor, report)?;
             }
             // C startPoller, ANG1Driver.cpp:98
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
@@ -341,6 +346,39 @@ mod tests {
         assert!(text.contains(axis0), "{text}");
         assert!(text.contains("Configuration for axis 1 [0x0]:\n"), "{text}");
         assert!(text.ends_with(RULE), "{text}");
+    }
+
+    fn ang1_args(port: &str) -> Vec<ArgValue> {
+        vec![
+            ArgValue::String(port.into()),
+            ArgValue::String(format!("{port}In").into()),
+            ArgValue::String(format!("{port}Out").into()),
+            ArgValue::Int(2),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ]
+    }
+
+    /// C `ANG1Controller::report`, then the base's, which runs each
+    /// `ANG1Axis::report` (ANG1Driver.cpp:127-133, 313-321).
+    #[epics_rs::base::epics_test]
+    async fn the_ang1_report_prints_the_driver_line_then_each_axis_as_c() {
+        let cmd = (ang1_create_controller_command(), ang1_args("ang1Report1"));
+        let text = report_after(vec![cmd], "ang1Report1", 1).await;
+        let want = "ANG1 motor driver ang1Report1, numAxes=2, \
+                    moving poll period=0.100000, idle poll period=1.000000\n  axis 0\n  axis 1\n";
+        assert!(text.contains(want), "{text}");
+    }
+
+    #[epics_rs::base::epics_test]
+    async fn a_level_0_ang1_report_prints_no_axis_line() {
+        let cmd = (ang1_create_controller_command(), ang1_args("ang1Report0"));
+        let text = report_after(vec![cmd], "ang1Report0", 0).await;
+        assert!(
+            text.contains("ANG1 motor driver ang1Report0, numAxes=2, "),
+            "{text}"
+        );
+        assert!(!text.contains("  axis "), "{text}");
     }
 
     #[epics_rs::base::epics_test]
