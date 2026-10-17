@@ -77,7 +77,7 @@ pub fn ims_create_controller_command() -> CommandDef {
             let port =
                 register_controller_port(owner, &motor_port, 1, ImsParams::new(line.clone()))?;
             let mut axis = ImsMDrivePlusAxis::new(line, &motor_port);
-            axis.post_locked_rotor_to(port)
+            axis.post_params_to(port)
                 .map_err(|e| format!("ImsMDrivePlusCreateController: {e}"))?;
 
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
@@ -457,6 +457,35 @@ mod extra_params {
             ],
             "{text}"
         );
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:371-373, ImsMDrivePlusMotorAxis.cpp:
+    /// 494-497: a failed IO sets the controller's addr-0 COMMS_ERROR param,
+    /// not MSTA; a good poll clears it.
+    #[epics_rs::base::epics_test]
+    async fn a_failed_poll_sets_only_the_comms_error_param() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dead = Arc::new(AtomicBool::new(false));
+        let fails = {
+            let dead = dead.clone();
+            move |l: &str| l == "APR P" && dead.load(Ordering::Relaxed)
+        };
+        let (_line, io) = failing_controller("imsComms", "imsCommsLine", fails).await;
+        let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
+        let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
+        let until = |want: i32| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while io.read_int32(comms).unwrap_or(-1) != want {
+                assert!(std::time::Instant::now() < deadline, "comms never {want}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        until(0);
+        dead.store(true, Ordering::Relaxed);
+        until(1);
+        assert_eq!(io.read_int32(msta).unwrap() & 1 << 12, 0);
+        dead.store(false, Ordering::Relaxed);
+        until(0);
     }
 
     /// ImsMDrivePlusMotorController.cpp:335-343 and

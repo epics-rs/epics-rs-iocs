@@ -31,7 +31,7 @@
 //!   so those are left at their defaults here too.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -43,7 +43,7 @@ use epics_rs::asyn::request::{ParamSetValue, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerParams, ParamWrite};
+use epics_rs::motor::controller_port::{ControllerParams, ParamWrite, index};
 use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::{atof, atoi};
@@ -178,6 +178,11 @@ pub struct ImsLine {
     /// Device name (`DN`) prepended to every command for party mode; empty when
     /// not in party mode.
     device_name: String,
+    /// An IO failed since the last [`Self::take_comms_failed`]: C's
+    /// `setIntegerParam(motorStatusCommsError_, 1)`, which is the
+    /// controller's addr-0 param and never reaches the axis's MSTA
+    /// (ImsMDrivePlusMotorController.cpp:371-373).
+    comms_failed: AtomicBool,
 }
 
 impl ImsLine {
@@ -185,7 +190,19 @@ impl ImsLine {
         Arc::new(Self {
             handle,
             device_name,
+            comms_failed: AtomicBool::new(false),
         })
+    }
+
+    fn take_comms_failed(&self) -> bool {
+        self.comms_failed.swap(false, Ordering::Relaxed)
+    }
+
+    fn failed<T>(&self, status: AsynResult<T>) -> AsynResult<T> {
+        if status.is_err() {
+            self.comms_failed.store(true, Ordering::Relaxed);
+        }
+        status
     }
 
     fn framed(&self, cmd: &str) -> Vec<u8> {
@@ -194,7 +211,7 @@ impl ImsLine {
 
     /// Write a set command; the controller sends no reply (C `writeController`).
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &self.framed(cmd))?;
+        self.failed(self.handle.write_octet(0, &self.framed(cmd)))?;
         Ok(())
     }
 
@@ -212,7 +229,7 @@ impl ImsLine {
     /// Write a query and read one reply line (C `writeReadController`:
     /// `pasynOctetSyncIO->writeRead`, which flushes a stray line first).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &self.framed(cmd), READ_BUF)?;
+        let raw = self.failed(self.handle.write_read(0, &self.framed(cmd), READ_BUF))?;
         let s = String::from_utf8_lossy(&raw);
         Ok(s.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
@@ -320,6 +337,9 @@ impl ControllerParams for ImsParams {
             );
             Ok(())
         };
+        if self.line.take_comms_failed() {
+            let _ = base.set_int32_param(index::STATUS_COMMS_ERROR, addr, 1);
+        }
         let _ = base.call_param_callbacks(addr);
         ParamWrite::Handled(status)
     }
@@ -340,8 +360,8 @@ pub struct ImsMDrivePlusAxis {
     /// `R1=1` "homed" latch in [`Self::poll`]).
     homing: bool,
     /// The controller port and its IMS_LOCKEDROTOR, which the poll sets
-    /// (ImsMDrivePlusMotorAxis.cpp:484).
-    locked_rotor: Option<(PortHandle, usize)>,
+    /// (ImsMDrivePlusMotorAxis.cpp:484), as it does the port's COMMS_ERROR.
+    port: Option<(PortHandle, usize)>,
     /// The controller's `pasynUserSelf`, which C's error lines print on.
     trace: MotorTrace,
     /// The `motorStatusProblem_` sets of the last write.
@@ -362,7 +382,7 @@ impl ImsMDrivePlusAxis {
             neg_limit_switch: None,
             has_encoder: false,
             homing: false,
-            locked_rotor: None,
+            port: None,
             trace,
             status_writes: Vec::new(),
         };
@@ -378,11 +398,18 @@ impl ImsMDrivePlusAxis {
         axis
     }
 
-    /// Set IMS_LOCKEDROTOR on the controller port `port` from each poll.
-    pub fn post_locked_rotor_to(&mut self, port: PortHandle) -> AsynResult<()> {
+    /// Set IMS_LOCKEDROTOR and COMMS_ERROR on the controller port `port`.
+    pub fn post_params_to(&mut self, port: PortHandle) -> AsynResult<()> {
         let io = SyncIOHandle::from_handle(port.clone(), 0, IS_READ_TIMEOUT);
-        self.locked_rotor = Some((port, io.drv_user_create("IMS_LOCKEDROTOR")?));
+        self.port = Some((port, io.drv_user_create("IMS_LOCKEDROTOR")?));
         Ok(())
+    }
+
+    fn post(&self, reason: usize, value: i32) {
+        if let Some((port, _)) = &self.port {
+            let value = ParamSetValue::new(reason, 0, ParamValue::Int32(value));
+            let _ = port.set_params_and_notify_blocking(0, vec![value]);
+        }
     }
 
     fn framed(&self, cmd: &str) -> Vec<u8> {
@@ -627,6 +654,9 @@ impl ImsMDrivePlusAxis {
                 self.trace
                     .print_self(TraceMask::ERROR, format_args!("{line}"));
             }
+            if self.line.take_comms_failed() {
+                self.post(index::STATUS_COMMS_ERROR, 1);
+            }
         }
         status
     }
@@ -661,9 +691,8 @@ impl ImsMDrivePlusAxis {
         let stall = atoi(&self.write_read("PR ST")?) > 0;
         let encoder_position = atof(&self.write_read("PR C2")?);
         let locked_rotor = atoi(&self.write_read("PR LR")?);
-        if let Some((port, reason)) = &self.locked_rotor {
-            let value = ParamSetValue::new(*reason, 0, ParamValue::Int32(locked_rotor));
-            let _ = port.set_params_and_notify_blocking(0, vec![value]);
+        if let Some(&(_, reason)) = self.port.as_ref() {
+            self.post(reason, locked_rotor);
         }
 
         Ok(MotorStatus {
@@ -770,6 +799,11 @@ impl AsynMotor for ImsMDrivePlusAxis {
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let status = self.poll_status();
+        if status.is_ok() {
+            // C resets motorStatusCommsError_ on every good poll (:496).
+            self.line.take_comms_failed();
+            self.post(index::STATUS_COMMS_ERROR, 0);
+        }
         self.bail("poll()", "polling motor", status)
     }
 
