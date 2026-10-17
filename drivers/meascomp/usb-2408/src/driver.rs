@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::asyn_record::PortClaim;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
@@ -26,6 +26,33 @@ fn device_addr(addr: i32) -> i32 {
     if addr == -1 { 0 } else { addr }
 }
 
+/// The converter widths C reads once at connect
+/// (drvMultiFunction.cpp:1045-1048).
+#[derive(Clone, Copy)]
+struct Resolution {
+    adc_bits: i32,
+    dac_bits: i32,
+}
+
+impl Resolution {
+    /// C `MultiFunction::getBounds` (drvMultiFunction.cpp:1920-1936): an
+    /// analog value's raw range is the converter's; any other parameter is
+    /// asynError.
+    fn bounds(self, params: &MultiFunctionParams, reason: usize) -> AsynResult<(i32, i32)> {
+        let bits = if reason == params.analog_out_value {
+            self.dac_bits
+        } else if reason == params.analog_in_value {
+            self.adc_bits
+        } else {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: String::new(),
+            });
+        };
+        Ok((0, (1 << bits) - 1))
+    }
+}
+
 /// USB-2408-2AO port driver.
 pub struct MultiFunctionDriver {
     base: PortDriverBase,
@@ -37,6 +64,7 @@ pub struct MultiFunctionDriver {
     /// Whether AUXPORT accepts a direction change at all (`DPIOT_IO` /
     /// `DPIOT_BITIO`). The USB-2408 reports `DPIOT_NONCONFIG`.
     dio_configurable: bool,
+    resolution: Resolution,
 }
 
 impl MultiFunctionDriver {
@@ -86,6 +114,17 @@ impl MultiFunctionDriver {
         base.set_string_param(params.ul_version, 0, ul_ver)?;
         base.set_string_param(params.driver_version, 0, "4.4")?;
 
+        // C ignores the query's status; a width the device does not report
+        // is 0 here, a degenerate range device support leaves alone.
+        let resolution = Resolution {
+            adc_bits: device
+                .ai_get_info(uldaq_sys::AI_INFO_RESOLUTION, 0)
+                .map_or(0, |v| v as i32),
+            dac_bits: device
+                .ao_get_info(uldaq_sys::AO_INFO_RESOLUTION, 0)
+                .map_or(0, |v| v as i32),
+        };
+
         // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
         // ulDConfigPort and ulDConfigBit reject anything else outright, so ask
         // the device instead of assuming.
@@ -119,6 +158,7 @@ impl MultiFunctionDriver {
             max_input_points,
             max_output_points,
             dio_configurable,
+            resolution,
         })
     }
 }
@@ -471,6 +511,10 @@ impl PortDriver for MultiFunctionDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    fn get_bounds_int32(&self, user: &AsynUser) -> AsynResult<(i32, i32)> {
+        self.resolution.bounds(&self.params, user.reason)
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
@@ -920,4 +964,28 @@ pub fn create_usb_2408(
         device,
         _poller_handle: poller_handle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_bounds_is_the_converter_range_of_an_analog_value() {
+        let mut base = PortDriverBase::new("MFBOUNDS", MAX_SIGNALS, PortFlags::default());
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let usb_2408 = Resolution {
+            adc_bits: 24,
+            dac_bits: 16,
+        };
+        assert_eq!(
+            usb_2408.bounds(&params, params.analog_out_value).unwrap(),
+            (0, 65535)
+        );
+        assert_eq!(
+            usb_2408.bounds(&params, params.analog_in_value).unwrap(),
+            (0, 16_777_215)
+        );
+        assert!(usb_2408.bounds(&params, params.counter_reset).is_err());
+    }
 }
