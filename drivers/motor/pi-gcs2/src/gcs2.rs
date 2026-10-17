@@ -806,6 +806,9 @@ impl PIGCS2Axis {
             return Ok(());
         }
         if self.max_acceleration.is_none() {
+            // C defect not copied: setAccelerationCts ignores a failed
+            // getMaxAcceleration (PIGCSMotorController.cpp:47) and clamps to
+            // the -1 sentinel, sending SPA -1; rs aborts the move instead.
             let max_acc = self
                 .lock()
                 .get_gcs_parameter(&self.axis_name, PARA_MOT_MAX_ACCEL)?;
