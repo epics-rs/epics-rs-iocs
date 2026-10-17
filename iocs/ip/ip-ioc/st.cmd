@@ -72,20 +72,15 @@ asynOctetSetOutputEos("SerialMKS", 0, "\r")
 dbLoadRecords("$(IP)/db/MKS.db", "P=$(PREFIX),PORT=SerialMKS,CC1=cc1,CC2=cc2,PR1=pr1,PR2=pr2")
 
 # --- Heidenhain ND261 display unit ------------------------------------------
-# devAiHeidND261.c set the input EOS to "\n\n" itself; the port carries it here.
-# The readout request is the two bytes ^B LF, written by the driver, so the port
-# must NOT append an output EOS.
+# devAiHeidND261.c sets the input EOS to "\n\n" itself on every read, and
+# writes the bare ^B LF request, so the port must NOT append an output EOS.
 drvAsynSerialPortConfigure("SerialND261", "/dev/ttyS4", 0, 0, 0)
 asynSetOption("SerialND261", 0, "baud", "9600")
 asynSetOption("SerialND261", 0, "bits", "8")
 asynSetOption("SerialND261", 0, "parity", "none")
 asynSetOption("SerialND261", 0, "stop", "1")
-asynOctetSetInputEos("SerialND261", 0, "\n\n")
 
-# ND261Config(portName, octetPort, pollPeriodSeconds)
-ND261Config("ND261", "SerialND261", 1.0)
-
-dbLoadRecords("$(IP)/db/nd261.db", "P=$(PREFIX),AXIS=nd1,PORT=ND261")
+dbLoadRecords("$(IP)/db/heidND261.db", "P=$(PREFIX)nd1:,PORT=SerialND261")
 
 # --- Eurotherm 800/2000 temperature controller ------------------------------
 # The ao/stringout records write bisync frames that carry their own

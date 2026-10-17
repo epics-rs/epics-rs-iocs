@@ -891,7 +891,8 @@ exceptions are `devAiMKS.c`, kept as per-record ai device support
 per-record device support (DTYP `asyn MPC`) on the upstream `MPC.db` and
 `TSP.db`, `devTPG261.c` (DTYP `asyn TPG261`) on the upstream `TPG261.db`,
 and `devXxStrParm.c` (DTYP `asyn <xx> stringParm`) with `devXxEurotherm.c`
-(DTYP `asyn ao Eurotherm` / `asyn so Eurotherm`) on the upstream `Eurotherm.db`.
+(DTYP `asyn ao Eurotherm` / `asyn so Eurotherm`) on the upstream `Eurotherm.db`,
+and `devAiHeidND261.c` (DTYP `asyn ai HeidND261`) on the upstream `heidND261.db`.
 
 **Build/run:** `cargo run -p ip-ioc --release -- iocs/ip/ip-ioc/st.cmd`
 
@@ -903,7 +904,7 @@ and `devXxStrParm.c` (DTYP `asyn <xx> stringParm`) with `devXxEurotherm.c`
 | Televac vacuum gauge | `televac.db` | `PRES` (1 record) |
 | Televac relay outputs | `televac_relay.db` | `ON`, `OFF`, `STATE` (3 records) |
 | MKS / HPS SensaVac 937 gauge | `MKS.db` (upstream) | `$(CC1)`, `$(CC2)`, `$(PR1)`, `$(PR2)` and their `_log` calcs (8 records) |
-| Heidenhain ND261 display unit | `nd261.db` | `POS`, `STATUS` (2 records) |
+| Heidenhain ND261 display unit | `heidND261.db` (upstream) | `HeidND261_read`, `HeidND261`, `HeidND261_ave` (3 records) |
 | Eurotherm 800/2000 temperature controller | `Eurotherm.db` (upstream) | `ET:Setpoint`, `ET:RampRate`, `ET:Temperature`, `ET:SetpointReadback`, `ET:RampRateRBV`, `ET:Read*`, `ET:Query*`, `ET:ack*`, `ET:trash*` (18 records) |
 
 ---

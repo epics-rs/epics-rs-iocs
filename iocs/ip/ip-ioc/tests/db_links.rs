@@ -1,6 +1,6 @@
-//! The MPC, TPG261 and Eurotherm databases are ipApp/Db's, whose device
-//! records carry the per-record links devMPC.c, devTPG261.c and
-//! devXxStrParm.c parse.
+//! The MPC, TPG261, Eurotherm and heidND261 databases are ipApp/Db's, whose
+//! device records carry the per-record links devMPC.c, devTPG261.c,
+//! devXxStrParm.c and devAiHeidND261.c parse.
 
 use std::path::Path;
 
@@ -66,4 +66,18 @@ fn eurotherm_records_read_through_dev_xx_str_parm() {
     assert_eq!(count("asyn ai stringParm"), 6, "{records:?}");
     assert_eq!(count("asyn si stringParm"), 2, "{records:?}");
     assert_eq!(count("<none>"), 5, "{records:?}");
+}
+
+/// ipApp/Db's heidND261.db: one devAiHeidND261 ai feeding two calcs.
+#[test]
+fn heid_nd261_reads_through_dev_ai_heid_nd261() {
+    let records = device_records("heidND261.db");
+    assert_eq!(
+        records,
+        [(
+            "ai".to_owned(),
+            "asyn ai HeidND261".to_owned(),
+            "@asyn($(PORT))".to_owned()
+        )]
+    );
 }

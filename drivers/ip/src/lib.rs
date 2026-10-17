@@ -6,8 +6,8 @@
 //! it binds to a parameter of the port instead. The port drives the device over
 //! a pre-configured octet port (`drvAsynSerialPortConfigure` /
 //! `drvAsynIPPortConfigure`), exactly as the C device support did. [`mks`],
-//! [`mpc`], [`tpg261`], [`strparm`] and [`eurotherm`] are the exceptions: they
-//! stay per-record device support, as their C files are.
+//! [`mpc`], [`tpg261`], [`strparm`], [`eurotherm`] and [`nd261`] are the
+//! exceptions: they stay per-record device support, as their C files are.
 //!
 //! Ported so far:
 //!
@@ -21,8 +21,8 @@
 //! | `devXxEurotherm.c` | [`eurotherm`] | Eurotherm 800/2000 temperature controller |
 //! | `devXxStrParm.c` | [`strparm`] | generic string-parameter serial I/O |
 //!
-//! All device I/O runs on a plain `std::thread` worker owned by the port (see
-//! [`worker`]); the asyn write handlers only enqueue onto it. That keeps
+//! A port driver's device I/O runs on a plain `std::thread` worker owned by
+//! the port (see [`worker`]); the asyn write handlers only enqueue onto it. That keeps
 //! `SyncIOHandle` calls off the port-actor thread, where the blocking submit
 //! path is not usable.
 
