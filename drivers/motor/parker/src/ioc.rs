@@ -174,6 +174,8 @@ pub fn pc6k_config_command() -> CommandDef {
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let handle = connect_with_eos(
                 &asyn_port,
+                // C connects at an asyn_address PC6KConfig never sets (drvPC6K.cc:782).
+                0,
                 drv_pc6k::TIMEOUT,
                 b">",
                 b"\n",

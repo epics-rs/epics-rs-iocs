@@ -69,7 +69,7 @@ pub fn pm304_config_command() -> CommandDef {
             }
             let n_axes = usize::try_from(n_axes).map_err(|_| "PM304Config: n_axes < 0")?;
 
-            let handle = connect_serial(&asyn_port, PM304_TIMEOUT)?;
+            let handle = connect_serial(&asyn_port, 0, PM304_TIMEOUT)?;
             let controller =
                 Pm304Controller::new(handle, n_axes).map_err(|e| format!("PM304Config: {e}"))?;
             let num_axes = controller.num_axes();

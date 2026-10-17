@@ -56,6 +56,8 @@ pub fn emc18011_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                // C connects at an asyn_address EMC18011Config never sets (drvEMC18011.cc:661).
+                0,
                 EMC18011_TIMEOUT,
                 b"\n",
                 b"\r",

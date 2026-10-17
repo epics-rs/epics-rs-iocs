@@ -55,6 +55,8 @@ pub fn mdt695_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                // C connects at an asyn_address MDT695Config never sets (drvMDT695.cc:548).
+                0,
                 MDT695_TIMEOUT,
                 INPUT_EOS,
                 OUTPUT_EOS,

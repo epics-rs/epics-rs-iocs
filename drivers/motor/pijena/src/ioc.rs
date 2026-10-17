@@ -56,6 +56,7 @@ pub fn pijeds_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 PIJEDS_TIMEOUT,
                 b"\x11",
                 b"\r",

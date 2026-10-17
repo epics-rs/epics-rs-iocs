@@ -60,6 +60,7 @@ impl SpiiPlusComm {
     pub fn connect(comm_port: &str, asyn_port: &str) -> Result<Self, String> {
         let io = connect_with_eos(
             asyn_port,
+            0,
             ASCII_TIMEOUT,
             INPUT_EOS,
             OUTPUT_EOS,

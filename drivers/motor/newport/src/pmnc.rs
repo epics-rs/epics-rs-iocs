@@ -203,8 +203,8 @@ fn model_from_ident(ident: &str) -> Option<(PmncModel, bool)> {
     Some((model, change_eos))
 }
 
-fn eos_user() -> AsynUser {
-    AsynUser::new(0).with_addr(0)
+fn eos_user(addr: i32) -> AsynUser {
+    AsynUser::new(0).with_addr(addr)
 }
 
 /// Shared controller endpoint: owns the octet handle and the cross-axis
@@ -213,6 +213,8 @@ pub struct PmncController {
     handle: SyncIOHandle,
     /// The same port, for the per-read input-EOS switch.
     port: PortHandle,
+    /// `PMNC87xxConfig`'s address, which C connects at (drvPMNC87xx.cc:853).
+    addr: i32,
     /// Firmware 1.5.3/1.5.4: `STA` replies end in `\n` (C `changeEOS`).
     change_eos: bool,
     ident: String,
@@ -227,14 +229,15 @@ impl PmncController {
     /// — an 8750 lists its 8753 channels indirectly via `MPV`, an 8752 reads
     /// each module's type via `DRT` (8753 → 3 channels, 8751 → 1). Performs
     /// blocking I/O.
-    pub fn new(port: PortHandle, timeout: Duration) -> AsynResult<Self> {
+    pub fn new(port: PortHandle, addr: i32, timeout: Duration) -> AsynResult<Self> {
         // C ignores every setInputEos/setOutputEos status
         // (drvPMNC87xx.cc:586, 595, 720, 727, 873-874).
-        let _ = port.set_input_eos_blocking(eos_user(), PROMPT_EOS);
-        let _ = port.set_output_eos_blocking(eos_user(), CMND_EOS);
+        let _ = port.set_input_eos_blocking(eos_user(addr), PROMPT_EOS);
+        let _ = port.set_output_eos_blocking(eos_user(addr), CMND_EOS);
         let mut ctrl = Self {
-            handle: SyncIOHandle::from_handle(port.clone(), 0, timeout),
+            handle: SyncIOHandle::from_handle(port.clone(), addr, timeout),
             port,
+            addr,
             change_eos: false,
             ident: String::new(),
             model: PmncModel::Pmnc8750,
@@ -343,9 +346,13 @@ impl PmncController {
         if !self.change_eos {
             return self.command(&cmd);
         }
-        let _ = self.port.set_input_eos_blocking(eos_user(), NL_EOS);
+        let _ = self
+            .port
+            .set_input_eos_blocking(eos_user(self.addr), NL_EOS);
         let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF);
-        let _ = self.port.set_input_eos_blocking(eos_user(), PROMPT_EOS);
+        let _ = self
+            .port
+            .set_input_eos_blocking(eos_user(self.addr), PROMPT_EOS);
         Self::trimmed(raw?)
     }
 
@@ -831,7 +838,7 @@ mod tests {
             "POS 0" => "A0=0>".into(),
             _ => ">".into(),
         });
-        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
         let axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
         line.sent();
         (line, axis, sta)
@@ -845,7 +852,7 @@ mod tests {
             "DRT" => "A0=2>".into(),
             _ => ">".into(),
         });
-        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
         assert_eq!(ctrl.unwrap().ident(), " Version 1.6.0\r\n");
     }
 
@@ -920,7 +927,7 @@ mod tests {
             "DRT" => "A0=1>".into(),
             _ => ">".into(),
         });
-        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
         let mut axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 1).unwrap();
         line.sent();
         axis.move_velocity(&AsynUser::default(), 50.0, -100.0, 200.0)
@@ -1114,8 +1121,8 @@ mod tests {
         )
         .unwrap();
         let port = rt.port_handle().clone();
-        assert!(port.set_input_eos_blocking(eos_user(), NL_EOS).is_err());
-        let ctrl = PmncController::new(port, Duration::from_secs(1)).unwrap();
+        assert!(port.set_input_eos_blocking(eos_user(0), NL_EOS).is_err());
+        let ctrl = PmncController::new(port, 0, Duration::from_secs(1)).unwrap();
         assert!(ctrl.change_eos);
         assert_eq!(ctrl.num_axes(), 3);
         assert_eq!(ctrl.status(0).unwrap(), "A0=0x05");
@@ -1137,7 +1144,7 @@ mod tests {
             "POS 0" => "A0=0>".into(),
             _ => ">".into(),
         });
-        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
         let mut axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
@@ -1174,7 +1181,7 @@ mod tests {
             "POS 0" => "A0=0>".into(),
             _ => ">".into(),
         });
-        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
         let mut axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);

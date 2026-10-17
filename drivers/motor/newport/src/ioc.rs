@@ -1776,7 +1776,7 @@ pub fn mm3000_setup_command() -> CommandDef {
 pub fn mm3000_config_command() -> CommandDef {
     model1_config_command("MM3000Config", &MM3000, |ctx, card, port, addr| {
         // C drops a card it cannot connect to without a word.
-        let Ok(handle) = connect_serial(port, MM3000_TIMEOUT) else {
+        let Ok(handle) = connect_serial(port, addr, MM3000_TIMEOUT) else {
             return Ok(());
         };
         let Some(controller) = Mm3000Controller::new(handle) else {
@@ -1836,7 +1836,7 @@ pub fn mm4000_setup_command() -> CommandDef {
 pub fn mm4000_config_command() -> CommandDef {
     model1_config_command("MM4000Config", &MM4000, |ctx, card, port, addr| {
         // C drops a card it cannot connect to without a word.
-        let Ok(handle) = connect_serial(port, MM4000_TIMEOUT) else {
+        let Ok(handle) = connect_serial(port, addr, MM4000_TIMEOUT) else {
             return Ok(());
         };
         // Six per-axis polls share one controller-wide exchange: cache for
@@ -1985,7 +1985,7 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 c.moving_s = f64::from(c_int(args, 4)) / 1000.0;
                 c.idle_s = f64::from(c_int(args, 5)) / 1000.0;
             });
-            let Ok(handle) = connect_serial(&port_name, MM4000_TIMEOUT) else {
+            let Ok(handle) = connect_serial(&port_name, c_int(args, 2), MM4000_TIMEOUT) else {
                 println!("MM4000AsynConfig: cannot connect to asyn port {port_name}");
                 return Ok(CommandOutcome::Continue);
             };
@@ -2063,8 +2063,8 @@ pub fn pm500_setup_command() -> CommandDef {
 /// scan finds. C `motor_init` drops a controller it cannot connect to or
 /// that leaves `SVN?` unanswered without a word (drvPM500.cc:577, :671-672).
 pub fn pm500_config_command() -> CommandDef {
-    model1_config_command("PM500Config", &PM500, |ctx, card, port, _addr| {
-        let Ok(handle) = connect_serial(port, PM500_TIMEOUT) else {
+    model1_config_command("PM500Config", &PM500, |ctx, card, port, addr| {
+        let Ok(handle) = connect_serial(port, addr, PM500_TIMEOUT) else {
             return Ok(());
         };
         let Some(controller) = Pm500Controller::new(handle) else {
@@ -2102,6 +2102,7 @@ pub fn esp300_config_command() -> CommandDef {
         const ERRMSG: &str = "drvESP300.c:motor_init: ASYN";
         let handle = match connect_with_eos(
             port,
+            addr,
             ESP300_TIMEOUT,
             esp300::INPUT_EOS,
             esp300::OUTPUT_EOS,
@@ -2178,7 +2179,7 @@ pub fn pmnc87xx_config_command() -> CommandDef {
         let asyn_port = get_port(port).ok_or_else(|| {
             format!("IP port '{port}' not found (call drvAsynIPPortConfigure first)")
         })?;
-        let controller = PmncController::new(asyn_port.handle.clone(), PMNC_TIMEOUT)
+        let controller = PmncController::new(asyn_port.handle.clone(), addr, PMNC_TIMEOUT)
             .map_err(|e| format!("PMNC87xxConfig: {e}"))?;
         let num_axes = controller.num_axes();
         let line = format!("{port}, address={addr}, id: {}", controller.ident());

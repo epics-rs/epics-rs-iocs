@@ -180,6 +180,7 @@ pub fn ensemble_config_command() -> CommandDef {
 
             let Ok(handle) = connect_with_eos(
                 &port_name,
+                c_int(args, 2),
                 TIMEOUT,
                 ensemble::INPUT_EOS,
                 ensemble::OUTPUT_EOS,
@@ -272,6 +273,7 @@ pub fn a3200_config_command() -> CommandDef {
 
             let Ok(handle) = connect_with_eos(
                 &port_name,
+                c_int(args, 2),
                 TIMEOUT,
                 a3200::INPUT_EOS,
                 a3200::OUTPUT_EOS,

@@ -52,6 +52,8 @@ pub fn spiiplus_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                // C connects at an asyn_address SPiiPlusConfig never sets (drvSPiiPlus.cc:682).
+                0,
                 SPIIPLUS_TIMEOUT,
                 INPUT_EOS,
                 OUTPUT_EOS,

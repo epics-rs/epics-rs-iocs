@@ -95,6 +95,7 @@ pub fn pic862_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 PIC862_TIMEOUT,
                 b"\n\x03",
                 b"\r",
@@ -154,6 +155,7 @@ pub fn pic663_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 PIC663_TIMEOUT,
                 b"\n\x03",
                 b"\r",
@@ -245,6 +247,7 @@ pub fn pic630_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 PIC630_TIMEOUT,
                 b"\n",
                 b"\n",
@@ -302,6 +305,7 @@ pub fn pic662_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 PIC662_TIMEOUT,
                 b"\n",
                 b"\n",
@@ -356,6 +360,7 @@ pub fn pic844_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 PIC844_TIMEOUT,
                 b"\n",
                 b"\n",
@@ -413,6 +418,7 @@ pub fn pic848_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 PIC848_TIMEOUT,
                 b"\n",
                 b"\n",
@@ -477,6 +483,7 @@ pub fn pie516_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 PIE516_TIMEOUT,
                 b"\n",
                 b"\n",
@@ -535,6 +542,7 @@ pub fn pie517_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 PIE517_TIMEOUT,
                 b"\n",
                 b"\n",
@@ -594,6 +602,7 @@ pub fn pie710_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 PIE710_TIMEOUT,
                 b"\n",
                 b"\n",
@@ -652,6 +661,7 @@ pub fn pie816_config_command() -> CommandDef {
 
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 PIE816_TIMEOUT,
                 b"\n",
                 b"\n",

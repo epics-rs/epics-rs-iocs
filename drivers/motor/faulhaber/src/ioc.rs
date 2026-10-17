@@ -58,7 +58,7 @@ pub fn mcdc2805_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 2, "asyn port name")?;
 
-            let handle = connect_serial(&asyn_port, MCDC2805_TIMEOUT)?;
+            let handle = connect_serial(&asyn_port, 0, MCDC2805_TIMEOUT)?;
             let controller = FaulhaberController::new(handle, num_motors as usize)
                 .map_err(|e| format!("MCDC2805Config: {e}"))?;
             let num_axes = controller.num_axes();

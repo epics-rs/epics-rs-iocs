@@ -21,6 +21,8 @@ type Fails = Box<dyn Fn(&str) -> bool + Send + Sync>;
 struct Line {
     base: PortDriverBase,
     sent: Arc<Mutex<Vec<String>>>,
+    /// The asyn address of each write in `sent`.
+    addrs: Arc<Mutex<Vec<i32>>>,
     /// The last write that was more than a terminator: GCS2 writes a command
     /// and its `\n` separately, and the reply belongs to the command.
     command: String,
@@ -43,8 +45,9 @@ impl PortDriver for Line {
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
     }
-    fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+    fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let line = String::from_utf8_lossy(data).into_owned();
+        self.addrs.lock().unwrap().push(user.addr);
         if !data.iter().all(|b| matches!(b, b'\r' | b'\n')) {
             self.command.clone_from(&line);
             if let Answer::Queued(lines, queue) = &mut self.answer {
@@ -88,6 +91,7 @@ impl PortDriver for Line {
 /// The test's side of one port.
 pub struct LineRig {
     sent: Arc<Mutex<Vec<String>>>,
+    addrs: Arc<Mutex<Vec<i32>>>,
 }
 
 impl LineRig {
@@ -108,7 +112,7 @@ impl LineRig {
         reply: impl Fn(&str) -> String + Send + Sync + 'static,
         fails: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> (Self, SyncIOHandle) {
-        Self::open(name, Answer::Last(Box::new(reply)), Box::new(fails))
+        Self::open(name, 1, Answer::Last(Box::new(reply)), Box::new(fails))
     }
 
     /// [`Self::new`] for a device that answers a command with `lines`, one
@@ -119,16 +123,34 @@ impl LineRig {
     ) -> (Self, SyncIOHandle) {
         Self::open(
             name,
+            1,
             Answer::Queued(Box::new(lines), VecDeque::new()),
             Box::new(|_| false),
         )
     }
 
-    fn open(name: &str, answer: Answer, fails: Fails) -> (Self, SyncIOHandle) {
+    /// [`Self::new`] on a multi-device port of `max_addr` addresses, as a
+    /// GPIB port is; [`Self::addresses`] gives where each write went.
+    pub fn multi_device(
+        name: &str,
+        max_addr: usize,
+        reply: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (Self, SyncIOHandle) {
+        Self::open(
+            name,
+            max_addr,
+            Answer::Last(Box::new(reply)),
+            Box::new(|_| false),
+        )
+    }
+
+    fn open(name: &str, max_addr: usize, answer: Answer, fails: Fails) -> (Self, SyncIOHandle) {
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let addrs = Arc::new(Mutex::new(Vec::new()));
         let line = Line {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(name, max_addr, PortFlags::default()),
             sent: sent.clone(),
+            addrs: addrs.clone(),
             command: String::new(),
             answer,
             fails,
@@ -140,12 +162,17 @@ impl LineRig {
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        (Self { sent }, io)
+        (Self { sent, addrs }, io)
     }
 
     /// The messages written since the last call.
     pub fn sent(&self) -> Vec<String> {
         std::mem::take(&mut *self.sent.lock().unwrap())
+    }
+
+    /// The address of each write since the last call.
+    pub fn addresses(&self) -> Vec<i32> {
+        std::mem::take(&mut *self.addrs.lock().unwrap())
     }
 }
 
@@ -282,6 +309,7 @@ mod tests {
         let (_rig, _io) = LineRig::new("lineRigEos", |_| String::new());
         let io = connect_with_eos(
             "lineRigEos",
+            0,
             Duration::from_secs(1),
             b"\n",
             b"",

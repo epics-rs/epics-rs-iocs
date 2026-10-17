@@ -86,6 +86,7 @@ pub fn anc150_config_command() -> CommandDef {
 
             let Ok(handle) = connect_with_eos(
                 &port_name,
+                0,
                 ANC150_TIMEOUT,
                 INPUT_EOS,
                 OUTPUT_EOS,

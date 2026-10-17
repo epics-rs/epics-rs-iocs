@@ -127,7 +127,7 @@ pub fn mcb4b_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let handle = connect_serial(&asyn_port, DRV_MCB4B_TIMEOUT)?;
+            let handle = connect_serial(&asyn_port, 0, DRV_MCB4B_TIMEOUT)?;
             let controller = Mcb4bController::new(handle, MCB4B_NUM_AXES);
             if !motor_init(&controller) {
                 return Ok(CommandOutcome::Continue);

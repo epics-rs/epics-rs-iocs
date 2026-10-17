@@ -550,6 +550,7 @@ pub fn micos_config_command() -> CommandDef {
             // end only on timeout; the ETX alone ends one here.
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 MICOS_TIMEOUT,
                 b"\x03",
                 b"\r",

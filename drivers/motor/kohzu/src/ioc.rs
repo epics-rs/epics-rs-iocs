@@ -34,8 +34,8 @@ pub fn sc800_setup_command() -> CommandDef {
     SC800.setup_command("SC800Setup")
 }
 
-/// `SC800Config(card, name, address)`; `address` is GPIB's, unused on a
-/// serial port.
+/// `SC800Config(card, name, address)`; `address` is the asyn address C
+/// connects at.
 pub fn sc800_config_command() -> CommandDef {
     CommandDef::new(
         "SC800Config",
@@ -53,6 +53,7 @@ pub fn sc800_config_command() -> CommandDef {
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let handle = connect_with_eos(
                 &asyn_port,
+                c_int(args, 2),
                 SC800_TIMEOUT,
                 INPUT_EOS,
                 OUTPUT_EOS,
@@ -70,4 +71,28 @@ pub fn sc800_config_command() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use motor_common::testing::{LineRig, run_command};
+
+    /// drvSC800.cc:537-538 connects at the Config's `address`.
+    #[epics_rs::base::epics_test]
+    async fn sc800_talks_at_the_config_address() {
+        let int = ArgValue::Int;
+        run_command(sc800_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::multi_device("sc800Gpib", 8, |cmd| {
+            match cmd.trim_start_matches('\u{2}').trim_end() {
+                "IDN" => "C\tIDN0\t200\t1".into(),
+                c => format!("C\t{c}"),
+            }
+        });
+        let config = vec![int(0), ArgValue::String("sc800Gpib".into()), int(5)];
+        run_command(sc800_config_command(), config).await;
+        let addrs = line.addresses();
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|&a| a == 5), "{addrs:?}");
+    }
 }

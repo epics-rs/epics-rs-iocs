@@ -13,32 +13,38 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
-/// asyn subaddress for a single-device octet port (0; GPIB would differ).
-const SERIAL_ADDR: i32 = 0;
+/// The address every `asynMotorController` constructor connects its octet
+/// port at (`pasynOctetSyncIO->connect(port, 0, …)`).
+const CONTROLLER_ADDR: i32 = 0;
 
-/// Connect a [`SyncIOHandle`] to a pre-configured serial octet port by name
-/// (created by `drvAsynSerialPortConfigure`).
-pub fn connect_serial(serial_port: &str, timeout: Duration) -> Result<SyncIOHandle, String> {
+/// `pasynOctetSyncIO->connect(serial_port, addr, …)` on a pre-configured
+/// serial octet port (created by `drvAsynSerialPortConfigure`). `addr` is the
+/// one the C driver passes: a model-1 Config's `asyn_address` where it keeps
+/// one (drvMM4000.cc:698), else 0.
+pub fn connect_serial(
+    serial_port: &str,
+    addr: i32,
+    timeout: Duration,
+) -> Result<SyncIOHandle, String> {
     let port = get_port(serial_port).ok_or_else(|| {
         format!("serial port '{serial_port}' not found (call drvAsynSerialPortConfigure first)")
     })?;
     Ok(SyncIOHandle::from_handle(
         port.handle.clone(),
-        SERIAL_ADDR,
+        addr,
         timeout,
     ))
 }
 
-/// Connect a [`SyncIOHandle`] to a pre-configured TCP octet port by name
-/// (created by `drvAsynIPPortConfigure`). Same lookup as [`connect_serial`] —
-/// separate only for a TCP-appropriate error message.
-pub fn connect_ip(ip_port: &str, timeout: Duration) -> Result<SyncIOHandle, String> {
+/// [`connect_serial`] on a TCP octet port (created by
+/// `drvAsynIPPortConfigure`), separate only for its error message.
+pub fn connect_ip(ip_port: &str, addr: i32, timeout: Duration) -> Result<SyncIOHandle, String> {
     let port = get_port(ip_port).ok_or_else(|| {
         format!("IP port '{ip_port}' not found (call drvAsynIPPortConfigure first)")
     })?;
     Ok(SyncIOHandle::from_handle(
         port.handle.clone(),
-        SERIAL_ADDR,
+        addr,
         timeout,
     ))
 }
@@ -55,7 +61,7 @@ pub fn connect_controller(
     report: std::fmt::Arguments<'_>,
 ) -> (SyncIOHandle, AsynResult<()>) {
     let (handle, status) =
-        SyncIOHandle::connect_port(octet_port, SERIAL_ADDR, timeout, InterfaceType::Octet);
+        SyncIOHandle::connect_port(octet_port, CONTROLLER_ADDR, timeout, InterfaceType::Octet);
     if status.is_err() {
         MotorTrace::new(self_port, 0).print_self(TraceMask::ERROR, report);
     }
@@ -71,7 +77,7 @@ pub fn set_eos_ignored(handle: &SyncIOHandle, input_eos: &[u8], output_eos: &[u8
     let Ok(port) = handle.port() else {
         return;
     };
-    let user = || AsynUser::new(0).with_addr(SERIAL_ADDR);
+    let user = || AsynUser::new(0).with_addr(CONTROLLER_ADDR);
     let _ = port.set_input_eos_blocking(user(), input_eos);
     let _ = port.set_output_eos_blocking(user(), output_eos);
 }
@@ -119,12 +125,13 @@ impl From<EosConnectError> for String {
     }
 }
 
-/// Connect to a pre-configured octet port by name and set the EOS the C
-/// driver sets on its `pasynUser` right after `pasynOctetSyncIO->connect`, so
-/// the wire framing does not depend on st.cmd. EOS lives on the port (per
-/// address), so it must be set on the `PortHandle` before wrapping.
+/// [`connect_serial`] at `addr`, then the EOS the C driver sets on its
+/// `pasynUser` right after `pasynOctetSyncIO->connect`, so the wire framing
+/// does not depend on st.cmd. EOS lives on the port per address, so it is set
+/// on the `PortHandle` at `addr` before wrapping.
 pub fn connect_with_eos(
     port_name: &str,
+    addr: i32,
     timeout: Duration,
     input_eos: &[u8],
     output_eos: &[u8],
@@ -132,7 +139,7 @@ pub fn connect_with_eos(
 ) -> Result<SyncIOHandle, EosConnectError> {
     let port =
         get_port(port_name).ok_or_else(|| EosConnectError::PortNotFound(port_name.to_string()))?;
-    let user = || AsynUser::new(0).with_addr(SERIAL_ADDR);
+    let user = || AsynUser::new(0).with_addr(addr);
     let set_input = || {
         port.handle
             .set_input_eos_blocking(user(), input_eos)
@@ -159,7 +166,7 @@ pub fn connect_with_eos(
     }
     Ok(SyncIOHandle::from_handle(
         port.handle.clone(),
-        SERIAL_ADDR,
+        addr,
         timeout,
     ))
 }
@@ -212,7 +219,7 @@ mod tests {
 
     /// The create's verdict: `Ok(())` when it connected.
     fn connect(port: &str, refusal: EosRefusal) -> Result<(), String> {
-        connect_with_eos(port, Duration::from_secs(1), b"\n", b"\r", refusal)
+        connect_with_eos(port, 0, Duration::from_secs(1), b"\n", b"\r", refusal)
             .map(drop)
             .map_err(String::from)
     }

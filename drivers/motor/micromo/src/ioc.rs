@@ -189,6 +189,7 @@ pub fn micromo_config_command() -> CommandDef {
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 drv_mvp2001::COMM_TIMEOUT,
                 b"\n",
                 b"\r",

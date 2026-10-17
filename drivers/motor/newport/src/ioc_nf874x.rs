@@ -39,7 +39,7 @@ pub fn nf874x_create_controller_command() -> CommandDef {
             let num_axes = c_int(args, 2).max(0);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&nf_port, NF874X_TIMEOUT)
+            let handle = connect_serial(&nf_port, 0, NF874X_TIMEOUT)
                 .inspect_err(|_| {
                     eprintln!(
                         "nf874xMotorDriver:nf874xController: cannot connect to nf874x controller"

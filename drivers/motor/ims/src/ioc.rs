@@ -132,8 +132,14 @@ pub fn im483pl_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let handle =
-                connect_with_eos(&asyn_port, COMM_TIMEOUT, b"\n", b"\n", EosRefusal::Ignored)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                0,
+                COMM_TIMEOUT,
+                b"\n",
+                b"\n",
+                EosRefusal::Ignored,
+            )?;
             let controller = Im483Controller::new(handle);
             let axes = im483pl_probe(&controller);
             let controller = Arc::new(Mutex::new(controller));
@@ -182,6 +188,7 @@ pub fn im483sm_config_command() -> CommandDef {
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 COMM_TIMEOUT,
                 b"\r\n",
                 b"\r",
@@ -231,6 +238,7 @@ pub fn mdrive_config_command() -> CommandDef {
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let handle = connect_with_eos(
                 &asyn_port,
+                0,
                 COMM_TIMEOUT,
                 b"\r\n",
                 b"\n",
