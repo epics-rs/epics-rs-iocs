@@ -1090,11 +1090,6 @@ impl QuadEmBase {
         let params = QuadEmParams::create(&mut port_base)?;
 
         port_base.set_int32_param(nd_params.array_callbacks, 0, 1)?;
-        port_base.set_float64_param(
-            nd_params.pool_max_memory,
-            0,
-            max_memory as f64 / 1_048_576.0,
-        )?;
 
         // C++ drvQuadEM constructor defaults.
         port_base.set_int32_param(params.ring_overflows, 0, 0)?;
@@ -1747,6 +1742,15 @@ mod tests {
         assert_eq!(pb.get_float64_param(nd.timestamp_rbv, 0).unwrap(), 0.0);
         assert_eq!(pb.get_int32_param(nd.n_dimensions, 0).unwrap(), 0);
         assert_eq!(pb.get_int32_param(nd.bayer_pattern, 0).unwrap(), 0);
+    }
+
+    /// drvQuadEM.cpp sets no PoolMaxMemory, so it reads the 0 the base
+    /// constructor sets until a PoolPollStats write.
+    #[test]
+    fn construction_leaves_pool_max_memory_zero() {
+        let base = QuadEmBase::new("QE_POOL_MAX", 100_000_000).unwrap();
+        let max = base.nd_params.pool_max_memory;
+        assert_eq!(base.port_base.get_float64_param(max, 0).unwrap(), 0.0);
     }
 
     fn acquire_busy(m: &FakeMeter) -> i32 {
