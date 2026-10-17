@@ -170,6 +170,11 @@ const PI_CNTR_STOP: i32 = 10;
 /// unsupported (used to distinguish "no limit switches" from a real fault).
 const PI_CNTR_UNKNOWN_COMMAND: i32 = 2;
 
+/// `COM_ERROR` and `COM_TIMEOUT`: what C `getGCSError` returns when `ERR?`
+/// itself fails.
+const COM_ERROR: i32 = -1;
+const COM_TIMEOUT: i32 = -7;
+
 /// `PIGCSMotorController` GCS parameter IDs (`SPA`/`SPA?`), formatted as a
 /// plain decimal (`%d` in the C `sprintf`) — NOT hex, despite the hex-valued
 /// enum literals in the C header.
@@ -552,7 +557,7 @@ impl PIGCS2Controller {
         std::thread::sleep(Duration::from_millis(200));
         self.get_global_state()?;
         if !self.hexapod.moving {
-            let err = self.get_gcs_error()?;
+            let err = self.get_gcs_error();
             if err != 0 {
                 self.print(format_args!(
                     "PIHexapodController::moveCts() failed, GCS error {err}\n"
@@ -605,7 +610,7 @@ impl PIGCS2Controller {
         self.knows_vel = match self.query("VEL?") {
             Ok(_) => true,
             Err(_) => {
-                let _ = self.get_gcs_error();
+                self.get_gcs_error();
                 false
             }
         };
@@ -630,7 +635,7 @@ impl PIGCS2Controller {
         let Ok(reply) = self.query(read_pivot) else {
             return;
         };
-        if !matches!(self.get_gcs_error(), Ok(0)) {
+        if self.get_gcs_error() != 0 {
             return;
         }
         // One "R = 1.0 " line per pivot coordinate; one unparsed keeps all.
@@ -679,7 +684,7 @@ impl PIGCS2Controller {
         }
         let rst = ["R", "S", "T"][index];
         self.send_only(&format!("SPI {rst} {}", CFloat(value)))?;
-        let err = self.get_gcs_error()?;
+        let err = self.get_gcs_error();
         if err != 0 {
             self.print(format_args!(
                 "PIHexapodController::SetPivot() failed, GCS error {err}\n"
@@ -698,7 +703,7 @@ impl PIGCS2Controller {
             Ok(_) => true,
             Err(e) => {
                 if e.status() == AsynStatus::Timeout {
-                    let _ = self.get_gcs_error();
+                    self.get_gcs_error();
                 }
                 false
             }
@@ -847,9 +852,14 @@ impl PIGCS2Controller {
     }
 
     /// C `getGCSError`: a non-zero code prints, with its message, once
-    /// there is a log sink.
-    fn get_gcs_error(&self) -> AsynResult<i32> {
-        let err = atoi(&self.query("ERR?")?);
+    /// there is a log sink. An `ERR?` that fails is a code too, neither
+    /// printed nor kept as the last error.
+    fn get_gcs_error(&self) -> i32 {
+        let err = match self.query("ERR?") {
+            Ok(reply) => atoi(&reply),
+            Err(e) if e.status() == AsynStatus::Timeout => return COM_TIMEOUT,
+            Err(_) => return COM_ERROR,
+        };
         if err != 0 {
             self.last_error.set(err);
         }
@@ -862,13 +872,13 @@ impl PIGCS2Controller {
                 error_message(err)
             ));
         }
-        Ok(err)
+        err
     }
 
     /// `ERR?` reading `expected`; any other code prints C's `failed` line
     /// for it and is an error.
     fn check(&self, expected: i32, failed: impl FnOnce(i32) -> String) -> AsynResult<()> {
-        let err = self.get_gcs_error()?;
+        let err = self.get_gcs_error();
         if err == expected {
             return Ok(());
         }
@@ -935,7 +945,7 @@ impl PIGCS2Controller {
             return self.hexapod_move(&cmd);
         }
         self.send_only(&cmd)?;
-        let err = self.get_gcs_error()?;
+        let err = self.get_gcs_error();
         if err != 0 {
             self.print(format_args!(
                 "PIGCSController::moveCts(array) failed, GCS error {err}\n"
@@ -1014,7 +1024,7 @@ impl PIGCS2Controller {
     /// whatever the axis.
     fn init_platform(&mut self) -> AsynResult<()> {
         if let Err(e) = self.send_only("INI X") {
-            let _ = self.get_gcs_error();
+            self.get_gcs_error();
             self.print(format_args!(
                 "PIHexapodController::referenceVelCts() failed\n"
             ));
@@ -1126,7 +1136,7 @@ impl PIGCS2Controller {
             // that returned partial bytes (EOS interpose installed) is still
             // recognized as "no limit switches" rather than a hard fault.
             Err(e) if e.status() == AsynStatus::Timeout => {
-                let err = self.get_gcs_error()?;
+                let err = self.get_gcs_error();
                 if err == PI_CNTR_UNKNOWN_COMMAND {
                     Ok(false)
                 } else {
@@ -3410,7 +3420,7 @@ mod tests {
                 } else {
                     port.write_float64_blocking(p.rbpivot_x, -1, 1.0).unwrap();
                 }
-                ctrl.lock().unwrap().get_gcs_error().unwrap();
+                ctrl.lock().unwrap().get_gcs_error();
             });
             assert!(
                 printed.contains("PIGCSController::getGCSError() GCS error code = 2"),
@@ -3827,9 +3837,9 @@ mod tests {
         poll();
         assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
         code.store(5, Ordering::Relaxed);
-        assert_eq!(ctrl.lock().unwrap().get_gcs_error().unwrap(), 5);
+        assert_eq!(ctrl.lock().unwrap().get_gcs_error(), 5);
         code.store(0, Ordering::Relaxed);
-        assert_eq!(ctrl.lock().unwrap().get_gcs_error().unwrap(), 0);
+        assert_eq!(ctrl.lock().unwrap().get_gcs_error(), 0);
         poll();
         assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 5);
         port.write_int32_blocking(p.clear_err, 0, 1).unwrap();
@@ -4070,7 +4080,7 @@ mod tests {
         });
         let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2ErrLine")));
         let before = traced("gcs2ErrLine", || {
-            assert_eq!(ctrl.lock().unwrap().get_gcs_error().unwrap(), 2);
+            assert_eq!(ctrl.lock().unwrap().get_gcs_error(), 2);
         });
         assert_eq!(before, "");
         let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2ErrCtl");
@@ -4359,6 +4369,39 @@ mod tests {
             .zip(starts.iter().skip(1).chain([&bytes.len()]))
             .map(|(&from, &to)| printed[from + STAMP.len()..to].to_string())
             .collect()
+    }
+
+    /// An `ERR?` that times out reads as COM_TIMEOUT (-7) and one that fails
+    /// otherwise as COM_ERROR (-1), so the caller's `failed` line still
+    /// prints (PIGCSController.cpp:263-271).
+    #[test]
+    fn a_failed_error_query_reads_as_a_com_error_code() {
+        let (_line, io) = motor_common::testing::LineRig::queued("gcs2ErrTimeout", |_| vec![]);
+        let ctrl = PIGCS2Controller::new(io, "gcs2ErrTimeout");
+        let printed = traced("gcs2ErrTimeout", || {
+            assert!(ctrl.check_mov().is_err());
+            assert!(ctrl.halt("1").is_err());
+        });
+        for line in [
+            "PIGCSController::move() failed, GCS error -7\n",
+            "PIGCSController::haltAxis() failed, GCS error -7",
+        ] {
+            assert!(printed.contains(line), "{line:?} not in {printed}");
+        }
+
+        let (_line, io) = motor_common::testing::LineRig::failing(
+            "gcs2ErrFails",
+            |_| "0".into(),
+            |line| line == "ERR?",
+        );
+        let ctrl = PIGCS2Controller::new(io, "gcs2ErrFails");
+        let printed = traced("gcs2ErrFails", || {
+            assert!(ctrl.check_mov().is_err());
+        });
+        assert!(
+            printed.contains("PIGCSController::move() failed, GCS error -1\n"),
+            "{printed}"
+        );
     }
 
     /// Each failed `ERR?` check prints C's line (PIGCSController.cpp:224,
