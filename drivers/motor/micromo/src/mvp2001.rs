@@ -2,7 +2,7 @@
 //!
 //! Ported from `motorMicroMo/microMoApp/src/MVP2001Driver.cpp` (the model-3
 //! `asynMotorController`/`asynMotorAxis` form; the older `drvMVP2001.cc` model-1
-//! pair is not ported). Commands are ASCII `<axis> <CMD> <args>` where `<axis>`
+//! pair is [`crate::drv_mvp2001`]). Commands are ASCII `<axis> <CMD> <args>` where `<axis>`
 //! is 1-based; commands are CR-terminated (the driver owns output framing, the
 //! startup script sets the input EOS).
 //!
