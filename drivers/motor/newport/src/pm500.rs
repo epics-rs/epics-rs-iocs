@@ -162,8 +162,8 @@ pub struct Pm500Axis {
     digits: usize,
     /// Wire units per record step (C `drive_resolution`).
     drive_resolution: f64,
-    /// Last polled status, reused on the comm-retry early exit where C
-    /// leaves the record's bits stale.
+    /// Last good status: the base of the next one, whose position and
+    /// encoder it keeps when the steps are unchanged.
     last_status: MotorStatus,
     strings: MoveStrings,
 }
@@ -196,7 +196,8 @@ impl Pm500Axis {
             },
             strings: MoveStrings::default(),
         };
-        ax.set_status();
+        // C motor_init ignores set_status's verdict.
+        let _ = ax.set_status();
         ax
     }
 
@@ -256,11 +257,14 @@ impl Pm500Axis {
 }
 
 impl AsynMotor for Pm500Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvPM500.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
+    /// C `set_status` (drvPM500.cc:244-260): the first unanswered status
+    /// query is RETRY, which raises nothing and posts nothing; the next is
+    /// COMM_ERR, raising `CNTRL_COMM_ERR` and `RA_PROBLEM`.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        match self.lock().comm_state {
+            CommState::Retry => PollFailure::NONE,
+            _ => PollFailure::PROBLEM_AND_COMMS_ERROR,
+        }
     }
 
     fn move_absolute(
@@ -385,7 +389,7 @@ impl AsynMotor for Pm500Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(self.set_status())
+        self.set_status()
     }
 }
 
@@ -393,7 +397,7 @@ impl Pm500Axis {
     /// Port of C `set_status`: one `{letter}R` status/position query, then
     /// `{letter}M?` for the servo state. Reply format
     /// `[letter][status][sign+digits...]`, e.g. `XB+5.012`.
-    fn set_status(&mut self) -> MotorStatus {
+    fn set_status(&mut self) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let c = self.name;
@@ -403,16 +407,14 @@ impl Pm500Axis {
         // Deviations).
         let reply = ctrl.command(&format!("{c}R")).unwrap_or_default();
         if reply.len() < 3 {
-            if ctrl.comm_state == CommState::Normal {
-                // One empty reply: retry silently next poll (C RETRY state),
-                // leaving the record's bits stale.
-                ctrl.comm_state = CommState::Retry;
-                return self.last_status.clone();
-            }
-            ctrl.comm_state = CommState::CommErr;
-            self.last_status.comms_error = true;
-            self.last_status.problem = true;
-            return self.last_status.clone();
+            ctrl.comm_state = match ctrl.comm_state {
+                CommState::Normal => CommState::Retry,
+                _ => CommState::CommErr,
+            };
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("PM500 axis {c}: no status reply"),
+            });
         }
         ctrl.comm_state = CommState::Normal;
 
@@ -471,7 +473,7 @@ impl Pm500Axis {
             vbas_supported: false,
             ..MotorStatus::default()
         };
-        self.last_status.clone()
+        Ok(self.last_status.clone())
     }
 }
 
@@ -709,6 +711,26 @@ mod tests {
                 "XM?"
             ]
         );
+    }
+
+    /// drvPM500.cc:244-260: a first unanswered `R` is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and an answer clears it.
+    #[test]
+    fn an_unanswered_status_is_retry_then_comm_error() {
+        let (mut axis, _, xr) = pm500_axis("pm500_retry");
+        let user = AsynUser::default();
+        *xr.lock().unwrap() = "";
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        *xr.lock().unwrap() = "XD+5.000";
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        assert!(axis.poll(&user).is_ok());
+        *xr.lock().unwrap() = "";
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
     #[test]
