@@ -171,6 +171,11 @@ static PIC630_AXES: AtomicU8 = AtomicU8::new(PIC630_NUM_AXIS);
 /// `PIC630Setup(num_cards, num_channels, scan_rate)`.
 pub fn pic630_setup_command() -> CommandDef {
     PIC630.register_row();
+    PIC630.register_report("drvPIC630", |cards| {
+        cards.report("PIC630", |card, line| {
+            format!("    PIC630 controller #{card}, {line} \n")
+        })
+    });
     CommandDef::new(
         "PIC630Setup",
         vec![
@@ -242,6 +247,8 @@ pub fn pic630_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 PIC630.install(ctx, card, signal as i32, motor)?;
             }
+            // C's ident is the constant motor_init copies (drvPIC630.cc:546).
+            PIC630.describe(card, format!("port={asyn_port}, id: PIC630"));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -602,4 +609,56 @@ pub fn pie816_config_command() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, run_command};
+
+    fn int(v: i64) -> ArgValue {
+        ArgValue::Int(v)
+    }
+
+    fn port(name: &str) -> ArgValue {
+        ArgValue::String(name.into())
+    }
+
+    /// The drvet `report` `dbior` runs, before `setup` and after `config`
+    /// brought up card 1 of the two `setup` made.
+    async fn reports(
+        drvet: &str,
+        setup: (CommandDef, Vec<ArgValue>),
+        config: (CommandDef, Vec<ArgValue>),
+    ) -> (String, String) {
+        let before = driver_report(drvet, 0);
+        run_command(setup.0, setup.1).await;
+        run_command(config.0, config.1).await;
+        (before, driver_report(drvet, 0))
+    }
+
+    /// drvPIC630.cc:114-136, which `dbior` runs; the ident is C's constant "PIC630".
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic630_chain() {
+        let setup = pic630_setup_command();
+        let (_line, _io) = LineRig::new("c630RepLine", |last| match last {
+            "1TS" => "1TS:0".into(),
+            "1TP" => "1TP:0".into(),
+            c => c.into(),
+        });
+        let mut config = vec![int(1), port("c630RepLine")];
+        config.extend((0..9).map(|_| int(1)));
+        let (before, after) = reports(
+            "drvPIC630",
+            (setup, vec![int(2), int(1), int(10)]),
+            (pic630_config_command(), config),
+        )
+        .await;
+        assert_eq!(before, "    No PIC630 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC630 controller 0 connection failed.\n    PIC630 controller #1, \
+             port=c630RepLine, id: PIC630 \n"
+        );
+    }
 }
