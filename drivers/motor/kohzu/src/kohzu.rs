@@ -333,9 +333,8 @@ impl AsynMotor for KohzuAxis {
         acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
-        // C HOME_FOR/HOME_REV both emit the same ORG sequence. C leaves
-        // accl_rate at the raw SET_ACCEL rate (steps/s^2) where ASI takes
-        // the time; the move's time is used here instead.
+        // C HOME_FOR/HOME_REV both emit the same ORG sequence.
+        // C sends SET_ACCEL's steps/s^2 as ASI's time (devSC800.cc:274); not copied.
         self.set_speeds(min_velocity, velocity, acceleration);
         self.write_move(&format!("ORG{}/2/0/0/3/1", self.axis))
     }
