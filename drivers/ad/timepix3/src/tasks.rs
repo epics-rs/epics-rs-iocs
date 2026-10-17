@@ -4789,9 +4789,19 @@ mod tests {
                 .unwrap_or(0),
             0
         );
+        // The worker traces the frame after it posts it.
+        let processed = adlog::log(
+            adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+            "Processed PrvImg1 frame: width=1, height=1, format=uint16, frame=7, thresholdID=0",
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        while !text.contains(&processed) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            text = std::fs::read_to_string(&path).unwrap();
+        }
         worker.request_stop();
         drop(peer);
-        let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(
             text.contains(&adlog::log(
@@ -4800,13 +4810,7 @@ mod tests {
             )),
             "{text}"
         );
-        assert!(
-            text.contains(&adlog::log(
-                adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
-                "Processed PrvImg1 frame: width=1, height=1, format=uint16, frame=7, thresholdID=0"
-            )),
-            "{text}"
-        );
+        assert!(text.contains(&processed), "{text}");
     }
 
     /// C sends a threshold-1 frame to its own address, and a T1 then T0
