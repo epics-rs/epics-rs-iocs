@@ -25,6 +25,7 @@ use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -63,7 +64,7 @@ use crate::report::{AxisLines, ControllerHead, period_s};
 use crate::smc100::Smc100Axis;
 use crate::xps::{
     ExecutionPlan, GatheringReadback, MoveMode, PcoParams, Profile, SocketMode, XpsAxis,
-    XpsController, XpsError, XpsSocket, ftp, gathering, gpio, pco, profile,
+    XpsController, XpsError, XpsSocket, ftp, gathering, gpio, pco, profile, sftp,
 };
 
 /// Per-command serial I/O timeout: SMC100 (asynMotorController's
@@ -602,17 +603,16 @@ impl ControllerParams for XpsHead {
                 // XPSCreateProfile, as "(null)".
                 let (user, password) =
                     ftp_login.unwrap_or_else(|| ("(null)".into(), "(null)".into()));
-                // useSFTP_ is set only by an XPS-D profile build, which this
-                // port does not have.
                 let _ = write!(
                     out,
                     "       enableSetPosition: {}\n setPositionSettlingTime: {:.6}\n\
                      \x20              IPAddress: {ip}\n                  IPPort: {ip_port}\n\
                      \x20            ftpUserName: {user}\n         ftpUserPassword: {password}\n\
-                     \x20                useSFTP: false\n           movesDeferred: {}\n\
+                     \x20                useSFTP: {}\n           movesDeferred: {}\n\
                      \x20             autoEnable: {}\n          noDisableError: {}\n",
                     i32::from(self.enable_set_position),
                     CFloat(self.settling_s),
+                    ctrl.use_sftp(),
                     i32::from(ctrl.moves_deferred()),
                     i32::from(ctrl.auto_enable()),
                     i32::from(ctrl.no_disable_error())
@@ -1206,20 +1206,36 @@ pub fn xps_build_profile_command() -> CommandDef {
             // poll socket); the FTP upload touches no controller state, so
             // it runs between the two without the lock held.
             let build = || {
-                let (built, firmware) = {
-                    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                    (ctrl.build_profile_text()?, ctrl.firmware().to_string())
+                let (built, directory, use_sftp) = {
+                    let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                    let built = ctrl.build_profile_text()?;
+                    let (directory, sftp) = trajectory_upload(ctrl.firmware())?;
+                    if sftp {
+                        ctrl.set_use_sftp();
+                    }
+                    (built, directory, ctrl.use_sftp())
                 };
-                let (directory, _sftp) = trajectory_upload(&firmware)?;
                 let directory = ftp_dir.clone().unwrap_or_else(|| directory.to_string());
-                ftp::upload_trajectory(
-                    &host,
-                    &directory,
-                    &file_name,
-                    &built.text,
-                    &ftp_user,
-                    &ftp_pass,
-                )?;
+                if use_sftp {
+                    xps_sftp_upload_traced(
+                        &motor_port,
+                        &host,
+                        &directory,
+                        &file_name,
+                        &built.text,
+                        &ftp_user,
+                        &ftp_pass,
+                    )?;
+                } else {
+                    ftp::upload_trajectory(
+                        &host,
+                        &directory,
+                        &file_name,
+                        &built.text,
+                        &ftp_user,
+                        &ftp_pass,
+                    )?;
+                }
                 controller
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -2130,6 +2146,40 @@ fn parse_move_mode(arg: Option<String>) -> Result<MoveMode, String> {
 
 /// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, "%s:%s: %s\n", driverName,
 /// functionName, message)` for a failed XPS profile build, run or readback.
+/// XPSController.cpp:710-720: `xpsSFTPUpload` between C's FLOW lines,
+/// verbose when the controller's own user traces IO_DRIVER.
+fn xps_sftp_upload_traced(
+    motor_port: &str,
+    host: &str,
+    directory: &str,
+    file_name: &str,
+    contents: &str,
+    user: &str,
+    password: &str,
+) -> Result<(), String> {
+    let trace = MotorTrace::new(motor_port, 0);
+    let verbose = PortManager::global().trace_manager().is_enabled_device(
+        motor_port,
+        0,
+        TraceMask::IO_DRIVER,
+    );
+    trace.print_self(
+        TraceMask::FLOW,
+        format_args!("XPSController::buildProfile calling xpsSFTPUpload\n"),
+    );
+    let status = sftp::xps_sftp_upload(
+        host, directory, file_name, contents, user, password, verbose,
+    );
+    trace.print_self(
+        TraceMask::FLOW,
+        format_args!("XPSController::buildProfile xpsSFTPUpload returned {status}\n"),
+    );
+    if status != 0 {
+        return Err(format!("Error calling xpsSFTPUpload, status={status}\n"));
+    }
+    Ok(())
+}
+
 fn xps_profile_failed(motor_port: &str, function: &str, message: &str) {
     MotorTrace::new(motor_port, 0).print_self(
         TraceMask::ERROR,

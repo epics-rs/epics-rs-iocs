@@ -173,6 +173,8 @@ pub struct XpsController {
     moving_mode: bool,
     /// C `movesDeferred_`.
     moves_deferred: bool,
+    /// C `useSFTP_`: set by the first XPS-D profile build.
+    use_sftp: bool,
     /// Each registered axis's `(positioner, group)`, in registration order —
     /// for group-membership counts (C `XPSAxis::isInGroup`) and for enumerating
     /// a group's positioners when building/executing a PVT profile.
@@ -208,6 +210,7 @@ impl XpsController {
             no_disable_error: false,
             moving_mode: false,
             moves_deferred: false,
+            use_sftp: false,
             axes: Vec::new(),
             referencing_groups: HashSet::new(),
             profile: None,
@@ -274,6 +277,16 @@ impl XpsController {
             move_sock,
             state,
         });
+    }
+
+    /// Whether profile builds upload over SFTP (C `useSFTP_`).
+    pub fn use_sftp(&self) -> bool {
+        self.use_sftp
+    }
+
+    /// An XPS-D profile build sets `useSFTP_`; nothing clears it.
+    pub fn set_use_sftp(&mut self) {
+        self.use_sftp = true;
     }
 
     /// Whether moves are held for a group move (C `movesDeferred_`).
