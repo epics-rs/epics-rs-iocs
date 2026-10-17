@@ -286,9 +286,7 @@ impl Emc18011Axis {
         let prem = self.strings.arm();
         let mut ctrl = self.lock();
         ctrl.select(self.index)?;
-        if velocity > 0.0 {
-            ctrl.command(&vel_cmd(velocity * DRIVE_RESOLUTION))?;
-        }
+        ctrl.command(&vel_cmd(velocity * DRIVE_RESOLUTION))?;
         send_prem(&ctrl, &prem)?;
         ctrl.command(move_str)?;
         ctrl.command("A")?;
@@ -599,6 +597,16 @@ mod tests {
         assert_eq!(axis.poll(&user).unwrap().position, 100.0);
         axis.move_velocity(&user, 0.0, -0.3, 0.0).unwrap();
         assert_eq!(line.sent().last().unwrap(), ">");
+    }
+
+    /// devEMC18011.cc:317-327: the record's SET_VELOCITY goes out with every
+    /// move, a zero one too.
+    #[test]
+    fn a_zero_velocity_move_still_sends_v() {
+        let (line, mut axis, _) = strings_rig("emcV0");
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 100.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["M1", "V0.00", "G1.0", "A"]);
     }
 
     #[test]
