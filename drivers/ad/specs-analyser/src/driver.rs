@@ -128,7 +128,11 @@ impl SpecsAnalyserDriver {
                 DiscoveredValue::String(_) => ParamType::Octet,
             };
             let base = &mut self.ad.port_base;
-            let Ok(reason) = base.create_param(&param.epics_name, kind) else {
+            // C ignores createParam's status and uses the index it wrote: a
+            // reconnect's re-create is refused but sets the existing parameter
+            // (asynPortDriver.cpp:130).
+            let created = base.create_param(&param.epics_name, kind);
+            let Some(reason) = created.ok().or_else(|| base.find_param(&param.epics_name)) else {
                 continue;
             };
             match param.value {
@@ -807,6 +811,25 @@ mod tests {
             (e.status(), e.message()),
             (AsynStatus::Error, String::new())
         );
+    }
+
+    /// A reconnect runs setupEPICSParameters again (specsAnalyser.cpp:196):
+    /// the re-create is refused, and the new value still lands on the
+    /// parameter the first connect created.
+    #[test]
+    fn a_rediscovered_param_takes_the_new_value() {
+        let mut d = offline("SPECS_REDISC");
+        let found = |v| {
+            vec![wire::DiscoveredParam {
+                epics_name: "LENS_VOLTAGE".into(),
+                raw_name: "LensVoltage".into(),
+                value: DiscoveredValue::Double(Some(v)),
+            }]
+        };
+        d.create_discovered(found(1.5));
+        d.create_discovered(found(2.5));
+        let reason = d.ad.port_base.find_param("LENS_VOLTAGE").unwrap();
+        assert_eq!(d.ad.port_base.get_float64_param(reason, 0).unwrap(), 2.5);
     }
 
     /// writeInt32/writeFloat64 set and post list 0 whatever the address
