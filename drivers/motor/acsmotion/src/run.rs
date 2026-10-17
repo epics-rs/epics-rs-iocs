@@ -583,6 +583,8 @@ mod tests {
         rig.sent()
             .into_iter()
             .filter(|c| !c.starts_with('?') || c.starts_with("?GSFREE"))
+            // The controller poll's reads.
+            .filter(|c| !c.starts_with("BIN ??") || c.starts_with("BIN ??DC_DATA"))
             .collect()
     }
 
@@ -612,10 +614,11 @@ mod tests {
         rig
     }
 
-    /// Axis 0's poll, which the profile thread reads; the rig has no
-    /// record to start the poller.
+    /// A poller pass over axis 0, which the profile thread reads; the rig
+    /// has no record to start the poller.
     fn poll(rig: &Rig, var: &str, value: i32) {
         rig.line.lock().unwrap().set(var, &[f64::from(value)]);
+        rig.ctrl.lock().unwrap().poll().unwrap();
         SpiiPlusAxis::new(rig.ctrl.clone(), 0)
             .poll(&AsynUser::default())
             .unwrap();

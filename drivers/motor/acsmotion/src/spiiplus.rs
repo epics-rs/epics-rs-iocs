@@ -5,14 +5,10 @@
 //! through the controller's comm, as C's `pComm_` does; axes are addressed by
 //! 0-based index on the wire.
 //!
-//! ## Poll transport (deviation, documented)
+//! ## Poll
 //!
-//! The C controller `poll()` reads all axes at once with the binary
-//! protocol (`getDoubleArray`/`getIntegerArray`). This port still issues
-//! per-axis ASCII single-element queries (`?APOS(n)`, `?FPOS(n)`, `?MST(n)`,
-//! `?FAULT(n)`, `?MFLAGS(n)`, `?FVEL(n)`, `?AST(n)`) from each axis's
-//! [`poll`](AsynMotor::poll); the values are the same, only the number of
-//! round-trips differs.
+//! As C, [`SpiiPlusController::poll`] reads every axis at once with the
+//! binary protocol before the axes' polls, which only parse what it read.
 //!
 //! ## Units
 //!
@@ -31,8 +27,7 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! The binary bulk poll (replaced by ASCII queries), and the other aux
-//! asyn parameters (MFLAGS/MFLAGSX bit fields, safe-torque-off, encoder offsets
+//! The aux asyn parameters (MFLAGS/MFLAGSX bit fields, safe-torque-off, encoder offsets
 //! and factors, reference position, PEG, disable-set-position guard, global
 //! variable read/write, ACSPL program start/stop).
 
@@ -216,6 +211,29 @@ pub struct SpiiPlusController {
     setup: Vec<AxisSetup>,
     motion: Vec<AxisMotion>,
     homing: Vec<Homing>,
+    polled: Polled,
+}
+
+/// The arrays C's controller `poll()` reads that the axis polls parse,
+/// each kept from the last poll that read it.
+#[derive(Debug, Clone, Default)]
+struct Polled {
+    /// `APOS`, C `axisPosition_`.
+    axis_position: Vec<f64>,
+    /// `FPOS`, C `feedbackPosition_`.
+    feedback_position: Vec<f64>,
+    /// `VPOS`, C `virtualFeedbackPosition_`.
+    virtual_feedback_position: Vec<f64>,
+    /// `FVEL`, C `feedbackVelocity_`.
+    feedback_velocity: Vec<f64>,
+    /// `AST`, C `axisStatus_`.
+    axis_status: Vec<i32>,
+    /// `MST`, C `motorStatus_`.
+    motor_status: Vec<i32>,
+    /// `FAULT`, C `faultStatus_`.
+    fault_status: Vec<i32>,
+    /// `MFLAGS`, C `motorFlags_`.
+    motor_flags: Vec<i32>,
 }
 
 impl SpiiPlusController {
@@ -278,7 +296,62 @@ impl SpiiPlusController {
             setup,
             motion: vec![AxisMotion::default(); num_axes],
             homing: vec![Homing::default(); num_axes],
+            polled: Polled {
+                axis_position: vec![0.0; num_axes],
+                feedback_position: vec![0.0; num_axes],
+                virtual_feedback_position: vec![0.0; num_axes],
+                feedback_velocity: vec![0.0; num_axes],
+                axis_status: vec![0; num_axes],
+                motor_status: vec![0; num_axes],
+                fault_status: vec![0; num_axes],
+                motor_flags: vec![0; num_axes],
+            },
         }
+    }
+
+    /// C `SPiiPlusController::poll` (SPiiPlusDriver.cpp:547-635): every
+    /// axis's position, status and limits in one binary read each, for the
+    /// axes' polls to parse. The first failed read ends the poll, leaving
+    /// it and the arrays after it as the last poll read them. The arrays
+    /// only C's parameters use are read and dropped.
+    pub fn poll(&mut self) -> AsynResult<()> {
+        self.trace_flow(format_args!("POLL_START"));
+        let span = Span::one(0, self.num_axes as i32 - 1);
+        let comm = &self.comm;
+        let polled = &mut self.polled;
+        polled.axis_position = comm.get_double_array("APOS", span)?;
+        for var in ["RPOS", "EPOS"] {
+            comm.get_double_array(var, span)?;
+        }
+        polled.feedback_position = comm.get_double_array("FPOS", span)?;
+        comm.get_double_array("F2POS", span)?;
+        if self.vpos_supported && self.setup.iter().any(|s| s.is_virtual) {
+            polled.virtual_feedback_position = comm.get_double_array("VPOS", span)?;
+        }
+        polled.feedback_velocity = comm.get_double_array("FVEL", span)?;
+        for var in ["ROFFS", "EOFFS", "E2OFFS", "E_AOFFS"] {
+            comm.get_double_array(var, span)?;
+        }
+        polled.axis_status = comm.get_integer_array("AST", span)?;
+        polled.motor_status = comm.get_integer_array("MST", span)?;
+        polled.fault_status = comm.get_integer_array("FAULT", span)?;
+        polled.motor_flags = comm.get_integer_array("MFLAGS", span)?;
+        comm.get_integer_array("MFLAGSX", span)?;
+        for var in ["XVEL", "XACC"] {
+            comm.get_double_array(var, span)?;
+        }
+        self.trace_flow(format_args!("POLL_END"));
+        Ok(())
+    }
+
+    fn trace_flow(&self, args: std::fmt::Arguments<'_>) {
+        PortManager::global().trace_manager().print(
+            Some(&self.port),
+            Some(0),
+            0,
+            TraceMask::FLOW,
+            format_args!("SPiiPlusController:poll: {args}\n"),
+        );
     }
 
     /// The firmware version string (`?VR`).
@@ -338,16 +411,6 @@ impl SpiiPlusController {
     /// Send a set/motion command (C `writeReadAck`).
     fn command(&self, cmd: &str) -> AsynResult<()> {
         self.comm.write_read_ack(cmd)
-    }
-
-    /// Read a single integer array element `?VAR(index)`.
-    fn query_int(&self, var: &str, index: usize) -> AsynResult<i32> {
-        self.comm.write_read_int(&format!("?{var}({index})"))
-    }
-
-    /// Read a single double array element `?VAR(index)`.
-    fn query_double(&self, var: &str, index: usize) -> AsynResult<f64> {
-        self.comm.write_read_double(&format!("?{var}({index})"))
     }
 }
 
@@ -542,35 +605,39 @@ impl AsynMotor for SpiiPlusAxis {
         Ok(())
     }
 
+    /// C `SPiiPlusAxis::poll` (SPiiPlusDriver.cpp:751-866): what the
+    /// controller's [`SpiiPlusController::poll`] read, with no I/O of its own.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let mut ctrl = self.lock();
         let a = self.axis;
+        let polled = &ctrl.polled;
+        let at = |values: &[f64]| values.get(a).copied().unwrap_or_default();
+        let bits = |values: &[i32]| values.get(a).copied().unwrap_or_default();
 
-        let apos = ctrl.query_double("APOS", a)? / self.resolution;
-        let velocity = ctrl.query_double("FVEL", a)? / self.resolution;
-        let ast = ctrl.query_int("AST", a)?;
+        let apos = at(&polled.axis_position) / self.resolution;
+        let velocity = at(&polled.feedback_velocity) / self.resolution;
+        let ast = bits(&polled.axis_status);
 
         let (moving, powered, high_limit, low_limit, homed, encoder) = if self.reduced {
             // Dummy/virtual: motion from AST, no faults; the encoder is the
             // commanded position, or VPOS for a virtual axis that has it.
             let encoder = if !self.dummy && ctrl.vpos_supported {
-                ctrl.query_double("VPOS", a)? / ctrl.encoder_factor[a]
+                at(&polled.virtual_feedback_position) / ctrl.encoder_factor[a]
             } else {
                 apos
             };
             ((ast & AST_MOTION) != 0, false, false, false, false, encoder)
         } else {
-            let mst = ctrl.query_int("MST", a)?;
-            let fault = ctrl.query_int("FAULT", a)?;
-            let mflags = ctrl.query_int("MFLAGS", a)?;
-            let fpos = ctrl.query_double("FPOS", a)?;
+            let mst = bits(&polled.motor_status);
+            let fault = bits(&polled.fault_status);
+            let mflags = bits(&polled.motor_flags);
             (
                 (mst & MST_MOTION) != 0,
                 (mst & MST_ENABLED) != 0,
                 (fault & FAULT_HARD_RIGHT_LIMIT) != 0,
                 (fault & FAULT_HARD_LEFT_LIMIT) != 0,
                 (mflags & MFLAGS_HOME) != 0,
-                fpos / ctrl.encoder_factor[a],
+                at(&polled.feedback_position) / ctrl.encoder_factor[a],
             )
         };
         // C stores the poller's `moving` from before this axis's poll, the
@@ -835,6 +902,38 @@ mod tests {
         assert_eq!(rig.ctrl.lock().unwrap().homing(1).method, 3);
     }
 
+    /// One poller pass over `axis`: the controller poll, then the axis's.
+    fn pass(ctrl: &Arc<Mutex<SpiiPlusController>>, axis: &mut SpiiPlusAxis) -> MotorStatus {
+        ctrl.lock().unwrap().poll().unwrap();
+        axis.poll(&AsynUser::default()).unwrap()
+    }
+
+    /// C's controller poll reads every axis in binary, in its order, and
+    /// the axis polls only parse what it read (SPiiPlusDriver.cpp:547-635,
+    /// :751-866).
+    #[test]
+    fn the_controller_poll_reads_every_axis_and_the_axis_poll_sends_nothing() {
+        let (ctrl, line) = fake("spiiBulk", 2, &[("EFAC", &[1.0, 1.0])]);
+        line.lock().unwrap().set("APOS", &[3.0, 4.0]);
+        let mut axes = [0, 1].map(|i| SpiiPlusAxis::new(ctrl.clone(), i));
+        line.lock().unwrap().sent.clear();
+        ctrl.lock().unwrap().poll().unwrap();
+        let reads: Vec<String> = [
+            "APOS", "RPOS", "EPOS", "FPOS", "F2POS", "FVEL", "ROFFS", "EOFFS", "E2OFFS", "E_AOFFS",
+            "AST", "MST", "FAULT", "MFLAGS", "MFLAGSX", "XVEL", "XACC",
+        ]
+        .iter()
+        .map(|var| format!("BIN ??{var}(0,1)(0,0)"))
+        .collect();
+        assert_eq!(line.lock().unwrap().sent, reads);
+        line.lock().unwrap().sent.clear();
+        let positions = axes
+            .each_mut()
+            .map(|axis| axis.poll(&AsynUser::default()).unwrap().position);
+        assert_eq!(positions, [3.0, 4.0]);
+        assert!(line.lock().unwrap().sent.is_empty());
+    }
+
     /// A controller of `axes` axes on a fake line, its setup arrays given.
     fn fake(
         name: &str,
@@ -899,7 +998,7 @@ mod tests {
                 ("FPOS", &[6.0]),
             ],
         );
-        let mut axis = SpiiPlusAxis::new(ctrl, 0);
+        let mut axis = SpiiPlusAxis::new(ctrl.clone(), 0);
         line.lock().unwrap().sent.clear();
         let user = AsynUser::default();
         axis.move_absolute(&user, 10.0, 0.0, 4.0, 8.0).unwrap();
@@ -907,7 +1006,7 @@ mod tests {
             line.lock().unwrap().sent,
             ["ACC(0)=4", "DEC(0)=4", "VEL(0)=2", "PTP 0, 5"]
         );
-        let status = axis.poll(&user).unwrap();
+        let status = pass(&ctrl, &mut axis);
         // APOS / STEPF, and FPOS / EFAC.
         assert_eq!((status.position, status.encoder_position), (10.0, 3.0));
     }
@@ -936,33 +1035,31 @@ mod tests {
             &[0],
         );
         // A virtual microstepper still takes the encoder factor.
-        let mut axis = SpiiPlusAxis::new(ctrl, 0);
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let mut axis = SpiiPlusAxis::new(ctrl.clone(), 0);
+        let status = pass(&ctrl, &mut axis);
         assert_eq!((status.position, status.encoder_position), (0.5, 4.0));
     }
 
     #[test]
     fn direction_is_zero_until_a_move_runs_forward() {
         let (ctrl, line) = fake("spiiDir", 1, &[("EFAC", &[1.0]), ("FVEL", &[2.0])]);
-        let user = AsynUser::default();
-        let mut axis = SpiiPlusAxis::new(ctrl, 0);
+        let mut axis = SpiiPlusAxis::new(ctrl.clone(), 0);
         // Stationary: C leaves motorStatusDirection_ unset.
-        assert!(!axis.poll(&user).unwrap().direction);
+        assert!(!pass(&ctrl, &mut axis).direction);
         line.lock().unwrap().set("MST", &[f64::from(MST_MOTION)]);
-        assert!(axis.poll(&user).unwrap().direction);
+        assert!(pass(&ctrl, &mut axis).direction);
         line.lock().unwrap().set("MST", &[0.0]);
         line.lock().unwrap().set("FVEL", &[-2.0]);
-        assert!(axis.poll(&user).unwrap().direction);
+        assert!(pass(&ctrl, &mut axis).direction);
     }
 
     #[test]
     fn motion_sets_the_msta_moving_bit() {
         let (ctrl, line) = fake("spiiMsta", 1, &[("EFAC", &[1.0])]);
-        let user = AsynUser::default();
-        let mut axis = SpiiPlusAxis::new(ctrl, 0);
-        assert!(!axis.poll(&user).unwrap().msta_moving);
+        let mut axis = SpiiPlusAxis::new(ctrl.clone(), 0);
+        assert!(!pass(&ctrl, &mut axis).msta_moving);
         line.lock().unwrap().set("MST", &[f64::from(MST_MOTION)]);
-        assert!(axis.poll(&user).unwrap().msta_moving);
+        assert!(pass(&ctrl, &mut axis).msta_moving);
     }
 
     #[test]
@@ -977,6 +1074,7 @@ mod tests {
             .set("AST", &[f64::from(AST_PEG_READY), 0.0]);
         let user = AsynUser::default();
         let mut axes = [0, 1].map(|i| SpiiPlusAxis::new(ctrl.clone(), i));
+        ctrl.lock().unwrap().poll().unwrap();
         for axis in &mut axes {
             axis.poll(&user).unwrap();
         }
