@@ -3846,6 +3846,11 @@ impl PortDriver for TimePix3Driver {
         let n = buf.len().min(data.len());
         buf[..n].copy_from_slice(&data[..n]);
         buf[n..].fill(0);
+        // Only PixelConfigDiff and ImgImageFrame return before C's
+        // callParamCallbacks (mask_io.cpp:38-91, :243).
+        if reason != self.p.pixel_config_diff && reason != self.p.img_image_frame {
+            self.ad.port_base.call_param_callbacks(0)?;
+        }
         Ok(buf.len())
     }
 }
@@ -7032,6 +7037,53 @@ mod tests {
             .read_int32_array(&AsynUser::new(p.pixel_config_diff), &mut buf)
             .unwrap();
         assert_eq!((n, buf), (4, [5, 6, 0, 0]));
+    }
+
+    /// C's readInt32Array tail posts the pending parameters for every
+    /// reason but the two it answers first (mask_io.cpp:38-91, :239-247).
+    #[test]
+    fn a_waveform_read_posts_pending_params_as_c() {
+        use epics_rs::asyn::interrupt::{InterruptFilter, InterruptManager};
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_READ_TAIL",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        det.ad.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+        let posted = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = posted.clone();
+        std::mem::forget(det.ad.port_base.interrupts.register_sync_callback(
+            InterruptFilter {
+                reason: Some(p.http_code),
+                ..Default::default()
+            },
+            move |iv| {
+                if let ParamValue::Int32(v) = iv.value {
+                    seen.lock().push(v);
+                }
+            },
+        ));
+        for (reason, value, posts) in [
+            (p.pixel_config_diff, 1, false),
+            (p.img_image_frame, 2, false),
+            (p.prv_hst_histogram_frame, 3, true),
+        ] {
+            posted.lock().clear();
+            det.ad
+                .port_base
+                .set_int32_param(p.http_code, 0, value)
+                .unwrap();
+            let mut buf = [0; 2];
+            det.read_int32_array(&AsynUser::new(reason), &mut buf)
+                .unwrap();
+            assert_eq!(posted.lock().contains(&value), posts, "reason {reason}");
+        }
     }
 
     /// A Medipix3 counting both counters refuses 24-bit depth and CONTINUOUS
