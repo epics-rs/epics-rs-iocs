@@ -227,13 +227,18 @@ pub fn mdrive_config_command() -> CommandDef {
 #[cfg(all(test, target_os = "linux"))]
 mod one_poller {
     use super::*;
-    use motor_common::testing::pollers_after;
+    use motor_common::testing::{LineRig, pollers_after};
 
-    /// C ImsMDrivePlusMotorController's one asynMotorController poller. No
-    /// port has the line's name; the controller carries on unconnected as C's
-    /// does.
+    /// C ImsMDrivePlusMotorController's one asynMotorController poller.
     #[epics_rs::base::epics_test]
     async fn ims_mdrive_plus_create_controller_polls_on_one_poller() {
+        let (line, _io) = LineRig::new("mdrivePlusLine", |last| {
+            if last.contains("PR VR") {
+                "1.000".into()
+            } else {
+                "0".into()
+            }
+        });
         let args = vec![
             ArgValue::String("mdrivePlus".into()),
             ArgValue::String("mdrivePlusLine".into()),
@@ -243,5 +248,6 @@ mod one_poller {
         ];
         let cmd = ims_create_controller_command();
         assert_eq!(pollers_after(cmd, args).await, 1);
+        assert!(!line.sent().is_empty());
     }
 }
