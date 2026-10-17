@@ -56,31 +56,6 @@ impl HttpError {
     }
 }
 
-/// The base64 alphabet Serval encodes `PixelConfig` with.
-const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Decode standard base64; `None` for any byte outside the alphabet.
-pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
-    let bytes: Vec<u8> = input
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .take_while(|&b| b != b'=')
-        .collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut nbits = 0u32;
-    for b in bytes {
-        let v = B64.iter().position(|&c| c == b)? as u32;
-        acc = (acc << 6) | v;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
-    }
-    Some(out)
-}
-
 /// A Serval endpoint client.
 #[derive(Clone)]
 pub struct ServalHttp {
@@ -236,6 +211,9 @@ fn basic_auth_header(user: &str, pass: &str) -> String {
     )
 }
 
+/// The standard base64 alphabet.
+const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
 fn encode_base64(data: &[u8]) -> String {
     let mut out = String::new();
     for chunk in data.chunks(3) {
@@ -262,10 +240,11 @@ mod tests {
 
     #[test]
     fn base64_round_trips() {
-        for case in ["", "f", "fo", "foo", "foob", "fooba", "foobar"] {
+        assert_eq!(encode_base64(b""), "");
+        for case in ["f", "fo", "foo", "foob", "fooba", "foobar"] {
             let encoded = encode_base64(case.as_bytes());
             assert_eq!(
-                decode_base64(&encoded).unwrap(),
+                crate::mask::decode_base64_strict(&encoded).unwrap(),
                 case.as_bytes(),
                 "round trip of {case:?} via {encoded:?}"
             );
@@ -273,22 +252,6 @@ mod tests {
         // The RFC 4648 vectors.
         assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
         assert_eq!(encode_base64(b"fo"), "Zm8=");
-    }
-
-    #[test]
-    fn base64_rejects_a_nul_instead_of_decoding_it() {
-        // C's strchr(kChars, '\0') matches the terminating NUL and yields
-        // index 64, silently corrupting the decode (serval_http.cpp:49).
-        assert_eq!(decode_base64("AA\0A"), None);
-        assert_eq!(decode_base64("!!!!"), None);
-    }
-
-    #[test]
-    fn base64_decodes_a_padded_payload() {
-        assert_eq!(decode_base64("AAAA").unwrap(), vec![0, 0, 0]);
-        assert_eq!(decode_base64("/w==").unwrap(), vec![0xff]);
-        // Whitespace between groups is skipped, as in a wrapped payload.
-        assert_eq!(decode_base64("Zm9v\nYmFy").unwrap(), b"foobar");
     }
 
     #[test]

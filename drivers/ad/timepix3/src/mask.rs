@@ -8,9 +8,6 @@
 
 use crate::family::DetectorFamily;
 
-/// One chip's pixel-config bytes (C `kPixelConfigBytes`, serval_http.cpp:1011).
-pub const PIXEL_CONFIG_BYTES: usize = 65536;
-
 /// C `rowsCols`'s outputs (mask_io.cpp:251-313); all zero where C leaves
 /// them so.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -570,22 +567,134 @@ pub fn apply_mask_to_bpc(
     }
 }
 
-/// `|SERVAL − BPC|` per image pixel (C serval_http.cpp:1120-1142).
-///
-/// `serval` is the chip pixel-config bytes concatenated in chip order, `bpc`
-/// the file on disk. A pixel whose chip did not decode contributes 0.
-pub fn pixel_config_diff(map: &[i32], serval: &[u8], bpc: &[u8], out: &mut [i32]) {
-    out.fill(0);
-    for (dst, &k) in map.iter().enumerate() {
-        let Ok(k) = usize::try_from(k) else { continue };
-        if dst >= out.len() {
+/// C `ADTimePix3ServalPixelConfig::ResponseError`; `None` is the `Ok` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelConfigError {
+    HttpFailure,
+    EmptyBody,
+    MalformedJson,
+    InvalidRoot,
+    InvalidBase64,
+    LengthMismatch,
+}
+
+impl PixelConfigError {
+    /// C `responseErrorMessage`.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::HttpFailure => "HTTP request failed",
+            Self::EmptyBody => "Empty response body",
+            Self::MalformedJson => "Malformed JSON response",
+            Self::InvalidRoot => "JSON response is not a string",
+            Self::InvalidBase64 => "Invalid base64 payload",
+            Self::LengthMismatch => "Decoded PixelConfig length mismatch",
+        }
+    }
+}
+
+/// C `isspace` in the C locale, which `is_ascii_whitespace` lacks `\v` of.
+fn c_isspace(c: u8) -> bool {
+    c.is_ascii_whitespace() || c == 0x0b
+}
+
+/// C `decodeBase64Strict`: whitespace dropped, whole groups of four, and
+/// padding only in the last group with its unused bits zero.
+pub fn decode_base64_strict(encoded: &str) -> Option<Vec<u8>> {
+    let compact: Vec<u8> = encoded.bytes().filter(|&c| !c_isspace(c)).collect();
+    if compact.is_empty() || !compact.len().is_multiple_of(4) {
+        return None;
+    }
+    let value = |c: u8| -> Option<u8> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+    let mut decoded = Vec::with_capacity(compact.len() / 4 * 3);
+    let groups = compact.len() / 4;
+    for (n, group) in compact.as_chunks::<4>().0.iter().enumerate() {
+        let last = n + 1 == groups;
+        let (a, b) = (value(group[0])?, value(group[1])?);
+        if group[2] == b'=' {
+            if !last || group[3] != b'=' || b & 0x0f != 0 {
+                return None;
+            }
+            decoded.push((a << 2) | (b >> 4));
             continue;
         }
-        let (Some(&a), Some(&b)) = (serval.get(k), bpc.get(k)) else {
+        let c = value(group[2])?;
+        decoded.push((a << 2) | (b >> 4));
+        if group[3] == b'=' {
+            if !last || c & 0x03 != 0 {
+                return None;
+            }
+            decoded.push((b << 4) | (c >> 2));
             continue;
-        };
-        out[dst] = i32::from(a.abs_diff(b));
+        }
+        let d = value(group[3])?;
+        decoded.push((b << 4) | (c >> 2));
+        decoded.push((c << 6) | d);
     }
+    Some(decoded)
+}
+
+/// C `ADTimePix3ServalPixelConfig::parseResponse`: a 200 reply whose body is
+/// a JSON string of exactly `expected` bytes in strict base64.
+pub fn parse_pixel_config_response(
+    code: i32,
+    body: &str,
+    expected: usize,
+) -> Result<Vec<u8>, PixelConfigError> {
+    if code != 200 {
+        return Err(PixelConfigError::HttpFailure);
+    }
+    if body.is_empty() {
+        return Err(PixelConfigError::EmptyBody);
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| PixelConfigError::MalformedJson)?;
+    let serde_json::Value::String(encoded) = parsed else {
+        return Err(PixelConfigError::InvalidRoot);
+    };
+    if expected == 0 || expected > usize::MAX - 2 {
+        return Err(PixelConfigError::LengthMismatch);
+    }
+    let characters = encoded.bytes().filter(|&c| !c_isspace(c)).count();
+    let expected_characters = expected.div_ceil(3);
+    if expected_characters.checked_mul(4) != Some(characters) {
+        return Err(PixelConfigError::LengthMismatch);
+    }
+    let decoded = decode_base64_strict(&encoded).ok_or(PixelConfigError::InvalidBase64)?;
+    if decoded.len() != expected {
+        return Err(PixelConfigError::LengthMismatch);
+    }
+    Ok(decoded)
+}
+
+/// C `ADTimePix3ServalPixelConfig::absolutePackedDifference`: `|a − b|` of
+/// the big-endian pixel at `offset`, one or two bytes wide.
+pub fn absolute_packed_difference(
+    first: &[u8],
+    second: &[u8],
+    offset: usize,
+    bytes_per_pixel: i32,
+) -> Option<u32> {
+    if !(1..=2).contains(&bytes_per_pixel) {
+        return None;
+    }
+    let range = offset..offset.checked_add(bytes_per_pixel as usize)?;
+    let pack = |v: &[u8]| -> Option<u32> {
+        Some(
+            v.get(range.clone())?
+                .iter()
+                .fold(0, |acc, &b| (acc << 8) | u32::from(b)),
+        )
+    };
+    Some(pack(first)?.abs_diff(pack(second)?))
 }
 
 /// The masked pixels of a BPC file, as image coordinates (C
@@ -919,7 +1028,7 @@ mod tests {
         let mut mask = vec![0i32; g.pixel_count()];
         rectangle(&mut mask, image(&g), 300, 2, 100, 2, true).unwrap();
         for (family, width) in [(DetectorFamily::Tpx3, 1), (DetectorFamily::Mpx3, 2)] {
-            let mut bpc = vec![0u8; 4 * PIXEL_CONFIG_BYTES * width];
+            let mut bpc = vec![0u8; 4 * CHIP_PIXELS * width];
             let at = offsets(&table(&g, 4, 0), width);
             apply_mask_to_bpc(family, &at, &mask, &mut bpc);
             // MPX3 masks the low byte of the big-endian word.
@@ -998,23 +1107,46 @@ mod tests {
         );
     }
 
+    /// One 256 x 256 chip.
+    const CHIP_PIXELS: usize = 65536;
+
     #[test]
-    fn the_pixel_config_diff_is_the_absolute_difference_at_the_mapped_byte() {
-        let g = single();
-        let mut serval = vec![0u8; PIXEL_CONFIG_BYTES];
-        let mut bpc = vec![0u8; PIXEL_CONFIG_BYTES];
-        let map = table(&g, 1, 0);
-        let k = usize::try_from(pel_index(&g, 1, 0, 3, 4).0).unwrap();
-        serval[k] = 200;
-        bpc[k] = 5;
-        let mut out = vec![0i32; g.pixel_count()];
-        pixel_config_diff(&map, &serval, &bpc, &mut out);
-        assert_eq!(out[4 * 256 + 3], 195);
-        assert_eq!(out.iter().filter(|&&v| v != 0).count(), 1);
-        // No underflow when the file byte is the larger one.
-        serval[k] = 1;
-        pixel_config_diff(&map, &serval, &bpc, &mut out);
-        assert_eq!(out[4 * 256 + 3], 4);
+    fn a_pixel_config_reply_is_a_json_string_of_exactly_the_chip_bytes() {
+        use PixelConfigError::*;
+        let parse = |code, body: &str, n| parse_pixel_config_response(code, body, n);
+        assert_eq!(parse(200, r#""Zm9v""#, 3), Ok(b"foo".to_vec()));
+        assert_eq!(parse(200, "\"Zm9v\\nYmFy\"", 6), Ok(b"foobar".to_vec()));
+        assert_eq!(parse(200, r#""Zm8=""#, 2), Ok(b"fo".to_vec()));
+        assert_eq!(parse(500, r#""Zm9v""#, 3), Err(HttpFailure));
+        assert_eq!(parse(200, "", 3), Err(EmptyBody));
+        // A bare payload is not JSON.
+        assert_eq!(parse(200, "Zm9v", 3), Err(MalformedJson));
+        assert_eq!(parse(200, "[1]", 3), Err(InvalidRoot));
+        assert_eq!(parse(200, r#""Zm9v""#, 0), Err(LengthMismatch));
+        assert_eq!(parse(200, r#""Zm9vYmFy""#, 3), Err(LengthMismatch));
+        assert_eq!(parse(200, r#""Zm9!""#, 3), Err(InvalidBase64));
+        // Padding with non-zero unused bits, and padding before the end.
+        assert_eq!(parse(200, r#""Zm9=""#, 2), Err(InvalidBase64));
+        assert_eq!(parse(200, r#""Zg==Zm9v""#, 5), Err(InvalidBase64));
+        // C isspace counts \v; a NUL is not base64.
+        assert_eq!(decode_base64_strict("Zm9v\u{b}"), Some(b"foo".to_vec()));
+        assert_eq!(decode_base64_strict("AA\0A"), None);
+        assert_eq!(decode_base64_strict("!!!!"), None);
+        assert_eq!(decode_base64_strict("AAAA"), Some(vec![0, 0, 0]));
+        assert_eq!(decode_base64_strict("/w=="), Some(vec![0xff]));
+        assert_eq!(decode_base64_strict(""), None);
+    }
+
+    #[test]
+    fn the_packed_difference_is_absolute_and_big_endian() {
+        assert_eq!(absolute_packed_difference(&[200], &[5], 0, 1), Some(195));
+        assert_eq!(absolute_packed_difference(&[1], &[5], 0, 1), Some(4));
+        assert_eq!(
+            absolute_packed_difference(&[0, 1, 0], &[0, 0, 255], 1, 2),
+            Some(0x0100 - 0x00ff)
+        );
+        assert_eq!(absolute_packed_difference(&[1, 2], &[1, 2], 1, 2), None);
+        assert_eq!(absolute_packed_difference(&[1], &[1], 0, 3), None);
     }
 
     #[test]
@@ -1024,7 +1156,7 @@ mod tests {
             let map = table(&g, 4, o);
             let mut mask = vec![0i32; g.pixel_count()];
             rectangle(&mut mask, image(&g), 10, 1, 400, 1, true).unwrap();
-            let mut bpc = vec![0u8; 4 * PIXEL_CONFIG_BYTES];
+            let mut bpc = vec![0u8; 4 * CHIP_PIXELS];
             apply_mask_to_bpc(DetectorFamily::Tpx3, &offsets(&map, 1), &mask, &mut bpc);
             assert_eq!(
                 masked_pixels(&g, &map, &bpc),

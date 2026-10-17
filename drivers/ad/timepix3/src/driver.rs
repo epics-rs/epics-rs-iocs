@@ -21,10 +21,8 @@ use crate::calibration::{PathAccess, PathPolicy};
 use crate::coordinator::{Phase, Resource};
 use crate::destination;
 use crate::family::DetectorFamily;
-use crate::http::{
-    DEFAULT_TIMEOUT, HttpError, HttpResult, ServalHttp, TIMEOUT_5000_MS, decode_base64,
-};
-use crate::mask::{self, Geometry, PIXEL_CONFIG_BYTES};
+use crate::http::{DEFAULT_TIMEOUT, HttpError, HttpResult, ServalHttp, TIMEOUT_5000_MS};
+use crate::mask::{self, Geometry, PixelConfigError};
 use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Mirrored, Shared};
@@ -224,6 +222,38 @@ pub struct TimePix3Driver {
 const NLOHMANN_EMPTY_INPUT: &str = "[json.exception.parse_error.101] parse error at line 1, \
      column 1: attempting to parse an empty input; check that your input string or stream \
      contains the expected JSON";
+
+/// C `pixelConfigDiff_`'s fixed length (ADTimePix.cpp:1911).
+const PIXEL_CONFIG_DIFF_LEN: usize = 262144;
+
+enum LayoutEntryError {
+    /// The nlohmann parse message.
+    Json(String),
+    Incomplete,
+}
+
+/// One Serval Layout chip entry: integer `Chip` equal to `chip`, integer
+/// `X` and `Y`, and a string `Orientation`.
+fn mpx3_layout_entry(layout: &str, chip: i32) -> Result<(i32, i32, String), LayoutEntryError> {
+    let entry: Value = if layout.is_empty() {
+        return Err(LayoutEntryError::Json(NLOHMANN_EMPTY_INPUT.to_string()));
+    } else {
+        serde_json::from_str(layout).map_err(|e| LayoutEntryError::Json(e.to_string()))?
+    };
+    let int = |key| match entry.get(key) {
+        Some(Value::Number(n)) if !n.is_f64() => n
+            .as_i64()
+            .or_else(|| n.as_u64().map(|v| v as i64))
+            .map(|v| v as i32),
+        _ => None,
+    };
+    match (int("Chip"), int("X"), int("Y"), entry.get("Orientation")) {
+        (Some(id), Some(x), Some(y), Some(Value::String(orientation))) if id == chip => {
+            Ok((x, y, orientation.clone()))
+        }
+        _ => Err(LayoutEntryError::Incomplete),
+    }
+}
 
 impl TimePix3Driver {
     pub fn new(
@@ -1840,26 +1870,11 @@ impl TimePix3Driver {
         for chip in 0..self.int(p.number_of_chips, 0) {
             let layout = self.text(p.layout, chip);
             let mapped = (|| {
-                let entry: Value = if layout.is_empty() {
-                    return Err(NLOHMANN_EMPTY_INPUT.to_string());
-                } else {
-                    serde_json::from_str(&layout).map_err(|e| e.to_string())?
-                };
-                let int = |key| match entry.get(key) {
-                    Some(Value::Number(n)) if !n.is_f64() => n
-                        .as_i64()
-                        .or_else(|| n.as_u64().map(|v| v as i64))
-                        .map(|v| v as i32),
-                    _ => None,
-                };
-                let (Some(id), Some(ox), Some(oy), Some(Value::String(orientation))) =
-                    (int("Chip"), int("X"), int("Y"), entry.get("Orientation"))
-                else {
-                    return Err("incomplete chip layout".to_string());
-                };
-                if id != chip {
-                    return Err("incomplete chip layout".to_string());
-                }
+                let (ox, oy, orientation) =
+                    mpx3_layout_entry(&layout, chip).map_err(|e| match e {
+                        LayoutEntryError::Json(e) => e,
+                        LayoutEntryError::Incomplete => "incomplete chip layout".to_string(),
+                    })?;
                 for ly in 0..g.pel_width {
                     for lx in 0..g.pel_width {
                         let (ix, iy) = mask::mpx3_layout_coordinates(
@@ -1867,7 +1882,7 @@ impl TimePix3Driver {
                             g.pel_width,
                             (ox, oy),
                             g.rows,
-                            orientation,
+                            &orientation,
                         )
                         .filter(|&(ix, iy)| (0..g.cols).contains(&ix) && (0..g.rows).contains(&iy))
                         .ok_or("unsupported or out-of-range chip layout")?;
@@ -1894,18 +1909,6 @@ impl TimePix3Driver {
             return refuse(self, "MPX3 chip layout does not cover the full image");
         }
         Some(offsets)
-    }
-
-    /// The geometry the mask operations need, or the error C's zeroed
-    /// `rowsCols` outputs lead to.
-    fn geometry(&mut self) -> AsynResult<Geometry> {
-        self.rows_cols()
-            .filter(|g| g.pixel_count() > 0)
-            .ok_or_else(|| AsynError::Status {
-                status: AsynStatus::Error,
-                message: "timepix3: the detector layout is not known yet (no /detector reply)"
-                    .into(),
-            })
     }
 
     /// C `readInt32Array`'s MaskBPC branch (mask_io.cpp:95-207, :240-242): the
@@ -2209,115 +2212,237 @@ impl TimePix3Driver {
         );
     }
 
-    /// C `refreshPixelConfigFromServal` (serval_http.cpp:1000).
+    /// C `refreshPixelConfigFromServal` (serval_http.cpp:1074-1290).
     fn refresh_pixel_config(&mut self) -> AsynResult<()> {
-        let geom = self.geometry()?;
-        let Some(bpc) = self.read_bpc() else {
+        let p = self.p;
+        self.ad.port_base.trace_print(
+            TraceMask::FLOW,
+            format_args!(
+                "{}",
+                adlog::log(
+                    adlog::REFRESH_PIXEL_CONFIG,
+                    "fetch per chip, compare to BPC on disk"
+                )
+            ),
+        );
+        let bpc = self.read_bpc();
+        let num_chips = self.int(p.number_of_chips, 0).max(1);
+        let g = self.rows_cols().unwrap_or_default();
+        let per_chip = usize::try_from(g.pel_width).map_or(0, |w| w * w);
+        let family = self.shared.family();
+        let caps = family.capabilities();
+        let (bpp, slices) = (caps.bpc_bytes_per_pel, caps.bpc_threshold_slices);
+        let chip_bytes = mask::bytes_per_chip(per_chip, bpp, slices);
+        let Some(total) = (num_chips as usize)
+            .checked_mul(chip_bytes)
+            .filter(|_| chip_bytes != 0)
+        else {
+            let msg = "Invalid PixelConfig detector geometry";
+            self.set_text(p.write_msg, msg)?;
+            self.ad.port_base.call_param_callbacks(0)?;
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: "ReadBPC failed".into(),
+                message: msg.into(),
             });
         };
-        let num_chips = usize::try_from(self.int(self.p.number_of_chips, 0)).unwrap_or(0);
-        let mut serval_linear = vec![0u8; num_chips * PIXEL_CONFIG_BYTES];
+        let mut serval_linear = vec![0u8; total];
+        let mut chip_decoded = vec![false; num_chips as usize];
+        let mut failed = false;
 
         for chip in 0..num_chips {
-            let path = serval::chip_pixel_config(i32::try_from(chip).unwrap_or(0));
-            let reply = self.http.get(&path, TIMEOUT_5000_MS).map_err(|e| {
-                let err = self.http_failed(&format!("GET {path}"), &e, HttpPrint::None);
-                self.ad.port_base.trace_print(
-                    TraceMask::ERROR,
-                    format_args!(
-                        "{}",
-                        adlog::err(
-                            adlog::REFRESH_PIXEL_CONFIG,
-                            &format!("chip {chip} PixelConfig GET failed: HTTP {}", e.code()),
-                        )
-                    ),
-                );
-                err
-            })?;
-            // Serval answers with a JSON string, or with the bare base64.
-            let encoded = match serde_json::from_str::<serde_json::Value>(&reply) {
-                Ok(v) => serval::json_to_string(&v),
-                Err(_) => reply.trim().to_string(),
+            let reply = self
+                .http
+                .get(&serval::chip_pixel_config(chip), TIMEOUT_5000_MS);
+            let (code, body) = match &reply {
+                Ok(body) => (200, body.as_str()),
+                Err(e) => (e.code(), e.body()),
             };
-            let addr = i32::try_from(chip).unwrap_or(0);
-            let Some(decoded) = decode_base64(&encoded) else {
-                self.ad
-                    .port_base
-                    .set_int32_param(self.p.pixel_config_match_bp_c, addr, -1)?;
-                self.ad.port_base.set_string_param(
-                    self.p.pixel_config_status,
-                    addr,
-                    "base64 decode failed",
-                )?;
+            let decoded = match mask::parse_pixel_config_response(code, body, chip_bytes) {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    failed = true;
+                    let status = match e {
+                        PixelConfigError::HttpFailure => format!("HTTP {code}"),
+                        PixelConfigError::LengthMismatch => {
+                            format!("Length mismatch (expected {chip_bytes} bytes)")
+                        }
+                        _ => e.message().to_string(),
+                    };
+                    let match_code = if e == PixelConfigError::LengthMismatch {
+                        3
+                    } else {
+                        -1
+                    };
+                    self.set_pixel_config_status(chip, 0, match_code, 0, &status)?;
+                    self.ad.port_base.trace_print(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "{}",
+                            adlog::err(
+                                adlog::REFRESH_PIXEL_CONFIG,
+                                &format!("chip {chip} PixelConfig failed: {status}"),
+                            )
+                        ),
+                    );
+                    continue;
+                }
+            };
+            let len = i32::try_from(decoded.len()).unwrap_or(i32::MAX);
+            let Some(bpc) = &bpc else {
+                self.set_pixel_config_status(chip, len, 2, 0, "OK, no BPC file")?;
                 continue;
             };
-
-            let offset = chip * PIXEL_CONFIG_BYTES;
-            let len = decoded.len();
-            self.ad.port_base.set_int32_param(
-                self.p.pixel_config_len,
-                addr,
-                i32::try_from(len).unwrap_or(i32::MAX),
-            )?;
-
-            let file_len = bpc.len().saturating_sub(offset).min(PIXEL_CONFIG_BYTES);
-            let (match_code, mismatch, status) = if file_len == 0 {
-                (
-                    3,
-                    0i64,
-                    format!("BPC too small for chip (need offset {offset})"),
-                )
-            } else {
-                let n = decoded
-                    .iter()
-                    .zip(&bpc[offset..offset + file_len])
-                    .filter(|(a, b)| a != b)
-                    .count() as i64;
-                if n > 0 {
-                    (0, n, format!("Mismatch {n} bytes"))
-                } else if len != file_len {
-                    (
-                        3,
-                        0,
-                        format!("Length mismatch (decoded {len}, chip file {file_len})"),
-                    )
-                } else {
-                    (1, 0, "OK, matches BPC".to_string())
-                }
+            let offset = chip as usize * chip_bytes;
+            let Some(file) = bpc.get(offset..).and_then(|b| b.get(..chip_bytes)) else {
+                failed = true;
+                let status = format!(
+                    "BPC too small for chip (need {chip_bytes} bytes at {offset}, have {})",
+                    bpc.len()
+                );
+                self.set_pixel_config_status(chip, len, 3, 0, &status)?;
+                continue;
             };
-            for (i, &b) in decoded.iter().take(PIXEL_CONFIG_BYTES).enumerate() {
-                if let Some(slot) = serval_linear.get_mut(offset + i) {
-                    *slot = b;
-                }
+            let mismatch = decoded.iter().zip(file).filter(|(a, b)| a != b).count() as i64;
+            chip_decoded[chip as usize] = true;
+            serval_linear[offset..offset + chip_bytes].copy_from_slice(&decoded);
+            if mismatch > 0 {
+                let status = format!("Mismatch {mismatch} bytes");
+                self.set_pixel_config_status(chip, len, 0, mismatch, &status)?;
+            } else {
+                self.set_pixel_config_status(chip, len, 1, 0, "OK, matches BPC")?;
             }
-            self.ad
-                .port_base
-                .set_int32_param(self.p.pixel_config_match_bp_c, addr, match_code)?;
-            self.ad.port_base.set_int64_param(
-                self.p.pixel_config_mismatch_bytes,
-                addr,
-                mismatch,
-            )?;
-            self.ad
-                .port_base
-                .set_string_param(self.p.pixel_config_status, addr, status)?;
-            self.ad.port_base.call_param_callbacks(addr)?;
         }
 
-        let mut diff = vec![0i32; geom.pixel_count()];
-        let map = self.pel_table(&geom);
-        mask::pixel_config_diff(&map, &serval_linear, &bpc, &mut diff);
+        let mut diff = self
+            .ad
+            .port_base
+            .params
+            .get_int32_array(p.pixel_config_diff, 0)
+            .map(|d| d.to_vec())
+            .unwrap_or_default();
+        diff.resize(PIXEL_CONFIG_DIFF_LEN, 0);
+        if let Some(bpc) = &bpc {
+            let mut selected = self.int(p.counter_select_in, 0);
+            if !(0..slices).contains(&selected) {
+                selected = 0;
+            }
+            diff.fill(0);
+            let store = |diff: &mut [i32], image: usize, logical: usize| {
+                let Some(slot) = diff.get_mut(image) else {
+                    return;
+                };
+                let Some(k) = mask::selected_slice_index(logical, per_chip, bpp, slices, selected)
+                    .filter(|&k| k < bpc.len() && k < serval_linear.len())
+                else {
+                    return;
+                };
+                if chip_decoded.get(logical / per_chip) != Some(&true) {
+                    return;
+                }
+                if let Some(d) = mask::absolute_packed_difference(&serval_linear, bpc, k, bpp) {
+                    *slot = d as i32;
+                }
+            };
+            let cols = usize::try_from(g.cols).unwrap_or(0);
+            if family == DetectorFamily::Mpx3 {
+                for chip in 0..num_chips {
+                    let layout = self.text(p.layout, chip);
+                    let warning = match mpx3_layout_entry(&layout, chip) {
+                        Err(LayoutEntryError::Incomplete) => {
+                            format!("chip {chip} MPX3 layout entry is incomplete")
+                        }
+                        Err(LayoutEntryError::Json(e)) => {
+                            format!("chip {chip} MPX3 layout JSON error: {e}")
+                        }
+                        Ok((ox, oy, orientation)) => {
+                            let map = |lx, ly| {
+                                mask::mpx3_layout_coordinates(
+                                    (lx, ly),
+                                    g.pel_width,
+                                    (ox, oy),
+                                    g.rows,
+                                    &orientation,
+                                )
+                            };
+                            if map(0, 0).is_some() {
+                                for ly in 0..g.pel_width {
+                                    for lx in 0..g.pel_width {
+                                        let Some((ix, iy)) = map(lx, ly).filter(|&(ix, iy)| {
+                                            (0..g.cols).contains(&ix) && (0..g.rows).contains(&iy)
+                                        }) else {
+                                            continue;
+                                        };
+                                        let local =
+                                            ly as usize * g.pel_width as usize + lx as usize;
+                                        store(
+                                            &mut diff,
+                                            iy as usize * cols + ix as usize,
+                                            chip as usize * per_chip + local,
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                            format!(
+                                "chip {chip} MPX3 layout orientation is unsupported: {orientation}"
+                            )
+                        }
+                    };
+                    self.ad.port_base.trace_print(
+                        TraceMask::WARNING,
+                        format_args!("{}", adlog::warn(adlog::REFRESH_PIXEL_CONFIG, &warning)),
+                    );
+                }
+            } else {
+                for (image, &k) in self.pel_table(&g).iter().enumerate() {
+                    if let Ok(k) = usize::try_from(k) {
+                        store(&mut diff, image, k);
+                    }
+                }
+            }
+            let map = self.pel_table(&g);
+            let masked = mask::masked_pixels(&g, &map, bpc);
+            self.export_masked_pixels(&masked)?;
+        }
+        self.ad
+            .port_base
+            .set_param_status(p.pixel_config_diff, 0, AsynStatus::Success, 0, 0)?;
         self.ad
             .port_base
             .params
-            .set_int32_array(self.p.pixel_config_diff, 0, diff)?;
+            .set_int32_array(p.pixel_config_diff, 0, diff)?;
 
-        let masked = mask::masked_pixels(&geom, &map, &bpc);
-        self.export_masked_pixels(&masked)?;
+        let msg = match (failed, bpc.is_some()) {
+            (true, _) => "PixelConfig refresh completed with one or more chip errors.",
+            (false, true) => "PixelConfig refresh complete.",
+            (false, false) => "PixelConfig refresh complete; BPC comparison skipped.",
+        };
+        self.set_text(p.write_msg, msg)?;
+        self.ad.port_base.call_param_callbacks(0)?;
+        if failed {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: msg.into(),
+            });
+        }
         Ok(())
+    }
+
+    /// One chip's PixelConfig readbacks, then `callParamCallbacks(chip)`.
+    fn set_pixel_config_status(
+        &mut self,
+        chip: i32,
+        len: i32,
+        match_code: i32,
+        mismatch: i64,
+        status: &str,
+    ) -> AsynResult<()> {
+        let (p, base) = (self.p, &mut self.ad.port_base);
+        base.set_int32_param(p.pixel_config_len, chip, len)?;
+        base.set_int32_param(p.pixel_config_match_bp_c, chip, match_code)?;
+        base.set_int64_param(p.pixel_config_mismatch_bytes, chip, mismatch)?;
+        base.set_string_param(p.pixel_config_status, chip, status)?;
+        base.call_param_callbacks(chip)
     }
 
     /// C `exportMaskedPelsJsonFromBpcBuffer` (serval_http.cpp:900).
@@ -6938,6 +7063,112 @@ mod tests {
             )
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PixelConfig is compared chip by chip with the BPC at the geometry's
+    /// size; a missing BPC skips the comparison instead of failing, and a
+    /// reply of the wrong length is refused (serval_http.cpp:1074-1290).
+    #[test]
+    fn refresh_pixel_config_compares_each_chip_as_c() {
+        // 65536 zero bytes as Serval's JSON string.
+        fn zeros() -> &'static str {
+            Box::leak(format!("\"{}AA==\"", "AAAA".repeat(21845)).into_boxed_str())
+        }
+        fn run(name: &str, reply: &'static str, bpc: Option<&[u8]>) -> (TimePix3Driver, bool) {
+            let routes: &'static [(&str, &str)] =
+                Box::leak(Box::new([("GET /detector/chips/0/PixelConfig", reply)]));
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+            let shared = Arc::new(Shared::new());
+            shared.note_family(DetectorFamily::Tpx3);
+            let mut det = TimePix3Driver::new(
+                name,
+                Arc::new(ServalHttp::new(&fake_serval_with("\0", routes))),
+                shared,
+                0,
+                cmd_tx,
+            )
+            .unwrap();
+            calibration_files(&mut det, name);
+            let p = det.p;
+            for (reason, value) in [
+                (p.pix_count, 65536),
+                (p.row_len, 1),
+                (p.number_of_chips, 1),
+                (p.number_of_rows, 256),
+            ] {
+                det.ad.port_base.set_int32_param(reason, 0, value).unwrap();
+            }
+            let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            match bpc {
+                Some(bpc) => std::fs::write(dir.join("cal.bpc"), bpc).unwrap(),
+                None => std::fs::remove_file(dir.join("cal.bpc")).unwrap(),
+            }
+            let ok = det.refresh_pixel_config().is_ok();
+            let _ = std::fs::remove_dir_all(&dir);
+            (det, ok)
+        }
+        let readback = |det: &mut TimePix3Driver| {
+            let p = det.p;
+            (
+                det.int(p.pixel_config_match_bp_c, 0),
+                det.ad
+                    .port_base
+                    .get_int64_param(p.pixel_config_mismatch_bytes, 0)
+                    .unwrap(),
+                det.int(p.pixel_config_len, 0),
+                det.text(p.pixel_config_status, 0),
+                det.text(p.write_msg, 0),
+            )
+        };
+
+        let (mut det, ok) = run("TPX_PIXCFG_NOBPC", zeros(), None);
+        assert!(ok);
+        assert_eq!(
+            readback(&mut det),
+            (
+                2,
+                0,
+                65536,
+                "OK, no BPC file".into(),
+                "PixelConfig refresh complete; BPC comparison skipped.".into()
+            )
+        );
+
+        let mut bpc = vec![0u8; 65536];
+        bpc[5] = 3;
+        let (mut det, ok) = run("TPX_PIXCFG_DIFF", zeros(), Some(&bpc));
+        assert!(ok);
+        assert_eq!(
+            readback(&mut det),
+            (
+                0,
+                1,
+                65536,
+                "Mismatch 1 bytes".into(),
+                "PixelConfig refresh complete.".into()
+            )
+        );
+        let diff = det
+            .ad
+            .port_base
+            .params
+            .get_int32_array(det.p.pixel_config_diff, 0)
+            .unwrap();
+        assert_eq!(diff.len(), 262144);
+        assert_eq!(diff.iter().filter(|&&d| d != 0).collect::<Vec<_>>(), [&3]);
+
+        let (mut det, ok) = run("TPX_PIXCFG_SHORT", "\"AAAA\"", Some(&bpc));
+        assert!(!ok);
+        assert_eq!(
+            readback(&mut det),
+            (
+                3,
+                0,
+                0,
+                "Length mismatch (expected 65536 bytes)".into(),
+                "PixelConfig refresh completed with one or more chip errors.".into()
+            )
+        );
     }
 
     /// Point the BPC and DACS file PVs at real files, which C
