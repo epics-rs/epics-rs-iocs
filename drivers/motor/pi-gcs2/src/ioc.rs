@@ -62,11 +62,11 @@ pub fn pigcs2_config_command() -> CommandDef {
             };
             let mut controller = PIGCS2Controller::new(handle, &asyn_port);
             let idn = controller.read_idn().to_string();
-            controller.print(format_args!("read from {asyn_port}: {idn}\n"));
+            controller.print(format_args!("read from {asyn_port}: {idn}"));
             let idn = idn.to_ascii_uppercase();
             if !is_known_controller(&idn) {
                 controller.print(format_args!(
-                    "PIasynController: unknown controller type {asyn_port}: {idn}\n"
+                    "PIasynController: unknown controller type {asyn_port}: {idn}"
                 ));
                 return Ok(CommandOutcome::Continue);
             }
@@ -90,6 +90,7 @@ pub fn pigcs2_config_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    10, // C startPoller, PIasynController.cpp:192
                 )?;
             }
             Ok(CommandOutcome::Continue)
@@ -113,7 +114,7 @@ fn connect(asyn_port: &str) -> Option<SyncIOHandle> {
             None,
             0,
             TraceMask::ERROR,
-            format_args!("echoHandler: unable to connect to port {asyn_port}\n"),
+            format_args!("echoHandler: unable to connect to port {asyn_port}"),
         ),
         EosConnectError::InputEos(_, e) => trace.print(
             Some(asyn_port),
@@ -121,7 +122,7 @@ fn connect(asyn_port: &str) -> Option<SyncIOHandle> {
             0,
             TraceMask::ERROR,
             format_args!(
-                "echoHandler: unable to set input EOS on {asyn_port}: {}\n",
+                "echoHandler: unable to set input EOS on {asyn_port}: {}",
                 e.message_display()
             ),
         ),
@@ -131,7 +132,7 @@ fn connect(asyn_port: &str) -> Option<SyncIOHandle> {
             0,
             TraceMask::ERROR,
             format_args!(
-                "echoHandler: unable to set output EOS on {asyn_port}: {}\n",
+                "echoHandler: unable to set output EOS on {asyn_port}: {}",
                 e.message_display()
             ),
         ),

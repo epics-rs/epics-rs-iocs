@@ -136,6 +136,7 @@ impl MotorSimHolder {
                         motor,
                         POLL_MS,
                         POLL_MS,
+                        0, // motorSimDriver.cpp's own 0.1 s loop forces none
                     )?;
                     holder
                         .axes

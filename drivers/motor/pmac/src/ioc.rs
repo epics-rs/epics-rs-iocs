@@ -42,7 +42,8 @@ use crate::ethernet::pmac_asyn_ip_configure_command;
 const POLL_CACHE_TTL: Duration = Duration::from_millis(50);
 
 /// pmacAsynCoord.c's `motorAxisDrvSET_t`, its cards keyed by `reference`.
-pub static PMAC_ASYN_COORD: Model2 = Model2::new("pmacAsynCoord");
+/// pmacAsynCoord.c:729's poller forces no fast polls.
+pub static PMAC_ASYN_COORD: Model2 = Model2::new("pmacAsynCoord", 0);
 
 /// `defaultMovingPollPeriod` / `defaultIdlePollPeriod` (pmacAsynCoord.c:122).
 const COORD_MOVING_POLL_MS: u64 = 100;
@@ -108,7 +109,7 @@ fn low_level_port_connect(self_port: &str, port: &str, addr: i32) -> Option<Sync
             trace.print_self(
                 TraceMask::ERROR,
                 format_args!(
-                    "pmacController::motorAxisAsynConnect: unable to connect to port {port}\n"
+                    "pmacController::motorAxisAsynConnect: unable to connect to port {port}"
                 ),
             );
             Some(handle)
@@ -129,7 +130,7 @@ fn low_level_port_connect(self_port: &str, port: &str, addr: i32) -> Option<Sync
             trace.print_self(
                 TraceMask::ERROR,
                 format_args!(
-                    "pmacController: unable to set {which} EOS on {port}: {}\n",
+                    "pmacController: unable to set {which} EOS on {port}: {}",
                     e.message_display()
                 ),
             );
@@ -231,6 +232,7 @@ fn create_axis(
         motor,
         reg.moving_poll_ms,
         reg.idle_poll_ms,
+        10, // C startPoller, tpmac pmacController.cpp:201
     )
 }
 
@@ -502,7 +504,7 @@ fn coord_create(
                 TraceMask::ERROR,
                 0,
                 format_args!(
-                    "drvPmacCreate: unable to set input EOS on {port}: {}\n",
+                    "drvPmacCreate: unable to set input EOS on {port}: {}",
                     e.message_display()
                 ),
             );
@@ -513,7 +515,7 @@ fn coord_create(
                 TraceMask::ERROR,
                 0,
                 format_args!(
-                    "drvPmacCreate: unable to set output EOS on {port}: {}\n",
+                    "drvPmacCreate: unable to set output EOS on {port}: {}",
                     e.message_display()
                 ),
             );
@@ -534,7 +536,7 @@ fn coord_create(
                 TraceMask::FLOW,
                 0,
                 format_args!(
-                    "Created motor for ref {reference}, C.S. {cs}, signal {} OK\n",
+                    "Created motor for ref {reference}, C.S. {cs}, signal {} OK",
                     axis - 1
                 ),
             );

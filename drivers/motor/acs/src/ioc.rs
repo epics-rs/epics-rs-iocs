@@ -74,6 +74,7 @@ pub fn mcb4b_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, MCB4BDriver.cpp:58
                 )?;
             }
             Ok(CommandOutcome::Continue)

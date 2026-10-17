@@ -206,7 +206,7 @@ impl ScuController {
             Err(e) => {
                 // A failed writeRead leaves fromController_ holding the last reply.
                 io.print(format_args!(
-                    "ERROR: sendCmd: status={}, sent: {cmd}, received: {}\n",
+                    "ERROR: sendCmd: status={}, sent: {cmd}, received: {}",
                     e.status() as i32,
                     io.from_controller
                 ));
@@ -276,7 +276,7 @@ impl AxisIo {
 
     /// C `get*Val`'s unparsable reply: printed, then asynError.
     fn parse_error(&self, getter: &str, reply: &str) -> AsynError {
-        self.print(format_args!("{getter}:ERROR parsing response {reply}\n"));
+        self.print(format_args!("{getter}:ERROR parsing response {reply}"));
         scu_err(format!("SCU: bad reply {reply:?}"))
     }
 }

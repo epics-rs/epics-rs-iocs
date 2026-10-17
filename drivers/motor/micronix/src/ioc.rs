@@ -69,6 +69,7 @@ pub fn mmc200_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, MMC200Driver.cpp:62
                 )?;
             }
             Ok(CommandOutcome::Continue)

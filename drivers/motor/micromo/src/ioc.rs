@@ -142,6 +142,7 @@ pub fn mvp2001_create_axis_command() -> CommandDef {
                 motor,
                 moving_poll_ms,
                 idle_poll_ms,
+                2, // C startPoller, MVP2001Driver.cpp:57
             )?;
             Ok(CommandOutcome::Continue)
         },

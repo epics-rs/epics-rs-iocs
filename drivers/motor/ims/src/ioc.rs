@@ -77,6 +77,7 @@ pub fn ims_create_controller_command() -> CommandDef {
                 motor,
                 moving_poll_ms as u64,
                 idle_poll_ms as u64,
+                2, // C startPoller, ImsMDrivePlusMotorController.cpp:101
             )?;
 
             Ok(CommandOutcome::Continue)

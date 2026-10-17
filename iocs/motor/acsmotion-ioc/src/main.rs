@@ -1,8 +1,8 @@
 //! ACS SPiiPlus motion controller IOC (motorAcsMotion).
 //!
 //! Assembles: a serial/TCP octet port (`drvAsynSerialPortConfigure` /
-//! `drvAsynIPPortConfigure`), the `AcsMotionConfig`, `SPiiPlusComm` and
-//! `AcsMotionAuxIOConfig` iocsh commands, the motor record type, and the
+//! `drvAsynIPPortConfigure`), the `AcsMotionConfig`, `SPiiPlusCreateProfile`,
+//! `SPiiPlusComm` and `AcsMotionAuxIOConfig` iocsh commands, the motor record type, and the
 //! CA + PVA (QSRV) server.
 //!
 //! Usage:
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_acsmotion::ioc::acsmotion_config_command;
+use motor_acsmotion::ioc::{acsmotion_config_command, spiiplus_create_profile_command};
 use motor_acsmotion::ioc_aux::acsmotion_aux_io_config_command;
 use motor_acsmotion::ioc_comm::spiiplus_comm_command;
 
@@ -35,7 +35,11 @@ async fn main() -> CaResult<()> {
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
 
-    // asyn's devEpics, for SPiiPlusHoming.db.
+    // profileMoveController.template's busy records: opt-in in epics-rs, as
+    // a C IOC links busy's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+
+    // asyn's devEpics, for SPiiPlusHoming.db and the profile databases.
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides the serial/IP port configure verbs.
@@ -44,6 +48,7 @@ async fn main() -> CaResult<()> {
 
     // SPiiPlus iocsh commands + motor device support.
     app = app.register_startup_command(acsmotion_config_command());
+    app = app.register_startup_command(spiiplus_create_profile_command());
     app = app.register_startup_command(spiiplus_comm_command());
     app = app.register_startup_command(acsmotion_aux_io_config_command());
     app = app.register_dynamic_device_support(

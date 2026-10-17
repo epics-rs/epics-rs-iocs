@@ -147,7 +147,7 @@ impl OmsController {
             0,
             TraceMask::ERROR,
             format_args!(
-                "drv{}Asyn:sendOnly: error sending command {cmd}, sent={}, status={}\n",
+                "drv{}Asyn:sendOnly: error sending command {cmd}, sent={}, status={}",
                 self.controller_type,
                 e.partial_write().unwrap_or(0),
                 e.status() as i32
