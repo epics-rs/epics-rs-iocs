@@ -1,8 +1,10 @@
-# Vendored, byte-for-byte, from epics-modbus-rs 0.22.1's db/longinInt32.template.
-# See aiFloat64.template's header comment for why this is a local copy
+# Copied verbatim from modbus R3-4 modbusApp/Db/longinInt32.template. See
+# aiFloat64.template's header comment for why this is a local copy
 # rather than a MODBUS-macro reference.
+# longin record template for register inputs
 record(longin,"$(P)$(R)") {
     field(DTYP,"asynInt32")
+    field(DESC, "$(DESC=)")
     field(INP,"@asyn($(PORT) $(OFFSET))$(DATA_TYPE)")
     field(SCAN, "$(SCAN)")
 }

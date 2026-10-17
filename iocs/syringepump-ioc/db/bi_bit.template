@@ -1,8 +1,10 @@
-# Vendored, byte-for-byte, from epics-modbus-rs 0.22.1's db/bi_bit.template.
-# See aiFloat64.template's header comment for why this is a local copy
+# Copied verbatim from modbus R3-4 modbusApp/Db/bi_bit.template. See
+# aiFloat64.template's header comment for why this is a local copy
 # rather than a MODBUS-macro reference.
+# bi record template for register inputs
 record(bi,"$(P)$(R)") {
     field(DTYP,"asynUInt32Digital")
+    field(DESC, "$(DESC=)")
     field(INP,"@asynMask($(PORT) $(OFFSET) 0x1)")
     field(SCAN,"$(SCAN)")
     field(ZNAM,"$(ZNAM)")

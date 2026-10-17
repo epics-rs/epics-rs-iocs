@@ -1,9 +1,6 @@
 # Ported from epics-modules/SyringePump/SPApp/Db/VindumWriteHoldingRegisters.substitutions.
 # `$(MODBUS)/db/` is `$(SYRINGEPUMP)/db/`: the modbus
-# templates are copied into this directory. Upstream's "mbbo.template" is
-# "vindumMbbo.template" here: epics-modbus-rs only bundles bit-packed
-# mbbiDirect/mbboDirect, not a plain enumerated mbbo (see
-# vindumMbbo.template's own header).
+# templates are copied into this directory.
 #
 # These are the output holding registers starting at address 0, function code 16
 file "$(SYRINGEPUMP)/db/longoutInt32.template" {
@@ -23,7 +20,7 @@ pattern
 {B:ClosePropGain,         45,     UINT16,    NO}
 }
 
-file "$(SYRINGEPUMP)/db/vindumMbbo.template" {
+file "$(SYRINGEPUMP)/db/mbbo.template" {
 pattern
 {     R,              OFFSET,       ZRST,    ZRVL,   ONST,     ONVL, TWST, TWVL,  THST,  THVL,  PINI}
 #

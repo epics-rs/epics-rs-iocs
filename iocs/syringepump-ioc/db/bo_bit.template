@@ -1,8 +1,10 @@
-# Vendored, byte-for-byte, from epics-modbus-rs 0.22.1's db/bo_bit.template.
-# See aiFloat64.template's header comment for why this is a local copy
+# Copied verbatim from modbus R3-4 modbusApp/Db/bo_bit.template. See
+# aiFloat64.template's header comment for why this is a local copy
 # rather than a MODBUS-macro reference.
+# bo record template for register outputs
 record(bo,"$(P)$(R)") {
     field(DTYP,"asynUInt32Digital")
+    field(DESC, "$(DESC=)")
     field(OUT,"@asynMask($(PORT) $(OFFSET) 0x1)")
     field(ZNAM,"$(ZNAM)")
     field(ONAM,"$(ONAM)")

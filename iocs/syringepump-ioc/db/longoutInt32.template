@@ -1,8 +1,10 @@
-# Vendored, byte-for-byte, from epics-modbus-rs 0.22.1's db/longoutInt32.template.
-# See aiFloat64.template's header comment for why this is a local copy
+# Copied verbatim from modbus R3-4 modbusApp/Db/longoutInt32.template. See
+# aiFloat64.template's header comment for why this is a local copy
 # rather than a MODBUS-macro reference.
+# longout record template for register inputs
 record(longout,"$(P)$(R)") {
     field(DTYP,"asynInt32")
+    field(DESC, "$(DESC=)")
     field(OUT,"@asyn($(PORT) $(OFFSET))$(DATA_TYPE)")
     field(PINI,"$(PINI=NO)")
 }
