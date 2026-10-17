@@ -263,6 +263,9 @@ impl PmncController {
             return Err(pmnc_err("PMNC: no response to VER identity query".into()));
         }
         ctrl.ident = ident;
+        // An invalid model or driver makes C return ERROR from motor_init
+        // (drvPMNC87xx.cc:938, 987), abandoning every later card and the
+        // poll task; a C defect not copied: only this card is dropped.
         let refuse = |line: String| {
             errlog_vprintf(format_args!("{line}\n"));
             pmnc_err(line)
