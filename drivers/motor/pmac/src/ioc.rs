@@ -27,6 +27,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::trace::MotorTrace;
 
+use motor_common::drv_motor_asyn::{DrvGet, DrvSet};
 use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_req, opt_double, poll_intervals, req_string,
 };
@@ -594,10 +595,12 @@ fn coord_create(
         program,
         POLL_CACHE_TTL,
     )));
+    let mut setters: Vec<Arc<Mutex<dyn DrvSet>>> = Vec::new();
     let axes = (1..=CS_AXES)
         .map(|axis| {
-            let motor: Arc<Mutex<dyn AsynMotor>> =
-                Arc::new(Mutex::new(PmacCsAxis::new(system.clone(), axis)?));
+            let cs_axis = Arc::new(Mutex::new(PmacCsAxis::new(system.clone(), axis)?));
+            setters.push(cs_axis.clone());
+            let motor: Arc<Mutex<dyn AsynMotor>> = cs_axis;
             trace.print(
                 TraceMask::FLOW,
                 0,
@@ -616,6 +619,12 @@ fn coord_create(
         COORD_IDLE_POLL_MS,
     );
     PMAC_ASYN_COORD.set_axis_logs(reference, lock_system(&system).logs());
+    PMAC_ASYN_COORD.set_axis_setters(reference, setters);
+    let getters = lock_system(&system).getters();
+    PMAC_ASYN_COORD.set_axis_getters(
+        reference,
+        getters.into_iter().map(|g| g as Arc<dyn DrvGet>).collect(),
+    );
     systems.push(CoordSystem {
         reference,
         port: port.to_string(),

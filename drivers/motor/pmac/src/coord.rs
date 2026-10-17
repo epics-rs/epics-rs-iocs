@@ -36,6 +36,7 @@
 //! kinematic coordinate, and neither a limit-switch seek nor an open-ended jog
 //! is defined for one.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,7 +47,9 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
+use motor_common::drv_motor_asyn::{DrvGet, DrvSet, function};
 use motor_common::model2::AxisLog;
+use motor_common::param_lib::Params;
 
 use crate::controller::{PMAC_MAXBUF, checked_reply, pmac_err};
 use crate::protocol::{
@@ -79,6 +82,34 @@ struct CsPoll {
     read_at: Instant,
 }
 
+/// C `motorAxisGetInteger`/`motorAxisGetDouble` of a CS axis: its
+/// parameters, but the system's `movesDeferred` for motorAxisDeferMoves
+/// (pmacAsynCoord.c:239-269).
+pub struct CoordGet {
+    params: Params,
+    moves_deferred: Arc<AtomicBool>,
+}
+
+impl DrvGet for CoordGet {
+    fn params(&self) -> &Params {
+        &self.params
+    }
+
+    fn get_integer(&self, function: i32) -> Option<i32> {
+        match function {
+            function::DEFER_MOVES => Some(i32::from(self.moves_deferred.load(Ordering::Relaxed))),
+            _ => self.params.get_integer(function).ok().flatten(),
+        }
+    }
+
+    fn get_double(&self, function: i32) -> Option<f64> {
+        match function {
+            function::DEFER_MOVES => self.get_integer(function).map(f64::from),
+            _ => self.params.get_double(function).ok().flatten(),
+        }
+    }
+}
+
 /// The coordinate system itself: C `drvPmac_t`, one per
 /// `pmacAsynCoordCreate`.
 pub struct PmacCoordSystem {
@@ -88,7 +119,9 @@ pub struct PmacCoordSystem {
     /// C `program`: the motion program a move runs. Zero means "an external
     /// process starts the motion" — the demand is written and nothing is run.
     program: i32,
-    moves_deferred: bool,
+    /// Shared with the axes' getters, which the parameter callback reads
+    /// under this system's lock.
+    moves_deferred: Arc<AtomicBool>,
     /// Which CS axes have a demand written but not yet run (C
     /// `motorAxis::deferred_move`).
     deferred: [bool; CS_AXES],
@@ -105,9 +138,8 @@ pub struct PmacCoordSystem {
     reference: i32,
     /// C `motorAxis::logParam` of each CS axis.
     logs: [Arc<AxisLog>; CS_AXES],
-    /// C `motorAxisCommError` of each CS axis: whether its last transfer
-    /// failed.
-    comms_error: [bool; CS_AXES],
+    /// C `motorAxis::params` of each CS axis.
+    gets: [Arc<CoordGet>; CS_AXES],
 }
 
 impl PmacCoordSystem {
@@ -119,26 +151,43 @@ impl PmacCoordSystem {
         program: i32,
         poll_ttl: Duration,
     ) -> Self {
+        let moves_deferred = Arc::new(AtomicBool::new(false));
+        let gets = std::array::from_fn(|_| {
+            Arc::new(CoordGet {
+                params: Params::default(),
+                moves_deferred: moves_deferred.clone(),
+            })
+        });
         Self {
             handle,
             trace,
             reference,
             cs,
             program,
-            moves_deferred: false,
+            moves_deferred,
+            gets,
             deferred: [false; CS_AXES],
             poll: None,
             status: [0; 3],
             poll_ttl,
             step_size: [DEFAULT_STEP_SIZE; CS_AXES],
             logs: Default::default(),
-            comms_error: [false; CS_AXES],
         }
     }
 
     /// The axes' logs, A first, for `Model2::set_axis_logs`.
     pub fn logs(&self) -> Vec<Arc<AxisLog>> {
         self.logs.to_vec()
+    }
+
+    /// The axes' getters, A first, for `Model2::set_axis_getters`.
+    pub fn getters(&self) -> Vec<Arc<CoordGet>> {
+        self.gets.to_vec()
+    }
+
+    /// The parameters of 1-based `axis`.
+    fn params(&self, axis: usize) -> &Params {
+        &self.gets[axis - 1].params
     }
 
     /// C `asynPrint(pAxis->pasynUser, ASYN_TRACE_ERROR, line)`, then the
@@ -211,7 +260,6 @@ impl PmacCoordSystem {
             );
         }
         let reply = self.handle.write_read(0, command.as_bytes(), PMAC_MAXBUF);
-        self.comms_error[axis - 1] = reply.is_err();
         if let (Some(log), Ok(raw)) = (log, &reply)
             && !raw.is_empty()
         {
@@ -224,6 +272,10 @@ impl PmacCoordSystem {
                 ),
             );
         }
+        // C `motorAxisWriteRead`'s comm error (pmacAsynCoord.c:336, 345).
+        let _ = self
+            .params(axis)
+            .set_integer(function::COMM_ERROR, i32::from(reply.is_err()));
         reply.inspect_err(|e| {
             self.trace.print(
                 TraceMask::ERROR,
@@ -403,7 +455,7 @@ impl AsynMotor for PmacCsAxis {
             position = CFloat(position)
         ));
 
-        if system.moves_deferred {
+        if system.moves_deferred.load(Ordering::Relaxed) {
             system.deferred[axis - 1] = true;
         } else if system.program != 0 {
             // Abort first so the motors are back in closed loop; then append the
@@ -414,6 +466,10 @@ impl AsynMotor for PmacCsAxis {
         }
         let sent = system.command(axis, &command);
         self.motion_sent = true;
+        // Whatever the write gave (pmacAsynCoord.c:520-523).
+        let params = system.params(axis);
+        let _ = params.set_integer(function::DONE, 0);
+        params.call_callback();
         sent
     }
 
@@ -513,8 +569,8 @@ impl AsynMotor for PmacCsAxis {
                 system.cs
             ),
         );
-        let release = !defer && system.moves_deferred;
-        system.moves_deferred = defer;
+        let release = !defer && system.moves_deferred.load(Ordering::Relaxed);
+        system.moves_deferred.store(defer, Ordering::Relaxed);
         if release {
             system.process_deferred_moves();
         }
@@ -568,6 +624,7 @@ impl AsynMotor for PmacCsAxis {
                 axis_name(self.axis).unwrap_or(' ')
             ),
         );
+        system.params(self.axis).force_callback();
     }
 
     /// C `drvPmacGetAxesStatus`, for this axis's share of the system poll.
@@ -591,6 +648,24 @@ impl AsynMotor for PmacCsAxis {
         let flags = decode_cs_status((status1, status2, status3), system.deferred[axis - 1]);
 
         let done = flags.done && !std::mem::take(&mut self.motion_sent);
+        // C's setInteger block (pmacAsynCoord.c:650-671), with the done and
+        // problem the record sees.
+        let params = system.params(axis);
+        let _ = params.set_double(function::POSITION, position);
+        let _ = params.set_double(function::ENCODER_POSN, position);
+        for (f, v) in [
+            (function::DIRECTION, direction),
+            (function::HIGH_HARD_LIMIT, flags.limit),
+            (function::HOME_SIGNAL, false),
+            (function::MOVING, flags.moving),
+            (function::DONE, done),
+            (function::LOW_HARD_LIMIT, flags.limit),
+            (function::FOLLOWING_ERROR, flags.following_error),
+            (function::PROBLEM, flags.problem),
+        ] {
+            let _ = params.set_integer(f, i32::from(v));
+        }
+        params.call_callback();
         Ok(MotorStatus {
             position,
             encoder_position: position,
@@ -604,9 +679,43 @@ impl AsynMotor for PmacCsAxis {
             direction,
             slip_stall: flags.following_error,
             problem: flags.problem,
-            comms_error: system.comms_error[axis - 1],
+            comms_error: system.params(axis).get_integer(function::COMM_ERROR) == Ok(Some(1)),
             ..MotorStatus::default()
         })
+    }
+}
+
+/// C `motorAxisSetDouble`, which `motorAxisSetInteger` calls with the value
+/// as a double (pmacAsynCoord.c:371-475): a function it has no case for
+/// fails, and a success goes into the parameters and is called back.
+impl DrvSet for PmacCsAxis {
+    fn set_double(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+        match function {
+            function::POSITION => self.set_position(user, value)?,
+            function::ENCODER_RATIO => self.set_encoder_ratio(user, value)?,
+            function::LOW_LIMIT => self.set_low_limit(user, value)?,
+            function::HIGH_LIMIT => self.set_high_limit(user, value)?,
+            function::P_GAIN => self.set_pid_gain(user, PidGainKind::Proportional, value)?,
+            function::I_GAIN => self.set_pid_gain(user, PidGainKind::Integral, value)?,
+            function::D_GAIN => self.set_pid_gain(user, PidGainKind::Derivative, value)?,
+            function::CLOSED_LOOP => self.set_closed_loop(user, value != 0.0)?,
+            // C keeps `(int)value`.
+            function::DEFER_MOVES => self.set_deferred_moves(user, value as i32 != 0)?,
+            _ => {
+                return Err(pmac_err(format!(
+                    "motorAxisSetDouble: unknown function {function}"
+                )));
+            }
+        }
+        let system = lock(&self.system);
+        let params = system.params(self.axis);
+        let _ = params.set_double(function, value);
+        params.call_callback();
+        Ok(())
+    }
+
+    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+        self.set_double(user, function, f64::from(value))
     }
 }
 
@@ -750,6 +859,29 @@ mod tests {
                 "&1Q71=2.500000000000"
             ]
         );
+    }
+
+    /// pmacAsynCoord.c:239-269, 371-475, 650-671: the sets C has a case for
+    /// go into the parameters, any other fails; DEFER reads the system's
+    /// flag, a poll sets the readback and a move clears done.
+    #[test]
+    fn sets_and_polls_keep_the_c_parameters() {
+        let (mut axis, system, _, _) = idle_axis("pmac_cs_params", Duration::ZERO);
+        let get = lock(&system).getters().remove(0);
+        let user = AsynUser::default();
+        axis.set_double(&user, function::P_GAIN, 0.5).unwrap();
+        axis.set_integer(&user, function::DEFER_MOVES, 1).unwrap();
+        assert!(axis.set_integer(&user, function::SLIP, 1).is_err());
+        assert_eq!(get.get_double(function::P_GAIN), Some(0.5));
+        assert_eq!(get.get_integer(function::DEFER_MOVES), Some(1));
+        assert_eq!(get.get_integer(function::SLIP), None);
+        axis.set_integer(&user, function::DEFER_MOVES, 0).unwrap();
+        axis.poll(&user).unwrap();
+        assert_eq!(get.get_double(function::POSITION), Some(15000.0));
+        assert_eq!(get.get_integer(function::DONE), Some(1));
+        assert_eq!(get.get_integer(function::COMM_ERROR), Some(0));
+        axis.move_absolute(&user, 1.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(get.get_integer(function::DONE), Some(0));
     }
 
     /// pmacAsynCoord.c motorAxisMove clears motorAxisDone and wakes the
