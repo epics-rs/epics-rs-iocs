@@ -320,6 +320,11 @@ impl AsynMotor for Emc18011Axis {
         self.failure
     }
 
+    // drvEMC18011.cc:356-358: the position is not updated in motion.
+    fn no_motion_test(&self) -> bool {
+        false
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
