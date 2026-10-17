@@ -1,7 +1,7 @@
 //! iocsh commands for the PMAC driver, under C's names and arguments.
 //!
 //! `pmacCreateController` / `pmacCreateAxis` / `pmacCreateAxes` /
-//! `pmacDisableLimitsCheck` / `pmacSetOpenLoopEncoderAxis` /
+//! `pmacDisableLimitsCheck` / `pmacSetAxisScale` / `pmacSetOpenLoopEncoderAxis` /
 //! `pmacCreateCsGroup` / `pmacCsGroupAddAxis` are pmacController.cpp's: the
 //! controller is asyn port `portName` and records reach axis n as
 //! `@asyn(portName,n)`. `pmacAsynCoordCreate` and the
@@ -12,8 +12,6 @@
 //!
 //! `pmacSetCoordStepsPerUnit` and `pmacSetDefaultCoordSteps` are
 //! pmacAsynCoord.c's, setting a coordinate-system axis's `stepSize`.
-//! `pmacSetAxisScale` is not provided: the driver speaks controller counts
-//! and the record's `MRES` does the scaling (see [`crate::axis`]).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -159,6 +157,7 @@ pub fn pmac_commands() -> Vec<CommandDef> {
         pmac_create_axis_command(&registry),
         pmac_create_axes_command(&registry),
         pmac_disable_limits_check_command(&registry),
+        pmac_set_axis_scale_command(&registry),
         pmac_set_open_loop_encoder_axis_command(&registry),
         pmac_create_cs_group_command(&registry),
         pmac_cs_group_add_axis_command(&registry),
@@ -330,6 +329,35 @@ fn pmac_disable_limits_check_command(registry: &Registry) -> CommandDef {
             });
             if done.is_none() {
                 port_not_found("pmacDisableLimitsCheck", &name);
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// C `pmacSetAxisScale(controller, axis, scale)`.
+fn pmac_set_axis_scale_command(registry: &Registry) -> CommandDef {
+    let registry = registry.clone();
+    CommandDef::new(
+        "pmacSetAxisScale",
+        vec![
+            arg_str_req("Controller port name"),
+            arg_int_req("Axis number"),
+            arg_int_req("Scale"),
+        ],
+        "pmacSetAxisScale(controller, axis, scale)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let name = req_string(args, 0, "Controller port name")?;
+            let axis = c_int(args, 1);
+            let scale = c_int(args, 2);
+            let done = find(&registry, &name, |reg| {
+                reg.controller
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_axis_scale(axis, scale)
+            });
+            if done.is_none() {
+                port_not_found("pmacSetAxisScale", &name);
             }
             Ok(CommandOutcome::Continue)
         },
@@ -1068,8 +1096,9 @@ mod tests {
         let text = motor_common::testing::port_report("pmacRepCtl", 0);
         assert!(text.contains(head), "{text}");
         assert!(!text.contains("scale"), "{text}");
+        controller.lock().unwrap().set_axis_scale(2, 3);
         let text = motor_common::testing::port_report("pmacRepCtl", 1);
-        let axes = "  axis 0\n    scale = 1\n  axis 2\n    scale = 1\n";
+        let axes = "  axis 0\n    scale = 1\n  axis 2\n    scale = 3\n";
         assert!(text.contains(&format!("{head}{axes}")), "{text}");
     }
 
@@ -1266,6 +1295,83 @@ mod tests {
         let _ = axis.set_high_limit(&user, f64::NAN);
         let _ = axis.set_low_limit(&user, -f64::NAN);
         assert_eq!(rig.written()[1..], ["I113=nan", "I114=-nan"]);
+    }
+
+    /// pmacAxis.cpp:178/188/330/509, pmacController.cpp:408/457/463: an axis
+    /// scale divides every demand on the wire and multiplies the readback.
+    #[test]
+    fn an_axis_scale_divides_demands_and_multiplies_readbacks() {
+        let (_rt, rig) = publish_scripted("pmacScale");
+        rig.answer("#1 ? F P", b"882000000001\r0\r100.0\r");
+        rig.answer("i124", b"$0\r");
+        for command in [
+            "I122=0.500000 I120=500.000000 #1 J=123.40",
+            "I122=0.500000 I120=500.000000 #1 J-",
+            "I113=10.000000",
+            "I114=-10.000000",
+            "#1K M161=32*I108 M162=32*I108",
+            "#1J/",
+        ] {
+            rig.answer(command, b"\x06");
+        }
+        let controller = Arc::new(Mutex::new(controller_on("pmacScale")));
+        controller.lock().unwrap().add_axis(1).unwrap();
+        controller.lock().unwrap().set_axis_scale(1, 10);
+        let mut axis = PmacAxis::new(controller, 1);
+        let user = AsynUser::new(0).with_addr(1);
+        axis.move_absolute(&user, 1234.0, 0.0, 5000.0, 10000.0)
+            .unwrap();
+        axis.move_velocity(&user, 0.0, -5000.0, 10000.0).unwrap();
+        axis.set_high_limit(&user, 100.0).unwrap();
+        axis.set_low_limit(&user, -100.0).unwrap();
+        axis.set_position(&user, 10.0).unwrap();
+        let status = axis.poll(&user).unwrap();
+        assert_eq!((status.position, status.encoder_position), (1000.0, 1000.0));
+        assert_eq!(
+            rig.written()[1..],
+            [
+                "I122=0.500000 I120=500.000000 #1 J=123.40",
+                "I122=0.500000 I120=500.000000 #1 J-",
+                "I113=10.000000",
+                "I114=-10.000000",
+                "#1K M161=32*I108 M162=32*I108",
+                "#1J/",
+                "#1 ? F P",
+                "i124",
+            ]
+        );
+    }
+
+    /// pmacController.cpp:774-801: the scale's refusals and its FLOW lines.
+    #[test]
+    fn set_axis_scale_prints_c_lines() {
+        let (_rt, _rig) = publish_scripted("pmacScaleLow");
+        let mut controller = PmacController::new(
+            "pmacScaleCtl",
+            "pmacScaleLow",
+            0,
+            low_level_port_connect("pmacScaleCtl", "pmacScaleLow", 0),
+        );
+        controller.add_axis(1).unwrap();
+        let capture = TraceCapture::on("pmacScaleCtl");
+        PortManager::global()
+            .trace_manager()
+            .set_trace_mask(Some("pmacScaleCtl"), TraceMask::ERROR | TraceMask::FLOW);
+        controller.set_axis_scale(1, 0);
+        controller.set_axis_scale(2, 4);
+        controller.set_axis_scale(1, 4);
+        assert_eq!(
+            capture.take(),
+            "pmacController::pmacSetAxisScale\n\
+             pmacController::pmacSetAxisScale: Error: scale factor must be >=1.\n\
+             pmacController::pmacSetAxisScale\n\
+             pmacController::pmacSetAxisScale: Error: axis 2 has not been configured using \
+             pmacCreateAxis.\n\
+             pmacController::pmacSetAxisScale\n\
+             pmacController::pmacSetAxisScale. Setting scale factor of 4 on axis 1, on \
+             controller pmacScaleCtl.\n"
+        );
+        assert_eq!(controller.axis_scale(1), 4);
     }
 
     /// `port`'s trace, address 0 included, without the prefix, so what it

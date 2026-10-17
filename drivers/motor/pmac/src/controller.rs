@@ -21,7 +21,7 @@
 //! [`PmacControllerParams`] is the `pmacController::writeInt32` that takes
 //! them, and the controller posts what its poll reads to the same port.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -162,9 +162,9 @@ pub struct PmacController {
     /// missing port keeps its unconnected user, which refuses every transfer.
     handle: Option<SyncIOHandle>,
     /// Axes created with `pmacCreateAxis`/`pmacCreateAxes` (1-based; address 0
-    /// is reserved for controller parameters in C and is never an axis).
-    /// Shared with [`PmacControllerParams`]'s report.
-    axes: Arc<Mutex<BTreeSet<i32>>>,
+    /// is reserved for controller parameters in C and is never an axis), each
+    /// with its C `scale_`. Shared with [`PmacControllerParams`]'s report.
+    axes: Arc<Mutex<BTreeMap<i32, i32>>>,
     config: BTreeMap<i32, AxisConfig>,
 
     /// C `movesDeferred_`: the last `MOTOR_DEFER_MOVES` value, 0 for none.
@@ -292,9 +292,10 @@ impl PmacController {
                     .to_string(),
             );
         }
-        if !lock_axes(&self.axes).insert(axis) {
+        if self.has_axis(axis) {
             return Err(format!("axis {axis} has already been created"));
         }
+        lock_axes(&self.axes).insert(axis, 1);
         self.config.insert(
             axis,
             AxisConfig {
@@ -306,7 +307,48 @@ impl PmacController {
     }
 
     pub fn has_axis(&self, axis: i32) -> bool {
-        lock_axes(&self.axes).contains(&axis)
+        lock_axes(&self.axes).contains_key(&axis)
+    }
+
+    /// C `pmacAxis::scale_`: demands are divided by it on the wire and
+    /// readbacks multiplied by it. Axis 0 (C `pAxisZero`) keeps 1.
+    pub fn axis_scale(&self, axis: i32) -> i32 {
+        lock_axes(&self.axes).get(&axis).copied().unwrap_or(1)
+    }
+
+    /// C `pmacController::pmacSetAxisScale`. An unknown axis returns
+    /// without C's `unlock()`, as [`Self::disable_limits_check`].
+    pub fn set_axis_scale(&mut self, axis: i32, scale: i32) {
+        const FUNCTION: &str = "pmacController::pmacSetAxisScale";
+        self.own
+            .print_self(TraceMask::FLOW, format_args!("{FUNCTION}\n"));
+        if scale < 1 {
+            self.own.print_self(
+                TraceMask::ERROR,
+                format_args!("{FUNCTION}: Error: scale factor must be >=1.\n"),
+            );
+            return;
+        }
+        match lock_axes(&self.axes).get_mut(&axis) {
+            Some(slot) => {
+                *slot = scale;
+                self.own.print_self(
+                    TraceMask::FLOW,
+                    format_args!(
+                        "{FUNCTION}. Setting scale factor of {scale} on axis {axis}, on \
+                         controller {}.\n",
+                        self.own.port()
+                    ),
+                );
+            }
+            None => self.own.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "{FUNCTION}: Error: axis {axis} has not been configured using \
+                     pmacCreateAxis.\n"
+                ),
+            ),
+        }
     }
 
     pub fn axis_config(&self, axis: i32) -> AxisConfig {
@@ -344,7 +386,7 @@ impl PmacController {
     pub fn set_open_loop_encoder_axis(&mut self, axis: i32, encoder_axis: i32, encoder_ratio: f64) {
         let error = match self.config.get_mut(&axis) {
             None => format!("axis {axis}"),
-            Some(_) if !lock_axes(&self.axes).contains(&encoder_axis) => {
+            Some(_) if !lock_axes(&self.axes).contains_key(&encoder_axis) => {
                 format!("encoder axis {encoder_axis}")
             }
             Some(cfg) => {
@@ -638,7 +680,7 @@ pub struct PmacControllerParams {
     controller: Arc<Mutex<PmacController>>,
     /// The controller's axes, read by the report without the controller
     /// lock, which a poll holds while it posts to this port.
-    axes: Arc<Mutex<BTreeSet<i32>>>,
+    axes: Arc<Mutex<BTreeMap<i32, i32>>>,
     /// C `movingPollPeriod_`/`idlePollPeriod_`, in seconds.
     moving_s: f64,
     idle_s: f64,
@@ -657,7 +699,7 @@ impl PmacControllerParams {
     }
 }
 
-fn lock_axes(axes: &Mutex<BTreeSet<i32>>) -> std::sync::MutexGuard<'_, BTreeSet<i32>> {
+fn lock_axes(axes: &Mutex<BTreeMap<i32, i32>>) -> std::sync::MutexGuard<'_, BTreeMap<i32, i32>> {
     axes.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -748,8 +790,7 @@ impl ControllerParams for PmacControllerParams {
         Ok(())
     }
 
-    /// pmacController.cpp:355-375. Address 0 is C's `pAxisZero`; every
-    /// `scale_` is 1, `pmacSetAxisScale` being absent here.
+    /// pmacController.cpp:355-375. Address 0 is C's `pAxisZero`, scale 1.
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
             out,
@@ -761,9 +802,9 @@ impl ControllerParams for PmacControllerParams {
         );
         if level > 0 {
             let axes = lock_axes(&self.axes);
-            for axis in std::iter::once(0).chain(axes.iter().copied()) {
+            for (axis, scale) in std::iter::once((0, 1)).chain(axes.iter().map(|(&a, &s)| (a, s))) {
                 if axis < ctx.num_axes() as i32 {
-                    let _ = write!(out, "  axis {axis}\n    scale = 1\n");
+                    let _ = write!(out, "  axis {axis}\n    scale = {scale}\n");
                 }
             }
         }

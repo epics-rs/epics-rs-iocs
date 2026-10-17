@@ -36,11 +36,6 @@
 //!
 //! Each is argued where it lives; in summary:
 //!
-//! - **Real-axis raw-step scaling is gone.** `pmacSetAxisScale` configures a
-//!   driver-side multiplier whose inverse the IOC must put in the record's
-//!   `MRES`. The two cancel, and the motor record already does the division,
-//!   so this port speaks controller counts (real axes, `MRES = 1`). See
-//!   [`axis`]. CS axes keep C's `stepSize` (see [`coord`]).
 //! - **Deferred moves live on the controller,** not on each axis. See
 //!   [`controller`].
 //!
