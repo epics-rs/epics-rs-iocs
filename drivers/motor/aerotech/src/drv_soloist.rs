@@ -17,6 +17,7 @@ use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::util::{atof, atoi, nint};
 
 /// `Soloist_NUM_CARDS`.
@@ -210,7 +211,11 @@ impl DrvSoloistAxis {
 
     /// `"%.*f"` of `steps` in user units.
     fn units(&self, steps: f64) -> String {
-        format!("{:.*}", self.setup.digits, steps * self.setup.resolution)
+        format!(
+            "{:.*}",
+            self.setup.digits,
+            CFloat(steps * self.setup.resolution)
+        )
     }
 
     /// `SET_VELOCITY`: the default speed and the home feed rate.
@@ -435,6 +440,24 @@ mod tests {
         assert_eq!(decimals(1.0), 2);
         assert_eq!(decimals(1.0 / 3.0), 2);
         assert_eq!(decimals(1000.0), 1);
+    }
+
+    /// drvSoloist.cc's `%.*f` of a non-finite step value.
+    #[test]
+    fn units_print_a_non_finite_value_as_c() {
+        use motor_common::testing::LineRig;
+        let (_line, io) = LineRig::new("soloistNan", |_| "%0".into());
+        let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+        let setup = AxisSetup {
+            encoder: false,
+            gain: false,
+            resolution: 1.0,
+            digits: 3,
+            home_dparam: 0,
+        };
+        let axis = DrvSoloistAxis::new(card, setup);
+        assert_eq!(axis.units(f64::NAN), "nan");
+        assert_eq!(axis.units(1.5), "1.500");
     }
 
     #[test]

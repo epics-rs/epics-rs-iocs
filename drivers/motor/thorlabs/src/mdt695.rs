@@ -39,6 +39,8 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, nint};
 
@@ -250,7 +252,9 @@ impl AsynMotor for Mdt695Axis {
         self.send_prem()?;
         // Set the channel output voltage: "<axis>V<volts>" (C "#V%.1f").
         let ctrl = self.lock();
-        ctrl.write_only(format!("{}V{:.1}", self.letter, position * DRIVE_RESOLUTION).as_bytes())
+        ctrl.write_only(
+            format!("{}V{:.1}", self.letter, CFloat(position * DRIVE_RESOLUTION)).as_bytes(),
+        )
     }
 
     fn move_relative(
@@ -451,6 +455,15 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// devMDT695.cc:224: C's `%.*f` spells a NaN voltage `nan`.
+    #[test]
+    fn a_nan_voltage_goes_out_as_c_printf_spells_it() {
+        let (line, mut axis) = rig("mdt695Nan");
+        let user = AsynUser::default();
+        axis.move_absolute(&user, f64::NAN, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(line.sent().last().map(String::as_str), Some("YVnan"));
     }
 
     /// devMDT695.cc:190-194: INIT's first '#' carries the axis letter.

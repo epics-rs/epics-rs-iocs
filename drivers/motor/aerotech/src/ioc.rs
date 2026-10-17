@@ -14,6 +14,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::AxisReport;
 use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_string};
@@ -64,7 +65,8 @@ fn motor_axis_report(cards: &Mutex<Vec<CardReport>>, level: i32) -> String {
         if level != 0 {
             out += &format!(
                 "    moving poll period: {:.6}\n    idle poll period: {:.6}\n",
-                card.moving_poll_s, card.idle_poll_s
+                CFloat(card.moving_poll_s),
+                CFloat(card.idle_poll_s)
             );
         }
         for axis in &card.axes {
@@ -201,6 +203,7 @@ pub fn ensemble_config_command() -> CommandDef {
 
             let mut axes = Vec::new();
             let mut reports: Vec<Arc<dyn AxisReport>> = Vec::new();
+            let mut logs = Vec::new();
             for axis in 0..ENSEMBLE_MAX_AXES {
                 if axes.len() as i32 == num_axes {
                     break;
@@ -210,9 +213,10 @@ pub fn ensemble_config_command() -> CommandDef {
                     .unwrap_or_else(|e| e.into_inner())
                     .axis_exists(axis);
                 if exists {
-                    let ax = EnsembleAxis::new(controller.clone(), axis)
+                    let ax = EnsembleAxis::new(controller.clone(), axis, axes.len() as i32)
                         .map_err(|e| format!("EnsembleAsynConfig: axis {axis}: {e}"))?;
                     reports.push(ax.report());
+                    logs.push(ax.log());
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     axes.push(motor);
                 }
@@ -224,6 +228,7 @@ pub fn ensemble_config_command() -> CommandDef {
                 .wait_mode_nowait();
             lock_cards(&ENSEMBLE_CARDS)[card as usize].axes = reports;
             MOTOR_ENSEMBLE.set_card(card, axes, moving_poll_ms, idle_poll_ms);
+            MOTOR_ENSEMBLE.set_axis_logs(card, logs);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -296,6 +301,7 @@ pub fn a3200_config_command() -> CommandDef {
 
             let mut axes = Vec::new();
             let mut reports: Vec<Arc<dyn AxisReport>> = Vec::new();
+            let mut logs = Vec::new();
             for axis in 0..num_axes {
                 let axis_name = controller
                     .lock()
@@ -305,6 +311,7 @@ pub fn a3200_config_command() -> CommandDef {
                 let ax = A3200Axis::new(controller.clone(), axis_name.clone())
                     .map_err(|e| format!("A3200AsynConfig: axis {axis} ({axis_name}): {e}"))?;
                 reports.push(ax.report());
+                logs.push(ax.log());
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 axes.push(motor);
             }
@@ -315,6 +322,7 @@ pub fn a3200_config_command() -> CommandDef {
                 .map_err(|e| format!("A3200AsynConfig: finalize failed: {e}"))?;
             lock_cards(&A3200_CARDS)[card as usize].axes = reports;
             MOTOR_A3200.set_card(card, axes, moving_poll_ms, idle_poll_ms);
+            MOTOR_A3200.set_axis_logs(card, logs);
             Ok(CommandOutcome::Continue)
         },
     )

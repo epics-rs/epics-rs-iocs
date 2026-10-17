@@ -41,6 +41,8 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, Pol
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use motor_common::util::{atof, atoi};
 
 use crate::smc::{SmcMembers, SmcState, travel_limits};
@@ -182,8 +184,11 @@ impl TaurusAxis {
     ) -> AsynResult<()> {
         let addr = self.addr();
         ctrl.write_all([
-            format!("{:.6} {addr} snv", (velocity * self.axis_res()).abs()),
-            format!("{:.6} {addr} sna", (acceleration * self.axis_res()).abs()),
+            format!("{} {addr} snv", CFloat((velocity * self.axis_res()).abs())),
+            format!(
+                "{} {addr} sna",
+                CFloat((acceleration * self.axis_res()).abs())
+            ),
             cmd,
         ])
     }
@@ -191,7 +196,12 @@ impl TaurusAxis {
     /// Push the current travel-limit pair to the controller (`setnlimit`).
     fn send_travel_limits(&self, ctrl: &TaurusController) -> AsynResult<()> {
         let (neg, pos) = self.members.state().travel_limits;
-        ctrl.write_only(&format!("{neg:.6} {pos:.6} {} setnlimit", self.addr()))
+        ctrl.write_only(&format!(
+            "{} {} {} setnlimit",
+            CFloat(neg),
+            CFloat(pos),
+            self.addr()
+        ))
     }
 }
 
@@ -210,7 +220,7 @@ impl AsynMotor for TaurusAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let cmd = format!("{:.6} {} nm", position * self.axis_res(), self.addr());
+        let cmd = format!("{} {} nm", CFloat(position * self.axis_res()), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -222,7 +232,7 @@ impl AsynMotor for TaurusAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let cmd = format!("{:.6} {} nr", distance * self.axis_res(), self.addr());
+        let cmd = format!("{} {} nr", CFloat(distance * self.axis_res()), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -236,7 +246,7 @@ impl AsynMotor for TaurusAxis {
         // No jog command — move to the cached axis travel limit.
         let (neg, pos) = self.members.state().travel_limits;
         let target = if velocity > 0.0 { pos } else { neg };
-        let cmd = format!("{target:.6} {} nm", self.addr());
+        let cmd = format!("{} {} nm", CFloat(target), self.addr());
         self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
@@ -263,8 +273,8 @@ impl AsynMotor for TaurusAxis {
         // setnpos takes the distance from the current position to the desired
         // origin, hence the negation (C multiplies by -1).
         ctrl.write_only(&format!(
-            "{:.6} {} setnpos",
-            -position * self.axis_res(),
+            "{} {} setnpos",
+            CFloat(-position * self.axis_res()),
             self.addr()
         ))
     }

@@ -6,17 +6,51 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::server::iocsh::registry::*;
 
 use crate::iocsh::{arg_int_req, arg_str_req};
 use crate::model1::c_int;
 use crate::{Controller, TraceUser, register_drv_motor_asyn_port};
 
-/// The axes a card's `Config` built, and the poller they go on.
+/// The axes a card's `Config` built, the poller they go on, and the log
+/// users `drvAsynMotorConfigure` connects them.
 struct Card {
     card: i32,
     axes: Vec<Arc<Mutex<dyn AsynMotor>>>,
     poller: Poller,
+    logs: Vec<Arc<AxisLog>>,
+}
+
+/// The `logFunc`/`logParam` pair an axis's `motorAxisSetLog` keeps
+/// (drvMotorAsyn.c:413): the user at `(port, addr)` once
+/// `drvAsynMotorConfigure` opened the axis, the unconnected
+/// `defaultAsynUser` before.
+#[derive(Debug, Default)]
+pub struct AxisLog(Mutex<Option<(String, i32)>>);
+
+impl AxisLog {
+    fn attach(&self, port: &str, addr: i32) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((port.to_owned(), addr));
+    }
+
+    fn user(&self) -> Option<(String, i32)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The driver's `PRINT(param, MOTOR_ERROR, ...)`, which `logFunc` turns
+    /// into `asynPrint` on the user (drvMotorAsyn.c:793).
+    pub fn print(&self, mask: TraceMask, args: std::fmt::Arguments<'_>) {
+        let user = self.user();
+        let (port, addr) = match &user {
+            Some((port, addr)) => (Some(port.as_str()), Some(*addr)),
+            None => (None, None),
+        };
+        PortManager::global()
+            .trace_manager()
+            .print(port, addr, 0, mask, args);
+    }
 }
 
 /// drvMotorAsyn has no task of its own; each driver's task polls its axes.
@@ -84,6 +118,7 @@ impl Model2 {
                 moving_poll_ms,
                 idle_poll_ms,
             },
+            logs: Vec::new(),
         });
     }
 
@@ -99,7 +134,23 @@ impl Model2 {
             card,
             axes,
             poller: Poller::Driver(poller),
+            logs: Vec::new(),
         });
+    }
+
+    /// The log user of each of `card`'s axes, by axis; set after
+    /// `set_card`/`set_card_on`.
+    pub fn set_axis_logs(&self, card: i32, logs: Vec<Arc<AxisLog>>) {
+        let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cards.iter_mut().find(|c| c.card == card) {
+            c.logs = logs;
+        }
+    }
+
+    fn axis_log(&self, card: i32, axis: i32) -> Option<Arc<AxisLog>> {
+        let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
+        let card = cards.iter().find(|c| c.card == card)?;
+        card.logs.get(usize::try_from(axis).ok()?).cloned()
     }
 
     fn put_card(&self, card: Card) {
@@ -186,6 +237,9 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                     addr,
                 };
                 controller.install(user, motor)?;
+                if let Some(log) = driver.axis_log(card, addr) {
+                    log.attach(&port_name, addr);
+                }
             }
             if let (
                 Some(controller),
@@ -299,5 +353,47 @@ mod one_task {
         let cmd = drv_asyn_motor_configure_command(vec![&OWN]);
         assert_eq!(pollers_after(cmd, args).await, 1);
         assert!(!OWN.set_poll_periods(0, Some(50), None));
+    }
+}
+
+#[cfg(all(test, feature = "testing", target_os = "linux"))]
+mod axis_log {
+    use super::*;
+    use crate::testing::run_command;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::motor::sim_motor::SimMotor;
+
+    static LOGGED: Model2 = Model2::new("logged", 0);
+
+    /// drvMotorAsyn.c:395-413: each opened axis logs through the user at its
+    /// address on the configured port; one that did not open keeps none.
+    #[epics_rs::base::epics_test]
+    async fn configure_hands_each_opened_axis_its_log_user() {
+        let logs: Vec<Arc<AxisLog>> = (0..3).map(|_| Arc::default()).collect();
+        let axis = || -> Arc<Mutex<dyn AsynMotor>> { Arc::new(Mutex::new(SimMotor::default())) };
+        LOGGED.set_card(0, vec![axis(), axis()], 100, 1000);
+        LOGGED.set_axis_logs(0, logs.clone());
+        let args = vec![
+            ArgValue::String("loggedPort".into()),
+            ArgValue::String("logged".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(3),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&LOGGED]), args).await;
+        assert_eq!(logs[2].user(), None);
+
+        let path = std::env::temp_dir().join(format!("model2-log-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("loggedPort"), TraceMask::ERROR);
+        trace.set_trace_file(Some("loggedPort"), TraceFile::File(file.clone()));
+        for addr in 0..3 {
+            trace.set_device_trace_file("loggedPort", addr, TraceFile::File(file.clone()));
+        }
+        logs[1].print(TraceMask::ERROR, format_args!("axis one\n"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("axis one\n"), "{text}");
     }
 }
