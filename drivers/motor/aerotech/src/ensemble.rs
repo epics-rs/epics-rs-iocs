@@ -252,11 +252,11 @@ impl EnsembleAxis {
                 .get_param(axis, PARAM_END_OF_TRAVEL_LIMIT_SETUP)
                 .map(|s| atol(&s) as u32)
                 .unwrap_or(0);
+            ctrl.command(&format!("RAMP MODE @{axis} RATE"))?;
             let reverse_direc = ctrl
                 .get_param(axis, PARAM_REVERSE_MOTION_DIRECTION)
                 .map(|s| atoi(&s) != 0)
                 .unwrap_or(false);
-            ctrl.command(&format!("RAMP MODE @{axis} RATE"))?;
             (
                 has_encoder,
                 step_size,
@@ -746,6 +746,29 @@ mod tests {
                 "EnsemblePoller: controller fault on axis=2 fault=0x1",
             ],
             "{text}"
+        );
+    }
+
+    /// drvEnsembleAsyn.cc:972-1015: the axis probe in C's order, RAMP MODE
+    /// RATE before ReverseMotionDirection.
+    #[test]
+    fn the_axis_probe_reads_reverse_direction_after_ramp_mode() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::new("ensProbeLine", |_| "%0".into());
+        let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensProbeLine", "0")));
+        line.sent();
+        EnsembleAxis::new(controller, 0, 0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                format!("GETPARM(@0, {PARAM_POSITION_FEEDBACK_TYPE})"),
+                format!("GETPARM(@0, {PARAM_COUNTS_PER_UNIT})"),
+                format!("GETPARM(@0, {PARAM_HOME_OFFSET})"),
+                format!("GETPARM(@0, {PARAM_HOME_SETUP})"),
+                format!("GETPARM(@0, {PARAM_END_OF_TRAVEL_LIMIT_SETUP})"),
+                "RAMP MODE @0 RATE".to_string(),
+                format!("GETPARM(@0, {PARAM_REVERSE_MOTION_DIRECTION})"),
+            ]
         );
     }
 
