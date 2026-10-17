@@ -61,6 +61,13 @@ impl Model2 {
         }
     }
 
+    /// The driver's `motorAxisReport`, the drvet `report` `dbior` runs: C
+    /// exports the `motorAxisDrvSET_t` under its name as a drvet
+    /// (drvMotorSim.c:71).
+    pub fn register_report(&'static self, report: impl Fn(i32) -> String + Send + Sync + 'static) {
+        crate::register_driver_report(self.name, report);
+    }
+
     /// What `Config` built for `card`, polled at `moving_poll_ms` and
     /// `idle_poll_ms`, replacing an earlier `Config` of it.
     pub fn set_card(
@@ -201,6 +208,17 @@ mod tests {
     use epics_rs::motor::sim_motor::SimMotor;
 
     static DRIVER: Model2 = Model2::new("test", 0);
+
+    static REPORTING: Model2 = Model2::new("motorTestReport", 0);
+
+    /// C `dbior` runs the `motorAxisDrvSET_t` exported as a drvet.
+    #[test]
+    fn dbior_reaches_the_model2_axis_report() {
+        use epics_rs::base::server::driver_support::find_driver_support;
+        REPORTING.register_report(|level| format!("level {level}\n"));
+        let drvet = find_driver_support("motorTestReport").unwrap();
+        assert_eq!(drvet.report(1).unwrap(), "level 1\n");
+    }
 
     fn axis() -> Arc<Mutex<dyn AsynMotor>> {
         Arc::new(Mutex::new(SimMotor::default()))

@@ -8,6 +8,7 @@ pub mod corvus;
 pub mod drv_micos;
 pub mod hydra;
 pub mod ioc;
+pub mod smc;
 pub mod taurus;
 
 pub use corvus::{CorvusAxis, CorvusController};

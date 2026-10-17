@@ -63,6 +63,11 @@ static PIC862: Model1 = Model1::new(&DEV_PIC862, 8, SCAN_RATE);
 
 /// `PIC862Setup(num_cards, scan_rate)`.
 pub fn pic862_setup_command() -> CommandDef {
+    PIC862.register_report("drvPIC862", |cards| {
+        cards.report("PIC862", |card, line| {
+            format!("    PIC862 controller #{card}, {line} \n")
+        })
+    });
     PIC862.setup_command("PIC862Setup")
 }
 
@@ -97,11 +102,13 @@ pub fn pic862_config_command() -> CommandDef {
             )?;
             let controller = PIC862Controller::new(handle, addr as u8)
                 .map_err(|e| format!("PIC862Config: {e}"))?;
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             let axis = PIC862Axis::new(controller).map_err(|e| format!("PIC862Config: {e}"))?;
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             PIC862.install(ctx, card, 0, motor)?;
+            PIC862.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -115,6 +122,11 @@ static PIC663: Model1 = Model1::new(&DEV_PIC663, 8, SCAN_RATE);
 
 /// `PIC663Setup(num_cards, scan_rate)`.
 pub fn pic663_setup_command() -> CommandDef {
+    PIC663.register_report("drvPIC663", |cards| {
+        cards.report("PIC663", |card, line| {
+            format!("    PIC663 controller #{card}, {line} \n")
+        })
+    });
     PIC663.setup_command("PIC663Setup")
 }
 
@@ -149,11 +161,13 @@ pub fn pic663_config_command() -> CommandDef {
             )?;
             let controller = PIC663Controller::new(handle, addr as u8)
                 .map_err(|e| format!("PIC663Config: {e}"))?;
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             let axis = PIC663Axis::new(controller).map_err(|e| format!("PIC663Config: {e}"))?;
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             PIC663.install(ctx, card, 0, motor)?;
+            PIC663.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -171,6 +185,11 @@ static PIC630_AXES: AtomicU8 = AtomicU8::new(PIC630_NUM_AXIS);
 /// `PIC630Setup(num_cards, num_channels, scan_rate)`.
 pub fn pic630_setup_command() -> CommandDef {
     PIC630.register_row();
+    PIC630.register_report("drvPIC630", |cards| {
+        cards.report("PIC630", |card, line| {
+            format!("    PIC630 controller #{card}, {line} \n")
+        })
+    });
     CommandDef::new(
         "PIC630Setup",
         vec![
@@ -242,6 +261,8 @@ pub fn pic630_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 PIC630.install(ctx, card, signal as i32, motor)?;
             }
+            // C's ident is the constant motor_init copies (drvPIC630.cc:546).
+            PIC630.describe(card, format!("port={asyn_port}, id: PIC630"));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -255,6 +276,11 @@ static PIC662: Model1 = Model1::new(&DEV_PIC662, 8, SCAN_RATE);
 
 /// `PIC662Setup(num_cards, scan_rate)`.
 pub fn pic662_setup_command() -> CommandDef {
+    PIC662.register_report("drvPIC662", |cards| {
+        cards.report("PIC662", |card, line| {
+            format!("    PIC662 controller #{card}, {line} \n")
+        })
+    });
     PIC662.setup_command("PIC662Setup")
 }
 
@@ -283,11 +309,13 @@ pub fn pic662_config_command() -> CommandDef {
             )?;
             let controller =
                 PIC662Controller::new(handle).map_err(|e| format!("PIC662Config: {e}"))?;
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             let axis = PIC662Axis::new(controller).map_err(|e| format!("PIC662Config: {e}"))?;
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             PIC662.install(ctx, card, 0, motor)?;
+            PIC662.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -301,6 +329,11 @@ static PIC844: Model1 = Model1::new(&DEV_PIC844, 8, SCAN_RATE);
 
 /// `PIC844Setup(num_cards, scan_rate)`.
 pub fn pic844_setup_command() -> CommandDef {
+    PIC844.register_report("drvPIC844", |cards| {
+        cards.report("PIC844", |card, line| {
+            format!("    PIC844 controller #{card}, {line} \n")
+        })
+    });
     PIC844.setup_command("PIC844Setup")
 }
 
@@ -330,6 +363,7 @@ pub fn pic844_config_command() -> CommandDef {
             )?;
             let controller =
                 PIC844Controller::new(handle).map_err(|e| format!("PIC844Config: {e}"))?;
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for signal in 0..PIC844_NUM_AXES {
@@ -338,6 +372,7 @@ pub fn pic844_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 PIC844.install(ctx, card, signal as i32, motor)?;
             }
+            PIC844.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -351,6 +386,11 @@ static PIC848: Model1 = Model1::new(&DEV_PIC848, 8, SCAN_RATE);
 
 /// `PIC848Setup(num_cards, scan_rate)`.
 pub fn pic848_setup_command() -> CommandDef {
+    PIC848.register_report("drvPIC848", |cards| {
+        cards.report("PIC848", |card, line| {
+            format!("    PIC848 controller #{card}, {line} \n")
+        })
+    });
     PIC848.setup_command("PIC848Setup")
 }
 
@@ -387,6 +427,7 @@ pub fn pic848_config_command() -> CommandDef {
                      (CST? => NOSTAGE on axis A)"
                 ));
             }
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for signal in 0..num_axes {
@@ -395,6 +436,7 @@ pub fn pic848_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 PIC848.install(ctx, card, signal as i32, motor)?;
             }
+            PIC848.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -408,6 +450,11 @@ static PIE516: Model1 = Model1::new(&DEV_PIE516, 10, SCAN_RATE);
 
 /// `PIE516Setup(num_cards, scan_rate)`.
 pub fn pie516_setup_command() -> CommandDef {
+    PIE516.register_report("drvPIE516", |cards| {
+        cards.report("PIE516", |card, line| {
+            format!("    PIE516 controller #{card}, {line} \n")
+        })
+    });
     PIE516.setup_command("PIE516Setup")
 }
 
@@ -438,6 +485,7 @@ pub fn pie516_config_command() -> CommandDef {
             let controller =
                 PIE516Controller::new(handle).map_err(|e| format!("PIE516Config: {e}"))?;
             let num_axes = controller.num_axes();
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
@@ -446,6 +494,7 @@ pub fn pie516_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                 PIE516.install(ctx, card, axis as i32, motor)?;
             }
+            PIE516.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -459,6 +508,11 @@ static PIE517: Model1 = Model1::new(&DEV_PIE517, 10, SCAN_RATE);
 
 /// `PIE517Setup(num_cards, scan_rate)`.
 pub fn pie517_setup_command() -> CommandDef {
+    PIE517.register_report("drvPIE517", |cards| {
+        cards.report("PIE517", |card, line| {
+            format!("    PIE517 controller #{card}, {line} \n")
+        })
+    });
     PIE517.setup_command("PIE517Setup")
 }
 
@@ -489,6 +543,8 @@ pub fn pie517_config_command() -> CommandDef {
             let controller =
                 PIE517Controller::new(handle).map_err(|e| format!("PIE517Config: {e}"))?;
             let num_axes = controller.num_axes();
+            // C copies an uninitialised buffer into the ident (see crate::e517).
+            let line = format!("port={asyn_port}, id: ");
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
@@ -497,6 +553,7 @@ pub fn pie517_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                 PIE517.install(ctx, card, axis as i32, motor)?;
             }
+            PIE517.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -510,6 +567,11 @@ static PIE710: Model1 = Model1::new(&DEV_PIE710, 8, SCAN_RATE);
 
 /// `PIE710Setup(num_cards, scan_rate)`.
 pub fn pie710_setup_command() -> CommandDef {
+    PIE710.register_report("drvPIE710", |cards| {
+        cards.report("PIE710", |card, line| {
+            format!("    PIE710 controller #{card}, {line} \n")
+        })
+    });
     PIE710.setup_command("PIE710Setup")
 }
 
@@ -540,6 +602,7 @@ pub fn pie710_config_command() -> CommandDef {
             let controller =
                 PIE710Controller::new(handle).map_err(|e| format!("PIE710Config: {e}"))?;
             let num_axes = controller.num_axes();
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
@@ -548,6 +611,7 @@ pub fn pie710_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                 PIE710.install(ctx, card, axis as i32, motor)?;
             }
+            PIE710.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -561,6 +625,11 @@ static PIE816: Model1 = Model1::new(&DEV_PIE816, 10, SCAN_RATE);
 
 /// `PIE816Setup(num_cards, scan_rate)`.
 pub fn pie816_setup_command() -> CommandDef {
+    PIE816.register_report("drvPIE816", |cards| {
+        cards.report("PIE816", |card, line| {
+            format!("    PIE816 controller #{card}, {line} \n")
+        })
+    });
     PIE816.setup_command("PIE816Setup")
 }
 
@@ -591,6 +660,7 @@ pub fn pie816_config_command() -> CommandDef {
             let controller =
                 PIE816Controller::new(handle).map_err(|e| format!("PIE816Config: {e}"))?;
             let num_axes = controller.num_axes();
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
@@ -599,7 +669,292 @@ pub fn pie816_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                 PIE816.install(ctx, card, axis as i32, motor)?;
             }
+            PIE816.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, run_command};
+
+    fn int(v: i64) -> ArgValue {
+        ArgValue::Int(v)
+    }
+
+    fn port(name: &str) -> ArgValue {
+        ArgValue::String(name.into())
+    }
+
+    /// The drvet `report` `dbior` runs, before `setup` and after `config`
+    /// brought up card 1 of the two `setup` made.
+    async fn reports(
+        drvet: &str,
+        setup: (CommandDef, Vec<ArgValue>),
+        config: (CommandDef, Vec<ArgValue>),
+    ) -> (String, String) {
+        let before = driver_report(drvet, 0);
+        run_command(setup.0, setup.1).await;
+        run_command(config.0, config.1).await;
+        (before, driver_report(drvet, 0))
+    }
+
+    /// drvPIC630.cc:114-136, which `dbior` runs; the ident is C's constant "PIC630".
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic630_chain() {
+        let setup = pic630_setup_command();
+        let (_line, _io) = LineRig::new("c630RepLine", |last| match last {
+            "1TS" => "1TS:0".into(),
+            "1TP" => "1TP:0".into(),
+            c => c.into(),
+        });
+        let mut config = vec![int(1), port("c630RepLine")];
+        config.extend((0..9).map(|_| int(1)));
+        let (before, after) = reports(
+            "drvPIC630",
+            (setup, vec![int(2), int(1), int(10)]),
+            (pic630_config_command(), config),
+        )
+        .await;
+        assert_eq!(before, "    No PIC630 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC630 controller 0 connection failed.\n    PIC630 controller #1, \
+             port=c630RepLine, id: PIC630 \n"
+        );
+    }
+
+    /// drvPIC662.cc:135-160, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic662_controller() {
+        let setup = pic662_setup_command();
+        let (_line, _io) = LineRig::new("c662RepLine", |last| match last {
+            "*IDN?" => "E-662".into(),
+            "*ESR?" => "1".into(),
+            _ => "0.000".into(),
+        });
+        let (before, after) = reports(
+            "drvPIC662",
+            (setup, vec![int(2), int(10)]),
+            (pic662_config_command(), vec![int(1), port("c662RepLine")]),
+        )
+        .await;
+        assert_eq!(before, "    No PIC662 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC662 controller 0 connection failed.\n    PIC662 controller #1, \
+             port=c662RepLine, id: E-662 \n"
+        );
+    }
+
+    /// drvPIC663.cc:108-133, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic663_controller() {
+        let setup = pic663_setup_command();
+        let (_line, _io) = LineRig::new("c663RepLine", |last| match last {
+            "TP" => "P:0\r".into(),
+            _ => "C-663\r".into(),
+        });
+        let (before, after) = reports(
+            "drvPIC663",
+            (setup, vec![int(2), int(10)]),
+            (
+                pic663_config_command(),
+                vec![int(1), port("c663RepLine"), int(1)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIC663 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC663 controller 0 connection failed.\n    PIC663 controller #1, \
+             port=c663RepLine, id: C-663 \n"
+        );
+    }
+
+    /// drvPIC844.cc:143-168, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic844_controller() {
+        let setup = pic844_setup_command();
+        let (_line, _io) = LineRig::new("c844RepLine", |last| match last {
+            "*IDN?" => "C-844".into(),
+            c if c.ends_with("AXIS:STAT?") => "ON".into(),
+            _ => "0".into(),
+        });
+        let (before, after) = reports(
+            "drvPIC844",
+            (setup, vec![int(2), int(10)]),
+            (
+                pic844_config_command(),
+                vec![int(1), port("c844RepLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIC844 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC844 controller 0 connection failed.\n    PIC844 controller #1, \
+             port=c844RepLine, id: C-844 \n"
+        );
+    }
+
+    /// drvPIC848.cc:134-159, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic848_controller() {
+        let setup = pic848_setup_command();
+        let (_line, _io) = LineRig::new("c848RepLine", |last| match last {
+            "*IDN?" => "C-848".into(),
+            "CST? A" => "A=M-110".into(),
+            "CST? B" => "B=NOSTAGE".into(),
+            _ => "A=0".into(),
+        });
+        let (before, after) = reports(
+            "drvPIC848",
+            (setup, vec![int(2), int(10)]),
+            (
+                pic848_config_command(),
+                vec![int(1), port("c848RepLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIC848 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC848 controller 0 connection failed.\n    PIC848 controller #1, \
+             port=c848RepLine, id: C-848 \n"
+        );
+    }
+
+    /// drvPIC862.cc:117-142, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic862_controller() {
+        let setup = pic862_setup_command();
+        let (_line, _io) = LineRig::new("c862RepLine", |last| match last {
+            "TP" => "P:0\r".into(),
+            _ => "C-862\r".into(),
+        });
+        let (before, after) = reports(
+            "drvPIC862",
+            (setup, vec![int(2), int(10)]),
+            (
+                pic862_config_command(),
+                vec![int(1), port("c862RepLine"), int(1)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIC862 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC862 controller 0 connection failed.\n    PIC862 controller #1, \
+             port=c862RepLine, id: C-862 \n"
+        );
+    }
+
+    /// drvPIE516.cc:140-165, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pie516_controller() {
+        let setup = pie516_setup_command();
+        let (_line, _io) = LineRig::new("e516RepLine", |last| match last {
+            "ONL?" | "SVO? A" => "1".into(),
+            "VER?" => "E-516".into(),
+            "POS? A" => "0.000".into(),
+            _ => String::new(),
+        });
+        let (before, after) = reports(
+            "drvPIE516",
+            (setup, vec![int(2), int(10)]),
+            (
+                pie516_config_command(),
+                vec![int(1), port("e516RepLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIE516 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIE516 controller 0 connection failed.\n    PIE516 controller #1, \
+             port=e516RepLine, id: E-516 \n"
+        );
+    }
+
+    /// drvPIE517.cc:148-173, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pie517_controller() {
+        let setup = pie517_setup_command();
+        let (_line, _io) = LineRig::new("e517RepLine", |last| match last {
+            "SVO? 1" => "1=1".into(),
+            "POS? 1" => "1=0.000".into(),
+            _ => String::new(),
+        });
+        let (before, after) = reports(
+            "drvPIE517",
+            (setup, vec![int(2), int(10)]),
+            (
+                pie517_config_command(),
+                vec![int(1), port("e517RepLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIE517 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIE517 controller 0 connection failed.\n    PIE517 controller #1, \
+             port=e517RepLine, id:  \n"
+        );
+    }
+
+    /// drvPIE710.cc:132-157, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pie710_controller() {
+        let setup = pie710_setup_command();
+        let (_line, _io) = LineRig::new("e710RepLine", |last| match last {
+            "GI" => "PI E-710 V5.000".into(),
+            "1TP" => "0.0".into(),
+            _ => String::new(),
+        });
+        let (before, after) = reports(
+            "drvPIE710",
+            (setup, vec![int(2), int(10)]),
+            (
+                pie710_config_command(),
+                vec![int(1), port("e710RepLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIE710 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIE710 controller 0 connection failed.\n    PIE710 controller #1, \
+             port=e710RepLine, id: PI E-710 V5.000 \n"
+        );
+    }
+
+    /// drvPIE816.cc:149-174, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pie816_controller() {
+        let setup = pie816_setup_command();
+        let (_line, _io) = LineRig::new("e816RepLine", |last| match last {
+            "*IDN?" => "E-816".into(),
+            "SVO? A" => "1".into(),
+            "POS? A" => "0.000".into(),
+            _ => String::new(),
+        });
+        let (before, after) = reports(
+            "drvPIE816",
+            (setup, vec![int(2), int(10)]),
+            (
+                pie816_config_command(),
+                vec![int(1), port("e816RepLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIE816 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIE816 controller 0 connection failed.\n    PIE816 controller #1, \
+             port=e816RepLine, id: E-816 \n"
+        );
+    }
 }

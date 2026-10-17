@@ -142,9 +142,6 @@
 //!   (decides how eagerly `motor_task` re-polls); the position/encoder
 //!   fields it gates are unconditionally set to the same value either way, so
 //!   this port always updates `position` from `TP` and doesn't track it.
-//! - **`report()`** driver-status iocsh diagnostic: not implemented, matching
-//!   every other port in this workspace (the identify string is logged once
-//!   at `PIC862Config` time instead, like `PIGCS2CreateController`).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

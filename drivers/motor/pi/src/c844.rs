@@ -71,9 +71,9 @@
 //! - `SET_HIGH_LIMIT`/`SET_LOW_LIMIT`/`SET_ENC_RATIO`/`GO` — no wire command.
 //!
 //! ## Not modeled (documented deviations)
-//! - **`no_motion_count`** poll-scheduling counter and **`recv_mess(FLUSH)`** /
-//!   **`report()`**: as elsewhere in this workspace (record-layer state / no
-//!   `SyncIOHandle` primitive / not implemented).
+//! - **`no_motion_count`** poll-scheduling counter and **`recv_mess(FLUSH)`**:
+//!   as elsewhere in this workspace (record-layer state / no `SyncIOHandle`
+//!   primitive).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

@@ -76,26 +76,70 @@ pub fn im483pl_probe(ctrl: &Im483Controller) -> usize {
 }
 
 /// `motor_init`'s probe of an IM483SM, three tries: reset with ETX, wait a
-/// second, send a space and read the sign-on. True when it answered; the
-/// rest of the sign-on, up to `BUFF_SIZE` characters, is read and dropped,
-/// as C keeps it only for `dbior`.
-pub fn im483sm_probe(ctrl: &Im483Controller) -> bool {
-    (0..3).any(|_| {
+/// second, send a space and read the sign-on. Its identification when it
+/// answered, which C keeps only for `dbior`.
+pub fn im483sm_probe(ctrl: &Im483Controller) -> Option<String> {
+    (0..3).find_map(|_| {
         let _ = ctrl.handle.write_octet(0, b"\x03");
         sleep(Duration::from_secs(1));
-        let first = ctrl.ask(" ");
-        if first.is_empty() {
-            return false;
-        }
-        let mut read = first.len();
-        while read < BUFF_SIZE {
-            match ctrl.handle.read_octet(0, BUFF_SIZE) {
-                Ok(line) if !line.is_empty() => read += line.len(),
-                _ => break,
-            }
-        }
-        true
+        let mut first = Some(ctrl.ask(" "));
+        sign_on_ident(|| {
+            let line = match first.take() {
+                Some(line) => line.into_bytes(),
+                None => ctrl.handle.read_octet(0, BUFF_SIZE).unwrap_or_default(),
+            };
+            Some(line).filter(|l| !l.is_empty())
+        })
     })
+}
+
+/// C's copy of the sign-on into `brdptr->ident` (drvIM483SM.cc:557-598):
+/// leading blanks of a line dropped, a run of blanks kept as one, lines
+/// joined by a blank, an `AD` copyright line's 22 characters as `AMS`, 50
+/// steps at most. `next` is C's `recv_mess`. `None` when the first read
+/// gets nothing. C reads past the line's end into what an earlier, longer
+/// line left in the buffer and, after 50 steps, leaves `ident`
+/// unterminated; both are defects not copied, past the end reads as the
+/// line's NUL.
+fn sign_on_ident(mut next: impl FnMut() -> Option<Vec<u8>>) -> Option<String> {
+    let at = |buff: &[u8], i: usize| buff.get(i).copied().unwrap_or(0);
+    let mut buff = Vec::new();
+    let mut src = 0;
+    let mut ident = Vec::new();
+    let mut itera = 0;
+    while itera < 50 {
+        if at(&buff, src) == 0 {
+            let Some(line) = next() else {
+                if itera == 0 {
+                    return None;
+                }
+                break;
+            };
+            buff = line;
+            src = 0;
+            while at(&buff, src).is_ascii_whitespace() {
+                src += 1;
+            }
+            if itera != 0 {
+                ident.push(b' ');
+                itera += 1;
+            }
+        } else if at(&buff, src).is_ascii_whitespace() {
+            while at(&buff, src).is_ascii_whitespace() {
+                src += 1;
+            }
+            src -= 1;
+        } else if buff[src..].starts_with(b"AD") {
+            ident.extend_from_slice(b"AMS");
+            src += 22;
+            itera += 3;
+        }
+        ident.push(at(&buff, src));
+        src += 1;
+        itera += 1;
+    }
+    let end = ident.iter().position(|&b| b == 0).unwrap_or(ident.len());
+    Some(String::from_utf8_lossy(&ident[..end]).into_owned())
 }
 
 /// One axis of a model-1 IM483 card.
@@ -359,6 +403,23 @@ fn from(reply: &str, i: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ident_of(lines: &[&str]) -> Option<String> {
+        let mut lines = lines.iter();
+        sign_on_ident(|| lines.next().map(|l| l.as_bytes().to_vec()))
+    }
+
+    /// drvIM483SM.cc:557-598 over a scripted sign-on.
+    #[test]
+    fn the_sign_on_is_copied_as_c_copies_it_into_ident() {
+        assert_eq!(ident_of(&[]), None);
+        assert_eq!(
+            ident_of(&["  IM483  Ver  1.2", "xAD01234567890123456789QZ"]).unwrap(),
+            "IM483 Ver 1.2 xAMSQZ"
+        );
+        let endless = sign_on_ident(|| Some(b"ab".to_vec())).unwrap();
+        assert_eq!(endless, vec!["ab"; 17].join(" "));
+    }
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};

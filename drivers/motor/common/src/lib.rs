@@ -38,10 +38,14 @@ use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::runtime::sync::mpsc;
+use epics_rs::base::server::driver_support::{DriverSupport, register_driver_support};
 use epics_rs::base::server::iocsh::registry::CommandContext;
 use epics_rs::motor::builder::{
     AxisSetup, ControllerAxes, ControllerAxis, ControllerBuilder, MotorBuilder,
 };
+pub use epics_rs::motor::controller_port::{ControllerParams, ControllerReport};
+pub use epics_rs::motor::device_support::AxisReport;
+use epics_rs::motor::device_support::MotorAxis;
 pub use epics_rs::motor::devices::{
     device_support_factory, devices, model1_device, register_controller_port,
     register_drv_motor_asyn_port, register_model1_device,
@@ -52,8 +56,34 @@ pub use epics_rs::motor::trace::TraceUser;
 /// Create C `asynMotorController` port `port` with axes `0..num_axes` for a
 /// driver with no parameters of its own, gated on the IOC's interruptAccept.
 pub fn register_port(ctx: &CommandContext, port: &str, num_axes: i32) -> Result<(), String> {
+    register_port_with(ctx, port, num_axes, ())
+}
+
+/// [`register_port`] for a driver whose subclass adds to the base port, such
+/// as its `report(fp, level)` override.
+pub fn register_port_with(
+    ctx: &CommandContext,
+    port: &str,
+    num_axes: i32,
+    params: impl ControllerParams,
+) -> Result<(), String> {
     let owner = ctx.db().scan_control().interrupt_gate();
-    register_controller_port(owner, port, num_axes, ()).map(drop)
+    register_controller_port(owner, port, num_axes, params).map(drop)
+}
+
+/// A `.dbd` `driver(name)` line with its drvet `report`, which `dbior` runs
+/// with its level and prints after `Driver: name`.
+pub fn register_driver_report(
+    name: &'static str,
+    report: impl Fn(i32) -> String + Send + Sync + 'static,
+) {
+    struct Drvet<F>(F);
+    impl<F: Fn(i32) -> String + Send + Sync + 'static> DriverSupport for Drvet<F> {
+        fn report(&self, level: i32) -> Option<String> {
+            Some((self.0)(level))
+        }
+    }
+    register_driver_support(name, Arc::new(Drvet(report)));
 }
 
 /// The trace user of an axis a C asyn driver serves: its port and address.
@@ -106,8 +136,28 @@ impl Controller {
         user: TraceUser,
         motor: Arc<Mutex<dyn AsynMotor>>,
     ) -> Result<mpsc::Sender<PollCommand>, String> {
+        self.add(user, motor, None)
+    }
+
+    /// [`Self::install`] for an axis with C's `asynMotorAxis::report`
+    /// override, which its controller's report runs.
+    pub fn install_with_report(
+        &self,
+        user: TraceUser,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+        report: Arc<dyn AxisReport>,
+    ) -> Result<mpsc::Sender<PollCommand>, String> {
+        self.add(user, motor, Some(report))
+    }
+
+    fn add(
+        &self,
+        user: TraceUser,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+        report: Option<Arc<dyn AxisReport>>,
+    ) -> Result<mpsc::Sender<PollCommand>, String> {
         let ControllerAxis { axis, poll_cmd_tx } = self.axes.add(motor, user)?;
-        epics_rs::motor::devices::register_axis(axis)?;
+        epics_rs::motor::devices::register_axis(with_report(axis, report))?;
         Ok(poll_cmd_tx)
     }
 
@@ -154,6 +204,47 @@ pub fn install(
     idle_poll_ms: u64,
     forced_fast_polls: u32,
 ) -> Result<(), String> {
+    install_axis(
+        ctx,
+        user,
+        motor,
+        None,
+        moving_poll_ms,
+        idle_poll_ms,
+        forced_fast_polls,
+    )
+}
+
+/// [`install`] for an axis with C's `asynMotorAxis::report` override.
+pub fn install_with_report(
+    ctx: &CommandContext,
+    user: TraceUser,
+    motor: Arc<Mutex<dyn AsynMotor>>,
+    report: Arc<dyn AxisReport>,
+    moving_poll_ms: u64,
+    idle_poll_ms: u64,
+    forced_fast_polls: u32,
+) -> Result<(), String> {
+    install_axis(
+        ctx,
+        user,
+        motor,
+        Some(report),
+        moving_poll_ms,
+        idle_poll_ms,
+        forced_fast_polls,
+    )
+}
+
+fn install_axis(
+    ctx: &CommandContext,
+    user: TraceUser,
+    motor: Arc<Mutex<dyn AsynMotor>>,
+    report: Option<Arc<dyn AxisReport>>,
+    moving_poll_ms: u64,
+    idle_poll_ms: u64,
+    forced_fast_polls: u32,
+) -> Result<(), String> {
     let AxisSetup {
         axis,
         poll_loop,
@@ -164,9 +255,16 @@ pub fn install(
         .idle_poll_interval(Duration::from_millis(idle_poll_ms))
         .forced_fast_polls(forced_fast_polls)
         .build_axis();
-    epics_rs::motor::devices::register_axis(axis)?;
+    epics_rs::motor::devices::register_axis(with_report(axis, report))?;
     ctx.bridge().spawn(poll_loop.run());
     Ok(())
+}
+
+fn with_report(axis: MotorAxis, report: Option<Arc<dyn AxisReport>>) -> MotorAxis {
+    match report {
+        Some(report) => axis.with_report(report),
+        None => axis,
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +345,54 @@ mod tests {
         }
         let passes = log.lock().unwrap()[joined..].to_vec();
         assert_eq!(passes[..4], [0, 1, 0, 1], "{passes:?}");
+    }
+
+    struct Reporting;
+
+    impl ControllerParams for Reporting {
+        fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+            let _ = writeln!(out, "driver {} numAxes={}", ctx.port_name(), ctx.num_axes());
+            ctx.report(out, level);
+        }
+    }
+
+    struct AxisLine(i32);
+
+    impl AxisReport for AxisLine {
+        fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+            if level > 0 {
+                let _ = writeln!(out, "  axis {}", self.0);
+            }
+        }
+    }
+
+    /// C `asynReport`: the controller's `report` override, then each axis's.
+    #[test]
+    fn the_port_report_reaches_the_controller_and_axis_overrides() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _entered = rt.enter();
+        let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
+        register_port_with(&ctx, "reportHooks", 2, Reporting).unwrap();
+        let controller = Controller::new();
+        for addr in 0..2 {
+            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Polled {
+                addr,
+                log: Log::default(),
+            }));
+            controller
+                .install_with_report(
+                    asyn_user("reportHooks", addr),
+                    motor,
+                    Arc::new(AxisLine(addr)),
+                )
+                .unwrap();
+        }
+        let port = epics_rs::asyn::manager::PortManager::global()
+            .find_port_handle("reportHooks")
+            .unwrap();
+        let text = port.report_blocking(1).unwrap();
+        let want = "driver reportHooks numAxes=2\n  axis 0\n  axis 1\n";
+        assert!(text.contains(want), "{text}");
     }
 }
 

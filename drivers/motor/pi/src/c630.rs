@@ -117,9 +117,8 @@
 //!   (gated on an active `motor_motion` node this interface does not carry);
 //!   the position it guards is set identically either way, so this port always
 //!   updates `position` from `TP` — matching the C-862 port's treatment.
-//! - **`recv_mess(..., FLUSH)`** on the (nonexistent) comm-error path and
-//!   **`report()`** iocsh diagnostic: no `SyncIOHandle` equivalent / not
-//!   implemented, matching every other port here.
+//! - **`recv_mess(..., FLUSH)`** on the (nonexistent) comm-error path: no
+//!   `SyncIOHandle` equivalent.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
