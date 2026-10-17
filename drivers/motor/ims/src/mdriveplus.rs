@@ -424,6 +424,8 @@ pub struct ImsMDrivePlusAxis {
     /// The controller port and its IMS_LOCKEDROTOR, which the poll sets
     /// (ImsMDrivePlusMotorAxis.cpp:484), as it does the port's COMMS_ERROR.
     port: Option<(PortHandle, usize)>,
+    /// The params the last poll set, posted with its status.
+    poll_params: Vec<(usize, ParamValue)>,
     /// C's status params as its polls left them, a failed poll's partial
     /// reads included.
     status: MotorStatus,
@@ -457,6 +459,7 @@ impl ImsMDrivePlusAxis {
             },
             failed: None,
             status_writes: Vec::new(),
+            poll_params: Vec::new(),
         };
         if axis.config_axis() == AsynStatus::Error {
             axis.line.print(
@@ -758,16 +761,20 @@ impl ImsMDrivePlusAxis {
     /// C's `bail:` label: a failed `function` runs handleAxisError, which
     /// sets `motorStatusProblem_` and prints the drive's `PR ER` code.
     fn bail<T>(&mut self, function: &str, what: &str, status: AsynResult<T>) -> AsynResult<T> {
-        if status.is_err() {
-            self.status_writes.push(StatusWrite::Problem(true));
-            if let Some(line) = self.line.axis_error(function, what) {
-                self.line.print(TraceMask::ERROR, format_args!("{line}"));
-            }
-            if self.line.take_comms_failed() {
-                self.post(index::STATUS_COMMS_ERROR, 1);
-            }
+        if status.is_err() && self.handle_axis_error(function, what) {
+            self.post(index::STATUS_COMMS_ERROR, 1);
         }
         status
+    }
+
+    /// C `handleAxisError`; true when an exchange failed, which C's
+    /// writeController/writeReadController mark as COMMS_ERROR.
+    fn handle_axis_error(&mut self, function: &str, what: &str) -> bool {
+        self.status_writes.push(StatusWrite::Problem(true));
+        if let Some(line) = self.line.axis_error(function, what) {
+            self.line.print(TraceMask::ERROR, format_args!("{line}"));
+        }
+        self.line.take_comms_failed()
     }
 
     /// C `poll` up to its bail label, setting [`Self::status`] field by
@@ -809,7 +816,8 @@ impl ImsMDrivePlusAxis {
         self.status.encoder_position = atof(&self.write_read("PR C2")?);
         let locked_rotor = atoi(&self.write_read("PR LR")?);
         if let Some(&(_, reason)) = self.port.as_ref() {
-            self.post(reason, locked_rotor);
+            self.poll_params
+                .push((reason, ParamValue::Int32(locked_rotor)));
         }
         Ok(())
     }
@@ -951,13 +959,18 @@ impl AsynMotor for ImsMDrivePlusAxis {
             // every good poll (:496-497); the problem bit a failed
             // IMS_* write set lives only in the params.
             self.line.take_comms_failed();
-            self.post(index::STATUS_COMMS_ERROR, 0);
-            self.post(STATUS_PROBLEM, 0);
+            self.poll_params.extend([
+                (index::STATUS_COMMS_ERROR, ParamValue::Int32(0)),
+                (STATUS_PROBLEM, ParamValue::Int32(0)),
+            ]);
             self.failed = None;
         } else {
             self.failed = Some(self.status.clone());
+            if self.handle_axis_error("poll()", "polling motor") {
+                self.poll_params
+                    .push((index::STATUS_COMMS_ERROR, ParamValue::Int32(1)));
+            }
         }
-        let status = self.bail("poll()", "polling motor", status);
         let mut word = MstaFlags::from_status(&self.status);
         word.set(MstaFlags::PROBLEM, status.is_err());
         let word = word.bits();
@@ -969,6 +982,12 @@ impl AsynMotor for ImsMDrivePlusAxis {
             ),
         );
         status
+    }
+
+    /// C's poll sets these and posts them in the callParamCallbacks that
+    /// posts its status (ImsMDrivePlusMotorAxis.cpp:484-501).
+    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
+        std::mem::take(&mut self.poll_params)
     }
 
     fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
@@ -1243,6 +1262,50 @@ mod tests {
             axis.poll(&user).unwrap();
         });
         assert_eq!(sent.iter().filter(|s| *s == "R1=1").count(), 1, "{sent:?}");
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:494-501: a good poll's COMMS_ERROR and
+    /// PROBLEM resets, and a failed exchange's COMMS_ERROR, go out with the
+    /// poll's status rather than on their own.
+    #[test]
+    fn a_poll_hands_its_params_to_the_poller() {
+        let ints = |params: Vec<(usize, ParamValue)>| -> Vec<(usize, i32)> {
+            params
+                .into_iter()
+                .map(|(reason, value)| match value {
+                    ParamValue::Int32(v) => (reason, v),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let mut taken = Vec::new();
+        axis_error_lines(
+            "imsPollParams",
+            "imsPollParamsLine",
+            |l| l == "PR MV",
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.poll(&user).is_err());
+                taken.push(ints(axis.take_poll_params()));
+                assert!(axis.take_poll_params().is_empty());
+            },
+        );
+        axis_error_lines(
+            "imsPollParamsOk",
+            "imsPollParamsOkLine",
+            |_| false,
+            |axis| {
+                axis.poll(&AsynUser::new(0)).unwrap();
+                taken.push(ints(axis.take_poll_params()));
+            },
+        );
+        assert_eq!(
+            taken,
+            [
+                vec![(index::STATUS_COMMS_ERROR, 1)],
+                vec![(index::STATUS_COMMS_ERROR, 0), (STATUS_PROBLEM, 0)],
+            ]
+        );
     }
 
     /// ImsMDrivePlusMotorAxis.cpp:407-427, 486-503: a poll that bails keeps
