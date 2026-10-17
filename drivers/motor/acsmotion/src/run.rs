@@ -192,7 +192,7 @@ impl Runner {
             Some(0),
             0,
             mask,
-            format_args!("SPiiPlusController:{func}: {args}"),
+            format_args!("SPiiPlusController:{func}: {args}\n"),
         );
     }
 

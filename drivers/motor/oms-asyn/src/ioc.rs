@@ -69,7 +69,12 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                 );
                 return Ok(CommandOutcome::Continue);
             };
-            let controller = OmsController::new(handle, &serial_port, controller_type);
+            let mut controller =
+                OmsController::new(handle, &port_name, &serial_port, controller_type);
+            if let Err(e) = controller.watch_connection() {
+                println!("{who}: can't set exceptionCallback for {serial_port}: {e}");
+                return Ok(CommandOutcome::Continue);
+            }
             let (fw_major, fw_minor) = match controller.firmware_version() {
                 Ok(version) => version,
                 Err(e) => {
@@ -121,6 +126,12 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                     10, // C startPoller, omsMAXnet.cpp:364, omsMXA.cpp:359
                 )?;
             }
+            crate::poller::start(
+                &controller,
+                Duration::from_millis(moving_poll_ms),
+                Duration::from_millis(idle_poll_ms),
+                fw_minor,
+            );
             Ok(CommandOutcome::Continue)
         },
     )

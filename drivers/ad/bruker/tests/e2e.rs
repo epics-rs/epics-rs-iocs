@@ -618,17 +618,18 @@ fn every_status_read_is_posted_as_read() {
     let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
     let (reason, size_x) = (detector.params.status, detector.ad_params.size_x);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // BIS_STATUS is undefined until statusTask's first post, as in C.
     let read = || {
         (
             sync.read_int32(size_x).unwrap(),
-            sync.read_octet(reason, 128).unwrap(),
+            sync.read_octet(reason, 128).ok(),
         )
     };
     let mut got = read();
-    while got != (1024, b"\0".to_vec()) && std::time::Instant::now() < deadline {
+    while got != (1024, Some(b"\0".to_vec())) && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
         got = read();
     }
     assert_eq!(got.0, 1024);
-    assert_eq!(String::from_utf8_lossy(&got.1), "\0");
+    assert_eq!(got.1.as_deref(), Some(&b"\0"[..]));
 }

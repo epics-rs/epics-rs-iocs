@@ -309,6 +309,11 @@ pub struct PIC663Axis {
     /// / DLLM the requested direction selects.
     high_limit: Option<f64>,
     low_limit: Option<f64>,
+    /// What the last failed poll raises: nothing on C `set_status`'s
+    /// first missed reply (RETRY, drvPIC663.cc:232), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :238). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
 }
@@ -322,6 +327,7 @@ impl PIC663Axis {
             controller: controller.clone(),
             high_limit: None,
             low_limit: None,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -358,11 +364,8 @@ impl PIC663Axis {
 }
 
 impl AsynMotor for PIC663Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvPIC663.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -481,11 +484,12 @@ impl AsynMotor for PIC663Axis {
         let comm_err = ctrl.comm_state == CommState::CommErr;
 
         let Some(polled) = polled else {
-            if comm_err {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            self.failure = if comm_err {
+                PollFailure::PROBLEM_AND_COMMS_ERROR
+            } else {
+                PollFailure::NONE
+            };
+            return Err(pic663_err("no status reply"));
         };
         self.last_status = status_from_polled(&polled);
         // drvPIC663.cc:273-313: POST once done or stopped by a limit in the
@@ -703,5 +707,38 @@ mod tests {
         // powered now reflects the live drv_cur_act bit (C EA_POSITION), not
         // the MotorStatus default: polled.powered = false propagates through.
         assert!(!status.powered);
+    }
+
+    /// drvPIC663.cc:223-244: a first failed status read is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good read clears it.
+    #[test]
+    fn a_failed_status_read_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("c663Retry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                return String::new();
+            }
+            match last {
+                "TS" => format!("{DONE}\r"),
+                "TP" => "P:0\r".into(),
+                _ => "C-663\r".into(),
+            }
+        });
+        let ctrl = PIC663Controller::new(io, 1).unwrap();
+        let mut axis = PIC663Axis::new(Arc::new(Mutex::new(ctrl))).unwrap();
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

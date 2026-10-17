@@ -121,7 +121,7 @@ impl PixiradServer {
                 };
                 trace_error(&format!(
                     "pixirad:writeReadServer, timeout={:.6}, status={} wrote {wrote} bytes, \
-                     received 0 bytes\n",
+                     received 0 bytes\n\n",
                     SERVER_TIMEOUT.as_secs_f64(),
                     status as i32
                 ));
@@ -137,7 +137,7 @@ impl PixiradServer {
                     Ok(())
                 } else {
                     trace_error(&format!(
-                        "pixirad:writeReadServer unexpected response from server = {reply}"
+                        "pixirad:writeReadServer unexpected response from server = {reply}\n"
                     ));
                     Err(ServerError::Rejected(reply.clone()))
                 };

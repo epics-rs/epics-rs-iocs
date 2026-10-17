@@ -259,8 +259,8 @@ impl PIC848Controller {
         self.exchange(cmd)
     }
 
-    /// C `set_status` for axis `signal`. `None` means keep the cached status
-    /// (RETRY) or flag comm error (COMM_ERR), per [`Self::comm_state`].
+    /// C `set_status` for axis `signal`. `None` fails the poll, raising
+    /// nothing (RETRY) or comm error (COMM_ERR), per [`Self::comm_state`].
     fn poll_status(&mut self, signal: u8) -> Option<PolledStatus> {
         let letter = axis_letter(signal);
         let sta = self.query(&format!("STA? {letter}"));
@@ -309,6 +309,11 @@ pub struct PIC848Axis {
     letter: char,
     /// C `cntrl->reference[signal]`: `true` ⟹ `LOAD_POS` may only zero.
     reference: bool,
+    /// What the last failed poll raises: nothing on C `set_status`'s
+    /// first missed reply (RETRY, drvPIC848.cc:253), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :259). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
 }
@@ -327,6 +332,7 @@ impl PIC848Axis {
             signal,
             letter: axis_letter(signal),
             reference,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -399,11 +405,8 @@ impl PIC848Axis {
 }
 
 impl AsynMotor for PIC848Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvPIC848.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -537,11 +540,12 @@ impl AsynMotor for PIC848Axis {
         let comm_err = ctrl.comm_state == CommState::CommErr;
 
         let Some(polled) = polled else {
-            if comm_err {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            self.failure = if comm_err {
+                PollFailure::PROBLEM_AND_COMMS_ERROR
+            } else {
+                PollFailure::NONE
+            };
+            return Err(pic848_err("no status reply"));
         };
         self.apply(polled);
         // drvPIC848.cc:302-346: POST once done or stopped by a limit in the
@@ -738,5 +742,41 @@ mod tests {
     fn pid_gain_scales_by_32767_not_res() {
         let g = 0.5 * 32767.0;
         assert_eq!(format!("SPA  A1 {g:.5}"), "SPA  A1 16383.50000");
+    }
+
+    /// drvPIC848.cc:244-265: a first failed status read is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good read clears it.
+    #[test]
+    fn a_failed_status_read_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("c848Retry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                return String::new();
+            }
+            match last {
+                "*IDN?" => "C-848".into(),
+                "CST? A" => "A=M-110".into(),
+                "CST? B" => "B=NOSTAGE".into(),
+                "REF? A" => "A=0".into(),
+                "STA? A" => format!("A={DONE}"),
+                _ => "A=0".into(),
+            }
+        });
+        let ctrl = PIC848Controller::new(io).unwrap();
+        let mut axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

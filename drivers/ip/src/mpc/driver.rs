@@ -329,7 +329,7 @@ impl MpcWorker {
             Err(e) if e.never_ran() => return None,
             Err(e) => {
                 self.print(format_args!(
-                    "devMPC::devMPCCallback write error, status={} error= {}",
+                    "devMPC::devMPCCallback write error, status={} error= {}\n",
                     e.status() as i32,
                     e.message_display()
                 ));
@@ -347,7 +347,7 @@ impl MpcWorker {
             Err(e) => {
                 if e.status() != prev {
                     self.print(format_args!(
-                        "devMPC::devMPCCallback {who} read error, status={} error= {}",
+                        "devMPC::devMPCCallback {who} read error, status={} error= {}\n",
                         e.status() as i32,
                         e.message_display()
                     ));
@@ -358,7 +358,7 @@ impl MpcWorker {
             Ok(raw) => {
                 if prev != AsynStatus::Success {
                     self.print(format_args!(
-                        "devMPC::devMPCCallback {who} read status back to normal"
+                        "devMPC::devMPCCallback {who} read status back to normal\n"
                     ));
                     self.prev_read.insert(who.to_string(), AsynStatus::Success);
                 }
@@ -367,7 +367,7 @@ impl MpcWorker {
         };
         if raw.len() < 4 {
             self.print(format_args!(
-                "devMPC::devMPCCallback {who} message too small={}",
+                "devMPC::devMPCCallback {who} message too small={}\n",
                 raw.len()
             ));
             return None;
@@ -385,7 +385,7 @@ impl MpcWorker {
     fn rtn_size_ok(&self, who: &str, rec: &str, min: usize) -> bool {
         if rec.len() < min {
             self.print(format_args!(
-                "devMPC, {who} rtnSize={}, should be >{min}, response={rec}",
+                "devMPC, {who} rtnSize={}, should be >{min}, response={rec}\n",
                 rec.len()
             ));
             return false;
@@ -396,7 +396,7 @@ impl MpcWorker {
     /// `readSi`'s length check.
     fn si_ok(&self, who: &str, rec: &str) -> bool {
         if rec.len() > 39 {
-            self.print(format_args!("devMPC::readSi message too big in {who} "));
+            self.print(format_args!("devMPC::readSi message too big in {who} \n"));
             return false;
         }
         true
@@ -460,7 +460,7 @@ impl MpcWorker {
         if let Some(rec) = self.transact(cmd::READ_SIZE, &s, &who) {
             if !rec.contains('L') {
                 self.print(format_args!(
-                    "devMPC::readAi, {who} cannot find L, response={rec}"
+                    "devMPC::readAi, {who} cannot find L, response={rec}\n"
                 ));
             } else if let Ok(reading) = protocol::parse_size(&rec) {
                 values.push(ParamSetValue::new(
@@ -537,7 +537,7 @@ impl DeviceWorker for MpcWorker {
         if let Some(rec) = self.callback(&frame, &who)
             && rec.len() > 2
         {
-            self.print(format_args!("devMPC::{record} message too big in {who}"));
+            self.print(format_args!("devMPC::{record} message too big in {who}\n"));
         }
     }
 }

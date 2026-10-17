@@ -172,7 +172,7 @@ impl MpxConnection {
         }
         if junk > 0 {
             self.trace(&format!(
-                "merlinDetector:mpxRead, status=0 {junk} bytes of leading garbage discarded before header  "
+                "merlinDetector:mpxRead, status=0 {junk} bytes of leading garbage discarded before header  \n"
             ));
         }
 
@@ -180,12 +180,12 @@ impl MpxConnection {
         match self.read_exact(&mut window, rest, timeout) {
             Ok(()) => {}
             Err(None) => {
-                self.trace("merlinDetector:mpxRead, Header too short");
+                self.trace("merlinDetector:mpxRead, Header too short\n");
                 return Err(closed());
             }
             Err(Some(e)) => {
                 self.trace(&format!(
-                    "merlinDetector:mpxRead, timeout={timeout_s:.6}, status={} received {} bytes",
+                    "merlinDetector:mpxRead, timeout={timeout_s:.6}, status={} received {} bytes\n\n",
                     e.code(),
                     window.len() - MPX_HEADER.len()
                 ));
@@ -198,7 +198,7 @@ impl MpxConnection {
             Err(e) => {
                 if let MpxError::BadBodySize(n) = e {
                     self.trace(&format!(
-                        "merlinDetector:mpxRead, frame size {n} not supported"
+                        "merlinDetector:mpxRead, frame size {n} not supported\n"
                     ));
                 }
                 return Err(e.into());
@@ -211,7 +211,7 @@ impl MpxConnection {
         let mut body = Vec::with_capacity(body_len);
         if let Err(e) = self.read_exact(&mut body, body_len, timeout) {
             self.trace(&format!(
-                "merlinDetector:mpxRead, timeout={timeout_s:.6}, status={} received {} bytes in MPX command body, expected {body_len}",
+                "merlinDetector:mpxRead, timeout={timeout_s:.6}, status={} received {} bytes in MPX command body, expected {body_len}\n",
                 e.as_ref().map_or(0, ChannelError::code),
                 body.len()
             ));
@@ -246,7 +246,7 @@ impl MpxConnection {
             )
         }) {
             self.trace(&format!(
-                "merlinDetector:mpxWrite, status={}, sent\n{msg}",
+                "merlinDetector:mpxWrite, status={}, sent\n{msg}\n",
                 ChannelError::from(e).code()
             ));
         }
@@ -260,7 +260,7 @@ impl MpxConnection {
                 Err(e) => (e.code(), String::new()),
             };
             self.trace(&format!(
-                "merlinDetector:mpxReadCmd error, status={code} unexpected response from labview: '{header}{body}'"
+                "merlinDetector:mpxReadCmd error, status={code} unexpected response from labview: '{header}{body}'\n"
             ));
             read?;
         }

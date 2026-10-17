@@ -18,11 +18,20 @@
 //!
 //! The controller also emits unsolicited `"%000 ..."` *notification* lines when
 //! a move completes. The C driver registers an asyn interrupt handler to count
-//! them and accelerate the poller; this port instead polls at the configured
-//! rate (as every other asyn-rs motor driver does) and simply skips any
-//! notification line that arrives in the reply stream. The notification-driven
-//! fast-poll optimisation is therefore not modeled — only its correctness
-//! effect (move-done detection) matters, and that comes from the polled status.
+//! them and wake the poller; this port skips any notification line that
+//! arrives in the reply stream, and the poller finds the move done at its
+//! next loop.
+//!
+//! ## Polling
+//!
+//! As in C, one poller thread per controller ([`crate::poller`]) reads the
+//! status of every axis at once and owns the axes' status parameters;
+//! [`OmsAxis::poll`] returns them without touching the line. The asyn-rs
+//! motor poll loops still run per axis, so a change reaches the record at the
+//! axis loop's next pass rather than at the poller's `callParamCallbacks`,
+//! and a forced status refresh posts the parameters without waking the
+//! poller as C `omsBaseAxis::poll` does: the axis poll also serves the timed
+//! passes, where a wakeup would run the controller loop once per axis.
 //!
 //! ## Units
 //!
@@ -35,32 +44,34 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! - The async notification interrupt / watchdog / connection-reset machinery
-//!   (`asynCallback`, `waitInterruptible`, `resetConnection`): replaced by plain
-//!   periodic polling with notification-line skipping.
-//! - The controller-central multi-axis poller: this port polls each axis
-//!   independently (single-axis `A<char>` queries), the natural fit for the
-//!   per-axis `AsynMotor::poll` boundary. Slightly more traffic; same result.
+//! - The notification interrupt (`asynCallback`): see above.
 //! - The auxiliary parameter records exposed through the C `writeInt32` /
-//!   `writeFloat64` overrides, closed-loop gain status (`CL?`), the following-
-//!   error / encoder-status word (`EA`). These are not motor-record motion
-//!   fields.
+//!   `writeFloat64` overrides. These are not motor-record motion fields.
 //! - The init-time firmware-version gate: the driver reads the firmware
 //!   string once as a comms check and assumes the modern (>= 1.30) command
-//!   forms MAXnet mandates.
+//!   forms MAXnet mandates, `CL?` included; only the watchdog check reads
+//!   the version.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::exception::{AsynException, ExceptionCallbackGuard};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use motor_common::util::atoi;
+
+use crate::poller::PollShared;
+
+/// C `omsTotalControllerNumber`.
+static CONTROLLERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Reply read buffer size (C `OMSINPUTBUFFERLEN` = 12*10 + 2).
 const READ_BUF: usize = 256;
@@ -114,19 +125,99 @@ fn is_notification(s: &str) -> bool {
 /// its axes behind a mutex so command/reply pairs stay atomic.
 pub struct OmsController {
     handle: SyncIOHandle,
+    /// The motor port, C `this->portName`.
+    port_name: String,
     /// The octet port `pasynUserSyncIOSerial` prints on.
     serial_port: String,
     /// `"MAXnet"` or `"MXA"` (label only; the protocol is identical).
     controller_type: &'static str,
+    /// C `portConnected`, kept by [`Self::watch_connection`]'s callback.
+    port_connected: Arc<AtomicBool>,
+    /// The `exceptionCallbackAdd` registration; dropped with the controller.
+    _connect_callback: Option<ExceptionCallbackGuard>,
+    /// C `controllerNumber`, which names the poller thread.
+    controller_number: usize,
+    /// The axes' status parameters and the poll event.
+    poll_shared: Arc<PollShared>,
 }
 
 impl OmsController {
     /// Wrap a connected octet handle.
-    pub fn new(handle: SyncIOHandle, serial_port: &str, controller_type: &'static str) -> Self {
+    pub fn new(
+        handle: SyncIOHandle,
+        port_name: &str,
+        serial_port: &str,
+        controller_type: &'static str,
+    ) -> Self {
         Self {
             handle,
+            port_name: port_name.to_owned(),
             serial_port: serial_port.to_owned(),
             controller_type,
+            port_connected: Arc::new(AtomicBool::new(false)),
+            _connect_callback: None,
+            controller_number: CONTROLLERS.fetch_add(1, Ordering::Relaxed),
+            poll_shared: Arc::default(),
+        }
+    }
+
+    pub(crate) fn port_name(&self) -> &str {
+        &self.port_name
+    }
+
+    pub(crate) fn controller_number(&self) -> usize {
+        self.controller_number
+    }
+
+    pub(crate) fn poll_shared(&self) -> &Arc<PollShared> {
+        &self.poll_shared
+    }
+
+    /// The constructor's `exceptionCallbackAdd(connectCallback)` and
+    /// `isConnected` (omsMAXnet.cpp:105-111, omsMXA.cpp:100-106), on the
+    /// serial user at addr 0. `connectCallback`'s trace lines are gated on
+    /// `motorMAXnetdebug`/`motorMXAdebug`, which the dbd never registers
+    /// (`#variable`), so they cannot fire and are not ported.
+    pub fn watch_connection(&mut self) -> AsynResult<()> {
+        let port = self.handle.port()?;
+        let cells = port.connect_device(0);
+        let flag = Arc::clone(&self.port_connected);
+        let callback = cells.clone();
+        self._connect_callback = Some(port.exception_callback_add(0, move |ev| {
+            if ev.exception == AsynException::Connect {
+                flag.store(callback.connected(), Ordering::Release);
+            }
+        }));
+        self.port_connected
+            .store(cells.connected(), Ordering::Release);
+        Ok(())
+    }
+
+    /// C `portConnected`.
+    pub fn port_connected(&self) -> bool {
+        self.port_connected.load(Ordering::Acquire)
+    }
+
+    /// C `resetConnection` (omsMAXnet.cpp:332-350, omsMXA.cpp:327-345):
+    /// the serial transport's disconnect through the serial user at addr 0,
+    /// its connect unless autoConnect will do it, then after 0.1 s a line
+    /// if `connectCallback` saw it come back. C ignores both statuses.
+    pub fn reset_connection(&self) {
+        let Ok(port) = self.handle.port() else {
+            return;
+        };
+        let auto_connect = port.is_auto_connect_blocking(0).unwrap_or(false);
+        let user = || AsynUser::new(0).with_addr(0);
+        errlog_vprintf(format_args!(
+            "*** disconnect and reconnect serial/IP connection ****\n"
+        ));
+        let _ = port.submit_blocking(RequestOp::Disconnect, user());
+        if !auto_connect {
+            let _ = port.submit_blocking(RequestOp::Connect, user());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        if self.port_connected() {
+            errlog_vprintf(format_args!("*** reconnect done ****\n"));
         }
     }
 
@@ -256,25 +347,22 @@ pub struct OmsAxis {
     has_encoder: bool,
     /// C `omsBaseAxis::encoderRatio`, set by `setEncoderRatio`.
     encoder_ratio: f64,
-    /// Limit true-state inversion (C `invertLimit`, from `LT?`).
-    invert_limit: bool,
     /// Last base velocity sent, to order `VL`/`VB` so `VB < VL` always holds.
     last_min_velo: i32,
-    /// Consecutive polls seen stopped-but-not-done (C `moveDelay`).
-    move_delay: i32,
-    /// Whether the previous poll reported motion (C poller `axisMoving`).
-    was_moving: bool,
+    /// The status parameters the controller's poller writes.
+    poll_shared: Arc<PollShared>,
 }
 
 impl OmsAxis {
     /// Construct axis `index` and probe its type (`PS?`) and limit true-state
-    /// (`LT?`). Assumes the modern (firmware >= 1.30) command forms.
+    /// (`LT?`), and add its status parameters. Axes are created in order.
+    /// Assumes the modern (firmware >= 1.30) command forms.
     pub fn new(controller: Arc<Mutex<OmsController>>, index: usize) -> AsynResult<Self> {
         let axis_char = *AXIS_CHARS
             .get(index)
             .ok_or_else(|| oms_err(format!("oms: axis index {index} out of range (max 9)")))?;
 
-        let (has_encoder, invert_limit) = {
+        let (has_encoder, poll_shared) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // Axis type: "=O" stepper/no-encoder, "=M" servo, "=E" stepper+enc.
             let ps = ctrl.send_receive(&format!("A{axis_char} PS?"))?;
@@ -290,7 +378,9 @@ impl OmsAxis {
                 Some(b'h') | Some(b'H') => false,
                 _ => return Err(oms_err(format!("oms: unknown limit true-state '{lt}'"))),
             };
-            (has_encoder, invert_limit)
+            let poll_shared = ctrl.poll_shared().clone();
+            poll_shared.add_axis(index, has_encoder, invert_limit);
+            (has_encoder, poll_shared)
         };
 
         Ok(Self {
@@ -299,10 +389,8 @@ impl OmsAxis {
             axis_char,
             has_encoder,
             encoder_ratio: 1.0,
-            invert_limit,
             last_min_velo: 0,
-            move_delay: 0,
-            was_moving: false,
+            poll_shared,
         })
     }
 
@@ -353,16 +441,12 @@ impl OmsAxis {
             format!("A{ch};AC{acc};VL{velo};VB{minvelo};{relabs}{pos};GO;ID;")
         };
         self.last_min_velo = minvelo;
-        self.lock().send_only(&cmd)?;
-        self.was_moving = true;
-        self.move_delay = 0;
-        Ok(())
+        self.lock().send_only(&cmd)
     }
 }
 
 impl AsynMotor for OmsAxis {
-    /// C `omsBaseController`'s poller skips the pass (`continue`) on a failed
-    /// read, posting nothing.
+    /// [`Self::poll`] reads parameters and cannot fail.
     fn poll_failure(&self) -> PollFailure {
         PollFailure::NONE
     }
@@ -382,7 +466,9 @@ impl AsynMotor for OmsAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(position, false, min_velocity, velocity, acceleration)
+        let moved = self.do_move(position, false, min_velocity, velocity, acceleration);
+        self.poll_shared.moved(self.axis_index);
+        moved
     }
 
     fn move_relative(
@@ -393,7 +479,9 @@ impl AsynMotor for OmsAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(distance, true, min_velocity, velocity, acceleration)
+        let moved = self.do_move(distance, true, min_velocity, velocity, acceleration);
+        self.poll_shared.moved(self.axis_index);
+        moved
     }
 
     fn move_velocity(
@@ -407,11 +495,9 @@ impl AsynMotor for OmsAxis {
         let acc = (acceleration as i32).clamp(1, MAX_ACCEL);
         let velo = (velocity as i32).clamp(-MAX_VELOCITY, MAX_VELOCITY);
         let ch = self.axis_char;
-        self.lock()
-            .send_only(&format!("A{ch} AC{acc}; JG{velo};"))?;
-        self.was_moving = true;
-        self.move_delay = 0;
-        Ok(())
+        let moved = self.lock().send_only(&format!("A{ch} AC{acc}; JG{velo};"));
+        self.poll_shared.moved(self.axis_index);
+        moved
     }
 
     fn home(
@@ -435,10 +521,9 @@ impl AsynMotor for OmsAxis {
             format!("A{ch};AC{acc};VL{velo};VB{minvelo};{dir};MA0;GO;ID;")
         };
         self.last_min_velo = minvelo;
-        self.lock().send_only(&cmd)?;
-        self.was_moving = true;
-        self.move_delay = 0;
-        Ok(())
+        let moved = self.lock().send_only(&cmd);
+        self.poll_shared.moved(self.axis_index);
+        moved
     }
 
     fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
@@ -454,99 +539,15 @@ impl AsynMotor for OmsAxis {
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.poll_shared.set_position(self.axis_index, position);
         let ch = self.axis_char;
         let pos = position as i32;
         self.lock().send_only(&format!("A{ch} LP{pos};"))
     }
 
+    /// The status parameters as the controller's poller left them.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let (pos, status, velo, enc, limit_hex) = {
-            let ctrl = self.lock();
-            let ch = self.axis_char;
-            let pos = atoi(&ctrl.send_receive(&format!("A{ch};RP;"))?);
-            let status = ctrl.send_receive(&format!("A{ch};RI;"))?;
-            let velo = atoi(&ctrl.send_receive(&format!("A{ch};RV;"))?);
-            let enc = if self.has_encoder {
-                atoi(&ctrl.send_receive(&format!("A{ch};RE;"))?)
-            } else {
-                0
-            };
-            // All-axes limit flags (hex); optional — fall back to the status bit.
-            let limit_hex = ctrl
-                .send_receive("AM;QL;")
-                .ok()
-                .and_then(|s| u32::from_str_radix(s.trim(), 16).ok());
-            (pos, status, velo, enc, limit_hex)
-        };
-
-        let b = status.as_bytes();
-        if b.len() < 4 {
-            return Err(oms_err(format!("oms: short status '{status}'")));
-        }
-        // Status field "MDNN": [0] direction P/M, [1] done D, [2] limit L, [3] home H.
-        let direction = b[0] == b'P';
-        let d_flag = b[1] == b'D';
-        let at_limit = b[2] == b'L';
-        let at_home = b[3] == b'H';
-
-        // Done / problem detection (C poller): the D flag is authoritative; a
-        // stopped axis at a limit is done; a stopped axis that never sets D for
-        // several polls is flagged as a problem.
-        let done;
-        let mut problem = false;
-        if d_flag {
-            done = true;
-            self.move_delay = 0;
-        } else if velo == 0 && self.was_moving {
-            if at_limit {
-                done = true;
-                self.move_delay = 0;
-            } else {
-                self.move_delay += 1;
-                if self.move_delay >= 5 {
-                    done = true;
-                    problem = true;
-                    self.move_delay = 0;
-                } else {
-                    done = false;
-                }
-            }
-        } else if velo == 0 {
-            // Idle and not previously moving.
-            done = true;
-            self.move_delay = 0;
-        } else {
-            done = false;
-            self.move_delay = 0;
-        }
-        let moving = !done;
-        self.was_moving = moving;
-
-        // Limits: prefer the all-axes flag word, else derive from the status bit.
-        let (high_limit, low_limit) = if let Some(flags) = limit_hex {
-            let off = if self.axis_index > 7 { 8 } else { 0 };
-            let low_bit = (flags & (1 << (self.axis_index + off))) != 0;
-            let high_bit = (flags & (1 << (self.axis_index + off + 8))) != 0;
-            (high_bit ^ self.invert_limit, low_bit ^ self.invert_limit)
-        } else if at_limit {
-            (direction, !direction)
-        } else {
-            (false, false)
-        };
-
-        Ok(MotorStatus {
-            position: pos as f64,
-            encoder_position: enc as f64,
-            done,
-            moving,
-            high_limit,
-            low_limit,
-            home: at_home,
-            direction,
-            problem,
-            has_encoder: self.has_encoder,
-            ..Default::default()
-        })
+        Ok(self.poll_shared.status(self.axis_index))
     }
 }
 
@@ -561,6 +562,35 @@ mod tests {
         assert_eq!(OmsAxis::nint(-1.4), -1);
         assert_eq!(OmsAxis::nint(-1.5), -2);
         assert_eq!(OmsAxis::nint(0.0), 0);
+    }
+
+    /// `connectCallback` follows the serial port's connect exceptions.
+    #[test]
+    fn port_connected_follows_the_connect_exceptions() {
+        let name = "omsConnectCallback";
+        let base = epics_rs::asyn::port::PortDriverBase::new(
+            name,
+            1,
+            epics_rs::asyn::port::PortFlags::default(),
+        );
+        let (rt, _jh) = epics_rs::asyn::runtime::create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            DeadLine {
+                base,
+                written: Default::default(),
+            },
+            epics_rs::asyn::runtime::RuntimeConfig::default(),
+        )
+        .unwrap();
+        let port = rt.port_handle().clone();
+        let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_millis(100));
+        let mut controller = OmsController::new(io, name, name, "MXA");
+        controller.watch_connection().unwrap();
+        assert!(controller.port_connected());
+        port.disconnect_blocking().unwrap();
+        assert!(!controller.port_connected());
+        port.connect_blocking().unwrap();
+        assert!(controller.port_connected());
     }
 
     #[test]
@@ -635,6 +665,7 @@ mod tests {
         let controller = Arc::new(Mutex::new(OmsController::new(
             io,
             "omsEncoderRatio",
+            "omsEncoderRatio",
             "MAXnet",
         )));
         let mut axis = OmsAxis::new(controller, 0).unwrap();
@@ -662,7 +693,7 @@ mod tests {
         )
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        let controller = OmsController::new(io, "omsAxisCount", "MAXnet");
+        let controller = OmsController::new(io, "omsAxisCount", "omsAxisCount", "MAXnet");
         assert_eq!(controller.axis_count(), 3);
     }
 
@@ -710,7 +741,7 @@ mod tests {
             0,
             std::time::Duration::from_secs(1),
         );
-        OmsController::new(io, "omsDeadInit", "MAXnet").init("AX LP0;");
+        OmsController::new(io, "omsDeadInit", "omsDeadInit", "MAXnet").init("AX LP0;");
         assert_eq!(*written.lock().unwrap(), ["IC;", "AM SA;", "AX LP0;"]);
     }
 
@@ -778,7 +809,8 @@ mod tests {
         )
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        let controller = OmsController::new(io, "omsPartialAxisCount", "MAXnet");
+        let controller =
+            OmsController::new(io, "omsPartialAxisCount", "omsPartialAxisCount", "MAXnet");
         assert_eq!(controller.axis_count(), 2);
     }
 
@@ -799,7 +831,7 @@ mod tests {
         )
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        let controller = OmsController::new(io, "omsDeadAxisCount", "MAXnet");
+        let controller = OmsController::new(io, "omsDeadAxisCount", "omsDeadAxisCount", "MAXnet");
         assert_eq!(controller.axis_count(), 0);
     }
 }

@@ -530,13 +530,13 @@ impl Dg645Driver {
         if let Err(f) = &result {
             self.base.trace_print(
                 TraceMask::ERROR,
-                format_args!("{port} writeRead: error {} wrote \"{cmd}\"", f.status()),
+                format_args!("{port} writeRead: error {} wrote \"{cmd}\"\n", f.status()),
             );
         }
         let read = result.as_deref().unwrap_or("");
         self.base.trace_print(
             TraceMask::IO_FILTER,
-            format_args!("{port} writeRead: wrote \"{cmd}\" read \"{read}\""),
+            format_args!("{port} writeRead: wrote \"{cmd}\" read \"{read}\"\n"),
         );
         Ok(result?)
     }
@@ -548,12 +548,12 @@ impl Dg645Driver {
         if let Err(f) = &result {
             self.base.trace_print(
                 TraceMask::ERROR,
-                format_args!("{port} writeOnly: error {} wrote \"{cmd}\"", f.status()),
+                format_args!("{port} writeOnly: error {} wrote \"{cmd}\"\n", f.status()),
             );
         }
         self.base.trace_print(
             TraceMask::IO_FILTER,
-            format_args!("{port} writeOnly: wrote \"{cmd}\""),
+            format_args!("{port} writeOnly: wrote \"{cmd}\"\n"),
         );
         Ok(result?)
     }

@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -150,6 +150,11 @@ pub struct DrvMDriveAxis {
     controller: Arc<Mutex<MDriveController>>,
     name: &'static str,
     inputs: Inputs,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// missed `PR MV` (RETRY, drvMDrive.cc:272), `CNTRL_COMM_ERR` and `RA_PROBLEM` on
+    /// the next (COMM_ERR, :278). Per axis, as the controller's state can
+    /// move on under another axis's poll.
+    failure: PollFailure,
     /// `motor_info->status`, which `set_status` starts from.
     status: MotorStatus,
     /// `motor_info->position`.
@@ -170,6 +175,7 @@ impl DrvMDriveAxis {
             controller,
             name: MDRIVE_AXIS[signal],
             inputs: drive.inputs,
+            failure: PollFailure::NONE,
             status: MotorStatus {
                 has_encoder: drive.encoder,
                 gain_support: drive.encoder,
@@ -250,9 +256,8 @@ impl DrvMDriveAxis {
 }
 
 impl AsynMotor for DrvMDriveAxis {
-    /// `poll` never fails: `set_status`'s missed replies are handled in it.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::NONE
+        self.failure
     }
 
     fn move_absolute(
@@ -352,8 +357,8 @@ impl AsynMotor for DrvMDriveAxis {
 
     /// `set_status`: `PR MV` for moving, `PR P` for the position, `PR I<n>`
     /// for each wired switch, `PR C2` for the encoder and `PR V` for the
-    /// velocity. A first unanswered `PR MV` keeps the last status; a second
-    /// raises the comms error.
+    /// velocity. A first unanswered `PR MV` fails the poll raising nothing; a
+    /// second raises the comms error.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -361,14 +366,14 @@ impl AsynMotor for DrvMDriveAxis {
         let ask = |ctrl: &MDriveController, q: &str| ctrl.ask(&format!("{name}{q}"));
         let moving = ask(&ctrl, "PR MV");
         if moving.is_empty() {
-            if ctrl.comm == CommState::Normal {
-                ctrl.comm = CommState::Retry;
-            } else {
-                ctrl.comm = CommState::CommErr;
-                self.status.comms_error = true;
-                self.status.problem = true;
-            }
-            return Ok(self.status.clone());
+            (ctrl.comm, self.failure) = match ctrl.comm {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
+            };
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("MDrive {name}: no PR MV reply"),
+            });
         }
         ctrl.comm = CommState::Normal;
         let position = ask(&ctrl, "PR P");
@@ -536,5 +541,42 @@ mod tests {
         r.moving.store(true, Ordering::SeqCst);
         r.minus.store(true, Ordering::SeqCst);
         assert_eq!(r.poll_extra(), ["1DE=0"]);
+    }
+
+    /// drvMDrive.cc:263-283: a first unanswered `PR MV` is RETRY (nothing
+    /// raised, nothing posted), the next COMM_ERR, and a reply clears it.
+    #[test]
+    fn an_unanswered_moving_query_is_retry_then_comm_error() {
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("mdrive_retry", move |_| {
+            if q.load(Ordering::SeqCst) {
+                String::new()
+            } else {
+                "0".into()
+            }
+        });
+        let controller = Arc::new(Mutex::new(MDriveController::new(io)));
+        let drive = MDriveDrive {
+            encoder: false,
+            inputs: Inputs {
+                plus: 0,
+                minus: 0,
+                home: 0,
+            },
+        };
+        let mut axis = DrvMDriveAxis::new(controller, 0, drive);
+        let user = AsynUser::new(0);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

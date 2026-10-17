@@ -403,7 +403,7 @@ fn trace_error(port: Option<&str>, args: std::fmt::Arguments<'_>) {
         port.map(|_| 0),
         0,
         TraceMask::ERROR,
-        format_args!("drvFastSweep:drvFastSweep:, {args}"),
+        format_args!("drvFastSweep:drvFastSweep:, {args}\n"),
     );
 }
 

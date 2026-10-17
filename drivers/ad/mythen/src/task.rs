@@ -112,7 +112,7 @@ async fn acquire(s: &Arc<Shared>) {
             Err(e) => {
                 det.trace_error(&format!(
                     "mythen:acquisitionTask: error using readout command status={}, nRead=0, \
-                     eomReason=0",
+                     eomReason=0\n",
                     e.status() as i32
                 ));
                 break;
@@ -130,7 +130,7 @@ async fn acquire(s: &Arc<Shared>) {
     let image_mode = s.get_int(s.ad.image_mode).await;
     if status == ADStatus::Error {
         // C aborts the detector on the way out (mythen.cpp:939-946).
-        det.trace_error("mythen:acquisitionTask: error timed out waiting for data");
+        det.trace_error("mythen:acquisitionTask: error timed out waiting for data\n");
         let _ = det.stop();
     } else {
         println!("Acquisition finish");

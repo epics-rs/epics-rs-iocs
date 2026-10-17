@@ -444,7 +444,7 @@ impl AmptekDriver {
         self.failed_sends += 1;
         if self.failed_sends > MAX_FAILED_SENDS {
             self.trace_error(&format!(
-                "drvAmptek::{function_name} too many failed status queries, disconnecting"
+                "drvAmptek::{function_name} too many failed status queries, disconnecting\n"
             ));
             // `disconnect(pasynUserSelf)`: pasynUserSelf is device 0's.
             self.do_disconnect(0);
@@ -545,7 +545,7 @@ impl AmptekDriver {
         }
         self.failed_sends = 0;
         self.trace_io(&format!(
-            "drvAmptek::sendCommand called CH_.SendCommand({}) OK",
+            "drvAmptek::sendCommand called CH_.SendCommand({}) OK\n",
             cmd as i32
         ));
         Ok(raw)
@@ -596,7 +596,7 @@ impl AmptekDriver {
                 )));
             }
             self.trace_io(&format!(
-                "drvAmptek::connectDevice DPP device {} connected",
+                "drvAmptek::connectDevice DPP device {} connected\n",
                 self.address_info
             ));
         } else {
@@ -609,7 +609,7 @@ impl AmptekDriver {
                 )));
             }
             self.trace_io(&format!(
-                "drvAmptek::connectDevice DPP device {} connected, total devices found={}",
+                "drvAmptek::connectDevice DPP device {} connected, total devices found={}\n",
                 self.address_info, self.num_devices
             ));
         }
@@ -676,7 +676,7 @@ impl AmptekDriver {
     fn send_command_string(&mut self, command_string: &str) -> AsynResult<()> {
         let target = self.target.ok_or_else(disconnected_error)?;
         self.trace_io(&format!(
-            "drvAmptek::sendCommandString sending configuration string:\n{command_string}"
+            "drvAmptek::sendCommandString sending configuration string:\n{command_string}\n"
         ));
         let packet = protocol::build_config_packet_ex(command_string);
         let send_status: AsynResult<()> = match self.raw_config_round_trip(target, packet) {
@@ -739,7 +739,7 @@ impl AmptekDriver {
         let content = format!("[DP5 Configuration File]\r\n{}", self.hw_cfg_dp5);
         std::fs::write(file_name, content).map_err(|e| {
             self.trace_error(&format!(
-                "drvAmptek::saveConfigurationFile Couldn't open {file_name} for writing."
+                "drvAmptek::saveConfigurationFile Couldn't open {file_name} for writing.\n"
             ));
             AsynError::from(e)
         })
@@ -871,7 +871,7 @@ impl AmptekDriver {
     fn apply_parsed_configuration(&mut self) -> AsynResult<()> {
         let dpp_type = self.last_status.dpp_type;
         self.trace_io(&format!(
-            "drvAmptek::parseConfiguration configuration string from device:\n{}",
+            "drvAmptek::parseConfiguration configuration string from device:\n{}\n",
             self.hw_cfg_dp5
         ));
         let (parsed, errors) = config::parse_configuration(&self.hw_cfg_dp5, dpp_type);
@@ -1254,7 +1254,7 @@ impl PortDriver for AmptekDriver {
             file!(),
             line!(),
             format_args!(
-                "asynPortDriver:writeOctet: function={}, name={}, value={}",
+                "asynPortDriver:writeOctet: function={}, name={}, value={}\n",
                 user.reason,
                 self.base.params.param_name(user.reason).unwrap_or(""),
                 String::from_utf8_lossy(data)

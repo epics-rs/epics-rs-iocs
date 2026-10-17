@@ -130,7 +130,7 @@ impl TetrAmmDriver {
             asyn_print!(
                 self.base.port_base,
                 ERROR,
-                "drvTetrAMM::sendCommand: error, outString={out} expected ACK, received {resp}"
+                "drvTetrAMM::sendCommand: error, outString={out} expected ACK, received {resp}\n"
             );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
@@ -202,7 +202,7 @@ impl QuadEmDevice for TetrAmmDriver {
                             asyn_print!(
                                 self.base.port_base,
                                 WARNING,
-                                "drvTetrAMM::setAcquire waiting for ACK response, nread={}",
+                                "drvTetrAMM::setAcquire waiting for ACK response, nread={}\n",
                                 outcome.data.len()
                             );
                         }
@@ -210,7 +210,7 @@ impl QuadEmDevice for TetrAmmDriver {
                             asyn_print!(
                                 self.base.port_base,
                                 ERROR,
-                                "drvTetrAMM::setAcquire error waiting for ACK response, status={}",
+                                "drvTetrAMM::setAcquire error waiting for ACK response, status={}\n",
                                 e.c_status_code()
                             );
                             status = Err(e);
@@ -309,7 +309,7 @@ impl QuadEmDevice for TetrAmmDriver {
             asyn_print!(
                 self.base.port_base,
                 ERROR,
-                "drvTetrAMM::getStatus: error, outString={}, inString={}",
+                "drvTetrAMM::getStatus: error, outString={}, inString={}\n",
                 last.out,
                 last.inp
             );
@@ -350,7 +350,7 @@ impl QuadEmDevice for TetrAmmDriver {
             asyn_print!(
                 self.base.port_base,
                 ERROR,
-                "drvTetrAMM::reset: error, no response from meter after {RESET_WAIT_LOOPS} seconds"
+                "drvTetrAMM::reset: error, no response from meter after {RESET_WAIT_LOOPS} seconds\n"
             );
         }
         self.base_reset()
@@ -614,7 +614,7 @@ fn read_thread(ctx: ReadContext) {
                             asyn_print!(
                                 ctx.handle,
                                 ERROR,
-                                "drvTetrAMM::readThread Extra trigger start, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}"
+                                "drvTetrAMM::readThread Extra trigger start, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}\n"
                             );
                         }
                         next_expected_edge = 1;
@@ -628,7 +628,7 @@ fn read_thread(ctx: ReadContext) {
                             asyn_print!(
                                 ctx.handle,
                                 ERROR,
-                                "drvTetrAMM::readThread Extra trigger end, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}"
+                                "drvTetrAMM::readThread Extra trigger end, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}\n"
                             );
                         }
                         next_expected_edge = 0;
@@ -637,14 +637,14 @@ fn read_thread(ctx: ReadContext) {
                         asyn_print!(
                             ctx.handle,
                             IO_DRIVER,
-                            "drvTetrAMM::readThread: seen acq done sNaN (0xfff40003ffffffffull)"
+                            "drvTetrAMM::readThread: seen acq done sNaN (0xfff40003ffffffffull)\n"
                         );
                     }
                     proto::Trailer::LostSync => {
                         asyn_print!(
                             ctx.handle,
                             WARNING,
-                            "drvTetrAMM::readThread: warning, lost sync, no NaN where expected; resynchronizing"
+                            "drvTetrAMM::readThread: warning, lost sync, no NaN where expected; resynchronizing\n"
                         );
                         resync(&ctx, num_channels);
                     }
@@ -666,7 +666,7 @@ fn read_thread(ctx: ReadContext) {
                             asyn_print!(
                                 ctx.handle,
                                 ERROR,
-                                "drvTetrAMM::readThread Extra trigger start, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}"
+                                "drvTetrAMM::readThread Extra trigger start, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}\n"
                             );
                         }
                         next_expected_edge = 1;
@@ -680,7 +680,7 @@ fn read_thread(ctx: ReadContext) {
                             asyn_print!(
                                 ctx.handle,
                                 ERROR,
-                                "drvTetrAMM::readThread Extra trigger end, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}"
+                                "drvTetrAMM::readThread Extra trigger end, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}\n"
                             );
                         }
                         next_expected_edge = 0;
@@ -706,7 +706,7 @@ fn report_read_failure(handle: &PortHandle, read: &AsynResult<ReadOutcome>, bina
             asyn_print!(
                 *handle,
                 WARNING,
-                "drvTetrAMM::readThread: timeout reading meter"
+                "drvTetrAMM::readThread: timeout reading meter\n"
             );
         }
         return;
@@ -740,20 +740,20 @@ fn resync(ctx: &ReadContext, num_channels: usize) {
             asyn_print!(
                 ctx.handle,
                 WARNING,
-                "drvTetrAMM::readThread: found NaN at position {offset}, read {remainder} bytes"
+                "drvTetrAMM::readThread: found NaN at position {offset}, read {remainder} bytes\n"
             );
         }
         None => {
             asyn_print!(
                 ctx.handle,
                 ERROR,
-                "drvTetrAMM::readThread: ERROR, did not find NaN"
+                "drvTetrAMM::readThread: ERROR, did not find NaN\n"
             );
             trace::print_io(
                 &ctx.handle,
                 trace::TraceMask::ERROR,
                 &data,
-                format_args!("drvTetrAMM::readThread: buffer read when resynchronizing"),
+                format_args!("drvTetrAMM::readThread: buffer read when resynchronizing\n"),
             );
         }
     }

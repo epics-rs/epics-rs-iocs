@@ -179,7 +179,7 @@ impl DevMcaAsyn {
                 link.addr,
                 0,
                 format_args!(
-                    "devMcaAsyn::init_record, {} connectDevice failed to {}",
+                    "devMcaAsyn::init_record, {} connectDevice failed to {}\n",
                     self.name, link.port_name
                 ),
             );
@@ -205,7 +205,7 @@ impl DevMcaAsyn {
                         port.addr,
                         reason,
                         format_args!(
-                            "devMcaAsyn::findDrvInfo, {} drvUserCreate failed for {}",
+                            "devMcaAsyn::findDrvInfo, {} drvUserCreate failed for {}\n",
                             self.name,
                             command.drv_info()
                         ),
@@ -539,7 +539,7 @@ impl DeviceSupport for DevMcaAsyn {
                     0,
                     format_args!(
                         "devMcaAsyn::send_msg: {} error calling queueRequest, \
-                         asynManager::queueRequest asynUser not associated with a port",
+                         asynManager::queueRequest asynUser not associated with a port\n",
                         self.name
                     ),
                 ),

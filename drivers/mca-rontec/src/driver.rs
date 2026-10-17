@@ -160,6 +160,32 @@ fn c_atoi(bytes: &[u8]) -> i32 {
     if negative { -value } else { value }
 }
 
+/// C `%s` of a reply buffer: the bytes up to its first NUL.
+struct CStr<'a>(&'a [u8]);
+
+impl std::fmt::Display for CStr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let end = self.0.iter().position(|&b| b == 0).unwrap_or(self.0.len());
+        f.write_str(&String::from_utf8_lossy(&self.0[..end]))
+    }
+}
+
+/// C `%f`: glibc spells the non-finite values `nan`, `-nan`, `inf`, `-inf`.
+struct CFloat(f64);
+
+impl std::fmt::Display for CFloat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sign = if self.0.is_sign_negative() { "-" } else { "" };
+        if self.0.is_nan() {
+            write!(f, "{sign}nan")
+        } else if self.0.is_infinite() {
+            write!(f, "{sign}inf")
+        } else {
+            write!(f, "{:.6}", self.0)
+        }
+    }
+}
+
 /// C `mcaRontecPvt` (`drvMcaRontec.c:62-88`), minus the asyn
 /// interface/registration bookkeeping the Rust runtime already owns, and
 /// minus the dead `ptschan`/`ptechan`/`ptotal`/`etotals` fields (see module
@@ -309,8 +335,8 @@ impl RontecDriver {
             .find(|r| self.reasons[*r as usize] == idx)
     }
 
-    /// C `sendMessage` (`drvMcaRontec.c:581-604`): the error line is printed
-    /// through the serial port's trace, as C prints it on `pPvt->pasynUser`.
+    /// C `sendMessage` (`drvMcaRontec.c:581-604`): both lines are printed
+    /// through the serial port's trace, as C prints them on `pPvt->pasynUser`.
     fn send_message(&self, output: &str) -> AsynResult<Vec<u8>> {
         let result = self
             .serial
@@ -333,6 +359,19 @@ impl RontecDriver {
                 (None, None) => (&[], e.status(), 0),
             },
         };
+        self.serial.user_trace().print(
+            self.addr,
+            OCTET_REASON as i32,
+            TraceMask::IO_DEVICE,
+            file!(),
+            line!(),
+            format_args!(
+                "drvMcaRontec::sendMessage: output={output}, output_len={} number sent={nbytes_out}\n                           input={}, input_len={RONTEC_MESSAGE_SIZE}, number_received={}\n",
+                output.len(),
+                CStr(input),
+                input.len()
+            ),
+        );
         if status != AsynStatus::Success || input.starts_with(b"!ERROR") {
             self.serial.user_trace().print(
                 self.addr,
@@ -341,8 +380,8 @@ impl RontecDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "drvMcaRontec::sendMessage: error {}, status={}, nbytesOut={nbytes_out}, nbytesIn={}",
-                    String::from_utf8_lossy(input),
+                    "drvMcaRontec::sendMessage: error {}, status={}, nbytesOut={nbytes_out}, nbytesIn={}\n",
+                    CStr(input),
                     status as i32,
                     input.len()
                 ),
@@ -355,7 +394,17 @@ impl RontecDriver {
     /// clamped to `RONTEC_MAXCHANS` (module doc). Fills `data` and returns
     /// its length; a short reply is logged and the rest of `data` comes from
     /// the previous transfer's bytes, as C parses `pPvt->mcaBuffer` anyway.
-    fn read_spectrum(&mut self, data: &mut [i32]) -> usize {
+    fn read_spectrum(&mut self, user: &AsynUser, data: &mut [i32]) -> usize {
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "drvMcaRontec::int32ArrayRead entry, signal={}, maxChans={}\n",
+                user.addr,
+                data.len()
+            ),
+        );
         let max_chans = data.len().min(RONTEC_MAXCHANS);
 
         // C: `sprintf(message, "$SS 0,%d,%d,%ld", binning, binning,
@@ -407,7 +456,7 @@ impl RontecDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "drvMcaRontec::int32ArrayRead: error reading MCA data, nbytesIn={nbytes_in}, should be {nread}"
+                    "drvMcaRontec::int32ArrayRead: error reading MCA data, nbytesIn={nbytes_in}, should be {nread}\n"
                 ),
             );
         }
@@ -428,7 +477,7 @@ impl RontecDriver {
     /// (`drvMcaRontec.c:307-317`), with the uninitialized-read defect fixed
     /// at source (module doc): a field is only updated when its query
     /// actually succeeded.
-    fn read_status(&mut self) {
+    fn read_status(&mut self, user: &AsynUser) {
         if let Ok(resp) = self.send_message("$FP")
             && let Some(&flag) = resp.get(4)
         {
@@ -439,7 +488,7 @@ impl RontecDriver {
         // real time" -- a side-effecting device interaction whose data is
         // discarded (`drvMcaRontec.c:311-312`); best-effort, matching C's
         // own disregard for this call's status.
-        self.read_spectrum(&mut [0]);
+        self.read_spectrum(user, &mut [0]);
 
         // Preserved quirk: `elive` mirrors `ereal` from the same `"$MS"`
         // reply (module doc's "unfixable-without-spec" entry).
@@ -483,6 +532,17 @@ impl RontecDriver {
     /// C, this is enforced by construction (no `?` anywhere in this
     /// function) rather than by a single trailing `return`.
     fn dispatch_write(&mut self, user: &AsynUser, ivalue: i32, dvalue: f64) {
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "drvMcaRontec::RontecWrite entry, command={}, signal={}, ivalue={ivalue}, dvalue={}\n",
+                user.reason,
+                user.addr,
+                CFloat(dvalue)
+            ),
+        );
         match self.reason_of(user.reason) {
             Some(McaReason::StartAcquire) => {
                 let _ = if self.plive > 0 {
@@ -499,7 +559,7 @@ impl RontecDriver {
             Some(McaReason::Erase) => {
                 let _ = self.send_message("$CC");
             }
-            Some(McaReason::ReadStatus) => self.read_status(),
+            Some(McaReason::ReadStatus) => self.read_status(user),
             Some(McaReason::NumChannels) => self.set_num_channels(user, ivalue),
             Some(McaReason::PresetRealTime) => self.preal = (1000.0 * dvalue) as i32,
             Some(McaReason::PresetLiveTime) => self.plive = (1000.0 * dvalue) as i32,
@@ -527,7 +587,7 @@ impl RontecDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "drvMcaRontec::RontecWrite port {} got illegal command {}",
+                    "drvMcaRontec::RontecWrite port {} got illegal command {}\n",
                     self.base.port_name, user.reason
                 ),
             ),
@@ -541,7 +601,7 @@ impl RontecDriver {
             file!(),
             line!(),
             format_args!(
-                "drvMcaRontec::RontecRead got illegal command {}",
+                "drvMcaRontec::RontecRead got illegal command {}\n",
                 user.reason
             ),
         );
@@ -575,12 +635,19 @@ impl PortDriver for RontecDriver {
             .into_iter()
             .find(|r| r.drv_info().eq_ignore_ascii_case(&req.drv_info))
         {
-            Some(r) => Ok(DrvUserInfo::from_reason(self.reasons[r as usize])),
+            Some(r) => {
+                // C's own text: it names drvSweep, not drvMcaRontec.
+                self.base.trace_print(
+                    TraceMask::FLOW,
+                    format_args!("drvSweep::drvUserCreate, command={}\n", r.drv_info()),
+                );
+                Ok(DrvUserInfo::from_reason(self.reasons[r as usize]))
+            }
             None => {
                 self.base.trace_print(
                     TraceMask::ERROR,
                     format_args!(
-                        "drvMcaRontec::drvUserCreate, unknown command={}",
+                        "drvMcaRontec::drvUserCreate, unknown command={}\n",
                         req.drv_info
                     ),
                 );
@@ -624,18 +691,28 @@ impl PortDriver for RontecDriver {
         }
     }
 
-    fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
-        Ok(self.read_spectrum(buf))
+    fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
+        Ok(self.read_spectrum(user, buf))
     }
 
     /// C `int32ArrayWrite` (`drvMcaRontec.c:480-498`): the device memory
     /// cannot be written, so nothing is stored and no callback runs.
-    fn write_int32_array(&mut self, user: &AsynUser, _data: &[i32]) -> AsynResult<()> {
+    fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "drvMcaRontec::int32ArrayWrite entry, signal={}, maxChans={}\n",
+                user.addr,
+                data.len().min(RONTEC_MAXCHANS)
+            ),
+        );
         user.print(
             TraceMask::ERROR,
             file!(),
             line!(),
-            format_args!("drvMcaRontec::int32ArrayWrite, write to Rontec not implemented"),
+            format_args!("drvMcaRontec::int32ArrayWrite, write to Rontec not implemented\n"),
         );
         Ok(())
     }
@@ -827,6 +904,8 @@ mod tests {
         serial: epics_rs::asyn::runtime::port::PortRuntimeHandle,
         writes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
         trace_path: std::path::PathBuf,
+        services: epics_rs::asyn::services::PortServices,
+        names: [String; 2],
     }
 
     impl Rig {
@@ -883,6 +962,15 @@ mod tests {
                 serial: serial_rt,
                 writes,
                 trace_path,
+                services,
+                names: [serial_name, rontec_name],
+            }
+        }
+
+        /// C `asynSetTraceMask` on both ports.
+        fn trace_on(&self, mask: TraceMask) {
+            for name in &self.names {
+                self.services.trace().set_trace_mask(Some(name), mask);
             }
         }
 
@@ -929,6 +1017,70 @@ mod tests {
         rig.submit(RequestOp::Int32Write { value: 1 }, McaReason::Sequence)
             .expect("noop");
         assert_eq!(rig.trace().matches("sendMessage").count(), 1);
+    }
+
+    /// C `sendMessage`'s `ASYN_TRACEIO_DEVICE` line (`drvMcaRontec.c:593-597`)
+    /// comes before its error line.
+    #[test]
+    fn send_message_prints_c_traceio_device_line() {
+        let rig = Rig::new("traceio", rontec_reply);
+        rig.trace_on(TraceMask::ERROR | TraceMask::IO_DEVICE);
+        rig.submit(RequestOp::Int32Write { value: 1 }, McaReason::Erase)
+            .expect("RontecWrite always succeeds");
+        let trace = rig.trace();
+        let io = "drvMcaRontec::sendMessage: output=$CC, output_len=3 number sent=3\n\
+                  \x20                          input=!ERROR 3, input_len=100, number_received=8\n";
+        let at = trace.find(io).unwrap_or_else(|| panic!("{trace}"));
+        assert!(trace[at..].contains("drvMcaRontec::sendMessage: error !ERROR 3"));
+    }
+
+    /// C's `ASYN_TRACE_FLOW` entry lines (`drvMcaRontec.c:284, 452, 490, 516`).
+    #[test]
+    fn flow_prints_c_entry_lines() {
+        let rig = Rig::new("flow", spectrum_reply);
+        rig.trace_on(TraceMask::ERROR | TraceMask::FLOW);
+        rig.submit(
+            RequestOp::Float64Write { value: f64::NAN },
+            McaReason::PresetRealTime,
+        )
+        .expect("write");
+        rig.submit(RequestOp::Int32Write { value: 7 }, McaReason::Sequence)
+            .expect("write");
+        rig.submit(
+            RequestOp::Int32ArrayRead { max_elements: 4 },
+            McaReason::Data,
+        )
+        .expect("read");
+        rig.submit(
+            RequestOp::Int32ArrayWrite {
+                data: vec![1, 2, 3],
+            },
+            McaReason::Data,
+        )
+        .expect("write");
+        rig.rontec
+            .port_handle()
+            .drv_user_create_blocking(&DrvUserRequest::new("mca_erase", 0))
+            .expect("drvUserCreate");
+        let trace = rig.trace();
+        for line in [
+            format!(
+                "drvMcaRontec::RontecWrite entry, command={}, signal=-1, ivalue=0, dvalue=nan\n",
+                McaReason::PresetRealTime as usize
+            ),
+            format!(
+                "drvMcaRontec::RontecWrite entry, command={}, signal=-1, ivalue=7, dvalue=0.000000\n",
+                McaReason::Sequence as usize
+            ),
+            "drvMcaRontec::int32ArrayRead entry, signal=-1, maxChans=4\n".to_owned(),
+            "drvMcaRontec::int32ArrayWrite entry, signal=-1, maxChans=3\n".to_owned(),
+            format!(
+                "drvSweep::drvUserCreate, command={}\n",
+                McaReason::Erase.drv_info()
+            ),
+        ] {
+            assert!(trace.contains(&line), "{line:?} not in\n{trace}");
+        }
     }
 
     #[test]

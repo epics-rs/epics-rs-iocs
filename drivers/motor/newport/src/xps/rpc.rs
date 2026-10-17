@@ -276,7 +276,7 @@ impl XpsSocket {
             .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
             .inspect_err(|e| {
                 self.trace_error(format_args!(
-                    "SendAndReceive error calling writeRead, output={cmd} status={}, error={}",
+                    "SendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
                     e.status() as i32,
                     e.message()
                 ))
@@ -322,7 +322,7 @@ impl XpsSocket {
                     // C prints only for asynError (asynOctetSocket.cpp:197).
                     if e.status() == AsynStatus::Error {
                         self.trace_error(format_args!(
-                            "SendAndReceive error calling write, output={cmd} status={}, error={}",
+                            "SendAndReceive error calling write, output={cmd} status={}, error={}\n",
                             e.status() as i32,
                             e.message()
                         ));
@@ -337,7 +337,7 @@ impl XpsSocket {
                         -1 => continue,
                         0 => {}
                         _ => self.trace_error(format_args!(
-                            "SendAndReceive unexpected response ={}",
+                            "SendAndReceive unexpected response ={}\n",
                             reply.0
                         )),
                     }

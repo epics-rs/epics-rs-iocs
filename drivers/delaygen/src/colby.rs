@@ -158,7 +158,7 @@ fn device_write_read(handle: &OctetLink, iface: Iface, cmd: &str) -> AsynResult<
         handle.print(
             TraceMask::ERROR,
             format_args!(
-                "writeRead: error sending {cmd},sent={},recv={},err={}",
+                "writeRead: error sending {cmd},sent={},recv={},err={}\n",
                 f.sent,
                 f.received,
                 f.status()
@@ -181,7 +181,7 @@ fn device_write_only(handle: &OctetLink, iface: Iface, cmd: &str) -> AsynResult<
         handle.print(
             TraceMask::ERROR,
             format_args!(
-                "writeOnly: error sending {cmd},sent={},err={}",
+                "writeOnly: error sending {cmd},sent={},err={}\n",
                 f.sent,
                 f.status()
             ),

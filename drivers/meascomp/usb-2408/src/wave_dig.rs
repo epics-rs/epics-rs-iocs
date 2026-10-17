@@ -211,7 +211,7 @@ pub fn start_wave_dig(
     trace.print(
         TraceMask::FLOW,
         format_args!(
-            "{DRIVER_NAME}:{FUNCTION}: called cbAInScan, firstChan={first_chan}, lastChan={last_chan}, numPoints={num_points}, dwell={:.6}, options=0x{options:x}",
+            "{DRIVER_NAME}:{FUNCTION}: called cbAInScan, firstChan={first_chan}, lastChan={last_chan}, numPoints={num_points}, dwell={:.6}, options=0x{options:x}\n",
             state.dwell_actual
         ),
     );
@@ -260,7 +260,7 @@ pub fn read_wave_dig(
     trace.print(
         TraceMask::IO_DRIVER,
         format_args!(
-            "{DRIVER_NAME}::pollerThread waveform digitizer status, aiStatus={status}, aiCount={}, aiIndex={}",
+            "{DRIVER_NAME}::pollerThread waveform digitizer status, aiStatus={status}, aiCount={}, aiIndex={}\n",
             xfer.current_total_count, xfer.current_index
         ),
     );
@@ -343,7 +343,7 @@ pub fn waveform_updates(
             trace.print(
                 TraceMask::FLOW,
                 format_args!(
-                    "{DRIVER_NAME}:readWaveDig:, doing callbacks on input {ch}, first value={:.6}",
+                    "{DRIVER_NAME}:readWaveDig:, doing callbacks on input {ch}, first value={:.6}\n",
                     state.channel_buffers[ch][0]
                 ),
             );

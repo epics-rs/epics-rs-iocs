@@ -278,13 +278,13 @@ fn device_write_read(port: &str, handle: &OctetLink, cmd: &str) -> AsynResult<St
         handle.reset();
         handle.print(
             TraceMask::ERROR,
-            format_args!("{port} writeRead: error {} wrote \"{cmd}\"", f.status()),
+            format_args!("{port} writeRead: error {} wrote \"{cmd}\"\n", f.status()),
         );
     }
     let read = result.as_deref().unwrap_or("");
     handle.print(
         TraceMask::IO_FILTER,
-        format_args!("{port} writeRead: wrote \"{cmd}\" read \"{read}\""),
+        format_args!("{port} writeRead: wrote \"{cmd}\" read \"{read}\"\n"),
     );
     std::thread::sleep(WRITEREADDELAY);
     Ok(result?)

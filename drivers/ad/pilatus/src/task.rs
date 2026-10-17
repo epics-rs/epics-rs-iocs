@@ -284,7 +284,7 @@ async fn reset_module_power(w: &mut Worker, version: (i32, i32, i32)) {
             TraceMask::ERROR,
             &format!(
                 "pilatusDetector::resetModulePower ResetModulePower not supported on \
-                 version {major}.{minor}.{patch} of camserver"
+                 version {major}.{minor}.{patch} of camserver\n"
             ),
         );
         return;
@@ -376,7 +376,7 @@ async fn read_bad_pixel_file(w: &mut Worker, file: &str) {
         Err(_) => {
             w.ctx.trace(
                 TraceMask::ERROR,
-                &format!("pilatusDetector::readBadPixelFile, cannot open file {file}"),
+                &format!("pilatusDetector::readBadPixelFile, cannot open file {file}\n"),
             );
             w.ctx.callbacks().await;
             return;
@@ -391,7 +391,7 @@ async fn read_bad_pixel_file(w: &mut Worker, file: &str) {
         // C returns without updating NUM_BAD_PIXELS, which it zeroed above.
         Err(n) => w.ctx.trace(
             TraceMask::ERROR,
-            &format!("pilatusDetector::readBadPixelFile, too few items ={n}, should be 4"),
+            &format!("pilatusDetector::readBadPixelFile, too few items ={n}, should be 4\n"),
         ),
     }
     w.ctx.callbacks().await;
@@ -427,7 +427,7 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
             w.ctx.trace(
                 TraceMask::ERROR,
                 &format!(
-                    "pilatusDetector::readFlatFieldFile, error reading flat field file {file}"
+                    "pilatusDetector::readFlatFieldFile, error reading flat field file {file}\n"
                 ),
             );
             w.ctx.callbacks().await;
@@ -523,7 +523,7 @@ async fn wait_for_file_to_exist(
                         ctx.trace(
                             TraceMask::ERROR,
                             &format!(
-                                "pilatusDetector::waitForFileToExist error calling fstat, errno={} {}",
+                                "pilatusDetector::waitForFileToExist error calling fstat, errno={} {}\n",
                                 e.raw_os_error().unwrap_or(0),
                                 file.display()
                             ),
@@ -553,14 +553,14 @@ async fn wait_for_file_to_exist(
         ctx.trace(
             TraceMask::ERROR,
             &format!(
-                "pilatusDetector::waitForFileToExist timeout waiting for file to be created {}",
+                "pilatusDetector::waitForFileToExist timeout waiting for file to be created {}\n",
                 file.display()
             ),
         );
         if file_exists {
             ctx.trace(
                 TraceMask::ERROR,
-                "  file exists but is more than 10 seconds old, possible clock synchronization problem",
+                "  file exists but is more than 10 seconds old, possible clock synchronization problem\n",
             );
             ctx.set_str(
                 ctx.ad.status_message,
@@ -613,21 +613,21 @@ async fn read_tiff(
             Ok(img) if img.width as usize != nx => ctx.trace(
                 TraceMask::ERROR,
                 &format!(
-                    "pilatusDetector::readTiff, image width incorrect ={}, should be {nx}",
+                    "pilatusDetector::readTiff, image width incorrect ={}, should be {nx}\n",
                     img.width
                 ),
             ),
             Ok(img) => ctx.trace(
                 TraceMask::ERROR,
                 &format!(
-                    "pilatusDetector::readTiff, image length incorrect ={}, should be {ny}",
+                    "pilatusDetector::readTiff, image length incorrect ={}, should be {ny}\n",
                     img.height
                 ),
             ),
             Err(_) => ctx.trace(
                 TraceMask::FLOW,
                 &format!(
-                    "pilatusDetector::readTiff, error reading TIFF file {}",
+                    "pilatusDetector::readTiff, error reading TIFF file {}\n",
                     file.display()
                 ),
             ),
@@ -682,7 +682,7 @@ async fn read_image_file(
             TraceMask::ERROR,
             &format!(
                 "pilatusDetector::readImageFile, unsupported image file name extension, \
-                 expected .tif or .cbf, fileName={file}"
+                 expected .tif or .cbf, fileName={file}\n"
             ),
         );
         ctx.set_str(

@@ -107,7 +107,7 @@ impl Job {
                 self.trace(
                     TraceMask::ERROR,
                     format_args!(
-                        "{WRITE_READ} {name} pasynOctet->write, status={}, error={}",
+                        "{WRITE_READ} {name} pasynOctet->write, status={}, error={}\n",
                         e.status() as i32,
                         e.message()
                     ),
@@ -118,7 +118,7 @@ impl Job {
         self.trace(
             TraceMask::IO_DEVICE,
             format_args!(
-                "{WRITE_READ} {name} nwrite={n} output=[{}]",
+                "{WRITE_READ} {name} nwrite={n} output=[{}]\n",
                 String::from_utf8_lossy(send)
             ),
         );
@@ -127,7 +127,7 @@ impl Job {
             self.trace(
                 TraceMask::ERROR,
                 format_args!(
-                    "{WRITE_READ} {name} pasynOctet->read, status={}, error={}",
+                    "{WRITE_READ} {name} pasynOctet->read, status={}, error={}\n",
                     e.status() as i32,
                     e.message()
                 ),
@@ -142,14 +142,14 @@ impl Job {
             self.trace(
                 TraceMask::ERROR,
                 format_args!(
-                    "{WRITE_READ} {name} pasynOctet->flush, status={status}, error={error}"
+                    "{WRITE_READ} {name} pasynOctet->flush, status={status}, error={error}\n"
                 ),
             );
         }
         self.trace(
             TraceMask::IO_DEVICE,
             format_args!(
-                "{WRITE_READ} {name} nread={} input=[{}]",
+                "{WRITE_READ} {name} nread={} input=[{}]\n",
                 read.data.len(),
                 c_str(&read.data)
             ),
@@ -173,13 +173,16 @@ impl CellBody for Job {
                 if reply.is_empty() {
                     self.trace(
                         TraceMask::ERROR,
-                        format_args!("{CALLBACK} {name} Cmd reply too small=0"),
+                        format_args!("{CALLBACK} {name} Cmd reply too small=0\n"),
                     );
                     false
                 } else if check_control_reply(dev, &reply).is_err() {
                     self.trace(
                         TraceMask::ERROR,
-                        format_args!("{CALLBACK} {name} Cmd reply has error=[{}]", c_str(&reply)),
+                        format_args!(
+                            "{CALLBACK} {name} Cmd reply has error=[{}]\n",
+                            c_str(&reply)
+                        ),
                     );
                     ex.read_alarm = true;
                     false
@@ -200,7 +203,7 @@ impl CellBody for Job {
                     self.trace(
                         TraceMask::ERROR,
                         format_args!(
-                            "{CALLBACK} {name} Read reply too small/too large ={}",
+                            "{CALLBACK} {name} Read reply too small/too large ={}\n",
                             reply.len()
                         ),
                     );
@@ -219,7 +222,7 @@ impl CellBody for Job {
                         self.trace(
                             TraceMask::ERROR,
                             format_args!(
-                                "{CALLBACK} {name} Read reply has error=[{}]",
+                                "{CALLBACK} {name} Read reply has error=[{}]\n",
                                 c_str(&reply)
                             ),
                         );
@@ -368,7 +371,7 @@ impl DeviceSupport for VacSen {
         job.trace(
             TraceMask::IO_DEVICE,
             format_args!(
-                "devVacSen::readWrite {} command {code} len={} string=|{}|",
+                "devVacSen::readWrite {} command {code} len={} string=|{}|\n",
                 self.name,
                 sendbuf.len(),
                 String::from_utf8_lossy(&sendbuf)
@@ -389,7 +392,7 @@ impl DeviceSupport for VacSen {
                 job.trace(
                     TraceMask::ERROR,
                     format_args!(
-                        "devVacSen::readWrite {} ERROR calling queueRequest status={}, error={}",
+                        "devVacSen::readWrite {} ERROR calling queueRequest status={}, error={}\n",
                         self.name,
                         e.status() as i32,
                         e.message()

@@ -52,6 +52,8 @@
 //! - `set_position` only supports zeroing (`CA`), matching C `LOAD_POS`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::sleep;
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
@@ -65,6 +67,9 @@ use motor_common::util::{atof, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
+
+/// C `MOTION_DELAY` (drvEMC18011.cc:72), slept on entering RETRY.
+const MOTION_DELAY: Duration = Duration::from_millis(100);
 
 /// Fixed number of axes (C `EMC18011_MAX_MOTORS`).
 pub const MAX_MOTORS: usize = 3;
@@ -244,6 +249,11 @@ pub struct Emc18011Axis {
     /// 0-based motor index (wire selection is `index + 1`).
     index: usize,
     prev_position: f64,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// missed `Z` (RETRY, drvEMC18011.cc:303), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :306). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
 }
@@ -255,6 +265,7 @@ impl Emc18011Axis {
             controller,
             index,
             prev_position: 0.0,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 ..MotorStatus::default()
@@ -293,11 +304,8 @@ fn send_prem(ctrl: &Emc18011Controller, prem: &[u8]) -> AsynResult<()> {
 }
 
 impl AsynMotor for Emc18011Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvEMC18011.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -420,26 +428,27 @@ impl AsynMotor for Emc18011Axis {
             return Ok(self.last_status.clone());
         }
 
-        // C drvEMC18011.cc:249-321: a missing or unknown `Z` reply keeps the
-        // previous status once (RETRY); a second in a row raises COMM_ERR.
+        // C drvEMC18011.cc:249-321: a missing or unknown `Z` reply fails the
+        // poll raising nothing once (RETRY); a second in a row raises COMM_ERR.
         let z_char = ctrl
             .command("Z")
             .ok()
             .and_then(|r| r.chars().next())
             .filter(|c| (Z_STOPPED..=Z_LSUP).contains(c));
         let Some(z_char) = z_char else {
-            let hard = ctrl.comm_state != CommState::Normal;
-            ctrl.comm_state = if hard {
-                CommState::CommErr
+            self.failure = if ctrl.comm_state == CommState::Normal {
+                ctrl.comm_state = CommState::Retry;
+                drop(ctrl);
+                sleep(MOTION_DELAY);
+                PollFailure::NONE
             } else {
-                CommState::Retry
+                ctrl.comm_state = CommState::CommErr;
+                PollFailure::PROBLEM_AND_COMMS_ERROR
             };
-            drop(ctrl);
-            if hard {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            return Err(oriel_err(format!(
+                "EMC18011 motor {}: no Z reply",
+                self.index + 1
+            )));
         };
         ctrl.comm_state = CommState::Normal;
         let z = decode_z(z_char);
@@ -610,5 +619,26 @@ mod tests {
         // Unknown char falls back to negative motion (still moving).
         let s = decode_z('z');
         assert!(s.moving);
+    }
+
+    /// drvEMC18011.cc:249-321: a first bad `Z` is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good one clears it.
+    #[test]
+    fn a_bad_z_reply_is_retry_then_comm_error() {
+        let (line, mut axis, z) = strings_rig("emcRetry");
+        let user = AsynUser::default();
+        axis.move_relative(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
+        line.sent();
+        *z.lock().unwrap() = 'x';
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        *z.lock().unwrap() = Z_RUNDOWN;
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        *z.lock().unwrap() = 'x';
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

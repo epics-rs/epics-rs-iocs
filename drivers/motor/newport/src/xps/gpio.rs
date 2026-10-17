@@ -97,7 +97,7 @@ impl XpsGpio {
         match self.socket.gpio_analog_get(&ANALOG_INPUTS) {
             Ok(values) => state.analog = values.try_into().ok(),
             Err(e) => self.trace_error(format_args!(
-                "drvXPSAsynAux::XPSAuxPoller error calling GPIOAnalogGet={}",
+                "drvXPSAsynAux::XPSAuxPoller error calling GPIOAnalogGet={}\n",
                 e.code()
             )),
         }
@@ -115,7 +115,7 @@ impl XpsGpio {
                     state.posted[addr] = true;
                 }
                 Err(e) => self.trace_error(format_args!(
-                    "drvXPSAsynAux::XPSAuxPoller error calling GPIODigitalGet={}",
+                    "drvXPSAsynAux::XPSAuxPoller error calling GPIODigitalGet={}\n",
                     e.code()
                 )),
             }
@@ -211,7 +211,7 @@ impl PortDriver for XpsGpio {
             TraceMask::IO_DRIVER,
             file!(),
             line!(),
-            format_args!("drvXPSAsynAux::readFloat64, value={value:.6}"),
+            format_args!("drvXPSAsynAux::readFloat64, value={value:.6}\n"),
         );
         Ok(value)
     }
@@ -235,7 +235,7 @@ impl PortDriver for XpsGpio {
             TraceMask::IO_DRIVER,
             file!(),
             line!(),
-            format_args!("drvXPSAsynAux::writeFloat64, value={value:.6}"),
+            format_args!("drvXPSAsynAux::writeFloat64, value={value:.6}\n"),
         );
         Ok(())
     }
@@ -277,7 +277,7 @@ impl PortDriver for XpsGpio {
             TraceMask::IO_DRIVER,
             file!(),
             line!(),
-            format_args!("drvXPSAsynAux::readUInt32D, value={value:x}"),
+            format_args!("drvXPSAsynAux::readUInt32D, value={value:x}\n"),
         );
         Ok(value)
     }
@@ -305,7 +305,7 @@ impl PortDriver for XpsGpio {
                     file!(),
                     line!(),
                     format_args!(
-                        "drvXPSAsynAux::writeUInt32D, set binary output value={}",
+                        "drvXPSAsynAux::writeUInt32D, set binary output value={}\n",
                         value as i32
                     ),
                 );
@@ -325,7 +325,7 @@ impl PortDriver for XpsGpio {
                     file!(),
                     line!(),
                     format_args!(
-                        "drvXPSAsynAux::writeUInt32D, set gain value={}",
+                        "drvXPSAsynAux::writeUInt32D, set gain value={}\n",
                         value as i32
                     ),
                 );

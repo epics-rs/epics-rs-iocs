@@ -113,7 +113,7 @@ impl TelevacWorker {
         if raw.is_empty() {
             self.transport.print(
                 TraceMask::ERROR,
-                format_args!("devTelevac::devTelevacCallback {who} message too small=0"),
+                format_args!("devTelevac::devTelevacCallback {who} message too small=0\n"),
             );
             return None;
         }

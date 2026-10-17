@@ -127,7 +127,7 @@ impl SimTaskContext {
                 Some(0),
                 0,
                 TraceMask::ERROR,
-                "simDetector:computeImage: error getting parameters",
+                "simDetector:computeImage: error getting parameters\n",
             );
         }
 
@@ -235,7 +235,7 @@ async fn sim_task(mut ctx: SimTaskContext) {
                     Some(0),
                     0,
                     TraceMask::ERROR,
-                    &format!("simDetector:computeImage: {e}"),
+                    &format!("simDetector:computeImage: {e}\n"),
                 );
                 notify(
                     &ctx.handle,
