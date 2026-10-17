@@ -1635,6 +1635,19 @@ impl AsynMotor for PIGCS2Axis {
     /// deferral runs `processDeferredMoves`, whose status C ignores.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
         self.log_here();
+        // C defect not copied: its format puts the "Sett"/"Clear" argument
+        // first, printing "Sett:PIasynDriver: writeInt32ing ...".
+        PortManager::global().trace_manager().print(
+            Some(&self.port_name),
+            Some(self.axis_no as i32),
+            0,
+            TraceMask::FLOW,
+            format_args!(
+                "PIasynDriver:writeInt32: {}ing Deferred Move flag on driver {}\n",
+                if defer { "Sett" } else { "Clear" },
+                self.port_name
+            ),
+        );
         let mut ctrl = self.lock();
         if !defer && ctrl.moves_deferred {
             let _ = ctrl.process_deferred_moves();
@@ -2312,6 +2325,26 @@ mod tests {
         assert!(sent_lines(&line).is_empty());
     }
 
+    /// `PIasynController::writeInt32` (PIasynController.cpp:305-308) logs
+    /// each write of the flag on the writer's user, with C's misordered
+    /// arguments put back in place.
+    #[test]
+    fn a_deferred_move_flag_write_is_logged() {
+        let (_line, mut first, mut second) = two_axes("gcs2DeferLog");
+        let user = AsynUser::new(0);
+        let printed = traced_mask("gcs2DeferLog", TraceMask::FLOW, || {
+            second.set_deferred_moves(&user, true).unwrap();
+            first.set_deferred_moves(&user, false).unwrap();
+        });
+        assert_eq!(
+            messages(&printed),
+            [
+                "PIasynDriver:writeInt32: Setting Deferred Move flag on driver gcs2DeferLog\n",
+                "PIasynDriver:writeInt32: Clearing Deferred Move flag on driver gcs2DeferLog\n",
+            ]
+        );
+    }
+
     /// `PIasynAxis::stop` (:310-316) drops the axis's deferred move.
     #[test]
     fn a_stop_drops_the_axis_deferred_move() {
@@ -2328,12 +2361,16 @@ mod tests {
 
     /// What prints on `port` (every address) while `f` runs.
     fn traced(port: &str, f: impl FnOnce()) -> String {
+        traced_mask(port, TraceMask::ERROR, f)
+    }
+
+    fn traced_mask(port: &str, mask: TraceMask, f: impl FnOnce()) -> String {
         use epics_rs::asyn::trace::TraceFile;
         let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
         let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
         let manager = PortManager::global();
         let trace = manager.trace_manager();
-        trace.set_trace_mask(Some(port), TraceMask::ERROR);
+        trace.set_trace_mask(Some(port), mask);
         trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
         for addr in 0..2 {
             trace.set_device_trace_file(port, addr, TraceFile::File(file.clone()));
