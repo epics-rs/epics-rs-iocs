@@ -779,6 +779,43 @@ impl PIGCS2Controller {
         })
     }
 
+    /// C `sendOnly(char)`: the byte alone, no terminator.
+    fn send_only_char(&self, c: u8) -> AsynResult<()> {
+        let e = match self.handle.write_octet(0, &[c]) {
+            Ok(1) => return Ok(()),
+            Ok(n) => pigcs2_err(format!("{n} bytes written")).with_partial_write(n),
+            Err(e) => e,
+        };
+        self.print(format_args!(
+            "PIGCSController:sendOnly: error sending command {c}, sent={}, status={}\n",
+            e.partial_write().unwrap_or(0),
+            e.status() as i32
+        ));
+        Err(e)
+    }
+
+    /// `PIHexapodController::haltAxis`: byte 24 + `ERR? == PI_CNTR_STOP`.
+    fn halt_platform(&self) -> AsynResult<()> {
+        self.send_only_char(24)?;
+        self.check(PI_CNTR_STOP, |err| {
+            format!("PIGCSController::haltAxis() failed, GCS error {err}")
+        })
+    }
+
+    /// `PIHexapodController::referenceVelCts`: `INI X` homes the platform,
+    /// whatever the axis.
+    fn init_platform(&mut self) -> AsynResult<()> {
+        if let Err(e) = self.send_only("INI X") {
+            let _ = self.get_gcs_error();
+            self.print(format_args!(
+                "PIHexapodController::referenceVelCts() failed\n"
+            ));
+            return Err(e);
+        }
+        self.hexapod.homing = true;
+        Ok(())
+    }
+
     /// `HLT {axis}` + `ERR? == PI_CNTR_STOP`.
     fn halt(&self, axis: &str) -> AsynResult<()> {
         self.send_only(&format!("HLT {axis}"))?;
@@ -1304,6 +1341,9 @@ impl PIGCS2Axis {
     /// skips the velocity; `PIC885Controller`'s sends `FRF` alone.
     fn reference_vel_cts(&mut self, velocity: f64, forward: bool) -> AsynResult<()> {
         let model = self.lock().model;
+        if model == Model::Hexapod {
+            return self.lock().init_platform();
+        }
         if model == Model::C702 {
             return self.reference_c702(velocity, forward);
         }
@@ -1525,6 +1565,7 @@ impl AsynMotor for PIGCS2Axis {
         ctrl.deferred.remove(&self.axis_no);
         match ctrl.model {
             Model::C885 => ctrl.stop_all(),
+            Model::Hexapod => ctrl.halt_platform(),
             _ => ctrl.halt(&self.axis_name),
         }
     }
@@ -2628,6 +2669,29 @@ mod tests {
             messages(&printed),
             ["PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch\n"]
         );
+    }
+
+    /// `PIHexapodController::referenceVelCts` (PIHexapodController.cpp:
+    /// 370-385) sends `INI X` for any axis and homes the platform until `#5`
+    /// reads it stopped; its `haltAxis` (:387-403) is byte 24, then `ERR?`
+    /// reading `PI_CNTR_STOP`.
+    #[test]
+    fn a_hexapod_homes_with_ini_x_and_stops_with_byte_24() {
+        let (line, ctrl) = hexapod("gcs2HexIni", |last| match last {
+            "\u{5}" => "1".into(),
+            "ERR?" => "10".into(),
+            last => hexapod_reply(last),
+        });
+        let mut axis = PIGCS2Axis::new(ctrl.clone(), "Y".into(), 1, "gcs2HexIni");
+        line.sent();
+        let user = AsynUser::new(0);
+        axis.home(&user, 0.0, 1.0, 0.0, true).unwrap();
+        assert_eq!(sent_lines(&line), ["INI X"]);
+        ctrl.lock().unwrap().poll();
+        assert!(!axis.poll(&user).unwrap().done && axis.is_homing);
+        line.sent();
+        axis.stop(&user, 0.0).unwrap();
+        assert_eq!(sent_lines(&line), ["\u{18}", "ERR?"]);
     }
 
     /// `PIInterface::sendAndReceive` (PIInterface.cpp:133-141) reads, with
