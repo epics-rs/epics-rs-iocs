@@ -453,7 +453,6 @@ impl AsynMotor for DrvPc6kAxis {
         status.direction = bit(TAS_NEG, b'0');
         status.home = bit(TAS_HOME, b'1');
         status.done = bit(TAS_INMOTION, b'0');
-        status.moving = !status.done;
         status.high_limit = !(bit(TAS_HPLUSTL, b'0') && bit(TAS_SPLUSTL, b'0') || status.home);
         status.low_limit = !(bit(TAS_HMINUSTL, b'0') && bit(TAS_SMINUSTL, b'0') || status.home);
         let ls_active =

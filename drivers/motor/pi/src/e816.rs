@@ -138,7 +138,7 @@ fn fold_reading(
         encoder_position: position,
         velocity: 0.0,
         done,
-        moving: !done,
+        moving: false,
         high_limit: done && reading.overflow,
         low_limit: false,
         home: done,

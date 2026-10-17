@@ -402,7 +402,6 @@ impl AsynMotor for SmartMotorAxis {
             encoder_position: position as f64,
             velocity,
             done,
-            moving: !done,
             high_limit: plus_ls,
             low_limit: minus_ls,
             direction,

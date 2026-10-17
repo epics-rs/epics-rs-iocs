@@ -289,7 +289,6 @@ impl AsynMotor for DrvMicosAxis {
         let positive = bytes[3] & 0x04 != 0;
         let status = &mut self.status;
         status.done = bytes[0] & 0x04 != 0;
-        status.moving = !status.done;
         status.high_limit = bytes[5] & 0x04 != 0 && positive;
         status.low_limit = bytes[5] & 0x01 != 0 && !positive;
         status.slip_stall = bytes[3] & 0x48 != 0;

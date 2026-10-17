@@ -454,7 +454,6 @@ impl AsynMotor for FaulhaberAxis {
             velocity: signed_velocity as f64,
             direction,
             done,
-            moving: !done,
             high_limit: plus_ls,
             low_limit: minus_ls,
             home,

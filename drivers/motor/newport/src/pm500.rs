@@ -452,7 +452,6 @@ impl Pm500Axis {
             encoder_position,
             velocity: 0.0, // C: "Parse motor velocity? NEEDS WORK"
             done: !moving,
-            moving,
             direction,
             // C sets only the switch in the travel direction on an 'L' and
             // leaves the other as it was.
@@ -609,7 +608,8 @@ mod tests {
         let s = &axis.last_status;
         // drvPM500.cc: NINT steps, the encoder truncated.
         assert_eq!((s.position, s.encoder_position), (502.0, 501.0));
-        assert!(s.moving && s.direction && s.powered && s.has_encoder);
+        // drvPM500 reports a busy axis as RA_DONE 0 and never sets RA_MOVING.
+        assert!(!s.done && !s.moving && s.direction && s.powered && s.has_encoder);
     }
 
     /// devPM500.cc sends `steps * drive_resolution`, speeds further ÷1000.

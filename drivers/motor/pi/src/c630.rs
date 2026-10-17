@@ -322,7 +322,6 @@ impl PIC630Axis {
             encoder_position: polled.position as f64,
             velocity: 0.0,
             done: polled.done,
-            moving: !polled.done,
             high_limit: polled.high_limit,
             low_limit: polled.low_limit,
             direction,
