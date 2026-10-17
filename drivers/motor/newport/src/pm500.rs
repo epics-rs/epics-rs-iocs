@@ -192,6 +192,17 @@ impl Pm500Axis {
     fn lock(&self) -> MutexGuard<'_, Pm500Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// The SET_VELOCITY and SET_ACCEL parts of a move or home; the record
+    /// sends SET_ACCEL only for a positive rate (motorRecord.cc:874, 940).
+    fn speeds(&self, velocity: f64, acceleration: f64) -> String {
+        let (c, d) = (self.name, self.digits);
+        let mut msg = format!("{c}V{:.d$};", velocity / 1000.0);
+        if acceleration > 0.0 {
+            msg += &format!("{c}ACCEL{:.d$};", acceleration / 1000.0);
+        }
+        msg
+    }
 }
 
 impl AsynMotor for Pm500Axis {
@@ -213,13 +224,10 @@ impl AsynMotor for Pm500Axis {
         // Record move transaction: SET_VELOCITY;SET_ACCEL;MOVE_ABS (VEL_BASE
         // and GO build nothing). Wire velocity/acceleration are mm/sec(²) —
         // the ÷1000 from position units is C's, kept (module Units note).
-        let (c, d) = (self.name, self.digits);
-        let ctrl = self.lock();
-        ctrl.command(&format!(
-            "{c}V{:.d$};{c}ACCEL{:.d$};{c}G{position:.d$};",
-            velocity / 1000.0,
-            acceleration / 1000.0
-        ))?;
+        let c = self.name;
+        let msg =
+            self.speeds(velocity, acceleration) + &format!("{c}G{position:.0$};", self.digits);
+        self.lock().command(&msg)?;
         Ok(())
     }
 
@@ -231,13 +239,10 @@ impl AsynMotor for Pm500Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let (c, d) = (self.name, self.digits);
-        let ctrl = self.lock();
-        ctrl.command(&format!(
-            "{c}V{:.d$};{c}ACCEL{:.d$};{c}R{distance:.d$};",
-            velocity / 1000.0,
-            acceleration / 1000.0
-        ))?;
+        let c = self.name;
+        let msg =
+            self.speeds(velocity, acceleration) + &format!("{c}R{distance:.0$};", self.digits);
+        self.lock().command(&msg)?;
         Ok(())
     }
 
@@ -270,13 +275,8 @@ impl AsynMotor for Pm500Axis {
     ) -> AsynResult<()> {
         // C builds the same `F0` for HOME_FOR and HOME_REV, after the
         // record's velocity/acceleration transaction parts.
-        let (c, d) = (self.name, self.digits);
-        let ctrl = self.lock();
-        ctrl.command(&format!(
-            "{c}V{:.d$};{c}ACCEL{:.d$};{c}F0;",
-            velocity / 1000.0,
-            acceleration / 1000.0
-        ))?;
+        let msg = self.speeds(velocity, acceleration) + &format!("{}F0;", self.name);
+        self.lock().command(&msg)?;
         Ok(())
     }
 
@@ -553,6 +553,21 @@ mod tests {
         assert_eq!(poll("XL-5.012"), (true, true));
         assert_eq!(poll("XD-5.012"), (false, false));
         assert_eq!(poll("XL-5.012"), (false, true));
+    }
+
+    /// motorRecord.cc builds no SET_ACCEL for a zero rate, so the move
+    /// carries no `ACCEL` part.
+    #[test]
+    fn a_zero_acceleration_sends_no_accel() {
+        let (mut axis, sent, _) = pm500_axis("pm500_acc0");
+        let user = AsynUser::default();
+        sent.lock().unwrap().clear();
+        axis.move_absolute(&user, 1.5, 0.0, 2000.0, 0.0).unwrap();
+        axis.home(&user, 0.0, 2000.0, 3000.0, true).unwrap();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["XV2.0000;XG1.5000;", "XV2.0000;XACCEL3.0000;XF0;"]
+        );
     }
 
     #[test]
