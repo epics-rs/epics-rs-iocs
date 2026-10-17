@@ -996,6 +996,19 @@ impl PIGCS2Controller {
         get_value_f64(&self.query(&format!("POS? {axis}"))?)
     }
 
+    /// C `getAxisPositionCts`: the position in whole counts, logged. C
+    /// defect not copied: `int(x + 0.5)` (PIGCSController.cpp:485), and
+    /// `int(x)` on a zero CPU term (:481), round a negative position toward
+    /// zero; rs takes the nearest count, as `target_counts`.
+    fn get_axis_position_cts(&self, axis: &str, cpu: f64, last: f64) -> AsynResult<f64> {
+        let counts = nint(self.get_axis_position(axis, last / cpu)? * cpu);
+        self.trace(
+            TraceMask::FLOW,
+            format_args!("PIGCSController::getAxisPositionCts() pos:{counts}\n"),
+        );
+        Ok(f64::from(counts))
+    }
+
     /// `TMN? {axis}` / `TMX? {axis}` -> `(negLimit, posLimit)`.
     /// Each limit is stored as soon as it is read, so a failed `TMX?` keeps
     /// the `TMN?` value, as C's reference out-parameters do.
@@ -1401,14 +1414,14 @@ impl PIGCS2Axis {
                 .unwrap_or(axis.cpu)
         };
         let _ = ctrl.get_axis_velocity(&axis.axis_name);
-        let position = ctrl.get_axis_position(&axis.axis_name, axis.last_position / cpu);
+        let position = ctrl.get_axis_position_cts(&axis.axis_name, cpu, axis.last_position);
         let (mut low_limit, mut high_limit) = (axis.low_limit, axis.high_limit);
         let _ = ctrl.get_travel_limits(&axis.axis_name, &mut low_limit, &mut high_limit);
         let homed = ctrl.get_referenced_state(&axis.axis_name);
         drop(ctrl);
         axis.cpu = cpu;
         if let Ok(position) = position {
-            axis.last_position = position * cpu;
+            axis.last_position = position;
         }
         (axis.low_limit, axis.high_limit) = (low_limit, high_limit);
         if let Ok(homed) = homed {
@@ -1695,8 +1708,8 @@ impl PIGCS2Axis {
             self.servo_on = servo_control;
             let ctrl = self.lock();
             let position = ctrl
-                .get_axis_position(&self.axis_name, self.last_position / self.cpu)
-                .map_or(self.last_position, |p| p * self.cpu);
+                .get_axis_position_cts(&self.axis_name, self.cpu, self.last_position)
+                .unwrap_or(self.last_position);
             // C defect not copied: a failed read posts C's uninitialized
             // realPosition (PIasynAxis.cpp:163); rs posts nothing.
             let real = ctrl
@@ -2193,7 +2206,8 @@ mod tests {
             acceleration: 0.0,
         };
         let status = axis.poll(&AsynUser::new(0)).unwrap();
-        assert_eq!(status.position, 2.5);
+        // POS? 2.5 in whole counts.
+        assert_eq!(status.position, 3.0);
         assert!(status.moving && status.msta_moving && status.high_limit && status.powered);
         assert!(!status.problem);
         assert_eq!((axis.low_limit, axis.high_limit), (-10.0, 10.0));
@@ -2744,6 +2758,44 @@ mod tests {
         assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
         poll();
         assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
+    }
+
+    /// `PIGCSController::getAxisPositionCts` (PIGCSController.cpp:485)
+    /// keeps a whole count and logs it (:487-491); rs rounds negatives to
+    /// the nearest count too, where C's `int(x + 0.5)` rounds toward zero.
+    #[test]
+    fn the_polled_position_is_the_nearest_whole_count() {
+        let pos = Arc::new(Mutex::new("1=0"));
+        let reply = pos.clone();
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2PosCts", move |last| {
+            match last {
+                "ERR?" => "0",
+                "POS? 1" => *reply.lock().unwrap(),
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2PosCts")));
+        *pos.lock().unwrap() = "1=2.5";
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2PosCts");
+        assert_eq!(axis.last_position, 3.0);
+        let user = AsynUser::new(0);
+        let mut polled = Vec::new();
+        let printed = traced_mask("gcs2PosCts", TraceMask::FLOW, || {
+            for reply in ["1=2.4", "1=-2.4", "1=-2.6"] {
+                *pos.lock().unwrap() = reply;
+                polled.push(axis.poll(&user).unwrap().position);
+            }
+        });
+        assert_eq!(polled, [2.0, -2.0, -3.0]);
+        let logged: Vec<_> = messages(&printed)
+            .into_iter()
+            .filter(|m| m.contains("getAxisPositionCts"))
+            .collect();
+        assert_eq!(
+            logged,
+            ["2", "-2", "-3"].map(|n| format!("PIGCSController::getAxisPositionCts() pos:{n}\n"))
+        );
     }
 
     /// `PIasynAxis::poll` posts the second position read as
