@@ -35,11 +35,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, StatusWrite};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
+};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{ParamSetValue, RequestOp};
+use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -420,9 +422,11 @@ pub struct ImsMDrivePlusAxis {
     /// True between a `home` command and the move completing (drives the
     /// `R1=1` "homed" latch in [`Self::poll`]).
     homing: bool,
-    /// The controller port and its IMS_LOCKEDROTOR, which the poll sets
-    /// (ImsMDrivePlusMotorAxis.cpp:484), as it does the port's COMMS_ERROR.
-    port: Option<(PortHandle, usize)>,
+    /// The controller port's IMS_LOCKEDROTOR, which the poll sets
+    /// (ImsMDrivePlusMotorAxis.cpp:484).
+    locked_rotor: Option<usize>,
+    /// The controller-port steps of the last write, for the owner to apply.
+    sets: PortSets,
     /// The params the last poll set, posted with its status.
     poll_params: Vec<(usize, ParamValue)>,
     /// C's status params as its polls left them, a failed poll's partial
@@ -450,7 +454,8 @@ impl ImsMDrivePlusAxis {
             pos_limit_switch: None,
             neg_limit_switch: None,
             homing: false,
-            port: None,
+            locked_rotor: None,
+            sets: PortSets::default(),
             status: MotorStatus {
                 // IMS honours a base velocity (VI).
                 vbas_supported: true,
@@ -472,18 +477,11 @@ impl ImsMDrivePlusAxis {
         axis
     }
 
-    /// Set IMS_LOCKEDROTOR and COMMS_ERROR on the controller port `port`.
+    /// Set IMS_LOCKEDROTOR on the controller port `port`.
     pub fn post_params_to(&mut self, port: PortHandle) -> AsynResult<()> {
-        let io = SyncIOHandle::from_handle(port.clone(), 0, IS_READ_TIMEOUT);
-        self.port = Some((port, io.drv_user_create("IMS_LOCKEDROTOR")?));
+        let io = SyncIOHandle::from_handle(port, 0, IS_READ_TIMEOUT);
+        self.locked_rotor = Some(io.drv_user_create("IMS_LOCKEDROTOR")?);
         Ok(())
-    }
-
-    fn post(&self, reason: usize, value: i32) {
-        if let Some((port, _)) = &self.port {
-            let value = ParamSetValue::new(reason, 0, ParamValue::Int32(value));
-            let _ = port.set_params_and_notify_blocking(0, vec![value]);
-        }
     }
 
     fn framed(&self, cmd: &str) -> Vec<u8> {
@@ -761,7 +759,9 @@ impl ImsMDrivePlusAxis {
     /// sets `motorStatusProblem_` and prints the drive's `PR ER` code.
     fn bail<T>(&mut self, function: &str, what: &str, status: AsynResult<T>) -> AsynResult<T> {
         if status.is_err() && self.handle_axis_error(function, what) {
-            self.post(index::STATUS_COMMS_ERROR, 1);
+            self.sets
+                .set(0, index::STATUS_COMMS_ERROR, ParamValue::Int32(1));
+            self.sets.call_param_callbacks(0);
         }
         status
     }
@@ -814,7 +814,7 @@ impl ImsMDrivePlusAxis {
         self.status.slip = stalled;
         self.status.encoder_position = atof(&self.write_read("PR C2")?);
         let locked_rotor = atoi(&self.write_read("PR LR")?);
-        if let Some(&(_, reason)) = self.port.as_ref() {
+        if let Some(reason) = self.locked_rotor {
             self.poll_params
                 .push((reason, ParamValue::Int32(locked_rotor)));
         }
@@ -834,6 +834,10 @@ impl AsynMotor for ImsMDrivePlusAxis {
     /// 371-373, :403-406) and cleared by a good poll.
     fn param_owned_msta_bits(&self) -> u32 {
         MstaFlags::COMM_ERR.bits()
+    }
+
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
     }
 
     fn move_absolute(
@@ -1002,6 +1006,7 @@ impl AsynMotor for ImsMDrivePlusAxis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::interfaces::motor::PortSet;
 
     /// ImsMDrivePlusMotorController.cpp:69-99: a missing IO port still builds
     /// the axis; configAxis and readHomeAndLimitConfig run on the dead user.
@@ -1107,6 +1112,42 @@ mod tests {
         assert_eq!(sent, ["VM=50", "ST=0", "MA 100", "PR ER"]);
         assert_eq!(lines, [error_line("move()", "moving motor")]);
         assert_eq!(writes, [StatusWrite::Problem(true)]);
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:371-373: the failed write sets the
+    /// controller's COMMS_ERROR, which the move's callParamCallbacks posts.
+    #[test]
+    fn a_failed_move_hands_comms_error_to_the_owner() {
+        let mut sets = Vec::new();
+        axis_error_lines(
+            "imsErrComms",
+            "imsErrCommsLine",
+            |l| l.starts_with("MA "),
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.move_absolute(&user, 100.0, 0.0, 50.0, 0.0).is_err());
+                sets = axis
+                    .take_port_sets()
+                    .into_iter()
+                    .map(|set| match set {
+                        PortSet::Set {
+                            addr,
+                            reason,
+                            value: ParamValue::Int32(v),
+                        } => format!("set {addr} {reason} {v}"),
+                        PortSet::Set { .. } => "set other".into(),
+                        PortSet::Callbacks(addr) => format!("callbacks {addr}"),
+                    })
+                    .collect();
+            },
+        );
+        assert_eq!(
+            sets,
+            [
+                format!("set 0 {} 1", index::STATUS_COMMS_ERROR),
+                "callbacks 0".into()
+            ]
+        );
     }
 
     /// ImsMDrivePlusMotorAxis.cpp:159-164, 199-206: a failed
