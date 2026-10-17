@@ -385,6 +385,32 @@ impl DrvMotorSimAxis {
         }
     }
 
+    /// The lines C `motorAxisReportAxis` prints for this axis at level 1
+    /// (drvMotorSim.c:136-157), before its paramLib dump.
+    pub fn report(&self, out: &mut dyn std::fmt::Write, (low_soft, hi_soft): (f64, f64)) {
+        let axis = &self.axis;
+        let (next, end) = (axis.nextpoint, axis.endpoint);
+        let _ = writeln!(
+            out,
+            "Current position = {:.6}, velocity = {:.6} at current time: {:.6}",
+            next.p, next.v, next.t
+        );
+        let _ = writeln!(
+            out,
+            "Destination posn = {:.6}, velocity = {:.6} at desination time:  {:.6}",
+            end.p, end.v, end.t
+        );
+        let _ = writeln!(
+            out,
+            "Hard limits: {:.6}, {:.6}",
+            axis.low_hard_limit, axis.hi_hard_limit
+        );
+        let _ = writeln!(out, "Soft limits: {low_soft:.6}, {hi_soft:.6}");
+        if axis.homing {
+            let _ = writeln!(out, "Currently homing axis");
+        }
+    }
+
     /// `motorParam->setInteger(motorAxisDone, 0)` + `callCallback`, which
     /// drvMotorSim.c's move, home and velocity move post before returning.
     fn started(&mut self) {
