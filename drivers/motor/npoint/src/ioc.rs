@@ -15,9 +15,9 @@ use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port};
+use motor_common::{Controller, asyn_user, register_port_with};
 
-use crate::c300::{C300Axis, C300Controller};
+use crate::c300::{C300Axis, C300Controller, C300Params};
 
 /// Command timeout (C `C300_TIMEOUT` 1 s).
 const C300_TIMEOUT: Duration = Duration::from_secs(1);
@@ -45,8 +45,6 @@ pub fn c300_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, num_axes as i32)?;
-
             let (handle, _) = connect_controller(
                 &asyn_port,
                 C300_TIMEOUT,
@@ -55,6 +53,12 @@ pub fn c300_create_controller_command() -> CommandDef {
             );
             let controller = C300Controller::new(handle, num_axes as usize);
             let controller = Arc::new(Mutex::new(controller));
+            let params = C300Params {
+                controller: controller.clone(),
+                moving_poll: moving_poll_ms as f64 / 1000.0,
+                idle_poll: idle_poll_ms as f64 / 1000.0,
+            };
+            register_port_with(ctx, &port_name, num_axes as i32, params)?;
 
             let poller = Controller::new();
             for index in 0..num_axes as usize {
