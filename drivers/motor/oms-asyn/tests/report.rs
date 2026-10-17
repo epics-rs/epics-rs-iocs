@@ -116,3 +116,28 @@ async fn a_level_0_oms_report_prints_only_the_axis_numbers() {
     );
     assert!(!text.contains("Current position"), "{text}");
 }
+
+/// A home sent through the port leaves C `homing` set until the axis reads
+/// done, and the level-1 report says so (omsBaseController.cpp:156).
+#[epics_rs::base::epics_test]
+async fn a_homing_axis_is_reported_as_c() {
+    use epics_rs::motor::controller_port::index;
+
+    maxnet("omsReportHoming").await;
+    let shell = std::thread::spawn(|| {
+        PortManager::global()
+            .find_port_handle("omsReportHoming")
+            .unwrap()
+            .write_float64_blocking(index::HOME, 0, 1.0)
+            .unwrap()
+    });
+    while !shell.is_finished() {
+        sleep(Duration::from_millis(5)).await;
+    }
+    shell.join().unwrap();
+    let text = settled_report("omsReportHoming", 1, "    Currently homing axis\n").await;
+    assert!(
+        text.contains("Encoder position 7.000000\n    Currently homing axis\n"),
+        "{text}"
+    );
+}
