@@ -2,7 +2,8 @@
 //!
 //! Every exchange is two round trips (`devTPG261.c:276-286`): the command with
 //! a `<CR>`, answered `<ACK>` or `<NAK>`, then `<ENQ>`, answered with the data.
-//! Both replies end in `<CR><LF>`, the input EOS.
+//! Both replies end in `<CR><LF>`, the input EOS the callback sets
+//! (`devTPG261.c:657`).
 
 use epics_rs::base::calc::engine::strtod::strtod;
 

@@ -201,6 +201,13 @@ impl Job {
 
     /// The exchange, up to `finish:`.
     fn exchange(&self, port: &mut dyn PortCalls, ex: &mut Exchange) {
+        // C overwrites this status with the write's, unread.
+        let _ = port.call(
+            &RequestOp::SetInputEos {
+                eos: b"\r\n".to_vec(),
+            },
+            AsynUser::new(0).with_addr(ADDR),
+        );
         let Some(reply) = self.round_trip(port, ex.send.as_bytes(), "Cmd") else {
             raise(&mut ex.alarm, READ_ALARM, AlarmSeverity::Invalid);
             return;
@@ -613,6 +620,8 @@ impl DeviceSupport for DevTpg261 {
 
 #[cfg(test)]
 mod tests {
+    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::request::RequestResult;
     use epics_rs::base::server::records::ai::AiRecord;
     use epics_rs::base::server::records::ao::AoRecord;
     use epics_rs::base::server::records::bi::BiRecord;
@@ -767,6 +776,58 @@ mod tests {
         let mut bo = BoRecord::default();
         bo.put_field("VAL", EpicsValue::Enum(1)).unwrap();
         assert_eq!(command(&dev, &bo), "SEN,0,2\r");
+    }
+
+    /// A port that logs each op and answers reads `<ACK>` then the data.
+    struct Wire(Vec<String>);
+
+    impl PortCalls for Wire {
+        fn call(&mut self, op: &RequestOp, _user: AsynUser) -> AsynResult<RequestResult> {
+            let reads = self.0.iter().filter(|s| *s == "read").count();
+            Ok(match op {
+                RequestOp::SetInputEos { eos } => {
+                    self.0.push(format!("ieos {eos:?}"));
+                    RequestResult::write_ok()
+                }
+                RequestOp::OctetWrite { data } => {
+                    self.0.push(format!("write {data:?}"));
+                    RequestResult::write_ok()
+                }
+                RequestOp::OctetRead { .. } => {
+                    self.0.push("read".into());
+                    let reply = if reads == 0 { "\x06" } else { "0,1.0E-06" };
+                    RequestResult::octet_read(reply.into(), reply.len())
+                }
+                _ => {
+                    self.0.push(format!("{op:?}"));
+                    RequestResult::write_ok()
+                }
+            })
+        }
+    }
+
+    /// `devTPG261Callback` sets the input EOS to `<CR><LF>` before its first
+    /// write, so the device works whatever the port was configured with.
+    #[test]
+    fn the_callback_sets_its_input_eos_before_writing() {
+        let (dev, _h) = live_dev(Kind::Ai, Command::GetPressure, 1, "TPG_IEOS");
+        let job = &dev.live.as_ref().unwrap().job;
+        job.exchange.lock().unwrap().send = "PR1\r".into();
+        let mut wire = Wire(Vec::new());
+        job.process(&mut wire);
+        let ieos = format!("ieos {:?}", b"\r\n".to_vec());
+        let write = |d: &[u8]| format!("write {:?}", d.to_vec());
+        assert_eq!(
+            wire.0,
+            [
+                ieos,
+                write(b"PR1\r"),
+                "read".into(),
+                write(&[ENQ]),
+                "read".into()
+            ]
+        );
+        assert_eq!(job.exchange.lock().unwrap().rec_buf, "0,1.0E-06");
     }
 
     #[test]

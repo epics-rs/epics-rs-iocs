@@ -25,16 +25,15 @@ dbLoadRecords("$(IP)/db/MPC.db", "P=$(PREFIX),PUMP=ip2,PORT=SerialMPC,PA=5,PN=2"
 dbLoadRecords("$(IP)/db/TSP.db", "P=$(PREFIX),TSP=tsp1,PORT=SerialMPC,PA=5")
 
 # --- Pfeiffer TPG261 / TPG262 gauge controller ------------------------------
-# 9600 8N1; the controller frames every line with CR/LF and expects a bare CR.
+# 9600 8N1. devTPG261 sets the CR/LF input EOS on every exchange and writes
+# its own CR and <ENQ>, so the port carries no EOS in either direction.
 drvAsynSerialPortConfigure("SerialTPG", "/dev/ttyS1", 0, 0, 0)
 asynSetOption("SerialTPG", 0, "baud", "9600")
 asynSetOption("SerialTPG", 0, "bits", "8")
 asynSetOption("SerialTPG", 0, "parity", "none")
 asynSetOption("SerialTPG", 0, "stop", "1")
-asynOctetSetInputEos("SerialTPG", 0, "\r\n")
 
-# devTPG261 takes the gauge from each record's INP/OUT, on the octet port
-# itself; it writes the command CR and the <ENQ>, so the port has no output EOS.
+# devTPG261 takes the gauge from each record's INP/OUT, on the octet port itself.
 dbLoadRecords("$(IP)/db/TPG261.db", "P=$(PREFIX),GAUGE=gauge1,PORT=SerialTPG,ADDR=0")
 dbLoadRecords("$(IP)/db/TPG261.db", "P=$(PREFIX),GAUGE=gauge2,PORT=SerialTPG,ADDR=1")
 
