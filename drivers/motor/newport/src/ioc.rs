@@ -2178,6 +2178,13 @@ pub fn pmnc87xx_setup_command() -> CommandDef {
 pub fn pmnc87xx_config_command() -> CommandDef {
     model1_config_command("PMNC87xxConfig", &PMNC87XX, |init, port, addr| {
         let Some(asyn_port) = get_port(port) else {
+            // A missing port is the one connect refusal; connectDevice
+            // returns asynError for it.
+            println!(
+                "drvPMNC:motor_init(), error calling pasynOctetSyncIO->connect port={port} \
+                 error={}",
+                AsynStatus::Error as i32
+            );
             return;
         };
         let Ok(controller) = PmncController::new(asyn_port.handle.clone(), addr, PMNC_TIMEOUT)
@@ -3308,6 +3315,70 @@ mod report {
         assert_eq!(
             driver_report("drvMM4000", 0),
             "    MM4000 controller 0, port=mm4000RepLine, address=0, id: MM4005 Version 2.0 \n"
+        );
+    }
+
+    /// drvPMNC87xx.cc:853-856: a refused connect at motor_init is printf'd.
+    #[epics_rs::base::epics_test]
+    async fn pmnc87xx_prints_a_connect_error_at_ioc_init() {
+        use motor_common::testing::{child_stdout, drvsup_init, in_child};
+        if !in_child() {
+            let out = child_stdout(
+                module_path!(),
+                "pmnc87xx_prints_a_connect_error_at_ioc_init",
+            );
+            let line = "drvPMNC:motor_init(), error calling pasynOctetSyncIO->connect \
+                        port=pmncNowhere error=3\n";
+            assert_eq!(out.matches(line).count(), 1, "{out}");
+            return;
+        }
+        let int = ArgValue::Int;
+        run_command(pmnc87xx_setup_command(), vec![int(1), int(1), int(10)]).await;
+        let config = vec![int(0), ArgValue::String("pmncNowhere".into()), int(0)];
+        run_command(pmnc87xx_config_command(), config).await;
+        drvsup_init().await;
+    }
+
+    /// The errlog drvPMNC87xx.cc's motor_init prints for a card that
+    /// answers `VER` with `ver` and `DRT` with `drt`.
+    async fn pmnc87xx_init_errlog(port: &str, ver: &'static str, drt: &'static str) -> Vec<String> {
+        use motor_common::testing::{LineRig, ioc_init_errlog};
+        let int = ArgValue::Int;
+        run_command(pmnc87xx_setup_command(), vec![int(1), int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new(port, move |last| match last {
+            "VER" => ver.into(),
+            "DRT" => drt.into(),
+            _ => ">".into(),
+        });
+        let config = vec![int(0), ArgValue::String(port.into()), int(0)];
+        run_command(pmnc87xx_config_command(), config).await;
+        ioc_init_errlog("").await
+    }
+
+    /// drvPMNC87xx.cc:919-924: no `VER_STR` in the ident.
+    #[epics_rs::base::epics_test]
+    async fn pmnc87xx_errlogs_an_unknown_version() {
+        assert_eq!(
+            pmnc87xx_init_errlog("pmncNoVer", "Picomotor 2.0", "A0=2>").await,
+            ["drvPMNC87xx.c:motor_init() - unknown version = Picomotor 2.0"]
+        );
+    }
+
+    /// drvPMNC87xx.cc:935-938: a firmware digit other than 0, 5 or 6.
+    #[epics_rs::base::epics_test]
+    async fn pmnc87xx_errlogs_an_invalid_model() {
+        assert_eq!(
+            pmnc87xx_init_errlog("pmncBadModel", "Version 1.9.0", "A0=2>").await,
+            ["drvPMNC87xx:motor_init() - invalid model = Version 1.9.0"]
+        );
+    }
+
+    /// drvPMNC87xx.cc:984-987: a DRT driver type other than 8753 or 8751.
+    #[epics_rs::base::epics_test]
+    async fn pmnc87xx_errlogs_an_invalid_driver() {
+        assert_eq!(
+            pmnc87xx_init_errlog("pmncBadDrt", "Version 1.6.0", "A0=7>").await,
+            ["drvPMNC87xx:motor_init() - invalid driver = 7"]
         );
     }
 

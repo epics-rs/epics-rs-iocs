@@ -50,6 +50,7 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atoi, nint};
 use motor_common::model1::MoveStrings;
@@ -160,17 +161,11 @@ fn parse_int_after_eq(reply: &str) -> Option<i64> {
     s.get(..end)?.parse().ok()
 }
 
-/// Parse a `DRT` line `A{driver}={type}` into a driver-module model
-/// (C: type 1 → 8753, type 2 → 8751).
-fn parse_drt_line(line: &str) -> Option<(i32, PmdModel)> {
+/// Parse a `DRT` line `A{driver}={type}` (C `sscanf(buff, "A%d=%d", …)`).
+fn parse_drt_line(line: &str) -> Option<(i32, i32)> {
     let (a, rest) = line.split_once('=')?;
     let driver: i32 = a.trim().trim_start_matches('A').trim().parse().ok()?;
-    let model = match rest.trim().parse::<i32>().ok()? {
-        1 => PmdModel::Pmd8753,
-        2 => PmdModel::Pmd8751,
-        _ => return None,
-    };
-    Some((driver, model))
+    Some((driver, rest.trim().parse().ok()?))
 }
 
 /// Parse an `MPV` line `A{driver} M{motor}=...` into (driver, motor)
@@ -189,18 +184,27 @@ fn parse_mpv_line(line: &str) -> Option<(i32, i32)> {
 }
 
 /// Firmware digit after [`VER_STR`] → model, plus the changeEOS flag
-/// (firmware `1.5.3`/`1.5.4`). C: `'0'` → 8750, `'5'`/`'6'` → 8752.
-fn model_from_ident(ident: &str) -> Option<(PmncModel, bool)> {
-    let tail = &ident[ident.find(VER_STR)? + VER_STR.len()..];
-    let mut chars = tail.chars();
-    let model = match chars.next()? {
-        '0' => PmncModel::Pmnc8750,
-        '5' | '6' => PmncModel::Pmnc8752,
-        _ => return None,
+/// (firmware `1.5.3`/`1.5.4`). C: `'0'` → 8750, `'5'`/`'6'` → 8752; the
+/// error is the line C errlogs (drvPMNC87xx.cc:922, 937).
+fn model_from_ident(ident: &str) -> Result<(PmncModel, bool), String> {
+    let Some(at) = ident.find(VER_STR) else {
+        return Err(format!(
+            "drvPMNC87xx.c:motor_init() - unknown version = {ident}"
+        ));
+    };
+    let tail = &ident[at + VER_STR.len()..];
+    let model = match tail.chars().next() {
+        Some('0') => PmncModel::Pmnc8750,
+        Some('5' | '6') => PmncModel::Pmnc8752,
+        _ => {
+            return Err(format!(
+                "drvPMNC87xx:motor_init() - invalid model = {ident}"
+            ));
+        }
     };
     // C inspects the char two positions on (the sub-minor digit).
     let change_eos = matches!(tail.as_bytes().get(2), Some(b'3') | Some(b'4'));
-    Some((model, change_eos))
+    Ok((model, change_eos))
 }
 
 fn eos_user(addr: i32) -> AsynUser {
@@ -259,8 +263,11 @@ impl PmncController {
             return Err(pmnc_err("PMNC: no response to VER identity query".into()));
         }
         ctrl.ident = ident;
-        let (model, change_eos) = model_from_ident(&ctrl.ident)
-            .ok_or_else(|| pmnc_err(format!("PMNC: unknown version = {}", ctrl.ident)))?;
+        let refuse = |line: String| {
+            errlog_vprintf(format_args!("{line}\n"));
+            pmnc_err(line)
+        };
+        let (model, change_eos) = model_from_ident(&ctrl.ident).map_err(refuse)?;
         ctrl.model = model;
         ctrl.change_eos = change_eos;
 
@@ -288,9 +295,14 @@ impl PmncController {
                     let Some((driver_num, driver_type)) = parse_drt_line(line.trim()) else {
                         continue;
                     };
-                    let channels = match driver_type {
-                        PmdModel::Pmd8753 => 3,
-                        PmdModel::Pmd8751 => 1,
+                    let (driver_type, channels) = match driver_type {
+                        1 => (PmdModel::Pmd8753, 3),
+                        2 => (PmdModel::Pmd8751, 1),
+                        other => {
+                            return Err(refuse(format!(
+                                "drvPMNC87xx:motor_init() - invalid driver = {other}"
+                            )));
+                        }
                     };
                     for motor_num in 0..channels {
                         axes.push(AxisDef {
@@ -1027,22 +1039,28 @@ mod tests {
     fn model_and_change_eos_from_ident() {
         assert_eq!(
             model_from_ident("New Focus Version 1.0.2"),
-            Some((PmncModel::Pmnc8750, false))
+            Ok((PmncModel::Pmnc8750, false))
         );
         assert_eq!(
             model_from_ident("Version 1.5.4"),
-            Some((PmncModel::Pmnc8752, true))
+            Ok((PmncModel::Pmnc8752, true))
         );
         assert_eq!(
             model_from_ident("Version 1.5.3"),
-            Some((PmncModel::Pmnc8752, true))
+            Ok((PmncModel::Pmnc8752, true))
         );
         assert_eq!(
             model_from_ident("Version 1.6.0"),
-            Some((PmncModel::Pmnc8752, false))
+            Ok((PmncModel::Pmnc8752, false))
         );
-        assert_eq!(model_from_ident("Version 1.9.0"), None);
-        assert_eq!(model_from_ident("no version here"), None);
+        assert_eq!(
+            model_from_ident("Version 1.9.0"),
+            Err("drvPMNC87xx:motor_init() - invalid model = Version 1.9.0".into())
+        );
+        assert_eq!(
+            model_from_ident("no version here"),
+            Err("drvPMNC87xx.c:motor_init() - unknown version = no version here".into())
+        );
     }
 
     #[test]
@@ -1062,10 +1080,11 @@ mod tests {
     }
 
     #[test]
-    fn drt_line_maps_type_to_model() {
-        assert_eq!(parse_drt_line("A0=1"), Some((0, PmdModel::Pmd8753)));
-        assert_eq!(parse_drt_line("A3=2"), Some((3, PmdModel::Pmd8751)));
-        assert_eq!(parse_drt_line("A1=9"), None);
+    fn drt_line_reads_driver_and_type() {
+        assert_eq!(parse_drt_line("A0=1"), Some((0, 1)));
+        assert_eq!(parse_drt_line("A3=2"), Some((3, 2)));
+        assert_eq!(parse_drt_line("A1=9"), Some((1, 9)));
+        assert_eq!(parse_drt_line("A1"), None);
     }
 
     #[test]
