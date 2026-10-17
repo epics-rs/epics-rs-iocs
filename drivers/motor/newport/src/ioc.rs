@@ -3318,6 +3318,39 @@ mod report {
         );
     }
 
+    /// drvESP300.cc:671-676, now at motor_init rather than ESP300Config.
+    #[epics_rs::base::epics_test]
+    async fn esp300_errlogs_a_connect_error_at_ioc_init() {
+        use motor_common::testing::ioc_init_errlog;
+        let int = ArgValue::Int;
+        run_command(esp300_setup_command(), vec![int(1), int(10)]).await;
+        let config = vec![int(0), ArgValue::String("espNowhere".into()), int(0)];
+        run_command(esp300_config_command(), config).await;
+        assert_eq!(
+            ioc_init_errlog("").await,
+            ["drvESP300.c:motor_init: ASYN connect error = 3"]
+        );
+    }
+
+    /// drvMM4000.cc:728-733, now at motor_init rather than MM4000Config.
+    #[epics_rs::base::epics_test]
+    async fn mm4000_errlogs_an_invalid_model_at_ioc_init() {
+        use motor_common::testing::{LineRig, ioc_init_errlog};
+        let int = ArgValue::Int;
+        run_command(mm4000_setup_command(), vec![int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new("mm4000Odd", |last| match last {
+            "TH;" => "TH 0".into(),
+            "VE;" => "VEXPS 1.0".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("mm4000Odd".into()), int(0)];
+        run_command(mm4000_config_command(), config).await;
+        assert_eq!(
+            ioc_init_errlog("").await,
+            ["drvMM4000.c:motor_init() - invalid model = XPS 1.0"]
+        );
+    }
+
     /// drvPMNC87xx.cc:853-856: a refused connect at motor_init is printf'd.
     #[epics_rs::base::epics_test]
     async fn pmnc87xx_prints_a_connect_error_at_ioc_init() {
