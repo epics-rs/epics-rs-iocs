@@ -168,7 +168,6 @@ remain open upstream defects the port did not guess at.
 | 57 | `serval_http.cpp:91` — `strip_quotes` drops first/last char unconditionally: `null` → `"ul"` | fixed-in-port (strings unquoted, everything else dumped) |
 | 62 | `serval_http.cpp:1518,1823,1930,2320,2367,2372` — booleans PUT as JSON strings, read back as bools at :1269 | fixed-in-port (JSON booleans) |
 | 64 | `serval_http.cpp:1198` — `ADMaxSizeX = PixCount / NumberOfRows` unguarded → SIGFPE | fixed-in-port (guarded) |
-| 65 | `serval_http.cpp:1190` — `ADSerialNumber` set from the software version | fixed-in-port (`Info.Boards[0].ChipboardId`) |
 | 66 | `serval_http.cpp:1603/1881/image-channel` — three disagreeing "is this a stream" predicates; a `tcp://` image channel still gets a `FilePattern` | fixed-in-port (one `is_stream()` rule) |
 | 73 | `serval_stream.cpp:487,1353` — `int` overflow before the range check | fixed-in-port (checked `usize` math + dimension caps) |
 | 74 | `serval_stream.cpp:568-1443`; `histogram_io.cpp:352` — unconditional `__builtin_bswap` (breaks on big-endian hosts) | fixed-in-port (`from_be_bytes`) |

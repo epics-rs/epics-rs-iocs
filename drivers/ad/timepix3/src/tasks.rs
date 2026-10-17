@@ -1095,13 +1095,9 @@ fn publish_detector(
     w.text(p.iface_name, 0, &info_text("IfaceName"));
     w.text(p.sw_version, 0, &info_text("SW_version"));
     w.text(p.fw_version, 0, &info_text("FW_version"));
-    // UPSTREAM DEFECT (serval_http.cpp:1341-1342): C sets ADSerialNumber from
-    // `Info.SW_version` — the Serval software version, not a serial number —
-    // and the line that would have used the chipboard ID sits commented out
-    // right above it. The chipboard ID is the detector's identity.
-    if let Some(id) = detector.pointer("/Info/Boards/0/ChipboardId") {
-        w.text(ad.base.serial_number, 0, &serval::json_to_string(id));
-    }
+    // serval_http.cpp:1341-1342: C publishes the software version, not the
+    // chipboard ID it commented out.
+    w.text(ad.base.serial_number, 0, &info_text("SW_version"));
     w.text(ad.base.firmware_version, 0, &info_text("FW_version"));
 
     // parse_detector_response checked these are ints and the rows positive.
@@ -5206,7 +5202,7 @@ mod tests {
         let (url, _log) = logging_serval(&[], |path| match path {
             "/detector" => {
                 r#"{"Info":{"PixCount":131072,"RowLen":2,"NumberOfChips":2,
-                "NumberOfRows":256,"MpxType":0,"ChipType":"MPX3",
+                "NumberOfRows":256,"MpxType":0,"ChipType":"MPX3","SW_version":"3.3.2",
                 "Boards":[{"ChipboardId":"B","IpAddress":"ip","Chips":[{"Name":"W1"},{"Id":7}]}]},
                 "Health":[{"VDD":[1.5,0.1,0.6],"ChipTemperatures":[30.9,41]},
                           {"VDD":[2.5,0.2,0.7]}],
@@ -5276,6 +5272,10 @@ mod tests {
         assert_eq!(octet_set(&u, p.boards_ch3).as_deref(), Some(""));
         assert_eq!(octet_set(&u, p.boards2_id).as_deref(), Some(""));
         assert_eq!(octet_set(&u, p.iface_name).as_deref(), Some(""));
+        assert_eq!(
+            octet_set(&u, ad.base.serial_number).as_deref(),
+            Some("3.3.2")
+        );
         assert_eq!(
             octet_set(&u, p.chip_temperature).as_deref(),
             Some("[30.9,41]")
