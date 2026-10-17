@@ -100,9 +100,6 @@
 //! - **Per-model controllers**: `PIE517Controller` and `PIE727Controller`
 //!   (piezo-based, each with its own init and status quirks); those
 //!   controllers run on [`Model::Motor`].
-//! - **`TranslatePIError`**: the 2172-line errcode→string table
-//!   (`TranslatePIError.cpp`/`picontrollererrors.h`) is not ported; only the
-//!   numeric `ERR?` code (`atoi`) is surfaced, in error messages.
 //! - **`SVO?` (`getServo`)**: implemented here as a protocol primitive (the
 //!   task spec calls it out explicitly), but — matching upstream — the
 //!   generic motor axis's `poll` never calls it; servo state comes from the
@@ -217,6 +214,14 @@ fn counts_per_unit(numerator: i32, denominator: i32) -> f64 {
         1.0
     } else {
         f64::from(numerator) / f64::from(denominator)
+    }
+}
+
+/// C `TranslatePIError(epicsInt32)`.
+fn error_message(error: i32) -> std::borrow::Cow<'static, str> {
+    match crate::pi_errors::message(error) {
+        Some(message) => message.into(),
+        None => format!("Unknown Error - number {error}").into(),
     }
 }
 
@@ -513,9 +518,20 @@ impl PIGCS2Controller {
         Ok(names)
     }
 
+    /// C `getGCSError`: a non-zero code prints, with its message, once
+    /// there is a log sink.
     fn get_gcs_error(&self) -> AsynResult<i32> {
-        let reply = self.query("ERR?")?;
-        Ok(atoi(&reply))
+        let err = atoi(&self.query("ERR?")?);
+        if err != 0 && self.log_sink.is_some() {
+            self.print(format_args!(
+                "PIGCSController::getGCSError() GCS error code = {err}\n"
+            ));
+            self.print(format_args!(
+                "PIGCSController::getGCSError() GCS error, {}\n",
+                error_message(err)
+            ));
+        }
+        Ok(err)
     }
 
     fn check_ok(&self) -> AsynResult<()> {
@@ -1985,6 +2001,45 @@ mod tests {
             "{on_axis}"
         );
         assert!(!on_line.contains("moveCts"), "{on_line}");
+    }
+
+    /// `PIGCSController::getGCSError` (PIGCSController.cpp:260-292) prints
+    /// a non-zero code and its `TranslatePIError` message, once a log sink
+    /// is set.
+    #[test]
+    fn a_gcs_error_prints_its_code_and_message_on_the_log_sink() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2ErrLine", |last| {
+            if last == "ERR?" { "2" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2ErrLine")));
+        let before = traced("gcs2ErrLine", || {
+            assert_eq!(ctrl.lock().unwrap().get_gcs_error().unwrap(), 2);
+        });
+        assert_eq!(before, "");
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2ErrCtl");
+        let text = traced("gcs2ErrCtl", || {
+            let _ = axis.set_closed_loop(&AsynUser::new(0), true);
+        });
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.split_once(" PIGCSController::"))
+            .map(|(_, rest)| rest)
+            .collect();
+        assert_eq!(
+            lines[..2],
+            [
+                "getGCSError() GCS error code = 2",
+                "getGCSError() GCS error, Unknown command"
+            ],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unlisted_gcs_error_is_unknown() {
+        assert_eq!(error_message(10), "Controller was stopped by command");
+        assert_eq!(error_message(-7), "Timeout error");
+        assert_eq!(error_message(123456), "Unknown Error - number 123456");
     }
 
     #[test]
