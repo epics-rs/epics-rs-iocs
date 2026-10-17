@@ -641,6 +641,18 @@ impl AsynMotor for A3200Axis {
         Ok(())
     }
 
+    /// `motorAxisforceCallback` (drvA3200Asyn.cc:688-700); the status update it asks for
+    /// is the poll that follows it.
+    fn force_callback(&mut self, _user: &AsynUser) {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "motorAxisforceCallback: request card {}, axis {} status update\n",
+                self.card, self.axis
+            ),
+        );
+    }
+
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         self.log.print(
             TraceMask::FLOW,
@@ -1141,7 +1153,8 @@ mod tests {
         assert!(!FAULT_ACK_ALL_CODES.contains(&1));
     }
 
-    /// drvA3200Asyn.cc:488-489, :575-576, :675: move, home and abort print
+    /// drvA3200Asyn.cc:488-489, :575-576, :675, :693: move, home, abort and
+    /// forceCallback print
     /// their FLOW line with the card the config gave the axis; the move
     /// names the axis, home and abort number it.
     #[epics_rs::base::epics_test]
@@ -1163,6 +1176,7 @@ mod tests {
         axis.move_absolute(&user, 1.5, 0.5, 2.0, 3.0).unwrap();
         axis.home(&user, 0.0, 1.0, 1.0, false).unwrap();
         axis.stop(&user, 1.0).unwrap();
+        axis.force_callback(&user);
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let lines: Vec<_> = text
@@ -1175,6 +1189,7 @@ mod tests {
                 "Set card 3, axis Y move to 1.500000, min vel=0.500000, max_vel=2.000000, accel=3.000000",
                 "motorAxisHome: set card 3, axis 2 to home, forwards = 0",
                 "Abort on card 3, axis 2",
+                "motorAxisforceCallback: request card 3, axis 2 status update",
             ],
             "{text}"
         );

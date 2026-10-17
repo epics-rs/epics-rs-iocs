@@ -558,6 +558,18 @@ impl AsynMotor for EnsembleAxis {
         Ok(())
     }
 
+    /// `motorAxisforceCallback` (drvEnsembleAsyn.cc:671-683); the status update it asks for
+    /// is the poll that follows it.
+    fn force_callback(&mut self, _user: &AsynUser) {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "motorAxisforceCallback: request card {}, axis {} status update\n",
+                self.card, self.axis
+            ),
+        );
+    }
+
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let axis = self.axis;
         self.log.print(
@@ -1191,8 +1203,8 @@ mod tests {
         assert_eq!(TRAVEL_LIMIT_FAULT_MASK, 0x0C);
     }
 
-    /// drvEnsembleAsyn.cc:497-498, :562-563, :662: move, home and abort
-    /// print their FLOW line with the card the config gave the axis.
+    /// drvEnsembleAsyn.cc:497-498, :562-563, :662, :676: move, home, abort
+    /// and forceCallback print their FLOW line with the card the config gave the axis.
     #[epics_rs::base::epics_test]
     async fn commands_print_their_flow_line_with_the_card() {
         use epics_rs::asyn::manager::PortManager;
@@ -1213,6 +1225,7 @@ mod tests {
         axis.move_relative(&user, -1.0, 0.0, 2.0, 0.0).unwrap();
         axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
         axis.stop(&user, 1.0).unwrap();
+        axis.force_callback(&user);
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let lines: Vec<_> = text
@@ -1226,6 +1239,7 @@ mod tests {
                 "Set card 3, axis 2 move to -1.000000, min vel=0.000000, max_vel=2.000000, accel=0.000000",
                 "motorAxisHome: set card 3, axis 2 to home, forwards = 1",
                 "Abort on card 3, axis 2",
+                "motorAxisforceCallback: request card 3, axis 2 status update",
             ],
             "{text}"
         );
