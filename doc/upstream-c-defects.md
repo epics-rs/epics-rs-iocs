@@ -168,9 +168,7 @@ remain open upstream defects the port did not guess at.
 | 56 | `serval_http.cpp:49` — base64 `strchr` matches the terminating NUL: byte 0 decodes as index 64 | fixed-in-port (strict decoder, `None` on non-alphabet byte) |
 | 57 | `serval_http.cpp:91` — `strip_quotes` drops first/last char unconditionally: `null` → `"ul"` | fixed-in-port (strings unquoted, everything else dumped) |
 | 58 | `serval_http.cpp:1296` — mangled name fed to `std::map::operator[]`, which inserts it and reports orientation UP | fixed-in-port (`orientation_index` returns `Option`) |
-| 59 | `serval_http.cpp:37` — every GET carries junk `?anon=true&key=value` | fixed-in-port (not sent) |
 | 60 | `serval_http.cpp:77-87` — Basic auth applied on GET but not PUT/getJson | fixed-in-port (every request) |
-| 61 | `serval_http.cpp:185,569,1490,2199,2254` — HTTP calls with no timeout | fixed-in-port (5 s poll / 10 s config) |
 | 62 | `serval_http.cpp:1518,1823,1930,2320,2367,2372` — booleans PUT as JSON strings, read back as bools at :1269 | fixed-in-port (JSON booleans) |
 | 63 | `serval_http.cpp:2286-2363` — enum index into a `json` array via `operator[]`: out-of-range grows the array with nulls, PUT carries `null` | fixed-in-port (`enum_name` errors on out-of-range) |
 | 64 | `serval_http.cpp:1198` — `ADMaxSizeX = PixCount / NumberOfRows` unguarded → SIGFPE | fixed-in-port (guarded) |
