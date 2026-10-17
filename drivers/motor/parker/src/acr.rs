@@ -48,6 +48,7 @@ use epics_rs::motor::controller_port::{
 };
 
 use motor_common::util::{atof, atoi};
+use motor_common::{AxisReport, ControllerReport};
 
 /// Response buffer size.
 const READ_BUF: usize = 64;
@@ -147,13 +148,22 @@ struct AcrParamIds {
 pub struct AcrParams {
     controller: Arc<Mutex<AcrController>>,
     ids: Option<AcrParamIds>,
+    /// C's `movingPollPeriod_`/`idlePollPeriod_`, in seconds.
+    moving_poll_s: f64,
+    idle_poll_s: f64,
 }
 
 impl AcrParams {
-    pub fn new(controller: Arc<Mutex<AcrController>>) -> Self {
+    pub fn new(
+        controller: Arc<Mutex<AcrController>>,
+        moving_poll_ms: u64,
+        idle_poll_ms: u64,
+    ) -> Self {
         Self {
             controller,
             ids: None,
+            moving_poll_s: moving_poll_ms as f64 / 1000.0,
+            idle_poll_s: idle_poll_ms as f64 / 1000.0,
         }
     }
 
@@ -191,6 +201,28 @@ impl WriteHook for AcrWriteHook {
 }
 
 impl ControllerParams for AcrParams {
+    /// C `ACRController::report` (ACRMotorDriver.cpp:108-120).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "ACR motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll_s,
+            self.idle_poll_s
+        );
+        if level > 0 {
+            let ctrl = self.lock();
+            let _ = writeln!(out, "  binary input = 0x{:x}", ctrl.binary_in);
+            let _ = writeln!(
+                out,
+                "  binary output readback = 0x{:x}",
+                ctrl.binary_out_rbv
+            );
+        }
+        ctx.report(out, level);
+    }
+
     fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
         Some(Arc::new(AcrWriteHook))
     }
@@ -274,8 +306,46 @@ fn acr_err(message: impl Into<String>) -> AsynError {
 }
 
 /// One ACR axis sharing a controller. Implements [`AsynMotor`].
+/// The members C `ACRAxis::poll` stores as it reads them, which
+/// `ACRAxis::report` prints.
+#[derive(Default)]
+struct AcrAxisState {
+    encoder_position: f64,
+    theory_position: f64,
+    limits: i32,
+    flags: i32,
+}
+
+/// C `ACRAxis::report` (ACRMotorDriver.cpp:317-333).
+pub struct AcrAxisReport {
+    axis_no: i32,
+    pulses_per_unit: f64,
+    state: Arc<Mutex<AcrAxisState>>,
+}
+
+impl AxisReport for AcrAxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = write!(
+                out,
+                "  axis {}\n    pulsesPerUnit_ = {:.6}\n    encoder position={:.6}\n    \
+                 theory position={:.6}\n    limits=0x{:x}\n    flags=0x{:x}\n",
+                self.axis_no,
+                self.pulses_per_unit,
+                s.encoder_position,
+                s.theory_position,
+                s.limits,
+                s.flags
+            );
+        }
+    }
+}
+
 pub struct AcrAxis {
     controller: Arc<Mutex<AcrController>>,
+    axis_no: i32,
+    state: Arc<Mutex<AcrAxisState>>,
     /// Axis name used in commands (`AXIS<n>`).
     name: String,
     /// Pulses per engineering unit (read from the controller); `None` when
@@ -302,6 +372,8 @@ impl AcrAxis {
         let pulses_per_unit = reply.ok().map(|reply| atof(&reply));
         Self {
             controller,
+            axis_no,
+            state: Arc::default(),
             name,
             pulses_per_unit,
             encoder_pos_reg: 12290 + 256 * axis_no,
@@ -313,6 +385,20 @@ impl AcrAxis {
 
     fn lock(&self) -> MutexGuard<'_, AcrController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The axis's `report`. C prints an unset `pulsesPerUnit_` when the
+    /// PPU query failed; 0 stands for it.
+    pub fn report(&self) -> AcrAxisReport {
+        AcrAxisReport {
+            axis_no: self.axis_no,
+            pulses_per_unit: self.pulses_per_unit.unwrap_or(0.0),
+            state: self.state.clone(),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, AcrAxisState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Convert an engineering value to controller units (÷ PPU). C divides by
@@ -454,12 +540,16 @@ impl AsynMotor for AcrAxis {
         let ctrl = self.lock();
 
         let encoder_position = atof(&ctrl.read_reg(self.encoder_pos_reg)?);
+        self.state().encoder_position = encoder_position;
         let theory_position = atof(&ctrl.read_reg(self.theory_pos_reg)?);
+        self.state().theory_position = theory_position;
 
         let flags = atoi(&ctrl.read_reg(self.flags_reg)?);
+        self.state().flags = flags;
         let moving = (flags & FLAG_MOVING) != 0;
 
         let limits = atoi(&ctrl.read_reg(self.limits_reg)?);
+        self.state().limits = limits;
         let high_limit = (limits & 0x1) != 0;
         let low_limit = (limits & 0x2) != 0;
         let at_home = (limits & 0x4) != 0;
@@ -624,9 +714,13 @@ mod tests {
             .unwrap();
         let handle = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let ctrl = Arc::new(Mutex::new(AcrController::new(handle)));
-        let port =
-            register_controller_port(&open_owner(), "acrRegs", 1, AcrParams::new(ctrl.clone()))
-                .unwrap();
+        let port = register_controller_port(
+            &open_owner(),
+            "acrRegs",
+            1,
+            AcrParams::new(ctrl.clone(), 100, 1000),
+        )
+        .unwrap();
         let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(AcrAxis::new(ctrl, 0)));
         let sent = || std::mem::take(&mut *written.lock().unwrap());
         assert_eq!(sent(), ["ECHO 4", "?P4096", "?P4097", "AXIS0 PPU"]);
@@ -691,9 +785,13 @@ mod tests {
         let (handle, _) =
             SyncIOHandle::connect_port("ACR_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let ctrl = Arc::new(Mutex::new(AcrController::new(handle)));
-        let port =
-            register_controller_port(&open_owner(), "acrTrace", 1, AcrParams::new(ctrl.clone()))
-                .unwrap();
+        let port = register_controller_port(
+            &open_owner(),
+            "acrTrace",
+            1,
+            AcrParams::new(ctrl.clone(), 100, 1000),
+        )
+        .unwrap();
         let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(AcrAxis::new(ctrl, 0)));
         let user = TraceUser::Asyn {
             port: "acrTrace".into(),
