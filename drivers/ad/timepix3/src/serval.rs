@@ -182,14 +182,8 @@ pub const POLARITIES: [&str; 2] = ["Positive", "Negative"];
 /// `TPX3_TDC0` / `TPX3_TDC1`.
 pub const TDC_MODES: [&str; 6] = ["P0123", "N0123", "PN0123", "P0", "N0", "PN0"];
 
-/// The name behind an enum index.
-///
-/// UPSTREAM DEFECT (serval_http.cpp:2286, 2322, 2329, 2335, 2355, 2363): C
-/// indexes a `json` array with the raw PV value — `json::operator[]` on a
-/// non-const array *grows the array with nulls* for an out-of-range index, so
-/// an out-of-range enum silently PUTs `"TriggerMode": null` (and a negative
-/// value is cast to `size_type`). Here an out-of-range index is an error the
-/// caller has to handle.
+/// The name behind an enum index; `None` out of range, which the callers
+/// refuse as C's range checks do (serval_http.cpp:1805-2146).
 pub fn enum_name(table: &[&'static str], index: i32) -> Option<&'static str> {
     usize::try_from(index)
         .ok()
@@ -1247,13 +1241,10 @@ fn dump_double(out: &mut String, d: f64) {
 
 /// C `strip_quotes` (serval_http.cpp:91).
 ///
-/// UPSTREAM DEFECT (serval_http.cpp:91-95): C removes the first and last
+/// UPSTREAM DEFECT (serval_http.cpp:44-48): C removes the first and last
 /// character unconditionally, so a `dump()` of a non-string (`null`, a number,
-/// an array) is mangled — `null` becomes `ul`, and that mangled key is then
-/// used to look up the detector orientation in a `std::map`, whose
-/// `operator[]` *inserts* it with value 0 and silently reports orientation UP
-/// (serval_http.cpp:1296). Here a JSON string yields its contents and anything
-/// else its compact encoding.
+/// an array) is mangled — `null` becomes `ul`, `1234` becomes `23`. Here a
+/// JSON string yields its contents and anything else its compact encoding.
 pub fn json_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),

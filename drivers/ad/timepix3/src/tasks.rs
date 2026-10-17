@@ -856,7 +856,7 @@ pub(crate) fn read_detector(
         ad.base.firmware_version,
         detector.pointer("/Info/FW_version"),
     );
-    // UPSTREAM DEFECT (serval_http.cpp:1190): C sets ADSerialNumber from
+    // UPSTREAM DEFECT (serval_http.cpp:1341-1342): C sets ADSerialNumber from
     // `Info.SW_version` — the Serval software version, not a serial number —
     // and the line that would have used the chipboard ID sits commented out
     // right above it. The chipboard ID is the detector's identity.
@@ -1452,11 +1452,9 @@ impl StreamKind {
 /// and a stream that ends or fails ends the run for the rest of that
 /// acquisition.
 ///
-/// C creates these threads inside `acquireStart` and never joins the one that
-/// stops itself (UPSTREAM DEFECT, acquire.cpp:625-628: `epicsThreadMustJoin` is
-/// skipped when the callback thread *is* the caller, leaking a joinable thread
-/// on every DA_IDLE stop). Here each worker is created once and parks between
-/// runs.
+/// C starts these threads per acquisition (`startStreamWorker`,
+/// acquire.cpp:132-157) and joins them in `stopAndJoinStreamWorkers`
+/// (:159-199); here each worker is created once and parks between runs.
 async fn stream_worker(ctx: Arc<Ctx>, kind: StreamKind) {
     let worker = kind.worker(&ctx.shared);
     let mut served = None;

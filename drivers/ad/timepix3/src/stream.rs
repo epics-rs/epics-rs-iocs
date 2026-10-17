@@ -7,17 +7,6 @@
 //! of **big-endian** payload. There is no trailer and no length prefix outside
 //! the header, so a decoder that miscounts consumed bytes by even one desyncs
 //! the stream permanently.
-//!
-//! UPSTREAM DEFECT (serval_stream.cpp:524, :1389, histogram_io.cpp:311): C
-//! computes the payload bytes it already holds as
-//! `remaining = total_read - (newline_pos - line_buffer + 1)`, where
-//! `total_read` counts from the *read buffer's* start but `line_buffer` is the
-//! caller's `json_start` — a different base whenever the frame did not begin at
-//! offset 0. The difference under-counts (re-reading payload bytes as a header
-//! → permanent desync) or over-counts (`memcpy` from past the end of the read
-//! buffer → heap over-read). This decoder owns the buffer and consumes exactly
-//! `header_len + 1 + payload_len` bytes per frame, so the class of bug cannot
-//! be expressed.
 
 use serde_json::Value;
 
@@ -428,8 +417,8 @@ impl Pending {
 
 /// The payload is big-endian on the wire.
 ///
-/// UPSTREAM DEFECT (serval_stream.cpp:568, :578, :1433, :1443,
-/// histogram_io.cpp:352): C calls `__builtin_bswap16/32` unconditionally, which
+/// UPSTREAM DEFECT (serval_stream.cpp:210, :218, :848, :860,
+/// histogram_io.cpp:331): C calls `__builtin_bswap16/32` unconditionally, which
 /// is only a network-to-host conversion on a little-endian host — on a
 /// big-endian host it corrupts every pixel. `from_be_bytes` is correct on both.
 fn decode_be(payload: &[u8], format: PixelFormat) -> Vec<u32> {

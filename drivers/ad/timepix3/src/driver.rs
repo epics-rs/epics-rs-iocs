@@ -1604,7 +1604,7 @@ impl TimePix3Driver {
         Ok(())
     }
 
-    /// C `uploadBPC` / `uploadDACS` (mask_io.cpp:534-562,
+    /// C `uploadBPC` / `uploadDACS` (mask_io.cpp:534-563,
     /// serval_http.cpp:1668-1695): Serval loads the file from its own
     /// filesystem, so only the resolved path travels.
     fn config_load(&mut self, format: &str, path: usize, name: usize) -> AsynResult<()> {
@@ -1738,7 +1738,7 @@ impl TimePix3Driver {
         Ok(())
     }
 
-    /// C `readBPCfile` (mask_io.cpp:582).
+    /// C `readBPCfile` (mask_io.cpp:586).
     fn read_bpc(&mut self) -> AsynResult<Vec<u8>> {
         let (dir, name) = (
             self.text(self.p.bp_c_file_path, 0),
@@ -1756,7 +1756,7 @@ impl TimePix3Driver {
         Ok(bpc)
     }
 
-    /// C `writeBPCfile` (mask_io.cpp:645-723): write the edited BPC to the
+    /// C `writeBPCfile` (mask_io.cpp:639-720): write the edited BPC to the
     /// mask file name, then have Serval load *that* file.
     fn write_mask_file(&mut self, bpc: &[u8]) -> AsynResult<()> {
         let dir = self.text(self.p.bp_c_file_path, 0);
@@ -1773,7 +1773,7 @@ impl TimePix3Driver {
             message: format!("timepix3: writing {}: {e}", path.display()),
         })?;
 
-        // mask_io.cpp:708-719: uploadBPC loads the mask under BPCFileName,
+        // mask_io.cpp:707-718: uploadBPC loads the mask under BPCFileName,
         // which then reads back the operator's file again.
         let bpc_name = self.text(self.p.bp_c_file_name, 0);
         self.set_text(self.p.bp_c_file_name, &name)?;
@@ -5138,7 +5138,7 @@ mod tests {
 
     /// The mask write uploads through uploadBPC, so its reply is HttpCode
     /// and WriteMsg and BPCFileName comes back afterwards
-    /// (mask_io.cpp:559-560, :708-719).
+    /// (mask_io.cpp:559-560, :707-718).
     #[test]
     fn the_mask_write_uploads_through_upload_bpc() {
         let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);

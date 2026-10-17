@@ -2,8 +2,9 @@
 //!
 //! In C this is a pile of `ADTimePix` members guarded by three `epicsMutex`es
 //! — and the stream workers reach straight into the asyn parameter library
-//! without holding the port lock (UPSTREAM DEFECT, serval_stream.cpp:582-700,
-//! :1447-1533, histogram_io.cpp:430-700). Here the workers read the few
+//! without holding the port lock (UPSTREAM DEFECT: `processPrvImgDataLine`,
+//! `processImgDataLine`, serval_stream.cpp:92-230, :729-870;
+//! `processPrvHstDataLine`, histogram_io.cpp:162-400). Here the workers read the few
 //! parameters they need from [`ParamMirror`] and hand their writes to
 //! [`PortJobs`], so neither waits for the port: a stop that holds the port
 //! through the workers' drain, as C's does, still sees them drain.

@@ -59,13 +59,7 @@ impl HttpError {
 /// The base64 alphabet Serval encodes `PixelConfig` with.
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Decode standard base64.
-///
-/// UPSTREAM DEFECT (serval_http.cpp:49): C looks the character up with
-/// `strchr(kChars, c)`, which *matches the terminating NUL* for `c == 0` and
-/// returns index 64 — a NUL byte in the payload is silently decoded as a valid
-/// 6-bit group instead of failing. C also validates neither the padding nor the
-/// length. This returns `None` for any byte outside the alphabet.
+/// Decode standard base64; `None` for any byte outside the alphabet.
 pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
     let bytes: Vec<u8> = input
         .bytes()
