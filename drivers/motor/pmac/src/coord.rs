@@ -274,10 +274,24 @@ impl PmacCoordSystem {
         // A failed read leaves C's position buffer uninitialised; that
         // garbage is not posted here.
         let raw = self.transfer(1, &query, true)?;
-        let response = String::from_utf8_lossy(&raw);
-        // strtod reads 0 past the end of a short reply, which C posts.
-        let mut positions = parse_cs_positions(response.trim_matches('\0'), CS_AXES);
-        positions.resize(CS_AXES, 0.0);
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let response = String::from_utf8_lossy(&raw[..end]);
+        let positions = parse_cs_positions(&response, CS_AXES)
+            .into_iter()
+            .map(|(position, underflow)| {
+                if underflow {
+                    self.trace.print(
+                        TraceMask::ERROR,
+                        0,
+                        format_args!(
+                            "drvPmacAxisGetStatus: not all status values returned. Status: \
+                             0\nCommand :{query}\nResponse1:{response}\n"
+                        ),
+                    );
+                }
+                position
+            })
+            .collect();
 
         let [s0, s1, s2] = self.status;
         let poll = CsPoll {

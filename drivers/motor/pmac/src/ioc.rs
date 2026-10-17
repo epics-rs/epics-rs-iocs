@@ -1519,6 +1519,38 @@ mod tests {
         assert_eq!(axis.poll(&AsynUser::new(0)).unwrap().position, 0.0);
     }
 
+    /// pmacAsynCoord.c:636-643: each position is one strtod from where the
+    /// last stopped, and an underflow to 0 prints C's Response1 line.
+    #[test]
+    fn cs_positions_are_successive_strtods() {
+        let (rt, rig) = publish_scripted("pmacCsRange");
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let trace = MotorTrace::new("pmacCsRange", 0);
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(
+            io,
+            trace,
+            9109,
+            2,
+            0,
+            Duration::ZERO,
+        )));
+        let mut a = PmacCsAxis::new(system.clone(), 1).unwrap();
+        let mut b = PmacCsAxis::new(system.clone(), 2).unwrap();
+        let mut c = PmacCsAxis::new(system, 3).unwrap();
+        let own = TraceCapture::on("pmacCsRange");
+        let user = AsynUser::new(0);
+        rig.answer("&2??", b"000000\r020000\r000000\r");
+        rig.answer("&2Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"1e-400\r0.5abc 7\r");
+        assert_eq!(a.poll(&user).unwrap().position, 0.0);
+        assert_eq!(
+            own.take(),
+            "drvPmacAxisGetStatus: not all status values returned. Status: 0\n\
+             Command :&2Q81Q82Q83Q84Q85Q86Q87Q88Q89\nResponse1:1e-400\r0.5abc 7\r\n"
+        );
+        assert_eq!(b.poll(&user).unwrap().position, 5000.0);
+        assert_eq!(c.poll(&user).unwrap().position, 0.0);
+    }
+
     /// pmacController.cpp:457/463 `%f`: glibc's nan, sign bit included.
     #[test]
     fn a_nan_soft_limit_is_written_as_c_prints_it() {
