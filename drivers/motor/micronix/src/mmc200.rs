@@ -33,6 +33,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi};
+use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
@@ -126,6 +127,71 @@ fn parse_position(reply: &str) -> (f64, f64) {
     }
 }
 
+/// The controller's poll periods, in seconds, and `ignoreLimits_`, for its
+/// report.
+pub struct Mmc200Params {
+    pub moving_poll: f64,
+    pub idle_poll: f64,
+    pub ignore_limits: bool,
+}
+
+impl ControllerParams for Mmc200Params {
+    /// C `MMC200Controller::report` (MMC200Driver.cpp:90-101).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = write!(
+            out,
+            "MMC-200 motor driver\n  port name={}\n  num axes={}\n  moving poll period={:.6}\n  \
+             idle poll period={:.6}\n  ignore limits={}\n",
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll,
+            self.idle_poll,
+            i32::from(self.ignore_limits),
+        );
+        ctx.report(out, level);
+    }
+}
+
+/// What C's `MMC200Axis::report` prints (MMC200Driver.cpp:281-298): the
+/// axis's constructor probes, which never change. The MMC-ETH module's are
+/// 0, where C leaves them unset.
+#[derive(Default)]
+pub struct Mmc200AxisReport {
+    axis: usize,
+    axis_index: i32,
+    version: String,
+    model: i32,
+    closed_loop: i32,
+    rez: i32,
+    micro_steps: i32,
+    encoder_resolution: f64,
+    resolution: f64,
+    max_velocity: f64,
+}
+
+impl AxisReport for Mmc200AxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let _ = write!(
+                out,
+                "  axis {}\n  axis index {}\n  version {}\n  model {}\n  feedback mode {}\n  \
+                 rez {}\n  micro steps {}\n  encoder resolution {:.6}\n  resolution {:.6}\n  \
+                 max velocity {:.6}\n",
+                self.axis,
+                self.axis_index,
+                self.version,
+                self.model,
+                self.closed_loop,
+                self.rez,
+                self.micro_steps,
+                self.encoder_resolution,
+                self.resolution,
+                self.max_velocity,
+            );
+        }
+    }
+}
+
 /// One MMC-200 axis sharing a controller. Implements [`AsynMotor`].
 pub struct Mmc200Axis {
     controller: Arc<Mutex<Mmc200Controller>>,
@@ -144,6 +210,8 @@ pub struct Mmc200Axis {
     ignore_limits: bool,
     /// Last polled status, reused on the comm-failure early exit.
     last_status: MotorStatus,
+    /// What the constructor read, for [`Self::report`].
+    probed: Arc<Mmc200AxisReport>,
 }
 
 impl Mmc200Axis {
@@ -174,6 +242,13 @@ impl Mmc200Axis {
 
         if model == MODEL_ETH {
             drop(ctrl);
+            let probed = Mmc200AxisReport {
+                axis: index,
+                axis_index,
+                version,
+                model,
+                ..Mmc200AxisReport::default()
+            };
             return Self {
                 controller,
                 axis_index,
@@ -186,6 +261,7 @@ impl Mmc200Axis {
                     done: true,
                     ..MotorStatus::default()
                 },
+                probed: Arc::new(probed),
             };
         }
 
@@ -204,6 +280,18 @@ impl Mmc200Axis {
         let vmx = query(format!("{axis_index}VMX?"));
         let max_velocity = atof(vmx.get(1..).unwrap_or(""));
         drop(ctrl);
+        let probed = Mmc200AxisReport {
+            axis: index,
+            axis_index,
+            version,
+            model,
+            closed_loop,
+            rez,
+            micro_steps,
+            encoder_resolution,
+            resolution,
+            max_velocity,
+        };
 
         Self {
             controller,
@@ -217,7 +305,13 @@ impl Mmc200Axis {
                 problem: error,
                 ..MotorStatus::default()
             },
+            probed: Arc::new(probed),
         }
+    }
+
+    /// C `MMC200Axis::report`.
+    pub fn report(&self) -> Arc<Mmc200AxisReport> {
+        self.probed.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, Mmc200Controller> {
