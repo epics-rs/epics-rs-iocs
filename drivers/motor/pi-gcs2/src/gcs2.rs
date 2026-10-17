@@ -98,21 +98,14 @@
 //!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
 //!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
 //! - **Per-model controllers**: `PIE517Controller`, `PIE727Controller`,
-//!   `PIE755Controller`, `PIC702Controller`, `PIC885Controller` (each has its
-//!   own init quirks/enable-after-homing behavior); those controllers run
-//!   on [`Model::Motor`].
+//!   `PIE755Controller` and `PIC702Controller` (each has its own init and
+//!   status quirks); those controllers run on [`Model::Motor`].
 //! - **`TranslatePIError`**: the 2172-line errcode→string table
 //!   (`TranslatePIError.cpp`/`picontrollererrors.h`) is not ported; only the
 //!   numeric `ERR?` code (`atoi`) is surfaced, in error messages.
 //! - **Deferred/coordinated moves**: `PIasynController::processDeferredMoves`
 //!   / `PIGCSController::moveCts(array)` (multi-axis `MOV` in one command) —
 //!   controller-wide, not part of the single-axis `AsynMotor` interface.
-//! - **Axis enable** (`EAX`/`EAX?`, `setEnableAxis`/`getEnableAxis`): present
-//!   in the base class but only ever *called* from `PIasynAxis::poll`'s
-//!   post-homing branch gated on `m_bEnableAxisAfterHoming`/
-//!   `m_bSetServoAfterHoming` — flags that default `false` and are set `true`
-//!   only by `PIC885Controller` (out of scope). Dead code in the generic
-//!   motor path; not ported.
 //! - **`SVO?` (`getServo`)**: implemented here as a protocol primitive (the
 //!   task spec calls it out explicitly), but — matching upstream — the
 //!   generic motor axis's `poll` never calls it; servo state comes from the
@@ -171,6 +164,10 @@ const PARA_MOT_CPU_N: i32 = 0x0F;
 /// C `PIasynAxis` CPU defaults, kept when the `SPA?` reads fail.
 const DEFAULT_CPU_Z: i32 = 1000;
 const DEFAULT_CPU_N: i32 = 1;
+
+/// C `PIGCSController::getResolution`: the fixed CPU of a controller whose
+/// class reads none.
+const BASE_CPU_Z: i32 = 10000;
 
 /// Reference-velocity `SPA` parameter ID, written as the *literal hex text*
 /// `"0x50"` — the C `referenceVelCts` hardcodes `"SPA %s 0x50 %f"` directly in
@@ -249,6 +246,8 @@ pub enum Model {
     Motor,
     /// `PIGCSMotorControllerNoRefVel` (E-873.3QTU).
     MotorNoRefVel,
+    /// `PIC885Controller`.
+    C885,
 }
 
 impl Model {
@@ -259,8 +258,13 @@ impl Model {
             Some(Self::MotorNoRefVel)
         } else if any(&[
             "C-663", "C-863", "C-867", "C-884", "E-861", "E-871", "E-873", "E-517", "E-518",
-            "C-885", "E-753", "E-754", "E-709", "E-712", "E-725", "E-727", "E-755", "C-702",
-            "HEXAPOD", "F-HEX", "F-206", "M-8", "C-887",
+        ]) {
+            Some(Self::Motor)
+        } else if idn.contains("C-885") {
+            Some(Self::C885)
+        } else if any(&[
+            "E-753", "E-754", "E-709", "E-712", "E-725", "E-727", "E-755", "C-702", "HEXAPOD",
+            "F-HEX", "F-206", "M-8", "C-887",
         ]) {
             Some(Self::Motor)
         } else {
@@ -474,6 +478,29 @@ impl PIGCS2Controller {
     fn get_gcs_parameter(&self, axis: &str, param_id: i32) -> AsynResult<f64> {
         let reply = self.query(&format!("SPA? {axis} {param_id}"))?;
         get_value_f64(&reply)
+    }
+
+    /// `STP` + `ERR? == PI_CNTR_STOP`: stops every axis (C
+    /// `PIC885Controller::haltAxis`).
+    fn stop_all(&self) -> AsynResult<()> {
+        self.send_only("STP")?;
+        self.check_stopped()
+    }
+
+    /// `EAX? {axis}`, then `ERR? == 0` before the value counts (C
+    /// `getEnableAxis`).
+    fn get_enable_axis(&self, axis: &str) -> AsynResult<i32> {
+        let reply = self.query(&format!("EAX? {axis}"))?;
+        self.check_ok()?;
+        value_str(&reply)
+            .map(atoi)
+            .ok_or_else(|| pigcs2_err(format!("no '=' in reply {reply:?}")))
+    }
+
+    /// `EAX {axis} {state}` + `ERR? == 0` (C `PIGCSController::setEnableAxis`).
+    fn set_enable_axis(&self, axis: &str, state: i32) -> AsynResult<()> {
+        self.send_only(&format!("EAX {axis} {state}"))?;
+        self.check_ok()
     }
 
     /// `HLT {axis}` + `ERR? == PI_CNTR_STOP`.
@@ -733,15 +760,19 @@ impl PIGCS2Axis {
         };
         let _ = axis.init_axis(port_name);
         let ctrl = axis.lock();
-        // C `getResolution` stops at the first failed read, keeps both
-        // defaults unless both succeed, and truncates the replies into ints.
-        let cpu = ctrl
-            .get_gcs_parameter(&axis.axis_name, PARA_MOT_CPU_Z)
-            .and_then(|num| {
-                let den = ctrl.get_gcs_parameter(&axis.axis_name, PARA_MOT_CPU_N)?;
-                Ok(counts_per_unit(num as i32, den as i32))
-            })
-            .unwrap_or(axis.cpu);
+        // C `PIGCSMotorController::getResolution` stops at the first failed
+        // read, keeps both defaults unless both succeed, and truncates the
+        // replies into ints.
+        let cpu = if ctrl.model == Model::C885 {
+            counts_per_unit(BASE_CPU_Z, 1)
+        } else {
+            ctrl.get_gcs_parameter(&axis.axis_name, PARA_MOT_CPU_Z)
+                .and_then(|num| {
+                    let den = ctrl.get_gcs_parameter(&axis.axis_name, PARA_MOT_CPU_N)?;
+                    Ok(counts_per_unit(num as i32, den as i32))
+                })
+                .unwrap_or(axis.cpu)
+        };
         let _ = ctrl.get_axis_velocity(&axis.axis_name);
         let position = ctrl.get_axis_position(&axis.axis_name);
         let (mut low_limit, mut high_limit) = (axis.low_limit, axis.high_limit);
@@ -761,6 +792,12 @@ impl PIGCS2Axis {
 
     /// C `PIGCSMotorController::initAxis`: stops at the first failure.
     fn init_axis(&mut self, port_name: &str) -> AsynResult<()> {
+        if self.lock().model == Model::C885 {
+            // C PIC885Controller::initAxis: a reference sensor by
+            // construction, no LIM?/CST? and no servo-on.
+            self.has_reference = true;
+            return self.enable_axis();
+        }
         let addr = self.axis_no as i32;
         let flow = |args: std::fmt::Arguments<'_>| {
             PortManager::global().trace_manager().print(
@@ -801,7 +838,8 @@ impl PIGCS2Axis {
     /// `CURR_DECEL`. Gated on `knows_vel`, matching both `getMaxAcceleration`
     /// and `setAcceleration`'s own early return.
     fn apply_acceleration(&mut self, acceleration: f64) -> AsynResult<()> {
-        if !self.lock().knows_vel() {
+        // C-885 runs the base class's no-op setAccelerationCts.
+        if self.lock().model == Model::C885 || !self.lock().knows_vel() {
             return Ok(());
         }
         let acceleration = (acceleration / self.cpu).abs();
@@ -830,6 +868,16 @@ impl PIGCS2Axis {
         Ok(())
     }
 
+    /// C `PIC885Controller::setEnableAxis`: `EAX` only when `EAX?`
+    /// differs.
+    fn enable_axis(&self) -> AsynResult<()> {
+        let ctrl = self.lock();
+        if ctrl.get_enable_axis(&self.axis_name)? != 1 {
+            ctrl.set_enable_axis(&self.axis_name, 1)?;
+        }
+        Ok(())
+    }
+
     /// C `setServo`: a servo turned on clears the problem flag.
     fn set_servo(&mut self, enable: bool) -> AsynResult<()> {
         self.lock().set_servo(&self.axis_name, enable)?;
@@ -842,9 +890,14 @@ impl PIGCS2Axis {
 
     /// C `referenceVelCts`: `PIGCSMotorController`'s writes the reference
     /// velocity, then `referenceAxis`; `PIGCSMotorControllerNoRefVel`'s
-    /// skips the velocity.
+    /// skips the velocity; `PIC885Controller`'s sends `FRF` alone.
     fn reference_vel_cts(&mut self, velocity: f64, forward: bool) -> AsynResult<()> {
         let model = self.lock().model;
+        if model == Model::C885 {
+            return self
+                .lock()
+                .reference_axis(&self.axis_name, forward, self.has_reference, false);
+        }
         if model == Model::Motor && velocity != 0.0 {
             self.lock()
                 .set_reference_velocity(&self.axis_name, velocity / self.cpu)?;
@@ -936,7 +989,11 @@ impl AsynMotor for PIGCS2Axis {
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
-        self.lock().halt(&self.axis_name)
+        let ctrl = self.lock();
+        match ctrl.model {
+            Model::C885 => ctrl.stop_all(),
+            _ => ctrl.halt(&self.axis_name),
+        }
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
@@ -950,46 +1007,52 @@ impl AsynMotor for PIGCS2Axis {
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let old_homing = self.is_homing;
-        let old_servo_on = self.servo_on;
 
         // C `PIasynAxis::poll` ignores every read's status and goes on, so a
         // failed read leaves what the last poll read. On a failed `#4`, C's
         // moving, limit and servo bits are uninitialized locals; that C
         // defect is not copied.
-        let ctrl = self.lock();
         let (homing, raw_moving, neg_limit, pos_limit, servo_control) =
-            ctrl.get_status(self.axis_no).unwrap_or((
+            self.lock().get_status(self.axis_no).unwrap_or((
                 old_homing,
                 self.moving,
                 self.neg_limit,
                 self.pos_limit,
-                old_servo_on,
+                self.servo_on,
             ));
+        self.moving = raw_moving;
+        self.neg_limit = neg_limit;
+        self.pos_limit = pos_limit;
+        self.is_homing = homing;
         // C only re-queries FRF? (the homed flag) right when homing just
         // finished (oldHoming true, new homing false) — not every cycle.
-        let refreshed_homed = (old_homing && !homing)
-            .then(|| ctrl.get_referenced_state(&self.axis_name).ok())
-            .flatten();
+        if old_homing && !homing {
+            let homed = self.lock().get_referenced_state(&self.axis_name);
+            if let Ok(homed) = homed {
+                self.homed = homed;
+            }
+            // C m_bEnableAxisAfterHoming / m_bSetServoAfterHoming, set by
+            // PIC885Controller::initAxis alone.
+            if self.homed && self.lock().model == Model::C885 {
+                let _ = self.enable_axis();
+                let _ = self.set_servo(true);
+            }
+        }
+        // Servo dropping out on its own (not via set_closed_loop) is a
+        // problem (C poll: "servo changed without user interaction!"); C
+        // compares the servo state as the post-homing servo-on left it.
+        if self.servo_on && !servo_control {
+            self.problem = true;
+        }
+        self.servo_on = servo_control;
+
+        let ctrl = self.lock();
         let position = ctrl
             .get_axis_position(&self.axis_name)
             .map_or(self.last_position, |p| p * self.cpu);
         let (mut low_limit, mut high_limit) = (self.low_limit, self.high_limit);
         let _ = ctrl.get_travel_limits(&self.axis_name, &mut low_limit, &mut high_limit);
         drop(ctrl);
-
-        self.moving = raw_moving;
-        self.neg_limit = neg_limit;
-        self.pos_limit = pos_limit;
-        self.is_homing = homing;
-        if let Some(homed) = refreshed_homed {
-            self.homed = homed;
-        }
-        // Servo dropping out on its own (not via set_closed_loop) is a
-        // problem (C poll: "servo changed without user interaction!").
-        if old_servo_on && !servo_control {
-            self.problem = true;
-        }
-        self.servo_on = servo_control;
         self.last_position = position;
         self.low_limit = low_limit;
         self.high_limit = high_limit;
@@ -1336,6 +1399,84 @@ mod tests {
         );
     }
 
+    /// A C-885 on a line answering `reply`, after `PIasynAxis::Init`.
+    fn c885_axis(
+        name: &str,
+        reply: fn(&str) -> String,
+    ) -> (motor_common::testing::LineRig, PIGCS2Axis) {
+        let (line, io) = motor_common::testing::LineRig::new(name, reply);
+        let mut ctrl = PIGCS2Controller::new(io, name);
+        ctrl.set_model(Model::C885);
+        let axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "1".into(), 0, name);
+        (line, axis)
+    }
+
+    fn c885_reply(last: &str) -> String {
+        match last {
+            "ERR?" => "0",
+            "EAX? 1" => "1=0",
+            "\u{4}" => "010000",
+            _ => "1=1",
+        }
+        .into()
+    }
+
+    fn sent_lines(line: &motor_common::testing::LineRig) -> Vec<String> {
+        line.sent().into_iter().filter(|w| w != "\n").collect()
+    }
+
+    /// C `PIC885Controller::initAxis` (PIC885Controller.cpp:51-70) asks no
+    /// LIM?/TRS?/CST? and turns no servo on: it enables the axis through
+    /// its `setEnableAxis` (:93-113), and the base `getResolution`
+    /// (PIGCSController.cpp:738-744) reads no CPU.
+    #[test]
+    fn a_c885_axis_init_enables_the_axis() {
+        let (line, axis) = c885_axis("gcs2C885Init", c885_reply);
+        assert_eq!(
+            sent_lines(&line),
+            [
+                "EAX? 1", "ERR?", "EAX 1 1", "ERR?", "POS? 1", "TMN? 1", "TMX? 1", "FRF? 1"
+            ]
+        );
+        assert_eq!(axis.cpu, 10000.0);
+        assert!(axis.has_reference && !axis.has_limit_switches && !axis.servo_on);
+    }
+
+    /// C-885 `referenceVelCts` (:115-152) sends `FRF` alone, `haltAxis`
+    /// (:76-91) `STP`, and the base `setAccelerationCts` nothing.
+    #[test]
+    fn a_c885_axis_homes_with_frf_and_stops_with_stp() {
+        let (line, mut axis) = c885_axis("gcs2C885Cmds", c885_reply);
+        line.sent();
+        let user = AsynUser::new(0);
+        axis.home(&user, 0.0, 2.0, 0.0, true).unwrap();
+        assert_eq!(sent_lines(&line), ["FRF 1", "ERR?"]);
+        let _ = axis.stop(&user, 0.0);
+        assert_eq!(sent_lines(&line), ["STP", "ERR?"]);
+        axis.apply_acceleration(5.0).unwrap();
+        assert!(sent_lines(&line).is_empty());
+    }
+
+    /// C `PIasynAxis::poll` (PIasynAxis.cpp:128-157): a C-885 homing that
+    /// ends referenced re-enables the axis and turns the servo on before the
+    /// position read; the status read before it still says servo off, so
+    /// the servo check flags a problem.
+    #[test]
+    fn a_c885_axis_enables_and_servos_after_homing() {
+        let (line, mut axis) = c885_axis("gcs2C885Poll", c885_reply);
+        axis.is_homing = true;
+        line.sent();
+        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        assert_eq!(
+            sent_lines(&line),
+            [
+                "\u{4}", "FRF? 1", "EAX? 1", "ERR?", "EAX 1 1", "ERR?", "SVO 1 1", "ERR?",
+                "POS? 1", "TMN? 1", "TMX? 1"
+            ]
+        );
+        assert!(status.homed && status.problem && !status.powered);
+    }
+
     #[test]
     fn error_codes_match_c_constants() {
         assert_eq!(PI_CNTR_STOP, 10);
@@ -1361,6 +1502,7 @@ mod tests {
         assert_eq!(Model::from_idn("PI E-873.3QTU"), Some(Model::MotorNoRefVel));
         assert_eq!(Model::from_idn("PI E-873.1AT"), Some(Model::Motor));
         assert_eq!(Model::from_idn("PI M-824"), Some(Model::Motor));
+        assert_eq!(Model::from_idn("PI C-885.M1"), Some(Model::C885));
         assert_eq!(Model::from_idn("PI E-665"), None);
         assert_eq!(Model::from_idn(""), None);
     }
