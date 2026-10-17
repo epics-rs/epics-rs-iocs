@@ -219,7 +219,6 @@ pub struct Anc150Axis {
     /// Wall-clock deadline of the in-flight move, and its planned duration.
     move_deadline: Option<Instant>,
     move_interval: f64,
-    last_status: MotorStatus,
     /// drvANC150Asyn.cc `pAxis->params`.
     params: Arc<Params>,
 }
@@ -253,11 +252,6 @@ impl Anc150Axis {
             moving: false,
             move_deadline: None,
             move_interval: 0.0,
-            last_status: MotorStatus {
-                done: true,
-                gain_support: true,
-                ..MotorStatus::default()
-            },
             // drvANC150Asyn.cc:773-775.
             params: {
                 let params = Params::default();
@@ -477,7 +471,7 @@ impl AsynMotor for Anc150Axis {
         // timer has run out (drvANC150Asyn.cc:599-603).
         let axis_done = !self.moving;
         // Interpolate the software position (C poller).
-        let (position, done) = if self.moving {
+        let position = if self.moving {
             let time_remaining = self
                 .move_deadline
                 .map(|d| {
@@ -500,10 +494,10 @@ impl AsynMotor for Anc150Axis {
                 self.move_deadline = None;
                 self.current_position = self.target_position;
             }
-            (pos, finished)
+            pos
         } else {
             self.current_position = self.target_position;
-            (self.current_position, true)
+            self.current_position
         };
 
         // C `axisStatus` is never set (module Deviations).
@@ -554,23 +548,7 @@ impl AsynMotor for Anc150Axis {
         let _ = params.set_integer(function::POWER_ON, i32::from(powered));
         params.call_callback();
 
-        self.last_status = MotorStatus {
-            position,
-            encoder_position: position,
-            velocity: 0.0,
-            done,
-            moving: !done,
-            // ANC150 reports no home/limit switches (module Deviations).
-            high_limit: false,
-            low_limit: false,
-            home: false,
-            powered,
-            comms_error: !freq_ok,
-            problem: !freq_ok,
-            gain_support: true,
-            ..MotorStatus::default()
-        };
-        Ok(self.last_status.clone())
+        Ok(params.motor_status())
     }
 }
 
@@ -931,6 +909,27 @@ mod tests {
         assert_eq!(params.get_integer(function::CLOSED_LOOP), Ok(Some(0)));
         assert!(DrvSet::set_double(&mut *axis, &user, function::P_GAIN, 0.5).is_err());
         assert_eq!(params.get_double(function::P_GAIN), Ok(None));
+    }
+
+    /// drvANC150Asyn.cc:599-649: the poll reports what it set in
+    /// `pAxis->params`; the pass that finds the timer run out is not done,
+    /// and a failed `getFreq` sets the comm error alone.
+    #[test]
+    fn the_poll_reports_the_axis_s_parameters() {
+        use motor_common::testing::LineRig;
+        let (_line, io) = LineRig::new("ancReport", |last| match last {
+            "ver" => "ver\r\nattocube ANC150\r\nOK\r\n".into(),
+            c if c.starts_with("getm") => format!("{c}\r\nmode = stp\r\nOK\r\n"),
+            c => format!("{c}\r\nERROR\r\n"),
+        });
+        let ctrl = Arc::new(Mutex::new(Anc150Controller::new(io, "ancReport").unwrap()));
+        let mut axis = Anc150Axis::new(ctrl, 1, 0).unwrap();
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 2.0, 0.0, 1.0, 1.0).unwrap();
+        axis.move_deadline = Some(Instant::now());
+        let polled = axis.poll(&user).unwrap();
+        assert_eq!(polled, axis.params().motor_status());
+        assert!(!polled.done && polled.comms_error && !polled.problem);
     }
 
     /// drvANC150Asyn.cc:633-634: each poll prints the axis's never-set
