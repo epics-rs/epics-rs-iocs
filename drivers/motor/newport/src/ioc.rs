@@ -1960,6 +1960,13 @@ static PMNC87XX: Model1 = Model1::new(&DEV_PMNC87XX, 10, SCAN_RATE);
 /// are discovered, so `num_drivers` has no use.
 pub fn pmnc87xx_setup_command() -> CommandDef {
     PMNC87XX.register_row();
+    // C breaks out of the card loop after the first configured card
+    // (drvPMNC87xx.cc:233), leaving the rest unreported; not copied.
+    PMNC87XX.register_report("drvPMNC87xx", |cards| {
+        cards.report("PMNC87xx", |card, line| {
+            format!("    PMNC87xx controller {card} asyn port= {line} \n")
+        })
+    });
     CommandDef::new(
         "PMNC87xxSetup",
         vec![
@@ -1979,19 +1986,21 @@ pub fn pmnc87xx_setup_command() -> CommandDef {
 /// modules found (`MPV` for the 8750, `DRT` for the 8752). The controller
 /// sets the port EOS itself, as C `motor_init` does.
 pub fn pmnc87xx_config_command() -> CommandDef {
-    model1_config_command("PMNC87xxConfig", &PMNC87XX, |ctx, card, port, _addr| {
+    model1_config_command("PMNC87xxConfig", &PMNC87XX, |ctx, card, port, addr| {
         let asyn_port = get_port(port).ok_or_else(|| {
             format!("IP port '{port}' not found (call drvAsynIPPortConfigure first)")
         })?;
         let controller = PmncController::new(asyn_port.handle.clone(), PMNC_TIMEOUT)
             .map_err(|e| format!("PMNC87xxConfig: {e}"))?;
         let num_axes = controller.num_axes();
+        let line = format!("{port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for index in 0..num_axes {
             let ax = PmncAxis::new(controller.clone(), index)
                 .map_err(|e| format!("PMNC87xxConfig: axis {index}: {e}"))?;
             PMNC87XX.install(ctx, card, index as i32, Arc::new(Mutex::new(ax)))?;
         }
+        PMNC87XX.describe(card, line);
         Ok(())
     })
 }
@@ -2674,6 +2683,44 @@ mod report {
         assert_eq!(
             driver_report("drvMM4000", 0),
             "    MM4000 controller 0, port=mm4000RepLine, address=0, id: MM4005 Version 2.0 \n"
+        );
+    }
+
+    /// drvPMNC87xx.cc's drvet `report` (drvPMNC87xx.cc:211-238), past the
+    /// `break` after the first configured card.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pmnc87xx_controller() {
+        use motor_common::testing::{LineRig, driver_report};
+        let setup = pmnc87xx_setup_command();
+        let none = "    No PMNC87xx controllers configured.\n";
+        assert_eq!(driver_report("drvPMNC87xx", 0), none);
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(3), int(1), int(10)]).await;
+        let rig = |name: &str| {
+            LineRig::new(name, |last| match last {
+                "VER" => "Version 1.6.0>".into(),
+                "DRT" => "A0=2>".into(),
+                _ => ">".into(),
+            })
+        };
+        let (_a, _) = rig("pmncRepA");
+        let (_b, _) = rig("pmncRepB");
+        for (card, port) in [(0, "pmncRepA"), (2, "pmncRepB")] {
+            let config = vec![int(card), ArgValue::String(port.into()), int(0)];
+            run_command(pmnc87xx_config_command(), config).await;
+        }
+        let id = |card, port| {
+            format!(
+                "    PMNC87xx controller {card} asyn port= {port}, address=0, id: Version 1.6.0 \n"
+            )
+        };
+        assert_eq!(
+            driver_report("drvPMNC87xx", 0),
+            format!(
+                "{}    PMNC87xx controller 1 connection failed.\n{}",
+                id(0, "pmncRepA"),
+                id(2, "pmncRepB")
+            )
         );
     }
 
