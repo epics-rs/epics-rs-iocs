@@ -15,10 +15,10 @@
 //! counts: positions pass through with `NINT` rounding, the record's `MRES` is
 //! 1, and its `EGU` is counts. Velocities cross the boundary in counts/s and
 //! accelerations in counts/s²; the controller wants rev/min and rev/s², so they
-//! are converted with the axis's counts-per-rev (the `MCDC2805Config`
-//! `countsPerRev` argument, sent as `ENCRES` ahead of every `SP`/`AC`/`HOSP`
-//! as C does). This replaces the C driver's use of the record's `SREV` field,
-//! which is not visible at the asyn-rs boundary.
+//! are converted with the axis's counts-per-rev, sent as `ENCRES` ahead of
+//! every `SP`/`AC`/`HOSP` as C does. C takes it from the record's `SREV`,
+//! which is not visible at the asyn-rs boundary; the IOC passes `SREV`'s
+//! default, 200.
 //!
 //! ## Done detection
 //!
@@ -30,7 +30,8 @@
 //!
 //! - The C poller is a background thread; here the `GST`/`POS`/`GAST`/`GV`
 //!   reads and the limit-switch hold run inside [`poll`](AsynMotor::poll).
-//! - `countsPerRev` is a config argument rather than the record's `SREV`.
+//! - counts-per-rev is fixed at `SREV`'s default rather than read from the
+//!   record.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;

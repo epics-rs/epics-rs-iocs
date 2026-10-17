@@ -13,8 +13,6 @@ epicsEnvSet("P",      "MCDC:")
 epicsEnvSet("CARD",   "0")
 epicsEnvSet("SERIAL", "SERIAL1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
-# Encoder counts per revolution (matches the motor's encoder; also programs the
-# controller via ENCRES and scales velocity/acceleration).
 
 # ---- serial octet port ----
 drvAsynSerialPortConfigure("$(SERIAL)", "$(TTY)")
