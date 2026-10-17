@@ -66,6 +66,21 @@ impl Fake {
 
     /// Refusing from the constructor's first command on.
     fn start_refusing(name: &str, code: u32, refuse: &[&'static str]) -> Fake {
+        let fake = Self::launch(name, code, refuse);
+        // The task's first post would overwrite a test's ADStatusMessage.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fake.status_message() != "Waiting for the acquire command" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the task never waited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        fake
+    }
+
+    /// The detector as the constructor returns it, its task not yet waiting.
+    fn launch(name: &str, code: u32, refuse: &[&'static str]) -> Fake {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let (arm, armed) = mpsc::channel::<Rules>();
@@ -121,22 +136,11 @@ impl Fake {
         claim
             .publish(runtime.port_handle().clone(), &open_owner())
             .unwrap();
-        let fake = Fake {
+        Fake {
             runtime,
             arm,
             heard,
-        };
-        // The task's first post would overwrite a test's ADStatusMessage, and
-        // an Acquire it reads before its wait is never started.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while fake.status_message() != "Waiting for the acquire command" {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the task never waited"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        fake
     }
 
     fn refuse(&self, code: u32, commands: &[&'static str]) {
@@ -441,4 +445,23 @@ fn a_write_waits_for_the_task_sequence() {
         .position(|c| c == "GetAcquisitionStatus")
         .unwrap_or(heard.len());
     assert!(status < set, "{heard:?}");
+}
+
+/// An Acquire the task reads before its first start wait runs the body with
+/// C's function-scope locals (specsAnalyser.cpp:270-294, 300-303).
+#[test]
+fn an_acquire_before_the_first_wait_starts_the_acquisition() {
+    let fake = Fake::launch("SPECS_WS_EARLY", 0, &[]);
+    fake.write_int32(fake.runtime.ad_params.acquire, 1).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let (_, command) = fake
+            .heard
+            .recv_timeout(left)
+            .expect("the acquisition never started");
+        if command.starts_with("Start") {
+            break;
+        }
+    }
 }

@@ -67,13 +67,24 @@ fn now_epoch_f64() -> f64 {
 /// (`specsAnalyser.cpp:301-303`) — e.g. `ImageMode::Continuous`, which never
 /// resets `ADAcquire` between batches — so the preamble (and the
 /// `start`/wait) is skipped and the previous pass's values are reused
-/// verbatim; see `Worker::run`.
+/// verbatim; see `Task::run`.
 #[derive(Clone, Copy)]
 struct Prepared {
     iterations: i32,
     acquire: i32,
     non_energy_channels: i32,
     energy_channels: i32,
+}
+
+impl Prepared {
+    /// The C locals' initial values, which an `ADAcquire` already 1 at the
+    /// first pass runs with.
+    const C_LOCALS: Prepared = Prepared {
+        iterations: 1,
+        acquire: 0,
+        non_energy_channels: 0,
+        energy_channels: 0,
+    };
 }
 
 impl Task {
@@ -572,27 +583,18 @@ impl Task {
     /// `ADAcquire` between batches) it falls straight through to rerun the
     /// acquisition body against the previous pass's `Prepared` state.
     async fn run(mut self) {
-        let mut prepared: Option<Prepared> = None;
+        let mut prepared = Prepared::C_LOCALS;
         while self.hold.is_some() {
             let acquire = self.get_i32(self.w.ad.acquire);
             if acquire == 0 {
-                prepared = self.wait_and_prepare();
-                if prepared.is_none() {
-                    continue;
-                }
-            } else {
-                match prepared.as_mut() {
-                    Some(p) => p.acquire = acquire,
-                    // ADAcquire was already 1 with nothing ever prepared —
-                    // only reachable if the IOC starts up with ADAcquire=1,
-                    // a state C itself has no derivable behaviour for
-                    // (energyChannels/image/spectrum are all still
-                    // zero/NULL at that point). Wait for a real start
-                    // signal instead of running against unprepared state.
+                match self.wait_and_prepare() {
+                    Some(p) => prepared = p,
                     None => continue,
                 }
+            } else {
+                prepared.acquire = acquire;
             }
-            self.run_acquisition(prepared.expect("checked above")).await;
+            self.run_acquisition(prepared).await;
         }
     }
 }
