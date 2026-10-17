@@ -17,6 +17,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ADStatus;
+use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
@@ -329,7 +330,8 @@ async fn publish_image(
         }
     };
 
-    let Ok(mut array) = ctx.pool.wrap(
+    let Ok(mut array) = alloc_with(
+        &ctx.pool,
         vec![
             NDDimension::new(header.x_size),
             NDDimension::new(header.y_size),
@@ -353,6 +355,19 @@ async fn publish_image(
     array.attributes = build_attributes(&header.attrs, acquisition_header);
     publish(ctx, array).await;
     true
+}
+
+/// C allocates with a NULL pData and copies the frame in
+/// (merlinDetector.cpp:377, :434, :471, :507), so the pool's limit applies;
+/// `wrap` would charge the decoded buffer unchecked.
+fn alloc_with(
+    pool: &DriverPool,
+    dims: Vec<NDDimension>,
+    data: NDDataBuffer,
+) -> ADResult<DriverArray> {
+    let mut array = pool.alloc(dims, data.data_type())?;
+    array.data = data;
+    Ok(array)
 }
 
 /// False when no NDArray went out (C's `pImage == NULL`).
@@ -398,7 +413,8 @@ async fn publish_profiles(
     };
     // C fills the profile waveforms only once the array is allocated
     // (merlinDetector.cpp:384-391).
-    let Ok(mut array) = ctx.pool.wrap(
+    let Ok(mut array) = alloc_with(
+        &ctx.pool,
         vec![NDDimension::new(stride), NDDimension::new(2)],
         profiles.image,
     ) else {
