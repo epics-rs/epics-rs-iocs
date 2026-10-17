@@ -29,8 +29,6 @@
 //!   into the travel-limit cache that `getnlimit` filled in controller units,
 //!   and send it as such through `setnlimit` and the jog `nm`. This port scales
 //!   the record limit by `axisRes`, so the cache stays in controller units.
-//! - The C poll issues `gnv`/`gna` reads whose replies are discarded; these dead
-//!   reads are omitted.
 //! - The Taurus-specific limit-switch type parameters (`setsw`/`getsw` driven by
 //!   the `SMCTaurusLimit*Type` aux PVs, commented out in the C poll) are not
 //!   modeled.
@@ -314,6 +312,11 @@ impl AsynMotor for TaurusAxis {
         let moving = (status & STATUS_MOVING) != 0;
         let powered = (status & STATUS_POWER_OFF) == 0;
         let problem = (status & STATUS_ESTOP_SWITCH) != 0;
+
+        // SMCTaurusAxis.cpp:267-271 reads the commanded velocity and
+        // acceleration, ignoring the replies and their status.
+        let _ = ctrl.query(&format!("{addr} gnv"));
+        let _ = ctrl.query(&format!("{addr} gna"));
 
         // Switch config: bit 1 (0x2) masks (disables) the switch.
         let sw = ctrl.query(&format!("{addr} getsw"))?;
