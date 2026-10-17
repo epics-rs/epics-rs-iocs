@@ -899,7 +899,7 @@ impl AsynMotor for SpiiPlusAxis {
         let bits = |values: &[i32]| values.get(a).copied().unwrap_or_default();
 
         let apos = at(&polled.axis_position) / self.resolution;
-        let velocity = at(&polled.feedback_velocity) / self.resolution;
+        let fvel = at(&polled.feedback_velocity);
         let ast = bits(&polled.axis_status);
 
         let (moving, powered, high_limit, low_limit, homed, encoder) = if self.reduced {
@@ -937,9 +937,9 @@ impl AsynMotor for SpiiPlusAxis {
         // C updates the direction bit only while moving and only on a non-zero
         // feedback velocity; otherwise it keeps the previous direction.
         if moving {
-            if velocity > 0.0 {
+            if fvel > 0.0 {
                 self.last_direction = true;
-            } else if velocity < 0.0 {
+            } else if fvel < 0.0 {
                 self.last_direction = false;
             }
         }
@@ -1491,6 +1491,19 @@ mod tests {
         let rig = rig("spiiNoVel", 1, &[("EFAC", &[0.5]), ("FVEL", &[10.0])]);
         let mut axis = SpiiPlusAxis::new(rig.ctrl.clone(), 0);
         assert_eq!(pass(&rig.ctrl, &mut axis).velocity, 0.0);
+    }
+
+    /// The direction bit follows FVEL's own sign, not FVEL over a negative
+    /// resolution_ (SPiiPlusDriver.cpp:845-855).
+    #[test]
+    fn the_direction_is_the_sign_of_fvel() {
+        let rig = rig("spiiDirSign", 1, &[("EFAC", &[-0.5]), ("FVEL", &[10.0])]);
+        rig.line
+            .lock()
+            .unwrap()
+            .set("MST", &[f64::from(MST_MOTION)]);
+        let mut axis = SpiiPlusAxis::new(rig.ctrl.clone(), 0);
+        assert!(pass(&rig.ctrl, &mut axis).direction);
     }
 
     /// A dummy axis has no fault or homed bits, and max velocity follows
