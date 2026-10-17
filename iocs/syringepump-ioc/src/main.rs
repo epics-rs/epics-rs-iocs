@@ -30,13 +30,10 @@
 //! own bundled `db/` directory (unlike a classic EPICS support module's
 //! install tree, which is what `$(MODBUS)/db/...` resolves against
 //! upstream). `db/aiFloat64.template`, `aoFloat64.template`, `bi_bit.template`,
-//! `bo_bit.template`, `longinInt32.template`, `longoutInt32.template`, and
-//! `ai.template` are therefore local, verbatim copies of the C modbus
-//! module's `modbusApp/Db` templates (see each file's header).
-//! `db/vindumMbbi.template`/`vindumMbbo.template` are new: epics-modbus-rs
-//! 0.22.1 only bundles the bit-packed `mbbiDirect`/`mbboDirect` templates,
-//! not a plain 4-state enumerated-register `mbbi`/`mbbo` (the shape Vindum's
-//! holding-register Direction/PressureUnits/RateUnits records need).
+//! `bo_bit.template`, `longinInt32.template`, `longoutInt32.template`,
+//! `ai.template`, `mbbi.template` and `mbbo.template` are therefore local,
+//! verbatim copies of the C modbus module's `modbusApp/Db` templates (see
+//! each file's header).
 //!
 //! Usage:
 //!   cargo run -p syringepump-ioc -- st.cmd

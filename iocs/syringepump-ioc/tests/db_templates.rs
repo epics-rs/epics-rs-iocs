@@ -119,3 +119,27 @@ fn row_macros_set_the_fields_c_sets() {
     let ao = record(&defs, "VINDUM1:P1:A:SetFlowRate");
     assert_eq!(field(ao, "PINI").as_deref(), Some("YES"));
 }
+
+/// modbus `mbbi.template`/`mbbo.template` bind through asynInt32 at the
+/// port's default data type.
+#[test]
+fn vindum_enumerations_bind_as_c_mbbi_template() {
+    let defs = records();
+    let mut seen = 0;
+    for def in defs
+        .iter()
+        .filter(|d| d.record_type == "mbbi" || d.record_type == "mbbo")
+    {
+        seen += 1;
+        assert_eq!(
+            field(def, "DTYP").as_deref(),
+            Some("asynInt32"),
+            "{}",
+            def.name
+        );
+        let link = field(def, "INP").or_else(|| field(def, "OUT")).unwrap();
+        assert!(link.starts_with("@asyn(SP2_"), "{}: {link}", def.name);
+        assert!(link.ends_with(')'), "{}: {link}", def.name);
+    }
+    assert_eq!(seen, 8);
+}
