@@ -111,6 +111,9 @@ pub struct HydraAxis {
     /// port's write sets. C reads it uninitialised before the first write;
     /// it is 0 here.
     regulator_mode: Arc<AtomicI32>,
+    /// What the last poll left: a failed exchange keeps every parameter
+    /// the poll did not reach.
+    last_status: MotorStatus,
 }
 
 impl HydraAxis {
@@ -152,6 +155,10 @@ impl HydraAxis {
             members: Arc::new(members),
             motor_form,
             regulator_mode,
+            last_status: MotorStatus {
+                gain_support: true,
+                ..MotorStatus::default()
+            },
         }
     }
 
@@ -309,18 +316,35 @@ impl AsynMotor for HydraAxis {
         Ok(())
     }
 
+    /// C `SMChydraAxis::poll`: a failed exchange skips the rest and sets
+    /// Problem, and the parameters set before it are still posted
+    /// (SMChydraAxis.cpp:247-362).
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        let mut status = self.last_status.clone();
+        if self.poll_into(&mut status).is_err() {
+            status.problem = true;
+        }
+        self.last_status = status.clone();
+        Ok(status)
+    }
+}
+
+impl HydraAxis {
+    /// Write each field as C sets its parameter, in C's order.
+    fn poll_into(&self, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
         let addr = self.addr();
 
-        let position = atof(&ctrl.query(&format!("{addr} np"))?);
+        let position = atof(&ctrl.query(&format!("{addr} np"))?) / self.axis_res();
+        status.position = position;
+        status.encoder_position = position;
 
-        let status = atoi(&ctrl.query(&format!("{addr} nst"))?);
-        let moving = (status & STATUS_MOVING) != 0;
-        let powered = (status & STATUS_POWER_OFF) == 0;
-        // C sets problem from 0x200 (SMChydraAxis.cpp:302-311), then
-        // overwrites it at :357 and :360, a dead store; not copied.
-        let problem = (status & STATUS_ESTOP_SWITCH) != 0;
+        let axis_status = atoi(&ctrl.query(&format!("{addr} nst"))?);
+        let moving = (axis_status & STATUS_MOVING) != 0;
+        status.done = !moving;
+        status.moving = moving;
+        // SMChydraAxis.cpp:273 motorStatusMoving_ = !done.
+        status.msta_moving = moving;
 
         // SMChydraAxis.cpp:276-281 reads the commanded velocity and
         // acceleration, ignoring the replies and their status.
@@ -342,23 +366,14 @@ impl AsynMotor for HydraAxis {
             low_limit = !ignore_low && *low != 0;
             high_limit = !ignore_high && *high != 0;
         }
-        drop(ctrl);
+        status.low_limit = low_limit;
+        status.high_limit = high_limit;
 
-        Ok(MotorStatus {
-            position: position / self.axis_res(),
-            encoder_position: position / self.axis_res(),
-            velocity: 0.0,
-            done: !moving,
-            moving,
-            // SMChydraAxis.cpp:273 motorStatusMoving_ = !done.
-            msta_moving: moving,
-            gain_support: true,
-            high_limit,
-            low_limit,
-            powered,
-            problem,
-            ..MotorStatus::default()
-        })
+        status.powered = (axis_status & STATUS_POWER_OFF) == 0;
+        // C sets problem from 0x200 (SMChydraAxis.cpp:302-311), then
+        // overwrites it at :357 and :360, a dead store; not copied.
+        status.problem = (axis_status & STATUS_ESTOP_SWITCH) != 0;
+        Ok(())
     }
 }
 
@@ -367,6 +382,30 @@ mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
 
+    /// A failed `nst` skips the rest of C's poll, but the position it read
+    /// first is still posted, with Problem (SMChydraAxis.cpp:255-266).
+    #[test]
+    fn a_failed_status_read_still_posts_the_position() {
+        use motor_common::testing::LineRig;
+        let (_line, handle) = LineRig::failing(
+            "hydraNstFails",
+            |cmd| match cmd.trim_end() {
+                "1 getmotor" => "1".into(),
+                "1 getclperiod" => "0.5".into(),
+                "1 np" => "2.5".into(),
+                _ => String::new(),
+            },
+            |cmd| cmd.trim_end() == "1 nst",
+        );
+        let controller = Arc::new(Mutex::new(HydraController::new(handle)));
+        let mut axis = HydraAxis::new(controller, 0, Arc::default());
+        let res = axis.axis_res();
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert_eq!(status.position, 2.5 / res);
+        assert_eq!(status.encoder_position, 2.5 / res);
+        assert!(status.problem);
+        assert!(status.gain_support);
+    }
     #[test]
     fn an_axis_of_an_unanswering_controller_is_still_built() {
         let (handle, _) =
@@ -395,6 +434,7 @@ mod tests {
             }),
             motor_form: 0,
             regulator_mode: Arc::default(),
+            last_status: MotorStatus::default(),
         };
         line.sent();
         axis.move_absolute(&AsynUser::default(), f64::NAN, 0.0, 2.0, 4.0)
@@ -484,6 +524,7 @@ mod tests {
             }),
             motor_form: 0,
             regulator_mode: Arc::default(),
+            last_status: MotorStatus::default(),
         };
         let user = AsynUser::default();
         axis.move_absolute(&user, 2.0, 0.0, 2.0, 4.0).unwrap();
