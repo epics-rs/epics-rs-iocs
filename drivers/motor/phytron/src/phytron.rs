@@ -66,7 +66,7 @@
 //! - The auto status-reset-on-error option (`SEC` via the `statusResetTime`
 //!   option): dormant by default, so `clearAxisError` is a no-op here.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -209,10 +209,11 @@ fn build_frame(ctrl_type: CtrlType, address: u8, cmd: &str) -> Vec<u8> {
     frame
 }
 
-/// Parse `STX <ACK|NAK> <data> [":" <CRC>] [ETX]` into the data payload. The
+/// The body of `STX <ACK|NAK> <data> [":" <CRC>] [ETX]`, its ACK or NAK
+/// kept, as C `sendPhytronCommand` checks it before the ACK test. The
 /// trailing ETX may already be stripped by the port's input EOS, so both an
 /// EOS-stripped and a raw buffer are accepted.
-fn parse_reply(raw: &[u8]) -> AsynResult<String> {
+fn parse_frame(raw: &[u8]) -> AsynResult<Vec<u8>> {
     let start = raw
         .iter()
         .position(|&b| b == STX)
@@ -246,11 +247,115 @@ fn parse_reply(raw: &[u8]) -> AsynResult<String> {
         }
         resp.truncate(n - 3);
     }
+    Ok(resp)
+}
 
-    match resp.first() {
-        Some(&ACK) => Ok(String::from_utf8_lossy(&resp[1..]).into_owned()),
-        Some(&NAK) => Err(phytron_err("phytron: controller returned NAK")),
-        _ => Err(phytron_err("phytron: reply without ACK/NAK")),
+/// C `sendPhytronCommand`'s reply check (phytronAxisMotor.cpp:1081-1126):
+/// with `ack_only` an ACK reply, stripped; without, an ACK or NAK reply,
+/// kept. Anything else is `phytronInvalidReturn` (6).
+fn reply_payload(raw: &[u8], ack_only: bool) -> Result<String, i32> {
+    let resp = parse_frame(raw).map_err(|_| 6)?;
+    match (resp.first(), ack_only) {
+        (Some(&ACK), true) => Ok(String::from_utf8_lossy(&resp[1..]).into_owned()),
+        (Some(&ACK), false) | (Some(&NAK), false) => {
+            Ok(String::from_utf8_lossy(&resp).into_owned())
+        }
+        _ => Err(6),
+    }
+}
+
+/// C `isspace`, which `epicsParseInt64` and writeOption's trim skip.
+fn c_isspace(c: char) -> bool {
+    c == ' ' || ('\t'..='\r').contains(&c)
+}
+
+/// C `epicsParseInt64(value, &v, 0, NULL)`: a base-0 integer with only
+/// white space around it.
+fn parse_int64(value: &str) -> Option<i64> {
+    let t = value.trim_matches(c_isspace);
+    let (neg, body) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let (radix, digits) = if body.len() > 2 && (body.starts_with("0x") || body.starts_with("0X")) {
+        (16, &body[2..])
+    } else if body.len() > 1 && body.starts_with('0') {
+        (8, &body[1..])
+    } else {
+        (10, body)
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let v = i64::from_str_radix(digits, radix).ok()?;
+    Some(if neg { -v } else { v })
+}
+
+/// C `pollMethod` (phytronAxisMotor.h:96-101). An axis's `Default` takes
+/// the controller's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollMethod {
+    Default,
+    /// One command and reply at a time: `P20R`, `P22R`, `==H`, `SE`.
+    Serial,
+    /// The axis's `SE`, `P20R`, `P22R` on one line.
+    AxisParallel,
+    /// Every such axis's requests on one line, sent by the controller poll.
+    ControllerParallel,
+}
+
+impl PollMethod {
+    fn code(self) -> i64 {
+        match self {
+            Self::Default => -1,
+            Self::Serial => 0,
+            Self::AxisParallel => 1,
+            Self::ControllerParallel => 2,
+        }
+    }
+
+    /// C readOption's spelling (phytronAxisMotor.cpp:597-604).
+    fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Serial => "serial",
+            Self::AxisParallel => "axis-parallel",
+            Self::ControllerParallel => "ctrl-parallel",
+        }
+    }
+
+    /// C writeOption's value (phytronAxisMotor.cpp:676-708): a code or a
+    /// name; only an axis may take `default`.
+    fn parse(value: &str, axis: bool) -> Option<Self> {
+        let all = [
+            Self::Default,
+            Self::Serial,
+            Self::AxisParallel,
+            Self::ControllerParallel,
+        ];
+        let allowed = |m: &Self| axis || *m != Self::Default;
+        if let Some(code) = parse_int64(value) {
+            return all.into_iter().filter(allowed).find(|m| m.code() == code);
+        }
+        let v = value.trim_matches(c_isspace);
+        let names: [(Self, &[&str]); 4] = [
+            (Self::Default, &["default", "standard", "controller"]),
+            (
+                Self::Serial,
+                &["serial", "no-parallel", "not-parallel", "old"],
+            ),
+            (Self::AxisParallel, &["axis", "axis-parallel"]),
+            (
+                Self::ControllerParallel,
+                &["ctrl", "parallel", "ctrl-parallel", "controller-parallel"],
+            ),
+        ];
+        names
+            .into_iter()
+            .filter(|(m, _)| allowed(m))
+            .find(|(_, words)| words.iter().any(|w| v.eq_ignore_ascii_case(w)))
+            .map(|(m, _)| m)
     }
 }
 
@@ -337,8 +442,8 @@ impl PhytronParams {
             return sent.map(|_| ());
         }
         let sent = ctrl.reset(&port, user.reason);
-        for &axis_no in &ctrl.axes {
-            let _ = base.set_float64_param(index::ENCODER_RATIO, axis_no, 1.0);
+        for a in &ctrl.axes {
+            let _ = base.set_float64_param(index::ENCODER_RATIO, a.axis_no, 1.0);
         }
         // C's callParamCallbacks() is address 0's.
         let _ = base.call_param_callbacks(0);
@@ -504,6 +609,65 @@ impl ControllerParams for PhytronParams {
         Ok(atof(&reply) / 10.)
     }
 
+    /// C `phytronController::readOption` (phytronAxisMotor.cpp:589-655).
+    /// With no address to read, an axis's own poll method is not shown;
+    /// the controller's is.
+    fn read_option(&self, _base: &PortDriverBase, key: &str) -> Option<AsynResult<String>> {
+        if !key.eq_ignore_ascii_case("pollMethod") {
+            return None;
+        }
+        Some(self.controller().map(|ctrl| {
+            let m = ctrl.default_poll_method;
+            format!("{}/{}", m.code(), m.name())
+        }))
+    }
+
+    /// C `phytronController::writeOption` (phytronAxisMotor.cpp:661-818);
+    /// an address above 0 is an axis's.
+    fn write_option(
+        &mut self,
+        _base: &mut PortDriverBase,
+        user: &AsynUser,
+        key: &str,
+        value: &str,
+    ) -> Option<AsynResult<()>> {
+        if !key.eq_ignore_ascii_case("pollMethod") {
+            return None;
+        }
+        let refuse = |why: &str| -> AsynResult<()> {
+            Err(phytron_err(format!(
+                "phytronController:writeOption({key}, {value}) {why}"
+            )))
+        };
+        let Ok(mut ctrl) = self.controller() else {
+            return Some(refuse("wrong axis"));
+        };
+        let axis = user.addr > 0;
+        if axis && ctrl.axis(user.addr).is_none() {
+            return Some(refuse("wrong axis"));
+        }
+        let Some(method) = PollMethod::parse(value, axis) else {
+            let (default, controller) = if axis {
+                ("default,", "controller-")
+            } else {
+                ("", "")
+            };
+            return Some(refuse(&format!(
+                "wrong value - allowed are {default}serial,axis-parallel,{controller}parallel"
+            )));
+        };
+        if ctrl.ctrl_type != CtrlType::Phymotion
+            && !matches!(method, PollMethod::Default | PollMethod::Serial)
+        {
+            return Some(refuse("pollMethod not allowed for this controller"));
+        }
+        match ctrl.axis_mut(user.addr).filter(|_| axis) {
+            Some(a) => a.poll_method = method,
+            None => ctrl.default_poll_method = method,
+        }
+        Some(Ok(()))
+    }
+
     /// C `phytronController::report` (phytronAxisMotor.cpp:836-843), which
     /// says phyMOTION for an MCC too.
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
@@ -548,20 +712,40 @@ impl AxisReport for PhytronAxisReport {
     }
 }
 
+/// The controller's view of one created axis, which its writes, options
+/// and controller poll reach (C reaches the `phytronAxis` itself).
+struct AxisState {
+    axis_no: i32,
+    /// C `axisModuleNo_`.
+    module_no: String,
+    /// C `iPollMethod_`.
+    poll_method: PollMethod,
+    /// C `phytronAxis::lastStatus_`, which the axis's `CHECK_AXIS` compares.
+    last_status: i32,
+    /// The controller-parallel poll's answers for this axis this pass, which
+    /// its own poll parses (C parses them in the controller poll).
+    answers: Option<Vec<String>>,
+}
+
 /// A Phytron controller endpoint owning the asyn octet handle. Shared by all of
 /// its axes behind a mutex so command/reply pairs stay atomic.
 pub struct PhytronController {
     handle: SyncIOHandle,
+    /// C `controllerName_`, the controller port.
+    name: String,
     ctrl_type: CtrlType,
     /// Controller address 0..=15 (one hex digit in the frame).
     address: u8,
     /// The MCC `SUI` reply of this poll pass, ACK stripped (C `sLastSUI_`).
     last_sui: String,
-    /// C `axes_`, the created axes a controller reset walks; `getAxis`
-    /// looks in the base's table instead.
-    axes: BTreeSet<i32>,
-    /// C `lastStatus_`, the controller-wide status `CHECK_AXIS` compares.
+    /// C `axes_`, in creation order; `getAxis` looks in the base's table
+    /// instead.
+    axes: Vec<AxisState>,
+    /// C `lastStatus_`, the controller-wide status `CHECK_CTRL` and the
+    /// controller's `CHECK_AXIS` compare.
     last_status: i32,
+    /// C `iDefaultPollMethod_`.
+    default_poll_method: PollMethod,
     /// C's `motorEncoderRatio_` by axis prefix, which a controller reset
     /// sets back to 1 (phytronAxisMotor.cpp:821-827); an absent axis's is 1.
     encoder_ratios: HashMap<String, f64>,
@@ -570,24 +754,21 @@ pub struct PhytronController {
 }
 
 impl PhytronController {
-    /// Wrap a connected octet handle. `address` is the MCC hardware selector
-    /// 0..=15 (0 for a phyMOTION).
-    pub fn new(handle: SyncIOHandle, ctrl_type: CtrlType, address: u8) -> Self {
+    /// Wrap a connected octet handle for controller port `name`. `address`
+    /// is the MCC hardware selector 0..=15 (0 for a phyMOTION).
+    pub fn new(handle: SyncIOHandle, name: &str, ctrl_type: CtrlType, address: u8) -> Self {
         Self {
             handle,
+            name: name.to_owned(),
             ctrl_type,
             address: address.min(15),
             last_sui: String::new(),
-            axes: BTreeSet::new(),
+            axes: Vec::new(),
             last_status: 0,
+            default_poll_method: PollMethod::Serial,
             encoder_ratios: HashMap::new(),
             axis_status: None,
         }
-    }
-
-    /// C `axes_.push_back`: axis `axis_no` is one a reset walks.
-    pub fn add_axis(&mut self, axis_no: i32) {
-        self.axes.insert(axis_no);
     }
 
     /// Let each axis poll set AXIS_STATUS, reason `reason`.
@@ -595,23 +776,83 @@ impl PhytronController {
         self.axis_status = Some(reason);
     }
 
-    /// C `phytronController::poll` with the serial poll method: an MCC reads
-    /// the `SUI` limit-switch word once for every axis's poll to parse; a
-    /// phyMOTION sends nothing.
-    pub fn poll(&mut self, name: &str) {
-        if self.ctrl_type != CtrlType::Mcc {
+    fn axis(&self, axis_no: i32) -> Option<&AxisState> {
+        self.axes.iter().find(|a| a.axis_no == axis_no)
+    }
+
+    fn axis_mut(&mut self, axis_no: i32) -> Option<&mut AxisState> {
+        self.axes.iter_mut().find(|a| a.axis_no == axis_no)
+    }
+
+    /// Axis `axis_no`'s poll method, its `Default` the controller's.
+    fn poll_method(&self, axis_no: i32) -> PollMethod {
+        match self.axis(axis_no).map(|a| a.poll_method) {
+            Some(PollMethod::Default) | None => self.default_poll_method,
+            Some(m) => m,
+        }
+    }
+
+    /// C `phytronController::poll` (phytronAxisMotor.cpp:886-1001): an MCC
+    /// reads the `SUI` limit-switch word once for every axis's poll to
+    /// parse; a phyMOTION reads every controller-parallel axis on one line.
+    pub fn poll(&mut self) {
+        let mut commands = Vec::new();
+        let mut todo = Vec::new();
+        for a in &mut self.axes {
+            a.answers = None;
+        }
+        match self.ctrl_type {
+            CtrlType::Phymotion => {
+                for a in &self.axes {
+                    if self.poll_method(a.axis_no) == PollMethod::ControllerParallel {
+                        todo.push(a.axis_no);
+                        request(self.ctrl_type, PollMethod::ControllerParallel, &a.module_no)
+                            .into_iter()
+                            .for_each(|c| commands.push(c));
+                    }
+                }
+            }
+            CtrlType::Mcc => {
+                self.last_sui.clear();
+                commands.push("SUI".to_owned());
+            }
+        }
+        if commands.is_empty() {
             return;
         }
-        self.last_sui.clear();
-        match self.command("SUI") {
-            Ok(sui) => self.last_sui = sui,
-            Err(e) => MotorTrace::new(name, 0).print_self(
+        let status = match self.multi_command(commands, true, self.ctrl_type != CtrlType::Phymotion)
+        {
+            Ok(mut answers) => {
+                let mut ok = true;
+                if self.ctrl_type == CtrlType::Mcc {
+                    match answers.first().and_then(|sui| sui.strip_prefix('\x06')) {
+                        Some(sui) => self.last_sui = sui.to_owned(),
+                        None => ok = false,
+                    }
+                    answers.clear();
+                }
+                for axis_no in todo {
+                    // C erases the axis's three whatever they hold.
+                    let n = answers.len().min(3);
+                    let mine: Vec<String> = answers.drain(..n).collect();
+                    if let Some(a) = self.axis_mut(axis_no) {
+                        a.answers = Some(mine);
+                    }
+                }
+                if ok && answers.is_empty() {
+                    0
+                } else {
+                    AsynStatus::Error as i32
+                }
+            }
+            Err(code) => phy_to_asyn(code).status() as i32,
+        };
+        if status != 0 {
+            let name = &self.name;
+            MotorTrace::new(name, 0).print_self(
                 TraceMask::ERROR,
-                format_args!(
-                    "phytronController::poll({name}) error {}\n",
-                    e.status() as i32
-                ),
-            ),
+                format_args!("phytronController::poll({name}) error {status}\n"),
+            );
         }
     }
 
@@ -626,15 +867,14 @@ impl PhytronController {
     /// Send one command line and return its reply payload (ACK/CRC/framing
     /// removed). A NAK or malformed reply is an error (C `bACKonly = true`).
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        let frame = build_frame(self.ctrl_type, self.address, cmd);
-        let raw = self.handle.write_read(0, &frame, READ_BUF)?;
-        parse_reply(&raw)
+        self.send(cmd, true).map_err(phy_to_asyn)
     }
 
     /// C `sendPhytronCommand` with its status code: the asyn status of a
     /// failed transfer, `phytronInvalidReturn` (6) for a reply that is not
-    /// an ACK, `phytronInvalidCommand` (7) past 994 bytes.
-    fn phy_command(&self, cmd: &str) -> Result<String, i32> {
+    /// an ACK (or a NAK when `ack_only` is false, when the reply keeps it),
+    /// `phytronInvalidCommand` (7) past 994 bytes.
+    fn send(&self, cmd: &str, ack_only: bool) -> Result<String, i32> {
         if cmd.len() > 994 {
             return Err(7);
         }
@@ -643,11 +883,96 @@ impl PhytronController {
             .handle
             .write_read(0, &frame, READ_BUF)
             .map_err(|e| e.status() as i32)?;
-        parse_reply(&raw).map_err(|_| 6)
+        reply_payload(&raw, ack_only)
     }
 
-    /// `cmd` for axis `axis_no` under C `CHECK_AXIS`, which prints a failure
-    /// on the axis only when it differs from the last status.
+    /// C `sendPhytronMultiCommand` (phytronAxisMotor.cpp:1151-1216):
+    /// `commands` joined by spaces, up to 42 (one when `single`) and 994
+    /// bytes a line, and the replies split at each ACK or NAK. Without
+    /// `allow_nak` every reply must be an ACK, which is stripped.
+    fn multi_command(
+        &self,
+        mut commands: Vec<String>,
+        allow_nak: bool,
+        single: bool,
+    ) -> Result<Vec<String>, i32> {
+        let total = commands.len();
+        let mut replies = Vec::new();
+        loop {
+            let mut len = 0;
+            let mut count = 0;
+            for c in commands.iter().take(if single { 1 } else { 42 }) {
+                len += c.len() + 1;
+                if c.is_empty() {
+                    return Err(7);
+                }
+                if len > 994 {
+                    break;
+                }
+                count += 1;
+            }
+            // C sends an empty line forever when the first command alone
+            // passes 994 bytes; that command is refused here.
+            if count == 0 {
+                return Err(7);
+            }
+            let line = commands.drain(..count).collect::<Vec<_>>().join(" ");
+            let owned = self.send(&line, false)?;
+            let mut reply = owned.as_str();
+            while !reply.is_empty() {
+                let end = reply
+                    .char_indices()
+                    .skip(1)
+                    .find(|&(_, c)| c == '\x06' || c == '\x15')
+                    .map_or(reply.len(), |(i, _)| i);
+                let (one, rest) = reply.split_at(end);
+                if allow_nak {
+                    replies.push(one.to_owned());
+                } else {
+                    replies.push(one.strip_prefix('\x06').ok_or(6)?.to_owned());
+                }
+                reply = rest;
+            }
+            if commands.is_empty() {
+                break;
+            }
+        }
+        if replies.len() == total {
+            Ok(replies)
+        } else {
+            Err(6)
+        }
+    }
+
+    /// C `CHECK_AXIS` in an axis method: a failure printed on the axis
+    /// only when it differs from that axis's last status.
+    fn check_axis<T>(
+        &mut self,
+        axis_no: i32,
+        func: &str,
+        txt: &str,
+        result: Result<T, i32>,
+    ) -> AsynResult<T> {
+        let code = result.as_ref().err().copied().unwrap_or(0);
+        let name = self.name.clone();
+        if let Some(a) = self.axis_mut(axis_no) {
+            if code != 0 && code != a.last_status {
+                MotorTrace::new(&name, axis_no).print(
+                    TraceMask::ERROR,
+                    0,
+                    format_args!(
+                        "phytronAxis::{func}: ({name}) {txt} for axis {axis_no} failed with error code: {code}\n"
+                    ),
+                );
+            }
+            a.last_status = code;
+        }
+        result.map_err(phy_to_asyn)
+    }
+
+    /// `cmd` for axis `axis_no` under C `CHECK_AXIS` in a controller method,
+    /// which prints a failure on the axis only when it differs from the
+    /// controller's last status.
     fn axis_command(
         &mut self,
         port: &str,
@@ -656,7 +981,7 @@ impl PhytronController {
         axis_no: i32,
         cmd: &str,
     ) -> AsynResult<String> {
-        let result = self.phy_command(cmd);
+        let result = self.send(cmd, true);
         let code = result.as_ref().err().copied().unwrap_or(0);
         if code != 0 && code != self.last_status {
             MotorTrace::new(port, axis_no).print(
@@ -689,7 +1014,7 @@ impl PhytronController {
         reason: usize,
         cmd: &str,
     ) -> AsynResult<String> {
-        let result = self.phy_command(cmd);
+        let result = self.send(cmd, true);
         let code = result.as_ref().err().copied().unwrap_or(0);
         if code != 0 && code != self.last_status {
             MotorTrace::new(port, 0).print_self(
@@ -702,7 +1027,6 @@ impl PhytronController {
         self.last_status = code;
         result.map_err(phy_to_asyn)
     }
-
     /// Reset the controller at boot (C constructor, unless `noResetAtBoot`):
     /// send `CR`, wait, then poll `S` until it answers (capped at 120 s). Never
     /// fails construction — matches the C behaviour of logging and continuing
@@ -734,10 +1058,37 @@ impl PhytronController {
     }
 }
 
+/// C `appendRequestString` (phytronAxisMotor.cpp:1879-1907): the poll's
+/// requests for axis `m` under `method`.
+fn request(ctrl_type: CtrlType, method: PollMethod, m: &str) -> Vec<String> {
+    match ctrl_type {
+        CtrlType::Phymotion if method == PollMethod::Serial => vec![
+            format!("{m}P20R"),
+            format!("{m}P22R"),
+            format!("{m}==H"),
+            format!("SE{}", &m[1..]),
+        ],
+        // The status word's bit 0 stands in for `==H`, read in one go.
+        CtrlType::Phymotion => vec![
+            format!("SE{}", &m[1..]),
+            format!("{m}P20R"),
+            format!("{m}P22R"),
+        ],
+        CtrlType::Mcc => vec![
+            format!("{m}=H"),
+            format!("{m}=E"),
+            format!("{m}P20R"),
+            format!("{m}P22R"),
+        ],
+    }
+}
+
 /// One Phytron axis sharing a controller. Implements [`AsynMotor`].
 pub struct PhytronAxis {
     controller: Arc<Mutex<PhytronController>>,
     ctrl_type: CtrlType,
+    /// C `axisNo_`, `module*10 + index`.
+    axis_no: i32,
     /// Command prefix: `M<mod>.<idx>` (phyMOTION) or a single digit (MCC).
     axis_module_no: String,
     /// True once the module output has been enabled (`MA`) for a move; the C
@@ -752,8 +1103,10 @@ pub struct PhytronAxis {
 }
 
 impl PhytronAxis {
-    /// Construct axis `(module, index)` on `controller`. `index` must be >= 1
-    /// (C rejects `iAxis <= 0`); for an MCC it must be 1..=8.
+    /// Construct axis `(module, index)` on `controller` and add it to the
+    /// controller's axes, as C's constructor and `axes_.push_back` do under
+    /// one lock. `index` must be >= 1 (C rejects `iAxis <= 0`); for an MCC
+    /// it must be 1..=8.
     pub fn new(
         controller: Arc<Mutex<PhytronController>>,
         module: i32,
@@ -762,15 +1115,22 @@ impl PhytronAxis {
         if index <= 0 {
             return Err(phytron_err("phytron: axis index must be >= 1"));
         }
-        let ctrl_type = controller
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .ctrl_type;
         let axis_no = module * 10 + index;
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let ctrl_type = ctrl.ctrl_type;
         let axis_module_no = axis_module_no(ctrl_type, axis_no)?;
+        ctrl.axes.push(AxisState {
+            axis_no,
+            module_no: axis_module_no.clone(),
+            poll_method: PollMethod::Default,
+            last_status: 0,
+            answers: None,
+        });
+        drop(ctrl);
         Ok(Self {
             controller,
             ctrl_type,
+            axis_no,
             axis_module_no,
             motor_enabled: false,
             home_state: 0,
@@ -792,7 +1152,41 @@ impl PhytronAxis {
         &self.axis_module_no[1..]
     }
 
-    /// Shared move body for absolute and relative moves.
+    /// C `setVelocity` and `setAcceleration` onto `commands`
+    /// (phytronAxisMotor.cpp:1425-1508): P14/P04/P15 for a move, P08/P10/P09
+    /// for a home.
+    fn profile(&self, commands: &mut Vec<String>, set: char, v: (f64, f64), a: f64, home: bool) {
+        let m = &self.axis_module_no;
+        let (mn, mx) = clamp_velocity(v.0, v.1);
+        let (max, min, acc) = if home {
+            ("P08", "P10", "P09")
+        } else {
+            ("P14", "P04", "P15")
+        };
+        commands.push(format!("{m}{max}{set}{}", fmt6(mx)));
+        commands.push(format!("{m}{min}{set}{}", fmt6(mn)));
+        commands.push(format!("{m}{acc}{set}{}", fmt6(clamp_acceleration(a))));
+    }
+
+    /// C `setBrakeOutput(list, 1)` with no brake configured: the module
+    /// output enabled (`MA`) the first time.
+    fn release(&mut self, commands: &mut Vec<String>) {
+        if !self.motor_enabled {
+            commands.push(format!("{}MA", self.axis_module_no));
+            self.motor_enabled = true;
+        }
+    }
+
+    /// `commands` as one exchange under the axis's poll method, C's last
+    /// `sendPhytronMultiCommand` of a motion method and its `CHECK_AXIS`.
+    fn run(&self, commands: Vec<String>, func: &str, txt: &str) -> AsynResult<()> {
+        let mut ctrl = self.lock();
+        let single = ctrl.poll_method(self.axis_no) == PollMethod::Serial;
+        let sent = ctrl.multi_command(commands, false, single).map(|_| ());
+        ctrl.check_axis(self.axis_no, func, txt, sent)
+    }
+
+    /// C `move` (phytronAxisMotor.cpp:1597-1628).
     fn do_move(
         &mut self,
         position: f64,
@@ -801,31 +1195,92 @@ impl PhytronAxis {
         max_v: f64,
         accel: f64,
     ) -> AsynResult<()> {
-        let need_enable = !self.motor_enabled;
-        {
+        let set = self.lock().set_char();
+        let mut commands = Vec::new();
+        self.profile(&mut commands, set, (min_v, max_v), accel, false);
+        self.release(&mut commands);
+        let m = &self.axis_module_no;
+        commands.push(if relative {
+            let sign = if position > 0.0 { '+' } else { '-' };
+            format!("{m}{sign}{}", nint(position).unsigned_abs())
+        } else {
+            format!("{m}A{}", nint(position))
+        });
+        self.run(commands, "move", "Start move")
+    }
+
+    /// C `parseAnswer` (phytronAxisMotor.cpp:1916-2091) over this axis's
+    /// `answers`, each ACK already stripped.
+    fn parse_answer(&mut self, answers: &[String], method: PollMethod) -> AsynResult<MotorStatus> {
+        let bad = || phytron_err("phytron: invalid poll answer");
+        let (pos, enc, moving, status) = match self.ctrl_type {
+            CtrlType::Phymotion if method == PollMethod::Serial => {
+                let [pos, enc, idle, se] = answers else {
+                    return Err(bad());
+                };
+                let moving = !idle.starts_with('E');
+                (atof(pos), atof(enc), moving, atoi(se))
+            }
+            CtrlType::Phymotion => {
+                let [se, pos, enc] = answers else {
+                    return Err(bad());
+                };
+                let status = atoi(se);
+                (atof(pos), atof(enc), status & 1 != 0, status)
+            }
+            CtrlType::Mcc => {
+                let [idle, perr, pos, enc] = answers else {
+                    return Err(bad());
+                };
+                let moving = !idle.starts_with('E');
+                let status = self.mcc_status_word(perr, &self.lock().last_sui, moving)?;
+                (atof(pos), atof(enc), moving, status)
+            }
+        };
+        // The poll reports `P22R` times the ratio (:2005-2006).
+        let (ratio, axis_status) = {
             let ctrl = self.lock();
-            let set = ctrl.set_char();
-            let m = self.axis_module_no.as_str();
-            let (mn, mx) = clamp_velocity(min_v, max_v);
-            // stdMove: max velocity P14, base velocity P04, acceleration P15.
-            ctrl.command(&format!("{m}P14{set}{}", fmt6(mx)))?;
-            ctrl.command(&format!("{m}P04{set}{}", fmt6(mn)))?;
-            ctrl.command(&format!("{m}P15{set}{}", fmt6(clamp_acceleration(accel))))?;
-            if need_enable {
-                ctrl.command(&format!("{m}MA"))?;
-            }
-            if relative {
-                let mag = nint(position).unsigned_abs();
-                let sign = if position > 0.0 { '+' } else { '-' };
-                ctrl.command(&format!("{m}{sign}{mag}"))?;
-            } else {
-                ctrl.command(&format!("{m}A{}", nint(position)))?;
-            }
+            let ratio = ctrl
+                .encoder_ratios
+                .get(&self.axis_module_no)
+                .copied()
+                .unwrap_or(1.0);
+            (ratio, ctrl.axis_status)
+        };
+
+        // Limit-home state machine. `problem` is the axis
+        // internal/power-stage/SFI/ENDAT error mask, cleared through the state
+        // machine while homing onto a limit switch.
+        let step = step_home_state(self.home_state, status, moving, self.ctrl_type);
+        self.home_state = step.new_home_state;
+        let problem = if step.clear_limit_error {
+            // End of reference: clear the limit-switch error the phyMOTION sets.
+            let cmd = format!("SEC{}", self.se_suffix());
+            self.lock().command(&cmd).is_err()
+        } else {
+            step.problem
+        };
+
+        // phytronAxisMotor.cpp:2084
+        if let Some(reason) = axis_status {
+            self.poll_params.push((reason, ParamValue::Int32(status)));
         }
-        if need_enable {
-            self.motor_enabled = true;
-        }
-        Ok(())
+
+        Ok(MotorStatus {
+            position: pos,
+            encoder_position: enc * ratio,
+            done: !moving,
+            moving,
+            high_limit: step.high,
+            low_limit: step.low,
+            home: (status & 0x40) != 0,
+            encoder_home: (status & 0x08) != 0,
+            homed: (status & 0x08) != 0,
+            slip: (status & 0x4000) != 0,
+            problem,
+            has_encoder: true,
+            ..Default::default()
+        })
     }
 }
 
@@ -881,6 +1336,8 @@ impl AsynMotor for PhytronAxis {
         self.do_move(distance, true, min_velocity, velocity, acceleration)
     }
 
+    /// C `moveVelocity` (phytronAxisMotor.cpp:1712-1736): the direction is
+    /// the velocity's sign.
     fn move_velocity(
         &mut self,
         _user: &AsynUser,
@@ -888,31 +1345,23 @@ impl AsynMotor for PhytronAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let need_enable = !self.motor_enabled;
-        {
-            let ctrl = self.lock();
-            let set = ctrl.set_char();
-            let m = self.axis_module_no.as_str();
-            let (mn, mx) = clamp_velocity(min_velocity, velocity);
-            ctrl.command(&format!("{m}P14{set}{}", fmt6(mx)))?;
-            ctrl.command(&format!("{m}P04{set}{}", fmt6(mn)))?;
-            ctrl.command(&format!(
-                "{m}P15{set}{}",
-                fmt6(clamp_acceleration(acceleration))
-            ))?;
-            if need_enable {
-                ctrl.command(&format!("{m}MA"))?;
-            }
-            // Jog direction from the sign of the requested velocity.
-            let dir = if velocity < 0.0 { "L-" } else { "L+" };
-            ctrl.command(&format!("{m}{dir}"))?;
-        }
-        if need_enable {
-            self.motor_enabled = true;
-        }
-        Ok(())
+        let set = self.lock().set_char();
+        let mut commands = Vec::new();
+        self.profile(
+            &mut commands,
+            set,
+            (min_velocity, velocity),
+            acceleration,
+            false,
+        );
+        self.release(&mut commands);
+        let dir = if velocity < 0.0 { "L-" } else { "L+" };
+        commands.push(format!("{}{dir}", self.axis_module_no));
+        self.run(commands, "moveVelocity", "Start move")
     }
 
+    /// C `home` (phytronAxisMotor.cpp:1637-1705) with the `limit` homing
+    /// procedure, which arms the limit-home state machine before the send.
     fn home(
         &mut self,
         _user: &AsynUser,
@@ -921,123 +1370,67 @@ impl AsynMotor for PhytronAxis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        let need_enable = !self.motor_enabled;
-        {
-            let ctrl = self.lock();
-            let set = ctrl.set_char();
-            let m = self.axis_module_no.as_str();
-            let (mn, mx) = clamp_velocity(min_velocity, velocity);
-            // homeMove: max velocity P08, base velocity P10, acceleration P09.
-            ctrl.command(&format!("{m}P08{set}{}", fmt6(mx)))?;
-            ctrl.command(&format!("{m}P10{set}{}", fmt6(mn)))?;
-            ctrl.command(&format!(
-                "{m}P09{set}{}",
-                fmt6(clamp_acceleration(acceleration))
-            ))?;
-            if need_enable {
-                ctrl.command(&format!("{m}MA"))?;
-            }
-            // Default homing procedure = limit: R+ / R-.
-            let cmd = if forward {
-                format!("{m}R+")
-            } else {
-                format!("{m}R-")
-            };
-            ctrl.command(&cmd)?;
-        }
-        if need_enable {
-            self.motor_enabled = true;
-        }
-        // Arm the limit-home state machine (C: homeState_ = forwards ? 3 : 2).
+        let set = self.lock().set_char();
+        let mut commands = Vec::new();
+        self.profile(
+            &mut commands,
+            set,
+            (min_velocity, velocity),
+            acceleration,
+            true,
+        );
+        self.release(&mut commands);
         self.home_state = if forward { 3 } else { 2 };
-        Ok(())
+        let dir = if forward { "R+" } else { "R-" };
+        commands.push(format!("{}{dir}", self.axis_module_no));
+        self.run(commands, "home", "Start homing")
     }
 
+    /// C `stop` (phytronAxisMotor.cpp:1741-1756): the deceleration on P15.
     fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
-        let ctrl = self.lock();
-        let set = ctrl.set_char();
-        let m = self.axis_module_no.as_str();
-        // stopMove acceleration -> P15, then the axis stop command S.
-        ctrl.command(&format!(
-            "{m}P15{set}{}",
-            fmt6(clamp_acceleration(acceleration))
-        ))?;
-        ctrl.command(&format!("{m}S"))?;
-        Ok(())
+        let set = self.lock().set_char();
+        let m = &self.axis_module_no;
+        let commands = vec![
+            format!("{m}P15{set}{}", fmt6(clamp_acceleration(acceleration))),
+            format!("{m}S"),
+        ];
+        self.run(commands, "stop", "Stop move")
     }
 
+    /// C `setPosition` (phytronAxisMotor.cpp:1790-1818), which sends under
+    /// the axis's own poll method unresolved; the resolved one is used here,
+    /// as every other motion method does.
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        let ctrl = self.lock();
-        let set = ctrl.set_char();
-        let m = self.axis_module_no.as_str();
-        ctrl.command(&format!("{m}P20{set}{}", fmt6(position)))?;
-        Ok(())
+        let set = self.lock().set_char();
+        let commands = vec![format!("{}P20{set}{}", self.axis_module_no, fmt6(position))];
+        self.run(commands, "setPosition", "Setting motor position")
     }
 
+    /// C `phytronAxis::poll` (phytronAxisMotor.cpp:1842-1872): a serial or
+    /// axis-parallel axis reads itself; a controller-parallel one parses
+    /// what the controller poll read for it.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        // Gather the raw readings while holding the controller lock.
-        let (pos, enc, moving, status, axis_status) = {
-            let ctrl = self.lock();
-            let m = self.axis_module_no.as_str();
-            // The poll reports `P22R` times the ratio (:2005-2006).
-            let ratio = ctrl.encoder_ratios.get(m).copied().unwrap_or(1.0);
-            let (pos, enc, moving, status) = match self.ctrl_type {
-                CtrlType::Phymotion => {
-                    let pos = atof(&ctrl.command(&format!("{m}P20R"))?);
-                    let enc = atof(&ctrl.command(&format!("{m}P22R"))?);
-                    let idle = ctrl.command(&format!("{m}==H"))?;
-                    let status = atoi(&ctrl.command(&format!("SE{}", self.se_suffix()))?);
-                    let moving = idle.as_bytes().first() != Some(&b'E');
-                    (pos, enc, moving, status)
-                }
-                CtrlType::Mcc => {
-                    let idle = ctrl.command(&format!("{m}=H"))?;
-                    let perr = ctrl.command(&format!("{m}=E"))?;
-                    let pos = atof(&ctrl.command(&format!("{m}P20R"))?);
-                    let enc = atof(&ctrl.command(&format!("{m}P22R"))?);
-                    let moving = idle.as_bytes().first() != Some(&b'E');
-                    let status = self.mcc_status_word(&perr, &ctrl.last_sui, moving)?;
-                    (pos, enc, moving, status)
-                }
+        let (method, answers) = {
+            let mut ctrl = self.lock();
+            let method = ctrl.poll_method(self.axis_no);
+            let answers = if method == PollMethod::ControllerParallel {
+                let answers = ctrl.axis_mut(self.axis_no).and_then(|a| a.answers.take());
+                // Each one's ACK is still on it (:1963-1969).
+                answers
+                    .and_then(|a| {
+                        a.iter()
+                            .map(|s| s.strip_prefix('\x06').map(str::to_owned))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .ok_or_else(|| phytron_err("phytron: no controller poll answer"))
+            } else {
+                let commands = request(self.ctrl_type, method, &self.axis_module_no);
+                let read = ctrl.multi_command(commands, false, method == PollMethod::Serial);
+                ctrl.check_axis(self.axis_no, "poll", "Reading axis", read)
             };
-            (pos, enc * ratio, moving, status, ctrl.axis_status)
+            (method, answers)
         };
-
-        // Limit-home state machine (C parseAnswer). `problem` is the axis
-        // internal/power-stage/SFI/ENDAT error mask, cleared through the state
-        // machine while homing onto a limit switch.
-        let step = step_home_state(self.home_state, status, moving, self.ctrl_type);
-        self.home_state = step.new_home_state;
-        let high = step.high;
-        let low = step.low;
-        let problem = if step.clear_limit_error {
-            // End of reference: clear the limit-switch error the phyMOTION sets.
-            let cmd = format!("SEC{}", self.se_suffix());
-            self.lock().command(&cmd).is_err()
-        } else {
-            step.problem
-        };
-
-        // phytronAxisMotor.cpp:2084
-        if let Some(reason) = axis_status {
-            self.poll_params.push((reason, ParamValue::Int32(status)));
-        }
-
-        Ok(MotorStatus {
-            position: pos,
-            encoder_position: enc,
-            done: !moving,
-            moving,
-            high_limit: high,
-            low_limit: low,
-            home: (status & 0x40) != 0,
-            encoder_home: (status & 0x08) != 0,
-            homed: (status & 0x08) != 0,
-            slip: (status & 0x4000) != 0,
-            problem,
-            has_encoder: true,
-            ..Default::default()
-        })
+        self.parse_answer(&answers?, method)
     }
 }
 
@@ -1215,7 +1608,12 @@ mod tests {
             create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
                 .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        let controller = Arc::new(Mutex::new(PhytronController::new(io, CtrlType::Mcc, 0)));
+        let controller = Arc::new(Mutex::new(PhytronController::new(
+            io,
+            name,
+            CtrlType::Mcc,
+            0,
+        )));
         (PhytronAxis::new(controller, 0, 1).unwrap(), written)
     }
 
@@ -1254,8 +1652,13 @@ mod tests {
         )
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        let controller = Arc::new(Mutex::new(PhytronController::new(io, CtrlType::Mcc, 0)));
-        controller.lock().unwrap().poll("phytronEncoderPoll");
+        let controller = Arc::new(Mutex::new(PhytronController::new(
+            io,
+            "phytronEncoderPoll",
+            CtrlType::Mcc,
+            0,
+        )));
+        controller.lock().unwrap().poll();
         let mut axis = PhytronAxis::new(controller.clone(), 0, 1).unwrap();
         let user = AsynUser::new(0);
         assert_eq!(axis.poll(&user).unwrap().encoder_position, 1000.0);
@@ -1292,6 +1695,7 @@ mod tests {
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let controller = Arc::new(Mutex::new(PhytronController::new(
             io,
+            "phytronSlip",
             CtrlType::Phymotion,
             0,
         )));
@@ -1299,6 +1703,225 @@ mod tests {
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         assert!(status.slip);
         assert!(!status.slip_stall);
+    }
+
+    /// A phyMOTION that answers each space-separated command of a line,
+    /// ACK and `answer(command)`, or NAK where that is `None`; records each
+    /// line.
+    struct Lines {
+        base: epics_rs::asyn::port::PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+        answer: fn(&str) -> Option<String>,
+        reply: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Lines {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            // STX, address, then `:` and the CRC, ETX.
+            let line = String::from_utf8_lossy(&data[2..data.len() - 4]).into_owned();
+            let mut body = Vec::new();
+            for cmd in line.split(' ') {
+                match (self.answer)(cmd) {
+                    Some(a) => body.extend([&[ACK][..], a.as_bytes()].concat()),
+                    None => body.push(NAK),
+                }
+            }
+            self.reply = [&[STX][..], &body, b":XX", &[ETX]].concat();
+            self.written.lock().unwrap().push(line);
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = std::mem::take(&mut self.reply);
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    /// A moving axis at 7 with its encoder at 9 and status word 0x11.
+    fn moving_axis(cmd: &str) -> Option<String> {
+        Some(
+            match cmd {
+                c if c.starts_with("SE") => "17",
+                c if c.ends_with("P20R") => "7",
+                c if c.ends_with("P22R") => "9",
+                c if c.ends_with("==H") => "N",
+                c if c.starts_with("BAD") => return None,
+                _ => "",
+            }
+            .to_owned(),
+        )
+    }
+
+    type Rig = (
+        Arc<Mutex<PhytronController>>,
+        [PhytronAxis; 2],
+        Arc<Mutex<Vec<String>>>,
+    );
+
+    /// A phyMOTION on a fresh [`Lines`] port `name`, axes 1.1 and 1.2, and
+    /// its line log.
+    fn lines(name: &str) -> Rig {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let port = Lines {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            written: written.clone(),
+            answer: moving_axis,
+            reply: Vec::new(),
+        };
+        let (rt, _actor) =
+            create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
+                .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let ctrl = PhytronController::new(io, name, CtrlType::Phymotion, 0);
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let axes = [1, 2].map(|i| PhytronAxis::new(ctrl.clone(), 1, i).unwrap());
+        (ctrl, axes, written)
+    }
+
+    /// C `sendPhytronMultiCommand` (phytronAxisMotor.cpp:1151-1216): up
+    /// to 42 commands and 994 bytes a line, one reply per command.
+    #[test]
+    fn a_multi_command_line_holds_42_commands_or_994_bytes() {
+        let (ctrl, _, written) = lines("phyMulti");
+        let ctrl = ctrl.lock().unwrap();
+        let replies = ctrl.multi_command(vec!["M1.1P20R".to_owned(); 43], false, false);
+        assert_eq!(replies.unwrap(), vec!["7"; 43]);
+        let sent = std::mem::take(&mut *written.lock().unwrap());
+        assert_eq!(
+            sent.iter()
+                .map(|l| l.split(' ').count())
+                .collect::<Vec<_>>(),
+            [42, 1]
+        );
+        let long = "M1.1P20R".to_owned() + &"0".repeat(490);
+        ctrl.multi_command(vec![long; 2], false, false).unwrap();
+        assert_eq!(
+            written.lock().unwrap().len(),
+            2,
+            "two 499-byte commands pass 994"
+        );
+        let single = ctrl.multi_command(vec!["M1.1P20R".to_owned(); 2], false, true);
+        assert_eq!(single.unwrap().len(), 2);
+        assert_eq!(written.lock().unwrap().len(), 4);
+        // A NAK is refused unless allowed, when it is kept with each ACK.
+        let commands = vec!["BAD".to_owned(), "M1.1P20R".to_owned()];
+        assert_eq!(ctrl.multi_command(commands.clone(), false, false), Err(6));
+        assert_eq!(
+            ctrl.multi_command(commands, true, false).unwrap(),
+            ["\x15", "\x067"]
+        );
+        // C loops forever on a command over 994 bytes.
+        assert_eq!(
+            ctrl.multi_command(vec!["0".repeat(995)], false, false),
+            Err(7)
+        );
+    }
+
+    /// C `appendRequestString`/`parseAnswer` (phytronAxisMotor.cpp:
+    /// 1879-1907, 1916-2003): serial asks four times, axis-parallel once
+    /// with the status word's bit 0 for moving.
+    #[test]
+    fn an_axis_parallel_poll_reads_its_status_and_positions_on_one_line() {
+        let (ctrl, [mut axis, _], written) = lines("phyAxisParallel");
+        let user = AsynUser::new(0);
+        let serial = axis.poll(&user).unwrap();
+        assert_eq!(
+            *written.lock().unwrap(),
+            ["M1.1P20R", "M1.1P22R", "M1.1==H", "SE1.1"]
+        );
+        assert!(serial.moving);
+        written.lock().unwrap().clear();
+        ctrl.lock().unwrap().axis_mut(11).unwrap().poll_method = PollMethod::AxisParallel;
+        let parallel = axis.poll(&user).unwrap();
+        assert_eq!(*written.lock().unwrap(), ["SE1.1 M1.1P20R M1.1P22R"]);
+        assert!(parallel.moving && parallel.high_limit);
+        assert_eq!((parallel.position, parallel.encoder_position), (7.0, 9.0));
+    }
+
+    /// C's controller poll reads every controller-parallel axis on one line
+    /// and their own polls send nothing (phytronAxisMotor.cpp:899-985).
+    #[test]
+    fn a_controller_parallel_poll_reads_every_axis_on_one_line() {
+        let (ctrl, mut axes, written) = lines("phyCtrlParallel");
+        ctrl.lock().unwrap().default_poll_method = PollMethod::ControllerParallel;
+        let user = AsynUser::new(0);
+        assert!(axes[0].poll(&user).is_err(), "no controller poll yet");
+        ctrl.lock().unwrap().poll();
+        for axis in &mut axes {
+            let status = axis.poll(&user).unwrap();
+            assert_eq!(status.position, 7.0);
+        }
+        assert_eq!(
+            *written.lock().unwrap(),
+            ["SE1.1 M1.1P20R M1.1P22R SE1.2 M1.2P20R M1.2P22R"]
+        );
+        assert!(axes[1].poll(&user).is_err(), "each pass's answers once");
+        // A pass that reads no axis in parallel leaves none of the last's.
+        ctrl.lock().unwrap().poll();
+        ctrl.lock().unwrap().default_poll_method = PollMethod::Serial;
+        ctrl.lock().unwrap().poll();
+        ctrl.lock().unwrap().default_poll_method = PollMethod::ControllerParallel;
+        assert!(axes[0].poll(&user).is_err());
+    }
+
+    /// A motion method is one line unless the axis polls serially.
+    #[test]
+    fn a_move_is_one_line_unless_the_axis_polls_serially() {
+        let (ctrl, [mut axis, _], written) = lines("phyMoveLine");
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 12.4, 10.0, 100.0, 5000.0)
+            .unwrap();
+        ctrl.lock().unwrap().axis_mut(11).unwrap().poll_method = PollMethod::AxisParallel;
+        axis.move_relative(&user, -3.0, 10.0, 100.0, 5000.0)
+            .unwrap();
+        let sent = written.lock().unwrap().clone();
+        assert_eq!(
+            sent,
+            [
+                "M1.1P14=100.000000",
+                "M1.1P04=10.000000",
+                "M1.1P15=5000.000000",
+                "M1.1MA",
+                "M1.1A12",
+                "M1.1P14=100.000000 M1.1P04=10.000000 M1.1P15=5000.000000 M1.1-3",
+            ]
+        );
+    }
+
+    /// C writeOption's poll method values (phytronAxisMotor.cpp:676-708).
+    #[test]
+    fn poll_method_values_parse_as_c_parses_them() {
+        use PollMethod::*;
+        let cases = [
+            ("2", false, Some(ControllerParallel)),
+            ("0x1", false, Some(AxisParallel)),
+            ("-1", false, None),
+            ("-1", true, Some(Default)),
+            ("3", true, None),
+            (" Parallel\t", false, Some(ControllerParallel)),
+            ("default", false, None),
+            ("controller", true, Some(Default)),
+            ("old", false, Some(Serial)),
+            ("axis-parallel", false, Some(AxisParallel)),
+            ("ax", false, None),
+        ];
+        for (value, axis, want) in cases {
+            assert_eq!(
+                PollMethod::parse(value, axis),
+                want,
+                "{value:?} axis {axis}"
+            );
+        }
     }
 
     #[test]
@@ -1326,7 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_reply_roundtrips_a_phymotion_frame() {
+    fn reply_payload_roundtrips_a_phymotion_frame() {
         // A controller reply: STX ACK "12345" ':' CRC ETX. Reuse build_frame's
         // CRC by framing "\x0612345" as the inner payload.
         let mut payload = vec![ACK];
@@ -1346,35 +1969,36 @@ mod tests {
         resp.push(hex_upper(crc >> 4));
         resp.push(hex_upper(crc & 0x0F));
         resp.push(ETX);
-        assert_eq!(parse_reply(&resp).unwrap(), "12345");
+        assert_eq!(reply_payload(&resp, true).unwrap(), "12345");
     }
 
     #[test]
-    fn parse_reply_accepts_eos_stripped_etx() {
+    fn reply_payload_accepts_eos_stripped_etx() {
         // No trailing ETX (input EOS consumed it), no CRC: STX ACK data.
         let mut resp = vec![STX, ACK];
         resp.extend_from_slice(b"678");
-        assert_eq!(parse_reply(&resp).unwrap(), "678");
+        assert_eq!(reply_payload(&resp, true).unwrap(), "678");
     }
 
     #[test]
-    fn parse_reply_rejects_nak() {
+    fn reply_payload_rejects_nak() {
         let resp = vec![STX, NAK, ETX];
-        assert!(parse_reply(&resp).is_err());
+        assert!(reply_payload(&resp, true).is_err());
+        assert_eq!(reply_payload(&resp, false).unwrap(), "\x15");
     }
 
     #[test]
-    fn parse_reply_rejects_crc_mismatch() {
+    fn reply_payload_rejects_crc_mismatch() {
         // STX ACK "5" ':' "00" ETX — CRC "00" is wrong for the payload.
         let resp = vec![STX, ACK, b'5', b':', b'0', b'0', ETX];
-        assert!(parse_reply(&resp).is_err());
+        assert!(reply_payload(&resp, true).is_err());
     }
 
     #[test]
-    fn parse_reply_xx_disables_crc_check() {
+    fn reply_payload_xx_disables_crc_check() {
         // ":XX" marks the CRC as disabled; payload is accepted verbatim.
         let resp = vec![STX, ACK, b'9', b':', b'X', b'X', ETX];
-        assert_eq!(parse_reply(&resp).unwrap(), "9");
+        assert_eq!(reply_payload(&resp, true).unwrap(), "9");
     }
 
     #[test]

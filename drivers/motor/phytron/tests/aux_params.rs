@@ -291,3 +291,30 @@ async fn the_poll_sets_axis_status() {
     .await;
     assert_eq!(status, 0x10, "the positive limit switch");
 }
+
+/// C `phytronController::writeOption`/`readOption` "pollMethod"
+/// (phytronAxisMotor.cpp:597-606, 668-725): an MCC polls serially only,
+/// and an axis must exist.
+#[epics_rs::base::epics_test]
+async fn the_poll_method_option_is_the_controllers_and_an_mcc_refuses_parallel() {
+    use epics_rs::asyn::user::AsynUser;
+    let ((refused, missing, axis, shown), _) = on_mcc("phyPollOption", |port| {
+        let at = |addr| AsynUser::default().with_addr(addr);
+        let refused = port
+            .set_option_blocking(at(0), "pollMethod", "parallel")
+            .is_err();
+        let missing = port
+            .set_option_blocking(at(2), "POLLMETHOD", "serial")
+            .is_err();
+        let axis = port.set_option_blocking(at(1), "pollMethod", "default");
+        port.set_option_blocking(at(0), "pollMethod", " old ")
+            .unwrap();
+        let shown = port.get_option_blocking(at(0), "pollmethod").unwrap();
+        (refused, missing, axis.is_ok(), shown)
+    })
+    .await;
+    assert!(refused, "an MCC has no parallel poll");
+    assert!(missing, "no axis 2");
+    assert!(axis);
+    assert_eq!(shown, "0/serial");
+}
