@@ -32,6 +32,11 @@ static SC800: Model1 = Model1::new(&DEV_SC800, 16, SCAN_RATE);
 
 /// `SC800Setup(num_cards, scan_rate)`.
 pub fn sc800_setup_command() -> CommandDef {
+    SC800.register_report("drvSC800", |cards| {
+        cards.report("SC800", |card, line| {
+            format!("    SC800 controller {card}, {line} \n")
+        })
+    });
     SC800.setup_command("SC800Setup")
 }
 
@@ -73,12 +78,17 @@ pub fn sc800_config_command() -> CommandDef {
                     return;
                 };
                 let num_axes = controller.num_axes();
+                let line = format!(
+                    "port={asyn_port}, address={address}, id: {}",
+                    controller.ident()
+                );
                 let controller = Arc::new(Mutex::new(controller));
                 for index in 0..num_axes {
                     let motor: Arc<Mutex<dyn AsynMotor>> =
                         Arc::new(Mutex::new(KohzuAxis::new(controller.clone(), index)));
                     init.axis(index as i32, motor);
                 }
+                init.describe(line);
             })?;
             Ok(CommandOutcome::Continue)
         },
@@ -88,7 +98,9 @@ pub fn sc800_config_command() -> CommandDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use motor_common::testing::{LineRig, drvsup_init, ioc_init_errlog, run_command};
+    use motor_common::testing::{
+        LineRig, driver_report, drvsup_init, ioc_init_errlog, run_command,
+    };
 
     /// drvSC800.cc:537-538 connects at the Config's `address`.
     #[epics_rs::base::epics_test]
@@ -172,5 +184,34 @@ mod tests {
         let idns = |sent: Vec<String>| sent.iter().filter(|c| c.contains("IDN")).count();
         assert_eq!(idns(third.sent()), 3);
         assert_eq!(idns(never.sent()), 3);
+    }
+
+    /// drvSC800.cc's drvet `report` (drvSC800.cc:144-170), which `dbior` runs
+    /// at every level.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_sc800_card() {
+        let int = ArgValue::Int;
+        let setup = sc800_setup_command();
+        assert_eq!(
+            driver_report("drvSC800", 0),
+            "    No SC800 controllers configured.\n"
+        );
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::multi_device("sc800RepGpib", 8, |cmd| {
+            match cmd.trim_start_matches('\u{2}').trim_end() {
+                "IDN" => "C\tIDN0\t400\t7".into(),
+                c => format!("C\t{c}"),
+            }
+        });
+        let config = vec![int(1), ArgValue::String("sc800RepGpib".into()), int(4)];
+        run_command(sc800_config_command(), config).await;
+        drvsup_init().await;
+        for level in [0, 1, 2] {
+            assert_eq!(
+                driver_report("drvSC800", level),
+                "    SC800 controller 0 connection failed.\n    SC800 controller 1, \
+                 port=sc800RepGpib, address=4, id: SC-400 Ver7 \n"
+            );
+        }
     }
 }
