@@ -270,6 +270,35 @@ impl SpiiPlusAxis {
     fn lock(&self) -> MutexGuard<'_, SpiiPlusController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// One record transaction as devSPiiPlus.cc builds it into one message:
+    /// SET_VELOCITY's `VEL` when the record sends it, SET_ACCEL's `ACC` in
+    /// Buffer mode when the record sends it (`acc > 0`), then `body`. In
+    /// Buffer mode `start` follows alone, as GO or JOG end the message there.
+    fn transaction(
+        &self,
+        velocity: Option<f64>,
+        acceleration: f64,
+        body: &str,
+        start: &str,
+    ) -> AsynResult<()> {
+        let ctrl = self.lock();
+        let a = self.axis;
+        let buffer = matches!(ctrl.mode, CommandMode::Buffer);
+        let mut msg = String::new();
+        if let Some(v) = velocity {
+            msg += &format!("VEL{a}={};", nint(v));
+        }
+        if buffer && acceleration > 0.0 {
+            msg += &format!("ACC{a}={};", nint(acceleration));
+        }
+        msg += body;
+        ctrl.command(&msg)?;
+        if buffer {
+            ctrl.command(start)?;
+        }
+        Ok(())
+    }
 }
 
 impl AsynMotor for SpiiPlusAxis {
@@ -288,23 +317,20 @@ impl AsynMotor for SpiiPlusAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
         let a = self.axis;
-        let v = nint(velocity);
         let p = nint(position);
-        match ctrl.mode {
+        let body = match self.lock().mode {
             CommandMode::Buffer => {
-                let acc = nint(acceleration);
-                ctrl.command(&format!(
-                    "VEL{a}={v};ACC{a}={acc};Done({a})=0;target_pos({a})={p};opReq({a})={OP_ABS_MOVE};"
-                ))?;
-                ctrl.command(&format!("start {a}, 1"))?;
+                format!("Done({a})=0;target_pos({a})={p};opReq({a})={OP_ABS_MOVE};")
             }
-            CommandMode::Connect | CommandMode::Direct => {
-                ctrl.command(&format!("VEL{a}={v};ptp ({a}), {p};"))?;
-            }
-        }
-        Ok(())
+            CommandMode::Connect | CommandMode::Direct => format!("ptp ({a}), {p};"),
+        };
+        self.transaction(
+            Some(velocity),
+            acceleration,
+            &body,
+            &format!("start {a}, 1"),
+        )
     }
 
     fn move_relative(
@@ -315,23 +341,20 @@ impl AsynMotor for SpiiPlusAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
         let a = self.axis;
-        let v = nint(velocity);
         let d = nint(distance);
-        match ctrl.mode {
+        let body = match self.lock().mode {
             CommandMode::Buffer => {
-                let acc = nint(acceleration);
-                ctrl.command(&format!(
-                    "VEL{a}={v};ACC{a}={acc};Done({a})=0;target_pos({a})={d};opReq({a})={OP_REL_MOVE};"
-                ))?;
-                ctrl.command(&format!("start {a}, 1"))?;
+                format!("Done({a})=0;target_pos({a})={d};opReq({a})={OP_REL_MOVE};")
             }
-            CommandMode::Connect | CommandMode::Direct => {
-                ctrl.command(&format!("VEL{a}={v};ptp/r ({a}), {d};"))?;
-            }
-        }
-        Ok(())
+            CommandMode::Connect | CommandMode::Direct => format!("ptp/r ({a}), {d};"),
+        };
+        self.transaction(
+            Some(velocity),
+            acceleration,
+            &body,
+            &format!("start {a}, 1"),
+        )
     }
 
     fn move_velocity(
@@ -339,40 +362,41 @@ impl AsynMotor for SpiiPlusAxis {
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
+        // The record's jog sends SET_ACCEL and JOG, no SET_VELOCITY.
         let a = self.axis;
         let v = nint(velocity);
-        match ctrl.mode {
+        let body = match self.lock().mode {
             CommandMode::Buffer => {
-                ctrl.command(&format!(
-                    "Done({a})=0;jog_vel({a})={v}; opReq({a})={OP_JOG_MOVE};"
-                ))?;
-                ctrl.command(&format!("start {a},1"))?;
+                format!("Done({a})=0;jog_vel({a})={v}; opReq({a})={OP_JOG_MOVE};")
             }
-            CommandMode::Connect | CommandMode::Direct => {
-                ctrl.command(&format!("jog/v ({a}), {v};"))?;
-            }
-        }
-        Ok(())
+            CommandMode::Connect | CommandMode::Direct => format!("jog/v ({a}), {v};"),
+        };
+        self.transaction(None, acceleration, &body, &format!("start {a},1"))
     }
 
     fn home(
         &mut self,
         _user: &AsynUser,
         _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
+        velocity: f64,
+        acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
         let a = self.axis;
-        match ctrl.mode {
+        let mode = self.lock().mode;
+        match mode {
             CommandMode::Buffer => {
+                // The record's home ends in GO, which starts the axis buffer.
                 let op = if forward { OP_HOME_F } else { OP_HOME_R };
-                ctrl.command(&format!("Done({a})=0;opReq({a})={op};"))?;
-                Ok(())
+                let body = format!("Done({a})=0;opReq({a})={op};");
+                self.transaction(
+                    Some(velocity),
+                    acceleration,
+                    &body,
+                    &format!("start {a}, 1"),
+                )
             }
             CommandMode::Connect | CommandMode::Direct => Err(spiiplus_err(
                 "SPiiPlus: homing is only available in Buffer command mode",
@@ -523,5 +547,63 @@ mod tests {
     fn direction_follows_velocity_sign() {
         assert!(decode_status(CommandMode::Direct, 0, 0, 0, 0, 5.0).direction);
         assert!(!decode_status(CommandMode::Direct, 0, 0, 0, 0, -5.0).direction);
+    }
+
+    use motor_common::testing::LineRig;
+
+    /// Axis 0 of a controller in `mode` on a [`LineRig`].
+    fn rig(name: &str, mode: CommandMode) -> (LineRig, SpiiPlusAxis) {
+        let (line, io) = LineRig::new(name, |last| match last {
+            "?VR" => "ACS SPiiPlus".into(),
+            "?APOS(0)" => "0".into(),
+            _ => String::new(),
+        });
+        let ctrl = SpiiPlusController::new(io, mode).unwrap();
+        let axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        (line, axis)
+    }
+
+    /// motorRecord.cc:872-884: VEL, ACC, HOME, GO; GO's `start` goes alone.
+    #[test]
+    fn a_buffer_home_programs_and_starts_the_axis_buffer() {
+        let (line, mut axis) = rig("spiiHome", CommandMode::Buffer);
+        axis.home(&AsynUser::default(), 0.0, 100.0, 50.0, true)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            ["VEL0=100;ACC0=50;Done(0)=0;opReq(0)=4;", "start 0, 1"]
+        );
+    }
+
+    /// The record sends no SET_ACCEL for a zero acceleration.
+    #[test]
+    fn a_zero_acceleration_sends_no_acc() {
+        let (line, mut axis) = rig("spiiNoAcc", CommandMode::Buffer);
+        axis.move_absolute(&AsynUser::default(), 7.0, 0.0, 100.0, 0.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL0=100;Done(0)=0;target_pos(0)=7;opReq(0)=1;",
+                "start 0, 1"
+            ]
+        );
+    }
+
+    /// SET_ACCEL ahead of the jog in Buffer mode; none in Direct mode.
+    #[test]
+    fn a_jog_carries_the_records_acc_in_buffer_mode_only() {
+        let (line, mut axis) = rig("spiiJogBuf", CommandMode::Buffer);
+        axis.move_velocity(&AsynUser::default(), 0.0, -20.0, 5.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            ["ACC0=5;Done(0)=0;jog_vel(0)=-20; opReq(0)=3;", "start 0,1"]
+        );
+        let (line, mut axis) = rig("spiiJogDir", CommandMode::Direct);
+        axis.move_velocity(&AsynUser::default(), 0.0, -20.0, 5.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["jog/v (0), -20;"]);
     }
 }
