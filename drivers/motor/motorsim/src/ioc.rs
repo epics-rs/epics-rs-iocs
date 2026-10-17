@@ -13,6 +13,7 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
+use epics_rs::motor::controller_port::index;
 use epics_rs::motor::devices::{
     motor_interface_device, register_motor_interface_device, register_motor_interface_driver,
 };
@@ -20,7 +21,9 @@ use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_int, req_st
 use motor_common::model1::c_int;
 use motor_common::model2::Model2;
 pub use motor_common::model2::drv_asyn_motor_configure_command;
-use motor_common::{Controller, TraceUser, asyn_user, register_port};
+use motor_common::{
+    Controller, ControllerParams, ControllerReport, TraceUser, asyn_user, register_port_with,
+};
 
 use crate::motorsim::{
     DEFAULT_HI_LIMIT, DEFAULT_HOME, DEFAULT_LOW_LIMIT, DEFAULT_START, DrvMotorSimAxis, MotorSimAxis,
@@ -144,6 +147,39 @@ pub fn motor_sim_create_command() -> CommandDef {
     )
 }
 
+/// C `motorSimController::report` (motorSimDriver.cpp:111-150), over the
+/// axes [`MotorSimHolder`] keeps.
+struct MotorSimReport {
+    holder: Arc<MotorSimHolder>,
+}
+
+impl ControllerParams for MotorSimReport {
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let port = ctx.port_name();
+        let _ = writeln!(
+            out,
+            "Simulation motor driver {port}, numAxes={}",
+            ctx.num_axes()
+        );
+        let axes = self.holder.axes.lock().unwrap_or_else(|e| e.into_inner());
+        for addr in 0..ctx.num_axes() as i32 {
+            let _ = writeln!(out, "  axis {addr}");
+            let Some(axis) = axes.get(&MotorSimHolder::axis_key(port, addr.into())) else {
+                continue;
+            };
+            if level > 0 {
+                // C's locals stay 0.0 when getDoubleParam finds no value.
+                let soft = |reason| ctx.float64_param(addr, reason).unwrap_or(0.0);
+                let soft_limits = (soft(index::LOW_LIMIT), soft(index::HIGH_LIMIT));
+                let axis = axis.lock().unwrap_or_else(|e| e.into_inner());
+                axis.report(out, soft_limits);
+            }
+        }
+        drop(axes);
+        ctx.report(out, level);
+    }
+}
+
 /// The concrete axes keyed by `"{portName}:{axis}"` for `motorSimConfigAxis`.
 pub struct MotorSimHolder {
     axes: Mutex<HashMap<String, Arc<Mutex<MotorSimAxis>>>>,
@@ -181,7 +217,10 @@ impl MotorSimHolder {
                 if num_axes < 1 {
                     num_axes = 1; // C: `if (numAxes < 1) numAxes = 1;`
                 }
-                register_port(ctx, &port_name, num_axes as i32)?;
+                let report = MotorSimReport {
+                    holder: holder.clone(),
+                };
+                register_port_with(ctx, &port_name, num_axes as i32, report)?;
                 let poller = Controller::new();
                 for index in 0..num_axes {
                     let axis = Arc::new(Mutex::new(MotorSimAxis::new(
@@ -275,6 +314,74 @@ mod one_poller {
         ];
         let cmd = MotorSimHolder::new().create_controller_command();
         assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// C `motorSimController::report` (motorSimDriver.cpp:111-150): the
+    /// driver line and each axis, at level 1 its trajectory, limits, home,
+    /// encoder offset and the port's soft-limit params, before the base.
+    #[epics_rs::base::epics_test]
+    async fn the_port_report_prints_the_motorsim_lines() {
+        use epics_rs::motor::controller_port::index;
+        use motor_common::testing::{port_report, run_command};
+
+        let holder = MotorSimHolder::new();
+        let args = vec![
+            ArgValue::String("simReport".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(0),
+            ArgValue::Int(0),
+        ];
+        run_command(holder.create_controller_command(), args).await;
+        let args = ["simReport"]
+            .map(|p| ArgValue::String(p.into()))
+            .into_iter()
+            .chain([0, 100, -100, 5, 3].map(ArgValue::Int))
+            .collect();
+        run_command(holder.config_axis_command(), args).await;
+        let port = epics_rs::asyn::manager::PortManager::global()
+            .find_port_handle("simReport")
+            .unwrap();
+        port.write_float64_blocking(index::HIGH_LIMIT, 0, 50.0)
+            .unwrap();
+        port.write_float64_blocking(index::LOW_LIMIT, 0, -20.0)
+            .unwrap();
+
+        let text = port_report("simReport", 0);
+        assert!(
+            text.contains("Simulation motor driver simReport, numAxes=2\n  axis 0\n  axis 1\n"),
+            "{text}"
+        );
+        let text = port_report("simReport", 1);
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "Simulation motor driver simReport, numAxes=2")
+            .unwrap_or_else(|| panic!("{text}"));
+        let axis0 = &lines[at + 1..at + 9];
+        assert_eq!(axis0[0], "  axis 0");
+        assert!(
+            axis0[1].starts_with(
+                "  Current position = 0.000000, velocity = 0.000000 at current time: "
+            ),
+            "{text}"
+        );
+        assert!(
+            axis0[2].starts_with(
+                "  Destination posn = 0.000000, velocity = 0.000000 at desination time:  "
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            axis0[3..],
+            [
+                "    Hard limits: -100.000000, 100.000000",
+                "           Home: 5.000000",
+                "    Enc. offset: 3.000000",
+                "    Soft limits: -20.000000, 50.000000",
+                "  axis 1",
+            ],
+            "{text}"
+        );
     }
 
     /// drvMotorSim's one motorSimThread (drvMotorSim.c:790) polls the axes

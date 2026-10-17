@@ -109,6 +109,33 @@ impl MotorSimAxis {
         self.homed = false;
     }
 
+    /// The level-1 lines C `motorSimController::report` prints for this
+    /// axis (motorSimDriver.cpp:122-141), with the port's soft limits.
+    pub fn report(&self, out: &mut dyn std::fmt::Write, (low_soft, hi_soft): (f64, f64)) {
+        let (next, end) = (self.nextpoint, self.endpoint);
+        let _ = writeln!(
+            out,
+            "  Current position = {:.6}, velocity = {:.6} at current time: {:.6}",
+            next.p, next.v, next.t
+        );
+        let _ = writeln!(
+            out,
+            "  Destination posn = {:.6}, velocity = {:.6} at desination time:  {:.6}",
+            end.p, end.v, end.t
+        );
+        let _ = writeln!(
+            out,
+            "    Hard limits: {:.6}, {:.6}",
+            self.low_hard_limit, self.hi_hard_limit
+        );
+        let _ = writeln!(out, "           Home: {:.6}", self.home);
+        let _ = writeln!(out, "    Enc. offset: {:.6}", self.enc_offset);
+        let _ = writeln!(out, "    Soft limits: {low_soft:.6}, {hi_soft:.6}");
+        if self.homing {
+            let _ = writeln!(out, "    Currently homing axis");
+        }
+    }
+
     /// Shared body of the absolute/relative move (C `motorSimAxis::move`).
     fn do_move(
         &mut self,
