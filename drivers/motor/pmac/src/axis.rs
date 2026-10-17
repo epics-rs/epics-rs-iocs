@@ -32,9 +32,10 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
-use crate::controller::{PmacController, pmac_err};
+use crate::controller::{ErrorThrottle, PmacController, pmac_err};
 use crate::cs_groups::{AxisPoll, DeferredMove};
 use crate::protocol::{
     AXIS_GENERAL_PROB2, CID_GEOBRICK, CID_PMAC, IX24_LIMITS_DISABLED, STATUS1_AMP_ENABLED,
@@ -60,6 +61,8 @@ pub struct PmacAxis {
     pub(crate) has_encoder: bool,
     /// The status the last poll posted, which a failed status read keeps.
     last: MotorStatus,
+    /// C's per-axis `printErrors` / `printNextError_`.
+    throttle: ErrorThrottle,
 }
 
 /// Lock the shared controller. Taken as a free function on the field rather than
@@ -97,12 +100,32 @@ fn speed_preamble(axis: i32, velocity: f64, acceleration: f64) -> String {
 impl PmacAxis {
     pub fn new(controller: Arc<Mutex<PmacController>>, axis: i32) -> Self {
         // C getAxisInitialStatus; axis 0 skips it.
-        let has_encoder = axis != 0
-            && lock(&controller)
+        let has_encoder = axis != 0 && {
+            let c = lock(&controller);
+            let read = c
                 .write_read(&format!(
                     "I{axis}13 I{axis}14 I{axis}30 I{axis}31 I{axis}33"
                 ))
                 .is_ok_and(|resp| parse_initial_status(&resp).is_some());
+            if !read {
+                c.trace().print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "pmacAxis::getAxisInitialStatus: Error: initial status poll failed on \
+                         axis {axis}.\n"
+                    ),
+                );
+                c.trace().print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "pmacAxis::pmacAxis: getAxisInitialStatus failed to return asynSuccess. \
+                         Controller: {}, Axis: {axis}.\n",
+                        c.port_name()
+                    ),
+                );
+            }
+            read
+        };
         Self {
             controller,
             axis,
@@ -113,6 +136,7 @@ impl PmacAxis {
             fatal_following: false,
             has_encoder,
             last: MotorStatus::default(),
+            throttle: ErrorThrottle::default(),
         }
     }
 
@@ -181,8 +205,21 @@ impl PmacAxis {
         forward: bool,
     ) -> AsynResult<String> {
         let axis = self.axis;
-        let cid = parse_cid(&controller.write_read("cid")?)
-            .ok_or_else(|| pmac_err("could not read controller type (cid)"))?;
+        let error = |what: std::fmt::Arguments<'_>| {
+            controller.trace().print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "Controller {} Addr {axis}. pmacAxis::home: ERROR {what}.\n",
+                    controller.port_name()
+                ),
+            );
+            pmac_err(what.to_string())
+        };
+        let cid = controller
+            .reply("cid")
+            .map_err(|_| error(format_args!("Reading Controller Type")))?;
+        // C's controller_type stays 0 when the reply does not scan.
+        let cid = parse_cid(&cid).unwrap_or(0);
 
         let flags = match cid {
             CID_GEOBRICK => {
@@ -194,17 +231,27 @@ impl PmacAxis {
                     let n = axis - 4;
                     format!("I71{n}2 I71{n}3 i{axis}24 i{axis}23 i{axis}26")
                 };
-                parse_home_flags_geobrick(&controller.write_read(&query)?)
+                controller
+                    .reply(&query)
+                    .ok()
+                    .as_deref()
+                    .and_then(parse_home_flags_geobrick)
             }
             CID_PMAC => {
                 // VME Turbo PMAC 2: the flags live on the MACRO station.
                 let ms = ((axis - 1) / 2) * 4 + (axis - 1) % 2;
                 let query = format!("ms{ms},i912 ms{ms},i913 i{axis}24 i{axis}23 i{axis}26");
-                parse_home_flags_pmac(&controller.write_read(&query)?)
+                controller
+                    .reply(&query)
+                    .ok()
+                    .as_deref()
+                    .and_then(parse_home_flags_pmac)
             }
-            other => return Err(pmac_err(format!("unknown controller type cid={other}"))),
+            other => {
+                return Err(error(format_args!("Unknown controller type = {other}")));
+            }
         };
-        let flags = flags.ok_or_else(|| pmac_err("could not read home flags"))?;
+        let flags = flags.ok_or_else(|| error(format_args!("Cannot Read Home Flags")))?;
 
         // The record's home velocity wins over the axis's configured i{n}23.
         let home_velocity = if velocity != 0.0 {
@@ -217,8 +264,21 @@ impl PmacAxis {
             self.limits_disabled = true;
             Ok(format!(" i{axis}24=i{axis}24|$20000"))
         } else {
-            // C logs this at ASYN_TRACE_ERROR and homes anyway: an axis that does
-            // not home onto a limit simply keeps its limits.
+            // C homes anyway: an axis that does not home onto a limit simply
+            // keeps its limits. C prints `type` in hex and `flag` in decimal.
+            controller.trace().print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "pmacAxis::home: Error: Cannot disable limits to home PMAC controller {}, \
+                     axis {axis}, type:{:x}, flag:${}, vel:{home_velocity:.6}, mode:0x{:x}, \
+                     offset: {}\n",
+                    controller.port_name(),
+                    flags.home_type as i32,
+                    flags.home_flag as i32,
+                    flags.flag_mode,
+                    flags.home_offset as i32,
+                ),
+            );
             Ok(String::new())
         }
     }
@@ -365,6 +425,7 @@ impl AsynMotor for PmacAxis {
         let mut controller = lock(&self.controller);
         let config = controller.axis_config(axis);
         let controller_problem = controller.controller_problem();
+        let print_errors = self.throttle.print_errors();
 
         // One round trip for the two status words, the following error and the
         // position. With an open-loop axis the encoder position comes back from
@@ -375,12 +436,23 @@ impl AsynMotor for PmacAxis {
         } else {
             format!("#{axis} ? F P")
         };
-        let Some((status1, status2, first, second)) = controller
-            .write_read(&query)
-            .ok()
-            .as_deref()
-            .and_then(parse_axis_status)
-        else {
+        let read = controller.reply(&query);
+        let parsed = read.as_deref().ok().and_then(parse_axis_status);
+        let Some((status1, status2, first, second)) = parsed else {
+            // C's poll returns before the read with no low-level user.
+            if controller.connected() {
+                let (status, response) = match &read {
+                    Ok(reply) => (0, reply.as_str()),
+                    Err(e) => (e.c_status_code(), ""),
+                };
+                controller.trace().print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "drvPmacAxisGetStatus: not all status values returned. Status: \
+                         {status}\nCommand :{query}\nResponse:{response}"
+                    ),
+                );
+            }
             // C keeps every status parameter but the power-on bit, which it
             // reads from the zeroed status words, and returns success
             // (pmacAxis.cpp:494-498, 606-613).
@@ -427,6 +499,19 @@ impl AsynMotor for PmacAxis {
             && ix24 & IX24_LIMITS_DISABLED != 0
         {
             problem = true;
+            if print_errors {
+                controller.trace().print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "*** WARNING *** Limits are disabled on controller {}, axis {axis}\n",
+                        controller.port_name()
+                    ),
+                );
+                self.throttle.print_next = false;
+            }
+        }
+        if !problem {
+            self.throttle.print_next = true;
         }
 
         // The home move that borrowed the limits has finished: give them back.

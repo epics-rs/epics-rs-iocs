@@ -193,11 +193,12 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
             let num_axes = c_int(args, 3);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
 
-            let controller = Arc::new(Mutex::new(PmacController::new(low_level_port_connect(
+            let controller = Arc::new(Mutex::new(PmacController::new(
                 &name,
                 &low_level_port,
                 low_level_addr,
-            ))));
+                low_level_port_connect(&name, &low_level_port, low_level_addr),
+            )));
             let params = PmacControllerParams::new(controller.clone());
             let owner = ctx.db().scan_control().interrupt_gate();
             let handle = register_controller_port(owner, &name, num_axes + 1, params)?;
@@ -320,19 +321,13 @@ fn pmac_disable_limits_check_command(registry: &Registry) -> CommandDef {
             let done = find(&registry, &name, |reg| {
                 let mut controller = reg.controller.lock().unwrap_or_else(|e| e.into_inner());
                 match all_axes {
-                    1 => {
-                        controller.disable_limits_check_all();
-                        Ok(())
-                    }
-                    0 => controller
-                        .disable_limits_check(axis)
-                        .map_err(|e| format!("pmacDisableLimitsCheck: {e}")),
-                    _ => Ok(()),
+                    1 => controller.disable_limits_check_all(),
+                    0 => controller.disable_limits_check(axis),
+                    _ => {}
                 }
             });
-            match done {
-                Some(result) => result?,
-                None => port_not_found("pmacDisableLimitsCheck", &name),
+            if done.is_none() {
+                port_not_found("pmacDisableLimitsCheck", &name);
             }
             Ok(CommandOutcome::Continue)
         },
@@ -359,11 +354,9 @@ fn pmac_set_open_loop_encoder_axis_command(registry: &Registry) -> CommandDef {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .set_open_loop_encoder_axis(axis, encoder_axis, 1.0)
-                    .map_err(|e| format!("pmacSetOpenLoopEncoderAxis: {e}"))
             });
-            match done {
-                Some(result) => result?,
-                None => port_not_found("pmacSetOpenLoopEncoderAxis", &name),
+            if done.is_none() {
+                port_not_found("pmacSetOpenLoopEncoderAxis", &name);
             }
             Ok(CommandOutcome::Continue)
         },
@@ -729,7 +722,12 @@ mod tests {
     }
 
     fn controller_on(port: &str) -> PmacController {
-        PmacController::new(low_level_port_connect("pmacTest", port, 0))
+        PmacController::new(
+            "pmacTest",
+            port,
+            0,
+            low_level_port_connect("pmacTest", port, 0),
+        )
     }
 
     #[test]
@@ -1039,6 +1037,192 @@ mod tests {
         let mut axis = PmacAxis::new(controller, 1);
         let status = axis.poll(&AsynUser::new(0).with_addr(1)).unwrap();
         assert!(status.powered && !status.problem);
+    }
+
+    /// `port`'s trace, address 0 included, without the prefix, so what it
+    /// holds is the driver's own bytes.
+    struct TraceCapture {
+        path: std::path::PathBuf,
+        seen: std::cell::Cell<usize>,
+    }
+
+    impl TraceCapture {
+        fn on(port: &str) -> Self {
+            use epics_rs::asyn::trace::TraceInfoMask;
+            let path = std::env::temp_dir().join(format!("pmac-err-{port}-{}", std::process::id()));
+            let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+            let manager = PortManager::global();
+            let trace = manager.trace_manager();
+            trace.set_trace_info_mask(Some(port), TraceInfoMask::empty());
+            trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+            trace.set_device_trace_info_mask(port, 0, TraceInfoMask::empty());
+            trace.set_device_trace_file(port, 0, TraceFile::File(file));
+            Self {
+                path,
+                seen: std::cell::Cell::new(0),
+            }
+        }
+
+        /// What was printed since the last call.
+        fn take(&self) -> String {
+            let text = std::fs::read_to_string(&self.path).unwrap();
+            let new = text[self.seen.get()..].to_owned();
+            self.seen.set(text.len());
+            new
+        }
+    }
+
+    impl Drop for TraceCapture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Controller port `name` over low-level port `low`, with its parameters.
+    fn controller_port(name: &str, low: &str) -> (Arc<Mutex<PmacController>>, SyncIOHandle) {
+        let connected = low_level_port_connect(name, low, 0);
+        let controller = Arc::new(Mutex::new(PmacController::new(name, low, 0, connected)));
+        let params = PmacControllerParams::new(controller.clone());
+        let port =
+            epics_rs::motor::devices::register_controller_port(&open_owner(), name, 2, params)
+                .unwrap();
+        controller.lock().unwrap().attach_port(port.clone());
+        (
+            controller,
+            SyncIOHandle::from_handle(port, 0, Duration::from_secs(1)),
+        )
+    }
+
+    /// pmacController.cpp:341, 601-708: C's error lines on the low-level
+    /// port's trace, the feed-rate one once per `PMAC_ERROR_PRINT_TIME_`
+    /// unless the rate recovered in between.
+    #[test]
+    fn controller_errors_print_c_lines_on_the_low_level_trace() {
+        let (_rt, rig) = publish_scripted("pmacErrLow");
+        let low = TraceCapture::on("pmacErrLow");
+        let (controller, io) = controller_port("pmacErrCtl", "pmacErrLow");
+        let write = |name, value| {
+            io.write_int32(io.drv_user_create(name).unwrap(), value)
+                .unwrap()
+        };
+        write("PMAC_C_FEEDRATE_LIMIT", 100);
+        write("PMAC_C_FEEDRATE_POLL", 1);
+        let poll = || controller.lock().unwrap().poll();
+        let failed = |command| {
+            format!(
+                "pmacController::lowLevelWriteRead: Error from pasynOctetSyncIO->writeRead. \
+                 command: {command}, status=1\n"
+            )
+        };
+        let unread_global = format!(
+            "{}pmacController::getGlobalStatus: Error reading ???.\n",
+            failed("???")
+        );
+        let below = "pmacController::poll: *** ERROR ***: global feed rate below limit. \
+                     feedrate: 50, feedrate limit 100\n";
+
+        rig.answer("%", b"50\r");
+        poll();
+        assert_eq!(low.take(), format!("{unread_global}{below}"));
+        poll();
+        assert_eq!(low.take(), unread_global);
+
+        rig.answer("???", b"zz\r");
+        rig.answer("%", b"\r");
+        poll();
+        assert_eq!(
+            low.take(),
+            "pmacController::getGlobalStatus: Error reading ???. nvals: 0, response: zz\r\n\
+             pmacController::getGlobalStatus: Error reading feedrate: nvals: -1, response: \r\n\
+             pmacController::poll: Error reading or setting params.\n"
+        );
+
+        rig.answer("???", b"000000\r");
+        rig.answer("%", b"100\r");
+        poll();
+        assert_eq!(low.take(), "");
+        rig.answer("%", b"50\r");
+        poll();
+        assert_eq!(low.take(), below);
+
+        rig.silence("%");
+        poll();
+        assert_eq!(
+            low.take(),
+            format!(
+                "{}pmacController::getGlobalStatus: Error reading feedrate.\n\
+                 pmacController::poll: Error reading or setting params.\n",
+                failed("%")
+            )
+        );
+    }
+
+    /// pmacAxis.cpp:96, 136, 243-305, 497, 585: C's axis error lines on the
+    /// controller's trace, the limits warning throttled as the feed rate's.
+    #[test]
+    fn axis_errors_print_c_lines_on_the_controller_trace() {
+        let (_rt, rig) = publish_scripted("pmacAxErrLow");
+        let (controller, _io) = controller_port("pmacAxErrCtl", "pmacAxErrLow");
+        // After the port exists: registering it resets its trace.
+        let own = TraceCapture::on("pmacAxErrCtl");
+        let mut axis = PmacAxis::new(controller, 1);
+        assert_eq!(
+            own.take(),
+            "pmacAxis::getAxisInitialStatus: Error: initial status poll failed on axis 1.\n\
+             pmacAxis::pmacAxis: getAxisInitialStatus failed to return asynSuccess. \
+             Controller: pmacAxErrCtl, Axis: 1.\n"
+        );
+
+        let user = AsynUser::new(0).with_addr(1);
+        rig.answer("#1 ? F P", b"zz\r");
+        axis.poll(&user).unwrap();
+        assert_eq!(
+            own.take(),
+            "drvPmacAxisGetStatus: not all status values returned. Status: 0\n\
+             Command :#1 ? F P\nResponse:zz\r"
+        );
+        rig.silence("#1 ? F P");
+        axis.poll(&user).unwrap();
+        assert_eq!(
+            own.take(),
+            "drvPmacAxisGetStatus: not all status values returned. Status: 1\n\
+             Command :#1 ? F P\nResponse:"
+        );
+
+        let warning = "*** WARNING *** Limits are disabled on controller pmacAxErrCtl, axis 1\n";
+        rig.answer("#1 ? F P", b"882000000001\r0\r100.0\r");
+        // The failed polls took this period's print.
+        rig.answer("i124", b"$20000\r");
+        axis.poll(&user).unwrap();
+        assert_eq!(own.take(), "");
+        rig.answer("i124", b"$0\r");
+        axis.poll(&user).unwrap();
+        rig.answer("i124", b"$20000\r");
+        axis.poll(&user).unwrap();
+        axis.poll(&user).unwrap();
+        assert_eq!(own.take(), warning);
+
+        let home = |axis: &mut PmacAxis| axis.home(&user, 0.0, 2.0, 0.0, false);
+        let addr = "Controller pmacAxErrCtl Addr 1. pmacAxis::home: ERROR";
+        assert!(home(&mut axis).is_err());
+        assert_eq!(own.take(), format!("{addr} Reading Controller Type.\n"));
+        rig.answer("cid", b"12\r");
+        assert!(home(&mut axis).is_err());
+        assert_eq!(
+            own.take(),
+            format!("{addr} Unknown controller type = 12.\n")
+        );
+        rig.answer("cid", b"603382\r");
+        assert!(home(&mut axis).is_err());
+        assert_eq!(own.take(), format!("{addr} Cannot Read Home Flags.\n"));
+        rig.answer("I7012 I7013 i124 i123 i126", b"0\r0\r$0\r10\r0\r");
+        rig.answer("#1 HOME", b"\r");
+        assert!(home(&mut axis).is_ok());
+        assert_eq!(
+            own.take(),
+            "pmacAxis::home: Error: Cannot disable limits to home PMAC controller \
+             pmacAxErrCtl, axis 1, type:0, flag:$0, vel:-0.002000, mode:0x0, offset: 0\n"
+        );
     }
 
     /// pmacController.cpp:201: one poller from pmacCreateController, which
