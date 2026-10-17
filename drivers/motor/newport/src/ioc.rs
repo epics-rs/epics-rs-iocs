@@ -183,9 +183,14 @@ pub fn smc100_create_controller_command() -> CommandDef {
             let serial_port = req_string(args, 1, "SMC100 port name")?;
             let num_axes = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-            let step_size = atof(&opt_string(args, 5)?.unwrap_or_default());
-            if step_size == 0.0 {
-                return Err("SMC100CreateController: EGUs per step must be non-zero".into());
+            let text = opt_string(args, 5)?.unwrap_or_default();
+            let step_size = atof(&text);
+            // C prints this after building the controller, on an errno it never
+            // cleared; a zero or infinite step it builds, dividing every
+            // readback by it. Both are refused here before the build.
+            if !step_size.is_finite() || step_size == 0.0 {
+                println!("SMC100: Error invalid steps per unit={text}");
+                return Ok(CommandOutcome::Continue);
             }
 
             register_port(ctx, &port_name, num_axes)?;
