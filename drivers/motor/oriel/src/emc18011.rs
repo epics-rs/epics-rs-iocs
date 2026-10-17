@@ -60,6 +60,8 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, nint};
 
@@ -96,9 +98,9 @@ fn oriel_err(message: impl Into<String>) -> AsynError {
 /// value, matching the C 7-character field limit: one decimal place, dropping to
 /// none if too long, then clamping to the controller's max travel string.
 fn move_cmd(prefix: char, mm: f64) -> String {
-    let mut field = format!("{mm:.1}");
+    let mut field = format!("{:.1}", CFloat(mm));
     if field.len() > 7 {
-        field = format!("{mm:.0}");
+        field = format!("{:.0}", CFloat(mm));
     }
     if field.len() > 7 {
         field = if mm < 0.0 {
@@ -114,11 +116,11 @@ fn move_cmd(prefix: char, mm: f64) -> String {
 /// magnitude-dependent precision (finer at low speeds, capped at `V200`).
 fn vel_cmd(mms: f64) -> String {
     if mms < 5.0 {
-        format!("V{mms:.2}")
+        format!("V{:.2}", CFloat(mms))
     } else if mms < 50.0 {
-        format!("V{mms:.1}")
+        format!("V{:.1}", CFloat(mms))
     } else if mms < 200.0 {
-        format!("V{mms:.0}")
+        format!("V{:.0}", CFloat(mms))
     } else {
         "V200".to_string()
     }
@@ -659,6 +661,13 @@ mod tests {
         // Still too long -> clamp.
         assert_eq!(move_cmd('G', 12345678.0), "G9999999");
         assert_eq!(move_cmd('G', -12345678.0), "G-999999");
+    }
+
+    /// C's `%.1f` spells a NaN target `nan`, keeping its sign.
+    #[test]
+    fn a_nan_target_goes_out_as_c_printf_spells_it() {
+        assert_eq!(move_cmd('G', -f64::NAN), "G-nan");
+        assert_eq!(move_cmd('T', f64::NAN), "Tnan");
     }
 
     #[test]
