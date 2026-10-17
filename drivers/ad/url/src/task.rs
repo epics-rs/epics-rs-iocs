@@ -180,7 +180,7 @@ async fn acquire_one_image(
     ctx.pool.owner().store_array(0, None);
     // C dereferences a refused alloc unchecked (URLDriver.cpp:133); here the frame
     // is dropped after the pool's limit line.
-    let Ok(mut array) = ctx.pool.wrap(decoded.dims, decoded.data) else {
+    let Ok(mut array) = ctx.pool.alloc_with(decoded.dims, decoded.data) else {
         return Ok(());
     };
     array.unique_id = image_counter;

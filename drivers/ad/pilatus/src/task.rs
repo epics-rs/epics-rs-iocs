@@ -707,7 +707,7 @@ fn build_array(
     if let Some(d) = description {
         attributes.add(tiff_description(d));
     }
-    let mut array = pool.wrap(vec![NDDimension::new(nx), NDDimension::new(ny)], buffer)?;
+    let mut array = pool.alloc_with(vec![NDDimension::new(nx), NDDimension::new(ny)], buffer)?;
     array.unique_id = unique_id;
     array.timestamp = ts;
     array.time_stamp = ts.as_f64();

@@ -1332,7 +1332,7 @@ fn build_array(
     unique_id: i32,
     timestamp: EpicsTimestamp,
 ) -> ADResult<DriverArray> {
-    let mut array = pool.wrap(
+    let mut array = pool.alloc_with(
         vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])],
         data,
     )?;

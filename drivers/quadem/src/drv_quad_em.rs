@@ -1192,7 +1192,7 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
     }
     // C dereferences a refused alloc unchecked (drvQuadEM.cpp:333, :351); here
     // that array is dropped after the pool's limit line.
-    if let Ok(mut all) = ctx.pool.wrap(
+    if let Ok(mut all) = ctx.pool.alloc_with(
         vec![NDDimension::new(QE_MAX_DATA), NDDimension::new(num_read)],
         NDDataBuffer::F64(flat),
     ) {
@@ -1209,7 +1209,7 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
         let column: Vec<f64> = samples.iter().map(|s| s[item]).collect();
         let Ok(mut single) = ctx
             .pool
-            .wrap(vec![NDDimension::new(num_read)], NDDataBuffer::F64(column))
+            .alloc_with(vec![NDDimension::new(num_read)], NDDataBuffer::F64(column))
         else {
             continue;
         };

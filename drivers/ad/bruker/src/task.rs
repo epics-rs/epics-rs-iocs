@@ -320,7 +320,7 @@ async fn publish_frame(
     let data_size = image.data.len() * 4;
     // C dereferences a refused alloc unchecked (BISDetector.cpp:588); here the frame
     // is dropped after the pool's limit line.
-    let Ok(mut array) = ctx.pool.wrap(
+    let Ok(mut array) = ctx.pool.alloc_with(
         vec![NDDimension::new(image.cols), NDDimension::new(image.rows)],
         NDDataBuffer::U32(image.data),
     ) else {

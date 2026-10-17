@@ -531,7 +531,7 @@ async fn process_color_frame(
         let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
         // No C driver to follow: a refused frame is dropped after the pool's
         // limit line.
-        let Ok(mut array) = ctx.color_pool.wrap(dims, data) else {
+        let Ok(mut array) = ctx.color_pool.alloc_with(dims, data) else {
             return;
         };
         array.unique_id = array_counter;
@@ -583,7 +583,7 @@ async fn process_depth_frame(
     let dims = vec![NDDimension::new(w), NDDimension::new(h)];
 
     let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-    let Ok(mut array) = ctx.depth_pool.wrap(dims, data) else {
+    let Ok(mut array) = ctx.depth_pool.alloc_with(dims, data) else {
         return;
     };
     array.unique_id = array_counter;
@@ -626,7 +626,7 @@ async fn process_pointcloud(
             .collect();
 
         let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-        let Ok(mut array) = ctx.color_pool.wrap(
+        let Ok(mut array) = ctx.color_pool.alloc_with(
             vec![
                 NDDimension::new(3),
                 NDDimension::new(w),

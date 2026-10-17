@@ -182,7 +182,7 @@ async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> 
 
     // C allocates before it counts (mythen.cpp:973, :993) and dereferences a
     // refused alloc; the frame is dropped after the pool's reached-limit line.
-    let Ok(mut array) = s.pool.wrap(
+    let Ok(mut array) = s.pool.alloc_with(
         vec![NDDimension::new(width), NDDimension::new(1)],
         NDDataBuffer::U32(channels),
     ) else {
