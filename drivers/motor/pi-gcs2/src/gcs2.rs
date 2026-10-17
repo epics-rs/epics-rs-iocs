@@ -930,6 +930,8 @@ impl AsynMotor for PIGCS2Axis {
             velocity: 0.0,
             done,
             moving: !done,
+            // PIasynAxis.cpp:197 motorStatusMoving_ = !done.
+            msta_moving: !done,
             high_limit: pos_limit,
             low_limit: neg_limit,
             direction: self.last_direction,
@@ -1143,7 +1145,7 @@ mod tests {
         };
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         assert_eq!(status.position, 2.5);
-        assert!(status.moving && status.high_limit && status.powered);
+        assert!(status.moving && status.msta_moving && status.high_limit && status.powered);
         assert!(!status.problem);
         assert_eq!((axis.low_limit, axis.high_limit), (-10.0, 10.0));
     }
