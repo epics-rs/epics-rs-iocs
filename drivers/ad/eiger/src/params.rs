@@ -201,7 +201,11 @@ impl Builder<'_> {
             AsynType::Float64 => ParamType::Float64,
             AsynType::Octet => ParamType::Octet,
         };
-        let index = self.base.create_param(name, param_type)?;
+        // C creates only a name the port lacks (eigerParam.cpp:318-327).
+        let index = match self.base.find_param(name) {
+            Some(index) => index,
+            None => self.base.create_param(name, param_type)?,
+        };
         self.reg.add(index, name, ty, sys, remote);
         Ok(index)
     }
@@ -294,8 +298,8 @@ pub fn create(
     let stream_version = b.remote("STREAM_VERSION", Int32, SC, "format")?;
 
     // Base-class parameters, bound to their detector-config counterparts.
-    // `create_param` resolves an existing name to the index `ADDriverParams`
-    // already assigned, so these are the same parameters the AD records use.
+    // `remote` finds the index `ADDriverParams` already assigned, so these are
+    // the same parameters the AD records use.
     let acquire_time = b.remote("ACQ_TIME", Float64, DC, "count_time")?;
     let acquire_period = b.remote("ACQ_PERIOD", Float64, DC, "frame_time")?;
     let num_images = b.remote("NIMAGES", Int32, DC, "nimages")?;
