@@ -16,14 +16,16 @@ use epics_rs::base::server::iocsh::registry::{ArgValue, CommandContext};
 use motor_common::testing::LineRig;
 
 /// An MCC at address 0 whose axis 1 holds `P41 = 45` (10 mA units),
-/// `P54 = 235` (0.1 °C) and `P36 = 1`; a `P34` read is refused.
+/// `P54 = 235` (0.1 °C) and `P36 = 1`; a `P34` read and a status reset
+/// are refused, the controller status is 42.
 fn mcc_reply(frame: &str) -> String {
     let payload = match &frame[2..frame.len() - 1] {
         "SUI" => "I=00000000",
+        "ST" => "42",
+        "1P34R" | "STC" => return "\x02\x15\x03".into(),
         "1P41R" => "45",
         "1P54R" => "235",
         "1P36R" => "1",
-        "1P34R" => return "\x02\x15\x03".into(),
         c if c.ends_with("=H") => "E",
         c if c.ends_with("=E") || c.ends_with("P20R") || c.ends_with("P22R") => "0",
         _ => "",
@@ -195,4 +197,61 @@ async fn a_write_with_no_axis_prints_axis_not_found() {
     let float = "phytronAxis::writeFloat64: Axis not found on the controller phyNoAxis\n";
     assert_eq!(text.matches(int).count(), 2, "{text}");
     assert_eq!(text.matches(float).count(), 1, "{text}");
+}
+
+/// C `phytronController::writeInt32`/`readInt32` answer the controller
+/// reasons at any address (phytronAxisMotor.cpp:293-303, 375-386).
+#[epics_rs::base::epics_test]
+async fn a_controller_reset_sends_cr_and_sets_every_encoder_ratio_to_1() {
+    use epics_rs::asyn::param::ParamValue;
+    use epics_rs::asyn::request::ParamSetValue;
+    use epics_rs::motor::controller_port::index;
+    let ((ratio, status), sent) = on_mcc("phyCtrlReset", |port| {
+        // The ratio alone, without the axis write that would store it again.
+        let ratio = ParamSetValue::new(index::ENCODER_RATIO, 1, ParamValue::Float64(0.5));
+        port.set_params_and_notify_blocking(1, vec![ratio]).unwrap();
+        port.write_int32_blocking(reason(&port, "CONTROLLER_RESET"), 0, 1)
+            .unwrap();
+        (
+            port.read_float64_blocking(index::ENCODER_RATIO, 1).unwrap(),
+            port.read_int32_blocking(reason(&port, "CONTROLLER_STATUS"), 0)
+                .unwrap(),
+        )
+    })
+    .await;
+    assert_eq!(ratio, 1.0);
+    assert_eq!(status, 42);
+    let wire: Vec<&str> = sent.iter().map(|f| &f[2..f.len() - 1]).collect();
+    for want in ["CR", "ST"] {
+        assert!(wire.contains(&want), "{want}: {wire:?}");
+    }
+}
+
+/// C `CHECK_CTRL` prints a failed controller command once until the
+/// status changes (phytronAxisMotor.cpp:48-58).
+#[epics_rs::base::epics_test]
+async fn a_failed_status_reset_prints_check_ctrl_once() {
+    use epics_rs::asyn::trace::TraceFile;
+    let path = std::env::temp_dir().join(format!("phyCtrlTrace-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    let (status_reset, _) = on_mcc("phyCtrlTrace", move |port| {
+        let file = Arc::new(Mutex::new(file));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_file(Some("phyCtrlTrace"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("phyCtrlTrace", 0, TraceFile::File(file));
+        let status_reset = reason(&port, "CONTROLLER_STATUS_RESET");
+        for _ in 0..2 {
+            assert!(port.write_int32_blocking(status_reset, 0, 1).is_err());
+        }
+        status_reset
+    })
+    .await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let line = format!(
+        "phytronController::writeInt32: (phyCtrlTrace) Reseting status failed with error \
+         code: 6, reason: {status_reset}\n"
+    );
+    assert_eq!(text.matches(&line).count(), 1, "{text}");
 }
