@@ -312,7 +312,8 @@ impl AsynMotor for KohzuAxis {
     ) -> AsynResult<()> {
         // C JOG: cap base speed to the slew speed, program, then FRP
         // with the direction polarity.
-        let polarity = if velocity > 0.0 { '1' } else { '0' };
+        // C takes the polarity from NINT(v), so |v| < 0.5 jogs reverse.
+        let polarity = if nint(velocity) > 0 { '1' } else { '0' };
         self.set_speeds(min_velocity, velocity.abs(), acceleration);
         if self.speeds.base > self.speeds.slew {
             self.speeds.base = self.speeds.slew;
@@ -557,6 +558,11 @@ mod tests {
         axis.set_move_strings(&user, b"COF1/0", None).unwrap();
         axis.move_velocity(&user, 10.0, -100.0, 1000.0).unwrap();
         assert_eq!(sent(&line), ["COF1/0", asi, "FRP1/2/0/0/0/1"]);
+        axis.move_velocity(&user, 0.0, 0.4, 1000.0).unwrap();
+        assert!(
+            sent(&line).last().unwrap().ends_with("/0/1"),
+            "NINT(0.4) = 0"
+        );
     }
 
     /// drvSC800.cc:325-332: POST once the move is done, not while it runs.
