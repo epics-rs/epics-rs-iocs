@@ -25,11 +25,11 @@ use crate::acr::{AcrAxis, AcrController};
 use crate::drv_pc6k::{self, DrvPc6kAxis, PC6K_NUM_CARDS, Pc6kCard};
 use crate::oem::{OemAxis, OemController, OemParams};
 
-/// Command timeout.
-const OEM_TIMEOUT: Duration = Duration::from_secs(1);
+/// Command timeout: asynMotorController's `DEFAULT_CONTROLLER_TIMEOUT`.
+const OEM_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// ACR command timeout.
-const ACR_TIMEOUT: Duration = Duration::from_secs(1);
+/// ACR command timeout: asynMotorController's `DEFAULT_CONTROLLER_TIMEOUT`.
+const ACR_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the `OEMCreateController(portName, OEMPortName, numAxes,
 /// movingPollPeriod, idlePollPeriod)` command, periods in ms.

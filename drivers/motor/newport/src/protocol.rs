@@ -96,6 +96,8 @@ pub struct TsStatus {
 /// response is too short to hold the full status field.
 pub fn parse_status(resp: &str) -> Option<TsStatus> {
     let b = resp.as_bytes();
+    // C reads [6..=8] past a short reply's NUL into the previous reply's
+    // bytes and posts a clean status (C defect, not copied).
     if b.len() < 9 {
         return None;
     }
