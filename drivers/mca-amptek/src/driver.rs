@@ -444,17 +444,19 @@ impl AmptekDriver {
         self.failed_sends += 1;
         if self.failed_sends > MAX_FAILED_SENDS {
             self.trace_error(&format!(
-                "drvAmptek::{function_name} too many failed status queries, disconnecting\n"
+                "drvAmptek::{function_name} too many failed status queries, disconnecting"
             ));
             // `disconnect(pasynUserSelf)`: pasynUserSelf is device 0's.
             self.do_disconnect(0);
         }
     }
 
-    /// `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, "...\n")`.
+    /// `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, "...\n")`: every one of
+    /// C's error formats ends in the newline, which `msg`, also the
+    /// caller's error message, does not carry.
     fn trace_error(&self, msg: &str) {
         self.base
-            .trace_print(TraceMask::ERROR, format_args!("{msg}"));
+            .trace_print(TraceMask::ERROR, format_args!("{msg}\n"));
     }
 
     /// `asynPrint(pasynUserSelf, ASYN_TRACEIO_DRIVER, "...\n")`.
@@ -754,7 +756,7 @@ impl AmptekDriver {
         let content = format!("[DP5 Configuration File]\r\n{}", self.hw_cfg_dp5);
         std::fs::write(file_name, content).map_err(|e| {
             self.trace_error(&format!(
-                "drvAmptek::saveConfigurationFile Couldn't open {file_name} for writing.\n"
+                "drvAmptek::saveConfigurationFile Couldn't open {file_name} for writing."
             ));
             AsynError::from(e)
         })
@@ -1826,20 +1828,20 @@ mod tests {
         assert!(handle.connect_device(-1).connected());
     }
 
-    /// `connectDevice` traces its connected line on the caller's
-    /// `pasynUser`, not `pasynUserSelf` (`drvAmptek.cpp:311`).
-    #[test]
-    fn connect_device_traces_on_the_callers_user() {
+    /// The trace port "fake" prints, with the PORT prefix, while a user with
+    /// reason 5 connects device 0 to a [`FakeDp5`] whose configuration has
+    /// two keys. A direct-built driver traces through the process-global
+    /// services; nextest runs each test in its own process.
+    fn trace_of_a_connect(mask: TraceMask) -> String {
         use epics_rs::asyn::services::PortServices;
         use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
 
-        let path =
-            std::env::temp_dir().join(format!("mca-amptek-conn-{}.trace", std::process::id()));
+        let path = std::env::temp_dir().join(format!("mca-amptek-{}.trace", std::process::id()));
         let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
         let services = PortServices::global();
         let trace = services.trace();
         trace.register_port("fake", true);
-        trace.set_trace_mask(Some("fake"), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        trace.set_trace_mask(Some("fake"), mask);
         trace.set_trace_info_mask(Some("fake"), TraceInfoMask::PORT);
         trace.set_trace_file(Some("fake"), TraceFile::File(file));
 
@@ -1848,8 +1850,29 @@ mod tests {
         driver.connect_addr(&AsynUser::new(5).with_addr(0)).unwrap();
         let out = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
+        out
+    }
+
+    /// `connectDevice` traces its connected line on the caller's
+    /// `pasynUser`, not `pasynUserSelf` (`drvAmptek.cpp:311`).
+    #[test]
+    fn connect_device_traces_on_the_callers_user() {
+        let out = trace_of_a_connect(TraceMask::ERROR | TraceMask::IO_DRIVER);
         assert!(
             out.contains("[fake,0,5] drvAmptek::connectDevice DPP device 127.0.0.1 connected\n"),
+            "{out}"
+        );
+    }
+
+    /// Each of C's error formats ends in its newline (`drvAmptek.cpp:671`).
+    #[test]
+    fn error_lines_end_in_c_newline() {
+        let out = trace_of_a_connect(TraceMask::ERROR);
+        assert!(
+            out.contains(
+                "[fake,0,0] drvAmptek::parseConfigEnum string AINP= not found in configuration\n\
+                 [fake,0,0] drvAmptek::parseConfigDouble string TPEA= not found in configuration\n"
+            ),
             "{out}"
         );
     }
