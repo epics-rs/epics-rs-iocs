@@ -383,9 +383,10 @@ impl ControllerParams for PhytronParams {
         Ok(())
     }
 
-    /// C `phytronController::writeInt32` (phytronAxisMotor.cpp:365-466):
-    /// the register is set after the base stores the value; `ENC_FUNCTION`
-    /// sets `P36` to 1 for any positive value.
+    /// C `phytronController::writeInt32` (phytronAxisMotor.cpp:365-466),
+    /// which calls the base before it sends the register; here the register
+    /// is sent first and the base stores after. `ENC_FUNCTION` sets `P36` to
+    /// 1 for any positive value.
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
