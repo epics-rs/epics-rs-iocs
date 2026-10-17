@@ -588,6 +588,8 @@ pub(crate) mod tests {
     use epics_rs::asyn::sync_io::SyncIOHandle;
     use epics_rs::asyn::user::AsynUser;
 
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
     use crate::oms::OmsAxis;
 
@@ -602,6 +604,7 @@ pub(crate) mod tests {
         replies: Replies,
         reply: Vec<u8>,
         unsolicited: Unsolicited,
+        reads: Arc<AtomicUsize>,
     }
 
     type Unsolicited = Arc<Mutex<std::collections::VecDeque<String>>>;
@@ -625,6 +628,7 @@ pub(crate) mod tests {
             Ok(data.len())
         }
         fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
             let mut reply = std::mem::take(&mut self.reply);
             if reply.is_empty() {
                 let next = self.unsolicited.lock().unwrap().pop_front();
@@ -647,6 +651,7 @@ pub(crate) mod tests {
         pub(crate) written: Arc<Mutex<Vec<String>>>,
         replies: Replies,
         unsolicited: Unsolicited,
+        reads: Arc<AtomicUsize>,
     }
 
     /// A MAXnet on port `name` with an `=E`/`=h` X axis and an `=O`/`=l` Y
@@ -665,12 +670,14 @@ pub(crate) mod tests {
         .collect();
         let replies = Arc::new(Mutex::new(table));
         let unsolicited = Unsolicited::default();
+        let reads = Arc::new(AtomicUsize::new(0));
         let driver = Scripted {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             written: written.clone(),
             replies: replies.clone(),
             reply: Vec::new(),
             unsolicited: unsolicited.clone(),
+            reads: reads.clone(),
         };
         let (rt, _actor) =
             create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
@@ -691,6 +698,7 @@ pub(crate) mod tests {
             written,
             replies,
             unsolicited,
+            reads,
         }
     }
 
@@ -789,6 +797,29 @@ pub(crate) mod tests {
         assert!(poller.wait_interruptible(Duration::from_secs(2), false));
         assert!(start.elapsed() < Duration::from_secs(1));
         notify.join().unwrap();
+    }
+
+    /// An idle loop waits in idlePollPeriod/5 slices. C picks that slice
+    /// only when the time left equals the idle period, which a loop that
+    /// took any time never meets, so it waits in movingPollPeriod/20 slices
+    /// (omsMAXnet.cpp:178-181); here the slice follows the period chosen.
+    #[test]
+    fn an_idle_loop_waits_in_idle_slices() {
+        let mut done = HEALTHY.to_vec();
+        done.push(("AM;RI;", "PDNN,MDNN"));
+        let rig = rig("omsWaitIdleSlice", 2, &done);
+        let poller = poller(&rig);
+        let shared = poller.shared.clone();
+        let run = std::thread::spawn(move || poller.run());
+        std::thread::sleep(Duration::from_millis(1500));
+        let before = rig.reads.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(1));
+        let reads = rig.reads.load(Ordering::Relaxed) - before;
+        shared.shutting_down.store(true, Ordering::Release);
+        shared.wakeup();
+        run.join().unwrap();
+        // Five slice reads and one loop's reads; C's slices make ~200.
+        assert!(reads < 40, "{reads} reads in an idle second");
     }
 
     /// The wait starts with a flush, so a line already waiting is dropped
