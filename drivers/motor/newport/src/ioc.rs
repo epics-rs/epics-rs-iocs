@@ -39,7 +39,7 @@ use epics_rs::motor::trace::MotorTrace;
 use motor_common::connect::{
     EosConnectError, EosRefusal, connect_controller, connect_serial, connect_with_eos,
 };
-use motor_common::drv_motor_asyn::DrvSet;
+use motor_common::drv_motor_asyn::{DrvGet, DrvSet};
 use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_int,
     opt_string, poll_intervals, req_string,
@@ -2022,7 +2022,7 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
             };
             let (firmware, model) = (controller.firmware().to_owned(), controller.model());
             let controller = Arc::new(Mutex::new(controller));
-            let (mut logs, mut setters) = (Vec::new(), Vec::new());
+            let (mut logs, mut setters, mut getters) = (Vec::new(), Vec::new(), Vec::new());
             let (axes, reports): (Vec<_>, Vec<_>) = (1..=num_axes as usize)
                 .map(|axis| {
                     let ax = Mm4000Axis::new(
@@ -2033,6 +2033,7 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                     );
                     let report = ax.report();
                     logs.push(ax.log());
+                    getters.push(ax.params() as Arc<dyn DrvGet>);
                     let ax = Arc::new(Mutex::new(ax));
                     setters.push(ax.clone() as Arc<Mutex<dyn DrvSet>>);
                     (ax as Arc<Mutex<dyn AsynMotor>>, report)
@@ -2047,6 +2048,7 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
             MOTOR_MM4000.set_card(card, axes, moving_poll_ms, idle_poll_ms);
             MOTOR_MM4000.set_axis_logs(card, logs);
             MOTOR_MM4000.set_axis_setters(card, setters);
+            MOTOR_MM4000.set_axis_getters(card, getters);
             Ok(CommandOutcome::Continue)
         },
     )

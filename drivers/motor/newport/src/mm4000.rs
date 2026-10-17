@@ -56,6 +56,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use motor_common::drv_motor_asyn::{DrvSet, function};
 use motor_common::model2::AxisLog;
+use motor_common::param_lib::Params;
 
 use crate::util::{atof, atoi, max_digits};
 use motor_common::model1::MoveStrings;
@@ -612,6 +613,8 @@ pub struct Mm4000Axis {
     strings: MoveStrings,
     /// What the model-2 poll last read from `MS;`, for [`Mm4000AxisReport`].
     status: Arc<AtomicI32>,
+    /// drvMM4000Asyn.c `pAxis->params`.
+    params: Arc<Params>,
 }
 
 /// C model-1 `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
@@ -684,7 +687,19 @@ impl Mm4000Axis {
             motion_sent: false,
             strings: MoveStrings::default(),
             status: Arc::default(),
+            params: {
+                // motorAxisInit's GAIN_SUPPORT (drvMM4000Asyn.c:242).
+                let params = Params::default();
+                let _ = params.set_integer(function::HAS_CLOSED_LOOP, 1);
+                Arc::new(params)
+            },
         }
+    }
+
+    /// The axis' drvMM4000Asyn.c parameters, which drvAsynMotorConfigure
+    /// reads and calls back through.
+    pub fn params(&self) -> Arc<Params> {
+        self.params.clone()
     }
 
     /// The log `Model2::set_axis_logs` attaches.
@@ -739,6 +754,9 @@ impl Mm4000Axis {
     fn start_motion(&mut self, cmd: &str) -> AsynResult<()> {
         self.lock().write(cmd)?;
         self.motion_sent = true;
+        // drvMM4000Asyn.c:485-486, 518-519.
+        let _ = self.params.set_integer(function::DONE, 0);
+        self.params.call_callback();
         Ok(())
     }
 
@@ -1125,6 +1143,7 @@ impl AsynMotor for Mm4000Axis {
                 self.axis - 1
             ),
         );
+        self.params.force_callback();
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -1186,11 +1205,13 @@ impl AsynMotor for Mm4000Axis {
             ),
         );
         let position = position / step;
+        let done = !motion_sent && byte & MM4000_MOVING == 0;
+        self.set_poll_params(&data, byte, position, done);
         Ok(MotorStatus {
             position,
             encoder_position: position,
             velocity: 0.0, // C: no way to query the actual velocity
-            done: !motion_sent && byte & MM4000_MOVING == 0,
+            done,
             moving: byte & MM4000_MOVING != 0,
             direction: byte & MM4000_DIRECTION != 0,
             high_limit: byte & MM4000_HIGH_LIMIT != 0,
@@ -1210,10 +1231,55 @@ impl AsynMotor for Mm4000Axis {
     }
 }
 
+impl Mm4000Axis {
+    /// MM4000Poller's parameters of the axis (drvMM4000Asyn.c:653-718): a
+    /// failed read sets only the comm error. The limit, home and direction
+    /// parameters are C's masked status bits, not 0/1.
+    fn set_poll_params(&self, data: &Mm4000PollData, byte: u8, position: f64, done: bool) {
+        let params = &self.params;
+        let _ = params.set_integer(function::COMM_ERROR, i32::from(data.comms_error));
+        if !data.comms_error {
+            for (f, v) in [
+                (function::DONE, i32::from(done)),
+                (function::HOME_SIGNAL, i32::from(byte & MM4000_HOME)),
+                (
+                    function::HIGH_HARD_LIMIT,
+                    i32::from(byte & MM4000_HIGH_LIMIT),
+                ),
+                (function::LOW_HARD_LIMIT, i32::from(byte & MM4000_LOW_LIMIT)),
+                (function::DIRECTION, i32::from(byte & MM4000_DIRECTION)),
+                (function::POWER_ON, i32::from(byte & MM4000_POWER_OFF == 0)),
+                (function::PROBLEM, i32::from(data.problem)),
+            ] {
+                let _ = params.set_integer(f, v);
+            }
+            let _ = params.set_double(function::POSITION, position);
+            let _ = params.set_double(function::ENCODER_POSN, position);
+        }
+        params.call_callback();
+    }
+}
+
 /// C `motorAxisSetDouble`/`motorAxisSetInteger` (drvMM4000Asyn.c:323-452),
 /// which drvMotorAsyn's writes reach.
 impl DrvSet for Mm4000Axis {
     fn set_double(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+        self.set_double_only(user, function, value)?;
+        let _ = self.params.set_double(function, value);
+        self.params.call_callback();
+        Ok(())
+    }
+
+    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+        self.set_integer_only(user, function, value)?;
+        let _ = self.params.set_integer(function, value);
+        self.params.call_callback();
+        Ok(())
+    }
+}
+
+impl Mm4000Axis {
+    fn set_double_only(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
         let kind = match function {
             function::POSITION => return self.set_position(user, value),
             function::ENCODER_RATIO => return self.set_encoder_ratio(user, value),
@@ -1242,7 +1308,7 @@ impl DrvSet for Mm4000Axis {
         self.set_pid_gain(user, kind, value)
     }
 
-    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+    fn set_integer_only(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
         if function == function::CLOSED_LOOP {
             return self.set_closed_loop(user, value != 0);
         }
@@ -1906,6 +1972,11 @@ mod tests {
             .map(|a| a.clone() as Arc<Mutex<dyn DrvSet>>)
             .collect();
         driver.set_axis_setters(2, setters);
+        let getters = axes
+            .iter()
+            .map(|a| a.lock().unwrap().params() as Arc<dyn motor_common::drv_motor_asyn::DrvGet>)
+            .collect();
+        driver.set_axis_getters(2, getters);
         let args = vec![
             ArgValue::String(port.into()),
             ArgValue::String(port.into()),
@@ -1929,6 +2000,41 @@ mod tests {
         let text = std::fs::read_to_string(path).unwrap();
         let _ = std::fs::remove_file(path);
         text
+    }
+
+    /// drvMM4000Asyn.c:384-391, 653-718: a write C acts on goes into the
+    /// parameters the port reads back, a refused one does not, and the
+    /// poller posts C's masked status bits.
+    #[epics_rs::base::epics_test]
+    async fn the_port_reads_back_what_the_driver_keeps() {
+        let (axes, _path) = traced_axes("mm4kParams", TraceMask::ERROR).await;
+        let port = PortManager::global()
+            .find_port_handle("mm4kParams")
+            .unwrap();
+        let reads = std::thread::spawn(move || {
+            let limit = port.write_float64_blocking(function::LOW_LIMIT as usize, 1, -500.0);
+            let gain = port.write_float64_blocking(function::P_GAIN as usize, 1, 0.5);
+            (
+                limit.is_ok(),
+                gain.is_err(),
+                port.read_float64_blocking(function::LOW_LIMIT as usize, 1)
+                    .ok(),
+                port.read_float64_blocking(function::P_GAIN as usize, 1)
+                    .ok(),
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(reads, (true, true, Some(-500.0), Some(0.0)));
+        let mut axis = axes[1].lock().unwrap();
+        axis.poll(&AsynUser::default()).unwrap();
+        let params = axis.params();
+        // `E`: moving, plus direction.
+        assert_eq!(params.get_integer(function::DIRECTION), Ok(Some(4)));
+        assert_eq!(params.get_integer(function::DONE), Ok(Some(0)));
+        assert_eq!(params.get_integer(function::POWER_ON), Ok(Some(1)));
+        assert_eq!(params.get_double(function::POSITION), Ok(Some(-1250.0)));
+        assert_eq!(params.get_integer(function::COMM_ERROR), Ok(Some(0)));
     }
 
     /// drvMM4000Asyn.c:344-381: the encoder ratio and the gains are refused
