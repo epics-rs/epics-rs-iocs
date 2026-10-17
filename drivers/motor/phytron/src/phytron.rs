@@ -1427,14 +1427,15 @@ impl PhytronAxis {
 }
 
 impl AsynMotor for PhytronAxis {
-    /// C `phytronAxis::poll` sets only `motorStatusProblem_` on a failed
-    /// exchange.
     fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
         std::mem::take(&mut self.poll_params)
     }
 
+    /// C sets motorStatusProblem_ and returns asynSuccess on every failure:
+    /// a failed exchange (:1860-1863), a parse that fails (:2087) or a
+    /// controller-parallel exchange that fails (:982-986).
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM
+        PollFailure::PROBLEM.succeeding()
     }
 
     /// C `phytronAxis::setEncoderRatio` (phytronAxisMotor.cpp:1759-1779):
@@ -1935,6 +1936,30 @@ mod tests {
         let ctrl = Arc::new(Mutex::new(ctrl));
         let axes = [1, 2].map(|i| PhytronAxis::new(ctrl.clone(), 1, i).unwrap());
         (ctrl, axes, written)
+    }
+
+    /// C's axis poll raises the problem bit on a failed exchange and still
+    /// returns asynSuccess (phytronAxisMotor.cpp:1842-1872), so a GET_INFO
+    /// write prints no error.
+    #[test]
+    fn a_get_info_on_a_failed_exchange_succeeds() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::motor::flags::MotorCommand;
+        use epics_rs::motor::poll_loop::execute_commands;
+
+        let name = "phyQuietPoll";
+        let (_ctrl, [mut axis, _], _) = lines_with(name, |_| None);
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        PortManager::global()
+            .trace_manager()
+            .set_trace_file(Some(name), TraceFile::File(file));
+        let trace = MotorTrace::new(name, 0);
+        execute_commands(&mut axis, &trace, &[MotorCommand::Poll], &mut |_| {});
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!text.contains("asynMotorController"), "{text}");
     }
 
     /// C `sendPhytronMultiCommand` (phytronAxisMotor.cpp:1151-1216): up
