@@ -38,23 +38,8 @@ dbLoadRecords("$(IP)/db/TPG261.db", "P=$(PREFIX),GAUGE=gauge1,PORT=SerialTPG,ADD
 dbLoadRecords("$(IP)/db/TPG261.db", "P=$(PREFIX),GAUGE=gauge2,PORT=SerialTPG,ADDR=1")
 
 # --- Televac vacuum gauge controller ----------------------------------------
-# The controller answers with a CR-terminated line; devTelevac.c relied on the
-# port's EOS for both directions.
-drvAsynSerialPortConfigure("SerialTVAC", "/dev/ttyS2", 0, 0, 0)
-asynSetOption("SerialTVAC", 0, "baud", "9600")
-asynSetOption("SerialTVAC", 0, "bits", "8")
-asynSetOption("SerialTVAC", 0, "parity", "none")
-asynSetOption("SerialTVAC", 0, "stop", "1")
-asynOctetSetInputEos("SerialTVAC", 0, "\r")
-asynOctetSetOutputEos("SerialTVAC", 0, "\r")
-
-# TelevacConfig(portName, octetPort, numStations, numRelays, pollPeriodSeconds)
-TelevacConfig("TVAC1", "SerialTVAC", 2, 2, 1.0)
-
-dbLoadRecords("$(IP)/db/televac.db", "P=$(PREFIX),GAUGE=tv1,PORT=TVAC1,ADDR=0")
-dbLoadRecords("$(IP)/db/televac.db", "P=$(PREFIX),GAUGE=tv2,PORT=TVAC1,ADDR=1")
-dbLoadRecords("$(IP)/db/televac_relay.db", "P=$(PREFIX),RELAY=tvrly1,PORT=TVAC1,ADDR=0")
-dbLoadRecords("$(IP)/db/televac_relay.db", "P=$(PREFIX),RELAY=tvrly2,PORT=TVAC1,ADDR=1")
+# devTelevac.c ("asyn Televac" ai/bi) is built in, but ipApp ships no database
+# for it, so nothing is loaded.
 
 # --- MKS / HPS SensaVac 937 gauge controller --------------------------------
 # devAiMKS.c: "set the serial port settings ... to use the correct baud rate and

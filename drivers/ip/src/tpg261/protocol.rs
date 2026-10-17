@@ -5,8 +5,6 @@
 //! Both replies end in `<CR><LF>`, the input EOS the callback sets
 //! (`devTPG261.c:657`).
 
-use epics_rs::base::calc::engine::strtod::strtod;
-
 /// `<ENQ>`, which asks for the data (`devTPG261.c:653`).
 pub const ENQ: u8 = 0x05;
 
@@ -61,69 +59,6 @@ impl Command {
     }
 }
 
-/// C `sscanf` over a reply, one conversion at a time; a failed conversion
-/// stops the scan and leaves the rest unassigned.
-pub struct Scan<'a> {
-    rest: &'a [u8],
-    failed: bool,
-}
-
-impl<'a> Scan<'a> {
-    pub fn new(text: &'a str) -> Self {
-        Self {
-            rest: text.as_bytes(),
-            failed: false,
-        }
-    }
-
-    /// `%d`.
-    pub fn int(&mut self) -> Option<i32> {
-        if self.failed {
-            return None;
-        }
-        let s = self.rest.trim_ascii_start();
-        let sign = usize::from(matches!(s.first(), Some(b'-' | b'+')));
-        let digits = s[sign..].iter().take_while(|b| b.is_ascii_digit()).count();
-        if digits == 0 {
-            self.failed = true;
-            return None;
-        }
-        let end = sign + digits;
-        self.rest = &s[end..];
-        // Out-of-range input is undefined in C; saturate.
-        let text = std::str::from_utf8(&s[..end]).unwrap_or("0");
-        Some(
-            text.parse::<i64>()
-                .map_or(0, |v| v.clamp(i32::MIN.into(), i32::MAX.into()) as i32),
-        )
-    }
-
-    /// `%E` into a `float`.
-    pub fn float(&mut self) -> Option<f32> {
-        if self.failed {
-            return None;
-        }
-        let parsed = strtod(self.rest);
-        if parsed.len == 0 {
-            self.failed = true;
-            return None;
-        }
-        self.rest = &self.rest[parsed.len..];
-        Some(parsed.value as f32)
-    }
-
-    /// A literal `,` in the format.
-    pub fn comma(&mut self) -> &mut Self {
-        if !self.failed {
-            match self.rest.split_first() {
-                Some((b',', rest)) => self.rest = rest,
-                _ => self.failed = true,
-            }
-        }
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,21 +71,5 @@ mod tests {
         );
         assert_eq!(Command::from_name("SET_SP2"), Some(Command::SetSp2));
         assert_eq!(Command::from_name("GET_FOO"), None);
-    }
-
-    /// `sscanf(pvalue, "%d,%E,%E", ...)`: each conversion lands until the
-    /// first that fails.
-    #[test]
-    fn scan_stops_at_the_first_failed_conversion() {
-        let mut s = Scan::new("0,1.2300E-06,4.5000E-06");
-        assert_eq!(s.int(), Some(0));
-        assert_eq!(s.comma().float(), Some(1.23e-6));
-        assert_eq!(s.comma().float(), Some(4.5e-6));
-        let mut s = Scan::new("4");
-        assert_eq!(s.int(), Some(4));
-        assert_eq!(s.comma().float(), None);
-        let mut s = Scan::new("");
-        assert_eq!(s.int(), None);
-        assert_eq!(s.comma().int(), None);
     }
 }

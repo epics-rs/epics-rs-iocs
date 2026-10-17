@@ -882,17 +882,15 @@ bit addressing (`B <bit>`), and I/O-Intr driven records.
 (`ipApp/src`: `devMPC.c`, `devTPG261.c`, `devTelevac.c`, `devAiMKS.c`,
 `devAiHeidND261.c`, `devXxEurotherm.c`, `devXxStrParm.c`)
 
-`drivers/ip` (crate `ip-devices`) re-implements each C device-support file
-as an asyn **port driver**: the record link binds to a port parameter
-instead of embedding the raw command text, and each port drives its device
-over a pre-configured serial/IP octet port on its own worker thread. The
-exceptions are `devAiMKS.c`, kept as per-record ai device support
-(DTYP `HPS SensaVac 937`) on the upstream `MKS.db`, and `devMPC.c`, kept as
-per-record device support (DTYP `asyn MPC`) on the upstream `MPC.db` and
-`TSP.db`, `devTPG261.c` (DTYP `asyn TPG261`) on the upstream `TPG261.db`,
-and `devXxStrParm.c` (DTYP `asyn <xx> stringParm`) with `devXxEurotherm.c`
-(DTYP `asyn ao Eurotherm` / `asyn so Eurotherm`) on the upstream `Eurotherm.db`,
-and `devAiHeidND261.c` (DTYP `asyn ai HeidND261`) on the upstream `heidND261.db`.
+`drivers/ip` (crate `ip-devices`) keeps each C device-support file as
+per-record device support, bound by its `ipSupport.dbd` DTYP and driving its
+device over a pre-configured serial/IP octet port, as in C: `devAiMKS.c`
+(`HPS SensaVac 937`) on the upstream `MKS.db`, `devMPC.c` (`asyn MPC`) on
+`MPC.db` and `TSP.db`, `devTPG261.c` (`asyn TPG261`) on `TPG261.db`,
+`devXxStrParm.c` (`asyn <xx> stringParm`) and `devXxEurotherm.c`
+(`asyn ao Eurotherm` / `asyn so Eurotherm`) on `Eurotherm.db`,
+`devAiHeidND261.c` (`asyn ai HeidND261`) on `heidND261.db`, and
+`devTelevac.c` (`asyn Televac` ai/bi), for which ipApp ships no database.
 
 **Build/run:** `cargo run -p ip-ioc --release -- iocs/ip/ip-ioc/st.cmd`
 
@@ -901,8 +899,6 @@ and `devAiHeidND261.c` (DTYP `asyn ai HeidND261`) on the upstream `heidND261.db`
 | Gamma Vacuum MPC / Digitel ion pump | `MPC.db` (upstream) | `STAT`, `PRES`, `CUR`, `VOLT`, `SIZE`, `SP1V`-`SP4V`, `SP1S`-`SP4S`, `GAUTOS`, `DIS`, `SSIZE`, `SET1`-`SET4`, `STOP`, `ULCK`, `SAUTOS` (23 records) |
 | Titanium sublimation pump (same controller) | `TSP.db` (upstream) | `TSP_STAT`, `TSP_REMAINING`, `TSP_MIN1`-`MIN4`, `SEND_TIMED`, `TSP_OFF`, `TSP_FIL`, `TSP_CLEAR`, `TSP_AUTO_ADV`, `TSP_CONTINUOUS`, `SEND_SUBLIMATION`, `TSP_DEGAS`, `TSP_MODE`, `TSP_SUBLIMATION`, `TSP_SUB2`, `TSP_SETMODE`, `TSP_TIMED`, `TSP_VALUE`, `TSP_UNITS`, `TSP_SECONDS`, `TSP_MINUTES`, `TSP_NCYCLES`, `TSP_MIN_PRESS` (25 records) |
 | Pfeiffer TPG261/TPG262 gauge controller | `TPG261.db` (upstream) | `ID`, `UNIT`, `PRES`, `STATUS`, `SP1S`, `SP2S`, `SP1V`, `SP2V`, `START`, `SUNIT`, `SET1`, `SET2` (12 records) |
-| Televac vacuum gauge | `televac.db` | `PRES` (1 record) |
-| Televac relay outputs | `televac_relay.db` | `ON`, `OFF`, `STATE` (3 records) |
 | MKS / HPS SensaVac 937 gauge | `MKS.db` (upstream) | `$(CC1)`, `$(CC2)`, `$(PR1)`, `$(PR2)` and their `_log` calcs (8 records) |
 | Heidenhain ND261 display unit | `heidND261.db` (upstream) | `HeidND261_read`, `HeidND261`, `HeidND261_ave` (3 records) |
 | Eurotherm 800/2000 temperature controller | `Eurotherm.db` (upstream) | `ET:Setpoint`, `ET:RampRate`, `ET:Temperature`, `ET:SetpointReadback`, `ET:RampRateRBV`, `ET:Read*`, `ET:Query*`, `ET:ack*`, `ET:trash*` (18 records) |
