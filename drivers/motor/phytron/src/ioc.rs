@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::connect::connect_controller;
@@ -174,10 +176,18 @@ fn register_controller(
     if connected.is_err() {
         return Ok(CommandOutcome::Continue);
     }
-    let controller = PhytronController::new(handle, ctrl_type, address);
+    let mut controller = PhytronController::new(handle, ctrl_type, address);
     if reset_at_boot {
         controller.reset_at_boot(&name);
     }
+    let port = PortManager::global()
+        .find_port_handle(&name)
+        .map_err(|e| format!("{cmd_name}: {e}"))?;
+    let axis_status = port
+        .drv_user_create_blocking(&DrvUserRequest::new("AXIS_STATUS", 0))
+        .map_err(|e| format!("{cmd_name}: {e}"))?
+        .reason;
+    controller.post_axis_status_to(port, axis_status);
     let controller = Arc::new(Mutex::new(controller));
     let _ = slot.set(controller.clone());
     let poller = Controller::new().controller_poll({

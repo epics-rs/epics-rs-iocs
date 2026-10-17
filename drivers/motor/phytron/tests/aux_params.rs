@@ -16,11 +16,11 @@ use epics_rs::base::server::iocsh::registry::{ArgValue, CommandContext};
 use motor_common::testing::LineRig;
 
 /// An MCC at address 0 whose axis 1 holds `P41 = 45` (10 mA units),
-/// `P54 = 235` (0.1 °C) and `P36 = 1`; a `P34` read and a status reset
-/// are refused, the controller status is 42.
+/// `P54 = 235` (0.1 °C) and `P36 = 1` and sits on its positive limit; a
+/// `P34` read and a status reset are refused, the controller status is 42.
 fn mcc_reply(frame: &str) -> String {
     let payload = match &frame[2..frame.len() - 1] {
-        "SUI" => "I=00000000",
+        "SUI" => "I=+0000000",
         "ST" => "42",
         "1P34R" | "STC" => return "\x02\x15\x03".into(),
         "1P41R" => "45",
@@ -254,4 +254,40 @@ async fn a_failed_status_reset_prints_check_ctrl_once() {
          code: 6, reason: {status_reset}\n"
     );
     assert_eq!(text.matches(&line).count(), 1, "{text}");
+}
+
+/// C sends `{m}C` for AXIS_RESET; AXIS_STATUS_RESET is phyMOTION's only
+/// (phytronAxisMotor.cpp:399-404).
+#[epics_rs::base::epics_test]
+async fn an_axis_reset_sends_c_and_an_mcc_refuses_a_status_reset() {
+    let (refused, sent) = on_mcc("phyAxisReset", |port| {
+        port.write_int32_blocking(reason(&port, "AXIS_RESET"), 1, 1)
+            .unwrap();
+        port.write_int32_blocking(reason(&port, "AXIS_STATUS_RESET"), 1, 1)
+            .is_err()
+    })
+    .await;
+    assert!(refused);
+    let wire: Vec<&str> = sent.iter().map(|f| &f[2..f.len() - 1]).collect();
+    assert!(wire.contains(&"1C"), "{wire:?}");
+    assert!(!wire.iter().any(|c| c.starts_with("SEC")), "{wire:?}");
+}
+
+/// C `phytronAxis::poll` sets AXIS_STATUS to the axis status word
+/// (phytronAxisMotor.cpp:2084).
+#[epics_rs::base::epics_test]
+async fn the_poll_sets_axis_status() {
+    let (status, _) = on_mcc("phyAxisStatus", |port| {
+        let axis_status = reason(&port, "AXIS_STATUS");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = port.read_int32_blocking(axis_status, 1).unwrap();
+            if status != 0 || std::time::Instant::now() > deadline {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })
+    .await;
+    assert_eq!(status, 0x10, "the positive limit switch");
 }
