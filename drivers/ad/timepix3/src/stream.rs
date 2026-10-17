@@ -295,8 +295,10 @@ impl EndOfStream {
 }
 
 /// C `MAX_BUFFER_SIZE` (ADTimePix.h:415): the header and trailing-byte
-/// limits of every stream's `FrameBuffer`.
-const MAX_BUFFER_SIZE: usize = 32768;
+/// limits of every stream's `FrameBuffer`, and the size of each socket read
+/// (serval_stream.cpp:505, histogram_io.cpp:971) — a larger read can carry more
+/// trailing bytes than the limit admits.
+pub const MAX_BUFFER_SIZE: usize = 32768;
 /// C `maxHistogramBins` (histogram_io.cpp:973).
 const MAX_BINS: usize = 1_000_000;
 

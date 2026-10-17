@@ -1545,7 +1545,7 @@ fn disconnected(ctx: &Ctx, kind: StreamKind) {
 
 async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stream: TcpStream) {
     let mut decoder = FrameDecoder::new(kind.channel());
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; crate::stream::MAX_BUFFER_SIZE];
 
     let worker = kind.worker(&ctx.shared);
     while worker.running(run) {
@@ -3986,6 +3986,46 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// A largest-image frame followed at once by a second frame stays within
+    /// the FrameBuffer limit, because each read is C's MAX_BUFFER_SIZE
+    /// (serval_stream.cpp:505-510).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_largest_frame_with_its_successor_is_read_in_c_chunks() {
+        use std::io::Write;
+
+        let name = "TPX_READ_CHUNK";
+        let ctx = Arc::new(idle_ctx(name));
+        let path = capture_errors(&ctx, name);
+        assert!(ctx.shared.prv_img_worker.start());
+        let run = ctx.shared.prv_img_worker.wait_for_start(None);
+        let frame = |w: usize, h: usize, fmt: &str, bpp: usize| {
+            let mut f =
+                format!(r#"{{"width":{w},"height":{h},"pixelFormat":"{fmt}"}}"#).into_bytes();
+            f.push(b'\n');
+            f.resize(f.len() + w * h * bpp, 0);
+            f.push(b'\n');
+            f
+        };
+        let (first, second) = (frame(2048, 256, "uint32", 4), frame(512, 256, "uint16", 2));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _ = client.set_read_timeout(Some(READ_TIMEOUT));
+        let (mut peer, _) = listener.accept().unwrap();
+        let writer = std::thread::spawn(move || {
+            let (head, tail) = first.split_at(first.len() - 10);
+            peer.write_all(head).unwrap();
+            // The reader drains the head and then finds the tail and the
+            // whole second frame queued for one read.
+            std::thread::sleep(Duration::from_millis(300));
+            peer.write_all(&[tail, &second].concat()).unwrap();
+        });
+        read_stream(&ctx, StreamKind::PrvImg, run, client).await;
+        writer.join().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!text.contains("rejected TCP stream"), "{text}");
     }
 
     /// The first PrvImgLogHeaders PrvImg headers are logged as nlohmann
