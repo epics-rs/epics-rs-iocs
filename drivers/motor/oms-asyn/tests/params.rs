@@ -31,6 +31,8 @@ fn maxnet_reply(cmd: &str) -> String {
         "AM;QL;" => "0",
         "#WS" => "=0",
         "AX;RE;" => "7",
+        "AX RP" => "-1234",
+        "AX RE" => "77",
         _ => "",
     }
     .into()
@@ -45,6 +47,14 @@ fn old_maxnet_reply(cmd: &str) -> String {
         "AX ?LS" => "=h".into(),
         "AX ?PM" => "=on".into(),
         "AX PS?" | "AX LT?" | "AM;CL?;" => String::new(),
+        other => maxnet_reply(other),
+    }
+}
+
+/// [`maxnet_reply`]'s axis X with no encoder.
+fn stepper_reply(cmd: &str) -> String {
+    match cmd.trim_end() {
+        "AX PS?" => "=O".into(),
         other => maxnet_reply(other),
     }
 }
@@ -327,4 +337,40 @@ async fn an_unknown_axis_type_or_limit_state_keeps_the_axis() {
     ] {
         assert!(lines.iter().any(|l| l == want), "{lines:#?}");
     }
+}
+
+/// An asynInt32 read of the position asks the controller, and of the
+/// encoder position too once the poll has found the encoder
+/// (omsBaseController.cpp:225-254).
+#[epics_rs::base::epics_test]
+async fn int32_position_reads_ask_the_controller() {
+    let (position, encoder) = on_maxnet("omsReadInt32", |port, _| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let encoder = loop {
+            let read = port.read_int32_blocking(index::ENCODER_POSITION, 0);
+            if read.is_ok() || Instant::now() > deadline {
+                break read;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        (port.read_int32_blocking(index::POSITION, 0), encoder)
+    })
+    .await;
+    assert_eq!(position.unwrap(), -1234);
+    assert_eq!(encoder.unwrap(), 77);
+}
+
+/// C answers success without asking the controller for an axis with no
+/// encoder.
+#[epics_rs::base::epics_test]
+async fn an_int32_encoder_read_without_an_encoder_succeeds() {
+    let (read, sent) = on_line("omsReadNoEnc", stepper_reply, |port, rig| {
+        std::thread::sleep(Duration::from_millis(300));
+        rig.lock().unwrap().sent();
+        let read = port.read_int32_blocking(index::ENCODER_POSITION, 0);
+        (read, sent_within(rig, Duration::from_millis(200)))
+    })
+    .await;
+    assert!(read.is_ok(), "{read:?}");
+    assert!(!sent.iter().any(|c| c == "AX RE"), "{sent:?}");
 }
