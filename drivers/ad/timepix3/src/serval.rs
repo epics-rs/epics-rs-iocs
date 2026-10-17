@@ -1113,6 +1113,33 @@ pub fn parse_config_readback(body: &str) -> Result<ConfigSnapshot, ConfigReadbac
     Ok(snapshot)
 }
 
+/// nlohmann `dump(3, ' ', true)`: three-space indent, every non-ASCII
+/// character escaped as `\uXXXX` UTF-16 units.
+pub fn dump_indent3_ascii(v: &Value) -> String {
+    // serde_json indents by two; a string's newline is escaped, so every
+    // leading run of spaces is indentation.
+    let pretty = serde_json::to_string_pretty(v).expect("a Value always serialises");
+    let text = pretty
+        .lines()
+        .map(|line| {
+            let body = line.trim_start_matches(' ');
+            format!("{}{body}", " ".repeat((line.len() - body.len()) / 2 * 3))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut ascii = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii() {
+            ascii.push(c);
+        } else {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                ascii.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    ascii
+}
+
 /// C `strip_quotes` (serval_http.cpp:91).
 ///
 /// UPSTREAM DEFECT (serval_http.cpp:91-95): C removes the first and last
@@ -1615,6 +1642,14 @@ mod tests {
         assert_eq!(
             histogram_body(&h).unwrap()["IntegrationMode"],
             json!("last")
+        );
+    }
+
+    #[test]
+    fn a_dump_is_indented_and_escaped_as_nlohmann() {
+        assert_eq!(
+            dump_indent3_ascii(&json!({"Raw": [{"Base": "file:/d\u{e9}\u{1f600}"}], "n": []})),
+            "{\n   \"Raw\": [\n      {\n         \"Base\": \"file:/d\\u00e9\\ud83d\\ude00\"\n      }\n   ],\n   \"n\": []\n}"
         );
     }
 

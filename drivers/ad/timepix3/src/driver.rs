@@ -1342,6 +1342,8 @@ impl TimePix3Driver {
             );
             return Ok(());
         }
+        // C `sendConfiguration` (serval_http.cpp:2172-2190).
+        println!("server={}", serval::dump_indent3_ascii(&server));
         let reply = self
             .http
             .put_json(serval::SERVER_DESTINATION, &server, TIMEOUT_CONFIG);
