@@ -2382,46 +2382,47 @@ impl PortDriver for TimePix3Driver {
             );
             return Ok(data.len());
         }
-        // C keeps the store's status and lets a path check overwrite it
-        // (ADTimePix.cpp:443-462).
-        let stored = self
-            .ad
-            .port_base
-            .set_string_param(reason, addr, value.clone());
-        let status = if reason == p.bp_c_file_path {
-            self.check_calibration_dir(
+        // C keeps the store's status, lets a path check overwrite it, takes
+        // the callbacks' only over success, and returns it raw
+        // (ADTimePix.cpp:443-475).
+        let code = |r: AsynResult<()>| r.err().map_or(0, |e| e.c_status_code());
+        let stored = code(
+            self.ad
+                .port_base
+                .set_string_param(reason, addr, value.clone()),
+        );
+        let checked = if reason == p.bp_c_file_path {
+            Some(self.check_calibration_dir(
                 p.bp_c_file_path,
                 p.bp_c_file_path_exists,
                 adlog::CHECK_BPC_PATH,
-            )
+            ))
         } else if reason == p.da_cs_file_path {
-            self.check_calibration_dir(
+            Some(self.check_calibration_dir(
                 p.da_cs_file_path,
                 p.da_cs_file_path_exists,
                 adlog::CHECK_DACS_PATH,
-            )
+            ))
         } else if let Some(channel) = CHANNEL_PATHS.iter().find(|c| (c.base)(&p) == reason) {
-            self.check_channel_path(channel)
+            Some(self.check_channel_path(channel))
         } else if reason == p.tof_tdc_reference {
-            self.send_measurement_config()
+            Some(self.send_measurement_config())
         } else {
-            stored
+            None
         };
-        // The callbacks run on failure too (ADTimePix.cpp:463-465).
-        let callbacks = self.ad.port_base.call_param_callbacks(addr);
-        if let Err(e) = status.and(callbacks) {
-            let status = match e {
-                AsynError::Status { status, .. } => status,
-                _ => AsynStatus::Error,
-            };
-            return Err(AsynError::Status {
-                status,
-                message: format!(
-                    "ADTimePix:{}: status={}, function={reason}, paramName={name}, value={value}",
-                    adlog::WRITE_OCTET,
-                    status as i32
-                ),
-            });
+        let mut status = checked.map_or(stored, code);
+        let callbacks = code(self.ad.port_base.call_param_callbacks(addr));
+        if status == 0 {
+            status = callbacks;
+        }
+        if let Some(e) = AsynError::from_c_status_code(
+            status,
+            format!(
+                "ADTimePix:{}: status={status}, function={reason}, paramName={name}, value={value}",
+                adlog::WRITE_OCTET,
+            ),
+        ) {
+            return Err(e);
         }
         self.ad.port_base.trace_print(
             TraceMask::IO_DRIVER,
@@ -2805,10 +2806,11 @@ mod tests {
         let e = det
             .write_octet(&mut AsynUser::new(p.http_code), b"x")
             .unwrap_err();
+        assert_eq!(e.c_status_code(), 8);
         let message = e.to_string();
         assert!(
             message.contains(&format!(
-                "ADTimePix:{}: status=",
+                "ADTimePix:{}: status=8,",
                 "virtual asynStatus ADTimePix::writeOctet(asynUser*, const char*, size_t, size_t*)"
             )) && message.ends_with(&format!(
                 ", function={}, paramName=TPX3_HTTP_CODE, value=x",
