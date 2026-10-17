@@ -302,8 +302,11 @@ impl Mmc200Axis {
             max_velocity,
             resolution,
             ignore_limits,
+            // MMC200Driver.cpp:259-268, once.
             last_status: MotorStatus {
                 problem: error,
+                gain_support: true,
+                has_encoder: true,
                 ..MotorStatus::default()
             },
             probed: Arc::new(probed),
@@ -450,58 +453,43 @@ impl AsynMotor for Mmc200Axis {
         }
 
         let n = self.axis_index;
-        let ctrl = self.lock();
+        let controller = Arc::clone(&self.controller);
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // C `poll`: `POS?` (position + encoder), `STA?` (status word, clearing
         // the error buffer with `CER` when the error bit is set), `MOT?`
-        // (drive power). Any read failure is C's `goto skip` — mark the record
-        // in error and keep the previous readings.
-        let readings = (|| -> AsynResult<(f64, f64, i32, i32)> {
-            let pos_reply = ctrl.query(&format!("{n}POS?"))?;
-            let (position, encoder) = parse_position(&pos_reply);
+        // (drive power), each written as it arrives. A read failure is C's
+        // `goto skip`: what was written stays, and `poll_failure` adds PROBLEM.
+        let pos_reply = ctrl.query(&format!("{n}POS?"))?;
+        let (position, encoder) = parse_position(&pos_reply);
+        self.last_status.position = position / self.resolution;
+        self.last_status.encoder_position = encoder / self.resolution;
 
-            let sta_reply = ctrl.query(&format!("{n}STA?"))?;
-            let status = atoi(sta_reply.get(1..).unwrap_or(""));
-            if status & STA_ERROR != 0 {
-                ctrl.write(&format!("{n}CER"))?;
-            }
-
-            let mot_reply = ctrl.query(&format!("{n}MOT?"))?;
-            let drive_on = atoi(mot_reply.get(1..).unwrap_or(""));
-            Ok((position, encoder, status, drive_on))
-        })();
-        drop(ctrl);
-
-        match readings {
-            Ok((position, encoder, status, drive_on)) => {
-                let done = status & STA_DONE != 0;
-                let (high_limit, low_limit) = if self.ignore_limits {
-                    (false, false)
-                } else {
-                    (status & STA_HIGH_LIMIT != 0, status & STA_LOW_LIMIT != 0)
-                };
-                self.last_status = MotorStatus {
-                    position: position / self.resolution,
-                    encoder_position: encoder / self.resolution,
-                    velocity: 0.0,
-                    done,
-                    moving: !done,
-                    high_limit,
-                    low_limit,
-                    home: false,
-                    powered: drive_on != 0,
-                    problem: false,
-                    comms_error: false,
-                    gain_support: true,
-                    has_encoder: true,
-                    ..MotorStatus::default()
-                };
-            }
-            Err(_) => {
-                self.last_status.problem = true;
-                self.last_status.comms_error = true;
-            }
+        let sta_reply = ctrl.query(&format!("{n}STA?"))?;
+        let status = atoi(sta_reply.get(1..).unwrap_or(""));
+        let done = status & STA_DONE != 0;
+        self.last_status.done = done;
+        self.last_status.moving = !done;
+        (self.last_status.high_limit, self.last_status.low_limit) = if self.ignore_limits {
+            (false, false)
+        } else {
+            (status & STA_HIGH_LIMIT != 0, status & STA_LOW_LIMIT != 0)
+        };
+        if status & STA_ERROR != 0 {
+            // C stores this return in `status`, which nothing reads after
+            // done/limits were taken from it: a refused CER neither skips nor
+            // raises PROBLEM.
+            let _ = ctrl.write(&format!("{n}CER"));
         }
+
+        let mot_reply = ctrl.query(&format!("{n}MOT?"))?;
+        let drive_on = atoi(mot_reply.get(1..).unwrap_or(""));
+        self.last_status.powered = drive_on != 0;
+        self.last_status.problem = false;
         Ok(self.last_status.clone())
+    }
+
+    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+        Some(self.last_status.clone())
     }
 }
 
@@ -519,6 +507,56 @@ mod tests {
         let axis = Mmc200Axis::new(controller, 0, false);
         assert_eq!(axis.model, -1);
         assert!(axis.last_status.problem);
+    }
+
+    /// C sets GAIN_SUPPORT and EA_PRESENT once, in the constructor
+    /// (MMC200Driver.cpp:259-261), and its `skip` label raises only
+    /// PROBLEM and returns asynError (:519-522).
+    #[test]
+    fn a_failed_poll_keeps_the_constructor_status_bits() {
+        let (handle, _) =
+            SyncIOHandle::connect_port("MMC200_DEAD", 0, Duration::ZERO, InterfaceType::Octet);
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(handle)));
+        let mut axis = Mmc200Axis::new(controller, 0, false);
+        assert!(axis.poll(&AsynUser::default()).is_err());
+        let left = axis.take_failed_poll_status().expect("the status C left");
+        assert!(left.gain_support && left.has_encoder, "{left:?}");
+        assert!(!left.comms_error, "{left:?}");
+    }
+
+    /// MMC200Driver.cpp:505 stores the `CER` write's return in `status`, not
+    /// `comStatus`, so a refused `CER` neither skips `MOT?` nor raises PROBLEM.
+    #[test]
+    fn rv4_a_refused_cer_does_not_fail_the_poll() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::failing(
+            "mmc200RefusedCer",
+            |cmd| {
+                match cmd.trim_end() {
+                    "1VER?" => "#MMC-200 v4.1",
+                    "1REZ?" => "#1000",
+                    "1UST?" => "#8",
+                    "1VMX?" => "#2.5",
+                    "1POS?" => "#1.000000,1.000000",
+                    "1STA?" => "#136",
+                    "1MOT?" => "#1",
+                    _ => "#0",
+                }
+                .into()
+            },
+            |cmd| cmd.trim_end() == "1CER",
+        );
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
+        let mut axis = Mmc200Axis::new(controller, 0, false);
+        rig.sent();
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert!(
+            status.done && status.powered && !status.problem,
+            "{status:?}"
+        );
+        let sent: Vec<String> = rig.sent().iter().map(|c| c.trim_end().to_owned()).collect();
+        assert!(sent.contains(&"1CER".to_owned()), "{sent:?}");
+        assert!(sent.contains(&"1MOT?".to_owned()), "{sent:?}");
     }
 
     /// C `sprintf("%dVEL%.3f")` / `"%dMVA%.6f"` spell a non-finite value
