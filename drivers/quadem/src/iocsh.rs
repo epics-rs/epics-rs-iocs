@@ -106,10 +106,7 @@ pub fn ahxxx_configure_command(
                 Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("modelName required".into()),
             };
-            let max_memory = match args.get(4) {
-                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
-                _ => 100_000_000,
-            };
+            let max_memory = max_memory_arg(args.get(4));
 
             // asynPortDriver registers the port before the driver body runs
             // (asynPortDriver.cpp:4031-4040).
@@ -195,10 +192,7 @@ pub fn nsls_em_configure_command(
                 Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
                 _ => 0,
             };
-            let max_memory = match args.get(4) {
-                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
-                _ => 100_000_000,
-            };
+            let max_memory = max_memory_arg(args.get(4));
 
             // asynPortDriver registers the port before the driver body runs
             // (asynPortDriver.cpp:4031-4040).
@@ -276,10 +270,7 @@ pub fn fx4_configure_command(
                 Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
                 _ => 0,
             };
-            let max_memory = match args.get(3) {
-                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
-                _ => 100_000_000,
-            };
+            let max_memory = max_memory_arg(args.get(3));
 
             // asynPortDriver registers the port before the driver body runs
             // (asynPortDriver.cpp:4031-4040).
@@ -349,10 +340,7 @@ pub fn pcr4_configure_command(
                 Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
                 _ => 0,
             };
-            let max_memory = match args.get(3) {
-                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
-                _ => 100_000_000,
-            };
+            let max_memory = max_memory_arg(args.get(3));
 
             // asynPortDriver registers the port before the driver body runs
             // (asynPortDriver.cpp:4031-4040).
@@ -429,10 +417,7 @@ pub fn t4u_em_configure_command(
                 _ => 0,
             };
             let base_port_num = port_number(args.get(3), "basePortNum")?;
-            let max_memory = match args.get(4) {
-                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
-                _ => 100_000_000,
-            };
+            let max_memory = max_memory_arg(args.get(4));
 
             // asynPortDriver registers the port before the driver body runs
             // (asynPortDriver.cpp:4031-4040).
@@ -521,10 +506,7 @@ pub fn t4u_direct_em_configure_command(
                 Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("cfgFileName required".into()),
             };
-            let max_memory = match args.get(5) {
-                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
-                _ => 100_000_000,
-            };
+            let max_memory = max_memory_arg(args.get(5));
 
             // asynPortDriver registers the port before the driver body runs
             // (asynPortDriver.cpp:4031-4040).
@@ -577,6 +559,16 @@ fn cpp_error(what: &str) -> String {
     }
 }
 
+/// The rs-only `[maxMemory]` argument. C's drvQuadEM passes maxMemory 0 to
+/// asynNDArrayDriver (drvQuadEM.cpp:53), an unbounded pool, so that is the
+/// default.
+pub fn max_memory_arg(arg: Option<&ArgValue>) -> usize {
+    match arg {
+        Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+        _ => 0,
+    }
+}
+
 /// C++ takes the base port number as an `int` and passes it to `%d`; a value
 /// outside the TCP/UDP port range is a typo in `st.cmd`, so it is rejected here
 /// rather than wrapped.
@@ -586,5 +578,17 @@ fn port_number(arg: Option<&ArgValue>, name: &str) -> Result<u16, String> {
             u16::try_from(*n).map_err(|_| format!("{name}: {n} is not a valid port number"))
         }
         _ => Err(format!("{name} required")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_memory_defaults_to_c_unbounded_pool() {
+        assert_eq!(max_memory_arg(None), 0);
+        assert_eq!(max_memory_arg(Some(&ArgValue::Int(0))), 0);
+        assert_eq!(max_memory_arg(Some(&ArgValue::Int(5_000_000))), 5_000_000);
     }
 }

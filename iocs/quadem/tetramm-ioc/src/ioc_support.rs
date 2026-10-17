@@ -11,7 +11,7 @@ use epics_rs::ad_plugins::ioc::AdIoc;
 use epics_rs::asyn::manager::claim_port_driver;
 use epics_rs::base::server::iocsh::registry::*;
 
-use quadem::iocsh::register_quadem_port;
+use quadem::iocsh::{max_memory_arg, register_quadem_port};
 use quadem::{TetrAmmRuntime, create_tetramm};
 
 fn tetramm_configure_command(
@@ -55,10 +55,7 @@ fn tetramm_configure_command(
                 Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
                 _ => 0,
             };
-            let max_memory = match args.get(3) {
-                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
-                _ => 100_000_000,
-            };
+            let max_memory = max_memory_arg(args.get(3));
 
             // asynPortDriver registers the port before the driver body runs
             // (asynPortDriver.cpp:4031-4040).
