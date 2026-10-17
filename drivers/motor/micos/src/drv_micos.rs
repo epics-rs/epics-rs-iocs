@@ -8,10 +8,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{atoi, nint};
 
 /// `MICOS_NUM_CARDS`.
@@ -42,7 +45,12 @@ impl MicosController {
     }
 
     fn send(&self, msg: &str) {
-        let _ = self.handle.write_octet(0, msg.as_bytes());
+        self.send_bytes(msg.as_bytes());
+    }
+
+    /// `send_mess` of a record string, written as the field holds it.
+    fn send_bytes(&self, msg: &[u8]) {
+        let _ = self.handle.write_octet(0, msg);
     }
 }
 
@@ -75,6 +83,7 @@ pub struct DrvMicosAxis {
     /// The raw soft limits, which a jog moves to.
     high_limit: f64,
     low_limit: f64,
+    strings: MoveStrings,
 }
 
 impl DrvMicosAxis {
@@ -90,6 +99,7 @@ impl DrvMicosAxis {
             position: 0,
             high_limit: 0.0,
             low_limit: 0.0,
+            strings: MoveStrings::default(),
         }
     }
 
@@ -105,6 +115,19 @@ impl DrvMicosAxis {
         Ok(())
     }
 
+    /// A MOVE_ABS, MOVE_REL, HOME or JOG: the record's earlier commands,
+    /// PREM as its own message, then `motion`; POST is armed. C copies PREM
+    /// into the message and starts a new transaction over it without ending
+    /// the first (devMicos.cc:197-200), so C never sends PREM; not copied.
+    fn send_move(&mut self, commands: Vec<String>, motion: String) -> AsynResult<()> {
+        let prem = self.strings.arm();
+        self.send(&commands)?;
+        if !prem.is_empty() {
+            self.lock().send_bytes(&prem);
+        }
+        self.send(&[motion])
+    }
+
     /// `SET_ACCEL`, which the record sends only for a positive rate.
     fn accel(commands: &mut Vec<String>, acceleration: f64) {
         if acceleration > 0.0 {
@@ -114,11 +137,10 @@ impl DrvMicosAxis {
 
     /// The record's `SET_VELOCITY`, `SET_ACCEL` (`SET_VEL_BASE` sends
     /// nothing), then `motion`.
-    fn motion(&self, velocity: f64, acceleration: f64, motion: String) -> AsynResult<()> {
+    fn motion(&mut self, velocity: f64, acceleration: f64, motion: String) -> AsynResult<()> {
         let mut commands = vec![format!("dv{},ud", clamp(velocity, 1_000_000))];
         Self::accel(&mut commands, acceleration);
-        commands.push(motion);
-        self.send(&commands)
+        self.send_move(commands, motion)
     }
 }
 
@@ -184,8 +206,7 @@ impl AsynMotor for DrvMicosAxis {
         } else {
             self.low_limit
         };
-        commands.push(format!("ma{}", limit.trunc() as i64));
-        self.send(&commands)
+        self.send_move(commands, format!("ma{}", limit.trunc() as i64))
     }
 
     fn home(
@@ -238,6 +259,22 @@ impl AsynMotor for DrvMicosAxis {
         self.send(&[format!("{mnemonic}{},ud", clamp(gain, 32767))])
     }
 
+    /// `PRIMITIVE`: INIT as its own message (devMicos.cc:182-188).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        self.lock().send_bytes(init);
+        Ok(())
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     /// `set_status`: `ts` for seven status bytes, `tp` for the position.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let ctrl = self.lock();
@@ -266,6 +303,14 @@ impl AsynMotor for DrvMicosAxis {
             status.position = f64::from(data);
             status.encoder_position = f64::from(data);
         }
+        // drvMicos.cc:285-293: POST with no reply, once the move is done or
+        // a limit in its direction is hit.
+        if (status.done || status.high_limit || status.low_limit)
+            && let Some(post) = self.strings.post_due()
+        {
+            let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+            ctrl.send_bytes(&post);
+        }
         Ok(status.clone())
     }
 }
@@ -280,5 +325,72 @@ mod tests {
         assert_eq!(hex_byte(b"0S0:7", 4), 7);
         assert_eq!(hex_byte(b"0S0:", 4), 0);
         assert_eq!(hex_byte(b"0S0:x1", 4), 0);
+    }
+
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// MoCo address 0 on a [`LineRig`]; `ts` reports done unless `moving`.
+    fn rig(name: &str) -> (LineRig, DrvMicosAxis, Arc<AtomicBool>) {
+        let moving = Arc::new(AtomicBool::new(false));
+        let m = moving.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "\x010ts" if m.load(Ordering::SeqCst) => "0S0:00 00 00 00 00 00 00".into(),
+            "\x010ts" => "0S0:04 00 00 00 00 00 00".into(),
+            "\x010tp" => "0P0:0".into(),
+            _ => String::new(),
+        });
+        let ctrl = MicosController::new(io);
+        (
+            line,
+            DrvMicosAxis::new(Arc::new(Mutex::new(ctrl)), 0),
+            moving,
+        )
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    #[test]
+    fn init_goes_out_as_written() {
+        let (line, mut axis, _) = rig("micosInit");
+        axis.primitive(&AsynUser::default(), b"\x010mn").unwrap();
+        assert_eq!(line.sent(), ["\x010mn"]);
+    }
+
+    /// PREM ahead of the motion command, POST once at the next done poll.
+    #[test]
+    fn prem_precedes_the_move_and_post_follows_done() {
+        let (line, mut axis, moving) = rig("micosPrem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"\x010mn", Some(post(b"\x010mf")))
+            .unwrap();
+        axis.move_absolute(&user, 100.0, 0.0, 500.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["\x010dv500,ud", "\x010mn", "\x010ma100"]);
+        moving.store(true, Ordering::SeqCst);
+        axis.poll(&user).unwrap();
+        assert_eq!(line.sent(), ["\x010ts", "\x010tp"]);
+        moving.store(false, Ordering::SeqCst);
+        axis.poll(&user).unwrap();
+        assert_eq!(line.sent(), ["\x010ts", "\x010tp", "\x010mf"]);
+        axis.poll(&user).unwrap();
+        assert_eq!(line.sent(), ["\x010ts", "\x010tp"]);
+    }
+
+    /// A jog and a home carry PREM too.
+    #[test]
+    fn jog_and_home_carry_prem() {
+        let (line, mut axis, _) = rig("micosJog");
+        let user = AsynUser::default();
+        axis.set_high_limit(&user, 900.0).unwrap();
+        axis.set_move_strings(&user, b"P", None).unwrap();
+        axis.move_velocity(&user, 0.0, 10.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["P", "\x010ma900"]);
+        axis.set_move_strings(&user, b"P", None).unwrap();
+        axis.home(&user, 0.0, 10.0, 0.0, true).unwrap();
+        assert_eq!(line.sent(), ["\x010dv10,ud", "P", "\x010gh"]);
     }
 }

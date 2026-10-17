@@ -19,6 +19,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, Pos
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, atoi, nint};
 
 /// `IM483PL_NUM_CARDS`.
@@ -111,10 +112,7 @@ pub struct DrvIm483Axis {
     status: MotorStatus,
     /// `motor_info->position`.
     position: i32,
-    /// The record's PREM and POST for the move it sends next.
-    strings: Option<(Vec<u8>, Option<PostMessage>)>,
-    /// The move in flight's POST, `nodeptr->postmsgptr`.
-    post: Option<PostMessage>,
+    strings: MoveStrings,
 }
 
 impl DrvIm483Axis {
@@ -130,8 +128,7 @@ impl DrvIm483Axis {
                 ..MotorStatus::default()
             },
             position: 0,
-            strings: None,
-            post: None,
+            strings: MoveStrings::default(),
         }
     }
 
@@ -144,8 +141,7 @@ impl DrvIm483Axis {
             init_prefix: "",
             status: MotorStatus::default(),
             position: 0,
-            strings: None,
-            post: None,
+            strings: MoveStrings::default(),
         }
     }
 
@@ -178,8 +174,7 @@ impl DrvIm483Axis {
     /// A move, home or jog: its PREM rides ahead of the last command, and
     /// its POST, or none, becomes the one `poll` sends.
     fn send_move(&mut self, commands: &[String]) -> AsynResult<()> {
-        let (prem, post) = self.strings.take().unwrap_or_default();
-        self.post = post;
+        let prem = self.strings.arm();
         let Some((last, rest)) = commands.split_last() else {
             return Ok(());
         };
@@ -285,7 +280,7 @@ impl AsynMotor for DrvIm483Axis {
         prem: &[u8],
         post: Option<PostMessage>,
     ) -> AsynResult<()> {
-        self.strings = Some((prem.to_vec(), post));
+        self.strings.set(prem, post);
         Ok(())
     }
 
@@ -340,8 +335,7 @@ impl AsynMotor for DrvIm483Axis {
         let ls_active =
             (status.high_limit && status.direction) || (status.low_limit && !status.direction);
         if (status.done || ls_active)
-            && let Some(post) = self.post.take().map(|p| p.get())
-            && !post.is_empty()
+            && let Some(post) = self.strings.post_due()
         {
             let mut line = self.name.as_bytes().to_vec();
             line.extend_from_slice(&post);

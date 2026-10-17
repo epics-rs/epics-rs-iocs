@@ -175,15 +175,19 @@ impl SmartMotorController {
     /// in the reply read that follows, and the input EOS is restored to `\r`
     /// either way.
     fn send(&self, axis: usize, cmd: &str) {
+        self.send_bytes(axis, cmd.as_bytes());
+    }
+
+    fn send_bytes(&self, axis: usize, cmd: &[u8]) {
         if self.echo {
             let mut out = Vec::with_capacity(cmd.len() + 1);
             out.push(FIRST_ADDR + axis as u8);
-            out.extend_from_slice(cmd.as_bytes());
+            out.extend_from_slice(cmd);
             let _ = self.writer.write_octet(0, &out);
             let _ = self.port.set_input_eos_blocking(eos_user(), ECHO_EOS);
             let _ = self.reader.read_octet(0, READ_BUF);
         } else {
-            let _ = self.writer.write_octet(0, cmd.as_bytes());
+            let _ = self.writer.write_octet(0, cmd);
         }
         let _ = self.port.set_input_eos_blocking(eos_user(), INPUT_EOS);
     }
@@ -330,6 +334,15 @@ impl AsynMotor for SmartMotorAxis {
         Ok(())
     }
 
+    /// `PRIMITIVE`: " " + INIT as its own message (devSmartMotor.cc:211-215).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let mut msg = Vec::with_capacity(init.len() + 1);
+        msg.push(b' ');
+        msg.extend_from_slice(init);
+        self.lock().send_bytes(self.axis, &msg);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let mut ctrl = self.lock();
 
@@ -422,6 +435,7 @@ mod tests {
         replies: std::collections::VecDeque<Vec<u8>>,
         refuse_writes: Arc<std::sync::atomic::AtomicBool>,
         reads: Arc<std::sync::atomic::AtomicUsize>,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     fn chain(name: &str) -> Chain {
@@ -434,6 +448,7 @@ mod tests {
             replies: Default::default(),
             refuse_writes: Default::default(),
             reads: Default::default(),
+            sent: Default::default(),
         }
     }
 
@@ -451,6 +466,7 @@ mod tests {
             {
                 return Err(smartmotor_err("write refused"));
             }
+            self.sent.lock().unwrap().push(data.to_vec());
             self.replies.push_back(data.to_vec());
             if data.first() == Some(&FIRST_ADDR) {
                 self.replies.push_back(b"1".to_vec());
@@ -507,5 +523,27 @@ mod tests {
         let before = reads.load(Ordering::Relaxed);
         axis.stop(&AsynUser::new(0), 0.0).unwrap();
         assert_eq!(reads.load(Ordering::Relaxed), before + 1, "the echo read");
+    }
+
+    #[test]
+    fn init_goes_out_addressed_after_a_space() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let chain = chain("smartInit");
+        let sent = chain.sent.clone();
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("smartInit").unwrap(),
+            chain,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl =
+            SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
+        let mut axis = SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        sent.lock().unwrap().clear();
+
+        axis.primitive(&AsynUser::new(0), b"EIGN(2)").unwrap();
+        assert_eq!(*sent.lock().unwrap(), vec![b"\x81 EIGN(2)".to_vec()]);
     }
 }

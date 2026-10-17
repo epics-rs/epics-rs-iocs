@@ -44,10 +44,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -146,7 +147,12 @@ impl PiJedsController {
     /// Send a write-only set command (`set`/`sr`/`cl`); the E-516 returns no
     /// reply to these forms.
     fn write_cmd(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.write_bytes(cmd.as_bytes())
+    }
+
+    /// [`write_cmd`](Self::write_cmd) for a record string's raw bytes.
+    fn write_bytes(&self, cmd: &[u8]) -> AsynResult<()> {
+        self.handle.write_octet(0, cmd)?;
         Ok(())
     }
 
@@ -182,6 +188,7 @@ pub struct PiJedsAxis {
     /// Whether a commanded move is in progress (C `nodeptr != 0`).
     moving: bool,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl PiJedsAxis {
@@ -201,6 +208,7 @@ impl PiJedsAxis {
                 gain_support: true,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         }
     }
 
@@ -208,9 +216,34 @@ impl PiJedsAxis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A record string as the motor queue sends it: `send_mess` puts the
+    /// axis name in place of its first `#` (drvPIJEDS.cc:435-443).
+    fn named(&self, text: &[u8]) -> Vec<u8> {
+        let mut line = text.to_vec();
+        if let Some(c) = line.iter_mut().find(|c| **c == b'#') {
+            *c = b'0' + self.axis as u8;
+        }
+        line
+    }
+
+    /// PREM as its own message ahead of the move's (devPIJEDS.cc:195-213).
+    fn send_prem(&self, ctrl: &PiJedsController, prem: &[u8]) -> AsynResult<()> {
+        if prem.is_empty() {
+            return Ok(());
+        }
+        ctrl.write_bytes(&self.named(prem))
+    }
+
+    /// The record's GO after a move or home: `stat,#`, whose reply the next
+    /// `set_status` flushes (devPIJEDS.cc GO, drvPIJEDS.cc:257).
+    fn go(&self, ctrl: &PiJedsController) -> AsynResult<()> {
+        ctrl.write_cmd(&format!("stat,{}", self.axis))
+    }
+
     /// Send an absolute move to `position` (steps), optionally setting
     /// the slew velocity first (C `SET_VELOCITY` + `MOVE_ABS`).
     fn issue_move(&mut self, position: f64, velocity: f64) -> AsynResult<()> {
+        let prem = self.strings.arm();
         let ctrl = self.lock();
         if velocity > 0.0 {
             ctrl.write_cmd(&format!(
@@ -220,12 +253,14 @@ impl PiJedsAxis {
                 velocity * DRIVE_RESOLUTION
             ))?;
         }
+        self.send_prem(&ctrl, &prem)?;
         ctrl.write_cmd(&format!(
             "set,{},{:.*}",
             self.axis,
             MAX_RES,
             position * DRIVE_RESOLUTION
         ))?;
+        self.go(&ctrl)?;
         drop(ctrl);
         self.moving = true;
         self.no_motion_count = 0;
@@ -273,7 +308,9 @@ impl AsynMotor for PiJedsAxis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         // C JOG only sets the slew rate — the E-516 has no continuous jog.
+        let prem = self.strings.arm();
         let ctrl = self.lock();
+        self.send_prem(&ctrl, &prem)?;
         ctrl.write_cmd(&format!(
             "sr,{},{:.*}",
             self.axis,
@@ -290,8 +327,13 @@ impl AsynMotor for PiJedsAxis {
         _acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
-        // C HOME_* send nothing — no home on an absolute closed-loop stage.
-        Ok(())
+        // C HOME_* send nothing — no home on an absolute closed-loop stage —
+        // but for PREM. C hangs POST off a message it never sends; not
+        // copied, POST goes at the next poll that reports done.
+        let prem = self.strings.arm();
+        let ctrl = self.lock();
+        self.send_prem(&ctrl, &prem)?;
+        self.go(&ctrl)
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -311,11 +353,28 @@ impl AsynMotor for PiJedsAxis {
         ctrl.write_cmd(&format!("cl,{},{}", self.axis, i32::from(enable)))
     }
 
+    /// `PRIMITIVE`: INIT as its own message. C's PRIMITIVE case sets
+    /// `send = false`, so C never sends it (devPIJEDS.cc:190-191, 263-268);
+    /// not copied.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        self.lock().write_bytes(&self.named(init))
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let status_reply = ctrl.query(&format!("stat,{}", self.axis));
         let pos_reply = ctrl.query(&format!("mess,{}", self.axis));
-        drop(ctrl);
 
         // A read is OK only when both queries returned a parseable value.
         let status_word = status_reply.ok().as_deref().and_then(value_field).map(atoi);
@@ -328,6 +387,7 @@ impl AsynMotor for PiJedsAxis {
         let (Some(status_word), Some(position)) = (status_word, position) else {
             // C: first failure after NORMAL is a silent RETRY; a repeat failure
             // is a hard comms error. Keep the last position, flag the error.
+            drop(ctrl);
             self.last_status = MotorStatus {
                 comms_error: true,
                 problem: true,
@@ -356,6 +416,12 @@ impl AsynMotor for PiJedsAxis {
         if done {
             self.moving = false;
         }
+        // drvPIJEDS.cc:388-395: POST without the axis name, as C's
+        // send_mess(card, buff, NULL) gives it no `#` substitution.
+        if done && let Some(post) = self.strings.post_due() {
+            let _ = ctrl.write_bytes(&post);
+        }
+        drop(ctrl);
 
         let powered = (status_word & STATUS_CLOSE_LOOP) != 0;
         self.last_status = MotorStatus {
@@ -383,6 +449,102 @@ impl AsynMotor for PiJedsAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    /// Axis 0 of an E-516 on a [`LineRig`] whose `mess` reads `pos` µm,
+    /// with the construction traffic taken.
+    fn strings_rig(name: &str) -> (LineRig, PiJedsAxis, Arc<AtomicI32>) {
+        let pos = Arc::new(AtomicI32::new(0));
+        let p = pos.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "" => "DSM V1.959".into(),
+            "mess,0" => format!("mess,0,{}", p.load(Ordering::SeqCst)),
+            "stat,0" => "stat,0,133".into(),
+            _ => "not present".into(),
+        });
+        let ctrl = PiJedsController::new(io).unwrap();
+        let axis = PiJedsAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        (line, axis, pos)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut PiJedsAxis) -> Vec<String> {
+        axis.poll(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| l != "stat,0" && l != "mess,0")
+            .collect()
+    }
+
+    /// devPIJEDS.cc:190-191: INIT as its own message, named like any queued
+    /// one.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = strings_rig("pijedsInit");
+        axis.primitive(&AsynUser::default(), b"cl,#,1").unwrap();
+        assert_eq!(line.sent(), ["cl,0,1"]);
+    }
+
+    /// devPIJEDS.cc GO: `stat,#` closes a relative move and a home, which
+    /// otherwise send nothing; a jog has no GO.
+    #[test]
+    fn go_sends_the_stat_query() {
+        let (line, mut axis, _) = strings_rig("pijedsGo");
+        let user = AsynUser::default();
+        axis.move_relative(&user, 1000.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["set,0,1.000", "stat,0"]);
+        axis.home(&user, 0.0, 0.0, 0.0, true).unwrap();
+        assert_eq!(line.sent(), ["stat,0"]);
+        axis.move_velocity(&user, 0.0, 2000.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["sr,0,2.000"]);
+    }
+
+    /// devPIJEDS.cc:195-213: PREM as its own message ahead of the move's,
+    /// for that move only.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("pijedsPrem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
+        axis.move_absolute(&user, 1500.0, 0.0, 2000.0, 0.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            ["sr,0,2.000", "cl,0,1", "set,0,1.500", "stat,0"]
+        );
+        axis.move_absolute(&user, 1500.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["set,0,1.500", "stat,0"]);
+        axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
+        axis.move_velocity(&user, 0.0, -2000.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["cl,0,1", "sr,0,2.000"]);
+        axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
+        axis.home(&user, 0.0, 2000.0, 0.0, true).unwrap();
+        assert_eq!(line.sent(), ["cl,0,1", "stat,0"]);
+    }
+
+    /// drvPIJEDS.cc:388-395: POST once the move settles, not while it runs,
+    /// with no axis name.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, pos) = strings_rig("pijedsPost");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"cl,#,0")))
+            .unwrap();
+        axis.move_absolute(&user, 5000.0, 0.0, 0.0, 0.0).unwrap();
+        line.sent();
+        pos.store(5, Ordering::SeqCst);
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        assert_eq!(poll_extra(&line, &mut axis), ["cl,#,0"]);
+        assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+    }
 
     /// An E-516 axis 0 that steps 1 µm toward its `set` target per `mess`.
     struct Stage {

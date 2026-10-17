@@ -89,8 +89,13 @@ impl Mcb4bController {
     /// queries and set commands (whose reply is discarded) to keep the stream
     /// synchronized.
     pub(crate) fn command(&self, cmd: &str) -> AsynResult<String> {
+        self.command_bytes(cmd.as_bytes())
+    }
+
+    /// [`command`](Self::command) for a record string's raw bytes.
+    pub(crate) fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
         // C writeReadController: pasynOctetSyncIO->writeRead.
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd, READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_end_matches(['\r', '\n', '\0']).to_string())
     }

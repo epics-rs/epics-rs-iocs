@@ -54,10 +54,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -206,7 +209,12 @@ impl Emc18011Controller {
     /// reply, so this is used for both queries and set commands (whose reply is
     /// discarded) to keep the stream synchronized.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        self.command_bytes(cmd.as_bytes())
+    }
+
+    /// [`command`](Self::command) for a record string's raw bytes.
+    fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
+        let raw = self.handle.write_read(0, cmd, READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
@@ -237,6 +245,7 @@ pub struct Emc18011Axis {
     index: usize,
     prev_position: f64,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl Emc18011Axis {
@@ -250,6 +259,7 @@ impl Emc18011Axis {
                 done: true,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         }
     }
 
@@ -257,18 +267,29 @@ impl Emc18011Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Program the velocity, then send `move_str`, then `A` (which both starts
-    /// motion and returns an acknowledgment), after selecting this motor.
-    fn issue_move(&self, velocity: f64, move_str: &str) -> AsynResult<()> {
+    /// Program the velocity, then send PREM and `move_str`, then `A` (which
+    /// both starts motion and returns an acknowledgment), after selecting
+    /// this motor.
+    fn issue_move(&mut self, velocity: f64, move_str: &str) -> AsynResult<()> {
+        let prem = self.strings.arm();
         let mut ctrl = self.lock();
         ctrl.select(self.index)?;
         if velocity > 0.0 {
             ctrl.command(&vel_cmd(velocity))?;
         }
+        send_prem(&ctrl, &prem)?;
         ctrl.command(move_str)?;
         ctrl.command("A")?;
         Ok(())
     }
+}
+
+/// PREM as its own message ahead of the move's (devEMC18011.cc:251-264).
+fn send_prem(ctrl: &Emc18011Controller, prem: &[u8]) -> AsynResult<()> {
+    if !prem.is_empty() {
+        ctrl.command_bytes(prem)?;
+    }
+    Ok(())
 }
 
 impl AsynMotor for Emc18011Axis {
@@ -308,8 +329,12 @@ impl AsynMotor for Emc18011Axis {
         velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
+        // C hangs POST off the `V` message, and the direction message's
+        // VELOCITY node replaces it, so C never sends it; not copied.
+        let prem = self.strings.arm();
         let mut ctrl = self.lock();
         ctrl.select(self.index)?;
+        send_prem(&ctrl, &prem)?;
         ctrl.command(&vel_cmd(velocity.abs()))?;
         // Direction character: '>' forward, '<' reverse (C JOG).
         let dir = if velocity >= 0.0 { ">" } else { "<" };
@@ -363,8 +388,32 @@ impl AsynMotor for Emc18011Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    /// `PRIMITIVE`: INIT as its own message, to this motor only. C sends
+    /// it only when this motor is already the selected one; here it is
+    /// selected, as for `set_position`.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
         let mut ctrl = self.lock();
+        if matches!(ctrl.active, Some(a) if a != self.index) {
+            return Ok(());
+        }
+        ctrl.select(self.index)?;
+        ctrl.command_bytes(init)?;
+        Ok(())
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
+    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
         // Only the selected motor yields fresh status; others report last state.
         if ctrl.active != Some(self.index) {
@@ -404,6 +453,13 @@ impl AsynMotor for Emc18011Axis {
                 ctrl.active = None;
             }
         }
+        // drvEMC18011.cc:347, 379-386, reading the reply C leaves for the
+        // next command's flush.
+        if (z.done || z.plus_ls || z.minus_ls)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.command_bytes(&post);
+        }
         drop(ctrl);
 
         self.prev_position = position;
@@ -427,6 +483,96 @@ impl AsynMotor for Emc18011Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use std::sync::Mutex as StdMutex;
+
+    /// Motor 1 of a controller on a [`LineRig`] whose `Z` reply is `z`.
+    fn strings_rig(name: &str) -> (LineRig, Emc18011Axis, Arc<StdMutex<char>>) {
+        let z = Arc::new(StdMutex::new(Z_STOPPED));
+        let zr = z.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "R" => RTN_REMOTE.into(),
+            "Z" => zr.lock().unwrap().to_string(),
+            "A" => "1.0".into(),
+            _ => "OK".into(),
+        });
+        let ctrl = Emc18011Controller::new(io).unwrap();
+        let axis = Emc18011Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        (line, axis, z)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut Emc18011Axis) -> Vec<String> {
+        axis.poll(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| l != "Z" && l != "A")
+            .collect()
+    }
+
+    /// devEMC18011.cc:243-249: INIT as its own message.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = strings_rig("emcInit");
+        axis.primitive(&AsynUser::default(), b"CA").unwrap();
+        assert_eq!(line.sent(), ["M1", "CA"]);
+    }
+
+    /// devEMC18011.cc:251-264: PREM as its own message ahead of the move's,
+    /// for that move only.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("emcPrem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"CA", None).unwrap();
+        axis.move_absolute(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["M1", "V2.00", "CA", "G1.5", "A"]);
+        axis.move_relative(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["V2.00", "T1.5", "A"]);
+        axis.set_move_strings(&user, b"CA", None).unwrap();
+        axis.move_velocity(&user, 0.0, -2.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["CA", "V2.00", "<"]);
+    }
+
+    /// drvEMC18011.cc:379-386: POST once the move is done, not while it
+    /// runs; a jog's too.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, z) = strings_rig("emcPost");
+        let user = AsynUser::default();
+        for jog in [false, true] {
+            axis.set_move_strings(&user, b"", Some(post(b"S"))).unwrap();
+            if jog {
+                axis.move_velocity(&user, 0.0, 2.0, 0.0).unwrap();
+            } else {
+                axis.move_relative(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
+            }
+            line.sent();
+            *z.lock().unwrap() = Z_RUNDOWN;
+            assert!(poll_extra(&line, &mut axis).is_empty());
+            *z.lock().unwrap() = Z_STOPPED;
+            assert_eq!(poll_extra(&line, &mut axis), ["S"]);
+        }
+    }
+
+    /// drvEMC18011.cc:347: either limit ends the move too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let (line, mut axis, z) = strings_rig("emcPostLs");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"S"))).unwrap();
+        axis.move_relative(&user, -1.5, 0.0, 2.0, 0.0).unwrap();
+        line.sent();
+        *z.lock().unwrap() = Z_LSDOWN;
+        assert_eq!(poll_extra(&line, &mut axis), ["S"]);
+    }
 
     #[test]
     fn move_cmd_precision_and_clamp() {
