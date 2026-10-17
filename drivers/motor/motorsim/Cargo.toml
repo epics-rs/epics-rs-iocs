@@ -14,4 +14,3 @@ motor-common = { path = "../common" }
 
 [dev-dependencies]
 motor-common = { path = "../common", features = ["testing"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
