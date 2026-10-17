@@ -22,7 +22,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
-use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
@@ -81,20 +81,14 @@ impl PslDetector {
         max_memory: usize,
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
-    ) -> AsynResult<Self> {
+    ) -> AsynResult<(Self, bool)> {
         let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let params = PslParams::create(&mut ad.port_base)?;
-
-        let base = &mut ad.port_base;
-        base.set_string_param(ad.params.base.manufacturer, 0, "PSL")?;
-        base.set_string_param(ad.params.base.model, 0, "CCD")?;
-        base.set_string_param(ad.params.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
-        base.set_int32_param(ad.params.base.data_type, 0, NDDataType::UInt16 as u8 as i32)?;
-        base.set_int32_param(ad.params.image_mode, 0, ImageMode::Single as i32)?;
-        base.set_float64_param(ad.params.acquire_period, 0, 0.0)?;
-        base.set_float64_param(ad.params.acquire_time, 0, 1.0)?;
-        base.set_int32_param(ad.params.num_images, 0, 1)?;
-        base.set_int32_param(ad.params.status, 0, ADStatus::Idle as i32)?;
+        ad.port_base.set_string_param(
+            ad.params.base.driver_version,
+            0,
+            env!("CARGO_PKG_VERSION"),
+        )?;
 
         let mut det = Self {
             ad,
@@ -107,30 +101,21 @@ impl PslDetector {
             shared,
             commands,
         };
-        det.connect_to_server()?;
-        Ok(det)
+        let booted = det.connect_to_server()?;
+        Ok((det, booted))
     }
 
-    /// Greet the server and open its first camera (C's constructor).
-    ///
-    /// A server that is not running must not take the IOC down with it: the
-    /// port comes up with no choices, and the next `CameraName` write retries.
-    fn connect_to_server(&mut self) -> AsynResult<()> {
+    /// The rest of C's constructor, from getVersion on. False when the
+    /// server version is wrong: C returns there (PSL.cpp:168-173), leaving
+    /// the defaults unset and PSLTask not started, and the port stays up.
+    fn connect_to_server(&mut self) -> AsynResult<bool> {
         let reply = self.command("GetVersion")?;
-        if let Err(e) = protocol::parse_version(&reply) {
+        if protocol::parse_version(&reply).is_err() {
             self.server.trace_error(&format!(
                 "PSL:getVersion, ERROR, unexpected version string = {reply}."
             ));
             self.trace_error("PSL:PSL: ERROR, incorrect server version");
-            self.ad.port_base.set_string_param(
-                self.ad.params.status_message,
-                0,
-                format!("PSL server: {e}"),
-            )?;
-            self.ad
-                .port_base
-                .set_int32_param(self.ad.params.status, 0, ADStatus::Error as i32)?;
-            return Ok(());
+            return Ok(false);
         }
 
         self.state.camera_names = self.get_choices("GetCamList")?;
@@ -138,7 +123,17 @@ impl PslDetector {
         self.state.camera_names.insert("multiconf".into());
         // C's constructor ignores what openCamera returns (PSL.cpp:180).
         let _ = self.open_camera(0);
-        Ok(())
+
+        let ad = &self.ad.params;
+        let base = &mut self.ad.port_base;
+        base.set_string_param(ad.base.manufacturer, 0, "PSL")?;
+        base.set_string_param(ad.base.model, 0, "CCD")?;
+        base.set_int32_param(ad.base.data_type, 0, NDDataType::UInt16 as u8 as i32)?;
+        base.set_int32_param(ad.image_mode, 0, ImageMode::Single as i32)?;
+        base.set_float64_param(ad.acquire_period, 0, 0.0)?;
+        base.set_float64_param(ad.acquire_time, 0, 1.0)?;
+        base.set_int32_param(ad.num_images, 0, 1)?;
+        Ok(true)
     }
 
     /// Send one command and publish both sides of the exchange to the
@@ -662,8 +657,9 @@ pub struct PslRuntime {
     pub params: PslParams,
     pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    /// None when the constructor returned early, as C never starts PSLTask.
     #[allow(dead_code)]
-    task: std::thread::JoinHandle<()>,
+    task: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PslRuntime {
@@ -701,21 +697,24 @@ pub fn create_psl_detector(
     let server = PslServer::new(server_handle);
     let (tx, rx) = rt::command_channel::<TaskCommand>(4);
 
-    let det = PslDetector::new(port_name, server.clone(), max_memory, shared.clone(), tx)?;
+    let (det, booted) =
+        PslDetector::new(port_name, server.clone(), max_memory, shared.clone(), tx)?;
     let ad_params = det.ad.params;
     let params = det.params;
     let pool = det.ad.pool.clone();
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
 
-    let task = start_acquisition_task(AcquisitionContext {
-        server,
-        handle: runtime_handle.port_handle().clone(),
-        output: ArrayPublisher::new(array_output.clone()),
-        pool: pool.clone(),
-        ad_params,
-        shared,
-        commands: rx,
+    let task = booted.then(|| {
+        start_acquisition_task(AcquisitionContext {
+            server,
+            handle: runtime_handle.port_handle().clone(),
+            output: ArrayPublisher::new(array_output.clone()),
+            pool: pool.clone(),
+            ad_params,
+            shared,
+            commands: rx,
+        })
     });
 
     Ok(PslRuntime {
@@ -731,7 +730,7 @@ pub fn create_psl_detector(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::driver::ShutterMode;
+    use epics_rs::ad_core::driver::{ADStatus, ShutterMode};
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::registry::claim_port;
@@ -759,10 +758,13 @@ mod tests {
             tx,
         )
         .unwrap()
+        .0
     }
 
     /// C ignores the `pasynOctetSyncIO->connect` status (PSL.cpp:166): with no
-    /// server port configured, getVersion fails and the port stays up.
+    /// server port configured, getVersion fails and the port stays up, but the
+    /// constructor returns there (PSL.cpp:168-173): ADStatus keeps the base
+    /// class Idle, the defaults are unset and PSLTask never runs.
     #[test]
     fn a_detector_whose_server_port_is_missing_still_boots() {
         let (server, status) =
@@ -770,11 +772,19 @@ mod tests {
         assert!(status.is_err());
         let rt = create_psl_detector(&claim_port("PSL_NONE").unwrap(), server, 1 << 20)
             .expect("the detector port");
+        assert!(rt.task.is_none());
         let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
         assert_eq!(
             sync.read_int32(rt.ad_params.status).unwrap(),
-            ADStatus::Error as i32
+            ADStatus::Idle as i32
         );
+        let octet = |reason| {
+            let mut v = sync.read_octet(reason, 64).unwrap();
+            v.retain(|&b| b != 0);
+            String::from_utf8(v).unwrap()
+        };
+        assert_eq!(octet(rt.ad_params.status_message), "");
+        assert!(sync.read_octet(rt.ad_params.base.model, 64).is_err());
     }
 
     /// ADDriver::writeInt32 and asynNDArrayDriver::writeInt32 each close with
@@ -970,7 +980,8 @@ mod tests {
             shared,
             tx,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         det.state.valid_options = ["RecordPath".to_string()].into();
         let p = det.ad.params.base;
         det.get_config().unwrap();
