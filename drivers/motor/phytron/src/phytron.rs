@@ -66,14 +66,14 @@
 //! - The auto status-reset-on-error option (`SEC` via the `statusResetTime`
 //!   option): dormant by default, so `clearAxisError` is a no-op here.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{PortDriverBase, param_list};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -296,19 +296,21 @@ impl PhytronParams {
         self.controller.clone()
     }
 
-    /// C `getAxis` plus the "Axis not found" line `func` prints on
-    /// pasynUserSelf.
+    /// C `getAxis` (the base's axis table, which phytronCreateAxis fills
+    /// before `axes_`): the axis's address and command prefix, or the "Axis
+    /// not found" line `func` prints on pasynUserSelf.
     fn axis_controller(
         &self,
-        port: &str,
+        base: &PortDriverBase,
+        user: &AsynUser,
         func: &str,
-        addr: i32,
-    ) -> AsynResult<(MutexGuard<'_, PhytronController>, String)> {
-        if let Some(ctrl) = self.controller.get() {
+    ) -> AsynResult<(MutexGuard<'_, PhytronController>, i32, String)> {
+        let port = &*base.port_name;
+        if let Some(ctrl) = self.controller.get().filter(|_| has_motor_axis(base, user)) {
             let ctrl = ctrl.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(m) = ctrl.axes.get(&addr).cloned() {
-                return Ok((ctrl, m));
-            }
+            let addr = param_list(base.flags.multi_device, user.addr);
+            let m = axis_module_no(ctrl.ctrl_type, addr)?;
+            return Ok((ctrl, addr, m));
         }
         MotorTrace::new(port, 0).print_self(
             TraceMask::ERROR,
@@ -337,7 +339,7 @@ impl PhytronParams {
             return sent.map(|_| ());
         }
         let sent = ctrl.reset(&port, user.reason);
-        for &axis_no in ctrl.axes.keys() {
+        for &axis_no in &ctrl.axes {
             let _ = base.set_float64_param(index::ENCODER_RATIO, axis_no, 1.0);
         }
         // C's callParamCallbacks() is address 0's.
@@ -409,7 +411,7 @@ impl ControllerParams for PhytronParams {
                 .unwrap_or(ParamWrite::PassToBase(Ok(())));
         }
         let port = base.port_name.clone();
-        let (mut ctrl, m) = match self.axis_controller(&port, "phytronAxis::writeInt32", user.addr)
+        let (mut ctrl, addr, m) = match self.axis_controller(base, user, "phytronAxis::writeInt32")
         {
             Ok(found) => found,
             Err(e) => return ParamWrite::PassToBase(Err(e)),
@@ -431,7 +433,7 @@ impl ControllerParams for PhytronParams {
                 )));
             }
         };
-        let sent = ctrl.axis_command(&port, "writeInt32", "Writing parameter", user.addr, &cmd);
+        let sent = ctrl.axis_command(&port, "writeInt32", "Writing parameter", addr, &cmd);
         ParamWrite::PassToBase(sent.map(|_| ()))
     }
 
@@ -467,8 +469,8 @@ impl ControllerParams for PhytronParams {
             )?;
             return Ok(atoi(&reply));
         }
-        let (mut ctrl, m) =
-            self.axis_controller(&port, "phytronController::readInt32", user.addr)?;
+        let (mut ctrl, addr, m) =
+            self.axis_controller(base, user, "phytronController::readInt32")?;
         let Some(&p) = self.p_regs.get(&user.reason) else {
             return Ok(value);
         };
@@ -476,7 +478,7 @@ impl ControllerParams for PhytronParams {
             &port,
             "readInt32",
             "Reading parameter",
-            user.addr,
+            addr,
             &format!("{m}P{p}R"),
         )?;
         let value = atoi(&reply);
@@ -487,8 +489,8 @@ impl ControllerParams for PhytronParams {
     /// which looks the axis up before the base.
     fn read_float64(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<f64> {
         let port = base.port_name.clone();
-        let (mut ctrl, m) =
-            self.axis_controller(&port, "phytronController::readFloat64", user.addr)?;
+        let (mut ctrl, addr, m) =
+            self.axis_controller(base, user, "phytronController::readFloat64")?;
         let value = base.read_float64_param(user).unwrap_or(0.0);
         let Some(&p) = self.temps.get(&user.reason) else {
             return Ok(value);
@@ -497,7 +499,7 @@ impl ControllerParams for PhytronParams {
             &port,
             "readFloat64",
             "Reading parameter",
-            user.addr,
+            addr,
             &format!("{m}P{p}R"),
         )?;
         Ok(atof(&reply) / 10.)
@@ -517,6 +519,22 @@ impl ControllerParams for PhytronParams {
         );
         ctx.report(out, level);
     }
+}
+
+/// C `axisModuleNo_`, axis `axis_no`'s command prefix: `M<mod>.<idx>` or
+/// the MCC digit.
+fn axis_module_no(ctrl_type: CtrlType, axis_no: i32) -> AsynResult<String> {
+    Ok(match ctrl_type {
+        // C: epicsSnprintf(..., "M%.1f", iAxisNo / 10.)
+        CtrlType::Phymotion => format!("M{:.1}", CFloat(axis_no as f64 / 10.0)),
+        CtrlType::Mcc => {
+            let n = axis_no % 10;
+            if !(1..=8).contains(&n) {
+                return Err(phytron_err("phytron MCC: axis index must be 1..=8"));
+            }
+            n.to_string()
+        }
+    })
 }
 
 /// C `phytronAxis::report` (phytronAxisMotor.cpp:1377-1384): the axis
@@ -540,8 +558,9 @@ pub struct PhytronController {
     address: u8,
     /// The MCC `SUI` reply of this poll pass, ACK stripped (C `sLastSUI_`).
     last_sui: String,
-    /// Each created axis's command prefix by axis number (C `getAxis`).
-    axes: BTreeMap<i32, String>,
+    /// C `axes_`, the created axes a controller reset walks; `getAxis`
+    /// looks in the base's table instead.
+    axes: BTreeSet<i32>,
     /// C `lastStatus_`, the controller-wide status `CHECK_AXIS` compares.
     last_status: i32,
     /// C's `motorEncoderRatio_` by axis prefix, which a controller reset
@@ -560,17 +579,16 @@ impl PhytronController {
             ctrl_type,
             address: address.min(15),
             last_sui: String::new(),
-            axes: BTreeMap::new(),
+            axes: BTreeSet::new(),
             last_status: 0,
             encoder_ratios: HashMap::new(),
             axis_status: None,
         }
     }
 
-    /// Make axis `axis_no` (`PhytronAxis::module_no`) one the parameter
-    /// reads and writes find.
-    pub fn add_axis(&mut self, axis_no: i32, module_no: &str) {
-        self.axes.insert(axis_no, module_no.to_owned());
+    /// C `axes_.push_back`: axis `axis_no` is one a reset walks.
+    pub fn add_axis(&mut self, axis_no: i32) {
+        self.axes.insert(axis_no);
     }
 
     /// Let each axis poll set AXIS_STATUS on controller port `port`.
@@ -750,17 +768,7 @@ impl PhytronAxis {
             .unwrap_or_else(|e| e.into_inner())
             .ctrl_type;
         let axis_no = module * 10 + index;
-        let axis_module_no = match ctrl_type {
-            // C: epicsSnprintf(..., "M%.1f", iAxisNo / 10.)
-            CtrlType::Phymotion => format!("M{:.1}", CFloat(axis_no as f64 / 10.0)),
-            CtrlType::Mcc => {
-                let n = axis_no % 10;
-                if !(1..=8).contains(&n) {
-                    return Err(phytron_err("phytron MCC: axis index must be 1..=8"));
-                }
-                n.to_string()
-            }
-        };
+        let axis_module_no = axis_module_no(ctrl_type, axis_no)?;
         Ok(Self {
             controller,
             axis_no,
