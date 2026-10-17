@@ -65,6 +65,21 @@ impl Model1Cards<'_> {
             .find(|(c, _)| *c == card)
             .map(|(_, line)| line.as_str())
     }
+
+    /// The report most model-1 drivers print (e.g. drvIM483PL.cc:147-171):
+    /// `line(card, description)` for each card, or the lines for no
+    /// `Setup` and a failed card naming the `driver`.
+    pub fn report(&self, driver: &str, line: impl Fn(i32, &str) -> String) -> String {
+        if self.num_cards <= 0 {
+            return format!("    No {driver} controllers configured.\n");
+        }
+        (0..self.num_cards)
+            .map(|card| match self.card(card) {
+                Some(description) => line(card, description),
+                None => format!("    {driver} controller {card} connection failed.\n"),
+            })
+            .collect()
+    }
 }
 
 enum Task {
@@ -340,15 +355,9 @@ mod tests {
     static REPORT: Model1 = Model1::new(&DEV_REPORT, 4, SCAN_RATE);
 
     fn report(cards: &Model1Cards<'_>) -> String {
-        if cards.num_cards() <= 0 {
-            return "    No TestReport controllers configured.\n".into();
-        }
-        (0..cards.num_cards())
-            .map(|card| match cards.card(card) {
-                Some(line) => format!("    TestReport controller {card}, {line}\n"),
-                None => format!("    TestReport controller {card} connection failed.\n"),
-            })
-            .collect()
+        cards.report("TestReport", |card, line| {
+            format!("    TestReport controller {card}, {line}\n")
+        })
     }
 
     /// C `dbior`'s `pdrvet->report(level)` over `motor_state`.
