@@ -51,11 +51,7 @@ pub fn nf874x_create_controller_command() -> CommandDef {
             let params =
                 Nf874xControllerParams::new(controller.clone(), moving_poll_ms, idle_poll_ms);
             let owner = ctx.db().scan_control().interrupt_gate();
-            let port = register_controller_port(owner, &port_name, num_axes + 1, params)?;
-            controller
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .attach_port(port);
+            register_controller_port(owner, &port_name, num_axes + 1, params)?;
             for axis in 1..=num_axes {
                 let motor: Arc<Mutex<dyn AsynMotor>> =
                     Arc::new(Mutex::new(Nf874xAxis::new(controller.clone(), axis)));

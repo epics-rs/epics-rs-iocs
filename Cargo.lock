@@ -2741,6 +2741,7 @@ dependencies = [
 name = "motor-micromo"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2766,6 +2767,7 @@ dependencies = [
 name = "motor-newport"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
  "suppaftp",
@@ -2801,6 +2803,7 @@ dependencies = [
 name = "motor-parker"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2844,6 +2847,7 @@ dependencies = [
 name = "motor-pmac"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]

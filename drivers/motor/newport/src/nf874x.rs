@@ -8,12 +8,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -42,7 +41,6 @@ pub struct Nf874xController {
     handle: Option<SyncIOHandle>,
     /// `hasClosedLoopSupport_`: the master answered `VE?` as an 8743-CL.
     closed_loop: bool,
-    port: Option<PortHandle>,
     params: Option<Nf874xParams>,
 }
 
@@ -52,7 +50,6 @@ impl Nf874xController {
         let mut controller = Self {
             handle,
             closed_loop: false,
-            port: None,
             params: None,
         };
         let reply = controller.write_read("VE?").unwrap_or_default();
@@ -61,10 +58,6 @@ impl Nf874xController {
         let model: String = reply.chars().take(9).take_while(|&c| c != ' ').collect();
         controller.closed_loop = model == "8743-CL";
         controller
-    }
-
-    pub fn attach_port(&mut self, port: PortHandle) {
-        self.port = Some(port);
     }
 
     /// `axesPerController`.
@@ -155,6 +148,8 @@ pub struct Nf874xAxis {
     /// stage with no limit switches (8410 rotary).
     limit_checking: bool,
     status: MotorStatus,
+    /// The soft limits the last poll read, for [`AsynMotor::take_poll_params`].
+    limits: Vec<(usize, ParamValue)>,
 }
 
 impl Nf874xAxis {
@@ -172,6 +167,7 @@ impl Nf874xAxis {
             last_direction: false,
             encoder_position: 0.0,
             limit_checking: false,
+            limits: Vec::new(),
             status: MotorStatus::default(),
         };
         if closed_loop {
@@ -199,8 +195,16 @@ impl Nf874xAxis {
     /// `AC` and `VA`, which every motion sends first.
     fn speeds(&self, velocity: f64, acceleration: f64) -> [String; 2] {
         [
-            format!("{} AC {acceleration:.6}", self.name),
-            format!("{} VA {velocity:.6}", self.name),
+            format!(
+                "{} AC {acceleration:.6}",
+                self.name,
+                acceleration = CFloat(acceleration)
+            ),
+            format!(
+                "{} VA {velocity:.6}",
+                self.name,
+                velocity = CFloat(velocity)
+            ),
         ]
     }
 
@@ -220,20 +224,9 @@ impl Nf874xAxis {
         result
     }
 
-    /// Post the soft limits an 8743-CL poll read, as C's `setDoubleParam`.
-    fn post(&self, updates: Vec<ParamSetValue>) {
-        if updates.is_empty() {
-            return;
-        }
-        let port = lock(&self.controller).port.clone();
-        if let Some(port) = port {
-            let _ = port.set_params_and_notify_blocking(self.axis, updates);
-        }
-    }
-
     /// The reads of `poll` up to the first that fails; the soft limits read
-    /// go to `limits`.
-    fn read_status(&mut self, limits: &mut Vec<ParamSetValue>) -> AsynResult<()> {
+    /// go to `self.limits`.
+    fn read_status(&mut self) -> AsynResult<()> {
         let ctrl = lock(&self.controller);
         let name = self.name.clone();
         let ask = |q: &str| ctrl.write_read(&format!("{name} {q}"));
@@ -255,7 +248,7 @@ impl Nf874xAxis {
         status.powered = atoi(skip(&ask("MM?")?, &name)) != 0;
         for (reason, query) in [(index::HIGH_LIMIT, "SR?"), (index::LOW_LIMIT, "SL?")] {
             let value = ParamValue::Float64(atof(skip(&ask(query)?, &name)));
-            limits.push(ParamSetValue::new(reason, self.axis, value));
+            self.limits.push((reason, value));
         }
         let (bits, shift) = ctrl.hardware_status(self.axis, &name)?;
         let bit = |i: i32| bits & (1 << (shift + i)) != 0;
@@ -281,7 +274,15 @@ impl AsynMotor for Nf874xAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let [ac, va] = self.speeds(velocity, acceleration);
-        let result = self.send(&[ac, va, format!("{} PA {position:.6}", self.name)]);
+        let result = self.send(&[
+            ac,
+            va,
+            format!(
+                "{} PA {position:.6}",
+                self.name,
+                position = CFloat(position)
+            ),
+        ]);
         self.last_direction = position > self.encoder_position;
         result
     }
@@ -295,7 +296,15 @@ impl AsynMotor for Nf874xAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let [ac, va] = self.speeds(velocity, acceleration);
-        let result = self.send(&[ac, va, format!("{} PR {distance:.6}", self.name)]);
+        let result = self.send(&[
+            ac,
+            va,
+            format!(
+                "{} PR {distance:.6}",
+                self.name,
+                distance = CFloat(distance)
+            ),
+        ]);
         self.last_direction = distance > 0.0;
         result
     }
@@ -338,12 +347,20 @@ impl AsynMotor for Nf874xAxis {
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.send(&[format!("{} DH {position:.6}", self.name)])
+        self.send(&[format!(
+            "{} DH {position:.6}",
+            self.name,
+            position = CFloat(position)
+        )])
     }
 
     /// The same `DH` as [`Self::set_position`], as C's `setEncoderPosition`.
     fn set_encoder_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.send(&[format!("{} DH {position:.6}", self.name)])
+        self.send(&[format!(
+            "{} DH {position:.6}",
+            self.name,
+            position = CFloat(position)
+        )])
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
@@ -351,11 +368,19 @@ impl AsynMotor for Nf874xAxis {
     }
 
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.send(&[format!("{} SR {position:.6}", self.name)])
+        self.send(&[format!(
+            "{} SR {position:.6}",
+            self.name,
+            position = CFloat(position)
+        )])
     }
 
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.send(&[format!("{} SL {position:.6}", self.name)])
+        self.send(&[format!(
+            "{} SL {position:.6}",
+            self.name,
+            position = CFloat(position)
+        )])
     }
 
     /// `doMoveToHome`: to absolute 0, the position `DH` defined.
@@ -373,10 +398,14 @@ impl AsynMotor for Nf874xAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let mut limits = Vec::new();
-        self.status.problem = self.read_status(&mut limits).is_err();
-        self.post(limits);
+        self.limits.clear();
+        self.status.problem = self.read_status().is_err();
         Ok(self.status.clone())
+    }
+
+    /// C's `setDoubleParam` of the soft limits, posted with the poll.
+    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
+        std::mem::take(&mut self.limits)
     }
 }
 
@@ -422,7 +451,7 @@ impl WriteHook for Nf874xWriteHook {
         let function = write.function;
         let (method, value) = match write.value {
             WriteValue::Int32(v) => ("writeInt32", v.to_string()),
-            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}")),
+            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}", v = CFloat(v))),
         };
         match write.status {
             Err(e) => write.print(
@@ -449,8 +478,8 @@ impl ControllerParams for Nf874xControllerParams {
             "nf874x motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll_s,
-            self.idle_poll_s
+            CFloat(self.moving_poll_s),
+            CFloat(self.idle_poll_s)
         );
         ctx.report(out, level);
     }
@@ -505,7 +534,7 @@ impl ControllerParams for Nf874xControllerParams {
             return ParamWrite::PassToBase(Ok(()));
         }
         let _ = base.set_float64_param(user.reason, user.addr, value);
-        let status = self.send(user, "CL", format!("{value:.6}"));
+        let status = self.send(user, "CL", format!("{value:.6}", value = CFloat(value)));
         let _ = base.call_param_callbacks(user.addr);
         ParamWrite::Handled(status)
     }
@@ -514,6 +543,7 @@ impl ControllerParams for Nf874xControllerParams {
 #[cfg(test)]
 mod tests {
     use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::port_handle::PortHandle;
     use epics_rs::asyn::registry::open_owner;
     use epics_rs::asyn::trace::TraceFile;
     use epics_rs::motor::builder::MotorBuilder;
@@ -526,7 +556,6 @@ mod tests {
         Nf874xController {
             handle: None,
             closed_loop,
-            port: None,
             params: None,
         }
     }
@@ -595,6 +624,34 @@ mod tests {
         assert!(!axis.poll(&user).unwrap().msta_moving);
     }
 
+    /// 874xMotorDriver.cpp:513-519: an 8743-CL poll sets the soft limits it
+    /// read, which go out in the poll's own callParamCallbacks.
+    #[test]
+    fn the_polled_limits_post_with_the_poll() {
+        let (_rig, io) = motor_common::testing::LineRig::new("nf874xLimits", |sent| {
+            match sent {
+                "VE?" => "8743-CL v2.0",
+                "1 SR?" => "2.5",
+                "1 SL?" => "-1.5",
+                _ => "0",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(Nf874xController::new(Some(io))));
+        let mut axis = Nf874xAxis::new(ctrl, 1);
+        axis.poll(&AsynUser::default()).unwrap();
+        let taken: Vec<_> = axis
+            .take_poll_params()
+            .into_iter()
+            .map(|(reason, value)| match value {
+                ParamValue::Float64(v) => (reason, v),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(taken, [(index::HIGH_LIMIT, 2.5), (index::LOW_LIMIT, -1.5)]);
+        assert!(axis.take_poll_params().is_empty());
+    }
+
     #[test]
     fn every_write_ends_on_cs_line_the_base_included() {
         let (port, _) = port("nf874xTrace");
@@ -618,6 +675,18 @@ mod tests {
         for (line, want) in mine.iter().zip(&want) {
             assert!(line.ends_with(want.as_str()), "{line:?} vs {want:?}");
         }
+    }
+
+    /// 874xMotorDriver.cpp `%f`: glibc's nan in the write trace.
+    #[test]
+    fn a_nan_write_traces_as_c_prints_it() {
+        let (port, _) = port("nf874xNan");
+        let lines = traced("nf874xNan", || {
+            let _ = port.write_float64_blocking(index::VELOCITY, 1, -f64::NAN);
+        });
+        let velocity = index::VELOCITY;
+        let want = format!("nf874xMotorDriver:writeFloat64: function={velocity}, value=-nan");
+        assert!(lines.iter().any(|l| l.ends_with(&want)), "{lines:?}");
     }
 
     #[test]

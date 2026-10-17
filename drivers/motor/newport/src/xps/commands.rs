@@ -2,7 +2,7 @@
 //!
 //! Each method marshals the exact `FuncName (args)` string the vendor
 //! `XPS_C8_drivers.cpp` builds (note the space before `(`, and `%.13g` for
-//! doubles via `format_g`) and parses the reply's out-parameters. Action
+//! doubles via `g13`) and parses the reply's out-parameters. Action
 //! functions return `Ok(())` on error code `0`; getters return the parsed
 //! values. The socket's [`SocketMode`] decides whether the call waits for the
 //! reply (poll socket) or fires without waiting (per-axis move socket), so the
@@ -10,15 +10,7 @@
 //!
 //! [`SocketMode`]: super::rpc::SocketMode
 
-use super::rpc::{XpsResult, XpsSocket, format_g};
-
-/// Double precision used by the vendor library (`%.13g`).
-const G13: usize = 13;
-
-/// Format a double for the wire exactly as `XPS_C8_drivers.cpp` (`%.13g`).
-fn g(value: f64) -> String {
-    format_g(value, G13)
-}
+use super::rpc::{XpsResult, XpsSocket, g13 as g};
 
 /// Marshal an extended-event name list: each element is followed by its four
 /// (empty) parameters, elements joined by `,` (C
@@ -210,9 +202,11 @@ impl XpsSocket {
         Ok(())
     }
 
-    /// `GroupMoveAbsolute(positioner, [target])` (one element).
-    pub fn group_move_absolute(&self, positioner: &str, target: f64) -> XpsResult<()> {
-        let cmd = format!("GroupMoveAbsolute ({positioner},{})", g(target));
+    /// `GroupMoveAbsolute(name, targets)`: one target for a positioner, one
+    /// per positioner for a group.
+    pub fn group_move_absolute(&self, name: &str, targets: &[f64]) -> XpsResult<()> {
+        let targets: Vec<String> = targets.iter().map(|&t| g(t)).collect();
+        let cmd = format!("GroupMoveAbsolute ({name},{})", targets.join(","));
         self.exec(&cmd)?.require_ok()?;
         Ok(())
     }

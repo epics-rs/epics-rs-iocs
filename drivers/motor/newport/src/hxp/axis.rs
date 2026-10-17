@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::user::AsynUser;
@@ -196,12 +196,8 @@ impl AsynMotor for HxpAxis {
     }
 
     fn set_position(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
-        // C `HXPAxis` does not override setPosition; a hexapod coordinate
-        // cannot be redefined per-axis.
-        Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: "HXP set position is not supported".into(),
-        })
+        // C `HXPAxis` inherits asynMotorAxis::setPosition: no-op, asynSuccess.
+        Ok(())
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
@@ -242,6 +238,24 @@ mod tests {
     use super::*;
     use crate::xps::fake::FakeLine;
     use crate::xps::rpc::SocketMode;
+
+    /// HXPAxis inherits asynMotorAxis::setPosition, which sends nothing and
+    /// returns asynSuccess (asynMotorAxis.cpp:130).
+    #[test]
+    fn set_position_is_a_successful_no_op() {
+        let line = FakeLine::new("hxp_setpos", "");
+        let controller = Arc::new(Mutex::new(HxpController::new(
+            line.socket(SocketMode::Query),
+        )));
+        let mut axis = HxpAxis::new(
+            controller,
+            Arc::new(MoveLine::new(line.socket(SocketMode::Fire))),
+            0,
+        );
+        line.log.lock().unwrap().clear();
+        axis.set_position(&AsynUser::new(0), 5.0).unwrap();
+        assert!(line.log.lock().unwrap().is_empty());
+    }
 
     /// HXPDriver.cpp:605, 631, 766, 769: record steps times MRES go out,
     /// and the readbacks come back divided by it.

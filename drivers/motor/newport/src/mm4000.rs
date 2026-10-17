@@ -40,10 +40,12 @@
 //!   bit reads ON) loops forever if the bit never clears; this port bounds
 //!   the wait at 50 tries (5 s) and errors.
 
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
@@ -52,6 +54,7 @@ use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use motor_common::model2::AxisLog;
 
 use crate::util::{atof, atoi, max_digits};
 use motor_common::model1::MoveStrings;
@@ -205,8 +208,13 @@ pub enum Mm4000Refusal {
     NoAnswer,
     /// The firmware string (past `VE`) names no MM4000/4005/4006.
     InvalidModel(String),
-    /// `TP;` reported fewer fields than the axes asked for.
-    TooFewAxes { total_axes: usize },
+    /// `TP;` reported fewer fields than the axes asked for, past the
+    /// firmware and model C has already stored.
+    TooFewAxes {
+        total_axes: usize,
+        firmware: String,
+        model: Mm4000Model,
+    },
 }
 
 impl Mm4000Controller {
@@ -247,7 +255,11 @@ impl Mm4000Controller {
         let tp = ctrl.write_read("TP;").unwrap_or_default();
         let total_axes = strtok_count(&tp);
         if total_axes < num_axes {
-            return Err(Mm4000Refusal::TooFewAxes { total_axes });
+            return Err(Mm4000Refusal::TooFewAxes {
+                total_axes,
+                firmware: ctrl.firmware,
+                model,
+            });
         }
         Ok(ctrl)
     }
@@ -520,9 +532,48 @@ impl Mm4000Controller {
     }
 }
 
+/// drvMM4000Asyn.c `motorAxisReportAxis` (:194-206). The default is C's
+/// calloc'd axis, which a Config that fails past its range checks leaves.
+#[derive(Default)]
+pub struct Mm4000AxisReport {
+    /// 0-based, C's `pAxis->axis`.
+    axis: usize,
+    /// The `MS;` status byte the last poll read, C's `axisStatus`.
+    status: Arc<AtomicI32>,
+    high_limit: f64,
+    low_limit: f64,
+    home_preset: f64,
+    step_size: f64,
+    digits: usize,
+}
+
+impl Mm4000AxisReport {
+    pub fn report(&self, out: &mut String, level: i32) {
+        use std::fmt::Write;
+        if level > 0 {
+            let _ = write!(
+                out,
+                "Axis {}\n   axisStatus:  0x{:x}\n   high limit:  {:.6}\n   low limit:   {:.6}\n   \
+                 home preset: {:.6}\n   step size:   {:.6}\n   max digits:  {}\n",
+                self.axis,
+                self.status.load(Ordering::Relaxed),
+                CFloat(self.high_limit),
+                CFloat(self.low_limit),
+                CFloat(self.home_preset),
+                CFloat(self.step_size),
+                self.digits
+            );
+        }
+    }
+}
+
 /// One MM4000 axis sharing a controller. Implements [`AsynMotor`].
 pub struct Mm4000Axis {
     controller: Arc<Mutex<Mm4000Controller>>,
+    /// C `pAxis->card`.
+    card: i32,
+    /// C `pAxis->logParam`.
+    log: Arc<AxisLog>,
     /// 1-based controller axis number, sent unpadded (`%d`).
     axis: usize,
     model: Mm4000Model,
@@ -558,6 +609,8 @@ pub struct Mm4000Axis {
     motion_sent: bool,
     /// The model-1 record's PREM and POST.
     strings: MoveStrings,
+    /// What the model-2 poll last read from `MS;`, for [`Mm4000AxisReport`].
+    status: Arc<AtomicI32>,
 }
 
 /// C model-1 `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
@@ -576,6 +629,7 @@ impl Mm4000Axis {
     /// serial I/O under the controller lock.
     pub fn new(
         controller: Arc<Mutex<Mm4000Controller>>,
+        card: i32,
         axis: usize,
         poll_failure: PollFailure,
     ) -> Self {
@@ -603,6 +657,8 @@ impl Mm4000Axis {
         };
         Self {
             controller,
+            card,
+            log: Arc::default(),
             axis,
             model,
             step_size,
@@ -626,6 +682,25 @@ impl Mm4000Axis {
             },
             motion_sent: false,
             strings: MoveStrings::default(),
+            status: Arc::default(),
+        }
+    }
+
+    /// The log `Model2::set_axis_logs` attaches.
+    pub fn log(&self) -> Arc<AxisLog> {
+        self.log.clone()
+    }
+
+    /// drvMM4000Asyn.c `motorAxisReportAxis`'s view of this axis.
+    pub fn report(&self) -> Mm4000AxisReport {
+        Mm4000AxisReport {
+            axis: self.axis - 1,
+            status: self.status.clone(),
+            high_limit: self.high_limit,
+            low_limit: self.low_limit,
+            home_preset: self.home_preset,
+            step_size: self.step_size,
+            digits: self.digits,
         }
     }
 
@@ -681,7 +756,10 @@ impl Mm4000Axis {
     fn model1_accel(&self, acceleration: f64) -> String {
         let (a, d) = (self.axis, self.digits);
         if acceleration > 0.0 {
-            format!("{a}AC{acceleration:.d$};")
+            format!(
+                "{a}AC{acceleration:.d$};",
+                acceleration = CFloat(acceleration)
+            )
         } else {
             String::new()
         }
@@ -703,11 +781,16 @@ impl Mm4000Axis {
             return Ok(format!(
                 "{a}VA{velocity:.d$};{}{}{a}{cmd}{value:.d$};",
                 self.model1_accel(acceleration),
-                self.model1_prem()
+                self.model1_prem(),
+                velocity = CFloat(velocity),
+                value = CFloat(value)
             ));
         }
         Ok(format!(
-            "{a}AC{acceleration:.d$};{a}VA{velocity:.d$};{a}{cmd}{value:.d$};"
+            "{a}AC{acceleration:.d$};{a}VA{velocity:.d$};{a}{cmd}{value:.d$};",
+            acceleration = CFloat(acceleration),
+            velocity = CFloat(velocity),
+            value = CFloat(value)
         ))
     }
 }
@@ -763,7 +846,10 @@ impl AsynMotor for Mm4000Axis {
             };
             let prem = self.model1_prem();
             return self.start_motion(&format!(
-                "{a}AC{acceleration:.d$};{prem}{a}VA{speed:.d$};{a}PA{target:.d$};"
+                "{a}AC{acceleration:.d$};{prem}{a}VA{speed:.d$};{a}PA{target:.d$};",
+                acceleration = CFloat(acceleration),
+                speed = CFloat(speed),
+                target = CFloat(target)
             ));
         }
         // C `motorAxisVelocityMove`: no jog command — move absolute to the
@@ -795,10 +881,15 @@ impl AsynMotor for Mm4000Axis {
             // devMM4000.cc HOME after the record's SET_VELOCITY, SET_ACCEL.
             let accel = self.model1_accel(acceleration);
             let prem = self.model1_prem();
-            return self.start_motion(&format!("{a}VA{velocity:.d$};{accel}{prem}{a}OR;"));
+            return self.start_motion(&format!(
+                "{a}VA{velocity:.d$};{accel}{prem}{a}OR;",
+                velocity = CFloat(velocity)
+            ));
         }
         self.start_motion(&format!(
-            "{a}AC{acceleration:.d$}; {a}VA{velocity:.d$};{a}OR;"
+            "{a}AC{acceleration:.d$}; {a}VA{velocity:.d$};{a}OR;",
+            acceleration = CFloat(acceleration),
+            velocity = CFloat(velocity)
         ))
     }
 
@@ -812,7 +903,10 @@ impl AsynMotor for Mm4000Axis {
         let (d, step) = (self.digits, self.step_size()?);
         let acceleration = acceleration * step;
         let mut ctrl = self.lock();
-        ctrl.write(&format!("{a}AC{acceleration:.d$};{a}ST;"))
+        ctrl.write(&format!(
+            "{a}AC{acceleration:.d$};{a}ST;",
+            acceleration = CFloat(acceleration)
+        ))
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
@@ -827,7 +921,8 @@ impl AsynMotor for Mm4000Axis {
         let mut ctrl = self.lock();
         ctrl.write(&format!(
             "{a}SH{position:.d$};{a}DH;{a}SH{:.d$}",
-            self.home_preset
+            CFloat(self.home_preset),
+            position = CFloat(position)
         ))
     }
 
@@ -886,7 +981,7 @@ impl AsynMotor for Mm4000Axis {
             return Ok(());
         }
         let mut ctrl = self.lock();
-        ctrl.write(&format!("{a}SR{position:.d$}"))
+        ctrl.write(&format!("{a}SR{position:.d$}", position = CFloat(position)))
     }
 
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
@@ -904,7 +999,7 @@ impl AsynMotor for Mm4000Axis {
             return Ok(());
         }
         let mut ctrl = self.lock();
-        ctrl.write(&format!("{a}SL{position:.d$}"))
+        ctrl.write(&format!("{a}SL{position:.d$}", position = CFloat(position)))
     }
 
     fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
@@ -916,7 +1011,9 @@ impl AsynMotor for Mm4000Axis {
                 PidGainKind::Integral => "KI",
                 PidGainKind::Derivative => "KD",
             };
-            return self.lock().write(&format!("{a}{cc}{gain:.6};{a}UF;"));
+            return self
+                .lock()
+                .write(&format!("{a}{cc}{gain:.6};{a}UF;", gain = CFloat(gain)));
         }
         Err(mm_err(format!(
             "MM4000 does not support setting {kind:?} gain"
@@ -942,6 +1039,19 @@ impl AsynMotor for Mm4000Axis {
             self.strings.set(prem, post);
         }
         Ok(())
+    }
+
+    /// drvMM4000Asyn.c `motorAxisforceCallback`; the poll that follows is
+    /// the poller's.
+    fn force_callback(&mut self, _user: &AsynUser) {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "motorAxisforceCallback: request card {}, axis {} status update\n",
+                self.card,
+                self.axis - 1
+            ),
+        );
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -985,6 +1095,8 @@ impl AsynMotor for Mm4000Axis {
                     self.axis
                 ))
             })?;
+        // C stores the status `char`, signed on its targets.
+        self.status.store(i32::from(byte as i8), Ordering::Relaxed);
         let position = data.positions.get(idx).copied().flatten().ok_or_else(|| {
             mm_err(format!(
                 "MM4000 axis {}: missing TP position field",
@@ -1142,7 +1254,7 @@ mod tests {
         let ctrl = Arc::new(Mutex::new(ctrl));
         let axes = (1..=num_axes)
             .map(|axis| {
-                let mut ax = Mm4000Axis::new(ctrl.clone(), axis, MODEL1_POLL_FAILURE);
+                let mut ax = Mm4000Axis::new(ctrl.clone(), 0, axis, MODEL1_POLL_FAILURE);
                 ax.model1_set_status();
                 ax
             })
@@ -1291,6 +1403,19 @@ mod tests {
         assert_eq!(*sent.lock().unwrap(), ["1ST;"]);
     }
 
+    /// drvMM4000Asyn.c `%.*f`: glibc's nan, sign bit included.
+    #[test]
+    fn model1_a_nan_move_goes_out_as_c_prints_it() {
+        let (axes, sent, _) = model1_card("mm4000_m1_nan", &[], Duration::ZERO);
+        let mut axes = axes.unwrap();
+        let user = AsynUser::default();
+        sent.lock().unwrap().clear();
+        axes[0]
+            .move_absolute(&user, -f64::NAN, 0.0, f64::NAN, 0.0)
+            .unwrap();
+        assert_eq!(*sent.lock().unwrap(), ["1VAnan;1PA-nan;"]);
+    }
+
     /// motorRecord.cc:874, 940: no SET_ACCEL for a zero move or home rate;
     /// the jog's is unconditional.
     #[test]
@@ -1396,7 +1521,7 @@ mod tests {
         let ctrl = Mm4000Controller::new(io, "mm4000_dead", "mm4000_dead_motor", 1, Duration::ZERO)
             .ok()
             .unwrap();
-        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1, MODEL2_POLL_FAILURE);
+        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
         let user = AsynUser::default();
         assert_eq!(axis.poll(&user).unwrap().position, 50000.0);
 
@@ -1437,7 +1562,7 @@ mod tests {
         let ctrl = Mm4000Controller::new(io, "mm4000_moved", "mm4000_moved_motor", 1, ttl)
             .ok()
             .unwrap();
-        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1, MODEL2_POLL_FAILURE);
+        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
         let user = AsynUser::default();
         assert!(axis.poll(&user).unwrap().done);
         sent.lock().unwrap().clear();
@@ -1547,5 +1672,63 @@ mod tests {
         assert!(te_ok("TE@"));
         assert!(!te_ok("TEA"));
         assert!(!te_ok(""));
+    }
+
+    /// drvMM4000Asyn.c:579-592: a GET_INFO's motorAxisforceCallback prints
+    /// its FLOW line, 0-based axis, on the axis's log.
+    #[epics_rs::base::epics_test]
+    async fn force_callback_prints_the_c_flow_line() {
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::testing::{LineRig, run_command};
+
+        static DRIVER: Model2 = Model2::new("mm4kForceTest", 0);
+        let (_line, io) = LineRig::new("mm4kForceLine", |last| {
+            match last {
+                "VE;" => "VEMM4005 Version 2.0",
+                "TP;" => "1TP0.0,2TP0.0",
+                _ => "",
+            }
+            .to_string()
+        });
+        let ctrl = Mm4000Controller::new(io, "mm4kForceLine", "mm4kForce", 2, Duration::ZERO)
+            .ok()
+            .unwrap();
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let axes: Vec<_> = (1..=2)
+            .map(|axis| Mm4000Axis::new(ctrl.clone(), 2, axis, MODEL2_POLL_FAILURE))
+            .collect();
+        let logs = axes.iter().map(Mm4000Axis::log).collect();
+        let axes: Vec<_> = axes.into_iter().map(|a| Arc::new(Mutex::new(a))).collect();
+        let motors = axes
+            .iter()
+            .map(|a| a.clone() as Arc<Mutex<dyn AsynMotor>>)
+            .collect();
+        DRIVER.set_card(2, motors, 100, 1000);
+        DRIVER.set_axis_logs(2, logs);
+        let args = vec![
+            ArgValue::String("mm4kForce".into()),
+            ArgValue::String("mm4kForceTest".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(2),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&DRIVER]), args).await;
+
+        let path = std::env::temp_dir().join(format!("mm4k-force-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("mm4kForce"), TraceMask::FLOW);
+        trace.set_device_trace_mask("mm4kForce", 1, TraceMask::FLOW);
+        trace.set_device_trace_info_mask("mm4kForce", 1, TraceInfoMask::empty());
+        trace.set_device_trace_file("mm4kForce", 1, TraceFile::File(file));
+        axes[1].lock().unwrap().force_callback(&AsynUser::default());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            text,
+            "motorAxisforceCallback: request card 2, axis 1 status update\n"
+        );
     }
 }

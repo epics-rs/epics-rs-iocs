@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -236,16 +237,25 @@ fn parse_closed_loop(resp: &str) -> Option<bool> {
 // --- Command formatters (bare text, C `outString_`).
 
 fn cmd_set_acceleration(id: i32, accel_egu: f64) -> String {
-    format!("{id}AC{accel_egu:.6}")
+    format!("{id}AC{accel_egu:.6}", accel_egu = CFloat(accel_egu))
 }
 fn cmd_set_velocity(id: i32, velocity_egu: f64) -> String {
-    format!("{id}VA{velocity_egu:.6}")
+    format!(
+        "{id}VA{velocity_egu:.6}",
+        velocity_egu = CFloat(velocity_egu)
+    )
 }
 fn cmd_move_absolute(id: i32, position_egu: f64) -> String {
-    format!("{id}PA{position_egu:.6}")
+    format!(
+        "{id}PA{position_egu:.6}",
+        position_egu = CFloat(position_egu)
+    )
 }
 fn cmd_move_relative(id: i32, distance_egu: f64) -> String {
-    format!("{id}PR{distance_egu:.6}")
+    format!(
+        "{id}PR{distance_egu:.6}",
+        distance_egu = CFloat(distance_egu)
+    )
 }
 fn cmd_stop(id: i32) -> String {
     format!("{id}ST")
@@ -260,7 +270,7 @@ fn cmd_dl_init(id: i32) -> String {
     format!("{id}IE")
 }
 fn cmd_home_velocity(id: i32, velocity: f64) -> String {
-    format!("{id}OH{velocity:.6}")
+    format!("{id}OH{velocity:.6}", velocity = CFloat(velocity))
 }
 fn cmd_home_type(id: i32, home_type: i32) -> String {
     format!("{id}HT{home_type}")
@@ -269,7 +279,7 @@ fn cmd_set_closed_loop(id: i32, enable: bool) -> String {
     format!("{id}MM{}", if enable { 1 } else { 0 })
 }
 fn cmd_set_gain(id: i32, letters: &str, value: f64) -> String {
-    format!("{id}{letters}{value:.6}")
+    format!("{id}{letters}{value:.6}", value = CFloat(value))
 }
 /// A bare query command: `{id}{code}` (e.g. `1TP`, `1SU?`).
 fn query(id: i32, code: &str) -> String {
@@ -385,13 +395,17 @@ impl AxisReport for ConexAxisReport {
              KP={kp:.6}, KI={ki:.6}, KD/LF={lf:.6}\n  \
              fullStepSize={:.6}, microStepsPerFullStep={}\n",
             shown.stage_id,
-            shown.encoder_increment,
-            shown.interpolation_factor,
-            self.step_size,
-            self.low_limit,
-            self.high_limit,
-            shown.full_step_size,
-            shown.micro_steps_per_full_step
+            CFloat(shown.encoder_increment),
+            CFloat(shown.interpolation_factor),
+            CFloat(self.step_size),
+            CFloat(self.low_limit),
+            CFloat(self.high_limit),
+            CFloat(shown.full_step_size),
+            shown.micro_steps_per_full_step,
+            current = CFloat(current),
+            kp = CFloat(kp),
+            ki = CFloat(ki),
+            lf = CFloat(lf)
         );
     }
 }

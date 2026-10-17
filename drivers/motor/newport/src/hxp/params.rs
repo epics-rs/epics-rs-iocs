@@ -4,9 +4,10 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{PortDriverBase, param_list};
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{ControllerParams, ControllerReport, ParamWrite};
 
@@ -118,8 +119,8 @@ impl ControllerParams for HxpControllerParams {
              period={:.6}, coordSys={}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll_s,
-            self.idle_poll_s,
+            CFloat(self.moving_poll_s),
+            CFloat(self.idle_poll_s),
             self.coord_sys
         );
         ctx.report(out, level);
@@ -141,7 +142,9 @@ impl ControllerParams for HxpControllerParams {
             return ParamWrite::PassToBase(Ok(()));
         };
         let reason = user.reason;
-        if reason == p.move_coord_sys && user.addr == 0 {
+        // C getAxis: getAddress resolves -1 to 0.
+        let addr = param_list(base.flags.multi_device, user.addr);
+        if reason == p.move_coord_sys && addr == 0 {
             self.coord_sys = value;
             // C `move()` reads it at address 0: 0 is Work, anything else Tool.
             let cs = if value == 0 {
@@ -155,13 +158,13 @@ impl ControllerParams for HxpControllerParams {
             return ParamWrite::PassToBase(Ok(()));
         }
         // C getAxis(pasynUser): the record's axis, whose move socket runs it.
-        let Some(line) = self.lock().line(user.addr) else {
+        let Some(line) = self.lock().line(addr) else {
             return ParamWrite::Handled(Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("HXP has no axis {}", user.addr),
+                message: format!("HXP has no axis {addr}"),
             }));
         };
-        ParamWrite::Handled(write_own(base, &p, &line, user, value))
+        ParamWrite::Handled(write_own(base, &p, &line, addr, user.reason, value))
     }
 }
 
@@ -170,20 +173,21 @@ fn write_own(
     base: &mut PortDriverBase,
     p: &HxpParams,
     line: &MoveLine,
-    user: &AsynUser,
+    addr: i32,
+    reason: usize,
     value: i32,
 ) -> AsynResult<()> {
-    base.set_int32_param(user.reason, user.addr, value)?;
+    base.set_int32_param(reason, addr, value)?;
     if value == 1 {
-        if user.reason == p.move_all {
+        if reason == p.move_all {
             move_all(base, p, line)?;
-        } else if user.reason == p.coord_sys_read_all {
+        } else if reason == p.coord_sys_read_all {
             read_all_cs(base, p, line)?;
         } else {
             set_cs(base, p, line)?;
         }
     }
-    base.call_param_callbacks(user.addr)
+    base.call_param_callbacks(addr)
 }
 
 /// C `HXPController::moveAll`.
@@ -411,6 +415,25 @@ mod tests {
         assert_eq!(
             r.controller.lock().unwrap().move_coord_sys(),
             MoveCoordSys::Tool
+        );
+    }
+
+    /// HXPDriver.cpp:185: getAxis resolves address -1 to axis 0, as
+    /// getAddress does.
+    #[test]
+    fn address_minus_1_writes_reach_axis_0() {
+        let r = rig("hxpAddrMinus1");
+        r.port
+            .write_int32_blocking(r.p.move_coord_sys, -1, 1)
+            .unwrap();
+        assert_eq!(
+            r.controller.lock().unwrap().move_coord_sys(),
+            MoveCoordSys::Tool
+        );
+        r.port.write_int32_blocking(r.p.move_all, -1, 1).unwrap();
+        assert_eq!(
+            r.line.take_log(),
+            ["HexapodMoveAbsolute (HEXAPOD,Work,0,0,0,0,0,0)"]
         );
     }
 }

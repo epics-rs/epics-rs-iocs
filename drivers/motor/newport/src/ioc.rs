@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::asyn_record::{claim_port, get_port};
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::AsynStatus;
@@ -46,7 +47,7 @@ use motor_common::model2::Model2;
 use motor_common::util::atof;
 use motor_common::{
     Controller, ControllerParams, ControllerReport, asyn_user, install_with_report,
-    register_controller_port, register_port, register_port_with,
+    register_controller_port, register_port_with,
 };
 
 use crate::agap::{self, AgapAxis, AgapController};
@@ -55,7 +56,7 @@ use crate::conex::ConexAxis;
 use crate::esp300::{self, Esp300Axis, Esp300Controller};
 use crate::hxp::{HxpAxis, HxpController, HxpControllerParams, MoveLine, NUM_HXP_AXES};
 use crate::mm3000::{Mm3000Axis, Mm3000Controller};
-use crate::mm4000::{self, Mm4000Axis, Mm4000Controller, Mm4000Refusal};
+use crate::mm4000::{self, Mm4000Axis, Mm4000AxisReport, Mm4000Controller, Mm4000Refusal};
 use crate::pm500::{Pm500Axis, Pm500Controller};
 use crate::pmnc::{PmncAxis, PmncController};
 use crate::report::{AxisLines, ControllerHead, period_s};
@@ -108,12 +109,31 @@ const PM500_TIMEOUT: Duration = Duration::from_secs(2);
 /// `PMNC_TIMEOUT` 3 s).
 const PMNC_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Default XPS FTP account and trajectory directory: the factory
-/// `Administrator` login C's `XPSCreateProfile` is normally given, and the
-/// XPS-C/Q public trajectory folder.
+/// Default XPS FTP account: the factory `Administrator` login C's
+/// `XPSCreateProfile` is normally given.
 const XPS_FTP_USER: &str = "Administrator";
 const XPS_FTP_PASSWORD: &str = "Administrator";
-const XPS_TRAJECTORY_DIR: &str = "/Admin/Public/Trajectories";
+
+/// The trajectory folders by controller (XPSController.h:19-21).
+const XPS_C_TRAJECTORY_DIRECTORY: &str = "/Admin/Public/Trajectories";
+const XPS_Q_TRAJECTORY_DIRECTORY: &str = "/Public/Trajectories";
+const XPS_D_TRAJECTORY_DIRECTORY: &str = "/Admin/Public/Trajectories";
+
+/// `buildProfile`'s firmware switch (XPSController.cpp:695-706): the
+/// trajectory folder, and whether the upload is SFTP (C `useSFTP_`).
+fn trajectory_upload(firmware: &str) -> Result<(&'static str, bool), String> {
+    if firmware.contains("XPS-C") {
+        Ok((XPS_C_TRAJECTORY_DIRECTORY, false))
+    } else if firmware.contains("XPS-Q") {
+        Ok((XPS_Q_TRAJECTORY_DIRECTORY, false))
+    } else if firmware.contains("XPS-D") {
+        Ok((XPS_D_TRAJECTORY_DIRECTORY, true))
+    } else {
+        Err(format!(
+            "Firmware version does not contain XPS-C, XPS-Q, or XPS-D={firmware}\n"
+        ))
+    }
+}
 
 /// `MAX_SOCKETS` (asynOctetSocket.cpp:36).
 const MAX_SOCKETS: usize = 1000;
@@ -123,8 +143,8 @@ static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
 
 /// C `ConnectToServer` (asynOctetSocket.cpp:60): asyn IP port
 /// `ip:port:N` from `drvAsynIPPortConfigure(name, "ip:port TCP", 0, 0, 1)`.
-/// `None` is C's -1, printed as C prints it.
-fn connect_to_server(ctx: &CommandContext, ip: &str, ip_port: i32) -> Option<PortHandle> {
+/// The socket index and its port; `None` is C's -1, printed as C prints it.
+fn connect_to_server(ctx: &CommandContext, ip: &str, ip_port: i32) -> Option<(i32, PortHandle)> {
     let socket = NEXT_SOCKET.load(Ordering::Relaxed);
     if socket >= MAX_SOCKETS {
         println!("ConnectToServer: too many open sockets, max={MAX_SOCKETS}");
@@ -163,7 +183,7 @@ fn connect_to_server(ctx: &CommandContext, ip: &str, ip_port: i32) -> Option<Por
         return None;
     };
     NEXT_SOCKET.store(socket + 1, Ordering::Relaxed);
-    Some(handle.port_handle().clone())
+    Some((socket as i32, handle.port_handle().clone()))
 }
 
 /// `SMC100CreateController(portName, SMC100PortName, numAxes,
@@ -205,7 +225,9 @@ pub fn smc100_create_controller_command() -> CommandDef {
                     "SMC100 motor driver {}, numAxes={}, moving poll period={moving_s:.6}, \
                      idle poll period={idle_s:.6}",
                     ctx.port_name(),
-                    ctx.num_axes()
+                    ctx.num_axes(),
+                    moving_s = CFloat(moving_s),
+                    idle_s = CFloat(idle_s)
                 );
             });
             register_port_with(ctx, &port_name, num_axes, head)?;
@@ -278,7 +300,9 @@ fn conex_head(
             out,
             "CONEX motor driver {}, controllerID={controller_id}, version=\"{version}\n  \
              moving poll period={moving_s:.6}, idle poll period={idle_s:.6}\n",
-            ctx.port_name()
+            ctx.port_name(),
+            moving_s = CFloat(moving_s),
+            idle_s = CFloat(idle_s)
         );
     });
     (version, head)
@@ -425,7 +449,9 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
                     "Agilis UC motor driver {}, model={model}, numAxes={}, moving poll \
                      period={moving_s:.6}, idle poll period={idle_s:.6}\ncontroller version {version}\n",
                     ctx.port_name(),
-                    ctx.num_axes()
+                    ctx.num_axes(),
+                    moving_s = CFloat(moving_s),
+                    idle_s = CFloat(idle_s)
                 );
             });
             register_port_with(ctx, &port_name, c_int(args, 2), head)?;
@@ -539,6 +565,64 @@ fn with_xps<R>(
     }
 }
 
+/// `XPSController::report` (XPSController.cpp:222-246); the rest comes
+/// from the registration `XPSCreateController` pushes after the port.
+struct XpsHead {
+    moving_s: f64,
+    idle_s: f64,
+    enable_set_position: bool,
+    settling_s: f64,
+}
+
+impl ControllerParams for XpsHead {
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn Write, level: i32) {
+        let found = XPS_CONTROLLERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|r| r.port_name == ctx.port_name())
+            .map(|r| {
+                let ip = (r.ip.clone(), r.ip_port);
+                (r.controller.clone(), ip, r.ftp_login.clone())
+            });
+        if let Some((controller, (ip, ip_port), ftp_login)) = found {
+            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = write!(
+                out,
+                "XPS motor driver: {}\n                 numAxes: {}\n        firmware version: \
+                 {}\n      moving poll period: {:.6}\n        idle poll period: {:.6}\n",
+                ctx.port_name(),
+                ctx.num_axes(),
+                ctrl.firmware(),
+                CFloat(self.moving_s),
+                CFloat(self.idle_s)
+            );
+            if level > 0 {
+                // glibc prints a NULL %s, C's ftpUsername_ before
+                // XPSCreateProfile, as "(null)".
+                let (user, password) =
+                    ftp_login.unwrap_or_else(|| ("(null)".into(), "(null)".into()));
+                // useSFTP_ is set only by an XPS-D profile build, which this
+                // port does not have.
+                let _ = write!(
+                    out,
+                    "       enableSetPosition: {}\n setPositionSettlingTime: {:.6}\n\
+                     \x20              IPAddress: {ip}\n                  IPPort: {ip_port}\n\
+                     \x20            ftpUserName: {user}\n         ftpUserPassword: {password}\n\
+                     \x20                useSFTP: false\n           movesDeferred: {}\n\
+                     \x20             autoEnable: {}\n          noDisableError: {}\n",
+                    i32::from(self.enable_set_position),
+                    CFloat(self.settling_s),
+                    i32::from(ctrl.moves_deferred()),
+                    i32::from(ctrl.auto_enable()),
+                    i32::from(ctrl.no_disable_error())
+                );
+            }
+        }
+        ctx.report(out, level);
+    }
+}
+
 /// `XPSCreateController(portName, IPAddress, IPPort, numAxes,
 /// movingPollPeriod, idlePollPeriod, enableSetPosition,
 /// setPositionSettlingTime)`; the axes come from `XPSCreateAxis`.
@@ -565,13 +649,23 @@ pub fn xps_create_controller_command() -> CommandDef {
             let enable_set_position = c_int(args, 6) != 0;
             let settling = Duration::from_millis(c_int(args, 7).max(0) as u64);
 
-            register_port(ctx, &port_name, c_int(args, 3))?;
+            let head = XpsHead {
+                moving_s: period_s(moving_poll_ms),
+                idle_s: period_s(idle_poll_ms),
+                enable_set_position,
+                settling_s: f64::from(c_int(args, 7)) / 1000.0,
+            };
+            register_port_with(ctx, &port_name, c_int(args, 3), head)?;
             // C goes on with socket -1 for either socket
             // (XPSController.cpp:179-193).
             let poll = match connect_to_server(ctx, &ip, ip_port) {
-                Some(handle) => {
-                    XpsSocket::new(handle, &port_name, SocketMode::Query, XPS_POLL_TIMEOUT)
-                }
+                Some((index, handle)) => XpsSocket::new(
+                    handle,
+                    index,
+                    &port_name,
+                    SocketMode::Query,
+                    XPS_POLL_TIMEOUT,
+                ),
                 None => {
                     println!(
                         "XPSController:XPSController: error calling TCP_ConnectToServer for pollSocket"
@@ -580,9 +674,13 @@ pub fn xps_create_controller_command() -> CommandDef {
                 }
             };
             let profile_sock = Arc::new(match connect_to_server(ctx, &ip, ip_port) {
-                Some(handle) => {
-                    XpsSocket::new(handle, &port_name, SocketMode::Query, XPS_PVT_EXEC_TIMEOUT)
-                }
+                Some((index, handle)) => XpsSocket::new(
+                    handle,
+                    index,
+                    &port_name,
+                    SocketMode::Query,
+                    XPS_PVT_EXEC_TIMEOUT,
+                ),
                 None => {
                     println!(
                         "XPSController:XPSController: error calling TCP_ConnectToServer for moveSocket"
@@ -653,9 +751,13 @@ pub fn xps_create_axis_command() -> CommandDef {
             // C goes on with socket -1, whose TCP_SetTimeout prints
             // (XPSAxis.cpp:146-152).
             let move_sock = match connect_to_server(ctx, &ip, ip_port) {
-                Some(handle) => {
-                    XpsSocket::new(handle, &port_name, SocketMode::Fire, XPS_MOVE_TIMEOUT)
-                }
+                Some((index, handle)) => XpsSocket::new(
+                    handle,
+                    index,
+                    &port_name,
+                    SocketMode::Fire,
+                    XPS_MOVE_TIMEOUT,
+                ),
                 None => {
                     println!("XPSAxis:XPSAxis: error calling TCP_ConnectToServer for move socket");
                     println!(
@@ -673,8 +775,9 @@ pub fn xps_create_axis_command() -> CommandDef {
                 &positioner_name,
                 1.0 / steps_per_unit,
             );
+            let report = Arc::new(ax.report());
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            poller.install(asyn_user(&port_name, axis), motor)?;
+            poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -832,9 +935,9 @@ pub fn tclcall_command() -> CommandDef {
                 _ => Ok("(null)".to_owned()),
             };
             println!("XPS ip = {TCLCALL_IP}");
-            let socket = connect_to_server(ctx, TCLCALL_IP, TCLCALL_PORT).map(|handle| {
+            let socket = connect_to_server(ctx, TCLCALL_IP, TCLCALL_PORT).map(|(index, handle)| {
                 let port = handle.port_name().to_owned();
-                XpsSocket::new(handle, &port, SocketMode::Query, TCLCALL_TIMEOUT)
+                XpsSocket::new(handle, index, &port, SocketMode::Query, TCLCALL_TIMEOUT)
             });
             if socket.is_none() {
                 println!(" Error TCP_ConnectToServer");
@@ -861,13 +964,14 @@ pub fn xps_aux_config_command() -> CommandDef {
         move |args: &[ArgValue], ctx: &CommandContext| {
             let port_name = opt_string(args, 0)?.unwrap_or_default();
             let ip = opt_string(args, 1)?.unwrap_or_default();
-            let Some(handle) = connect_to_server(ctx, &ip, c_int(args, 2)) else {
+            let Some((index, handle)) = connect_to_server(ctx, &ip, c_int(args, 2)) else {
                 println!("drvXPSAsynAuxConfig: error calling TCP_ConnectToServer");
                 return Ok(CommandOutcome::Continue);
             };
             let period = Duration::from_millis(c_int(args, 3).max(0) as u64);
             let socket = XpsSocket::new(
                 handle.clone(),
+                index,
                 handle.port_name(),
                 SocketMode::Query,
                 gpio::TCP_TIMEOUT,
@@ -1061,9 +1165,8 @@ pub fn xps_define_profile_command() -> CommandDef {
 /// XPS trajectory folder, then verifies it against the group dynamics and
 /// each axis's soft limits (C `buildProfile`). `fileName` is the bare
 /// trajectory file name the controller opens; `host` is the XPS IP/hostname
-/// (no port). Credentials and directory default to the XPS factory
-/// `Administrator` account and `/Admin/Public/Trajectories`; `ftpDir` must
-/// name the controller's actual trajectory folder if overridden.
+/// (no port). Credentials default to the XPS factory `Administrator`
+/// account and the directory to the firmware's trajectory folder.
 pub fn xps_build_profile_command() -> CommandDef {
     CommandDef::new(
         "XPSBuildProfile",
@@ -1095,7 +1198,7 @@ pub fn xps_build_profile_command() -> CommandDef {
                     .unwrap_or_else(|| (XPS_FTP_USER.into(), XPS_FTP_PASSWORD.into()));
             let ftp_user = opt_string(args, 3)?.unwrap_or(default_user);
             let ftp_pass = opt_string(args, 4)?.unwrap_or(default_pass);
-            let ftp_dir = opt_string(args, 5)?.unwrap_or_else(|| XPS_TRAJECTORY_DIR.to_string());
+            let ftp_dir = opt_string(args, 5)?;
 
             let controller = xps_controller(&motor_port, "XPSBuildProfile")?;
 
@@ -1103,13 +1206,15 @@ pub fn xps_build_profile_command() -> CommandDef {
             // poll socket); the FTP upload touches no controller state, so
             // it runs between the two without the lock held.
             let build = || {
-                let built = controller
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .build_profile_text()?;
+                let (built, firmware) = {
+                    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                    (ctrl.build_profile_text()?, ctrl.firmware().to_string())
+                };
+                let (directory, _sftp) = trajectory_upload(&firmware)?;
+                let directory = ftp_dir.clone().unwrap_or_else(|| directory.to_string());
                 ftp::upload_trajectory(
                     &host,
-                    &ftp_dir,
+                    &directory,
                     &file_name,
                     &built.text,
                     &ftp_user,
@@ -1118,14 +1223,18 @@ pub fn xps_build_profile_command() -> CommandDef {
                 controller
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .verify_profile(&file_name, &built)
+                    .verify_profile(&file_name, &built)?;
+                Ok::<_, String>(directory)
             };
-            if let Err(message) = build() {
-                xps_profile_failed(&motor_port, "buildProfile", &message);
-                return Ok(CommandOutcome::Continue);
-            }
+            let directory = match build() {
+                Ok(directory) => directory,
+                Err(message) => {
+                    xps_profile_failed(&motor_port, "buildProfile", &message);
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
             println!(
-                "XPSBuildProfile: motorPort={motor_port} file={file_name} uploaded to {host}:{ftp_dir} and verified"
+                "XPSBuildProfile: motorPort={motor_port} file={file_name} uploaded to {host}:{directory} and verified"
             );
             Ok(CommandOutcome::Continue)
         },
@@ -1251,7 +1360,7 @@ fn xps_run_profile(
 fn xps_profile_moves(sock: &XpsSocket, mode: MoveMode, moves: &[(String, f64)]) {
     for (positioner, target) in moves {
         let _ = match mode {
-            MoveMode::Absolute => sock.group_move_absolute(positioner, *target),
+            MoveMode::Absolute => sock.group_move_absolute(positioner, &[*target]),
             MoveMode::Relative => sock.group_move_relative(positioner, *target),
         };
     }
@@ -1465,9 +1574,13 @@ pub fn hxp_create_controller_command() -> CommandDef {
             // C goes on with socket -1 for either socket (HXPDriver.cpp:106-116,
             // 559-562).
             let poll_sock = match connect_to_server(ctx, &ip, ip_port) {
-                Some(handle) => {
-                    XpsSocket::new(handle, &port_name, SocketMode::Query, HXP_POLL_TIMEOUT)
-                }
+                Some((index, handle)) => XpsSocket::new(
+                    handle,
+                    index,
+                    &port_name,
+                    SocketMode::Query,
+                    HXP_POLL_TIMEOUT,
+                ),
                 None => {
                     println!(
                         "HXPDriver:HXPController::HXPController: error calling TCP_ConnectToServer for pollSocket"
@@ -1494,9 +1607,13 @@ pub fn hxp_create_controller_command() -> CommandDef {
 
             for axis_no in 0..NUM_HXP_AXES {
                 let move_sock = match connect_to_server(ctx, &ip, ip_port) {
-                    Some(handle) => {
-                        XpsSocket::new(handle, &port_name, SocketMode::Fire, HXP_MOVE_TIMEOUT)
-                    }
+                    Some((index, handle)) => XpsSocket::new(
+                        handle,
+                        index,
+                        &port_name,
+                        SocketMode::Fire,
+                        HXP_MOVE_TIMEOUT,
+                    ),
                     None => {
                         println!(
                             "SetTCPTimeout, SocketIndex=-1, must be >=0 and < {}",
@@ -1543,7 +1660,7 @@ fn model1_config_args() -> Vec<ArgDesc> {
 fn model1_config_command(
     name: &'static str,
     driver: &'static Model1,
-    build: fn(&CommandContext, i32, &str) -> Result<(), String>,
+    build: fn(&CommandContext, i32, &str, i32) -> Result<(), String>,
 ) -> CommandDef {
     CommandDef::new(
         name,
@@ -1555,7 +1672,7 @@ fn model1_config_command(
                 return Ok(CommandOutcome::Continue);
             }
             let port = req_string(args, 1, "asyn port name")?;
-            build(ctx, card, &port)?;
+            build(ctx, card, &port, c_int(args, 2))?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1569,13 +1686,18 @@ static MM3000: Model1 = Model1::new(&DEV_MM3000, 4, SCAN_RATE);
 /// `MM300Setup(num_cards, scan_rate)` — C registers it under this name
 /// (NewportRegister.cc:56).
 pub fn mm3000_setup_command() -> CommandDef {
+    MM3000.register_report("drvMM3000", |cards| {
+        cards.report("MM3000", |card, line| {
+            format!("    MM3000 controller {card} asyn port= {line} \n")
+        })
+    });
     MM3000.setup_command("MM300Setup")
 }
 
 /// `MM3000Config(card, name, addr)`: one signal per axis slot the
 /// controller's `RC` reports, including the trailing `unused` slot C counts.
 pub fn mm3000_config_command() -> CommandDef {
-    model1_config_command("MM3000Config", &MM3000, |ctx, card, port| {
+    model1_config_command("MM3000Config", &MM3000, |ctx, card, port, addr| {
         // C drops a card it cannot connect to without a word.
         let Ok(handle) = connect_serial(port, MM3000_TIMEOUT) else {
             return Ok(());
@@ -1584,11 +1706,13 @@ pub fn mm3000_config_command() -> CommandDef {
             return Ok(());
         };
         let num_axes = controller.axis_types().len();
+        let line = format!("{port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
             let ax = Mm3000Axis::new(controller.clone(), axis);
             MM3000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
+        MM3000.describe(card, line);
         Ok(())
     })
 }
@@ -1603,6 +1727,11 @@ static MM4000: Model1 = Model1::new(&DEV_MM4000, MM4000_NUM_CARDS, SCAN_RATE);
 /// card count it clamps, between two 5 s sleeps (drvMM4000.cc:606-611).
 pub fn mm4000_setup_command() -> CommandDef {
     MM4000.register_row();
+    MM4000.register_report("drvMM4000", |cards| {
+        cards.report("MM4000", |card, line| {
+            format!("    MM4000 controller {card}, {line} \n")
+        })
+    });
     CommandDef::new(
         "MM4000Setup",
         vec![
@@ -1628,7 +1757,7 @@ pub fn mm4000_setup_command() -> CommandDef {
 /// `MM4000Config(card, name, addr)`: one signal per axis the controller's
 /// `TH;` reports.
 pub fn mm4000_config_command() -> CommandDef {
-    model1_config_command("MM4000Config", &MM4000, |ctx, card, port| {
+    model1_config_command("MM4000Config", &MM4000, |ctx, card, port, addr| {
         // C drops a card it cannot connect to without a word.
         let Ok(handle) = connect_serial(port, MM4000_TIMEOUT) else {
             return Ok(());
@@ -1647,12 +1776,15 @@ pub fn mm4000_config_command() -> CommandDef {
             Err(_) => return Ok(()),
         };
         let num_axes = controller.num_axes();
+        let line = format!("port={port}, address={addr}, id: {}", controller.firmware());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let mut ax = Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL1_POLL_FAILURE);
+            let mut ax =
+                Mm4000Axis::new(controller.clone(), card, axis, mm4000::MODEL1_POLL_FAILURE);
             ax.model1_set_status();
             MM4000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
+        MM4000.describe(card, line);
         Ok(())
     })
 }
@@ -1661,11 +1793,52 @@ pub fn mm4000_config_command() -> CommandDef {
 /// Its poller forces 10 fast polls (drvMM4000Asyn.c:630).
 pub static MOTOR_MM4000: Model2 = Model2::new("motorMM4000", 10);
 
-/// `numMM4000Controllers`, which `MM4000AsynSetup` sets.
-static NUM_MM4000_ASYN: Mutex<i32> = Mutex::new(0);
+/// C's `MM4000Controller`, as `motorAxisReport` prints it: zeroed by
+/// `MM4000AsynSetup`'s calloc, filled by `MM4000AsynConfig` up to where it
+/// stops.
+#[derive(Default)]
+struct Mm4000AsynCard {
+    firmware: String,
+    /// C's `MM_model`: MM4000 0, MM4005 1.
+    model: i32,
+    moving_s: f64,
+    idle_s: f64,
+    axes: Vec<Mm4000AxisReport>,
+}
+
+/// `pMM4000Controller`, `numMM4000Controllers` long.
+static MM4000_ASYN: Mutex<Vec<Mm4000AsynCard>> = Mutex::new(Vec::new());
+
+/// drvMM4000Asyn.c `motorAxisReport` (:208-224).
+fn mm4000_asyn_report(level: i32) -> String {
+    let mut out = String::new();
+    for (i, card) in MM4000_ASYN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .enumerate()
+    {
+        let firmware = format!("Controller {i} firmware version: {}\n", card.firmware);
+        out.push_str(&firmware);
+        if level != 0 {
+            out.push_str(&format!(
+                "    model: {}\n    moving poll period: {:.6}\n    idle poll period: {:.6}\n",
+                card.model,
+                CFloat(card.moving_s),
+                CFloat(card.idle_s)
+            ));
+            out.push_str(&firmware);
+        }
+        for axis in &card.axes {
+            axis.report(&mut out, level);
+        }
+    }
+    out
+}
 
 /// `MM4000AsynSetup(num_controllers)`, printing what C's does.
 pub fn mm4000_asyn_setup_command() -> CommandDef {
+    MOTOR_MM4000.register_report(mm4000_asyn_report);
     CommandDef::new(
         "MM4000AsynSetup",
         vec![arg_int_req("Max. controller count")],
@@ -1676,7 +1849,9 @@ pub fn mm4000_asyn_setup_command() -> CommandDef {
                 println!("MM4000Setup, num_controllers must be > 0");
                 return Ok(CommandOutcome::Continue);
             }
-            *NUM_MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner()) = num_controllers;
+            *MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner()) = (0..num_controllers)
+                .map(|_| Mm4000AsynCard::default())
+                .collect();
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1705,7 +1880,8 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
             let moving_poll_ms = c_int(args, 4).max(0) as u64;
             let idle_poll_ms = c_int(args, 5).max(0) as u64;
 
-            let num_controllers = *NUM_MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner());
+            let num_controllers =
+                MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner()).len() as i32;
             if num_controllers < 1 {
                 println!("MM4000Config: no MM4000 controllers allocated, call MM4000Setup first");
                 return Ok(CommandOutcome::Continue);
@@ -1721,6 +1897,17 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 println!("MM4000Config: numAxes must in range 1 to {MM4000_MAX_AXES}");
                 return Ok(CommandOutcome::Continue);
             }
+            // C fills its controller as it goes, so a Config stopping below
+            // leaves what the report then prints; a re-Config keeps the
+            // firmware and model until VE; answers (drvMM4000Asyn.c:804-808).
+            let shown = |f: &mut dyn FnMut(&mut Mm4000AsynCard)| {
+                f(&mut MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner())[card as usize]);
+            };
+            shown(&mut |c| {
+                c.axes = (0..num_axes).map(|_| Mm4000AxisReport::default()).collect();
+                c.moving_s = f64::from(c_int(args, 4)) / 1000.0;
+                c.idle_s = f64::from(c_int(args, 5)) / 1000.0;
+            });
             let Ok(handle) = connect_serial(&port_name, MM4000_TIMEOUT) else {
                 println!("MM4000AsynConfig: cannot connect to asyn port {port_name}");
                 return Ok(CommandOutcome::Continue);
@@ -1737,26 +1924,49 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 Err(Mm4000Refusal::NoAnswer) => return Ok(CommandOutcome::Continue),
                 Err(Mm4000Refusal::InvalidModel(firmware)) => {
                     println!("MM4000AsynConfig: invalid model = {firmware}");
+                    shown(&mut |c| c.firmware = firmware.clone());
                     return Ok(CommandOutcome::Continue);
                 }
-                Err(Mm4000Refusal::TooFewAxes { total_axes }) => {
+                Err(Mm4000Refusal::TooFewAxes {
+                    total_axes,
+                    firmware,
+                    model,
+                }) => {
+                    shown(&mut |c| {
+                        c.firmware = firmware.clone();
+                        c.model = model as i32;
+                    });
                     println!(
                         "MM4000AsynConfig: actual number of axes={total_axes} < numAxes={num_axes}"
                     );
                     return Ok(CommandOutcome::Continue);
                 }
             };
+            let (firmware, model) = (controller.firmware().to_owned(), controller.model());
             let controller = Arc::new(Mutex::new(controller));
-            let axes =
-                (1..=num_axes as usize)
-                    .map(|axis| {
-                        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
-                            Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL2_POLL_FAILURE),
-                        ));
-                        motor
-                    })
-                    .collect();
+            let mut logs = Vec::new();
+            let (axes, reports): (Vec<_>, Vec<_>) = (1..=num_axes as usize)
+                .map(|axis| {
+                    let ax = Mm4000Axis::new(
+                        controller.clone(),
+                        card,
+                        axis,
+                        mm4000::MODEL2_POLL_FAILURE,
+                    );
+                    let report = ax.report();
+                    logs.push(ax.log());
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    (motor, report)
+                })
+                .unzip();
+            let mut reports = Some(reports);
+            shown(&mut |c| {
+                c.firmware = firmware.clone();
+                c.model = model as i32;
+                c.axes = reports.take().unwrap_or_default();
+            });
             MOTOR_MM4000.set_card(card, axes, moving_poll_ms, idle_poll_ms);
+            MOTOR_MM4000.set_axis_logs(card, logs);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1776,7 +1986,7 @@ pub fn pm500_setup_command() -> CommandDef {
 /// scan finds. C `motor_init` drops a controller it cannot connect to or
 /// that leaves `SVN?` unanswered without a word (drvPM500.cc:577, :671-672).
 pub fn pm500_config_command() -> CommandDef {
-    model1_config_command("PM500Config", &PM500, |ctx, card, port| {
+    model1_config_command("PM500Config", &PM500, |ctx, card, port, _addr| {
         let Ok(handle) = connect_serial(port, PM500_TIMEOUT) else {
             return Ok(());
         };
@@ -1800,13 +2010,18 @@ static ESP300: Model1 = Model1::new(&DEV_ESP300, 4, SCAN_RATE);
 
 /// `ESP300Setup(num_cards, scan_rate)`.
 pub fn esp300_setup_command() -> CommandDef {
+    ESP300.register_report("drvESP300", |cards| {
+        cards.report("ESP300", |card, line| {
+            format!("    ESP300 controller {card} {line} \n")
+        })
+    });
     ESP300.setup_command("ESP300Setup")
 }
 
 /// `ESP300Config(card, name, addr)`: one signal per axis C `motor_init`
 /// finds (stop each axis until "axis number out of range").
 pub fn esp300_config_command() -> CommandDef {
-    model1_config_command("ESP300Config", &ESP300, |ctx, card, port| {
+    model1_config_command("ESP300Config", &ESP300, |ctx, card, port, addr| {
         const ERRMSG: &str = "drvESP300.c:motor_init: ASYN";
         let handle = match connect_with_eos(
             port,
@@ -1835,11 +2050,13 @@ pub fn esp300_config_command() -> CommandDef {
             return Ok(());
         };
         let num_axes = controller.num_axes();
+        let line = format!("port={port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
             let ax = Esp300Axis::new(controller.clone(), axis);
             ESP300.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
+        ESP300.describe(card, line);
         Ok(())
     })
 }
@@ -1854,6 +2071,13 @@ static PMNC87XX: Model1 = Model1::new(&DEV_PMNC87XX, 10, SCAN_RATE);
 /// are discovered, so `num_drivers` has no use.
 pub fn pmnc87xx_setup_command() -> CommandDef {
     PMNC87XX.register_row();
+    // C breaks out of the card loop after the first configured card
+    // (drvPMNC87xx.cc:233), leaving the rest unreported; not copied.
+    PMNC87XX.register_report("drvPMNC87xx", |cards| {
+        cards.report("PMNC87xx", |card, line| {
+            format!("    PMNC87xx controller {card} asyn port= {line} \n")
+        })
+    });
     CommandDef::new(
         "PMNC87xxSetup",
         vec![
@@ -1873,19 +2097,21 @@ pub fn pmnc87xx_setup_command() -> CommandDef {
 /// modules found (`MPV` for the 8750, `DRT` for the 8752). The controller
 /// sets the port EOS itself, as C `motor_init` does.
 pub fn pmnc87xx_config_command() -> CommandDef {
-    model1_config_command("PMNC87xxConfig", &PMNC87XX, |ctx, card, port| {
+    model1_config_command("PMNC87xxConfig", &PMNC87XX, |ctx, card, port, addr| {
         let asyn_port = get_port(port).ok_or_else(|| {
             format!("IP port '{port}' not found (call drvAsynIPPortConfigure first)")
         })?;
         let controller = PmncController::new(asyn_port.handle.clone(), PMNC_TIMEOUT)
             .map_err(|e| format!("PMNC87xxConfig: {e}"))?;
         let num_axes = controller.num_axes();
+        let line = format!("{port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for index in 0..num_axes {
             let ax = PmncAxis::new(controller.clone(), index)
                 .map_err(|e| format!("PMNC87xxConfig: axis {index}: {e}"))?;
             PMNC87XX.install(ctx, card, index as i32, Arc::new(Mutex::new(ax)))?;
         }
+        PMNC87XX.describe(card, line);
         Ok(())
     })
 }
@@ -1915,6 +2141,28 @@ fn xps_profile_failed(motor_port: &str, function: &str, message: &str) {
 mod tests {
     use super::*;
     use crate::xps::fake::FakeLine;
+
+    /// XPSController.cpp:695-706: the trajectory folder and transport follow
+    /// the firmware string, and any other firmware fails the build.
+    #[test]
+    fn the_firmware_picks_the_trajectory_folder() {
+        assert_eq!(
+            trajectory_upload("XPS-C8 Firmware V2.6.x"),
+            Ok(("/Admin/Public/Trajectories", false))
+        );
+        assert_eq!(
+            trajectory_upload("XPS-Q8 Firmware V1.4.x"),
+            Ok(("/Public/Trajectories", false))
+        );
+        assert_eq!(
+            trajectory_upload("XPS-D8 Firmware V1.0.x"),
+            Ok(("/Admin/Public/Trajectories", true))
+        );
+        assert_eq!(
+            trajectory_upload("0"),
+            Err("Firmware version does not contain XPS-C, XPS-Q, or XPS-D=0\n".to_string())
+        );
+    }
 
     fn plan() -> ExecutionPlan {
         ExecutionPlan {
@@ -2420,6 +2668,285 @@ mod report {
             text.contains(&format!("{}{axes}Port: hxpRep\n", head(2))),
             "{text}"
         );
+    }
+
+    /// XPSController::report then XPSAxis::report (XPSController.cpp:222-246,
+    /// XPSAxis.cpp:207-219); the axis prints at every level.
+    #[epics_rs::base::epics_test]
+    async fn xps_report_prints_the_controller_then_each_axis() {
+        let first = NEXT_SOCKET.load(Ordering::Relaxed);
+        let args = vec![
+            ArgValue::String("xpsRep".into()),
+            ArgValue::String("127.0.0.1".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(2),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+            ArgValue::Int(1),
+            ArgValue::Int(500),
+        ];
+        run_command(xps_create_controller_command(), args).await;
+        let args = vec![
+            ArgValue::String("xpsRep".into()),
+            ArgValue::Int(0),
+            ArgValue::String("G1.P1".into()),
+            ArgValue::String("1000".into()),
+        ];
+        run_command(xps_create_axis_command(), args).await;
+        let head = "XPS motor driver: xpsRep\n\
+                    \x20                numAxes: 2\n\
+                    \x20       firmware version: \n\
+                    \x20     moving poll period: 0.100000\n\
+                    \x20       idle poll period: 1.000000\n";
+        let axis = format!(
+            "  axis 0\n    name = G1.P1\n    step size = 0.001\n    \
+             poll socket = {first}, moveSocket = {}\n    status = 0\n",
+            first + 2
+        );
+        let text = port_report("xpsRep", 0);
+        assert!(
+            text.contains(&format!("{head}{axis}Port: xpsRep\n")),
+            "{text}"
+        );
+        let detail = |user: &str, password: &str, no_disable_error: i32| {
+            format!(
+                "       enableSetPosition: 1\n\
+                 \x20setPositionSettlingTime: 0.500000\n\
+                 \x20              IPAddress: 127.0.0.1\n\
+                 \x20                 IPPort: 1\n\
+                 \x20            ftpUserName: {user}\n\
+                 \x20        ftpUserPassword: {password}\n\
+                 \x20                useSFTP: false\n\
+                 \x20          movesDeferred: 0\n\
+                 \x20             autoEnable: 1\n\
+                 \x20         noDisableError: {no_disable_error}\n"
+            )
+        };
+        let text = port_report("xpsRep", 1);
+        assert!(
+            text.contains(&format!("{head}{}{axis}", detail("(null)", "(null)", 0))),
+            "{text}"
+        );
+        let args = vec![
+            ArgValue::String("xpsRep".into()),
+            ArgValue::Int(100),
+            ArgValue::String("user".into()),
+            ArgValue::String("pass".into()),
+        ];
+        run_command(xps_create_profile_command(), args).await;
+        run_command(
+            xps_no_disable_error_command(),
+            vec![ArgValue::String("xpsRep".into())],
+        )
+        .await;
+        let text = port_report("xpsRep", 1);
+        assert!(
+            text.contains(&format!("{head}{}{axis}", detail("user", "pass", 1))),
+            "{text}"
+        );
+        // XPSController::setDeferredMoves sets movesDeferred_.
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::motor::controller_port::index;
+        let port = PortManager::global().find_port_handle("xpsRep").unwrap();
+        port.write_int32(index::DEFER_MOVES, 0, 1).await.unwrap();
+        let deferred = "           movesDeferred: 1\n";
+        let mut text = String::new();
+        for _ in 0..200 {
+            text = port_report("xpsRep", 1);
+            if text.contains(deferred) {
+                break;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(text.contains(deferred), "{text}");
+    }
+
+    /// drvESP300.cc's drvet `report` (drvESP300.cc:153-178), which `dbior`
+    /// runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_esp300_controller() {
+        use motor_common::testing::{LineRig, driver_report};
+        let setup = esp300_setup_command();
+        let none = "    No ESP300 controllers configured.\n";
+        assert_eq!(driver_report("drvESP300", 0), none);
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("esp300RepLine", |last| {
+            match last {
+                "VE?" => "ESP300 Version 3.08",
+                "TB?" => "9, 0, AXIS NUMBER OUT OF RANGE",
+                _ => "",
+            }
+            .to_string()
+        });
+        let config = vec![int(1), ArgValue::String("esp300RepLine".into()), int(3)];
+        run_command(esp300_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvESP300", 0),
+            "    ESP300 controller 0 connection failed.\n    ESP300 controller 1 \
+             port=esp300RepLine, address=3, id: ESP300 Version 3.08 \n"
+        );
+    }
+
+    /// drvMM3000.cc's drvet `report` (drvMM3000.cc:173-199).
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mm3000_controller() {
+        use motor_common::testing::{LineRig, driver_report};
+        let setup = mm3000_setup_command();
+        let none = "    No MM3000 controllers configured.\n";
+        assert_eq!(driver_report("drvMM3000", 0), none);
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("mm3000RepLine", |last| match last {
+            "VE" => "MM3000 Version 2.4".into(),
+            "RC" => "1=dc".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("mm3000RepLine".into()), int(4)];
+        run_command(mm3000_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvMM3000", 0),
+            "    MM3000 controller 0 asyn port= mm3000RepLine, address=4, id: MM3000 Version \
+             2.4 \n    MM3000 controller 1 connection failed.\n"
+        );
+    }
+
+    /// drvMM4000.cc's drvet `report` (drvMM4000.cc:198-224); `id` is the
+    /// `VE;` reply past "VE".
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mm4000_controller() {
+        use motor_common::testing::{LineRig, driver_report};
+        let setup = mm4000_setup_command();
+        let none = "    No MM4000 controllers configured.\n";
+        assert_eq!(driver_report("drvMM4000", 0), none);
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new("mm4000RepLine", |last| match last {
+            "TH;" => "1TH0".into(),
+            "VE;" => "VEMM4005 Version 2.0".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("mm4000RepLine".into()), int(0)];
+        run_command(mm4000_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvMM4000", 0),
+            "    MM4000 controller 0, port=mm4000RepLine, address=0, id: MM4005 Version 2.0 \n"
+        );
+    }
+
+    /// drvPMNC87xx.cc's drvet `report` (drvPMNC87xx.cc:211-238), past the
+    /// `break` after the first configured card.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pmnc87xx_controller() {
+        use motor_common::testing::{LineRig, driver_report};
+        let setup = pmnc87xx_setup_command();
+        let none = "    No PMNC87xx controllers configured.\n";
+        assert_eq!(driver_report("drvPMNC87xx", 0), none);
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(3), int(1), int(10)]).await;
+        let rig = |name: &str| {
+            LineRig::new(name, |last| match last {
+                "VER" => "Version 1.6.0".into(),
+                "DRT" => "A0=2>".into(),
+                _ => ">".into(),
+            })
+        };
+        let (_a, _) = rig("pmncRepA");
+        let (_b, _) = rig("pmncRepB");
+        for (card, port) in [(0, "pmncRepA"), (2, "pmncRepB")] {
+            let config = vec![int(card), ArgValue::String(port.into()), int(0)];
+            run_command(pmnc87xx_config_command(), config).await;
+        }
+        let id = |card, port| {
+            format!(
+                "    PMNC87xx controller {card} asyn port= {port}, address=0, id: Version 1.6.0 \n"
+            )
+        };
+        assert_eq!(
+            driver_report("drvPMNC87xx", 0),
+            format!(
+                "{}    PMNC87xx controller 1 connection failed.\n{}",
+                id(0, "pmncRepA"),
+                id(2, "pmncRepB")
+            )
+        );
+    }
+
+    /// drvMM4000Asyn.c `motorAxisReport` (:194-224), every controller
+    /// `MM4000AsynSetup` allocated; a Config stopping after its range checks
+    /// leaves its calloc'd axes.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mm4000_asyn_controller() {
+        use motor_common::testing::{LineRig, driver_report};
+        let int = ArgValue::Int;
+        run_command(mm4000_asyn_setup_command(), vec![int(3)]).await;
+        let (_line, _io) = LineRig::new("mm4kAsynLine", |last| {
+            match last {
+                "VE;" => "VEMM4005 Version 2.0",
+                "TP;" => "1TP0.0",
+                "1TU" => "1TU0.001",
+                "1XH" => "1XH1.5",
+                "1TL" => "1TL-10",
+                "1TR" => "1TR10",
+                _ => "",
+            }
+            .to_string()
+        });
+        let config = |card, port: &str, num_axes, moving, idle| {
+            vec![
+                int(card),
+                ArgValue::String(port.into()),
+                int(0),
+                int(num_axes),
+                int(moving),
+                int(idle),
+            ]
+        };
+        let cmd = mm4000_asyn_config_command;
+        run_command(cmd(), config(0, "mm4kAsynLine", 1, 100, 1000)).await;
+        run_command(cmd(), config(1, "mm4kAsynNoPort", 2, 200, 2000)).await;
+        let controller =
+            |n, firmware: &str| format!("Controller {n} firmware version: {firmware}\n");
+        assert_eq!(
+            driver_report("motorMM4000", 0),
+            format!(
+                "{}{}{}",
+                controller(0, "MM4005 Version 2.0"),
+                controller(1, ""),
+                controller(2, "")
+            )
+        );
+        let detail = |n, firmware: &str, model, moving: &str, idle: &str| {
+            format!(
+                "{}    model: {model}\n    moving poll period: {moving}\n    idle poll period: \
+                 {idle}\n{}",
+                controller(n, firmware),
+                controller(n, firmware)
+            )
+        };
+        let axis = |high: &str, low: &str, home: &str, step: &str, digits| {
+            format!(
+                "Axis 0\n   axisStatus:  0x0\n   high limit:  {high}\n   low limit:   {low}\n   \
+                 home preset: {home}\n   step size:   {step}\n   max digits:  {digits}\n"
+            )
+        };
+        let zero = axis("0.000000", "0.000000", "0.000000", "0.000000", 0);
+        assert_eq!(
+            driver_report("motorMM4000", 1),
+            format!(
+                "{}{}{}{zero}{zero}{}",
+                detail(0, "MM4005 Version 2.0", 1, "0.100000", "1.000000"),
+                axis("10.000000", "-10.000000", "1.500000", "0.001000", 5),
+                detail(1, "", 0, "0.200000", "2.000000"),
+                detail(2, "", 0, "0.000000", "0.000000"),
+            )
+        );
+        // drvMM4000Asyn.c:804-808: a re-Config resets only the axes and the
+        // poll periods before it connects; the firmware and model stay.
+        run_command(cmd(), config(0, "mm4kAsynNoPort", 2, 300, 3000)).await;
+        let text = driver_report("motorMM4000", 1);
+        let again = detail(0, "MM4005 Version 2.0", 1, "0.300000", "3.000000");
+        assert!(text.starts_with(&format!("{again}{zero}{zero}")), "{text}");
     }
 
     /// SMC100Controller::report then SMC100Axis::report

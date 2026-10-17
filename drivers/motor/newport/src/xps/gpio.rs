@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::ParamType;
@@ -211,7 +212,10 @@ impl PortDriver for XpsGpio {
             TraceMask::IO_DRIVER,
             file!(),
             line!(),
-            format_args!("drvXPSAsynAux::readFloat64, value={value:.6}\n"),
+            format_args!(
+                "drvXPSAsynAux::readFloat64, value={value:.6}\n",
+                value = CFloat(value)
+            ),
         );
         Ok(value)
     }
@@ -235,7 +239,10 @@ impl PortDriver for XpsGpio {
             TraceMask::IO_DRIVER,
             file!(),
             line!(),
-            format_args!("drvXPSAsynAux::writeFloat64, value={value:.6}\n"),
+            format_args!(
+                "drvXPSAsynAux::writeFloat64, value={value:.6}\n",
+                value = CFloat(value)
+            ),
         );
         Ok(())
     }

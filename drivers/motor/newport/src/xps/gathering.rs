@@ -10,6 +10,8 @@
 //! position and derives the following error `actual - setpoint`; positions are
 //! device/positioner units, matching this driver's CSV profile convention.
 
+use epics_libcom_rs::cfmt::CFloat;
+
 /// Gathering values sampled per axis (`SetpointPosition` + `CurrentPosition`,
 /// C `NUM_GATHERING_ITEMS`).
 pub const NUM_GATHERING_ITEMS: usize = 2;
@@ -97,8 +99,8 @@ pub fn readback_csv(positioners: &[String], readback: &GatheringReadback) -> Str
         let row: Vec<String> = (0..positioners.len())
             .flat_map(|axis| {
                 [
-                    format!("{:.6}", readback.actuals[axis][sample]),
-                    format!("{:.6}", readback.following_errors[axis][sample]),
+                    format!("{:.6}", CFloat(readback.actuals[axis][sample])),
+                    format!("{:.6}", CFloat(readback.following_errors[axis][sample])),
                 ]
             })
             .collect();

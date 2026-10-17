@@ -66,6 +66,9 @@ const PROMPT_EOS: &[u8] = b">";
 /// `STA` reply terminator on firmware 1.5.3/1.5.4 (C `NL_EOS`).
 const NL_EOS: &[u8] = b"\n";
 
+/// C `MAX_IDENT_LEN` (motordrvCom.h:57), the size of the saved identity.
+const MAX_IDENT_LEN: usize = 100;
+
 /// Identity substring that precedes the firmware digit (C `VER_STR`).
 const VER_STR: &str = "Version 1.";
 
@@ -238,19 +241,21 @@ impl PmncController {
             axes: Vec::new(),
             comm_state: CommState::Normal,
         };
+        // C strncpy's the raw reply (drvPMNC87xx.cc:914), up to MAX_IDENT_LEN.
         let mut ident = String::new();
         for _ in 0..3 {
-            if let Ok(reply) = ctrl.command("VER")
-                && !reply.trim().is_empty()
+            if let Ok(raw) = ctrl.handle.write_read(0, b"VER", READ_BUF)
+                && !raw.is_empty()
             {
-                ident = reply;
+                let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                ident = String::from_utf8_lossy(&raw[..len.min(MAX_IDENT_LEN)]).into_owned();
                 break;
             }
         }
-        if ident.trim().is_empty() {
+        if ident.is_empty() {
             return Err(pmnc_err("PMNC: no response to VER identity query".into()));
         }
-        ctrl.ident = ident.trim().to_string();
+        ctrl.ident = ident;
         let (model, change_eos) = model_from_ident(&ctrl.ident)
             .ok_or_else(|| pmnc_err(format!("PMNC: unknown version = {}", ctrl.ident)))?;
         ctrl.model = model;
@@ -819,7 +824,7 @@ mod tests {
         let sta = Arc::new(AtomicU8::new(S8751_MOVE_DONE | S8751_POWER_ON));
         let st = sta.clone();
         let (line, io) = LineRig::new(name, move |last| match last {
-            "VER" => "Version 1.6.0>".into(),
+            "VER" => "Version 1.6.0".into(),
             "DRT" => "A0=2>".into(),
             "STA 0" => format!("A0=0x{:02x}>", st.load(Ordering::SeqCst)),
             "DIAG 0" => "A0=0x04>".into(),
@@ -830,6 +835,18 @@ mod tests {
         let axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
         line.sent();
         (line, axis, sta)
+    }
+
+    /// drvPMNC87xx.cc:914: the identity is the raw VER reply, not trimmed.
+    #[test]
+    fn the_ident_is_the_raw_ver_reply() {
+        let (_line, io) = LineRig::new("pmnc_raw_ver", |last| match last {
+            "VER" => " Version 1.6.0\r\n".into(),
+            "DRT" => "A0=2>".into(),
+            _ => ">".into(),
+        });
+        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
+        assert_eq!(ctrl.unwrap().ident(), " Version 1.6.0\r\n");
     }
 
     fn post(text: &[u8]) -> PostMessage {
@@ -899,7 +916,7 @@ mod tests {
     #[test]
     fn an_8753_jog_sends_the_vel_base_parts() {
         let (line, io) = LineRig::new("pmnc8753Jog", |last| match last {
-            "VER" => "Version 1.6.0>".into(),
+            "VER" => "Version 1.6.0".into(),
             "DRT" => "A0=1>".into(),
             _ => ">".into(),
         });
@@ -1066,7 +1083,7 @@ mod tests {
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             self.reply = match data {
-                b"VER" => b"Version 1.5.4>".to_vec(),
+                b"VER" => b"Version 1.5.4".to_vec(),
                 b"DRT" => b"A0=1>".to_vec(),
                 b"STA 0" => b"A0=0x05\n".to_vec(),
                 _ => b">".to_vec(),
@@ -1112,7 +1129,7 @@ mod tests {
         let quiet = Arc::new(AtomicBool::new(false));
         let q = quiet.clone();
         let (_line, io) = LineRig::new("pmncRetry", move |last| match last {
-            "VER" => "Version 1.6.0>".into(),
+            "VER" => "Version 1.6.0".into(),
             "DRT" => "A0=2>".into(),
             "STA 0" if q.load(Ordering::SeqCst) => String::new(),
             "STA 0" => format!("A0=0x{:02x}>", S8751_MOVE_DONE | S8751_POWER_ON),
@@ -1148,7 +1165,7 @@ mod tests {
         );
         let (q, qd) = (quiet.clone(), quiet_diag.clone());
         let (_line, io) = LineRig::new("pmncDiagRetry", move |last| match last {
-            "VER" => "Version 1.6.0>".into(),
+            "VER" => "Version 1.6.0".into(),
             "DRT" => "A0=2>".into(),
             "STA 0" if q.load(Ordering::SeqCst) => String::new(),
             "STA 0" => format!("A0=0x{:02x}>", S8751_MOVE_DONE | S8751_POWER_ON),

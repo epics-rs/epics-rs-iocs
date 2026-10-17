@@ -27,6 +27,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -214,11 +215,15 @@ impl AxisReport for AgapAxisReport {
              KP={kp:.6}, KI={ki:.6}, KD/LF={lf:.6}\n",
             self.axis_name,
             shown.stage_id,
-            shown.encoder_increment,
-            0.0,
-            shown.step_size,
-            shown.low_limit,
-            shown.high_limit
+            CFloat(shown.encoder_increment),
+            CFloat(0.0),
+            CFloat(shown.step_size),
+            CFloat(shown.low_limit),
+            CFloat(shown.high_limit),
+            current = CFloat(current),
+            kp = CFloat(kp),
+            ki = CFloat(ki),
+            lf = CFloat(lf)
         );
     }
 }
@@ -303,7 +308,7 @@ impl AsynMotor for AgapAxis {
             "{}PA{}{:.6}",
             ctrl.controller_id,
             self.axis_name,
-            position * STEP_SIZE
+            CFloat(position * STEP_SIZE)
         ))
     }
 
@@ -322,7 +327,7 @@ impl AsynMotor for AgapAxis {
             "{}PR{}{:.6}",
             ctrl.controller_id,
             self.axis_name,
-            distance * STEP_SIZE
+            CFloat(distance * STEP_SIZE)
         ))
     }
 
@@ -337,7 +342,9 @@ impl AsynMotor for AgapAxis {
         let ctrl = self.lock();
         ctrl.write(&format!(
             "{}JA{}{:.6}",
-            ctrl.controller_id, self.axis_name, velocity
+            ctrl.controller_id,
+            self.axis_name,
+            CFloat(velocity)
         ))
     }
 
@@ -388,7 +395,11 @@ impl AsynMotor for AgapAxis {
                 };
                 let was_closed = ctrl.read_closed_loop()?;
                 ctrl.write(&format!("{id}MM0"))?;
-                ctrl.write(&format!("{id}{letter}{}{:.6}", self.axis_name, gain * max))?;
+                ctrl.write(&format!(
+                    "{id}{letter}{}{:.6}",
+                    self.axis_name,
+                    CFloat(gain * max)
+                ))?;
                 if was_closed {
                     ctrl.write(&format!("{id}MM1"))?;
                 }
@@ -396,7 +407,7 @@ impl AsynMotor for AgapAxis {
             }
             // C setDGain: low-pass filter frequency LF, controller-wide (no
             // axis letter), with no closed-loop save/restore.
-            PidGainKind::Derivative => ctrl.write(&format!("{id}LF{:.6}", gain * LF_MAX)),
+            PidGainKind::Derivative => ctrl.write(&format!("{id}LF{:.6}", CFloat(gain * LF_MAX))),
         }
     }
 

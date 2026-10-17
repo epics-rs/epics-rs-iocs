@@ -4,20 +4,6 @@
 //! through the controller because they arrive as asyn parameters rather than
 //! `asynMotorAxis` methods).
 //!
-//! ## Units (deviation, deliberate)
-//!
-//! C carries a per-axis `scale_` (set by `pmacSetAxisScale`) and multiplies every
-//! position read by it, dividing every demand by it — with `motorRecord.MRES`
-//! configured as `1/scale`. The two cancel at the record boundary: the record
-//! sends `demand_egu`, C divides by `scale`, the controller moves
-//! `demand_egu/scale` counts, and the readback is multiplied back up. The
-//! asyn-rs motor interface speaks EGU on both sides, and the record's MRES
-//! already performs exactly that division, so a driver-side scale would apply it
-//! twice. This port therefore works in controller counts (`scale = 1`) and
-//! `pmacSetAxisScale` is not provided: an IOC that used it sets `MRES` in the
-//! record instead. Silently accepting the command and ignoring it would be worse
-//! than not having it.
-//!
 //! ## Initial status (framework gap, half ported)
 //!
 //! `pmacAxis::getAxisInitialStatus` reads `I{n}13 I{n}14 I{n}30 I{n}31 I{n}33`
@@ -30,6 +16,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::trace::TraceMask;
@@ -83,15 +70,18 @@ fn enable_limits_command(axis: i32) -> String {
 /// The velocity/acceleration preamble every move shares (C `vel_buff` +
 /// `acc_buff`): `I{n}22` is the jog speed in counts/msec, `I{n}20` the jog
 /// acceleration *time* in msec.
-fn speed_preamble(axis: i32, velocity: f64, acceleration: f64) -> String {
+fn speed_preamble(axis: i32, scale: f64, velocity: f64, acceleration: f64) -> String {
     let mut preamble = String::new();
     if velocity != 0.0 {
-        preamble.push_str(&format!("I{axis}22={:.6} ", velocity.abs() / 1000.0));
+        preamble.push_str(&format!(
+            "I{axis}22={:.6} ",
+            CFloat(velocity.abs() / (scale * 1000.0))
+        ));
     }
     if velocity != 0.0 && acceleration != 0.0 {
         preamble.push_str(&format!(
             "I{axis}20={:.6} ",
-            (velocity / acceleration).abs() * 1000.0
+            CFloat((velocity / acceleration).abs() * 1000.0)
         ));
     }
     preamble
@@ -153,8 +143,9 @@ impl PmacAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let axis = self.axis;
-        let mut command = speed_preamble(axis, velocity, acceleration);
         let mut controller = lock(&self.controller);
+        let scale = f64::from(controller.axis_scale(axis));
+        let mut command = speed_preamble(axis, scale, velocity, acceleration);
 
         if controller.moves_deferred() {
             let distance = if relative {
@@ -165,7 +156,7 @@ impl PmacAxis {
             controller.defer_move(
                 axis,
                 DeferredMove {
-                    position,
+                    position: position / scale,
                     relative,
                     time_ms: if velocity != 0.0 {
                         (distance / velocity).abs() * 1000.0
@@ -176,7 +167,10 @@ impl PmacAxis {
             );
         } else {
             let jog = if relative { "J^" } else { "J=" };
-            command.push_str(&format!("#{axis} {jog}{position:.2}"));
+            command.push_str(&format!(
+                "#{axis} {jog}{position:.2}",
+                position = CFloat(position / scale)
+            ));
         }
 
         if self.limits_disabled {
@@ -277,6 +271,7 @@ impl PmacAxis {
                     flags.home_flag as i32,
                     flags.flag_mode,
                     flags.home_offset as i32,
+                    home_velocity = CFloat(home_velocity)
                 ),
             );
             Ok(String::new())
@@ -322,7 +317,13 @@ impl AsynMotor for PmacAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let axis = self.axis;
-        let mut command = speed_preamble(axis, velocity, acceleration);
+        let controller = lock(&self.controller);
+        let mut command = speed_preamble(
+            axis,
+            f64::from(controller.axis_scale(axis)),
+            velocity,
+            acceleration,
+        );
         let jog = if velocity < 0.0 { "J-" } else { "J+" };
         command.push_str(&format!("#{axis} {jog}"));
         if self.limits_disabled {
@@ -330,7 +331,7 @@ impl AsynMotor for PmacAxis {
             command.push_str(&enable_limits_command(axis));
             self.limits_disabled = false;
         }
-        lock(&self.controller).command(&command)
+        controller.command(&command)
     }
 
     /// C `pmacAxis::home`.
@@ -371,7 +372,8 @@ impl AsynMotor for PmacAxis {
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
         let controller = lock(&self.controller);
-        let counts = (position * 32.0 + 0.5).floor() as i64;
+        let scale = f64::from(controller.axis_scale(axis));
+        let counts = (position * 32.0 / scale + 0.5).floor() as i64;
 
         controller.command(&format!(
             "#{axis}K M{axis}61={counts}*I{axis}08 M{axis}62={counts}*I{axis}08"
@@ -404,13 +406,23 @@ impl AsynMotor for PmacAxis {
     /// C `pmacController::writeFloat64`, `motorHighLimit_` branch.
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
-        lock(&self.controller).command(&format!("I{axis}13={position:.6}"))
+        let controller = lock(&self.controller);
+        let scale = f64::from(controller.axis_scale(axis));
+        controller.command(&format!(
+            "I{axis}13={position:.6}",
+            position = CFloat(position / scale)
+        ))
     }
 
     /// C `pmacController::writeFloat64`, `motorLowLimit_` branch.
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
-        lock(&self.controller).command(&format!("I{axis}14={position:.6}"))
+        let controller = lock(&self.controller);
+        let scale = f64::from(controller.axis_scale(axis));
+        controller.command(&format!(
+            "I{axis}14={position:.6}",
+            position = CFloat(position / scale)
+        ))
     }
 
     /// C `pmacController::writeInt32`, `motorDeferMoves_` branch, which C takes
@@ -481,6 +493,8 @@ impl AsynMotor for PmacAxis {
         } else {
             (first + second, second)
         };
+        let scale = f64::from(controller.axis_scale(axis));
+        let (position, encoder_position) = (position * scale, encoder_position * scale);
 
         let direction = if position > self.previous_position {
             true
@@ -615,23 +629,23 @@ mod tests {
     fn speed_preamble_matches_c_format() {
         // I{n}22 is counts/msec, I{n}20 the acceleration time in msec.
         assert_eq!(
-            speed_preamble(3, 2000.0, 1000.0),
+            speed_preamble(3, 1.0, 2000.0, 1000.0),
             "I322=2.000000 I320=2000.000000 "
         );
     }
 
     #[test]
     fn speed_preamble_omits_unset_fields() {
-        assert_eq!(speed_preamble(1, 0.0, 500.0), "");
+        assert_eq!(speed_preamble(1, 1.0, 0.0, 500.0), "");
         // C only emits the acceleration when a velocity came with it: I{n}20 is
         // a *time*, and without the velocity there is nothing to divide by.
-        assert_eq!(speed_preamble(1, 1000.0, 0.0), "I122=1.000000 ");
+        assert_eq!(speed_preamble(1, 1.0, 1000.0, 0.0), "I122=1.000000 ");
     }
 
     #[test]
     fn speed_preamble_uses_the_magnitude_of_a_reverse_jog() {
         assert_eq!(
-            speed_preamble(2, -2000.0, 1000.0),
+            speed_preamble(2, 1.0, -2000.0, 1000.0),
             "I222=2.000000 I220=2000.000000 "
         );
     }

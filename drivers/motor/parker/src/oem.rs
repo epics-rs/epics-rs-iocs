@@ -26,19 +26,18 @@
 //! relative moves in absolute mode); this port instead honours it by converting a
 //! relative move to an absolute target from the last polled position.
 //!
-//! ## Not modeled (documented)
-//!
-//! The `OEM_SELECT_SWITCH` aux parameter (which of the two detected switches is
-//! the home/low-limit end) is not exposed; the C startup default of `0` is used,
-//! so switch 1 maps to the low-limit/home end and switch 2 to the high-limit end.
-//! `OEM_SWITCH_DETECTED` is surfaced only through the limit/home status bits.
+//! `OEM_SELECT_SWITCH` picks which detected switch is the home/low-limit end;
+//! the poll posts `OEM_SWITCH_DETEC`, the switch it found.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
-use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -55,10 +54,6 @@ const READ_BUF: usize = 64;
 /// 2^32, subtracted to sign-extend a negative 32-bit step count (C).
 const TWO_POW_32: f64 = 4_294_967_296.0;
 
-/// Which detected switch is the home/low-limit end (C `OEM_SELECT_SWITCH`
-/// startup default).
-const SELECT_SWITCH: i32 = 0;
-
 /// `pulsesPerUnit_` until `OEM_RESOLUTION` is written. C leaves the member
 /// uninitialised in a fresh heap block, so its constructor sends `MR0`.
 const DEFAULT_PULSES_PER_UNIT: f64 = 0.0;
@@ -68,6 +63,12 @@ pub struct OemController {
     handle: SyncIOHandle,
     /// C `OEMAxis::pulsesPerUnit_`, per axis.
     pulses_per_unit: Vec<f64>,
+    /// The last `OEM_SELECT_SWITCH` write, per axis, for the poll to read
+    /// without asking the port.
+    select_switch: Vec<i32>,
+    /// `OEM_SWITCH_DETEC`'s index, and the port the poll posts it to.
+    switch_detected: Option<usize>,
+    port: Option<PortHandle>,
 }
 
 impl OemController {
@@ -78,7 +79,17 @@ impl OemController {
         Self {
             handle,
             pulses_per_unit: vec![DEFAULT_PULSES_PER_UNIT; num_axes],
+            // C reads OEM_SELECT_SWITCH unset (OEMMotorDriver.cpp:397) and
+            // polls on an uninitialised `selectSwitch` (:338); rs starts at 0.
+            select_switch: vec![0; num_axes],
+            switch_detected: None,
+            port: None,
         }
+    }
+
+    /// Post the poll's `OEM_SWITCH_DETEC` to `port` from here on.
+    pub fn attach_port(&mut self, port: PortHandle) {
+        self.port = Some(port);
     }
 
     fn trimmed(raw: &[u8]) -> String {
@@ -152,9 +163,9 @@ impl OemAxis {
         let ctrl = self.lock();
         let v = velocity / ctrl.pulses_per_unit[self.axis_no];
         ctrl.command(&format!("{addr}MN"))?;
-        ctrl.command(&format!("{addr}A{a:.2}"))?;
-        ctrl.command(&format!("{addr}V{v:.2}"))?;
-        ctrl.command(&format!("{addr}D{target:.0}"))?;
+        ctrl.command(&format!("{addr}A{a:.2}", a = CFloat(a)))?;
+        ctrl.command(&format!("{addr}V{v:.2}", v = CFloat(v)))?;
+        ctrl.command(&format!("{addr}D{target:.0}", target = CFloat(target)))?;
         ctrl.command(&format!("{addr}G"))?;
         drop(ctrl);
         self.homed = false;
@@ -174,10 +185,11 @@ impl OemController {
     }
 }
 
-/// `OEMController`'s `OEM_RESOLUTION` parameter; its write hook runs `MR`.
+/// `OEMController`'s parameters; the `OEM_RESOLUTION` write hook runs `MR`.
 pub struct OemParams {
     controller: Arc<Mutex<OemController>>,
     resolution: Option<usize>,
+    select_switch: Option<usize>,
     /// C's `movingPollPeriod_`/`idlePollPeriod_`, in seconds.
     moving_poll_s: f64,
     idle_poll_s: f64,
@@ -192,6 +204,7 @@ impl OemParams {
         Self {
             controller,
             resolution: None,
+            select_switch: None,
             moving_poll_s: moving_poll_ms as f64 / 1000.0,
             idle_poll_s: idle_poll_ms as f64 / 1000.0,
         }
@@ -204,14 +217,23 @@ impl OemParams {
 struct OemWriteHook {
     controller: Arc<Mutex<OemController>>,
     resolution: Option<usize>,
+    select_switch: Option<usize>,
 }
 
 impl WriteHook for OemWriteHook {
     fn after_write(&self, write: &FinishedWrite<'_>) -> WriteOutcome {
         let function = write.function;
+        if let WriteValue::Int32(v) = write.value
+            && self.select_switch == Some(function)
+        {
+            let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = ctrl.select_switch.get_mut(write.addr as usize) {
+                *slot = v;
+            }
+        }
         let (method, value, mr) = match write.value {
             WriteValue::Int32(v) => ("writeInt32", v.to_string(), Some(v)),
-            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}"), None),
+            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}", v = CFloat(v)), None),
         };
         let status = match mr.filter(|_| self.resolution == Some(function)) {
             Some(v) => {
@@ -251,14 +273,19 @@ impl ControllerParams for OemParams {
             "OEM motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll_s,
-            self.idle_poll_s
+            CFloat(self.moving_poll_s),
+            CFloat(self.idle_poll_s)
         );
         ctx.report(out, level);
     }
 
+    /// OEMMotorDriver.cpp:48-50, in C's order.
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.select_switch = Some(base.create_param("OEM_SELECT_SWITCH", ParamType::Int32)?);
+        let detected = base.create_param("OEM_SWITCH_DETEC", ParamType::Int32)?;
         self.resolution = Some(base.create_param("OEM_RESOLUTION", ParamType::Int32)?);
+        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        ctrl.switch_detected = Some(detected);
         Ok(())
     }
 
@@ -266,6 +293,7 @@ impl ControllerParams for OemParams {
         Some(Arc::new(OemWriteHook {
             controller: self.controller.clone(),
             resolution: self.resolution,
+            select_switch: self.select_switch,
         }))
     }
 }
@@ -334,7 +362,7 @@ impl AsynMotor for OemAxis {
         let ctrl = self.lock();
         let v = velocity / ctrl.pulses_per_unit[self.axis_no];
         ctrl.command(&format!("{addr}MC"))?;
-        ctrl.command(&format!("{addr}V{v:.2}"))?;
+        ctrl.command(&format!("{addr}V{v:.2}", v = CFloat(v)))?;
         // C maps forward -> H-, reverse -> H+.
         ctrl.command(&format!("{addr}H{}", if forward { '-' } else { '+' }))?;
         ctrl.command(&format!("{addr}G"))?;
@@ -397,13 +425,15 @@ impl AsynMotor for OemAxis {
         // Switch status (character flags at fixed offsets 6 and 7).
         let is = ctrl.query(&format!("{addr}IS"))?;
         let switch_detected = switch_from_is(&is);
+        let select_switch = ctrl.select_switch[self.axis_no];
+        let post = ctrl.port.clone().zip(ctrl.switch_detected);
 
         let mut high_limit = false;
         let mut low_limit = false;
         let mut home = false;
         let mut homed_status = false;
         if switch_detected > 0 {
-            if SELECT_SWITCH == switch_detected - 1 {
+            if select_switch == switch_detected - 1 {
                 if self.homed {
                     ctrl.command(&format!("{addr}PZ"))?;
                     homed_status = true;
@@ -415,6 +445,12 @@ impl AsynMotor for OemAxis {
             }
         }
         drop(ctrl);
+        // Posted with the controller unlocked: the port's write hook locks it.
+        if let Some((port, reason)) = post {
+            let value = ParamValue::Int32(switch_detected);
+            let update = ParamSetValue::new(reason, self.axis_no as i32, value);
+            let _ = port.set_params_and_notify_blocking(self.axis_no as i32, vec![update]);
+        }
 
         self.encoder_base = new_base;
         self.position = new_position;
@@ -454,6 +490,8 @@ fn switch_from_is(is: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
     use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::port::DrvUserRequest;
@@ -529,6 +567,93 @@ mod tests {
         assert_eq!(*written.lock().unwrap(), ["1E", "1SSA0", "1MPA", "1MR0"]);
     }
 
+    /// A port that acknowledges every command and answers the poll's
+    /// queries (`R`, `PR`, `IS`) with an echo line then `replies`' line.
+    struct Polled {
+        base: PortDriverBase,
+        replies: HashMap<&'static str, &'static str>,
+        queued: std::collections::VecDeque<String>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Polled {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            self.queued.push_back("\r".into());
+            if let Some(reply) = self.replies.get(&cmd[1..]) {
+                self.queued.push_back(format!("{reply}\r"));
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let line = self.queued.pop_front().unwrap_or_else(|| "\r".into());
+            buf[..line.len()].copy_from_slice(line.as_bytes());
+            Ok(line.len())
+        }
+    }
+
+    /// OEMMotorDriver.cpp:385-412: the poll posts the switch it found on
+    /// OEM_SWITCH_DETEC, and OEM_SELECT_SWITCH picks which one is home.
+    #[test]
+    fn the_selected_switch_is_the_home_end() {
+        use epics_rs::asyn::port::PortFlags;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let name = "OEM_SWITCH_LINE";
+        let driver = Polled {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            replies: HashMap::from([("R", "*R"), ("PR", "*+0"), ("IS", "*ABCD001")]),
+            queued: Default::default(),
+        };
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        let handle = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_secs(1),
+        );
+        let ctrl = Arc::new(Mutex::new(OemController::new(handle, 1)));
+        let port = register_controller_port(
+            &open_owner(),
+            "oemSwitch",
+            1,
+            OemParams::new(ctrl.clone(), 100, 1000),
+        )
+        .unwrap();
+        ctrl.lock().unwrap().attach_port(port.clone());
+        let reason = |param| {
+            port.drv_user_create_blocking(&DrvUserRequest::new(param, 0))
+                .unwrap()
+                .reason
+        };
+        let (select, detected) = (reason("OEM_SELECT_SWITCH"), reason("OEM_SWITCH_DETEC"));
+        let axis = Arc::new(Mutex::new(OemAxis::new(ctrl, 0)));
+        let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
+        let user = TraceUser::Asyn {
+            port: "oemSwitch".into(),
+            addr: 0,
+        };
+        register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
+        let poll = || axis.lock().unwrap().poll(&AsynUser::new(0)).unwrap();
+
+        let status = poll();
+        assert_eq!(port.read_int32_blocking(detected, 0).unwrap(), 2);
+        assert!(status.high_limit && !status.low_limit && !status.home);
+
+        port.write_int32_blocking(select, 0, 1).unwrap();
+        let status = poll();
+        assert!(!status.high_limit && status.low_limit && status.home);
+    }
+
     #[test]
     fn ramp_time_is_delta_v_over_a() {
         assert_eq!(ramp_time(10.0, 2.0, 4.0), 2.0);
@@ -602,6 +727,40 @@ mod tests {
         for (line, want) in mine.iter().zip(&want) {
             assert!(line.ends_with(want.as_str()), "{line:?} vs {want:?}");
         }
+    }
+
+    /// OEMMotorDriver.cpp:188 `value=%f`: glibc's -nan, sign bit included.
+    #[test]
+    fn a_nan_write_traces_as_c_prints_it() {
+        let (handle, _) = SyncIOHandle::connect_port(
+            "OEM_NONE",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let ctrl = Arc::new(Mutex::new(OemController::new(handle, 2)));
+        let port = register_controller_port(
+            &open_owner(),
+            "oemNanTrace",
+            2,
+            OemParams::new(ctrl.clone(), 100, 1000),
+        )
+        .unwrap();
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(OemAxis::new(ctrl, 1)));
+        let user = TraceUser::Asyn {
+            port: "oemNanTrace".into(),
+            addr: 1,
+        };
+        register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
+        let lines = traced("oemNanTrace", || {
+            port.write_float64_blocking(index::VELOCITY, 1, -f64::NAN)
+                .unwrap();
+        });
+        let want = format!(
+            "OEMMotorDriver:writeFloat64: function={}, value=-nan",
+            index::VELOCITY
+        );
+        assert!(lines.iter().any(|l| l.ends_with(&want)), "{lines:?}");
     }
 
     #[test]

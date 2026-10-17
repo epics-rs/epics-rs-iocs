@@ -2,7 +2,7 @@
 //!
 //! Ported from `motorMicroMo/microMoApp/src/MVP2001Driver.cpp` (the model-3
 //! `asynMotorController`/`asynMotorAxis` form; the older `drvMVP2001.cc` model-1
-//! pair is not ported). Commands are ASCII `<axis> <CMD> <args>` where `<axis>`
+//! pair is [`crate::drv_mvp2001`]). Commands are ASCII `<axis> <CMD> <args>` where `<axis>`
 //! is 1-based; commands are CR-terminated (the driver owns output framing, the
 //! startup script sets the input EOS).
 //!
@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -170,8 +171,8 @@ impl ControllerParams for Mvp2001Params {
             "MVP 2001 motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll_s,
-            self.idle_poll_s
+            CFloat(self.moving_poll_s),
+            CFloat(self.idle_poll_s)
         );
         ctx.report(out, level);
     }

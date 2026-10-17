@@ -21,10 +21,11 @@
 //! [`PmacControllerParams`] is the `pmacController::writeInt32` that takes
 //! them, and the controller posts what its poll reads to the same port.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
@@ -34,8 +35,8 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, FinishedWrite, ParamDelta, ParamWrite, WriteHook, WriteOutcome, WriteValue,
-    index,
+    ControllerParams, ControllerReport, FinishedWrite, ParamDelta, ParamWrite, WriteHook,
+    WriteOutcome, WriteValue, index,
 };
 use epics_rs::motor::trace::MotorTrace;
 
@@ -144,7 +145,7 @@ pub fn octet_write_read(handle: &SyncIOHandle, command: &str) -> AsynResult<Stri
     )
 }
 
-fn checked_reply(command: &str, raw: Vec<u8>) -> AsynResult<String> {
+pub(crate) fn checked_reply(command: &str, raw: Vec<u8>) -> AsynResult<String> {
     if raw.first() == Some(&BELL) {
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_matches(|c: char| c.is_control() || c == '\0');
@@ -161,8 +162,9 @@ pub struct PmacController {
     /// missing port keeps its unconnected user, which refuses every transfer.
     handle: Option<SyncIOHandle>,
     /// Axes created with `pmacCreateAxis`/`pmacCreateAxes` (1-based; address 0
-    /// is reserved for controller parameters in C and is never an axis).
-    axes: BTreeSet<i32>,
+    /// is reserved for controller parameters in C and is never an axis), each
+    /// with its C `scale_`. Shared with [`PmacControllerParams`]'s report.
+    axes: Arc<Mutex<BTreeMap<i32, i32>>>,
     config: BTreeMap<i32, AxisConfig>,
 
     /// C `movesDeferred_`: the last `MOTOR_DEFER_MOVES` value, 0 for none.
@@ -196,7 +198,7 @@ impl PmacController {
     pub fn new(port: &str, low_port: &str, low_addr: i32, handle: Option<SyncIOHandle>) -> Self {
         Self {
             handle,
-            axes: BTreeSet::new(),
+            axes: Arc::default(),
             config: BTreeMap::new(),
             moves_deferred: 0,
             deferred: BTreeMap::new(),
@@ -290,9 +292,10 @@ impl PmacController {
                     .to_string(),
             );
         }
-        if !self.axes.insert(axis) {
+        if self.has_axis(axis) {
             return Err(format!("axis {axis} has already been created"));
         }
+        lock_axes(&self.axes).insert(axis, 1);
         self.config.insert(
             axis,
             AxisConfig {
@@ -304,11 +307,48 @@ impl PmacController {
     }
 
     pub fn has_axis(&self, axis: i32) -> bool {
-        self.axes.contains(&axis)
+        lock_axes(&self.axes).contains_key(&axis)
     }
 
-    pub fn axes(&self) -> impl Iterator<Item = i32> + '_ {
-        self.axes.iter().copied()
+    /// C `pmacAxis::scale_`: demands are divided by it on the wire and
+    /// readbacks multiplied by it. Axis 0 (C `pAxisZero`) keeps 1.
+    pub fn axis_scale(&self, axis: i32) -> i32 {
+        lock_axes(&self.axes).get(&axis).copied().unwrap_or(1)
+    }
+
+    /// C `pmacController::pmacSetAxisScale`. An unknown axis returns
+    /// without C's `unlock()`, as [`Self::disable_limits_check`].
+    pub fn set_axis_scale(&mut self, axis: i32, scale: i32) {
+        const FUNCTION: &str = "pmacController::pmacSetAxisScale";
+        self.own
+            .print_self(TraceMask::FLOW, format_args!("{FUNCTION}\n"));
+        if scale < 1 {
+            self.own.print_self(
+                TraceMask::ERROR,
+                format_args!("{FUNCTION}: Error: scale factor must be >=1.\n"),
+            );
+            return;
+        }
+        match lock_axes(&self.axes).get_mut(&axis) {
+            Some(slot) => {
+                *slot = scale;
+                self.own.print_self(
+                    TraceMask::FLOW,
+                    format_args!(
+                        "{FUNCTION}. Setting scale factor of {scale} on axis {axis}, on \
+                         controller {}.\n",
+                        self.own.port()
+                    ),
+                );
+            }
+            None => self.own.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "{FUNCTION}: Error: axis {axis} has not been configured using \
+                     pmacCreateAxis.\n"
+                ),
+            ),
+        }
     }
 
     pub fn axis_config(&self, axis: i32) -> AxisConfig {
@@ -346,7 +386,7 @@ impl PmacController {
     pub fn set_open_loop_encoder_axis(&mut self, axis: i32, encoder_axis: i32, encoder_ratio: f64) {
         let error = match self.config.get_mut(&axis) {
             None => format!("axis {axis}"),
-            Some(_) if !self.axes.contains(&encoder_axis) => {
+            Some(_) if !lock_axes(&self.axes).contains_key(&encoder_axis) => {
                 format!("encoder axis {encoder_axis}")
             }
             Some(cfg) => {
@@ -638,12 +678,29 @@ pub struct PmacParams {
 /// `writeInt32`, ahead of the base's.
 pub struct PmacControllerParams {
     controller: Arc<Mutex<PmacController>>,
+    /// The controller's axes, read by the report without the controller
+    /// lock, which a poll holds while it posts to this port.
+    axes: Arc<Mutex<BTreeMap<i32, i32>>>,
+    /// C `movingPollPeriod_`/`idlePollPeriod_`, in seconds.
+    moving_s: f64,
+    idle_s: f64,
 }
 
 impl PmacControllerParams {
-    pub fn new(controller: Arc<Mutex<PmacController>>) -> Self {
-        Self { controller }
+    /// `moving_ms`/`idle_ms` are `pmacCreateController`'s poll periods.
+    pub fn new(controller: Arc<Mutex<PmacController>>, moving_ms: u64, idle_ms: u64) -> Self {
+        let axes = lock(&controller).axes.clone();
+        Self {
+            controller,
+            axes,
+            moving_s: moving_ms as f64 / 1000.0,
+            idle_s: idle_ms as f64 / 1000.0,
+        }
     }
+}
+
+fn lock_axes(axes: &Mutex<BTreeMap<i32, i32>>) -> std::sync::MutexGuard<'_, BTreeMap<i32, i32>> {
+    axes.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// C `pmacController::PMAC_OK_` / `PMAC_ERROR_`.
@@ -733,6 +790,27 @@ impl ControllerParams for PmacControllerParams {
         Ok(())
     }
 
+    /// pmacController.cpp:355-375. Address 0 is C's `pAxisZero`, scale 1.
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "pmac motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            CFloat(self.moving_s),
+            CFloat(self.idle_s)
+        );
+        if level > 0 {
+            let axes = lock_axes(&self.axes);
+            for (axis, scale) in std::iter::once((0, 1)).chain(axes.iter().map(|(&a, &s)| (a, s))) {
+                if axis < ctx.num_axes() as i32 {
+                    let _ = write!(out, "  axis {axis}\n    scale = {scale}\n");
+                }
+            }
+        }
+        ctx.report(out, level);
+    }
+
     /// Address 0 is C's `pAxisZero`, the axis that carries these parameters.
     fn is_controller_axis(&self, addr: i32) -> bool {
         addr == 0
@@ -815,7 +893,7 @@ mod tests {
     #[test]
     fn every_write_prints_pmac_controllers_flow_line() {
         let ctrl = Arc::new(Mutex::new(PmacController::new("pmacTest", "", 0, None)));
-        let params = PmacControllerParams::new(ctrl);
+        let params = PmacControllerParams::new(ctrl, 100, 1000);
         let port = register_controller_port(&open_owner(), "pmacFlow", 2, params).unwrap();
         let lines = traced("pmacFlow", || {
             for reason in [index::VELOCITY, index::VEL_BASE, index::ACCEL] {
@@ -838,7 +916,7 @@ mod tests {
     #[test]
     fn every_write_sets_motor_status_comms_error_from_its_status() {
         let ctrl = Arc::new(Mutex::new(PmacController::new("pmacTest", "", 0, None)));
-        let params = PmacControllerParams::new(ctrl.clone());
+        let params = PmacControllerParams::new(ctrl.clone(), 100, 1000);
         let port = register_controller_port(&open_owner(), "pmacComms", 2, params).unwrap();
         let group = lock(&ctrl).params.unwrap().coord_sys_group;
         let comms = || {

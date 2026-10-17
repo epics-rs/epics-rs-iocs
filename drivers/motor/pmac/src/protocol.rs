@@ -254,9 +254,22 @@ pub fn may_disable_limits(flags: &HomeFlags, home_velocity: f64) -> bool {
 /// `drvPmacGetCoordStatus`, `sscanf(response, "%6x%6x%6x", &status[0],
 /// &status[1], &status[2])` on the `&n ??` reply.
 pub fn parse_cs_status(resp: &str) -> Option<(u32, u32, u32)> {
-    let (s0, s1, rest) = take_status_pair(resp)?;
-    let (s2, _) = take_hex(rest, 6)?;
-    Some((s0, s1, s2))
+    let mut status = [0; 3];
+    (scan_cs_status(resp, &mut status) == 3).then_some((status[0], status[1], status[2]))
+}
+
+/// C `sscanf(resp, "%6x%6x%6x", ...)`: overwrites the words it reads, in
+/// order, and returns how many.
+pub fn scan_cs_status(resp: &str, status: &mut [u32; 3]) -> usize {
+    let mut rest = resp;
+    for (n, word) in status.iter_mut().enumerate() {
+        let Some((value, tail)) = take_hex(rest, 6) else {
+            return n;
+        };
+        *word = value;
+        rest = tail;
+    }
+    status.len()
 }
 
 /// The coordinate-system position block: C `drvPmacGetAxesStatus` walks the
