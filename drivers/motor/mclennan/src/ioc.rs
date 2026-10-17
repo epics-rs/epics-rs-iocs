@@ -123,7 +123,9 @@ mod report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use motor_common::testing::{LineRig, call_command, drvsup_init, ioc_init_errlog, run_command};
+    use motor_common::testing::{
+        LineRig, call_command, driver_report, drvsup_init, ioc_init_errlog, run_command,
+    };
 
     /// C's PM304Config only stores the port (drvPM304.cc:497-509); motor_init
     /// drops a card that does not answer without a word, and its record
@@ -179,5 +181,24 @@ mod tests {
         };
         assert_eq!(sent(&live)[..3], ["1OA", "1ST", "1ID"]);
         assert_eq!(sent(&mute), ["1OA", "1OA", "1OA"]);
+    }
+
+    /// drvPM304.cc:653-700: only the `1OA` probe decides the card; a silent
+    /// `1ID` leaves an empty ident and a PM600 guess, and the card stays.
+    #[epics_rs::base::epics_test]
+    async fn r43_card_answering_1oa_survives_silent_1id() {
+        let int = ArgValue::Int;
+        run_command(pm304_setup_command(), vec![int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new("pm304NoId", |cmd| match cmd.trim_end() {
+            "1OA" => "0".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("pm304NoId".into()), int(1)];
+        run_command(pm304_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvPM304", 0),
+            "    PM304 controller 0, id:  \n"
+        );
     }
 }
