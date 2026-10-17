@@ -9,5 +9,5 @@ pub mod drv_pc6k;
 pub mod ioc;
 pub mod oem;
 
-pub use acr::{AcrAxis, AcrController};
+pub use acr::{AcrAxis, AcrController, AcrParams};
 pub use oem::{OemAxis, OemController};

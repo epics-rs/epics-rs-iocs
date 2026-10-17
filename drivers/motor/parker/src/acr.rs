@@ -26,21 +26,23 @@
 //! Jog motion commands are prefixed with `Ctrl-Y` (0x19), which clears the kill
 //! latch on all axes (e.g. after a limit hit), matching C.
 //!
-//! ## Not modeled (documented)
+//! ## Controller parameters
 //!
-//! The controller-wide binary I/O registers (`ACR_BINARY_IN`/`OUT`, the
-//! `ACR_READ_BINARY_IO` trigger) and the per-axis jerk (`ACR_JERK`) are auxiliary
-//! asyn parameters outside the motor record and are not exposed. `set_pid_gain`
-//! is a no-op (the jerk write is the only tuning the C driver offers, and it is
-//! not a PID gain).
+//! [`AcrParams`] adds C's binary I/O registers (`ACR_BINARY_IN`/`OUT`/`OUT_RBV`,
+//! the `ACR_READ_BINARY_IO` trigger) and the per-axis jerk (`ACR_JERK`).
+//! `set_pid_gain` is a no-op: the jerk write is the only tuning the C driver
+//! offers, and it is not a PID gain.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::controller_port::{ControllerParams, ParamWrite};
 
 use motor_common::util::{atof, atoi};
 
@@ -53,19 +55,31 @@ const CTL_Y: char = '\u{19}';
 /// Settle time after `ECHO 4` before draining its echo (C `epicsThreadSleep`).
 const ECHO_SETTLE: Duration = Duration::from_millis(500);
 
+/// The binary input and output registers (C `binaryInReg_`/`binaryOutReg_`).
+const BINARY_IN_REG: i32 = 4096;
+const BINARY_OUT_REG: i32 = 4097;
+
 /// Flags-register bit indicating the axis is moving (C `0x1000000`).
 const FLAG_MOVING: i32 = 0x0100_0000;
 
 /// Shared ACR controller endpoint owning the asyn octet handle.
 pub struct AcrController {
     handle: SyncIOHandle,
+    /// C `binaryIn_` / `binaryOutRBV_`; C leaves them unset until a read
+    /// succeeds.
+    binary_in: i32,
+    binary_out_rbv: i32,
 }
 
 impl AcrController {
     /// Wrap a connected octet handle and disable command echo (`ECHO 4`),
     /// draining the echo of that command so subsequent replies parse cleanly.
     pub fn new(handle: SyncIOHandle) -> Self {
-        let ctrl = Self { handle };
+        let ctrl = Self {
+            handle,
+            binary_in: 0,
+            binary_out_rbv: 0,
+        };
         let _ = ctrl.write_only("ECHO 4");
         std::thread::sleep(ECHO_SETTLE);
         // Drain the echoed "ECHO 4" line (best effort; the port may already be
@@ -91,6 +105,129 @@ impl AcrController {
     /// Read a controller register (`?P<reg>`).
     fn read_reg(&self, reg: i32) -> AsynResult<String> {
         self.query(&format!("?P{reg}"))
+    }
+
+    /// C `readBinaryIO` (ACRMotorDriver.cpp:254-271): each register read
+    /// that succeeds is stored, then address 0 is posted; the output
+    /// read's status is returned.
+    fn read_binary_io(&mut self, base: &mut PortDriverBase, ids: &AcrParamIds) -> AsynResult<()> {
+        if let Ok(reply) = self.read_reg(BINARY_IN_REG) {
+            self.binary_in = atoi(&reply);
+            let _ = base.set_uint32_param(ids.binary_in, 0, self.binary_in as u32, u32::MAX, 0);
+        }
+        let status = self.read_reg(BINARY_OUT_REG).map(|reply| {
+            self.binary_out_rbv = atoi(&reply);
+            let _ = base.set_uint32_param(
+                ids.binary_out_rbv,
+                0,
+                self.binary_out_rbv as u32,
+                u32::MAX,
+                0,
+            );
+        });
+        let _ = base.call_param_callbacks(0);
+        status
+    }
+}
+
+/// `ACRController`'s parameter indices.
+#[derive(Clone, Copy)]
+struct AcrParamIds {
+    jerk: usize,
+    read_binary_io: usize,
+    binary_in: usize,
+    binary_out: usize,
+    binary_out_rbv: usize,
+}
+
+/// `ACRController`'s own parameters, its binary I/O and jerk.
+pub struct AcrParams {
+    controller: Arc<Mutex<AcrController>>,
+    ids: Option<AcrParamIds>,
+}
+
+impl AcrParams {
+    pub fn new(controller: Arc<Mutex<AcrController>>) -> Self {
+        Self {
+            controller,
+            ids: None,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, AcrController> {
+        self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl ControllerParams for AcrParams {
+    /// The constructor's `createParam` calls, then its `readBinaryIO` and
+    /// output = readback (ACRMotorDriver.cpp:54-76).
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        let ids = AcrParamIds {
+            jerk: base.create_param("ACR_JERK", ParamType::Float64)?,
+            read_binary_io: base.create_param("ACR_READ_BINARY_IO", ParamType::Int32)?,
+            binary_in: base.create_param("ACR_BINARY_IN", ParamType::UInt32Digital)?,
+            binary_out: base.create_param("ACR_BINARY_OUT", ParamType::UInt32Digital)?,
+            binary_out_rbv: base.create_param("ACR_BINARY_OUT_RBV", ParamType::UInt32Digital)?,
+        };
+        self.ids = Some(ids);
+        let mut ctrl = self.lock();
+        let _ = ctrl.read_binary_io(base, &ids);
+        let _ = base.set_uint32_param(ids.binary_out, 0, ctrl.binary_out_rbv as u32, u32::MAX, 0);
+        Ok(())
+    }
+
+    /// C `writeInt32`: `ACR_READ_BINARY_IO` reads the registers in place
+    /// of the base, and returns the parameter store's status.
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> ParamWrite {
+        let Some(ids) = self.ids.filter(|ids| user.reason == ids.read_binary_io) else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        let _ = base.set_int32_param(user.reason, user.addr, value);
+        let _ = self.lock().read_binary_io(base, &ids);
+        let _ = base.call_param_callbacks(user.addr);
+        ParamWrite::Handled(Ok(()))
+    }
+
+    /// C `writeFloat64`: `ACR_JERK` sends `JOG JRK` in place of the base.
+    fn write_float64(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: f64,
+    ) -> ParamWrite {
+        if self.ids.is_none_or(|ids| user.reason != ids.jerk) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        let _ = base.set_float64_param(user.reason, user.addr, value);
+        let status = self
+            .lock()
+            .write_only(&format!("AXIS{} JOG JRK {value:.6}", user.addr));
+        let _ = base.call_param_callbacks(user.addr);
+        ParamWrite::Handled(status)
+    }
+
+    /// C `writeUInt32Digital`, for any parameter: `BIT` on the mask's lowest
+    /// set bit, then `readBinaryIO`; nothing is stored (:232-248).
+    fn write_uint32_digital(
+        &mut self,
+        base: &mut PortDriverBase,
+        _user: &AsynUser,
+        value: u32,
+        mask: u32,
+    ) -> ParamWrite {
+        let Some(ids) = self.ids else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        let mut ctrl = self.lock();
+        let status = ctrl.write_only(&format!("BIT {}={value}", 32 + mask.trailing_zeros()));
+        let _ = ctrl.read_binary_io(base, &ids);
+        ParamWrite::Handled(status)
     }
 }
 
@@ -386,6 +523,122 @@ mod tests {
             written.lock().unwrap()[..2],
             [b"ECHO 4".to_vec(), b"AXIS0 PPU".to_vec()]
         );
+    }
+
+    /// A port answering the binary I/O registers and PPU, recording what it
+    /// is sent; a `BIT` write sets the output register.
+    struct Registers {
+        base: PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+        output: u32,
+        reply: Option<String>,
+    }
+
+    impl PortDriver for Registers {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            self.reply = match cmd.as_str() {
+                "?P4096" => Some("5".into()),
+                "?P4097" => Some(self.output.to_string()),
+                "AXIS0 PPU" => Some("1".into()),
+                _ => None,
+            };
+            if let Some(value) = cmd.strip_prefix("BIT 35=") {
+                self.output = value.parse().unwrap();
+            }
+            self.written.lock().unwrap().push(cmd);
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = self.reply.take().ok_or_else(|| acr_err("no reply"))?;
+            buf[..reply.len()].copy_from_slice(reply.as_bytes());
+            Ok(reply.len())
+        }
+    }
+
+    /// ACRMotorDriver.cpp:72-74, 160-162, 202-206, 232-271: the constructor
+    /// reads the binary I/O and copies the output readback to the output,
+    /// a bit write sends `BIT` and reads them back, `ACR_READ_BINARY_IO`
+    /// reads them, and `ACR_JERK` sends `JOG JRK`.
+    #[test]
+    fn binary_io_and_jerk_reach_the_controller_as_c() {
+        use epics_rs::asyn::port::DrvUserRequest;
+        use epics_rs::asyn::request::RequestOp;
+        use epics_rs::motor::builder::MotorBuilder;
+        use epics_rs::motor::devices::{register_axis, register_controller_port};
+        use epics_rs::motor::trace::TraceUser;
+
+        let name = "ACR_REGS";
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let driver = Registers {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            written: written.clone(),
+            output: 6,
+            reply: None,
+        };
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        let handle = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let ctrl = Arc::new(Mutex::new(AcrController::new(handle)));
+        let port =
+            register_controller_port(&open_owner(), "acrRegs", 1, AcrParams::new(ctrl.clone()))
+                .unwrap();
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(AcrAxis::new(ctrl, 0)));
+        let sent = || std::mem::take(&mut *written.lock().unwrap());
+        assert_eq!(sent(), ["ECHO 4", "?P4096", "?P4097", "AXIS0 PPU"]);
+        let user = TraceUser::Asyn {
+            port: "acrRegs".into(),
+            addr: 0,
+        };
+        // The axis's startup poll.
+        register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
+        sent();
+        let reason = |param| {
+            port.drv_user_create_blocking(&DrvUserRequest::new(param, 0))
+                .unwrap()
+                .reason
+        };
+        let digital = |reason| {
+            port.submit_blocking(
+                RequestOp::UInt32DigitalRead { mask: u32::MAX },
+                AsynUser::new(reason).with_addr(0),
+            )
+            .unwrap()
+            .uint_val
+            .unwrap()
+        };
+        let (input, output, rbv) = (
+            reason("ACR_BINARY_IN"),
+            reason("ACR_BINARY_OUT"),
+            reason("ACR_BINARY_OUT_RBV"),
+        );
+        assert_eq!((digital(input), digital(output), digital(rbv)), (5, 6, 6));
+
+        port.submit_blocking(
+            RequestOp::UInt32DigitalWrite { value: 8, mask: 8 },
+            AsynUser::new(output).with_addr(0),
+        )
+        .unwrap();
+        assert_eq!(sent(), ["BIT 35=8", "?P4096", "?P4097"]);
+        assert_eq!((digital(output), digital(rbv)), (6, 8));
+
+        port.write_int32_blocking(reason("ACR_READ_BINARY_IO"), 0, 1)
+            .unwrap();
+        assert_eq!(sent(), ["?P4096", "?P4097"]);
+
+        let jerk = reason("ACR_JERK");
+        port.write_float64_blocking(jerk, 0, 2.5).unwrap();
+        assert_eq!(sent(), ["AXIS0 JOG JRK 2.500000"]);
+        assert_eq!(port.read_float64_blocking(jerk, 0).unwrap(), 2.5);
     }
 
     #[test]

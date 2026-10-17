@@ -19,9 +19,9 @@ use motor_common::iocsh::{
     req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{Controller, asyn_user, model1_device, register_controller_port, register_port};
+use motor_common::{Controller, asyn_user, model1_device, register_controller_port};
 
-use crate::acr::{AcrAxis, AcrController};
+use crate::acr::{AcrAxis, AcrController, AcrParams};
 use crate::drv_pc6k::{self, DrvPc6kAxis, PC6K_NUM_CARDS, Pc6kCard};
 use crate::oem::{OemAxis, OemController, OemParams};
 
@@ -106,8 +106,6 @@ pub fn acr_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, num_axes as i32)?;
-
             let (handle, _) = connect_controller(
                 &acr_port,
                 ACR_TIMEOUT,
@@ -115,6 +113,12 @@ pub fn acr_create_controller_command() -> CommandDef {
                 format_args!("ACRMotorDriver:ACRController: cannot connect to ACR controller"),
             );
             let controller = Arc::new(Mutex::new(AcrController::new(handle)));
+            register_controller_port(
+                ctx.db().scan_control().interrupt_gate(),
+                &port_name,
+                num_axes as i32,
+                AcrParams::new(controller.clone()),
+            )?;
 
             let poller = Controller::new();
             for index in 0..num_axes as usize {
