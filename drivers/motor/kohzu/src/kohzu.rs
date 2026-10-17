@@ -74,6 +74,16 @@ pub struct KohzuController {
     handle: SyncIOHandle,
     ident: String,
     num_axes: usize,
+    comm_state: CommState,
+}
+
+/// Controller communication state (C `cntrl->status`, shared by the axes):
+/// one bad `STR` reply is RETRY, a second in a row COMM_ERR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommState {
+    Normal,
+    Retry,
+    CommErr,
 }
 
 impl KohzuController {
@@ -85,6 +95,7 @@ impl KohzuController {
             handle,
             ident: String::new(),
             num_axes: 0,
+            comm_state: CommState::Normal,
         };
         let reply = ctrl.command("IDN")?;
         // "C\tIDN0\t<model>\t<version>"
@@ -140,6 +151,23 @@ impl KohzuController {
     }
 }
 
+/// C's `sscanf(buff, "C\tSTR%d\t1\t%d\t%d\t%d\t%d\t%d\t%d\t%d", ..) == 8`:
+/// the move, norg, orgg, cw, ccw, swng and err fields, each a whitespace
+/// directive apart as scanf reads `\t`.
+fn parse_str(reply: &str) -> Option<[i32; 7]> {
+    let rest = reply.strip_prefix('C')?.trim_start().strip_prefix("STR")?;
+    let mut words = rest.split_whitespace();
+    words.next()?.parse::<i32>().ok()?;
+    if words.next()? != "1" {
+        return None;
+    }
+    let mut fields = [0; 7];
+    for f in &mut fields {
+        *f = words.next()?.parse().ok()?;
+    }
+    Some(fields)
+}
+
 /// The three programmable move speeds (C `base_speed`/`slew_speed`/`accl_rate`).
 #[derive(Clone, Copy)]
 struct Speeds {
@@ -173,6 +201,11 @@ pub struct KohzuAxis {
     axis: u32,
     speeds: Speeds,
     prev_position: i32,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// bad `STR` (RETRY), `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next
+    /// (COMM_ERR). Per axis, as the controller's state moves under another
+    /// axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
 }
@@ -189,6 +222,7 @@ impl KohzuAxis {
                 accel: 100,
             },
             prev_position: 0,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -235,11 +269,8 @@ impl KohzuAxis {
 }
 
 impl AsynMotor for KohzuAxis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvSC800.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -336,36 +367,22 @@ impl AsynMotor for KohzuAxis {
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
-        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        // Status: "C\tSTR<a>\t1\t<move>\t<norg>\t<orgg>\t<cw>\t<ccw>\t<swng>\t<err>"
         let status_reply = ctrl.command(&format!("STR1/{}", self.axis));
+        // drvSC800.cc:229-249: a bad reply fails the poll raising nothing
+        // once (RETRY); a second in a row raises COMM_ERR. Nothing else is
+        // sent on that poll.
+        let Some(sf) = status_reply.ok().as_deref().and_then(parse_str) else {
+            (ctrl.comm_state, self.failure) = match ctrl.comm_state {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
+            };
+            return Err(kohzu_err(format!("SC800 axis {}: no STR reply", self.axis)));
+        };
+        ctrl.comm_state = CommState::Normal;
         let pos_reply = ctrl.command(&format!("RDP{}/0", self.axis));
         let torque_reply = ctrl.command(&format!("RSY{}/21", self.axis));
-
-        // Status: "C\tSTR<a>\t1\t<move>\t<norg>\t<orgg>\t<cw>\t<ccw>\t<swng>\t<err>"
-        let status_fields: Option<Vec<i32>> = status_reply.ok().and_then(|r| {
-            let f: Vec<&str> = r.split('\t').collect();
-            if f.len() >= 10 && f[0] == "C" {
-                Some(
-                    (3..=9)
-                        .map(|i| f[i].trim().parse::<i32>().unwrap_or(0))
-                        .collect(),
-                )
-            } else {
-                None
-            }
-        });
-
-        let Some(sf) = status_fields else {
-            drop(ctrl);
-            // C: first failure after NORMAL is a silent RETRY; a repeat is a
-            // hard comms error. Keep the last position, flag the error.
-            self.last_status = MotorStatus {
-                comms_error: true,
-                problem: true,
-                ..self.last_status.clone()
-            };
-            return Ok(self.last_status.clone());
-        };
         let str_move = sf[0];
         let plus_ls = sf[3] == 1; // cw limit
         let minus_ls = sf[4] == 1; // ccw limit
@@ -436,6 +453,8 @@ mod tests {
     const MOVING: u8 = 1;
     const CW: u8 = 2;
     const CCW: u8 = 4;
+    /// Every reply empty.
+    const QUIET: u8 = 8;
 
     /// An SC-200's axis 1 on a [`LineRig`] whose `STR` reply follows
     /// `state`.
@@ -444,6 +463,9 @@ mod tests {
         let st = state.clone();
         let (line, io) = LineRig::new(name, move |last| {
             let bit = |b: u8| u8::from(st.load(Ordering::SeqCst) & b != 0);
+            if bit(QUIET) == 1 {
+                return String::new();
+            }
             match last.trim_start_matches('\u{2}') {
                 "IDN" => "C\tIDN0\t200\t1.0".into(),
                 "STR1/1" => format!(
@@ -562,5 +584,37 @@ mod tests {
         // Non-positive acceleration keeps the previous accel parameter.
         let s = compute_speeds(100.0, 1000.0, 0.0, 42);
         assert_eq!(s.accel, 42);
+    }
+
+    /// drvSC800.cc:229-249: a first bad `STR` is RETRY (nothing raised,
+    /// nothing posted, nothing more sent), the next COMM_ERR, and a reply
+    /// clears it.
+    #[test]
+    fn a_missed_str_is_retry_then_comm_error() {
+        let (line, mut axis, state) = strings_rig("sc800Retry");
+        let user = AsynUser::default();
+        state.store(QUIET, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(sent(&line), ["STR1/1"]);
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        state.store(0, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        state.store(QUIET, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    #[test]
+    fn str_parses_as_c_sscanf() {
+        assert_eq!(
+            parse_str("C\tSTR1\t1\t1\t0\t0\t1\t0\t0\t2"),
+            Some([1, 0, 0, 1, 0, 0, 2])
+        );
+        assert_eq!(parse_str("C\tSTR1\t2\t1\t0\t0\t1\t0\t0\t2"), None);
+        assert_eq!(parse_str("C\tSTR1\t1\t1\t0\t0\t1\t0\t0"), None);
+        assert_eq!(parse_str("C\tSTR1\t1\tx\t0\t0\t1\t0\t0\t2"), None);
     }
 }
