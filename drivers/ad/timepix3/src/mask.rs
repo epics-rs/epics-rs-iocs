@@ -656,7 +656,7 @@ pub fn parse_pixel_config_response(
         return Err(PixelConfigError::EmptyBody);
     }
     let parsed: serde_json::Value =
-        serde_json::from_str(body).map_err(|_| PixelConfigError::MalformedJson)?;
+        crate::serval::parse_json(body).map_err(|_| PixelConfigError::MalformedJson)?;
     let serde_json::Value::String(encoded) = parsed else {
         return Err(PixelConfigError::InvalidRoot);
     };

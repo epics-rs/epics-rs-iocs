@@ -463,7 +463,9 @@ impl FrameDecoder {
         let (channel, limits) = (self.channel, &self.limits);
         loop {
             let resolved = self.buffer.next(|line| {
-                let header = nlohmann_parse(line).filter(Value::is_object);
+                let header = crate::serval::parse_json(line)
+                    .ok()
+                    .filter(Value::is_object);
                 let (payload, pending) = match channel {
                     Channel::Image => {
                         let header = header
@@ -488,13 +490,6 @@ impl FrameDecoder {
             }
         }
     }
-}
-
-/// `json::parse`: nlohmann skips a UTF-8 BOM at the very start, which
-/// serde_json refuses.
-fn nlohmann_parse(line: &[u8]) -> Option<Value> {
-    let line = line.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(line);
-    serde_json::from_slice(line).ok()
 }
 
 /// The line handlers' rescan of an accepted header (serval_stream.cpp:94-101,

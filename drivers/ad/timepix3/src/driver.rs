@@ -271,7 +271,7 @@ fn mpx3_layout_entry(layout: &str, chip: i32) -> Result<(i32, i32, String), Layo
     let entry: Value = if layout.is_empty() {
         return Err(LayoutEntryError::Json(NLOHMANN_EMPTY_INPUT.to_string()));
     } else {
-        serde_json::from_str(layout).map_err(|e| LayoutEntryError::Json(e.to_string()))?
+        crate::serval::parse_json(layout).map_err(|e| LayoutEntryError::Json(e.to_string()))?
     };
     let int = |key| match entry.get(key) {
         Some(Value::Number(n)) if !n.is_f64() => n
@@ -980,7 +980,7 @@ impl TimePix3Driver {
         let Ok(body) = self.http.get(serval::DETECTOR_CONFIG, DEFAULT_TIMEOUT) else {
             return Ok(());
         };
-        let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&body) else {
+        let Ok(cfg) = crate::serval::parse_json(&body) else {
             return Ok(());
         };
         if let Some(depth) = cfg.get("PixelDepth") {

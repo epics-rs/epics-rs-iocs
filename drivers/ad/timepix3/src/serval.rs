@@ -6,6 +6,13 @@
 
 use serde_json::{Value, json};
 
+/// nlohmann `json::parse`, which skips a UTF-8 BOM at the very start where
+/// serde_json refuses it.
+pub fn parse_json(text: impl AsRef<[u8]>) -> serde_json::Result<Value> {
+    let text = text.as_ref();
+    serde_json::from_slice(text.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(text))
+}
+
 // ---------------------------------------------------------------------------
 // Endpoints (C `serverURL + "/..."`)
 // ---------------------------------------------------------------------------
@@ -58,8 +65,7 @@ pub fn prepare_dac_update(
     if body.is_empty() {
         return Err(DacUpdateError::EmptyBody);
     }
-    let mut parsed: Value =
-        serde_json::from_str(body).map_err(|_| DacUpdateError::MalformedJson)?;
+    let mut parsed: Value = parse_json(body).map_err(|_| DacUpdateError::MalformedJson)?;
     let dacs = parsed.as_object_mut().ok_or(DacUpdateError::InvalidRoot)?;
     let current = dacs.get(dac).ok_or(DacUpdateError::MissingDac)?;
     let current = current
@@ -521,7 +527,7 @@ pub fn parse_detector_config_response(body: &str) -> Result<Value, DetectorConfi
     if body.is_empty() {
         return Err(E::EmptyBody);
     }
-    let config: Value = serde_json::from_str(body).map_err(|_| E::MalformedJson)?;
+    let config: Value = parse_json(body).map_err(|_| E::MalformedJson)?;
     if !config.is_object() {
         return Err(E::InvalidRoot);
     }
@@ -715,7 +721,7 @@ pub fn parse_status_response(body: &str) -> Result<StatusSnapshot, StatusRespons
     if body.is_empty() {
         return Err(E::EmptyBody);
     }
-    let m: Value = serde_json::from_str(body).map_err(|_| E::MalformedJson)?;
+    let m: Value = parse_json(body).map_err(|_| E::MalformedJson)?;
     let Value::Object(m) = m else {
         return Err(E::InvalidRoot);
     };
@@ -791,8 +797,7 @@ pub fn parse_config_response(body: &str) -> Result<Value, ConfigResponseError> {
     if body.is_empty() {
         return Err(ConfigResponseError::EmptyBody);
     }
-    let config: Value =
-        serde_json::from_str(body).map_err(|_| ConfigResponseError::MalformedJson)?;
+    let config: Value = parse_json(body).map_err(|_| ConfigResponseError::MalformedJson)?;
     if config.is_object() {
         Ok(config)
     } else {
@@ -861,7 +866,7 @@ pub fn parse_dashboard_response(code: i32, body: &str) -> Result<Dashboard, Dash
     if body.is_empty() {
         return Err(E::EmptyBody);
     }
-    let response: Value = serde_json::from_str(body).map_err(|_| E::MalformedJson)?;
+    let response: Value = parse_json(body).map_err(|_| E::MalformedJson)?;
     let root = response.as_object().ok_or(E::InvalidRoot)?;
     let server = root.get("Server").ok_or(E::MissingServer)?;
     let server = server.as_object().ok_or(E::InvalidServer)?;
@@ -946,7 +951,7 @@ pub fn parse_detector_response(body: &str) -> Result<Value, DetectorParseError> 
     if body.is_empty() {
         return Err(E::EmptyBody);
     }
-    let detector: Value = serde_json::from_str(body).map_err(|_| E::MalformedJson)?;
+    let detector: Value = parse_json(body).map_err(|_| E::MalformedJson)?;
     if !detector.is_object() {
         return Err(E::InvalidRoot);
     }
@@ -1316,7 +1321,7 @@ pub fn parse_destination_response(
     if body.is_empty() {
         return Err(E::EmptyBody);
     }
-    let parsed: Value = serde_json::from_str(body).map_err(|_| E::MalformedJson)?;
+    let parsed: Value = parse_json(body).map_err(|_| E::MalformedJson)?;
     if !parsed.is_object() {
         return Err(E::InvalidRoot);
     }
@@ -1351,6 +1356,25 @@ pub fn parse_destination_response(
 
 #[cfg(test)]
 mod tests {
+
+    /// nlohmann skips a leading UTF-8 BOM in every reply it parses.
+    #[test]
+    fn a_reply_with_a_leading_bom_parses_as_nlohmann() {
+        assert_eq!(parse_json("\u{FEFF}[1]").unwrap(), json!([1]));
+        assert!(parse_json("\u{FEFF}").is_err());
+        assert!(parse_json(" \u{FEFF}[1]").is_err());
+        assert!(
+            parse_detector_response(
+                "\u{FEFF}{\"Info\":{\"PixCount\":65536,\"RowLen\":1,\"NumberOfChips\":1,\
+                 \"NumberOfRows\":256,\"MpxType\":3},\"Config\":{}}"
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            crate::mask::parse_pixel_config_response(200, "\u{FEFF}\"AAAA\"", 3),
+            Ok(vec![0, 0, 0])
+        );
+    }
 
     #[test]
     fn a_dac_reply_is_validated_as_c() {
