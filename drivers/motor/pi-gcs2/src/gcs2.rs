@@ -447,6 +447,31 @@ impl PIGCS2Controller {
         }
     }
 
+    /// C `AcceptsNewTarget`: a GCS 1 hexapod takes none while its platform
+    /// moves.
+    fn accepts_new_target(&self) -> bool {
+        self.model != Model::Hexapod || !self.hexapod.any_moving
+    }
+
+    /// `PIHexapodController::moveCts`: `cmd`, 0.2 s, then `#5`; a platform
+    /// that has not started is an error when `ERR?` says so.
+    fn hexapod_move(&mut self, cmd: &str) -> AsynResult<()> {
+        self.send_only(cmd)?;
+        std::thread::sleep(Duration::from_millis(200));
+        self.get_global_state()?;
+        if !self.hexapod.moving {
+            let err = self.get_gcs_error()?;
+            if err != 0 {
+                self.print(format_args!(
+                    "PIHexapodController::moveCts() failed, GCS error {err}\n"
+                ));
+                return Err(pigcs2_err(format!("MOV failed, GCS error {err}")));
+            }
+        }
+        self.hexapod.any_moving = true;
+        Ok(())
+    }
+
     /// `PIHexapodController::getGlobalState`: a non-zero `#5` is every axis
     /// moving, and a zero one ends an `INI`.
     fn get_global_state(&mut self) -> AsynResult<()> {
@@ -714,6 +739,9 @@ impl PIGCS2Controller {
         for (&axis_no, mv) in &deferred {
             cmd.push_str(&format!(" {} {}", mv.axis, CFloat(mv.counts / mv.cpu)));
             self.released.insert(axis_no, mv.counts);
+        }
+        if self.model == Model::Hexapod {
+            return self.hexapod_move(&cmd);
         }
         self.send_only(&cmd)?;
         let err = self.get_gcs_error()?;
@@ -1297,6 +1325,22 @@ impl PIGCS2Axis {
         Ok(())
     }
 
+    /// `PIasynAxis::move`/`moveVelocity`'s refusal when the controller
+    /// takes no new target, printed on the axis user.
+    fn refuse_target(&self, function: &str, end: &str) -> AsynError {
+        PortManager::global().trace_manager().print(
+            Some(&self.port_name),
+            Some(self.axis_no as i32),
+            0,
+            TraceMask::ERROR,
+            format_args!(
+                "PIasynAxis:{function}: Set port {}, axis {} - controller does not accept new target (busy?){end}",
+                self.port_name, self.axis_no
+            ),
+        );
+        pigcs2_err("controller does not accept new target (busy?)")
+    }
+
     /// C `PIasynAxis::poll`'s reads after the status, skipped while a
     /// controller that cannot talk while homing homes.
     fn poll_reads(&mut self, old_homing: bool, servo_control: bool) {
@@ -1364,6 +1408,9 @@ impl AsynMotor for PIGCS2Axis {
         acceleration: f64,
     ) -> AsynResult<()> {
         self.log_here();
+        if !self.lock().accepts_new_target() {
+            return Err(self.refuse_target("moveAxis", "\n"));
+        }
         let mut ctrl = self.lock();
         if ctrl.moves_deferred {
             ctrl.deferred.insert(
@@ -1386,7 +1433,17 @@ impl AsynMotor for PIGCS2Axis {
         if acceleration != 0.0 {
             self.apply_acceleration(acceleration)?;
         }
-        self.lock().mov(&self.axis_name, position / self.cpu)?;
+        let mut ctrl = self.lock();
+        if ctrl.model == Model::Hexapod {
+            ctrl.hexapod_move(&format!(
+                "MOV {} {}",
+                self.axis_name,
+                CFloat(position / self.cpu)
+            ))?;
+        } else {
+            ctrl.mov(&self.axis_name, position / self.cpu)?;
+        }
+        drop(ctrl);
         self.last_direction = position > self.last_position;
         Ok(())
     }
@@ -1405,6 +1462,9 @@ impl AsynMotor for PIGCS2Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         self.log_here();
+        if !self.lock().accepts_new_target() {
+            return Err(self.refuse_target("moveVelocityAxis", ""));
+        }
         // C `moveVelocity`: VEL, then MOV toward whichever travel limit the
         // sign of velocity selects (TMN/TMX, already controller units). No
         // acceleration write, and — unlike move_absolute — `m_lastDirection`
@@ -2364,6 +2424,106 @@ mod tests {
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         assert_eq!(sent_lines(&line), ["\u{5}", "\u{4}", "POS? X"]);
         assert!(!axis.is_homing && status.done && status.homed);
+    }
+
+    /// `PIHexapodController::moveCts` (PIHexapodController.cpp:150-195)
+    /// waits 0.2 s after `MOV` and reads `#5`; a moving platform needs no
+    /// `ERR?`. Its `AcceptsNewTarget` then refuses the next move until `#5`
+    /// reads the platform stopped (PIasynAxis.cpp:218-224, 279-285).
+    #[test]
+    fn a_hexapod_move_reads_the_platform_and_refuses_the_next_while_it_moves() {
+        let moving = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let state = moving.clone();
+        let (line, ctrl) = hexapod("gcs2HexMove", move |last| match last {
+            "\u{5}" => if state.load(std::sync::atomic::Ordering::Relaxed) {
+                "1"
+            } else {
+                "0"
+            }
+            .into(),
+            last => hexapod_reply(last),
+        });
+        let mut axis = PIGCS2Axis::new(ctrl.clone(), "X".into(), 0, "gcs2HexMove");
+        line.sent();
+        let user = AsynUser::new(0);
+        let started = Instant::now();
+        axis.move_absolute(&user, 20000.0, 0.0, 10000.0, 5.0)
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(
+            sent_lines(&line),
+            ["VEL X 1.000000", "MOV X 2.000000", "\u{5}"]
+        );
+        assert!(axis.last_direction);
+        let mut refused = (Ok(()), Ok(()));
+        let printed = traced("gcs2HexMove", || {
+            refused = (
+                axis.move_absolute(&user, 0.0, 0.0, 0.0, 0.0),
+                axis.move_velocity(&user, 0.0, 1.0, 0.0),
+            );
+        });
+        assert!(refused.0.is_err() && refused.1.is_err());
+        assert!(sent_lines(&line).is_empty());
+        assert!(
+            printed.contains(
+                "PIasynAxis:moveAxis: Set port gcs2HexMove, axis 0 - controller does not accept new target (busy?)\n"
+            ),
+            "{printed}"
+        );
+        assert!(
+            printed.contains(
+                "PIasynAxis:moveVelocityAxis: Set port gcs2HexMove, axis 0 - controller does not accept new target (busy?)"
+            ),
+            "{printed}"
+        );
+        moving.store(false, std::sync::atomic::Ordering::Relaxed);
+        ctrl.lock().unwrap().poll();
+        line.sent();
+        axis.move_absolute(&user, 0.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(sent_lines(&line), ["MOV X 0.000000", "\u{5}", "ERR?"]);
+    }
+
+    /// A hexapod move `#5` does not see start is an error when `ERR?` says
+    /// so (PIHexapodController.cpp:180-189).
+    #[test]
+    fn a_hexapod_move_that_does_not_start_prints_its_gcs_error() {
+        let (line, ctrl) = hexapod("gcs2HexMoveErr", |last| match last {
+            "ERR?" => "7".into(),
+            last => hexapod_reply(last),
+        });
+        let mut axis = PIGCS2Axis::new(ctrl, "X".into(), 0, "gcs2HexMoveErr");
+        line.sent();
+        let mut moved = Ok(());
+        let printed = traced("gcs2HexMoveErr", || {
+            moved = axis.move_absolute(&AsynUser::new(0), 10000.0, 0.0, 0.0, 0.0);
+        });
+        assert!(moved.is_err());
+        assert_eq!(sent_lines(&line), ["MOV X 1.000000", "\u{5}", "ERR?"]);
+        assert!(
+            printed.contains("PIHexapodController::moveCts() failed, GCS error 7\n"),
+            "{printed}"
+        );
+    }
+
+    /// `processDeferredMoves` on a hexapod runs its `moveCts(array)`
+    /// (PIHexapodController.cpp:197-227): one `MOV`, the wait and `#5`.
+    #[test]
+    fn hexapod_deferred_moves_go_out_in_one_mov_then_read_the_platform() {
+        let (line, ctrl) = hexapod("gcs2HexDefer", |last| match last {
+            "\u{5}" => "1".into(),
+            last => hexapod_reply(last),
+        });
+        let mut x = PIGCS2Axis::new(ctrl.clone(), "X".into(), 0, "gcs2HexDefer");
+        let mut y = PIGCS2Axis::new(ctrl.clone(), "Y".into(), 1, "gcs2HexDefer");
+        line.sent();
+        let user = AsynUser::new(0);
+        x.set_deferred_moves(&user, true).unwrap();
+        y.move_absolute(&user, 20000.0, 0.0, 0.0, 0.0).unwrap();
+        x.move_absolute(&user, 10000.0, 0.0, 0.0, 0.0).unwrap();
+        assert!(sent_lines(&line).is_empty());
+        y.set_deferred_moves(&user, false).unwrap();
+        assert_eq!(sent_lines(&line), ["MOV X 1.000000 Y 2.000000", "\u{5}"]);
+        assert!(ctrl.lock().unwrap().hexapod.any_moving);
     }
 
     /// `PIInterface::sendAndReceive` (PIInterface.cpp:133-141) reads, with
