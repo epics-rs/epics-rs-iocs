@@ -119,6 +119,81 @@ impl ControllerParams for HydraParams {
     }
 }
 
+/// SMCTaurusController's port: its line, and the limit-switch type
+/// parameters (SMCTaurusDriver.cpp:29-31) its `writeInt32` and `readInt32`
+/// answer from the controller (:70-112).
+struct TaurusParams {
+    line: ControllerLine,
+    limit_type: Option<usize>,
+    limit1_type: Option<usize>,
+    limit2_type: Option<usize>,
+    /// Set once the command connects, after the port exists as in C.
+    controller: Arc<OnceLock<Arc<Mutex<TaurusController>>>>,
+}
+
+impl TaurusParams {
+    /// C's `getAxis(address)` controller call, then `callParamCallbacks()`
+    /// and the axis's.
+    fn on_axis<T>(
+        &self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        call: impl FnOnce(&TaurusController, usize) -> T,
+    ) -> Option<T> {
+        let addr = base.get_address(user.addr, user.reason).ok()?;
+        let ctrl = self.controller.get()?;
+        let out = call(
+            &ctrl.lock().unwrap_or_else(|e| e.into_inner()),
+            addr as usize + 1,
+        );
+        let _ = base.call_param_callbacks(0);
+        let _ = base.call_param_callbacks(addr);
+        Some(out)
+    }
+}
+
+impl ControllerParams for TaurusParams {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.limit_type = Some(base.create_param("SMCTAURUS_SET_LIMIT_TYPE", ParamType::Int32)?);
+        self.limit1_type = Some(base.create_param("SMCTAURUS_LIMIT1_TYPE", ParamType::Int32)?);
+        self.limit2_type = Some(base.create_param("SMCTAURUS_LIMIT2_TYPE", ParamType::Int32)?);
+        Ok(())
+    }
+
+    /// C stores nothing for `SMCTAURUS_SET_LIMIT_TYPE` and returns
+    /// `setLimitSwitches`'s asynSuccess.
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> ParamWrite {
+        if Some(user.reason) != self.limit_type {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        self.on_axis(base, user, |ctrl, addr| {
+            ctrl.set_limit_switches(addr, value)
+        });
+        ParamWrite::Handled(Ok(()))
+    }
+
+    fn read_int32(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<i32> {
+        let index = if Some(user.reason) == self.limit1_type {
+            0
+        } else if Some(user.reason) == self.limit2_type {
+            1
+        } else {
+            return base.read_int32_param(user);
+        };
+        self.on_axis(base, user, |ctrl, addr| ctrl.limit_switches(addr, index))
+            .unwrap_or_else(|| base.read_int32_param(user))
+    }
+
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        self.line.report(ctx, out, level);
+    }
+}
+
 /// An axis whose C `axisRes_` a `*ChangeResolution` command replaces.
 trait ChangeResolution: Send {
     fn change_resolution(&mut self, new_resolution: f64);
@@ -363,12 +438,15 @@ pub fn taurus_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port_with(
-                ctx,
-                &port_name,
-                num_axes as i32,
-                ControllerLine::new("SMC Taurus", moving_poll_ms, idle_poll_ms),
-            )?;
+            let shared = Arc::new(OnceLock::new());
+            let params = TaurusParams {
+                line: ControllerLine::new("SMC Taurus", moving_poll_ms, idle_poll_ms),
+                limit_type: None,
+                limit1_type: None,
+                limit2_type: None,
+                controller: shared.clone(),
+            };
+            register_port_with(ctx, &port_name, num_axes as i32, params)?;
 
             let (handle, _) = connect_controller(
                 &taurus_port,
@@ -379,6 +457,7 @@ pub fn taurus_create_controller_command() -> CommandDef {
                 ),
             );
             let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
+            let _ = shared.set(controller.clone());
 
             // C startPoller, SMCTaurusDriver.cpp:41
             let poller = Controller::new();
@@ -720,5 +799,62 @@ mod regulator_mode {
             sent.extend(line.sent());
         }
         assert!(sent.iter().any(|s| s == "2 2 setcloop"), "{sent:?}");
+    }
+}
+
+#[cfg(test)]
+mod taurus_limit_type {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use super::*;
+    use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::sync_io::SyncIOHandle;
+    use motor_common::testing::{LineRig, run_command};
+
+    /// SMCTaurusDriver.cpp:70-112: `SMCTAURUS_SET_LIMIT_TYPE` writes both
+    /// switches' `setsw`, and `SMCTAURUS_LIMIT{1,2}_TYPE` read `getsw`.
+    #[epics_rs::base::epics_test]
+    async fn limit_types_write_setsw_and_read_getsw() {
+        static GARBLED: AtomicBool = AtomicBool::new(false);
+        let (line, _io) = LineRig::new("taurusSwLine", |cmd| {
+            match cmd.trim_end().rsplit(' ').next().unwrap_or_default() {
+                "getsw" if GARBLED.load(Ordering::Relaxed) => "x",
+                "getsw" => "3 1",
+                _ => "0",
+            }
+            .into()
+        });
+        let args = vec![
+            ArgValue::String("taurusSw".into()),
+            ArgValue::String("taurusSwLine".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ];
+        run_command(taurus_create_controller_command(), args).await;
+        let port = PortManager::global().find_port_handle("taurusSw").unwrap();
+        let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
+        let reason = |name| io.drv_user_create(name).unwrap();
+        let (set, low, high) = (
+            reason("SMCTAURUS_SET_LIMIT_TYPE"),
+            reason("SMCTAURUS_LIMIT1_TYPE"),
+            reason("SMCTAURUS_LIMIT2_TYPE"),
+        );
+
+        line.sent();
+        io.write_int32(set, 2).unwrap();
+        // The poller's queries interleave.
+        let sent: Vec<String> = line
+            .sent()
+            .into_iter()
+            .filter(|s| s.contains("setsw"))
+            .collect();
+        assert_eq!(sent, ["2 0 1 setsw\r\n", "2 1 1 setsw\r\n"]);
+
+        assert_eq!(io.read_int32(low).unwrap(), 3);
+        assert_eq!(io.read_int32(high).unwrap(), 1);
+        GARBLED.store(true, Ordering::Relaxed);
+        assert!(io.read_int32(low).is_err());
     }
 }

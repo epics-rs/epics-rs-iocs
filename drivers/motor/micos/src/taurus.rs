@@ -29,14 +29,11 @@
 //!   into the travel-limit cache that `getnlimit` filled in controller units,
 //!   and send it as such through `setnlimit` and the jog `nm`. This port scales
 //!   the record limit by `axisRes`, so the cache stays in controller units.
-//! - The Taurus-specific limit-switch type parameters (`setsw`/`getsw` driven by
-//!   the `SMCTaurusLimit*Type` aux PVs, commented out in the C poll) are not
-//!   modeled.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -94,6 +91,35 @@ impl TaurusController {
             status = self.write_only(cmd);
         }
         status
+    }
+
+    /// C `SMCTaurusAxis::setLimitSwitches` for 1-based `addr`: both
+    /// switches take `value`; C ignores both writes' status.
+    pub fn set_limit_switches(&self, addr: usize, value: i32) {
+        for switch in 0..2 {
+            let _ = self.write_only(&format!("{value} {switch} {addr} setsw"));
+        }
+    }
+
+    /// C `SMCTaurusAxis::getLimitSwitches` for 1-based `addr`: switch
+    /// `index`'s type from `getsw`.
+    pub fn limit_switches(&self, addr: usize, index: usize) -> AsynResult<i32> {
+        // C parses inString_ whatever writeReadController returned
+        // (SMCTaurusAxis.cpp:186-187); a failed query is an unparsed reply.
+        let reply = self.query(&format!("{addr} getsw")).unwrap_or_default();
+        let types: Vec<i32> = reply
+            .split_whitespace()
+            .map_while(|tok| tok.parse::<i32>().ok())
+            .take(2)
+            .collect();
+        if types.len() != 2 {
+            println!("Could not parse getsw response.");
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("could not parse getsw response {reply:?}"),
+            });
+        }
+        Ok(types[index])
     }
 
     /// Write a query and read one reply line.
