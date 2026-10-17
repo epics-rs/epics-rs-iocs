@@ -887,10 +887,12 @@ per-record device support, bound by its `ipSupport.dbd` DTYP and driving its
 device over a pre-configured serial/IP octet port, as in C: `devAiMKS.c`
 (`HPS SensaVac 937`) on the upstream `MKS.db`, `devMPC.c` (`asyn MPC`) on
 `MPC.db` and `TSP.db`, `devTPG261.c` (`asyn TPG261`) on `TPG261.db`,
-`devXxStrParm.c` (`asyn <xx> stringParm`) and `devXxEurotherm.c`
-(`asyn ao Eurotherm` / `asyn so Eurotherm`) on `Eurotherm.db`,
-`devAiHeidND261.c` (`asyn ai HeidND261`) on `heidND261.db`, and
-`devTelevac.c` (`asyn Televac` ai/bi), for which ipApp ships no database.
+`devXxStrParm.c` (`asyn <xx> stringParm`), `devAiHeidND261.c`
+(`asyn ai HeidND261`) on `heidND261.db`, `devXxEurotherm.c`
+(`asyn ao Eurotherm` / `asyn so Eurotherm`) and `devTelevac.c`
+(`asyn Televac` ai/bi). No C st.cmd loads ipApp's `Eurotherm.db`, whose
+writers carry DTYP `<none>`, and ipApp ships no Televac database, so
+`st.cmd` loads neither.
 
 **Build/run:** `cargo run -p ip-ioc --release -- iocs/ip/ip-ioc/st.cmd`
 
@@ -901,7 +903,6 @@ device over a pre-configured serial/IP octet port, as in C: `devAiMKS.c`
 | Pfeiffer TPG261/TPG262 gauge controller | `TPG261.db` (upstream) | `ID`, `UNIT`, `PRES`, `STATUS`, `SP1S`, `SP2S`, `SP1V`, `SP2V`, `START`, `SUNIT`, `SET1`, `SET2` (12 records) |
 | MKS / HPS SensaVac 937 gauge | `MKS.db` (upstream) | `$(CC1)`, `$(CC2)`, `$(PR1)`, `$(PR2)` and their `_log` calcs (8 records) |
 | Heidenhain ND261 display unit | `heidND261.db` (upstream) | `HeidND261_read`, `HeidND261`, `HeidND261_ave` (3 records) |
-| Eurotherm 800/2000 temperature controller | `Eurotherm.db` (upstream) | `ET:Setpoint`, `ET:RampRate`, `ET:Temperature`, `ET:SetpointReadback`, `ET:RampRateRBV`, `ET:Read*`, `ET:Query*`, `ET:ack*`, `ET:trash*` (18 records) |
 
 ---
 
