@@ -108,8 +108,9 @@ impl PathPolicy {
     ) -> Result<PathBuf, PathError> {
         let root = self.root.as_ref().ok_or(PathError::RootNotConfigured)?;
         let mut components = Path::new(file_name).components();
-        // C `isBaseName`: `filename() == name`, which a trailing '/' fails.
-        if file_name.ends_with('/')
+        // C `isBaseName`: `filename() == name`, which a trailing separator
+        // ('\\' too on Windows) fails.
+        if file_name.ends_with(std::path::is_separator)
             || !matches!(
                 (components.next(), components.next()),
                 (Some(Component::Normal(_)), None)
@@ -226,7 +227,11 @@ mod tests {
         let sub = t.join("root/sub");
         let sub = sub.to_str().unwrap();
         assert!(p.resolve(sub, "a.bpc", PathAccess::Read).is_ok());
-        for bad in ["", ".", "..", "x/a.bpc", "/a.bpc", "a.bpc/", "./a.bpc"] {
+        let mut bad = vec!["", ".", "..", "x/a.bpc", "/a.bpc", "a.bpc/", "./a.bpc"];
+        if cfg!(windows) {
+            bad.extend([r"a.bpc\", r"x\a.bpc", r"C:a.bpc", r"\a.bpc"]);
+        }
+        for bad in bad {
             assert_eq!(
                 p.resolve(sub, bad, PathAccess::Read),
                 Err(PathError::InvalidFileName),
