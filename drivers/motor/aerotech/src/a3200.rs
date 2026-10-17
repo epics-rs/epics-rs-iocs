@@ -62,6 +62,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi, atol};
 
+use crate::axis_report::AxisMembers;
 use crate::exchange::Exchange;
 
 /// Reply read buffer size (C `BUFFER_SIZE`).
@@ -256,19 +257,24 @@ pub struct A3200Axis {
     current_cmd_pos: f64,
     /// Last commanded direction; the poller does not refresh it.
     last_direction: bool,
+    report: Arc<AxisMembers>,
 }
 
 impl A3200Axis {
     /// Construct the named axis and probe its feedback type, home/limit setup and
     /// reverse-direction parameters, then set `RAMP MODE RATE`.
     pub fn new(controller: Arc<Mutex<A3200Controller>>, axis_name: String) -> AsynResult<Self> {
-        let (has_encoder, step_size, home_direction, reverse_direc, swconfig) = {
+        let (has_encoder, step_size, home_preset, home_direction, reverse_direc, swconfig) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let has_encoder = ctrl
                 .get_param("PositionFeedbackType", &axis_name)
                 .map(|s| atoi(&s) > 0)
                 .unwrap_or(false);
             let step_size = step_size(ctrl.get_param("CountsPerUnit", &axis_name));
+            let home_preset = ctrl
+                .get_param("HomeOffset", &axis_name)
+                .map(|s| atof(&s))
+                .unwrap_or(0.0);
             let home_direction = ctrl
                 .get_param("HomeSetup", &axis_name)
                 .map(|s| atol(&s) as u32 & 0x1)
@@ -285,6 +291,7 @@ impl A3200Axis {
             (
                 has_encoder,
                 step_size,
+                home_preset,
                 home_direction,
                 reverse_direc,
                 swconfig,
@@ -293,6 +300,12 @@ impl A3200Axis {
 
         Ok(Self {
             controller,
+            report: Arc::new(AxisMembers::new(
+                axis_name.clone(),
+                step_size,
+                max_digits(step_size),
+                home_preset,
+            )),
             axis_name,
             has_encoder,
             home_direction,
@@ -305,6 +318,11 @@ impl A3200Axis {
             current_cmd_pos: 0.0,
             last_direction: false,
         })
+    }
+
+    /// What C's `motorAxisReport` prints of this axis.
+    pub fn report(&self) -> Arc<AxisMembers> {
+        self.report.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, A3200Controller> {
@@ -553,6 +571,7 @@ impl AsynMotor for A3200Axis {
 
         let mut it = payload.split_whitespace();
         let axis_status = it.next().map(atol).unwrap_or(0) as u32;
+        self.report.set_axis_status(axis_status);
         let drive_status = it.next().map(atol).unwrap_or(0) as u32;
         let axis_fault = it.next().map(atoi).unwrap_or(0);
         let enc_pos = it.next().map(atof).unwrap_or(0.0);

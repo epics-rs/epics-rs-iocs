@@ -37,7 +37,6 @@
 //!   which removes the `set_closed_loop`/`poll` coupling and matches the motor
 //!   record's limit semantics (a limit is not a fault that must be acknowledged).
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -45,9 +44,9 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::AxisReport;
 use motor_common::util::{atof, atoi, atol};
 
+use crate::axis_report::AxisMembers;
 use crate::exchange::Exchange;
 
 /// Reply read buffer size (C `BUFFER_SIZE`).
@@ -203,36 +202,6 @@ impl EnsembleController {
     }
 }
 
-/// The `motorAxis` members C's `motorAxisReportAxis` prints
-/// (drvEnsembleAsyn.cc:218-228); it reads them without the axis lock.
-pub struct EnsembleAxisReport {
-    axis: i32,
-    /// C `stepSize`, signed.
-    step_size: f64,
-    max_digits: usize,
-    /// C `homePreset`: the `HomeOffset` parameter, 0 when refused.
-    home_preset: f64,
-    /// C `axisStatus`: the poller's last `AXISSTATUS` reply.
-    axis_status: AtomicU32,
-}
-
-impl AxisReport for EnsembleAxisReport {
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
-        if level > 0 {
-            let _ = write!(
-                out,
-                "Axis {}\n   axisStatus:  0x{:x}\n   home preset: {:.6}\n   \
-                 step size:   {:.6}\n   max digits:  {}\n",
-                self.axis,
-                self.axis_status.load(Ordering::Relaxed),
-                self.home_preset,
-                self.step_size,
-                self.max_digits
-            );
-        }
-    }
-}
-
 /// One Ensemble axis sharing a controller. Implements [`AsynMotor`].
 pub struct EnsembleAxis {
     controller: Arc<Mutex<EnsembleController>>,
@@ -249,7 +218,7 @@ pub struct EnsembleAxis {
     step: f64,
     /// C `maxDigits`.
     digits: usize,
-    report: Arc<EnsembleAxisReport>,
+    report: Arc<AxisMembers>,
 }
 
 impl EnsembleAxis {
@@ -299,18 +268,17 @@ impl EnsembleAxis {
             swconfig,
             step: step_size.abs(),
             digits: max_digits(step_size),
-            report: Arc::new(EnsembleAxisReport {
-                axis,
+            report: Arc::new(AxisMembers::new(
+                axis.to_string(),
                 step_size,
-                max_digits: max_digits(step_size),
+                max_digits(step_size),
                 home_preset,
-                axis_status: AtomicU32::new(0),
-            }),
+            )),
         })
     }
 
     /// What C's `motorAxisReport` prints of this axis.
-    pub fn report(&self) -> Arc<EnsembleAxisReport> {
+    pub fn report(&self) -> Arc<AxisMembers> {
         self.report.clone()
     }
 
@@ -470,9 +438,7 @@ impl AsynMotor for EnsembleAxis {
         let (axis_status, plane_active, enc_pos, cmd_pos, fault, act_vel) = {
             let ctrl = self.lock();
             let axis_status = atol(&ctrl.query(&format!("AXISSTATUS(@{axis})"))?) as u32;
-            self.report
-                .axis_status
-                .store(axis_status, Ordering::Relaxed);
+            self.report.set_axis_status(axis_status);
             let plane_active = (atoi(&ctrl.query("PLANESTATUS(0)")?) & 0x01) != 0;
             let enc_pos = atof(&ctrl.query(&format!("PFBKPROG(@{axis})"))?);
             let cmd_pos = atof(&ctrl.query(&format!("PCMDPROG(@{axis})"))?);

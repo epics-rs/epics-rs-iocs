@@ -120,6 +120,7 @@ pub fn ensemble_setup_command() -> CommandDef {
 
 /// `A3200AsynSetup(num_controllers)`.
 pub fn a3200_setup_command() -> CommandDef {
+    MOTOR_A3200.register_report(|level| motor_axis_report(&A3200_CARDS, level));
     setup_command(
         "A3200AsynSetup",
         &A3200_CARDS,
@@ -265,6 +266,7 @@ pub fn a3200_config_command() -> CommandDef {
                 println!("A3200AsynConfig: numAxes must be in the range of 1 to {A3200_MAX_AXES}");
                 return Ok(CommandOutcome::Continue);
             }
+            begin_card(&A3200_CARDS, card, moving_poll_ms, idle_poll_ms);
 
             let Ok(handle) = connect_with_eos(
                 &port_name,
@@ -293,6 +295,7 @@ pub fn a3200_config_command() -> CommandDef {
             }
 
             let mut axes = Vec::new();
+            let mut reports: Vec<Arc<dyn AxisReport>> = Vec::new();
             for axis in 0..num_axes {
                 let axis_name = controller
                     .lock()
@@ -301,6 +304,7 @@ pub fn a3200_config_command() -> CommandDef {
                     .map_err(|e| format!("A3200AsynConfig: axis {axis}: name discovery: {e}"))?;
                 let ax = A3200Axis::new(controller.clone(), axis_name.clone())
                     .map_err(|e| format!("A3200AsynConfig: axis {axis} ({axis_name}): {e}"))?;
+                reports.push(ax.report());
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 axes.push(motor);
             }
@@ -309,6 +313,7 @@ pub fn a3200_config_command() -> CommandDef {
                 .unwrap_or_else(|e| e.into_inner())
                 .finalize()
                 .map_err(|e| format!("A3200AsynConfig: finalize failed: {e}"))?;
+            lock_cards(&A3200_CARDS)[card as usize].axes = reports;
             MOTOR_A3200.set_card(card, axes, moving_poll_ms, idle_poll_ms);
             Ok(CommandOutcome::Continue)
         },
@@ -443,5 +448,47 @@ mod report {
         .await;
         let text = reported("motorEnsemble", 1, "axisStatus:  0x5\n").await;
         assert!(text.contains("Axis 0\n   axisStatus:  0x5\n"), "{text}");
+    }
+
+    /// drvA3200Asyn.cc's motorAxisReport (:199-228).
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_a3200_controller_and_axis() {
+        let setup = a3200_setup_command();
+        assert_eq!(driver_report("motorA3200", 1), "");
+        run_command(setup, vec![ArgValue::Int(2)]).await;
+        let (_line, _io) = LineRig::new("a32RepLine", |cmd| {
+            match cmd.trim_end() {
+                "~GETVARIABLE $strtask0" => "%X",
+                "CountsPerUnit.X" => "%1000",
+                "HomeOffset.X" => "%2.5",
+                c if c.starts_with("~STATUS") => "%5 0 0 0 0 0",
+                _ => "%0",
+            }
+            .into()
+        });
+        let mut args = config(1, "a32RepLine", 1);
+        args.extend([ArgValue::Int(1), ArgValue::Int(0)]);
+        run_command(a3200_config_command(), args).await;
+        let axis = "Axis X\n   axisStatus:  0x0\n   home preset: 2.500000\n   \
+                    step size:   0.001000\n   max digits:  5\n";
+        assert_eq!(
+            driver_report("motorA3200", 1),
+            format!(
+                "    moving poll period: 0.000000\n    idle poll period: 0.000000\n    \
+                 moving poll period: 0.100000\n    idle poll period: 1.000000\n{axis}"
+            )
+        );
+        assert_eq!(driver_report("motorA3200", 0), "");
+
+        // The poller's ~STATUS AxisStatus lands in axisStatus.
+        let args = vec![
+            ArgValue::String("a32Rep".into()),
+            ArgValue::String("motorA3200".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(1),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&MOTOR_A3200]), args).await;
+        let text = reported("motorA3200", 1, "axisStatus:  0x5\n").await;
+        assert!(text.contains("Axis X\n   axisStatus:  0x5\n"), "{text}");
     }
 }
