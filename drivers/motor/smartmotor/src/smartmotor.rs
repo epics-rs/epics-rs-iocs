@@ -234,12 +234,16 @@ impl SmartMotorController {
 pub struct SmartMotorAxis {
     controller: Arc<Mutex<SmartMotorController>>,
     axis: usize,
+    /// C `motor_info->position`, updated only when `RP` moves.
     prev_position: i32,
     /// What the last failed poll raises: nothing on C `set_status`'s first
     /// missed `RBt` (RETRY, drvSmartMotor.cc:252), `CNTRL_COMM_ERR` and
     /// `RA_PROBLEM` on the next (COMM_ERR, :258). Per axis, as the
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
+    /// The record's `cdir` while C's motion node exists: from a move until a
+    /// status that is done, on the direction's limit, or a problem.
+    motion_dir: Option<bool>,
     last_status: MotorStatus,
 }
 
@@ -251,6 +255,7 @@ impl SmartMotorAxis {
             axis,
             prev_position: 0,
             failure: PollFailure::NONE,
+            motion_dir: None,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -286,6 +291,7 @@ impl AsynMotor for SmartMotorAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.motion_dir = Some(position >= f64::from(self.prev_position));
         let ctrl = self.lock();
         SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration);
         ctrl.send(self.axis, &format!("P={}", nint(position)));
@@ -301,6 +307,7 @@ impl AsynMotor for SmartMotorAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.motion_dir = Some(distance >= 0.0);
         let ctrl = self.lock();
         SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration);
         ctrl.send(self.axis, &format!("D={}", nint(distance)));
@@ -316,6 +323,7 @@ impl AsynMotor for SmartMotorAxis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         // C JOG: "MV\rV=<v>\rG" — velocity mode, set signed velocity, go.
+        self.motion_dir = Some(velocity >= 0.0);
         let ctrl = self.lock();
         ctrl.send(self.axis, &format!("MV\rV={}\rG", nint(velocity * VCONFAC)));
         Ok(())
@@ -384,6 +392,10 @@ impl AsynMotor for SmartMotorAxis {
                 CommState::Normal => (CommState::Retry, PollFailure::NONE),
                 _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
             };
+            // motordrvCom.cc:335-343: COMM_ERR's RA_PROBLEM ends the motion.
+            if ctrl.comm_state == CommState::CommErr {
+                self.motion_dir = None;
+            }
             return Err(smartmotor_err(format!(
                 "SmartMotor axis {}: no RBt reply",
                 self.axis
@@ -392,7 +404,7 @@ impl AsynMotor for SmartMotorAxis {
         ctrl.comm_state = CommState::Normal;
         let done = atoi(&rbt) == 0;
 
-        let position = nint(atof(&ctrl.reply(self.axis, "RP")));
+        let rp = atof(&ctrl.reply(self.axis, "RP"));
 
         let plus_ls = atoi(&ctrl.reply(self.axis, "RBp")) != 0;
         let minus_ls = atoi(&ctrl.reply(self.axis, "RBm")) != 0;
@@ -411,8 +423,22 @@ impl AsynMotor for SmartMotorAxis {
         let velocity_raw = atoi(&ctrl.reply(self.axis, "RV"));
         drop(ctrl);
 
-        let direction = position >= self.prev_position;
-        self.prev_position = position;
+        // drvSmartMotor.cc:271-291: an unchanged RP keeps the direction, a
+        // moving motor reports the record's.
+        let mut direction = self.last_status.direction;
+        if rp != f64::from(self.prev_position) {
+            let position = nint(rp);
+            direction = position >= self.prev_position;
+            self.prev_position = position;
+        }
+        if let Some(cdir) = self.motion_dir {
+            direction = cdir;
+        }
+        let position = self.prev_position;
+        let ls_active = if direction { plus_ls } else { minus_ls };
+        if done || ls_active {
+            self.motion_dir = None;
+        }
 
         let velocity = if direction {
             velocity_raw as f64
@@ -740,5 +766,51 @@ mod tests {
         let s = axis.poll(&user).unwrap();
         assert_eq!(s.position, 0.0);
         assert!(!s.high_limit && s.powered && !s.comms_error && !s.problem);
+    }
+
+    /// drvSmartMotor.cc:271-291: an unchanged position keeps the direction,
+    /// and from a move until it is done the commanded one is reported.
+    #[test]
+    fn direction_is_kept_at_rest_and_commanded_while_moving() {
+        let (mut axis, replies, _, _rt) = single("smartDir");
+        let user = AsynUser::new(0);
+        let set = |rbt, rp| {
+            let mut r = replies.lock().unwrap();
+            r.insert("RBt", rbt);
+            r.insert("RP", rp);
+        };
+        set("0", "-50");
+        assert!(!axis.poll(&user).unwrap().direction);
+        set("0", "-50");
+        assert!(!axis.poll(&user).unwrap().direction, "kept at rest");
+        axis.move_absolute(&user, 100.0, 0.0, 1.0, 1.0).unwrap();
+        set("1", "-60");
+        assert!(axis.poll(&user).unwrap().direction, "commanded");
+        set("0", "100");
+        assert!(axis.poll(&user).unwrap().direction);
+        set("0", "90");
+        assert!(!axis.poll(&user).unwrap().direction, "done clears it");
+    }
+
+    /// motordrvCom.cc:335-343: a COMM_ERR poll ends the motion too, so the
+    /// commanded direction is no longer reported.
+    #[test]
+    fn comm_error_ends_the_commanded_direction() {
+        use std::sync::atomic::Ordering;
+        let (mut axis, replies, quiet, _rt) = single("smartDirErr");
+        let user = AsynUser::new(0);
+        replies
+            .lock()
+            .unwrap()
+            .extend([("RBt", "1"), ("RP", "-50")]);
+        axis.poll(&user).unwrap();
+        axis.move_absolute(&user, 100.0, 0.0, 1.0, 1.0).unwrap();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        replies.lock().unwrap().insert("RP", "-60");
+        assert!(!axis.poll(&user).unwrap().direction);
     }
 }
