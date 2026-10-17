@@ -1217,7 +1217,8 @@ mod tests {
     }
 
     /// pmacAsynCoord.c:335-342: a failed transfer prints the C.S. line with
-    /// the axis that sent it; a BELL reply is a transfer that worked.
+    /// the axis that sent it. A BELL reply prints nothing but is refused,
+    /// where C returns MOTOR_AXIS_OK (:345): the C defect is not copied.
     #[test]
     fn a_failed_cs_transfer_prints_the_c_line() {
         let (rt, rig) = publish_scripted("pmacCsRw");

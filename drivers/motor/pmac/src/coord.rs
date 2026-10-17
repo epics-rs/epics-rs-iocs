@@ -154,7 +154,8 @@ impl PmacCoordSystem {
     }
 
     /// C `motorAxisWriteRead` for 1-based `axis`: a failed transfer prints
-    /// its line; a refused (BELL) reply is a successful transfer there.
+    /// its line. C returns MOTOR_AXIS_OK on a refused (BELL) reply
+    /// (pmacAsynCoord.c:345); that C defect is not copied (see the crate doc).
     fn write_read(&self, axis: usize, command: &str) -> AsynResult<String> {
         checked_reply(command, self.transfer(axis, command)?)
     }
