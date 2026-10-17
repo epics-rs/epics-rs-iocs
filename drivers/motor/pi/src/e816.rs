@@ -348,6 +348,11 @@ impl PIE816Axis {
 }
 
 impl AsynMotor for PIE816Axis {
+    // devPIE816.cc:130 forces NTM to NO.
+    fn disables_ntm(&self) -> bool {
+        true
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
