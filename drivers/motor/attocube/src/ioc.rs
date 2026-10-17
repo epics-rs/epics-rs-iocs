@@ -12,7 +12,7 @@ use epics_rs::base::server::iocsh::registry::*;
 use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
 use motor_common::model1::c_int;
-use motor_common::model2::{Model2, Model2Axis};
+use motor_common::model2::Model2;
 
 use crate::anc150::{Anc150Axis, Anc150Controller, INPUT_EOS, OUTPUT_EOS};
 
@@ -104,14 +104,10 @@ pub fn anc150_config_command() -> CommandDef {
                     let ax = Anc150Axis::new(controller.clone(), axis)
                         .map_err(|e| format!("ANC150AsynConfig: axis {axis}: {e}"))?;
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    Ok(Model2Axis {
-                        motor,
-                        moving_poll_ms,
-                        idle_poll_ms,
-                    })
+                    Ok(motor)
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            MOTOR_ANC150.set_card(card, axes);
+            MOTOR_ANC150.set_card(card, axes, moving_poll_ms, idle_poll_ms);
             Ok(CommandOutcome::Continue)
         },
     )

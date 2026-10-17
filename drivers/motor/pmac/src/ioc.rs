@@ -32,7 +32,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_req, opt_double, poll_intervals, req_string,
 };
 use motor_common::model1::c_int;
-use motor_common::model2::{Model2, Model2Axis};
+use motor_common::model2::Model2;
 use motor_common::{asyn_user, install, register_controller_port};
 
 use crate::axis::PmacAxis;
@@ -549,14 +549,10 @@ fn coord_create(
                     axis - 1
                 ),
             );
-            Ok(Model2Axis {
-                motor,
-                moving_poll_ms: COORD_MOVING_POLL_MS,
-                idle_poll_ms: COORD_IDLE_POLL_MS,
-            })
+            Ok(motor)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    PMAC_ASYN_COORD.set_card(reference, axes);
+    PMAC_ASYN_COORD.set_card(reference, axes, COORD_MOVING_POLL_MS, COORD_IDLE_POLL_MS);
     systems.push((reference, port.to_string(), addr, cs, system));
     Ok(())
 }

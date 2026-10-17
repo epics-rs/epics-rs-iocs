@@ -18,7 +18,7 @@ use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_string};
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
-use motor_common::model2::{Model2, Model2Axis};
+use motor_common::model2::Model2;
 
 use crate::a3200::{self, A3200_MAX_AXES, A3200Axis, A3200Controller};
 use crate::drv_soloist::{self, DrvSoloistAxis, SOLOIST_NUM_CARDS, SoloistCard};
@@ -163,11 +163,7 @@ pub fn ensemble_config_command() -> CommandDef {
                     let ax = EnsembleAxis::new(controller.clone(), axis)
                         .map_err(|e| format!("EnsembleAsynConfig: axis {axis}: {e}"))?;
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    axes.push(Model2Axis {
-                        motor,
-                        moving_poll_ms,
-                        idle_poll_ms,
-                    });
+                    axes.push(motor);
                 }
             }
             // C ignores the reply.
@@ -175,7 +171,7 @@ pub fn ensemble_config_command() -> CommandDef {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .wait_mode_nowait();
-            MOTOR_ENSEMBLE.set_card(card, axes);
+            MOTOR_ENSEMBLE.set_card(card, axes, moving_poll_ms, idle_poll_ms);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -255,18 +251,14 @@ pub fn a3200_config_command() -> CommandDef {
                 let ax = A3200Axis::new(controller.clone(), axis_name.clone())
                     .map_err(|e| format!("A3200AsynConfig: axis {axis} ({axis_name}): {e}"))?;
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                axes.push(Model2Axis {
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                });
+                axes.push(motor);
             }
             controller
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .finalize()
                 .map_err(|e| format!("A3200AsynConfig: finalize failed: {e}"))?;
-            MOTOR_A3200.set_card(card, axes);
+            MOTOR_A3200.set_card(card, axes, moving_poll_ms, idle_poll_ms);
             Ok(CommandOutcome::Continue)
         },
     )
