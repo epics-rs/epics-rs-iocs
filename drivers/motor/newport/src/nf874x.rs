@@ -17,7 +17,8 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, index,
+    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue,
+    has_motor_axis, index,
 };
 
 use motor_common::util::{atof, atoi};
@@ -506,6 +507,10 @@ impl ControllerParams for Nf874xControllerParams {
         user: &AsynUser,
         value: i32,
     ) -> ParamWrite {
+        // C dereferences the null axis there (874xMotorDriver.cpp:152-157); refused as the base does.
+        if !has_motor_axis(base, user) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
         let Some(p) = lock(&self.controller).params else {
             return ParamWrite::PassToBase(Ok(()));
         };
@@ -527,6 +532,10 @@ impl ControllerParams for Nf874xControllerParams {
         user: &AsynUser,
         value: f64,
     ) -> ParamWrite {
+        // C dereferences the null axis there (874xMotorDriver.cpp:193-197); refused as the base does.
+        if !has_motor_axis(base, user) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
         let Some(p) = lock(&self.controller).params else {
             return ParamWrite::PassToBase(Ok(()));
         };
@@ -687,6 +696,22 @@ mod tests {
         let velocity = index::VELOCITY;
         let want = format!("nf874xMotorDriver:writeFloat64: function={velocity}, value=-nan");
         assert!(lines.iter().any(|l| l.ends_with(&want)), "{lines:?}");
+    }
+
+    /// C dereferences the null axis of an address with no axis
+    /// (874xMotorDriver.cpp:152-157, 193-197); rs refuses there as the base
+    /// does, storing nothing.
+    #[test]
+    fn a_write_with_no_axis_is_refused_and_stores_nothing() {
+        let (port, ctrl) = port("nf874xNoAxis");
+        let p = lock(&ctrl).params.unwrap();
+        assert!(port.write_int32_blocking(p.deadband, 0, 4).is_err());
+        assert!(port.read_int32_blocking(p.deadband, 0).is_err());
+        assert!(
+            port.write_float64_blocking(p.update_interval, 0, 0.5)
+                .is_err()
+        );
+        assert!(port.read_float64_blocking(p.update_interval, 0).is_err());
     }
 
     #[test]

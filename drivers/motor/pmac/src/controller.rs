@@ -36,7 +36,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
     ControllerParams, ControllerReport, FinishedWrite, ParamDelta, ParamWrite, WriteHook,
-    WriteOutcome, WriteValue, index,
+    WriteOutcome, WriteValue, has_motor_axis, index,
 };
 use epics_rs::motor::trace::MotorTrace;
 
@@ -845,12 +845,36 @@ impl ControllerParams for PmacControllerParams {
         user: &AsynUser,
         value: i32,
     ) -> ParamWrite {
+        if self.refuses(base, user, "writeInt32") {
+            return ParamWrite::PassToBase(Ok(()));
+        }
         self.write_int32_own(base, user, value).into()
+    }
+
+    fn write_float64(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        _value: f64,
+    ) -> ParamWrite {
+        self.refuses(base, user, "writeFloat64");
+        ParamWrite::PassToBase(Ok(()))
     }
 }
 
 /// The driver's own write code, which then passes to the base.
 impl PmacControllerParams {
+    /// C's opening FLOW line and `getAxis` refusal at an address with no
+    /// axis (pmacController.cpp:396-400, :502-507); the [`PmacWriteHook`]
+    /// prints the line for a write that has one.
+    fn refuses(&self, base: &PortDriverBase, user: &AsynUser, method: &str) -> bool {
+        if has_motor_axis(base, user) || self.is_controller_axis(user.addr) {
+            return false;
+        }
+        base.trace_print(TraceMask::FLOW, format_args!("pmacController::{method}\n"));
+        true
+    }
+
     fn write_int32_own(
         &mut self,
         base: &mut PortDriverBase,
@@ -930,6 +954,30 @@ mod tests {
             ["writeFloat64", "writeFloat64", "writeFloat64", "writeInt32"],
             "{lines:?}"
         );
+    }
+
+    /// pmacController.cpp:396-400, 502-507: at an address with no axis C
+    /// prints the FLOW line and refuses before its own code.
+    #[test]
+    fn a_write_with_no_axis_prints_the_flow_line_and_changes_nothing() {
+        let ctrl = Arc::new(Mutex::new(PmacController::new("pmacTest", "", 0, None)));
+        let params = PmacControllerParams::new(ctrl.clone(), 100, 1000);
+        let port = register_controller_port(&open_owner(), "pmacNoAxis", 2, params).unwrap();
+        let limit = lock(&ctrl).params.unwrap().feed_rate_limit;
+        let before = lock(&ctrl).feed_rate_limit;
+        let lines = traced("pmacNoAxis", || {
+            assert!(port.write_int32_blocking(limit, 1, before + 7).is_err());
+            assert!(
+                port.write_float64_blocking(index::VELOCITY, 1, 2.5)
+                    .is_err()
+            );
+        });
+        assert_eq!(lock(&ctrl).feed_rate_limit, before);
+        let mine: Vec<_> = lines
+            .iter()
+            .filter_map(|l| l.split_once("pmacController::").map(|(_, m)| m))
+            .collect();
+        assert_eq!(mine, ["writeInt32", "writeFloat64"], "{lines:?}");
     }
 
     #[test]

@@ -1410,6 +1410,27 @@ pub(crate) mod tests {
         );
     }
 
+    /// SPiiPlusDriver.cpp:398-399, 471-472: at an address with no axis C
+    /// returns asynError before its own code, which indexes the axes.
+    #[test]
+    fn a_write_with_no_axis_is_refused_before_the_driver_s_code() {
+        use epics_rs::asyn::port::DrvUserRequest;
+        let rig = rig("acsNoAxis", 2, &[]);
+        let reason = |name| {
+            rig.port
+                .drv_user_create_blocking(&DrvUserRequest::new(name, 0))
+                .unwrap()
+                .reason
+        };
+        let method = reason("SPIIPLUS_HOMING_METHOD");
+        let max_dist = reason("SPIIPLUS_HOMING_MAX_DIST");
+        assert!(rig.port.write_int32_blocking(method, 2, 1).is_err());
+        assert!(rig.port.write_float64_blocking(max_dist, 2, 1.0).is_err());
+        // Nothing indexed past the axes: the port still answers.
+        rig.int(method, 1, 3);
+        assert_eq!(rig.port.read_int32_blocking(method, 1).unwrap(), 3);
+    }
+
     #[test]
     fn axes_print_as_acspl_takes_them() {
         assert_eq!(axes_to_string(&[2]), "2");

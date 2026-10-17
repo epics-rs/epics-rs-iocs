@@ -19,7 +19,7 @@ use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
-use epics_rs::motor::controller_port::ParamWrite;
+use epics_rs::motor::controller_port::{ParamWrite, has_motor_axis};
 
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -105,6 +105,10 @@ impl ControllerParams for HydraParams {
         user: &AsynUser,
         value: i32,
     ) -> ParamWrite {
+        // SMChydra has no writeInt32: the base refuses a missing axis.
+        if !has_motor_axis(base, user) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
         if Some(user.reason) == self.regulator_mode {
             let addr = base.get_address(user.addr, user.reason);
             if let Some(mode) = addr.ok().and_then(|a| self.modes.get(a as usize)) {

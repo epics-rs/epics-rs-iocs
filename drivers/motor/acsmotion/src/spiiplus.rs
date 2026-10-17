@@ -44,7 +44,8 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::calc::engine::cvt::{fmt_e, fmt_f, fmt_g};
 use epics_rs::motor::controller_port::{
-    ControllerCtx, ControllerParams, ControllerReport, PROFILE_EXECUTE_DONE, ParamWrite, index,
+    ControllerCtx, ControllerParams, ControllerReport, PROFILE_EXECUTE_DONE, ParamWrite,
+    has_motor_axis, index,
 };
 use epics_rs::motor::device_support::AxisReport;
 
@@ -948,6 +949,10 @@ impl ControllerParams for AcsMotionParams {
         user: &AsynUser,
         value: i32,
     ) -> ParamWrite {
+        // C returns asynError there (SPiiPlusDriver.cpp:398-399).
+        if !has_motor_axis(base, user) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
         self.write_int32_own(base, user, value).into()
     }
 
@@ -957,6 +962,10 @@ impl ControllerParams for AcsMotionParams {
         user: &AsynUser,
         value: f64,
     ) -> ParamWrite {
+        // C returns asynError there (SPiiPlusDriver.cpp:471-472).
+        if !has_motor_axis(base, user) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
         self.write_float64_own(base, user, value).into()
     }
 

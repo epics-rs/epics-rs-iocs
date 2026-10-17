@@ -33,7 +33,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, Pol
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::ParamWrite;
+use epics_rs::motor::controller_port::{ParamWrite, has_motor_axis};
 
 use motor_common::util::nint;
 use motor_common::{AxisReport, ControllerParams, ControllerReport};
@@ -272,6 +272,10 @@ impl ControllerParams for Anf2Params {
         user: &AsynUser,
         value: i32,
     ) -> ParamWrite {
+        // C dereferences the null axis there (ANF2Driver.cpp:215-219); refused as the base does.
+        if !has_motor_axis(base, user) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
         let addr = user.addr;
         let reset = Some(user.reason) == self.reset_errors;
         if !reset && Some(user.reason) != self.get_info {
