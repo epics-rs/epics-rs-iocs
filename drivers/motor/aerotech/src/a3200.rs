@@ -65,7 +65,9 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
+use motor_common::drv_motor_asyn::{DrvSet, function};
 use motor_common::model2::AxisLog;
+use motor_common::param_lib::Params;
 use motor_common::util::{atof, atoi, atol};
 
 use crate::axis_report::AxisMembers;
@@ -255,10 +257,10 @@ pub struct A3200Axis {
     last_fault: i32,
     /// Last commanded position (for absolute-move direction; refreshed by poll).
     current_cmd_pos: f64,
-    /// C's motorParam view of the axis: the poller's sets, kept when a poll
-    /// bails; `problem` latched by a faulted move and cleared by enable,
-    /// `direction` set by the commands, never by the poller.
-    status: MotorStatus,
+    /// `pAxis->params`: the poller's sets, kept when a poll bails;
+    /// `motorAxisProblem` latched by a faulted move and cleared by enable,
+    /// `motorAxisDirection` set by the commands, never by the poller.
+    params: Arc<Params>,
     /// The status a failed poll left, for the next post.
     failed: Option<MotorStatus>,
     /// The sets a command made, for its callback.
@@ -308,8 +310,16 @@ impl A3200Axis {
             )
         };
 
+        let params = Arc::new(Params::default());
+        // motorAxisInit's GAIN_SUPPORT (drvA3200Asyn.cc:245) and the
+        // config's encoder (:940).
+        let _ = params.set_integer(function::HAS_CLOSED_LOOP, 1);
+        if has_encoder {
+            let _ = params.set_integer(function::HAS_ENCODER, 1);
+        }
         Self {
             controller,
+            params,
             card,
             axis,
             report: Arc::new(AxisMembers::new(
@@ -326,11 +336,6 @@ impl A3200Axis {
             digits: max_digits(step_size),
             last_fault: 0,
             current_cmd_pos: 0.0,
-            status: MotorStatus {
-                has_encoder,
-                gain_support: true,
-                ..Default::default()
-            },
             failed: None,
             status_writes: Vec::new(),
             log: Arc::default(),
@@ -340,6 +345,18 @@ impl A3200Axis {
     /// What C's `motorAxisReport` prints of this axis.
     pub fn report(&self) -> Arc<AxisMembers> {
         self.report.clone()
+    }
+
+    /// The axis' parameters, which drvAsynMotorConfigure reads and calls
+    /// back through.
+    pub fn params(&self) -> Arc<Params> {
+        self.params.clone()
+    }
+
+    /// A command's set, which the poller also posts to the record.
+    fn post(&mut self, write: StatusWrite) {
+        self.params.apply(write);
+        self.status_writes.push(write);
     }
 
     /// The user C's `PRINT(pAxis->logParam, ...)` lines go through.
@@ -428,10 +445,9 @@ impl A3200Axis {
     /// and a velocity move set together before their callback, so the
     /// record's next status update sees the motion started.
     fn set_started(&mut self, direction: bool) {
-        self.status.direction = direction;
-        self.status.done = false;
-        self.status_writes
-            .extend([StatusWrite::Direction(direction), StatusWrite::Done(false)]);
+        self.post(StatusWrite::Direction(direction));
+        self.post(StatusWrite::Done(false));
+        self.params.call_callback();
     }
 
     fn do_move(
@@ -466,7 +482,7 @@ impl A3200Axis {
                 Ok(())
             }
             Some(taskerr) => {
-                self.status.problem = true;
+                let _ = self.params.set_integer(function::PROBLEM, 1);
                 if taskerr != 0 {
                     self.last_fault = taskerr;
                 }
@@ -478,7 +494,7 @@ impl A3200Axis {
 
 impl A3200Axis {
     /// One axis of C `A3200Poller` (drvA3200Asyn.cc:738-797), setting
-    /// [`Self::status`] in its order; an `Err` is its `continue` before
+    /// [`Self::params`] in its order; an `Err` is its `continue` before
     /// `callCallback`.
     fn poll_status(&mut self) -> AsynResult<()> {
         let name = &self.axis_name;
@@ -490,7 +506,7 @@ impl A3200Axis {
              ({name}, ProgramVelocityFeedback)"
         ));
         if sent.is_err() || !ctrl.ack() {
-            self.status.comms_error = true;
+            let _ = self.params.set_integer(function::COMM_ERROR, 1);
             return sent.and(Err(a3200_err(format!(
                 "a3200: ~STATUS refused: '{}'",
                 ctrl.input
@@ -510,30 +526,37 @@ impl A3200Axis {
         let cmd_pos = it.next().map(atof).unwrap_or(0.0);
         let act_vel = it.next().map(atof).unwrap_or(0.0);
 
-        let status = &mut self.status;
-        status.comms_error = false;
+        let params = self.params.clone();
+        let bit = |f, v: bool| {
+            let _ = params.set_integer(f, i32::from(v));
+        };
+        bit(function::COMM_ERROR, false);
         let move_active = (axis_status & AXISSTATUS_MOVE_DONE) == 0;
-        status.done = !move_active;
-        status.moving = move_active;
-        status.powered = (drive_status & DRIVESTATUS_ENABLED) != 0;
+        bit(function::DONE, !move_active);
+        bit(
+            function::POWER_ON,
+            (drive_status & DRIVESTATUS_ENABLED) != 0,
+        );
         // C maps AXISSTATUS_Homed to the home-switch signal, not "homed".
-        status.home = (axis_status & AXISSTATUS_HOMED) != 0;
+        bit(function::HOME_SIGNAL, (axis_status & AXISSTATUS_HOMED) != 0);
         // Limit switches are only set on a physical (non-virtual) axis.
         if (axis_status & AXISSTATUS_NOT_VIRTUAL) != 0 {
             let cw_active = !(((drive_status & DRIVESTATUS_CW_EOT) != 0)
                 ^ ((self.swconfig & CW_EOT_SW_STATE) != 0));
             let ccw_active = !(((drive_status & DRIVESTATUS_CCW_EOT) != 0)
                 ^ ((self.swconfig & CCW_EOT_SW_STATE) != 0));
-            (status.high_limit, status.low_limit) = if self.reverse_direc {
+            let (high, low) = if self.reverse_direc {
                 (ccw_active, cw_active)
             } else {
                 (cw_active, ccw_active)
             };
+            bit(function::HIGH_HARD_LIMIT, high);
+            bit(function::LOW_HARD_LIMIT, low);
         }
         self.report.set_axis_status(axis_status);
-        status.encoder_position = enc_pos / self.step;
-        status.position = cmd_pos / self.step;
-        self.current_cmd_pos = status.position;
+        let _ = params.set_double(function::ENCODER_POSN, enc_pos / self.step);
+        self.current_cmd_pos = cmd_pos / self.step;
+        let _ = params.set_double(function::POSITION, self.current_cmd_pos);
         self.log.print(
             TraceMask::IO_DRIVER,
             format_args!(
@@ -551,7 +574,8 @@ impl A3200Axis {
             );
             self.last_fault = axis_fault;
         }
-        status.velocity = act_vel / self.step;
+        let _ = params.set_double(function::ACTUAL_VEL, act_vel / self.step);
+        params.call_callback();
         Ok(())
     }
 }
@@ -655,6 +679,7 @@ impl AsynMotor for A3200Axis {
     /// `motorAxisforceCallback` (drvA3200Asyn.cc:688-700); the status update it asks for
     /// is the poll that follows it.
     fn force_callback(&mut self, _user: &AsynUser) {
+        self.params.force_callback();
         self.log.print(
             TraceMask::FLOW,
             format_args!(
@@ -727,8 +752,7 @@ impl AsynMotor for A3200Axis {
             task + 1
         ));
         if sent.is_err() || !ctrl.ack() {
-            self.status.comms_error = true;
-            self.status_writes.push(StatusWrite::CommsError(true));
+            self.post(StatusWrite::CommsError(true));
             return sent;
         }
         // If the motion task is idle, re-init its queue before enabling.
@@ -754,24 +778,22 @@ impl AsynMotor for A3200Axis {
                 // Enable is the owner that clears the latched fault/problem
                 // state, whatever the acknowledgement returned.
                 self.last_fault = 0;
-                self.status.problem = false;
-                self.status_writes.push(StatusWrite::Problem(false));
+                self.post(StatusWrite::Problem(false));
             }
             let _ = ctrl.send(&format!("ENABLE {name}"));
         }
         // PowerOn follows the request even when ENABLE fails, and C calls
         // back whatever WAIT MODE AUTO returns (:454-466).
-        self.status.powered = closed_loop;
-        self.status_writes.push(StatusWrite::PowerOn(closed_loop));
+        self.post(StatusWrite::PowerOn(closed_loop));
         ctrl.send("WAIT MODE AUTO")
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let polled = self.poll_status();
         if polled.is_err() {
-            self.failed = Some(self.status.clone());
+            self.failed = Some(self.params.motor_status());
         }
-        polled.map(|()| self.status.clone())
+        polled.map(|()| self.params.motor_status())
     }
 
     fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
@@ -780,6 +802,45 @@ impl AsynMotor for A3200Axis {
 
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
         std::mem::take(&mut self.status_writes)
+    }
+}
+
+/// C `motorAxisSetDouble`/`motorAxisSetInteger` (drvA3200Asyn.cc:327-472):
+/// a double it does not set prints a TERROR line and still succeeds, an
+/// integer other than the closed loop fails; a success goes into the
+/// parameters and is called back.
+impl DrvSet for A3200Axis {
+    fn set_double(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+        match function {
+            function::POSITION => self.set_position(user, value)?,
+            function::ENCODER_RATIO => self.set_encoder_ratio(user, value)?,
+            function::RESOLUTION => self.refuse("A3200 does not support setting motor resolution"),
+            function::LOW_LIMIT => self.set_low_limit(user, value)?,
+            function::HIGH_LIMIT => self.set_high_limit(user, value)?,
+            function::P_GAIN => self.set_pid_gain(user, PidGainKind::Proportional, value)?,
+            function::I_GAIN => self.set_pid_gain(user, PidGainKind::Integral, value)?,
+            function::D_GAIN => self.set_pid_gain(user, PidGainKind::Derivative, value)?,
+            _ => self.refuse(&format!("unknown function {function}")),
+        }
+        let _ = self.params.set_double(function, value);
+        self.params.call_callback();
+        Ok(())
+    }
+
+    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+        if function != function::CLOSED_LOOP {
+            self.log.print(
+                TraceMask::ERROR,
+                format_args!("motorAxisSetInteger: unknown function {function}\n"),
+            );
+            return Err(a3200_err(format!(
+                "motorAxisSetInteger: unknown function {function}"
+            )));
+        }
+        self.set_closed_loop(user, value != 0)?;
+        let _ = self.params.set_integer(function, value);
+        self.params.call_callback();
+        Ok(())
     }
 }
 
@@ -990,12 +1051,12 @@ mod tests {
         let (line, mut axis) = rig_axis("a32FaultLine", true, reply, fails);
         assert!(axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).is_err());
         assert_eq!(axis.last_fault, 17);
-        assert!(axis.status.problem);
+        assert_eq!(axis.params.get_integer(function::PROBLEM), Ok(Some(1)));
         line.sent();
         axis.set_closed_loop(&user, true).unwrap();
         assert!(line.sent().iter().any(|c| c == "FAULTACK X"));
         assert_eq!(axis.last_fault, 0);
-        assert!(!axis.status.problem);
+        assert_eq!(axis.params.get_integer(function::PROBLEM), Ok(Some(0)));
 
         // The TaskErrorCode query failing leaves the move's own `#` reply.
         let fails = |cmd: &str| cmd.starts_with("~STATUS(1");
@@ -1122,6 +1183,54 @@ mod tests {
         let mut ctrl = A3200Controller::new(io, "a32BareLine", "0", 1, true);
         assert_eq!(ctrl.get_param("HomeSetup", "X").as_deref(), Some(""));
         assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    /// drvA3200Asyn.cc:327-472: through the port, a double the A3200 does
+    /// not set succeeds into its parameters, an unknown integer fails, and a
+    /// move posts not-done.
+    #[epics_rs::base::epics_test]
+    async fn the_port_writes_go_through_the_c_set_switch() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::testing::{LineRig, run_command};
+
+        static DRIVER: Model2 = Model2::new("a32SetTest", 0);
+        let (_line, io) = LineRig::new("a32SetLine", |_| "%0".into());
+        let controller = A3200Controller::new(io, "a32SetLine", "0", 1, false);
+        let axis = A3200Axis::new(Arc::new(Mutex::new(controller)), 0, 0, "X".into());
+        let params = axis.params();
+        let axis = Arc::new(Mutex::new(axis));
+        DRIVER.set_card(0, vec![axis.clone()], 3_600_000, 3_600_000);
+        DRIVER.set_axis_setters(0, vec![axis.clone()]);
+        DRIVER.set_axis_getters(0, vec![params.clone()]);
+        let args = vec![
+            ArgValue::String("a32Set".into()),
+            ArgValue::String("a32SetTest".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(1),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&DRIVER]), args).await;
+        let port = PortManager::global().find_port_handle("a32Set").unwrap();
+        let reads = std::thread::spawn(move || {
+            let gain = port.write_float64_blocking(function::P_GAIN as usize, 0, 0.5);
+            let unknown = port.write_float64_blocking(function::SLIP as usize, 0, 2.0);
+            let int = port.write_int32_blocking(function::SLIP as usize, 0, 1);
+            let read = port.read_float64_blocking(function::P_GAIN as usize, 0);
+            (gain.is_ok(), unknown.is_ok(), int.is_err(), read.ok())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(reads, (true, true, true, Some(0.5)));
+        assert_eq!(params.get_double(function::SLIP), Ok(Some(2.0)));
+        assert_eq!(params.get_integer(function::HAS_CLOSED_LOOP), Ok(Some(1)));
+        let user = AsynUser::new(0);
+        axis.lock()
+            .unwrap()
+            .move_velocity(&user, 0.0, 1.0, 1.0)
+            .unwrap();
+        assert_eq!(params.get_integer(function::DONE), Ok(Some(0)));
+        assert_eq!(params.get_integer(function::DIRECTION), Ok(Some(1)));
     }
 
     #[test]

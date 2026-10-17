@@ -4,6 +4,10 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_rs::asyn::interfaces::motor::{MotorStatus, StatusWrite};
+
+use crate::drv_motor_asyn::function;
+
 /// `MOTOR_AXIS_NUM_PARAMS` (motor_interface.h:333), the store's size.
 pub const NUM_PARAMS: usize = 28;
 
@@ -122,6 +126,54 @@ impl Params {
     /// nothing changed.
     pub fn force_callback(&self) {
         self.lock().force = true;
+    }
+
+    /// The `motorAxis` parameter `write` names, set to its value: a
+    /// command's set that the poller also posts to the record.
+    pub fn apply(&self, write: StatusWrite) {
+        let bit = |f, v: bool| self.set_integer(f, i32::from(v));
+        let _ = match write {
+            StatusWrite::Position(v) => self.set_double(function::POSITION, v),
+            StatusWrite::EncoderPosition(v) => self.set_double(function::ENCODER_POSN, v),
+            StatusWrite::Done(v) => bit(function::DONE, v),
+            StatusWrite::PowerOn(v) => bit(function::POWER_ON, v),
+            StatusWrite::Problem(v) => bit(function::PROBLEM, v),
+            StatusWrite::Direction(v) => bit(function::DIRECTION, v),
+            StatusWrite::HighHardLimit(v) => bit(function::HIGH_HARD_LIMIT, v),
+            StatusWrite::HomeSignal(v) => bit(function::HOME_SIGNAL, v),
+            StatusWrite::Moving(v) => bit(function::MOVING, v),
+            StatusWrite::LowHardLimit(v) => bit(function::LOW_HARD_LIMIT, v),
+            StatusWrite::CommsError(v) => bit(function::COMM_ERROR, v),
+        };
+    }
+
+    /// The record's status as the store holds it, an undefined parameter
+    /// reading 0; the poller paces on not-done.
+    pub fn motor_status(&self) -> MotorStatus {
+        let bit = |f| self.get_integer(f).ok().flatten().unwrap_or(0) != 0;
+        let double = |f| self.get_double(f).ok().flatten().unwrap_or(0.0);
+        MotorStatus {
+            position: double(function::POSITION),
+            encoder_position: double(function::ENCODER_POSN),
+            velocity: double(function::ACTUAL_VEL),
+            done: bit(function::DONE),
+            moving: !bit(function::DONE),
+            msta_moving: bit(function::MOVING),
+            high_limit: bit(function::HIGH_HARD_LIMIT),
+            low_limit: bit(function::LOW_HARD_LIMIT),
+            home: bit(function::HOME_SIGNAL),
+            encoder_home: bit(function::HOME_ENCODER),
+            powered: bit(function::POWER_ON),
+            problem: bit(function::PROBLEM),
+            direction: bit(function::DIRECTION),
+            slip: bit(function::SLIP),
+            slip_stall: bit(function::FOLLOWING_ERROR),
+            comms_error: bit(function::COMM_ERROR),
+            homed: bit(function::HOMED),
+            gain_support: bit(function::HAS_CLOSED_LOOP),
+            has_encoder: bit(function::HAS_ENCODER),
+            ..MotorStatus::default()
+        }
     }
 
     /// C `paramDump`, which a driver's report prints (paramLib.c:299-319).
