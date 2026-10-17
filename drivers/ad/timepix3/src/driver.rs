@@ -2785,7 +2785,7 @@ impl TimePix3Driver {
             preview.diff = None;
         }
         self.shared.rates.lock().prv_img.restart();
-        self.sync_stream_endpoints()?;
+        self.sync_stream_endpoints();
         self.start_stream_workers()?;
 
         if self.cmd_tx.try_send(Command::AcquisitionStarted).is_err() {
@@ -2802,7 +2802,7 @@ impl TimePix3Driver {
     /// from the enabled channels' Base PVs as they stand at the start. Img
     /// needs ImgAccumulationEnable, PrvHst needs Format 4 and
     /// PrvHstAccumulationEnable too (acquire.cpp:461-475, :478-500).
-    fn sync_stream_endpoints(&mut self) -> Result<(), &'static str> {
+    fn sync_stream_endpoints(&mut self) {
         let p = self.p;
         let enabled = |this: &Self, write: usize, base: usize| {
             (this.int(write, 0) != 0).then(|| this.text(base, 0))
@@ -2816,12 +2816,6 @@ impl TimePix3Driver {
                 && self.int(p.prv_hst_format, 0) == 4
                 && self.int(p.prv_hst_accumulation_enable, 0) != 0
         });
-        if let Some(path) = &prv_hst {
-            let Some(target) = self.parse_tcp_path(path) else {
-                return Err("Histogram TCP path is invalid");
-            };
-            self.shared.endpoints.lock().prv_hst = Some(target);
-        }
         self.sync_tcp_stream_endpoints();
         self.shared.set_stream_paths(crate::state::StreamPaths {
             prv_img,
@@ -2829,7 +2823,6 @@ impl TimePix3Driver {
             img,
             prv_hst,
         });
-        Ok(())
     }
 
     /// C `syncTcpStreamEndpoints` (acquire.cpp:201-223): re-check each
@@ -2957,12 +2950,6 @@ impl TimePix3Driver {
                 Resource::ImageWorker,
                 "Image stream did not become ready",
             ),
-            (
-                paths.prv_hst,
-                &s.prv_hst_worker,
-                Resource::HistogramWorker,
-                "Histogram stream did not become ready",
-            ),
         ] {
             if !path.is_some_and(|p| p.starts_with("tcp://")) {
                 continue;
@@ -2973,6 +2960,22 @@ impl TimePix3Driver {
             {
                 return Err(failure);
             }
+        }
+        // acquire.cpp:477-516: the histogram path is parsed only after the
+        // image workers have connected.
+        let Some(path) = paths.prv_hst else {
+            return Ok(());
+        };
+        let Some(target) = self.parse_tcp_path(&path) else {
+            return Err("Histogram TCP path is invalid");
+        };
+        let s = &self.shared;
+        s.endpoints.lock().prv_hst = Some(target);
+        if !s.prv_hst_worker.start()
+            || !s.acquisition.note_resource(Resource::HistogramWorker)
+            || !s.prv_hst_worker.wait_for_connected_for(READY)
+        {
+            return Err("Histogram stream did not become ready");
         }
         Ok(())
     }
@@ -5322,6 +5325,84 @@ mod tests {
         ] {
             assert!(text.contains(&line), "{line}\n{text}");
         }
+    }
+
+    /// C syncs and connects the image channels before it parses the
+    /// histogram path (acquire.cpp:430-501), so the start's Parsed line
+    /// precedes the bad PrvHst path's ERR line.
+    #[test]
+    fn a_start_parses_prv_hst_after_the_image_workers() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "TPX_HST_ORDER";
+        let shared = Arc::new(Shared::new());
+        serve_workers(&shared, true);
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new(&fake_serval("/server/destination"))),
+            shared,
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        for (reason, v) in [
+            (p.write_prv_img, 1),
+            (p.write_prv_hst, 1),
+            (p.prv_hst_format, 4),
+            (p.prv_hst_accumulation_enable, 1),
+        ] {
+            det.ad.port_base.set_int32_param(reason, 0, v).unwrap();
+        }
+        det.set_text(p.prv_img_base, "tcp://localhost:8089")
+            .unwrap();
+        det.set_text(p.prv_hst_base, "tcp://h:0").unwrap();
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let (started, status) = h
+            .with_driver_blocking::<TimePix3Driver, _>(move |d| {
+                let acquire = d.ad.params.acquire;
+                let started = d.write_int32(&mut AsynUser::new(acquire), 1).is_ok();
+                (started, d.text(d.ad.params.status_message, 0))
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        std::mem::forget(runtime);
+        assert!(!started);
+        assert_eq!(status, "Histogram TCP path is invalid");
+        let parsed = adlog::log(
+            adlog::CHECK_PRV_IMG_PATH,
+            "Parsed PrvImg TCP path: host=localhost, port=8089",
+        );
+        let err = adlog::err(
+            adlog::PARSE_TCP_PATH,
+            "Invalid port number: 0 (must be 1-65535)",
+        );
+        // ensurePreviewTcpPortsFree parses and syncs, then the start syncs
+        // and only then parses PrvHst.
+        let order: Vec<_> = text
+            .lines()
+            .filter_map(|l| {
+                (l.ends_with(&parsed).then_some("parsed")).or(l.ends_with(&err).then_some("err"))
+            })
+            .collect();
+        assert_eq!(order, ["err", "parsed", "parsed", "err"], "{text}");
     }
 
     /// An enabled tcp:// channel whose port is bound locally moves to the
