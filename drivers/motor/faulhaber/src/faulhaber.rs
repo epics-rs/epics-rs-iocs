@@ -202,22 +202,20 @@ pub struct FaulhaberAxis {
 impl FaulhaberAxis {
     /// Construct axis `node` (0-based) and run the C `motor_init` per-axis setup:
     /// RS-232 velocity source (`SOR 0`) and the limit-switch and homing
-    /// configuration. Performs blocking serial I/O.
-    pub fn new(controller: Arc<Mutex<FaulhaberController>>, node: usize) -> AsynResult<Self> {
+    /// configuration. Performs blocking serial I/O; as C's bare `send_mess`
+    /// (drvMCDC2805.cc:600-623), a refused command keeps the axis.
+    pub fn new(controller: Arc<Mutex<FaulhaberController>>, node: usize) -> Self {
         {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            // Velocity control source = RS-232.
-            ctrl.write_cmd(node, "SOR 0")?;
-            // Limit-switch / homing configuration (C motor_init sequence).
-            ctrl.write_cmd(node, "REFIN")?;
-            ctrl.write_cmd(node, "HP7")?;
-            ctrl.write_cmd(node, "HB6")?;
-            ctrl.write_cmd(node, "HD2")?;
-            ctrl.write_cmd(node, "HL1")?;
-            ctrl.write_cmd(node, "HA1")?;
-            ctrl.write_cmd(node, "CAHOSEQ")?;
+            // Velocity control source = RS-232, then the limit-switch /
+            // homing configuration (C motor_init sequence).
+            for cmd in [
+                "SOR 0", "REFIN", "HP7", "HB6", "HD2", "HL1", "HA1", "CAHOSEQ",
+            ] {
+                let _ = ctrl.write_cmd(node, cmd);
+            }
         }
-        Ok(Self {
+        Self {
             controller,
             node,
             // Read only by a move, which set_record_fields leads.
@@ -234,7 +232,7 @@ impl FaulhaberAxis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
-        })
+        }
     }
 
     fn counts_per_rev(&self) -> f64 {
@@ -545,7 +543,7 @@ mod tests {
                     _ => String::new(),
                 });
             let controller = Arc::new(Mutex::new(FaulhaberController::new(io, 2).unwrap()));
-            let mut axis = FaulhaberAxis::new(controller, 1).unwrap();
+            let mut axis = FaulhaberAxis::new(controller, 1);
             let user = AsynUser::new(0);
             axis.set_record_fields(&user, &fields(0.0)).unwrap();
             line.sent();
@@ -706,7 +704,7 @@ mod tests {
             }
         });
         let controller = Arc::new(Mutex::new(FaulhaberController::new(io, 2).unwrap()));
-        let mut axis = FaulhaberAxis::new(controller, 1).unwrap();
+        let mut axis = FaulhaberAxis::new(controller, 1);
         let user = AsynUser::new(0);
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());

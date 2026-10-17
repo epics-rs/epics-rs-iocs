@@ -68,9 +68,7 @@ pub fn mcdc2805_config_command() -> CommandDef {
                 let line = format!("port={asyn_port}, id: {}", controller.ident());
                 let controller = Arc::new(Mutex::new(controller));
                 for node in 0..num_axes {
-                    let Ok(ax) = FaulhaberAxis::new(controller.clone(), node) else {
-                        return;
-                    };
+                    let ax = FaulhaberAxis::new(controller.clone(), node);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     init.axis(node as i32, motor);
                 }
@@ -114,6 +112,35 @@ mod report {
             driver_report("drvMCDC2805", 0),
             "    MCDC2805 controller 0 connection failed.\n    MCDC2805SM controller #1, \
              port=mcdcRepLine, id: MCDC 2805 \n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
+
+    /// drvMCDC2805.cc:584-626: after the VER probe every setup command is a
+    /// bare send_mess, so a refused `SOR 0` keeps the card and its axes.
+    #[epics_rs::base::epics_test]
+    async fn card_answering_ver_survives_refused_setup() {
+        let int = ArgValue::Int;
+        run_command(mcdc2805_setup_command(), vec![int(1), int(10)]).await;
+        let (_line, _io) = LineRig::failing(
+            "mcdcSetupRefused",
+            |cmd| match cmd.trim_end() {
+                c if c.ends_with("VER") => "V1".into(),
+                _ => String::new(),
+            },
+            |cmd| cmd.contains("SOR"),
+        );
+        let config = vec![int(0), int(2), ArgValue::String("mcdcSetupRefused".into())];
+        run_command(mcdc2805_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvMCDC2805", 0),
+            "    MCDC2805SM controller #0, port=mcdcSetupRefused, id: V1 \n"
         );
     }
 }
