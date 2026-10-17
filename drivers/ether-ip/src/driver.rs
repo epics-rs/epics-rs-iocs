@@ -16,11 +16,11 @@ use crate::cip::{self, CipType, ParsedTag};
 use crate::connection::{Connection, EipError};
 use crate::encap::{self, ETHERIP_PORT};
 use chrono::TimeZone;
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::task::CallbackPriority;
 use epics_rs::base::server::database::DeviceDone;
 use epics_rs::base::server::ioc_app::InitHookState;
-use epics_rs::base::server::records::printf::format_g;
 
 /// `EIP_TIMEOUT` -- default connect / response timeout.
 pub const DEFAULT_TIMEOUT_MS: u32 = 5000;
@@ -607,7 +607,7 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
                 crate::eip_printf!(
                     8,
                     "drvEtherIP scan task slow, {} sec delay\n",
-                    format_g(delay, 6)
+                    CFloat(delay).g()
                 );
                 plc.stats.lock().slow_scans += 1;
             }
@@ -635,7 +635,7 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
     crate::eip_printf!(5, "complete_PLC_ScanList_TagInfos PLC '{}':\n", plc.name);
     let lists: Vec<_> = plc.scanlists.lock().clone();
     for list in lists {
-        crate::eip_printf!(5, "- Scanlist {:.2}\n", list.period);
+        crate::eip_printf!(5, "- Scanlist {:.2}\n", CFloat(list.period));
         let tags: Vec<_> = list.tags.lock().clone();
         for info in tags {
             tried += 1;
@@ -1016,7 +1016,7 @@ fn dump_tag_info(info: &TagInfo, list: &ScanList, level: i32) {
     if level > 3 {
         println!(
             "  transfer time       : {} secs",
-            format_g(d.transfer_time, 6)
+            CFloat(d.transfer_time).g()
         );
     }
 }
@@ -1026,7 +1026,7 @@ fn dump_scan_list(list: &ScanList, level: i32) {
     let s = list.stats.lock().clone();
     println!(
         "Scanlist {} secs @ 0x{:X}:",
-        format_g(list.period, 6),
+        CFloat(list.period).g(),
         list as *const ScanList as usize
     );
     println!(
@@ -1051,9 +1051,9 @@ fn dump_scan_list(list: &ScanList, level: i32) {
         // count stays 0 (see `scan_pass`).
         println!("  Schedule Errs : 0");
         println!("  Next scan     : {}", epics_strftime(next));
-        println!("  Min. scan time: {} secs", format_g(s.min_scan_time, 6));
-        println!("  Max. scan time: {} secs", format_g(s.max_scan_time, 6));
-        println!("  Last scan time: {} secs", format_g(s.last_scan_time, 6));
+        println!("  Min. scan time: {} secs", CFloat(s.min_scan_time).g());
+        println!("  Max. scan time: {} secs", CFloat(s.max_scan_time).g());
+        println!("  Last scan time: {} secs", CFloat(s.last_scan_time).g());
     }
     if level > 5 {
         for info in list.tags.lock().iter() {
