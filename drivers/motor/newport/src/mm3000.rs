@@ -264,6 +264,9 @@ pub struct Mm3000Axis {
     /// Last polled status, reused on the comm-retry poll path where C leaves
     /// the record's other bits stale.
     last_status: MotorStatus,
+    /// What the last failed poll raises: nothing on C's first missed reply
+    /// (RETRY), `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next (COMM_ERR).
+    failure: PollFailure,
     strings: MoveStrings,
 }
 
@@ -288,6 +291,7 @@ impl Mm3000Axis {
             low_limit: None,
             // C clears the status, then sets EA_PRESENT and GAIN_SUPPORT
             // for an encoder.
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 gain_support: true,
                 has_encoder: true,
@@ -295,7 +299,8 @@ impl Mm3000Axis {
             },
             strings: MoveStrings::default(),
         };
-        ax.set_status();
+        // C motor_init ignores set_status's verdict.
+        let _ = ax.set_status();
         ax
     }
 
@@ -323,11 +328,8 @@ impl Mm3000Axis {
 }
 
 impl AsynMotor for Mm3000Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvMM3000.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -476,15 +478,16 @@ impl AsynMotor for Mm3000Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(self.set_status())
+        self.set_status()
     }
 }
 
 impl Mm3000Axis {
     /// Port of C `set_status`: `{axis}MS` (binary status byte) then
     /// `{axis}TP` (position), each guarded by the NORMAL/RETRY/COMM_ERR
-    /// machine on an empty or failed read.
-    fn set_status(&mut self) -> MotorStatus {
+    /// machine on an empty or failed read. RETRY goes to C's `exit` with
+    /// `rtn_state` 0, which posts nothing: the poll fails.
+    fn set_status(&mut self) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let a = self.axis;
@@ -507,11 +510,8 @@ impl Mm3000Axis {
         };
 
         let Some(ms) = exchange(&mut ctrl, &format!("{a}MS")) else {
-            if ctrl.comm_state == CommState::CommErr {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return self.last_status.clone();
+            self.failure = failure(ctrl.comm_state);
+            return Err(retry(a));
         };
         // C writes the MS bits into the status before asking TP, and its
         // exit stores them even when TP goes unanswered.
@@ -527,11 +527,8 @@ impl Mm3000Axis {
         s.powered = mstat.powered;
 
         let Some(tp) = exchange(&mut ctrl, &format!("{a}TP")) else {
-            if ctrl.comm_state == CommState::CommErr {
-                s.comms_error = true;
-                s.problem = true;
-            }
-            return s.clone();
+            self.failure = failure(ctrl.comm_state);
+            return Err(retry(a));
         };
         // drvMM3000.cc:371-378; C ignores the write's status too.
         let ls_active = (mstat.plus_tl && mstat.direction) || (mstat.minus_tl && !mstat.direction);
@@ -548,7 +545,24 @@ impl Mm3000Axis {
         s.encoder_position = if self.encoder_present { position } else { 0.0 };
         s.velocity = 0.0; // C: "Parse motor velocity? NEEDS WORK"
         s.problem = false;
-        s.clone()
+        Ok(s.clone())
+    }
+}
+
+/// C `set_status`'s RETRY: the first missed reply.
+/// What a failed exchange raises in `comm_state`: nothing on RETRY, both
+/// bits on COMM_ERR.
+fn failure(comm_state: CommState) -> PollFailure {
+    match comm_state {
+        CommState::CommErr => PollFailure::PROBLEM_AND_COMMS_ERROR,
+        _ => PollFailure::NONE,
+    }
+}
+
+fn retry(axis: impl std::fmt::Display) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: format!("MM3000 axis {axis}: no status reply"),
     }
 }
 
@@ -893,5 +907,36 @@ mod tests {
                 home_ls: true,
             }
         );
+    }
+
+    /// drvMM3000.cc:254-269: a first missed `MS` is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a reply clears it.
+    #[test]
+    fn a_missed_status_is_retry_then_comm_error() {
+        use std::sync::atomic::AtomicBool;
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("mm3000Retry", move |last| match last {
+            "VE" => "MM3000".into(),
+            "RC" => "1=dc".into(),
+            _ if q.load(Ordering::SeqCst) => String::new(),
+            "1MS" => "\u{4}".into(),
+            "1TP" => "0 ".into(),
+            _ => String::new(),
+        });
+        let ctrl = Mm3000Controller::new(io).unwrap();
+        let mut axis = Mm3000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

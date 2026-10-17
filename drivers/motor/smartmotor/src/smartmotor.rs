@@ -25,7 +25,8 @@
 //! The SmartMotor works natively in encoder counts (`RP` returns counts, `P=`
 //! takes counts) with no resolution scaling, so the asyn-rs motor boundary is
 //! counts: positions pass through with `NINT` rounding, the record's `MRES` is
-//! 1, and its `EGU` is counts.
+//! 1, and its `EGU` is counts. Velocity and acceleration go out times C's
+//! `VCONFAC` / `ACONFAC`, per PID sample.
 //!
 //! ## Deviations from C (documented)
 //!
@@ -35,6 +36,7 @@
 //!   (`build_trans` sends nothing and returns `ERROR`); [`home`](AsynMotor::home)
 //!   returns an error and [`set_pid_gain`](AsynMotor::set_pid_gain) is a no-op.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -44,6 +46,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 
 use motor_common::util::{atof, atoi, nint};
 
@@ -68,13 +71,33 @@ const MAX_AXIS: usize = 32;
 /// Address byte of axis 0 in daisy-chain mode (C `SmartMotor_addr[0]`).
 const FIRST_ADDR: u8 = 129;
 
+/// Counts/s to the `V=` scaled counts per PID sample (C `VCONFAC`).
+const VCONFAC: f64 = 16.1063;
+
+/// Counts/s² to the `A=` scaled counts per PID sample² (C `ACONFAC`).
+const ACONFAC: f64 = 3.958322E-3;
+
 /// Minimum acceleration the controller accepts (C forces `A >= 2`).
 const MIN_ACCEL: i32 = 2;
 
-/// Round an acceleration to the controller value, clamped to the minimum the
-/// SmartMotor accepts (C overrides `A <= 1` to `2`).
+/// Scale and round an acceleration to the controller value, clamped to the minimum the
+/// SmartMotor accepts (C overrides `A <= 1` to `2`, saying so once per process).
 fn clamped_accel(acceleration: f64) -> i32 {
-    nint(acceleration).max(MIN_ACCEL)
+    static INVALID_ACCMSG_LATCH: AtomicBool = AtomicBool::new(false);
+    let cacc = nint(acceleration * ACONFAC);
+    if cacc > 1 {
+        return cacc;
+    }
+    if !INVALID_ACCMSG_LATCH.swap(true, Ordering::Relaxed) {
+        // errPrintf(-1, ...): no errSym name, then a space for the nonzero
+        // status. The file and line are ours.
+        errlog_vprintf(format_args!(
+            " filename=\"{}\" line number={} Overriding invalid acceleration; A < 2.\n",
+            file!(),
+            line!()
+        ));
+    }
+    MIN_ACCEL
 }
 
 fn smartmotor_err(message: impl Into<String>) -> AsynError {
@@ -199,18 +222,28 @@ impl SmartMotorController {
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
+
+    /// [`query`](Self::query) whose failed read is an empty reply, as C
+    /// `recv_mess` leaves the buffer for the `atoi`/`atof` after it.
+    fn reply(&self, axis: usize, cmd: &str) -> String {
+        self.query(axis, cmd).unwrap_or_default()
+    }
 }
 
 /// One SmartMotor on the controller's port. Implements [`AsynMotor`].
 pub struct SmartMotorAxis {
     controller: Arc<Mutex<SmartMotorController>>,
     axis: usize,
+    /// C `motor_info->position`, updated only when `RP` moves.
     prev_position: i32,
     /// What the last failed poll raises: nothing on C `set_status`'s first
     /// missed `RBt` (RETRY, drvSmartMotor.cc:252), `CNTRL_COMM_ERR` and
     /// `RA_PROBLEM` on the next (COMM_ERR, :258). Per axis, as the
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
+    /// The record's `cdir` while C's motion node exists: from a move until a
+    /// status that is done, on the direction's limit, or a problem.
+    motion_dir: Option<bool>,
     last_status: MotorStatus,
 }
 
@@ -222,6 +255,7 @@ impl SmartMotorAxis {
             axis,
             prev_position: 0,
             failure: PollFailure::NONE,
+            motion_dir: None,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -236,12 +270,10 @@ impl SmartMotorAxis {
     }
 
     /// Program speed/acceleration before a move (C sends `V=`/`A=` as separate
-    /// transactions ahead of the move command). Non-positive values are skipped;
-    /// acceleration is clamped to the controller minimum.
+    /// transactions ahead of the move command). The record skips SET_ACCEL
+    /// for a zero acceleration (motorRecord.cc:940); one sent is clamped.
     fn program_speeds(ctrl: &SmartMotorController, axis: usize, velocity: f64, acceleration: f64) {
-        if velocity > 0.0 {
-            ctrl.send(axis, &format!("V={}", nint(velocity)));
-        }
+        ctrl.send(axis, &format!("V={}", nint(velocity * VCONFAC)));
         if acceleration > 0.0 {
             ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)));
         }
@@ -261,6 +293,7 @@ impl AsynMotor for SmartMotorAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.motion_dir = Some(position >= f64::from(self.prev_position));
         let ctrl = self.lock();
         SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration);
         ctrl.send(self.axis, &format!("P={}", nint(position)));
@@ -276,6 +309,7 @@ impl AsynMotor for SmartMotorAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.motion_dir = Some(distance >= 0.0);
         let ctrl = self.lock();
         SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration);
         ctrl.send(self.axis, &format!("D={}", nint(distance)));
@@ -288,11 +322,14 @@ impl AsynMotor for SmartMotorAxis {
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
-        // C JOG: "MV\rV=<v>\rG" — velocity mode, set signed velocity, go.
+        // The record's unguarded SET_ACCEL (motorRecord.cc:2141), then C JOG:
+        // "MV\rV=<v>\rG" — velocity mode, set signed velocity, go.
+        self.motion_dir = Some(velocity >= 0.0);
         let ctrl = self.lock();
-        ctrl.send(self.axis, &format!("MV\rV={}\rG", nint(velocity)));
+        ctrl.send(self.axis, &format!("A={}", clamped_accel(acceleration)));
+        ctrl.send(self.axis, &format!("MV\rV={}\rG", nint(velocity * VCONFAC)));
         Ok(())
     }
 
@@ -359,37 +396,57 @@ impl AsynMotor for SmartMotorAxis {
                 CommState::Normal => (CommState::Retry, PollFailure::NONE),
                 _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
             };
+            // motordrvCom.cc:335-343: COMM_ERR's RA_PROBLEM ends the motion.
+            if ctrl.comm_state == CommState::CommErr {
+                self.motion_dir = None;
+            }
             return Err(smartmotor_err(format!(
                 "SmartMotor axis {}: no RBt reply",
                 self.axis
             )));
         };
         ctrl.comm_state = CommState::Normal;
-        // A later query's transport error, which C does not check, raises both.
-        self.failure = PollFailure::PROBLEM_AND_COMMS_ERROR;
         let done = atoi(&rbt) == 0;
 
-        let position = nint(atof(&ctrl.query(self.axis, "RP")?));
+        let rp = atof(&ctrl.reply(self.axis, "RP"));
 
-        let plus_ls = atoi(&ctrl.query(self.axis, "RBp")?) != 0;
-        let minus_ls = atoi(&ctrl.query(self.axis, "RBm")?) != 0;
+        let plus_ls = atoi(&ctrl.reply(self.axis, "RBp")) != 0;
+        let minus_ls = atoi(&ctrl.reply(self.axis, "RBm")) != 0;
 
         // Latched right/left travel-limit flags: clear them if set (C Zr/Zl).
-        if atoi(&ctrl.query(self.axis, "RBr")?) != 0 {
+        if atoi(&ctrl.reply(self.axis, "RBr")) != 0 {
             ctrl.send(self.axis, "Zr");
         }
-        if atoi(&ctrl.query(self.axis, "RBl")?) != 0 {
+        if atoi(&ctrl.reply(self.axis, "RBl")) != 0 {
             ctrl.send(self.axis, "Zl");
         }
 
         // RBo != 0 means "not on commanded position" (C clears EA_POSITION).
-        let on_position = atoi(&ctrl.query(self.axis, "RBo")?) == 0;
+        let on_position = atoi(&ctrl.reply(self.axis, "RBo")) == 0;
 
-        let velocity_raw = atoi(&ctrl.query(self.axis, "RV")?);
+        // C motor_init sets encoder_present, so the encoder is a second RP,
+        // truncated by its (epicsInt32) cast.
+        let encoder_position = atof(&ctrl.reply(self.axis, "RP")) as i32;
+
+        let velocity_raw = atoi(&ctrl.reply(self.axis, "RV"));
         drop(ctrl);
 
-        let direction = position >= self.prev_position;
-        self.prev_position = position;
+        // drvSmartMotor.cc:271-291: an unchanged RP keeps the direction, a
+        // moving motor reports the record's.
+        let mut direction = self.last_status.direction;
+        if rp != f64::from(self.prev_position) {
+            let position = nint(rp);
+            direction = position >= self.prev_position;
+            self.prev_position = position;
+        }
+        if let Some(cdir) = self.motion_dir {
+            direction = cdir;
+        }
+        let position = self.prev_position;
+        let ls_active = if direction { plus_ls } else { minus_ls };
+        if done || ls_active {
+            self.motion_dir = None;
+        }
 
         let velocity = if direction {
             velocity_raw as f64
@@ -399,7 +456,7 @@ impl AsynMotor for SmartMotorAxis {
 
         let status = MotorStatus {
             position: position as f64,
-            encoder_position: position as f64,
+            encoder_position: f64::from(encoder_position),
             velocity,
             done,
             high_limit: plus_ls,
@@ -421,12 +478,12 @@ mod tests {
 
     #[test]
     fn accel_clamps_to_minimum() {
-        assert_eq!(clamped_accel(1.0), 2); // C overrides A <= 1 to 2
+        assert_eq!(clamped_accel(1.0 / ACONFAC), 2); // C overrides A <= 1 to 2
         assert_eq!(clamped_accel(0.0), 2);
         assert_eq!(clamped_accel(-5.0), 2);
-        assert_eq!(clamped_accel(2.4), 2); // NINT rounds down
-        assert_eq!(clamped_accel(2.5), 3); // NINT rounds up
-        assert_eq!(clamped_accel(100.0), 100);
+        assert_eq!(clamped_accel(2.4 / ACONFAC), 2); // NINT rounds down
+        assert_eq!(clamped_accel(2.6 / ACONFAC), 3); // NINT rounds up
+        assert_eq!(clamped_accel(10_000.0), 40);
     }
 
     /// A daisy chain of one echoing SmartMotor on a port with no EOS support
@@ -585,5 +642,194 @@ mod tests {
         silent.store(true, Ordering::Relaxed);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// devSmartMotor.cc:190-191: V= and A= are counts/s times VCONFAC and
+    /// counts/s² times ACONFAC; a jog's V= too.
+    #[test]
+    fn speeds_scale_per_pid_sample() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let chain = chain("smartScale");
+        let sent = chain.sent.clone();
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("smartScale").unwrap(),
+            chain,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl =
+            SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
+        let mut axis = SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::new(0);
+        sent.lock().unwrap().clear();
+
+        axis.move_absolute(&user, 100.0, 0.0, 1000.0, 10_000.0)
+            .unwrap();
+        axis.move_velocity(&user, 0.0, -1000.0, 0.0).unwrap();
+        // devSmartMotor.cc:249-251: a zero velocity still goes out; the
+        // record sends no zero acceleration.
+        axis.move_relative(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
+        let sent: Vec<_> = sent.lock().unwrap().drain(..).collect();
+        assert_eq!(
+            sent,
+            [
+                &b"\x81V=16106"[..],
+                b"\x81A=40",
+                b"\x81P=100",
+                b"\x81G",
+                b"\x81A=2",
+                b"\x81MV\rV=-16106\rG",
+                b"\x81V=0",
+                b"\x81D=5",
+                b"\x81G",
+            ]
+        );
+    }
+
+    /// One SmartMotor without echo answering each query from a table, or
+    /// nothing at all while `quiet`.
+    struct Single {
+        base: epics_rs::asyn::port::PortDriverBase,
+        last: String,
+        replies: Arc<Mutex<std::collections::HashMap<&'static str, &'static str>>>,
+        quiet: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Single {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.last = String::from_utf8_lossy(data).into_owned();
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = if self.quiet.load(std::sync::atomic::Ordering::SeqCst) {
+                ""
+            } else {
+                let replies = self.replies.lock().unwrap();
+                replies.get(self.last.as_str()).copied().unwrap_or("0")
+            };
+            if reply == "!" {
+                return Err(smartmotor_err("read failed"));
+            }
+            buf[..reply.len()].copy_from_slice(reply.as_bytes());
+            Ok(reply.len())
+        }
+    }
+
+    type Replies = Arc<Mutex<std::collections::HashMap<&'static str, &'static str>>>;
+
+    /// The axis, its reply table and quiet flag, and the port runtime to keep.
+    fn single(
+        name: &str,
+    ) -> (
+        SmartMotorAxis,
+        Replies,
+        Arc<std::sync::atomic::AtomicBool>,
+        Box<dyn std::any::Any>,
+    ) {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let replies: Replies = Default::default();
+        let quiet: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let driver = Single {
+            base: epics_rs::asyn::port::PortDriverBase::new(
+                name,
+                1,
+                epics_rs::asyn::port::PortFlags::default(),
+            ),
+            last: String::new(),
+            replies: replies.clone(),
+            quiet: quiet.clone(),
+        };
+        let (rt, actor) =
+            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let ctrl =
+            SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
+        (
+            SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0),
+            replies,
+            quiet,
+            Box::new((rt, actor)),
+        )
+    }
+
+    /// drvSmartMotor.cc:268-357: once RBt answers, a failed read is C
+    /// `recv_mess`'s empty buffer, read as 0, and the status still posts.
+    #[test]
+    fn a_missed_reply_after_rbt_reads_as_zero() {
+        let (mut axis, replies, _, _rt) = single("smartZero");
+        let user = AsynUser::new(0);
+        replies
+            .lock()
+            .unwrap()
+            .extend([("RP", "!"), ("RBp", "!"), ("RBo", "!"), ("RV", "!")]);
+        let s = axis.poll(&user).unwrap();
+        assert_eq!(s.position, 0.0);
+        assert!(!s.high_limit && s.powered && !s.comms_error && !s.problem);
+    }
+
+    /// drvSmartMotor.cc:271-291: an unchanged position keeps the direction,
+    /// and from a move until it is done the commanded one is reported.
+    #[test]
+    fn direction_is_kept_at_rest_and_commanded_while_moving() {
+        let (mut axis, replies, _, _rt) = single("smartDir");
+        let user = AsynUser::new(0);
+        let set = |rbt, rp| {
+            let mut r = replies.lock().unwrap();
+            r.insert("RBt", rbt);
+            r.insert("RP", rp);
+        };
+        set("0", "-50");
+        assert!(!axis.poll(&user).unwrap().direction);
+        set("0", "-50");
+        assert!(!axis.poll(&user).unwrap().direction, "kept at rest");
+        axis.move_absolute(&user, 100.0, 0.0, 1.0, 1.0).unwrap();
+        set("1", "-60");
+        assert!(axis.poll(&user).unwrap().direction, "commanded");
+        set("0", "100");
+        assert!(axis.poll(&user).unwrap().direction);
+        set("0", "90");
+        assert!(!axis.poll(&user).unwrap().direction, "done clears it");
+    }
+
+    /// motordrvCom.cc:335-343: a COMM_ERR poll ends the motion too, so the
+    /// commanded direction is no longer reported.
+    #[test]
+    fn comm_error_ends_the_commanded_direction() {
+        use std::sync::atomic::Ordering;
+        let (mut axis, replies, quiet, _rt) = single("smartDirErr");
+        let user = AsynUser::new(0);
+        replies
+            .lock()
+            .unwrap()
+            .extend([("RBt", "1"), ("RP", "-50")]);
+        axis.poll(&user).unwrap();
+        axis.move_absolute(&user, 100.0, 0.0, 1.0, 1.0).unwrap();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        replies.lock().unwrap().insert("RP", "-60");
+        assert!(!axis.poll(&user).unwrap().direction);
+    }
+
+    /// drvSmartMotor.cc:332-348: the encoder is its own RP after RBo,
+    /// truncated, where the position is rounded.
+    #[test]
+    fn encoder_is_a_second_rp_truncated() {
+        let (mut axis, replies, _, _rt) = single("smartEnc");
+        replies.lock().unwrap().insert("RP", "-7.6");
+        let s = axis.poll(&AsynUser::new(0)).unwrap();
+        assert_eq!((s.position, s.encoder_position), (-8.0, -7.0));
     }
 }

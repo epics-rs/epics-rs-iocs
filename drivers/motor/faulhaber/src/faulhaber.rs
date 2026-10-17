@@ -16,9 +16,9 @@
 //! 1, and its `EGU` is counts. Velocities cross the boundary in counts/s and
 //! accelerations in counts/s²; the controller wants rev/min and rev/s², so they
 //! are converted with the axis's counts-per-rev (the `MCDC2805Config`
-//! `countsPerRev` argument, which also programs the controller via `ENCRES`).
-//! This replaces the C driver's use of the record's `SREV` field, which is not
-//! visible at the asyn-rs boundary.
+//! `countsPerRev` argument, sent as `ENCRES` ahead of every `SP`/`AC`/`HOSP`
+//! as C does). This replaces the C driver's use of the record's `SREV` field,
+//! which is not visible at the asyn-rs boundary.
 //!
 //! ## Done detection
 //!
@@ -30,8 +30,7 @@
 //!
 //! - The C poller is a background thread; here the `GST`/`POS`/`GAST`/`GV`
 //!   reads and the limit-switch hold run inside [`poll`](AsynMotor::poll).
-//! - `countsPerRev` is a config argument (sent once via `ENCRES` at init)
-//!   rather than the record's `SREV` re-sent before every velocity command.
+//! - `countsPerRev` is a config argument rather than the record's `SREV`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -194,9 +193,8 @@ pub struct FaulhaberAxis {
 
 impl FaulhaberAxis {
     /// Construct axis `node` (0-based) and run the C `motor_init` per-axis setup:
-    /// RS-232 velocity source (`SOR 0`), limit-switch and homing configuration,
-    /// and program the encoder resolution (`ENCRES`). Performs blocking serial
-    /// I/O.
+    /// RS-232 velocity source (`SOR 0`) and the limit-switch and homing
+    /// configuration. Performs blocking serial I/O.
     pub fn new(
         controller: Arc<Mutex<FaulhaberController>>,
         node: usize,
@@ -214,9 +212,6 @@ impl FaulhaberAxis {
             ctrl.write_cmd(node, "HL1")?;
             ctrl.write_cmd(node, "HA1")?;
             ctrl.write_cmd(node, "CAHOSEQ")?;
-            // Program the encoder resolution once (C sends this before every
-            // velocity command using mr->srev).
-            ctrl.write_cmd(node, &format!("ENCRES{}", nint(counts_per_rev)))?;
         }
         Ok(Self {
             controller,
@@ -238,26 +233,32 @@ impl FaulhaberAxis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Program acceleration then speed for an upcoming move, if supplied.
-    fn program_motion(
-        &self,
-        ctrl: &FaulhaberController,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn encres(&self) -> String {
+        format!("ENCRES{}", nint(self.counts_per_rev))
+    }
+
+    /// The record's SET_VELOCITY, then SET_ACCEL unless the acceleration is
+    /// zero (motorRecord.cc:938-942), each `ENCRES` then `SP` / `AC`
+    /// (devMCDC2805.cc:248-270).
+    fn program_motion(&self, velocity: f64, acceleration: f64) -> AsynResult<()> {
+        let ctrl = self.lock();
+        ctrl.write_cmd(self.node, &self.encres())?;
+        ctrl.write_cmd(
+            self.node,
+            &format!("SP {}", vel_to_rpm(velocity, self.counts_per_rev)),
+        )?;
         if acceleration > 0.0 {
-            ctrl.write_cmd(
-                self.node,
-                &format!("AC {}", accel_to_rev(acceleration, self.counts_per_rev)),
-            )?;
-        }
-        if velocity > 0.0 {
-            ctrl.write_cmd(
-                self.node,
-                &format!("SP {}", vel_to_rpm(velocity, self.counts_per_rev)),
-            )?;
+            self.set_accel(&ctrl, acceleration)?;
         }
         Ok(())
+    }
+
+    fn set_accel(&self, ctrl: &FaulhaberController, acceleration: f64) -> AsynResult<()> {
+        ctrl.write_cmd(self.node, &self.encres())?;
+        ctrl.write_cmd(
+            self.node,
+            &format!("AC {}", accel_to_rev(acceleration, self.counts_per_rev)),
+        )
     }
 
     /// PREM and a blank lead a move's first message, and its POST waits for
@@ -287,7 +288,7 @@ impl AsynMotor for FaulhaberAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.program_motion(&self.lock(), velocity, acceleration)?;
+        self.program_motion(velocity, acceleration)?;
         self.lead_move(&format!("LA {}", nint(position)))?;
         self.lock().write_cmd(self.node, "M")
     }
@@ -300,7 +301,7 @@ impl AsynMotor for FaulhaberAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.program_motion(&self.lock(), velocity, acceleration)?;
+        self.program_motion(velocity, acceleration)?;
         self.lead_move(&format!("LR {}", nint(distance)))?;
         self.lock().write_cmd(self.node, "M")
     }
@@ -310,12 +311,17 @@ impl AsynMotor for FaulhaberAxis {
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
-        // C JOG: set speed, then enter velocity mode with the signed rate.
+        // The record's unguarded SET_ACCEL (motorRecord.cc:2141), then C JOG:
+        // ENCRES, the speed, and velocity mode at the signed rate. C's SP is
+        // signed too; a maximum speed is not, so that is not copied.
+        self.set_accel(&self.lock(), acceleration)?;
         let rpm = vel_to_rpm(velocity, self.counts_per_rev);
-        self.lead_move(&format!("SP {}", rpm.abs()))?;
-        self.lock().write_cmd(self.node, &format!("V {rpm}"))
+        self.lead_move(&self.encres())?;
+        let ctrl = self.lock();
+        ctrl.write_cmd(self.node, &format!("SP {}", rpm.abs()))?;
+        ctrl.write_cmd(self.node, &format!("V {rpm}"))
     }
 
     fn home(
@@ -323,17 +329,22 @@ impl AsynMotor for FaulhaberAxis {
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        // C HOME_*: set the homing speed (signed by direction) and start the
-        // controller's homing sequence.
+        // The record's SET_VELOCITY/SET_ACCEL (motorRecord.cc:872-875), then C
+        // HOME_*: ENCRES, the homing speed signed by direction, the homing
+        // sequence, and GO's `M`.
+        self.program_motion(velocity, acceleration)?;
         let mut rpm = vel_to_rpm(velocity, self.counts_per_rev);
         if !forward {
             rpm = -rpm;
         }
-        self.lead_move(&format!("HOSP{rpm}"))?;
-        self.lock().write_cmd(self.node, "GOHOSEQ")
+        self.lead_move(&self.encres())?;
+        let ctrl = self.lock();
+        ctrl.write_cmd(self.node, &format!("HOSP{rpm}"))?;
+        ctrl.write_cmd(self.node, "GOHOSEQ")?;
+        ctrl.write_cmd(self.node, "M")
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -412,13 +423,15 @@ impl AsynMotor for FaulhaberAxis {
         let status_bytes = status_buff.as_bytes();
         let home = status_bytes.get(6) == Some(&b'1');
 
+        // drvMCDC2805.cc:263-281: the raw POS against the last rounded
+        // position; only a change moves it and sets the direction.
         let motor_data = pos.as_deref().map(atof).unwrap_or(0.0);
-        let new_position = nint(motor_data);
-        let direction = if new_position != self.prev_position {
-            new_position >= self.prev_position
-        } else {
-            self.last_status.direction
-        };
+        let mut direction = self.last_status.direction;
+        if motor_data != f64::from(self.prev_position) {
+            let new_position = nint(motor_data);
+            direction = new_position >= self.prev_position;
+            self.prev_position = new_position;
+        }
         let plusdir = direction;
 
         // Limit switches (GAST: byte 0 = plus, byte 1 = minus).
@@ -429,10 +442,11 @@ impl AsynMotor for FaulhaberAxis {
         let ls_active = (plus_ls && plusdir) || (minus_ls && !plusdir);
 
         // If an active limit switch stopped motion, hold position with an
-        // absolute move to the current position (C set_status).
+        // absolute move to the current position (C set_status). C's
+        // send_mess status is not checked here or for POST.
         if ls_active {
-            ctrl.write_cmd(self.node, &format!("LA {}", nint(motor_data)))?;
-            ctrl.write_cmd(self.node, "M")?;
+            let _ = ctrl.write_cmd(self.node, &format!("LA {}", nint(motor_data)));
+            let _ = ctrl.write_cmd(self.node, "M");
         }
 
         // Actual velocity → done (reliable across jog and velocity=0 stops).
@@ -441,16 +455,16 @@ impl AsynMotor for FaulhaberAxis {
         if (done || ls_active)
             && let Some(post) = self.strings.post_due()
         {
-            ctrl.write_bytes(self.node, &post)?;
+            let _ = ctrl.write_bytes(self.node, &post);
         }
         drop(ctrl);
 
-        self.prev_position = new_position;
         let signed_velocity = if plusdir { velocity } else { -velocity };
 
         self.last_status = MotorStatus {
-            position: motor_data,
-            encoder_position: motor_data,
+            position: f64::from(self.prev_position),
+            // C `(int) motorData`.
+            encoder_position: f64::from(motor_data as i32),
             velocity: signed_velocity as f64,
             direction,
             done,
@@ -479,6 +493,7 @@ mod tests {
         axis: FaulhaberAxis,
         moving: Arc<AtomicBool>,
         minus: Arc<AtomicBool>,
+        pos: Arc<Mutex<&'static str>>,
         user: AsynUser,
     }
 
@@ -487,12 +502,13 @@ mod tests {
         fn new(name: &str) -> Self {
             let moving = Arc::new(AtomicBool::new(false));
             let minus = Arc::new(AtomicBool::new(false));
-            let (m, l) = (moving.clone(), minus.clone());
+            let pos = Arc::new(Mutex::new("0"));
+            let (m, l, p) = (moving.clone(), minus.clone(), pos.clone());
             let (line, io) =
                 LineRig::new(name, move |last| match last.get(1..).unwrap_or_default() {
                     "VER" => "MCDC2805".into(),
                     "GST" => "0000000".into(),
-                    "POS" => "0".into(),
+                    "POS" => (*p.lock().unwrap()).into(),
                     "GAST" => if l.load(Ordering::SeqCst) { "01" } else { "00" }.into(),
                     "GV" => if m.load(Ordering::SeqCst) { "-60" } else { "0" }.into(),
                     _ => String::new(),
@@ -505,6 +521,7 @@ mod tests {
                 axis,
                 moving,
                 minus,
+                pos,
                 user: AsynUser::new(0),
             }
         }
@@ -541,12 +558,12 @@ mod tests {
         let mut r = Rig::new("mcdc_prem");
         r.axis.set_move_strings(&r.user, b"EN", None).unwrap();
         r.axis.move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0).unwrap();
-        assert_eq!(r.line.sent(), ["1EN LA 100", "1M"]);
+        assert_eq!(r.line.sent(), ["1ENCRES1000", "1SP 0", "1EN LA 100", "1M"]);
         r.axis.move_relative(&r.user, -5.0, 0.0, 0.0, 0.0).unwrap();
-        assert_eq!(r.line.sent(), ["1LR -5", "1M"]);
+        assert_eq!(r.line.sent(), ["1ENCRES1000", "1SP 0", "1LR -5", "1M"]);
         r.axis.set_move_strings(&r.user, b"EN", None).unwrap();
         r.axis.move_relative(&r.user, -5.0, 0.0, 0.0, 0.0).unwrap();
-        assert_eq!(r.line.sent(), ["1EN LR -5", "1M"]);
+        assert_eq!(r.line.sent(), ["1ENCRES1000", "1SP 0", "1EN LR -5", "1M"]);
     }
 
     /// devMCDC2805.cc:222-236 and 286-300 lose PREM and POST on HOME and
@@ -558,13 +575,26 @@ mod tests {
             .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
             .unwrap();
         r.axis.home(&r.user, 0.0, 1000.0, 0.0, false).unwrap();
-        assert_eq!(r.line.sent(), ["1EN HOSP-60", "1GOHOSEQ"]);
+        assert_eq!(
+            r.line.sent(),
+            [
+                "1ENCRES1000",
+                "1SP 60",
+                "1EN ENCRES1000",
+                "1HOSP-60",
+                "1GOHOSEQ",
+                "1M"
+            ]
+        );
         assert_eq!(r.poll_extra(), ["1DI"]);
         r.axis
             .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
             .unwrap();
-        r.axis.move_velocity(&r.user, 0.0, 1000.0, 0.0).unwrap();
-        assert_eq!(r.line.sent(), ["1EN SP 60", "1V 60"]);
+        r.axis.move_velocity(&r.user, 0.0, -1000.0, 0.0).unwrap();
+        assert_eq!(
+            r.line.sent(),
+            ["1ENCRES1000", "1AC 0", "1EN ENCRES1000", "1SP 60", "1V -60"]
+        );
         assert_eq!(r.poll_extra(), ["1DI"]);
     }
 
@@ -654,5 +684,45 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// motorRecord.cc:938-945 with devMCDC2805.cc:248-274: SP before AC,
+    /// each behind its own ENCRES, then the target and `M`.
+    #[test]
+    fn a_move_sends_the_records_transactions() {
+        let mut r = Rig::new("mcdc_move");
+        r.axis
+            .move_absolute(&r.user, 100.0, 0.0, 2000.0, 3000.0)
+            .unwrap();
+        assert_eq!(
+            r.line.sent(),
+            [
+                "1ENCRES1000",
+                "1SP 120",
+                "1ENCRES1000",
+                "1AC 3",
+                "1LA 100",
+                "1M"
+            ]
+        );
+    }
+
+    /// drvMCDC2805.cc:263-281, 334-339: the position is NINT of POS, the
+    /// encoder its truncation, and a fraction off the last position still
+    /// sets the direction from the rounded one.
+    #[test]
+    fn position_rounds_encoder_truncates() {
+        let mut r = Rig::new("mcdc_pos");
+        *r.pos.lock().unwrap() = "-20";
+        assert!(!r.axis.poll(&r.user).unwrap().direction);
+        *r.pos.lock().unwrap() = "-20.4";
+        let s = r.axis.poll(&r.user).unwrap();
+        assert_eq!((s.position, s.encoder_position), (-20.0, -20.0));
+        assert!(s.direction, "-20 >= -20");
+        *r.pos.lock().unwrap() = "-20";
+        assert!(r.axis.poll(&r.user).unwrap().direction, "kept");
+        *r.pos.lock().unwrap() = "7.6";
+        let s = r.axis.poll(&r.user).unwrap();
+        assert_eq!((s.position, s.encoder_position), (8.0, 7.0));
     }
 }

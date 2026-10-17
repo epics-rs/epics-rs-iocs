@@ -183,9 +183,14 @@ pub fn smc100_create_controller_command() -> CommandDef {
             let serial_port = req_string(args, 1, "SMC100 port name")?;
             let num_axes = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-            let step_size = atof(&opt_string(args, 5)?.unwrap_or_default());
-            if step_size == 0.0 {
-                return Err("SMC100CreateController: EGUs per step must be non-zero".into());
+            let text = opt_string(args, 5)?.unwrap_or_default();
+            let step_size = atof(&text);
+            // C prints this after building the controller, on an errno it never
+            // cleared; a zero or infinite step it builds, dividing every
+            // readback by it. Both are refused here before the build.
+            if !step_size.is_finite() || step_size == 0.0 {
+                println!("SMC100: Error invalid steps per unit={text}");
+                return Ok(CommandOutcome::Continue);
             }
 
             register_port(ctx, &port_name, num_axes)?;
@@ -565,10 +570,6 @@ pub fn xps_create_axis_command() -> CommandDef {
             let port_name = req_string(args, 0, "Controller port name")?;
             let axis = c_int(args, 1);
             let positioner_name = req_string(args, 2, "Axis name")?;
-            let steps_per_unit = atof(&opt_string(args, 3)?.unwrap_or_default());
-            if steps_per_unit == 0.0 {
-                return Err("XPSCreateAxis: steps per unit must be non-zero".into());
-            }
             let Some((controller, ip, ip_port, moving_poll_ms, idle_poll_ms)) =
                 with_xps(&port_name, "XPSCreateAxis", |reg| {
                     (
@@ -582,6 +583,14 @@ pub fn xps_create_axis_command() -> CommandDef {
             else {
                 return Ok(CommandOutcome::Continue);
             };
+            let text = opt_string(args, 3)?.unwrap_or_default();
+            let steps_per_unit = atof(&text);
+            // An infinite strtod is C's ERANGE. C builds a zero with stepSize
+            // 1/0, so every move sends inf; that is refused here.
+            if !steps_per_unit.is_finite() || steps_per_unit == 0.0 {
+                println!("XPSController:XPSCreateAxis: Error invalid steps per unit={text}");
+                return Ok(CommandOutcome::Continue);
+            }
             let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
                 println!("XPSAxis:XPSAxis: error calling TCP_ConnectToServer for move socket");
                 return Ok(CommandOutcome::Continue);

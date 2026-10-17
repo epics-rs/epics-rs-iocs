@@ -3,11 +3,10 @@
 # 0,1,2 to controller motors 1,2,3.
 #
 # The controller works in millimetres (position query and G/T moves are mm).
-# Positions travel the driver boundary in mm (EGU = mm); MRES is the record's
-# step (RRBV is an integer count), the C drive_resolution 0.01 mm. VELO
-# (mm/s) feeds the V command; done and the plus/minus limit switches come from
-# the Z status character. The controller only reports position when stopped, and
-# only for the currently selected motor.
+# The driver converts record steps with C's drive_resolution 0.01 mm, so MRES
+# must stay 0.01 for EGU mm. VELO (mm/s) feeds the V command; done and the
+# plus/minus limit switches come from the Z status character. The controller
+# only reports position when stopped, and only for the currently selected motor.
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "EMC18011")

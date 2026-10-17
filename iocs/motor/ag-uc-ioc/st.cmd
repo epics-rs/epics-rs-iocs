@@ -45,4 +45,4 @@ iocInit()
 # Example:
 #   dbl
 #   camonitor AGILIS:m0 AGILIS:m0.RBV
-#   caput AGILIS:m0 1000
+#   caput AGILIS:m0 1      # 1000 steps at MRES .001
