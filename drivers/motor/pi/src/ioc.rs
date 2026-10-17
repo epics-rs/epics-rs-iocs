@@ -663,6 +663,8 @@ pub fn pie710_config_command() -> CommandDef {
                     return;
                 };
                 let num_axes = controller.num_axes();
+                // drvPIE710.cc:580 passes `buff[0]`, a char, as strcpy's
+                // source; a C defect not copied: the GI reply is the ident.
                 let line = format!("port={asyn_port}, id: {}", controller.ident());
                 let controller = Arc::new(Mutex::new(controller));
 
