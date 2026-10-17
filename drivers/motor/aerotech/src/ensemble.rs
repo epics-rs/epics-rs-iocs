@@ -46,6 +46,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi, atol};
 
+use crate::axis_report::AxisMembers;
 use crate::exchange::Exchange;
 
 /// Reply read buffer size (C `BUFFER_SIZE`).
@@ -81,6 +82,7 @@ const PARAM_END_OF_TRAVEL_LIMIT_SETUP: i32 = 61;
 const PARAM_ABORT_DECEL_RATE: i32 = 73;
 const PARAM_HOME_SETUP: i32 = 75;
 const PARAM_HOME_SPEED: i32 = 76;
+const PARAM_HOME_OFFSET: i32 = 77;
 const PARAM_HOME_RAMP_RATE: i32 = 78;
 const PARAM_AXIS_NAME: i32 = 140;
 
@@ -216,19 +218,24 @@ pub struct EnsembleAxis {
     step: f64,
     /// C `maxDigits`.
     digits: usize,
+    report: Arc<AxisMembers>,
 }
 
 impl EnsembleAxis {
     /// Construct axis `axis` and probe its feedback type, home/limit setup and
     /// reverse-direction parameters, then set `RAMP MODE RATE`.
     pub fn new(controller: Arc<Mutex<EnsembleController>>, axis: i32) -> AsynResult<Self> {
-        let (has_encoder, step_size, home_direction, reverse_direc, swconfig) = {
+        let (has_encoder, step_size, home_preset, home_direction, reverse_direc, swconfig) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let has_encoder = ctrl
                 .get_param(axis, PARAM_POSITION_FEEDBACK_TYPE)
                 .map(|s| atoi(&s) > 0)
                 .unwrap_or(false);
             let step_size = step_size(ctrl.get_param(axis, PARAM_COUNTS_PER_UNIT));
+            let home_preset = ctrl
+                .get_param(axis, PARAM_HOME_OFFSET)
+                .map(|s| atof(&s))
+                .unwrap_or(0.0);
             let home_direction = ctrl
                 .get_param(axis, PARAM_HOME_SETUP)
                 .map(|s| atol(&s) as u32)
@@ -245,6 +252,7 @@ impl EnsembleAxis {
             (
                 has_encoder,
                 step_size,
+                home_preset,
                 home_direction,
                 reverse_direc,
                 swconfig,
@@ -260,7 +268,18 @@ impl EnsembleAxis {
             swconfig,
             step: step_size.abs(),
             digits: max_digits(step_size),
+            report: Arc::new(AxisMembers::new(
+                axis.to_string(),
+                step_size,
+                max_digits(step_size),
+                home_preset,
+            )),
         })
+    }
+
+    /// What C's `motorAxisReport` prints of this axis.
+    pub fn report(&self) -> Arc<AxisMembers> {
+        self.report.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, EnsembleController> {
@@ -419,6 +438,7 @@ impl AsynMotor for EnsembleAxis {
         let (axis_status, plane_active, enc_pos, cmd_pos, fault, act_vel) = {
             let ctrl = self.lock();
             let axis_status = atol(&ctrl.query(&format!("AXISSTATUS(@{axis})"))?) as u32;
+            self.report.set_axis_status(axis_status);
             let plane_active = (atoi(&ctrl.query("PLANESTATUS(0)")?) & 0x01) != 0;
             let enc_pos = atof(&ctrl.query(&format!("PFBKPROG(@{axis})"))?);
             let cmd_pos = atof(&ctrl.query(&format!("PCMDPROG(@{axis})"))?);
