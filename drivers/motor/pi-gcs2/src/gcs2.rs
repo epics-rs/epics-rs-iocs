@@ -94,9 +94,8 @@
 //! - **Piezo closed loop**: `PIGCS2PiezoCL` — closed-loop piezo
 //!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
 //!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
-//! - **Per-model controllers**: `PIE517Controller` and `PIE727Controller`
-//!   (piezo-based, each with its own init and status quirks); those
-//!   controllers run on [`Model::Motor`].
+//! - **Per-model controllers**: `PIE727Controller` (piezo-based, with its
+//!   own closed-loop parameter access); the E-727 runs on [`Model::Motor`].
 //! - **`SVO?` (`getServo`)**: as upstream, only the C-887's status and
 //!   [`Model::Piezo`]'s without `SRG?` ask it; the generic motor axis's servo
 //!   state comes from the `char(4)` status bitmask.
@@ -346,18 +345,25 @@ pub enum Model {
     CoordinateSystem,
     /// `PIGCSPiezoController` (E-753/754/709/712/725).
     Piezo,
+    /// `PIE517Controller` (E-517/518).
+    E517,
 }
 
 impl Model {
     /// `PIGCSMotorController::getResolution`'s `SPA?` CPU reads; the others
     /// run the base's fixed one.
     fn reads_cpu(self) -> bool {
-        !matches!(self, Self::C885 | Self::E755 | Self::Piezo) && !self.is_hexapod()
+        !matches!(self, Self::C885 | Self::E755) && !self.is_hexapod() && !self.is_piezo()
     }
 
     /// `PIGCSMotorController::setAccelerationCts`; the others' is a no-op.
     fn sets_acceleration(self) -> bool {
-        !matches!(self, Self::C885 | Self::E755 | Self::Piezo) && !self.is_hexapod()
+        !matches!(self, Self::C885 | Self::E755) && !self.is_hexapod() && !self.is_piezo()
+    }
+
+    /// `PIGCSPiezoController` or a class built on it.
+    fn is_piezo(self) -> bool {
+        matches!(self, Self::Piezo | Self::E517)
     }
 
     /// `PIHexapodController` or the GCS 2 class built on it.
@@ -398,9 +404,11 @@ impl Model {
         if idn.contains("E-873.3QTU") {
             Some(Self::MotorNoRefVel)
         } else if any(&[
-            "C-663", "C-863", "C-867", "C-884", "E-861", "E-871", "E-873", "E-517", "E-518",
+            "C-663", "C-863", "C-867", "C-884", "E-861", "E-871", "E-873",
         ]) {
             Some(Self::Motor)
+        } else if any(&["E-517", "E-518"]) {
+            Some(Self::E517)
         } else if idn.contains("C-885") {
             Some(Self::C885)
         } else if any(&["E-753", "E-754", "E-709", "E-712", "E-725"]) {
@@ -624,6 +632,10 @@ impl PIGCS2Controller {
     /// The class C's `CreateGCSController` picked from the `*IDN?`.
     pub fn set_model(&mut self, model: Model) {
         self.model = model;
+        if model == Model::E517 {
+            self.piezo.frf.set(false);
+            self.piezo.trs.set(false);
+        }
     }
 
     /// The constructor's `*IDN?` into an emptied buffer: empty when the
@@ -650,6 +662,22 @@ impl PIGCS2Controller {
         self.axis_names = self.find_connected_axes().unwrap_or_default();
         if self.model.is_hexapod() {
             self.init_hexapod();
+        }
+        if self.model == Model::E517 {
+            self.set_outputs_online();
+        }
+    }
+
+    /// `PIE517Controller::init` after the base's: each of `TPC?`'s output
+    /// channels `ONL`, which the E-517 needs before it takes commands.
+    fn set_outputs_online(&self) {
+        let Ok(reply) = self.query("TPC?") else {
+            return;
+        };
+        for channel in 1..=atoi(&reply) {
+            if self.send_only(&format!("ONL {channel} 1")).is_err() {
+                return;
+            }
         }
     }
 
@@ -1100,7 +1128,7 @@ impl PIGCS2Controller {
     /// `RON {axis} 0` / `POS {axis} {position}` / `RON {axis} 1`, one
     /// `ERR? == 0` after all three (C `setAxisPosition`).
     fn set_axis_position(&self, axis: &str, position: f64) -> AsynResult<()> {
-        if self.model == Model::Piezo {
+        if self.model.is_piezo() {
             // PIGCSPiezoController::setAxisPosition: no RON or POS.
             return Ok(());
         }
@@ -1229,7 +1257,7 @@ impl PIGCS2Controller {
             return Ok(self.get_gcs_parameter(axis, PARA_C702_REFERENCED)? > 0.1);
         }
         let frf = || get_value_bool(&self.query(&format!("FRF? {axis}"))?);
-        if self.model != Model::Piezo {
+        if !self.model.is_piezo() {
             return frf();
         }
         // PIGCSPiezoController::getReferencedState: a controller without
@@ -1860,7 +1888,7 @@ impl PIGCS2Axis {
             // PIHexapodController::initAxis: no LIM?/TRS?/CST?.
             return self.set_servo(true);
         }
-        if self.lock().model == Model::Piezo {
+        if self.lock().model.is_piezo() {
             return self.init_piezo_axis();
         }
         if self.lock().model == Model::C885 {
@@ -1992,6 +2020,13 @@ impl PIGCS2Axis {
         }
         if ctrl.model == Model::Piezo {
             return ctrl.get_piezo_status(&self.axis_name, 1 << self.axis_no);
+        }
+        if ctrl.model == Model::E517 {
+            // PIE517Controller::getStatus: #5 alone. C defect not copied: it
+            // never sets servoControl, which poll then reads uninitialized;
+            // rs keeps the last servo state.
+            let moving = ctrl.get_moving(1 << self.axis_no)?;
+            return Ok((false, moving, false, false, self.servo_on));
         }
         if !matches!(ctrl.model, Model::E755 | Model::C702) {
             return ctrl.get_status(&self.axis_name, self.axis_no);
@@ -2132,7 +2167,7 @@ impl PIGCS2Axis {
         if model == Model::C702 {
             return self.reference_c702(velocity, forward);
         }
-        if model == Model::Piezo {
+        if model.is_piezo() {
             return self.reference_piezo();
         }
         if model == Model::C885 {
@@ -3041,6 +3076,68 @@ mod tests {
         axis.home(&user, 0.0, 1.0, 0.0, false).unwrap();
         assert_eq!(sent_lines(&line), ["SVO 1 0", "ERR?", "FRF 1", "ERR?"]);
         assert!(!axis.servo_on);
+    }
+
+    /// `PIE517Controller::init` (PIE517Controller.cpp:25-51): every `TPC?`
+    /// output channel set online, stopping at the first refused `ONL`.
+    #[test]
+    fn an_e517_controller_sets_its_output_channels_online() {
+        for idn in ["E-517", "E-518"] {
+            let port = format!("gcs2Online{}", &idn[2..]);
+            let reply = |last: &str| match last {
+                "TPC?" => "3".into(),
+                last => piezo_reply(last),
+            };
+            // sendOnly's status is its terminator write's.
+            let last = Mutex::new(String::new());
+            let refused = move |cmd: &str| {
+                let mut last = last.lock().unwrap();
+                if cmd == "\n" {
+                    return *last == "ONL 2 1";
+                }
+                *last = cmd.into();
+                false
+            };
+            let (line, io) = motor_common::testing::LineRig::failing(&port, reply, refused);
+            let mut ctrl = PIGCS2Controller::new(io, &port);
+            ctrl.set_model(Model::from_idn(idn).unwrap());
+            ctrl.init();
+            assert_eq!(
+                sent_lines(&line),
+                ["VEL?", "SAI?", "TPC?", "ONL 1 1", "ONL 2 1"],
+                "{idn}"
+            );
+        }
+    }
+
+    /// An E-517 asks no `TRS?` or `FRF?` (PIE517Controller.h:35-36), halts
+    /// one axis with `HLT`, and polls `#5` alone (PIE517Controller.cpp:74-87).
+    #[test]
+    fn an_e517_axis_polls_char5_halts_with_hlt_and_homes_with_nothing() {
+        let (line, _ctrl, mut axis) = piezo("gcs2E517Axis", "E-517", |last| match last {
+            "\u{5}" => "1".into(),
+            last => piezo_reply(last),
+        });
+        assert_eq!(
+            sent_lines(&line),
+            ["SVO 1 1", "ERR?", "VEL? 1", "POS? 1", "TMN? 1", "TMX? 1"]
+        );
+        assert!(axis.homed && axis.servo_on && !axis.has_reference);
+        let user = AsynUser::new(0);
+        let status = axis.poll(&user).unwrap();
+        let sent = sent_lines(&line);
+        assert_eq!(sent.first().map(String::as_str), Some("\u{5}"));
+        assert!(
+            !sent
+                .iter()
+                .any(|c| c.starts_with("SRG?") || c.starts_with("SVO?")),
+            "{sent:?}"
+        );
+        assert!(status.moving && status.powered);
+        axis.stop(&user, 0.0).unwrap();
+        assert_eq!(sent_lines(&line), ["HLT 1", "ERR?"]);
+        axis.home(&user, 0.0, 1.0, 0.0, false).unwrap();
+        assert!(sent_lines(&line).is_empty());
     }
 
     /// A piezo whose `FRF?` is an unknown command reads as homed and from
