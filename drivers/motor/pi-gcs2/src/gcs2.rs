@@ -145,6 +145,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::util::{atof, atoi, leading_hex};
 use motor_common::{ControllerParams, ControllerReport};
 
@@ -453,7 +454,7 @@ impl PIGCS2Controller {
 
     /// `MOV {axis} {position}` + `ERR? == 0`.
     fn mov(&self, axis: &str, position: f64) -> AsynResult<()> {
-        self.send_only(&format!("MOV {axis} {position:.6}"))?;
+        self.send_only(&format!("MOV {axis} {}", CFloat(position)))?;
         self.check_ok()
     }
 
@@ -463,12 +464,12 @@ impl PIGCS2Controller {
         if !self.knows_vel {
             return Ok(());
         }
-        self.send_only(&format!("VEL {axis} {:.6}", velocity.abs()))
+        self.send_only(&format!("VEL {axis} {}", CFloat(velocity.abs())))
     }
 
     /// `SPA {axis} {param_id} {value}`; no error check (C `setGCSParameter`).
     fn set_gcs_parameter(&self, axis: &str, param_id: i32, value: f64) -> AsynResult<()> {
-        self.send_only(&format!("SPA {axis} {param_id} {value:.6}"))
+        self.send_only(&format!("SPA {axis} {param_id} {:.12}", CFloat(value).g()))
     }
 
     /// `SPA? {axis} {param_id}`.
@@ -487,7 +488,7 @@ impl PIGCS2Controller {
     /// `ERR? == 0` after all three (C `setAxisPosition`).
     fn set_axis_position(&self, axis: &str, position: f64) -> AsynResult<()> {
         self.send_only(&format!("RON {axis} 0"))?;
-        self.send_only(&format!("POS {axis} {position:.6}"))?;
+        self.send_only(&format!("POS {axis} {}", CFloat(position)))?;
         self.send_only(&format!("RON {axis} 1"))?;
         self.check_ok()
     }
@@ -558,8 +559,8 @@ impl PIGCS2Controller {
     /// [`Self::set_gcs_parameter`]).
     fn set_reference_velocity(&self, axis: &str, velocity: f64) -> AsynResult<()> {
         self.send_only(&format!(
-            "SPA {axis} {REF_VEL_PARAM_HEX} {:.6}",
-            velocity.abs()
+            "SPA {axis} {REF_VEL_PARAM_HEX} {}",
+            CFloat(velocity.abs())
         ))?;
         self.check_ok()
     }
@@ -1188,6 +1189,45 @@ mod tests {
         assert!(status.moving && status.msta_moving && status.high_limit && status.powered);
         assert!(!status.problem);
         assert_eq!((axis.low_limit, axis.high_limit), (-10.0, 10.0));
+    }
+
+    /// C sprintf's `%f` and `%.12g` (PIGCSController.cpp:142, 202, 242,
+    /// 626; PIGCSMotorController.cpp:61): glibc spells a NaN `nan`/`-nan`,
+    /// and SPA takes `%.12g`.
+    #[test]
+    fn commands_print_floats_as_c_sprintf() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2CFloat", |last| {
+            if last == "ERR?" { "0" } else { "" }.into()
+        });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2CFloat");
+        ctrl.knows_vel = true;
+        let neg_nan = -f64::NAN;
+        let _ = ctrl.mov("1", f64::NAN);
+        let _ = ctrl.mov("1", neg_nan);
+        let _ = ctrl.set_velocity("1", f64::NAN);
+        let _ = ctrl.set_axis_position("1", neg_nan);
+        let _ = ctrl.set_reference_velocity("1", f64::NAN);
+        let _ = ctrl.set_gcs_parameter("1", 0x50, 1e-7);
+        let _ = ctrl.set_gcs_parameter("1", 0x50, 2.5);
+        let sent: Vec<String> = line
+            .sent()
+            .into_iter()
+            .filter(|w| w != "ERR?" && w != "\n")
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "MOV 1 nan",
+                "MOV 1 -nan",
+                "VEL 1 nan",
+                "RON 1 0",
+                "POS 1 -nan",
+                "RON 1 1",
+                "SPA 1 0x50 nan",
+                "SPA 1 80 1e-07",
+                "SPA 1 80 2.5",
+            ]
+        );
     }
 
     #[test]
