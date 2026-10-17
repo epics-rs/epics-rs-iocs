@@ -735,6 +735,23 @@ impl TimePix3Driver {
             base.set_int32_param(p.http_code, 0, 400)?;
             return Err(refused("PUT", MPX3_TRIGGER_MSG));
         }
+        // serval_http.cpp:2596-2602: the depth sent is normalised, and 12
+        // when counting both counters rules 24 out.
+        let mpx3 = (self.shared.family() == DetectorFamily::Mpx3).then(|| {
+            let depth = serval::pixel_depth_normalize(self.int(p.pixel_depth, 0));
+            let conflict = self.mpx3_pixel_depth_conflict(depth);
+            let config = serval::Mpx3Config {
+                both_counters: self.int(p.both_counters, 0) != 0,
+                charge_summing: self.int(p.charge_summing, 0) != 0,
+                colour: self.int(p.colour, 0) != 0,
+                gain_mode: self.int(p.gain_mode, 0),
+                pixel_depth: if conflict { 12 } else { depth },
+                counter_select_in: self.int(p.counter_select_in, 0),
+                counter_select_out: self.int(p.counter_select_out, 0),
+                idelay: [p.i_delay0, p.i_delay1, p.i_delay2, p.i_delay3].map(|r| self.int(r, 0)),
+            };
+            (conflict, config)
+        });
         let cfg = serval::DetectorConfig {
             trigger_mode,
             exposure_time: self.dbl(ad.acquire_time, 0),
@@ -753,6 +770,7 @@ impl TimePix3Driver {
             periph_clk80: self.int(p.periph_clk80, 0),
             tdc0: self.int(p.tdc0, 0),
             tdc1: self.int(p.tdc1, 0),
+            mpx3: mpx3.as_ref().map(|(_, m)| m.clone()),
         };
         let body = match serval::detector_config_body(&current, &cfg) {
             Ok(body) => body,
@@ -763,6 +781,14 @@ impl TimePix3Driver {
                 return Err(refused("PUT", message));
             }
         };
+        if let Some((conflict, m)) = &mpx3 {
+            self.ad
+                .port_base
+                .set_int32_param(p.pixel_depth, 0, m.pixel_depth)?;
+            if *conflict {
+                self.set_text(ad.status_message, MPX3_PIXEL_DEPTH_MSG)?;
+            }
+        }
 
         let reply = self
             .http
@@ -3788,6 +3814,96 @@ mod tests {
             "bad config",
         );
         assert!(text.contains(&line), "{line}: {text:?}");
+    }
+
+    /// A Medipix3 detector gets its own settings, with the depth normalised
+    /// and published back (serval_http.cpp:2583-2617).
+    #[test]
+    fn a_medipix3_init_acquisition_sends_the_medipix3_settings() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let (mut request, mut length) = (String::new(), 0);
+                let _ = reader.read_line(&mut request);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                if request.starts_with("PUT ") {
+                    let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+                }
+                let reply = r#"{"Tdc":["P0","P0"],"PeriphClk80":true}"#;
+                let _ = reader.get_mut().write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        let shared = Arc::new(Shared::new());
+        shared.note_family(DetectorFamily::Mpx3);
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_MPX3_BODY",
+            Arc::new(ServalHttp::new(&url)),
+            shared,
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        for (reason, v) in [
+            (p.both_counters, 1),
+            (p.pixel_depth, 24),
+            (p.gain_mode, 2),
+            (p.colour, 1),
+            (p.counter_select_out, 1),
+            (p.i_delay2, 9),
+        ] {
+            det.ad.port_base.set_int32_param(reason, 0, v).unwrap();
+        }
+        det.init_acquisition().unwrap();
+        let body: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert!(body.get("Tdc").is_none() && body.get("PeriphClk80").is_none());
+        assert_eq!(
+            [
+                &body["BothCounters"],
+                &body["PixelDepth"],
+                &body["GainMode"],
+                &body["Colour"],
+                &body["ChargeSumming"],
+                &body["CounterSelectOut"],
+                &body["IDelayConfig"],
+            ],
+            [
+                &json!(true),
+                &json!(12),
+                &json!("LGM"),
+                &json!(true),
+                &json!(false),
+                &json!(1),
+                &json!([0, 0, 9, 0]),
+            ]
+        );
+        assert_eq!(det.int(p.pixel_depth, 0), 12);
+        assert_eq!(
+            det.text(det.ad.params.status_message, 0),
+            MPX3_PIXEL_DEPTH_MSG
+        );
     }
 
     const MEASUREMENT_CONFIG_READBACK: &str = r#"{"Stem": {"Scan": {"Width": 64,

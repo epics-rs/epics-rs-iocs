@@ -323,7 +323,32 @@ pub struct DetectorConfig {
     pub periph_clk80: i32,
     pub tdc0: i32,
     pub tdc1: i32,
+    /// The Medipix3 settings, sent in place of the Timepix3-only fields.
+    pub mpx3: Option<Mpx3Config>,
 }
+
+/// The Medipix3 settings (serval_http.cpp:2583-2617); `pixel_depth` is
+/// already normalised.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mpx3Config {
+    pub both_counters: bool,
+    pub charge_summing: bool,
+    pub colour: bool,
+    pub gain_mode: i32,
+    pub pixel_depth: i32,
+    pub counter_select_in: i32,
+    pub counter_select_out: i32,
+    pub idelay: [i32; 4],
+}
+
+/// C `stripTpx3DetectorConfigFields` (serval_http.cpp:133-145).
+const TPX3_ONLY_FIELDS: [&str; 5] = [
+    "TriggerDelay",
+    "GlobalTimestampInterval",
+    "Tdc",
+    "ExternalReferenceClock",
+    "PeriphClk80",
+];
 
 /// C `ADTimePix3ServalConfig::setBoolean` (serval_config.cpp:84-92).
 fn set_boolean(config: &mut Value, field: &str, value: i32) -> bool {
@@ -342,7 +367,14 @@ pub fn detector_config_body(current: &Value, c: &DetectorConfig) -> Result<Value
     body["TriggerMode"] =
         json!(enum_name(&TRIGGER_MODES, c.trigger_mode).unwrap_or(TRIGGER_MODES[0]));
     body["ExposureTime"] = json!(c.exposure_time);
-    body["TriggerPeriod"] = json!(c.trigger_period);
+    // CONTINUOUS runs frame after frame; otherwise the period leaves 3 ms
+    // past the exposure (serval_http.cpp:2502-2518).
+    let period = if c.trigger_mode == 5 {
+        c.exposure_time
+    } else {
+        c.trigger_period.max(c.exposure_time + 0.003)
+    };
+    body["TriggerPeriod"] = json!(period);
     body["nTriggers"] = json!(c.n_triggers);
     body["BiasVoltage"] = json!(c.bias_voltage);
     if !set_boolean(&mut body, "BiasEnabled", c.bias_enabled) {
@@ -353,19 +385,38 @@ pub fn detector_config_body(current: &Value, c: &DetectorConfig) -> Result<Value
     body["Polarity"] = json!(enum_name(&POLARITIES, c.polarity).ok_or("Polarity must be 0 or 1")?);
     body["TriggerIn"] = json!(c.trigger_in);
     body["TriggerOut"] = json!(c.trigger_out);
-    body["TriggerDelay"] = json!(c.trigger_delay);
-    body["GlobalTimestampInterval"] = json!(c.global_timestamp_interval);
-    let tdc = |n| enum_name(&TDC_MODES, n).ok_or("Tdc values must be between 0 and 5");
-    body["Tdc"] = json!([tdc(c.tdc0)?, tdc(c.tdc1)?]);
-    if !set_boolean(
-        &mut body,
-        "ExternalReferenceClock",
-        c.external_reference_clock,
-    ) {
-        return Err("ExternalReferenceClock must be 0 or 1");
-    }
-    if !set_boolean(&mut body, "PeriphClk80", c.periph_clk80) {
-        return Err("PeriphClk80 must be 0 or 1");
+    match &c.mpx3 {
+        None => {
+            body["TriggerDelay"] = json!(c.trigger_delay);
+            body["GlobalTimestampInterval"] = json!(c.global_timestamp_interval);
+            let tdc = |n| enum_name(&TDC_MODES, n).ok_or("Tdc values must be between 0 and 5");
+            body["Tdc"] = json!([tdc(c.tdc0)?, tdc(c.tdc1)?]);
+            if !set_boolean(
+                &mut body,
+                "ExternalReferenceClock",
+                c.external_reference_clock,
+            ) {
+                return Err("ExternalReferenceClock must be 0 or 1");
+            }
+            if !set_boolean(&mut body, "PeriphClk80", c.periph_clk80) {
+                return Err("PeriphClk80 must be 0 or 1");
+            }
+        }
+        Some(m) => {
+            if let Some(config) = body.as_object_mut() {
+                for key in TPX3_ONLY_FIELDS {
+                    config.remove(key);
+                }
+            }
+            body["BothCounters"] = json!(m.both_counters);
+            body["ChargeSumming"] = json!(m.charge_summing);
+            body["Colour"] = json!(m.colour);
+            body["GainMode"] = json!(enum_name(&GAIN_MODES, m.gain_mode).unwrap_or(GAIN_MODES[0]));
+            body["PixelDepth"] = json!(m.pixel_depth);
+            body["CounterSelectIn"] = json!(m.counter_select_in);
+            body["CounterSelectOut"] = json!(m.counter_select_out);
+            body["IDelayConfig"] = json!(m.idelay);
+        }
     }
     body["LogLevel"] = json!(c.log_level);
     Ok(body)
@@ -1383,7 +1434,61 @@ mod tests {
             periph_clk80: 0,
             tdc0: 2,
             tdc1: 2,
+            mpx3: None,
         }
+    }
+
+    /// C's TriggerPeriod rule (serval_http.cpp:2502-2518).
+    #[test]
+    fn the_trigger_period_follows_the_exposure_as_c() {
+        let period = |mode, exposure, period| {
+            let c = DetectorConfig {
+                trigger_mode: mode,
+                exposure_time: exposure,
+                trigger_period: period,
+                ..config()
+            };
+            detector_config_body(&json!({}), &c).unwrap()["TriggerPeriod"].clone()
+        };
+        assert_eq!(period(5, 0.5, 2.0), json!(0.5));
+        assert_eq!(period(4, 0.5, 2.0), json!(2.0));
+        assert_eq!(period(4, 0.5, 0.503), json!(0.5 + 0.003));
+        assert_eq!(period(4, 0.5, 0.1), json!(0.5 + 0.003));
+    }
+
+    /// A Medipix3 config drops the Timepix3-only fields, sends its own, and
+    /// skips their range checks (serval_http.cpp:2583-2617).
+    #[test]
+    fn a_medipix3_config_sends_its_own_fields() {
+        let c = DetectorConfig {
+            tdc0: 9,
+            periph_clk80: 5,
+            mpx3: Some(Mpx3Config {
+                both_counters: true,
+                charge_summing: false,
+                colour: true,
+                gain_mode: 7,
+                pixel_depth: 6,
+                counter_select_in: 1,
+                counter_select_out: 2,
+                idelay: [1, 2, 3, 4],
+            }),
+            ..config()
+        };
+        let current = json!({"Tdc": ["P0", "P0"], "TriggerDelay": 1.0, "Fan1PWM": 50});
+        let body = detector_config_body(&current, &c).unwrap();
+        for key in TPX3_ONLY_FIELDS {
+            assert!(body.get(key).is_none(), "{key}");
+        }
+        assert_eq!(body["Fan1PWM"], json!(50));
+        assert_eq!(body["BothCounters"], json!(true));
+        assert_eq!(body["ChargeSumming"], json!(false));
+        assert_eq!(body["Colour"], json!(true));
+        assert_eq!(body["GainMode"], json!("SHGM"));
+        assert_eq!(body["PixelDepth"], json!(6));
+        assert_eq!(body["CounterSelectIn"], json!(1));
+        assert_eq!(body["CounterSelectOut"], json!(2));
+        assert_eq!(body["IDelayConfig"], json!([1, 2, 3, 4]));
     }
 
     #[test]
