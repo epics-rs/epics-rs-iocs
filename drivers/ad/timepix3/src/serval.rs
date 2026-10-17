@@ -591,6 +591,68 @@ pub fn parse_config_response(body: &str) -> Result<Value, ConfigResponseError> {
     }
 }
 
+/// C `ADTimePix3ServalDetector::ParseError` (serval_detector.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectorParseError {
+    EmptyBody,
+    MalformedJson,
+    InvalidRoot,
+    MissingInfo,
+    MissingConfig,
+    InvalidGeometry,
+}
+
+impl DetectorParseError {
+    /// C `parseErrorMessage` (serval_detector.cpp:90-109).
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::EmptyBody => "empty detector response",
+            Self::MalformedJson => "malformed detector JSON",
+            Self::InvalidRoot => "detector JSON root is not an object",
+            Self::MissingInfo => "detector response is missing the Info object",
+            Self::MissingConfig => "detector response is missing the Config object",
+            Self::InvalidGeometry => "detector response contains invalid geometry",
+        }
+    }
+}
+
+/// C `ADTimePix3ServalDetector::parseResponse` (serval_detector.cpp:60-88):
+/// Info and Config are objects and the geometry is whole.
+pub fn parse_detector_response(body: &str) -> Result<Value, DetectorParseError> {
+    use DetectorParseError as E;
+    if body.is_empty() {
+        return Err(E::EmptyBody);
+    }
+    let detector: Value = serde_json::from_str(body).map_err(|_| E::MalformedJson)?;
+    if !detector.is_object() {
+        return Err(E::InvalidRoot);
+    }
+    let info = detector
+        .get("Info")
+        .filter(|v| v.is_object())
+        .ok_or(E::MissingInfo)?;
+    detector
+        .get("Config")
+        .filter(|v| v.is_object())
+        .ok_or(E::MissingConfig)?;
+    // C `positiveInt`/`nonnegativeInt`: an integer in int range.
+    let int = |name: &str, min: i64| {
+        info.get(name)
+            .and_then(Value::as_i64)
+            .filter(|&n| n >= min && n <= i64::from(i32::MAX))
+    };
+    let geometry = (|| {
+        let pix_count = int("PixCount", 1)?;
+        int("RowLen", 1)?;
+        int("NumberOfChips", 1)?;
+        let rows = int("NumberOfRows", 1)?;
+        int("MpxType", 0)?;
+        (pix_count % rows == 0).then_some(())
+    })();
+    geometry.ok_or(E::InvalidGeometry)?;
+    Ok(detector)
+}
+
 /// A validated `GET /measurement/config` reply (C `ConfigSnapshot`,
 /// serval_measurement.h); `None` is a field Serval did not send.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -738,6 +800,43 @@ pub fn json_to_string(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `parseResponse` (serval_detector.cpp:60-88).
+    #[test]
+    fn the_detector_reply_is_validated_as_c() {
+        use DetectorParseError as E;
+        let info = |extra: &str| {
+            format!(
+                r#"{{"Info":{{"PixCount":65536,"RowLen":1,"NumberOfChips":1,"NumberOfRows":256,"MpxType":0{extra}}},"Config":{{}}}}"#
+            )
+        };
+        assert!(parse_detector_response(&info("")).is_ok());
+        assert_eq!(parse_detector_response(""), Err(E::EmptyBody));
+        assert_eq!(parse_detector_response("{"), Err(E::MalformedJson));
+        assert_eq!(parse_detector_response("[]"), Err(E::InvalidRoot));
+        assert_eq!(
+            parse_detector_response(r#"{"Info":1,"Config":{}}"#),
+            Err(E::MissingInfo)
+        );
+        assert_eq!(
+            parse_detector_response(r#"{"Info":{}}"#),
+            Err(E::MissingConfig)
+        );
+        for bad in [
+            r#"{"Info":{"PixCount":65536,"RowLen":1,"NumberOfChips":1,"NumberOfRows":0,"MpxType":0},"Config":{}}"#,
+            r#"{"Info":{"PixCount":65537,"RowLen":1,"NumberOfChips":1,"NumberOfRows":256,"MpxType":0},"Config":{}}"#,
+            r#"{"Info":{"PixCount":65536,"RowLen":1.5,"NumberOfChips":1,"NumberOfRows":256,"MpxType":0},"Config":{}}"#,
+            r#"{"Info":{"PixCount":65536,"RowLen":1,"NumberOfChips":1,"NumberOfRows":256,"MpxType":-1},"Config":{}}"#,
+            r#"{"Info":{"PixCount":4294967296,"RowLen":1,"NumberOfChips":1,"NumberOfRows":256,"MpxType":0},"Config":{}}"#,
+            r#"{"Info":{"RowLen":1,"NumberOfChips":1,"NumberOfRows":256,"MpxType":0},"Config":{}}"#,
+        ] {
+            assert_eq!(
+                parse_detector_response(bad),
+                Err(E::InvalidGeometry),
+                "{bad}"
+            );
+        }
+    }
 
     fn image(base: &str) -> ImageChannel {
         ImageChannel {

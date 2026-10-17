@@ -654,10 +654,42 @@ async fn refresh_dashboard(ctx: &Arc<Ctx>) {
 /// C `getDetector` (serval_http.cpp:1293); false when `/detector` failed.
 async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
     let p = ctx.p;
-    let detector = match ctx.http.get_json(serval::DETECTOR, TIMEOUT_POLL) {
+    let failure = |write_msg: String, message: &str, status: ADStatus| {
+        let octet = |s: &str| ParamValue::Octet(s.as_bytes().to_vec().into());
+        vec![
+            ParamSetValue::new(p.det_connected, 0, ParamValue::Int32(0)),
+            ParamSetValue::new(p.write_msg, 0, octet(&write_msg)),
+            ParamSetValue::new(ctx.ad.status_message, 0, octet(message)),
+            ParamSetValue::new(ctx.ad.status, 0, ParamValue::Int32(status as i32)),
+        ]
+    };
+    // C getDetector (serval_http.cpp:1300-1323).
+    let detector = match ctx
+        .http
+        .get(serval::DETECTOR, TIMEOUT_POLL)
+        .map_err(|e| (e.body().to_string(), Some(e)))
+        .and_then(|body| {
+            serval::parse_detector_response(&body).map_err(|e| (e.message().to_string(), None))
+        }) {
         Ok(d) => d,
-        Err(_) => {
-            ctx.set_int(p.det_connected, 0, 0).await;
+        Err((body, Some(e))) => {
+            let url = format!("{}{}", ctx.http.base_url(), serval::DETECTOR);
+            if let Some(line) = adlog::http_failure("getDetector GET /detector", "GET", &url, &e) {
+                ctx.trace(TraceMask::ERROR, &line);
+            }
+            let updates = failure(
+                body,
+                "Failed to read detector information",
+                ADStatus::Disconnected,
+            );
+            ctx.set(0, updates).await;
+            return false;
+        }
+        Err((reason, None)) => {
+            let message = format!("Invalid detector response: {reason}");
+            ctx.trace(TraceMask::ERROR, &adlog::err("getDetector", &message));
+            let updates = failure(message.clone(), &message, ADStatus::Error);
+            ctx.set(0, updates).await;
             return false;
         }
     };
@@ -749,22 +781,17 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
     );
     int(p.log_level, detector.pointer("/Config/LogLevel"));
 
-    // UPSTREAM DEFECT (serval_http.cpp:1198): C computes
-    // `ADMaxSizeX = PixCount / NumberOfRows` with no guard — a detector that
-    // reports `NumberOfRows: 0` (or omits it, which nlohmann turns into 0)
-    // raises SIGFPE and takes the IOC down.
-    if rows > 0 {
-        updates.push(ParamSetValue::new(
-            ctx.ad.max_size_x,
-            0,
-            ParamValue::Int32(i32::try_from(pix_count / rows).unwrap_or(0)),
-        ));
-        updates.push(ParamSetValue::new(
-            ctx.ad.max_size_y,
-            0,
-            ParamValue::Int32(i32::try_from(rows).unwrap_or(0)),
-        ));
-    }
+    // serval_http.cpp:1349-1350; parse_detector_response made rows positive.
+    updates.push(ParamSetValue::new(
+        ctx.ad.max_size_x,
+        0,
+        ParamValue::Int32(i32::try_from(pix_count / rows).unwrap_or(0)),
+    ));
+    updates.push(ParamSetValue::new(
+        ctx.ad.max_size_y,
+        0,
+        ParamValue::Int32(i32::try_from(rows).unwrap_or(0)),
+    ));
 
     let mut float = |reason: usize, v: Option<&Value>| {
         if let Some(v) = v.and_then(Value::as_f64) {
@@ -3659,6 +3686,107 @@ mod tests {
         (url, log)
     }
 
+    /// A `/detector` reply that passes C `parseResponse`.
+    const DETECTOR: &str = r#"{"Info":{"PixCount":65536,"RowLen":1,"NumberOfChips":1,
+        "NumberOfRows":256,"MpxType":3},"Config":{}}"#;
+
+    /// A failed or invalid detector read is published as C getDetector
+    /// does: DetConnected 0, WriteMsg, StatusMessage, ADStatus and an ERR
+    /// line (serval_http.cpp:1300-1323).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_detector_read_is_published_as_c() {
+        async fn read(
+            name: &str,
+            fail: &'static [&'static str],
+            body_for: fn(&str) -> &'static str,
+        ) -> (Arc<Ctx>, String, String) {
+            let (url, _log) = logging_serval(fail, body_for);
+            let ctx = Arc::new(idle_ctx_at(name, &url, None));
+            let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let file = std::fs::File::create(&path).unwrap();
+            ctx.handle.trace().set_trace_file(
+                Some(name),
+                epics_rs::asyn::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+            ctx.handle
+                .trace()
+                .set_trace_mask(Some(name), TraceMask::ERROR);
+            ctx.set(
+                0,
+                vec![
+                    ParamSetValue::new(ctx.p.det_connected, 0, ParamValue::Int32(1)),
+                    ParamSetValue::new(
+                        ctx.p.write_msg,
+                        0,
+                        ParamValue::Octet(b"old".to_vec().into()),
+                    ),
+                ],
+            )
+            .await;
+            assert!(!refresh_detector(&ctx).await);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            (ctx, url, text)
+        }
+        async fn octet(ctx: &Ctx, reason: usize) -> String {
+            let v = ctx.handle.read_octet(reason, 0, 128).await.unwrap();
+            String::from_utf8(v)
+                .unwrap()
+                .trim_end_matches('\0')
+                .to_string()
+        }
+
+        let (ctx, url, text) = read("TPX_DET_500", &["/detector"], |_| "{}").await;
+        assert_eq!(
+            ctx.handle.read_int32(ctx.p.det_connected, 0).await.unwrap(),
+            0
+        );
+        assert_eq!(octet(&ctx, ctx.p.write_msg).await, "");
+        assert_eq!(
+            octet(&ctx, ctx.ad.status_message).await,
+            "Failed to read detector information"
+        );
+        assert_eq!(
+            ctx.handle.read_int32(ctx.ad.status, 0).await.unwrap(),
+            ADStatus::Disconnected as i32
+        );
+        let line = format!("getDetector GET /detector: GET {url}/detector HTTP 500: ");
+        assert!(
+            text.contains("ERROR | ADTimePix::") && text.contains(&line),
+            "{text}"
+        );
+
+        for (name, body_for, reason) in [
+            (
+                "TPX_DET_INFO",
+                (|_: &str| "{}") as fn(&str) -> &'static str,
+                "detector response is missing the Info object",
+            ),
+            (
+                "TPX_DET_ROWS",
+                |_: &str| r#"{"Info":{"PixCount":65536,"RowLen":1,"NumberOfChips":1,"NumberOfRows":0,"MpxType":3},"Config":{}}"#,
+                "detector response contains invalid geometry",
+            ),
+        ] {
+            let (ctx, _url, text) = read(name, &[], body_for).await;
+            let message = format!("Invalid detector response: {reason}");
+            assert_eq!(
+                ctx.handle.read_int32(ctx.p.det_connected, 0).await.unwrap(),
+                0
+            );
+            assert_eq!(octet(&ctx, ctx.p.write_msg).await, message);
+            assert_eq!(octet(&ctx, ctx.ad.status_message).await, message);
+            assert_eq!(
+                ctx.handle.read_int32(ctx.ad.status, 0).await.unwrap(),
+                ADStatus::Error as i32
+            );
+            assert!(
+                text.contains(&adlog::err("getDetector", &message)),
+                "{text}"
+            );
+        }
+    }
+
     /// The reconnect refresh reads the destination, the detector and the
     /// measurement config; a failed readback reports the refresh incomplete
     /// and is retried on the next poll (serval_http.cpp:287-312, :408-420).
@@ -3666,6 +3794,7 @@ mod tests {
     async fn an_incomplete_reconnect_refresh_is_reported_and_retried() {
         let (url, log) = logging_serval(&["/server/destination"], |path| match path {
             "/dashboard" => r#"{"Server":{},"Detector":{"DetectorType":"TPX3"}}"#,
+            "/detector" => DETECTOR,
             _ => "{}",
         });
         let ctx = Arc::new(idle_ctx_at("TPX_RECONNECT", &url, None));
