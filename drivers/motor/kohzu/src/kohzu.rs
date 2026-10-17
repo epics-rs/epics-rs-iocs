@@ -24,8 +24,8 @@
 //! 1, and its `EGU` is steps. Base/slew speeds cross the boundary in steps/s.
 //! The controller's acceleration parameter is the record's acceleration *time*
 //! scaled by 100 (C `NINT(mr->accl * 100)`); at the boundary the acceleration
-//! *rate* (steps/s²) is supplied instead, so the time is reconstructed as
-//! `velocity / acceleration`.
+//! *rate* (steps/s²) is supplied instead, so the time is reconstructed by
+//! inverting motorRecord's accEGUfromVelo, `(velocity - vbase) / acceleration`.
 //!
 //! ## Deviations from C (documented)
 //!
@@ -178,13 +178,18 @@ struct Speeds {
 
 /// Derive the programmable speeds from move parameters. Base/slew are the
 /// min/target velocities (steps/s), clamped as SET_VEL_BASE/SET_VELOCITY do
-/// (devSC800.cc). The controller's acceleration parameter is
-/// the acceleration *time* (`velocity / acceleration`) scaled by 100, matching
-/// C `NINT(mr->accl * 100)`; when it cannot be derived (non-positive velocity or
-/// acceleration) `prev_accel` is kept.
+/// (devSC800.cc). The controller's acceleration parameter is C
+/// `NINT(mr->accl * 100)`, the ACCL that motorRecord's accEGUfromVelo turned
+/// into `acceleration`; when it cannot be derived (non-positive acceleration)
+/// `prev_accel` is kept.
 fn compute_speeds(min_velocity: f64, velocity: f64, acceleration: f64, prev_accel: i32) -> Speeds {
-    let accel = if velocity > 0.0 && acceleration > 0.0 {
-        nint(velocity / acceleration * 100.0)
+    let accel = if acceleration > 0.0 {
+        let rise = if velocity > min_velocity {
+            velocity - min_velocity
+        } else {
+            velocity
+        };
+        nint(rise / acceleration * 100.0)
     } else {
         prev_accel
     };
@@ -312,6 +317,10 @@ impl AsynMotor for KohzuAxis {
         if self.speeds.base > self.speeds.slew {
             self.speeds.base = self.speeds.slew;
         }
+        // C `NINT((jvel - vbas) / jar * 100)`, with no VBAS guard.
+        if acceleration > 0.0 {
+            self.speeds.accel = nint((velocity.abs() - min_velocity) / acceleration * 100.0);
+        }
         self.write_move(&format!("FRP{}/2/0/0/{}/1", self.axis, polarity))
     }
 
@@ -323,7 +332,9 @@ impl AsynMotor for KohzuAxis {
         acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
-        // C HOME_FOR/HOME_REV both emit the same ORG sequence.
+        // C HOME_FOR/HOME_REV both emit the same ORG sequence. C leaves
+        // accl_rate at the raw SET_ACCEL rate (steps/s^2) where ASI takes
+        // the time; the move's time is used here instead.
         self.set_speeds(min_velocity, velocity, acceleration);
         self.write_move(&format!("ORG{}/2/0/0/3/1", self.axis))
     }
@@ -534,7 +545,7 @@ mod tests {
     fn prem_goes_ahead_of_the_move() {
         let (line, mut axis, _) = strings_rig("sc800Prem");
         let user = AsynUser::default();
-        let asi = "ASI1/10/100/10/10/0/0/0/0/0/0/0/0/0";
+        let asi = "ASI1/10/100/9/9/0/0/0/0/0/0/0/0/0";
         axis.set_move_strings(&user, b"COF1/0", None).unwrap();
         axis.move_absolute(&user, 5.0, 10.0, 100.0, 1000.0).unwrap();
         assert_eq!(sent(&line), ["COF1/0", asi, "APS1/2/0/0/5/0/0/1"]);
@@ -603,12 +614,13 @@ mod tests {
 
     #[test]
     fn speeds_reconstruct_accel_time() {
-        // velocity 1000 steps/s, acceleration 5000 steps/s² → accel time 0.2 s
-        // → accel param NINT(0.2 * 100) = 20.
-        let s = compute_speeds(100.0, 1000.0, 5000.0, 100);
+        // accEGUfromVelo inverted: (1000 - 100) / 4500 = ACCL 0.2 s → 20.
+        let s = compute_speeds(100.0, 1000.0, 4500.0, 100);
         assert_eq!(s.slew, 1000);
         assert_eq!(s.base, 100);
         assert_eq!(s.accel, 20);
+        // VELO <= VBAS: the record's rate is VELO / ACCL.
+        assert_eq!(compute_speeds(100.0, 100.0, 500.0, 0).accel, 20);
         // devSC800.cc SET_VEL_BASE/SET_VELOCITY clamp to [1, 4095500].
         let s = compute_speeds(0.0, 5e6, 5000.0, 100);
         assert_eq!((s.base, s.slew), (1, 4_095_500));
