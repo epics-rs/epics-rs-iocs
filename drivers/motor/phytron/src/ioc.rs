@@ -176,7 +176,7 @@ fn register_controller(
     if connected.is_err() {
         return Ok(CommandOutcome::Continue);
     }
-    let mut controller = PhytronController::new(handle, ctrl_type, address);
+    let mut controller = PhytronController::new(handle, &name, ctrl_type, address);
     if reset_at_boot {
         controller.reset_at_boot(&name);
     }
@@ -192,13 +192,7 @@ fn register_controller(
     let _ = slot.set(controller.clone());
     let poller = Controller::new().controller_poll({
         let controller = controller.clone();
-        let name = name.clone();
-        move || {
-            controller
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .poll(&name)
-        }
+        move || controller.lock().unwrap_or_else(|e| e.into_inner()).poll()
     });
     // C startPoller, phytronAxisMotor.cpp:240
     poller.start(ctx, moving_poll_ms, idle_poll_ms, 5);
@@ -250,10 +244,6 @@ fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
                 motor,
                 Arc::new(PhytronAxisReport(axis_no)),
             )?;
-            controller
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .add_axis(axis_no);
             Ok(CommandOutcome::Continue)
         },
     )
