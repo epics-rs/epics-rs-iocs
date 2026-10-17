@@ -2382,10 +2382,12 @@ impl PortDriver for TimePix3Driver {
             );
             return Ok(data.len());
         }
-        self.ad
+        // C keeps the store's status and lets a path check overwrite it
+        // (ADTimePix.cpp:443-462).
+        let stored = self
+            .ad
             .port_base
-            .set_string_param(reason, addr, value.clone())?;
-
+            .set_string_param(reason, addr, value.clone());
         let status = if reason == p.bp_c_file_path {
             self.check_calibration_dir(
                 p.bp_c_file_path,
@@ -2403,7 +2405,7 @@ impl PortDriver for TimePix3Driver {
         } else if reason == p.tof_tdc_reference {
             self.send_measurement_config()
         } else {
-            Ok(())
+            stored
         };
         // The callbacks run on failure too (ADTimePix.cpp:463-465).
         let callbacks = self.ad.port_base.call_param_callbacks(addr);
@@ -2784,6 +2786,36 @@ mod tests {
             )
         );
         assert_eq!(det.text(p.tof_tdc_reference, 0), "PN");
+    }
+
+    /// A refused store does not end writeOctet: the checks, the callbacks
+    /// and the errorMessage still follow (ADTimePix.cpp:443-470).
+    #[test]
+    fn a_refused_octet_store_still_reports_the_write_octet_message() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_OCTET_STORE",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let e = det
+            .write_octet(&mut AsynUser::new(p.http_code), b"x")
+            .unwrap_err();
+        let message = e.to_string();
+        assert!(
+            message.contains(&format!(
+                "ADTimePix:{}: status=",
+                "virtual asynStatus ADTimePix::writeOctet(asynUser*, const char*, size_t, size_t*)"
+            )) && message.ends_with(&format!(
+                ", function={}, paramName=TPX3_HTTP_CODE, value=x",
+                p.http_code
+            )),
+            "{message}"
+        );
     }
 
     /// writeOctet stores up to the first NUL and ignores a blank threshold
