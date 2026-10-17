@@ -1339,6 +1339,19 @@ impl PIGCS2Params {
     }
 }
 
+/// C `PIasynController::writeInt32`/`writeFloat64` with no
+/// `m_pGCSController`: asynError before anything is stored.
+fn not_initialized(base: &PortDriverBase, user: &AxisUser<'_>, method: &str) -> ParamWrite {
+    PortManager::global().trace_manager().print(
+        Some(&base.port_name),
+        Some(user.asyn().addr),
+        user.reason as i32,
+        TraceMask::ERROR,
+        format_args!("PIasynController::{method}() GCS controller not initialized!\n"),
+    );
+    ParamWrite::Handled(Err(pigcs2_err("GCS controller not initialized")))
+}
+
 impl ControllerParams for PIGCS2Params {
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let mut create = |name, kind| base.create_param(name, kind);
@@ -1372,7 +1385,10 @@ impl ControllerParams for PIGCS2Params {
         user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
-        let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
+        let Some(controller) = self.controller.get() else {
+            return not_initialized(base, &user, "writeInt32");
+        };
+        let Some(params) = self.params.get() else {
             return ParamWrite::PassToBase(Ok(()));
         };
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -1405,7 +1421,10 @@ impl ControllerParams for PIGCS2Params {
         user: AxisUser<'_>,
         value: f64,
     ) -> ParamWrite {
-        let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
+        let Some(controller) = self.controller.get() else {
+            return not_initialized(base, &user, "writeFloat64");
+        };
+        let Some(params) = self.params.get() else {
             return ParamWrite::PassToBase(Ok(()));
         };
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -2851,6 +2870,35 @@ mod tests {
         line.sent();
         first.set_deferred_moves(&user, false).unwrap();
         assert!(sent_lines(&line).is_empty());
+    }
+
+    /// A port whose constructor returned before `m_pGCSController` was set
+    /// refuses an Int32/Float64 write with asynError, storing nothing
+    /// (PIasynController.cpp:276-283, :345-352).
+    #[test]
+    fn a_port_with_no_controller_refuses_its_writes() {
+        let name = "gcs2NoCtl";
+        let params = PIGCS2Params::default();
+        let port = motor_common::register_controller_port(
+            &epics_rs::asyn::registry::open_owner(),
+            name,
+            1,
+            params.clone(),
+        )
+        .unwrap();
+        let p = *params.params.get().unwrap();
+        let printed = traced(name, || {
+            assert!(port.write_int32_blocking(p.target_mode, 0, 2).is_err());
+            assert!(port.write_float64_blocking(p.pivot_x, 0, 1.5).is_err());
+        });
+        for line in [
+            "PIasynController::writeInt32() GCS controller not initialized!\n",
+            "PIasynController::writeFloat64() GCS controller not initialized!\n",
+        ] {
+            assert!(printed.contains(line), "{line:?} not in {printed}");
+        }
+        assert!(port.read_int32_blocking(p.target_mode, 0).is_err());
+        assert!(port.read_float64_blocking(p.pivot_x, 0).is_err());
     }
 
     /// `ctrl`'s `PIasynController` port `name` with axis `axis` at address
