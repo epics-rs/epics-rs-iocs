@@ -1440,8 +1440,8 @@ impl TimePix3Driver {
         Ok(bpc)
     }
 
-    /// C `writeBPCfile` (mask_io.cpp:430): write the edited BPC to the mask
-    /// file name, then have Serval load *that* file.
+    /// C `writeBPCfile` (mask_io.cpp:645-723): write the edited BPC to the
+    /// mask file name, then have Serval load *that* file.
     fn write_mask_file(&mut self, bpc: &[u8]) -> AsynResult<()> {
         let dir = self.text(self.p.bp_c_file_path, 0);
         let mut name = self.text(self.p.mask_file_name, 0);
@@ -1457,27 +1457,26 @@ impl TimePix3Driver {
             message: format!("timepix3: writing {}: {e}", path.display()),
         })?;
 
-        let url = serval::config_load("pixelconfig", &path.to_string_lossy());
-        self.http.get(&url, TIMEOUT_CONFIG).map_err(|e| {
-            let err = self.http_failed(
-                "GET /config/load (pixelconfig)",
-                &e,
-                HttpPrint::Failure("uploadBPC GET /config/load pixelconfig", "GET", &url),
-            );
+        // mask_io.cpp:708-719: uploadBPC loads the mask under BPCFileName,
+        // which then reads back the operator's file again.
+        let bpc_name = self.text(self.p.bp_c_file_name, 0);
+        self.set_text(self.p.bp_c_file_name, &name)?;
+        let status = self.config_load("pixelconfig", self.p.bp_c_file_path, self.p.bp_c_file_name);
+        self.set_text(self.p.bp_c_file_name, &bpc_name)?;
+        self.ad.port_base.call_param_callbacks(0)?;
+        if status.is_err() {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
                 format_args!(
                     "{}",
                     adlog::err(
                         adlog::WRITE_BPC_FILE,
-                        "WriteBPC: uploadBPC to SERVAL failed",
+                        "WriteBPC: uploadBPC to SERVAL failed"
                     )
                 ),
             );
-            err
-        })?;
-        self.http_ok();
-        Ok(())
+        }
+        status
     }
 
     /// C `refreshPixelConfigFromServal` (serval_http.cpp:1000).
@@ -4050,6 +4049,32 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&tmp);
         std::mem::forget(runtime);
+    }
+
+    /// The mask write uploads through uploadBPC, so its reply is HttpCode
+    /// and WriteMsg and BPCFileName comes back afterwards
+    /// (mask_io.cpp:559-560, :708-719).
+    #[test]
+    fn the_mask_write_uploads_through_upload_bpc() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_MASK_UPLOAD",
+            Arc::new(ServalHttp::new(&fake_serval_with(
+                "GET /config/load",
+                &[("GET /config/load", "load refused")],
+            ))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        calibration_files(&mut det, "TPX_MASK_UPLOAD");
+        let p = det.p;
+        det.set_text(p.mask_file_name, "mask.bpc").unwrap();
+        assert!(det.write_mask_file(&[1, 0]).is_err());
+        assert_eq!(det.int(p.http_code, 0), 500);
+        assert_eq!(det.text(p.write_msg, 0), "load refused");
+        assert_eq!(det.text(p.bp_c_file_name, 0), "cal.bpc");
     }
 
     const MEASUREMENT_CONFIG_READBACK: &str = r#"{"Stem": {"Scan": {"Width": 64,
