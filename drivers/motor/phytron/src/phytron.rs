@@ -609,15 +609,22 @@ impl ControllerParams for PhytronParams {
         Ok(atof(&reply) / 10.)
     }
 
-    /// C `phytronController::readOption` (phytronAxisMotor.cpp:589-655).
-    /// With no address to read, an axis's own poll method is not shown;
-    /// the controller's is.
-    fn read_option(&self, _base: &PortDriverBase, key: &str) -> Option<AsynResult<String>> {
+    /// C `phytronController::readOption` (phytronAxisMotor.cpp:589-655):
+    /// the addressed axis's poll method, else the controller's. Unlike
+    /// writeOption it takes any address `getAxis` resolves, 0 included.
+    fn read_option(
+        &self,
+        _base: &PortDriverBase,
+        user: &AsynUser,
+        key: &str,
+    ) -> Option<AsynResult<String>> {
         if !key.eq_ignore_ascii_case("pollMethod") {
             return None;
         }
         Some(self.controller().map(|ctrl| {
-            let m = ctrl.default_poll_method;
+            let m = ctrl
+                .axis(user.addr)
+                .map_or(ctrl.default_poll_method, |a| a.poll_method);
             format!("{}/{}", m.code(), m.name())
         }))
     }
