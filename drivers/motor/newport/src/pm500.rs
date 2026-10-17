@@ -15,35 +15,38 @@
 //!
 //! ## Units
 //!
-//! The PM500 wire speaks microns/arc-sec for positions but mm/sec and
-//! karc-sec/sec for velocities (and /sec² for accelerations) — C divides
-//! velocity and acceleration by 1000 after its raw-step conversion. The
-//! asyn-rs motor boundary is dial-frame EGU (= wire position units, µm or
-//! arc-sec), so positions pass through unscaled and velocities/accelerations
-//! keep only the genuine ÷1000 unit conversion. C's `drive_resolution`
-//! (0.01 for every firmware type it recognizes) existed only for the
-//! raw-step record boundary; it survives here solely as the 4-decimal
-//! command precision.
+//! The record boundary is raw steps, as in devPM500.cc: every value goes
+//! out as `steps * drive_resolution` (0.01 for every firmware type C
+//! recognizes), and the `R` readback comes back as `NINT(position /
+//! drive_resolution)` steps. The wire speaks microns/arc-sec for positions
+//! but mm/sec and karc-sec/sec for velocities (and /sec² for
+//! accelerations), so C divides velocity and acceleration by 1000 after the
+//! step conversion.
 //!
 //! ## Deviations from C (documented)
 //!
 //! - C leaves `drive_resolution` at 0.0 for an unrecognized `CONFIG?`
 //!   firmware string and still creates the axis, with 1-digit command
-//!   precision; this port does the same. The ±inf readback and zeroed moves
-//!   that 0.0 causes at C's raw-step boundary do not exist at the EGU boundary.
+//!   precision, then sends every value as 0 (devPM500.cc:181, so a move
+//!   goes to 0) and divides its readback by 0 (drvPM500.cc:267). Not
+//!   copied: this port keeps the axis but refuses its commands and flags its
+//!   polls a problem.
 //! - C's axis-discovery and status parsing index fixed reply offsets into a
 //!   buffer that may hold stale bytes after a read failure; this port treats
 //!   a too-short reply like an empty one (comm-retry machine).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_message;
 
-use crate::util::{atof, max_digits};
+use crate::util::{atof, max_digits, nint};
+use motor_common::model1::MoveStrings;
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
@@ -136,7 +139,11 @@ impl Pm500Controller {
     /// every `send_mess` with a `recv_mess` (`cmnd_response = true`), so even
     /// pure motion messages consume a response.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        self.command_bytes(cmd.as_bytes())
+    }
+
+    fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
+        let raw = self.handle.write_read(0, cmd, READ_BUF)?;
         let reply = String::from_utf8_lossy(&raw).into_owned();
         if reply.starts_with("SE") {
             errlog_message("recv_mess(): PM500 system error.\n");
@@ -153,29 +160,36 @@ pub struct Pm500Axis {
     /// Command decimal precision (C `res_decpts`, from the firmware-table
     /// drive resolution — 4 for every recognized type).
     digits: usize,
-    /// Last polled status, reused on the comm-retry early exit where C
-    /// leaves the record's bits stale.
+    /// Wire units per record step (C `drive_resolution`).
+    drive_resolution: f64,
+    /// What the last failed poll raises, kept per axis: the controller's
+    /// state can move on under another axis's poll before it is read.
+    failure: PollFailure,
+    /// Last good status: the base of the next one, whose position and
+    /// encoder it keeps when the steps are unchanged.
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl Pm500Axis {
     /// Construct the axis at 0-based channel `index`, running the C
     /// per-motor init: `{letter}CONFIG?` → firmware string at reply offset 8
-    /// → drive resolution by lookup (only the command precision survives the
-    /// EGU boundary — module Units note), then `set_status`. Performs
+    /// → drive resolution by lookup, then `set_status`. Performs
     /// blocking serial I/O under the controller lock.
     pub fn new(controller: Arc<Mutex<Pm500Controller>>, index: usize) -> Self {
         let name = PM500_AXIS_NAMES[index];
-        let digits = {
+        let drive_resolution = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // A failed read leaves C an empty firmware string, so resolution 0.0.
             let config = ctrl.command(&format!("{name}CONFIG?")).unwrap_or_default();
-            max_digits(resolution_for_firmware(config.get(8..).unwrap_or("")))
+            resolution_for_firmware(config.get(8..).unwrap_or(""))
         };
         let mut ax = Self {
             controller,
             name,
-            digits,
+            digits: max_digits(drive_resolution),
+            drive_resolution,
+            failure: PollFailure::NONE,
             // C clears the status, then hard-wires EA_PRESENT and
             // GAIN_SUPPORT ("PM500 only supports DC motors").
             last_status: MotorStatus {
@@ -184,22 +198,74 @@ impl Pm500Axis {
                 vbas_supported: false,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         };
-        ax.set_status();
+        // C motor_init ignores set_status's verdict.
+        let _ = ax.set_status();
         ax
     }
 
     fn lock(&self) -> MutexGuard<'_, Pm500Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// One record transaction: its speed parts, then PREM and `;`, then the
+    /// motion part, in one message (devPM500.cc:216-232).
+    fn transaction(&mut self, speeds: String, motion: String) -> AsynResult<()> {
+        let mut msg = speeds.into_bytes();
+        let prem = self.strings.arm();
+        if !prem.is_empty() {
+            msg.extend_from_slice(&prem);
+            msg.push(b';');
+        }
+        msg.extend_from_slice(motion.as_bytes());
+        self.lock().command_bytes(&msg)?;
+        Ok(())
+    }
+
+    /// `drive_resolution`, refused at the 0.0 of an unknown firmware
+    /// (module Deviations).
+    fn resolution(&self) -> AsynResult<f64> {
+        match self.drive_resolution {
+            0.0 => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "PM500 axis {}: unknown firmware, no drive resolution",
+                    self.name
+                ),
+            }),
+            res => Ok(res),
+        }
+    }
+
+    /// A record step count as a wire position at command precision.
+    fn wire(&self, steps: f64) -> AsynResult<String> {
+        Ok(format!("{:.1$}", steps * self.resolution()?, self.digits))
+    }
+
+    /// A record step rate as wire mm/sec(²), C's ÷1000.
+    fn rate(&self, steps: f64) -> AsynResult<f64> {
+        Ok(steps * self.resolution()? / 1000.0)
+    }
+
+    /// The SET_VELOCITY and SET_ACCEL parts of a move or home; the record
+    /// sends SET_ACCEL only for a positive rate (motorRecord.cc:874, 940).
+    fn speeds(&self, velocity: f64, acceleration: f64) -> AsynResult<String> {
+        let (c, d) = (self.name, self.digits);
+        let mut msg = format!("{c}V{:.d$};", self.rate(velocity)?);
+        if acceleration > 0.0 {
+            msg += &format!("{c}ACCEL{:.d$};", self.rate(acceleration)?);
+        }
+        Ok(msg)
+    }
 }
 
 impl AsynMotor for Pm500Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvPM500.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
+    /// C `set_status` (drvPM500.cc:244-260): the first unanswered status
+    /// query is RETRY, which raises nothing and posts nothing; the next is
+    /// COMM_ERR, raising `CNTRL_COMM_ERR` and `RA_PROBLEM`.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -212,15 +278,10 @@ impl AsynMotor for Pm500Axis {
     ) -> AsynResult<()> {
         // Record move transaction: SET_VELOCITY;SET_ACCEL;MOVE_ABS (VEL_BASE
         // and GO build nothing). Wire velocity/acceleration are mm/sec(²) —
-        // the ÷1000 from position units is C's, kept (module Units note).
-        let (c, d) = (self.name, self.digits);
-        let ctrl = self.lock();
-        ctrl.command(&format!(
-            "{c}V{:.d$};{c}ACCEL{:.d$};{c}G{position:.d$};",
-            velocity / 1000.0,
-            acceleration / 1000.0
-        ))?;
-        Ok(())
+        // the ÷1000 from position units is C's (module Units note).
+        let speeds = self.speeds(velocity, acceleration)?;
+        let motion = format!("{}G{};", self.name, self.wire(position)?);
+        self.transaction(speeds, motion)
     }
 
     fn move_relative(
@@ -231,14 +292,9 @@ impl AsynMotor for Pm500Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let (c, d) = (self.name, self.digits);
-        let ctrl = self.lock();
-        ctrl.command(&format!(
-            "{c}V{:.d$};{c}ACCEL{:.d$};{c}R{distance:.d$};",
-            velocity / 1000.0,
-            acceleration / 1000.0
-        ))?;
-        Ok(())
+        let speeds = self.speeds(velocity, acceleration)?;
+        let motion = format!("{}R{};", self.name, self.wire(distance)?);
+        self.transaction(speeds, motion)
     }
 
     fn move_velocity(
@@ -251,13 +307,9 @@ impl AsynMotor for Pm500Axis {
         // Record JOG transaction: SET_ACCEL then the signed slew command
         // (C JOG case, `%f` — 6 decimals, unlike the other values).
         let (c, d) = (self.name, self.digits);
-        let ctrl = self.lock();
-        ctrl.command(&format!(
-            "{c}ACCEL{:.d$};{c}S{:.6};",
-            acceleration / 1000.0,
-            velocity / 1000.0
-        ))?;
-        Ok(())
+        let accel = format!("{c}ACCEL{:.d$};", self.rate(acceleration)?);
+        let motion = format!("{c}S{:.6};", self.rate(velocity)?);
+        self.transaction(accel, motion)
     }
 
     fn home(
@@ -270,14 +322,8 @@ impl AsynMotor for Pm500Axis {
     ) -> AsynResult<()> {
         // C builds the same `F0` for HOME_FOR and HOME_REV, after the
         // record's velocity/acceleration transaction parts.
-        let (c, d) = (self.name, self.digits);
-        let ctrl = self.lock();
-        ctrl.command(&format!(
-            "{c}V{:.d$};{c}ACCEL{:.d$};{c}F0;",
-            velocity / 1000.0,
-            acceleration / 1000.0
-        ))?;
-        Ok(())
+        let speeds = self.speeds(velocity, acceleration)?;
+        self.transaction(speeds, format!("{}F0;", self.name))
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -308,16 +354,14 @@ impl AsynMotor for Pm500Axis {
     }
 
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        let (c, d) = (self.name, self.digits);
-        let ctrl = self.lock();
-        ctrl.command(&format!("{c}PSLIM{position:.d$};"))?;
+        let msg = format!("{}PSLIM{};", self.name, self.wire(position)?);
+        self.lock().command(&msg)?;
         Ok(())
     }
 
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        let (c, d) = (self.name, self.digits);
-        let ctrl = self.lock();
-        ctrl.command(&format!("{c}NSLIM{position:.d$};"))?;
+        let msg = format!("{}NSLIM{};", self.name, self.wire(position)?);
+        self.lock().command(&msg)?;
         Ok(())
     }
 
@@ -327,8 +371,26 @@ impl AsynMotor for Pm500Axis {
         Ok(())
     }
 
+    /// `PRIMITIVE`: INIT and a CR (devPM500.cc:202-206).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let mut msg = init.to_vec();
+        msg.push(b'\r');
+        self.lock().command_bytes(&msg)?;
+        Ok(())
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        Ok(self.set_status())
+        self.set_status()
     }
 }
 
@@ -336,7 +398,7 @@ impl Pm500Axis {
     /// Port of C `set_status`: one `{letter}R` status/position query, then
     /// `{letter}M?` for the servo state. Reply format
     /// `[letter][status][sign+digits...]`, e.g. `XB+5.012`.
-    fn set_status(&mut self) -> MotorStatus {
+    fn set_status(&mut self) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let c = self.name;
@@ -346,24 +408,21 @@ impl Pm500Axis {
         // Deviations).
         let reply = ctrl.command(&format!("{c}R")).unwrap_or_default();
         if reply.len() < 3 {
-            if ctrl.comm_state == CommState::Normal {
-                // One empty reply: retry silently next poll (C RETRY state),
-                // leaving the record's bits stale.
-                ctrl.comm_state = CommState::Retry;
-                return self.last_status.clone();
-            }
-            ctrl.comm_state = CommState::CommErr;
-            self.last_status.comms_error = true;
-            self.last_status.problem = true;
-            return self.last_status.clone();
+            (ctrl.comm_state, self.failure) = match ctrl.comm_state {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
+            };
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("PM500 axis {c}: no status reply"),
+            });
         }
         ctrl.comm_state = CommState::Normal;
 
         let status_char = reply.as_bytes()[1];
         let dir_char = reply.as_bytes()[2];
-        // Position parses from the direction sign onward; wire units are the
-        // record EGU (module Units note).
-        let position = atof(&reply[2..]);
+        // Position parses from the direction sign onward, in steps.
+        let steps = self.resolution().map(|res| atof(&reply[2..]) / res);
 
         let moving = status_char == b'B';
         let direction = dir_char == b'+';
@@ -372,11 +431,25 @@ impl Pm500Axis {
         // Servo on/off (C maps the M? readback to EA_POSITION).
         let servo = ctrl.command(&format!("{c}M?")).unwrap_or_default();
         let powered = atof(servo.get(2..).unwrap_or("")) as i32 != 0;
+
+        // drvPM500.cc:334-342: POST and a CR, written with no reply read,
+        // once the move is done or on a limit ('L' is also done).
+        if !moving && let Some(mut post) = self.strings.post_due() {
+            post.push(b'\r');
+            let _ = ctrl.handle.write_octet(0, &post);
+        }
         drop(ctrl);
 
+        // drvPM500.cc:306-320: NINT steps and the encoder truncated, both
+        // kept when the steps equal the last position.
+        let last = &self.last_status;
+        let (position, encoder_position) = match steps {
+            Ok(steps) if steps != last.position => (nint(steps) as f64, steps as i32 as f64),
+            _ => (last.position, last.encoder_position),
+        };
         self.last_status = MotorStatus {
             position,
-            encoder_position: position,
+            encoder_position,
             velocity: 0.0, // C: "Parse motor velocity? NEEDS WORK"
             done: !moving,
             moving,
@@ -390,8 +463,8 @@ impl Pm500Axis {
             // C sets RA_PROBLEM from an 'E' status but unconditionally
             // clears it a few lines later (upstream dead store) — net
             // effect: never a problem outside the comm-error path. Kept
-            // bug-for-bug.
-            problem: false,
+            // bug-for-bug. An unknown firmware's 0.0 resolution is one.
+            problem: steps.is_err(),
             comms_error: false,
             // C: "PM500 only supports DC motors" — EA_PRESENT and
             // GAIN_SUPPORT are hard-wired on.
@@ -401,7 +474,7 @@ impl Pm500Axis {
             vbas_supported: false,
             ..MotorStatus::default()
         };
-        self.last_status.clone()
+        Ok(self.last_status.clone())
     }
 }
 
@@ -499,7 +572,7 @@ mod tests {
         use std::time::Duration;
 
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let xr = Arc::new(Mutex::new("XB+5.012"));
+        let xr = Arc::new(Mutex::new("XB+5.017"));
         let line = Scripted {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             reply: Vec::new(),
@@ -534,8 +607,45 @@ mod tests {
             ]
         );
         let s = &axis.last_status;
-        assert_eq!(s.position, 5.012);
+        // drvPM500.cc: NINT steps, the encoder truncated.
+        assert_eq!((s.position, s.encoder_position), (502.0, 501.0));
         assert!(s.moving && s.direction && s.powered && s.has_encoder);
+    }
+
+    /// devPM500.cc sends `steps * drive_resolution`, speeds further ÷1000.
+    #[test]
+    fn a_move_sends_record_steps_times_drive_resolution() {
+        let (mut axis, sent, _) = pm500_axis("pm500_move");
+        let user = AsynUser::default();
+        sent.lock().unwrap().clear();
+        axis.move_absolute(&user, 1234.0, 0.0, 5000.0, 20000.0)
+            .unwrap();
+        axis.move_velocity(&user, 0.0, -5000.0, 20000.0).unwrap();
+        axis.set_high_limit(&user, 1000.0).unwrap();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [
+                "XV0.0500;XACCEL0.2000;XG12.3400;",
+                "XACCEL0.2000;XS-0.050000;",
+                "XPSLIM10.0000;"
+            ]
+        );
+    }
+
+    /// drvPM500.cc:306-320 keeps the encoder when the steps equal the last
+    /// position, and refreshes both otherwise.
+    #[test]
+    fn an_unchanged_position_keeps_the_encoder() {
+        let (mut axis, _, xr) = pm500_axis("pm500_enc");
+        let user = AsynUser::default();
+        let mut poll = |reply: &'static str| {
+            *xr.lock().unwrap() = reply;
+            let s = axis.poll(&user).unwrap();
+            (s.position, s.encoder_position)
+        };
+        assert_eq!(poll("XD+4.997"), (500.0, 499.0));
+        assert_eq!(poll("XD+5.000"), (500.0, 499.0));
+        assert_eq!(poll("XD+5.034"), (503.0, 503.0));
     }
 
     /// drvPM500.cc set_status on an 'L' status sets only the switch in the
@@ -553,6 +663,75 @@ mod tests {
         assert_eq!(poll("XL-5.012"), (true, true));
         assert_eq!(poll("XD-5.012"), (false, false));
         assert_eq!(poll("XL-5.012"), (false, true));
+    }
+
+    /// motorRecord.cc builds no SET_ACCEL for a zero rate, so the move
+    /// carries no `ACCEL` part.
+    #[test]
+    fn a_zero_acceleration_sends_no_accel() {
+        let (mut axis, sent, _) = pm500_axis("pm500_acc0");
+        let user = AsynUser::default();
+        sent.lock().unwrap().clear();
+        axis.move_absolute(&user, 150.0, 0.0, 200000.0, 0.0)
+            .unwrap();
+        axis.home(&user, 0.0, 200000.0, 300000.0, true).unwrap();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["XV2.0000;XG1.5000;", "XV2.0000;XACCEL3.0000;XF0;"]
+        );
+    }
+
+    /// devPM500.cc: INIT and a CR alone, PREM between the speed parts and
+    /// the motion part of one message, POST and a CR once the move is done.
+    #[test]
+    fn init_prem_and_post_go_out_as_c_builds_them() {
+        let (mut axis, sent, xr) = pm500_axis("pm500_strings");
+        let user = AsynUser::default();
+        let post = PostMessage::default();
+        post.set(b"XSON");
+        sent.lock().unwrap().clear();
+        axis.primitive(&user, b"SCUM 1").unwrap();
+        axis.set_move_strings(&user, b"XSOFF", Some(post)).unwrap();
+        axis.move_relative(&user, 200.0, 0.0, 200000.0, 100000.0)
+            .unwrap();
+        axis.poll(&user).unwrap();
+        *xr.lock().unwrap() = "XD+7.012";
+        axis.poll(&user).unwrap();
+        axis.poll(&user).unwrap();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [
+                "SCUM 1\r",
+                "XV2.0000;XACCEL1.0000;XSOFF;XR2.0000;",
+                "XR",
+                "XM?",
+                "XR",
+                "XM?",
+                "XSON\r",
+                "XR",
+                "XM?"
+            ]
+        );
+    }
+
+    /// drvPM500.cc:244-260: a first unanswered `R` is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and an answer clears it.
+    #[test]
+    fn an_unanswered_status_is_retry_then_comm_error() {
+        let (mut axis, _, xr) = pm500_axis("pm500_retry");
+        let user = AsynUser::default();
+        *xr.lock().unwrap() = "";
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        *xr.lock().unwrap() = "XD+5.000";
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        assert!(axis.poll(&user).is_ok());
+        *xr.lock().unwrap() = "";
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
     #[test]

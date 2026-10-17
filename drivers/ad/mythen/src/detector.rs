@@ -66,6 +66,9 @@ pub struct Detector {
     pub state: DetState,
     /// The mythen port C's `pasynUserSelf` prints on.
     port_name: String,
+    /// C's `outString_`: the last command written to it, which C's
+    /// refusal lines print whether or not it was sent.
+    out_string: Mutex<String>,
     trace: Arc<TraceManager>,
 }
 
@@ -78,6 +81,21 @@ impl Detector {
             connected: AtomicBool::new(true),
             state: DetState::default(),
             port_name: port_name.to_string(),
+            out_string: Mutex::default(),
+        }
+    }
+
+    pub fn out_string(&self) -> String {
+        self.out_string.lock().clone()
+    }
+
+    /// C's `"<check> (outString = %s)"` refusal on `pasynUserSelf` and the
+    /// asynError that follows it (mythen.cpp:365, :392, :414).
+    pub fn refused(&self, check: &str) -> AsynError {
+        self.trace_error(&format!("{check} (outString = {})", self.out_string()));
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: String::new(),
         }
     }
 
@@ -95,9 +113,10 @@ impl Detector {
         what: &str,
         exchange: impl FnOnce(&Transport) -> AsynResult<T>,
     ) -> AsynResult<T> {
+        *self.out_string.lock() = what.to_string();
         let result = self.io(what, exchange);
         if result.is_err() {
-            self.trace_error("mythen:writeReadMeter: error!");
+            self.trace_error("mythen:writeReadMeter: error!\n");
         }
         result
     }
@@ -149,9 +168,10 @@ impl Detector {
     /// unusable until the IOC is restarted, because C's constructor is the only
     /// place that reads the module count (mythen.cpp:1363).
     pub fn probe(&self) -> AsynResult<String> {
+        *self.out_string.lock() = "-get version".to_string();
         let version = self
             .exchange(Transport::get_version)
-            .inspect_err(|_| self.trace_error("mythen:writeReadMeter: error!"))?;
+            .inspect_err(|_| self.trace_error("mythen:writeReadMeter: error!\n"))?;
         self.store_firmware(&version);
         Ok(version)
     }
@@ -181,7 +201,7 @@ impl Detector {
         let value = self.meter(command, |t| t.send_command(command))?;
         if value < 0 {
             self.trace_error(&format!(
-                "mythen:sendCommand: error, expected 0, received {value}"
+                "mythen:sendCommand: error, expected 0, received {value}\n"
             ));
         }
         Ok(())
@@ -264,7 +284,7 @@ impl Detector {
         // C sends `-stop` straight through pasynOctetSyncIO, not
         // writeReadMeter, and prints its own line.
         self.io("-stop", |t| t.send_command("-stop"))
-            .inspect_err(|_| self.trace_error("mythen:setAcquire: error!"))?;
+            .inspect_err(|_| self.trace_error("mythen:setAcquire: error!\n"))?;
         Ok(())
     }
 
@@ -327,17 +347,16 @@ impl Detector {
     /// `-module N` followed by `command`, for every module (C repeats this
     /// pattern in setKthresh / setEnergy / loadSettings / setReset).
     ///
-    /// Refuses when the module count is unknown rather than looping zero times:
-    /// a silent no-op here is a threshold the operator believes was applied.
+    /// Like C it runs zero times while the module count is unknown, carries on
+    /// past a failed command and returns the last command's status.
     fn for_each_module(&self, command: &str) -> AsynResult<()> {
-        let nmodules = self
-            .nmodules()
-            .ok_or_else(|| unknown_nmodules(&format!("send [{command}] to every module")))?;
+        let nmodules = self.nmodules().unwrap_or(0);
+        let mut status = Ok(());
         for module in 0..nmodules {
-            self.send(&format!("-module {module}"))?;
-            self.send(command)?;
+            let _ = self.send(&format!("-module {module}"));
+            status = self.send(command);
         }
-        Ok(())
+        status
     }
 
     pub fn set_exposure_time(&self, seconds: f64) -> AsynResult<()> {
@@ -493,6 +512,7 @@ impl Detector {
         } else {
             "-readout"
         };
+        *self.out_string.lock() = command.to_string();
         self.io(command, |t| t.readout(command, expect, timeout))
     }
 }
@@ -509,23 +529,11 @@ fn disconnected(what: &str) -> AsynError {
     }
 }
 
-/// The error a caller gets when it asks for detector work whose size depends on
-/// a module count the detector has never reported.
-pub fn unknown_nmodules(what: &str) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message: format!(
-            "mythen: cannot {what}: the module count is unknown — `-get nmodules` has not \
-             answered since the IOC started"
-        ),
-    }
-}
-
 impl Detector {
     /// C `getSettings`' `goto error`, mythen.cpp:791.
     fn settings_error(&self, command: &str, got: String) -> AsynError {
         self.trace_error(&format!(
-            "mythen:getSettings: error, outString={command}, inString={got}"
+            "mythen:getSettings: error, outString={command}, inString={got}\n"
         ));
         AsynError::Status {
             status: AsynStatus::Error,

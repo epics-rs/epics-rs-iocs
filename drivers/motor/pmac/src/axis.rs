@@ -18,15 +18,15 @@
 //! record instead. Silently accepting the command and ignoring it would be worse
 //! than not having it.
 //!
-//! ## Initial status (framework gap, not ported)
+//! ## Initial status (framework gap, half ported)
 //!
 //! `pmacAxis::getAxisInitialStatus` reads `I{n}13 I{n}14 I{n}30 I{n}31 I{n}33`
 //! and pushes the controller's soft limits and PID gains *up* into the motor
 //! record (`motorHighLimit_`, `motorLowLimit_`, `motorPGain_` …). The asyn-rs
 //! [`MotorStatus`] carries no limit or gain readback fields, so there is no
-//! boundary to push them through; [`crate::protocol::parse_initial_status`] is
-//! kept and tested for the day there is one. The record-to-controller direction
-//! (`set_high_limit` / `set_low_limit`) is ported and does work.
+//! boundary to push them through. The exchange is still sent, because only its
+//! success sets C's `motorStatusHasEncoder_`. The record-to-controller
+//! direction (`set_high_limit` / `set_low_limit`) is ported and does work.
 
 use std::sync::{Arc, Mutex};
 
@@ -40,7 +40,8 @@ use crate::protocol::{
     AXIS_GENERAL_PROB2, CID_GEOBRICK, CID_PMAC, IX24_LIMITS_DISABLED, STATUS1_AMP_ENABLED,
     STATUS1_DESIRED_VELOCITY_ZERO, STATUS1_MOTOR_ON, STATUS1_NEG_LIMIT_SET, STATUS1_POS_LIMIT_SET,
     STATUS2_ERR_FOLLOW_ERR, STATUS2_HOME_COMPLETE, STATUS2_IN_POSITION, may_disable_limits,
-    parse_axis_status, parse_cid, parse_home_flags_geobrick, parse_home_flags_pmac, parse_ix24,
+    parse_axis_status, parse_cid, parse_home_flags_geobrick, parse_home_flags_pmac,
+    parse_initial_status, parse_ix24,
 };
 
 pub struct PmacAxis {
@@ -55,6 +56,8 @@ pub struct PmacAxis {
     /// C `amp_enabled_` / `fatal_following_`, read by `stop`.
     amp_enabled: bool,
     fatal_following: bool,
+    /// C `motorStatusHasEncoder_`: the initial status read succeeded.
+    pub(crate) has_encoder: bool,
 }
 
 /// Lock the shared controller. Taken as a free function on the field rather than
@@ -91,6 +94,13 @@ fn speed_preamble(axis: i32, velocity: f64, acceleration: f64) -> String {
 
 impl PmacAxis {
     pub fn new(controller: Arc<Mutex<PmacController>>, axis: i32) -> Self {
+        // C getAxisInitialStatus; axis 0 skips it.
+        let has_encoder = axis != 0
+            && lock(&controller)
+                .write_read(&format!(
+                    "I{axis}13 I{axis}14 I{axis}30 I{axis}31 I{axis}33"
+                ))
+                .is_ok_and(|resp| parse_initial_status(&resp).is_some());
         Self {
             controller,
             axis,
@@ -99,6 +109,7 @@ impl PmacAxis {
             previous_direction: false,
             amp_enabled: false,
             fatal_following: false,
+            has_encoder,
         }
     }
 
@@ -431,7 +442,7 @@ impl AsynMotor for PmacAxis {
             direction,
             slip_stall: flags.following_error,
             gain_support: true,
-            has_encoder: true,
+            has_encoder: self.has_encoder,
             ..MotorStatus::default()
         })
     }

@@ -30,8 +30,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::task::CallbackPriority;
 use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
 
-/// `asynPrint(pasynUser, mask, ...)` on the record's port; the newline is
-/// added.
+/// `asynPrint(pasynUser, mask, ...)` on the record's port, printed as given.
 fn asyn_print(handle: &PortHandle, mask: TraceMask, args: fmt::Arguments<'_>) {
     handle
         .trace()

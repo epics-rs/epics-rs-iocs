@@ -11,7 +11,6 @@
 //! MPCConfig(port, octetPort, address, [pollPeriod])
 //! TPG261Config(port, octetPort, [pollPeriod])
 //! TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
-//! MKSConfig(port, octetPort, numGauges, [pollPeriod])
 //! ND261Config(port, octetPort, [pollPeriod])
 //! EurothermConfig(port, octetPort, groupAddress)
 //! ```
@@ -23,15 +22,27 @@ use epics_rs::asyn::registry::{PortClaim, claim_port};
 use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use ip_devices::eurotherm::create_eurotherm;
-use ip_devices::mks::create_mks;
 use ip_devices::mpc::create_mpc;
 use ip_devices::nd261::create_nd261;
 use ip_devices::runtime::IpPortRuntime;
 use ip_devices::televac::create_televac;
 use ip_devices::tpg261::create_tpg261;
+
+/// `ipSupport.dbd`'s `device(ai,INST_IO,devAiMKS,"HPS SensaVac 937")`; its dset
+/// is `{6, 0, 0, initAi, 0, readAi, convertAi}`.
+static DEVICES: &[(&str, &[DevSup])] = &[(
+    "ai",
+    &[DevSup {
+        name: "devAiMKS",
+        choice: ip_devices::mks::DTYP,
+        link_type: DbLinkType::InstIo,
+        dset: Dset::new(6, &[2, 4, 5], false),
+    }],
+)];
 
 /// Every port the startup script creates, kept alive for the life of the IOC.
 type Ports = Arc<Mutex<Vec<IpPortRuntime>>>;
@@ -102,6 +113,8 @@ async fn main() -> CaResult<()> {
         Box::new(epics_rs::base::server::records::scalcout::ScalcoutRecord::default())
     });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+    // devAiMKS: per-record ai device support, bound by DTYP.
+    app = app.register_dynamic_device_support(DEVICES, ip_devices::mks::device_support_factory());
 
     // MPCConfig(port, octetPort, address, [pollPeriod])
     {
@@ -228,52 +241,6 @@ async fn main() -> CaResult<()> {
                 let claim = claim_port(&name).map_err(|e| format!("TelevacConfig failed: {e}"))?;
                 let port = create_televac(&claim, &octet, stations, relays, poll)
                     .map_err(|e| format!("TelevacConfig failed: {e}"))?;
-                register(
-                    &ports,
-                    claim,
-                    ctx.db().scan_control().interrupt_gate(),
-                    port,
-                )?;
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
-
-    // MKSConfig(port, octetPort, numGauges, [pollPeriod])
-    {
-        let ports = ports.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "MKSConfig",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "octetPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "numGauges",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "pollPeriod",
-                    arg_type: ArgType::Double,
-                },
-            ],
-            "MKSConfig portName octetPort numGauges [pollPeriod] - MKS/HPS SensaVac 937 \
-             gauge controller",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let name = string_arg(args, 0)?;
-                let octet = string_arg(args, 1)?;
-                let gauges = int_arg(args, 2)?;
-                let gauges = u8::try_from(gauges)
-                    .map_err(|_| format!("MKSConfig: numGauges {gauges} is not 1..5"))?;
-                let poll = poll_arg(args, 3, 1.0)?;
-                let claim = claim_port(&name).map_err(|e| format!("MKSConfig failed: {e}"))?;
-                let port = create_mks(&claim, &octet, gauges, poll)
-                    .map_err(|e| format!("MKSConfig failed: {e}"))?;
                 register(
                     &ports,
                     claim,

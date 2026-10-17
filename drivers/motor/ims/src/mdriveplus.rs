@@ -493,12 +493,18 @@ impl AsynMotor for ImsMDrivePlusAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     /// ImsMDrivePlusMotorController.cpp:69-99: a missing IO port still builds
     /// the axis; configAxis and readHomeAndLimitConfig run on the dead user.
     #[test]
     fn an_axis_of_a_missing_port_is_still_built() {
-        let (handle, status) = SyncIOHandle::connect_port("IMS_NONE", 0, Duration::from_millis(10));
+        let (handle, status) = SyncIOHandle::connect_port(
+            "IMS_NONE",
+            0,
+            Duration::from_millis(10),
+            InterfaceType::Octet,
+        );
         assert!(status.is_err());
         let axis = ImsMDrivePlusAxis::new(handle, "IMS_MOTOR", String::new());
         assert!(!axis.has_encoder);

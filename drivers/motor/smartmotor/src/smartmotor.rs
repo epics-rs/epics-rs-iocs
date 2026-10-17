@@ -175,15 +175,19 @@ impl SmartMotorController {
     /// in the reply read that follows, and the input EOS is restored to `\r`
     /// either way.
     fn send(&self, axis: usize, cmd: &str) {
+        self.send_bytes(axis, cmd.as_bytes());
+    }
+
+    fn send_bytes(&self, axis: usize, cmd: &[u8]) {
         if self.echo {
             let mut out = Vec::with_capacity(cmd.len() + 1);
             out.push(FIRST_ADDR + axis as u8);
-            out.extend_from_slice(cmd.as_bytes());
+            out.extend_from_slice(cmd);
             let _ = self.writer.write_octet(0, &out);
             let _ = self.port.set_input_eos_blocking(eos_user(), ECHO_EOS);
             let _ = self.reader.read_octet(0, READ_BUF);
         } else {
-            let _ = self.writer.write_octet(0, cmd.as_bytes());
+            let _ = self.writer.write_octet(0, cmd);
         }
         let _ = self.port.set_input_eos_blocking(eos_user(), INPUT_EOS);
     }
@@ -202,6 +206,11 @@ pub struct SmartMotorAxis {
     controller: Arc<Mutex<SmartMotorController>>,
     axis: usize,
     prev_position: i32,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// missed `RBt` (RETRY, drvSmartMotor.cc:252), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :258). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
 }
 
@@ -212,6 +221,7 @@ impl SmartMotorAxis {
             controller,
             axis,
             prev_position: 0,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -239,11 +249,8 @@ impl SmartMotorAxis {
 }
 
 impl AsynMotor for SmartMotorAxis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvSmartMotor.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -330,28 +337,36 @@ impl AsynMotor for SmartMotorAxis {
         Ok(())
     }
 
+    /// `PRIMITIVE`: " " + INIT as its own message (devSmartMotor.cc:211-215).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let mut msg = Vec::with_capacity(init.len() + 1);
+        msg.push(b' ');
+        msg.extend_from_slice(init);
+        self.lock().send_bytes(self.axis, &msg);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let mut ctrl = self.lock();
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
         // Trajectory-busy flag: RBt == 0 means the move is done. C
-        // drvSmartMotor.cc:239-263: an empty or failed RBt keeps the previous
-        // status once (RETRY); a second in a row raises COMM_ERR.
+        // drvSmartMotor.cc:239-263: an empty or failed RBt fails the poll
+        // raising nothing once (RETRY); a second in a row raises COMM_ERR.
         let rbt = ctrl.query(self.axis, "RBt").ok().filter(|r| !r.is_empty());
         let Some(rbt) = rbt else {
-            let hard = ctrl.comm_state != CommState::Normal;
-            ctrl.comm_state = if hard {
-                CommState::CommErr
-            } else {
-                CommState::Retry
+            (ctrl.comm_state, self.failure) = match ctrl.comm_state {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
             };
-            drop(ctrl);
-            if hard {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            return Err(smartmotor_err(format!(
+                "SmartMotor axis {}: no RBt reply",
+                self.axis
+            )));
         };
         ctrl.comm_state = CommState::Normal;
+        // A later query's transport error, which C does not check, raises both.
+        self.failure = PollFailure::PROBLEM_AND_COMMS_ERROR;
         let done = atoi(&rbt) == 0;
 
         let position = nint(atof(&ctrl.query(self.axis, "RP")?));
@@ -421,7 +436,9 @@ mod tests {
         base: epics_rs::asyn::port::PortDriverBase,
         replies: std::collections::VecDeque<Vec<u8>>,
         refuse_writes: Arc<std::sync::atomic::AtomicBool>,
+        silent: Arc<std::sync::atomic::AtomicBool>,
         reads: Arc<std::sync::atomic::AtomicUsize>,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     fn chain(name: &str) -> Chain {
@@ -433,7 +450,9 @@ mod tests {
             ),
             replies: Default::default(),
             refuse_writes: Default::default(),
+            silent: Default::default(),
             reads: Default::default(),
+            sent: Default::default(),
         }
     }
 
@@ -450,6 +469,10 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 return Err(smartmotor_err("write refused"));
+            }
+            self.sent.lock().unwrap().push(data.to_vec());
+            if self.silent.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(data.len());
             }
             self.replies.push_back(data.to_vec());
             if data.first() == Some(&FIRST_ADDR) {
@@ -507,5 +530,61 @@ mod tests {
         let before = reads.load(Ordering::Relaxed);
         axis.stop(&AsynUser::new(0), 0.0).unwrap();
         assert_eq!(reads.load(Ordering::Relaxed), before + 1, "the echo read");
+    }
+
+    #[test]
+    fn init_goes_out_addressed_after_a_space() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let chain = chain("smartInit");
+        let sent = chain.sent.clone();
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("smartInit").unwrap(),
+            chain,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl =
+            SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
+        let mut axis = SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        sent.lock().unwrap().clear();
+
+        axis.primitive(&AsynUser::new(0), b"EIGN(2)").unwrap();
+        assert_eq!(*sent.lock().unwrap(), vec![b"\x81 EIGN(2)".to_vec()]);
+    }
+
+    /// drvSmartMotor.cc:239-263: a first missed `RBt` is RETRY (nothing
+    /// raised, nothing posted), the next COMM_ERR, and a reply clears it.
+    #[test]
+    fn a_missed_rbt_is_retry_then_comm_error() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+        use std::sync::atomic::Ordering;
+
+        let chain = chain("smartRetry");
+        let silent = chain.silent.clone();
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("smartRetry").unwrap(),
+            chain,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl =
+            SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
+        let mut axis = SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::new(0);
+
+        silent.store(true, Ordering::Relaxed);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        silent.store(false, Ordering::Relaxed);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        silent.store(true, Ordering::Relaxed);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

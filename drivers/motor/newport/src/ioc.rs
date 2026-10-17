@@ -22,6 +22,7 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::{claim_port, get_port};
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::AsynStatus;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -200,7 +201,13 @@ pub fn smc100_create_controller_command() -> CommandDef {
             let mut controller_user = Some(handle);
             for axis in 0..num_axes {
                 let handle = controller_user.take().unwrap_or_else(|| {
-                    SyncIOHandle::connect_port(&serial_port, 0, SMC100_TIMEOUT).0
+                    SyncIOHandle::connect_port(
+                        &serial_port,
+                        0,
+                        SMC100_TIMEOUT,
+                        InterfaceType::Octet,
+                    )
+                    .0
                 });
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Smc100Axis::new(
                     handle,
@@ -716,7 +723,7 @@ pub fn xps_tcl_script_execute_command() -> CommandDef {
                 MotorTrace::new(&motor_port, 0).print_self(
                     TraceMask::ERROR,
                     format_args!(
-                        "TCLScriptExecute returned error {}, on XPS: {motor_port}",
+                        "TCLScriptExecute returned error {}, on XPS: {motor_port}\n",
                         e.code()
                     ),
                 );
@@ -2011,7 +2018,7 @@ fn parse_move_mode(arg: Option<String>) -> Result<MoveMode, String> {
 fn xps_profile_failed(motor_port: &str, function: &str, message: &str) {
     MotorTrace::new(motor_port, 0).print_self(
         TraceMask::ERROR,
-        format_args!("XPSController:{function}: {message}"),
+        format_args!("XPSController:{function}: {message}\n"),
     );
 }
 

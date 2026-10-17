@@ -20,3 +20,6 @@ tokio = { version = "1", features = ["sync"] }
 # (sync) features only — the iocsh command handler that calls it is synchronous.
 # Pure Rust, so the crate still builds/tests on any host.
 suppaftp = "10"
+
+[dev-dependencies]
+motor-common = { path = "../common", features = ["testing"] }

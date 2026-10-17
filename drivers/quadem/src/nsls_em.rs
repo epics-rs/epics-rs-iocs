@@ -139,7 +139,7 @@ fn find_module(
                 *base,
                 ERROR,
                 "drvNSLS_EM::drvNSLS_EM error calling drvAsynIPPortConfigure for broadcast port={udp_name}, IP={udp_host}, status={}",
-                trace::status_code(&e)
+                e.c_status_code()
             );
             return transport;
         }
@@ -202,7 +202,7 @@ fn discover(
                 *base,
                 ERROR,
                 "drvNSLS_EM:findModules: error calling drvAsyIPPortConfigure for TCP port {name}, IP={ip}, status={}",
-                trace::status_code(&e)
+                e.c_status_code()
             );
         })
     };
@@ -281,7 +281,7 @@ impl NslsEmDriver {
                         self.base.port_base,
                         ERROR,
                         "drvNSLS_EM:writeReadMeter: error calling writeRead, outString={out} status={}, nread={n_read}, eomReason={eom}, inString={in_string}",
-                        trace::status_code(&e)
+                        e.c_status_code()
                     );
                     return Err(e);
                 }
@@ -421,7 +421,7 @@ impl QuadEmDevice for NslsEmDriver {
             self.shared.set_acquiring(true);
             self.shared.acquire_start.signal();
         }
-        let _ = self.base_set_acquire(value);
+        self.base_set_acquire(value);
         self.set_mode()
     }
 

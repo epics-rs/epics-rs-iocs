@@ -197,7 +197,7 @@ impl MythenDriver {
             // constructor (mythen.cpp:1367-1372); the port survives either way.
             Some(n) => {
                 self.det.trace_error(&format!(
-                    "mythen:mythen: error, outString=-get nmodules, inString={n}"
+                    "mythen:mythen: error, outString=-get nmodules, inString={n}\n"
                 ));
                 q.fail();
                 camera_params_failed = false;
@@ -317,29 +317,44 @@ impl MythenDriver {
 
 /// C's `int status` in `writeInt32` / `writeFloat64`: `status |= step()` keeps
 /// going after a failed step, and the write returns the OR of every status.
+/// mythen never writes the record's `pasynUser->errorMessage`; only the
+/// base-class write it calls does.
 #[derive(Default)]
 struct StatusOr {
     bits: i32,
-    err: Option<AsynError>,
+    message: String,
 }
 
 impl StatusOr {
     /// `status |= step`.
     fn or(&mut self, step: AsynResult<()>) {
         if let Err(e) = step {
-            self.bits |= e.status() as i32;
-            self.err = Some(e);
+            self.bits |= e.c_status_code();
         }
     }
 
     /// `status = step`.
     fn set(&mut self, step: AsynResult<()>) {
-        *self = Self::default();
+        let message = std::mem::take(&mut self.message);
+        *self = Self {
+            message,
+            ..Self::default()
+        };
         self.or(step);
     }
 
+    /// `status = ADDriver::writeXxx(pasynUser, value)`, whose errorMessage
+    /// the record keeps.
+    fn set_base(&mut self, step: AsynResult<()>) {
+        if let Err(e) = &step {
+            self.message = e.message();
+        }
+        self.set(step);
+    }
+
+    /// `return (asynStatus)status`: the OR, not the last failing step.
     fn into_result(self) -> AsynResult<()> {
-        self.err.map_or(Ok(()), Err)
+        AsynError::from_c_status_code(self.bits, self.message).map_or(Ok(()), Err)
     }
 }
 
@@ -363,7 +378,6 @@ impl PortDriver for MythenDriver {
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
         let acquire = self.ad.params.acquire;
 
         // C refuses every write except ADAcquire while an acquisition runs
@@ -371,16 +385,18 @@ impl PortDriver for MythenDriver {
         if reason != acquire && self.det.state.acquiring.load(Ordering::Acquire) {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
-                format_args!("mythen:writeInt32: detector is busy"),
+                format_args!("mythen:writeInt32: detector is busy\n"),
             );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: "mythen: detector is busy".into(),
+                message: String::new(),
             });
         }
 
         let mut status = StatusOr::default();
-        status.or(self.ad.port_base.set_int32_param(reason, addr, value));
+        // C's setIntegerParam(function, value) and callParamCallbacks() are
+        // list 0 whatever the address.
+        status.or(self.ad.port_base.set_int32_param(reason, 0, value));
 
         if reason == acquire {
             let read_mode = self.int_param(self.p.read_mode);
@@ -420,19 +436,19 @@ impl PortDriver for MythenDriver {
                 status.or(self.det.set_frames(frames, value));
             } else if reason < self.p.setting {
                 // `FIRST_SD_PARAM` is SDSetting (mythen.cpp:100, :1153).
-                status.set(ADDriver::ad_write_int32(self, user, value));
+                status.set_base(ADDriver::ad_write_int32(self, user, value));
             }
             status.or(self.refresh_settings());
         }
 
-        status.or(self.ad.port_base.call_param_callbacks(addr));
+        status.or(self.ad.port_base.call_param_callbacks(0));
         if status.bits != 0 {
             user.print(
                 TraceMask::ERROR,
                 file!(),
                 line!(),
                 format_args!(
-                    "mythen:writeInt32: error, status={} function={reason}, value={value}",
+                    "mythen:writeInt32: error, status={} function={reason}, value={value}\n",
                     status.bits
                 ),
             );
@@ -441,7 +457,7 @@ impl PortDriver for MythenDriver {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("mythen:writeInt32: function={reason}, value={value}"),
+                format_args!("mythen:writeInt32: function={reason}, value={value}\n"),
             );
         }
         status.into_result()
@@ -449,16 +465,18 @@ impl PortDriver for MythenDriver {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
+        // C refuses an address outside the port before anything else
+        // (mythen.cpp:1182-1183); callParamCallbacks() stays list 0.
+        let addr = self.ad.port_base.get_address(user.addr, reason)?;
 
         if self.det.state.acquiring.load(Ordering::Acquire) {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
-                format_args!("mythen:writeFloat64: detector is busy"),
+                format_args!("mythen:writeFloat64: detector is busy\n"),
             );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: "mythen: detector is busy".into(),
+                message: String::new(),
             });
         }
 
@@ -470,9 +488,20 @@ impl PortDriver for MythenDriver {
         } else if reason == self.p.delay_time {
             status.or(self.det.set_delay_after_trigger(value));
         } else if reason == self.p.threshold {
-            status.or(self.det.set_kthresh(value));
+            // C zeroes SDThreshold on a failed setKthresh (mythen.cpp:387-394).
+            if self.det.set_kthresh(value).is_err() {
+                let _ = self
+                    .ad
+                    .port_base
+                    .set_float64_param(self.p.threshold, 0, 0.0);
+                let _ = self.ad.port_base.call_param_callbacks(0);
+                status.or(Err(self.det.refused("error check if value > 0")));
+            }
         } else if reason == self.p.energy {
-            status.or(self.det.set_energy(value));
+            // mythen.cpp:413-416.
+            if self.det.set_energy(value).is_err() {
+                status.or(Err(self.det.refused("error check if value > 0")));
+            }
         } else if reason == self.p.tau {
             // C zeroes the parameter and errors out on a value that is neither
             // -1 nor positive (mythen.cpp:361-368).
@@ -480,21 +509,18 @@ impl PortDriver for MythenDriver {
                 Ok(true) => Ok(()),
                 Ok(false) => {
                     let _ = self.ad.port_base.set_float64_param(self.p.tau, 0, 0.0);
-                    let _ = self.ad.port_base.call_param_callbacks(addr);
-                    Err(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!("mythen: tau must be -1 or > 0, got {value}"),
-                    })
+                    let _ = self.ad.port_base.call_param_callbacks(0);
+                    Err(self.det.refused("error check if tau -1 or >0"))
                 }
                 Err(e) => Err(e),
             });
         } else if reason < self.p.setting {
             // ADDriver::writeFloat64 is asynPortDriver's (mythen.cpp:1210).
-            status.set(self.ad.port_base.write_float64_param(user, value));
+            status.set_base(self.ad.port_base.write_float64_param(user, value));
         }
 
         status.or(self.refresh_settings());
-        status.or(self.ad.port_base.call_param_callbacks(addr));
+        status.or(self.ad.port_base.call_param_callbacks(0));
         let g = format_g(value, 6);
         if status.bits != 0 {
             user.print(
@@ -502,7 +528,7 @@ impl PortDriver for MythenDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "mythen:writeFloat64: error, status={} function={reason}, value={g}",
+                    "mythen:writeFloat64: error, status={} function={reason}, value={g}\n",
                     status.bits
                 ),
             );
@@ -511,37 +537,43 @@ impl PortDriver for MythenDriver {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("mythen:writeFloat64: function={reason}, value={g}"),
+                format_args!("mythen:writeFloat64: function={reason}, value={g}\n"),
             );
         }
         status.into_result()
     }
 
-    /// `mythen::writeOctet` (mythen.cpp:1062-1097) handles no octet of its
-    /// own and calls `ADDriver::writeOctet`.
+    /// `mythen::writeOctet` (mythen.cpp:1062-1097): the list-0 set's status
+    /// stands unless a base-class param replaces it with ADDriver::writeOctet's.
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let reason = user.reason;
-        let status = self.ad.write_octet(user, data);
         // C prints the value as the `char *` it was handed: up to the NUL.
         let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-        let value = String::from_utf8_lossy(&data[..end]);
-        match &status {
-            Err(e) => user.print(
+        let value = String::from_utf8_lossy(&data[..end]).into_owned();
+        let mut status = StatusOr::default();
+        status.or(self.ad.port_base.set_string_param(reason, 0, value.clone()));
+        if reason < self.p.setting {
+            status.set_base(self.ad.write_octet(user, data).map(|_| ()));
+        }
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        if status.bits != 0 {
+            user.print(
                 TraceMask::ERROR,
                 file!(),
                 line!(),
                 format_args!(
-                    "mythen:writeOctet: error, status={} function={reason}, value={value}",
-                    e.status() as i32
+                    "mythen:writeOctet: error, status={} function={reason}, value={value}\n",
+                    status.bits
                 ),
-            ),
-            Ok(_) => user.print(
+            );
+        } else {
+            user.print(
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("mythen:writeOctet: function={reason}, value={value}"),
-            ),
+                format_args!("mythen:writeOctet: function={reason}, value={value}\n"),
+            );
         }
-        status
+        status.into_result().map(|()| data.len())
     }
 }

@@ -32,12 +32,15 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atof, is_unsolicited_limit_error, nint};
+use motor_common::model1::MoveStrings;
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
@@ -196,7 +199,12 @@ impl Mm3000Controller {
 
     /// Write a command (C `send_mess`); the port output EOS terminates it.
     fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.write_bytes(cmd.as_bytes())
+    }
+
+    /// [`write`](Self::write) for a record string's raw bytes.
+    fn write_bytes(&self, cmd: &[u8]) -> AsynResult<()> {
+        self.handle.write_octet(0, cmd)?;
         Ok(())
     }
 
@@ -253,6 +261,7 @@ pub struct Mm3000Axis {
     /// Last polled status, reused on the comm-retry poll path where C leaves
     /// the record's other bits stale.
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl Mm3000Axis {
@@ -281,6 +290,7 @@ impl Mm3000Axis {
                 has_encoder: true,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         };
         ax.set_status();
         ax
@@ -292,6 +302,20 @@ impl Mm3000Axis {
 
     fn motion_preamble(&self, vel_base: f64, velocity: f64, accel: f64) -> String {
         motion_preamble(self.axis, self.axis_type, vel_base, velocity, accel)
+    }
+
+    /// One move transaction: the record's earlier parts, then PREM and a
+    /// `;` ahead of the move's own command (devMM3000.cc:211-222), whose
+    /// POST waits for the move to end.
+    fn write_move(&mut self, parts: &str, command: &str) -> AsynResult<()> {
+        let mut line = format!("{parts};").into_bytes();
+        let prem = self.strings.arm();
+        if !prem.is_empty() {
+            line.extend_from_slice(&prem);
+            line.push(b';');
+        }
+        line.extend_from_slice(command.as_bytes());
+        self.lock().write_bytes(&line)
     }
 }
 
@@ -313,13 +337,8 @@ impl AsynMotor for Mm3000Axis {
     ) -> AsynResult<()> {
         // One transaction: [VB;]VA;AC;PA (the MM3000 starts moving on PA;
         // the record's GO is a no-op).
-        let ctrl = self.lock();
-        ctrl.write(&format!(
-            "{};{}PA{}",
-            self.motion_preamble(min_velocity, velocity, acceleration),
-            self.axis,
-            nint(position)
-        ))
+        let parts = self.motion_preamble(min_velocity, velocity, acceleration);
+        self.write_move(&parts, &format!("{}PA{}", self.axis, nint(position)))
     }
 
     fn move_relative(
@@ -330,13 +349,8 @@ impl AsynMotor for Mm3000Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        ctrl.write(&format!(
-            "{};{}PR{}",
-            self.motion_preamble(min_velocity, velocity, acceleration),
-            self.axis,
-            nint(distance)
-        ))
+        let parts = self.motion_preamble(min_velocity, velocity, acceleration);
+        self.write_move(&parts, &format!("{}PR{}", self.axis, nint(distance)))
     }
 
     fn move_velocity(
@@ -367,12 +381,10 @@ impl AsynMotor for Mm3000Axis {
             AxisType::Dc => ac = ac.max(250),
             AxisType::Unused => {}
         }
-        let ctrl = self.lock();
-        ctrl.write(&format!(
-            "{a}AC{ac};{a}VA{};{a}PA{}",
-            nint(velocity).abs(),
-            nint(target)
-        ))
+        self.write_move(
+            &format!("{a}AC{ac}"),
+            &format!("{a}VA{};{a}PA{}", nint(velocity).abs(), nint(target)),
+        )
     }
 
     fn home(
@@ -384,12 +396,8 @@ impl AsynMotor for Mm3000Axis {
         _forward: bool,
     ) -> AsynResult<()> {
         // C sends the same `OR1` for HOME_FOR and HOME_REV.
-        let ctrl = self.lock();
-        ctrl.write(&format!(
-            "{};{}OR1",
-            self.motion_preamble(min_velocity, velocity, acceleration),
-            self.axis
-        ))
+        let parts = self.motion_preamble(min_velocity, velocity, acceleration);
+        self.write_move(&parts, &format!("{}OR1", self.axis))
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -444,6 +452,23 @@ impl AsynMotor for Mm3000Axis {
         let v = nint(gain * 32767.0);
         let ctrl = self.lock();
         ctrl.write(&format!("{a}{cc}{v};{a}UF"))
+    }
+
+    /// `PRIMITIVE`: INIT and a CR, its own transaction.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let mut line = init.to_vec();
+        line.push(b'\r');
+        self.lock().write_bytes(&line)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -504,6 +529,13 @@ impl Mm3000Axis {
             }
             return s.clone();
         };
+        // drvMM3000.cc:371-378; C ignores the write's status too.
+        let ls_active = (mstat.plus_tl && mstat.direction) || (mstat.minus_tl && !mstat.direction);
+        if (s.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.write_bytes(&post);
+        }
         drop(ctrl);
 
         // C: first space-delimited token, `atof`, `(epicsInt32)` cast.
@@ -519,6 +551,8 @@ impl Mm3000Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     /// Answers `VE` and the commands in `replies`, fails every other read,
     /// and records every command.
@@ -619,6 +653,97 @@ mod tests {
             ["VE", "ST", "VE", "RC"]
         );
         (ctrl, sent)
+    }
+
+    /// Axis 1, a DC axis, on a [`LineRig`] whose `MS` byte is `ms`, with the
+    /// construction traffic taken.
+    fn strings_rig(name: &str) -> (LineRig, Mm3000Axis, Arc<AtomicU8>) {
+        let ms = Arc::new(AtomicU8::new(0x04));
+        let m = ms.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "VE" => "MM3000".into(),
+            "RC" => "1=dc".into(),
+            "1MS" => char::from(m.load(Ordering::SeqCst)).to_string(),
+            "1TP" => "0 ".into(),
+            _ => String::new(),
+        });
+        let ctrl = Mm3000Controller::new(io).unwrap();
+        let axis = Mm3000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        line.sent();
+        (line, axis, ms)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut Mm3000Axis) -> Vec<String> {
+        axis.poll(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| l != "1MS" && l != "1TP")
+            .collect()
+    }
+
+    /// devMM3000.cc:192-196: INIT and a CR.
+    #[test]
+    fn init_goes_out_with_a_cr() {
+        let (line, mut axis, _) = strings_rig("mm3000Init");
+        axis.primitive(&AsynUser::default(), b"MO").unwrap();
+        assert_eq!(line.sent(), ["MO\r"]);
+    }
+
+    /// devMM3000.cc:211-222: PREM and a `;` go ahead of each move's own
+    /// command, for that move only.
+    #[test]
+    fn prem_leads_the_move_command() {
+        let (line, mut axis, _) = strings_rig("mm3000Prem");
+        let user = AsynUser::default();
+        axis.set_high_limit(&user, 900.0).unwrap();
+        line.sent();
+        axis.set_move_strings(&user, b"MO", None).unwrap();
+        axis.move_absolute(&user, 15.0, 0.0, 400.0, 300.0).unwrap();
+        assert_eq!(line.sent(), ["1VA400;1AC300;MO;1PA15"]);
+        axis.move_relative(&user, 15.0, 0.0, 400.0, 300.0).unwrap();
+        assert_eq!(line.sent(), ["1VA400;1AC300;1PR15"]);
+        axis.set_move_strings(&user, b"MO", None).unwrap();
+        axis.home(&user, 0.0, 400.0, 300.0, true).unwrap();
+        assert_eq!(line.sent(), ["1VA400;1AC300;MO;1OR1"]);
+        axis.set_move_strings(&user, b"MO", None).unwrap();
+        axis.move_velocity(&user, 0.0, 400.0, 300.0).unwrap();
+        assert_eq!(line.sent(), ["1AC300;MO;1VA400;1PA900"]);
+    }
+
+    /// drvMM3000.cc:371-378: POST once the move is done, not while it runs.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, ms) = strings_rig("mm3000Post");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"MF")))
+            .unwrap();
+        axis.move_absolute(&user, 15.0, 0.0, 400.0, 300.0).unwrap();
+        line.sent();
+        ms.store(0x05, Ordering::SeqCst);
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        ms.store(0x04, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["MF"]);
+        assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+    }
+
+    /// drvMM3000.cc:372: a limit in the move's direction ends it too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let (line, mut axis, ms) = strings_rig("mm3000PostLs");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"MF")))
+            .unwrap();
+        axis.move_absolute(&user, -15.0, 0.0, 400.0, 300.0).unwrap();
+        line.sent();
+        ms.store(0x11, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["MF"]);
     }
 
     /// drvMM3000.cc motor_init ends each axis with set_status.

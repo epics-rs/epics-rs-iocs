@@ -97,10 +97,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{nint, parse_int_at, parse_value_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -224,7 +227,15 @@ impl PIC848Controller {
     /// Write a command, no reply expected (C `send_mess`). No terminator (port
     /// output EOS) and no echo.
     fn send(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.send_bytes(cmd.as_bytes())
+    }
+
+    /// [`send`](Self::send) for raw bytes; an empty message is not sent.
+    fn send_bytes(&self, cmd: &[u8]) -> AsynResult<()> {
+        if cmd.is_empty() {
+            return Ok(());
+        }
+        self.handle.write_octet(0, cmd)?;
         Ok(())
     }
 
@@ -248,8 +259,8 @@ impl PIC848Controller {
         self.exchange(cmd)
     }
 
-    /// C `set_status` for axis `signal`. `None` means keep the cached status
-    /// (RETRY) or flag comm error (COMM_ERR), per [`Self::comm_state`].
+    /// C `set_status` for axis `signal`. `None` fails the poll, raising
+    /// nothing (RETRY) or comm error (COMM_ERR), per [`Self::comm_state`].
     fn poll_status(&mut self, signal: u8) -> Option<PolledStatus> {
         let letter = axis_letter(signal);
         let sta = self.query(&format!("STA? {letter}"));
@@ -298,7 +309,13 @@ pub struct PIC848Axis {
     letter: char,
     /// C `cntrl->reference[signal]`: `true` ⟹ `LOAD_POS` may only zero.
     reference: bool,
+    /// What the last failed poll raises: nothing on C `set_status`'s
+    /// first missed reply (RETRY, drvPIC848.cc:253), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :259). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl PIC848Axis {
@@ -315,6 +332,7 @@ impl PIC848Axis {
             signal,
             letter: axis_letter(signal),
             reference,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -322,6 +340,7 @@ impl PIC848Axis {
                 vbas_supported: false,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         };
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(polled) = ctrl.poll_status(signal) {
@@ -333,6 +352,31 @@ impl PIC848Axis {
 
     fn lock(&self) -> MutexGuard<'_, PIC848Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A record string with the axis letter over its byte 5, as C's
+    /// `send_mess` addresses a message (drvPIC848.cc:389). C also writes it
+    /// over a 5-byte string's terminator; not copied.
+    fn addressed(&self, text: &[u8]) -> Vec<u8> {
+        let mut text = text.to_vec();
+        if let Some(b) = text.get_mut(5) {
+            *b = self.letter as u8;
+        }
+        text
+    }
+
+    /// A move's own message: PREM and a `;` ahead of its command
+    /// (devPIC848.cc:199-208), whose POST waits for the move to end. C
+    /// addresses only byte 5 of the whole message, so behind a PREM the
+    /// command keeps its `#`; not copied.
+    fn move_line(&mut self, command: &str) -> Vec<u8> {
+        let prem = self.strings.arm();
+        let mut line = self.addressed(&prem);
+        if !line.is_empty() {
+            line.push(b';');
+        }
+        line.extend_from_slice(command.as_bytes());
+        line
     }
 
     fn apply(&mut self, polled: PolledStatus) {
@@ -361,11 +405,8 @@ impl PIC848Axis {
 }
 
 impl AsynMotor for PIC848Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvPIC848.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -377,10 +418,11 @@ impl AsynMotor for PIC848Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let l = self.letter;
+        let line = self.move_line(&format!("MOV  {l}{:.5}", position * POS_RES));
         let ctrl = self.lock();
         // SET_VELOCITY ("VEL  L {v}") then MOVE_ABS ("MOV  L{p}") — two writes.
         ctrl.send(&format!("VEL  {l} {:.5}", velocity * POS_RES))?;
-        ctrl.send(&format!("MOV  {l}{:.5}", position * POS_RES))
+        ctrl.send_bytes(&line)
     }
 
     fn move_relative(
@@ -392,9 +434,10 @@ impl AsynMotor for PIC848Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let l = self.letter;
+        let line = self.move_line(&format!("MVR  {l}{:+.5}", distance * POS_RES));
         let ctrl = self.lock();
         ctrl.send(&format!("VEL  {l} {:.5}", velocity * POS_RES))?;
-        ctrl.send(&format!("MVR  {l}{:+.5}", distance * POS_RES))
+        ctrl.send_bytes(&line)
     }
 
     fn move_velocity(
@@ -406,8 +449,8 @@ impl AsynMotor for PIC848Axis {
     ) -> AsynResult<()> {
         // JOG: "VEL  L{v}" (no space after L, signed value). No SET_VELOCITY.
         let l = self.letter;
-        self.lock()
-            .send(&format!("VEL  {l}{:.5}", velocity * POS_RES))
+        let line = self.move_line(&format!("VEL  {l}{:.5}", velocity * POS_RES));
+        self.lock().send_bytes(&line)
     }
 
     fn home(
@@ -420,9 +463,10 @@ impl AsynMotor for PIC848Axis {
     ) -> AsynResult<()> {
         // Both HOME_FOR/HOME_REV send "REF  L" after SET_VELOCITY.
         let l = self.letter;
+        let line = self.move_line(&format!("REF  {l}"));
         let ctrl = self.lock();
         ctrl.send(&format!("VEL  {l} {:.5}", velocity * POS_RES))?;
-        ctrl.send(&format!("REF  {l}"))
+        ctrl.send_bytes(&line)
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -472,20 +516,48 @@ impl AsynMotor for PIC848Axis {
         self.lock().send(&body)
     }
 
+    /// `PRIMITIVE`: INIT as its own message, addressed
+    /// (devPIC848.cc:191-192).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let line = self.addressed(init);
+        self.lock().send_bytes(&line)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let mut ctrl = self.lock();
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let polled = ctrl.poll_status(self.signal);
         let comm_err = ctrl.comm_state == CommState::CommErr;
-        drop(ctrl);
 
         let Some(polled) = polled else {
-            if comm_err {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            self.failure = if comm_err {
+                PollFailure::PROBLEM_AND_COMMS_ERROR
+            } else {
+                PollFailure::NONE
+            };
+            return Err(pic848_err("no status reply"));
         };
         self.apply(polled);
+        // drvPIC848.cc:302-346: POST once done or stopped by a limit in the
+        // move's direction.
+        let s = &self.last_status;
+        let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
+        if (s.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.send_bytes(&post);
+        }
+        drop(ctrl);
         Ok(self.last_status.clone())
     }
 }
@@ -493,6 +565,108 @@ impl AsynMotor for PIC848Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// `STA? A` registers, torque on: done, moving, and moving into the
+    /// -limit.
+    const DONE: u32 = 0x101;
+    const MOVING: u32 = 0x100;
+    const MOVING_LOW_LS: u32 = 0x140;
+
+    /// Axis A of a one-stage C-848 on a [`LineRig`] whose `STA? A` reply
+    /// follows `sta`.
+    fn strings_rig(name: &str) -> (LineRig, PIC848Axis, Arc<AtomicU32>) {
+        let sta = Arc::new(AtomicU32::new(DONE));
+        let st = sta.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "*IDN?" => "C-848".into(),
+            "CST? A" => "A=M-110".into(),
+            "CST? B" => "B=NOSTAGE".into(),
+            "REF? A" => "A=0".into(),
+            "STA? A" => format!("A={}", st.load(Ordering::SeqCst)),
+            _ => "A=0".into(),
+        });
+        let ctrl = PIC848Controller::new(io).unwrap();
+        let axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        line.sent();
+        (line, axis, sta)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut PIC848Axis) -> Vec<String> {
+        axis.poll(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| l != "STA? A" && l != "POS? A")
+            .collect()
+    }
+
+    /// devPIC848.cc:191-192: INIT as its own message, the axis letter over
+    /// its byte 5; a shorter INIT goes out as written.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = strings_rig("pic848Init");
+        axis.primitive(&AsynUser::default(), b"SVO  #1").unwrap();
+        assert_eq!(line.sent(), ["SVO  A1"]);
+        axis.primitive(&AsynUser::default(), b"CLR").unwrap();
+        assert_eq!(line.sent(), ["CLR"]);
+    }
+
+    /// devPIC848.cc:199-208: PREM and a `;` ahead of the move's own command,
+    /// for that move only; the velocity goes ahead as its own message.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("pic848Prem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"SVO  #1", None).unwrap();
+        axis.move_absolute(&user, 1000.0, 0.0, 10.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["VEL  A 0.00001", "SVO  A1;MOV  A0.00100"]);
+        axis.move_relative(&user, 1000.0, 0.0, 10.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["VEL  A 0.00001", "MVR  A+0.00100"]);
+        axis.set_move_strings(&user, b"SVO  #1", None).unwrap();
+        axis.home(&user, 0.0, 10.0, 0.0, true).unwrap();
+        assert_eq!(line.sent(), ["VEL  A 0.00001", "SVO  A1;REF  A"]);
+        axis.set_move_strings(&user, b"SVO  #1", None).unwrap();
+        axis.move_velocity(&user, 0.0, -10.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["SVO  A1;VEL  A-0.00001"]);
+    }
+
+    /// drvPIC848.cc:339-346: POST once the move is done, not while it runs,
+    /// and only once.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, sta) = strings_rig("pic848Post");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"SVO A0")))
+            .unwrap();
+        axis.move_absolute(&user, 1000.0, 0.0, 10.0, 0.0).unwrap();
+        line.sent();
+        sta.store(MOVING, Ordering::SeqCst);
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        sta.store(DONE, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["SVO A0"]);
+        assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+    }
+
+    /// drvPIC848.cc:302-321: a limit in the move's direction ends it too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let (line, mut axis, sta) = strings_rig("pic848PostLs");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"SVO A0")))
+            .unwrap();
+        axis.move_absolute(&user, -1000.0, 0.0, 10.0, 0.0).unwrap();
+        line.sent();
+        sta.store(MOVING_LOW_LS, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["SVO A0"]);
+    }
 
     #[test]
     fn axis_letters_map_from_signal() {
@@ -568,5 +742,41 @@ mod tests {
     fn pid_gain_scales_by_32767_not_res() {
         let g = 0.5 * 32767.0;
         assert_eq!(format!("SPA  A1 {g:.5}"), "SPA  A1 16383.50000");
+    }
+
+    /// drvPIC848.cc:244-265: a first failed status read is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good read clears it.
+    #[test]
+    fn a_failed_status_read_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("c848Retry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                return String::new();
+            }
+            match last {
+                "*IDN?" => "C-848".into(),
+                "CST? A" => "A=M-110".into(),
+                "CST? B" => "B=NOSTAGE".into(),
+                "REF? A" => "A=0".into(),
+                "STA? A" => format!("A={DONE}"),
+                _ => "A=0".into(),
+            }
+        });
+        let ctrl = PIC848Controller::new(io).unwrap();
+        let mut axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

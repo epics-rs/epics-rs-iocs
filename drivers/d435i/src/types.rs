@@ -138,7 +138,7 @@ impl CameraCapabilities {
             trace::print(
                 port,
                 TraceMask::WARNING,
-                "D435i: camera not enumerable; assuming a D435i feature set",
+                "D435i: camera not enumerable; assuming a D435i feature set\n",
             );
             (true, true)
         });
@@ -191,7 +191,7 @@ pub fn discover_stream_modes(port: &str, serial: &str) -> Vec<StreamMode> {
         trace::print(
             port,
             TraceMask::WARNING,
-            "D435i: camera not enumerable; offering the D435i's stream modes",
+            "D435i: camera not enumerable; offering the D435i's stream modes\n",
         );
         return FALLBACK_STREAM_MODES.to_vec();
     };
@@ -199,7 +199,7 @@ pub fn discover_stream_modes(port: &str, serial: &str) -> Vec<StreamMode> {
         trace::print(
             port,
             TraceMask::WARNING,
-            "D435i: camera reported no colour+depth mode in common",
+            "D435i: camera reported no colour+depth mode in common\n",
         );
         return FALLBACK_STREAM_MODES.to_vec();
     }

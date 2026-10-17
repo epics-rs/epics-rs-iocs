@@ -287,7 +287,8 @@ impl QuadEmDevice for Fx4Driver {
             self.link.send_unsubscribe();
             self.shared.set_acquiring(false);
         }
-        self.base_set_acquire(value)
+        self.base_set_acquire(value);
+        Ok(())
     }
 
     fn set_acquire_mode(&mut self, _value: i32) -> AsynResult<()> {

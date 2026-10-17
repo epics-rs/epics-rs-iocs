@@ -72,15 +72,9 @@ asynSetOption("SerialMKS", 0, "stop", "1")
 asynOctetSetInputEos("SerialMKS", 0, "\r")
 asynOctetSetOutputEos("SerialMKS", 0, "\r")
 
-# MKSConfig(portName, octetPort, numGauges, pollPeriodSeconds)
-MKSConfig("MKS1", "SerialMKS", 5, 1.0)
-
-# ipApp/Db/MKS.db: gauges 1 and 2 are cold cathodes, 4 and 5 Piranis. asyn
-# addresses are 0-based here, so gauge n is address n-1.
-dbLoadRecords("$(IP)/db/mks.db", "P=$(PREFIX),GAUGE=cc1,PORT=MKS1,ADDR=0")
-dbLoadRecords("$(IP)/db/mks.db", "P=$(PREFIX),GAUGE=cc2,PORT=MKS1,ADDR=1")
-dbLoadRecords("$(IP)/db/mks.db", "P=$(PREFIX),GAUGE=pr1,PORT=MKS1,ADDR=3")
-dbLoadRecords("$(IP)/db/mks.db", "P=$(PREFIX),GAUGE=pr2,PORT=MKS1,ADDR=4")
+# devAiMKS reads the units and gauge types at iocInit, one record per gauge;
+# the gauge number (1..5) is the link address.
+dbLoadRecords("$(IP)/db/MKS.db", "P=$(PREFIX),PORT=SerialMKS,CC1=cc1,CC2=cc2,PR1=pr1,PR2=pr2")
 
 # --- Heidenhain ND261 display unit ------------------------------------------
 # devAiHeidND261.c set the input EOS to "\n\n" itself; the port carries it here.

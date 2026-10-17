@@ -576,7 +576,7 @@ impl PortDriver for MerlinDetector {
                 file!(),
                 line!(),
                 format_args!(
-                    "merlinDetector:writeInt32: error, status={}, reason={reason} value={value}",
+                    "merlinDetector:writeInt32: error, status={}, reason={reason} value={value}\n",
                     e.status() as i32
                 ),
             ),
@@ -584,7 +584,7 @@ impl PortDriver for MerlinDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("merlinDetector:writeInt32: reason={reason}, value={value}"),
+                format_args!("merlinDetector:writeInt32: reason={reason}, value={value}\n"),
             ),
         }
         status
@@ -643,7 +643,7 @@ impl PortDriver for MerlinDetector {
                     file!(),
                     line!(),
                     format_args!(
-                        "merlinDetector:writeFloat64 error, status={} function={reason}, value={value:.6}",
+                        "merlinDetector:writeFloat64 error, status={} function={reason}, value={value:.6}\n",
                         e.status() as i32
                     ),
                 );
@@ -652,7 +652,7 @@ impl PortDriver for MerlinDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("merlinDetector:writeFloat64: function={reason}, value={value:.6}"),
+                format_args!("merlinDetector:writeFloat64: function={reason}, value={value:.6}\n"),
             ),
         }
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -771,6 +771,7 @@ mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::registry::claim_port;
     use std::time::Duration;
 
@@ -810,9 +811,11 @@ mod tests {
     /// the detector port still exists.
     #[test]
     fn a_detector_whose_socket_ports_are_missing_still_boots() {
-        let (cmd, status) = SyncIOHandle::connect_port("MERLIN_NONE_CMD", 0, Duration::ZERO);
+        let (cmd, status) =
+            SyncIOHandle::connect_port("MERLIN_NONE_CMD", 0, Duration::ZERO, InterfaceType::Octet);
         assert!(status.is_err());
-        let (data, status) = SyncIOHandle::connect_port("MERLIN_NONE_DATA", 0, Duration::ZERO);
+        let (data, status) =
+            SyncIOHandle::connect_port("MERLIN_NONE_DATA", 0, Duration::ZERO, InterfaceType::Octet);
         assert!(status.is_err());
         let rt = create_merlin_detector(
             &claim_port("MERLIN_NONE").unwrap(),

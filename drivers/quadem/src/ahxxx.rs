@@ -100,7 +100,7 @@ impl AhxxxDriver {
         if let Err(e) = status {
             println!(
                 "drvAHxxx:drvAHxxx: error calling pasynOctetSyncIO->connect, status={}, error={}",
-                trace::status_code(&e),
+                e.c_status_code(),
                 e.message_display()
             );
             return Ok(Self {
@@ -172,7 +172,7 @@ impl AhxxxDriver {
             asyn_print!(
                 self.base.port_base,
                 ERROR,
-                "drvAHxxx:sendCommand: error, outString={out} expected ACK, received {resp}"
+                "drvAHxxx:sendCommand: error, outString={out} expected ACK, received {resp}\n"
             );
             return Err(error(format!("AHxxx: {out} -> {resp}, expected ACK")));
         }
@@ -311,8 +311,8 @@ impl QuadEmDevice for AhxxxDriver {
                     asyn_print!(
                         self.base.port_base,
                         ERROR,
-                        "drvAHxxx:setAcquire: error calling pasynOctetSyncIO->writeRead, status={}",
-                        trace::status_code(&e)
+                        "drvAHxxx:setAcquire: error calling pasynOctetSyncIO->writeRead, status={}\n",
+                        e.c_status_code()
                     );
                     status = Err(e);
                     break;
@@ -325,11 +325,11 @@ impl QuadEmDevice for AhxxxDriver {
                     break;
                 }
             }
-            let _ = self.base_set_acquire(0);
+            self.base_set_acquire(0);
             return status;
         }
 
-        let _ = self.base_set_acquire(1);
+        self.base_set_acquire(1);
 
         let num_acquire = proto::naq_value(acquire_mode, num_average);
         let model = self.model;
@@ -457,7 +457,7 @@ impl QuadEmDevice for AhxxxDriver {
             asyn_print!(
                 self.base.port_base,
                 ERROR,
-                "drvAHxxx:getStatus: error, outString={}, inString={}",
+                "drvAHxxx:getStatus: error, outString={}, inString={}\n",
                 last.out,
                 last.inp
             );
@@ -491,7 +491,7 @@ impl QuadEmDevice for AhxxxDriver {
                     asyn_print!(
                         self.base.port_base,
                         ERROR,
-                        "drvAHxxx:reset: unknown firmware version = {}",
+                        "drvAHxxx:reset: unknown firmware version = {}\n",
                         self.firmware_version
                     );
                     return Err(error(format!(
@@ -631,7 +631,7 @@ fn read_thread(ctx: ReadContext) {
                             asyn_print!(
                                 ctx.handle,
                                 IO_DRIVER,
-                                "drvAHxxx::readThread timeout with nRead=5, triggering callbacks"
+                                "drvAHxxx::readThread timeout with nRead=5, triggering callbacks\n"
                             );
                             let _ = ctx.shared.trigger_callbacks(&ctx.handle);
                         }
@@ -650,7 +650,7 @@ fn read_thread(ctx: ReadContext) {
                     asyn_print!(
                         ctx.handle,
                         IO_DRIVER,
-                        "drvAHxxx::readThread found ACK\\r\\n at start of data, triggering callbacks"
+                        "drvAHxxx::readThread found ACK\\r\\n at start of data, triggering callbacks\n"
                     );
                     let _ = ctx.shared.trigger_callbacks(&ctx.handle);
                     let preamble_len = proto::ACK_PREAMBLE.len();
@@ -664,7 +664,7 @@ fn read_thread(ctx: ReadContext) {
                             asyn_print!(
                                 ctx.handle,
                                 ERROR,
-                                "drvAHxxx:readThread: unexpected error reading additional {preamble_len} bytes from meter status={}, nRead={n_read}, eomReason={eom}",
+                                "drvAHxxx:readThread: unexpected error reading additional {preamble_len} bytes from meter status={}, nRead={n_read}, eomReason={eom}\n",
                                 status as i32
                             );
                         }
@@ -677,7 +677,7 @@ fn read_thread(ctx: ReadContext) {
                     &ctx.handle,
                     trace::TraceMask::IO_DRIVER,
                     &outcome.data,
-                    format_args!("drvAHxxx::readThread buffer read"),
+                    format_args!("drvAHxxx::readThread buffer read\n"),
                 );
 
                 let decoded = if ah401_series {
@@ -722,7 +722,7 @@ fn read_thread(ctx: ReadContext) {
                             asyn_print!(
                                 ctx.handle,
                                 ERROR,
-                                "drvAHxxx:readThread: error reading meter nRead={}, expected {n_expected}, input={line}",
+                                "drvAHxxx:readThread: error reading meter nRead={}, expected {n_expected}, input={line}\n",
                                 outcome.data.len()
                             );
                             continue;

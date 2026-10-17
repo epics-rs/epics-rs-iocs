@@ -16,11 +16,10 @@
 //!
 //! ## Units
 //!
-//! `PPU` (pulses per engineering unit) is read from the controller — it is a
-//! real hardware conversion, not a cancelling scale: the position registers hold
-//! pulses (counts) while `JOG` commands take engineering units, so commanded
-//! values are divided by `PPU` and readback is left in counts. The driver
-//! boundary is therefore counts with `MRES` = 1.
+//! `PPU` (pulses per engineering unit) is read from the controller: the
+//! position registers hold the record's steps (pulses) while `JOG` and `RES`
+//! take engineering units, so commanded steps are divided by `PPU` and sent
+//! `%f`, as C.
 //!
 //! ## Kill clear
 //!
@@ -173,11 +172,15 @@ impl AcrAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         ctrl.write_only(&format!(
-            "{} JOG ACC {}",
+            "{} JOG ACC {:.6}",
             self.name,
             self.scaled(acceleration)?
         ))?;
-        ctrl.write_only(&format!("{} JOG VEL {}", self.name, self.scaled(velocity)?))
+        ctrl.write_only(&format!(
+            "{} JOG VEL {:.6}",
+            self.name,
+            self.scaled(velocity)?
+        ))
     }
 }
 
@@ -199,7 +202,7 @@ impl AsynMotor for AcrAxis {
         let ctrl = self.lock();
         self.set_jog_speed(&ctrl, velocity, acceleration)?;
         ctrl.write_only(&format!(
-            "{CTL_Y}:{} JOG ABS {}",
+            "{CTL_Y}:{} JOG ABS {:.6}",
             self.name,
             self.scaled(position)?
         ))
@@ -216,7 +219,7 @@ impl AsynMotor for AcrAxis {
         let ctrl = self.lock();
         self.set_jog_speed(&ctrl, velocity, acceleration)?;
         ctrl.write_only(&format!(
-            "{CTL_Y}:{} JOG INC {}",
+            "{CTL_Y}:{} JOG INC {:.6}",
             self.name,
             self.scaled(distance)?
         ))
@@ -267,7 +270,7 @@ impl AsynMotor for AcrAxis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.write_only(&format!("{} RES {}", self.name, self.scaled(position)?))?;
+        ctrl.write_only(&format!("{} RES {:.6}", self.name, self.scaled(position)?))?;
         ctrl.write_only(&format!("{} JOG REN", self.name))
     }
 
@@ -324,12 +327,18 @@ impl AsynMotor for AcrAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     /// A failed PPU query keeps the axis with no encoder or gain support and
     /// refuses motion rather than dividing by an unset PPU.
     #[test]
     fn an_axis_of_a_missing_port_is_kept_and_never_scales() {
-        let (handle, _) = SyncIOHandle::connect_port("ACR_NONE", 0, std::time::Duration::ZERO);
+        let (handle, _) = SyncIOHandle::connect_port(
+            "ACR_NONE",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
         let controller = Arc::new(Mutex::new(AcrController::new(handle)));
         let mut axis = AcrAxis::new(controller, 0);
         assert_eq!(axis.pulses_per_unit, None);
@@ -352,7 +361,12 @@ mod tests {
     /// and a negative PPU scales as C does.
     #[test]
     fn a_zero_ppu_never_scales() {
-        let (handle, _) = SyncIOHandle::connect_port("ACR_PPU0", 0, std::time::Duration::ZERO);
+        let (handle, _) = SyncIOHandle::connect_port(
+            "ACR_PPU0",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
         let mut axis = AcrAxis::new(Arc::new(Mutex::new(AcrController::new(handle))), 0);
         axis.pulses_per_unit = Some(0.0);
         assert_eq!(axis.scaled(1.0).unwrap_err().message(), "AXIS0: PPU is 0");

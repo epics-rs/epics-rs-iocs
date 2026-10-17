@@ -78,8 +78,8 @@
 //! active-low in that configuration).
 //!
 //! A comm failure on `TS` runs the C `NORMAL`/`RETRY`/`COMM_ERR` two-strike
-//! debounce (`CommState`): the first bad `TS` in a row is silently retried
-//! (cached status returned unchanged); a second consecutive one sets
+//! debounce (`CommState`): the first bad `TS` in a row fails the poll
+//! raising nothing (RETRY); a second consecutive one sets
 //! `comms_error`/`problem`. `TS` succeeding unconditionally proceeds to `TP`
 //! with **no further debounce tied to `TP`** — a genuine C asymmetry (`TP`'s
 //! `atof(&buff[2])` has no read-failure guard at all) ported as-is: a failed
@@ -149,10 +149,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{nint, parse_value_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -294,7 +297,15 @@ impl PIC862Controller {
     /// appended here — the port's configured output EOS puts the CR on the
     /// wire (see module docs' "Wire shape" section).
     fn send(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.send_bytes(cmd.as_bytes())
+    }
+
+    /// [`send`](Self::send) for raw bytes; an empty message is not sent.
+    fn send_bytes(&self, cmd: &[u8]) -> AsynResult<()> {
+        if cmd.is_empty() {
+            return Ok(());
+        }
+        self.handle.write_octet(0, cmd)?;
         Ok(())
     }
 
@@ -324,8 +335,8 @@ impl PIC862Controller {
     /// C `set_status`: `TS` gated by the `NORMAL`/`RETRY`/`COMM_ERR` comm
     /// debounce, then (unconditionally on a good `TS`) `TP` with no further
     /// debounce — see the module docs' "Status" section for the exact C
-    /// asymmetry this reproduces. `None` means the caller should keep its
-    /// cached status (debounced retry) or flag a hard comm error, decided by
+    /// asymmetry this reproduces. `None` means the caller fails the poll,
+    /// raising nothing (RETRY) or a hard comm error, decided by
     /// [`Self::comm_state`] after the call.
     fn poll_status(&mut self) -> Option<PolledStatus> {
         let (ts_reply, ts_raw_len) = self.exchange("TS");
@@ -375,7 +386,13 @@ pub struct PIC862Axis {
     /// / DLLM the requested direction selects (C `JOG` case).
     high_limit: Option<f64>,
     low_limit: Option<f64>,
+    /// What the last failed poll raises: nothing on C `set_status`'s
+    /// first missed reply (RETRY, drvPIC862.cc:243), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :249). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl PIC862Axis {
@@ -388,6 +405,7 @@ impl PIC862Axis {
             controller: controller.clone(),
             high_limit: None,
             low_limit: None,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -395,6 +413,7 @@ impl PIC862Axis {
                 vbas_supported: false,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         };
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(polled) = ctrl.poll_status() {
@@ -406,14 +425,25 @@ impl PIC862Axis {
     fn lock(&self) -> MutexGuard<'_, PIC862Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// One move transaction: the record's earlier parts, then PREM and a `,`
+    /// ahead of the move's own command (devPIC862.cc:179-194), whose POST
+    /// waits for the move to end.
+    fn write_move(&mut self, parts: &str, command: &str) -> AsynResult<()> {
+        let mut line = parts.as_bytes().to_vec();
+        let prem = self.strings.arm();
+        if !prem.is_empty() {
+            line.extend_from_slice(&prem);
+            line.push(b',');
+        }
+        line.extend_from_slice(command.as_bytes());
+        self.lock().send_bytes(&line)
+    }
 }
 
 impl AsynMotor for PIC862Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvPIC862.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -424,12 +454,8 @@ impl AsynMotor for PIC862Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.lock().send(&format!(
-            "SV{},{}MA{}",
-            velocity as i32,
-            crate::accel_field(acceleration),
-            position as i32
-        ))
+        let parts = format!("SV{},{}", velocity as i32, crate::accel_field(acceleration));
+        self.write_move(&parts, &format!("MA{}", position as i32))
     }
 
     fn move_relative(
@@ -440,12 +466,8 @@ impl AsynMotor for PIC862Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.lock().send(&format!(
-            "SV{},{}MR{}",
-            velocity as i32,
-            crate::accel_field(acceleration),
-            distance as i32
-        ))
+        let parts = format!("SV{},{}", velocity as i32, crate::accel_field(acceleration));
+        self.write_move(&parts, &format!("MR{}", distance as i32))
     }
 
     fn move_velocity(
@@ -466,12 +488,10 @@ impl AsynMotor for PIC862Axis {
         // C's jog path issues SET_ACCEL unconditionally before the move
         // (motorRecord.cc:2141, no accel>0 guard — unlike the ordinary move
         // path), so the jog acceleration is always on the wire: `SA,SV,MA`.
-        self.lock().send(&format!(
-            "SA{},SV{},MA{}",
-            acceleration as i32,
-            velocity.abs() as i32,
-            target as i32
-        ))
+        self.write_move(
+            &format!("SA{},", acceleration as i32),
+            &format!("SV{},MA{}", velocity.abs() as i32, target as i32),
+        )
     }
 
     fn home(
@@ -483,11 +503,8 @@ impl AsynMotor for PIC862Axis {
         forward: bool,
     ) -> AsynResult<()> {
         let cmd = if forward { "FE0" } else { "FE1" };
-        self.lock().send(&format!(
-            "SV{},{}{cmd}",
-            velocity as i32,
-            crate::accel_field(acceleration)
-        ))
+        let parts = format!("SV{},{}", velocity as i32, crate::accel_field(acceleration));
+        self.write_move(&parts, cmd)
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -527,20 +544,46 @@ impl AsynMotor for PIC862Axis {
         self.lock().send(&cmd)
     }
 
+    /// `PRIMITIVE`: INIT as its own message (devPIC862.cc:176-177).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        self.lock().send_bytes(init)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let mut ctrl = self.lock();
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let polled = ctrl.poll_status();
         let comm_err = ctrl.comm_state == CommState::CommErr;
-        drop(ctrl);
 
         let Some(polled) = polled else {
-            if comm_err {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            self.failure = if comm_err {
+                PollFailure::PROBLEM_AND_COMMS_ERROR
+            } else {
+                PollFailure::NONE
+            };
+            return Err(pic862_err("no status reply"));
         };
         self.last_status = status_from_polled(&polled);
+        // drvPIC862.cc:299-340: POST once done or stopped by a limit in the
+        // move's direction.
+        let s = &self.last_status;
+        let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
+        if (s.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.send_bytes(&post);
+        }
+        drop(ctrl);
         Ok(self.last_status.clone())
     }
 }
@@ -548,6 +591,104 @@ impl AsynMotor for PIC862Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+
+    /// `TS` registers, limits active-high: done with no limit, moving, and
+    /// moving minus into the tripped -limit.
+    const DONE: &str = "S:04 00 00 02 00 00";
+    const MOVING: &str = "S:00 00 00 02 00 00";
+    const MOVING_LOW_LS: &str = "S:00 00 00 02 08 00";
+
+    /// A C-862 on a [`LineRig`] whose `TS` reply follows `ts`; replies carry
+    /// the trailing CR C's `recv_mess` strips.
+    fn strings_rig(name: &str) -> (LineRig, PIC862Axis, Arc<Mutex<&'static str>>) {
+        let ts = Arc::new(Mutex::new(DONE));
+        let t = ts.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "TS" => format!("{}\r", t.lock().unwrap()),
+            "TP" => "P:0\r".into(),
+            _ => "C-862\r".into(),
+        });
+        let ctrl = PIC862Controller::new(io, 1).unwrap();
+        let mut axis = PIC862Axis::new(Arc::new(Mutex::new(ctrl))).unwrap();
+        let user = AsynUser::default();
+        axis.set_high_limit(&user, 100.0).unwrap();
+        axis.set_low_limit(&user, -100.0).unwrap();
+        line.sent();
+        (line, axis, ts)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut PIC862Axis) -> Vec<String> {
+        axis.poll(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| l != "TS" && l != "TP")
+            .collect()
+    }
+
+    /// devPIC862.cc:176-177: INIT as its own message.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = strings_rig("pic862Init");
+        axis.primitive(&AsynUser::default(), b"DP100").unwrap();
+        assert_eq!(line.sent(), ["DP100"]);
+    }
+
+    /// devPIC862.cc:179-194: PREM and a `,` ahead of the move's own command,
+    /// for that move only.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("pic862Prem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.move_absolute(&user, 5.0, 0.0, 100.0, 50.0).unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MN,MA5"]);
+        axis.move_relative(&user, 5.0, 0.0, 100.0, 50.0).unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MR5"]);
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.home(&user, 0.0, 100.0, 50.0, false).unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MN,FE1"]);
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.move_velocity(&user, 0.0, 100.0, 50.0).unwrap();
+        assert_eq!(line.sent(), ["SA50,MN,SV100,MA100"]);
+    }
+
+    /// drvPIC862.cc:333-340: POST once the move is done, not while it runs,
+    /// and only once.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, ts) = strings_rig("pic862Post");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"MF")))
+            .unwrap();
+        axis.move_absolute(&user, 5.0, 0.0, 100.0, 50.0).unwrap();
+        line.sent();
+        *ts.lock().unwrap() = MOVING;
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        *ts.lock().unwrap() = DONE;
+        assert_eq!(poll_extra(&line, &mut axis), ["MF"]);
+        assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+    }
+
+    /// drvPIC862.cc:299-318: a limit in the move's direction ends it too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let (line, mut axis, ts) = strings_rig("pic862PostLs");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"MF")))
+            .unwrap();
+        axis.move_absolute(&user, -5.0, 0.0, 100.0, 50.0).unwrap();
+        line.sent();
+        *ts.lock().unwrap() = MOVING_LOW_LS;
+        assert_eq!(poll_extra(&line, &mut axis), ["MF"]);
+    }
 
     #[test]
     fn parse_ts_reply_reads_six_hex_registers() {
@@ -645,5 +786,38 @@ mod tests {
         assert!(!status.vbas_supported);
         assert!(!status.problem);
         assert!(!status.comms_error);
+    }
+
+    /// drvPIC862.cc:234-255: a first failed status read is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good read clears it.
+    #[test]
+    fn a_failed_status_read_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("c862Retry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                return String::new();
+            }
+            match last {
+                "TS" => format!("{DONE}\r"),
+                "TP" => "P:0\r".into(),
+                _ => "C-862\r".into(),
+            }
+        });
+        let ctrl = PIC862Controller::new(io, 1).unwrap();
+        let mut axis = PIC862Axis::new(Arc::new(Mutex::new(ctrl))).unwrap();
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

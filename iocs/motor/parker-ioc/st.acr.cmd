@@ -25,9 +25,7 @@ asynOctetSetInputEos("$(IPPORT)", 0, "\r")
 # ACRCreateController(portName, ACRPortName, numAxes, movingPollPeriod, idlePollPeriod).
 ACRCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 20, 1000)
 
-# One motor record per axis (OUT @asyn($(CTRL),axis)). The driver reports
-# positions in controller counts (PPU divides commands, not readback), so
-# MRES = 1.
+# One motor record per axis (OUT @asyn($(CTRL),axis)).
 dbLoadRecords("$(PARKER_IOC)/db/acr.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
 
 iocInit()

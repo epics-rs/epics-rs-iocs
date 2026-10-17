@@ -885,7 +885,9 @@ bit addressing (`B <bit>`), and I/O-Intr driven records.
 `drivers/ip` (crate `ip-devices`) re-implements each C device-support file
 as an asyn **port driver**: the record link binds to a port parameter
 instead of embedding the raw command text, and each port drives its device
-over a pre-configured serial/IP octet port on its own worker thread.
+over a pre-configured serial/IP octet port on its own worker thread. The
+exception is `devAiMKS.c`, kept as per-record ai device support
+(DTYP `HPS SensaVac 937`) on the upstream `MKS.db`.
 
 **Build/run:** `cargo run -p ip-ioc --release -- iocs/ip/ip-ioc/st.cmd`
 
@@ -896,7 +898,7 @@ over a pre-configured serial/IP octet port on its own worker thread.
 | Pfeiffer TPG261/TPG262 gauge controller | `tpg261.db` | `ID`, `UNIT`, `PRES`, `GSTATUS`, `STATUS`, `SP1S`, `SP2S`, `SP1V`, `SP2V`, `START`, `SUNIT`, `SET1`, `SET2` (13 records) |
 | Televac vacuum gauge | `televac.db` | `PRES` (1 record) |
 | Televac relay outputs | `televac_relay.db` | `ON`, `OFF`, `STATE` (3 records) |
-| MKS / HPS SensaVac 937 gauge | `mks.db` | `PRES`, `STATUS`, `UNITS`, `TYPE`, `LOW`, `HIGH` (6 records) |
+| MKS / HPS SensaVac 937 gauge | `MKS.db` (upstream) | `$(CC1)`, `$(CC2)`, `$(PR1)`, `$(PR2)` and their `_log` calcs (8 records) |
 | Heidenhain ND261 display unit | `nd261.db` | `POS`, `STATUS` (2 records) |
 | Eurotherm 800/2000 temperature controller | `eurotherm.db` | `Setpoint`, `RampRate`, `ReadRequest` (3 records) |
 

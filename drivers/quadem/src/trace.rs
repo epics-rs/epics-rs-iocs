@@ -32,7 +32,7 @@ impl AsynPrint for PortHandle {
     }
 }
 
-/// `asynPrint(pasynUserSelf, ASYN_TRACE_<MASK>, ...)`; the newline is added.
+/// `asynPrint(pasynUserSelf, ASYN_TRACE_<MASK>, ...)`, printed as given.
 #[macro_export]
 macro_rules! asyn_print {
     ($target:expr, $mask:ident, $($arg:tt)*) => {
@@ -42,11 +42,6 @@ macro_rules! asyn_print {
             format_args!($($arg)*),
         )
     };
-}
-
-/// The `status=%d` C prints: the `asynStatus` value.
-pub fn status_code(e: &AsynError) -> i32 {
-    e.status() as i32
 }
 
 /// The `status`, `nRead` and `eomReason` C prints for a read it rejected.
@@ -86,7 +81,7 @@ pub fn print_read_error(handle: &PortHandle, origin: &str, read: &AsynResult<Rea
     asyn_print!(
         *handle,
         ERROR,
-        "{origin}: unexpected error reading meter status={}, nRead={n_read}, eomReason={eom}",
+        "{origin}: unexpected error reading meter status={}, nRead={n_read}, eomReason={eom}\n",
         status as i32
     );
 }
@@ -99,8 +94,8 @@ pub fn ensure_input_eos(io: &OctetIo, port: &PortDriverBase, origin: &str) -> As
         asyn_print!(
             *port,
             ERROR,
-            "{origin}: error calling pasynOctetSyncIO->setInputEos, status={}",
-            status_code(&e)
+            "{origin}: error calling pasynOctetSyncIO->setInputEos, status={}\n",
+            e.c_status_code()
         );
         AsynError::Status {
             status: AsynStatus::Error,
@@ -183,7 +178,7 @@ mod tests {
             TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
         );
 
-        crate::asyn_print!(handle, ERROR, "drvQuadEM::readThread: line");
+        crate::asyn_print!(handle, ERROR, "drvQuadEM::readThread: line\n");
 
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);

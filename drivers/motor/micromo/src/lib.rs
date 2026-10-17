@@ -1,5 +1,6 @@
 //! MicroMo MVP 2001 motion controller driver.
 
+pub mod drv_mvp2001;
 pub mod ioc;
 pub mod mvp2001;
 

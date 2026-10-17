@@ -14,13 +14,6 @@
 //! thread).
 //!
 //! # Restructuring vs. C
-//! - **Every param access is pinned to addr 0** (`PARAM_ADDR`). The port
-//!   is not `ASYN_MULTIDEVICE` (`drvAmptek.cpp:68`), so C's `getAddress`
-//!   turns every record's ADDR into 0, and the 8 `Amptek_SCAn.db` instances
-//!   share one set of SCA params. asyn-rs does not do that mapping, so the
-//!   overridden read/write methods do it. Interrupt delivery to a record
-//!   with ADDR > 0 still matches on the record's own ADDR in the asyn-rs
-//!   device support, so those `_RBV` records see no callbacks.
 //! - **USB/Serial rejected at construction**, not merely left to fail at
 //!   connect time. C's constructor switch (`drvAmptek.cpp:140-153`) forces
 //!   `directMode=0` for `DppInterfaceUSB`/`DppInterfaceSerial` and
@@ -33,13 +26,12 @@
 //!   C's genuinely-unrecognized-type arm (partial construction, a bare
 //!   `return;` leaving the instance half-built, `drvAmptek.cpp:148-152`) is
 //!   likewise replaced by the same `Err` return.
-//! - **`connect()`'s `addr > 0` early return is omitted.** C's `connect`
-//!   (`drvAmptek.cpp:161-183`) special-cases a per-address connect request
-//!   as a cheap "is the port already connected" check -- an artifact of
-//!   `pasynManager` invoking `connect` once per configured address. asyn-rs
-//!   only ever calls a `PortDriver`'s port-level `connect` for addr 0 (see
-//!   `connect_addr`/`disconnect_addr` for the per-address hooks), so that
-//!   branch has no equivalent call site here.
+//! - **A successful `connect` always marks the user's address connected.**
+//!   C's `connect` (`drvAmptek.cpp:161-183`) calls `exceptionConnect` only
+//!   when it opened the DPP link itself, so an address asked while the
+//!   link is already up -- SCA devices 1-7 always, device 0 after a
+//!   port-level reconnect -- never connects, and its output writes time
+//!   out. A C defect, not copied.
 //! - **No `pData_`/cached-spectrum-buffer state.** C keeps a `pData_`
 //!   scratch buffer `mcaErase_` zeroes and `mcaNumChannels_` reallocates,
 //!   but every real spectrum read (`readInt32Array`) goes straight to a
@@ -113,10 +105,8 @@ use crate::protocol::{self, ReceivedPacket, TransmitPacketType};
 use crate::status::{self, Dp5Status};
 use crate::transport::AmptekUdpTransport;
 
-/// The param address every request uses: the port is not
-/// `ASYN_MULTIDEVICE` (`drvAmptek.cpp:68`), so `pasynManager->getAddr` gives
-/// -1 and `asynPortDriver::getAddress` maps it to 0 whatever the record's
-/// ADDR. asyn-rs passes `user.addr` through, so the driver pins it.
+/// The address C's single-argument `getIntegerParam(index)` and friends
+/// read: list 0.
 const PARAM_ADDR: i32 = 0;
 
 /// `DppInterface_t` (`DppConst.h`): only `DppInterfaceEthernet` (`0`) is
@@ -134,10 +124,12 @@ fn protocol_error(message: impl Into<String>) -> AsynError {
     }
 }
 
+/// C's `return asynDisconnected` on `!CH_.isConnected` leaves
+/// `errorMessage` empty.
 fn disconnected_error() -> AsynError {
     AsynError::Status {
         status: AsynStatus::Disconnected,
-        message: "not connected".to_string(),
+        message: String::new(),
     }
 }
 
@@ -420,7 +412,10 @@ impl AmptekDriver {
                 destructible: true,
             },
         );
-        base.init_connected(false);
+        // C's registration connect runs while asynPortDriver's constructor
+        // waits in waitConnect, so the base asynPortDriver::connect answers it
+        // and the port comes up connected; the DPP connect is device 0's.
+        base.init_connected(true);
 
         let mca = McaReason::create_params(&mut base)?;
         let amptek = AmptekReason::create_params(&mut base)?;
@@ -449,9 +444,10 @@ impl AmptekDriver {
         self.failed_sends += 1;
         if self.failed_sends > MAX_FAILED_SENDS {
             self.trace_error(&format!(
-                "drvAmptek::{function_name} too many failed status queries, disconnecting"
+                "drvAmptek::{function_name} too many failed status queries, disconnecting\n"
             ));
-            self.do_disconnect();
+            // `disconnect(pasynUserSelf)`: pasynUserSelf is device 0's.
+            self.do_disconnect(0);
         }
     }
 
@@ -467,16 +463,36 @@ impl AmptekDriver {
             .trace_print(TraceMask::IO_DRIVER, format_args!("{msg}"));
     }
 
-    /// The disconnect transition itself, shared by [`PortDriver::disconnect`]
-    /// and [`Self::check_failed_comm`]'s "too many failed sends" path
-    /// (`drvAmptek.cpp:185-198,252-257`).
-    fn do_disconnect(&mut self) {
-        if !self.base.is_connected() {
+    /// `drvAmptek::connect` (`drvAmptek.cpp:161-183`) for a user at `addr`,
+    /// which `exceptionConnect` marks: -1 the port, otherwise that device.
+    fn do_connect(&mut self, user: &AsynUser) -> AsynResult<()> {
+        let addr = self.base.get_address(user.addr, user.reason)?;
+        if self.target.is_none() {
+            if addr > 0 {
+                return Err(protocol_error(""));
+            }
+            if let Err(e) = self.connect_device() {
+                self.target = None;
+                self.num_devices = 0;
+                return Err(e);
+            }
+            self.failed_sends = 0;
+        }
+        // C defect not copied: drvAmptek::connect skips exceptionConnect when the link is already up.
+        self.base.set_addr_connected(user.addr, true);
+        Ok(())
+    }
+
+    /// `drvAmptek::disconnect` (`drvAmptek.cpp:185-198`) for a user at
+    /// `addr`; reached also from [`Self::check_failed_comm`] and the
+    /// `hostInfo` option write.
+    fn do_disconnect(&mut self, addr: i32) {
+        if self.target.is_none() {
             return;
         }
         self.target = None;
         self.num_devices = 0;
-        self.base.set_connected(false);
+        self.base.set_addr_connected(addr, false);
         let _ = self.set_params_alarm(alarm_status::COMM_ALARM, AlarmSeverity::Invalid as u16);
     }
 
@@ -529,7 +545,7 @@ impl AmptekDriver {
         }
         self.failed_sends = 0;
         self.trace_io(&format!(
-            "drvAmptek::sendCommand called CH_.SendCommand({}) OK",
+            "drvAmptek::sendCommand called CH_.SendCommand({}) OK\n",
             cmd as i32
         ));
         Ok(raw)
@@ -580,7 +596,7 @@ impl AmptekDriver {
                 )));
             }
             self.trace_io(&format!(
-                "drvAmptek::connectDevice DPP device {} connected",
+                "drvAmptek::connectDevice DPP device {} connected\n",
                 self.address_info
             ));
         } else {
@@ -593,7 +609,7 @@ impl AmptekDriver {
                 )));
             }
             self.trace_io(&format!(
-                "drvAmptek::connectDevice DPP device {} connected, total devices found={}",
+                "drvAmptek::connectDevice DPP device {} connected, total devices found={}\n",
                 self.address_info, self.num_devices
             ));
         }
@@ -660,7 +676,7 @@ impl AmptekDriver {
     fn send_command_string(&mut self, command_string: &str) -> AsynResult<()> {
         let target = self.target.ok_or_else(disconnected_error)?;
         self.trace_io(&format!(
-            "drvAmptek::sendCommandString sending configuration string:\n{command_string}"
+            "drvAmptek::sendCommandString sending configuration string:\n{command_string}\n"
         ));
         let packet = protocol::build_config_packet_ex(command_string);
         let send_status: AsynResult<()> = match self.raw_config_round_trip(target, packet) {
@@ -723,7 +739,7 @@ impl AmptekDriver {
         let content = format!("[DP5 Configuration File]\r\n{}", self.hw_cfg_dp5);
         std::fs::write(file_name, content).map_err(|e| {
             self.trace_error(&format!(
-                "drvAmptek::saveConfigurationFile Couldn't open {file_name} for writing."
+                "drvAmptek::saveConfigurationFile Couldn't open {file_name} for writing.\n"
             ));
             AsynError::from(e)
         })
@@ -781,10 +797,10 @@ impl AmptekDriver {
             .unwrap_or_default()
     }
 
-    /// `drvAmptek::sendSCAs` (`drvAmptek.cpp:479-508`). C's
+    /// `drvAmptek::sendSCAs` (`drvAmptek.cpp:479-508`): SCA `i` from addr
+    /// `i`, where its `Amptek_SCAn.db` record writes it. C's
     /// `getIntegerParam(i, ...)` zeroes `itemp` for a param never set at
-    /// addr `i` (`asynPortDriver.cpp:304`), and on this non-multidevice port
-    /// only addr 0 is ever set, so SCAs 2-8 send 0 / OFF.
+    /// addr `i` (`asynPortDriver.cpp:304`).
     fn send_scas(&mut self) -> AsynResult<()> {
         let reasons = [
             self.amptek[AmptekReason::SCALowChannel as usize],
@@ -855,7 +871,7 @@ impl AmptekDriver {
     fn apply_parsed_configuration(&mut self) -> AsynResult<()> {
         let dpp_type = self.last_status.dpp_type;
         self.trace_io(&format!(
-            "drvAmptek::parseConfiguration configuration string from device:\n{}",
+            "drvAmptek::parseConfiguration configuration string from device:\n{}\n",
             self.hw_cfg_dp5
         ));
         let (parsed, errors) = config::parse_configuration(&self.hw_cfg_dp5, dpp_type);
@@ -1070,29 +1086,21 @@ impl PortDriver for AmptekDriver {
         &mut self.base
     }
 
-    /// `drvAmptek::connect` (`drvAmptek.cpp:161-183`), minus the `addr > 0`
-    /// early return -- see the module doc.
-    fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        if self.base.is_connected() {
-            return Ok(());
-        }
-        match self.connect_device() {
-            Ok(()) => {
-                self.failed_sends = 0;
-                self.base.set_connected(true);
-                Ok(())
-            }
-            Err(e) => {
-                self.target = None;
-                self.num_devices = 0;
-                Err(e)
-            }
-        }
+    fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
+        self.do_connect(user)
     }
 
-    /// `drvAmptek::disconnect` (`drvAmptek.cpp:185-198`).
-    fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        self.do_disconnect();
+    fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
+        self.do_connect(user)
+    }
+
+    fn disconnect(&mut self, user: &AsynUser) -> AsynResult<()> {
+        self.do_disconnect(user.addr);
+        Ok(())
+    }
+
+    fn disconnect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
+        self.do_disconnect(user.addr);
         Ok(())
     }
 
@@ -1112,22 +1120,21 @@ impl PortDriver for AmptekDriver {
     fn set_option(&mut self, user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
         if key.eq_ignore_ascii_case("hostInfo") {
             self.address_info = value.to_string();
-            self.do_disconnect();
+            self.do_disconnect(user.addr);
             Ok(())
         } else if !key.is_empty() {
             Err(protocol_error(format!("Unsupported key \"{key}\"")))
         } else {
-            let _ = user;
             Ok(())
         }
     }
 
     /// `drvAmptek::writeInt32` (`drvAmptek.cpp:846-924`).
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        if !self.base.is_connected() {
+        if self.target.is_none() {
             return Err(disconnected_error());
         }
-        let addr = PARAM_ADDR;
+        let addr = self.base.get_address(user.addr, user.reason)?;
         let reason = user.reason;
         let mut status = self.base.set_int32_param(reason, addr, value);
 
@@ -1194,7 +1201,8 @@ impl PortDriver for AmptekDriver {
             }
             Ok(i32::from(self.acquiring))
         } else {
-            self.base.get_int32_param(user.reason, PARAM_ADDR)
+            let addr = self.base.get_address(user.addr, user.reason)?;
+            self.base.get_int32_param(user.reason, addr)
         }
     }
 
@@ -1208,7 +1216,8 @@ impl PortDriver for AmptekDriver {
         } else if user.reason == self.mca[McaReason::ElapsedCounts as usize] {
             Ok(s.slow_count)
         } else {
-            self.base.get_float64_param(user.reason, PARAM_ADDR)
+            let addr = self.base.get_address(user.addr, user.reason)?;
+            self.base.get_float64_param(user.reason, addr)
         }
     }
 
@@ -1216,34 +1225,36 @@ impl PortDriver for AmptekDriver {
     /// unconditionally sends the full configuration, regardless of which
     /// param changed.
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        if !self.base.is_connected() {
+        if self.target.is_none() {
             return Err(disconnected_error());
         }
-        let addr = PARAM_ADDR;
+        let addr = self.base.get_address(user.addr, user.reason)?;
         self.base.set_float64_param(user.reason, addr, value)?;
         let status = self.send_configuration();
         self.base.call_param_callbacks(addr)?;
         status
     }
 
-    /// `asynPortDriver::readOctet` at `PARAM_ADDR`.
+    /// `asynPortDriver::readOctet`.
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let bytes = self.base.get_string_param(user.reason, PARAM_ADDR)?;
+        let addr = self.base.get_address(user.addr, user.reason)?;
+        let bytes = self.base.get_string_param(user.reason, addr)?;
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
         Ok(n)
     }
 
-    /// `asynPortDriver::writeOctet` at `PARAM_ADDR`.
+    /// `asynPortDriver::writeOctet`.
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        self.base.set_string_param(user.reason, PARAM_ADDR, data)?;
-        self.base.call_param_callbacks(PARAM_ADDR)?;
+        let addr = self.base.get_address(user.addr, user.reason)?;
+        self.base.set_string_param(user.reason, addr, data)?;
+        self.base.call_param_callbacks(addr)?;
         user.print(
             TraceMask::IO_DRIVER,
             file!(),
             line!(),
             format_args!(
-                "asynPortDriver:writeOctet: function={}, name={}, value={}",
+                "asynPortDriver:writeOctet: function={}, name={}, value={}\n",
                 user.reason,
                 self.base.params.param_name(user.reason).unwrap_or(""),
                 String::from_utf8_lossy(data)
@@ -1459,10 +1470,11 @@ mod tests {
         );
     }
 
-    /// Every record ADDR lands on addr 0, and `sendSCAs` repeats the last
-    /// value read for each param unset at addr 1..7 (`drvAmptek.cpp:479-508`).
+    /// The port is multi-device (asynPortDriver.cpp:4014), so an SCA write
+    /// lands at its record's ADDR and `sendSCAs` sends SCA `i` from addr `i`,
+    /// zero for a param never set there (`drvAmptek.cpp:479-508,855-857`).
     #[test]
-    fn sca_writes_use_addr_0_and_send_scas_zeroes_undefined_params() {
+    fn sca_writes_land_at_their_addr_and_send_scas_reads_each() {
         let status = [0u8; 64];
         let (mut driver, fake) = driver_with_fake(move |req| default_reply(req, &status));
         connect(&mut driver).unwrap();
@@ -1473,8 +1485,8 @@ mod tests {
         let mut user = AsynUser::new(level).with_addr(7);
         driver.write_int32(&mut user, 1).unwrap();
 
-        assert_eq!(driver.base.get_int32_param(low, 0).unwrap(), 5);
-        assert!(driver.base.get_int32_param(low, 3).is_err());
+        assert_eq!(driver.base.get_int32_param(low, 3).unwrap(), 5);
+        assert!(driver.base.get_int32_param(low, 0).is_err());
         assert_eq!(
             driver.read_int32(&AsynUser::new(low).with_addr(3)).unwrap(),
             5
@@ -1487,12 +1499,25 @@ mod tests {
             .map(|r| String::from_utf8_lossy(&r[6..r.len() - 2]).into_owned())
             .collect();
         assert!(
-            sent[0].starts_with("SCAI=1;SCAL=5;SCAH=0;SCAO=OFF;SCAI=2;SCAL=0;SCAH=0;SCAO=OFF;")
+            sent[0].starts_with("SCAI=1;SCAL=0;SCAH=0;SCAO=OFF;"),
+            "{}",
+            sent[0]
         );
         assert!(
-            sent[1].starts_with("SCAI=1;SCAL=5;SCAH=0;SCAO=HIGH;SCAI=2;SCAL=0;SCAH=0;SCAO=OFF;")
+            sent[0].contains("SCAI=4;SCAL=5;SCAH=0;SCAO=OFF;"),
+            "{}",
+            sent[0]
         );
-        assert!(sent[1].ends_with("SCAI=8;SCAL=0;SCAH=0;SCAO=OFF;"));
+        assert!(
+            sent[1].contains("SCAI=4;SCAL=5;SCAH=0;SCAO=OFF;"),
+            "{}",
+            sent[1]
+        );
+        assert!(
+            sent[1].ends_with("SCAI=8;SCAL=0;SCAH=0;SCAO=HIGH;"),
+            "{}",
+            sent[1]
+        );
     }
 
     /// A param the device never reported sends C's zeroed value
@@ -1713,10 +1738,90 @@ mod tests {
         assert!(AmptekDriver::new("test3", 99, "192.168.0.1", false).is_err());
     }
 
+    /// C's port is connected by the base asynPortDriver::connect at
+    /// registration; device 0 carries the DPP link.
     #[test]
-    fn new_accepts_ethernet_interface_type_and_starts_disconnected() {
+    fn new_starts_with_the_port_connected_and_device_0_not() {
         let driver = AmptekDriver::new("test4", 0, "192.168.0.1", false).unwrap();
-        assert!(!driver.base.is_connected());
+        assert!(driver.base.is_connected());
+        assert!(!driver.base.is_device_connected(0));
+    }
+
+    #[test]
+    fn device_0_connect_failure_leaves_the_port_connected() {
+        let (mut driver, _fake) = driver_with_fake(|_| None);
+        let user = AsynUser::new(0).with_addr(0);
+        assert!(driver.connect_addr(&user).is_err());
+        assert!(driver.base.is_connected());
+        assert!(!driver.base.is_device_connected(0));
+    }
+
+    #[test]
+    fn device_connect_marks_that_device_only() {
+        let status = [0u8; 64];
+        let (mut driver, _fake) = driver_with_fake(move |req| default_reply(req, &status));
+        driver.connect_addr(&AsynUser::new(0).with_addr(0)).unwrap();
+        assert!(driver.base.is_device_connected(0));
+        assert!(!driver.base.is_device_connected(3));
+        driver.connect_addr(&AsynUser::new(0).with_addr(3)).unwrap();
+        assert!(driver.base.is_device_connected(3));
+    }
+
+    #[test]
+    fn sca_device_connect_before_the_link_is_up_sends_nothing() {
+        let status = [0u8; 64];
+        let (mut driver, fake) = driver_with_fake(move |req| default_reply(req, &status));
+        assert!(driver.connect_addr(&AsynUser::new(0).with_addr(3)).is_err());
+        assert!(!driver.base.is_device_connected(3));
+        assert!(fake.pids().is_empty());
+    }
+
+    /// `disconnect`'s `exceptionDisconnect(pasynUser)` (`drvAmptek.cpp:194`)
+    /// downs and announces only the caller's dpCommon.
+    #[test]
+    fn disconnect_announces_on_the_callers_dp_common_only() {
+        use epics_rs::asyn::exception::{AsynException, ExceptionEvent};
+        use epics_rs::asyn::registry::PortRegistry;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        type Heard = Arc<Mutex<Vec<(AsynException, i32)>>>;
+        fn recorder(heard: &Heard) -> impl Fn(&ExceptionEvent<'_>) + Send + Sync + 'static {
+            let heard = Arc::clone(heard);
+            move |ev| heard.lock().unwrap().push((ev.exception, ev.addr))
+        }
+
+        let status = [0u8; 64];
+        let (driver, _fake) = driver_with_fake(move |req| default_reply(req, &status));
+        let claim = PortRegistry::new().claim("fake").unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        let handle = runtime.port_handle();
+        let (device0, port): (Heard, Heard) = Default::default();
+        let _g0 = handle.exception_callback_add(0, recorder(&device0));
+        let _gp = handle.exception_callback_add(-1, recorder(&port));
+
+        handle.connect_addr_blocking(0).unwrap();
+        handle.disconnect_addr_blocking(0).unwrap();
+
+        let connect = AsynException::Connect;
+        assert_eq!(*device0.lock().unwrap(), [(connect, 0), (connect, 0)]);
+        assert!(port.lock().unwrap().is_empty());
+        assert!(!handle.connect_device(0).connected());
+        assert!(handle.connect_device(-1).connected());
+    }
+
+    /// `checkFailedComm` disconnects `pasynUserSelf`, device 0.
+    #[test]
+    fn failed_comm_disconnects_device_0_not_the_port() {
+        let status = [0u8; 64];
+        let (mut driver, _fake) = driver_with_fake(move |req| default_reply(req, &status));
+        driver.connect_addr(&AsynUser::new(0).with_addr(0)).unwrap();
+        driver.failed_sends = MAX_FAILED_SENDS;
+        driver.check_failed_comm("test");
+        assert!(driver.target.is_none());
+        assert!(!driver.base.is_device_connected(0));
+        assert!(driver.base.is_connected());
     }
 
     /// `setParamsAlarm` touches only the alarm fields (`drvAmptek.cpp:237-248`).
@@ -1728,8 +1833,8 @@ mod tests {
             .base
             .set_param_status(gain, 3, AsynStatus::Timeout, 0, 0)
             .unwrap();
-        driver.base.set_connected(true);
-        driver.do_disconnect();
+        driver.target = Some(Ipv4Addr::LOCALHOST);
+        driver.do_disconnect(0);
 
         let invalid = AlarmSeverity::Invalid as u16;
         assert_eq!(

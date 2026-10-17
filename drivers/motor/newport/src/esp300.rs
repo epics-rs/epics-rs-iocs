@@ -16,24 +16,25 @@
 //!
 //! ## Units
 //!
-//! The asyn-rs motor boundary is dial-frame EGU in both directions, and the
-//! ESP300 commands/readbacks are already in physical units (mm/deg per the
-//! stage's SN configuration) — so positions, velocities, and accelerations
-//! pass through unscaled. C's `cntrl_units = dval * drive_resolution` existed
-//! only because the C record boundary was raw steps. `drive_resolution` is
-//! still discovered per axis at startup (`ZB?` → `FR?`/`QS?` or `SU?`)
-//! because C scales PID gain writes by it (kept for wire parity) and the
-//! `ZB?` feedback bits drive encoder/gain-support status.
+//! The record boundary is raw steps, as in devESP300.cc: every command value
+//! is `steps * drive_resolution` (gains included) and `TP?` reads back as
+//! `NINT(TP / drive_resolution)` steps. `drive_resolution` comes per axis
+//! from `ZB?` → `FR?`/`QS?` or `SU?`. A resolution of 0 or a non-finite one
+//! (a failed `FR?`/`SU?`, a `QS?` of 0) refuses commands and flags the
+//! poll a problem, where C sends `0`/`inf` and reads back `inf`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atof, atoi, is_unsolicited_limit_error, leading_hex};
+use motor_common::model1::MoveStrings;
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
@@ -129,7 +130,12 @@ impl Esp300Controller {
 
     /// Write a command (C `send_mess`); the port output EOS terminates it.
     fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.write_bytes(cmd.as_bytes())
+    }
+
+    /// [`write`](Self::write) for a record string's raw bytes.
+    fn write_bytes(&self, cmd: &[u8]) -> AsynResult<()> {
+        self.handle.write_octet(0, cmd)?;
         Ok(())
     }
 
@@ -152,13 +158,17 @@ impl Esp300Controller {
 }
 
 /// The velocity/acceleration preamble every motion transaction carries
-/// (record `SET_VEL_BASE`/`SET_VELOCITY`/`SET_ACCEL` before the move):
-/// `VB;VA;AC;AG` — the ESP300 takes acceleration and deceleration (`AG`)
-/// separately, C sends both. Values are already controller units.
+/// in the motor record's order (`SET_VELOCITY`, `SET_VEL_BASE`,
+/// `SET_ACCEL`): `VA;VB;AC;AG` — the ESP300 takes acceleration and
+/// deceleration (`AG`) separately, C sends both. The record sends no
+/// SET_ACCEL for a zero rate (motorRecord.cc:874, 940). Values are
+/// controller units.
 fn motion_preamble(axis: usize, vel_base: f64, velocity: f64, acceleration: f64) -> String {
-    format!(
-        "{axis:02}VB{vel_base:.6};{axis:02}VA{velocity:.6};{axis:02}AC{acceleration:.6};{axis:02}AG{acceleration:.6}"
-    )
+    let mut msg = format!("{axis:02}VA{velocity:.6};{axis:02}VB{vel_base:.6}");
+    if acceleration > 0.0 {
+        msg += &format!(";{axis:02}AC{acceleration:.6};{axis:02}AG{acceleration:.6}");
+    }
+    msg
 }
 
 /// One ESP300 axis sharing a controller. Implements [`AsynMotor`].
@@ -167,8 +177,7 @@ pub struct Esp300Axis {
     /// 1-based controller axis number, sent zero-padded (`%.2d`).
     axis: usize,
     /// Controller units per motor step (C `drive_resolution`), discovered at
-    /// construction from the feedback configuration. Used only to scale PID
-    /// gain writes for C wire parity (module Units note).
+    /// construction from the feedback configuration (module Units note).
     drive_resolution: f64,
     /// Stage has an encoder (`ZB?` feedback bits 8/9) — drives the
     /// gain-support/has-encoder status bits (C `EA_PRESENT`/`GAIN_SUPPORT`).
@@ -176,6 +185,7 @@ pub struct Esp300Axis {
     /// Last polled status, reused on the early-exit poll paths where C leaves
     /// the record's other bits stale (TB?/MD errors).
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl Esp300Axis {
@@ -217,6 +227,7 @@ impl Esp300Axis {
                 has_encoder: encoder_present,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         };
         ax.set_status();
         ax
@@ -226,10 +237,46 @@ impl Esp300Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// [`motion_preamble`] for this axis. Values arrive in EGU/sec(²),
-    /// already controller units (module Units note).
-    fn motion_preamble(&self, min_velocity: f64, velocity: f64, acceleration: f64) -> String {
-        motion_preamble(self.axis, min_velocity, velocity, acceleration)
+    /// `drive_resolution`, refused at 0 or non-finite (module Units note).
+    fn resolution(&self) -> AsynResult<f64> {
+        let res = self.drive_resolution;
+        if res == 0.0 || !res.is_finite() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("ESP300 axis {}: drive resolution is {res}", self.axis),
+            });
+        }
+        Ok(res)
+    }
+
+    /// [`motion_preamble`] for this axis, steps scaled to controller units.
+    fn motion_preamble(
+        &self,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<String> {
+        let res = self.resolution()?;
+        Ok(motion_preamble(
+            self.axis,
+            min_velocity * res,
+            velocity * res,
+            acceleration * res,
+        ))
+    }
+
+    /// One move transaction: the record's earlier parts, then PREM and a
+    /// `;` ahead of the move's own command (devESP300.cc:201-216), whose
+    /// POST waits for the move to end.
+    fn write_move(&mut self, parts: &str, command: &str) -> AsynResult<()> {
+        let mut line = format!("{parts};").into_bytes();
+        let prem = self.strings.arm();
+        if !prem.is_empty() {
+            line.extend_from_slice(&prem);
+            line.push(b';');
+        }
+        line.extend_from_slice(command.as_bytes());
+        self.lock().write_bytes(&line)
     }
 }
 
@@ -248,15 +295,11 @@ impl AsynMotor for Esp300Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        // One transaction: VB;VA;AC;AG;PA (the ESP300 starts moving on PA;
+        // One transaction: VA;VB;AC;AG;PA (the ESP300 starts moving on PA;
         // the record's GO is a no-op).
-        let ctrl = self.lock();
-        ctrl.write(&format!(
-            "{};{:02}PA{:.6}",
-            self.motion_preamble(min_velocity, velocity, acceleration),
-            self.axis,
-            position
-        ))
+        let parts = self.motion_preamble(min_velocity, velocity, acceleration)?;
+        let position = position * self.resolution()?;
+        self.write_move(&parts, &format!("{:02}PA{position:.6}", self.axis))
     }
 
     fn move_relative(
@@ -267,31 +310,29 @@ impl AsynMotor for Esp300Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        ctrl.write(&format!(
-            "{};{:02}PR{:.6}",
-            self.motion_preamble(min_velocity, velocity, acceleration),
-            self.axis,
-            distance
-        ))
+        let parts = self.motion_preamble(min_velocity, velocity, acceleration)?;
+        let distance = distance * self.resolution()?;
+        self.write_move(&parts, &format!("{:02}PR{distance:.6}", self.axis))
     }
 
     fn move_velocity(
         &mut self,
         _user: &AsynUser,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        // Record JOG transaction: SET_ACCEL then VA with the jog speed and a
-        // signed MV (C `JOG` case).
+        // Record JOG transaction: SET_VEL_BASE, SET_ACCEL, then VA with the
+        // jog speed and a signed MV (C `JOG` case).
         let a = self.axis;
+        let res = self.resolution()?;
+        let (vel_base, velocity, acceleration) =
+            (min_velocity * res, velocity * res, acceleration * res);
         let sign = if velocity > 0.0 { '+' } else { '-' };
-        let ctrl = self.lock();
-        ctrl.write(&format!(
-            "{a:02}AC{acceleration:.6};{a:02}AG{acceleration:.6};{a:02}VA{:.6};{a:02}MV{sign}",
-            velocity.abs(),
-        ))
+        self.write_move(
+            &format!("{a:02}VB{vel_base:.6};{a:02}AC{acceleration:.6};{a:02}AG{acceleration:.6}"),
+            &format!("{a:02}VA{:.6};{a:02}MV{sign}", velocity.abs()),
+        )
     }
 
     fn home(
@@ -304,12 +345,8 @@ impl AsynMotor for Esp300Axis {
     ) -> AsynResult<()> {
         // C sends the same `OR` for HOME_FOR and HOME_REV (direction ignored),
         // after the record's velocity/acceleration transaction parts.
-        let ctrl = self.lock();
-        ctrl.write(&format!(
-            "{};{:02}OR",
-            self.motion_preamble(min_velocity, velocity, acceleration),
-            self.axis
-        ))
+        let parts = self.motion_preamble(min_velocity, velocity, acceleration)?;
+        self.write_move(&parts, &format!("{:02}OR", self.axis))
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -319,6 +356,7 @@ impl AsynMotor for Esp300Axis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         // C `LOAD_POS`: define home (DH) at the given position.
+        let position = position * self.resolution()?;
         let ctrl = self.lock();
         ctrl.write(&format!("{:02}DH{position:.6}", self.axis))
     }
@@ -334,11 +372,13 @@ impl AsynMotor for Esp300Axis {
     }
 
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        let position = position * self.resolution()?;
         let ctrl = self.lock();
         ctrl.write(&format!("{:02}SR{position:.6}", self.axis))
     }
 
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        let position = position * self.resolution()?;
         let ctrl = self.lock();
         ctrl.write(&format!("{:02}SL{position:.6}", self.axis))
     }
@@ -353,20 +393,26 @@ impl AsynMotor for Esp300Axis {
             PidGainKind::Integral => "KI",
             PidGainKind::Derivative => "KD",
         };
-        // C passes the gain through its uniform `dval * drive_resolution`
-        // conversion even though the gain is dimensionless; kept bug-for-bug
-        // so the wire bytes match.
-        // C's ESP300 axis divides FR? by a QS? that can read 0, so its gain
-        // write sends `inf`/`nan`; that C defect is not copied.
-        let value = gain * self.drive_resolution;
-        if !value.is_finite() {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("ESP300 axis {a}: drive resolution is not finite"),
-            });
-        }
+        let value = gain * self.resolution()?;
         let ctrl = self.lock();
         ctrl.write(&format!("{a}{cc}{value:.6};{a}UF"))
+    }
+
+    /// `PRIMITIVE`: INIT and a CR, its own transaction.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let mut line = init.to_vec();
+        line.push(b'\r');
+        self.lock().write_bytes(&line)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -410,8 +456,10 @@ impl Esp300Axis {
         }
         let done = md == "1";
 
-        // TP? reports controller units == record EGU (module Units note).
-        let position = atof(&read(&ctrl, &format!("{a:02}TP?")));
+        // TP? reports controller units; C NINTs them to steps.
+        let tp = atof(&read(&ctrl, &format!("{a:02}TP?")));
+        let steps = self.resolution().map(|res| (tp / res).round());
+        let position = steps.as_ref().copied().unwrap_or(self.last_status.position);
         // Direction from the position delta; only one position query exists,
         // so the encoder position is the same value (C set_status).
         if position != self.last_status.position {
@@ -429,9 +477,13 @@ impl Esp300Axis {
 
         let te = read(&ctrl, "TE?");
         let errcode = atoi(&te);
-        let problem = errcode != 0;
-        if problem {
+        let problem = errcode != 0 || steps.is_err();
+        if errcode != 0 {
             println!("ESP300 controller error = {errcode}.");
+        }
+        // drvESP300.cc:391-398; C ignores the write's status too.
+        if done && let Some(post) = self.strings.post_due() {
+            let _ = ctrl.write_bytes(&post);
         }
         drop(ctrl);
 
@@ -459,6 +511,8 @@ impl Esp300Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Answers `VE?` and the commands in `replies`; fails every other read.
     struct IdentOnly {
@@ -533,7 +587,7 @@ mod tests {
     }
 
     /// A QS? of 0 keeps the axis, as C does, with an infinite resolution
-    /// that the gain write refuses rather than sending `inf`.
+    /// that commands refuse rather than sending `inf`, and polls flag.
     #[test]
     fn a_non_finite_resolution_never_reaches_the_wire() {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
@@ -570,6 +624,8 @@ mod tests {
             axis.set_pid_gain(&user, PidGainKind::Proportional, 0.5)
                 .is_err()
         );
+        assert!(axis.move_absolute(&user, 10.0, 0.0, 1.0, 1.0).is_err());
+        assert!(axis.poll(&user).unwrap().problem);
     }
 
     /// An ESP300 line answering `replies`: the controller and the wire log
@@ -602,6 +658,92 @@ mod tests {
         (ctrl, sent)
     }
 
+    /// One axis on a [`LineRig`], reporting `MD` from `moving`, with the
+    /// construction traffic taken.
+    fn strings_rig(name: &str) -> (LineRig, Esp300Axis, Arc<AtomicBool>) {
+        let moving = Arc::new(AtomicBool::new(false));
+        let m = moving.clone();
+        let (line, io) = LineRig::new(name, move |last| {
+            match last {
+                "VE?" => "ESP300 Version 3.08",
+                "TB?" => "0, 0, NO ERROR",
+                "01MD" if m.load(Ordering::SeqCst) => "0",
+                "01MD" | "01MO?" => "1",
+                "TE?" | "01TP?" | "01ZB?" => "0",
+                // One controller unit per record step.
+                "01FR?" => "1",
+                _ => "",
+            }
+            .to_string()
+        });
+        let ctrl = Esp300Controller::new(io).unwrap();
+        let axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        line.sent();
+        (line, axis, moving)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// devESP300.cc:195-199: INIT and a CR.
+    #[test]
+    fn init_goes_out_with_a_cr() {
+        let (line, mut axis, _) = strings_rig("esp300Init");
+        axis.primitive(&AsynUser::default(), b"01MO").unwrap();
+        assert_eq!(line.sent(), ["01MO\r"]);
+    }
+
+    /// devESP300.cc:201-216: PREM and a `;` go ahead of each move's own
+    /// command, for that move only.
+    #[test]
+    fn prem_leads_the_move_command() {
+        let (line, mut axis, _) = strings_rig("esp300Prem");
+        let user = AsynUser::default();
+        let parts = "01VA2.000000;01VB0.000000;01AC3.000000;01AG3.000000";
+        axis.set_move_strings(&user, b"01MO", None).unwrap();
+        axis.move_absolute(&user, 1.5, 0.0, 2.0, 3.0).unwrap();
+        assert_eq!(line.sent(), [format!("{parts};01MO;01PA1.500000")]);
+        axis.move_relative(&user, 1.5, 0.0, 2.0, 3.0).unwrap();
+        assert_eq!(line.sent(), [format!("{parts};01PR1.500000")]);
+        axis.set_move_strings(&user, b"01MO", None).unwrap();
+        axis.home(&user, 0.0, 2.0, 3.0, true).unwrap();
+        assert_eq!(line.sent(), [format!("{parts};01MO;01OR")]);
+        axis.set_move_strings(&user, b"01MO", None).unwrap();
+        axis.move_velocity(&user, 0.0, -2.0, 3.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            ["01VB0.000000;01AC3.000000;01AG3.000000;01MO;01VA2.000000;01MV-"]
+        );
+    }
+
+    /// drvESP300.cc:391-398: POST once the move is done, not while it runs.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, moving) = strings_rig("esp300Post");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"01MF")))
+            .unwrap();
+        axis.move_absolute(&user, 1.0, 0.0, 2.0, 3.0).unwrap();
+        line.sent();
+        let extra = |line: &LineRig| -> Vec<String> {
+            line.sent()
+                .into_iter()
+                .filter(|l| !l.ends_with('?') && l != "01MD")
+                .collect()
+        };
+        moving.store(true, Ordering::SeqCst);
+        axis.poll(&user).unwrap();
+        assert!(extra(&line).is_empty());
+        moving.store(false, Ordering::SeqCst);
+        axis.poll(&user).unwrap();
+        assert_eq!(extra(&line), ["01MF"]);
+        axis.poll(&user).unwrap();
+        assert!(extra(&line).is_empty(), "sent once");
+    }
+
     /// drvESP300.cc motor_init ends each axis with set_status.
     #[test]
     fn axis_init_runs_set_status_after_the_resolution_queries() {
@@ -610,6 +752,7 @@ mod tests {
             &[
                 ("TB?", "0, 0, NO ERROR DETECTED"),
                 ("01MD", "1"),
+                ("01FR?", "0.001"),
                 ("01TP?", "1.5"),
                 ("01ZH?", "24"),
                 ("01MO?", "1"),
@@ -624,7 +767,7 @@ mod tests {
             ]
         );
         let s = &axis.last_status;
-        assert_eq!(s.position, 1.5);
+        assert_eq!(s.position, 1500.0);
         assert!(s.done && s.powered && !s.problem && !s.comms_error);
     }
 
@@ -646,11 +789,20 @@ mod tests {
         // both sent with the acceleration.
         assert_eq!(
             motion_preamble(1, 0.5, 2.0, 8.0),
-            "01VB0.500000;01VA2.000000;01AC8.000000;01AG8.000000"
+            "01VA2.000000;01VB0.500000;01AC8.000000;01AG8.000000"
         );
         assert_eq!(
             motion_preamble(12, 0.0, 1.0, 4.0),
-            "12VB0.000000;12VA1.000000;12AC4.000000;12AG4.000000"
+            "12VA1.000000;12VB0.000000;12AC4.000000;12AG4.000000"
+        );
+    }
+
+    /// motorRecord.cc:874, 940: no SET_ACCEL for a zero move or home rate.
+    #[test]
+    fn a_zero_rate_preamble_has_no_ac_or_ag() {
+        assert_eq!(
+            motion_preamble(3, 0.5, 2.0, 0.0),
+            "03VA2.000000;03VB0.500000"
         );
     }
 }

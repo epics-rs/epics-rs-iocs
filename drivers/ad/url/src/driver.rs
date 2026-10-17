@@ -7,9 +7,9 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
-use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::driver::write_tail::{OwnList, WriteTail};
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
@@ -19,6 +19,12 @@ use epics_rs::ad_core::runtime as rt;
 use crate::params::URLParams;
 use crate::task::{AcquisitionContext, start_acquisition_task};
 use crate::types::AcqCommand;
+
+const INT32_TAIL: WriteTail = WriteTail {
+    error: "URLDriver:writeInt32 error, ",
+    done: "URLDriver:writeInt32: ",
+    list: OwnList::Zero,
+};
 
 /// C++ `#define DRIVER_VERSION 2` / `DRIVER_REVISION 3` / `DRIVER_MODIFICATION 0`,
 /// formatted the same way as `epicsSnprintf(versionString, ..., "%d.%d.%d", ...)`.
@@ -88,47 +94,23 @@ impl PortDriver for URLDriver {
     /// idle or not); every other Int32 param goes to `ADDriver::writeInt32`.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad
-            .port_base
-            .set_int32_param(reason, user.addr, value)?;
-
-        let status = if reason == self.ad.params.acquire {
-            let status = self
-                .ad
-                .port_base
-                .get_int32_param(self.ad.params.status, 0)
-                .unwrap_or(ADStatus::Idle as i32);
-            if value != 0 && status == ADStatus::Idle as i32 {
-                let _ = self.acq_tx.try_send(AcqCommand::Start);
-            } else if value == 0 && status != ADStatus::Idle as i32 {
-                let _ = self.acq_tx.try_send(AcqCommand::Stop);
+        INT32_TAIL.write_int32(self, user, value, |drv, user, status| {
+            if reason == drv.ad.params.acquire {
+                let adstatus = drv
+                    .ad
+                    .port_base
+                    .get_int32_param(drv.ad.params.status, 0)
+                    .unwrap_or(ADStatus::Idle as i32);
+                if value != 0 && adstatus == ADStatus::Idle as i32 {
+                    let _ = drv.acq_tx.try_send(AcqCommand::Start);
+                } else if value == 0 && adstatus != ADStatus::Idle as i32 {
+                    let _ = drv.acq_tx.try_send(AcqCommand::Stop);
+                }
+            } else if reason < drv.url_params.url_name {
+                return ADDriver::ad_write_int32(drv, user, value);
             }
-            Ok(())
-        } else if reason < self.url_params.url_name {
-            ADDriver::ad_write_int32(self, user, value)
-        } else {
-            Ok(())
-        };
-
-        self.ad.port_base.call_param_callbacks(0)?;
-        match &status {
-            Err(e) => user.print(
-                TraceMask::ERROR,
-                file!(),
-                line!(),
-                format_args!(
-                    "URLDriver:writeInt32 error, status={} function={reason}, value={value}",
-                    e.status() as i32
-                ),
-            ),
-            Ok(()) => user.print(
-                TraceMask::IO_DRIVER,
-                file!(),
-                line!(),
-                format_args!("URLDriver:writeInt32: function={reason}, value={value}"),
-            ),
-        }
-        status
+            status
+        })
     }
 }
 
@@ -231,6 +213,53 @@ mod tests {
                 .unwrap(),
             1,
             "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
+
+    /// URLDriver.cpp:305-319: setIntegerParam(function, value) is list 0,
+    /// so an acquire at another address sets list 0 and starts.
+    #[test]
+    fn an_acquire_at_another_address_sets_list_zero_and_starts() {
+        let (acq_tx, mut acq_rx) = rt::command_channel(1);
+        let mut det = URLDriver::new("URL_LIST_ZERO", 1 << 20, acq_tx).unwrap();
+        let acquire = det.ad.params.acquire;
+        let mut user = AsynUser::new(acquire).with_addr(1);
+        assert!(det.write_int32(&mut user, 1).is_ok());
+        assert_eq!(det.ad.port_base.get_int32_param(acquire, 0).unwrap(), 1);
+        assert!(matches!(acq_rx.try_recv(), Ok(AcqCommand::Start)));
+    }
+
+    /// URLDriver.cpp:327-330 prints asynPortDriver::writeInt32's
+    /// asynParamWrongType for an int written to a float param.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "URL_STATUS_CODE";
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let mut det = URLDriver::new(port, 1 << 20, acq_tx).unwrap();
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("url-status-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let reason = det.ad.params.acquire_time;
+        let mut user = AsynUser::new(reason);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        assert!(det.write_int32(&mut user, 1).is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(&format!(
+                "URLDriver:writeInt32 error, status=8 function={reason}, value=1"
+            )),
+            "{text}"
         );
     }
 

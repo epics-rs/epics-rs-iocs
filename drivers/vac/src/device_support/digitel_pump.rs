@@ -131,7 +131,7 @@ impl Job {
         if self.cfg.dev == DevType::Qpc && send.len() < 10 {
             self.trace(
                 TraceMask::ERROR,
-                format_args!("{PROCESS} sendBuf too small  command=[{sent}]"),
+                format_args!("{PROCESS} sendBuf too small  command=[{sent}]\n"),
             );
         } else {
             let _ = port.call(&RequestOp::Flush, user(self.addr, IO_TIMEOUT));
@@ -139,13 +139,13 @@ impl Job {
                 Err(e) => self.trace(
                     TraceMask::ERROR,
                     format_args!(
-                        "{PROCESS} write failed {} Bytes read: 0, Reason: 0",
+                        "{PROCESS} write failed {} Bytes read: 0, Reason: 0\n",
                         e.message()
                     ),
                 ),
                 Ok(n) => self.trace(
                     TraceMask::IO_DEVICE,
-                    format_args!("{PROCESS} {name} nwrite={n} output=[{sent}]"),
+                    format_args!("{PROCESS} {name} nwrite={n} output=[{sent}]\n"),
                 ),
             }
             let read = octet_read(port, user(self.addr, IO_TIMEOUT), digitel::READ_SIZE);
@@ -153,7 +153,7 @@ impl Job {
                 Some(e) => self.trace(
                     TraceMask::ERROR,
                     format_args!(
-                        "{PROCESS} read failed {} Bytes read: {}, Reason: {}",
+                        "{PROCESS} read failed {} Bytes read: {}, Reason: {}\n",
                         e.message(),
                         read.data.len(),
                         read.eom
@@ -162,7 +162,7 @@ impl Job {
                 None => self.trace(
                     TraceMask::IO_DEVICE,
                     format_args!(
-                        "{PROCESS} {name} nread={} input=[{}]",
+                        "{PROCESS} {name} nread={} input=[{}]\n",
                         read.data.len(),
                         c_str(&read.data)
                     ),
@@ -173,7 +173,7 @@ impl Job {
         self.trace(
             TraceMask::IO_DEVICE,
             format_args!(
-                "{PROCESS} {name} nread={} input=[{}]",
+                "{PROCESS} {name} nread={} input=[{}]\n",
                 reply.len(),
                 c_str(&reply)
             ),
@@ -198,13 +198,16 @@ impl CellBody for Job {
                 if reply.is_empty() {
                     self.trace(
                         TraceMask::ERROR,
-                        format_args!("{CALLBACK} {name} Cmd reply too small=0"),
+                        format_args!("{CALLBACK} {name} Cmd reply too small=0\n"),
                     );
                     false
                 } else if check_control_reply(dev, &reply).is_err() {
                     self.trace(
                         TraceMask::ERROR,
-                        format_args!("{CALLBACK} {name} Cmd reply has error=[{}]", c_str(&reply)),
+                        format_args!(
+                            "{CALLBACK} {name} Cmd reply has error=[{}]\n",
+                            c_str(&reply)
+                        ),
                     );
                     ex.read_alarm = true;
                     false
@@ -232,7 +235,7 @@ impl CellBody for Job {
                 if reply.is_empty() {
                     self.trace(
                         TraceMask::ERROR,
-                        format_args!("{CALLBACK} {name} Read reply too small=0"),
+                        format_args!("{CALLBACK} {name} Read reply too small=0\n"),
                     );
                     return false;
                 }
@@ -240,7 +243,7 @@ impl CellBody for Job {
                     Ok(data) => {
                         self.trace(
                             TraceMask::IO_DEVICE,
-                            format_args!("{CALLBACK} {name} Read reply = [{}]", c_str(&data)),
+                            format_args!("{CALLBACK} {name} Read reply = [{}]\n", c_str(&data)),
                         );
                         response.strcpy_at(30 * i, &data);
                         true
@@ -249,7 +252,7 @@ impl CellBody for Job {
                         self.trace(
                             TraceMask::ERROR,
                             format_args!(
-                                "{CALLBACK} {name} Read reply has error=[{}]",
+                                "{CALLBACK} {name} Read reply has error=[{}]\n",
                                 c_str(&reply)
                             ),
                         );
@@ -361,7 +364,8 @@ impl DeviceSupport for DigitelPump {
         record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        let Some(live) = self.live.as_mut() else {
+        // The pass a completion re-entered is `pact == 1`: `read` decodes.
+        let Some(live) = self.live.as_mut().filter(|_| !done.pact()) else {
             return Ok(ReadStart::Synchronous);
         };
         let job = &live.job;
@@ -440,7 +444,7 @@ impl DeviceSupport for DigitelPump {
         job.trace(
             TraceMask::IO_DEVICE,
             format_args!(
-                "devDigitelPump::readWrite_dg {} command {} len={} string=|{}|",
+                "devDigitelPump::readWrite_dg {} command {} len={} string=|{}|\n",
                 self.name,
                 ex.command.code(),
                 sendbuf.len(),
@@ -462,7 +466,7 @@ impl DeviceSupport for DigitelPump {
                 job.trace(
                     TraceMask::ERROR,
                     format_args!(
-                        "devDigitelPump::readWrite {} ERROR calling queueRequest\n    status={}, error={}",
+                        "devDigitelPump::readWrite {} ERROR calling queueRequest\n    status={}, error={}\n",
                         self.name,
                         e.status() as i32,
                         e.message()
@@ -689,5 +693,51 @@ mod tests {
             log.contains("devDigitelPumpCallback V:IP1 Read reply too small=0\n"),
             "{log}"
         );
+    }
+
+    /// The pass a completion re-enters is C `readWrite_dg` with `pact == 1`:
+    /// it decodes what landed and queues nothing.
+    #[test]
+    fn the_continuation_pass_does_not_queue_again() {
+        let port = "DGREENTRY";
+        let claim = claim_port_driver(port).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let driver = DrvAsynIPPort::new(port, &addr).unwrap();
+        let _runtime = PortManager::new()
+            .register_port(claim, driver, &open_owner())
+            .unwrap();
+        let mut dev = DigitelPump::new(AsynLink {
+            port_name: port.into(),
+            addr: 0,
+            timeout: None,
+            drv_info: "0".into(),
+        });
+        dev.set_record_info("V:IP2", ScanType::Passive);
+        let mut rec = d500();
+        assert!(matches!(dev.init(&mut rec), Ok(o) if o == DeviceInitOutcome::ok()));
+        let job = dev.live.as_ref().unwrap().job.clone();
+        job.exchange.lock().unwrap().err_count = 0;
+        let db = PvDatabase::new();
+        let done = DeviceDone::new(&db, &RecordInstance::new("V:IP2", d500()));
+
+        let start = dev
+            .read_begin(&mut rec, &DeviceDoneSource::new(&done))
+            .unwrap();
+        assert!(matches!(start, ReadStart::Pending));
+        // The listener never answers: the exchange ends on its timeout, and
+        // the cell is free to queue again, as it is when C re-enters.
+        let deadline = std::time::Instant::now() + 4 * IO_TIMEOUT;
+        while job.exchange.lock().unwrap().err_count == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exchange never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let again = dev
+            .read_begin(&mut rec, &DeviceDoneSource::continuing(&done))
+            .unwrap();
+        assert!(matches!(again, ReadStart::Synchronous));
     }
 }

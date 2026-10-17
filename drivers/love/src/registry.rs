@@ -17,6 +17,8 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use epics_rs::asyn::exception::ExceptionCallbackGuard;
+
 /// C `#define K_INSTRMAX (256)` — controller addresses are 1..=256, indexed
 /// `instr[addr-1]`.
 pub const K_INSTRMAX: usize = 256;
@@ -48,18 +50,32 @@ impl Model {
 
 pub type ModelTable = Arc<Mutex<[Model; K_INSTRMAX]>>;
 
+/// One `pports` entry: the port's name, its model table and the serial
+/// port's exception callback (C `struct Port` keeps the serial user that
+/// carries it).
+struct Entry {
+    name: String,
+    table: ModelTable,
+    _follow: ExceptionCallbackGuard,
+}
+
 /// C `pports`, newest port first.
-fn registry() -> &'static Mutex<Vec<(String, ModelTable)>> {
-    static REGISTRY: OnceLock<Mutex<Vec<(String, ModelTable)>>> = OnceLock::new();
+fn registry() -> &'static Mutex<Vec<Entry>> {
+    static REGISTRY: OnceLock<Mutex<Vec<Entry>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Register `table` under `port_name`, called once by `drvLoveInit`.
-pub fn register(port_name: &str, table: ModelTable) {
-    registry()
-        .lock()
-        .unwrap()
-        .insert(0, (port_name.to_string(), table));
+/// Register `table` under `port_name`, called once by `drvLoveInit`, with
+/// the [`crate::connect::follow_serial_port`] guard it keeps alive.
+pub fn register(port_name: &str, table: ModelTable, follow: ExceptionCallbackGuard) {
+    registry().lock().unwrap().insert(
+        0,
+        Entry {
+            name: port_name.to_string(),
+            table,
+            _follow: follow,
+        },
+    );
 }
 
 /// Look up the model table for an already-`drvLoveInit`-ed port, called by
@@ -71,18 +87,37 @@ pub fn lookup(port_name: &str) -> Option<ModelTable> {
         .lock()
         .unwrap()
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(port_name))
-        .map(|(_, table)| table.clone())
+        .find(|e| e.name.eq_ignore_ascii_case(port_name))
+        .map(|e| e.table.clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+    struct Bare(PortDriverBase);
+
+    impl PortDriver for Bare {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
 
     #[test]
     fn lookup_ignores_case_like_epics_str_case_cmp() {
+        let claim = claim_port("loveCaseS0").unwrap();
+        let base = PortDriverBase::new("loveCaseS0", 1, PortFlags::default());
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        let follow = rt.port_handle().exception_callback_add(-1, |_| {});
         let table: ModelTable = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
-        register("loveCaseL0", table.clone());
+        register("loveCaseL0", table.clone(), follow);
         let found = lookup("LOVECASEL0").expect("case-insensitive match");
         assert!(Arc::ptr_eq(&found, &table));
     }

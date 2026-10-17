@@ -425,6 +425,7 @@ impl AsynMotor for AgUcAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     #[test]
     fn model_detected_from_firmware_string() {
@@ -441,8 +442,12 @@ mod tests {
     /// its axes; VE fails, so the poller is never started.
     #[test]
     fn a_controller_of_a_missing_port_is_built_unpolled() {
-        let (handle, status) =
-            SyncIOHandle::connect_port("AG_UC_NONE", 0, Duration::from_millis(10));
+        let (handle, status) = SyncIOHandle::connect_port(
+            "AG_UC_NONE",
+            0,
+            Duration::from_millis(10),
+            InterfaceType::Octet,
+        );
         assert!(status.is_err());
         let controller = Arc::new(Mutex::new(AgUcController::new(
             handle,

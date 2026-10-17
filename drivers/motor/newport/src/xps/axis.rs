@@ -103,7 +103,9 @@ impl XpsAxis {
             trace_error(
                 &trace,
                 "XPSAxis",
-                format_args!("positionerName must be of form group.positioner = {positioner_name}"),
+                format_args!(
+                    "positionerName must be of form group.positioner = {positioner_name}\n"
+                ),
             );
         }
         let group_name = group_of(positioner_name).to_string();
@@ -215,7 +217,7 @@ impl XpsAxis {
                         self.error(
                             "move",
                             format_args!(
-                                "motorAxisMove[{},{}]: error performing GroupMotionEnable {}",
+                                "motorAxisMove[{},{}]: error performing GroupMotionEnable {}\n",
                                 self.port(),
                                 self.axis_no(),
                                 e.code()
@@ -243,7 +245,7 @@ impl XpsAxis {
             self.error(
                 "move",
                 format_args!(
-                    "Error performing PositionerSGammaParametersSet[{},{}] {}: {}",
+                    "Error performing PositionerSGammaParametersSet[{},{}] {}: {}\n",
                     self.port(),
                     self.axis_no(),
                     e.code(),
@@ -264,7 +266,7 @@ impl XpsAxis {
                 self.error(
                     "move",
                     format_args!(
-                        "Error performing {command}[{},{}] {}",
+                        "Error performing {command}[{},{}] {}\n",
                         self.port(),
                         self.axis_no(),
                         e.code()
@@ -279,7 +281,7 @@ impl XpsAxis {
         self.error(
             function,
             format_args!(
-                "[{},{}]: error performing PositionerUserTravelLimitsGet status={}",
+                "[{},{}]: error performing PositionerUserTravelLimitsGet status={}\n",
                 self.port(),
                 self.axis_no(),
                 e.code()
@@ -295,45 +297,45 @@ impl XpsAxis {
             PidFailure::TypeGet(code) => self.error(
                 "setPID",
                 format_args!(
-                    "Error with PositionerCorrectorTypeGet. XPS: {port}, Axis: {axis}, XPS API Error: {code}"
+                    "Error with PositionerCorrectorTypeGet. XPS: {port}, Axis: {axis}, XPS API Error: {code}\n"
                 ),
             ),
             PidFailure::Get(CorrectorType::PiPosition, code) => self.error(
                 "setPID",
                 format_args!(
-                    "Error with PositionerCorrectorPIPositionGet. Aborting setting PID XPS: {port}, Axis: {axis}, XPS API Error: {code}"
+                    "Error with PositionerCorrectorPIPositionGet. Aborting setting PID XPS: {port}, Axis: {axis}, XPS API Error: {code}\n"
                 ),
             ),
             PidFailure::Set(CorrectorType::PiPosition, code) => self.error(
                 "setPID",
                 format_args!(
-                    "Error with PositionerCorrectorPIPositionSet: {port}, Axis: {axis}, XPS API Error: {code}"
+                    "Error with PositionerCorrectorPIPositionSet: {port}, Axis: {axis}, XPS API Error: {code}\n"
                 ),
             ),
             PidFailure::Get(ct, code) => self.error(
                 "setPID",
                 format_args!(
-                    "Error with PositionerCorrector{}Get. Aborting setting PID {port}, Axis: {axis}, XPS API Error: {code}",
+                    "Error with PositionerCorrector{}Get. Aborting setting PID {port}, Axis: {axis}, XPS API Error: {code}\n",
                     name(ct)
                 ),
             ),
             PidFailure::Set(ct, code) => self.error(
                 "setPID",
                 format_args!(
-                    "Error with PositionerCorrector{}Set. Aborting setting PID {port}, Axis: {axis}, XPS API Error: {code}",
+                    "Error with PositionerCorrector{}Set. Aborting setting PID {port}, Axis: {axis}, XPS API Error: {code}\n",
                     name(ct)
                 ),
             ),
             PidFailure::Unsupported(CorrectorType::NoCorrector, type_name) => self.error(
                 "setPID",
                 format_args!(
-                    ". XPS {port} axis {axis} corrector type is {type_name}. Cannot set PID."
+                    ". XPS {port} axis {axis} corrector type is {type_name}. Cannot set PID.\n"
                 ),
             ),
             PidFailure::Unsupported(_, type_name) => self.error(
                 "setPID",
                 format_args!(
-                    ". XPS {port} axis {axis} not a valid corrector type: {type_name}. Cannot set PID."
+                    ". XPS {port} axis {axis} not a valid corrector type: {type_name}. Cannot set PID.\n"
                 ),
             ),
         }
@@ -347,26 +349,26 @@ impl XpsAxis {
             PidFailure::TypeGet(code) => self.error(
                 "getPID",
                 format_args!(
-                    "Error with PositionerCorrectorTypeGet. XPS: {port}, Axis: {axis}, XPS API Error: {code}"
+                    "Error with PositionerCorrectorTypeGet. XPS: {port}, Axis: {axis}, XPS API Error: {code}\n"
                 ),
             ),
             PidFailure::Get(ct, code) | PidFailure::Set(ct, code) => self.error(
                 "getPID",
                 format_args!(
-                    "XPS {port}, Axis: {axis}, Error with PositionerCorrector{}Get. XPS API Error: {code}",
+                    "XPS {port}, Axis: {axis}, Error with PositionerCorrector{}Get. XPS API Error: {code}\n",
                     ct.short_name()
                 ),
             ),
             PidFailure::Unsupported(CorrectorType::NoCorrector, type_name) => self.error(
                 "getPID",
                 format_args!(
-                    ". XPS {port} axis {axis} corrector type is {type_name}. Cannot get PID."
+                    ". XPS {port} axis {axis} corrector type is {type_name}. Cannot get PID.\n"
                 ),
             ),
             PidFailure::Unsupported(_, type_name) => self.error(
                 "getPID",
                 format_args!(
-                    ". XPS {port} axis {axis} not a valid corrector type: {type_name}. Cannot set PID."
+                    ". XPS {port} axis {axis} not a valid corrector type: {type_name}. Cannot set PID.\n"
                 ),
             ),
         }
@@ -375,7 +377,7 @@ impl XpsAxis {
     /// C `doMoveToHome`'s failure exit: print, then `GroupKill` on the move
     /// socket when C issues one.
     fn move_to_home_failed(&self, message: &str, kill: bool) -> AsynError {
-        self.error("XPSAxis::doMoveToHome", format_args!("{message}"));
+        self.error("XPSAxis::doMoveToHome", format_args!("{message}\n"));
         if kill {
             let _ = self.move_sock.group_kill(&self.group_name);
         }
@@ -507,7 +509,7 @@ impl AsynMotor for XpsAxis {
             self.error(
                 "moveVelocity",
                 format_args!(
-                    "[{},{}]: error calling {command} error={}",
+                    "[{},{}]: error calling {command} error={}\n",
                     self.port(),
                     self.axis_no(),
                     e.code()
@@ -544,7 +546,7 @@ impl AsynMotor for XpsAxis {
             self.error(
                 "home",
                 format_args!(
-                    "[{},{}]: error calling {command} error={}",
+                    "[{},{}]: error calling {command} error={}\n",
                     self.port(),
                     self.axis_no(),
                     Self::error_string(ctrl, e.code())
@@ -585,7 +587,7 @@ impl AsynMotor for XpsAxis {
                 &self.trace,
                 "stopAxis",
                 format_args!(
-                    "[{},{}]: error calling {command} status={}",
+                    "[{},{}]: error calling {command} status={}\n",
                     self.trace.port(),
                     self.trace.addr(),
                     e.code()
@@ -622,7 +624,7 @@ impl AsynMotor for XpsAxis {
             self.error(
                 "setPosition",
                 format_args!(
-                    "XPS set position is disabled. Enable it by setting enableSetPosition parameter in XPSCreateController)."
+                    "XPS set position is disabled. Enable it by setting enableSetPosition parameter in XPSCreateController).\n"
                 ),
             );
             return Err(AsynError::Status {
@@ -640,7 +642,7 @@ impl AsynMotor for XpsAxis {
                 self.error(
                     "setPosition",
                     format_args!(
-                        "Error performing GroupPositionCurrentGet({},{}). Aborting set position. XPS API Error: {code}.",
+                        "Error performing GroupPositionCurrentGet({},{}). Aborting set position. XPS API Error: {code}.\n",
                         self.port(),
                         self.axis_no()
                     ),
@@ -652,7 +654,7 @@ impl AsynMotor for XpsAxis {
                     self.error(
                         "setPosition",
                         format_args!(
-                            "Error performing GroupKill/GroupInitialize({},{}). Aborting set position. XPS API Error: {code}.",
+                            "Error performing GroupKill/GroupInitialize({},{}). Aborting set position. XPS API Error: {code}.\n",
                             self.port(),
                             self.axis_no()
                         ),
@@ -661,7 +663,7 @@ impl AsynMotor for XpsAxis {
                     self.error(
                         "setPosition",
                         format_args!(
-                            "Error performing GroupKill/GroupInitialize({},{}). XPS API Error: {code}. Aborting set position.",
+                            "Error performing GroupKill/GroupInitialize({},{}). XPS API Error: {code}. Aborting set position.\n",
                             self.port(),
                             self.axis_no()
                         ),
@@ -669,13 +671,14 @@ impl AsynMotor for XpsAxis {
                 }
                 Err(XpsError::Api(code).into())
             }
-            Err(SetPositionFailure::ReferencingStop(code)) => {
+            Err(SetPositionFailure::ReferencingStop { code, grouped }) => {
                 self.error(
                     "setPosition",
                     format_args!(
-                        "Error performing referencing set position ({},{}). XPS API Error: {code}.",
+                        "Error performing referencing set position ({},{}). XPS API Error: {code}.{}",
                         self.port(),
-                        self.axis_no()
+                        self.axis_no(),
+                        if grouped { "\n" } else { "" }
                     ),
                 );
                 Ok(())
@@ -701,7 +704,7 @@ impl AsynMotor for XpsAxis {
             self.error(
                 "setClosedLoop",
                 format_args!(
-                    "[{},{}]: error calling {command} status={}",
+                    "[{},{}]: error calling {command} status={}\n",
                     self.port(),
                     self.axis_no(),
                     e.code()
@@ -725,7 +728,7 @@ impl AsynMotor for XpsAxis {
                 self.error(
                     "setHighLimit",
                     format_args!(
-                        "[{},{}]: error performing PositionerUserTravelLimitsSet for highLim={device_value:.6} status={}",
+                        "[{},{}]: error performing PositionerUserTravelLimitsSet for highLim={device_value:.6} status={}\n",
                         self.port(),
                         self.axis_no(),
                         e.code()
@@ -749,7 +752,7 @@ impl AsynMotor for XpsAxis {
                 self.error(
                     "setLowLimit",
                     format_args!(
-                        "[{},{}]: error performing PositionerUserTravelLimitsSet for lowLim={device_value:.6} status={}",
+                        "[{},{}]: error performing PositionerUserTravelLimitsSet for lowLim={device_value:.6} status={}\n",
                         self.port(),
                         self.axis_no(),
                         e.code()
@@ -946,7 +949,7 @@ impl XpsAxis {
                 &self.trace,
                 "poll",
                 format_args!(
-                    "[{},{}]: error calling {command} status={}",
+                    "[{},{}]: error calling {command} status={}\n",
                     self.trace.port(),
                     self.trace.addr(),
                     e.code()

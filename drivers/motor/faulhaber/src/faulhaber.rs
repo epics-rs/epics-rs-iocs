@@ -36,10 +36,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -123,16 +126,19 @@ impl FaulhaberController {
         self.num_axes
     }
 
-    fn framed(node: usize, cmd: &str) -> Vec<u8> {
-        let prefix = node.to_string();
-        let mut out = Vec::with_capacity(prefix.len() + cmd.len());
-        out.extend_from_slice(prefix.as_bytes());
-        out.extend_from_slice(cmd.as_bytes());
+    fn framed(node: usize, cmd: impl AsRef<[u8]>) -> Vec<u8> {
+        let mut out = node.to_string().into_bytes();
+        out.extend_from_slice(cmd.as_ref());
         out
     }
 
     /// Send a write-only command to `node` (no reply expected).
     fn write_cmd(&self, node: usize, cmd: &str) -> AsynResult<()> {
+        self.write_bytes(node, cmd.as_bytes())
+    }
+
+    /// [`write_cmd`](Self::write_cmd) for a record string's raw bytes.
+    fn write_bytes(&self, node: usize, cmd: &[u8]) -> AsynResult<()> {
         self.handle.write_octet(0, &Self::framed(node, cmd))?;
         Ok(())
     }
@@ -177,7 +183,13 @@ pub struct FaulhaberAxis {
     counts_per_rev: f64,
     /// Last integer position (counts); C `motor_info->position`.
     prev_position: i32,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// missed `GST` (RETRY, drvMCDC2805.cc:240), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :246). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl FaulhaberAxis {
@@ -211,12 +223,14 @@ impl FaulhaberAxis {
             node,
             counts_per_rev,
             prev_position: 0,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
                 has_encoder: true,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         })
     }
 
@@ -245,14 +259,24 @@ impl FaulhaberAxis {
         }
         Ok(())
     }
+
+    /// PREM and a blank lead a move's first message, and its POST waits for
+    /// the move to end. C HOME/JOG strcpy their first split message over
+    /// PREM and replace the motion node holding POST; that defect is not
+    /// copied.
+    fn lead_move(&mut self, command: &str) -> AsynResult<()> {
+        let mut line = self.strings.arm();
+        if !line.is_empty() {
+            line.push(b' ');
+        }
+        line.extend_from_slice(command.as_bytes());
+        self.lock().write_bytes(self.node, &line)
+    }
 }
 
 impl AsynMotor for FaulhaberAxis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvMCDC2805.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -263,10 +287,9 @@ impl AsynMotor for FaulhaberAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.program_motion(&ctrl, velocity, acceleration)?;
-        ctrl.write_cmd(self.node, &format!("LA {}", nint(position)))?;
-        ctrl.write_cmd(self.node, "M")
+        self.program_motion(&self.lock(), velocity, acceleration)?;
+        self.lead_move(&format!("LA {}", nint(position)))?;
+        self.lock().write_cmd(self.node, "M")
     }
 
     fn move_relative(
@@ -277,10 +300,9 @@ impl AsynMotor for FaulhaberAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.program_motion(&ctrl, velocity, acceleration)?;
-        ctrl.write_cmd(self.node, &format!("LR {}", nint(distance)))?;
-        ctrl.write_cmd(self.node, "M")
+        self.program_motion(&self.lock(), velocity, acceleration)?;
+        self.lead_move(&format!("LR {}", nint(distance)))?;
+        self.lock().write_cmd(self.node, "M")
     }
 
     fn move_velocity(
@@ -292,9 +314,8 @@ impl AsynMotor for FaulhaberAxis {
     ) -> AsynResult<()> {
         // C JOG: set speed, then enter velocity mode with the signed rate.
         let rpm = vel_to_rpm(velocity, self.counts_per_rev);
-        let ctrl = self.lock();
-        ctrl.write_cmd(self.node, &format!("SP {}", rpm.abs()))?;
-        ctrl.write_cmd(self.node, &format!("V {rpm}"))
+        self.lead_move(&format!("SP {}", rpm.abs()))?;
+        self.lock().write_cmd(self.node, &format!("V {rpm}"))
     }
 
     fn home(
@@ -311,9 +332,8 @@ impl AsynMotor for FaulhaberAxis {
         if !forward {
             rpm = -rpm;
         }
-        let ctrl = self.lock();
-        ctrl.write_cmd(self.node, &format!("HOSP{rpm}"))?;
-        ctrl.write_cmd(self.node, "GOHOSEQ")
+        self.lead_move(&format!("HOSP{rpm}"))?;
+        self.lock().write_cmd(self.node, "GOHOSEQ")
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -333,6 +353,23 @@ impl AsynMotor for FaulhaberAxis {
         ctrl.write_cmd(self.node, if enable { "EN" } else { "DI" })
     }
 
+    /// `PRIMITIVE`: a blank, then INIT.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let mut line = vec![b' '];
+        line.extend_from_slice(init);
+        self.lock().write_bytes(self.node, &line)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
         // C SET_PGAIN/SET_IGAIN scale the 0..1 gain by 255; derivative is
         // unsupported.
@@ -349,26 +386,25 @@ impl AsynMotor for FaulhaberAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let mut ctrl = self.lock();
-        // C drvMCDC2805.cc:229-251: an empty or failed GST keeps the previous
-        // status once (RETRY); a second in a row raises COMM_ERR. Nothing else
-        // is sent on that poll.
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        // C drvMCDC2805.cc:229-251: an empty or failed GST fails the poll
+        // raising nothing once (RETRY); a second in a row raises COMM_ERR.
+        // Nothing else is sent on that poll.
         let gst = ctrl.query(self.node, "GST").ok().filter(|r| !r.is_empty());
         let Some(status_buff) = gst else {
-            let hard = ctrl.comm_state != CommState::Normal;
-            ctrl.comm_state = if hard {
-                CommState::CommErr
-            } else {
-                CommState::Retry
+            (ctrl.comm_state, self.failure) = match ctrl.comm_state {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
             };
-            drop(ctrl);
-            if hard {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            return Err(faulhaber_err(format!(
+                "MCDC2805 node {}: no GST reply",
+                self.node
+            )));
         };
         ctrl.comm_state = CommState::Normal;
+        // A later write's transport error, which C does not check, raises both.
+        self.failure = PollFailure::PROBLEM_AND_COMMS_ERROR;
         let pos = ctrl.query(self.node, "POS");
         let gast = ctrl.query(self.node, "GAST");
         let gv = ctrl.query(self.node, "GV");
@@ -402,6 +438,11 @@ impl AsynMotor for FaulhaberAxis {
         // Actual velocity → done (reliable across jog and velocity=0 stops).
         let velocity = gv.as_deref().map(|s| nint(atof(s))).unwrap_or(0);
         let done = velocity == 0;
+        if (done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            ctrl.write_bytes(self.node, &post)?;
+        }
         drop(ctrl);
 
         self.prev_position = new_position;
@@ -431,6 +472,137 @@ impl AsynMotor for FaulhaberAxis {
 mod tests {
     use super::*;
 
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Rig {
+        line: LineRig,
+        axis: FaulhaberAxis,
+        moving: Arc<AtomicBool>,
+        minus: Arc<AtomicBool>,
+        user: AsynUser,
+    }
+
+    impl Rig {
+        /// Node 1 at 1000 counts/rev, its setup traffic taken.
+        fn new(name: &str) -> Self {
+            let moving = Arc::new(AtomicBool::new(false));
+            let minus = Arc::new(AtomicBool::new(false));
+            let (m, l) = (moving.clone(), minus.clone());
+            let (line, io) =
+                LineRig::new(name, move |last| match last.get(1..).unwrap_or_default() {
+                    "VER" => "MCDC2805".into(),
+                    "GST" => "0000000".into(),
+                    "POS" => "0".into(),
+                    "GAST" => if l.load(Ordering::SeqCst) { "01" } else { "00" }.into(),
+                    "GV" => if m.load(Ordering::SeqCst) { "-60" } else { "0" }.into(),
+                    _ => String::new(),
+                });
+            let controller = Arc::new(Mutex::new(FaulhaberController::new(io, 2).unwrap()));
+            let axis = FaulhaberAxis::new(controller, 1, 1000.0).unwrap();
+            line.sent();
+            Self {
+                line,
+                axis,
+                moving,
+                minus,
+                user: AsynUser::new(0),
+            }
+        }
+
+        /// What one poll sent besides its queries.
+        fn poll_extra(&mut self) -> Vec<String> {
+            self.axis.poll(&self.user).unwrap();
+            self.line
+                .sent()
+                .into_iter()
+                .filter(|l| !["1GST", "1POS", "1GAST", "1GV"].contains(&l.as_str()))
+                .collect()
+        }
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// devMCDC2805.cc:185-189.
+    #[test]
+    fn init_goes_out_behind_a_blank() {
+        let mut r = Rig::new("mcdc_init");
+        r.axis.primitive(&r.user, b"EN").unwrap();
+        assert_eq!(r.line.sent(), ["1 EN"]);
+    }
+
+    /// devMCDC2805.cc:191-205: PREM and a blank lead `LA`/`LR`, for that
+    /// move only.
+    #[test]
+    fn prem_leads_the_target_message() {
+        let mut r = Rig::new("mcdc_prem");
+        r.axis.set_move_strings(&r.user, b"EN", None).unwrap();
+        r.axis.move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(r.line.sent(), ["1EN LA 100", "1M"]);
+        r.axis.move_relative(&r.user, -5.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(r.line.sent(), ["1LR -5", "1M"]);
+        r.axis.set_move_strings(&r.user, b"EN", None).unwrap();
+        r.axis.move_relative(&r.user, -5.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(r.line.sent(), ["1EN LR -5", "1M"]);
+    }
+
+    /// devMCDC2805.cc:222-236 and 286-300 lose PREM and POST on HOME and
+    /// JOG; rs sends both as for any other move.
+    #[test]
+    fn home_and_jog_send_prem_and_post() {
+        let mut r = Rig::new("mcdc_split");
+        r.axis
+            .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
+            .unwrap();
+        r.axis.home(&r.user, 0.0, 1000.0, 0.0, false).unwrap();
+        assert_eq!(r.line.sent(), ["1EN HOSP-60", "1GOHOSEQ"]);
+        assert_eq!(r.poll_extra(), ["1DI"]);
+        r.axis
+            .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
+            .unwrap();
+        r.axis.move_velocity(&r.user, 0.0, 1000.0, 0.0).unwrap();
+        assert_eq!(r.line.sent(), ["1EN SP 60", "1V 60"]);
+        assert_eq!(r.poll_extra(), ["1DI"]);
+    }
+
+    /// drvMCDC2805.cc:360-366: POST once the move is done, not while it
+    /// runs.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let mut r = Rig::new("mcdc_post");
+        r.axis
+            .set_move_strings(&r.user, b"", Some(post(b"DI")))
+            .unwrap();
+        r.axis.move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0).unwrap();
+        r.line.sent();
+        r.moving.store(true, Ordering::SeqCst);
+        assert!(r.poll_extra().is_empty());
+        r.moving.store(false, Ordering::SeqCst);
+        assert_eq!(r.poll_extra(), ["1DI"]);
+        assert!(r.poll_extra().is_empty(), "sent once");
+    }
+
+    /// drvMCDC2805.cc:361: a limit in the move's direction ends it too,
+    /// after the hold at the current position.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let mut r = Rig::new("mcdc_post_ls");
+        r.axis
+            .set_move_strings(&r.user, b"", Some(post(b"DI")))
+            .unwrap();
+        r.axis
+            .move_absolute(&r.user, -100.0, 0.0, 0.0, 0.0)
+            .unwrap();
+        r.line.sent();
+        r.moving.store(true, Ordering::SeqCst);
+        r.minus.store(true, Ordering::SeqCst);
+        assert_eq!(r.poll_extra(), ["1LA 0", "1M", "1DI"]);
+    }
+
     #[test]
     fn framed_prefixes_node() {
         assert_eq!(FaulhaberController::framed(0, "GST"), b"0GST");
@@ -452,5 +624,36 @@ mod tests {
         // 3000 counts/s² at 1000 counts/rev = 3 rev/s².
         assert_eq!(accel_to_rev(3000.0, 1000.0), 3);
         assert_eq!(accel_to_rev(3000.0, 0.0), 0);
+    }
+
+    /// drvMCDC2805.cc:229-251: a first missed `GST` is RETRY (nothing
+    /// raised, nothing posted), the next COMM_ERR, and a reply clears it.
+    #[test]
+    fn a_missed_gst_is_retry_then_comm_error() {
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("faulhaberRetry", move |last| {
+            match last.get(1..).unwrap_or_default() {
+                "VER" => "MCDC2805".into(),
+                "GST" if !q.load(Ordering::SeqCst) => "0000000".into(),
+                "POS" | "GV" => "0".into(),
+                "GAST" => "00".into(),
+                _ => String::new(),
+            }
+        });
+        let controller = Arc::new(Mutex::new(FaulhaberController::new(io, 2).unwrap()));
+        let mut axis = FaulhaberAxis::new(controller, 1, 1000.0).unwrap();
+        let user = AsynUser::new(0);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

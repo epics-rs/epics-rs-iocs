@@ -17,13 +17,9 @@
 //!
 //! ## Units
 //!
-//! The corvus works in physical units (the `pos`/`move` values are already
-//! engineering units). The C driver's `axisRes = pitch / (4 · polePairs)` only
-//! bridges the record's raw-step boundary to those units and cancels at the EGU
-//! boundary, so it is dropped: the driver boundary is controller-native units,
-//! and the record's `MRES` must carry `axisRes` as its step (raw counts are
-//! integers). The `SMCcorvusChangeResolution` iocsh command (a runtime
-//! `axisRes` override) is likewise not ported — set the record `MRES` instead.
+//! The corvus works in physical units; as C, the record's steps are scaled by
+//! `axisRes = pitch / (4 · polePairs)` on the way out and divided back on
+//! poll. `SMCcorvusChangeResolution` overrides `axisRes` at run time.
 //!
 //! ## Deviations (documented)
 //!
@@ -31,11 +27,6 @@
 //!   The C code sends each non-moving axis' *current absolute position* as its
 //!   `rmove` delta, which would move them by that amount — a latent bug for
 //!   multi-axis relative moves; this port sends `0`.
-//! - `move_velocity` moves to the axis travel limit read from `getnlimit` (the C
-//!   driver uses the record's `HLM`/`LLM`, which are not visible at this
-//!   boundary; the controller travel limits carry the same intent). The corvus
-//!   has no reliable jog command (its `speed` command is noted as crashing the
-//!   controller), so moving to a limit matches C.
 //! - Limit and drive-power status are read only when the axis is done (matching
 //!   C, which avoids polling switches mid-move to keep the interpreter
 //!   responsive); while moving they are reported as not-triggered / powered.
@@ -47,7 +38,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, Pol
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::util::atoi;
+use motor_common::util::{atof, atoi};
 
 /// Response buffer size.
 const READ_BUF: usize = 128;
@@ -110,12 +101,6 @@ impl CorvusController {
         Ok(values[..self.num_axes].to_vec())
     }
 
-    /// Send the global velocity and acceleration (`sv`/`sa`, all axes).
-    fn send_accel_velocity(&self, velocity: f64, acceleration: f64) -> AsynResult<()> {
-        self.write_only(&format!("{:.6} sv", velocity.abs()))?;
-        self.write_only(&format!("{:.6} sa", acceleration.abs()))
-    }
-
     /// Join a target vector and append `verb` (`move`, `rmove`, or `setpos`).
     fn send_target_vector(&self, targets: &[f64], verb: &str) -> AsynResult<()> {
         let mut cmd = String::new();
@@ -136,30 +121,52 @@ pub struct CorvusAxis {
     /// What the last poll left: C keeps every parameter a poll did not
     /// write (asynMotorAxis params persist across polls).
     last_status: MotorStatus,
+    /// C `axisRes_`: controller units per record step.
+    axis_res: f64,
+    /// The record's soft limits in steps (C `motorHighLimit_`/`motorLowLimit_`),
+    /// the jog targets.
+    high_limit: f64,
+    low_limit: f64,
 }
 
 impl CorvusAxis {
-    /// Construct axis `axis_no` (0-based). No per-axis probing is needed since
-    /// the resolution scale is dropped at the EGU boundary.
+    /// Construct axis `axis_no` (0-based) and read its pitch, pole pairs,
+    /// closed-loop period and travel limits as C's constructor does; only
+    /// `axisRes` is kept.
     pub fn new(controller: Arc<Mutex<CorvusController>>, axis_no: usize) -> AsynResult<Self> {
-        let num_axes = controller
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .num_axes;
-        if axis_no >= num_axes {
-            return Err(corvus_err(format!(
-                "corvus: axis {axis_no} out of range (num_axes {num_axes})"
-            )));
-        }
+        let (num_axes, axis_res) = {
+            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            if axis_no >= ctrl.num_axes {
+                return Err(corvus_err(format!(
+                    "corvus: axis {axis_no} out of range (num_axes {})",
+                    ctrl.num_axes
+                )));
+            }
+            // C ignores each exchange's status and parses what it got.
+            let read = |verb: &str| {
+                ctrl.query(&format!("{} {verb}", axis_no + 1))
+                    .unwrap_or_default()
+            };
+            let pitch = atof(&read("getpitch"));
+            let pole_pairs = atoi(&read("getpolepairs"));
+            read("getclperiod");
+            read("getnlimit");
+            (ctrl.num_axes, pitch / (4.0 * f64::from(pole_pairs)))
+        };
         Ok(Self {
             controller,
             axis_no,
             num_axes,
-            last_status: MotorStatus {
-                has_encoder: true,
-                ..MotorStatus::default()
-            },
+            last_status: MotorStatus::default(),
+            axis_res,
+            high_limit: 0.0,
+            low_limit: 0.0,
         })
+    }
+
+    /// C `changeResolution`: replace `axisRes`.
+    pub fn change_resolution(&mut self, new_resolution: f64) {
+        self.axis_res = new_resolution;
     }
 
     fn lock(&self) -> MutexGuard<'_, CorvusController> {
@@ -174,10 +181,21 @@ impl CorvusAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        ctrl.send_accel_velocity(velocity, acceleration)?;
+        self.send_accel_velocity(ctrl, velocity, acceleration)?;
         let mut targets = ctrl.read_positions()?;
-        targets[self.axis_no] = target;
+        targets[self.axis_no] = target * self.axis_res;
         ctrl.send_target_vector(&targets, "move")
+    }
+
+    /// C `sendAccelAndVelocity`: `sv`/`sa` for all axes, in controller units.
+    fn send_accel_velocity(
+        &self,
+        ctrl: &CorvusController,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        ctrl.write_only(&format!("{:.6} sv", (velocity * self.axis_res).abs()))?;
+        ctrl.write_only(&format!("{:.6} sa", (acceleration * self.axis_res).abs()))
     }
 }
 
@@ -209,10 +227,10 @@ impl AsynMotor for CorvusAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.send_accel_velocity(velocity, acceleration)?;
+        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
         // Non-moving axes get a zero delta (stay put); see module deviations.
         let mut targets = vec![0.0; self.num_axes];
-        targets[self.axis_no] = distance;
+        targets[self.axis_no] = distance * self.axis_res;
         ctrl.send_target_vector(&targets, "rmove")
     }
 
@@ -224,21 +242,12 @@ impl AsynMotor for CorvusAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        // No reliable jog on the corvus — move to the axis travel limit.
-        let reply = ctrl.query(&format!("{} getnlimit", self.axis_no + 1))?;
-        let bounds: Vec<f64> = reply
-            .split_whitespace()
-            .filter_map(|tok| tok.parse::<f64>().ok())
-            .collect();
-        let (neg, pos) = match bounds.as_slice() {
-            [neg, pos, ..] => (*neg, *pos),
-            _ => {
-                return Err(corvus_err(format!(
-                    "corvus: getnlimit returned {reply:?}, expected two values"
-                )));
-            }
+        // No reliable jog on the corvus — move to the record's soft limit.
+        let target = if velocity > 0.0 {
+            self.high_limit
+        } else {
+            self.low_limit
         };
-        let target = if velocity > 0.0 { pos } else { neg };
         self.absolute_move(&ctrl, target, velocity, acceleration)
     }
 
@@ -251,7 +260,7 @@ impl AsynMotor for CorvusAxis {
         forward: bool,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.send_accel_velocity(velocity, acceleration)?;
+        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
         // Forward homes to the range-measure switch (nrm); reverse calibrates
         // to the low switch (ncal).
         let verb = if forward { "nrm" } else { "ncal" };
@@ -269,7 +278,7 @@ impl AsynMotor for CorvusAxis {
         let mut targets = ctrl.read_positions()?;
         // setpos takes the distance from the current position to the desired
         // origin, hence the negation (C multiplies by -1).
-        targets[self.axis_no] = -position;
+        targets[self.axis_no] = -position * self.axis_res;
         ctrl.send_target_vector(&targets, "setpos")
     }
 
@@ -280,6 +289,16 @@ impl AsynMotor for CorvusAxis {
             if enable { 1 } else { 0 },
             self.axis_no + 1
         ))
+    }
+
+    fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.high_limit = position;
+        Ok(())
+    }
+
+    fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.low_limit = position;
+        Ok(())
     }
 
     fn set_pid_gain(&mut self, _user: &AsynUser, _kind: PidGainKind, _gain: f64) -> AsynResult<()> {
@@ -311,8 +330,8 @@ impl CorvusAxis {
             .filter_map(|tok| tok.parse::<f64>().ok())
             .nth(self.axis_no)
         {
-            status.position = position;
-            status.encoder_position = position;
+            status.position = position / self.axis_res;
+            status.encoder_position = position / self.axis_res;
         }
 
         let moving = (atoi(&ctrl.query("st")?) & STATUS_MOVING) != 0;

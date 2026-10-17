@@ -15,13 +15,9 @@
 //!
 //! ## Units
 //!
-//! The controller's motor resolution (`MR`) and the velocity scale
-//! (`V = velocity / pulsesPerUnit`) are the same factor applied in opposite
-//! directions: the C driver sets `MR = pulsesPerUnit` and divides the commanded
-//! velocity by it, so the physical velocity is independent of `pulsesPerUnit`.
-//! It therefore cancels at the EGU boundary — this port uses `MR 1` and reports
-//! and commands positions/velocities in controller counts (`MRES` = 1). Position
-//! targets (`D`) and readback (`PR`/`W3`) are already in native counts.
+//! Positions (`D`, `PR`, `W3`) are record steps. `OEM_RESOLUTION` sets the
+//! controller's `MR` and C's `pulsesPerUnit_`, which divides the step velocity
+//! into the `V` revolutions per second.
 //!
 //! ## Positioning mode and relative moves
 //!
@@ -35,15 +31,17 @@
 //! The `OEM_SELECT_SWITCH` aux parameter (which of the two detected switches is
 //! the home/low-limit end) is not exposed; the C startup default of `0` is used,
 //! so switch 1 maps to the low-limit/home end and switch 2 to the high-limit end.
-//! `OEM_RESOLUTION` is subsumed by the `MR 1` choice above; `OEM_SWITCH_DETECTED`
-//! is surfaced only through the limit/home status bits.
+//! `OEM_SWITCH_DETECTED` is surfaced only through the limit/home status bits.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::controller_port::{ControllerParams, ParamWrite};
 
 use motor_common::util::{atof, leading_hex};
 
@@ -57,17 +55,27 @@ const TWO_POW_32: f64 = 4_294_967_296.0;
 /// startup default).
 const SELECT_SWITCH: i32 = 0;
 
+/// `pulsesPerUnit_` until `OEM_RESOLUTION` is written. C leaves the member
+/// uninitialised and sends it as `MR` from the constructor on; 1 is the
+/// controller's step unchanged.
+const DEFAULT_PULSES_PER_UNIT: f64 = 1.0;
+
 /// Shared OEM750 controller endpoint owning the asyn octet handle.
 pub struct OemController {
     handle: SyncIOHandle,
+    /// C `OEMAxis::pulsesPerUnit_`, per axis.
+    pulses_per_unit: Vec<f64>,
 }
 
 impl OemController {
     /// Wrap a connected octet handle. The C controller constructor connects,
     /// sets the CR EOS, creates the axes and starts the poller; here
     /// `OEMCreateController` sets the EOS and creates the axes.
-    pub fn new(handle: SyncIOHandle) -> Self {
-        Self { handle }
+    pub fn new(handle: SyncIOHandle, num_axes: usize) -> Self {
+        Self {
+            handle,
+            pulses_per_unit: vec![DEFAULT_PULSES_PER_UNIT; num_axes],
+        }
     }
 
     fn trimmed(raw: &[u8]) -> String {
@@ -93,6 +101,7 @@ impl OemController {
 /// One OEM750 axis sharing a controller. Implements [`AsynMotor`].
 pub struct OemAxis {
     controller: Arc<Mutex<OemController>>,
+    axis_no: usize,
     /// 1-based unit address used to prefix every command.
     address: i32,
     /// Set by `home`, cleared by `move` (drives the poll's auto-zero step).
@@ -111,6 +120,7 @@ impl OemAxis {
     pub fn new(controller: Arc<Mutex<OemController>>, axis_no: usize) -> Self {
         let axis = Self {
             controller,
+            axis_no,
             address: axis_no as i32 + 1,
             homed: false,
             encoder_base: 0.0,
@@ -118,7 +128,7 @@ impl OemAxis {
             direction: false,
         };
         // C ignores configureController's status (OEMMotorDriver.cpp:208).
-        let _ = axis.lock().configure(axis.address);
+        let _ = axis.lock().configure(axis.axis_no);
         axis
     }
 
@@ -137,9 +147,10 @@ impl OemAxis {
         let a = ramp_time(velocity, min_velocity, acceleration);
         let addr = self.address;
         let ctrl = self.lock();
+        let v = velocity / ctrl.pulses_per_unit[self.axis_no];
         ctrl.command(&format!("{addr}MN"))?;
         ctrl.command(&format!("{addr}A{a:.2}"))?;
-        ctrl.command(&format!("{addr}V{velocity:.2}"))?;
+        ctrl.command(&format!("{addr}V{v:.2}"))?;
         ctrl.command(&format!("{addr}D{target:.0}"))?;
         ctrl.command(&format!("{addr}G"))?;
         drop(ctrl);
@@ -149,13 +160,47 @@ impl OemAxis {
 }
 
 impl OemController {
-    /// Re-apply the axis configuration (echo on, SSA0, absolute mode, MR 1). The
+    /// Re-apply the axis configuration (echo on, SSA0, absolute mode, MR). The
     /// C driver runs this at construction and at the head of every poll.
-    fn configure(&self, addr: i32) -> AsynResult<()> {
+    fn configure(&self, axis_no: usize) -> AsynResult<()> {
+        let addr = axis_no + 1;
         self.command(&format!("{addr}E"))?;
         self.command(&format!("{addr}SSA0"))?;
         self.command(&format!("{addr}MPA"))?;
-        self.command(&format!("{addr}MR1"))
+        self.command(&format!("{addr}MR{}", self.pulses_per_unit[axis_no] as i32))
+    }
+}
+
+/// `OEMController::writeInt32` for `OEM_RESOLUTION`: `MR` to the
+/// controller and the axis's `pulsesPerUnit_`.
+pub struct OemParams {
+    controller: Arc<Mutex<OemController>>,
+    resolution: Option<usize>,
+}
+
+impl OemParams {
+    pub fn new(controller: Arc<Mutex<OemController>>) -> Self {
+        Self {
+            controller,
+            resolution: None,
+        }
+    }
+}
+
+impl ControllerParams for OemParams {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.resolution = Some(base.create_param("OEM_RESOLUTION", ParamType::Int32)?);
+        Ok(())
+    }
+
+    fn write_int32(&mut self, _: &mut PortDriverBase, user: &AsynUser, value: i32) -> ParamWrite {
+        if self.resolution != Some(user.reason) {
+            return Ok(()).into();
+        }
+        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let status = ctrl.command(&format!("{}MR{value}", user.addr + 1));
+        ctrl.pulses_per_unit[user.addr as usize] = f64::from(value);
+        status.into()
     }
 }
 
@@ -221,8 +266,9 @@ impl AsynMotor for OemAxis {
     ) -> AsynResult<()> {
         let addr = self.address;
         let ctrl = self.lock();
+        let v = velocity / ctrl.pulses_per_unit[self.axis_no];
         ctrl.command(&format!("{addr}MC"))?;
-        ctrl.command(&format!("{addr}V{velocity:.2}"))?;
+        ctrl.command(&format!("{addr}V{v:.2}"))?;
         // C maps forward -> H-, reverse -> H+.
         ctrl.command(&format!("{addr}H{}", if forward { '-' } else { '+' }))?;
         ctrl.command(&format!("{addr}G"))?;
@@ -255,7 +301,7 @@ impl AsynMotor for OemAxis {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let addr = self.address;
         let ctrl = self.lock();
-        ctrl.configure(addr)?;
+        ctrl.configure(self.axis_no)?;
 
         // Moving flags: "*B"/"*C" mean in motion.
         let flags = ctrl.query(&format!("{addr}R"))?;
@@ -342,11 +388,17 @@ fn switch_from_is(is: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     #[test]
     fn an_axis_of_a_missing_port_is_still_built() {
-        let (handle, _) = SyncIOHandle::connect_port("OEM_NONE", 0, std::time::Duration::ZERO);
-        let controller = Arc::new(Mutex::new(OemController::new(handle)));
+        let (handle, _) = SyncIOHandle::connect_port(
+            "OEM_NONE",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let controller = Arc::new(Mutex::new(OemController::new(handle, 1)));
         assert_eq!(OemAxis::new(controller, 0).address, 1);
     }
 

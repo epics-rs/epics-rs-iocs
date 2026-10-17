@@ -185,7 +185,7 @@ impl PortDriver for D435iColorDriver {
                 if self.acq_tx.try_send(AcqCommand::Start).is_err() {
                     self.ad.port_base.trace_print(
                         TraceMask::ERROR,
-                        format_args!("D435i: acquisition task is not running"),
+                        format_args!("D435i: acquisition task is not running\n"),
                     );
                     self.ad.port_base.set_string_param(
                         self.ad.params.status_message,
@@ -204,7 +204,7 @@ impl PortDriver for D435iColorDriver {
                 if self.acq_tx.try_send(AcqCommand::Stop).is_err() {
                     self.ad.port_base.trace_print(
                         TraceMask::ERROR,
-                        format_args!("D435i: acquisition task is not running"),
+                        format_args!("D435i: acquisition task is not running\n"),
                     );
                 }
             } else {
@@ -242,7 +242,7 @@ impl PortDriver for D435iColorDriver {
                 self.ad.port_base.trace_print(
                     TraceMask::WARNING,
                     format_args!(
-                        "D435i: invalid stream mode index {value}, this camera offers {}",
+                        "D435i: invalid stream mode index {value}, this camera offers {}\n",
                         self.stream_modes.len()
                     ),
                 );
@@ -477,7 +477,7 @@ pub fn create_d435i_detector(
         port_name,
         TraceMask::FLOW,
         &format!(
-            "D435i: camera offers {} colour+depth stream modes, imu={}, emitter={}",
+            "D435i: camera offers {} colour+depth stream modes, imu={}, emitter={}\n",
             caps.modes.len(),
             caps.has_imu,
             caps.has_emitter

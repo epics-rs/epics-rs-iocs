@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 
@@ -117,7 +118,8 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
             // C ignores the connect status (pixirad.cpp:471-472): a missing
             // command port leaves a user whose every command fails.
-            let (command, _) = SyncIOHandle::connect_port(&command_port, 0, Duration::ZERO);
+            let (command, _) =
+                SyncIOHandle::connect_port(&command_port, 0, Duration::ZERO, InterfaceType::Octet);
 
             let rt = create_pixirad_detector(
                 &claim,

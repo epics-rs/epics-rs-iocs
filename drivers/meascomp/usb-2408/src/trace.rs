@@ -53,16 +53,16 @@ impl SelfTrace {
         match err {
             0 => self.print(
                 TraceMask::IO_DRIVER,
-                format_args!("{DRIVER_NAME}::{function} Info: {message}"),
+                format_args!("{DRIVER_NAME}::{function} Info: {message}\n"),
             ),
             -1 => self.print(
                 TraceMask::ERROR,
-                format_args!("{DRIVER_NAME}::{function} Error: {message}"),
+                format_args!("{DRIVER_NAME}::{function} Error: {message}\n"),
             ),
             _ => self.print(
                 TraceMask::ERROR,
                 format_args!(
-                    "{DRIVER_NAME}::{function} Error: {message}, err={err} {}",
+                    "{DRIVER_NAME}::{function} Error: {message}, err={err} {}\n",
                     MeasCompError::from_code(err).message
                 ),
             ),

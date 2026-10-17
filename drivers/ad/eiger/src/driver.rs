@@ -92,7 +92,7 @@ impl EigerDriver {
     pub fn reconnect(&mut self) -> AsynResult<()> {
         // A detector that comes back speaking another API keeps the parameter
         // set this port was created with; only an IOC restart rebuilds it.
-        self.ops.rest.probe().map_err(rest_err)?;
+        self.ops.rest.probe().map_err(exit_failure)?;
         self.init_params()
     }
 
@@ -294,28 +294,31 @@ impl EigerDriver {
     }
 
     fn put_int(&mut self, index: usize, value: i32) -> AsynResult<()> {
-        let updates = self.ops.put_int(index, value).map_err(rest_err)?;
+        let updates = self.ops.put_int(index, value).map_err(exit_failure)?;
         self.apply(updates)
     }
 
     fn put_bool(&mut self, index: usize, value: bool) -> AsynResult<()> {
-        let updates = self.ops.put_bool(index, value).map_err(rest_err)?;
+        let updates = self.ops.put_bool(index, value).map_err(exit_failure)?;
         self.apply(updates)
     }
 
     fn put_f64(&mut self, index: usize, value: f64) -> AsynResult<()> {
         let current = self.ad.port_base.get_float64_param(index, 0).unwrap_or(0.0);
-        let updates = self.ops.put_f64(index, value, current).map_err(rest_err)?;
+        let updates = self
+            .ops
+            .put_f64(index, value, current)
+            .map_err(exit_failure)?;
         self.apply(updates)
     }
 
     fn put_str(&mut self, index: usize, value: &str) -> AsynResult<()> {
-        let updates = self.ops.put_str(index, value).map_err(rest_err)?;
+        let updates = self.ops.put_str(index, value).map_err(exit_failure)?;
         self.apply(updates)
     }
 
     fn fetch(&mut self, index: usize) -> AsynResult<()> {
-        let updates = self.ops.fetch(index).map_err(rest_err)?;
+        let updates = self.ops.fetch(index).map_err(exit_failure)?;
         self.apply(updates)
     }
 
@@ -351,8 +354,14 @@ impl EigerDriver {
             return Ok(());
         }
 
-        if self.api == ApiVersion::V1_6_0 {
-            self.ops.rest.status_update().map_err(rest_err)?;
+        // eigerStatus returns asynError for any failure
+        // (eigerDetector.cpp:2017-2018, :2062).
+        let error = || AsynError::Status {
+            status: AsynStatus::Error,
+            message: String::new(),
+        };
+        if self.api == ApiVersion::V1_6_0 && self.ops.rest.status_update().is_err() {
+            return Err(error());
         }
 
         let mut indices = vec![
@@ -381,17 +390,12 @@ impl EigerDriver {
             self.p.fw_free,
         ]);
 
-        let mut first_err = None;
+        let mut failed = false;
         for index in indices {
-            if let Err(e) = self.fetch(index) {
-                first_err.get_or_insert(e);
-            }
+            failed |= self.fetch(index).is_err();
         }
         self.ad.port_base.call_param_callbacks(0)?;
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        if failed { Err(error()) } else { Ok(()) }
     }
 
     /// `writeInt32` up to its closing lines.
@@ -561,15 +565,14 @@ impl EigerDriver {
     }
 }
 
-fn rest_err(e: RestError) -> AsynError {
-    asyn_err(e.to_string())
-}
-
-/// An asyn error carrying a driver-level message.
-pub(crate) fn asyn_err(message: String) -> AsynError {
+/// A failed REST exchange. The parameter and REST layers have printed C's
+/// ERR_ARGS chain; eigerDetector adds no line of its own and never writes
+/// `pasynUser->errorMessage`. The status is `EigerParam::put`'s
+/// `EXIT_FAILURE` cast to asynStatus, asynTimeout (eigerParam.cpp:729-756).
+fn exit_failure(_: RestError) -> AsynError {
     AsynError::Status {
-        status: AsynStatus::Error,
-        message,
+        status: AsynStatus::Timeout,
+        message: String::new(),
     }
 }
 
@@ -610,18 +613,27 @@ impl PortDriver for EigerDriver {
             return Err(AsynError::ParamNotFound(drv_info.to_string()));
         }
 
-        let sys = Sys::from_drv_info_code(&drv_info[4..6]).ok_or_else(|| {
-            asyn_err(format!(
+        // C's ERR_ARGS and asynError, with no errorMessage
+        // (eigerDetector.cpp:2108-2120).
+        let refuse = |msg: String| {
+            self.ops.trace.err("drvUserCreate", &msg);
+            AsynError::Status {
+                status: AsynStatus::Error,
+                message: String::new(),
+            }
+        };
+        let Some(sys) = Sys::from_drv_info_code(&drv_info[4..6]) else {
+            return Err(refuse(format!(
                 "[{drv_info}] couldn't match {} to any subsystem",
                 &drv_info[4..6]
-            ))
-        })?;
+            )));
+        };
         let asyn_type = match drv_info.as_bytes()[6] {
             b'I' => AsynType::Int32,
             b'D' => AsynType::Float64,
             b'S' => AsynType::Octet,
             c => {
-                return Err(asyn_err(format!(
+                return Err(refuse(format!(
                     "[{drv_info}] couldn't match {} to an asyn type",
                     c as char
                 )));
@@ -652,8 +664,8 @@ impl PortDriver for EigerDriver {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
                 format_args!(
-                    "eigerDetector::writeInt32: error status={} function={function}, value={value}",
-                    e.status() as i32
+                    "eigerDetector::writeInt32: error status={} function={function}, value={value}\n",
+                    e.c_status_code()
                 ),
             );
             return Err(e);
@@ -663,7 +675,7 @@ impl PortDriver for EigerDriver {
             TraceMask::IO_DRIVER,
             file!(),
             line!(),
-            format_args!("eigerDetector:writeInt32: function={function}, value={value}"),
+            format_args!("eigerDetector:writeInt32: function={function}, value={value}\n"),
         );
         Ok(())
     }
@@ -677,8 +689,8 @@ impl PortDriver for EigerDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "eigerDetector:writeFloat64 error, status={} function={function}, value={value:.6}",
-                    e.status() as i32
+                    "eigerDetector:writeFloat64 error, status={} function={function}, value={value:.6}\n",
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => {
@@ -686,7 +698,7 @@ impl PortDriver for EigerDriver {
                     TraceMask::IO_DRIVER,
                     file!(),
                     line!(),
-                    format_args!("eigerDetector:writeFloat64: function={function}, value={value:.6}"),
+                    format_args!("eigerDetector:writeFloat64: function={function}, value={value:.6}\n"),
                 );
                 let _ = self.ad.port_base.call_param_callbacks(0);
             }
@@ -708,7 +720,7 @@ impl PortDriver for EigerDriver {
                 line!(),
                 format_args!(
                     "eigerDetector:writeOctet: status={}, function={function}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => {
@@ -716,7 +728,7 @@ impl PortDriver for EigerDriver {
                     TraceMask::IO_DRIVER,
                     file!(),
                     line!(),
-                    format_args!("eigerDetector:writeOctet: function={function}, value={value}"),
+                    format_args!("eigerDetector:writeOctet: function={function}, value={value}\n"),
                 );
                 let _ = self.ad.port_base.call_param_callbacks(0);
             }

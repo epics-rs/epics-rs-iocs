@@ -25,6 +25,7 @@ use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::param::{EnumEntry, ParamType};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -744,7 +745,12 @@ pub fn create_specs_analyser_detector(
 ) -> Result<SpecsAnalyserRuntime, String> {
     let port_name = claim.name();
     // C's debug() trace of the failure is off by default.
-    let (driver_port, _) = SyncIOHandle::connect_port(driver_port_name, 0, secs(SOCKET_TIMEOUT));
+    let (driver_port, _) = SyncIOHandle::connect_port(
+        driver_port_name,
+        0,
+        secs(SOCKET_TIMEOUT),
+        InterfaceType::Octet,
+    );
     let driver_port = Arc::new(driver_port);
 
     let wire_state = Arc::new(Mutex::new(0u32));

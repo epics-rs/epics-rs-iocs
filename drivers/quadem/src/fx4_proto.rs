@@ -258,7 +258,7 @@ impl Fx4Cache {
                     });
                     if let Some(last) = self.adc[0].back() {
                         let line = format!(
-                            "Gate event, value={:.6}, time={timestamp:.6}, ADC1 last time={:.6}",
+                            "Gate event, value={:.6}, time={timestamp:.6}, ADC1 last time={:.6}\n",
                             f64::from(u8::from(level)),
                             last.time
                         );
@@ -297,7 +297,7 @@ impl Fx4Cache {
             s.copied().unwrap_or_default()
         };
         let line = format!(
-            "drvFX4::onMessageEvent: Samples={} {} {} {}\n    ADCs oldest={:.6} {:.6} {:.6} {:.6}\n   Times oldest={:.6} {:.6} {:.6} {:.6}\n    ADCs newest={:.6} {:.6} {:.6} {:.6}\n   Times newest={:.6} {:.6} {:.6} {:.6}",
+            "drvFX4::onMessageEvent: Samples={} {} {} {}\n    ADCs oldest={:.6} {:.6} {:.6} {:.6}\n   Times oldest={:.6} {:.6} {:.6} {:.6}\n    ADCs newest={:.6} {:.6} {:.6} {:.6}\n   Times newest={:.6} {:.6} {:.6} {:.6}\n",
             a.len(),
             b.len(),
             c.len(),
@@ -323,7 +323,7 @@ impl Fx4Cache {
         let min_size = self.adc.iter().map(|q| q.len()).min().unwrap_or(0);
         let max_size = self.adc.iter().map(|q| q.len()).max().unwrap_or(0);
         let line = format!(
-            "drvFX4::onMessageEvent minimum size={min_size}, size={} {} {} {}",
+            "drvFX4::onMessageEvent minimum size={min_size}, size={} {} {} {}\n",
             self.adc[0].len(),
             self.adc[1].len(),
             self.adc[2].len(),
@@ -334,7 +334,7 @@ impl Fx4Cache {
         if min_size != max_size {
             if !self.synchronized {
                 let line = format!(
-                    "drvFX4::onMessageEvent not synchronized and different number of samples per channel={} {} {} {}",
+                    "drvFX4::onMessageEvent not synchronized and different number of samples per channel={} {} {} {}\n",
                     self.adc[0].len(),
                     self.adc[1].len(),
                     self.adc[2].len(),
@@ -362,7 +362,7 @@ impl Fx4Cache {
             if times[1..].iter().any(|t| *t != times[0]) {
                 if !self.timestamp_mismatch {
                     let line = format!(
-                        "drvFX4::onMessageEvent timestamps are not the same for sample {i} {:.6} {:.6} {:.6} {:.6}",
+                        "drvFX4::onMessageEvent timestamps are not the same for sample {i} {:.6} {:.6} {:.6} {:.6}\n",
                         times[0], times[1], times[2], times[3]
                     );
                     self.print(TraceMask::ERROR, line);
@@ -371,7 +371,7 @@ impl Fx4Cache {
             } else if self.timestamp_mismatch {
                 self.print(
                     TraceMask::ERROR,
-                    "drvFX4::onMessageEvent timestamps back to normal".to_string(),
+                    "drvFX4::onMessageEvent timestamps back to normal\n".to_string(),
                 );
                 self.timestamp_mismatch = false;
             }
@@ -401,7 +401,7 @@ impl Fx4Cache {
                             if self.gate_level == active_level(cfg.polarity) =>
                         {
                             let line = format!(
-                                "trigger event: gateLevel={}, triggerActive={}, numTriggerValues={}",
+                                "trigger event: gateLevel={}, triggerActive={}, numTriggerValues={}\n",
                                 self.gate_level as i32,
                                 i32::from(self.trigger_active),
                                 self.num_trigger_values
@@ -413,7 +413,8 @@ impl Fx4Cache {
                         QeTriggerMode::ExtBulb
                             if self.gate_level == inactive_level(cfg.polarity) =>
                         {
-                            let line = format!("bulb event: gateLevel={}", self.gate_level as i32);
+                            let line =
+                                format!("bulb event: gateLevel={}\n", self.gate_level as i32);
                             self.print(TraceMask::IO_DRIVER, line);
                             actions.push(Fx4Action::BulbTrigger);
                         }
@@ -590,14 +591,14 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                io("Gate event, value=1.000000, time=0.000500, ADC1 last time=0.000000"),
+                io("Gate event, value=1.000000, time=0.000500, ADC1 last time=0.000000\n"),
                 io("drvFX4::onMessageEvent: Samples=1 1 1 1\n    \
                     ADCs oldest=1.000000 2.000000 3.000000 4.000000\n   \
                     Times oldest=0.000000 0.000000 0.000000 0.000000\n    \
                     ADCs newest=1.000000 2.000000 3.000000 4.000000\n   \
-                    Times newest=0.000000 0.000000 0.000000 0.000000"),
-                io("drvFX4::onMessageEvent minimum size=1, size=1 1 1 1"),
-                io("trigger event: gateLevel=1, triggerActive=0, numTriggerValues=0"),
+                    Times newest=0.000000 0.000000 0.000000 0.000000\n"),
+                io("drvFX4::onMessageEvent minimum size=1, size=1 1 1 1\n"),
+                io("trigger event: gateLevel=1, triggerActive=0, numTriggerValues=0\n"),
             ]
         );
     }
@@ -617,7 +618,7 @@ mod tests {
             cache.take_trace()[0],
             (
                 TraceMask::IO_DRIVER,
-                "Gate event, value=1.000000, time=-1.000000, ADC1 last time=0.000000".to_string()
+                "Gate event, value=1.000000, time=-1.000000, ADC1 last time=0.000000\n".to_string()
             )
         );
     }

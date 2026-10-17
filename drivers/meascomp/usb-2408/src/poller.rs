@@ -132,7 +132,7 @@ fn poller_loop(
                             status = e.code;
                             if prev_status == 0 {
                                 trace.report_error(status, FUNCTION, "Calling DIn");
-                                trace.print(TraceMask::ERROR, format_args!("portNumber=0"));
+                                trace.print(TraceMask::ERROR, format_args!("portNumber=0\n"));
                             }
                             goto_error = true;
                             break 'error;

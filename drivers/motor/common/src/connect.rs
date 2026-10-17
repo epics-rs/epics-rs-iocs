@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -53,7 +54,8 @@ pub fn connect_controller(
     self_port: &str,
     report: std::fmt::Arguments<'_>,
 ) -> (SyncIOHandle, AsynResult<()>) {
-    let (handle, status) = SyncIOHandle::connect_port(octet_port, SERIAL_ADDR, timeout);
+    let (handle, status) =
+        SyncIOHandle::connect_port(octet_port, SERIAL_ADDR, timeout, InterfaceType::Octet);
     if status.is_err() {
         MotorTrace::new(self_port, 0).print_self(TraceMask::ERROR, report);
     }

@@ -114,7 +114,7 @@ impl PhotonIIDetector {
                 self.ad.port_base.trace_print(
                     TraceMask::ERROR,
                     format_args!(
-                        "PhotonII::writePhotonII, status={}, sent\n{command}",
+                        "PhotonII::writePhotonII, status={}, sent\n{command}\n",
                         status as i32
                     ),
                 );
@@ -192,7 +192,7 @@ impl PortDriver for PhotonIIDetector {
                 file!(),
                 line!(),
                 format_args!(
-                    "PhotonII::writeInt32: error, status={} function={reason}, value={value}",
+                    "PhotonII::writeInt32: error, status={} function={reason}, value={value}\n",
                     e.status() as i32
                 ),
             ),
@@ -200,7 +200,7 @@ impl PortDriver for PhotonIIDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("PhotonII::writeInt32: function={reason}, value={value}"),
+                format_args!("PhotonII::writeInt32: function={reason}, value={value}\n"),
             ),
         }
         status
@@ -227,7 +227,7 @@ impl PortDriver for PhotonIIDetector {
                 file!(),
                 line!(),
                 format_args!(
-                    "PhotonII::writeFloat64: error, status={} function={reason}, value={value:.6}",
+                    "PhotonII::writeFloat64: error, status={} function={reason}, value={value:.6}\n",
                     e.status() as i32
                 ),
             ),
@@ -235,7 +235,7 @@ impl PortDriver for PhotonIIDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("PhotonII::writeFloat64: function={reason}, value={value:.6}"),
+                format_args!("PhotonII::writeFloat64: function={reason}, value={value:.6}\n"),
             ),
         }
         status
@@ -345,6 +345,7 @@ mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::registry::claim_port;
     use std::time::Duration;
 
@@ -430,7 +431,8 @@ mod tests {
     /// with no p2util port configured the detector port still exists.
     #[test]
     fn a_detector_whose_command_port_is_missing_still_boots() {
-        let (cmd, status) = SyncIOHandle::connect_port("PII_NONE_CMD", 0, Duration::ZERO);
+        let (cmd, status) =
+            SyncIOHandle::connect_port("PII_NONE_CMD", 0, Duration::ZERO, InterfaceType::Octet);
         assert!(status.is_err());
         let rt = create_photonii_detector(&claim_port("PII_NONE").unwrap(), cmd, 1 << 20)
             .expect("the detector port");

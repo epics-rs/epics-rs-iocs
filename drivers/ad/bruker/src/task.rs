@@ -421,12 +421,13 @@ async fn finish(ctx: &AcquisitionContext, abort: Option<Abort>) {
             ParamValue::Octet("Acquisition aborted".as_bytes().into()),
         )),
         Some(Abort::Error(message)) => {
+            // C's line ends in a newline; ADStatusMessage below does not.
             ctx.handle.trace().output_device(
                 ctx.handle.port_name(),
                 Some(0),
                 0,
                 TraceMask::ERROR,
-                message,
+                &format!("{message}\n"),
             );
             updates.push(ParamSetValue::new(
                 ctx.ad_params.status_message,
@@ -447,10 +448,6 @@ async fn status_loop(ctx: StatusContext) {
             // something to say.
             Err(_) => continue,
         };
-        if message.is_empty() {
-            continue;
-        }
-
         let report = protocol::parse_status(&message);
         let mut updates = vec![ParamSetValue::new(
             ctx.params.status,
@@ -509,7 +506,7 @@ async fn read_status_message(ctx: &StatusContext) -> AsynResult<String> {
     };
     let result = ctx.status.port()?.submit_async(op, user).await?;
     let bytes = result.data.unwrap_or_default();
-    Ok(String::from_utf8_lossy(&bytes).trim_end().to_string())
+    Ok(crate::connection::reply_text(&bytes))
 }
 
 async fn read_i32(ctx: &AcquisitionContext, reason: usize) -> i32 {

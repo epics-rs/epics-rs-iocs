@@ -107,7 +107,7 @@ impl Job {
                 self.trace(
                     TraceMask::ERROR,
                     format_args!(
-                        "{WRITE_READ} {name} pasynOctet->write, status={}, error={}",
+                        "{WRITE_READ} {name} pasynOctet->write, status={}, error={}\n",
                         e.status() as i32,
                         e.message()
                     ),
@@ -118,7 +118,7 @@ impl Job {
         self.trace(
             TraceMask::IO_DEVICE,
             format_args!(
-                "{WRITE_READ} {name} nwrite={n} output=[{}]",
+                "{WRITE_READ} {name} nwrite={n} output=[{}]\n",
                 String::from_utf8_lossy(send)
             ),
         );
@@ -127,7 +127,7 @@ impl Job {
             self.trace(
                 TraceMask::ERROR,
                 format_args!(
-                    "{WRITE_READ} {name} pasynOctet->read, status={}, error={}",
+                    "{WRITE_READ} {name} pasynOctet->read, status={}, error={}\n",
                     e.status() as i32,
                     e.message()
                 ),
@@ -142,14 +142,14 @@ impl Job {
             self.trace(
                 TraceMask::ERROR,
                 format_args!(
-                    "{WRITE_READ} {name} pasynOctet->flush, status={status}, error={error}"
+                    "{WRITE_READ} {name} pasynOctet->flush, status={status}, error={error}\n"
                 ),
             );
         }
         self.trace(
             TraceMask::IO_DEVICE,
             format_args!(
-                "{WRITE_READ} {name} nread={} input=[{}]",
+                "{WRITE_READ} {name} nread={} input=[{}]\n",
                 read.data.len(),
                 c_str(&read.data)
             ),
@@ -173,13 +173,16 @@ impl CellBody for Job {
                 if reply.is_empty() {
                     self.trace(
                         TraceMask::ERROR,
-                        format_args!("{CALLBACK} {name} Cmd reply too small=0"),
+                        format_args!("{CALLBACK} {name} Cmd reply too small=0\n"),
                     );
                     false
                 } else if check_control_reply(dev, &reply).is_err() {
                     self.trace(
                         TraceMask::ERROR,
-                        format_args!("{CALLBACK} {name} Cmd reply has error=[{}]", c_str(&reply)),
+                        format_args!(
+                            "{CALLBACK} {name} Cmd reply has error=[{}]\n",
+                            c_str(&reply)
+                        ),
                     );
                     ex.read_alarm = true;
                     false
@@ -200,7 +203,7 @@ impl CellBody for Job {
                     self.trace(
                         TraceMask::ERROR,
                         format_args!(
-                            "{CALLBACK} {name} Read reply too small/too large ={}",
+                            "{CALLBACK} {name} Read reply too small/too large ={}\n",
                             reply.len()
                         ),
                     );
@@ -219,7 +222,7 @@ impl CellBody for Job {
                         self.trace(
                             TraceMask::ERROR,
                             format_args!(
-                                "{CALLBACK} {name} Read reply has error=[{}]",
+                                "{CALLBACK} {name} Read reply has error=[{}]\n",
                                 c_str(&reply)
                             ),
                         );
@@ -336,7 +339,8 @@ impl DeviceSupport for VacSen {
         record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        let Some(live) = self.live.as_mut() else {
+        // The pass a completion re-entered is `pact == 1`: `read` decodes.
+        let Some(live) = self.live.as_mut().filter(|_| !done.pact()) else {
             return Ok(ReadStart::Synchronous);
         };
         let job = &live.job;
@@ -367,7 +371,7 @@ impl DeviceSupport for VacSen {
         job.trace(
             TraceMask::IO_DEVICE,
             format_args!(
-                "devVacSen::readWrite {} command {code} len={} string=|{}|",
+                "devVacSen::readWrite {} command {code} len={} string=|{}|\n",
                 self.name,
                 sendbuf.len(),
                 String::from_utf8_lossy(&sendbuf)
@@ -388,7 +392,7 @@ impl DeviceSupport for VacSen {
                 job.trace(
                     TraceMask::ERROR,
                     format_args!(
-                        "devVacSen::readWrite {} ERROR calling queueRequest status={}, error={}",
+                        "devVacSen::readWrite {} ERROR calling queueRequest status={}, error={}\n",
                         self.name,
                         e.status() as i32,
                         e.message()
@@ -538,5 +542,60 @@ mod tests {
             ),
             "{log}"
         );
+    }
+
+    /// The pass a completion re-enters is C `readWrite_vs` with `pact == 1`:
+    /// it decodes what landed and queues nothing.
+    #[test]
+    fn the_continuation_pass_does_not_queue_again() {
+        let port = "VSREENTRY";
+        let claim = claim_port_driver(port).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let driver = DrvAsynIPPort::new(port, &addr).unwrap();
+        let _runtime = PortManager::new()
+            .register_port(claim, driver, &open_owner())
+            .unwrap();
+
+        let mut dev = VacSen::new(AsynLink {
+            port_name: port.into(),
+            addr: 0,
+            timeout: None,
+            drv_info: String::new(),
+        });
+        dev.set_record_info("V:G2", ScanType::Passive);
+        let mut rec = VsRecord::default();
+        assert!(matches!(dev.init(&mut rec), Ok(o) if o == DeviceInitOutcome::ok()));
+        let db = PvDatabase::new();
+        let done = DeviceDone::new(&db, &RecordInstance::new("V:G2", VsRecord::default()));
+
+        let start = dev
+            .read_begin(&mut rec, &DeviceDoneSource::new(&done))
+            .unwrap();
+        assert!(matches!(start, ReadStart::Pending));
+        // The listener never answers: the exchange ends on its timeout, and
+        // the cell is free to queue again, as it is when C re-enters.
+        let deadline = std::time::Instant::now() + 4 * IO_TIMEOUT;
+        while dev
+            .live
+            .as_ref()
+            .unwrap()
+            .job
+            .exchange
+            .lock()
+            .unwrap()
+            .err_count
+            == 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exchange never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let again = dev
+            .read_begin(&mut rec, &DeviceDoneSource::continuing(&done))
+            .unwrap();
+        assert!(matches!(again, ReadStart::Synchronous));
     }
 }

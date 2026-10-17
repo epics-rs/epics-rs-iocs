@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::{AsynMotor, PostMessage};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -120,5 +120,39 @@ impl Model1 {
             1000 / scan_rate as u64,
             DEFAULT_IDLE_POLL_MS,
         )
+    }
+}
+
+/// The record's PREM and POST as a model-1 device holds them: `build_trans`
+/// reads PREM into the move it builds, and points `postmsgptr` at the POST
+/// field when POST is set, for `set_status` to send once that move ends
+/// (devIM483PL.cc:191-205, drvIM483PL.cc:357-366).
+#[derive(Debug, Default)]
+pub struct MoveStrings {
+    /// What `set_move_strings` gave for the move built next.
+    next: Option<(Vec<u8>, Option<PostMessage>)>,
+    /// `nodeptr->postmsgptr` of the move built last.
+    post: Option<PostMessage>,
+}
+
+impl MoveStrings {
+    /// `AsynMotor::set_move_strings`.
+    pub fn set(&mut self, prem: &[u8], post: Option<PostMessage>) {
+        self.next = Some((prem.to_vec(), post));
+    }
+
+    /// Building a move: its PREM, empty when there is none, and its POST
+    /// becomes the one [`MoveStrings::post_due`] gives.
+    pub fn arm(&mut self) -> Vec<u8> {
+        let (prem, post) = self.next.take().unwrap_or_default();
+        self.post = post;
+        prem
+    }
+
+    /// `set_status` seeing the move done or stopped by a limit: the POST as
+    /// the field holds it now, once. An emptied field gives nothing, as
+    /// `send_mess` returns on an empty message.
+    pub fn post_due(&mut self) -> Option<Vec<u8>> {
+        self.post.take().map(|p| p.get()).filter(|p| !p.is_empty())
     }
 }

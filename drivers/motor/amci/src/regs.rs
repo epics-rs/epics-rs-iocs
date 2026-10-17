@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
@@ -47,7 +48,8 @@ impl ModbusRegs {
     /// it; C's NULL drvInfo cannot be refused, so a refused `MODBUS_DATA`
     /// leaves reason 0 as C's default.
     pub fn connect(port_name: &str, timeout: Duration) -> (Self, AsynResult<()>) {
-        let (handle, connected) = SyncIOHandle::connect_port(port_name, 0, timeout);
+        let (handle, connected) =
+            SyncIOHandle::connect_port(port_name, 0, timeout, InterfaceType::Int32);
         let data_reason = handle
             .port()
             .and_then(|port| port.drv_user_create_blocking(&DrvUserRequest::new(MODBUS_DATA, 0)))

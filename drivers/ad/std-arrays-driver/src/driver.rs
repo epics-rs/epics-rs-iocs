@@ -140,7 +140,7 @@ impl NdStdArraysDriver {
         let mut array = self.ad.pool.alloc(dims, data_type).map_err(|e| {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
-                format_args!("NDDriverStdArrays:writeXXXArray: error allocating raw buffer"),
+                format_args!("NDDriverStdArrays:writeXXXArray: error allocating raw buffer\n"),
             );
             pool_err(e)
         })?;
@@ -398,11 +398,11 @@ impl PortDriver for NdStdArraysDriver {
     /// `NDDriverStdArrays::writeInt32` (NDDriverStdArrays.cpp:336-384).
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
 
-        // setIntegerParam(function, value) (NDDriverStdArrays.cpp:346) — the
-        // ADAcquire/NDNumQueuedArrays intercept lives here.
-        self.ad.port_base.set_int32_param(reason, addr, value)?;
+        // setIntegerParam(function, value) (NDDriverStdArrays.cpp:346): list
+        // 0 whatever the address; the ADAcquire/NDNumQueuedArrays intercept
+        // lives here.
+        let _ = self.ad.port_base.set_int32_param(reason, 0, value);
 
         // C overwrites every status here with callParamCallbacks'
         // (NDDriverStdArrays.cpp:373), so none of these fail the write.
@@ -429,12 +429,12 @@ impl PortDriver for NdStdArraysDriver {
         }
 
         // A failure here reaches C's errorMessage only, never the console.
-        self.ad.port_base.call_param_callbacks(addr)?;
+        self.ad.port_base.call_param_callbacks(0)?;
         user.print(
             TraceMask::IO_DRIVER,
             file!(),
             line!(),
-            format_args!("NDDriverStdArrays:writeInt32: function={reason}, value={value}"),
+            format_args!("NDDriverStdArrays:writeInt32: function={reason}, value={value}\n"),
         );
         Ok(())
     }
@@ -603,6 +603,17 @@ mod tests {
 
     /// NDDriverStdArrays.cpp:369 hands ShutterControl to ADDriver::writeInt32,
     /// which calls setShutter (ADDriver.cpp:97-98).
+    /// NDDriverStdArrays.cpp:346, :373: the set and the callbacks are list 0
+    /// whatever the address, and the set's status is overwritten.
+    #[test]
+    fn a_write_at_another_address_sets_list_zero() {
+        let mut f = Fixture::new();
+        let reason = f.det.ndsa.append_mode;
+        let mut user = AsynUser::new(reason).with_addr(1);
+        f.det.write_int32(&mut user, 1).unwrap();
+        assert_eq!(f.get_i32(reason), 1);
+    }
+
     #[test]
     fn shutter_control_reaches_addriver_set_shutter() {
         use epics_rs::ad_core::driver::ShutterMode;

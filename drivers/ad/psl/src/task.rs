@@ -222,7 +222,7 @@ fn read_frame(ctx: &AcquisitionContext) -> Result<(ImageHeader, Vec<u8>), Abort>
                 TraceMask::ERROR,
                 &format!(
                     "PSL:getImage: error reading image, status={}, dataLen={}, nCopied={}, \
-                     maxRead={want}, nRead=0",
+                     maxRead={want}, nRead=0\n",
                     e.status(),
                     header.data_len,
                     payload.len()

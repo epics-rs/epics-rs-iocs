@@ -1,8 +1,9 @@
-//! Aerotech motor IOC (Ensemble + A3200).
+//! Aerotech motor IOC (Ensemble + A3200, and the model-1 Soloist).
 //!
 //! Assembles: an asyn octet port (`drvAsynIPPortConfigure` or
 //! `drvAsynSerialPortConfigure`), the Aerotech iocsh commands
-//! (`EnsembleAsynSetup`/`Config`, `A3200AsynSetup`/`Config`),
+//! (`EnsembleAsynSetup`/`Config`, `A3200AsynSetup`/`Config`,
+//! `SoloistSetup`/`Config`),
 //! `drvAsynMotorConfigure` over their drivers, the motor record type, and the
 //! CA + PVA (QSRV) server.
 //!
@@ -16,7 +17,7 @@ use epics_rs::ca::server::ioc_app::IocApplication;
 
 use motor_aerotech::ioc::{
     MOTOR_A3200, MOTOR_ENSEMBLE, a3200_config_command, a3200_setup_command,
-    ensemble_config_command, ensemble_setup_command,
+    ensemble_config_command, ensemble_setup_command, soloist_config_command, soloist_setup_command,
 };
 use motor_common::model2::drv_asyn_motor_configure_command;
 
@@ -48,6 +49,8 @@ async fn main() -> CaResult<()> {
     app = app.register_startup_command(ensemble_config_command());
     app = app.register_startup_command(a3200_setup_command());
     app = app.register_startup_command(a3200_config_command());
+    app = app.register_startup_command(soloist_setup_command());
+    app = app.register_startup_command(soloist_config_command());
     app = app.register_startup_command(drv_asyn_motor_configure_command(vec![
         &MOTOR_ENSEMBLE,
         &MOTOR_A3200,

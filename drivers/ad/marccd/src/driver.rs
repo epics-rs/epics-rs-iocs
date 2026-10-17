@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -17,6 +18,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::driver::write_tail::{OwnList, WriteTail};
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode, ShutterMode};
 use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
@@ -32,6 +34,18 @@ use crate::task::{Worker, start_det_task, start_image_task};
 use crate::types::{
     Event, FrameType, TASK_ACQUIRE, TASK_STATUS_EXECUTING, TASK_STATUS_QUEUED, TriggerMode,
     test_task_status,
+};
+
+const INT32_TAIL: WriteTail = WriteTail {
+    error: "marCCD:writeInt32: error, ",
+    done: "marCCD:writeInt32: ",
+    list: OwnList::Zero,
+};
+
+const FLOAT64_TAIL: WriteTail = WriteTail {
+    error: "marCCD:writeFloat64: error, ",
+    done: "marCCD:writeFloat64: ",
+    list: OwnList::Zero,
 };
 
 /// C `DRIVER_VERSION`.
@@ -148,117 +162,69 @@ impl PortDriver for MarccdDriver {
             .get_int32_param(params.acquire, 0)
             .unwrap_or(0);
 
-        if function == params.acquire {
-            self.ad.set_acquire(value)?;
-        } else {
-            self.ad
-                .port_base
-                .set_int32_param(function, user.addr, value)?;
-        }
-
-        let mut status = Ok(());
-        if function == params.acquire {
-            let state = self.get_state();
-            if value != 0
-                && test_task_status(
-                    state,
-                    TASK_ACQUIRE,
-                    TASK_STATUS_QUEUED | TASK_STATUS_EXECUTING,
-                ) == 0
-            {
-                // Kill any stale stop event, then wake the marCCD task.
-                self.stop.try_wait();
-                self.start.signal();
+        INT32_TAIL.write_int32(self, user, value, |det, user, mut status| {
+            if function == params.acquire {
+                let state = det.get_state();
+                if value != 0
+                    && test_task_status(
+                        state,
+                        TASK_ACQUIRE,
+                        TASK_STATUS_QUEUED | TASK_STATUS_EXECUTING,
+                    ) == 0
+                {
+                    // Kill any stale stop event, then wake the marCCD task.
+                    det.stop.try_wait();
+                    det.start.signal();
+                }
+                if value == 0 && acquiring != 0 {
+                    // The inline exposure deadline replaces C's epicsTimerCancel.
+                    det.stop.signal();
+                }
+            } else if function == params.bin_x || function == params.bin_y {
+                // marCCDServer only reports the binning after the next image, so
+                // C does not read it back here.
+                let bin_x = det.get_i32(params.bin_x);
+                let bin_y = det.get_i32(params.bin_y);
+                det.write_server(&cmd_set_bin(bin_x, bin_y));
+            } else if function == p.gate_mode && det.server_mode == 2 {
+                det.write_server(&cmd_set_gating(value));
+                det.get_config();
+            } else if function == p.readout_mode && det.server_mode == 2 {
+                det.write_server(&cmd_set_readout_mode(value));
+                det.get_config();
+            } else if function == p.frame_shift {
+                det.write_server(&cmd_set_frameshift(value));
+                det.get_config();
+            } else if function == params.read_status {
+                if value != 0 {
+                    det.get_state();
+                }
+            } else if function == params.base.write_file {
+                // Raw frames are saved uncorrected.
+                let frame_type = det.get_i32(params.frame_type);
+                let corrected_flag = i32::from(frame_type != FrameType::Raw as i32);
+                det.save_file(corrected_flag, true);
+            } else if function < p.first() {
+                status = ADDriver::ad_write_int32(det, user, value);
             }
-            if value == 0 && acquiring != 0 {
-                // The inline exposure deadline replaces C's epicsTimerCancel.
-                self.stop.signal();
-            }
-        } else if function == params.bin_x || function == params.bin_y {
-            // marCCDServer only reports the binning after the next image, so
-            // C does not read it back here.
-            let bin_x = self.get_i32(params.bin_x);
-            let bin_y = self.get_i32(params.bin_y);
-            self.write_server(&cmd_set_bin(bin_x, bin_y));
-        } else if function == p.gate_mode && self.server_mode == 2 {
-            self.write_server(&cmd_set_gating(value));
-            self.get_config();
-        } else if function == p.readout_mode && self.server_mode == 2 {
-            self.write_server(&cmd_set_readout_mode(value));
-            self.get_config();
-        } else if function == p.frame_shift {
-            self.write_server(&cmd_set_frameshift(value));
-            self.get_config();
-        } else if function == params.read_status {
-            if value != 0 {
-                self.get_state();
-            }
-        } else if function == params.base.write_file {
-            // Raw frames are saved uncorrected.
-            let frame_type = self.get_i32(params.frame_type);
-            let corrected_flag = i32::from(frame_type != FrameType::Raw as i32);
-            self.save_file(corrected_flag, true);
-        } else if function < p.first() {
-            status = ADDriver::ad_write_int32(self, user, value);
-        }
-
-        let _ = self.ad.port_base.call_param_callbacks(0);
-        match &status {
-            Err(e) => user.print(
-                TraceMask::ERROR,
-                file!(),
-                line!(),
-                format_args!(
-                    "marCCD:writeInt32: error, status={} function={function}, value={value}",
-                    e.status() as i32
-                ),
-            ),
-            Ok(()) => user.print(
-                TraceMask::IO_DRIVER,
-                file!(),
-                line!(),
-                format_args!("marCCD:writeInt32: function={function}, value={value}"),
-            ),
-        }
-        status
+            status
+        })
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let function = user.reason;
         let p = self.p;
 
-        let mut status = self
-            .ad
-            .port_base
-            .set_float64_param(function, user.addr, value);
-
-        if function == p.stability {
-            self.write_server(&cmd_set_stability(value));
-            self.get_config();
-        } else if function < p.gate_mode {
-            // ADDriver::writeFloat64 is asynPortDriver's (marCCD.cpp:1344).
-            status = self.ad.port_base.write_float64_param(user, value);
-        }
-
-        let _ = self.ad.port_base.call_param_callbacks(0);
-        match &status {
-            Err(e) => user.print(
-                TraceMask::ERROR,
-                file!(),
-                line!(),
-                format_args!(
-                    "marCCD:writeFloat64: error, status={} function={function}, value={value:.6}",
-                    e.status() as i32
-                ),
-            ),
-            Ok(()) => user.print(
-                TraceMask::IO_DRIVER,
-                file!(),
-                line!(),
-                format_args!("marCCD:writeFloat64: function={function}, value={value:.6}"),
-            ),
-        }
-        status
+        FLOAT64_TAIL.write_float64(self, user, value, |det, user, mut status| {
+            if function == p.stability {
+                det.write_server(&cmd_set_stability(value));
+                det.get_config();
+            } else if function < p.gate_mode {
+                // ADDriver::writeFloat64 is asynPortDriver's (marCCD.cpp:1344).
+                status = det.ad.port_base.write_float64_param(user, value);
+            }
+            status
+        })
     }
 
     /// C inherits `ADDriver::writeOctet`.
@@ -330,7 +296,8 @@ pub fn create_marccd_detector(
     max_memory: usize,
 ) -> Result<MarccdRuntime, String> {
     let port_name = claim.name();
-    let (server, connected) = SyncIOHandle::connect_port(server_port, 0, Duration::ZERO);
+    let (server, connected) =
+        SyncIOHandle::connect_port(server_port, 0, Duration::ZERO, InterfaceType::Octet);
 
     let start = Arc::new(Event::new());
     let stop = Arc::new(Event::new());
@@ -457,8 +424,12 @@ pub(crate) mod tests {
     /// A driver on a silent fake server, outside any port runtime.
     fn driver(name: &str) -> MarccdDriver {
         fake_server(name, |_| "");
-        let (server, connected) =
-            SyncIOHandle::connect_port(&format!("{name}_IP"), 0, Duration::ZERO);
+        let (server, connected) = SyncIOHandle::connect_port(
+            &format!("{name}_IP"),
+            0,
+            Duration::ZERO,
+            InterfaceType::Octet,
+        );
         connected.unwrap();
         let links = DriverLinks {
             server,
@@ -466,6 +437,57 @@ pub(crate) mod tests {
             stop: Arc::new(Event::new()),
         };
         MarccdDriver::new(name, 0, links).unwrap()
+    }
+
+    /// marCCD.cpp:1261, :1336: setIntegerParam / setDoubleParam(function,
+    /// value) are list 0 whatever the address.
+    #[test]
+    fn a_write_at_another_address_sets_list_zero() {
+        let mut d = driver("MARCCD_LIST0");
+        let (int, float) = (d.p.series_file_digits, d.p.tiff_timeout);
+        d.write_int32(&mut AsynUser::new(int).with_addr(1), 3)
+            .unwrap();
+        d.write_float64(&mut AsynUser::new(float).with_addr(1), 2.5)
+            .unwrap();
+        assert_eq!(d.ad.port_base.get_int32_param(int, 0).unwrap(), 3);
+        assert_eq!(d.ad.port_base.get_float64_param(float, 0).unwrap(), 2.5);
+    }
+
+    /// marCCD.cpp:1316-1319, :1352-1355 print asynParamWrongType for a write
+    /// of the other type.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MARCCD_STATUS";
+        let mut d = driver(port);
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let user = |reason| {
+            let mut user = AsynUser::new(reason);
+            user.trace = Some(UserTrace {
+                manager: manager.clone(),
+                port: port.into(),
+            });
+            user
+        };
+        let (float, int) = (d.p.tiff_timeout, d.p.gate_mode);
+        assert!(d.write_int32(&mut user(float), 1).is_err());
+        assert!(d.write_float64(&mut user(int), 1.0).is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        for line in [
+            format!("marCCD:writeInt32: error, status=8 function={float}, value=1"),
+            format!("marCCD:writeFloat64: error, status=8 function={int}, value=1.000000"),
+        ] {
+            assert!(text.contains(&line), "{line}: {text}");
+        }
     }
 
     /// Build the detector on `name`'s fake server, then send it a `set_bin`.
@@ -488,6 +510,20 @@ pub(crate) mod tests {
     /// How many times `command` reached the server.
     pub(crate) fn sent_count(log: &Mutex<Vec<String>>, command: &str) -> usize {
         log.lock().iter().map(|c| c.matches(command).count()).sum()
+    }
+
+    /// [`sent_count`] once it reaches `n` or 5 s pass. The fake server logs a
+    /// command after its read returns, so an unanswered write can complete
+    /// before its entry lands.
+    pub(crate) fn wait_sent(log: &Mutex<Vec<String>>, command: &str, n: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let count = sent_count(log, command);
+            if count >= n || Instant::now() >= deadline {
+                return count;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// marCCD.cpp:1250-1357 talks to marServer inside writeInt32 /
@@ -551,7 +587,7 @@ pub(crate) mod tests {
             .unwrap();
         h.write_int32_blocking(ad.shutter_control, 0, 1).unwrap();
         assert_eq!(h.read_int32_blocking(ad.shutter_status, 0).unwrap(), 1);
-        assert_eq!(sent_count(&log, "shutter,1"), 1);
+        assert_eq!(wait_sent(&log, "shutter,1", 1), 1);
         std::mem::forget(det);
     }
 
