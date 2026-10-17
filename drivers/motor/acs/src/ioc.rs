@@ -20,7 +20,7 @@ use motor_common::connect::{connect_controller, connect_serial};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1::{Model1, Model1Cards, SCAN_RATE, c_int};
 use motor_common::{Controller, asyn_user, model1_device, register_port};
 
 use crate::drv_mcb4b::{DrvMcb4bAxis, MCB4B_NUM_AXES, MCB4B_NUM_CARDS, motor_init};
@@ -88,7 +88,21 @@ static MCB4B: Model1 = Model1::new(&DEV_MCB4B, MCB4B_NUM_CARDS, SCAN_RATE);
 
 /// `MCB4BSetup(num_cards, scan_rate)`.
 pub fn mcb4b_setup_command() -> CommandDef {
+    MCB4B.register_report("drvMCB4B", mcb4b_report);
     MCB4B.setup_command("MCB4BSetup")
+}
+
+/// drvMCB4B.cc's drvet `report` (:123-140): only the cards that answered.
+fn mcb4b_report(cards: &Model1Cards<'_>) -> String {
+    if cards.num_cards() <= 0 {
+        return "    NO MCB4B controllers found\n".into();
+    }
+    (0..cards.num_cards())
+        .filter_map(|card| {
+            let line = cards.card(card)?;
+            Some(format!("    MCB4B controller {card}, {line} \n"))
+        })
+        .collect()
 }
 
 /// `MCB4BConfig(card, name)`. Connects and probes the card at once, where
@@ -119,7 +133,37 @@ pub fn mcb4b_config_command() -> CommandDef {
                     Arc::new(Mutex::new(DrvMcb4bAxis::new(controller.clone(), index)));
                 MCB4B.install(ctx, card, index as i32, motor)?;
             }
+            // C's ident is the constant motor_init copies (drvMCB4B.cc:501).
+            MCB4B.describe(card, format!("port={asyn_port}, id: MCB-4B"));
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, run_command};
+
+    /// drvMCB4B.cc's drvet `report` (:123-140), which `dbior` runs; C
+    /// prints nothing for a card that never answered.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_answering_mcb4b_card() {
+        let setup = mcb4b_setup_command();
+        assert_eq!(
+            driver_report("drvMCB4B", 0),
+            "    NO MCB4B controllers found\n"
+        );
+        run_command(setup, vec![ArgValue::Int(3), ArgValue::Int(10)]).await;
+        let (_on, _io_on) = LineRig::new("mcbRepLine", |_| "OK".into());
+        let (_off, _io_off) = LineRig::new("mcbRepSilent", |_| String::new());
+        for (card, line) in [(1, "mcbRepLine"), (2, "mcbRepSilent")] {
+            let args = vec![ArgValue::Int(card), ArgValue::String(line.into())];
+            run_command(mcb4b_config_command(), args).await;
+        }
+        assert_eq!(
+            driver_report("drvMCB4B", 0),
+            "    MCB4B controller 1, port=mcbRepLine, id: MCB-4B \n"
+        );
+    }
 }
