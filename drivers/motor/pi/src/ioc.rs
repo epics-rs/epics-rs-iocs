@@ -322,6 +322,11 @@ static PIC844: Model1 = Model1::new(&DEV_PIC844, 8, SCAN_RATE);
 
 /// `PIC844Setup(num_cards, scan_rate)`.
 pub fn pic844_setup_command() -> CommandDef {
+    PIC844.register_report("drvPIC844", |cards| {
+        cards.report("PIC844", |card, line| {
+            format!("    PIC844 controller #{card}, {line} \n")
+        })
+    });
     PIC844.setup_command("PIC844Setup")
 }
 
@@ -351,6 +356,7 @@ pub fn pic844_config_command() -> CommandDef {
             )?;
             let controller =
                 PIC844Controller::new(handle).map_err(|e| format!("PIC844Config: {e}"))?;
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for signal in 0..PIC844_NUM_AXES {
@@ -359,6 +365,7 @@ pub fn pic844_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 PIC844.install(ctx, card, signal as i32, motor)?;
             }
+            PIC844.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -721,6 +728,32 @@ mod report {
             after,
             "    PIC663 controller 0 connection failed.\n    PIC663 controller #1, \
              port=c663RepLine, id: C-663 \n"
+        );
+    }
+
+    /// drvPIC844.cc:143-168, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic844_controller() {
+        let setup = pic844_setup_command();
+        let (_line, _io) = LineRig::new("c844RepLine", |last| match last {
+            "*IDN?" => "C-844".into(),
+            c if c.ends_with("AXIS:STAT?") => "ON".into(),
+            _ => "0".into(),
+        });
+        let (before, after) = reports(
+            "drvPIC844",
+            (setup, vec![int(2), int(10)]),
+            (
+                pic844_config_command(),
+                vec![int(1), port("c844RepLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIC844 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC844 controller 0 connection failed.\n    PIC844 controller #1, \
+             port=c844RepLine, id: C-844 \n"
         );
     }
 }
