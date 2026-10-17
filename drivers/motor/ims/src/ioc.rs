@@ -424,6 +424,20 @@ mod extra_params {
         assert_eq!(io.read_int32(save).unwrap(), 1);
     }
 
+    /// asynPortDriver.cpp:1907: getAxis reads a user's -1 as axis 0, so an
+    /// IMS write there sends its command and stores the value on axis 0.
+    #[epics_rs::base::epics_test]
+    async fn an_ims_write_at_address_minus_one_is_axis_0() {
+        let (line, io) = controller("imsNvmAny", "imsNvmAnyLine").await;
+        let handle = PortManager::global().find_port_handle("imsNvmAny").unwrap();
+        let any = SyncIOHandle::from_handle(handle, -1, IMS_TIMEOUT);
+        let save = any.drv_user_create("IMS_SAVETONVM").unwrap();
+        line.sent();
+        any.write_int32(save, 1).unwrap();
+        assert_eq!(not_polled(line.sent()), ["AS"]);
+        assert_eq!(io.read_int32(save).unwrap(), 1);
+    }
+
     /// ImsMDrivePlusMotorController.cpp:317-318: an IMS write at an address
     /// with no axis (a create that failed after the port) fails before the
     /// val= print, the store or a command.

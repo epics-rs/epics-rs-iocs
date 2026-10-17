@@ -43,7 +43,9 @@ use epics_rs::asyn::request::{ParamSetValue, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerParams, ParamWrite, has_motor_axis, index};
+use epics_rs::motor::controller_port::{
+    AxisUser, ControllerParams, ParamWrite, has_motor_axis, index,
+};
 use epics_rs::motor::flags::MstaFlags;
 use epics_rs::motor::trace::MotorTrace;
 
@@ -346,7 +348,7 @@ impl ControllerParams for ImsParams {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         // ImsMDrivePlusMotorController.cpp:317-318: no axis, no print.
@@ -362,10 +364,7 @@ impl ControllerParams for ImsParams {
             r if r == self.clear_lr_error => CLEAR_LR_ERROR,
             _ => return ParamWrite::PassToBase(Ok(())),
         };
-        let addr = match base.get_address(user.addr, user.reason) {
-            Ok(addr) => addr,
-            Err(e) => return ParamWrite::Handled(Err(e)),
-        };
+        let addr = user.addr;
         let _ = base.set_int32_param(user.reason, addr, value);
         let status = if value == 1 {
             let status = self.line.write_only(action.command);
