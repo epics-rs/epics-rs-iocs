@@ -89,6 +89,16 @@ impl Detector {
         self.out_string.lock().clone()
     }
 
+    /// C's `"<check> (outString = %s)"` refusal on `pasynUserSelf` and the
+    /// asynError that follows it (mythen.cpp:365, :392, :414).
+    pub fn refused(&self, check: &str) -> AsynError {
+        self.trace_error(&format!("{check} (outString = {})", self.out_string()));
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: String::new(),
+        }
+    }
+
     /// An `ASYN_TRACE_ERROR` line on the mythen port.
     pub fn trace_error(&self, message: &str) {
         self.trace

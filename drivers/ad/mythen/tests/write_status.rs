@@ -359,3 +359,33 @@ fn a_refused_tau_prints_the_last_command() {
         "{text}"
     );
 }
+
+/// mythen.cpp:387-394, :413-416: a failed setKthresh or setEnergy prints its
+/// refusal with outString_ and returns asynError.
+#[test]
+fn a_failed_threshold_or_energy_prints_the_refusal() {
+    use epics_rs::asyn::services::PortServices;
+    use epics_rs::asyn::trace::TraceFile;
+    let port = "MYTHEN_WS_KTH";
+    let (mut driver, _received) = driver(port);
+    let manager = PortServices::global().trace().clone();
+    let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+    let file = std::fs::File::create(&log).unwrap();
+    manager.set_trace_file(
+        Some(port),
+        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+    );
+    for reason in [driver.p.threshold, driver.p.energy] {
+        let last = driver.det.out_string();
+        let e = driver
+            .write_float64(&mut AsynUser::new(reason), 7.0)
+            .unwrap_err();
+        assert_eq!(e.c_status_code(), 3);
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            text.contains(&format!("error check if value > 0 (outString = {last})")),
+            "{text}"
+        );
+    }
+    let _ = std::fs::remove_file(&log);
+}
