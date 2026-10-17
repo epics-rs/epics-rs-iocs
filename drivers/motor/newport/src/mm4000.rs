@@ -54,6 +54,7 @@ use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use motor_common::model2::AxisLog;
 
 use crate::util::{atof, atoi, max_digits};
 use motor_common::model1::MoveStrings;
@@ -569,6 +570,10 @@ impl Mm4000AxisReport {
 /// One MM4000 axis sharing a controller. Implements [`AsynMotor`].
 pub struct Mm4000Axis {
     controller: Arc<Mutex<Mm4000Controller>>,
+    /// C `pAxis->card`.
+    card: i32,
+    /// C `pAxis->logParam`.
+    log: Arc<AxisLog>,
     /// 1-based controller axis number, sent unpadded (`%d`).
     axis: usize,
     model: Mm4000Model,
@@ -624,6 +629,7 @@ impl Mm4000Axis {
     /// serial I/O under the controller lock.
     pub fn new(
         controller: Arc<Mutex<Mm4000Controller>>,
+        card: i32,
         axis: usize,
         poll_failure: PollFailure,
     ) -> Self {
@@ -651,6 +657,8 @@ impl Mm4000Axis {
         };
         Self {
             controller,
+            card,
+            log: Arc::default(),
             axis,
             model,
             step_size,
@@ -676,6 +684,11 @@ impl Mm4000Axis {
             strings: MoveStrings::default(),
             status: Arc::default(),
         }
+    }
+
+    /// The log `Model2::set_axis_logs` attaches.
+    pub fn log(&self) -> Arc<AxisLog> {
+        self.log.clone()
     }
 
     /// drvMM4000Asyn.c `motorAxisReportAxis`'s view of this axis.
@@ -1028,6 +1041,19 @@ impl AsynMotor for Mm4000Axis {
         Ok(())
     }
 
+    /// drvMM4000Asyn.c `motorAxisforceCallback`; the poll that follows is
+    /// the poller's.
+    fn force_callback(&mut self, _user: &AsynUser) {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "motorAxisforceCallback: request card {}, axis {} status update\n",
+                self.card,
+                self.axis - 1
+            ),
+        );
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         self.retry_failed = false;
         let step = self.step_size()?;
@@ -1228,7 +1254,7 @@ mod tests {
         let ctrl = Arc::new(Mutex::new(ctrl));
         let axes = (1..=num_axes)
             .map(|axis| {
-                let mut ax = Mm4000Axis::new(ctrl.clone(), axis, MODEL1_POLL_FAILURE);
+                let mut ax = Mm4000Axis::new(ctrl.clone(), 0, axis, MODEL1_POLL_FAILURE);
                 ax.model1_set_status();
                 ax
             })
@@ -1495,7 +1521,7 @@ mod tests {
         let ctrl = Mm4000Controller::new(io, "mm4000_dead", "mm4000_dead_motor", 1, Duration::ZERO)
             .ok()
             .unwrap();
-        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1, MODEL2_POLL_FAILURE);
+        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
         let user = AsynUser::default();
         assert_eq!(axis.poll(&user).unwrap().position, 50000.0);
 
@@ -1536,7 +1562,7 @@ mod tests {
         let ctrl = Mm4000Controller::new(io, "mm4000_moved", "mm4000_moved_motor", 1, ttl)
             .ok()
             .unwrap();
-        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1, MODEL2_POLL_FAILURE);
+        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
         let user = AsynUser::default();
         assert!(axis.poll(&user).unwrap().done);
         sent.lock().unwrap().clear();
@@ -1646,5 +1672,63 @@ mod tests {
         assert!(te_ok("TE@"));
         assert!(!te_ok("TEA"));
         assert!(!te_ok(""));
+    }
+
+    /// drvMM4000Asyn.c:579-592: a GET_INFO's motorAxisforceCallback prints
+    /// its FLOW line, 0-based axis, on the axis's log.
+    #[epics_rs::base::epics_test]
+    async fn force_callback_prints_the_c_flow_line() {
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::testing::{LineRig, run_command};
+
+        static DRIVER: Model2 = Model2::new("mm4kForceTest", 0);
+        let (_line, io) = LineRig::new("mm4kForceLine", |last| {
+            match last {
+                "VE;" => "VEMM4005 Version 2.0",
+                "TP;" => "1TP0.0,2TP0.0",
+                _ => "",
+            }
+            .to_string()
+        });
+        let ctrl = Mm4000Controller::new(io, "mm4kForceLine", "mm4kForce", 2, Duration::ZERO)
+            .ok()
+            .unwrap();
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let axes: Vec<_> = (1..=2)
+            .map(|axis| Mm4000Axis::new(ctrl.clone(), 2, axis, MODEL2_POLL_FAILURE))
+            .collect();
+        let logs = axes.iter().map(Mm4000Axis::log).collect();
+        let axes: Vec<_> = axes.into_iter().map(|a| Arc::new(Mutex::new(a))).collect();
+        let motors = axes
+            .iter()
+            .map(|a| a.clone() as Arc<Mutex<dyn AsynMotor>>)
+            .collect();
+        DRIVER.set_card(2, motors, 100, 1000);
+        DRIVER.set_axis_logs(2, logs);
+        let args = vec![
+            ArgValue::String("mm4kForce".into()),
+            ArgValue::String("mm4kForceTest".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(2),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&DRIVER]), args).await;
+
+        let path = std::env::temp_dir().join(format!("mm4k-force-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("mm4kForce"), TraceMask::FLOW);
+        trace.set_device_trace_mask("mm4kForce", 1, TraceMask::FLOW);
+        trace.set_device_trace_info_mask("mm4kForce", 1, TraceInfoMask::empty());
+        trace.set_device_trace_file("mm4kForce", 1, TraceFile::File(file));
+        axes[1].lock().unwrap().force_callback(&AsynUser::default());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            text,
+            "motorAxisforceCallback: request card 2, axis 1 status update\n"
+        );
     }
 }

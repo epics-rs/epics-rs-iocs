@@ -1754,7 +1754,8 @@ pub fn mm4000_config_command() -> CommandDef {
         let line = format!("port={port}, address={addr}, id: {}", controller.firmware());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let mut ax = Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL1_POLL_FAILURE);
+            let mut ax =
+                Mm4000Axis::new(controller.clone(), card, axis, mm4000::MODEL1_POLL_FAILURE);
             ax.model1_set_status();
             MM4000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
@@ -1918,10 +1919,17 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
             };
             let (firmware, model) = (controller.firmware().to_owned(), controller.model());
             let controller = Arc::new(Mutex::new(controller));
+            let mut logs = Vec::new();
             let (axes, reports): (Vec<_>, Vec<_>) = (1..=num_axes as usize)
                 .map(|axis| {
-                    let ax = Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL2_POLL_FAILURE);
+                    let ax = Mm4000Axis::new(
+                        controller.clone(),
+                        card,
+                        axis,
+                        mm4000::MODEL2_POLL_FAILURE,
+                    );
                     let report = ax.report();
+                    logs.push(ax.log());
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     (motor, report)
                 })
@@ -1933,6 +1941,7 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 c.axes = reports.take().unwrap_or_default();
             });
             MOTOR_MM4000.set_card(card, axes, moving_poll_ms, idle_poll_ms);
+            MOTOR_MM4000.set_axis_logs(card, logs);
             Ok(CommandOutcome::Continue)
         },
     )
