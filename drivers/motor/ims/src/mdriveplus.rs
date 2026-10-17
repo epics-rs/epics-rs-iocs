@@ -26,9 +26,6 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! - **Locked-rotor readback (`PR LR`).** An asyn extra parameter read by a
-//!   separate PV, outside the motor record, so it is not part of the
-//!   [`AsynMotor`] boundary.
 //! - **Velocity / direction / power-on readback.** The C poller never sets
 //!   `motorStatusActualVelocity`, `motorStatusDirection` or `motorStatusPowerOn`,
 //!   so those are left at their defaults here too.
@@ -39,9 +36,10 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
-use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::{ParamSetValue, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -249,6 +247,9 @@ pub struct ImsMDrivePlusAxis {
     /// True between a `home` command and the move completing (drives the
     /// `R1=1` "homed" latch in [`Self::poll`]).
     homing: bool,
+    /// The controller port and its IMS_LOCKEDROTOR, which the poll sets
+    /// (ImsMDrivePlusMotorAxis.cpp:484).
+    locked_rotor: Option<(PortHandle, usize)>,
 }
 
 impl ImsMDrivePlusAxis {
@@ -265,6 +266,7 @@ impl ImsMDrivePlusAxis {
             neg_limit_switch: None,
             has_encoder: false,
             homing: false,
+            locked_rotor: None,
         };
         if axis.config_axis(&trace) == AsynStatus::Error {
             trace.print_self(
@@ -276,6 +278,13 @@ impl ImsMDrivePlusAxis {
         }
         axis.read_home_and_limit_config();
         axis
+    }
+
+    /// Set IMS_LOCKEDROTOR on the controller port `port` from each poll.
+    pub fn post_locked_rotor_to(&mut self, port: PortHandle) -> AsynResult<()> {
+        let io = SyncIOHandle::from_handle(port.clone(), 0, IS_READ_TIMEOUT);
+        self.locked_rotor = Some((port, io.drv_user_create("IMS_LOCKEDROTOR")?));
+        Ok(())
     }
 
     fn framed(&self, cmd: &str) -> Vec<u8> {
@@ -597,6 +606,11 @@ impl AsynMotor for ImsMDrivePlusAxis {
         // slip/stall has a MotorStatus field, so both fold into slip_stall.
         let stall = atoi(&self.write_read("PR ST")?) > 0;
         let encoder_position = atof(&self.write_read("PR C2")?);
+        let locked_rotor = atoi(&self.write_read("PR LR")?);
+        if let Some((port, reason)) = &self.locked_rotor {
+            let value = ParamSetValue::new(*reason, 0, ParamValue::Int32(locked_rotor));
+            let _ = port.set_params_and_notify_blocking(0, vec![value]);
+        }
 
         Ok(MotorStatus {
             position,

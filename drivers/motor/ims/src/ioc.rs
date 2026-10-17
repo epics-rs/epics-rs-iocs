@@ -21,7 +21,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string, req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{Controller, asyn_user, model1_device, register_port_with};
+use motor_common::{Controller, asyn_user, model1_device, register_controller_port};
 
 use crate::drv_im483::{
     DrvIm483Axis, IM483PL_NUM_CARDS, IM483SM_NUM_CARDS, Im483Controller, im483pl_probe,
@@ -73,8 +73,12 @@ pub fn ims_create_controller_command() -> CommandDef {
             set_eos_ignored(&handle, INPUT_EOS, OUTPUT_EOS);
             let line = ImsLine::new(handle, device_name);
             // The port C's constructor builds first; it needs the line here.
-            register_port_with(ctx, &motor_port, 1, ImsParams::new(line.clone()))?;
-            let axis = ImsMDrivePlusAxis::new(line, &motor_port);
+            let owner = ctx.db().scan_control().interrupt_gate();
+            let port =
+                register_controller_port(owner, &motor_port, 1, ImsParams::new(line.clone()))?;
+            let mut axis = ImsMDrivePlusAxis::new(line, &motor_port);
+            axis.post_locked_rotor_to(port)
+                .map_err(|e| format!("ImsMDrivePlusCreateController: {e}"))?;
 
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             // C startPoller, ImsMDrivePlusMotorController.cpp:101
@@ -365,6 +369,8 @@ mod extra_params {
         let (rig, _io) = LineRig::new(line, |last| {
             if last.contains("PR VR") {
                 "1.000".into()
+            } else if last.contains("PR LR") {
+                "1".into()
             } else {
                 "0".into()
             }
@@ -416,5 +422,21 @@ mod extra_params {
         io.write_int32(clear, 1).unwrap();
         assert_eq!(not_polled(line.sent()), ["ACF"]);
         assert_eq!(io.read_int32(clear).unwrap(), 1);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:479-484: the poll reads `PR LR` after
+    /// `PR C2` into IMS_LOCKEDROTOR.
+    #[epics_rs::base::epics_test]
+    async fn the_poll_reads_the_locked_rotor_flag() {
+        let (line, io) = controller("imsLr", "imsLrLine").await;
+        let locked = io.drv_user_create("IMS_LOCKEDROTOR").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while io.read_int32(locked).unwrap_or(0) != 1 {
+            assert!(std::time::Instant::now() < deadline);
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        let sent = line.sent();
+        let c2 = sent.iter().position(|s| s == "APR C2").unwrap();
+        assert_eq!(sent[c2 + 1], "APR LR", "{sent:?}");
     }
 }
