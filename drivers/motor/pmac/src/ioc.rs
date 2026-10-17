@@ -558,6 +558,7 @@ fn coord_create(
     };
     let system = Arc::new(Mutex::new(PmacCoordSystem::new(
         handle,
+        MotorTrace::new(port, addr),
         cs,
         program,
         POLL_CACHE_TTL,
@@ -752,7 +753,13 @@ mod tests {
     fn step_commands_set_step_size_as_c() {
         let rt = publish_bare("pmacCoordSteps");
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::ZERO);
-        let system = Arc::new(Mutex::new(PmacCoordSystem::new(io, 3, 0, POLL_CACHE_TTL)));
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(
+            io,
+            MotorTrace::default(),
+            3,
+            0,
+            POLL_CACHE_TTL,
+        )));
         COORD_SYSTEMS.lock().unwrap().push(CoordSystem {
             reference: 9103,
             port: "pmacCoordSteps".into(),
@@ -1149,6 +1156,32 @@ mod tests {
         let mut axis = PmacAxis::new(controller, 1);
         let status = axis.poll(&AsynUser::new(0).with_addr(1)).unwrap();
         assert!(status.powered && !status.problem);
+    }
+
+    /// pmacAsynCoord.c:532-543: home and jog print their refusal on the
+    /// coordinate system's trace.
+    #[test]
+    fn cs_home_and_jog_print_c_refusals() {
+        let (rt, _rig) = publish_scripted("pmacCsRefuse");
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let trace = MotorTrace::new("pmacCsRefuse", 0);
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(
+            io,
+            trace,
+            2,
+            0,
+            POLL_CACHE_TTL,
+        )));
+        let mut axis = PmacCsAxis::new(system, 1).unwrap();
+        let own = TraceCapture::on("pmacCsRefuse");
+        let user = AsynUser::new(0);
+        assert!(axis.home(&user, 0.0, 1.0, 1.0, true).is_err());
+        assert!(axis.move_velocity(&user, 0.0, 1.0, 1.0).is_err());
+        assert_eq!(
+            own.take(),
+            "motorAxisHome: not implemented for CS axes\n\
+             motorAxisVelocityMove: not implemented for CS axes\n"
+        );
     }
 
     /// pmacController.cpp:457/463 `%f`: glibc's nan, sign bit included.

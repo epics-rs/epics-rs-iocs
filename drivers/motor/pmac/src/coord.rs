@@ -38,10 +38,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use epics_libcom_rs::cfmt::CFloat;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use crate::controller::{octet_write_read, pmac_err};
 use crate::protocol::{
@@ -91,12 +93,22 @@ pub struct PmacCoordSystem {
     poll_ttl: Duration,
     /// C `motorAxis::stepSize` of each CS axis: EGU per record step.
     step_size: [f64; CS_AXES],
+    /// C `pDrv->pasynUser`'s trace, which every axis's `pasynUser` shares
+    /// (pmacAsynCoord.c:812).
+    trace: MotorTrace,
 }
 
 impl PmacCoordSystem {
-    pub fn new(handle: SyncIOHandle, cs: i32, program: i32, poll_ttl: Duration) -> Self {
+    pub fn new(
+        handle: SyncIOHandle,
+        trace: MotorTrace,
+        cs: i32,
+        program: i32,
+        poll_ttl: Duration,
+    ) -> Self {
         Self {
             handle,
+            trace,
             cs,
             program,
             moves_deferred: false,
@@ -105,6 +117,14 @@ impl PmacCoordSystem {
             poll_ttl,
             step_size: [DEFAULT_STEP_SIZE; CS_AXES],
         }
+    }
+
+    /// C `asynPrint(pAxis->pasynUser, ASYN_TRACE_ERROR, line)`, then the
+    /// error the C function returns.
+    fn refuse(&self, line: &str) -> AsynError {
+        self.trace
+            .print(TraceMask::ERROR, 0, format_args!("{line}\n"));
+        pmac_err(line)
     }
 
     /// C `pAxis->stepSize = 1.0 / stepsPerUnit` for 0-based `axis`, which
@@ -300,9 +320,7 @@ impl AsynMotor for PmacCsAxis {
         _acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
-        Err(pmac_err(
-            "home is not implemented for coordinate-system axes",
-        ))
+        Err(lock(&self.system).refuse("motorAxisHome: not implemented for CS axes"))
     }
 
     /// C `motorAxisVelocityMove`: likewise, no open-ended jog in a CS.
@@ -313,9 +331,7 @@ impl AsynMotor for PmacCsAxis {
         _velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        Err(pmac_err(
-            "jog (velocity move) is not implemented for coordinate-system axes",
-        ))
+        Err(lock(&self.system).refuse("motorAxisVelocityMove: not implemented for CS axes"))
     }
 
     /// C `motorAxisStop`: abort the coordinate system and park the demand on the
@@ -483,7 +499,13 @@ mod tests {
             create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
                 .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        let system = Arc::new(Mutex::new(PmacCoordSystem::new(io, 1, 0, poll_ttl)));
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(
+            io,
+            MotorTrace::new(name, 0),
+            1,
+            0,
+            poll_ttl,
+        )));
         let axis = PmacCsAxis::new(system.clone(), 1).unwrap();
         (axis, system, sent)
     }
