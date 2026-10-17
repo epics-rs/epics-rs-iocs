@@ -333,8 +333,7 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
 struct AgUcRegistration {
     port_name: String,
     controller: Arc<Mutex<AgUcController>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
+    poller: Arc<Controller>,
 }
 
 static AG_UC_CONTROLLERS: Mutex<Vec<AgUcRegistration>> = Mutex::new(Vec::new());
@@ -369,18 +368,20 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
                     "AG_UCController::AG_UCController: cannot connect to Agilis controller"
                 ),
             );
-            let controller = Arc::new(Mutex::new(AgUcController::new(
-                handle,
-                &MotorTrace::new(&port_name, 0),
-            )));
+            let controller = AgUcController::new(handle, &MotorTrace::new(&port_name, 0));
+            // C's constructor returns before startPoller without a model
+            // (AG_UC.cpp:79, :96, :99); the axes created later stay unpolled.
+            let poller = Arc::new(Controller::new());
+            if controller.model().is_some() {
+                poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+            }
             AG_UC_CONTROLLERS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(AgUcRegistration {
                     port_name,
-                    controller,
-                    moving_poll_ms,
-                    idle_poll_ms,
+                    controller: Arc::new(Mutex::new(controller)),
+                    poller,
                 });
             Ok(CommandOutcome::Continue)
         },
@@ -401,16 +402,16 @@ pub fn ag_uc_create_axis_command() -> CommandDef {
         ],
         "AG_UCCreateAxis(controllerPortName, axis, hasLimits, forwardAmplitude, \
          reverseAmplitude)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Controller port name")?;
             let axis = c_int(args, 1);
-            let (controller, moving_poll_ms, idle_poll_ms) = {
+            let (controller, poller) = {
                 let controllers = AG_UC_CONTROLLERS.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(reg) = controllers.iter().find(|r| r.port_name == port_name) else {
                     println!("AG_UCCreateAxis: Error port {port_name} not found");
                     return Ok(CommandOutcome::Continue);
                 };
-                (reg.controller.clone(), reg.moving_poll_ms, reg.idle_poll_ms)
+                (reg.controller.clone(), reg.poller.clone())
             };
             let ax = AgUcAxis::new(
                 controller,
@@ -420,14 +421,7 @@ pub fn ag_uc_create_axis_command() -> CommandDef {
                 c_int(args, 4),
             );
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            install(
-                ctx,
-                asyn_user(&port_name, axis),
-                motor,
-                moving_poll_ms,
-                idle_poll_ms,
-                2, // C startPoller, AG_UC.cpp:99
-            )?;
+            poller.install(asyn_user(&port_name, axis), motor)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1990,6 +1984,45 @@ mod one_poller {
         ];
         let cmd = agap_conex_create_controller_command();
         assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// Run AG_UCCreateController on a line answering VE with `version`, then
+    /// two AG_UCCreateAxis, returning the poller count after each.
+    async fn ag_uc_pollers(prefix: &str, version: &'static str) -> Vec<usize> {
+        let line = format!("{prefix}Line");
+        publish_line(&line, version);
+        let args = vec![
+            ArgValue::String(prefix.into()),
+            ArgValue::String(line.into()),
+            ArgValue::Int(2),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+        ];
+        let mut counts = vec![pollers_after(ag_uc_create_controller_command(), args).await];
+        for axis in 0..2 {
+            let args = vec![
+                ArgValue::String(prefix.into()),
+                ArgValue::Int(axis),
+                ArgValue::Int(0),
+                ArgValue::Int(50),
+                ArgValue::Int(-50),
+            ];
+            counts.push(pollers_after(ag_uc_create_axis_command(), args).await);
+        }
+        counts
+    }
+
+    /// AG_UC.cpp:99: the controller's poller, which every AG_UCCreateAxis
+    /// joins.
+    #[epics_rs::base::epics_test]
+    async fn ag_uc_create_axis_joins_the_controller_poller() {
+        assert_eq!(ag_uc_pollers("agUcOne", "AG-UC8 v1").await, [1, 1, 1]);
+    }
+
+    /// AG_UC.cpp:96: no model, no poller.
+    #[epics_rs::base::epics_test]
+    async fn ag_uc_unknown_model_starts_no_poller() {
+        assert_eq!(ag_uc_pollers("agUcNone", "XX").await, [0, 0, 0]);
     }
 
     /// XPSController.cpp:197: the controller's poller, which every
