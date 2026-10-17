@@ -10,13 +10,6 @@
 #   TIMEOUT   asyn timeout
 #   XSIZE     X profile waveform length
 #   YSIZE     Y profile waveform length
-#
-# The upstream template also redefined $(P)$(R)FileFormat and
-# $(P)$(R)FileFormat_RBV "as defined in NDFile.template", but the Merlin
-# driver has no file plugin and no NDFile.template is loaded against this
-# prefix, so those two blocks created a pair of records with no device
-# support and no writer. They are dropped: $(P)$(R)FileFormat and
-# $(P)$(R)FileFormat_RBV no longer exist.
 
 include "ADBase.template"
 
@@ -52,6 +45,24 @@ record(mbbi,"$(P)$(R)TriggerMode_RBV") {
     field(FRST,"Trigger both rising")
     field(FVVL,"5")
     field(FVST,"Software")
+}
+
+# As in C: no NDFile.template loads on this prefix, so these two are plain
+# soft records carrying only the states (merlin.template:54-68).
+record(mbbo, "$(P)$(R)FileFormat")
+{
+    field(ZRST, "TIFF")
+    field(ZRVL, "0")
+    field(ONST, "Invalid")
+    field(ONVL, "1")
+}
+
+record(mbbi, "$(P)$(R)FileFormat_RBV")
+{
+    field(ZRST, "TIFF")
+    field(ZRVL, "0")
+    field(ONST, "Invalid")
+    field(ONVL, "1")
 }
 
 ###################################################################
