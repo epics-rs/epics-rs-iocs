@@ -15,11 +15,11 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::motor::controller_port::{WriteValue, index};
+use epics_rs::motor::controller_port::index;
 use epics_rs::motor::devices::{
     motor_interface_device, register_motor_interface_device, register_motor_interface_driver,
 };
-use motor_common::drv_motor_asyn::DrvSet;
+use motor_common::drv_motor_asyn::{DrvGet, DrvSet};
 use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_int, req_string};
 use motor_common::model1::c_int;
 pub use motor_common::model2::drv_asyn_motor_configure_command;
@@ -50,10 +50,6 @@ const DRIVER: &str = "motorSim";
 /// motorProcTask has no forced polls.
 pub static MOTOR_SIM: Model2 = Model2::new(DRIVER, 0);
 
-/// `motorAxisLowLimit` / `motorAxisHighLimit` (motor_interface.h:307-308).
-const MOTOR_AXIS_LOW_LIMIT: i32 = 3;
-const MOTOR_AXIS_HIGH_LIMIT: i32 = 4;
-
 /// An axis motorSimCreate built, as its device support, drvMotorAsyn's
 /// writes and its log reach it.
 struct SimAxis<A> {
@@ -61,18 +57,21 @@ struct SimAxis<A> {
     signal: i32,
     motor: Arc<Mutex<A>>,
     setter: Arc<Mutex<dyn DrvSet>>,
+    getter: Arc<dyn DrvGet>,
     log: Arc<AxisLog>,
 }
 
 impl SimAxis<DrvMotorSimAxis> {
     fn new(axis: DrvMotorSimAxis, card: i32, signal: i32) -> Self {
         let log = axis.log();
+        let getter = axis.getter();
         let motor = Arc::new(Mutex::new(axis));
         Self {
             card,
             signal,
             motor: motor.clone(),
             setter: motor,
+            getter,
             log,
         }
     }
@@ -151,18 +150,10 @@ impl SimDriver {
                 Arc::as_ptr(motor)
             );
             if level > 0 {
-                let params = MOTOR_SIM.params(*card, *signal);
-                // C's locals stay 0.0 when getDouble finds no value.
-                let soft = |reason| match params.as_ref().and_then(|p| p.get(reason)) {
-                    Some(WriteValue::Float64(v)) => v,
-                    _ => 0.0,
-                };
-                let soft_limits = (soft(MOTOR_AXIS_LOW_LIMIT), soft(MOTOR_AXIS_HIGH_LIMIT));
                 motor
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .report(&mut out, soft_limits);
-                params.unwrap_or_default().dump(&mut out);
+                    .report(&mut out);
             }
         }
         out
@@ -259,6 +250,7 @@ pub fn motor_sim_create_command() -> CommandDef {
                     driver.poller.clone(),
                 );
                 MOTOR_SIM.set_axis_logs(c, axes.iter().map(|a| a.log.clone()).collect());
+                MOTOR_SIM.set_axis_getters(c, axes.iter().map(|a| a.getter.clone()).collect());
                 MOTOR_SIM.set_axis_setters(c, axes.iter().map(|a| a.setter.clone()).collect());
             }
             Ok(CommandOutcome::Continue)
@@ -787,6 +779,7 @@ mod one_poller {
             card: 0,
             signal: 0,
             motor: counted,
+            getter: unused.getter(),
             setter: Arc::new(Mutex::new(unused)),
             log: Arc::default(),
         };

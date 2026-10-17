@@ -123,6 +123,19 @@ impl Params {
     pub fn force_callback(&self) {
         self.lock().force = true;
     }
+
+    /// C `paramDump`, which a driver's report prints (paramLib.c:299-319).
+    pub fn dump(&self, out: &mut dyn std::fmt::Write) {
+        let vals = self.lock().vals;
+        let _ = writeln!(out, "Number of parameters is: {NUM_PARAMS}");
+        for (i, val) in vals.iter().enumerate() {
+            let _ = match val {
+                Val::Double(v) => writeln!(out, "Parameter {i} is a double, value {v:.6}"),
+                Val::Int(v) => writeln!(out, "Parameter {i} is an integer, value {v}"),
+                Val::Undef => writeln!(out, "Parameter {i} is undefined"),
+            };
+        }
+    }
 }
 
 #[cfg(test)]

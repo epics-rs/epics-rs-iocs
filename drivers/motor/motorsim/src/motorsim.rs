@@ -32,8 +32,9 @@ use epics_rs::asyn::interfaces::motor::{
 };
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use motor_common::drv_motor_asyn::{DrvSet, function};
+use motor_common::drv_motor_asyn::{DrvGet, DrvSet, function};
 use motor_common::model2::AxisLog;
+use motor_common::param_lib::Params;
 
 use crate::route::{Demand, Reroute, Route};
 
@@ -408,6 +409,34 @@ impl Deferral {
     }
 }
 
+/// drvMotorSim's `motorAxisGetInteger`/`motorAxisGetDouble`: the axis'
+/// store, but the driver's deferral for motorAxisDeferMoves
+/// (drvMotorSim.c:221-248).
+pub struct SimGet {
+    params: Params,
+    deferral: Arc<Deferral>,
+}
+
+impl DrvGet for SimGet {
+    fn params(&self) -> &Params {
+        &self.params
+    }
+
+    fn get_integer(&self, function: i32) -> Option<i32> {
+        match function {
+            function::DEFER_MOVES => Some(i32::from(self.deferral.get().0)),
+            _ => self.params.get_integer(function).ok().flatten(),
+        }
+    }
+
+    fn get_double(&self, function: i32) -> Option<f64> {
+        match function {
+            function::DEFER_MOVES => Some(f64::from(u8::from(self.deferral.get().0))),
+            _ => self.params.get_double(function).ok().flatten(),
+        }
+    }
+}
+
 /// An axis of drvMotorSim.c, the model-2 simulator `motorSimCreate` builds
 /// for `DTYP "Motor Simulation"`: the same trajectory as [`MotorSimAxis`],
 /// reported through its motorAxis status bits, where the home sensor is
@@ -421,6 +450,8 @@ pub struct DrvMotorSimAxis {
     deferral: Arc<Deferral>,
     /// The releases of `deferral` this axis has taken up.
     releases: u64,
+    /// `pAxis->params` and the getters over it.
+    get: Arc<SimGet>,
 }
 
 impl DrvMotorSimAxis {
@@ -436,20 +467,27 @@ impl DrvMotorSimAxis {
         deferral: Arc<Deferral>,
     ) -> Self {
         let releases = deferral.get().1;
+        let get = Arc::new(SimGet {
+            params: Params::default(),
+            deferral: deferral.clone(),
+        });
+        // drvMotorSim.c:739.
+        let _ = get.params.set_double(function::POSITION, DEFAULT_START);
         Self {
             axis: MotorSimAxis::new(low_hard_limit, hi_hard_limit, home, DEFAULT_START),
-            writes: vec![StatusWrite::Position(DEFAULT_START)],
+            writes: Vec::new(),
             card,
             signal,
             log: Arc::new(AxisLog::with_own(sim_log)),
             deferral,
             releases,
+            get,
         }
     }
 
     /// The lines C `motorAxisReportAxis` prints for this axis at level 1
-    /// (drvMotorSim.c:136-157), before its paramLib dump.
-    pub fn report(&self, out: &mut dyn std::fmt::Write, (low_soft, hi_soft): (f64, f64)) {
+    /// (drvMotorSim.c:136-158), its soft limits and dump from its paramLib.
+    pub fn report(&self, out: &mut dyn std::fmt::Write) {
         let axis = &self.axis;
         let (next, end) = (axis.nextpoint, axis.endpoint);
         let _ = writeln!(
@@ -467,10 +505,24 @@ impl DrvMotorSimAxis {
             "Hard limits: {:.6}, {:.6}",
             axis.low_hard_limit, axis.hi_hard_limit
         );
+        // C's locals stay 0.0 when getDouble finds no value.
+        let soft = |f| self.params().get_double(f).ok().flatten().unwrap_or(0.0);
+        let (low_soft, hi_soft) = (soft(function::LOW_LIMIT), soft(function::HIGH_LIMIT));
         let _ = writeln!(out, "Soft limits: {low_soft:.6}, {hi_soft:.6}");
         if axis.homing {
             let _ = writeln!(out, "Currently homing axis");
         }
+        self.params().dump(out);
+    }
+
+    /// The axis' getters, which drvAsynMotorConfigure reads and calls back
+    /// through.
+    pub fn getter(&self) -> Arc<SimGet> {
+        self.get.clone()
+    }
+
+    fn params(&self) -> &Params {
+        &self.get.params
     }
 
     /// The axis' `print`/`logParam`, which drvAsynMotorConfigure sets.
@@ -486,6 +538,8 @@ impl DrvMotorSimAxis {
     /// drvMotorSim.c's move, home and velocity move post before returning.
     fn started(&mut self) {
         self.writes.push(StatusWrite::Done(false));
+        let _ = self.params().set_integer(function::DONE, 0);
+        self.params().call_callback();
     }
 
     /// The driver's deferral as of now: a release since the last call
@@ -707,20 +761,29 @@ impl AsynMotor for DrvMotorSimAxis {
         Ok(())
     }
 
+    /// motorProcTask's pass over the axis: motorSimProcess's parameters
+    /// (drvMotorSim.c:646-653), then the callback (:677).
     fn poll(&mut self, user: &AsynUser) -> AsynResult<MotorStatus> {
         self.sync();
         let status = self.axis.poll(user)?;
-        // motorSimProcess's paramLib sets (drvMotorSim.c:646-653).
-        self.writes.extend([
-            StatusWrite::Position(status.position),
-            StatusWrite::EncoderPosition(status.encoder_position),
-            StatusWrite::Direction(status.direction),
-            StatusWrite::Done(status.done),
-            StatusWrite::HighHardLimit(status.high_limit),
-            StatusWrite::HomeSignal(status.encoder_home),
-            StatusWrite::Moving(!status.done),
-            StatusWrite::LowHardLimit(status.low_limit),
-        ]);
+        let params = self.params();
+        for (f, v) in [
+            (function::POSITION, status.position),
+            (function::ENCODER_POSN, status.encoder_position),
+        ] {
+            let _ = params.set_double(f, v);
+        }
+        for (f, v) in [
+            (function::DIRECTION, status.direction),
+            (function::DONE, status.done),
+            (function::HIGH_HARD_LIMIT, status.high_limit),
+            (function::HOME_SIGNAL, status.encoder_home),
+            (function::MOVING, !status.done),
+            (function::LOW_HARD_LIMIT, status.low_limit),
+        ] {
+            let _ = params.set_integer(f, i32::from(v));
+        }
+        params.call_callback();
         Ok(MotorStatus {
             home: status.encoder_home,
             encoder_home: false,
@@ -732,13 +795,36 @@ impl AsynMotor for DrvMotorSimAxis {
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
         std::mem::take(&mut self.writes)
     }
+
+    /// C `motorAxisforceCallback` (drvMotorSim.c:571-579): the next
+    /// callback goes out with nothing changed; the poll the port then
+    /// forces is C's motorProcTask.
+    fn force_callback(&mut self, _user: &AsynUser) {
+        self.params().force_callback();
+    }
 }
 
 /// C `motorAxisSetDouble`/`motorAxisSetInteger` (drvMotorSim.c:292-432):
-/// each function they know prints its FLOW line and succeeds; any other
-/// fails with none.
+/// each function they know prints its FLOW line, goes into the store and
+/// runs the callback; any other fails with none.
 impl DrvSet for DrvMotorSimAxis {
     fn set_double(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+        self.set_double_only(user, function, value)?;
+        let _ = self.params().set_double(function, value);
+        self.params().call_callback();
+        Ok(())
+    }
+
+    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+        self.set_integer_only(user, function, value)?;
+        let _ = self.params().set_integer(function, value);
+        self.params().call_callback();
+        Ok(())
+    }
+}
+
+impl DrvMotorSimAxis {
+    fn set_double_only(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
         match function {
             function::POSITION => self.set_position(user, value),
             function::RESOLUTION => {
@@ -765,7 +851,7 @@ impl DrvSet for DrvMotorSimAxis {
         }
     }
 
-    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+    fn set_integer_only(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
         let what = match function {
             function::POSITION => {
                 self.sync();
@@ -904,26 +990,30 @@ mod tests {
     }
 
     /// drvMotorSim's paramLib sets: Position at create (drvMotorSim.c:739),
-    /// then the eight of each motorSimProcess (:646-653).
+    /// then the eight of each motorSimProcess (:646-653), into the axis'
+    /// store and nowhere else.
     #[test]
     fn drv_motor_sim_sets_its_parameters_at_create_and_each_update() {
         let mut axis = DrvMotorSimAxis::new(0, 0, -10.0, 10.0, 0.0, Arc::default());
-        assert_eq!(axis.take_status_writes(), vec![StatusWrite::Position(0.0)]);
+        let get = axis.getter();
+        assert_eq!(get.get_double(function::POSITION), Some(0.0));
+        assert_eq!(get.get_integer(function::DONE), None);
         axis.axis.process(0.05);
         axis.poll(&user()).unwrap();
-        assert_eq!(
-            axis.take_status_writes(),
-            vec![
-                StatusWrite::Position(0.0),
-                StatusWrite::EncoderPosition(0.0),
-                StatusWrite::Direction(false),
-                StatusWrite::Done(true),
-                StatusWrite::HighHardLimit(false),
-                StatusWrite::HomeSignal(true),
-                StatusWrite::Moving(false),
-                StatusWrite::LowHardLimit(false),
-            ]
-        );
+        assert!(axis.take_status_writes().is_empty());
+        for (f, v) in [(function::POSITION, 0.0), (function::ENCODER_POSN, 0.0)] {
+            assert_eq!(get.get_double(f), Some(v), "{f}");
+        }
+        for (f, v) in [
+            (function::DIRECTION, 0),
+            (function::DONE, 1),
+            (function::HIGH_HARD_LIMIT, 0),
+            (function::HOME_SIGNAL, 1),
+            (function::MOVING, 0),
+            (function::LOW_HARD_LIMIT, 0),
+        ] {
+            assert_eq!(get.get_integer(f), Some(v), "{f}");
+        }
     }
 
     #[test]
@@ -936,7 +1026,6 @@ mod tests {
             0.0,
             Arc::default(),
         );
-        axis.take_status_writes();
         axis.move_velocity(&user(), 0.0, 1.0, 1.0).unwrap();
         assert_eq!(axis.take_status_writes(), vec![StatusWrite::Done(false)]);
         axis.stop(&user(), 1.0).unwrap();
@@ -969,18 +1058,63 @@ mod tests {
         a.set_double(&user(), function::DEFER_MOVES, 0.0).unwrap();
         b.poll(&user()).unwrap();
         assert_eq!(
-            b.take_status_writes()[..3],
-            [
-                StatusWrite::Position(0.0),
-                StatusWrite::Done(false),
-                StatusWrite::Done(false)
-            ]
+            b.take_status_writes(),
+            [StatusWrite::Done(false), StatusWrite::Done(false)]
         );
         let (pos, done) = run_to_done(&mut b.axis, 0.05, 1000);
         assert!(done);
         assert!((pos - 4.0).abs() < 1e-3, "final position {pos}");
         assert!(a.set_integer(&user(), 12, 1).is_err());
         assert!(a.set_double(&user(), function::MOVE_TO_HOME, 1.0).is_err());
+    }
+
+    /// drvMotorSim.c:366-367, 426-427, 646-653, 677: sets and polls go into
+    /// the store and call back what changed; DEFER reads the driver's flag.
+    #[test]
+    fn drv_motor_sim_calls_back_its_parameters() {
+        let mut axis = DrvMotorSimAxis::new(
+            0,
+            0,
+            DEFAULT_LOW_LIMIT,
+            DEFAULT_HI_LIMIT,
+            5.0,
+            Arc::default(),
+        );
+        let get = axis.getter();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = calls.clone();
+        get.params().set_callback(Arc::new(move |changed: &[i32]| {
+            sink.lock().unwrap().push(changed.to_vec());
+        }));
+        axis.set_double(&user(), function::P_GAIN, 0.5).unwrap();
+        axis.set_integer(&user(), function::DEFER_MOVES, 1).unwrap();
+        assert_eq!(get.get_double(function::P_GAIN), Some(0.5));
+        assert_eq!(get.get_integer(function::DEFER_MOVES), Some(1));
+        axis.poll(&user()).unwrap();
+        axis.poll(&user()).unwrap();
+        axis.force_callback(&user());
+        axis.poll(&user()).unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                vec![function::POSITION, function::P_GAIN],
+                vec![function::DEFER_MOVES],
+                vec![
+                    function::ENCODER_POSN,
+                    function::DIRECTION,
+                    function::DONE,
+                    function::HIGH_HARD_LIMIT,
+                    function::HOME_SIGNAL,
+                    function::MOVING,
+                    function::LOW_HARD_LIMIT,
+                ],
+                vec![],
+            ]
+        );
+        assert_eq!(get.get_integer(function::DONE), Some(1));
+        axis.set_integer(&user(), function::DEFER_MOVES, 0).unwrap();
+        axis.move_velocity(&user(), 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(get.get_integer(function::DONE), Some(0));
     }
 
     #[test]
