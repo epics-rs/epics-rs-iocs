@@ -25,7 +25,8 @@
 //! The SmartMotor works natively in encoder counts (`RP` returns counts, `P=`
 //! takes counts) with no resolution scaling, so the asyn-rs motor boundary is
 //! counts: positions pass through with `NINT` rounding, the record's `MRES` is
-//! 1, and its `EGU` is counts.
+//! 1, and its `EGU` is counts. Velocity and acceleration go out times C's
+//! `VCONFAC` / `ACONFAC`, per PID sample.
 //!
 //! ## Deviations from C (documented)
 //!
@@ -68,13 +69,19 @@ const MAX_AXIS: usize = 32;
 /// Address byte of axis 0 in daisy-chain mode (C `SmartMotor_addr[0]`).
 const FIRST_ADDR: u8 = 129;
 
+/// Counts/s to the `V=` scaled counts per PID sample (C `VCONFAC`).
+const VCONFAC: f64 = 16.1063;
+
+/// Counts/s² to the `A=` scaled counts per PID sample² (C `ACONFAC`).
+const ACONFAC: f64 = 3.958322E-3;
+
 /// Minimum acceleration the controller accepts (C forces `A >= 2`).
 const MIN_ACCEL: i32 = 2;
 
-/// Round an acceleration to the controller value, clamped to the minimum the
+/// Scale and round an acceleration to the controller value, clamped to the minimum the
 /// SmartMotor accepts (C overrides `A <= 1` to `2`).
 fn clamped_accel(acceleration: f64) -> i32 {
-    nint(acceleration).max(MIN_ACCEL)
+    nint(acceleration * ACONFAC).max(MIN_ACCEL)
 }
 
 fn smartmotor_err(message: impl Into<String>) -> AsynError {
@@ -240,7 +247,7 @@ impl SmartMotorAxis {
     /// acceleration is clamped to the controller minimum.
     fn program_speeds(ctrl: &SmartMotorController, axis: usize, velocity: f64, acceleration: f64) {
         if velocity > 0.0 {
-            ctrl.send(axis, &format!("V={}", nint(velocity)));
+            ctrl.send(axis, &format!("V={}", nint(velocity * VCONFAC)));
         }
         if acceleration > 0.0 {
             ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)));
@@ -292,7 +299,7 @@ impl AsynMotor for SmartMotorAxis {
     ) -> AsynResult<()> {
         // C JOG: "MV\rV=<v>\rG" — velocity mode, set signed velocity, go.
         let ctrl = self.lock();
-        ctrl.send(self.axis, &format!("MV\rV={}\rG", nint(velocity)));
+        ctrl.send(self.axis, &format!("MV\rV={}\rG", nint(velocity * VCONFAC)));
         Ok(())
     }
 
@@ -421,12 +428,12 @@ mod tests {
 
     #[test]
     fn accel_clamps_to_minimum() {
-        assert_eq!(clamped_accel(1.0), 2); // C overrides A <= 1 to 2
+        assert_eq!(clamped_accel(1.0 / ACONFAC), 2); // C overrides A <= 1 to 2
         assert_eq!(clamped_accel(0.0), 2);
         assert_eq!(clamped_accel(-5.0), 2);
-        assert_eq!(clamped_accel(2.4), 2); // NINT rounds down
-        assert_eq!(clamped_accel(2.5), 3); // NINT rounds up
-        assert_eq!(clamped_accel(100.0), 100);
+        assert_eq!(clamped_accel(2.4 / ACONFAC), 2); // NINT rounds down
+        assert_eq!(clamped_accel(2.6 / ACONFAC), 3); // NINT rounds up
+        assert_eq!(clamped_accel(10_000.0), 40);
     }
 
     /// A daisy chain of one echoing SmartMotor on a port with no EOS support
@@ -585,5 +592,42 @@ mod tests {
         silent.store(true, Ordering::Relaxed);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// devSmartMotor.cc:190-191: V= and A= are counts/s times VCONFAC and
+    /// counts/s² times ACONFAC; a jog's V= too.
+    #[test]
+    fn speeds_scale_per_pid_sample() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let chain = chain("smartScale");
+        let sent = chain.sent.clone();
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("smartScale").unwrap(),
+            chain,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl =
+            SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
+        let mut axis = SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::new(0);
+        sent.lock().unwrap().clear();
+
+        axis.move_absolute(&user, 100.0, 0.0, 1000.0, 10_000.0)
+            .unwrap();
+        axis.move_velocity(&user, 0.0, -1000.0, 0.0).unwrap();
+        let sent: Vec<_> = sent.lock().unwrap().drain(..).collect();
+        assert_eq!(
+            sent,
+            [
+                &b"\x81V=16106"[..],
+                b"\x81A=40",
+                b"\x81P=100",
+                b"\x81G",
+                b"\x81MV\rV=-16106\rG",
+            ]
+        );
     }
 }
