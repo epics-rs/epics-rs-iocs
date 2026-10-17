@@ -38,12 +38,13 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
 
 use motor_common::util::{atof, atoi};
 
-use crate::smc::{SmcMembers, SmcState, travel_limits};
+use crate::smc::{SmcMembers, SmcState, trace_move_velocity, travel_limits};
 
 /// Response buffer size.
 const READ_BUF: usize = 128;
@@ -137,12 +138,18 @@ pub struct CorvusAxis {
     /// the jog targets.
     high_limit: f64,
     low_limit: f64,
+    /// C's `pasynUser_`, which the axis's lines print on.
+    trace: MotorTrace,
 }
 
 impl CorvusAxis {
     /// Construct axis `axis_no` (0-based) and read its pitch, pole pairs,
     /// closed-loop period and travel limits as C's constructor does.
-    pub fn new(controller: Arc<Mutex<CorvusController>>, axis_no: usize) -> AsynResult<Self> {
+    pub fn new(
+        controller: Arc<Mutex<CorvusController>>,
+        axis_no: usize,
+        port: &str,
+    ) -> AsynResult<Self> {
         let (num_axes, members) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             if axis_no >= ctrl.num_axes {
@@ -178,6 +185,7 @@ impl CorvusAxis {
             controller,
             members: Arc::new(members),
             num_axes,
+            trace: MotorTrace::new(port, axis_no as i32),
             last_status: MotorStatus::default(),
             high_limit: 0.0,
             low_limit: 0.0,
@@ -272,10 +280,17 @@ impl AsynMotor for CorvusAxis {
     fn move_velocity(
         &mut self,
         _user: &AsynUser,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        trace_move_velocity(
+            &self.trace,
+            "SMCcorvusAxis::moveVelocity",
+            min_velocity,
+            velocity,
+            acceleration,
+        );
         let ctrl = self.lock();
         // No reliable jog on the corvus — move to the record's soft limit.
         let target = if velocity > 0.0 {
@@ -406,6 +421,28 @@ impl CorvusAxis {
 mod tests {
     use super::*;
 
+    /// C `SMCcorvusAxis::moveVelocity`'s FLOW line, on the axis's
+    /// `pasynUser_` (SMCcorvusDriver.cpp:304-306).
+    #[test]
+    fn a_velocity_move_is_traced() {
+        use epics_rs::asyn::trace::TraceMask;
+        use motor_common::testing::LineRig;
+        let (_line, handle) = LineRig::new("corvusTraceLine", |_| "0".into());
+        let controller = Arc::new(Mutex::new(CorvusController::new(handle, 1)));
+        let mut axis = CorvusAxis::new(controller, 0, "corvusTrace").unwrap();
+        let lines = crate::smc::trace_lines("corvusTrace", TraceMask::FLOW, || {
+            axis.move_velocity(&AsynUser::default(), 1.0, -2.0, 4.0)
+                .unwrap();
+        });
+        assert_eq!(
+            lines,
+            [
+                "SMCcorvusAxis::moveVelocity: baseVelocity=1.000000, slewVelocity=-2.000000, \
+              acceleration=4.000000"
+            ]
+        );
+    }
+
     /// Refuses `sv` and `sa`, answers `pos`; records every write.
     struct SettingsRefused {
         base: epics_rs::asyn::port::PortDriverBase,
@@ -475,6 +512,7 @@ mod tests {
                 }),
             }),
             num_axes: 2,
+            trace: MotorTrace::default(),
             last_status: MotorStatus::default(),
             high_limit: 10.0,
             low_limit: -10.0,

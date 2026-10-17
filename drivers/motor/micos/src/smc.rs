@@ -4,11 +4,59 @@
 use std::sync::{Mutex, MutexGuard};
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::asyn::trace::TraceMask;
+use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::AxisReport;
 
 /// Switch-config bit that disables (masks) a limit switch.
 const SWITCH_IGNORE: i32 = 0x2;
+
+/// C's `moveVelocity` FLOW line, on the axis's `pasynUser_`.
+pub(crate) fn trace_move_velocity(
+    trace: &MotorTrace,
+    function: &str,
+    base: f64,
+    slew: f64,
+    accel: f64,
+) {
+    trace.print(
+        TraceMask::FLOW,
+        0,
+        format_args!(
+            "{function}: baseVelocity={}, slewVelocity={}, acceleration={}\n",
+            CFloat(base),
+            CFloat(slew),
+            CFloat(accel)
+        ),
+    );
+}
+
+/// The hydra and Taurus poll's lines on the `nst` bits
+/// (SMChydraAxis.cpp:283-320, SMCTaurusAxis.cpp:273-300).
+pub(crate) fn trace_axis_status(trace: &MotorTrace, function: &str, axis_no: usize, status: i32) {
+    let axis = axis_no + 1;
+    for (bit, what) in [
+        (0x40, "limit indicator active"),
+        (0x80, "emergency stopped"),
+        (0x200, "emergency stop switch active"),
+    ] {
+        if status & bit != 0 {
+            trace.print(
+                TraceMask::IO_DRIVER,
+                0,
+                format_args!("{function}: axis {axis} {what}.\n"),
+            );
+        }
+    }
+    if status & 0x400 != 0 {
+        trace.print(
+            TraceMask::ERROR,
+            0,
+            format_args!("{function}: axis {axis} device is busy - move commands discarded.\n"),
+        );
+    }
+}
 
 /// The C members an SMC axis's `report` prints, which it reads while a
 /// poller may hold the driver: their one home, behind their own lock. A
@@ -109,6 +157,29 @@ fn limit_config(reply: &str, (low, high): (i32, i32)) -> (i32, i32) {
         .map_while(|tok| tok.parse::<i32>().ok());
     let low = values.next().unwrap_or(low);
     (low, values.next().unwrap_or(high))
+}
+
+/// The lines `run` prints on port `port` under `mask`, less asynPrint's
+/// timestamp.
+#[cfg(test)]
+pub(crate) fn trace_lines(port: &str, mask: TraceMask, run: impl FnOnce()) -> Vec<String> {
+    use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::trace::TraceFile;
+    use std::sync::Arc;
+    let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+    let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+    let manager = PortManager::global();
+    let trace = manager.trace_manager();
+    trace.set_trace_mask(Some(port), mask);
+    trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+    trace.set_device_trace_file(port, 0, TraceFile::File(file));
+    run();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    text.lines()
+        .filter_map(|l| l.splitn(3, ' ').nth(2))
+        .map(str::to_owned)
+        .collect()
 }
 
 #[cfg(test)]

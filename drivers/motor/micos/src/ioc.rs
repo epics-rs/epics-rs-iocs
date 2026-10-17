@@ -324,7 +324,7 @@ pub fn corvus_create_controller_command() -> CommandDef {
             // C startPoller, SMCcorvusDriver.cpp:58
             let poller = Controller::new();
             for index in 0..num_axes as usize {
-                let ax = CorvusAxis::new(controller.clone(), index)
+                let ax = CorvusAxis::new(controller.clone(), index, &port_name)
                     .map_err(|e| format!("SMCcorvusCreateController: axis {index}: {e}"))?;
                 let report = ax.members();
                 let ax = Arc::new(Mutex::new(ax));
@@ -392,7 +392,7 @@ pub fn hydra_create_controller_command() -> CommandDef {
             // C startPoller, SMChydraDriver.cpp:60
             let poller = Controller::new();
             for (index, mode) in modes.into_iter().enumerate() {
-                let axis = HydraAxis::new(controller.clone(), index, mode);
+                let axis = HydraAxis::new(controller.clone(), index, mode, &port_name);
                 let report = axis.members();
                 let ax = Arc::new(Mutex::new(axis));
                 register_resolution_axis(&port_name, ax.clone());
@@ -462,7 +462,7 @@ pub fn taurus_create_controller_command() -> CommandDef {
             // C startPoller, SMCTaurusDriver.cpp:41
             let poller = Controller::new();
             for index in 0..num_axes as usize {
-                let axis = TaurusAxis::new(controller.clone(), index);
+                let axis = TaurusAxis::new(controller.clone(), index, &port_name);
                 let report = axis.members();
                 let ax = Arc::new(Mutex::new(axis));
                 register_resolution_axis(&port_name, ax.clone());
