@@ -2383,7 +2383,7 @@ async fn publish_hst_arrays(ctx: &Ctx, locking: Locking, a: HstArrays, output: S
         output,
     )
     .await;
-    if let Ok(mut array) = ctx.pool.wrap(dims(), data) {
+    if let Ok(mut array) = ctx.pool.alloc_with(dims(), data) {
         ctx.attributes_as(locking, &mut array).await;
         add_time_attributes(&mut array, &a.time_ms);
         let saturated = Accum::PrvHst.saturated(&ctx.shared);
@@ -2391,13 +2391,16 @@ async fn publish_hst_arrays(ctx: &Ctx, locking: Locking, a: HstArrays, output: S
         ctx.publish_at(5, array, time_stamp).await;
     }
 
-    if let Ok(mut array) = ctx.pool.wrap(dims(), NDDataBuffer::F64(a.time_ms.clone())) {
+    if let Ok(mut array) = ctx
+        .pool
+        .alloc_with(dims(), NDDataBuffer::F64(a.time_ms.clone()))
+    {
         ctx.attributes_as(locking, &mut array).await;
         ctx.publish_at(7, array, time_stamp).await;
     }
 
     if let Some(current) = a.current.filter(|c| c.len() == bins)
-        && let Ok(mut array) = ctx.pool.wrap(dims(), NDDataBuffer::U32(current))
+        && let Ok(mut array) = ctx.pool.alloc_with(dims(), NDDataBuffer::U32(current))
     {
         ctx.attributes_as(locking, &mut array).await;
         add_range_attributes(&mut array, "uint32", "counts", false);
@@ -2414,7 +2417,7 @@ async fn publish_hst_arrays(ctx: &Ctx, locking: Locking, a: HstArrays, output: S
             output,
         )
         .await;
-        if let Ok(mut array) = ctx.pool.wrap(dims(), data) {
+        if let Ok(mut array) = ctx.pool.alloc_with(dims(), data) {
             ctx.attributes_as(locking, &mut array).await;
             add_time_attributes(&mut array, &a.time_ms);
             let saturated = Accum::PrvHst.saturated(&ctx.shared);
@@ -2471,7 +2474,7 @@ async fn publish_img_sum(
     sum: Vec<u64>,
     unique_id: i32,
 ) {
-    let Ok(mut array) = ctx.pool.wrap(
+    let Ok(mut array) = ctx.pool.alloc_with(
         vec![NDDimension::new(width), NDDimension::new(height)],
         NDDataBuffer::U64(sum),
     ) else {
@@ -2524,7 +2527,7 @@ async fn push_processed_img(ctx: &Ctx) {
         output,
     )
     .await;
-    if let Ok(mut array) = ctx.pool.wrap(dims(), data) {
+    if let Ok(mut array) = ctx.pool.alloc_with(dims(), data) {
         let _ = ctx.pool.owner().get_attributes(&mut array).await;
         let saturated = Accum::Img.saturated(&ctx.shared);
         add_range_attributes(&mut array, range, units, saturated);
@@ -2542,7 +2545,7 @@ async fn push_processed_img(ctx: &Ctx) {
             output,
         )
         .await;
-        if let Ok(mut array) = ctx.pool.wrap(dims(), data) {
+        if let Ok(mut array) = ctx.pool.alloc_with(dims(), data) {
             let _ = ctx.pool.owner().get_attributes(&mut array).await;
             let saturated = Accum::Img.saturated(&ctx.shared);
             add_range_attributes(&mut array, range, units, saturated);
@@ -2599,7 +2602,7 @@ fn image_array(
         PixelFormat::UInt16 => NDDataBuffer::U16(pixels.into_iter().map(|p| p as u16).collect()),
         PixelFormat::UInt32 => NDDataBuffer::U32(pixels),
     };
-    let array = ctx.pool.wrap(
+    let array = ctx.pool.alloc_with(
         vec![NDDimension::new(f.width), NDDimension::new(f.height)],
         data,
     );
@@ -4599,5 +4602,25 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         assert!(polled());
+    }
+
+    /// serval_stream.cpp:177-183 allocates the frame with a NULL pData, so a
+    /// frame over the pool's maxMemory is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_over_the_pool_limit_is_refused() {
+        let mut ctx = idle_ctx("TPX3_POOL_LIMIT");
+        ctx.pool = DriverPool::standalone(8);
+        let frame = crate::stream::ImageFrame {
+            width: 2,
+            height: 2,
+            format: crate::stream::PixelFormat::UInt32,
+            frame_number: 1,
+            time_at_frame: 0.0,
+            threshold_id: 0,
+            integration_size: 0,
+            pixels: Vec::new(),
+            header: serde_json::Value::Null,
+        };
+        assert!(image_array(&ctx, &frame, vec![1; 4], "refused\n").is_none());
     }
 }
