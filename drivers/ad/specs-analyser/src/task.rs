@@ -826,7 +826,7 @@ impl Worker {
         // C dereferences a refused alloc unchecked (specsAnalyser.cpp:454, :493);
         // here the frame is dropped after the pool's limit line.
         if array_callbacks != 0
-            && let Ok(mut array) = self.pool.wrap(
+            && let Ok(mut array) = self.pool.alloc_with(
                 vec![NDDimension::new(nx), NDDimension::new(ny)],
                 NDDataBuffer::F64(image),
             )
