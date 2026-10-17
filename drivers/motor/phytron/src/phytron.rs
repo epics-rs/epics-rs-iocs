@@ -1033,7 +1033,7 @@ impl AsynMotor for PhytronAxis {
             home: (status & 0x40) != 0,
             encoder_home: (status & 0x08) != 0,
             homed: (status & 0x08) != 0,
-            slip_stall: (status & 0x4000) != 0,
+            slip: (status & 0x4000) != 0,
             problem,
             has_encoder: true,
             ..Default::default()
@@ -1160,11 +1160,12 @@ mod tests {
 
     /// An MCC that ACKs every command, answering `P22R` with 1000 and the
     /// rest of a poll with an idle, fault-free axis; records each command
-    /// payload.
+    /// payload. As a phyMOTION (`crc`) its `SE` status word is `0x4000`.
     struct Mcc {
         base: epics_rs::asyn::port::PortDriverBase,
         written: Arc<Mutex<Vec<String>>>,
         reply: Vec<u8>,
+        crc: bool,
     }
 
     impl epics_rs::asyn::port::PortDriver for Mcc {
@@ -1175,8 +1176,11 @@ mod tests {
             &mut self.base
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-            let cmd = String::from_utf8_lossy(&data[2..data.len() - 1]).into_owned();
+            // STX, address, then `:` and the CRC on a phyMOTION, ETX.
+            let tail = if self.crc { 4 } else { 1 };
+            let cmd = String::from_utf8_lossy(&data[2..data.len() - tail]).into_owned();
             let payload: &[u8] = match cmd.as_str() {
+                c if self.crc && c.starts_with("SE") => b"16384",
                 c if c.ends_with("P22R") => b"1000",
                 c if c.ends_with("P20R") || c.ends_with("=E") => b"0",
                 c if c.ends_with("=H") => b"E",
@@ -1205,6 +1209,7 @@ mod tests {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             written: written.clone(),
             reply: Vec::new(),
+            crc: false,
         };
         let (rt, _actor) =
             create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
@@ -1240,6 +1245,7 @@ mod tests {
             base: PortDriverBase::new("phytronEncoderPoll", 1, PortFlags::default()),
             written: Arc::new(Mutex::new(Vec::new())),
             reply: Vec::new(),
+            crc: false,
         };
         let (rt, _actor) = create_port_runtime(
             &claim_port("phytronEncoderPoll").unwrap(),
@@ -1261,6 +1267,38 @@ mod tests {
             .reset("phytronEncoderPoll", 0)
             .unwrap();
         assert_eq!(axis.poll(&user).unwrap().encoder_position, 1000.0);
+    }
+
+    /// phytronAxisMotor.cpp:2083: status bit 0x4000 is motorStatusSlip_,
+    /// MSTA bit 4, not the following error.
+    #[test]
+    fn status_bit_0x4000_is_slip() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = Mcc {
+            base: PortDriverBase::new("phytronSlip", 1, PortFlags::default()),
+            written: Arc::new(Mutex::new(Vec::new())),
+            reply: Vec::new(),
+            crc: true,
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("phytronSlip").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let controller = Arc::new(Mutex::new(PhytronController::new(
+            io,
+            CtrlType::Phymotion,
+            0,
+        )));
+        let mut axis = PhytronAxis::new(controller, 1, 1).unwrap();
+        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        assert!(status.slip);
+        assert!(!status.slip_stall);
     }
 
     #[test]
