@@ -780,8 +780,8 @@ impl ImsMDrivePlusAxis {
 
         // On the falling edge of a home move, latch R1 = 1 (homed).
         if self.homing && !moving {
-            self.write_only("R1=1")?;
             self.homing = false;
+            self.write_only("R1=1")?;
         }
 
         // Home / limit switch inputs (only those configured on this drive).
@@ -1192,6 +1192,26 @@ mod tests {
             own("poll(): POS=0.000000, MSTAT=514"),
         ]);
         assert_eq!(lines, want);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:427-432: the homed latch is dropped
+    /// before its `R1=1` is written, so a failed write is not retried.
+    #[test]
+    fn a_failed_homed_latch_write_is_not_retried() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dead = Arc::new(AtomicBool::new(true));
+        let fails = {
+            let dead = dead.clone();
+            move |l: &str| l == "R1=1" && dead.load(Ordering::Relaxed)
+        };
+        let (sent, _) = axis_error_lines("imsLatch", "imsLatchLine", fails, |axis| {
+            let user = AsynUser::new(0);
+            axis.home(&user, 0.0, 50.0, 0.0, true).unwrap();
+            assert!(axis.poll(&user).is_err());
+            dead.store(false, Ordering::Relaxed);
+            axis.poll(&user).unwrap();
+        });
+        assert_eq!(sent.iter().filter(|s| *s == "R1=1").count(), 1, "{sent:?}");
     }
 
     /// ImsMDrivePlusMotorAxis.cpp:407-427, 486-503: a poll that bails keeps
