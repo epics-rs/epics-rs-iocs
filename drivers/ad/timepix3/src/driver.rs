@@ -823,9 +823,11 @@ impl TimePix3Driver {
             }
         }
 
-        let reply = self
-            .http
-            .put_json(serval::DETECTOR_CONFIG, &body, DEFAULT_TIMEOUT);
+        let reply = self.http.put_json(
+            serval::DETECTOR_CONFIG,
+            &serval::dump(&body, None, false),
+            DEFAULT_TIMEOUT,
+        );
         // serval_http.cpp:2626-2648.
         let code = reply.as_ref().map_or_else(HttpError::code, |_| 200);
         self.ad.port_base.set_int32_param(p.http_code, 0, code)?;
@@ -940,10 +942,11 @@ impl TimePix3Driver {
         };
         let body = serval::measurement_config_body(&current, &cfg);
         // WriteMsg is the PUT's reply body, accepted or not (serval_http.cpp:2308-2309).
-        let e = match self
-            .http
-            .put_json(serval::MEASUREMENT_CONFIG, &body, DEFAULT_TIMEOUT)
-        {
+        let e = match self.http.put_json(
+            serval::MEASUREMENT_CONFIG,
+            &serval::dump(&body, None, false),
+            DEFAULT_TIMEOUT,
+        ) {
             Ok(reply) => {
                 self.http_ok();
                 return self.set_text(self.p.write_msg, &reply);
@@ -1350,10 +1353,12 @@ impl TimePix3Driver {
             return Ok(());
         }
         // C `sendConfiguration` (serval_http.cpp:2172-2190).
-        println!("server={}", serval::dump_indent3_ascii(&server));
-        let reply = self
-            .http
-            .put_json(serval::SERVER_DESTINATION, &server, DEFAULT_TIMEOUT);
+        println!("server={}", serval::dump(&server, Some(3), true));
+        let reply = self.http.put_json(
+            serval::SERVER_DESTINATION,
+            &serval::dump(&server, None, false),
+            DEFAULT_TIMEOUT,
+        );
         // serval_http.cpp:2182-2183.
         self.write_msg_from(&reply);
         reply.map_err(|e| {
@@ -1490,7 +1495,9 @@ impl TimePix3Driver {
             }
         };
 
-        let reply = self.http.put_json(&path, &dacs, DEFAULT_TIMEOUT);
+        let reply = self
+            .http
+            .put_json(&path, &serval::dump(&dacs, Some(3), true), DEFAULT_TIMEOUT);
         let e = match reply {
             Ok(text) => {
                 let base = &mut self.ad.port_base;
@@ -3715,6 +3722,14 @@ mod tests {
     /// A Serval that answers every request `200 {}` and reports each
     /// request line and body.
     fn capturing_serval() -> (String, std::sync::mpsc::Receiver<(String, String)>) {
+        capturing_serval_with(&[])
+    }
+
+    /// [`capturing_serval`] answering a request line that starts with a
+    /// route's prefix with that route's body.
+    fn capturing_serval_with(
+        routes: &'static [(&'static str, &'static str)],
+    ) -> (String, std::sync::mpsc::Receiver<(String, String)>) {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -3737,13 +3752,66 @@ mod tests {
                 }
                 let mut body = vec![0; length];
                 let _ = reader.read_exact(&mut body);
+                let reply = routes
+                    .iter()
+                    .find(|(prefix, _)| request.starts_with(prefix))
+                    .map_or("{}", |(_, body)| body);
                 let _ = tx.send((request, String::from_utf8_lossy(&body).into_owned()));
                 let _ = reader.get_mut().write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .as_bytes(),
                 );
             }
         });
         (url, rx)
+    }
+
+    /// Each PUT body is the text of C's dump call: writeDac's
+    /// `dump(3, ' ', true)` and fileWriter's compact `dump()`, keys sorted as
+    /// nlohmann's std::map holds them (serval_http.cpp:619, 2180).
+    #[test]
+    fn put_bodies_are_nlohmann_dumps() {
+        let (url, rx) = capturing_serval_with(&[(
+            "GET /detector/chips/0/dacs/ ",
+            r#"{"Vthreshold_fine": 7, "Ibias": 1.5e-5, "Name": "d\u00e9"}"#,
+        )]);
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            "TPX_PUT_DUMP",
+            Arc::new(ServalHttp::new(&url)),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let b = &mut det.ad.port_base;
+        b.set_int32_param(p.vthreshold_fine, 0, 7).unwrap();
+        b.set_string_param(p.raw1_base, 0, "file:/data").unwrap();
+        b.set_int32_param(p.write_raw1, 0, 1).unwrap();
+        det.write_int32(&mut AsynUser::new(p.vthreshold_fine).with_addr(0), 300)
+            .unwrap();
+        det.file_writer().unwrap();
+        let puts: Vec<_> = rx
+            .try_iter()
+            .filter(|(line, _)| line.starts_with("PUT "))
+            .collect();
+        assert_eq!(
+            puts[0],
+            (
+                "PUT /detector/chips/0/dacs/ HTTP/1.1\r\n".to_owned(),
+                "{\n   \"Ibias\": 1.5e-05,\n   \"Name\": \"d\\u00e9\",\n   \"Vthreshold_fine\": 300\n}"
+                    .to_owned()
+            )
+        );
+        assert_eq!(puts[1].0, "PUT /server/destination HTTP/1.1\r\n");
+        let body = &puts[1].1;
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(*body, serval::dump(&parsed, None, false));
+        assert!(body.contains(r#"[null,{"Base":"file:/data","#), "{body}");
     }
 
     /// fileWriter fills each channel at its own index, sends nothing when no

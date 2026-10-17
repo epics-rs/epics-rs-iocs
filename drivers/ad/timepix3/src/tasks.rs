@@ -635,7 +635,7 @@ fn measurement_status(p: TimePixParams, status: &Value, updates: &mut Vec<ParamS
     let (text, index) = match status {
         Value::Null => (String::new(), -1),
         Value::String(s) => (s.clone(), pipeline_state_index(s)),
-        other => (other.to_string(), -1),
+        other => (serval::dump(other, None, false), -1),
     };
     updates.push(ParamSetValue::new(
         p.status,

@@ -6,8 +6,6 @@
 
 use std::time::Duration;
 
-use serde_json::Value;
-
 /// C `kDefaultTimeoutMs` (serval_http.h:18), what a helper call without a
 /// timeout argument gets.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(10000);
@@ -174,10 +172,10 @@ impl ServalHttp {
         Ok(body)
     }
 
-    /// PUT a JSON body, returning the reply body.
-    pub fn put_json(&self, path: &str, body: &Value, timeout: Duration) -> HttpResult<String> {
+    /// C `putJson`: PUT `body`, already dumped as the caller's C `dump` call
+    /// lays it out, returning the reply body.
+    pub fn put_json(&self, path: &str, body: &str, timeout: Duration) -> HttpResult<String> {
         let url = format!("{}{path}", self.base);
-        let text = body.to_string();
         let mut req = self
             .agent
             .put(&url)
@@ -189,7 +187,7 @@ impl ServalHttp {
             .config()
             .timeout_global(Some(timeout))
             .build()
-            .send(&text)
+            .send(body)
             .map_err(|e| HttpError::Transport(format!("PUT {url}: {e}")))?;
         let code = resp.status().as_u16();
         let reply = resp
@@ -351,13 +349,10 @@ mod tests {
         let timeout = Duration::from_secs(5);
         let with = ServalHttp::with_credentials(&url, Some(("u".into(), "p".into())));
         with.get("/a", timeout).unwrap();
-        with.put_json("/b", &serde_json::json!({}), timeout)
-            .unwrap();
+        with.put_json("/b", "{}", timeout).unwrap();
         let without = ServalHttp::with_credentials(&url, None);
         without.get("/a", timeout).unwrap();
-        without
-            .put_json("/b", &serde_json::json!({}), timeout)
-            .unwrap();
+        without.put_json("/b", "{}", timeout).unwrap();
         let seen: Vec<_> = rx.iter().take(4).collect();
         let basic = Some(basic_auth_header("u", "p"));
         assert_eq!(seen, [basic.clone(), basic, None, None]);
@@ -405,8 +400,7 @@ mod tests {
         http.get("", DEFAULT_TIMEOUT).unwrap();
         http.get_auth_only("/b?x=1", DEFAULT_TIMEOUT).unwrap();
         http.get_json("/c", DEFAULT_TIMEOUT).unwrap();
-        http.put_json("/d", &serde_json::json!({}), DEFAULT_TIMEOUT)
-            .unwrap();
+        http.put_json("/d", "{}", DEFAULT_TIMEOUT).unwrap();
         let seen: Vec<_> = rx.iter().take(5).collect();
         let accept = "accept: */*".to_owned();
         let json = "content-type: application/json".to_owned();

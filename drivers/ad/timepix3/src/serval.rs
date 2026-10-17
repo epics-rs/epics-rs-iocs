@@ -1113,31 +1113,137 @@ pub fn parse_config_readback(body: &str) -> Result<ConfigSnapshot, ConfigReadbac
     Ok(snapshot)
 }
 
-/// nlohmann `dump(3, ' ', true)`: three-space indent, every non-ASCII
-/// character escaped as `\uXXXX` UTF-16 units.
-pub fn dump_indent3_ascii(v: &Value) -> String {
-    // serde_json indents by two; a string's newline is escaped, so every
-    // leading run of spaces is indentation.
-    let pretty = serde_json::to_string_pretty(v).expect("a Value always serialises");
-    let text = pretty
-        .lines()
-        .map(|line| {
-            let body = line.trim_start_matches(' ');
-            format!("{}{body}", " ".repeat((line.len() - body.len()) / 2 * 3))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut ascii = String::with_capacity(text.len());
-    for c in text.chars() {
-        if c.is_ascii() {
-            ascii.push(c);
-        } else {
-            for unit in c.encode_utf16(&mut [0; 2]) {
-                ascii.push_str(&format!("\\u{unit:04x}"));
+/// nlohmann `json::dump(indent, ' ', ensure_ascii)`: `None` is the compact
+/// `dump()`. Keys sort bytewise as nlohmann's `std::map` holds them, whatever
+/// order the `Value` was built in.
+pub fn dump(v: &Value, indent: Option<usize>, ensure_ascii: bool) -> String {
+    let mut out = String::new();
+    dump_into(&mut out, v, indent, ensure_ascii, 0);
+    out
+}
+
+fn dump_into(out: &mut String, v: &Value, indent: Option<usize>, ascii: bool, depth: usize) {
+    let open = |out: &mut String, bracket: char, depth: usize| {
+        out.push(bracket);
+        if let Some(step) = indent {
+            out.push('\n');
+            out.push_str(&" ".repeat(step * (depth + 1)));
+        }
+    };
+    let next = |out: &mut String, depth: usize| {
+        out.push(',');
+        if let Some(step) = indent {
+            out.push('\n');
+            out.push_str(&" ".repeat(step * (depth + 1)));
+        }
+    };
+    let close = |out: &mut String, bracket: char, depth: usize| {
+        if let Some(step) = indent {
+            out.push('\n');
+            out.push_str(&" ".repeat(step * depth));
+        }
+        out.push(bracket);
+    };
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => match n.as_f64().filter(|_| n.is_f64()) {
+            Some(d) => dump_double(out, d),
+            None => out.push_str(&n.to_string()),
+        },
+        Value::String(text) => dump_string(out, text, ascii),
+        Value::Array(items) if items.is_empty() => out.push_str("[]"),
+        Value::Array(items) => {
+            open(out, '[', depth);
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    next(out, depth);
+                }
+                dump_into(out, item, indent, ascii, depth + 1);
             }
+            close(out, ']', depth);
+        }
+        Value::Object(map) if map.is_empty() => out.push_str("{}"),
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            open(out, '{', depth);
+            for (i, (key, item)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    next(out, depth);
+                }
+                dump_string(out, key, ascii);
+                out.push_str(if indent.is_some() { ": " } else { ":" });
+                dump_into(out, item, indent, ascii, depth + 1);
+            }
+            close(out, '}', depth);
         }
     }
-    ascii
+}
+
+/// nlohmann `serializer::dump_escaped`.
+fn dump_string(out: &mut String, text: &str, ascii: bool) {
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if u32::from(c) <= 0x1f || (ascii && u32::from(c) >= 0x7f) => {
+                for unit in c.encode_utf16(&mut [0; 2]) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// nlohmann `serializer::dump_float`: the shortest round-trip digits, laid
+/// out by `dtoa_impl::format_buffer` (min_exp -4, max_exp 15).
+fn dump_double(out: &mut String, d: f64) {
+    if !d.is_finite() {
+        out.push_str("null");
+        return;
+    }
+    if d.is_sign_negative() {
+        out.push('-');
+    }
+    if d == 0.0 {
+        out.push_str("0.0");
+        return;
+    }
+    let sci = format!("{:e}", d.abs());
+    let (mantissa, exponent) = sci.split_once('e').expect("{:e} has an exponent");
+    let digits: String = mantissa.chars().filter(|&c| c != '.').collect();
+    let k = digits.len() as i32;
+    let n = exponent.parse::<i32>().expect("{:e} exponent") + 1;
+    if k <= n && n <= 15 {
+        out.push_str(&digits);
+        out.push_str(&"0".repeat((n - k) as usize));
+        out.push_str(".0");
+    } else if 0 < n && n <= 15 {
+        out.push_str(&digits[..n as usize]);
+        out.push('.');
+        out.push_str(&digits[n as usize..]);
+    } else if -4 < n && n <= 0 {
+        out.push_str("0.");
+        out.push_str(&"0".repeat((-n) as usize));
+        out.push_str(&digits);
+    } else {
+        out.push_str(&digits[..1]);
+        if k > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        let e = n - 1;
+        out.push_str(&format!("e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs()));
+    }
 }
 
 /// C `strip_quotes` (serval_http.cpp:91).
@@ -1153,7 +1259,7 @@ pub fn json_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
-        other => other.to_string(),
+        other => dump(other, None, false),
     }
 }
 
@@ -1648,9 +1754,60 @@ mod tests {
     #[test]
     fn a_dump_is_indented_and_escaped_as_nlohmann() {
         assert_eq!(
-            dump_indent3_ascii(&json!({"Raw": [{"Base": "file:/d\u{e9}\u{1f600}"}], "n": []})),
+            dump(
+                &json!({"Raw": [{"Base": "file:/d\u{e9}\u{1f600}"}], "n": []}),
+                Some(3),
+                true
+            ),
             "{\n   \"Raw\": [\n      {\n         \"Base\": \"file:/d\\u00e9\\ud83d\\ude00\"\n      }\n   ],\n   \"n\": []\n}"
         );
+        assert_eq!(
+            dump(&json!("d\u{e9}\u{7f}\u{1}"), None, false),
+            "\"d\u{e9}\u{7f}\\u0001\""
+        );
+        assert_eq!(dump(&json!("\u{7f}"), None, true), "\"\\u007f\"");
+    }
+
+    /// nlohmann keeps an object in a std::map, so its keys come out sorted
+    /// whatever order they were inserted in.
+    #[test]
+    fn a_dump_sorts_keys_as_nlohmann() {
+        let mut v = json!({});
+        v["b"] = json!(1);
+        v["a"] = json!({"z": null, "Y": true});
+        v["B"] = json!([]);
+        assert_eq!(
+            dump(&v, None, false),
+            r#"{"B":[],"a":{"Y":true,"z":null},"b":1}"#
+        );
+    }
+
+    /// nlohmann's dtoa layout: fixed notation for decimal exponents in
+    /// (-4, 15], a `.0` on an integral double, a two-digit signed exponent.
+    #[test]
+    fn a_double_is_written_as_nlohmann() {
+        let cases: [(f64, &str); 15] = [
+            (1e-5, "1e-05"),
+            (1.5625e-9, "1.5625e-09"),
+            (0.0001, "0.0001"),
+            (0.5, "0.5"),
+            (5.0, "5.0"),
+            (100.0, "100.0"),
+            (1.25, "1.25"),
+            (-0.0, "-0.0"),
+            (0.0, "0.0"),
+            (-2.5e-7, "-2.5e-07"),
+            (1e14, "100000000000000.0"),
+            (1e15, "1e+15"),
+            (1e16, "1e+16"),
+            (1.5e300, "1.5e+300"),
+            (0.1, "0.1"),
+        ];
+        for (d, text) in cases {
+            assert_eq!(dump(&json!(d), None, false), text, "{d:e}");
+        }
+        assert_eq!(dump(&json!(7), None, false), "7");
+        assert_eq!(dump(&json!(-7), None, false), "-7");
     }
 
     #[test]
