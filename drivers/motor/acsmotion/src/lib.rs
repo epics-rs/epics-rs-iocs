@@ -12,4 +12,5 @@ mod profile;
 mod run;
 pub mod spiiplus;
 
+pub use run::ProfileThread;
 pub use spiiplus::{AcsMotionParams, SpiiPlusAxis, SpiiPlusController};
