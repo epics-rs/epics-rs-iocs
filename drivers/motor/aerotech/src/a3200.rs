@@ -56,7 +56,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -250,6 +252,8 @@ pub struct A3200Axis {
     status: MotorStatus,
     /// The status a failed poll left, for the next post.
     failed: Option<MotorStatus>,
+    /// The sets a command made, for its callback.
+    status_writes: Vec<StatusWrite>,
     report: Arc<AxisMembers>,
     log: Arc<AxisLog>,
 }
@@ -312,6 +316,7 @@ impl A3200Axis {
                 ..Default::default()
             },
             failed: None,
+            status_writes: Vec::new(),
             log: Arc::default(),
         }
     }
@@ -632,6 +637,8 @@ impl AsynMotor for A3200Axis {
             task + 1
         ));
         if sent.is_err() || !ctrl.ack() {
+            self.status.comms_error = true;
+            self.status_writes.push(StatusWrite::CommsError(true));
             return sent;
         }
         // If the motion task is idle, re-init its queue before enabling.
@@ -658,9 +665,14 @@ impl AsynMotor for A3200Axis {
                 // state, whatever the acknowledgement returned.
                 self.last_fault = 0;
                 self.status.problem = false;
+                self.status_writes.push(StatusWrite::Problem(false));
             }
             let _ = ctrl.send(&format!("ENABLE {name}"));
         }
+        // PowerOn follows the request even when ENABLE fails, and C calls
+        // back whatever WAIT MODE AUTO returns (:454-466).
+        self.status.powered = closed_loop;
+        self.status_writes.push(StatusWrite::PowerOn(closed_loop));
         ctrl.send("WAIT MODE AUTO")
     }
 
@@ -674,6 +686,10 @@ impl AsynMotor for A3200Axis {
 
     fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
         self.failed.take()
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 }
 
@@ -961,6 +977,42 @@ mod tests {
             (good.high_limit, good.low_limit)
         );
         assert_eq!(virt.position, 8.0);
+    }
+
+    /// drvA3200Asyn.cc:414-466: enable and disable call back whatever
+    /// their status, with the comm error a refused TaskState set, the
+    /// cleared problem of an acknowledged fault, and the requested PowerOn.
+    #[test]
+    fn closed_loop_posts_what_it_set() {
+        use epics_rs::asyn::interfaces::motor::StatusWrite;
+        let user = AsynUser::new(0);
+        let state = Arc::new(Mutex::new("%0 0".to_string()));
+        let (_line, mut axis) = {
+            let state = state.clone();
+            rig_axis(
+                "a32PostLine",
+                true,
+                move |cmd: &str| {
+                    if cmd.starts_with("~STATUS (1, TaskState)") {
+                        state.lock().unwrap().clone()
+                    } else {
+                        "%0".into()
+                    }
+                },
+                |cmd: &str| cmd.starts_with("WAIT"),
+            )
+        };
+        axis.last_fault = 3;
+        assert!(axis.set_closed_loop(&user, true).is_err());
+        assert_eq!(
+            axis.take_status_writes(),
+            [StatusWrite::Problem(false), StatusWrite::PowerOn(true)]
+        );
+        assert!(axis.set_closed_loop(&user, false).is_err());
+        assert_eq!(axis.take_status_writes(), [StatusWrite::PowerOn(false)]);
+        *state.lock().unwrap() = "!".into();
+        axis.set_closed_loop(&user, true).unwrap();
+        assert_eq!(axis.take_status_writes(), [StatusWrite::CommsError(true)]);
     }
 
     /// drvA3200Asyn.cc:1049: a bare ACK is the reply, read once.
