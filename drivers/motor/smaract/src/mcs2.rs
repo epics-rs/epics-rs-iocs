@@ -191,7 +191,8 @@ impl Mcs2Controller {
     /// over between commands, printing each and tracing its meaning
     /// (smarActMCS2MotorDriver.cpp:121-162). Best-effort; ignores I/O
     /// errors. C also sets `motorStatusProblem_` at address 0 from the
-    /// I/O status, which is axis 0's, so rs leaves it to axis 0's poll.
+    /// I/O status (:164-166), overwriting axis 0's whatever axis drained;
+    /// that C defect is not copied, and axis 0's poll owns the bit.
     fn clear_errors(&self) {
         let count = self
             .query(":SYST:ERR:COUN?")
