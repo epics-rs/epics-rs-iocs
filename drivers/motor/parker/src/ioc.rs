@@ -64,16 +64,12 @@ pub fn oem_create_controller_command() -> CommandDef {
             );
             set_eos_ignored(&handle, b"\r", b"\r");
             let controller = Arc::new(Mutex::new(OemController::new(handle, num_axes as usize)));
-            let port = register_controller_port(
+            register_controller_port(
                 ctx.db().scan_control().interrupt_gate(),
                 &port_name,
                 num_axes as i32,
                 OemParams::new(controller.clone(), moving_poll_ms, idle_poll_ms),
             )?;
-            controller
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .attach_port(port);
 
             let poller = Controller::new();
             for index in 0..num_axes as usize {
