@@ -68,6 +68,13 @@ asynSetOption("SerialND261", 0, "stop", "1")
 dbLoadRecords("$(IP)/db/heidND261.db", "P=$(PREFIX)nd1:,PORT=SerialND261")
 
 # --- Eurotherm 800/2000 temperature controller ------------------------------
-# devXxEurotherm.c ("asyn ao Eurotherm" / "asyn so Eurotherm") is built in.
-# No C st.cmd loads ipApp's Eurotherm.db, whose writers carry DTYP "<none>",
-# so nothing is loaded.
+# The ao/stringout records write bisync frames that carry their own
+# EOT/STX/ETX/ENQ bytes and block check character; the stringParm records
+# reading the reply set their own input EOS per request (TERM=).
+drvAsynSerialPortConfigure("SerialEuro", "/dev/ttyS5", 0, 0, 0)
+asynSetOption("SerialEuro", 0, "baud", "9600")
+asynSetOption("SerialEuro", 0, "bits", "7")
+asynSetOption("SerialEuro", 0, "parity", "even")
+asynSetOption("SerialEuro", 0, "stop", "1")
+
+dbLoadRecords("$(IP)/db/Eurotherm.db", "P=$(PREFIX)et1:,PORT=SerialEuro")
