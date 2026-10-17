@@ -125,22 +125,25 @@ pub struct Mcs2Controller {
     ident: String,
     /// The channel parameters the poll sets, once the port created them.
     reasons: Option<Mcs2Reasons>,
+    /// C's `pasynUserSelf`.
+    trace: MotorTrace,
 }
 
 impl Mcs2Controller {
     /// Connect to an MCS2 and read its serial number (`:DEV:SNUM?`), draining
     /// the error queue around it as the C constructor does. Performs blocking
     /// I/O; `trace` is C's `pasynUserSelf`.
-    pub fn new(handle: SyncIOHandle, trace: &MotorTrace) -> Self {
+    pub fn new(handle: SyncIOHandle, trace: MotorTrace) -> Self {
         let mut ctrl = Self {
             handle,
             ident: String::new(),
             reasons: None,
+            trace,
         };
         ctrl.clear_errors();
         match ctrl.query(":DEV:SNUM?") {
             Ok(ident) => ctrl.ident = ident,
-            Err(_) => trace.print_self(
+            Err(_) => ctrl.trace.print_self(
                 TraceMask::ERROR,
                 format_args!(
                     "SmarActMCS2MotorDriver:MCS2Controller: cannot connect to MCS2 controller\n"
@@ -148,7 +151,7 @@ impl Mcs2Controller {
             ),
         }
         // C prints the reply on the error mask whether or not it came.
-        trace.print_self(
+        ctrl.trace.print_self(
             TraceMask::ERROR,
             format_args!(
                 "MCS2Controller::MCS2Controller: Device Name: {}\n",
@@ -185,7 +188,10 @@ impl Mcs2Controller {
 
     /// Drain the controller error queue (C `clearErrors`): read the error count
     /// and consume that many `:SYST:ERR?` entries, so queued errors do not carry
-    /// over between commands. Best-effort; ignores I/O errors.
+    /// over between commands, printing each and tracing its meaning
+    /// (smarActMCS2MotorDriver.cpp:121-162). Best-effort; ignores I/O
+    /// errors. C also sets `motorStatusProblem_` at address 0 from the
+    /// I/O status, which is axis 0's, so rs leaves it to axis 0's poll.
     fn clear_errors(&self) {
         let count = self
             .query(":SYST:ERR:COUN?")
@@ -193,11 +199,41 @@ impl Mcs2Controller {
             .map(|r| atof(&r) as i64)
             .unwrap_or(0);
         for _ in 0..count.clamp(0, MAX_ERROR_DRAIN as i64) {
-            if self.query(":SYST:ERR?").is_err() {
+            let Ok(reply) = self.query(":SYST:ERR?") else {
                 break;
-            }
+            };
+            // C's printf leaves the line open; rs ends it.
+            println!("{reply}");
+            self.trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "MCS2Controller::clearErrors: {}\n",
+                    error_message(atoi(&reply))
+                ),
+            );
         }
     }
+}
+
+/// C `clearErrors`' text for an `:SYST:ERR?` code
+/// (smarActMCS2MotorDriver.cpp:131-157).
+fn error_message(code: i32) -> String {
+    match code {
+        259 => "No sensor present",
+        34 => "Invalid channel index",
+        0 => "No error",
+        -101 => "Invalid character",
+        -103 => "Invalid seperator",
+        -104 => "Data type error",
+        -108 => "Parameter not allowed",
+        -109 => "Missing parameter",
+        -113 => "Command not exist",
+        -151 => "Invalid string",
+        -350 => "Queue overflow",
+        -363 => "Buffer overrun",
+        _ => return format!("Unable to decode {code}"),
+    }
+    .to_owned()
 }
 
 /// The MCS2 controller's poll periods, in seconds, for its report, and its
@@ -642,7 +678,7 @@ mod tests {
     fn moves_are_written_with_c_s_percent_f() {
         use motor_common::testing::LineRig;
         let (rig, io) = LineRig::new("mcs2PercentF", |_| String::new());
-        let ctrl = Mcs2Controller::new(io, &MotorTrace::new("mcs2PercentF", 0));
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2PercentF", 0));
         let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         rig.sent();
         let user = AsynUser::default();
@@ -667,6 +703,39 @@ mod tests {
         }
     }
 
+    /// C traces what each queued error means (smarActMCS2MotorDriver.cpp
+    /// :124-162).
+    #[test]
+    fn cleared_errors_are_traced() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        use motor_common::testing::LineRig;
+        let name = "mcs2ClearErrors";
+        let (_rig, io) = LineRig::new(name, |cmd| {
+            match cmd.trim_end() {
+                ":SYST:ERR:COUN?" => "2\r\n",
+                ":SYST:ERR?" => "-113,\"Undefined header\"\r\n",
+                _ => "0\r\n",
+            }
+            .to_string()
+        });
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(name), TraceMask::ERROR);
+        trace.set_trace_file(Some(name), TraceFile::File(file));
+        Mcs2Controller::new(io, MotorTrace::new(name, 0));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let traced = text
+            .lines()
+            .filter(|l| l.ends_with("MCS2Controller::clearErrors: Command not exist"))
+            .count();
+        // Two errors drained before and two after the serial number query.
+        assert_eq!(traced, 4, "{text}");
+    }
+
     /// C sets `motorStatusFollowingError_` from FOLLOWING_LIMIT_REACHED
     /// (smarActMCS2MotorDriver.cpp:492, 505).
     #[test]
@@ -679,7 +748,7 @@ mod tests {
             }
             .to_string()
         });
-        let ctrl = Mcs2Controller::new(io, &MotorTrace::new("mcs2FollowLimit", 0));
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2FollowLimit", 0));
         let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         assert!(axis.poll(&AsynUser::default()).unwrap().slip_stall);
     }

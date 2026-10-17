@@ -81,7 +81,7 @@ pub fn mcs2_create_controller_command() -> CommandDef {
                 ),
             );
             set_eos_ignored(&handle, mcs2::INPUT_EOS, mcs2::OUTPUT_EOS);
-            let mut controller = Mcs2Controller::new(handle, &MotorTrace::new(&port_name, 0));
+            let mut controller = Mcs2Controller::new(handle, MotorTrace::new(&port_name, 0));
             let port = PortManager::global()
                 .find_port_handle(&port_name)
                 .map_err(|e| format!("MCS2CreateController: {e}"))?;
