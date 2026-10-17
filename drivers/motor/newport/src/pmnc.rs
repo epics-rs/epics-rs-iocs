@@ -532,17 +532,20 @@ impl AsynMotor for PmncAxis {
     fn home(
         &mut self,
         _user: &AsynUser,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
         // C sends no command for HOME_FOR/HOME_REV (the FIN/RIN paths are
         // commented out) — homing is a silent no-op (module Deviations) but
-        // for its PREM. C hangs POST off a message it never sends; not
-        // copied, POST goes at the next poll that sees the axis done.
+        // for the record's speed parts and its PREM. C hangs POST off a
+        // message it never sends; not copied, POST goes at the next poll
+        // that sees the axis done.
         let prem = self.strings.arm();
-        Self::send_prem(&self.lock(), &prem)
+        let ctrl = self.lock();
+        self.send_speed(&ctrl, min_velocity, velocity, acceleration)?;
+        Self::send_prem(&ctrl, &prem)
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -856,7 +859,8 @@ mod tests {
     }
 
     /// devPMNC87xx.cc:204-219: PREM is its own message ahead of each move's
-    /// command, for that move only; a home sends nothing else.
+    /// command, for that move only; a home sends only the record's speed
+    /// parts ahead of it.
     #[test]
     fn prem_goes_ahead_of_the_move() {
         let (line, mut axis, _) = strings_rig("pmncPrem");
@@ -880,7 +884,9 @@ mod tests {
         );
         axis.set_move_strings(&user, b"SER A0", None).unwrap();
         axis.home(&user, 0.0, 100.0, 200.0, true).unwrap();
-        assert_eq!(line.sent(), ["SER A0"]);
+        assert_eq!(line.sent(), ["VEL A0 0=100", "ACC A0 0=200", "SER A0"]);
+        axis.home(&user, 0.0, 100.0, 0.0, true).unwrap();
+        assert_eq!(line.sent(), ["VEL A0 0=100"]);
         axis.set_move_strings(&user, b"SER A0", None).unwrap();
         axis.move_velocity(&user, 0.0, -100.0, 200.0).unwrap();
         assert_eq!(
