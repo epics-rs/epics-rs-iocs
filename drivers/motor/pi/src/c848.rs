@@ -348,13 +348,24 @@ impl PIC848Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A record string with the axis letter over its byte 5, as C's
+    /// `send_mess` addresses a message (drvPIC848.cc:389). C also writes it
+    /// over a 5-byte string's terminator; not copied.
+    fn addressed(&self, text: &[u8]) -> Vec<u8> {
+        let mut text = text.to_vec();
+        if let Some(b) = text.get_mut(5) {
+            *b = self.letter as u8;
+        }
+        text
+    }
+
     /// A move's own message: PREM and a `;` ahead of its command
-    /// (devPIC848.cc:199-208), whose POST waits for the move to end. C's
-    /// `send_mess` writes the axis letter over byte 5 of the whole message,
-    /// so PREM loses a byte and the command keeps its `#`
-    /// (drvPIC848.cc:389); not copied.
+    /// (devPIC848.cc:199-208), whose POST waits for the move to end. C
+    /// addresses only byte 5 of the whole message, so behind a PREM the
+    /// command keeps its `#`; not copied.
     fn move_line(&mut self, command: &str) -> Vec<u8> {
-        let mut line = self.strings.arm();
+        let prem = self.strings.arm();
+        let mut line = self.addressed(&prem);
         if !line.is_empty() {
             line.push(b';');
         }
@@ -502,10 +513,11 @@ impl AsynMotor for PIC848Axis {
         self.lock().send(&body)
     }
 
-    /// `PRIMITIVE`: INIT as its own message (devPIC848.cc:191-192). C's
-    /// axis letter overwrites INIT's byte 5 (drvPIC848.cc:389); not copied.
+    /// `PRIMITIVE`: INIT as its own message, addressed
+    /// (devPIC848.cc:191-192).
     fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
-        self.lock().send_bytes(init)
+        let line = self.addressed(init);
+        self.lock().send_bytes(&line)
     }
 
     fn set_move_strings(
@@ -592,12 +604,15 @@ mod tests {
             .collect()
     }
 
-    /// devPIC848.cc:191-192: INIT as its own message, whole.
+    /// devPIC848.cc:191-192: INIT as its own message, the axis letter over
+    /// its byte 5; a shorter INIT goes out as written.
     #[test]
     fn init_goes_out_as_its_own_message() {
         let (line, mut axis, _) = strings_rig("pic848Init");
-        axis.primitive(&AsynUser::default(), b"SVO A1").unwrap();
-        assert_eq!(line.sent(), ["SVO A1"]);
+        axis.primitive(&AsynUser::default(), b"SVO  #1").unwrap();
+        assert_eq!(line.sent(), ["SVO  A1"]);
+        axis.primitive(&AsynUser::default(), b"CLR").unwrap();
+        assert_eq!(line.sent(), ["CLR"]);
     }
 
     /// devPIC848.cc:199-208: PREM and a `;` ahead of the move's own command,
@@ -606,17 +621,17 @@ mod tests {
     fn prem_goes_ahead_of_the_move() {
         let (line, mut axis, _) = strings_rig("pic848Prem");
         let user = AsynUser::default();
-        axis.set_move_strings(&user, b"SVO A1", None).unwrap();
+        axis.set_move_strings(&user, b"SVO  #1", None).unwrap();
         axis.move_absolute(&user, 1000.0, 0.0, 10.0, 0.0).unwrap();
-        assert_eq!(line.sent(), ["VEL  A 0.00001", "SVO A1;MOV  A0.00100"]);
+        assert_eq!(line.sent(), ["VEL  A 0.00001", "SVO  A1;MOV  A0.00100"]);
         axis.move_relative(&user, 1000.0, 0.0, 10.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["VEL  A 0.00001", "MVR  A+0.00100"]);
-        axis.set_move_strings(&user, b"SVO A1", None).unwrap();
+        axis.set_move_strings(&user, b"SVO  #1", None).unwrap();
         axis.home(&user, 0.0, 10.0, 0.0, true).unwrap();
-        assert_eq!(line.sent(), ["VEL  A 0.00001", "SVO A1;REF  A"]);
-        axis.set_move_strings(&user, b"SVO A1", None).unwrap();
+        assert_eq!(line.sent(), ["VEL  A 0.00001", "SVO  A1;REF  A"]);
+        axis.set_move_strings(&user, b"SVO  #1", None).unwrap();
         axis.move_velocity(&user, 0.0, -10.0, 0.0).unwrap();
-        assert_eq!(line.sent(), ["SVO A1;VEL  A-0.00001"]);
+        assert_eq!(line.sent(), ["SVO  A1;VEL  A-0.00001"]);
     }
 
     /// drvPIC848.cc:339-346: POST once the move is done, not while it runs,
