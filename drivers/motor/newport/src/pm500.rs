@@ -162,6 +162,9 @@ pub struct Pm500Axis {
     digits: usize,
     /// Wire units per record step (C `drive_resolution`).
     drive_resolution: f64,
+    /// What the last failed poll raises, kept per axis: the controller's
+    /// state can move on under another axis's poll before it is read.
+    failure: PollFailure,
     /// Last good status: the base of the next one, whose position and
     /// encoder it keeps when the steps are unchanged.
     last_status: MotorStatus,
@@ -186,6 +189,7 @@ impl Pm500Axis {
             name,
             digits: max_digits(drive_resolution),
             drive_resolution,
+            failure: PollFailure::NONE,
             // C clears the status, then hard-wires EA_PRESENT and
             // GAIN_SUPPORT ("PM500 only supports DC motors").
             last_status: MotorStatus {
@@ -261,10 +265,7 @@ impl AsynMotor for Pm500Axis {
     /// query is RETRY, which raises nothing and posts nothing; the next is
     /// COMM_ERR, raising `CNTRL_COMM_ERR` and `RA_PROBLEM`.
     fn poll_failure(&self) -> PollFailure {
-        match self.lock().comm_state {
-            CommState::Retry => PollFailure::NONE,
-            _ => PollFailure::PROBLEM_AND_COMMS_ERROR,
-        }
+        self.failure
     }
 
     fn move_absolute(
@@ -407,9 +408,9 @@ impl Pm500Axis {
         // Deviations).
         let reply = ctrl.command(&format!("{c}R")).unwrap_or_default();
         if reply.len() < 3 {
-            ctrl.comm_state = match ctrl.comm_state {
-                CommState::Normal => CommState::Retry,
-                _ => CommState::CommErr,
+            (ctrl.comm_state, self.failure) = match ctrl.comm_state {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
             };
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
