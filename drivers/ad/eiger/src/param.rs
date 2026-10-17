@@ -967,6 +967,18 @@ mod tests {
         assert_eq!(m.min_int, None);
     }
 
+    /// serde_json's default parser lands one ULP off on this limit; C's
+    /// strtod and the `float_roundtrip` parser the workspace enables do not.
+    #[test]
+    fn meta_float_limit_parses_correctly_rounded() {
+        let m = meta_of(
+            r#"{"value": 0.5, "value_type": "float", "access_mode": "rw",
+                "min": -1.5432835417340557e+88, "max": 3600.0}"#,
+            Sys::DetConfig,
+        );
+        assert_eq!(m.min_f64.map(f64::to_bits), Some(0xd23f_0824_128b_2f33));
+    }
+
     #[test]
     fn meta_uint_with_limits() {
         let m = meta_of(
