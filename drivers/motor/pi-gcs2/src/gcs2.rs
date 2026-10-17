@@ -103,9 +103,6 @@
 //! - **`TranslatePIError`**: the 2172-line errcode→string table
 //!   (`TranslatePIError.cpp`/`picontrollererrors.h`) is not ported; only the
 //!   numeric `ERR?` code (`atoi`) is surfaced, in error messages.
-//! - **Deferred/coordinated moves**: `PIasynController::processDeferredMoves`
-//!   / `PIGCSController::moveCts(array)` (multi-axis `MOV` in one command) —
-//!   controller-wide, not part of the single-axis `AsynMotor` interface.
 //! - **`SVO?` (`getServo`)**: implemented here as a protocol primitive (the
 //!   task spec calls it out explicitly), but — matching upstream — the
 //!   generic motor axis's `poll` never calls it; servo state comes from the
@@ -122,6 +119,7 @@
 //!   the `m_velocity` it seeds is never read back (not in `PIasynAxis::poll`),
 //!   so `MotorStatus::velocity` stays `0.0`.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -331,6 +329,21 @@ pub struct PIGCS2Controller {
     axis_names: Vec<String>,
     /// `PIC702Controller::m_timeREFstarted`: one for the controller.
     ref_started: Option<Instant>,
+    /// `PIasynController::movesDeferred`.
+    moves_deferred: bool,
+    /// Each axis's `deferred_move`/`deferred_position`, by axis number.
+    deferred: BTreeMap<usize, DeferredMove>,
+    /// The counts each axis of the last `processDeferredMoves` was sent
+    /// to, for its `m_lastDirection` against the position its next poll
+    /// starts from (no poll ran in between, so C's `m_positionCts`).
+    released: BTreeMap<usize, f64>,
+}
+
+/// An axis's move held while moves are deferred.
+struct DeferredMove {
+    axis: String,
+    counts: f64,
+    cpu: f64,
 }
 
 impl PIGCS2Controller {
@@ -345,6 +358,9 @@ impl PIGCS2Controller {
             knows_vel: false,
             axis_names: Vec::new(),
             ref_started: None,
+            moves_deferred: false,
+            deferred: BTreeMap::new(),
+            released: BTreeMap::new(),
         }
     }
 
@@ -536,6 +552,30 @@ impl PIGCS2Controller {
     fn get_gcs_parameter(&self, axis: &str, param_id: i32) -> AsynResult<f64> {
         let reply = self.query(&format!("SPA? {axis} {param_id}"))?;
         get_value_f64(&reply)
+    }
+
+    /// C `PIasynController::processDeferredMoves` and
+    /// `PIGCSController::moveCts(array)`: one `MOV` for every deferred
+    /// axis, then `ERR?`.
+    fn process_deferred_moves(&mut self) -> AsynResult<()> {
+        let deferred = std::mem::take(&mut self.deferred);
+        if deferred.is_empty() {
+            return Ok(());
+        }
+        let mut cmd = String::from("MOV");
+        for (&axis_no, mv) in &deferred {
+            cmd.push_str(&format!(" {} {}", mv.axis, CFloat(mv.counts / mv.cpu)));
+            self.released.insert(axis_no, mv.counts);
+        }
+        self.send_only(&cmd)?;
+        let err = self.get_gcs_error()?;
+        if err != 0 {
+            self.print(format_args!(
+                "PIGCSController::moveCts(array) failed, GCS error {err}\n"
+            ));
+            return Err(pigcs2_err(format!("MOV failed, GCS error {err}")));
+        }
+        Ok(())
     }
 
     /// `STP` + `ERR? == PI_CNTR_STOP`: stops every axis (C
@@ -1076,6 +1116,19 @@ impl AsynMotor for PIGCS2Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        let mut ctrl = self.lock();
+        if ctrl.moves_deferred {
+            ctrl.deferred.insert(
+                self.axis_no,
+                DeferredMove {
+                    axis: self.axis_name.clone(),
+                    counts: position,
+                    cpu: self.cpu,
+                },
+            );
+            return Ok(());
+        }
+        drop(ctrl);
         // C `PIasynAxis::move`: VEL, then SPA accel/decel, then MOV — each an
         // independent command, no atomicity required between them.
         if velocity != 0.0 {
@@ -1133,7 +1186,8 @@ impl AsynMotor for PIGCS2Axis {
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
+        ctrl.deferred.remove(&self.axis_no);
         match ctrl.model {
             Model::C885 => ctrl.stop_all(),
             _ => ctrl.halt(&self.axis_name),
@@ -1149,8 +1203,23 @@ impl AsynMotor for PIGCS2Axis {
         self.set_servo(enable)
     }
 
+    /// C `PIasynController::writeInt32`, `motorDeferMoves_`: clearing a set
+    /// deferral runs `processDeferredMoves`, whose status C ignores.
+    fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
+        let mut ctrl = self.lock();
+        if !defer && ctrl.moves_deferred {
+            let _ = ctrl.process_deferred_moves();
+        }
+        ctrl.moves_deferred = defer;
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let old_homing = self.is_homing;
+        let released = self.lock().released.remove(&self.axis_no);
+        if let Some(counts) = released {
+            self.last_direction = counts > self.last_position;
+        }
 
         // C `PIasynAxis::poll` ignores every read's status and goes on, so a
         // failed read leaves what the last poll read. On a failed `#4`, C's
@@ -1345,6 +1414,9 @@ mod tests {
             knows_vel: false,
             axis_names: Vec::new(),
             ref_started: None,
+            moves_deferred: false,
+            deferred: BTreeMap::new(),
+            released: BTreeMap::new(),
         };
         // C overwrites the refused command's status with the `\n` write's.
         assert!(ctrl.send_only("MOV 1 1").is_ok());
@@ -1409,6 +1481,9 @@ mod tests {
             knows_vel: false,
             axis_names: Vec::new(),
             ref_started: None,
+            moves_deferred: false,
+            deferred: BTreeMap::new(),
+            released: BTreeMap::new(),
         };
         let mut axis = PIGCS2Axis {
             controller: Arc::new(Mutex::new(ctrl)),
@@ -1789,6 +1864,55 @@ mod tests {
         let status = axis.poll(&user).unwrap();
         assert!(sent_lines(&line).is_empty());
         assert!(!status.done && status.moving && axis.is_homing && status.powered);
+    }
+
+    /// Axes `1` and `2` of one controller on a line answering `1=1`.
+    fn two_axes(name: &str) -> (motor_common::testing::LineRig, PIGCS2Axis, PIGCS2Axis) {
+        let (line, io) = motor_common::testing::LineRig::new(name, |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, name)));
+        let first = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, name);
+        let second = PIGCS2Axis::new(ctrl, "2".into(), 1, name);
+        line.sent();
+        (line, first, second)
+    }
+
+    /// `PIasynAxis::move` (PIasynAxis.cpp:232-239) only records a move
+    /// while moves are deferred; releasing them at any axis runs
+    /// `processDeferredMoves` (PIasynController.cpp:236-270): one `MOV` for
+    /// every deferred axis, in axis order, and each axis's direction.
+    #[test]
+    fn deferred_moves_go_out_in_one_mov_on_release() {
+        let (line, mut first, mut second) = two_axes("gcs2Defer");
+        let user = AsynUser::new(0);
+        first.set_deferred_moves(&user, true).unwrap();
+        second.move_absolute(&user, -3.0, 0.0, 9.0, 4.0).unwrap();
+        first.move_absolute(&user, 5.0, 0.0, 9.0, 4.0).unwrap();
+        assert!(sent_lines(&line).is_empty());
+        second.set_deferred_moves(&user, false).unwrap();
+        assert_eq!(sent_lines(&line), ["MOV 1 5.000000 2 -3.000000", "ERR?"]);
+        first.last_position = 0.0;
+        second.last_position = 0.0;
+        assert!(first.poll(&user).unwrap().direction);
+        assert!(!second.poll(&user).unwrap().direction);
+        line.sent();
+        first.set_deferred_moves(&user, false).unwrap();
+        assert!(sent_lines(&line).is_empty());
+    }
+
+    /// `PIasynAxis::stop` (:310-316) drops the axis's deferred move.
+    #[test]
+    fn a_stop_drops_the_axis_deferred_move() {
+        let (line, mut first, mut second) = two_axes("gcs2DeferStop");
+        let user = AsynUser::new(0);
+        first.set_deferred_moves(&user, true).unwrap();
+        first.move_absolute(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
+        second.move_absolute(&user, 2.0, 0.0, 0.0, 0.0).unwrap();
+        let _ = first.stop(&user, 0.0);
+        line.sent();
+        first.set_deferred_moves(&user, false).unwrap();
+        assert_eq!(sent_lines(&line), ["MOV 2 2.000000", "ERR?"]);
     }
 
     #[test]
