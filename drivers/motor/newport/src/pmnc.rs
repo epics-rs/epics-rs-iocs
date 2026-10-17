@@ -23,10 +23,8 @@
 //!
 //! Picomotor moves are integer *steps*: positions, velocities (steps/sec,
 //! clamped to 2000), and accelerations (steps/sec², clamped 16..32000) are
-//! all counts. Following the asyn-rs dial-frame-EGU boundary convention for
-//! step-native controllers (as [`crate::mm3000`]), the EGU boundary values
-//! pass through with `NINT` rounding and the template carries `MRES=1`
-//! (EGU ≡ steps).
+//! all counts: the record steps that cross the motor boundary, sent with C's
+//! `NINT`, so any MRES works as in C.
 //!
 //! ## Open-loop position tracking (8753)
 //!
@@ -811,6 +809,28 @@ mod tests {
         let (line, mut axis, _) = strings_rig("pmncInit");
         axis.primitive(&AsynUser::default(), b"SER A0").unwrap();
         assert_eq!(line.sent(), ["SER A0"]);
+    }
+
+    #[test]
+    fn record_steps_go_out_with_c_nint() {
+        let (line, mut axis, _) = strings_rig("pmncSteps");
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 4000.5, 0.0, 4000.4, 200.0)
+            .unwrap();
+        axis.move_relative(&user, -2.5, 0.0, 100.0, 200.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL A0 0=2000",
+                "ACC A0 0=200",
+                "ABS A0=4001",
+                "GO A0",
+                "VEL A0 0=100",
+                "ACC A0 0=200",
+                "REL A0=-3",
+                "GO A0"
+            ]
+        );
     }
 
     /// devPMNC87xx.cc:204-219: PREM is its own message ahead of each move's

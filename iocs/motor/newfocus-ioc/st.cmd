@@ -24,13 +24,12 @@ PMNC87xxSetup(1, 2, 10)
 PMNC87xxConfig(0, "$(ASYN)")
 
 # One motor record per discovered channel, signal S of card 0.
-# Picomotor moves are integer steps: positions travel the driver boundary in
-# EGU (= steps) directly, so MRES=1 and EGU=steps.
-dbLoadRecords("$(NEWFOCUS_IOC)/db/newfocus.template", "P=$(P),M=m1,C=0,S=0,MRES=1,EGU=steps")
+# The template takes C's PMNC87xx.substitutions values (MRES 2.5e-4).
+dbLoadRecords("$(NEWFOCUS_IOC)/db/newfocus.template", "P=$(P),M=m1,C=0,S=0")
 
 iocInit()
 
 # Example:
 #   dbl
 #   camonitor NF:m1 NF:m1.RBV
-#   caput NF:m1 1000
+#   caput NF:m1 1.5
