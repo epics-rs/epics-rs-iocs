@@ -37,6 +37,15 @@ impl PixelFormat {
             Self::UInt32 => 4,
         }
     }
+
+    /// C `pixelFormatName` (serval_stream_validation.cpp:220-226).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::UInt8 => "uint8",
+            Self::UInt16 => "uint16",
+            Self::UInt32 => "uint32",
+        }
+    }
 }
 
 /// The largest `jsonimage` frame accepted (C `ImageFrameLimits`).

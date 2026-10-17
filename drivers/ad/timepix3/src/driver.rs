@@ -2781,9 +2781,13 @@ impl TimePix3Driver {
         }
         // acquire.cpp:411-428.
         let log_headers = self.int(self.p.prv_img_log_headers, 0).max(0);
-        self.shared
-            .prv_img_json_headers
-            .store(log_headers, std::sync::atomic::Ordering::Relaxed);
+        for preview in &self.shared.preview {
+            let mut preview = preview.lock();
+            preview.json_headers = log_headers;
+            preview.reset_pairing();
+            // C `releasePreviewBandArrays` (serval_stream.cpp:470-481).
+            preview.diff = None;
+        }
         self.shared.rates.lock().prv_img.restart();
         self.sync_stream_endpoints()?;
         self.start_stream_workers()?;
@@ -3082,6 +3086,9 @@ impl TimePix3Driver {
         }
         self.shared.img.lock().reset();
         self.shared.rates.lock().reset();
+        for preview in &self.shared.preview {
+            preview.lock().reset_pairing();
+        }
 
         if self.shared.acquisition.finish_stop(remote_stopped, fault) == Phase::Fault {
             let mut message = if reason.is_empty() {

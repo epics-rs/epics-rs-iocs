@@ -32,6 +32,8 @@ pub const STOP_ACQUISITION: &str =
     "asynStatus ADTimePix::stopAcquisition(bool, const std::string&)";
 pub const PROCESS_PREVIEW_JSONIMAGE_LINE: &str = "bool ADTimePix::processPreviewJsonimageLine(\
     const ADTimePix::PreviewJsonimageStream&, char*, char*, size_t)";
+pub const EMIT_PREVIEW_THRESHOLD_DIFF: &str =
+    "void ADTimePix::emitPreviewThresholdDiff(int, int, int, int, const char*, int&)";
 pub const PROCESS_IMG_DATA_LINE: &str = "bool ADTimePix::processImgDataLine(char*, char*, size_t)";
 pub const CONFIGURE_IMG_ROLLING_WINDOW: &str = "bool ADTimePix::configureImgRollingWindow(size_t)";
 pub const PROCESS_IMG_FRAME: &str = "void ADTimePix::processImgFrame(const ImageData&)";

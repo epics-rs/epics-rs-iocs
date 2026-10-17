@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -64,6 +64,36 @@ const ADDR: i32 = 0;
 /// (ADTimePix.h:907, :919): the PrvImg and Img images' NDArray addresses.
 const PRV_IMG_ADDR: usize = 0;
 const IMG_ADDR: usize = 1;
+/// C `NDARRAY_ADDR_IMG_THRESHOLD1` (ADTimePix.h:921).
+const IMG_THRESHOLD1_ADDR: usize = 13;
+
+/// C `previewNdarrayAddressForThreshold` (serval_stream.cpp:49-51).
+fn threshold_addr(threshold_id: i32, th0: usize, th1: usize) -> usize {
+    if threshold_id == 1 { th1 } else { th0 }
+}
+
+/// The constant half of C `PreviewJsonimageStream` (serval_stream.cpp:59-85,
+/// :1557-1604); its state is [`crate::state::PreviewState`] at `index`.
+#[derive(Clone, Copy)]
+struct Preview {
+    index: usize,
+    th0: usize,
+    th1: usize,
+    diff: usize,
+    /// C passes `paramFrameNumber == -1` for PrvImg1, which posts no
+    /// geometry, frame parameters or rate.
+    metadata: bool,
+    tag: &'static str,
+}
+
+const PRV_IMG: Preview = Preview {
+    index: 0,
+    th0: PRV_IMG_ADDR,
+    th1: 8,
+    diff: 9,
+    metadata: true,
+    tag: "PrvImg",
+};
 
 pub struct Ctx {
     pub handle: PortHandle,
@@ -2121,18 +2151,13 @@ fn framing_failed(ctx: &Ctx, kind: StreamKind, e: &FrameError) {
 
 /// C `processPreviewJsonimageLine`'s header log (serval_stream.cpp:142-151):
 /// the first PrvImgLogHeaders headers after a start, cut at 1024 bytes.
-fn log_json_header(ctx: &Ctx, header: &Value) {
-    use std::sync::atomic::Ordering;
-    let remaining = &ctx.shared.prv_img_json_headers;
-    let mut n = remaining.load(Ordering::Relaxed);
-    loop {
-        if n <= 0 {
+fn log_json_header(ctx: &Ctx, s: Preview, header: &Value) {
+    {
+        let mut state = ctx.shared.preview[s.index].lock();
+        if state.json_headers <= 0 {
             return;
         }
-        match remaining.compare_exchange_weak(n, n - 1, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(current) => n = current,
-        }
+        state.json_headers -= 1;
     }
     const MAX_HEADER_LOG: usize = 1024;
     let mut text = serval::dump(header, None, false);
@@ -2149,7 +2174,7 @@ fn log_json_header(ctx: &Ctx, header: &Value) {
         TraceMask::IO_DRIVER,
         &adlog::log(
             adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
-            &format!("PrvImg jsonimage header: {text}"),
+            &format!("{} jsonimage header: {text}", s.tag),
         ),
     );
 }
@@ -2167,62 +2192,7 @@ fn strerror(e: &std::io::Error) -> String {
 /// worker as a framing failure does (serval_stream.cpp:618-626, :639-644).
 async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
     match (kind, frame) {
-        (StreamKind::PrvImg, Frame::Image(mut f)) => {
-            log_json_header(ctx, &f.header);
-            let pixels = std::mem::take(&mut f.pixels);
-            let Some(mut array) = image_array(
-                ctx,
-                &f,
-                pixels,
-                &adlog::err(
-                    adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
-                    "PrvImg failed to allocate NDArray",
-                ),
-            ) else {
-                return false;
-            };
-            let p = ctx.p;
-            let rate = frame_rate(
-                ctx,
-                f.frame_number,
-                |r| &mut r.prv_img,
-                adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
-                "PrvImg ",
-            );
-            ctx.post(
-                ADDR,
-                geometry(ctx, &f)
-                    .into_iter()
-                    .chain([
-                        ParamSetValue::new(
-                            p.prv_img_frame_number,
-                            ADDR,
-                            ParamValue::Int32(f.frame_number),
-                        ),
-                        ParamSetValue::new(
-                            p.prv_img_time_at_frame,
-                            ADDR,
-                            ParamValue::Float64(f.time_at_frame),
-                        ),
-                        ParamSetValue::new(
-                            p.prv_img_threshold_id,
-                            ADDR,
-                            ParamValue::Int32(f.threshold_id),
-                        ),
-                        ParamSetValue::new(
-                            p.prv_img_integration_size,
-                            ADDR,
-                            ParamValue::Int32(f.integration_size),
-                        ),
-                    ])
-                    .chain(rate.map(|r| {
-                        ParamSetValue::new(p.prv_img_acq_rate, ADDR, ParamValue::Float64(r))
-                    }))
-                    .collect(),
-            );
-            attach_attributes(ctx, &mut array, &f).await;
-            publish_image(ctx, PRV_IMG_ADDR, array).await;
-        }
+        (StreamKind::PrvImg, Frame::Image(f)) => return preview_frame(ctx, PRV_IMG, f).await,
         (StreamKind::Img, Frame::Image(f)) => {
             let Some(mut array) = image_array(
                 ctx,
@@ -2336,7 +2306,22 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                     publish_img_sum(ctx, 3, f.width, f.height, sum_n, uid).await;
                 }
             }
-            publish_image(ctx, IMG_ADDR, array).await;
+            let addr = threshold_addr(f.threshold_id, IMG_ADDR, IMG_THRESHOLD1_ADDR);
+            publish_image(ctx, addr, array).await;
+            ctx.trace(
+                TraceMask::IO_DRIVER,
+                &adlog::log(
+                    adlog::PROCESS_IMG_DATA_LINE,
+                    &format!(
+                        "Processed Img frame: width={}, height={}, format={}, frame={}, thresholdID={}, addr={addr}, counter={counter}",
+                        f.width,
+                        f.height,
+                        f.format.name(),
+                        f.frame_number,
+                        f.threshold_id
+                    ),
+                ),
+            );
         }
         (StreamKind::PrvHst, Frame::Histogram(h)) => {
             // histogram_io.cpp:165-170, :425-433: a frame read before
@@ -2446,6 +2431,259 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
         _ => {}
     }
     true
+}
+
+/// C `processPreviewJsonimageLine` (serval_stream.cpp:88-361) after the
+/// framing: the frame goes to its threshold's address, and a T1/T0 pair
+/// makes the band-pass. `false` is a refused allocation.
+async fn preview_frame(ctx: &Arc<Ctx>, s: Preview, mut f: crate::stream::ImageFrame) -> bool {
+    log_json_header(ctx, s, &f.header);
+    let slot = usize::from(f.threshold_id == 1);
+    let addr = threshold_addr(f.threshold_id, s.th0, s.th1);
+    // C releases pArrays[addr] before allocating its replacement (:165-171).
+    ctx.shared.preview[s.index].lock().last[slot] = None;
+    let pixels = std::mem::take(&mut f.pixels);
+    let Some(mut array) = image_array(
+        ctx,
+        &f,
+        pixels,
+        &adlog::err(
+            adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+            &format!("{} failed to allocate NDArray", s.tag),
+        ),
+    ) else {
+        return false;
+    };
+    if s.metadata {
+        let p = ctx.p;
+        let rate = frame_rate(
+            ctx,
+            f.frame_number,
+            |r| &mut r.prv_img,
+            adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+            "PrvImg ",
+        );
+        ctx.post(
+            ADDR,
+            geometry(ctx, &f)
+                .into_iter()
+                .chain([
+                    ParamSetValue::new(
+                        p.prv_img_frame_number,
+                        ADDR,
+                        ParamValue::Int32(f.frame_number),
+                    ),
+                    ParamSetValue::new(
+                        p.prv_img_time_at_frame,
+                        ADDR,
+                        ParamValue::Float64(f.time_at_frame),
+                    ),
+                    ParamSetValue::new(
+                        p.prv_img_threshold_id,
+                        ADDR,
+                        ParamValue::Int32(f.threshold_id),
+                    ),
+                    ParamSetValue::new(
+                        p.prv_img_integration_size,
+                        ADDR,
+                        ParamValue::Int32(f.integration_size),
+                    ),
+                ])
+                .chain(
+                    rate.map(|r| {
+                        ParamSetValue::new(p.prv_img_acq_rate, ADDR, ParamValue::Float64(r))
+                    }),
+                )
+                .collect(),
+        );
+    }
+    attach_attributes(ctx, &mut array, &f).await;
+    let array = array.share();
+    ctx.shared.preview[s.index].lock().last[slot] = Some(array.clone());
+    publish_image(ctx, addr, array).await;
+
+    let pair_done = {
+        let mut state = ctx.shared.preview[s.index].lock();
+        if state.last_seen_frame >= 0 && f.frame_number.wrapping_add(10) < state.last_seen_frame {
+            state.t1_ready = false;
+            state.t0_orphan = false;
+            state.last_diff_t0 = -1;
+        }
+        state.last_seen_frame = f.frame_number;
+        match f.threshold_id {
+            1 if state.t0_orphan => {
+                state.t0_orphan = false;
+                true
+            }
+            1 => {
+                state.t1_ready = true;
+                false
+            }
+            0 if state.t1_ready => {
+                state.t1_ready = false;
+                true
+            }
+            0 => {
+                state.t0_orphan = true;
+                false
+            }
+            _ => false,
+        }
+    };
+    if pair_done {
+        emit_preview_threshold_diff(ctx, s, f.frame_number).await;
+    }
+    ctx.trace(
+        TraceMask::IO_DRIVER,
+        &adlog::log(
+            adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+            &format!(
+                "Processed {} frame: width={}, height={}, format={}, frame={}, thresholdID={}",
+                s.tag,
+                f.width,
+                f.height,
+                f.format.name(),
+                f.frame_number,
+                f.threshold_id
+            ),
+        ),
+    );
+    true
+}
+
+/// C `emitPreviewThresholdDiff` (serval_stream.cpp:366-468): T0 - T1 of the
+/// stream's last two frames as Int32, clipped at 0 when PrvImgThreshDiffClip.
+async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
+    use epics_rs::ad_core::ndarray::NDDataType;
+    let func = adlog::EMIT_PREVIEW_THRESHOLD_DIFF;
+    let p = ctx.p;
+    if ctx.handle.read_int32(p.both_counters, 0).await.unwrap_or(0) == 0 {
+        return;
+    }
+    let clip = ctx
+        .handle
+        .read_int32(p.prv_img_thresh_diff_clip, 0)
+        .await
+        .unwrap_or(0)
+        != 0;
+    let (t0, t1, last_diff_t0) = {
+        let state = ctx.shared.preview[s.index].lock();
+        (
+            state.last[0].clone(),
+            state.last[1].clone(),
+            state.last_diff_t0,
+        )
+    };
+    let (Some(t0), Some(t1)) = (t0, t1) else {
+        return;
+    };
+    let (t0_frame, t1_frame) = (t0.unique_id, t1.unique_id);
+    if t0_frame == last_diff_t0 {
+        return;
+    }
+    // C `previewThresholdFramesAligned` (serval_stream.cpp:54-56).
+    if (i64::from(t0_frame) - i64::from(t1_frame)).abs() > 1 {
+        ctx.trace(
+            TraceMask::IO_DRIVER,
+            &adlog::log(
+                func,
+                &format!(
+                    "{} threshold diff: frame ids T0={t0_frame} T1={t1_frame} (header {frame_number}), pairing by order",
+                    s.tag
+                ),
+            ),
+        );
+    }
+    if t0.dims.len() != 2
+        || t1.dims.len() != 2
+        || t0.dims[0].size != t1.dims[0].size
+        || t0.dims[1].size != t1.dims[1].size
+    {
+        ctx.trace(
+            TraceMask::ERROR,
+            &adlog::err(
+                func,
+                &format!("{} threshold diff skipped: dimension mismatch", s.tag),
+            ),
+        );
+        return;
+    }
+    ctx.shared.preview[s.index].lock().diff = None;
+    let dims = vec![
+        NDDimension::new(t0.dims[0].size),
+        NDDimension::new(t0.dims[1].size),
+    ];
+    let Ok(mut diff) = ctx.pool.alloc(dims, NDDataType::Int32) else {
+        ctx.trace(
+            TraceMask::ERROR,
+            &adlog::err(
+                func,
+                &format!("{} failed to allocate threshold-diff NDArray", s.tag),
+            ),
+        );
+        return;
+    };
+    fn band<T: Copy + Into<i64>>(out: &mut [i32], t0: &[T], t1: &[T], clip: bool) {
+        for (o, (a, b)) in out.iter_mut().zip(t0.iter().zip(t1)) {
+            // C subtracts the sources cast to int32.
+            let d = ((*a).into() as i32).wrapping_sub((*b).into() as i32);
+            *o = if clip { d.max(0) } else { d };
+        }
+    }
+    let NDDataBuffer::I32(out) = &mut diff.data else {
+        unreachable!("an Int32 allocation")
+    };
+    match (&t0.data, &t1.data) {
+        (NDDataBuffer::U32(a), NDDataBuffer::U32(b)) => band(out, a, b, clip),
+        (NDDataBuffer::U16(a), NDDataBuffer::U16(b)) => band(out, a, b, clip),
+        (NDDataBuffer::U8(a), NDDataBuffer::U8(b)) => band(out, a, b, clip),
+        (a, b) => {
+            ctx.trace(
+                TraceMask::ERROR,
+                &adlog::err(
+                    func,
+                    &format!(
+                        "{} threshold diff skipped: unsupported source types {} / {}",
+                        s.tag,
+                        a.data_type() as i32,
+                        b.data_type() as i32
+                    ),
+                ),
+            );
+            return;
+        }
+    }
+    diff.unique_id = t0_frame;
+    diff.time_stamp = t0.time_stamp;
+    diff.timestamp = t0.timestamp;
+    diff.attributes.copy_from(&t0.attributes);
+    diff.attributes.add(NDAttribute::new_static(
+        "ThresholdBandPass",
+        "Preview threshold band-pass",
+        NDAttrSource::Driver,
+        NDAttrValue::String(if clip { "max(0,T0-T1)" } else { "T0-T1" }.into()),
+    ));
+    let diff = diff.share();
+    {
+        let mut state = ctx.shared.preview[s.index].lock();
+        state.diff = Some(diff.clone());
+        state.last_diff_t0 = t0_frame;
+    }
+    publish_image(ctx, s.diff, diff).await;
+    ctx.trace(
+        TraceMask::IO_DRIVER,
+        &adlog::log(
+            func,
+            &format!(
+                "Processed {} threshold diff: T0={t0_frame} T1={t1_frame}, addr={} ({} - {}{})",
+                s.tag,
+                s.diff,
+                s.th0,
+                s.th1,
+                if clip { ", clipped" } else { "" }
+            ),
+        ),
+    );
 }
 
 /// C's PrvImg/Img rate block (serval_stream.cpp:248-283, :899-936): the
@@ -2971,7 +3209,7 @@ async fn attach_attributes(ctx: &Ctx, array: &mut DriverArray, f: &crate::stream
     ));
 }
 
-async fn publish_image(ctx: &Ctx, addr: usize, array: DriverArray) {
+async fn publish_image(ctx: &Ctx, addr: usize, array: impl Into<PublishedArray>) {
     if ctx.mirrored(Mirrored::ArrayCallbacks) != 0 {
         ArrayPublisher::new(ctx.outputs[addr].clone())
             .publish(array)
@@ -3437,6 +3675,10 @@ mod tests {
         outputs[PRV_IMG_ADDR].lock().add(tx);
         let (tx, mut rx_img) = ndarray_channel("TPXATTR_IMG_SINK", 4);
         outputs[IMG_ADDR].lock().add(tx);
+        let (tx, mut rx_t1) = ndarray_channel("TPXATTR_T1_SINK", 4);
+        outputs[PRV_IMG.th1].lock().add(tx);
+        let (tx, mut rx_img_t1) = ndarray_channel("TPXATTR_IMG_T1_SINK", 4);
+        outputs[IMG_THRESHOLD1_ADDR].lock().add(tx);
         let ctx = Arc::new(Ctx {
             handle: runtime.port_handle().clone(),
             http,
@@ -3491,8 +3733,8 @@ mod tests {
             assert_eq!(array.attributes.len(), 2);
         }
 
-        // The header's threshold reaches the attribute and the stream's
-        // params (serval_stream.cpp:245-246, :894).
+        // The header's threshold reaches the attribute, the stream's params
+        // and the threshold's address (serval_stream.cpp:245-246, :894).
         for kind in [StreamKind::PrvImg, StreamKind::Img] {
             let frame = Frame::Image(crate::stream::ImageFrame {
                 width: 2,
@@ -3506,9 +3748,11 @@ mod tests {
                 header: serde_json::Value::Null,
             });
             handle_frame(&ctx, kind, frame).await;
+            // A threshold-1 frame goes to its own address
+            // (serval_stream.cpp:139-140, :780-781).
             let rx = match kind {
-                StreamKind::Img => &mut rx_img,
-                _ => &mut rx,
+                StreamKind::Img => &mut rx_img_t1,
+                _ => &mut rx_t1,
             };
             let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
@@ -4402,6 +4646,79 @@ mod tests {
         assert!(!text.contains("rejected TCP stream"), "{text}");
     }
 
+    /// C sends a threshold-1 frame to its own address, and a T1 then T0
+    /// pair makes the T0 - T1 band-pass (serval_stream.cpp:139-140, :322-351,
+    /// :366-468, :780-781).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_threshold_pair_publishes_the_band_pass() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        let ctx = Arc::new(idle_ctx("TPX_BAND"));
+        let mut rx = std::collections::BTreeMap::new();
+        for addr in [PRV_IMG_ADDR, 8, 9, IMG_ADDR, IMG_THRESHOLD1_ADDR] {
+            let (tx, r) = ndarray_channel(&format!("TPX_BAND_{addr}"), 4);
+            ctx.outputs[addr].lock().add(tx);
+            rx.insert(addr, r);
+        }
+        let (p, ad) = (ctx.p, ctx.ad);
+        set_synced(&ctx, ad.base.array_callbacks, 0, 1).await;
+        set_synced(&ctx, p.both_counters, 0, 1).await;
+        let frame = |threshold_id, frame_number, pixels| {
+            Frame::Image(crate::stream::ImageFrame {
+                width: 2,
+                height: 1,
+                format: crate::stream::PixelFormat::UInt16,
+                frame_number,
+                time_at_frame: 0.0,
+                threshold_id,
+                integration_size: 0,
+                pixels,
+                header: Value::Null,
+            })
+        };
+        async fn next(
+            rx: &mut std::collections::BTreeMap<
+                usize,
+                epics_rs::ad_core::plugin::channel::NDArrayReceiver,
+            >,
+            addr: usize,
+        ) -> Arc<epics_rs::ad_core::ndarray::NDArray> {
+            tokio::time::timeout(Duration::from_secs(5), rx.get_mut(&addr).unwrap().recv())
+                .await
+                .unwrap_or_else(|_| panic!("no array at {addr}"))
+                .unwrap()
+        }
+
+        for (clip, n, band, label) in [(0, 5, [-1, 3], "T0-T1"), (1, 6, [0, 3], "max(0,T0-T1)")] {
+            set_synced(&ctx, p.prv_img_thresh_diff_clip, 0, clip).await;
+            assert!(handle_frame(&ctx, StreamKind::PrvImg, frame(1, n, vec![3, 1])).await);
+            assert_eq!(next(&mut rx, 8).await.unique_id, n);
+            assert!(handle_frame(&ctx, StreamKind::PrvImg, frame(0, n, vec![2, 4])).await);
+            assert_eq!(next(&mut rx, PRV_IMG_ADDR).await.unique_id, n);
+            let diff = next(&mut rx, 9).await;
+            assert_eq!(diff.unique_id, n);
+            match &diff.data {
+                NDDataBuffer::I32(v) => assert_eq!(v, &band),
+                other => panic!("{:?}", other.data_type()),
+            }
+            assert_eq!(
+                diff.attributes.get("ThresholdBandPass").map(|a| &a.value),
+                Some(&NDAttrValue::String(label.into()))
+            );
+            assert_eq!(
+                diff.attributes.get("ThresholdID").map(|a| &a.value),
+                Some(&NDAttrValue::Int32(0))
+            );
+        }
+        // A repeated T0 is an orphan waiting for its T1, not a new pair.
+        assert!(handle_frame(&ctx, StreamKind::PrvImg, frame(0, 7, vec![2, 4])).await);
+        next(&mut rx, PRV_IMG_ADDR).await;
+        assert_eq!(rx[&9].pending(), 0);
+
+        assert!(handle_frame(&ctx, StreamKind::Img, frame(1, 9, vec![1, 1])).await);
+        assert_eq!(next(&mut rx, IMG_THRESHOLD1_ADDR).await.unique_id, 9);
+        assert_eq!(rx[&IMG_ADDR].pending(), 0);
+    }
+
     /// The first PrvImgLogHeaders PrvImg headers are logged as nlohmann
     /// `dump()`, cut at 1024 bytes (serval_stream.cpp:142-151).
     #[tokio::test(flavor = "multi_thread")]
@@ -4412,16 +4729,15 @@ mod tests {
         ctx.handle
             .trace()
             .set_trace_mask(Some(name), TraceMask::IO_DRIVER);
-        ctx.shared
-            .prv_img_json_headers
-            .store(2, std::sync::atomic::Ordering::Relaxed);
+        ctx.shared.preview[0].lock().json_headers = 2;
         let long = "x".repeat(2000);
         log_json_header(
             &ctx,
+            PRV_IMG,
             &json!({"width": 2, "frameNumber": 1, "timeAtFrame": 1e-5}),
         );
-        log_json_header(&ctx, &json!({"a": long}));
-        log_json_header(&ctx, &json!({"never": true}));
+        log_json_header(&ctx, PRV_IMG, &json!({"a": long}));
+        log_json_header(&ctx, PRV_IMG, &json!({"never": true}));
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let line = |h: &str| {

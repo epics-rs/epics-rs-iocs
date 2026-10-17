@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
+use epics_rs::ad_core::ndarray_pool::PublishedArray;
 use epics_rs::asyn::port::PortDriverBase;
 use parking_lot::{Condvar, Mutex};
 
@@ -48,6 +49,51 @@ pub struct StreamPaths {
     pub prv_img: Option<String>,
     pub img: Option<String>,
     pub prv_hst: Option<String>,
+}
+
+/// C `PreviewJsonimageStream`'s state (serval_stream.cpp:59-85) and the
+/// `pArrays` slots its band-pass reads: the last frame at each threshold's
+/// address and the last band-pass. Index 0 is PrvImg, 1 PrvImg1.
+pub struct PreviewState {
+    /// C `jsonHeadersRemaining`.
+    pub json_headers: i32,
+    /// C `t1ReadyForDiff`.
+    pub t1_ready: bool,
+    /// C `t0OrphanForDiff`.
+    pub t0_orphan: bool,
+    /// C `lastSeenFrameForPair`, -1 for none.
+    pub last_seen_frame: i32,
+    /// C `lastDiffT0Frame`, -1 for none.
+    pub last_diff_t0: i32,
+    /// C `pArrays[ndAddrThreshold0]`, `pArrays[ndAddrThreshold1]`.
+    pub last: [Option<PublishedArray>; 2],
+    /// C `pArrays[ndAddrThreshDiff]`.
+    pub diff: Option<PublishedArray>,
+}
+
+impl Default for PreviewState {
+    fn default() -> Self {
+        Self {
+            json_headers: 0,
+            t1_ready: false,
+            t0_orphan: false,
+            last_seen_frame: -1,
+            last_diff_t0: -1,
+            last: [None, None],
+            diff: None,
+        }
+    }
+}
+
+impl PreviewState {
+    /// The T0/T1 pairing reset of an acquisition start (acquire.cpp:411-427)
+    /// and `resetAcquisitionRuntimeState` (acquisition_runtime.cpp:108-134).
+    pub fn reset_pairing(&mut self) {
+        self.t1_ready = false;
+        self.t0_orphan = false;
+        self.last_seen_frame = -1;
+        self.last_diff_t0 = -1;
+    }
 }
 
 /// A parameter the stream workers read with C's unlocked `getIntegerParam`.
@@ -146,8 +192,8 @@ pub struct Shared {
     pub prv_img_worker: WorkerState,
     pub img_worker: WorkerState,
     pub prv_hst_worker: WorkerState,
-    /// C `prvImgJsonHeadersRemaining_`: PrvImg headers still to log.
-    pub prv_img_json_headers: AtomicI32,
+    /// The PrvImg and PrvImg1 preview streams' state.
+    pub preview: [Mutex<PreviewState>; 2],
     orientation: AtomicI32,
     /// C `acquisitionCoordinator_`: the one owner of the acquisition phase.
     pub acquisition: Coordinator,
@@ -176,7 +222,7 @@ impl Shared {
             prv_img_worker: WorkerState::default(),
             img_worker: WorkerState::default(),
             prv_hst_worker: WorkerState::default(),
-            prv_img_json_headers: AtomicI32::new(0),
+            preview: Default::default(),
             orientation: AtomicI32::new(0),
             acquisition: Coordinator::default(),
             family: AtomicI32::new(DetectorFamily::Unknown as i32),
