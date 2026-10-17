@@ -5445,6 +5445,8 @@ name = "yokogawa-gm10-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "libc",
+ "tempfile",
  "yokogawa-gm10",
 ]
 
@@ -5464,6 +5466,8 @@ name = "yokogawa-mw100-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "libc",
+ "tempfile",
  "yokogawa-mw100",
 ]
 

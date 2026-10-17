@@ -1,6 +1,9 @@
 # MW100 MX115 (digital input) channel.
 # Macros: P, DAU, HANDLE, ADDRESS (Signal channel address).
 # Port of yokogawaDasApp/Db/MW100_MX115_channel.db.
+# THSV is "MAJOR" in Alarm1-4: upstream MW100_MX115_channel.db
+# lines 66, 100, 134, 168 write "MAJR", no menuAlarmSevr choice, so C
+# refuses it at load and leaves THSV at NO_ALARM. Not copied.
 
 record(bi, "$(P)$(DAU):$(ADDRESS):DI")
 {
@@ -66,7 +69,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm1")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJR")
+    field(THSV, "MAJOR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
@@ -100,7 +103,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm2")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJR")
+    field(THSV, "MAJOR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
@@ -134,7 +137,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm3")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJR")
+    field(THSV, "MAJOR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
@@ -168,7 +171,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm4")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJR")
+    field(THSV, "MAJOR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
