@@ -78,6 +78,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
+use epics_libcom_rs::cfmt::CFloat;
 use motor_common::util::{atof, atoi, nint};
 use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
@@ -120,7 +121,7 @@ fn hex_upper(v: u8) -> u8 {
 /// Format a value the way C `std::to_string(double)` does (six decimals), used
 /// for the `=`/`S` parameter writes.
 fn fmt6(v: f64) -> String {
-    format!("{v:.6}")
+    format!("{:.6}", CFloat(v))
 }
 
 /// Clamp a (base, max) velocity pair into the controller range, taking the
@@ -219,8 +220,8 @@ impl ControllerParams for PhytronParams {
              idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll,
-            self.idle_poll,
+            CFloat(self.moving_poll),
+            CFloat(self.idle_poll),
         );
         ctx.report(out, level);
     }
@@ -362,7 +363,7 @@ impl PhytronAxis {
         let axis_no = module * 10 + index;
         let axis_module_no = match ctrl_type {
             // C: epicsSnprintf(..., "M%.1f", iAxisNo / 10.)
-            CtrlType::Phymotion => format!("M{:.1}", axis_no as f64 / 10.0),
+            CtrlType::Phymotion => format!("M{:.1}", CFloat(axis_no as f64 / 10.0)),
             CtrlType::Mcc => {
                 let n = axis_no % 10;
                 if !(1..=8).contains(&n) {
@@ -448,7 +449,7 @@ impl AsynMotor for PhytronAxis {
             .trim()
             .parse::<f64>()
             .map_err(|_| phytron_err("phytron: setEncoderRatio: invalid encoder position"))?;
-        ctrl.command(&format!("{m}P39{set}{:.6}", 1.0 / ratio))?;
+        ctrl.command(&format!("{m}P39{set}{}", fmt6(1.0 / ratio)))?;
         Ok(())
     }
 
@@ -779,29 +780,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn set_encoder_ratio_reads_the_encoder_then_sets_p39_to_its_inverse() {
+    /// MCC axis 1 on a fresh [`Mcc`] port `name`, and its command log.
+    fn mcc_axis(name: &str) -> (PhytronAxis, Arc<Mutex<Vec<String>>>) {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let written = Arc::new(Mutex::new(Vec::new()));
         let port = Mcc {
-            base: PortDriverBase::new("phytronEncoderRatio", 1, PortFlags::default()),
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
             written: written.clone(),
             reply: Vec::new(),
         };
-        let (rt, _actor) = create_port_runtime(
-            &claim_port("phytronEncoderRatio").unwrap(),
-            port,
-            RuntimeConfig::default(),
-        )
-        .unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
+                .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let controller = Arc::new(Mutex::new(PhytronController::new(io, CtrlType::Mcc, 0)));
-        let mut axis = PhytronAxis::new(controller, 0, 1).unwrap();
+        (PhytronAxis::new(controller, 0, 1).unwrap(), written)
+    }
+
+    #[test]
+    fn set_encoder_ratio_reads_the_encoder_then_sets_p39_to_its_inverse() {
+        let (mut axis, written) = mcc_axis("phytronEncoderRatio");
         axis.set_encoder_ratio(&AsynUser::new(0), 0.5).unwrap();
         assert_eq!(*written.lock().unwrap(), ["1P22R", "1P39S2.000000"]);
+    }
+
+    /// C `std::to_string(double)` is `%f`, which spells a NaN `nan`.
+    #[test]
+    fn a_non_finite_parameter_is_written_as_c_prints_it() {
+        let (mut axis, written) = mcc_axis("phytronNonFinite");
+        axis.set_encoder_ratio(&AsynUser::new(0), f64::NAN).unwrap();
+        assert_eq!(*written.lock().unwrap(), ["1P22R", "1P39Snan"]);
+        assert_eq!(fmt6(f64::NAN), "nan");
     }
 
     #[test]
