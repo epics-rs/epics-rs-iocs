@@ -565,10 +565,6 @@ pub fn xps_create_axis_command() -> CommandDef {
             let port_name = req_string(args, 0, "Controller port name")?;
             let axis = c_int(args, 1);
             let positioner_name = req_string(args, 2, "Axis name")?;
-            let steps_per_unit = atof(&opt_string(args, 3)?.unwrap_or_default());
-            if steps_per_unit == 0.0 {
-                return Err("XPSCreateAxis: steps per unit must be non-zero".into());
-            }
             let Some((controller, ip, ip_port, moving_poll_ms, idle_poll_ms)) =
                 with_xps(&port_name, "XPSCreateAxis", |reg| {
                     (
@@ -582,6 +578,14 @@ pub fn xps_create_axis_command() -> CommandDef {
             else {
                 return Ok(CommandOutcome::Continue);
             };
+            let text = opt_string(args, 3)?.unwrap_or_default();
+            let steps_per_unit = atof(&text);
+            // An infinite strtod is C's ERANGE. C builds a zero with stepSize
+            // 1/0, so every move sends inf; that is refused here.
+            if !steps_per_unit.is_finite() || steps_per_unit == 0.0 {
+                println!("XPSController:XPSCreateAxis: Error invalid steps per unit={text}");
+                return Ok(CommandOutcome::Continue);
+            }
             let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
                 println!("XPSAxis:XPSAxis: error calling TCP_ConnectToServer for move socket");
                 return Ok(CommandOutcome::Continue);
