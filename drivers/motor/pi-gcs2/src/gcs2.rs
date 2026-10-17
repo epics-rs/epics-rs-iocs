@@ -146,6 +146,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi, leading_hex};
+use motor_common::{ControllerParams, ControllerReport};
 
 /// Response buffer size for a single reply line.
 const READ_BUF: usize = 256;
@@ -616,6 +617,45 @@ impl PIGCS2Controller {
             ))
         })?;
         Ok(status_from_bitmask(mask))
+    }
+}
+
+/// C `PIasynController::report` (PIasynController.cpp:196-221), over the
+/// axes `PI_GCS2_CreateController` created.
+#[derive(Clone, Default)]
+pub struct PIGCS2Report {
+    axes: Arc<Mutex<Vec<Arc<Mutex<PIGCS2Axis>>>>>,
+}
+
+impl PIGCS2Report {
+    /// An axis the report lists, in creation order.
+    pub fn add(&self, axis: Arc<Mutex<PIGCS2Axis>>) {
+        self.axes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(axis);
+    }
+}
+
+impl ControllerParams for PIGCS2Report {
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "PIGCS2 motor driver {}, numAxes={}",
+            ctx.port_name(),
+            ctx.num_axes()
+        );
+        // C reads getPIAxis(axis) for every numAxes_, a NULL dereference
+        // when the constructor returned before creating the axes; that C
+        // defect is not copied: only created axes print.
+        for axis in self.axes.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let axis = axis.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = writeln!(out, "  axis {}", axis.axis_no);
+            if level > 0 && axis.is_homing {
+                let _ = writeln!(out, "    Currently homing axis");
+            }
+        }
+        ctx.report(out, level);
     }
 }
 
