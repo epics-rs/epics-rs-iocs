@@ -15,6 +15,7 @@ use super::rpc::{SocketMode, XpsSocket};
 pub type Fail = Arc<Mutex<&'static str>>;
 pub type Log = Arc<Mutex<Vec<String>>>;
 pub type Digital = Arc<Mutex<u16>>;
+pub type Firmware = Arc<Mutex<&'static str>>;
 
 struct FakeXps {
     base: PortDriverBase,
@@ -22,6 +23,7 @@ struct FakeXps {
     fail: Fail,
     log: Log,
     digital: Digital,
+    firmware: Firmware,
 }
 
 impl PortDriver for FakeXps {
@@ -36,6 +38,7 @@ impl PortDriver for FakeXps {
         let name = cmd.split('(').next().unwrap_or("").trim();
         self.log.lock().unwrap().push(cmd.trim().to_string());
         let digital;
+        let firmware;
         let values = match name {
             _ if name == *self.fail.lock().unwrap() => "-3",
             "GPIOAnalogGet" => "0,1.5,2.5,3.5,4.5",
@@ -48,6 +51,10 @@ impl PortDriver for FakeXps {
                 "0,Error in the command parameters of a hexapod call"
             }
             "ErrorStringGet" => "0,Not allowed action",
+            "FirmwareVersionGet" => {
+                firmware = format!("0,{}", self.firmware.lock().unwrap());
+                &firmware
+            }
             "HexapodCoordinateSystemGet" => "0,1,2,3,4,5,6",
             "GroupStatusGet" => "0,12",
             "GroupPositionCurrentGet" if cmd.contains(".P2,") => "0,2.5",
@@ -78,6 +85,8 @@ pub struct FakeLine {
     pub log: Log,
     /// What `GPIODigitalGet` reads.
     pub digital: Digital,
+    /// What `FirmwareVersionGet` reads.
+    pub firmware: Firmware,
 }
 
 impl FakeLine {
@@ -85,12 +94,14 @@ impl FakeLine {
         let fail = Arc::new(Mutex::new(fail));
         let log = Log::default();
         let digital = Digital::default();
+        let firmware = Arc::new(Mutex::new("0"));
         let line = FakeXps {
             base: PortDriverBase::new(port, 1, PortFlags::default()),
             reply: None,
             fail: fail.clone(),
             log: log.clone(),
             digital: digital.clone(),
+            firmware: firmware.clone(),
         };
         let (rt, _jh) =
             create_port_runtime(&claim_port(port).unwrap(), line, RuntimeConfig::default())
@@ -101,6 +112,7 @@ impl FakeLine {
             fail,
             log,
             digital,
+            firmware,
         }
     }
 
