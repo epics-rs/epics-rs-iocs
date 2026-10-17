@@ -45,8 +45,8 @@ use motor_common::model1_device;
 use motor_common::model2::Model2;
 use motor_common::util::atof;
 use motor_common::{
-    Controller, ControllerReport, asyn_user, install, register_controller_port, register_port,
-    register_port_with,
+    Controller, ControllerReport, asyn_user, install_with_report, register_controller_port,
+    register_port, register_port_with,
 };
 
 use crate::agap::{self, AgapAxis, AgapController};
@@ -274,7 +274,22 @@ pub fn ag_conex_create_controller_command() -> CommandDef {
             let controller_id = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, 1)?;
+            // C's `controllerVersion_`, unset until VE answers; empty here.
+            let version = Arc::new(Mutex::new(String::new()));
+            let (moving_s, idle_s) = (period_s(moving_poll_ms), period_s(idle_poll_ms));
+            let shown = version.clone();
+            // AG_CONEXController::report (AG_CONEX.cpp:138-146), its quote
+            // unclosed as C's.
+            let head = ControllerHead(move |ctx: &ControllerReport<'_>, out: &mut dyn Write| {
+                let version = shown.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = write!(
+                    out,
+                    "CONEX motor driver {}, controllerID={controller_id}, version=\"{version}\n  \
+                     moving poll period={moving_s:.6}, idle poll period={idle_s:.6}\n",
+                    ctx.port_name()
+                );
+            });
+            register_port_with(ctx, &port_name, 1, head)?;
             // C returns from the constructor here: the port has no axis.
             let (handle, connected) = connect_controller(
                 &serial_port,
@@ -291,11 +306,15 @@ pub fn ag_conex_create_controller_command() -> CommandDef {
             else {
                 return Ok(CommandOutcome::Continue);
             };
+            axis.version()
+                .clone_into(&mut version.lock().unwrap_or_else(|e| e.into_inner()));
+            let report = Arc::new(axis.report());
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            install(
+            install_with_report(
                 ctx,
                 asyn_user(&port_name, 0),
                 motor,
+                report,
                 moving_poll_ms,
                 idle_poll_ms,
                 2, // C startPoller, AG_CONEX.cpp:80
@@ -2223,6 +2242,59 @@ mod report {
             epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
         }
         assert!(text.contains(&want), "{text}");
+    }
+
+    /// AG_CONEXController::report then AG_CONEXAxis::report, which reads
+    /// the gains (AG_CONEX.cpp:138-146, :283-319).
+    #[epics_rs::base::epics_test]
+    async fn ag_conex_report_prints_the_controller_then_reads_the_gains_above_level_0() {
+        use motor_common::testing::LineRig;
+        let (line, _io) = LineRig::new("cxRepLine", |cmd| {
+            match cmd.trim_end() {
+                "1VE" => "1VE CONEX-CC 2.0.1",
+                "1ID?" => "1IDMFA-CC",
+                "1SU?" => "1SU0.0001",
+                "1SL?" => "1SL-12.5",
+                "1SR?" => "1SR12.5",
+                "1TP" => "1TP1.5",
+                "1KP?" => "1KP12",
+                "1KI?" => "1KI3",
+                "1KD?" => "1KD0.5",
+                _ => "",
+            }
+            .into()
+        });
+        let args = vec![
+            ArgValue::String("cxRep".into()),
+            ArgValue::String("cxRepLine".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(100),
+            ArgValue::Int(100),
+        ];
+        run_command(ag_conex_create_controller_command(), args).await;
+        let head = "CONEX motor driver cxRep, controllerID=1, version=\"CONEX-CC 2.0.1\n  \
+                    moving poll period=0.100000, idle poll period=0.100000\n";
+        let text = port_report("cxRep", 0);
+        assert!(text.contains(&format!("{head}Port: cxRep\n")), "{text}");
+        let axis = "  stageID=MFA-CC\n  currentPosition=15000.000000, encoderIncrement=0.000100\n  \
+                    interpolationFactor=1.000000, stepSize=0.000100, lowLimit=-12.500000, \
+                    highLimit=12.500000\n  KP=12.000000, KI=3.000000, KD/LF=0.500000\n  \
+                    fullStepSize=0.000000, microStepsPerFullStep=0\n";
+        let want = format!("{head}{axis}Port: cxRep\n");
+        let mut text = String::new();
+        for _ in 0..300 {
+            line.sent();
+            text = port_report("cxRep", 1);
+            if text.contains(&want) {
+                break;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(text.contains(&want), "{text}");
+        let sent = line.sent();
+        for query in ["1KP?", "1KI?", "1KD?"] {
+            assert!(sent.iter().any(|s| s == query), "{sent:?}");
+        }
     }
 
     /// SMC100Controller::report then SMC100Axis::report

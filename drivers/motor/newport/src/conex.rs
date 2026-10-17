@@ -33,6 +33,7 @@
 //! - `set_pid_gain(Derivative)` on CC/DL emits a `KI` command (C sends `KI`
 //!   with `KDMax`, `AG_CONEX.cpp:480`), not `KD`.
 
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -42,6 +43,8 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
+
+use motor_common::AxisReport;
 
 use crate::util::{leading_hex, parse_int_at, parse_value_at};
 
@@ -304,7 +307,7 @@ fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
 
 /// A Newport CONEX single-axis driver implementing [`AsynMotor`].
 pub struct ConexAxis {
-    handle: SyncIOHandle,
+    handle: Arc<SyncIOHandle>,
     /// Numeric controller ID prefixed on every command (C `controllerID_`).
     controller_id: i32,
     model: ConexModel,
@@ -313,6 +316,84 @@ pub struct ConexAxis {
     /// Soft travel limits in controller EGU (C `lowLimit_`/`highLimit_`).
     low_limit: f64,
     high_limit: f64,
+    /// C `controllerVersion_`, the `VE` reply past its echo.
+    version: String,
+    /// What only `report` prints. C leaves it unset for an unknown model.
+    shown: Shown,
+    /// C `currentPosition_`, which `poll` sets.
+    current_position: Arc<Mutex<f64>>,
+}
+
+/// The constructor's readings that only C's `report` prints.
+#[derive(Clone, Default)]
+struct Shown {
+    stage_id: String,
+    encoder_increment: f64,
+    interpolation_factor: f64,
+    full_step_size: f64,
+    micro_steps_per_full_step: i32,
+}
+
+/// C `AG_CONEXAxis::report` (AG_CONEX.cpp:283-319): the gains, read off
+/// the controller at each report, then the constructor's readings.
+pub struct ConexAxisReport {
+    handle: Arc<SyncIOHandle>,
+    controller_id: i32,
+    model: ConexModel,
+    step_size: f64,
+    low_limit: f64,
+    high_limit: f64,
+    shown: Shown,
+    current_position: Arc<Mutex<f64>>,
+    /// C `KP_`/`KI_`/`LF_`, kept from the last report that read them.
+    gains: Mutex<(f64, f64, f64)>,
+}
+
+impl AxisReport for ConexAxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level <= 0 {
+            return;
+        }
+        // C ignores each read's status; a failed one reads as 0.
+        let read = |code: &str| {
+            let reply = write_read_raw(&self.handle, &query(self.controller_id, code));
+            parse_value_at(&reply.unwrap_or_default(), 3).unwrap_or(0.0)
+        };
+        let mut gains = self.gains.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(
+            self.model,
+            ConexModel::Agp | ConexModel::Cc | ConexModel::Dl
+        ) {
+            gains.0 = read("KP?");
+            gains.1 = read("KI?");
+            gains.2 = if self.model == ConexModel::Agp {
+                read("LF?")
+            } else {
+                read("KD?")
+            };
+        }
+        let (kp, ki, lf) = *gains;
+        let shown = &self.shown;
+        let current = *self
+            .current_position
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = write!(
+            out,
+            "  stageID={}\n  currentPosition={current:.6}, encoderIncrement={:.6}\n  \
+             interpolationFactor={:.6}, stepSize={:.6}, lowLimit={:.6}, highLimit={:.6}\n  \
+             KP={kp:.6}, KI={ki:.6}, KD/LF={lf:.6}\n  \
+             fullStepSize={:.6}, microStepsPerFullStep={}\n",
+            shown.stage_id,
+            shown.encoder_increment,
+            shown.interpolation_factor,
+            self.step_size,
+            self.low_limit,
+            self.high_limit,
+            shown.full_step_size,
+            shown.micro_steps_per_full_step
+        );
+    }
 }
 
 impl ConexAxis {
@@ -324,6 +405,7 @@ impl ConexAxis {
     /// iocsh create command, at IOC init). `None` only when `VE` fails.
     /// `trace` is C's `pasynUserSelf`.
     pub fn new(handle: SyncIOHandle, controller_id: i32, trace: &MotorTrace) -> Option<Self> {
+        let handle = Arc::new(handle);
         // C writeReadController status is ignored past VE, and a failed read
         // leaves an empty reply that atof reads as 0.
         let reply =
@@ -341,8 +423,8 @@ impl ConexAxis {
             );
             return None;
         };
-        let version = version_resp.get(4..).unwrap_or("");
-        let Some(model) = ConexModel::from_version(version) else {
+        let version = version_resp.get(4..).unwrap_or("").to_string();
+        let Some(model) = ConexModel::from_version(&version) else {
             trace.print_self(
                 TraceMask::ERROR,
                 format_args!(
@@ -356,11 +438,13 @@ impl ConexAxis {
                 step_size: 0.0,
                 low_limit: 0.0,
                 high_limit: 0.0,
+                version,
+                shown: Shown::default(),
+                current_position: Arc::default(),
             });
         };
 
-        // Stage ID: issued for wire fidelity (C stores it for report only).
-        let _ = reply("ID?");
+        let stage_id = reply("ID?").get(3..).unwrap_or("").to_string();
 
         // Encoder increment (CC/AGP only), else 1.0.
         let encoder_increment = if model.is_cc_or_agp() {
@@ -382,6 +466,9 @@ impl ConexAxis {
         if matches!(model, ConexModel::Pp | ConexModel::Fcl200) {
             micro_steps_per_full_step = parse_int_at(&reply("FRM?"), 4).unwrap_or(0);
             full_step_size = value_at("FRS?", 4);
+        } else if model == ConexModel::Dl {
+            // AG_CONEX.cpp:257 sets these for the report only.
+            (full_step_size, micro_steps_per_full_step) = (1.0, 1);
         }
 
         let step_size = compute_step_size(
@@ -403,7 +490,36 @@ impl ConexAxis {
             step_size,
             low_limit,
             high_limit,
+            version,
+            shown: Shown {
+                stage_id,
+                encoder_increment,
+                interpolation_factor,
+                full_step_size,
+                micro_steps_per_full_step,
+            },
+            current_position: Arc::default(),
         })
+    }
+
+    /// C `controllerVersion_`.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// The axis's `report`.
+    pub fn report(&self) -> ConexAxisReport {
+        ConexAxisReport {
+            handle: self.handle.clone(),
+            controller_id: self.controller_id,
+            model: self.model,
+            step_size: self.step_size,
+            low_limit: self.low_limit,
+            high_limit: self.high_limit,
+            shown: self.shown.clone(),
+            current_position: self.current_position.clone(),
+            gains: Mutex::default(),
+        }
     }
 
     fn write(&self, cmd: &str) -> AsynResult<()> {
@@ -579,6 +695,10 @@ impl AsynMotor for ConexAxis {
         let position = parse_value_at(&self.write_read(&query(self.controller_id, "TP"))?, 3)
             .ok_or_else(|| parse_error("TP"))?
             / step;
+        *self
+            .current_position
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = position;
 
         // Status (TS): done + limits (model-dependent parse). AG_CONEX.cpp:530,534
         // posts PROBLEM 0 on a bad reply, a C defect.
