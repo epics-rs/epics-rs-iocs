@@ -139,19 +139,36 @@ impl FrameAssembler {
 }
 
 /// Bind a UDP socket that listens on every interface, with the receive buffer
-/// the detector's data rate needs (C's `SO_RCVBUF` call), and return the
-/// buffer size the kernel reports back.
-pub fn bind_data_socket(port: u16) -> io::Result<(UdpSocket, usize)> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_recv_buffer_size(MAX_UDP_DATA_BUFFER)?;
-    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
-    let actual = socket.recv_buffer_size()?;
+/// the detector's data rate needs, and return the buffer size the kernel
+/// reports back. The error is C `udpDataListenerTask`'s text for the step
+/// that failed.
+pub fn bind_data_socket(port: u16) -> Result<(UdpSocket, usize), String> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|e| format!("Error creating socket error = {}", strerror(&e)))?;
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())
+        .map_err(|e| format!("Error binding socket error = {}", strerror(&e)))?;
+    socket
+        .set_recv_buffer_size(MAX_UDP_DATA_BUFFER)
+        .map_err(|e| format!("Error calling setsockopt for SO_RCVBUF = {}", strerror(&e)))?;
+    let actual = socket
+        .recv_buffer_size()
+        .map_err(|e| format!("Error calling getsockopt for SO_RCVBUF = {}", strerror(&e)))?;
     Ok((socket.into(), actual))
 }
 
 /// Bind the status broadcast socket.
 pub fn bind_status_socket(port: u16) -> io::Result<UdpSocket> {
     UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+}
+
+/// C `strerror(errno)`: the OS text without Rust's " (os error N)" suffix.
+pub(crate) fn strerror(e: &io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(end) => text[..end].to_string(),
+        None => text,
+    }
 }
 
 #[cfg(test)]

@@ -552,17 +552,6 @@ pub fn create_pixirad_detector(
         udp_speed: AtomicU64::new(0),
     });
 
-    let (data_socket, data_rcvbuf) =
-        crate::udp::bind_data_socket(data_port).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("pixirad: cannot listen on UDP data port {data_port}: {e}"),
-        })?;
-    let status_socket =
-        crate::udp::bind_status_socket(status_port).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("pixirad: cannot listen on UDP status port {status_port}: {e}"),
-        })?;
-
     let server = PixiradServer::new(command_handle);
     let det = PixiradDetector::new(
         port_name,
@@ -583,8 +572,7 @@ pub fn create_pixirad_detector(
 
     let threads = vec![
         task::start_udp_listener(
-            data_socket,
-            data_rcvbuf,
+            data_port,
             runtime_handle.port_handle().clone(),
             sensor,
             frame_tx,
@@ -601,7 +589,7 @@ pub fn create_pixirad_detector(
             frames: frame_rx,
         }),
         task::start_status_task(StatusContext {
-            socket: status_socket,
+            status_port,
             server,
             handle: runtime_handle.port_handle().clone(),
             ad_params,
@@ -969,5 +957,27 @@ mod tests {
                 .unwrap_or_else(|| panic!("{line}: {text:?}"))
         };
         assert!(at(&base) < at(&own));
+    }
+
+    /// pixirad.cpp:1106-1121, :1289-1303: the UDP sockets are bound inside the
+    /// tasks, so a port already in use stops that task and leaves the driver.
+    #[test]
+    fn a_udp_port_in_use_leaves_the_driver() {
+        let data = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let status = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let (command, _) =
+            SyncIOHandle::connect_port("PIXI_BUSY_IP", 0, Duration::ZERO, InterfaceType::Octet);
+        let rt = create_pixirad_detector(
+            &claim_port("PIXI_BUSY").unwrap(),
+            command,
+            data.local_addr().unwrap().port(),
+            status.local_addr().unwrap().port(),
+            1,
+            476,
+            512,
+            1 << 20,
+        )
+        .expect("C builds the driver before its tasks bind");
+        assert_eq!(rt.port_handle().port_name(), "PIXI_BUSY");
     }
 }
