@@ -25,9 +25,12 @@
 //! `SPiiPlusHoming.db` writes through the controller port;
 //! [`AcsMotionParams`] takes those writes into the controller.
 //!
-//! ## Not modeled (documented)
+//! ## Global variables and programs
 //!
-//! Global variable read/write and ACSPL program start/stop.
+//! As C, a `SPIIPLUS_*_VAR` record's asyn address is the global variable's
+//! tag and a `SPIIPLUS_START_<name>`/`SPIIPLUS_STOP_<name>` record's is the
+//! program's buffer; [`tag_address`] resolves an address past the axes to 0,
+//! and the program name rides the record's drvUser.
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -37,7 +40,9 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{
+    AddressSpace, DrvUser, DrvUserInfo, DrvUserRequest, PortDriverBase, port_get_address,
+};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::calc::engine::cvt::{fmt_e, fmt_f, fmt_g};
@@ -1044,6 +1049,37 @@ struct Writes {
     test: usize,
 }
 
+/// The global-variable and program parameters (SPiiPlusDriver.cpp:76-81).
+#[derive(Clone, Copy)]
+struct Globals {
+    read_int: usize,
+    write_int: usize,
+    read_real: usize,
+    write_real: usize,
+    start: usize,
+    stop: usize,
+}
+
+const START_PROGRAM: &str = "SPIIPLUS_START_";
+const STOP_PROGRAM: &str = "SPIIPLUS_STOP_";
+
+/// C `SPiiPlusDrvUser_t`: the program a start or stop record names.
+#[derive(Debug)]
+struct Program {
+    name: String,
+    len: i32,
+}
+
+/// C `SPiiPlusController::getAddress` (SPiiPlusDriver.cpp:342-357): an
+/// address past the axes is a tag or a buffer and resolves to 0. C returns
+/// asynSuccess whatever the base finds.
+pub fn tag_address(space: AddressSpace, addr: i32) -> Result<i32, i32> {
+    if addr > space.max_addr as i32 - 1 {
+        return Ok(0);
+    }
+    Ok(port_get_address(space, addr).unwrap_or_else(|a| a))
+}
+
 /// C `SPiiPlusController`'s parameters and profile on the controller
 /// port: the homing parameters, stored per axis for `home()` to read, and
 /// the profile move.
@@ -1051,6 +1087,9 @@ pub struct AcsMotionParams {
     controller: Arc<Mutex<SpiiPlusController>>,
     params: Option<HomingParams>,
     writes: Option<Writes>,
+    globals: Option<Globals>,
+    /// C `drvUser_`, every record's drvUser but a named program's.
+    undefined: Arc<Program>,
     pub(crate) pulse: Option<PulseParams>,
     pub(crate) profile: SpiiProfile,
     run: RunControl,
@@ -1065,6 +1104,11 @@ impl AcsMotionParams {
             controller,
             params: None,
             writes: None,
+            globals: None,
+            undefined: Arc::new(Program {
+                name: "undefined".into(),
+                len: -1,
+            }),
             pulse: None,
             profile: SpiiProfile::default(),
             run,
@@ -1090,6 +1134,15 @@ impl ControllerParams for AcsMotionParams {
             offset_neg: base.create_param("SPIIPLUS_HOMING_OFFSET_NEG", ParamType::Float64)?,
             curr_limit: base.create_param("SPIIPLUS_HOMING_CURR_LIMIT", ParamType::Float64)?,
         });
+        self.globals = Some(Globals {
+            read_int: base.create_param("SPIIPLUS_READ_INT_VAR", ParamType::Int32)?,
+            write_int: base.create_param("SPIIPLUS_WRITE_INT_VAR", ParamType::Int32)?,
+            read_real: base.create_param("SPIIPLUS_READ_REAL_VAR", ParamType::Float64)?,
+            write_real: base.create_param("SPIIPLUS_WRITE_REAL_VAR", ParamType::Float64)?,
+            start: base.create_param(START_PROGRAM, ParamType::Int32)?,
+            stop: base.create_param(STOP_PROGRAM, ParamType::Int32)?,
+        });
+        base.set_get_address(tag_address);
         let mode = base.create_param("SPIIPLUS_PULSE_MODE", ParamType::Int32)?;
         let pos = base.create_param("SPIIPLUS_PULSE_POS", ParamType::Float64Array)?;
         // C reads NUM_PULSES from the base's PROFILE_NUM_PULSES, never this.
@@ -1160,6 +1213,53 @@ impl ControllerParams for AcsMotionParams {
         Ok(())
     }
 
+    /// C `drvUserCreate` (SPiiPlusDriver.cpp:284-327): an unknown name
+    /// that starts `SPIIPLUS_START_` or `SPIIPLUS_STOP_`, in any case,
+    /// binds that parameter and names the program after it.
+    fn drv_user_create(
+        &mut self,
+        base: &mut PortDriverBase,
+        req: &DrvUserRequest,
+    ) -> AsynResult<DrvUserInfo> {
+        let mut drv_user: DrvUser = self.undefined.clone();
+        let mut req = req.clone();
+        if base.find_param(&req.drv_info).is_none() {
+            for prefix in [START_PROGRAM, STOP_PROGRAM] {
+                let info = &req.drv_info;
+                let named = info.len() > prefix.len()
+                    && info
+                        .get(..prefix.len())
+                        .is_some_and(|p| p.eq_ignore_ascii_case(prefix));
+                if named {
+                    let name = info[prefix.len()..].to_string();
+                    let len = name.len() as i32;
+                    drv_user = Arc::new(Program { name, len });
+                    req.drv_info = prefix.into();
+                    break;
+                }
+            }
+        }
+        Ok(base.drv_user_create(&req)?.with_drv_user(drv_user))
+    }
+
+    /// C `readInt32`: `?GETVAR(tag)` at the user's own address.
+    fn read_int32(&mut self, base: &mut PortDriverBase, user: AxisUser<'_>) -> AsynResult<i32> {
+        if self.globals.is_some_and(|g| user.reason == g.read_int) {
+            let cmd = format!("?GETVAR({})", user.asyn().addr);
+            return self.lock().comm().write_read_int(&cmd);
+        }
+        base.read_int32_param(user.asyn())
+    }
+
+    /// C `readFloat64`; see [`Self::read_int32`].
+    fn read_float64(&mut self, base: &mut PortDriverBase, user: AxisUser<'_>) -> AsynResult<f64> {
+        if self.globals.is_some_and(|g| user.reason == g.read_real) {
+            let cmd = format!("?GETVAR({})", user.asyn().addr);
+            return self.lock().comm().write_read_double(&cmd);
+        }
+        base.read_float64_param(user.asyn())
+    }
+
     fn write_float64_array(
         &mut self,
         ctx: &mut ControllerCtx<'_>,
@@ -1228,6 +1328,15 @@ impl ControllerParams for AcsMotionParams {
                 ctrl.test()
             }));
         }
+        if let Some(cmd) = self.global_int32(user, value) {
+            return ParamWrite::Handled(self.handled(base, user, |base, ctrl| {
+                base.set_int32_param(user.reason, user.addr, value)?;
+                if let GlobalWrite::Program(function, p, _) = &cmd {
+                    print_program(base, function, p);
+                }
+                ctrl.comm().write_read_ack(cmd.text())
+            }));
+        }
         self.write_int32_own(base, user, value).into()
     }
 
@@ -1240,6 +1349,13 @@ impl ControllerParams for AcsMotionParams {
         // C returns asynError there (SPiiPlusDriver.cpp:471-472).
         if !has_motor_axis(base, user) {
             return ParamWrite::PassToBase(Ok(()));
+        }
+        if self.globals.is_some_and(|g| user.reason == g.write_real) {
+            let cmd = format!("SETVAR({},{})", fmt(value), user.asyn().addr);
+            return ParamWrite::Handled(self.handled(base, user, |base, ctrl| {
+                base.set_float64_param(user.reason, user.addr, value)?;
+                ctrl.comm().write_read_ack(&cmd)
+            }));
         }
         let a = user.addr as usize;
         let max = self
@@ -1278,6 +1394,36 @@ impl ControllerParams for AcsMotionParams {
     }
 }
 
+/// A global-variable or program write's command, and for a program the
+/// function C names in its trace.
+enum GlobalWrite {
+    Var(String),
+    Program(&'static str, Arc<Program>, String),
+}
+
+impl GlobalWrite {
+    fn text(&self) -> &str {
+        match self {
+            Self::Var(cmd) | Self::Program(_, _, cmd) => cmd,
+        }
+    }
+}
+
+/// C prints on pasynUserSelf, which is connected to address 0
+/// (SPiiPlusDriver.cpp:710, 729).
+fn print_program(base: &PortDriverBase, function: &str, p: &Program) {
+    PortManager::global().trace_manager().print(
+        Some(&base.port_name),
+        Some(0),
+        0,
+        TraceMask::IO_DRIVER,
+        format_args!(
+            "SPiiPlusController:{function}: drvUser->programName = {}, drvUser->len = {}\n",
+            p.name, p.len
+        ),
+    );
+}
+
 /// C `SPiiPlusAxis::report` for axis `axis`, which the controller's report
 /// runs.
 pub struct SpiiPlusAxisReport {
@@ -1306,6 +1452,35 @@ impl AcsMotionParams {
         let status = act(base, &self.lock());
         let _ = base.call_param_callbacks(user.addr);
         status
+    }
+
+    /// C `writeGlobalIntVar`, `startProgram` and `stopProgram`'s command,
+    /// with the tag or buffer the user's own address (SPiiPlusDriver.cpp:
+    /// 653-735).
+    fn global_int32(&self, user: AxisUser<'_>, value: i32) -> Option<GlobalWrite> {
+        let g = self.globals?;
+        let at = user.asyn().addr;
+        let program = || {
+            // C dereferences a NULL drvUser for a user drvUserCreate never
+            // set; such a user reads as the default here.
+            user.asyn()
+                .drv_user
+                .clone()
+                .and_then(|d| d.downcast::<Program>().ok())
+                .unwrap_or_else(|| self.undefined.clone())
+        };
+        Some(match user.reason {
+            r if r == g.write_int => GlobalWrite::Var(format!("SETVAR({value},{at})")),
+            r if r == g.start => {
+                let p = program();
+                let cmd = format!("START {at},{}", p.name);
+                GlobalWrite::Program("startProgram", p, cmd)
+            }
+            r if r == g.stop => {
+                GlobalWrite::Program("stopProgram", program(), format!("STOP {at}"))
+            }
+            _ => return None,
+        })
     }
 
     fn write_int32_own(
@@ -1360,6 +1535,7 @@ impl AcsMotionParams {
 
 #[cfg(test)]
 mod tests {
+    use epics_rs::asyn::request::RequestOp;
     use epics_rs::asyn::trace::TraceFile;
 
     use super::*;
@@ -1905,5 +2081,98 @@ mod tests {
         assert_eq!(fmt(1.0 / 3.0), "0.333333");
         assert_eq!(fmt(1234567.0), "1.23457e+06");
         assert_eq!(fmt(0.0000001), "1e-07");
+    }
+
+    /// A global variable at its tag and a program in its buffer, both past
+    /// the axes, and the program named after `SPIIPLUS_START_`
+    /// (SPiiPlusDriver.cpp:284-357, 637-735).
+    #[test]
+    fn global_variables_and_programs_reach_the_controller_by_tag_and_buffer() {
+        let rig = rig("spiiGlobals", 2, SERVOS);
+        rig.line.lock().unwrap().vars.insert(
+            "GETVAR".into(),
+            [((100, 0), 42.0), ((101, 0), 2.5)].into_iter().collect(),
+        );
+        let submit = |info: &str, addr, op| {
+            let info = rig
+                .port
+                .drv_user_create_blocking(&DrvUserRequest::new(info, addr))
+                .unwrap();
+            let user = AsynUser::new(info.reason)
+                .with_addr(addr)
+                .with_drv_user(info.drv_user);
+            rig.port.submit_blocking(op, user).unwrap()
+        };
+        let read = submit("SPIIPLUS_READ_INT_VAR", 100, RequestOp::Int32Read);
+        assert_eq!(read.int_val, Some(42));
+        let read = submit("SPIIPLUS_READ_REAL_VAR", 101, RequestOp::Float64Read);
+        assert_eq!(read.float_val, Some(2.5));
+        let int = |value| RequestOp::Int32Write { value };
+        submit("SPIIPLUS_WRITE_INT_VAR", 100, int(7));
+        submit(
+            "SPIIPLUS_WRITE_REAL_VAR",
+            101,
+            RequestOp::Float64Write { value: 0.125 },
+        );
+        submit("spiiplus_start_Prog1", 5, int(1));
+        submit("SPIIPLUS_STOP_Prog1", 5, int(1));
+        // The bare name is a parameter, so it keeps the default drvUser.
+        submit("SPIIPLUS_START_", 1, int(1));
+        assert_eq!(
+            rig.sent(),
+            [
+                "?GETVAR(100)",
+                "?GETVAR(101)",
+                "SETVAR(7,100)",
+                "SETVAR(0.125,101)",
+                "START 5,Prog1",
+                "STOP 5",
+                "START 1,undefined",
+            ]
+        );
+    }
+
+    /// C prints the program on pasynUserSelf before each START and STOP
+    /// (SPiiPlusDriver.cpp:710, 729).
+    #[test]
+    fn a_program_start_and_stop_are_traced_as_c_traces_them() {
+        let rig = rig("spiiProgTrace", 2, SERVOS);
+        let path = std::env::temp_dir().join(format!("spii-prog-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("spiiProgTraceCtrl"), TraceMask::IO_DRIVER);
+        trace.set_trace_file(Some("spiiProgTraceCtrl"), TraceFile::File(file.clone()));
+        for addr in 0..2 {
+            trace.set_device_trace_file("spiiProgTraceCtrl", addr, TraceFile::File(file.clone()));
+        }
+        for info in ["SPIIPLUS_START_ab", "SPIIPLUS_STOP_ab", "SPIIPLUS_STOP_"] {
+            let info = rig
+                .port
+                .drv_user_create_blocking(&DrvUserRequest::new(info, 3))
+                .unwrap();
+            let user = AsynUser::new(info.reason)
+                .with_addr(3)
+                .with_drv_user(info.drv_user);
+            rig.port
+                .submit_blocking(RequestOp::Int32Write { value: 1 }, user)
+                .unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mine: Vec<_> = text
+            .lines()
+            .filter(|l| l.contains("SPiiPlusController"))
+            .map(|l| &l[l.find("SPiiPlusController").unwrap()..])
+            .collect();
+        assert_eq!(
+            mine,
+            [
+                "SPiiPlusController:startProgram: drvUser->programName = ab, drvUser->len = 2",
+                "SPiiPlusController:stopProgram: drvUser->programName = ab, drvUser->len = 2",
+                "SPiiPlusController:stopProgram: drvUser->programName = undefined, drvUser->len = -1",
+            ],
+            "{text}"
+        );
     }
 }
