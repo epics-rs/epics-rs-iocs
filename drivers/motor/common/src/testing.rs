@@ -192,21 +192,70 @@ pub async fn run_command(
     cmd: epics_rs::base::server::iocsh::registry::CommandDef,
     args: Vec<epics_rs::base::server::iocsh::registry::ArgValue>,
 ) {
-    use epics_rs::base::runtime::task::{BlockingBridge, sleep};
+    call_command(cmd, args).await.unwrap();
+}
+
+/// [`run_command`], returning what the command returned: an `Err` is what
+/// the shell would print for it.
+pub async fn call_command(
+    cmd: epics_rs::base::server::iocsh::registry::CommandDef,
+    args: Vec<epics_rs::base::server::iocsh::registry::ArgValue>,
+) -> epics_rs::base::server::iocsh::registry::CommandResult {
+    use epics_rs::base::runtime::task::BlockingBridge;
     use epics_rs::base::server::database::PvDatabase;
     use epics_rs::base::server::iocsh::registry::CommandContext;
 
     let bridge = BlockingBridge::capture();
-    let shell = std::thread::spawn(move || {
+    off_runtime(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
-        cmd.handler.call(&args, &ctx).unwrap();
-    });
-    // Awaited, not joined: an axis joining a started poller waits on it, and
-    // the poller's thread is spawned by a task this runtime has to run.
+        cmd.handler.call(&args, &ctx)
+    })
+    .await
+}
+
+/// iocInit's drvSup init, where each model-1 driver's `motor_init` runs
+/// over the cards its `Config` filled.
+pub async fn drvsup_init() {
+    use epics_rs::base::server::ioc_app::{InitHookState, init_hook_announce};
+    off_runtime(|| init_hook_announce(InitHookState::AfterInitDrvSup)).await;
+}
+
+/// The errlog lines of iocInit from drvSup init through record init, with
+/// the motor records of `db` loaded: what C's console shows for the cards
+/// and their records.
+pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
+    use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+    use epics_rs::base::server::ioc_builder::IocBuilder;
+    use epics_rs::motor::devices::{device_support_factory, devices};
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
+    drvsup_init().await;
+    let (name, factory) = epics_rs::motor::motor_record_factory();
+    let _db = IocBuilder::new()
+        .register_record_type(name, factory)
+        .register_dynamic_device_support(&devices(), device_support_factory())
+        .db_string(db, &std::collections::HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    errlog_flush();
+    errlog_remove_listener(id);
+    lines.lock().unwrap().clone()
+}
+
+/// Run `f` on a thread of its own. Awaited, not joined: an axis joining a
+/// started poller waits on it, and the poller's thread is spawned by a task
+/// this runtime has to run.
+async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    use epics_rs::base::runtime::task::sleep;
+    let shell = std::thread::spawn(f);
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;
     }
-    shell.join().unwrap();
+    shell.join().unwrap()
 }
 
 /// Run `cmd` with `args` as [`run_command`], and return the `motorPoller`

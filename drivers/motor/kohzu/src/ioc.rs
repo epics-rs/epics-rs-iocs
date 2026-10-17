@@ -2,8 +2,8 @@
 //! C's model-1 interface: records reach axis `signal` of `card` through
 //! `DTYP "SC-800"` and `OUT "#C card S signal"`.
 //!
-//! Config connects and identifies the controller at once, where C's
-//! `motor_init` does so at iocInit; the axis count comes from the model
+//! Config keeps the port and address; `motor_init` at iocInit connects and
+//! identifies the controller, and the axis count comes from the model
 //! (SC-800 → 8, SC-400 → 4, SC-200 → 2).
 
 use std::sync::{Arc, Mutex};
@@ -51,23 +51,29 @@ pub fn sc800_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let handle = connect_with_eos(
-                &asyn_port,
-                c_int(args, 2),
-                SC800_TIMEOUT,
-                INPUT_EOS,
-                OUTPUT_EOS,
-                EosRefusal::Ignored,
-            )?;
-            let controller =
-                KohzuController::new(handle).map_err(|e| format!("SC800Config: {e}"))?;
-            let num_axes = controller.num_axes();
-            let controller = Arc::new(Mutex::new(controller));
-            for index in 0..num_axes {
-                let motor: Arc<Mutex<dyn AsynMotor>> =
-                    Arc::new(Mutex::new(KohzuAxis::new(controller.clone(), index)));
-                SC800.install(ctx, card, index as i32, motor)?;
-            }
+            let address = c_int(args, 2);
+            SC800.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    address,
+                    SC800_TIMEOUT,
+                    INPUT_EOS,
+                    OUTPUT_EOS,
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = KohzuController::new(handle) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                let controller = Arc::new(Mutex::new(controller));
+                for index in 0..num_axes {
+                    let motor: Arc<Mutex<dyn AsynMotor>> =
+                        Arc::new(Mutex::new(KohzuAxis::new(controller.clone(), index)));
+                    init.axis(index as i32, motor);
+                }
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -76,7 +82,7 @@ pub fn sc800_config_command() -> CommandDef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use motor_common::testing::{LineRig, run_command};
+    use motor_common::testing::{LineRig, drvsup_init, run_command};
 
     /// drvSC800.cc:537-538 connects at the Config's `address`.
     #[epics_rs::base::epics_test]
@@ -91,6 +97,7 @@ mod tests {
         });
         let config = vec![int(0), ArgValue::String("sc800Gpib".into()), int(5)];
         run_command(sc800_config_command(), config).await;
+        drvsup_init().await;
         let addrs = line.addresses();
         assert!(!addrs.is_empty());
         assert!(addrs.iter().all(|&a| a == 5), "{addrs:?}");

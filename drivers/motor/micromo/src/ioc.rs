@@ -170,9 +170,9 @@ pub fn micromo_setup_command() -> CommandDef {
 
 /// `MicroMoConfig(card, name)`, MicroMoRegister.cc's name for
 /// `MVP2001Config`. C never registers it, and devMicroMo.dbd never names
-/// `MicroMomotorRegister`, so neither command reaches C's iocsh. Connects and probes the chain at once, where
-/// C's `motor_init` does so at iocInit; a chain with no answering
-/// controller is left unconfigured, as there.
+/// `MicroMomotorRegister`, so neither command reaches C's iocsh. `motor_init` at
+/// iocInit connects and probes the chain; a chain with no answering
+/// controller is left unconfigured.
 pub fn micromo_config_command() -> CommandDef {
     CommandDef::new(
         "MicroMoConfig",
@@ -187,31 +187,33 @@ pub fn micromo_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                drv_mvp2001::COMM_TIMEOUT,
-                b"\n",
-                b"\r",
-                EosRefusal::Ignored,
-            )?;
-            let chain = Mvp2001Chain::new(handle);
-            let limits = drv_mvp2001::motor_init(&chain);
-            // drvMVP2001.cc:725: a chain with no controller is NULL again.
-            if limits.is_empty() {
-                return Ok(CommandOutcome::Continue);
-            }
-            let chain = Arc::new(Mutex::new(chain));
-            for (signal, limits) in limits.into_iter().enumerate() {
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvMvp2001Axis::new(
-                    chain.clone(),
-                    signal,
-                    limits,
-                )));
-                MVP2001.install(ctx, card, signal as i32, motor)?;
-            }
-            // C's `motor_init` clears `ident` and never fills it.
-            MVP2001.describe(card, format!("port={asyn_port}, id: "));
+            MVP2001.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    drv_mvp2001::COMM_TIMEOUT,
+                    b"\n",
+                    b"\r",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let chain = Mvp2001Chain::new(handle);
+                let limits = drv_mvp2001::motor_init(&chain);
+                // drvMVP2001.cc:725: a chain with no controller is NULL again.
+                if limits.is_empty() {
+                    return;
+                }
+                let chain = Arc::new(Mutex::new(chain));
+                for (signal, limits) in limits.into_iter().enumerate() {
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
+                        DrvMvp2001Axis::new(chain.clone(), signal, limits),
+                    ));
+                    init.axis(signal as i32, motor);
+                }
+                // C's `motor_init` clears `ident` and never fills it.
+                init.describe(format!("port={asyn_port}, id: "));
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -252,7 +254,7 @@ mod one_poller {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{LineRig, driver_report, port_report, run_command};
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, port_report, run_command};
 
     /// drvMVP2001.cc's drvet `report` (drvMVP2001.cc:207-231), which `dbior`
     /// runs; `motor_init` leaves `ident` empty.
@@ -281,6 +283,7 @@ mod report {
         });
         let config = vec![int(1), ArgValue::String("mvpChainLine".into())];
         run_command(micromo_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvMVP2001", 0),
             "    MVP2001 controller chain #0 connection failed.\n    MVP2001 controller \

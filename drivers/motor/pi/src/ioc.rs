@@ -93,23 +93,30 @@ pub fn pic862_config_command() -> CommandDef {
                 return Err("PIC862Config: addr must be 0-15".into());
             }
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                PIC862_TIMEOUT,
-                b"\n\x03",
-                b"\r",
-                EosRefusal::Ignored,
-            )?;
-            let controller = PIC862Controller::new(handle, addr as u8)
-                .map_err(|e| format!("PIC862Config: {e}"))?;
-            let line = format!("port={asyn_port}, id: {}", controller.ident());
-            let controller = Arc::new(Mutex::new(controller));
+            PIC862.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIC862_TIMEOUT,
+                    b"\n\x03",
+                    b"\r",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PIC862Controller::new(handle, addr as u8) else {
+                    return;
+                };
+                let line = format!("port={asyn_port}, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
 
-            let axis = PIC862Axis::new(controller).map_err(|e| format!("PIC862Config: {e}"))?;
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            PIC862.install(ctx, card, 0, motor)?;
-            PIC862.describe(card, line);
+                let Ok(axis) = PIC862Axis::new(controller) else {
+                    return;
+                };
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                init.axis(0, motor);
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -153,23 +160,30 @@ pub fn pic663_config_command() -> CommandDef {
                 return Err("PIC663Config: addr must be 0-15".into());
             }
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                PIC663_TIMEOUT,
-                b"\n\x03",
-                b"\r",
-                EosRefusal::Ignored,
-            )?;
-            let controller = PIC663Controller::new(handle, addr as u8)
-                .map_err(|e| format!("PIC663Config: {e}"))?;
-            let line = format!("port={asyn_port}, id: {}", controller.ident());
-            let controller = Arc::new(Mutex::new(controller));
+            PIC663.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIC663_TIMEOUT,
+                    b"\n\x03",
+                    b"\r",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PIC663Controller::new(handle, addr as u8) else {
+                    return;
+                };
+                let line = format!("port={asyn_port}, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
 
-            let axis = PIC663Axis::new(controller).map_err(|e| format!("PIC663Config: {e}"))?;
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            PIC663.install(ctx, card, 0, motor)?;
-            PIC663.describe(card, line);
+                let Ok(axis) = PIC663Axis::new(controller) else {
+                    return;
+                };
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                init.axis(0, motor);
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -244,28 +258,34 @@ pub fn pic630_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let num_axes = PIC630_AXES.load(Ordering::Relaxed);
+            let currents: Vec<i32> = (0..num_axes).map(|s| c_int(args, 2 + s as usize)).collect();
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                PIC630_TIMEOUT,
-                b"\n",
-                b"\n",
-                EosRefusal::Ignored,
-            )?;
-            let controller = PIC630Controller::new(handle, num_axes)
-                .map_err(|e| format!("PIC630Config: {e}"))?;
-            let controller = Arc::new(Mutex::new(controller));
+            PIC630.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIC630_TIMEOUT,
+                    b"\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PIC630Controller::new(handle, num_axes) else {
+                    return;
+                };
+                let controller = Arc::new(Mutex::new(controller));
 
-            for signal in 0..num_axes {
-                let current = c_int(args, 2 + signal as usize);
-                let axis = PIC630Axis::new(controller.clone(), signal, current)
-                    .map_err(|e| format!("PIC630Config: {e}"))?;
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                PIC630.install(ctx, card, signal as i32, motor)?;
-            }
-            // C's ident is the constant motor_init copies (drvPIC630.cc:546).
-            PIC630.describe(card, format!("port={asyn_port}, id: PIC630"));
+                for (signal, current) in (0..num_axes).zip(currents) {
+                    let Ok(axis) = PIC630Axis::new(controller.clone(), signal, current) else {
+                        return;
+                    };
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                    init.axis(signal as i32, motor);
+                }
+                // C's ident is the constant motor_init copies (drvPIC630.cc:546).
+                init.describe(format!("port={asyn_port}, id: PIC630"));
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -303,23 +323,30 @@ pub fn pic662_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                PIC662_TIMEOUT,
-                b"\n",
-                b"\n",
-                EosRefusal::Ignored,
-            )?;
-            let controller =
-                PIC662Controller::new(handle).map_err(|e| format!("PIC662Config: {e}"))?;
-            let line = format!("port={asyn_port}, id: {}", controller.ident());
-            let controller = Arc::new(Mutex::new(controller));
+            PIC662.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIC662_TIMEOUT,
+                    b"\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PIC662Controller::new(handle) else {
+                    return;
+                };
+                let line = format!("port={asyn_port}, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
 
-            let axis = PIC662Axis::new(controller).map_err(|e| format!("PIC662Config: {e}"))?;
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            PIC662.install(ctx, card, 0, motor)?;
-            PIC662.describe(card, line);
+                let Ok(axis) = PIC662Axis::new(controller) else {
+                    return;
+                };
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                init.axis(0, motor);
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -358,26 +385,32 @@ pub fn pic844_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                PIC844_TIMEOUT,
-                b"\n",
-                b"\n",
-                EosRefusal::Ignored,
-            )?;
-            let controller =
-                PIC844Controller::new(handle).map_err(|e| format!("PIC844Config: {e}"))?;
-            let line = format!("port={asyn_port}, id: {}", controller.ident());
-            let controller = Arc::new(Mutex::new(controller));
+            PIC844.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIC844_TIMEOUT,
+                    b"\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PIC844Controller::new(handle) else {
+                    return;
+                };
+                let line = format!("port={asyn_port}, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
 
-            for signal in 0..PIC844_NUM_AXES {
-                let axis = PIC844Axis::new(controller.clone(), signal)
-                    .map_err(|e| format!("PIC844Config: {e}"))?;
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                PIC844.install(ctx, card, signal as i32, motor)?;
-            }
-            PIC844.describe(card, line);
+                for signal in 0..PIC844_NUM_AXES {
+                    let Ok(axis) = PIC844Axis::new(controller.clone(), signal) else {
+                        return;
+                    };
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                    init.axis(signal as i32, motor);
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -416,33 +449,36 @@ pub fn pic848_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                PIC848_TIMEOUT,
-                b"\n",
-                b"\n",
-                EosRefusal::Ignored,
-            )?;
-            let controller =
-                PIC848Controller::new(handle).map_err(|e| format!("PIC848Config: {e}"))?;
-            let num_axes = controller.num_axes();
-            if num_axes == 0 {
-                return Err(format!(
-                    "PIC848Config: card={card} asynPort={asyn_port} reported no stages \
-                     (CST? => NOSTAGE on axis A)"
-                ));
-            }
-            let line = format!("port={asyn_port}, id: {}", controller.ident());
-            let controller = Arc::new(Mutex::new(controller));
+            PIC848.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIC848_TIMEOUT,
+                    b"\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PIC848Controller::new(handle) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                if num_axes == 0 {
+                    return;
+                }
+                let line = format!("port={asyn_port}, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
 
-            for signal in 0..num_axes {
-                let axis = PIC848Axis::new(controller.clone(), card, signal)
-                    .map_err(|e| format!("PIC848Config: {e}"))?;
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                PIC848.install(ctx, card, signal as i32, motor)?;
-            }
-            PIC848.describe(card, line);
+                for signal in 0..num_axes {
+                    let Ok(axis) = PIC848Axis::new(controller.clone(), card, signal) else {
+                        return;
+                    };
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                    init.axis(signal as i32, motor);
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -481,27 +517,33 @@ pub fn pie516_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                PIE516_TIMEOUT,
-                b"\n",
-                b"\n",
-                EosRefusal::Ignored,
-            )?;
-            let controller =
-                PIE516Controller::new(handle).map_err(|e| format!("PIE516Config: {e}"))?;
-            let num_axes = controller.num_axes();
-            let line = format!("port={asyn_port}, id: {}", controller.ident());
-            let controller = Arc::new(Mutex::new(controller));
+            PIE516.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIE516_TIMEOUT,
+                    b"\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PIE516Controller::new(handle) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                let line = format!("port={asyn_port}, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
 
-            for axis in 0..num_axes {
-                let axis_obj = PIE516Axis::new(controller.clone(), axis)
-                    .map_err(|e| format!("PIE516Config: {e}"))?;
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                PIE516.install(ctx, card, axis as i32, motor)?;
-            }
-            PIE516.describe(card, line);
+                for axis in 0..num_axes {
+                    let Ok(axis_obj) = PIE516Axis::new(controller.clone(), axis) else {
+                        return;
+                    };
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
+                    init.axis(axis as i32, motor);
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -540,28 +582,34 @@ pub fn pie517_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                PIE517_TIMEOUT,
-                b"\n",
-                b"\n",
-                EosRefusal::Ignored,
-            )?;
-            let controller =
-                PIE517Controller::new(handle).map_err(|e| format!("PIE517Config: {e}"))?;
-            let num_axes = controller.num_axes();
-            // C copies an uninitialised buffer into the ident (see crate::e517).
-            let line = format!("port={asyn_port}, id: ");
-            let controller = Arc::new(Mutex::new(controller));
+            PIE517.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIE517_TIMEOUT,
+                    b"\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PIE517Controller::new(handle) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                // C copies an uninitialised buffer into the ident (see crate::e517).
+                let line = format!("port={asyn_port}, id: ");
+                let controller = Arc::new(Mutex::new(controller));
 
-            for axis in 0..num_axes {
-                let axis_obj = PIE517Axis::new(controller.clone(), axis)
-                    .map_err(|e| format!("PIE517Config: {e}"))?;
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                PIE517.install(ctx, card, axis as i32, motor)?;
-            }
-            PIE517.describe(card, line);
+                for axis in 0..num_axes {
+                    let Ok(axis_obj) = PIE517Axis::new(controller.clone(), axis) else {
+                        return;
+                    };
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
+                    init.axis(axis as i32, motor);
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -600,27 +648,33 @@ pub fn pie710_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                PIE710_TIMEOUT,
-                b"\n",
-                b"\n",
-                EosRefusal::Ignored,
-            )?;
-            let controller =
-                PIE710Controller::new(handle).map_err(|e| format!("PIE710Config: {e}"))?;
-            let num_axes = controller.num_axes();
-            let line = format!("port={asyn_port}, id: {}", controller.ident());
-            let controller = Arc::new(Mutex::new(controller));
+            PIE710.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIE710_TIMEOUT,
+                    b"\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PIE710Controller::new(handle) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                let line = format!("port={asyn_port}, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
 
-            for axis in 0..num_axes {
-                let axis_obj = PIE710Axis::new(controller.clone(), axis)
-                    .map_err(|e| format!("PIE710Config: {e}"))?;
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                PIE710.install(ctx, card, axis as i32, motor)?;
-            }
-            PIE710.describe(card, line);
+                for axis in 0..num_axes {
+                    let Ok(axis_obj) = PIE710Axis::new(controller.clone(), axis) else {
+                        return;
+                    };
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
+                    init.axis(axis as i32, motor);
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -659,27 +713,33 @@ pub fn pie816_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                PIE816_TIMEOUT,
-                b"\n",
-                b"\n",
-                EosRefusal::Ignored,
-            )?;
-            let controller =
-                PIE816Controller::new(handle).map_err(|e| format!("PIE816Config: {e}"))?;
-            let num_axes = controller.num_axes();
-            let line = format!("port={asyn_port}, id: {}", controller.ident());
-            let controller = Arc::new(Mutex::new(controller));
+            PIE816.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIE816_TIMEOUT,
+                    b"\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PIE816Controller::new(handle) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                let line = format!("port={asyn_port}, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
 
-            for axis in 0..num_axes {
-                let axis_obj = PIE816Axis::new(controller.clone(), axis)
-                    .map_err(|e| format!("PIE816Config: {e}"))?;
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                PIE816.install(ctx, card, axis as i32, motor)?;
-            }
-            PIE816.describe(card, line);
+                for axis in 0..num_axes {
+                    let Ok(axis_obj) = PIE816Axis::new(controller.clone(), axis) else {
+                        return;
+                    };
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
+                    init.axis(axis as i32, motor);
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -688,7 +748,7 @@ pub fn pie816_config_command() -> CommandDef {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{LineRig, driver_report, run_command};
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
     fn int(v: i64) -> ArgValue {
         ArgValue::Int(v)
@@ -708,6 +768,7 @@ mod report {
         let before = driver_report(drvet, 0);
         run_command(setup.0, setup.1).await;
         run_command(config.0, config.1).await;
+        drvsup_init().await;
         (before, driver_report(drvet, 0))
     }
 

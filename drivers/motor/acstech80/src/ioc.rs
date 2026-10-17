@@ -1,8 +1,7 @@
 //! `SPiiPlusSetup` / `SPiiPlusConfig` iocsh commands for the ACS Tech80
 //! SPiiPlus, C's model-1 interface: records reach axis `signal` of `card`
-//! through `DTYP "SPiiPlus"` and `OUT "#C card S signal"`. Config connects
-//! and identifies the controller at once, where C's `motor_init` does so at
-//! iocInit.
+//! through `DTYP "SPiiPlus"` and `OUT "#C card S signal"`. Config keeps
+//! the port; `motor_init` at iocInit connects and identifies the controller.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,25 +49,29 @@ pub fn spiiplus_config_command() -> CommandDef {
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let mode = CommandMode::parse(&opt_string(args, 2)?.unwrap_or_default());
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                // C connects at an asyn_address SPiiPlusConfig never sets (drvSPiiPlus.cc:682).
-                0,
-                SPIIPLUS_TIMEOUT,
-                INPUT_EOS,
-                OUTPUT_EOS,
-                EosRefusal::Ignored,
-            )?;
-            let controller = SpiiPlusController::new(handle, mode)
-                .map_err(|e| format!("SPiiPlusConfig: {e}"))?;
-            let num_axes = controller.num_axes();
-            let controller = Arc::new(Mutex::new(controller));
-
-            for index in 0..num_axes {
-                let ax = SpiiPlusAxis::new(controller.clone(), index);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                SPIIPLUS.install(ctx, card, index as i32, motor)?;
-            }
+            SPIIPLUS.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    // C connects at an asyn_address SPiiPlusConfig never sets (drvSPiiPlus.cc:682).
+                    0,
+                    SPIIPLUS_TIMEOUT,
+                    INPUT_EOS,
+                    OUTPUT_EOS,
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = SpiiPlusController::new(handle, mode) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                let controller = Arc::new(Mutex::new(controller));
+                for index in 0..num_axes {
+                    let ax = SpiiPlusAxis::new(controller.clone(), index);
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    init.axis(index as i32, motor);
+                }
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )

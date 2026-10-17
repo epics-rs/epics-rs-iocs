@@ -43,7 +43,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_int,
     opt_string, poll_intervals, req_string,
 };
-use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1::{CardInit, Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 use motor_common::model2::{Model2, Model2Axis};
 use motor_common::{
@@ -1731,13 +1731,13 @@ fn model1_config_args() -> Vec<ArgDesc> {
     ]
 }
 
-/// A model-1 `<name>(card, port, addr)` whose card `build` fills, if the
-/// driver's `Setup` sized a table holding `card`. `addr` is the GPIB address,
-/// which an octet port at address 0 has no use for.
+/// A model-1 `<name>(card, port, addr)` whose `motor_init` pass `build` is,
+/// if the driver's `Setup` sized a table holding `card`. `addr` is the asyn
+/// address C connects at.
 fn model1_config_command(
     name: &'static str,
     driver: &'static Model1,
-    build: fn(&CommandContext, i32, &str, i32) -> Result<(), String>,
+    build: fn(&mut CardInit, &str, i32),
 ) -> CommandDef {
     CommandDef::new(
         name,
@@ -1749,7 +1749,8 @@ fn model1_config_command(
                 return Ok(CommandOutcome::Continue);
             }
             let port = req_string(args, 1, "asyn port name")?;
-            build(ctx, card, &port, c_int(args, 2))?;
+            let addr = c_int(args, 2);
+            driver.config(ctx, card, move |init| build(init, &port, addr))?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1774,23 +1775,22 @@ pub fn mm3000_setup_command() -> CommandDef {
 /// `MM3000Config(card, name, addr)`: one signal per axis slot the
 /// controller's `RC` reports, including the trailing `unused` slot C counts.
 pub fn mm3000_config_command() -> CommandDef {
-    model1_config_command("MM3000Config", &MM3000, |ctx, card, port, addr| {
+    model1_config_command("MM3000Config", &MM3000, |init, port, addr| {
         // C drops a card it cannot connect to without a word.
         let Ok(handle) = connect_serial(port, addr, MM3000_TIMEOUT) else {
-            return Ok(());
+            return;
         };
         let Some(controller) = Mm3000Controller::new(handle) else {
-            return Ok(());
+            return;
         };
         let num_axes = controller.axis_types().len();
         let line = format!("{port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
             let ax = Mm3000Axis::new(controller.clone(), axis);
-            MM3000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
+            init.axis((axis - 1) as i32, Arc::new(Mutex::new(ax)));
         }
-        MM3000.describe(card, line);
-        Ok(())
+        init.describe(line);
     })
 }
 
@@ -1834,10 +1834,10 @@ pub fn mm4000_setup_command() -> CommandDef {
 /// `MM4000Config(card, name, addr)`: one signal per axis the controller's
 /// `TH;` reports.
 pub fn mm4000_config_command() -> CommandDef {
-    model1_config_command("MM4000Config", &MM4000, |ctx, card, port, addr| {
+    model1_config_command("MM4000Config", &MM4000, |init, port, addr| {
         // C drops a card it cannot connect to without a word.
         let Ok(handle) = connect_serial(port, addr, MM4000_TIMEOUT) else {
-            return Ok(());
+            return;
         };
         // Six per-axis polls share one controller-wide exchange: cache for
         // half the default scan period.
@@ -1848,21 +1848,24 @@ pub fn mm4000_config_command() -> CommandDef {
                 errlog_vprintf(format_args!(
                     "drvMM4000.c:motor_init() - invalid model = {ident}\n"
                 ));
-                return Ok(());
+                return;
             }
-            Err(_) => return Ok(()),
+            Err(_) => return,
         };
         let num_axes = controller.num_axes();
         let line = format!("port={port}, address={addr}, id: {}", controller.firmware());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let mut ax =
-                Mm4000Axis::new(controller.clone(), card, axis, mm4000::MODEL1_POLL_FAILURE);
+            let mut ax = Mm4000Axis::new(
+                controller.clone(),
+                init.card(),
+                axis,
+                mm4000::MODEL1_POLL_FAILURE,
+            );
             ax.model1_set_status();
-            MM4000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
+            init.axis((axis - 1) as i32, Arc::new(Mutex::new(ax)));
         }
-        MM4000.describe(card, line);
-        Ok(())
+        init.describe(line);
     })
 }
 
@@ -2063,20 +2066,19 @@ pub fn pm500_setup_command() -> CommandDef {
 /// scan finds. C `motor_init` drops a controller it cannot connect to or
 /// that leaves `SVN?` unanswered without a word (drvPM500.cc:577, :671-672).
 pub fn pm500_config_command() -> CommandDef {
-    model1_config_command("PM500Config", &PM500, |ctx, card, port, addr| {
+    model1_config_command("PM500Config", &PM500, |init, port, addr| {
         let Ok(handle) = connect_serial(port, addr, PM500_TIMEOUT) else {
-            return Ok(());
+            return;
         };
         let Some(controller) = Pm500Controller::new(handle) else {
-            return Ok(());
+            return;
         };
         let num_axes = controller.num_axes();
         let controller = Arc::new(Mutex::new(controller));
         for index in 0..num_axes {
             let ax = Pm500Axis::new(controller.clone(), index);
-            PM500.install(ctx, card, index as i32, Arc::new(Mutex::new(ax)))?;
+            init.axis(index as i32, Arc::new(Mutex::new(ax)));
         }
-        Ok(())
     })
 }
 
@@ -2098,7 +2100,7 @@ pub fn esp300_setup_command() -> CommandDef {
 /// `ESP300Config(card, name, addr)`: one signal per axis C `motor_init`
 /// finds (stop each axis until "axis number out of range").
 pub fn esp300_config_command() -> CommandDef {
-    model1_config_command("ESP300Config", &ESP300, |ctx, card, port, addr| {
+    model1_config_command("ESP300Config", &ESP300, |init, port, addr| {
         const ERRMSG: &str = "drvESP300.c:motor_init: ASYN";
         let handle = match connect_with_eos(
             port,
@@ -2114,28 +2116,27 @@ pub fn esp300_config_command() -> CommandDef {
                     "{ERRMSG} setInputEos error = {}\n",
                     e.status() as i32
                 ));
-                return Ok(());
+                return;
             }
             Err(_) => {
                 errlog_vprintf(format_args!(
                     "{ERRMSG} connect error = {}\n",
                     AsynStatus::Error as i32
                 ));
-                return Ok(());
+                return;
             }
         };
         let Some(controller) = Esp300Controller::new(handle) else {
-            return Ok(());
+            return;
         };
         let num_axes = controller.num_axes();
         let line = format!("port={port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
             let ax = Esp300Axis::new(controller.clone(), axis);
-            ESP300.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
+            init.axis((axis - 1) as i32, Arc::new(Mutex::new(ax)));
         }
-        ESP300.describe(card, line);
-        Ok(())
+        init.describe(line);
     })
 }
 
@@ -2175,22 +2176,24 @@ pub fn pmnc87xx_setup_command() -> CommandDef {
 /// modules found (`MPV` for the 8750, `DRT` for the 8752). The controller
 /// sets the port EOS itself, as C `motor_init` does.
 pub fn pmnc87xx_config_command() -> CommandDef {
-    model1_config_command("PMNC87xxConfig", &PMNC87XX, |ctx, card, port, addr| {
-        let asyn_port = get_port(port).ok_or_else(|| {
-            format!("IP port '{port}' not found (call drvAsynIPPortConfigure first)")
-        })?;
-        let controller = PmncController::new(asyn_port.handle.clone(), addr, PMNC_TIMEOUT)
-            .map_err(|e| format!("PMNC87xxConfig: {e}"))?;
+    model1_config_command("PMNC87xxConfig", &PMNC87XX, |init, port, addr| {
+        let Some(asyn_port) = get_port(port) else {
+            return;
+        };
+        let Ok(controller) = PmncController::new(asyn_port.handle.clone(), addr, PMNC_TIMEOUT)
+        else {
+            return;
+        };
         let num_axes = controller.num_axes();
         let line = format!("{port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for index in 0..num_axes {
-            let ax = PmncAxis::new(controller.clone(), index)
-                .map_err(|e| format!("PMNC87xxConfig: axis {index}: {e}"))?;
-            PMNC87XX.install(ctx, card, index as i32, Arc::new(Mutex::new(ax)))?;
+            let Ok(ax) = PmncAxis::new(controller.clone(), index) else {
+                return;
+            };
+            init.axis(index as i32, Arc::new(Mutex::new(ax)));
         }
-        PMNC87XX.describe(card, line);
-        Ok(())
+        init.describe(line);
     })
 }
 
@@ -2933,7 +2936,7 @@ mod one_poller {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{port_report, run_command};
+    use motor_common::testing::{drvsup_init, port_report, run_command};
 
     /// AG_UCController::report then AG_UCAxis::report (AG_UC.cpp:192-201,
     /// :255-267); currentPosition is the last poll's.
@@ -3252,6 +3255,7 @@ mod report {
         });
         let config = vec![int(1), ArgValue::String("esp300RepLine".into()), int(3)];
         run_command(esp300_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvESP300", 0),
             "    ESP300 controller 0 connection failed.\n    ESP300 controller 1 \
@@ -3275,6 +3279,7 @@ mod report {
         });
         let config = vec![int(0), ArgValue::String("mm3000RepLine".into()), int(4)];
         run_command(mm3000_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvMM3000", 0),
             "    MM3000 controller 0 asyn port= mm3000RepLine, address=4, id: MM3000 Version \
@@ -3299,6 +3304,7 @@ mod report {
         });
         let config = vec![int(0), ArgValue::String("mm4000RepLine".into()), int(0)];
         run_command(mm4000_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvMM4000", 0),
             "    MM4000 controller 0, port=mm4000RepLine, address=0, id: MM4005 Version 2.0 \n"
@@ -3333,6 +3339,7 @@ mod report {
                 "    PMNC87xx controller {card} asyn port= {port}, address=0, id: Version 1.6.0 \n"
             )
         };
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvPMNC87xx", 0),
             format!(

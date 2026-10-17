@@ -1,8 +1,8 @@
 //! `PIJEDSSetup` / `PIJEDSConfig` iocsh commands for the piezosystem jena
 //! E-516 controller, C's model-1 interface: records reach axis `signal` of
 //! `card` through `DTYP "PIJEDS"` and `OUT "#C card S signal"`. Config
-//! connects and identifies the controller at once, where C's `motor_init`
-//! does so at iocInit.
+//! keeps the port; `motor_init` at iocInit connects and identifies the
+//! controller.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,29 +54,33 @@ pub fn pijeds_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                PIJEDS_TIMEOUT,
-                b"\x11",
-                b"\r",
-                EosRefusal::Ignored,
-            )?;
-            let controller =
-                PiJedsController::new(handle).map_err(|e| format!("PIJEDSConfig: {e}"))?;
-            let num_axes = controller.num_axes();
-            if num_axes == 0 {
-                return Err("PIJEDSConfig: no axes detected".into());
-            }
-            let line = format!("port={asyn_port}, id: {}", controller.ident());
-            let controller = Arc::new(Mutex::new(controller));
-
-            for axis in 0..num_axes {
-                let ax = PiJedsAxis::new(controller.clone(), axis);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                PIJEDS.install(ctx, card, axis as i32, motor)?;
-            }
-            PIJEDS.describe(card, line);
+            PIJEDS.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIJEDS_TIMEOUT,
+                    b"\x11",
+                    b"\r",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PiJedsController::new(handle) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                if num_axes == 0 {
+                    return;
+                }
+                let line = format!("port={asyn_port}, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
+                for axis in 0..num_axes {
+                    let ax = PiJedsAxis::new(controller.clone(), axis);
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    init.axis(axis as i32, motor);
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -85,7 +89,7 @@ pub fn pijeds_config_command() -> CommandDef {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{LineRig, driver_report, run_command};
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
     /// drvPIJEDS.cc's drvet `report` (drvPIJEDS.cc:151-176), which `dbior`
     /// runs.
@@ -108,6 +112,7 @@ mod report {
         });
         let config = vec![int(1), ArgValue::String("jedsRepLine".into()), int(0)];
         run_command(pijeds_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvPIJEDS", 0),
             "    PIJEDS controller 0 connection failed.\n    PIJEDS controller #1, \

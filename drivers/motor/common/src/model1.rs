@@ -1,8 +1,10 @@
 //! The startup interface of a C model-1 driver: `<Drv>Setup(num_cards,
 //! scan_rate)` sizes its card table and sets its polling rate, and
-//! `<Drv>Config(card, …)` fills one slot. Records reach the axes through
-//! `DTYP "<choice>"` and `OUT "#C card S signal"`.
+//! `<Drv>Config(card, …)` fills one slot. The driver's `motor_init`, at
+//! drvSup init, connects to each card and finds its axes. Records reach the
+//! axes through `DTYP "<choice>"` and `OUT "#C card S signal"`.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::interfaces::motor::{AsynMotor, PostMessage};
@@ -20,6 +22,7 @@ pub fn c_int(args: &[ArgValue], i: usize) -> i32 {
 }
 use std::time::Duration;
 
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::task::BlockingBridge;
 use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::motor::builder::{ControllerAxis, MotorTaskBuilder};
@@ -38,8 +41,8 @@ pub struct Model1 {
     default_scan_rate: i32,
     /// `(num_cards, scan_rate)` once `Setup` ran.
     setup: Mutex<Option<(i32, i32)>>,
-    /// The driver's one `motor_task`, gathering the cards `Config` fills
-    /// until drvSup init starts it.
+    /// The cards `Config` filled, until drvSup init runs their
+    /// `motor_init` and starts the driver's one `motor_task`.
     task: Mutex<Task>,
     /// What the driver's report prints for each card `Config` filled.
     described: Mutex<Vec<(i32, String)>>,
@@ -83,11 +86,58 @@ impl Model1Cards<'_> {
     }
 }
 
+/// One axis a card's `motor_init` found: signal, motor, and the device's own
+/// `build_trans` when it has one.
+type FoundAxis = (i32, Arc<Mutex<dyn AsynMotor>>, Option<Arc<dyn BuildTrans>>);
+
+/// What one card's `motor_init` pass found on its controller: the axes it
+/// gives the records, and its report line. A card left with neither is the
+/// NULL `motor_state[card]` of a controller that did not answer, which C
+/// drops without a word; each of its records then fails init with
+/// "card does not exist!" (motordevCom.cc:231-235).
+pub struct CardInit {
+    card: i32,
+    axes: Vec<FoundAxis>,
+    description: Option<String>,
+}
+
+impl CardInit {
+    /// The card being initialized.
+    pub fn card(&self) -> i32 {
+        self.card
+    }
+
+    /// Make `motor` signal `signal` of the card.
+    pub fn axis(&mut self, signal: i32, motor: Arc<Mutex<dyn AsynMotor>>) {
+        self.axes.push((signal, motor, None));
+    }
+
+    /// [`Self::axis`] for a device whose `build_trans` decides from its own
+    /// state, as devEMC18011's does.
+    pub fn axis_with_build_trans(
+        &mut self,
+        signal: i32,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+        build_trans: Arc<dyn BuildTrans>,
+    ) {
+        self.axes.push((signal, motor, Some(build_trans)));
+    }
+
+    /// What the driver's report prints for the card: C's `motor_state[card]`,
+    /// read for `ident` and the controller's port.
+    pub fn describe(&mut self, line: impl Into<String>) {
+        self.description = Some(line.into());
+    }
+}
+
+/// A card's `motor_init` pass, which its `Config` deferred to drvSup init.
+type Init = Box<dyn FnOnce(&mut CardInit) + Send>;
+
 enum Task {
     /// No card yet.
     Empty,
-    /// The cards so far, and where to spawn the task.
-    Filling(MotorTaskBuilder, BlockingBridge),
+    /// Each configured card's init, and where to spawn the task.
+    Filling(BTreeMap<i32, Init>, BlockingBridge),
     /// drvSup init ran.
     Started,
 }
@@ -127,13 +177,10 @@ impl Model1 {
         });
     }
 
-    /// What the driver's report prints for `card`, which its `Config`
-    /// filled: C's `motor_state[card]`, read for `ident` and the
-    /// controller's port.
-    pub fn describe(&self, card: i32, line: impl Into<String>) {
+    fn describe(&self, card: i32, line: String) {
         let mut described = self.described.lock().unwrap_or_else(|e| e.into_inner());
         described.retain(|(c, _)| *c != card);
-        described.push((card, line.into()));
+        described.push((card, line));
     }
 
     /// `<name>(num_cards, scan_rate)`. Building it adds the driver's row to
@@ -185,61 +232,28 @@ impl Model1 {
         }
     }
 
-    /// Make `motor` signal `signal` of `card`, queried while moving at the
-    /// `Setup` scan rate on the driver's one task, which starts at drvSup
-    /// init as C `motor_init` starts `motor_task` (motordrvCom.cc:177).
-    pub fn install(
+    /// What `Config` does with `card`: keep `init`, its `motor_init` pass,
+    /// which drvSup init runs for each card in card order, as C `motor_init`
+    /// loops over `motor_state` (e.g. drvSC800.cc:520-623). A second `Config`
+    /// of the card replaces the first. The axes the passes find are queried
+    /// while moving at the `Setup` scan rate on the driver's one task, which
+    /// drvSup init then starts as C `motor_init` starts `motor_task`.
+    pub fn config(
         &'static self,
         ctx: &CommandContext,
         card: i32,
-        signal: i32,
-        motor: Arc<Mutex<dyn AsynMotor>>,
+        init: impl FnOnce(&mut CardInit) + Send + 'static,
     ) -> Result<(), String> {
-        self.install_axis(ctx, card, signal, motor, None)
-    }
-
-    /// [`Self::install`] for a device whose `build_trans` decides from its
-    /// own state, as devEMC18011's does.
-    pub fn install_with_build_trans(
-        &'static self,
-        ctx: &CommandContext,
-        card: i32,
-        signal: i32,
-        motor: Arc<Mutex<dyn AsynMotor>>,
-        build_trans: Arc<dyn BuildTrans>,
-    ) -> Result<(), String> {
-        self.install_axis(ctx, card, signal, motor, Some(build_trans))
-    }
-
-    fn install_axis(
-        &'static self,
-        ctx: &CommandContext,
-        card: i32,
-        signal: i32,
-        motor: Arc<Mutex<dyn AsynMotor>>,
-        build_trans: Option<Arc<dyn BuildTrans>>,
-    ) -> Result<(), String> {
-        let user = TraceUser::Model1 {
-            device: self.row.choice,
-            card,
-            signal,
-        };
         let mut task = self.task.lock().unwrap_or_else(|e| e.into_inner());
         if matches!(*task, Task::Empty) {
-            let scan_rate = self
-                .setup
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .map_or(self.default_scan_rate, |(_, rate)| rate);
-            let scan = Duration::from_millis(1000 / scan_rate as u64);
-            *task = Task::Filling(MotorTaskBuilder::new(scan), ctx.bridge().clone());
+            *task = Task::Filling(BTreeMap::new(), ctx.bridge().clone());
             init_hook_register(Arc::new(move |state| {
                 if state == InitHookState::AfterInitDrvSup {
                     self.start();
                 }
             }));
         }
-        let Task::Filling(builder, _) = &mut *task else {
+        let Task::Filling(cards, _) = &mut *task else {
             // Deliberate deviation from a C defect: C's Config fills the slot
             // after drvSup init without a word, and that card is never
             // initialized or polled; refuse it instead.
@@ -248,18 +262,55 @@ impl Model1 {
                 self.row.choice
             ));
         };
-        let ControllerAxis { axis, .. } = builder.axis(motor, user);
-        let axis = match build_trans {
-            Some(build_trans) => axis.with_build_trans(build_trans),
-            None => axis,
-        };
-        epics_rs::motor::devices::register_axis(axis)
+        cards.insert(card, Box::new(init));
+        Ok(())
     }
 
-    /// The task, after its startup pass over the cards.
+    /// drvSup init: each card's `motor_init` pass, then the task over the
+    /// axes they found.
     fn start(&self) {
-        let mut task = self.task.lock().unwrap_or_else(|e| e.into_inner());
-        if let Task::Filling(builder, bridge) = std::mem::replace(&mut *task, Task::Started) {
+        let (cards, bridge) = {
+            let mut task = self.task.lock().unwrap_or_else(|e| e.into_inner());
+            match std::mem::replace(&mut *task, Task::Started) {
+                Task::Filling(cards, bridge) => (cards, bridge),
+                _ => return,
+            }
+        };
+        let scan_rate = self
+            .setup
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map_or(self.default_scan_rate, |(_, rate)| rate);
+        let mut builder = MotorTaskBuilder::new(Duration::from_millis(1000 / scan_rate as u64));
+        let mut any_axis = false;
+        for (card, init) in cards {
+            let mut found = CardInit {
+                card,
+                axes: Vec::new(),
+                description: None,
+            };
+            init(&mut found);
+            if let Some(line) = found.description {
+                self.describe(card, line);
+            }
+            for (signal, motor, build_trans) in found.axes {
+                let user = TraceUser::Model1 {
+                    device: self.row.choice,
+                    card,
+                    signal,
+                };
+                let ControllerAxis { axis, .. } = builder.axis(motor, user);
+                let axis = match build_trans {
+                    Some(build_trans) => axis.with_build_trans(build_trans),
+                    None => axis,
+                };
+                match epics_rs::motor::devices::register_axis(axis) {
+                    Ok(()) => any_axis = true,
+                    Err(e) => errlog_vprintf(format_args!("{}: {e}\n", self.row.choice)),
+                }
+            }
+        }
+        if any_axis {
             bridge.spawn(builder.build().run());
         }
     }
@@ -358,26 +409,58 @@ mod tests {
         let _entered = rt.enter();
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
         let log = Log::default();
+        let inits = Log::default();
         TASK.setup(2, 10);
         for card in [1, 0] {
             let motor = Arc::new(Mutex::new(Card {
                 card,
                 log: log.clone(),
             }));
-            TASK.install(&ctx, card, 0, motor).unwrap();
+            let inits = inits.clone();
+            TASK.config(&ctx, card, move |init| {
+                inits.lock().unwrap().push(init.card());
+                init.axis(0, motor);
+            })
+            .unwrap();
         }
-        assert!(log.lock().unwrap().is_empty(), "Config polls no card");
+        assert!(inits.lock().unwrap().is_empty(), "Config talks to no card");
         init_hook_announce(InitHookState::AfterInitDrvSup);
+        assert_eq!(*inits.lock().unwrap(), [0, 1], "motor_init, in card order");
         assert_eq!(
             *log.lock().unwrap(),
-            [1, 0],
-            "drvSup init's startup pass, in Config order"
+            [0, 1],
+            "drvSup init's startup pass over the axes motor_init found"
         );
-        let late = Arc::new(Mutex::new(Card {
-            card: 2,
-            log: log.clone(),
-        }));
-        assert!(TASK.install(&ctx, 2, 0, late).is_err());
+        assert!(TASK.config(&ctx, 2, |_| {}).is_err());
+    }
+
+    static DEV_SILENT: DevSup = model1_device("devTestSilent", "TestSilent");
+    static SILENT: Model1 = Model1::new(&DEV_SILENT, 4, SCAN_RATE);
+
+    /// A card whose controller does not answer: C's `motor_init` drops it
+    /// and the report then calls it failed.
+    #[test]
+    fn a_card_motor_init_finds_nothing_on_is_dropped() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _entered = rt.enter();
+        let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
+        SILENT.register_report("drvTestSilent", |cards| {
+            cards.report("TestSilent", |card, line| format!("{card} {line}\n"))
+        });
+        SILENT.setup(2, 10);
+        SILENT.config(&ctx, 0, |_| {}).unwrap();
+        SILENT
+            .config(&ctx, 1, |init| init.describe("id: B"))
+            .unwrap();
+        init_hook_announce(InitHookState::AfterInitDrvSup);
+        let drvet =
+            epics_rs::base::server::driver_support::find_driver_support("drvTestSilent").unwrap();
+        assert_eq!(
+            drvet.report(0).unwrap(),
+            "    TestSilent controller 0 connection failed.\n1 id: B\n"
+        );
     }
 
     static DEV_REPORT: DevSup = model1_device("devTestReport", "TestReport");
@@ -400,7 +483,7 @@ mod tests {
             "    No TestReport controllers configured.\n"
         );
         REPORT.setup(2, 10);
-        REPORT.describe(1, "id: B");
+        REPORT.describe(1, "id: B".into());
         assert_eq!(
             drvet.report(0).unwrap(),
             "    TestReport controller 0 connection failed.\n    TestReport controller 1, id: B\n"

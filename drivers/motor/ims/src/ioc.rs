@@ -118,9 +118,8 @@ fn config_args() -> Vec<ArgDesc> {
     ]
 }
 
-/// `IM483PLConfig(card, name)`. Connects and probes the card at once, where
-/// C's `motor_init` does so at iocInit; a card with no answering axis is left
-/// unconfigured, as there.
+/// `IM483PLConfig(card, name)`. `motor_init` at iocInit connects and probes
+/// the card; a card with no answering axis is left unconfigured.
 pub fn im483pl_config_command() -> CommandDef {
     CommandDef::new(
         "IM483PLConfig",
@@ -132,27 +131,30 @@ pub fn im483pl_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                COMM_TIMEOUT,
-                b"\n",
-                b"\n",
-                EosRefusal::Ignored,
-            )?;
-            let controller = Im483Controller::new(handle);
-            let axes = im483pl_probe(&controller);
-            let controller = Arc::new(Mutex::new(controller));
-            for signal in 0..axes {
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvIm483Axis::im483pl(
-                    controller.clone(),
-                    signal,
-                )));
-                IM483PL.install(ctx, card, signal as i32, motor)?;
-            }
-            if axes > 0 {
-                IM483PL.describe(card, asyn_port);
-            }
+            IM483PL.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    COMM_TIMEOUT,
+                    b"\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let controller = Im483Controller::new(handle);
+                let axes = im483pl_probe(&controller);
+                let controller = Arc::new(Mutex::new(controller));
+                for signal in 0..axes {
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
+                        DrvIm483Axis::im483pl(controller.clone(), signal),
+                    ));
+                    init.axis(signal as i32, motor);
+                }
+                if axes > 0 {
+                    init.describe(asyn_port);
+                }
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -173,7 +175,7 @@ pub fn im483sm_setup_command() -> CommandDef {
     IM483SM.setup_command("IM483SMSetup")
 }
 
-/// `IM483SMConfig(card, name)`: one axis per card, probed at once as for
+/// `IM483SMConfig(card, name)`: one axis per card, probed at iocInit as for
 /// [`im483pl_config_command`].
 pub fn im483sm_config_command() -> CommandDef {
     CommandDef::new(
@@ -186,23 +188,27 @@ pub fn im483sm_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                COMM_TIMEOUT,
-                b"\r\n",
-                b"\r",
-                EosRefusal::Ignored,
-            )?;
-            let controller = Im483Controller::new(handle);
-            let Some(ident) = im483sm_probe(&controller) else {
-                return Ok(CommandOutcome::Continue);
-            };
-            let controller = Arc::new(Mutex::new(controller));
-            let motor: Arc<Mutex<dyn AsynMotor>> =
-                Arc::new(Mutex::new(DrvIm483Axis::im483sm(controller)));
-            IM483SM.install(ctx, card, 0, motor)?;
-            IM483SM.describe(card, format!("port={asyn_port}, id: {ident}"));
+            IM483SM.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    COMM_TIMEOUT,
+                    b"\r\n",
+                    b"\r",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let controller = Im483Controller::new(handle);
+                let Some(ident) = im483sm_probe(&controller) else {
+                    return;
+                };
+                let controller = Arc::new(Mutex::new(controller));
+                let motor: Arc<Mutex<dyn AsynMotor>> =
+                    Arc::new(Mutex::new(DrvIm483Axis::im483sm(controller)));
+                init.axis(0, motor);
+                init.describe(format!("port={asyn_port}, id: {ident}"));
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -223,7 +229,7 @@ pub fn mdrive_setup_command() -> CommandDef {
     MDRIVE.setup_command("MDriveSetup")
 }
 
-/// `MDriveConfig(card, name)`: probes the chain at once as for
+/// `MDriveConfig(card, name)`: probes the chain at iocInit as for
 /// [`im483pl_config_command`].
 pub fn mdrive_config_command() -> CommandDef {
     CommandDef::new(
@@ -236,28 +242,30 @@ pub fn mdrive_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let handle = connect_with_eos(
-                &asyn_port,
-                0,
-                COMM_TIMEOUT,
-                b"\r\n",
-                b"\n",
-                EosRefusal::Ignored,
-            )?;
-            let controller = MDriveController::new(handle);
-            let (ident, drives) = mdrive_probe(&controller, card);
-            if !drives.is_empty() {
-                MDRIVE.describe(card, format!("port={asyn_port}, id: {ident}"));
-            }
-            let controller = Arc::new(Mutex::new(controller));
-            for (signal, drive) in drives.into_iter().enumerate() {
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvMDriveAxis::new(
-                    controller.clone(),
-                    signal,
-                    drive,
-                )));
-                MDRIVE.install(ctx, card, signal as i32, motor)?;
-            }
+            MDRIVE.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    COMM_TIMEOUT,
+                    b"\r\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let controller = MDriveController::new(handle);
+                let (ident, drives) = mdrive_probe(&controller, card);
+                if !drives.is_empty() {
+                    init.describe(format!("port={asyn_port}, id: {ident}"));
+                }
+                let controller = Arc::new(Mutex::new(controller));
+                for (signal, drive) in drives.into_iter().enumerate() {
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
+                        DrvMDriveAxis::new(controller.clone(), signal, drive),
+                    ));
+                    init.axis(signal as i32, motor);
+                }
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -294,7 +302,7 @@ mod one_poller {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{LineRig, driver_report, run_command};
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
     /// drvIM483PL.cc's drvet `report` (drvIM483PL.cc:147-171), which `dbior`
     /// runs; the IM483PL has no identification message.
@@ -310,6 +318,7 @@ mod report {
         let (_line, _io) = LineRig::new("im483plRepLine", |_| "0".into());
         let config = vec![int(1), ArgValue::String("im483plRepLine".into())];
         run_command(im483pl_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvIM483PL", 0),
             "    IM483PL controller 0 connection failed.\n    IM483PL controller #1, \
@@ -333,6 +342,7 @@ mod report {
         });
         let config = vec![int(1), ArgValue::String("mdriveRepLine".into())];
         run_command(mdrive_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvMDrive", 0),
             "    MDrive controller 0 connection failed.\n    MDrive controller #1, \
@@ -355,6 +365,7 @@ mod report {
         let config = vec![int(1), ArgValue::String("im483smRepLine".into())];
         run_command(im483sm_config_command(), config).await;
         let ident = vec!["X"; 26].join(" ");
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvIM483SM", 0),
             format!(

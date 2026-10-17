@@ -1,8 +1,8 @@
 //! `MDT695Setup` / `MDT695Config` iocsh commands for the ThorLabs
 //! MDT693/694/695 piezo controller, C's model-1 interface: records reach axis
 //! `signal` of `card` through `DTYP "MDT695"` and `OUT "#C card S signal"`.
-//! Config connects and identifies the controller at once, where C's
-//! `motor_init` does so at iocInit.
+//! Config keeps the port; `motor_init` at iocInit connects and identifies
+//! the controller.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,36 +53,34 @@ pub fn mdt695_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            let handle = connect_with_eos(
-                &asyn_port,
-                // C connects at an asyn_address MDT695Config never sets (drvMDT695.cc:548).
-                0,
-                MDT695_TIMEOUT,
-                INPUT_EOS,
-                OUTPUT_EOS,
-                EosRefusal::Ignored,
-            )?;
-            let controller =
-                Mdt695Controller::new(handle).map_err(|e| format!("MDT695Config: {e}"))?;
-            let num_axes = controller.num_axes();
-            // C prints `cntrl->asyn_address`, which MDT695Config never sets
-            // (drvMDT695.cc:495-509), a read of uninitialized memory not
-            // copied; this is the address the line is opened at.
-            let line = format!("port={asyn_port}, address=0, id: {}", controller.ident());
-            let controller = Arc::new(Mutex::new(controller));
-
-            for index in 0..num_axes {
-                let ax = Mdt695Axis::new(controller.clone(), index);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                MDT695.install_with_build_trans(
-                    ctx,
-                    card,
-                    index as i32,
-                    motor,
-                    Arc::new(Mdt695Build),
-                )?;
-            }
-            MDT695.describe(card, line);
+            MDT695.config(ctx, card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    // C connects at an asyn_address MDT695Config never sets (drvMDT695.cc:548).
+                    0,
+                    MDT695_TIMEOUT,
+                    INPUT_EOS,
+                    OUTPUT_EOS,
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = Mdt695Controller::new(handle) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                // C prints `cntrl->asyn_address`, which MDT695Config never sets
+                // (drvMDT695.cc:495-509), a read of uninitialized memory not
+                // copied; this is the address the line is opened at.
+                let line = format!("port={asyn_port}, address=0, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
+                for index in 0..num_axes {
+                    let ax = Mdt695Axis::new(controller.clone(), index);
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    init.axis_with_build_trans(index as i32, motor, Arc::new(Mdt695Build));
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -91,7 +89,7 @@ pub fn mdt695_config_command() -> CommandDef {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{LineRig, driver_report, run_command};
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
     /// drvMDT695.cc's drvet `report` (drvMDT695.cc:145-172), which `dbior`
     /// runs.
@@ -110,6 +108,7 @@ mod report {
         });
         let config = vec![int(1), ArgValue::String("mdtRepLine".into())];
         run_command(mdt695_config_command(), config).await;
+        drvsup_init().await;
         assert_eq!(
             driver_report("drvMDT695", 0),
             "    MDT695 controller 0 connection failed.\n    MDT695 controller 1, \
