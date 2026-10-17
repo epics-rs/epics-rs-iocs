@@ -145,7 +145,8 @@ impl AsynMotor for Smc100Axis {
         let low =
             protocol::parse_value(&self.write_read(&protocol::cmd_query_low_limit(self.axis))?)
                 .ok_or_else(|| parse_error("SL?"))?;
-        let target = if velocity >= 0.0 { high } else { low };
+        // C: `maxVelocity > 0.`, so a zero jog goes to the low limit.
+        let target = if velocity > 0.0 { high } else { low };
         // The limits are already controller EGU — sent directly, not scaled.
         self.write(&protocol::cmd_move_absolute(self.axis, target))
     }
@@ -246,5 +247,23 @@ mod tests {
             ]
         );
         assert_eq!(axis.poll(&user).unwrap().position, 50000.0);
+    }
+
+    /// SMC100Driver.cpp:243-249: only a positive jog velocity goes to the
+    /// high limit.
+    #[test]
+    fn a_zero_jog_goes_to_the_low_limit() {
+        let (line, io) = LineRig::new("smc100_zero_jog", |last| {
+            match last {
+                "1SR?" => "1SR25",
+                "1SL?" => "1SL-5",
+                _ => "",
+            }
+            .to_string()
+        });
+        let mut axis = Smc100Axis::new(io, 1, 1.0);
+        axis.move_velocity(&AsynUser::default(), 0.0, 0.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent().last().unwrap(), "1PA-5.000000");
     }
 }
