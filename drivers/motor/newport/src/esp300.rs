@@ -160,11 +160,15 @@ impl Esp300Controller {
 /// The velocity/acceleration preamble every motion transaction carries
 /// in the motor record's order (`SET_VELOCITY`, `SET_VEL_BASE`,
 /// `SET_ACCEL`): `VA;VB;AC;AG` — the ESP300 takes acceleration and
-/// deceleration (`AG`) separately, C sends both. Values are controller units.
+/// deceleration (`AG`) separately, C sends both. The record sends no
+/// SET_ACCEL for a zero rate (motorRecord.cc:874, 940). Values are
+/// controller units.
 fn motion_preamble(axis: usize, vel_base: f64, velocity: f64, acceleration: f64) -> String {
-    format!(
-        "{axis:02}VA{velocity:.6};{axis:02}VB{vel_base:.6};{axis:02}AC{acceleration:.6};{axis:02}AG{acceleration:.6}"
-    )
+    let mut msg = format!("{axis:02}VA{velocity:.6};{axis:02}VB{vel_base:.6}");
+    if acceleration > 0.0 {
+        msg += &format!(";{axis:02}AC{acceleration:.6};{axis:02}AG{acceleration:.6}");
+    }
+    msg
 }
 
 /// One ESP300 axis sharing a controller. Implements [`AsynMotor`].
@@ -291,7 +295,7 @@ impl AsynMotor for Esp300Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        // One transaction: VB;VA;AC;AG;PA (the ESP300 starts moving on PA;
+        // One transaction: VA;VB;AC;AG;PA (the ESP300 starts moving on PA;
         // the record's GO is a no-op).
         let parts = self.motion_preamble(min_velocity, velocity, acceleration)?;
         let position = position * self.resolution()?;
@@ -790,6 +794,15 @@ mod tests {
         assert_eq!(
             motion_preamble(12, 0.0, 1.0, 4.0),
             "12VA1.000000;12VB0.000000;12AC4.000000;12AG4.000000"
+        );
+    }
+
+    /// motorRecord.cc:874, 940: no SET_ACCEL for a zero move or home rate.
+    #[test]
+    fn a_zero_rate_preamble_has_no_ac_or_ag() {
+        assert_eq!(
+            motion_preamble(3, 0.5, 2.0, 0.0),
+            "03VA2.000000;03VB0.500000"
         );
     }
 }
