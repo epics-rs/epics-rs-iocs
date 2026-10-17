@@ -881,6 +881,12 @@ mod tests {
             let mut replies = self.replies.lock().unwrap();
             replies.insert(command.into(), reply.into());
         }
+        fn silence(&self, command: &str) {
+            self.replies.lock().unwrap().remove(command);
+        }
+        fn written(&self) -> Vec<String> {
+            std::mem::take(&mut *self.written.lock().unwrap())
+        }
         fn disconnects(&self) -> usize {
             self.disconnects.load(Ordering::SeqCst)
         }
@@ -945,6 +951,56 @@ mod tests {
         assert_eq!(rig.disconnects(), 0);
         assert!(controller.write_read("I200").is_err());
         assert_eq!(rig.disconnects(), 1);
+    }
+
+    /// pmacController.cpp:594-708: an unread global status is 0, the feed
+    /// rate is still read after a failed `???`, and the feed-rate read's
+    /// verdict is the comms error.
+    #[test]
+    fn a_failed_global_status_read_clears_the_global_problem() {
+        let (_rt, rig) = publish_scripted("pmacGlobalLow");
+        rig.answer("???", b"008000\r");
+        rig.answer("%", b"100\r");
+        let controller = Arc::new(Mutex::new(controller_on("pmacGlobalLow")));
+        let params = PmacControllerParams::new(controller.clone());
+        let port = epics_rs::motor::devices::register_controller_port(
+            &open_owner(),
+            "pmacGlobalCtl",
+            2,
+            params,
+        )
+        .unwrap();
+        controller.lock().unwrap().attach_port(port.clone());
+        let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
+        let read = |name| io.read_int32(io.drv_user_create(name).unwrap()).unwrap();
+        let posted = || {
+            (
+                read("PMAC_C_GLOBALSTATUS"),
+                read("PMAC_C_COMMSERROR"),
+                read("PMAC_C_FEEDRATE"),
+            )
+        };
+        let poll = || controller.lock().unwrap().poll();
+        let problem = || controller.lock().unwrap().controller_problem();
+        let feed_rate_poll = io.drv_user_create("PMAC_C_FEEDRATE_POLL").unwrap();
+        io.write_int32(feed_rate_poll, 1).unwrap();
+
+        poll();
+        assert_eq!(rig.written(), ["???", "%"]);
+        assert!(problem());
+        assert_eq!(posted(), (1, 0, 100));
+
+        rig.silence("???");
+        rig.answer("%", b"50\r");
+        poll();
+        assert_eq!(rig.written(), ["???", "%"]);
+        assert!(!problem());
+        assert_eq!(posted(), (0, 0, 50));
+
+        rig.answer("???", b"008000\r");
+        rig.silence("%");
+        poll();
+        assert_eq!(posted(), (1, 1, 50));
     }
 
     /// pmacController.cpp:201: one poller from pmacCreateController, which

@@ -295,38 +295,38 @@ impl PmacController {
     /// C `pmacController::poll`: `getGlobalStatus` and the
     /// `PMAC_C_GLOBALSTATUS` / `PMAC_C_FEEDRATE_PROBLEM` handling.
     pub fn poll(&mut self) {
-        match self
+        // An unread global status is 0, and with feed-rate polling on the `%`
+        // read's verdict replaces the `???` read's (pmacController.cpp:662-708).
+        let global = self
             .write_read("???")
             .ok()
             .as_deref()
-            .and_then(parse_global_status)
-        {
-            Some(status) => self.global_problem = (status & HARDWARE_PROB) != 0,
-            // A failed read leaves the previous verdict, as C does (it sets the
-            // comms-error param and keeps the last global status).
-            None => return self.post(|p| vec![(p.comms_error, 1)]),
-        }
-        let rate = self
-            .feed_rate_poll
-            .then(|| self.write_read("%").ok())
-            .flatten()
-            .as_deref()
-            .and_then(parse_feedrate);
+            .and_then(parse_global_status);
+        let (rate, read_ok) = if self.feed_rate_poll {
+            let rate = self
+                .write_read("%")
+                .ok()
+                .as_deref()
+                .and_then(parse_feedrate);
+            (rate, rate.is_some())
+        } else {
+            (None, global.is_some())
+        };
+        self.global_problem = global.unwrap_or(0) & HARDWARE_PROB != 0;
         if let Some(rate) = rate {
             self.feed_rate = rate;
             self.feed_rate_problem = rate < self.feed_rate_limit - FEEDRATE_DEADBAND;
         }
-        let feed_rate_read = rate.is_some();
-        // C `pmacController::poll`: the feed rate and its verdict are posted
-        // only while polled.
-        let (global, rate, problem) = (
+        let (global, problem) = (
             i32::from(self.global_problem),
-            self.feed_rate,
             i32::from(self.feed_rate_problem),
         );
         self.post(|p| {
-            let mut values = vec![(p.global_status, global), (p.comms_error, 0)];
-            if feed_rate_read {
+            let mut values = vec![
+                (p.global_status, global),
+                (p.comms_error, i32::from(!read_ok)),
+            ];
+            if let Some(rate) = rate {
                 values.extend([(p.feed_rate, rate), (p.feed_rate_problem, problem)]);
             }
             values
