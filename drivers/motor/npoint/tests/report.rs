@@ -76,3 +76,29 @@ async fn a_level_0_c300_report_prints_the_driver_line_alone() {
     assert!(text.contains(want), "{text}");
     assert!(!text.contains("  axis 0"), "{text}");
 }
+
+/// C `LC400Controller::report` (LC400MotorDriver.cpp:181-199) on a
+/// two-axis controller whose port is missing.
+async fn lc400_report(port: &str, level: i32) -> String {
+    let mut args = create_args(port, &format!("{port}None"));
+    args[2] = ArgValue::Int(2);
+    let cmd = motor_npoint::ioc_lc400::lc400_commands().remove(0);
+    report_after(cmd, args, port, level).await
+}
+
+#[epics_rs::base::epics_test]
+async fn the_lc400_report_prints_each_axis_at_level_1() {
+    let text = lc400_report("lc400Report1", 1).await;
+    let want = "LC400 motor driver lc400Report1, numAxes=2, moving poll period=0.100000, \
+                idle poll period=1.000000\n axis 0\n axis 1\n";
+    assert!(text.contains(want), "{text}");
+}
+
+#[epics_rs::base::epics_test]
+async fn a_level_0_lc400_report_prints_the_driver_line_alone() {
+    let text = lc400_report("lc400Report0", 0).await;
+    let want = "LC400 motor driver lc400Report0, numAxes=2, moving poll period=0.100000, \
+                idle poll period=1.000000\n";
+    assert!(text.contains(want), "{text}");
+    assert!(!text.contains(" axis 0\n"), "{text}");
+}
