@@ -32,6 +32,8 @@ pub const VALIDATE_DESTINATION: &str =
     "asynStatus ADTimePix::validateDestination(const std::string&)";
 pub const GET_SERVER: &str = "asynStatus ADTimePix::getServer()";
 pub const INIT_ACQUISITION: &str = "asynStatus ADTimePix::initAcquisition()";
+pub const WRITE_DAC: &str =
+    "asynStatus ADTimePix::writeDac(int, int, const std::string&, int, int)";
 pub const UPLOAD_DACS: &str = "asynStatus ADTimePix::uploadDACS()";
 pub const UPLOAD_BPC: &str = "asynStatus ADTimePix::uploadBPC()";
 pub const RESOLVE_CALIBRATION_FILE: &str = "asynStatus ADTimePix::resolveCalibrationFile(\

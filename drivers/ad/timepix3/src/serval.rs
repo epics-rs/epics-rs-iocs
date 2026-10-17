@@ -24,6 +24,52 @@ pub fn chip_dacs(chip: i32) -> String {
     format!("/detector/chips/{chip}/dacs/")
 }
 
+/// C `ADTimePix3ServalDacs::UpdateError` (serval_dacs.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DacUpdateError {
+    EmptyBody,
+    MalformedJson,
+    InvalidRoot,
+    MissingDac,
+    InvalidDacValue,
+}
+
+impl DacUpdateError {
+    /// C `updateErrorMessage` (serval_dacs.cpp).
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::EmptyBody => "empty DAC response",
+            Self::MalformedJson => "malformed DAC JSON",
+            Self::InvalidRoot => "DAC JSON root is not an object",
+            Self::MissingDac => "DAC response is missing the requested field",
+            Self::InvalidDacValue => "DAC response contains an invalid requested-field value",
+        }
+    }
+}
+
+/// C `ADTimePix3ServalDacs::prepareUpdate`: the chip's DACs with `dac` set
+/// to `requested`, and the value Serval held for it, which must be an
+/// integer in `int` range.
+pub fn prepare_dac_update(
+    body: &str,
+    dac: &str,
+    requested: i32,
+) -> Result<(Value, i32), DacUpdateError> {
+    if body.is_empty() {
+        return Err(DacUpdateError::EmptyBody);
+    }
+    let mut parsed: Value =
+        serde_json::from_str(body).map_err(|_| DacUpdateError::MalformedJson)?;
+    let dacs = parsed.as_object_mut().ok_or(DacUpdateError::InvalidRoot)?;
+    let current = dacs.get(dac).ok_or(DacUpdateError::MissingDac)?;
+    let current = current
+        .as_i64()
+        .and_then(|v| i32::try_from(v).ok())
+        .ok_or(DacUpdateError::InvalidDacValue)?;
+    dacs.insert(dac.to_owned(), json!(requested));
+    Ok((parsed, current))
+}
+
 pub fn chip_pixel_config(chip: i32) -> String {
     format!("/detector/chips/{chip}/PixelConfig")
 }
@@ -1148,6 +1194,32 @@ pub fn parse_destination_response(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_dac_reply_is_validated_as_c() {
+        use DacUpdateError::*;
+        for (body, want) in [
+            ("", Err(EmptyBody)),
+            ("{", Err(MalformedJson)),
+            ("[1]", Err(InvalidRoot)),
+            (r#"{"Vfbk": 5}"#, Err(MissingDac)),
+            (r#"{"Vthreshold_fine": 1.5}"#, Err(InvalidDacValue)),
+            (r#"{"Vthreshold_fine": "7"}"#, Err(InvalidDacValue)),
+            (r#"{"Vthreshold_fine": 2147483648}"#, Err(InvalidDacValue)),
+            (r#"{"Vthreshold_fine": -2147483649}"#, Err(InvalidDacValue)),
+            (
+                r#"{"Vthreshold_fine": 7, "Vfbk": 5}"#,
+                Ok((json!({"Vthreshold_fine": 300, "Vfbk": 5}), 7)),
+            ),
+        ] {
+            assert_eq!(
+                prepare_dac_update(body, "Vthreshold_fine", 300),
+                want,
+                "{body}"
+            );
+        }
+        assert_eq!(InvalidRoot.message(), "DAC JSON root is not an object");
+    }
     use super::*;
 
     /// C `parseResponse` (serval_destination.cpp:23-75).

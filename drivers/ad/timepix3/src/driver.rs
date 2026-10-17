@@ -1261,35 +1261,119 @@ impl TimePix3Driver {
         self.ad.port_base.call_param_callbacks(0)
     }
 
-    /// C `writeDac` (serval_http.cpp:2199).
-    fn write_dac(&mut self, chip: i32, name: &str, value: i32) -> AsynResult<()> {
+    /// C `writeDac` (serval_http.cpp:589-660): a refused write puts the
+    /// record back to the value Serval holds.
+    fn write_dac(
+        &mut self,
+        chip: i32,
+        param: usize,
+        name: &str,
+        value: i32,
+        previous: i32,
+    ) -> AsynResult<()> {
         if !(0..MAX_ADDR as i32).contains(&chip) {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("timepix3: chip {chip} is outside 0..{}", MAX_ADDR - 1),
             });
         }
+        let p = self.p;
         let path = serval::chip_dacs(chip);
-        let mut dacs = self.http.get_json(&path, TIMEOUT_CONFIG).map_err(|e| {
-            let context = format!("writeDac GET chip {chip}");
-            self.http_failed(
-                &format!("GET {path}"),
-                &e,
-                HttpPrint::Failure(&context, "GET", &path),
-            )
-        })?;
-        dacs[name] = json!(value);
-        self.http
-            .put_json(&path, &dacs, TIMEOUT_CONFIG)
-            .map_err(|e| {
-                self.http_failed(
-                    &format!("PUT {path}"),
-                    &e,
-                    HttpPrint::Failure("writeDac PUT", "PUT", &path),
-                )
-            })?;
-        self.http_ok();
-        Ok(())
+        let refused = |what: &str, message: &str| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("timepix3: writeDac {what} {path}: {message}"),
+        };
+        let body = match self.http.get(&path, TIMEOUT_CONFIG) {
+            Ok(body) => body,
+            Err(e) => {
+                let base = &mut self.ad.port_base;
+                base.set_int32_param(param, chip, previous)?;
+                base.set_int32_param(p.http_code, 0, e.code())?;
+                let msg = match e.body() {
+                    "" => "Failed to read DAC configuration",
+                    body => body,
+                };
+                base.set_string_param(p.write_msg, 0, msg)?;
+                let context = format!("writeDac GET chip {chip}");
+                self.log_http(&e, HttpPrint::Failure(&context, "GET", &path));
+                self.ad.port_base.call_param_callbacks(0)?;
+                return Err(refused("GET", &e.to_string()));
+            }
+        };
+        let (dacs, accepted) = match serval::prepare_dac_update(&body, name, value) {
+            Ok(update) => update,
+            Err(e) => {
+                let base = &mut self.ad.port_base;
+                base.set_int32_param(param, chip, previous)?;
+                base.set_int32_param(p.http_code, 0, 200)?;
+                base.set_string_param(p.write_msg, 0, e.message())?;
+                base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{}",
+                        adlog::err(
+                            adlog::WRITE_DAC,
+                            &format!("writeDac GET chip {chip}: {}", e.message())
+                        )
+                    ),
+                );
+                base.call_param_callbacks(0)?;
+                return Err(refused("GET", e.message()));
+            }
+        };
+
+        let reply = self.http.put_json(&path, &dacs, TIMEOUT_CONFIG);
+        let e = match reply {
+            Ok(text) => {
+                let base = &mut self.ad.port_base;
+                base.set_int32_param(p.http_code, 0, 200)?;
+                let msg = if text.is_empty() {
+                    "Uploaded DAC configuration."
+                } else {
+                    &text
+                };
+                base.set_string_param(p.write_msg, 0, msg)?;
+                return base.call_param_callbacks(0);
+            }
+            Err(e) => e,
+        };
+        let failed = match e.body() {
+            "" => "Failed to upload DAC configuration".to_owned(),
+            body => body.to_owned(),
+        };
+        self.log_http(&e, HttpPrint::Failure("writeDac PUT", "PUT", &path));
+        // A rejected PUT leaves Serval's value; read it back, else keep the
+        // value validated before the PUT.
+        let restored = match self
+            .http
+            .get(&path, TIMEOUT_CONFIG)
+            .ok()
+            .and_then(|body| serval::prepare_dac_update(&body, name, value).ok())
+        {
+            Some((_, refreshed)) => refreshed,
+            None => {
+                self.ad.port_base.trace_print(
+                    TraceMask::WARNING,
+                    format_args!(
+                        "{}",
+                        adlog::warn(
+                            adlog::WRITE_DAC,
+                            &format!(
+                                "writeDac: failed to refresh {name} after rejected PUT; \
+                                 using pre-PUT value"
+                            )
+                        )
+                    ),
+                );
+                accepted
+            }
+        };
+        let base = &mut self.ad.port_base;
+        base.set_int32_param(param, chip, restored)?;
+        base.set_int32_param(p.http_code, 0, e.code())?;
+        base.set_string_param(p.write_msg, 0, &failed)?;
+        base.call_param_callbacks(0)?;
+        Err(refused("PUT", &e.to_string()))
     }
 
     /// C `rotateLayout` (serval_http.cpp:476).
@@ -2050,6 +2134,7 @@ impl TimePix3Driver {
         let reason = user.reason;
         let addr = user.addr;
         let acquiring = self.int(self.ad.params.acquire, 0) != 0;
+        let previous = self.int(reason, addr);
         // Acquire is published once the coordinator accepts the transition.
         // The set's status stands wherever C assigns no other
         // (ADTimePix.cpp:507-509).
@@ -2087,9 +2172,9 @@ impl TimePix3Driver {
         } else if reason == p.vthreshold_fine {
             // Only the two thresholds are written; the other DACs are
             // readbacks (ADTimePix.cpp:540-546).
-            self.write_dac(addr, "Vthreshold_fine", value)
+            self.write_dac(addr, reason, "Vthreshold_fine", value, previous)
         } else if reason == p.vthreshold_coarse {
-            self.write_dac(addr, "Vthreshold_coarse", value)
+            self.write_dac(addr, reason, "Vthreshold_coarse", value, previous)
         } else if reason == p.write_raw
             || reason == p.write_raw1
             || reason == p.write_img
@@ -3284,6 +3369,154 @@ mod tests {
             }
         });
         url
+    }
+
+    /// A threshold write Serval refuses leaves the record at Serval's value
+    /// and publishes the reply (serval_http.cpp:589-660).
+    #[test]
+    fn a_refused_dac_write_restores_the_threshold_as_c() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use std::io::{BufRead, BufReader, Read, Write};
+        type Script = &'static [(&'static str, &'static str)];
+        // Serval answers the requests in turn with (status, body).
+        fn run(name: &'static str, script: Script) -> (bool, i32, i32, String, String, String) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            std::thread::spawn(move || {
+                for (stream, (status, reply)) in listener.incoming().flatten().zip(script) {
+                    let mut reader = BufReader::new(stream);
+                    let (mut request, mut length) = (String::new(), 0);
+                    let _ = reader.read_line(&mut request);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(v) = lower.strip_prefix("content-length:") {
+                            length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    let _ = reader.read_exact(&mut body);
+                    let _ = reader.get_mut().write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                            reply.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+            let mut det = TimePix3Driver::new(
+                name,
+                Arc::new(ServalHttp::new(&url)),
+                Arc::new(Shared::new()),
+                0,
+                cmd_tx,
+            )
+            .unwrap();
+            let p = det.p;
+            det.ad
+                .port_base
+                .set_int32_param(p.vthreshold_fine, 0, 3)
+                .unwrap();
+            let (runtime, _) = create_port_runtime(
+                &epics_rs::asyn::registry::claim_port(name).unwrap(),
+                det,
+                RuntimeConfig::default(),
+            )
+            .unwrap();
+            let h = runtime.port_handle().clone();
+            let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let file = std::fs::File::create(&path).unwrap();
+            h.trace().set_trace_file(
+                Some(name),
+                TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+            h.trace()
+                .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::WARNING);
+            let (ok, value, code, msg) = h
+                .with_driver_blocking::<TimePix3Driver, _>(move |d| {
+                    let ok = d
+                        .write_int32(&mut AsynUser::new(p.vthreshold_fine).with_addr(0), 300)
+                        .is_ok();
+                    (
+                        ok,
+                        d.int(p.vthreshold_fine, 0),
+                        d.int(p.http_code, 0),
+                        d.text(p.write_msg, 0),
+                    )
+                })
+                .unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            std::mem::forget(runtime);
+            (
+                ok,
+                value,
+                code,
+                msg,
+                text,
+                format!("{url}/detector/chips/0/dacs/"),
+            )
+        }
+        const OK: &str = "200 OK";
+        const BAD: &str = "500 Internal Server Error";
+        const HELD: &str = r#"{"Vthreshold_fine": 7, "Vfbk": 5}"#;
+        let line = |context: &str, method: &str, url: &str, code: i32, body: &str| {
+            adlog::http_failure_reply(context, method, url, code, body)
+        };
+
+        let (ok, value, code, msg, text, url) = run("TPX_DAC_GET", &[(BAD, "no chip")]);
+        assert_eq!((ok, value, code, msg.as_str()), (false, 3, 500, "no chip"));
+        assert!(text.contains(&line("writeDac GET chip 0", "GET", &url, 500, "no chip")));
+
+        let (ok, value, code, msg, _, _) = run("TPX_DAC_GET_EMPTY", &[(BAD, "")]);
+        assert_eq!(
+            (ok, value, code, msg.as_str()),
+            (false, 3, 500, "Failed to read DAC configuration")
+        );
+
+        let (ok, value, code, msg, text, _) = run("TPX_DAC_MISSING", &[(OK, r#"{"Vfbk": 5}"#)]);
+        let missing = "DAC response is missing the requested field";
+        assert_eq!((ok, value, code, msg.as_str()), (false, 3, 200, missing));
+        assert!(text.contains(&adlog::err(
+            adlog::WRITE_DAC,
+            &format!("writeDac GET chip 0: {missing}")
+        )));
+
+        let (ok, value, code, msg, _, _) = run("TPX_DAC_OK", &[(OK, HELD), (OK, "")]);
+        assert_eq!(
+            (ok, value, code, msg.as_str()),
+            (true, 300, 200, "Uploaded DAC configuration.")
+        );
+
+        // Serval moved on before the rejection; the record follows it.
+        let (ok, value, code, msg, text, url) = run(
+            "TPX_DAC_PUT",
+            &[
+                (OK, HELD),
+                (BAD, "rejected"),
+                (OK, r#"{"Vthreshold_fine": 9}"#),
+            ],
+        );
+        assert_eq!((ok, value, code, msg.as_str()), (false, 9, 500, "rejected"));
+        assert!(text.contains(&line("writeDac PUT", "PUT", &url, 500, "rejected")));
+
+        let (ok, value, code, msg, text, _) =
+            run("TPX_DAC_PUT_STALE", &[(OK, HELD), (BAD, ""), (BAD, "")]);
+        assert_eq!(
+            (ok, value, code, msg.as_str()),
+            (false, 7, 500, "Failed to upload DAC configuration")
+        );
+        assert!(text.contains(&adlog::warn(
+            adlog::WRITE_DAC,
+            "writeDac: failed to refresh Vthreshold_fine after rejected PUT; using pre-PUT value"
+        )));
     }
 
     /// An acquisition that will not stop does not keep a timing write from
