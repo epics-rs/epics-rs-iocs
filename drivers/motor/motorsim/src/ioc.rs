@@ -20,7 +20,7 @@ use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_int, req_st
 use motor_common::model1::c_int;
 use motor_common::model2::Model2;
 pub use motor_common::model2::drv_asyn_motor_configure_command;
-use motor_common::{Controller, TraceUser, asyn_user, install, register_port};
+use motor_common::{Controller, TraceUser, asyn_user, register_port};
 
 use crate::motorsim::{
     DEFAULT_HI_LIMIT, DEFAULT_HOME, DEFAULT_LOW_LIMIT, DEFAULT_START, DrvMotorSimAxis, MotorSimAxis,
@@ -53,6 +53,7 @@ pub fn motor_sim_create_command() -> CommandDef {
     register_motor_interface_device(&DEV_MOTOR_SIM);
     register_motor_interface_driver(DRIVER);
     let created: Mutex<SimAxes> = Mutex::new(BTreeMap::new());
+    let poller = Controller::new();
     CommandDef::new(
         "motorSimCreate",
         vec![
@@ -80,6 +81,10 @@ pub fn motor_sim_create_command() -> CommandDef {
             println!(
                 "Creating motor simulator: card: {card}, axis: {signal}, hi: {hi}, low {low}, home: {home}, ncards: {num_cards}, naxis: {num_signals}"
             );
+            // The first motorSimCreate starts drvMotorSim's one
+            // motorSimThread, whose motorProcTask runs every axis each DELTA,
+            // moving or idle (drvMotorSim.c:657-690, 788-800).
+            poller.start(ctx, POLL_MS, POLL_MS, 0);
             let mut created = created.lock().unwrap_or_else(|e| e.into_inner());
             for c in card..card.saturating_add(num_cards) {
                 for s in signal..signal.saturating_add(num_signals) {
@@ -97,12 +102,10 @@ pub fn motor_sim_create_command() -> CommandDef {
                         card: c,
                         signal: s,
                     };
-                    // motorProcTask calls back every DELTA, moving or idle
-                    // (drvMotorSim.c:660-690). C devMotorSim's callback
-                    // scanOnce's from init_record, before scanInit, and
+                    // C devMotorSim's callback scanOnce's from init_record, before scanInit, and
                     // segfaults (a C defect); here a callback before the
                     // gate only sets needUpdate.
-                    install(ctx, user, motor, POLL_MS, POLL_MS, 0)?;
+                    poller.install(user, motor)?;
                     println!("Created motor for card {c}, signal {s} OK");
                 }
                 // Model2::open indexes by axis, so a card serves the axes
@@ -222,8 +225,13 @@ impl MotorSimHolder {
 
 #[cfg(all(test, target_os = "linux"))]
 mod one_poller {
+    use std::time::{Duration, Instant};
+
+    use epics_rs::base::runtime::task::BlockingBridge;
+    use epics_rs::base::server::database::PvDatabase;
+    use motor_common::testing::{pollers, pollers_after};
+
     use super::*;
-    use motor_common::testing::pollers_after;
 
     /// motorSimController's one motorSimTask polls every axis.
     #[epics_rs::base::epics_test]
@@ -236,5 +244,26 @@ mod one_poller {
         ];
         let cmd = MotorSimHolder::new().create_controller_command();
         assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// drvMotorSim's one motorSimThread runs every motorSimCreate's axes.
+    /// The second call's axes join a running poller, which needs a runtime
+    /// that keeps polling while the shell thread waits: not `pollers_after`'s.
+    #[test]
+    fn every_motor_sim_create_s_axes_share_one_poller() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _entered = rt.enter();
+        let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
+        let cmd = motor_sim_create_command();
+        for card in 0..2 {
+            let args = [card, 0, -100, 100, 0, 1, 3, 0].map(ArgValue::Int);
+            cmd.handler.call(&args, &ctx).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pollers() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(pollers(), 1);
     }
 }
