@@ -94,10 +94,8 @@
 //! - **Piezo closed loop**: `PIGCS2PiezoCL` — closed-loop piezo
 //!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
 //!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
-//! - **Per-model controllers**: `PIE727Controller` (piezo-based, with its
-//!   own closed-loop parameter access); the E-727 runs on [`Model::Motor`].
 //! - **`SVO?` (`getServo`)**: as upstream, only the C-887's status and
-//!   [`Model::Piezo`]'s without `SRG?` ask it; the generic motor axis's servo
+//!   a piezo's without `SRG?` ask it; the generic motor axis's servo
 //!   state comes from the `char(4)` status bitmask.
 //! - **`getAxisOnt`/`getAxisOvf`**: base-class no-ops (on-target/overflow
 //!   status meaningful only for the piezo closed-loop path); not ported.
@@ -347,6 +345,8 @@ pub enum Model {
     Piezo,
     /// `PIE517Controller` (E-517/518).
     E517,
+    /// `PIE727Controller` (E-727).
+    E727,
 }
 
 impl Model {
@@ -363,7 +363,7 @@ impl Model {
 
     /// `PIGCSPiezoController` or a class built on it.
     fn is_piezo(self) -> bool {
-        matches!(self, Self::Piezo | Self::E517)
+        matches!(self, Self::Piezo | Self::E517 | Self::E727)
     }
 
     /// `PIHexapodController` or the GCS 2 class built on it.
@@ -414,7 +414,7 @@ impl Model {
         } else if any(&["E-753", "E-754", "E-709", "E-712", "E-725"]) {
             Some(Self::Piezo)
         } else if idn.contains("E-727") {
-            Some(Self::Motor)
+            Some(Self::E727)
         } else if idn.contains("E-755") {
             Some(Self::E755)
         } else if idn.contains("C-702") {
@@ -632,9 +632,12 @@ impl PIGCS2Controller {
     /// The class C's `CreateGCSController` picked from the `*IDN?`.
     pub fn set_model(&mut self, model: Model) {
         self.model = model;
-        if model == Model::E517 {
+        if matches!(model, Model::E517 | Model::E727) {
             self.piezo.frf.set(false);
             self.piezo.trs.set(false);
+        }
+        if model == Model::E727 {
+            self.piezo.srg.set(false);
         }
     }
 
@@ -2018,7 +2021,7 @@ impl PIGCS2Axis {
             let moving = ctrl.hexapod.moving || ctrl.deferred.contains_key(&self.axis_no);
             return Ok((ctrl.hexapod.homing, moving, false, false, self.servo_on));
         }
-        if ctrl.model == Model::Piezo {
+        if matches!(ctrl.model, Model::Piezo | Model::E727) {
             return ctrl.get_piezo_status(&self.axis_name, 1 << self.axis_no);
         }
         if ctrl.model == Model::E517 {
@@ -2457,7 +2460,7 @@ impl AsynMotor for PIGCS2Axis {
         // C returns asynSuccess whatever haltAxis returned.
         let _ = match ctrl.model {
             Model::C885 => ctrl.stop_all("PIC885Controller"),
-            Model::Piezo => ctrl.stop_all("PIGCSPiezoController"),
+            Model::Piezo | Model::E727 => ctrl.stop_all("PIGCSPiezoController"),
             model if model.is_hexapod() => ctrl.halt_platform(),
             _ => ctrl.halt(&self.axis_name),
         };
@@ -3136,6 +3139,30 @@ mod tests {
         assert!(status.moving && status.powered);
         axis.stop(&user, 0.0).unwrap();
         assert_eq!(sent_lines(&line), ["HLT 1", "ERR?"]);
+        axis.home(&user, 0.0, 1.0, 0.0, false).unwrap();
+        assert!(sent_lines(&line).is_empty());
+    }
+
+    /// An E-727 is a `PIGCSPiezoController` without `FRF?`, `TRS?` or
+    /// `SRG?` (PIE727Controller.cpp:23-33): `#5` and `SVO?`, `STP`, and no
+    /// homing.
+    #[test]
+    fn an_e727_axis_runs_as_a_piezo_without_frf_trs_or_srg() {
+        let (line, _ctrl, mut axis) = piezo("gcs2E727Axis", "E-727", |last| match last {
+            "\u{5}" => "1".into(),
+            last => piezo_reply(last),
+        });
+        assert_eq!(
+            sent_lines(&line),
+            ["SVO 1 1", "ERR?", "VEL? 1", "POS? 1", "TMN? 1", "TMX? 1"]
+        );
+        assert!(axis.homed && axis.servo_on && !axis.has_reference);
+        let user = AsynUser::new(0);
+        let status = axis.poll(&user).unwrap();
+        assert_eq!(sent_lines(&line)[..2], ["\u{5}", "SVO? 1"]);
+        assert!(status.moving && status.powered);
+        axis.stop(&user, 0.0).unwrap();
+        assert_eq!(sent_lines(&line), ["STP", "ERR?"]);
         axis.home(&user, 0.0, 1.0, 0.0, false).unwrap();
         assert!(sent_lines(&line).is_empty());
     }
