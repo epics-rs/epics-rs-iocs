@@ -186,6 +186,23 @@ fn closing_trace(
 struct OmsWriteHook;
 
 impl WriteHook for OmsWriteHook {
+    /// The writes C's branches take without calling the base, which
+    /// prints nothing for them (omsBaseController.cpp:262-292, 333-406).
+    fn handles(&self, function: usize) -> bool {
+        matches!(
+            function,
+            index::DEFER_MOVES
+                | index::CLOSED_LOOP
+                | index::ENCODER_POSITION
+                | index::RESOLUTION
+                | index::LOW_LIMIT
+                | index::HIGH_LIMIT
+                | index::PGAIN
+                | index::IGAIN
+                | index::DGAIN
+        )
+    }
+
     fn after_write(&self, write: &FinishedWrite<'_>) -> WriteOutcome {
         let own = match write.value {
             WriteValue::Int32(_) => matches!(
