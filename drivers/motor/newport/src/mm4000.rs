@@ -658,6 +658,17 @@ impl Mm4000Axis {
         Ok(())
     }
 
+    /// The record's SET_ACCEL part of a model-1 move or home, which it
+    /// leaves out for a zero rate (motorRecord.cc:874, 940).
+    fn model1_accel(&self, acceleration: f64) -> String {
+        let (a, d) = (self.axis, self.digits);
+        if acceleration > 0.0 {
+            format!("{a}AC{acceleration:.d$};")
+        } else {
+            String::new()
+        }
+    }
+
     /// C `motorAxisMove` transaction: `AC;VA;PA|PR;` (trailing `;` as C
     /// sends it), steps scaled to wire units at this axis's precision. On
     /// model 1 it is the record's SET_VELOCITY, SET_ACCEL, MOVE: `VA;AC;PA;`.
@@ -672,7 +683,8 @@ impl Mm4000Axis {
         let (acceleration, velocity, value) = (acceleration * step, velocity * step, value * step);
         if self.model1 {
             return Ok(format!(
-                "{a}VA{velocity:.d$};{a}AC{acceleration:.d$};{a}{cmd}{value:.d$};"
+                "{a}VA{velocity:.d$};{}{a}{cmd}{value:.d$};",
+                self.model1_accel(acceleration)
             ));
         }
         Ok(format!(
@@ -759,7 +771,8 @@ impl AsynMotor for Mm4000Axis {
         if self.model1 {
             // devMM4000.cc HOME after the record's SET_VELOCITY, SET_ACCEL.
             return self.start_motion(&format!(
-                "{a}VA{velocity:.d$};{a}AC{acceleration:.d$};{a}OR;"
+                "{a}VA{velocity:.d$};{}{a}OR;",
+                self.model1_accel(acceleration)
             ));
         }
         self.start_motion(&format!(
@@ -1155,6 +1168,20 @@ mod tests {
         sent.lock().unwrap().clear();
         axes[0].stop(&AsynUser::default(), 0.0).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["1ST;"]);
+    }
+
+    /// motorRecord.cc:874, 940: no SET_ACCEL for a zero move or home rate;
+    /// the jog's is unconditional.
+    #[test]
+    fn model1_zero_rate_move_and_home_have_no_ac() {
+        let (axes, sent, _) = model1_card("mm4000_m1_acc0", &[], Duration::ZERO);
+        let mut axes = axes.unwrap();
+        let user = AsynUser::default();
+        sent.lock().unwrap().clear();
+        axes[0].move_absolute(&user, 100.0, 0.0, 10.0, 0.0).unwrap();
+        axes[0].home(&user, 0.0, 10.0, 0.0, true).unwrap();
+        let wire = sent.lock().unwrap().clone();
+        assert!(wire.iter().all(|c| !c.contains("AC")), "{wire:?}");
     }
 
     /// An unanswered MS; is a RETRY, which asks TH; but no TP; or TE; and
