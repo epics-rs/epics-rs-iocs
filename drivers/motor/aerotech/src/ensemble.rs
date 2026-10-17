@@ -573,9 +573,8 @@ impl AsynMotor for EnsembleAxis {
         // C's status is WAIT MODE NOWAIT's; PowerOn follows the request even
         // when ENABLE fails, to force a status update (:461-476).
         self.status.powered = closed_loop;
-        ctrl.wait_mode_nowait()?;
         self.status_writes.push(StatusWrite::PowerOn(closed_loop));
-        Ok(())
+        ctrl.wait_mode_nowait()
     }
 
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
@@ -832,10 +831,11 @@ mod tests {
 
     /// drvEnsembleAsyn.cc:458-476: enable and disable post the requested
     /// PowerOn whether or not ENABLE or DISABLE was accepted; a NAK'd
-    /// `WAIT MODE NOWAIT` too, and only a failed one posts nothing and fails
-    /// the write.
+    /// `WAIT MODE NOWAIT` too. A failed one fails the write and still
+    /// posts: C calls back unless the status is MOTOR_AXIS_ERROR (-1), which
+    /// no asyn status is (:479-483).
     #[epics_rs::base::epics_test]
-    async fn closed_loop_posts_power_on_unless_nowait_fails() {
+    async fn closed_loop_posts_power_on_even_when_nowait_fails() {
         use epics_rs::asyn::interfaces::motor::StatusWrite;
         use motor_common::testing::LineRig;
 
@@ -862,7 +862,7 @@ mod tests {
         assert_eq!(axis.take_status_writes(), [StatusWrite::PowerOn(false)]);
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(axis.set_closed_loop(&user, true).is_err());
-        assert!(axis.take_status_writes().is_empty());
+        assert_eq!(axis.take_status_writes(), [StatusWrite::PowerOn(true)]);
     }
 
     /// An axis 0 on a line answering `reply`, its writes `fails` picks
