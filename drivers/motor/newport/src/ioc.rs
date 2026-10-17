@@ -1654,13 +1654,18 @@ static MM3000: Model1 = Model1::new(&DEV_MM3000, 4, SCAN_RATE);
 /// `MM300Setup(num_cards, scan_rate)` — C registers it under this name
 /// (NewportRegister.cc:56).
 pub fn mm3000_setup_command() -> CommandDef {
+    MM3000.register_report("drvMM3000", |cards| {
+        cards.report("MM3000", |card, line| {
+            format!("    MM3000 controller {card} asyn port= {line} \n")
+        })
+    });
     MM3000.setup_command("MM300Setup")
 }
 
 /// `MM3000Config(card, name, addr)`: one signal per axis slot the
 /// controller's `RC` reports, including the trailing `unused` slot C counts.
 pub fn mm3000_config_command() -> CommandDef {
-    model1_config_command("MM3000Config", &MM3000, |ctx, card, port, _addr| {
+    model1_config_command("MM3000Config", &MM3000, |ctx, card, port, addr| {
         // C drops a card it cannot connect to without a word.
         let Ok(handle) = connect_serial(port, MM3000_TIMEOUT) else {
             return Ok(());
@@ -1669,11 +1674,13 @@ pub fn mm3000_config_command() -> CommandDef {
             return Ok(());
         };
         let num_axes = controller.axis_types().len();
+        let line = format!("{port}, address={addr}, id: {}", controller.ident());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
             let ax = Mm3000Axis::new(controller.clone(), axis);
             MM3000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
+        MM3000.describe(card, line);
         Ok(())
     })
 }
@@ -2614,6 +2621,29 @@ mod report {
             driver_report("drvESP300", 0),
             "    ESP300 controller 0 connection failed.\n    ESP300 controller 1 \
              port=esp300RepLine, address=3, id: ESP300 Version 3.08 \n"
+        );
+    }
+
+    /// drvMM3000.cc's drvet `report` (drvMM3000.cc:173-199).
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mm3000_controller() {
+        use motor_common::testing::{LineRig, driver_report};
+        let setup = mm3000_setup_command();
+        let none = "    No MM3000 controllers configured.\n";
+        assert_eq!(driver_report("drvMM3000", 0), none);
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("mm3000RepLine", |last| match last {
+            "VE" => "MM3000 Version 2.4".into(),
+            "RC" => "1=dc".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("mm3000RepLine".into()), int(4)];
+        run_command(mm3000_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvMM3000", 0),
+            "    MM3000 controller 0 asyn port= mm3000RepLine, address=4, id: MM3000 Version \
+             2.4 \n    MM3000 controller 1 connection failed.\n"
         );
     }
 
