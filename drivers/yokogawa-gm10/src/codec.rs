@@ -5,6 +5,8 @@
 //! own `ptr += 4`), or on a full raw binary frame (`FData`, which indexes
 //! from the frame start).
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::cache::ModuleType;
 
 // ---------------------------------------------------------------------
@@ -93,40 +95,9 @@ pub fn cmd_err_query(code: i32) -> String {
     format!("_ERR,{code}\r\n")
 }
 
-/// C `sprintf("%G", value)` — default precision (6 significant digits),
-/// trailing zeros stripped (`drvGM10.c:1168,1171,1174`). The style is
-/// chosen from the exponent after rounding, as C99 7.19.6.1 specifies.
+/// C `sprintf("%G", value)` (`drvGM10.c:1168,1171,1174`).
 pub fn format_g(value: f64) -> String {
-    if value.is_nan() {
-        return if value.is_sign_negative() {
-            "-NAN"
-        } else {
-            "NAN"
-        }
-        .to_string();
-    }
-    if value.is_infinite() {
-        return if value < 0.0 { "-INF" } else { "INF" }.to_string();
-    }
-    const PRECISION: i32 = 6;
-    let s = format!("{value:.*e}", (PRECISION - 1) as usize);
-    let (mantissa, exp) = s.split_once('e').expect("Rust {:e} always emits 'e'");
-    let exp: i32 = exp
-        .parse()
-        .expect("Rust {:e} exponent is always an integer");
-    if !(-4..PRECISION).contains(&exp) {
-        format!("{}E{exp:+03}", strip_trailing_zeros(mantissa))
-    } else {
-        let decimals = (PRECISION - 1 - exp) as usize;
-        strip_trailing_zeros(&format!("{value:.decimals$}"))
-    }
-}
-
-fn strip_trailing_zeros(s: &str) -> String {
-    if !s.contains('.') {
-        return s.to_string();
-    }
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    CFloat(value).g().to_string().to_ascii_uppercase()
 }
 
 // ---------------------------------------------------------------------
