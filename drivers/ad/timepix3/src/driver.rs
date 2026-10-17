@@ -11,7 +11,7 @@ use epics_rs::asyn::param::{EnumEntry, ParamValue};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::accum::{Accumulator, RangeState};
 use crate::adlog;
@@ -1042,150 +1042,254 @@ impl TimePix3Driver {
         Ok(())
     }
 
-    /// The destination the enabled channels describe (C `fileWriter`,
-    /// serval_http.cpp:2095).
-    fn destination(&self) -> serval::Destination {
-        let mut d = serval::Destination::default();
-
-        for (enable, base, pat, split, queue) in [
-            (
-                self.p.write_raw,
-                self.p.raw_base,
-                self.p.raw_file_pat,
-                self.p.raw_split_strategy,
-                self.p.raw_queue_size,
-            ),
-            (
-                self.p.write_raw1,
-                self.p.raw1_base,
-                self.p.raw1_file_pat,
-                self.p.raw1_split_strategy,
-                self.p.raw1_queue_size,
-            ),
-        ] {
-            if self.int(enable, 0) != 0 {
-                d.raw.push(serval::RawChannel {
-                    base: self.text(base, 0),
-                    file_pattern: self.text(pat, 0),
-                    split_strategy: self.int(split, 0),
-                    queue_size: self.int(queue, 0),
-                });
-            }
+    /// A builder's refusal of a channel setting.
+    fn destination_refused(message: String) -> AsynError {
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("timepix3: /server/destination: {message}"),
         }
-
-        let image = |this: &Self, base, pat, format, mode, int_size, int_mode, stop, queue| {
-            serval::ImageChannel {
-                base: this.text(base, 0),
-                file_pattern: this.text(pat, 0),
-                format: this.int(format, 0),
-                mode: this.int(mode, 0),
-                integration_size: this.int(int_size, 0),
-                integration_mode: this.int(int_mode, 0),
-                stop_on_disk_limit: this.int(stop, 0) != 0,
-                queue_size: this.int(queue, 0),
-            }
-        };
-
-        if self.int(self.p.write_img, 0) != 0 {
-            d.image.push(image(
-                self,
-                self.p.img_base,
-                self.p.img_file_pat,
-                self.p.img_format,
-                self.p.img_mode,
-                self.p.img_int_size,
-                self.p.img_int_mode,
-                self.p.img_stp_on_dsk_lim,
-                self.p.img_queue_size,
-            ));
-        }
-        if self.int(self.p.write_img1, 0) != 0 {
-            d.image.push(image(
-                self,
-                self.p.img1_base,
-                self.p.img1_file_pat,
-                self.p.img1_format,
-                self.p.img1_mode,
-                self.p.img1_int_size,
-                self.p.img1_int_mode,
-                self.p.img1_stp_on_dsk_lim,
-                self.p.img1_queue_size,
-            ));
-        }
-        if self.int(self.p.write_prv_img, 0) != 0 {
-            d.preview_image.push(image(
-                self,
-                self.p.prv_img_base,
-                self.p.prv_img_file_pat,
-                self.p.prv_img_format,
-                self.p.prv_img_mode,
-                self.p.prv_img_int_size,
-                self.p.prv_img_int_mode,
-                self.p.prv_img_stp_on_dsk_lim,
-                self.p.prv_img_queue_size,
-            ));
-        }
-        if self.int(self.p.write_prv_img1, 0) != 0 {
-            d.preview_image.push(image(
-                self,
-                self.p.prv_img1_base,
-                self.p.prv_img1_file_pat,
-                self.p.prv_img1_format,
-                self.p.prv_img1_mode,
-                self.p.prv_img1_int_size,
-                self.p.prv_img1_int_mode,
-                self.p.prv_img1_stp_on_dsk_lim,
-                self.p.prv_img1_queue_size,
-            ));
-        }
-        if self.int(self.p.write_prv_hst, 0) != 0 {
-            d.preview_histogram = Some(serval::HistogramChannel {
-                image: image(
-                    self,
-                    self.p.prv_hst_base,
-                    self.p.prv_hst_file_pat,
-                    self.p.prv_hst_format,
-                    self.p.prv_hst_mode,
-                    self.p.prv_hst_int_size,
-                    self.p.prv_hst_int_mode,
-                    self.p.prv_hst_stp_on_dsk_lim,
-                    self.p.prv_hst_queue_size,
-                ),
-                number_of_bins: self.int(self.p.prv_hst_num_bins, 0),
-                bin_width: self.dbl(self.p.prv_hst_bin_width, 0),
-                offset: self.dbl(self.p.prv_hst_offset, 0),
-            });
-        }
-        d.preview = Some(serval::PreviewSettings {
-            period: self.dbl(self.p.prv_period, 0),
-            sampling_mode: self.int(self.p.prv_sampling_mode, 0),
-        });
-        d
     }
 
-    /// C `fileWriter` (serval_http.cpp:2095).
-    fn file_writer(&mut self) -> AsynResult<()> {
-        let dest = self.destination();
-        // Every enabled channel's Base passes the allowlist before anything
-        // is sent (serval_http.cpp:1782, :1866, :2096).
-        let bases: Vec<String> = dest
-            .raw
-            .iter()
-            .map(|c| c.base.clone())
-            .chain(dest.image.iter().map(|c| c.base.clone()))
-            .chain(dest.preview_image.iter().map(|c| c.base.clone()))
-            .chain(dest.preview_histogram.iter().map(|h| h.image.base.clone()))
-            .collect();
-        for base in &bases {
-            self.validate_destination(base)?;
+    /// C `configureRawChannel` (serval_http.cpp:1755-1812).
+    fn configure_raw_channel(&mut self, index: usize, server: &mut Value) -> AsynResult<()> {
+        let p = self.p;
+        let [enable, base, pat, split, queue] = if index == 0 {
+            [
+                p.write_raw,
+                p.raw_base,
+                p.raw_file_pat,
+                p.raw_split_strategy,
+                p.raw_queue_size,
+            ]
+        } else {
+            [
+                p.write_raw1,
+                p.raw1_base,
+                p.raw1_file_pat,
+                p.raw1_split_strategy,
+                p.raw1_queue_size,
+            ]
+        };
+        if self.int(enable, 0) == 0 {
+            return Ok(());
         }
-        let body = serval::destination_body(&dest).map_err(|m| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("timepix3: /server/destination: {m}"),
-        })?;
+        let c = serval::RawChannel {
+            base: self.text(base, 0),
+            file_pattern: self.text(pat, 0),
+            split_strategy: self.int(split, 0),
+            queue_size: self.int(queue, 0),
+        };
+        self.validate_destination(&c.base)?;
+        let body = serval::raw_body(&c).map_err(Self::destination_refused)?;
+        *serval::channel_slot(&mut server["Raw"], index) = body;
+        Ok(())
+    }
+
+    /// One image channel's settings from its parameters: Base, FilePattern,
+    /// Format, Mode, IntegrationSize, IntegrationMode, StopOnDiskLimit,
+    /// QueueSize.
+    fn image_channel(
+        &self,
+        [base, pat, format, mode, size, int_mode, stop, queue]: [usize; 8],
+    ) -> serval::ImageChannel {
+        serval::ImageChannel {
+            base: self.text(base, 0),
+            file_pattern: self.text(pat, 0),
+            format: self.int(format, 0),
+            mode: self.int(mode, 0),
+            integration_size: self.int(size, 0),
+            integration_mode: self.int(int_mode, 0),
+            stop_on_disk_limit: self.int(stop, 0) != 0,
+            queue_size: self.int(queue, 0),
+        }
+    }
+
+    /// C `configureImageChannel` (serval_http.cpp:1817-2058): `preview`
+    /// selects `Preview.ImageChannels` over `Image`.
+    fn configure_image_channel(
+        &mut self,
+        preview: bool,
+        index: usize,
+        server: &mut Value,
+    ) -> AsynResult<()> {
+        let p = self.p;
+        let (enable, params) = match (preview, index) {
+            (false, 0) => (
+                p.write_img,
+                [
+                    p.img_base,
+                    p.img_file_pat,
+                    p.img_format,
+                    p.img_mode,
+                    p.img_int_size,
+                    p.img_int_mode,
+                    p.img_stp_on_dsk_lim,
+                    p.img_queue_size,
+                ],
+            ),
+            (false, _) => (
+                p.write_img1,
+                [
+                    p.img1_base,
+                    p.img1_file_pat,
+                    p.img1_format,
+                    p.img1_mode,
+                    p.img1_int_size,
+                    p.img1_int_mode,
+                    p.img1_stp_on_dsk_lim,
+                    p.img1_queue_size,
+                ],
+            ),
+            (true, 0) => (
+                p.write_prv_img,
+                [
+                    p.prv_img_base,
+                    p.prv_img_file_pat,
+                    p.prv_img_format,
+                    p.prv_img_mode,
+                    p.prv_img_int_size,
+                    p.prv_img_int_mode,
+                    p.prv_img_stp_on_dsk_lim,
+                    p.prv_img_queue_size,
+                ],
+            ),
+            (true, _) => (
+                p.write_prv_img1,
+                [
+                    p.prv_img1_base,
+                    p.prv_img1_file_pat,
+                    p.prv_img1_format,
+                    p.prv_img1_mode,
+                    p.prv_img1_int_size,
+                    p.prv_img1_int_mode,
+                    p.prv_img1_stp_on_dsk_lim,
+                    p.prv_img1_queue_size,
+                ],
+            ),
+        };
+        if self.int(enable, 0) == 0 {
+            return Ok(());
+        }
+        let c = self.image_channel(params);
+        self.validate_destination(&c.base)?;
+        let body = serval::image_body(&c).map_err(Self::destination_refused)?;
+        let channels = if preview {
+            &mut server["Preview"]["ImageChannels"]
+        } else {
+            &mut server["Image"]
+        };
+        *serval::channel_slot(channels, index) = body;
+        Ok(())
+    }
+
+    /// C `configureHistogramChannel` (serval_http.cpp:2085-2168).
+    fn configure_histogram_channel(&mut self, server: &mut Value) -> AsynResult<()> {
+        let p = self.p;
+        if self.int(p.write_prv_hst, 0) == 0 {
+            return Ok(());
+        }
+        let h = serval::HistogramChannel {
+            image: self.image_channel([
+                p.prv_hst_base,
+                p.prv_hst_file_pat,
+                p.prv_hst_format,
+                p.prv_hst_mode,
+                p.prv_hst_int_size,
+                p.prv_hst_int_mode,
+                p.prv_hst_stp_on_dsk_lim,
+                p.prv_hst_queue_size,
+            ]),
+            number_of_bins: self.int(p.prv_hst_num_bins, 0),
+            bin_width: self.dbl(p.prv_hst_bin_width, 0),
+            offset: self.dbl(p.prv_hst_offset, 0),
+        };
+        self.validate_destination(&h.image.base)?;
+        let body = serval::histogram_body(&h).map_err(Self::destination_refused)?;
+        *serval::channel_slot(&mut server["Preview"]["HistogramChannels"], 0) = body;
+        Ok(())
+    }
+
+    /// C `configurePreviewSettings` (serval_http.cpp:2063-2080).
+    fn configure_preview_settings(&mut self, server: &mut Value) -> AsynResult<()> {
+        let p = self.p;
+        let sampling_mode = self.int(p.prv_sampling_mode, 0);
+        let sampling = serval::enum_name(&serval::SAMPLING_MODES, sampling_mode)
+            .ok_or_else(|| Self::destination_refused(format!("sampling mode {sampling_mode}")))?;
+        server["Preview"]["Period"] = json!(self.dbl(p.prv_period, 0));
+        server["Preview"]["SamplingMode"] = json!(sampling);
+        Ok(())
+    }
+
+    /// C `fileWriter` (serval_http.cpp:2333-2425): every channel in C's
+    /// order, each at its own index, and nothing sent when none is enabled.
+    fn file_writer(&mut self) -> AsynResult<()> {
+        self.ad.port_base.trace_print(
+            TraceMask::FLOW,
+            format_args!(
+                "{}",
+                adlog::log(adlog::FILE_WRITER, "Configuring file writer channels")
+            ),
+        );
+        type Step = fn(&mut TimePix3Driver, &mut Value) -> AsynResult<()>;
+        let steps: [(&str, Step); 7] = [
+            ("Failed to configure raw channel 0", |d, s| {
+                d.configure_raw_channel(0, s)
+            }),
+            ("Failed to configure raw channel 1", |d, s| {
+                d.configure_raw_channel(1, s)
+            }),
+            ("Failed to configure image channel", |d, s| {
+                d.configure_image_channel(false, 0, s)
+            }),
+            ("Failed to configure image channel 1", |d, s| {
+                d.configure_image_channel(false, 1, s)
+            }),
+            ("Failed to configure preview image channel 0", |d, s| {
+                d.configure_image_channel(true, 0, s)
+            }),
+            ("Failed to configure preview image channel 1", |d, s| {
+                d.configure_image_channel(true, 1, s)
+            }),
+            ("Failed to configure histogram channel", |d, s| {
+                d.configure_histogram_channel(s)
+            }),
+        ];
+        let mut server = json!({});
+        let preview: Step = |d, s| {
+            if s.get("Preview").is_some() {
+                d.configure_preview_settings(s)
+            } else {
+                Ok(())
+            }
+        };
+        for (failed, step) in steps
+            .into_iter()
+            .chain([("Failed to configure preview settings", preview)])
+        {
+            if let Err(e) = step(self, &mut server) {
+                self.ad.port_base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!("{}", adlog::err(adlog::FILE_WRITER, failed)),
+                );
+                return Err(e);
+            }
+        }
+        if server.as_object().is_none_or(|o| o.is_empty()) {
+            self.ad.port_base.trace_print(
+                TraceMask::IO_DRIVER,
+                format_args!(
+                    "{}",
+                    adlog::log(
+                        adlog::FILE_WRITER,
+                        "No channels are enabled. Skipping file writer configuration."
+                    )
+                ),
+            );
+            return Ok(());
+        }
         let reply = self
             .http
-            .put_json(serval::SERVER_DESTINATION, &body, TIMEOUT_CONFIG);
+            .put_json(serval::SERVER_DESTINATION, &server, TIMEOUT_CONFIG);
         // serval_http.cpp:2182-2183.
         self.write_msg_from(&reply);
         reply.map_err(|e| {
@@ -3519,6 +3623,139 @@ mod tests {
         )));
     }
 
+    /// A Serval that answers every request `200 {}` and reports each
+    /// request line and body.
+    fn capturing_serval() -> (String, std::sync::mpsc::Receiver<(String, String)>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let (mut request, mut length) = (String::new(), 0);
+                let _ = reader.read_line(&mut request);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let _ = tx.send((request, String::from_utf8_lossy(&body).into_owned()));
+                let _ = reader.get_mut().write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        (url, rx)
+    }
+
+    /// fileWriter fills each channel at its own index, sends nothing when no
+    /// channel is enabled, and names the channel a refusal came from
+    /// (serval_http.cpp:2333-2425).
+    #[test]
+    fn file_writer_places_each_channel_as_c() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        type Setup = fn(&mut TimePix3Driver);
+        fn run(name: &'static str, setup: Setup) -> (bool, Option<serde_json::Value>, String) {
+            let (url, rx) = capturing_serval();
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+            let mut det = TimePix3Driver::new(
+                name,
+                Arc::new(ServalHttp::new(&url)),
+                Arc::new(Shared::new()),
+                0,
+                cmd_tx,
+            )
+            .unwrap();
+            setup(&mut det);
+            let (runtime, _) = create_port_runtime(
+                &epics_rs::asyn::registry::claim_port(name).unwrap(),
+                det,
+                RuntimeConfig::default(),
+            )
+            .unwrap();
+            let h = runtime.port_handle().clone();
+            let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let file = std::fs::File::create(&path).unwrap();
+            h.trace().set_trace_file(
+                Some(name),
+                TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+            h.trace().set_trace_mask(
+                Some(name),
+                TraceMask::ERROR | TraceMask::IO_DRIVER | TraceMask::FLOW,
+            );
+            let ok = h
+                .with_driver_blocking::<TimePix3Driver, _>(|d| d.file_writer().is_ok())
+                .unwrap();
+            let put = rx
+                .try_iter()
+                .find(|(line, _)| line.starts_with("PUT /server/destination "))
+                .map(|(_, body)| serde_json::from_str(&body).unwrap());
+            let text = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            std::mem::forget(runtime);
+            (ok, put, text)
+        }
+        fn enable(d: &mut TimePix3Driver, write: usize, base: usize) {
+            let b = &mut d.ad.port_base;
+            b.set_string_param(base, 0, "file:/data").unwrap();
+            b.set_int32_param(write, 0, 1).unwrap();
+        }
+
+        let (ok, put, text) = run("TPX_FW_NONE", |_| {});
+        assert!(ok);
+        assert_eq!(put, None);
+        assert!(text.contains(&adlog::log(
+            adlog::FILE_WRITER,
+            "Configuring file writer channels"
+        )));
+        assert!(text.contains(&adlog::log(
+            adlog::FILE_WRITER,
+            "No channels are enabled. Skipping file writer configuration."
+        )));
+
+        let (ok, put, _) = run("TPX_FW_SLOT", |d| {
+            let p = d.p;
+            enable(d, p.write_raw1, p.raw1_base);
+            enable(d, p.write_img1, p.img1_base);
+            enable(d, p.write_prv_img1, p.prv_img1_base);
+        });
+        assert!(ok);
+        let put = put.unwrap();
+        assert_eq!(put["Raw"][0], serde_json::Value::Null);
+        assert_eq!(put["Raw"][1]["Base"], json!("file:/data"));
+        assert_eq!(put["Image"][0], serde_json::Value::Null);
+        assert_eq!(put["Image"][1]["Base"], json!("file:/data"));
+        assert_eq!(put["Preview"]["ImageChannels"][0], serde_json::Value::Null);
+        assert_eq!(
+            put["Preview"]["ImageChannels"][1]["Base"],
+            json!("file:/data")
+        );
+        assert!(put["Preview"].get("SamplingMode").is_some());
+
+        let (ok, put, text) = run("TPX_FW_REFUSED", |d| {
+            let p = d.p;
+            enable(d, p.write_img1, p.img1_base);
+            d.ad.port_base.set_int32_param(p.img1_format, 0, 9).unwrap();
+        });
+        assert!(!ok);
+        assert_eq!(put, None);
+        assert!(text.contains(&adlog::err(
+            adlog::FILE_WRITER,
+            "Failed to configure image channel 1"
+        )));
+    }
+
     /// An acquisition that will not stop does not keep a timing write from
     /// reaching Serval (ADTimePix.cpp:533, :1095-1097).
     #[test]
@@ -5136,6 +5373,14 @@ mod tests {
             .unwrap()
         };
         let mut det = new("\0", &[("PUT /server/destination ", "destination set")]);
+        det.ad
+            .port_base
+            .set_string_param(det.p.raw_base, 0, "file:/data")
+            .unwrap();
+        det.ad
+            .port_base
+            .set_int32_param(det.p.write_raw, 0, 1)
+            .unwrap();
         let _ = det.file_writer();
         assert_eq!(det.text(det.p.write_msg, 0), "destination set");
 

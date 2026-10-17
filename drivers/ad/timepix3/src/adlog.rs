@@ -30,6 +30,7 @@ pub const CONFIGURE_PRV_HST_ROLLING_WINDOW: &str =
 pub const PROCESS_PRV_HST_FRAME: &str = "void ADTimePix::processPrvHstFrame(const HistogramData&)";
 pub const VALIDATE_DESTINATION: &str =
     "asynStatus ADTimePix::validateDestination(const std::string&)";
+pub const FILE_WRITER: &str = "asynStatus ADTimePix::fileWriter()";
 pub const GET_SERVER: &str = "asynStatus ADTimePix::getServer()";
 pub const INIT_ACQUISITION: &str = "asynStatus ADTimePix::initAcquisition()";
 pub const WRITE_DAC: &str =

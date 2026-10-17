@@ -234,21 +234,18 @@ pub struct HistogramChannel {
     pub offset: f64,
 }
 
-/// The preview sampling settings (C `configurePreviewSettings`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PreviewSettings {
-    pub period: f64,
-    pub sampling_mode: i32,
-}
-
-/// Everything `PUT /server/destination` carries.
-#[derive(Debug, Clone, Default)]
-pub struct Destination {
-    pub raw: Vec<RawChannel>,
-    pub image: Vec<ImageChannel>,
-    pub preview_image: Vec<ImageChannel>,
-    pub preview_histogram: Option<HistogramChannel>,
-    pub preview: Option<PreviewSettings>,
+/// nlohmann `json::operator[](size_type)` on a non-const value, as C
+/// fills `server_j["Raw"][channelIndex]`: a non-array becomes an array,
+/// grown with nulls to reach `index`.
+pub fn channel_slot(array: &mut Value, index: usize) -> &mut Value {
+    if !array.is_array() {
+        *array = Value::Array(Vec::new());
+    }
+    let a = array.as_array_mut().expect("made an array above");
+    if a.len() <= index {
+        a.resize(index + 1, Value::Null);
+    }
+    &mut a[index]
 }
 
 /// A channel whose `Base` is a stream URI has no file on disk, so the
@@ -263,7 +260,7 @@ pub fn is_stream(base: &str) -> bool {
     base.starts_with("tcp://") || base.starts_with("http://")
 }
 
-fn image_body(c: &ImageChannel) -> Result<Value, String> {
+pub fn image_body(c: &ImageChannel) -> Result<Value, String> {
     let format = enum_name(&FORMATS, c.format).ok_or_else(|| format!("format {}", c.format))?;
     let mode = enum_name(&MODES, c.mode).ok_or_else(|| format!("mode {}", c.mode))?;
 
@@ -291,7 +288,7 @@ fn image_body(c: &ImageChannel) -> Result<Value, String> {
     Ok(body)
 }
 
-fn raw_body(c: &RawChannel) -> Result<Value, String> {
+pub fn raw_body(c: &RawChannel) -> Result<Value, String> {
     let mut body = json!({ "Base": c.base, "QueueSize": c.queue_size });
     if !is_stream(&c.base) {
         let split = enum_name(&SPLIT_STRATEGIES, c.split_strategy)
@@ -302,45 +299,12 @@ fn raw_body(c: &RawChannel) -> Result<Value, String> {
     Ok(body)
 }
 
-/// The full `PUT /server/destination` body (C `fileWriter`,
-/// serval_http.cpp:2095).
-pub fn destination_body(d: &Destination) -> Result<Value, String> {
-    let mut body = json!({});
-    if !d.raw.is_empty() {
-        body["Raw"] = Value::Array(d.raw.iter().map(raw_body).collect::<Result<_, _>>()?);
-    }
-    if !d.image.is_empty() {
-        body["Image"] = Value::Array(d.image.iter().map(image_body).collect::<Result<_, _>>()?);
-    }
-
-    let mut preview = json!({});
-    let mut has_preview = false;
-    if !d.preview_image.is_empty() {
-        preview["ImageChannels"] = Value::Array(
-            d.preview_image
-                .iter()
-                .map(image_body)
-                .collect::<Result<_, _>>()?,
-        );
-        has_preview = true;
-    }
-    if let Some(h) = &d.preview_histogram {
-        let mut hb = image_body(&h.image)?;
-        hb["NumberOfBins"] = json!(h.number_of_bins);
-        hb["BinWidth"] = json!(h.bin_width);
-        hb["Offset"] = json!(h.offset);
-        preview["HistogramChannels"] = Value::Array(vec![hb]);
-        has_preview = true;
-    }
-    if has_preview {
-        if let Some(p) = d.preview {
-            let sampling = enum_name(&SAMPLING_MODES, p.sampling_mode)
-                .ok_or_else(|| format!("sampling mode {}", p.sampling_mode))?;
-            preview["Period"] = json!(p.period);
-            preview["SamplingMode"] = json!(sampling);
-        }
-        body["Preview"] = preview;
-    }
+/// The histogram channel's body (C `configureHistogramChannel`).
+pub fn histogram_body(h: &HistogramChannel) -> Result<Value, String> {
+    let mut body = image_body(&h.image)?;
+    body["NumberOfBins"] = json!(h.number_of_bins);
+    body["BinWidth"] = json!(h.bin_width);
+    body["Offset"] = json!(h.offset);
     Ok(body)
 }
 
@@ -1438,53 +1402,12 @@ mod tests {
     }
 
     #[test]
-    fn the_destination_body_nests_the_preview_channels() {
-        let d = Destination {
-            raw: vec![RawChannel {
-                base: "file:///raw".into(),
-                file_pattern: "r%d".into(),
-                split_strategy: 1,
-                queue_size: 16384,
-            }],
-            image: vec![image("file:///img")],
-            preview_image: vec![image("tcp://localhost:8451")],
-            preview_histogram: Some(HistogramChannel {
-                image: image("tcp://localhost:8452"),
-                number_of_bins: 16,
-                bin_width: 1.0,
-                offset: 0.0,
-            }),
-            preview: Some(PreviewSettings {
-                period: 0.2,
-                sampling_mode: 1,
-            }),
-        };
-        let body = destination_body(&d).unwrap();
-        assert_eq!(body["Raw"][0]["SplitStrategy"], json!("frame"));
-        assert_eq!(body["Image"][0]["Base"], json!("file:///img"));
-        assert_eq!(
-            body["Preview"]["ImageChannels"][0]["Base"],
-            json!("tcp://localhost:8451")
-        );
-        assert_eq!(body["Preview"]["HistogramChannels"][0]["NumberOfBins"], 16);
-        assert_eq!(body["Preview"]["SamplingMode"], json!("skipOnPeriod"));
-        assert_eq!(body["Preview"]["Period"], json!(0.2));
-    }
-
-    #[test]
-    fn a_raw_stream_channel_keeps_no_split_strategy() {
-        let d = Destination {
-            raw: vec![RawChannel {
-                base: "tcp://localhost:8450".into(),
-                file_pattern: "r%d".into(),
-                split_strategy: 0,
-                queue_size: 16,
-            }],
-            ..Default::default()
-        };
-        let body = destination_body(&d).unwrap();
-        assert!(body["Raw"][0].get("SplitStrategy").is_none());
-        assert!(body.get("Preview").is_none());
+    fn a_channel_slot_grows_with_nulls_as_nlohmann() {
+        let mut body = json!({});
+        *channel_slot(&mut body["Raw"], 1) = json!({"Base": "b"});
+        assert_eq!(body, json!({"Raw": [null, {"Base": "b"}]}));
+        *channel_slot(&mut body["Raw"], 0) = json!({"Base": "a"});
+        assert_eq!(body, json!({"Raw": [{"Base": "a"}, {"Base": "b"}]}));
     }
 
     fn config() -> DetectorConfig {
