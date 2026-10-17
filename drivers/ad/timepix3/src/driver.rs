@@ -15,7 +15,7 @@ use serde_json::json;
 
 use crate::accum::{Accumulator, RangeState};
 use crate::adlog;
-use crate::calibration::PathPolicy;
+use crate::calibration::{PathAccess, PathPolicy};
 use crate::coordinator::{Phase, Resource};
 use crate::destination;
 use crate::family::DetectorFamily;
@@ -405,6 +405,37 @@ impl TimePix3Driver {
             format_args!(
                 "{}",
                 adlog::err(func, &format!("{message} (directory=\"{normalized}\")"))
+            ),
+        );
+        self.ad.port_base.call_param_callbacks(0)?;
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message,
+        })
+    }
+
+    /// C `resolveCalibrationFile` (ADTimePix.cpp:153-169): a refused path
+    /// is WriteMsg, an ERR line and no file access.
+    fn resolve_calibration_file(
+        &mut self,
+        directory: &str,
+        file_name: &str,
+        access: PathAccess,
+    ) -> AsynResult<std::path::PathBuf> {
+        let e = match self.calibration.resolve(directory, file_name, access) {
+            Ok(path) => return Ok(path),
+            Err(e) => e,
+        };
+        let message = format!("Calibration path blocked: {}", e.message());
+        self.set_text(self.p.write_msg, &message)?;
+        self.ad.port_base.trace_print(
+            TraceMask::ERROR,
+            format_args!(
+                "{}",
+                adlog::err(
+                    adlog::RESOLVE_CALIBRATION_FILE,
+                    &format!("{message} (directory=\"{directory}\", name=\"{file_name}\")"),
+                )
             ),
         );
         self.ad.port_base.call_param_callbacks(0)?;
@@ -1279,11 +1310,32 @@ impl TimePix3Driver {
         Ok(())
     }
 
-    /// C `uploadBPC` / `uploadDACS` (mask_io.cpp:339): Serval loads the file
-    /// from its own filesystem, so only the path travels.
+    /// C `uploadBPC` / `uploadDACS` (mask_io.cpp:534-562,
+    /// serval_http.cpp:1668-1695): Serval loads the file from its own
+    /// filesystem, so only the resolved path travels.
     fn config_load(&mut self, format: &str, path: usize, name: usize) -> AsynResult<()> {
-        let file = format!("{}{}", self.text(path, 0), self.text(name, 0));
-        let url = serval::config_load(format, &file);
+        let (dir, file_name) = (self.text(path, 0), self.text(name, 0));
+        let file = match self.resolve_calibration_file(&dir, &file_name, PathAccess::Read) {
+            Ok(file) => file,
+            Err(e) => {
+                let (func, msg) = if format == "dacs" {
+                    (
+                        adlog::UPLOAD_DACS,
+                        "uploadDACS: calibration path validation failed; request not sent",
+                    )
+                } else {
+                    (
+                        adlog::UPLOAD_BPC,
+                        "uploadBPC: calibration path validation failed; request not sent",
+                    )
+                };
+                self.ad
+                    .port_base
+                    .trace_print(TraceMask::ERROR, format_args!("{}", adlog::err(func, msg)));
+                return Err(e);
+            }
+        };
+        let url = serval::config_load(format, &file.to_string_lossy());
         let reply = self.http.get(&url, TIMEOUT_CONFIG);
         // serval_http.cpp:1690-1691, mask_io.cpp:559-560.
         self.write_msg_from(&reply);
@@ -1317,14 +1369,6 @@ impl TimePix3Driver {
             status: AsynStatus::Error,
             message: "timepix3: the detector layout is not known yet (no /detector reply)".into(),
         })
-    }
-
-    fn bpc_path(&self) -> std::path::PathBuf {
-        std::path::PathBuf::from(format!(
-            "{}{}",
-            self.text(self.p.bp_c_file_path, 0),
-            self.text(self.p.bp_c_file_name, 0)
-        ))
     }
 
     /// The one mask drawing entry point (C's `readInt32Array` mask branch,
@@ -1378,9 +1422,13 @@ impl TimePix3Driver {
         Ok(())
     }
 
-    /// C `readBPCfile` (mask_io.cpp:363).
+    /// C `readBPCfile` (mask_io.cpp:582).
     fn read_bpc(&mut self) -> AsynResult<Vec<u8>> {
-        let path = self.bpc_path();
+        let (dir, name) = (
+            self.text(self.p.bp_c_file_path, 0),
+            self.text(self.p.bp_c_file_name, 0),
+        );
+        let path = self.resolve_calibration_file(&dir, &name, PathAccess::Read)?;
         let bpc = std::fs::read(&path).map_err(|e| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("timepix3: reading {}: {e}", path.display()),
@@ -1403,13 +1451,13 @@ impl TimePix3Driver {
                 .port_base
                 .set_string_param(self.p.mask_file_name, 0, name.clone())?;
         }
-        let path = std::path::PathBuf::from(format!("{dir}{name}"));
+        let path = self.resolve_calibration_file(&dir, &name, PathAccess::Write)?;
         std::fs::write(&path, bpc).map_err(|e| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("timepix3: writing {}: {e}", path.display()),
         })?;
 
-        let url = serval::config_load("pixelconfig", &format!("{dir}{name}"));
+        let url = serval::config_load("pixelconfig", &path.to_string_lossy());
         self.http.get(&url, TIMEOUT_CONFIG).map_err(|e| {
             let err = self.http_failed(
                 "GET /config/load (pixelconfig)",
@@ -3906,6 +3954,104 @@ mod tests {
         );
     }
 
+    /// Every calibration file goes through C `resolveCalibrationFile`: a
+    /// path outside the root or a non-basename is refused before Serval or
+    /// the filesystem sees it, and an accepted one travels resolved
+    /// (ADTimePix.cpp:153-169, mask_io.cpp:546, :594, :667,
+    /// serval_http.cpp:1675).
+    #[test]
+    fn calibration_files_resolve_inside_the_root() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "TPX_CALIB_RESOLVE";
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("{name}-{}", std::process::id()));
+        let (root, outside) = (tmp.join("root"), tmp.join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("a.dacs"), b"x").unwrap();
+        std::fs::write(outside.join("a.dacs"), b"x").unwrap();
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new(&fake_serval_with(
+                "\0",
+                &[("GET /config/load", "loaded")],
+            ))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        det.configure_calibration(root.to_str().unwrap()).unwrap();
+        let p = det.p;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let log = tmp.join("trace");
+        let file = std::fs::File::create(&log).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace().set_trace_mask(Some(name), TraceMask::ERROR);
+        let upload = |dir: String, file: &'static str| {
+            h.with_driver_blocking::<TimePix3Driver, _>(move |d| {
+                d.set_text(p.da_cs_file_path, &dir).unwrap();
+                d.set_text(p.da_cs_file_name, file).unwrap();
+                d.set_text(p.write_msg, "").unwrap();
+                let ok = d
+                    .write_int32(&mut AsynUser::new(p.write_da_cs_file), 1)
+                    .is_ok();
+                (ok, d.text(p.write_msg, 0))
+            })
+            .unwrap()
+        };
+        let dir = |d: &std::path::Path| format!("{}/", d.display());
+        assert_eq!(
+            upload(dir(&outside), "a.dacs"),
+            (
+                false,
+                "Calibration path blocked: calibration directory is outside the approved root"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            upload(dir(&root), "../outside/a.dacs"),
+            (
+                false,
+                "Calibration path blocked: calibration filename must be a basename".to_string()
+            )
+        );
+        assert_eq!(upload(dir(&root), "a.dacs"), (true, "loaded".to_string()));
+        let text = std::fs::read_to_string(&log).unwrap();
+        for line in [
+            adlog::err(
+                adlog::RESOLVE_CALIBRATION_FILE,
+                &format!(
+                    "Calibration path blocked: calibration directory is outside the approved \
+                     root (directory=\"{}\", name=\"a.dacs\")",
+                    dir(&outside)
+                ),
+            ),
+            adlog::err(
+                adlog::UPLOAD_DACS,
+                "uploadDACS: calibration path validation failed; request not sent",
+            ),
+        ] {
+            assert!(text.contains(&line), "{line}: {text:?}");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::mem::forget(runtime);
+    }
+
     const MEASUREMENT_CONFIG_READBACK: &str = r#"{"Stem": {"Scan": {"Width": 64,
         "Height": 32, "DwellTime": 0.25}, "VirtualDetector": {"RadiusOuter": 9,
         "RadiusInner": 3}}, "TimeOfFlight": {"TdcReference": ["PN0123", "NP0123"],
@@ -4751,6 +4897,7 @@ mod tests {
 
         for dacs in [false, true] {
             let mut det = new("GET /config/load", &[("GET /config/load", "load refused")]);
+            calibration_files(&mut det, "TPX_WRITE_MSG");
             let reason = if dacs {
                 det.p.write_da_cs_file
             } else {
@@ -4758,6 +4905,26 @@ mod tests {
             };
             assert!(det.write_int32(&mut AsynUser::new(reason), 1).is_err());
             assert_eq!(det.text(det.p.write_msg, 0), "load refused");
+        }
+    }
+
+    /// Point the BPC and DACS file PVs at real files, which C
+    /// `resolveCalibrationFile` requires before an upload.
+    fn calibration_files(det: &mut TimePix3Driver, name: &str) {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in ["cal.bpc", "cal.dacs"] {
+            std::fs::write(dir.join(file), b"x").unwrap();
+        }
+        let p = det.p;
+        let dir = format!("{}/", dir.display());
+        for (reason, text) in [
+            (p.bp_c_file_path, dir.as_str()),
+            (p.bp_c_file_name, "cal.bpc"),
+            (p.da_cs_file_path, dir.as_str()),
+            (p.da_cs_file_name, "cal.dacs"),
+        ] {
+            det.set_text(reason, text).unwrap();
         }
     }
 
@@ -4774,6 +4941,7 @@ mod tests {
             cmd_tx,
         )
         .unwrap();
+        calibration_files(&mut det, "TPX_UPLOAD_ADDR");
         let p = det.p;
         for reason in [p.write_bp_c_file, p.write_da_cs_file] {
             det.ad.port_base.set_int32_param(p.http_code, 0, 0).unwrap();
