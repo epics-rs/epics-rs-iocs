@@ -88,6 +88,8 @@ impl Esp300Controller {
             if let Ok(ident) = ctrl.write_read("VE?")
                 && !ident.is_empty()
             {
+                // C copies from `&buff[1]` ("Skip \n"), which drops the first
+                // character under its `\n` input EOS; not copied.
                 ctrl.ident = ident;
                 break;
             }
@@ -438,6 +440,7 @@ impl Esp300Axis {
         let tb = read(&ctrl, "TB?");
         if !tb.starts_with('0') {
             println!("ESP300 status error: {tb}.");
+            // C goes to `exit` with `rtn_state` uninitialised; this posts.
             self.last_status.problem = true;
             return Ok(self.last_status.clone());
         }
