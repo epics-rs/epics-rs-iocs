@@ -127,7 +127,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
-use epics_rs::motor::controller_port::{AxisUser, ParamWrite};
+use epics_rs::motor::controller_port::{AxisUser, ParamWrite, WriteHook, index};
 use epics_rs::motor::flags::{DriverCall, MotorCommand};
 use motor_common::util::{atof, atoi, nint};
 use motor_common::{ControllerParams, ControllerReport};
@@ -1352,7 +1352,36 @@ fn not_initialized(base: &PortDriverBase, user: &AxisUser<'_>, method: &str) -> 
     ParamWrite::Handled(Err(pigcs2_err("GCS controller not initialized")))
 }
 
+/// What `PIasynController::writeInt32`/`writeFloat64` do around
+/// `asynMotorController`'s.
+struct PiWriteHook(PiParams);
+
+impl WriteHook for PiWriteHook {
+    /// The functions C's writes take without calling the base
+    /// (PIasynController.cpp:294-322, :364-394).
+    fn handles(&self, function: usize) -> bool {
+        let p = &self.0;
+        [
+            index::CLOSED_LOOP,
+            index::DEFER_MOVES,
+            p.servo,
+            p.clear_err,
+            p.target_mode,
+            p.target,
+            p.pivot_x,
+            p.pivot_y,
+            p.pivot_z,
+        ]
+        .contains(&function)
+    }
+}
+
 impl ControllerParams for PIGCS2Params {
+    fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
+        let params = *self.params.get()?;
+        Some(Arc::new(PiWriteHook(params)))
+    }
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let mut create = |name, kind| base.create_param(name, kind);
         let params = PiParams {
@@ -3151,6 +3180,46 @@ mod tests {
         )
         .unwrap();
         write(&port, params.params.get().unwrap().cs_activate);
+    }
+
+    /// The functions `PIasynController::writeInt32`/`writeFloat64` take
+    /// themselves never reach `asynMotorController`'s, so none of the
+    /// base's lines print for them (PIasynController.cpp:294-322, :364-394);
+    /// a function C passes on prints the base's.
+    #[test]
+    fn functions_pi_takes_print_no_base_lines() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2QuietLine", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2QuietLine")));
+        let (port, p, mut poll_loop) = controller_port("gcs2Quiet", &ctrl, "1");
+        let printed = traced_mask("gcs2Quiet", TraceMask::IO_DRIVER | TraceMask::FLOW, || {
+            for (reason, value) in [
+                (p.servo, 1),
+                (p.clear_err, 1),
+                (p.target_mode, 1),
+                (index::CLOSED_LOOP, 1),
+                (index::DEFER_MOVES, 1),
+                (index::DEFER_MOVES, 0),
+            ] {
+                let _ = port.write_int32_blocking(reason, 0, value);
+                poll_loop.run_queued_commands();
+            }
+            for reason in [p.target, p.pivot_x, p.pivot_y, p.pivot_z] {
+                let _ = port.write_float64_blocking(reason, 0, 1.0);
+                poll_loop.run_queued_commands();
+            }
+        });
+        assert!(!printed.contains("asynMotorController"), "{printed}");
+        let printed = traced_mask("gcs2Quiet", TraceMask::IO_DRIVER, || {
+            port.write_float64_blocking(index::VELOCITY, 0, 1.0)
+                .unwrap();
+            poll_loop.run_queued_commands();
+        });
+        assert!(
+            printed.contains("asynMotorController:writeFloat64"),
+            "{printed}"
+        );
     }
 
     /// `PIasynController::writeInt32` and `writeFloat64` make the asynUser
