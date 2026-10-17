@@ -290,14 +290,16 @@ impl PmacCoordSystem {
     }
 
     /// C `processDeferredMoves`: abort (to re-enable the motors), then run the
-    /// motion program once for the whole coordinate system.
-    fn process_deferred_moves(&mut self) -> AsynResult<()> {
+    /// motion program once for the whole coordinate system. Its caller
+    /// ignores the status, and the abort's is overwritten (pmacAsynCoord.c:356-361),
+    /// so a failure only prints.
+    fn process_deferred_moves(&mut self) {
         let cs = self.cs;
         let program = self.program;
         self.deferred = [false; CS_AXES];
         // C sends both on `&pDrv->axis[0]`.
-        self.command(1, &format!("&{cs}A"))?;
-        self.command(1, &format!("&{cs}AB{program}R"))
+        let _ = self.command(1, &format!("&{cs}A"));
+        let _ = self.command(1, &format!("&{cs}AB{program}R"));
     }
 }
 
@@ -489,7 +491,7 @@ impl AsynMotor for PmacCsAxis {
         let release = !defer && system.moves_deferred;
         system.moves_deferred = defer;
         if release {
-            system.process_deferred_moves()?;
+            system.process_deferred_moves();
         }
         Ok(())
     }

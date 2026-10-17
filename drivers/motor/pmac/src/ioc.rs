@@ -1382,6 +1382,28 @@ mod tests {
         assert_eq!(written, ["&3Q71=0.001200", "&3A", "&3AB10R"]);
     }
 
+    /// pmacAsynCoord.c:355-361, :439-441: a deferred release runs the program
+    /// after a failed abort, and motorAxisSetDouble ignores both statuses.
+    #[test]
+    fn a_cs_release_runs_after_a_failed_abort_and_succeeds() {
+        let (rt, rig) = publish_scripted("pmacCsRel");
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(
+            io,
+            MotorTrace::new("pmacCsRel", 0),
+            9107,
+            3,
+            10,
+            POLL_CACHE_TTL,
+        )));
+        let mut axis = PmacCsAxis::new(system, 1).unwrap();
+        let user = AsynUser::new(0);
+        axis.set_deferred_moves(&user, true).unwrap();
+        rig.answer("&3AB10R", b"\x07ERR003\r");
+        axis.set_deferred_moves(&user, false).unwrap();
+        assert_eq!(rig.written(), ["&3A", "&3AB10R"]);
+    }
+
     /// pmacAsynCoord.c:584-592: an unparsed or failed `&{cs}??` prints
     /// cmdStatus (0, or MOTOR_AXIS_ERROR) and the response buffer; :625-634
     /// still read the positions over the status words sscanf left.
