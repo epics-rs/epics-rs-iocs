@@ -7,13 +7,13 @@
 //! [`rt::command_channel`]s and the `epicsEvent`s become either a channel
 //! message or an atomic flag, whichever matches how the event is consumed.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
+use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
@@ -482,11 +482,22 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
         err = Some("Stream API is disabled");
     }
     if fw_enable && save_files {
-        let path = s.get_str(s.ad.base.file_path).await;
-        let exists = !path.is_empty() && Path::new(&path).is_dir();
-        s.set_int(s.ad.base.file_path_exists, i32::from(exists))
+        // C `checkPath(); getIntegerParam(NDFilePathExists, ...)`
+        // (eigerDetector.cpp:870-871). An empty FilePath leaves both params as
+        // they were; on a never-defined NDFilePathExists C then reads an
+        // uninitialized int (a C defect), which rs takes as missing.
+        let base = &s.ad.base;
+        let mut path = s.get_str(base.file_path).await;
+        if !path.is_empty() {
+            let exists = check_path_str(&mut path);
+            s.apply(vec![
+                ParamUpdate::Octet(base.file_path, path),
+                ParamUpdate::Int32(base.file_path_exists, i32::from(exists)),
+            ])
             .await;
-        if !exists {
+        }
+        let exists = s.handle.read_int32(base.file_path_exists, 0).await;
+        if !matches!(exists, Ok(v) if v != 0) {
             err = Some("Invalid file path");
         }
     }
@@ -1767,6 +1778,85 @@ mod tests {
         }
         assert_eq!(ids, [0, 1]);
         assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
+        std::mem::forget(runtime);
+    }
+
+    /// Arming with SaveFiles runs `checkPath()` and then reads NDFilePathExists
+    /// (eigerDetector.cpp:870-871): an empty FilePath touches neither param, any
+    /// other is written back with its separator.
+    #[tokio::test]
+    async fn arming_runs_ndarray_driver_check_path_on_the_file_path() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let name = "EIGER_CHECK_PATH";
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: name.to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_size_x: 0,
+            max_size_y: 0,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let det = crate::driver::EigerDriver::new(cfg, rest, signals.clone()).expect("driver");
+        let (p, ad, ops) = (det.p, det.ad.params, det.ops.clone());
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
+                .expect("runtime");
+        let s = shared(
+            ops,
+            runtime.port_handle().clone(),
+            p,
+            ad,
+            Model::Eiger1,
+            ApiVersion::V1_6_0,
+            "127.0.0.1".to_string(),
+            Outputs::new(),
+            DriverPool::standalone(0),
+            &signals,
+        );
+        let (_ctl_tx, ctl_rx) = rt::command_channel::<CtlCommand>(1);
+        let (poll_tx, _poll_rx) = rt::command_channel::<Acquisition>(1);
+        let (_poll_done_tx, poll_done_rx) = rt::command_channel::<bool>(1);
+        let (stream_start_tx, _stream_start_rx) = rt::command_channel::<()>(1);
+        let (_stream_done_tx, stream_done_rx) = rt::command_channel::<bool>(1);
+        let mut ch = TaskChannels {
+            ctl_rx,
+            poll_tx,
+            poll_done_rx,
+            stream_start_tx,
+            stream_done_rx,
+        };
+        s.apply(vec![
+            ParamUpdate::Int32(s.p.data_source, SOURCE_FILEWRITER),
+            ParamUpdate::Int32(s.p.fw_enable, 1),
+            ParamUpdate::Int32(s.p.save_files, 1),
+            ParamUpdate::Octet(s.ad.base.file_path, String::new()),
+        ])
+        .await;
+        let handle = s.handle.clone();
+        let exists = s.ad.base.file_path_exists;
+
+        assert!(!acquire(&s, &mut ch).await);
+        assert!(
+            handle.read_int32(exists, 0).await.is_err(),
+            "an empty FilePath leaves NDFilePathExists undefined"
+        );
+        assert_eq!(s.get_str(s.ad.status_message).await, "Invalid file path");
+
+        let missing = std::env::temp_dir().join(format!("eiger-no-dir-{}", std::process::id()));
+        let missing = missing.to_str().unwrap().to_string();
+        s.set_str(s.ad.base.file_path, &missing).await;
+        assert!(!acquire(&s, &mut ch).await);
+        assert_eq!(
+            s.get_str(s.ad.base.file_path).await,
+            format!("{missing}/"),
+            "checkPath writes the path back with its separator"
+        );
+        assert_eq!(handle.read_int32(exists, 0).await.unwrap(), 0);
         std::mem::forget(runtime);
     }
 
