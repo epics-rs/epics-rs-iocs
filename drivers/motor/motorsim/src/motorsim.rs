@@ -784,12 +784,7 @@ impl AsynMotor for DrvMotorSimAxis {
             let _ = params.set_integer(f, i32::from(v));
         }
         params.call_callback();
-        Ok(MotorStatus {
-            home: status.encoder_home,
-            encoder_home: false,
-            homed: false,
-            ..status
-        })
+        Ok(params.motor_status())
     }
 
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
@@ -1014,6 +1009,20 @@ mod tests {
         ] {
             assert_eq!(get.get_integer(f), Some(v), "{f}");
         }
+    }
+
+    /// drvMotorSim's record sees only `pAxis->params` (drvMotorSim.c:646-677).
+    #[test]
+    fn drv_motor_sim_reports_its_parameters() {
+        let mut axis = DrvMotorSimAxis::new(0, 0, -10.0, 10.0, 0.0, Arc::default());
+        axis.axis.process(0.05);
+        let polled = axis.poll(&user()).unwrap();
+        assert_eq!(polled, axis.params().motor_status());
+        axis.move_absolute(&user(), 5.0, 0.0, 1.0, 1.0).unwrap();
+        axis.axis.process(0.5);
+        let polled = axis.poll(&user()).unwrap();
+        assert!(!polled.done);
+        assert_eq!(polled, axis.params().motor_status());
     }
 
     #[test]
