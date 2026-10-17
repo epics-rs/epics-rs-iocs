@@ -37,7 +37,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{
@@ -711,7 +711,7 @@ pub struct SpiiPlusAxis {
     /// the axis is moving); 0 until then, as asynMotorAxis's status starts.
     last_direction: bool,
     /// The readbacks the last poll set, for the poller's callParamCallbacks.
-    poll_params: Vec<(usize, ParamValue)>,
+    sets: PortSets,
 }
 
 impl SpiiPlusAxis {
@@ -727,7 +727,7 @@ impl SpiiPlusAxis {
             resolution: setup.resolution,
             is_virtual: setup.is_virtual,
             last_direction: false,
-            poll_params: Vec::new(),
+            sets: PortSets::default(),
         }
     }
 
@@ -937,7 +937,9 @@ impl AsynMotor for SpiiPlusAxis {
             peg_ready: ast & AST_PEG_READY != 0,
         };
         drop(ctrl);
-        self.poll_params.extend(readbacks.into_iter().flatten());
+        for (reason, value) in readbacks.into_iter().flatten() {
+            self.sets.axis(reason, value);
+        }
 
         // C updates the direction bit only while moving and only on a non-zero
         // feedback velocity; otherwise it keeps the previous direction.
@@ -967,8 +969,8 @@ impl AsynMotor for SpiiPlusAxis {
         })
     }
 
-    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
-        std::mem::take(&mut self.poll_params)
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
     }
 }
 
@@ -1540,6 +1542,17 @@ mod tests {
 
     use super::*;
     use crate::profile::tests::{SERVOS, rig};
+    use epics_rs::asyn::interfaces::motor::PortSet;
+
+    /// The poll's steps on the port, each on the axis's own address.
+    fn axis_params(sets: PortSets) -> Vec<(usize, ParamValue)> {
+        sets.into_iter()
+            .map(|set| match set {
+                PortSet::Axis { reason, value } => (reason, value),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
 
     #[test]
     fn a_homing_method_write_is_traced_as_c_traces_it() {
@@ -1627,8 +1640,7 @@ mod tests {
         }
         let mut axis = SpiiPlusAxis::new(rig.ctrl.clone(), 0);
         pass(&rig.ctrl, &mut axis);
-        let got: Vec<_> = axis
-            .take_poll_params()
+        let got: Vec<_> = axis_params(axis.take_port_sets())
             .into_iter()
             .map(|(reason, value)| (reason, format!("{value:?}")))
             .collect();
@@ -1657,7 +1669,7 @@ mod tests {
         ]
         .map(|(n, v)| (rig.param(n), format!("{v:?}")));
         assert_eq!(got, want);
-        assert!(axis.take_poll_params().is_empty());
+        assert!(axis.take_port_sets().is_empty());
     }
 
     /// C SPiiPlusAxis::poll never sets motorVelocity_, so the record's RVEL
@@ -1701,14 +1713,14 @@ mod tests {
         };
         let mut dummy = SpiiPlusAxis::new(rig.ctrl.clone(), 0);
         pass(&rig.ctrl, &mut dummy);
-        let got = reasons(dummy.take_poll_params());
+        let got = reasons(axis_params(dummy.take_port_sets()));
         let flags = [rig.param("SPIIPLUS_MFLAGS"), rig.param("SPIIPLUS_MFLAGSX")];
         assert_eq!(got[..2], flags);
 
         rig.float(index::REC_RESOLUTION, 1, 0.5);
         let mut servo = SpiiPlusAxis::new(rig.ctrl.clone(), 1);
         pass(&rig.ctrl, &mut servo);
-        let (reason, velocity) = servo.take_poll_params().swap_remove(4);
+        let (reason, velocity) = axis_params(servo.take_port_sets()).swap_remove(4);
         assert_eq!(reason, rig.param("SPIIPLUS_MAX_VELOCITY"));
         assert_eq!(format!("{velocity:?}"), "Float64(100.0)");
         rig.ctrl.lock().unwrap().rec_resolution[1] = None;
@@ -1718,7 +1730,7 @@ mod tests {
             rig.param("SPIIPLUS_MAX_ACCELERATION"),
         ];
         assert!(
-            !reasons(servo.take_poll_params())
+            !reasons(axis_params(servo.take_port_sets()))
                 .iter()
                 .any(|r| max.contains(r))
         );
