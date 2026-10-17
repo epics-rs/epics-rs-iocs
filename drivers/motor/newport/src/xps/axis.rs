@@ -975,6 +975,8 @@ impl XpsAxis {
             self.moving = false;
         }
         status.done = !self.moving;
+        // C `*moving`, the poller's pace (XPSAxis.cpp:623).
+        status.moving = self.moving;
 
         // A TCL script may change the soft limits; C re-reads them each poll
         // and ignores a failure.
@@ -1006,9 +1008,9 @@ impl XpsAxis {
             .inspect_err(|e| poll_error("GroupPositionVelocityGet", e))?;
         status.velocity = velocity / self.step_size;
         status.direction = velocity > XPS_VELOCITY_DEADBAND;
-        // Motion-done is the group-status view; `moving` is velocity-derived
-        // (C `motorStatusDone_` vs `motorStatusMoving_`).
-        status.moving = velocity.abs() > XPS_VELOCITY_DEADBAND;
+        // MSTA RA_MOVING is velocity-derived, C `motorStatusMoving_`
+        // (XPSAxis.cpp:753), apart from the group-state pace above.
+        status.msta_moving = velocity.abs() > XPS_VELOCITY_DEADBAND;
         Ok(())
     }
 }
@@ -1210,6 +1212,22 @@ mod tests {
         assert!(!mover.poll(&user).unwrap().done);
         assert!(!other.poll(&user).unwrap().done);
         assert!(*answer.lock().unwrap());
+    }
+
+    /// C paces the poller on the group state (`*moving`, XPSAxis.cpp:623)
+    /// and raises MSTA RA_MOVING from the velocity alone (753): a moving
+    /// group at rest paces fast without the bit, a ready group still drifting
+    /// sets the bit without pacing.
+    #[test]
+    fn the_group_state_paces_and_the_velocity_sets_msta_moving() {
+        let (_, mut other, _) = late_move_axes("xps_pace_bit", false);
+        let user = AsynUser::new(0);
+        let s = other.poll(&user).unwrap();
+        assert!(s.moving && !s.msta_moving);
+
+        let (mut axes, _, _) = fake_axes("xps_drift", "", false, &["G1.P1", "G1.P2"]);
+        let s = axes[1].poll(&user).unwrap();
+        assert!(!s.moving && s.msta_moving);
     }
 
     /// C `XPSAxis::poll` (`done:`, XPSAxis.cpp:755-758): a failed call raises
