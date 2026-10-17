@@ -256,7 +256,7 @@ async fn writes_print_c_s_closing_line() {
 
 /// The writes C takes itself never reach asynMotorController, whose lines
 /// print only for one it returns to the base (omsBaseController.cpp:262-305,
-/// 333-406).
+/// 333-406); MOVE_TO_HOME is kept from the base at :293-295.
 #[epics_rs::base::epics_test]
 async fn only_a_write_c_returns_to_the_base_prints_the_base_s_lines() {
     let name = "omsBaseLines";
@@ -273,6 +273,8 @@ async fn only_a_write_c_returns_to_the_base_prints_the_base_s_lines() {
         trace.set_device_trace_file(name, 0, TraceFile::File(file));
         port.write_int32_blocking(index::CLOSED_LOOP, 0, 1).unwrap();
         port.write_int32_blocking(index::DEFER_MOVES, 0, 0).unwrap();
+        port.write_int32_blocking(index::MOVE_TO_HOME, 0, 1)
+            .unwrap();
         port.write_float64_blocking(index::ENCODER_POSITION, 0, 12.7)
             .unwrap();
         port.write_float64_blocking(index::PGAIN, 0, 0.5).unwrap();
