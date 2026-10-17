@@ -1,6 +1,7 @@
 //! The ADTimePix3 asyn port driver (port of the `ADTimePix` class,
 //! `ADTimePix.cpp` + `serval_http.cpp` + `acquire.cpp` + `mask_io.cpp`).
 
+use std::path::Path;
 use std::sync::Arc;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
@@ -1949,7 +1950,8 @@ impl TimePix3Driver {
                 .ok_or_else(Self::read_array_refused)?;
             if write {
                 mask::apply_mask_to_bpc(family, &offsets, mask, &mut bpc);
-                self.write_mask_file(&bpc)?;
+                self.write_bpc_file(&bpc)
+                    .ok_or_else(Self::read_array_refused)?;
             } else {
                 mask::mask_from_bpc(family, &offsets, &bpc, mask);
             }
@@ -2076,29 +2078,97 @@ impl TimePix3Driver {
     }
 
     /// C `writeBPCfile` (mask_io.cpp:639-720): write the edited BPC to the
-    /// mask file name, then have Serval load *that* file.
-    fn write_mask_file(&mut self, bpc: &[u8]) -> AsynResult<()> {
-        let dir = self.text(self.p.bp_c_file_path, 0);
-        let mut name = self.text(self.p.mask_file_name, 0);
-        if name.is_empty() {
-            name = "mask.bpc".to_string();
-            self.ad
-                .port_base
-                .set_string_param(self.p.mask_file_name, 0, name.clone())?;
+    /// mask file name at the geometry's size, then have Serval load *that*
+    /// file.
+    fn write_bpc_file(&mut self, bpc: &[u8]) -> Option<()> {
+        let p = self.p;
+        let family = self.shared.family();
+        if !mask::operator_mask_supported(family) {
+            let _ = self.set_text(
+                p.write_msg,
+                &format!(
+                    "{} mask write blocked: pixel mask encoding is not documented",
+                    family.name()
+                ),
+            );
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "{}",
+                    adlog::err(
+                        adlog::WRITE_BPC_FILE,
+                        "WriteBPC: refusing unsupported detector-family mask write"
+                    )
+                ),
+            );
+            let _ = self.ad.port_base.call_param_callbacks(0);
+            return None;
         }
-        let path = self.resolve_calibration_file(&dir, &name, PathAccess::Write)?;
-        std::fs::write(&path, bpc).map_err(|e| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("timepix3: writing {}: {e}", path.display()),
-        })?;
+        let dir = self.text(p.bp_c_file_path, 0);
+        let mut name = self.text(p.mask_file_name, 0);
+        let path_kind = check_file(Path::new(&dir));
+        self.write_bpc_log(&format!(
+            "Mask write: BPCFilePath type={path_kind} (1=dir) path=\"{dir}\" maskName=\"{name}\""
+        ));
+        if name.is_empty() {
+            let _ = self.set_text(p.mask_file_name, "mask.bpc");
+            name = self.text(p.mask_file_name, 0);
+        }
+        let path = self
+            .resolve_calibration_file(&dir, &name, PathAccess::Write)
+            .ok()?;
+        let mask_kind = check_file(&path);
+        if path_kind != 1 {
+            let _ = self.set_text(
+                p.write_msg,
+                &adlog::snprintf(
+                    256,
+                    format!("Mask: BPC file path is not a directory: {dir}"),
+                ),
+            );
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "{}",
+                    adlog::err(
+                        adlog::WRITE_BPC_FILE,
+                        &format!(
+                            "Mask: BPCFilePath is not a directory (pathExists={path_kind}), \
+                             aborting write to \"{dir}\""
+                        )
+                    )
+                ),
+            );
+            let _ = self.ad.port_base.call_param_callbacks(0);
+            return None;
+        }
+        self.write_bpc_log(&if mask_kind == 2 {
+            format!(
+                "Mask: overwriting file \"{}\" (pathExists={path_kind}, maskFileExistsAsFile={mask_kind})",
+                path.display()
+            )
+        } else {
+            format!(
+                "Mask: writing new file \"{}\" (pathExists={path_kind}, maskStat={mask_kind})",
+                path.display()
+            )
+        });
+
+        let expected = self.expected_bpc_size()?;
+        let status = bpc_file::write_exact(&path, bpc, expected);
+        if status != bpc_file::Status::Ok {
+            let message = format!("WriteBPC: {}: {}", status.message(), path.display());
+            self.refuse_bpc(adlog::WRITE_BPC_FILE, adlog::snprintf(256, message));
+            return None;
+        }
 
         // mask_io.cpp:707-718: uploadBPC loads the mask under BPCFileName,
         // which then reads back the operator's file again.
-        let bpc_name = self.text(self.p.bp_c_file_name, 0);
-        self.set_text(self.p.bp_c_file_name, &name)?;
-        let status = self.config_load("pixelconfig", self.p.bp_c_file_path, self.p.bp_c_file_name);
-        self.set_text(self.p.bp_c_file_name, &bpc_name)?;
-        self.ad.port_base.call_param_callbacks(0)?;
+        let bpc_name = self.text(p.bp_c_file_name, 0);
+        let _ = self.set_text(p.bp_c_file_name, &name);
+        let status = self.config_load("pixelconfig", p.bp_c_file_path, p.bp_c_file_name);
+        let _ = self.set_text(p.bp_c_file_name, &bpc_name);
+        let _ = self.ad.port_base.call_param_callbacks(0);
         if status.is_err() {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
@@ -2110,8 +2180,16 @@ impl TimePix3Driver {
                     )
                 ),
             );
+            return None;
         }
-        status
+        Some(())
+    }
+
+    fn write_bpc_log(&self, line: &str) {
+        self.ad.port_base.trace_print(
+            TraceMask::IO_DRIVER,
+            format_args!("{}", adlog::log(adlog::WRITE_BPC_FILE, line)),
+        );
     }
 
     /// C `refreshPixelConfigFromServal` (serval_http.cpp:1000).
@@ -3462,6 +3540,38 @@ impl PortDriver for TimePix3Driver {
     }
 }
 
+/// C `checkFile` (mask_io.cpp:468-495): `stat`'s file type as 1 directory,
+/// 2 regular file, 3 block, 4 FIFO, 6 character, 7 socket, 8 other; 0 when
+/// `stat` fails.
+fn check_file(path: &Path) -> i32 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    let kind = meta.file_type();
+    if kind.is_dir() {
+        return 1;
+    }
+    if kind.is_file() {
+        return 2;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if kind.is_block_device() {
+            return 3;
+        }
+        if kind.is_fifo() {
+            return 4;
+        }
+        if kind.is_char_device() {
+            return 6;
+        }
+        if kind.is_socket() {
+            return 7;
+        }
+    }
+    8
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5857,11 +5967,61 @@ mod tests {
         .unwrap();
         calibration_files(&mut det, "TPX_MASK_UPLOAD");
         let p = det.p;
+        det.shared.note_family(DetectorFamily::Tpx3);
+        det.ad.port_base.set_int32_param(p.pix_count, 0, 2).unwrap();
         det.set_text(p.mask_file_name, "mask.bpc").unwrap();
-        assert!(det.write_mask_file(&[1, 0]).is_err());
+        assert!(det.write_bpc_file(&[1, 0]).is_none());
         assert_eq!(det.int(p.http_code, 0), 500);
         assert_eq!(det.text(p.write_msg, 0), "load refused");
         assert_eq!(det.text(p.bp_c_file_name, 0), "cal.bpc");
+    }
+
+    /// writeBPCfile refuses an undocumented family, a BPCFilePath that is
+    /// not a directory and data off the geometry's size before any upload
+    /// (mask_io.cpp:639-705).
+    #[test]
+    fn write_bpc_file_refuses_as_c_before_the_upload() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let name = "TPX_MASK_WRITE_REFUSED";
+        let mut det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        calibration_files(&mut det, name);
+        let p = det.p;
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+
+        assert!(det.write_bpc_file(&[1, 0]).is_none());
+        assert_eq!(
+            det.text(p.write_msg, 0),
+            "UNKNOWN mask write blocked: pixel mask encoding is not documented"
+        );
+
+        det.shared.note_family(DetectorFamily::Tpx3);
+        det.ad.port_base.set_int32_param(p.pix_count, 0, 3).unwrap();
+        assert!(det.write_bpc_file(&[1, 0]).is_none());
+        assert_eq!(det.text(p.mask_file_name, 0), "mask.bpc");
+        assert_eq!(
+            det.text(p.write_msg, 0),
+            format!(
+                "WriteBPC: invalid expected BPC size: {}",
+                dir.join("mask.bpc").display()
+            )
+        );
+        assert!(!dir.join("mask.bpc").exists());
+
+        let file_path = dir.join("cal.bpc").display().to_string();
+        det.set_text(p.bp_c_file_path, &file_path).unwrap();
+        assert!(det.write_bpc_file(&[1, 0, 0]).is_none());
+        assert!(
+            det.text(p.write_msg, 0)
+                .starts_with("Calibration path blocked")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     const MEASUREMENT_CONFIG_READBACK: &str = r#"{"Stem": {"Scan": {"Width": 64,
