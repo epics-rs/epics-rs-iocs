@@ -294,6 +294,9 @@ impl AsynMotor for TaurusAxis {
         }
     }
 
+    // C stores and sends the raw-step limit unscaled into the cache
+    // getnlimit filled in controller units (SMCTaurusAxis.cpp:157-171); not
+    // copied.
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let pos = position * self.axis_res();
         self.members.state().travel_limits.1 = pos;
