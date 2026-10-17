@@ -57,7 +57,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::motor::controller_port::{
-    FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, index,
+    AxisUser, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, index,
 };
 use epics_rs::motor::trace::MotorTrace;
 
@@ -246,11 +246,9 @@ impl OmsParams {
     }
 
     /// C `getAxis(pasynUser)`: the axis Init created at the address.
-    fn axis(&self, base: &PortDriverBase, user: &AsynUser) -> Option<i32> {
+    fn axis(&self, user: AxisUser<'_>) -> Option<i32> {
         let count = self.state.axes.get().map_or(0, |a| a.axis_count());
-        base.resolve_address(user.addr)
-            .ok()
-            .filter(|&addr| (addr as usize) < count)
+        Some(user.addr).filter(|&addr| (addr as usize) < count)
     }
 }
 
@@ -275,13 +273,13 @@ impl ControllerParams for OmsParams {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         if user.reason != self.reasons.poll {
             return ParamWrite::PassToBase(Ok(()));
         }
-        let Some(axis) = self.axis(base, user) else {
+        let Some(axis) = self.axis(user) else {
             return ParamWrite::Handled(Err(oms_err("oms: no axis at this address")));
         };
         // Past address 0 the set fails, and that is the write's status.
@@ -296,7 +294,7 @@ impl ControllerParams for OmsParams {
             |mask, args| {
                 PortManager::global().trace_manager().print(
                     Some(&base.port_name),
-                    Some(user.addr),
+                    Some(user.asyn().addr),
                     user.reason as i32,
                     mask,
                     args,
@@ -320,10 +318,10 @@ impl ControllerParams for OmsParams {
     fn write_octet(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         data: &[u8],
     ) -> ParamWrite {
-        let Some(axis) = self.axis(base, user) else {
+        let Some(axis) = self.axis(user) else {
             return ParamWrite::Handled(Err(oms_err("oms: no axis at this address")));
         };
         let r = self.reasons;
@@ -335,7 +333,7 @@ impl ControllerParams for OmsParams {
         };
         let value = data.split(|&b| b == 0).next().unwrap_or_default();
         let value = String::from_utf8_lossy(value);
-        let trace = MotorTrace::new(&*base.port_name, user.addr);
+        let trace = MotorTrace::new(&*base.port_name, user.asyn().addr);
         let print =
             |args: std::fmt::Arguments<'_>| trace.print(TraceMask::ERROR, user.reason as i32, args);
         let port = base.port_name.to_string();
