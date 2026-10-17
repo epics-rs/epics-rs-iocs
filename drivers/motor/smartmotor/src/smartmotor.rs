@@ -222,6 +222,12 @@ impl SmartMotorController {
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
+
+    /// [`query`](Self::query) whose failed read is an empty reply, as C
+    /// `recv_mess` leaves the buffer for the `atoi`/`atof` after it.
+    fn reply(&self, axis: usize, cmd: &str) -> String {
+        self.query(axis, cmd).unwrap_or_default()
+    }
 }
 
 /// One SmartMotor on the controller's port. Implements [`AsynMotor`].
@@ -384,27 +390,25 @@ impl AsynMotor for SmartMotorAxis {
             )));
         };
         ctrl.comm_state = CommState::Normal;
-        // A later query's transport error, which C does not check, raises both.
-        self.failure = PollFailure::PROBLEM_AND_COMMS_ERROR;
         let done = atoi(&rbt) == 0;
 
-        let position = nint(atof(&ctrl.query(self.axis, "RP")?));
+        let position = nint(atof(&ctrl.reply(self.axis, "RP")));
 
-        let plus_ls = atoi(&ctrl.query(self.axis, "RBp")?) != 0;
-        let minus_ls = atoi(&ctrl.query(self.axis, "RBm")?) != 0;
+        let plus_ls = atoi(&ctrl.reply(self.axis, "RBp")) != 0;
+        let minus_ls = atoi(&ctrl.reply(self.axis, "RBm")) != 0;
 
         // Latched right/left travel-limit flags: clear them if set (C Zr/Zl).
-        if atoi(&ctrl.query(self.axis, "RBr")?) != 0 {
+        if atoi(&ctrl.reply(self.axis, "RBr")) != 0 {
             ctrl.send(self.axis, "Zr");
         }
-        if atoi(&ctrl.query(self.axis, "RBl")?) != 0 {
+        if atoi(&ctrl.reply(self.axis, "RBl")) != 0 {
             ctrl.send(self.axis, "Zl");
         }
 
         // RBo != 0 means "not on commanded position" (C clears EA_POSITION).
-        let on_position = atoi(&ctrl.query(self.axis, "RBo")?) == 0;
+        let on_position = atoi(&ctrl.reply(self.axis, "RBo")) == 0;
 
-        let velocity_raw = atoi(&ctrl.query(self.axis, "RV")?);
+        let velocity_raw = atoi(&ctrl.reply(self.axis, "RV"));
         drop(ctrl);
 
         let direction = position >= self.prev_position;
@@ -647,5 +651,94 @@ mod tests {
                 b"\x81G",
             ]
         );
+    }
+
+    /// One SmartMotor without echo answering each query from a table, or
+    /// nothing at all while `quiet`.
+    struct Single {
+        base: epics_rs::asyn::port::PortDriverBase,
+        last: String,
+        replies: Arc<Mutex<std::collections::HashMap<&'static str, &'static str>>>,
+        quiet: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Single {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.last = String::from_utf8_lossy(data).into_owned();
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = if self.quiet.load(std::sync::atomic::Ordering::SeqCst) {
+                ""
+            } else {
+                let replies = self.replies.lock().unwrap();
+                replies.get(self.last.as_str()).copied().unwrap_or("0")
+            };
+            if reply == "!" {
+                return Err(smartmotor_err("read failed"));
+            }
+            buf[..reply.len()].copy_from_slice(reply.as_bytes());
+            Ok(reply.len())
+        }
+    }
+
+    type Replies = Arc<Mutex<std::collections::HashMap<&'static str, &'static str>>>;
+
+    /// The axis, its reply table and quiet flag, and the port runtime to keep.
+    fn single(
+        name: &str,
+    ) -> (
+        SmartMotorAxis,
+        Replies,
+        Arc<std::sync::atomic::AtomicBool>,
+        Box<dyn std::any::Any>,
+    ) {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let replies: Replies = Default::default();
+        let quiet: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let driver = Single {
+            base: epics_rs::asyn::port::PortDriverBase::new(
+                name,
+                1,
+                epics_rs::asyn::port::PortFlags::default(),
+            ),
+            last: String::new(),
+            replies: replies.clone(),
+            quiet: quiet.clone(),
+        };
+        let (rt, actor) =
+            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let ctrl =
+            SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
+        (
+            SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0),
+            replies,
+            quiet,
+            Box::new((rt, actor)),
+        )
+    }
+
+    /// drvSmartMotor.cc:268-357: once RBt answers, a failed read is C
+    /// `recv_mess`'s empty buffer, read as 0, and the status still posts.
+    #[test]
+    fn a_missed_reply_after_rbt_reads_as_zero() {
+        let (mut axis, replies, _, _rt) = single("smartZero");
+        let user = AsynUser::new(0);
+        replies
+            .lock()
+            .unwrap()
+            .extend([("RP", "!"), ("RBp", "!"), ("RBo", "!"), ("RV", "!")]);
+        let s = axis.poll(&user).unwrap();
+        assert_eq!(s.position, 0.0);
+        assert!(!s.high_limit && s.powered && !s.comms_error && !s.problem);
     }
 }
