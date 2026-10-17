@@ -456,10 +456,12 @@ impl DevStrParm {
                 n == 1
             }
             (Kind::Bi, Some(source)) => {
-                // C tests the record's UDF from the previous pass to decide
-                // whether `0STR=` matched, and returns 0, so biRecord then
-                // overwrites VAL from an RVAL nothing set: VAL never takes
-                // the reply. Here a match is local and VAL is the result.
+                // C defect not copied: C tests the record's UDF from the
+                // previous pass to decide whether `0STR=` matched
+                // (devXxStrParm.c:465, :471), and returns 0 (:479), so
+                // biRecord then overwrites VAL from an RVAL nothing set: VAL
+                // never takes the reply. Here a match is local and VAL is the
+                // result.
                 let matched = if !parm.zero.is_empty() && source.starts_with(parm.zero.as_bytes()) {
                     Some(0)
                 } else if !parm.one.is_empty() && source.starts_with(parm.one.as_bytes()) {
