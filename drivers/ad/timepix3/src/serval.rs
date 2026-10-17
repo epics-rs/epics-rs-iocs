@@ -206,6 +206,8 @@ pub fn enum_name(table: &[&'static str], index: i32) -> Option<&'static str> {
 pub struct RawChannel {
     pub base: String,
     pub file_pattern: String,
+    /// `TPX3_RAW_STREAM`: 0 is a file stream.
+    pub stream: i32,
     pub split_strategy: i32,
     pub queue_size: i32,
 }
@@ -289,12 +291,19 @@ pub fn image_body(c: &ImageChannel) -> Result<Value, String> {
 }
 
 pub fn raw_body(c: &RawChannel) -> Result<Value, String> {
-    let mut body = json!({ "Base": c.base, "QueueSize": c.queue_size });
-    if !is_stream(&c.base) {
-        let split = enum_name(&SPLIT_STRATEGIES, c.split_strategy)
-            .ok_or_else(|| format!("split strategy {}", c.split_strategy))?;
+    let mut body = json!({ "Base": c.base });
+    // Only `tcp://` streams a raw channel (serval_http.cpp:1785-1806); a
+    // file channel carries its split and queue only as a file stream.
+    if c.base.starts_with("tcp://") {
+        body["QueueSize"] = json!(c.queue_size);
+    } else {
         body["FilePattern"] = json!(c.file_pattern);
-        body["SplitStrategy"] = json!(split);
+        if c.stream == 0 {
+            let split = enum_name(&SPLIT_STRATEGIES, c.split_strategy)
+                .ok_or_else(|| format!("Invalid split strategy index: {}", c.split_strategy))?;
+            body["SplitStrategy"] = json!(split);
+            body["QueueSize"] = json!(c.queue_size);
+        }
     }
     Ok(body)
 }
@@ -1399,6 +1408,40 @@ mod tests {
         c.integration_size = 10;
         c.integration_mode = 1;
         assert_eq!(image_body(&c).unwrap()["IntegrationMode"], json!("average"));
+    }
+
+    #[test]
+    fn a_raw_channel_is_built_as_c() {
+        let raw = |base: &str, stream, split| {
+            raw_body(&RawChannel {
+                base: base.into(),
+                file_pattern: "r%d".into(),
+                stream,
+                split_strategy: split,
+                queue_size: 16,
+            })
+        };
+        assert_eq!(
+            raw("tcp://localhost:8450", 0, 9),
+            Ok(json!({"Base": "tcp://localhost:8450", "QueueSize": 16}))
+        );
+        assert_eq!(
+            raw("http://localhost:8450", 0, 1),
+            Ok(json!({
+                "Base": "http://localhost:8450",
+                "FilePattern": "r%d",
+                "SplitStrategy": "frame",
+                "QueueSize": 16,
+            }))
+        );
+        assert_eq!(
+            raw("file:/data", 1, 9),
+            Ok(json!({"Base": "file:/data", "FilePattern": "r%d"}))
+        );
+        assert_eq!(
+            raw("file:/data", 0, 2),
+            Err("Invalid split strategy index: 2".into())
+        );
     }
 
     #[test]

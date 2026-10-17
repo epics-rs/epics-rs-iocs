@@ -1050,14 +1050,24 @@ impl TimePix3Driver {
         }
     }
 
+    /// A channel builder's `ERR_ARGS` refusal.
+    fn configure_refused(&mut self, func: &str, message: String) -> AsynError {
+        self.ad.port_base.trace_print(
+            TraceMask::ERROR,
+            format_args!("{}", adlog::err(func, &message)),
+        );
+        Self::destination_refused(message)
+    }
+
     /// C `configureRawChannel` (serval_http.cpp:1755-1812).
     fn configure_raw_channel(&mut self, index: usize, server: &mut Value) -> AsynResult<()> {
         let p = self.p;
-        let [enable, base, pat, split, queue] = if index == 0 {
+        let [enable, base, pat, stream, split, queue] = if index == 0 {
             [
                 p.write_raw,
                 p.raw_base,
                 p.raw_file_pat,
+                p.raw_stream,
                 p.raw_split_strategy,
                 p.raw_queue_size,
             ]
@@ -1066,6 +1076,7 @@ impl TimePix3Driver {
                 p.write_raw1,
                 p.raw1_base,
                 p.raw1_file_pat,
+                p.raw1_stream,
                 p.raw1_split_strategy,
                 p.raw1_queue_size,
             ]
@@ -1076,11 +1087,13 @@ impl TimePix3Driver {
         let c = serval::RawChannel {
             base: self.text(base, 0),
             file_pattern: self.text(pat, 0),
+            stream: self.int(stream, 0),
             split_strategy: self.int(split, 0),
             queue_size: self.int(queue, 0),
         };
         self.validate_destination(&c.base)?;
-        let body = serval::raw_body(&c).map_err(Self::destination_refused)?;
+        let body = serval::raw_body(&c)
+            .map_err(|m| self.configure_refused(adlog::CONFIGURE_RAW_CHANNEL, m))?;
         *serval::channel_slot(&mut server["Raw"], index) = body;
         Ok(())
     }
@@ -3753,6 +3766,23 @@ mod tests {
         assert!(text.contains(&adlog::err(
             adlog::FILE_WRITER,
             "Failed to configure image channel 1"
+        )));
+
+        let (ok, _, text) = run("TPX_FW_RAW_SPLIT", |d| {
+            let p = d.p;
+            enable(d, p.write_raw, p.raw_base);
+            d.ad.port_base
+                .set_int32_param(p.raw_split_strategy, 0, 9)
+                .unwrap();
+        });
+        assert!(!ok);
+        assert!(text.contains(&adlog::err(
+            adlog::CONFIGURE_RAW_CHANNEL,
+            "Invalid split strategy index: 9"
+        )));
+        assert!(text.contains(&adlog::err(
+            adlog::FILE_WRITER,
+            "Failed to configure raw channel 0"
         )));
     }
 
