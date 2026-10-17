@@ -25,3 +25,15 @@ pub mod strparm;
 pub mod televac;
 pub mod tpg261;
 pub mod user_param;
+
+use epics_rs::base::error::CaResult;
+use epics_rs::base::server::record::Record;
+use epics_rs::base::types::EpicsValue;
+
+/// The body `MPCConvert`, `TPG261Convert`, `TelevacConvert` and
+/// `strParmConvert` share: `eslo = 1.0; roff = 0` on an ai. The device writes
+/// VAL itself, so the slope only has to stay out of the way.
+pub(crate) fn unit_slope(ai: &mut dyn Record) -> CaResult<()> {
+    ai.put_field("ESLO", EpicsValue::Double(1.0))?;
+    ai.put_field("ROFF", EpicsValue::ULong(0))
+}

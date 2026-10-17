@@ -87,3 +87,41 @@ fn mks_ai_rebases_eoff_only() {
         ]
     );
 }
+
+/// `MPCConvert` sets ESLO 1 and ROFF 0 on an ai. On an ao its `aiRecord *`
+/// cast writes LOPR 1 and zeroes ASLO's low word (C reads ASLO 1.0999994278
+/// afterwards); only the EOFF rebase is kept there.
+#[test]
+fn mpc_ai_takes_a_unit_slope_and_ao_rebases_eoff_only() {
+    let factory = ip_devices::mpc::device_support_factory;
+    let ai = linconv(
+        "LC:MPCAI",
+        "ai",
+        ip_devices::mpc::DTYP,
+        "@asyn(P 5)GET_PRESSURE 1",
+        factory(),
+    );
+    assert_eq!(
+        ai,
+        [
+            [1.0, 5.0, 0.0, -7.0, 1.1],
+            [1.0, 5.0, 0.0, -7.0, 1.1],
+            [1.0, 1.0, 0.0, -7.0, 1.1],
+        ]
+    );
+    let ao = linconv(
+        "LC:MPCAO",
+        "ao",
+        ip_devices::mpc::DTYP,
+        "@asyn(P 5)SET_SIZE 1",
+        factory(),
+    );
+    assert_eq!(
+        ao,
+        [
+            [2.0, 5.0, 4.0, -7.0, 1.1],
+            [2.0, 5.0, 4.0, -7.0, 1.1],
+            [2.0, 1.0, 4.0, -7.0, 1.1],
+        ]
+    );
+}
