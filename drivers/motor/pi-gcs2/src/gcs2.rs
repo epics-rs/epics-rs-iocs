@@ -825,9 +825,19 @@ impl PIGCS2Controller {
         Err(pigcs2_err(format!("GCS error {err}")))
     }
 
-    /// `MOV {axis} {position}` + `ERR? == 0`.
-    fn mov(&self, axis: &str, position: f64) -> AsynResult<()> {
-        self.send_only(&format!("MOV {axis} {}", CFloat(position)))?;
+    /// C `move`'s `MOV {axis} {position}` and its FLOW line.
+    fn send_mov(&self, axis: &str, position: f64) -> AsynResult<()> {
+        let cmd = format!("MOV {axis} {}", CFloat(position));
+        self.send_only(&cmd)?;
+        self.trace(
+            TraceMask::FLOW,
+            format_args!("PIGCSController::move() sent \"{cmd}\"\n"),
+        );
+        Ok(())
+    }
+
+    /// C `move`'s `ERR? == 0`.
+    fn check_mov(&self) -> AsynResult<()> {
         self.check(0, |err| {
             format!("PIGCSController::move() failed, GCS error {err}\n")
         })
@@ -1686,12 +1696,25 @@ impl PIGCS2Axis {
                 self.axis_name,
                 CFloat(value / self.cpu)
             ))?;
-        } else {
-            ctrl.mov(&self.axis_name, counts / self.cpu)?;
+            drop(ctrl);
+            self.last_direction = counts > self.last_position;
+            return Ok(());
         }
+        ctrl.trace(
+            TraceMask::FLOW,
+            format_args!("PIGCSController::moveCts(, {counts}) \n"),
+        );
         drop(ctrl);
-        self.last_direction = counts > self.last_position;
-        Ok(())
+        self.move_to(counts / self.cpu)
+    }
+
+    /// C `PIGCSController::move(pAxis, target)`: the direction is set once
+    /// `MOV` is sent, before its `ERR?`. C compares with the position in
+    /// units, rs with its whole counts.
+    fn move_to(&mut self, target: f64) -> AsynResult<()> {
+        self.lock().send_mov(&self.axis_name, target)?;
+        self.last_direction = target * self.cpu > self.last_position;
+        self.lock().check_mov()
     }
 
     /// C `setServo`: a servo turned on clears the problem flag.
@@ -1907,18 +1930,17 @@ impl AsynMotor for PIGCS2Axis {
         if !self.lock().accepts_new_target() {
             return Err(self.refuse_target("moveVelocityAxis", ""));
         }
-        // C `moveVelocity`: VEL, then MOV toward whichever travel limit the
-        // sign of velocity selects (TMN/TMX, already controller units). No
-        // acceleration write, and — unlike move_absolute — `m_lastDirection`
-        // is not updated here in C either.
-        let ctrl = self.lock();
-        ctrl.set_velocity(&self.axis_name, velocity / self.cpu)?;
+        // C `moveVelocity`: VEL, then `move` toward whichever travel limit
+        // the sign of velocity selects (TMN/TMX, already controller units).
+        // No acceleration write.
+        self.lock()
+            .set_velocity(&self.axis_name, velocity / self.cpu)?;
         let target = if velocity > 0.0 {
             self.high_limit
         } else {
             self.low_limit
         };
-        ctrl.mov(&self.axis_name, target)
+        self.move_to(target)
     }
 
     fn home(
@@ -2304,8 +2326,8 @@ mod tests {
         let mut ctrl = PIGCS2Controller::new(io, "gcs2CFloat");
         ctrl.knows_vel = true;
         let neg_nan = -f64::NAN;
-        let _ = ctrl.mov("1", f64::NAN);
-        let _ = ctrl.mov("1", neg_nan);
+        let _ = ctrl.send_mov("1", f64::NAN);
+        let _ = ctrl.send_mov("1", neg_nan);
         let _ = ctrl.set_velocity("1", f64::NAN);
         let _ = ctrl.set_axis_position("1", neg_nan);
         let _ = ctrl.set_reference_velocity("1", f64::NAN);
@@ -2931,6 +2953,45 @@ mod tests {
         }
     }
 
+    /// `PIGCSController::moveCts` and `move` (PIGCSController.cpp:230-257):
+    /// their FLOW lines, and `m_lastDirection` set once `MOV` is sent,
+    /// whatever `ERR?` then says, by `moveVelocity`'s move too
+    /// (PIasynAxis.cpp:296).
+    #[test]
+    fn a_move_prints_c_flow_lines_and_sets_its_direction_once_sent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fail = Arc::new(AtomicBool::new(false));
+        let reply = fail.clone();
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2MovFlowLine", move |last| {
+            match last {
+                "ERR?" if reply.load(Ordering::Relaxed) => "1",
+                "ERR?" => "0",
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2MovFlowLine")));
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2MovFlow");
+        let user = AsynUser::new(0);
+        let printed = traced_mask("gcs2MovFlow", TraceMask::FLOW, || {
+            axis.move_absolute(&user, 3000.0, 0.0, 0.0, 0.0).unwrap();
+        });
+        assert!(
+            printed.contains("PIGCSController::moveCts(, 3000) \n")
+                && printed.contains("PIGCSController::move() sent \"MOV 1 3000.000000\"\n"),
+            "{printed}"
+        );
+        fail.store(true, Ordering::Relaxed);
+        axis.last_direction = false;
+        assert!(axis.move_absolute(&user, 3000.0, 0.0, 0.0, 0.0).is_err());
+        assert!(axis.last_direction);
+        fail.store(false, Ordering::Relaxed);
+        axis.high_limit = 10.0;
+        axis.last_position = 20000.0;
+        axis.move_velocity(&user, 0.0, 1.0, 0.0).unwrap();
+        assert!(!axis.last_direction);
+    }
+
     /// `PI_CS_TARGETMODE` (PIasynController.cpp:320-324, 587) picks the
     /// hexapod's move: `MOV` to the target, or `MRT`/`MRW` by the distance
     /// from the position (PIHexapodController.cpp:151-165).
@@ -3543,7 +3604,7 @@ mod tests {
         let (_line, io) = motor_common::testing::LineRig::new("gcs2FailPrint", |_| "1=5".into());
         let mut ctrl = PIGCS2Controller::new(io, "gcs2FailPrint");
         let printed = traced("gcs2FailPrint", || {
-            assert!(ctrl.mov("1", 1.0).is_err());
+            assert!(ctrl.check_mov().is_err());
             assert!(ctrl.set_axis_position("1", 1.0).is_err());
             assert!(ctrl.halt("1").is_err());
             assert!(ctrl.set_enable_axis("1", 1).is_err());
