@@ -1,20 +1,21 @@
 //! What `eigerDetectorConfig` does with a detector that does not answer.
 //!
 //! The API version is read in C's `RestAPI` constructor, which throws when it
-//! cannot, so no port is made (restApi.cpp:258-275). A detector that answered
-//! that and then fails the state fetch keeps its port: C logs "Eiger FAILED TO
-//! CONNECT" and returns (eigerDetector.cpp:231-235).
+//! cannot (restApi.cpp:258-275), after the ADDriver base registered the port,
+//! so the port stays with ADDriver's parameters only. A detector that answered
+//! that and then fails the state fetch keeps its full port: C logs "Eiger
+//! FAILED TO CONNECT" and returns (eigerDetector.cpp:231-235).
 
 use std::net::TcpListener;
 
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::asyn::error::AsynError;
 
+use eiger::create_eiger_detector_on_port;
 use eiger::driver::{EigerConfig, EigerDriver, MAX_ASYN_ADDRESS, MONITOR_ASYN_ADDRESS};
 use eiger::params::Model;
 use eiger::rest::{ApiVersion, RestApi};
 use eiger::tasks;
-use eiger::{ConfigError, create_eiger_detector_on_port};
 
 /// A TCP port nothing is listening on — the same thing the driver sees when the
 /// detector is powered off.
@@ -73,17 +74,16 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
 }
 
 #[test]
-fn the_configure_command_fails_when_the_detector_does_not_answer() {
-    let result = create_eiger_detector_on_port(
+fn an_unanswered_version_read_leaves_the_base_port() {
+    let runtime = create_eiger_detector_on_port(
         &epics_rs::asyn::registry::claim_port("EIGER_OFFLINE_CFG").unwrap(),
         "127.0.0.1",
         dead_port(),
         0,
-    );
-    assert!(matches!(
-        result,
-        Err(ConfigError::Rest("unable to parse response json"))
-    ));
+    )
+    .expect("the port outlives the exception");
+    assert_eq!(runtime.thrown, Some("unable to parse response json"));
+    assert_eq!(runtime.num_tasks(), 0);
 }
 
 #[test]

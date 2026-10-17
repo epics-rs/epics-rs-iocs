@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
-use epics_rs::ad_core::ioc::GenericDriverContext;
+use epics_rs::ad_core::ioc::{GenericDriverContext, PluginManager};
 use epics_rs::base::server::iocsh::registry::*;
 
-use eiger::{ConfigError, EigerRuntime, create_eiger_detector};
+use eiger::{EigerRuntime, create_eiger_detector};
 
 /// NDArray fan-out names.
 ///
@@ -35,92 +35,131 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
     let runtime: Arc<std::sync::Mutex<Vec<EigerRuntime>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
-
-    {
-        let mgr = ioc.mgr().clone();
-        let rt = runtime.clone();
-        ioc.register_startup_command(CommandDef::new(
-            "eigerDetectorConfig",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "serverHostname",
-                    arg_type: ArgType::String,
-                },
-                // C also takes maxBuffers, priority and stackSize. The Rust
-                // NDArray pool is not buffer-count limited and the tasks are
-                // OS threads with the runtime's own priority, so only
-                // maxMemory carries over.
-                ArgDesc {
-                    name: "maxMemory",
-                    arg_type: ArgType::Int,
-                },
-            ],
-            "eigerDetectorConfig portName serverHostname [maxMemory]",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let port_name = match &args[0] {
-                    ArgValue::String(s) => s.to_str()?.to_owned(),
-                    _ => return Err("portName required".into()),
-                };
-                let hostname = match &args[1] {
-                    ArgValue::String(s) => s.to_str()?.to_owned(),
-                    _ => return Err("serverHostname required".into()),
-                };
-                let max_memory = match args.get(2) {
-                    Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
-                    _ => 0,
-                };
-
-                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
-                    Ok(claim) => claim,
-                    Err(e) => return Ok(ctx.cxx_error(e)),
-                };
-
-                let runtime =
-                    create_eiger_detector(&claim, &hostname, max_memory).map_err(|e| match e {
-                        ConfigError::Rest(what) => format!("C++ error: {what}"),
-                        e => format!("failed to create the Eiger detector: {e}"),
-                    })?;
-
-                claim
-                    .publish(
-                        runtime.port_handle().clone(),
-                        ctx.db().scan_control().interrupt_gate(),
-                    )
-                    .map_err(|e| e.to_string())?;
-
-                // Address 0: the driver context (pool + main fan-out).
-                mgr.set_driver(Arc::new(GenericDriverContext::new(
-                    runtime.pool.clone(),
-                    runtime.array_output().clone(),
-                    &port_name,
-                    mgr.wiring(),
-                )));
-
-                // Addresses 1..4 and 10.
-                for (i, output) in runtime.outputs.thresholds.iter().enumerate() {
-                    mgr.wiring()
-                        .register_output(&threshold_port(&port_name, i + 1), output.clone());
-                }
-                mgr.wiring()
-                    .register_output(&monitor_port(&port_name), runtime.outputs.monitor.clone());
-
-                rt.lock().unwrap().push(runtime);
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
+    ioc.register_startup_command(config_command(ioc.mgr().clone(), runtime.clone()));
 
     // Keep the runtimes (and their tasks) alive for the IOC's lifetime.
     ioc.keep_alive(runtime);
 }
 
+/// `eigerDetectorConfig`, keeping each runtime it makes in `rt`.
+fn config_command(
+    mgr: Arc<PluginManager>,
+    rt: Arc<std::sync::Mutex<Vec<EigerRuntime>>>,
+) -> CommandDef {
+    CommandDef::new(
+        "eigerDetectorConfig",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "serverHostname",
+                arg_type: ArgType::String,
+            },
+            // C also takes maxBuffers, priority and stackSize. The Rust
+            // NDArray pool is not buffer-count limited and the tasks are
+            // OS threads with the runtime's own priority, so only
+            // maxMemory carries over.
+            ArgDesc {
+                name: "maxMemory",
+                arg_type: ArgType::Int,
+            },
+        ],
+        "eigerDetectorConfig portName serverHostname [maxMemory]",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port_name = match &args[0] {
+                ArgValue::String(s) => s.to_str()?.to_owned(),
+                _ => return Err("portName required".into()),
+            };
+            let hostname = match &args[1] {
+                ArgValue::String(s) => s.to_str()?.to_owned(),
+                _ => return Err("serverHostname required".into()),
+            };
+            let max_memory = match args.get(2) {
+                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+                _ => 0,
+            };
+
+            let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
+            let runtime = create_eiger_detector(&claim, &hostname, max_memory)
+                .map_err(|e| format!("failed to create the Eiger detector: {e}"))?;
+
+            claim
+                .publish(
+                    runtime.port_handle().clone(),
+                    ctx.db().scan_control().interrupt_gate(),
+                )
+                .map_err(|e| e.to_string())?;
+
+            // Address 0: the driver context (pool + main fan-out).
+            mgr.set_driver(Arc::new(GenericDriverContext::new(
+                runtime.pool.clone(),
+                runtime.array_output().clone(),
+                &port_name,
+                mgr.wiring(),
+            )));
+
+            // Addresses 1..4 and 10.
+            for (i, output) in runtime.outputs.thresholds.iter().enumerate() {
+                mgr.wiring()
+                    .register_output(&threshold_port(&port_name, i + 1), output.clone());
+            }
+            mgr.wiring()
+                .register_output(&monitor_port(&port_name), runtime.outputs.monitor.clone());
+
+            let thrown = runtime.thrown;
+            rt.lock().unwrap().push(runtime);
+            Ok(match thrown {
+                Some(what) => ctx.cxx_error(what),
+                None => CommandOutcome::Continue,
+            })
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// eigerDetector.cpp:190-211, restApi.cpp:244: `mApi` throws after the
+    /// ADDriver base registered the port, which stays for the plugins.
+    #[epics_rs::base::epics_test]
+    async fn a_thrown_constructor_leaves_the_port_registered() {
+        use epics_rs::base::runtime::task::BlockingBridge;
+        use epics_rs::base::server::database::PvDatabase;
+
+        let mgr = PluginManager::new();
+        let rt = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cmd = config_command(mgr.clone(), rt.clone());
+        let args = vec![
+            ArgValue::String("EIGTHROWN".into()),
+            ArgValue::String("no-such-host.invalid".into()),
+        ];
+        let bridge = BlockingBridge::capture();
+        let outcome = std::thread::spawn(move || {
+            let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
+            cmd.handler.call(&args, &ctx)
+        })
+        .join()
+        .unwrap();
+        match outcome {
+            Ok(CommandOutcome::Failed) => {}
+            Err(e) => panic!("the command refused: {e}"),
+            Ok(_) => panic!("the command did not fail the line"),
+        }
+        assert!(mgr.driver().is_ok());
+        assert!(
+            epics_rs::asyn::manager::PortManager::global()
+                .find_port_handle("EIGTHROWN")
+                .is_ok()
+        );
+        assert_eq!(rt.lock().unwrap()[0].thrown, Some("invalid hostname"));
+    }
 
     #[test]
     fn the_fan_out_names_follow_the_c_addresses() {
