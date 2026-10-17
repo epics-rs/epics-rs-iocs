@@ -322,6 +322,8 @@ impl AsynMotor for TaurusAxis {
         let status = atoi(&ctrl.query(&format!("{addr} nst"))?);
         let moving = (status & STATUS_MOVING) != 0;
         let powered = (status & STATUS_POWER_OFF) == 0;
+        // C sets problem from 0x200 (SMCTaurusAxis.cpp:287-294), then
+        // overwrites it at :337 and :340, a dead store; not copied.
         let problem = (status & STATUS_ESTOP_SWITCH) != 0;
 
         // SMCTaurusAxis.cpp:267-271 reads the commanded velocity and
