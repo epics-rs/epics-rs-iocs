@@ -381,6 +381,18 @@ impl OctetInterpose for PmacIpInterpose {
         self.head = 0;
         next.flush(user)
     }
+
+    /// C `pmacAsynIPPortConfigure` registers `pmacInExceptionHandler`.
+    fn exception_user(&self) -> bool {
+        true
+    }
+
+    /// C `pmacInExceptionHandler`: either connect edge drops the input
+    /// buffer, so a reply cut by the drop is not read as the next one's.
+    fn connection_changed(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+    }
 }
 
 /// The interpose layers of a PMAC ethernet port, in install order. Each
@@ -666,5 +678,20 @@ mod tests {
         assert_eq!(base.written[0][1], 0xB3); // VR_PMAC_FLUSH
         assert_eq!(layer.head, 0);
         assert_eq!(layer.tail, 0);
+    }
+
+    #[test]
+    fn a_connect_edge_drops_buffered_input() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+
+        let mut base = PortDriverBase::new("pmacExc", 1, PortFlags::default());
+        base.install_octet_interpose(Box::new(PmacIpInterpose::new()));
+        assert_eq!(base.exception_user_count(-1), 1);
+
+        let mut layer = PmacIpInterpose::new();
+        layer.in_buf[..2].copy_from_slice(b"x\x06");
+        layer.head = 2;
+        layer.connection_changed();
+        assert_eq!((layer.head, layer.tail), (0, 0));
     }
 }
