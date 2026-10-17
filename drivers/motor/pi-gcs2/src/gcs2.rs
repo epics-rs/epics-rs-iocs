@@ -97,8 +97,8 @@
 //! - **Piezo**: `PIGCSPiezoController`, `PIGCS2PiezoCL` — closed-loop piezo
 //!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
 //!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
-//! - **Per-model controllers**: `PIE517Controller`, `PIE727Controller` and
-//!   `PIC702Controller` (each has its own init and status quirks); those
+//! - **Per-model controllers**: `PIE517Controller` and `PIE727Controller`
+//!   (piezo-based, each with its own init and status quirks); those
 //!   controllers run on [`Model::Motor`].
 //! - **`TranslatePIError`**: the 2172-line errcode→string table
 //!   (`TranslatePIError.cpp`/`picontrollererrors.h`) is not ported; only the
@@ -123,6 +123,7 @@
 //!   so `MotorStatus::velocity` stays `0.0`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
@@ -159,6 +160,9 @@ const PARA_MOT_CURR_DECEL: i32 = 0x0C;
 const PARA_MOT_MAX_ACCEL: i32 = 0x4A;
 const PARA_MOT_MAX_DECEL: i32 = 0x4B;
 const PARA_MOT_CPU_Z: i32 = 0x0E;
+const PARA_MOT_HAT_REF: i32 = 0x14;
+/// `PIC702Controller::PI_PARA_C702_REFERENCED`.
+const PARA_C702_REFERENCED: i32 = 0x1C;
 const PARA_MOT_CPU_N: i32 = 0x0F;
 
 /// C `PIasynAxis` CPU defaults, kept when the `SPA?` reads fail.
@@ -223,6 +227,9 @@ fn busy_from_reply(raw: &[u8]) -> bool {
     raw.first() == Some(&0xB0)
 }
 
+/// C `PIGCSController::MAX_NR_AXES`.
+const MAX_NR_AXES: usize = 64;
+
 /// `PIGCSController::getStatusFromBitMask`.
 fn status_from_bitmask(mask: u32) -> (bool, bool, bool, bool, bool) {
     let homing = mask & STATUS_HOMING != 0;
@@ -255,6 +262,8 @@ pub enum Model {
     C885,
     /// `PIE755Controller`.
     E755,
+    /// `PIC702Controller`.
+    C702,
 }
 
 impl Model {
@@ -267,6 +276,22 @@ impl Model {
     /// `PIGCSMotorController::setAccelerationCts`; the others' is a no-op.
     fn sets_acceleration(self) -> bool {
         !matches!(self, Self::C885 | Self::E755)
+    }
+
+    /// `getMaxAcceleration`'s parameters, and whether it reads them only
+    /// on a controller that knows `VEL` (`PIGCSMotorController`'s) or
+    /// always (`PIC702Controller`'s current, not maximum, ones).
+    fn max_acceleration_params(self) -> ((i32, i32), bool) {
+        match self {
+            Self::C702 => ((PARA_MOT_CURR_ACCEL, PARA_MOT_CURR_DECEL), false),
+            _ => ((PARA_MOT_MAX_ACCEL, PARA_MOT_MAX_DECEL), true),
+        }
+    }
+
+    /// C `IsGCS2`: false only on a C-702, whose poll reads no position or
+    /// servo while homing (PIasynAxis.cpp:159).
+    fn is_gcs2(self) -> bool {
+        self != Self::C702
     }
 
     /// `None` where C creates no controller.
@@ -284,7 +309,9 @@ impl Model {
             Some(Self::Motor)
         } else if idn.contains("E-755") {
             Some(Self::E755)
-        } else if any(&["C-702", "HEXAPOD", "F-HEX", "F-206", "M-8", "C-887"]) {
+        } else if idn.contains("C-702") {
+            Some(Self::C702)
+        } else if any(&["HEXAPOD", "F-HEX", "F-206", "M-8", "C-887"]) {
             Some(Self::Motor)
         } else {
             None
@@ -302,6 +329,8 @@ pub struct PIGCS2Controller {
     model: Model,
     knows_vel: bool,
     axis_names: Vec<String>,
+    /// `PIC702Controller::m_timeREFstarted`: one for the controller.
+    ref_started: Option<Instant>,
 }
 
 impl PIGCS2Controller {
@@ -315,6 +344,7 @@ impl PIGCS2Controller {
             model: Model::default(),
             knows_vel: false,
             axis_names: Vec::new(),
+            ref_started: None,
         }
     }
 
@@ -431,6 +461,15 @@ impl PIGCS2Controller {
     /// reads (no further write) while the previous line ended in a space,
     /// then trim that marker off each line (C `findConnectedAxes`).
     fn find_connected_axes(&self) -> AsynResult<Vec<String>> {
+        if self.model == Model::C702 {
+            // PIC702Controller::findConnectedAxes: one word of one-char
+            // axes, last first.
+            let word = self.query("SAI?")?;
+            if word.len() >= MAX_NR_AXES {
+                return Err(pigcs2_err(format!("{} axes in SAI? reply", word.len())));
+            }
+            return Ok(word.chars().rev().map(String::from).collect());
+        }
         let mut raw = self.send_and_receive("SAI?")?;
         let mut names = Vec::new();
         loop {
@@ -583,13 +622,19 @@ impl PIGCS2Controller {
         }
     }
 
-    /// `TRS? {axis}`.
+    /// `TRS? {axis}`; a C-702's `HAT_REF` parameter.
     fn has_reference_sensor(&self, axis: &str) -> AsynResult<bool> {
+        if self.model == Model::C702 {
+            return Ok(self.get_gcs_parameter(axis, PARA_MOT_HAT_REF)? > 0.1);
+        }
         get_value_bool(&self.query(&format!("TRS? {axis}"))?)
     }
 
-    /// `FRF? {axis}`.
+    /// `FRF? {axis}`; a C-702's `REFERENCED` parameter.
     fn get_referenced_state(&self, axis: &str) -> AsynResult<bool> {
+        if self.model == Model::C702 {
+            return Ok(self.get_gcs_parameter(axis, PARA_C702_REFERENCED)? > 0.1);
+        }
         get_value_bool(&self.query(&format!("FRF? {axis}"))?)
     }
 
@@ -856,7 +901,12 @@ impl PIGCS2Axis {
         ));
         self.has_reference = ctrl.has_reference_sensor(&self.axis_name)?;
         flow(format_args!(
-            "PIGCSController::hasReferenceSwitch() axis has {}reference sensor\n",
+            "{}::hasReferenceSwitch() axis has {}reference sensor\n",
+            if ctrl.model == Model::C702 {
+                "PIC702Controller"
+            } else {
+                "PIGCSController"
+            },
             if self.has_reference { "" } else { "no " }
         ));
         let stage_id = ctrl.stage_id(&self.axis_name)?;
@@ -876,12 +926,20 @@ impl PIGCS2Axis {
     /// posLimit, servoControl)`.
     fn status(&self) -> AsynResult<(bool, bool, bool, bool, bool)> {
         let ctrl = self.lock();
-        if ctrl.model != Model::E755 {
+        if !matches!(ctrl.model, Model::E755 | Model::C702) {
             return ctrl.get_status(self.axis_no);
         }
-        // PIE755Controller::getStatus: busy is homing and moving, no
-        // limits. C defect not copied: it never sets servoControl, which
-        // poll then reads uninitialized; rs keeps the last servo state.
+        // PIE755Controller::getStatus, and PIC702Controller's after the
+        // first second of a REF: busy is homing and moving, no limits. C
+        // defect not copied: neither sets servoControl, nor the limits in
+        // that second, which poll then reads uninitialized; rs keeps the
+        // last ones.
+        if ctrl
+            .ref_started
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return Ok((true, true, self.neg_limit, self.pos_limit, self.servo_on));
+        }
         let busy = ctrl.get_busy()?;
         let moving = busy || ctrl.get_moving(self.axis_no)?;
         Ok((busy, moving, false, false, self.servo_on))
@@ -893,25 +951,30 @@ impl PIGCS2Axis {
     /// `CURR_DECEL`. Gated on `knows_vel`, matching both `getMaxAcceleration`
     /// and `setAcceleration`'s own early return.
     fn apply_acceleration(&mut self, acceleration: f64) -> AsynResult<()> {
-        if !self.lock().model.sets_acceleration() || !self.lock().knows_vel() {
+        let (model, knows_vel) = {
+            let ctrl = self.lock();
+            (ctrl.model, ctrl.knows_vel())
+        };
+        if !model.sets_acceleration() {
             return Ok(());
         }
+        let ((max_accel, max_decel), needs_vel) = model.max_acceleration_params();
         let acceleration = (acceleration / self.cpu).abs();
         // C compares the unclamped request with the clamped value stored.
         if acceleration == self.acceleration {
             return Ok(());
         }
-        if self.max_acceleration.is_none() {
+        if self.max_acceleration.is_none() && (knows_vel || !needs_vel) {
             // C defect not copied: setAccelerationCts ignores a failed
             // getMaxAcceleration (PIGCSMotorController.cpp:47) and clamps to
             // the -1 sentinel, sending SPA -1; rs aborts the move instead.
-            let max_acc = self
-                .lock()
-                .get_gcs_parameter(&self.axis_name, PARA_MOT_MAX_ACCEL)?;
-            let max_dec = self
-                .lock()
-                .get_gcs_parameter(&self.axis_name, PARA_MOT_MAX_DECEL)?;
+            let max_acc = self.lock().get_gcs_parameter(&self.axis_name, max_accel)?;
+            let max_dec = self.lock().get_gcs_parameter(&self.axis_name, max_decel)?;
             self.max_acceleration = Some(max_acc.min(max_dec));
+        }
+        // PIGCSMotorController::setAcceleration.
+        if !knows_vel {
+            return Ok(());
         }
         let accel = acceleration.min(self.max_acceleration.unwrap());
         let ctrl = self.lock();
@@ -947,6 +1010,9 @@ impl PIGCS2Axis {
     /// skips the velocity; `PIC885Controller`'s sends `FRF` alone.
     fn reference_vel_cts(&mut self, velocity: f64, forward: bool) -> AsynResult<()> {
         let model = self.lock().model;
+        if model == Model::C702 {
+            return self.reference_c702(velocity, forward);
+        }
         if model == Model::C885 {
             return self
                 .lock()
@@ -957,6 +1023,30 @@ impl PIGCS2Axis {
                 .set_reference_velocity(&self.axis_name, velocity / self.cpu)?;
         }
         self.reference_axis(forward)
+    }
+
+    /// C `PIC702Controller::referenceVelCts`: servo on, `VEL`, then
+    /// `REF`/`MPL`/`MNL` with no `ERR?`, starting the one-second window in
+    /// which every axis reads as homing.
+    fn reference_c702(&mut self, velocity: f64, forward: bool) -> AsynResult<()> {
+        self.set_servo(true)?;
+        self.lock()
+            .set_velocity(&self.axis_name, velocity / self.cpu)?;
+        let cmd = if self.has_reference {
+            "REF"
+        } else if self.has_limit_switches {
+            if forward { "MPL" } else { "MNL" }
+        } else {
+            return Err(pigcs2_err(
+                "PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch",
+            ));
+        };
+        let mut ctrl = self.lock();
+        ctrl.send_only(&format!("{cmd} {}", self.axis_name))?;
+        ctrl.ref_started = Some(Instant::now());
+        drop(ctrl);
+        self.is_homing = true;
+        Ok(())
     }
 
     /// C `PIGCSMotorController::referenceAxis`: servo on, then the
@@ -1097,18 +1187,20 @@ impl AsynMotor for PIGCS2Axis {
         if self.servo_on && !servo_control {
             self.problem = true;
         }
-        self.servo_on = servo_control;
-
-        let ctrl = self.lock();
-        let position = ctrl
-            .get_axis_position(&self.axis_name)
-            .map_or(self.last_position, |p| p * self.cpu);
-        let (mut low_limit, mut high_limit) = (self.low_limit, self.high_limit);
-        let _ = ctrl.get_travel_limits(&self.axis_name, &mut low_limit, &mut high_limit);
-        drop(ctrl);
-        self.last_position = position;
-        self.low_limit = low_limit;
-        self.high_limit = high_limit;
+        if !homing || self.lock().model.is_gcs2() {
+            self.servo_on = servo_control;
+            let ctrl = self.lock();
+            let position = ctrl
+                .get_axis_position(&self.axis_name)
+                .map_or(self.last_position, |p| p * self.cpu);
+            let (mut low_limit, mut high_limit) = (self.low_limit, self.high_limit);
+            let _ = ctrl.get_travel_limits(&self.axis_name, &mut low_limit, &mut high_limit);
+            drop(ctrl);
+            self.last_position = position;
+            self.low_limit = low_limit;
+            self.high_limit = high_limit;
+        }
+        let position = self.last_position;
 
         // C: done = (moving==0 && isHoming==0); the record's reported
         // "moving" bit is `!done`, folding homing into it too — not the raw
@@ -1126,7 +1218,7 @@ impl AsynMotor for PIGCS2Axis {
             high_limit: pos_limit,
             low_limit: neg_limit,
             direction: self.last_direction,
-            powered: servo_control,
+            powered: self.servo_on,
             problem: self.problem,
             homed: self.homed,
             gain_support: true,
@@ -1252,6 +1344,7 @@ mod tests {
             model: Model::default(),
             knows_vel: false,
             axis_names: Vec::new(),
+            ref_started: None,
         };
         // C overwrites the refused command's status with the `\n` write's.
         assert!(ctrl.send_only("MOV 1 1").is_ok());
@@ -1315,6 +1408,7 @@ mod tests {
             model: Model::default(),
             knows_vel: false,
             axis_names: Vec::new(),
+            ref_started: None,
         };
         let mut axis = PIGCS2Axis {
             controller: Arc::new(Mutex::new(ctrl)),
@@ -1603,6 +1697,100 @@ mod tests {
         assert!(status.powered && !status.problem && !axis.is_homing);
     }
 
+    /// A C-702 on a line answering `reply`, on a controller that knows
+    /// `VEL`, after `PIasynAxis::Init`.
+    fn c702_axis(name: &str, knows_vel: bool) -> (motor_common::testing::LineRig, PIGCS2Axis) {
+        let (line, io) = motor_common::testing::LineRig::new(name, c702_reply);
+        let mut ctrl = PIGCS2Controller::new(io, name);
+        ctrl.set_model(Model::C702);
+        ctrl.knows_vel = knows_vel;
+        let axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "A".into(), 0, name);
+        (line, axis)
+    }
+
+    fn c702_reply(last: &str) -> String {
+        match last {
+            "ERR?" => "0",
+            "SAI?" => "BA",
+            "\u{7}" => "0",
+            "\u{5}" => "0",
+            _ => "A=1",
+        }
+        .into()
+    }
+
+    /// `PIC702Controller::findConnectedAxes` (PIC702Controller.cpp:55-84):
+    /// `SAI?` is one word of one-char axes, last char first.
+    #[test]
+    fn a_c702_finds_its_axes_in_one_reversed_word() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2C702Sai", c702_reply);
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2C702Sai");
+        ctrl.set_model(Model::C702);
+        ctrl.init();
+        assert_eq!(ctrl.axis_names(), ["A", "B"]);
+    }
+
+    /// `PIC702Controller::hasReferenceSensor` (:107-122) is `SPA?` 0x14 and
+    /// `getReferencedState` (:124-135) `SPA?` 0x1C.
+    #[test]
+    fn a_c702_axis_reads_reference_state_from_parameters() {
+        let (line, axis) = c702_axis("gcs2C702Init", false);
+        assert_eq!(
+            sent_lines(&line),
+            [
+                "LIM? A",
+                "SPA? A 20",
+                "CST? A",
+                "SVO A 1",
+                "ERR?",
+                "SPA? A 14",
+                "SPA? A 15",
+                "POS? A",
+                "TMN? A",
+                "TMX? A",
+                "SPA? A 28"
+            ]
+        );
+        assert!(axis.has_reference && axis.homed);
+    }
+
+    /// `PIC702Controller::getMaxAcceleration` (:86-105) reads CURR_ACCEL
+    /// and CURR_DECEL, whether or not the controller knows `VEL`; the
+    /// inherited `setAcceleration` writes only on one that does.
+    #[test]
+    fn a_c702_axis_caps_acceleration_by_the_current_parameters() {
+        let (line, mut axis) = c702_axis("gcs2C702Acc", false);
+        line.sent();
+        axis.apply_acceleration(5.0).unwrap();
+        assert_eq!(sent_lines(&line), ["SPA? A 11", "SPA? A 12"]);
+        let (line, mut axis) = c702_axis("gcs2C702AccVel", true);
+        line.sent();
+        axis.apply_acceleration(5.0).unwrap();
+        assert_eq!(
+            sent_lines(&line),
+            ["SPA? A 11", "SPA? A 12", "SPA A 11 1", "SPA A 12 1"]
+        );
+    }
+
+    /// `PIC702Controller::referenceVelCts` (:137-185): servo, `VEL`, then
+    /// `REF` with no `ERR?`. For a second after it, `getStatus` (:13-29)
+    /// answers homing without I/O, and a C-702 (`IsGCS2` false) reads no
+    /// position while homing (PIasynAxis.cpp:159).
+    #[test]
+    fn a_c702_axis_homes_with_ref_and_polls_nothing_while_it_starts() {
+        let (line, mut axis) = c702_axis("gcs2C702Home", true);
+        line.sent();
+        let user = AsynUser::new(0);
+        axis.home(&user, 0.0, 2000.0, 0.0, true).unwrap();
+        assert_eq!(
+            sent_lines(&line),
+            ["SVO A 1", "ERR?", "VEL A 2000.000000", "REF A"]
+        );
+        let status = axis.poll(&user).unwrap();
+        assert!(sent_lines(&line).is_empty());
+        assert!(!status.done && status.moving && axis.is_homing && status.powered);
+    }
+
     #[test]
     fn a_busy_byte_is_0xb0() {
         assert!(busy_from_reply(&[0xB0, b'\n']));
@@ -1635,6 +1823,7 @@ mod tests {
         assert_eq!(Model::from_idn("PI E-873.3QTU"), Some(Model::MotorNoRefVel));
         assert_eq!(Model::from_idn("PI E-873.1AT"), Some(Model::Motor));
         assert_eq!(Model::from_idn("PI E-755.1CD"), Some(Model::E755));
+        assert_eq!(Model::from_idn("PI C-702.00"), Some(Model::C702));
         assert_eq!(Model::from_idn("PI M-824"), Some(Model::Motor));
         assert_eq!(Model::from_idn("PI C-885.M1"), Some(Model::C885));
         assert_eq!(Model::from_idn("PI E-665"), None);
