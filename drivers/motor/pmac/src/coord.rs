@@ -37,6 +37,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -238,15 +239,18 @@ impl AsynMotor for PmacCsAxis {
 
         let mut command = format!("&{cs}");
         if velocity != 0.0 {
-            command.push_str(&format!("I{csvar}89={:.6} ", velocity * step));
+            command.push_str(&format!("I{csvar}89={:.6} ", CFloat(velocity * step)));
             if acceleration != 0.0 {
                 command.push_str(&format!(
                     "I{csvar}87={:.6} ",
-                    (velocity / acceleration).abs() * 1000.0
+                    CFloat((velocity / acceleration).abs() * 1000.0)
                 ));
             }
         }
-        command.push_str(&format!("Q7{axis}={position:.12}"));
+        command.push_str(&format!(
+            "Q7{axis}={position:.12}",
+            position = CFloat(position)
+        ));
 
         if system.moves_deferred {
             system.deferred[axis - 1] = true;
@@ -333,7 +337,10 @@ impl AsynMotor for PmacCsAxis {
         let (cs, step) = (system.cs, system.step_size[axis - 1]);
         // C rounds the record's steps to a whole step first.
         let position = (position + 0.5).floor() * step;
-        system.command(&format!("&{cs}Q7{axis}={position:.6}"))
+        system.command(&format!(
+            "&{cs}Q7{axis}={position:.6}",
+            position = CFloat(position)
+        ))
     }
 
     /// C `motorAxisSetDouble`, `motorAxisDeferMoves`: releasing the deferral runs

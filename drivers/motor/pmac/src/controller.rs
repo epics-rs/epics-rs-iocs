@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
@@ -755,8 +756,8 @@ impl ControllerParams for PmacControllerParams {
             "pmac motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_s,
-            self.idle_s
+            CFloat(self.moving_s),
+            CFloat(self.idle_s)
         );
         if level > 0 {
             let axes = lock_axes(&self.axes);

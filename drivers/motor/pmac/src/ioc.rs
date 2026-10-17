@@ -18,6 +18,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::interfaces::InterfaceType;
@@ -648,7 +649,10 @@ fn set_coord_steps_per_unit(reference: i32, axis: i32, steps_per_unit: f64) {
     let systems = COORD_SYSTEMS.lock().unwrap_or_else(|e| e.into_inner());
     for c in systems.iter().filter(|c| c.reference == reference) {
         lock_system(&c.system).set_steps_per_unit(axis, steps_per_unit);
-        println!("  Setting axis {axis} scaling factor to {steps_per_unit:.6}.");
+        println!(
+            "  Setting axis {axis} scaling factor to {steps_per_unit:.6}.",
+            steps_per_unit = CFloat(steps_per_unit)
+        );
     }
 }
 
@@ -679,7 +683,8 @@ fn set_default_coord_steps(default_steps: f64) {
         }
         println!(
             "  Set scaling factor to {default_steps:.6} for CS ref {}.",
-            c.reference
+            c.reference,
+            default_steps = CFloat(default_steps)
         );
     }
 }
@@ -1144,6 +1149,18 @@ mod tests {
         let mut axis = PmacAxis::new(controller, 1);
         let status = axis.poll(&AsynUser::new(0).with_addr(1)).unwrap();
         assert!(status.powered && !status.problem);
+    }
+
+    /// pmacController.cpp:457/463 `%f`: glibc's nan, sign bit included.
+    #[test]
+    fn a_nan_soft_limit_is_written_as_c_prints_it() {
+        let (_rt, rig) = publish_scripted("pmacLimNan");
+        let controller = Arc::new(Mutex::new(controller_on("pmacLimNan")));
+        let mut axis = PmacAxis::new(controller, 1);
+        let user = AsynUser::new(0).with_addr(1);
+        let _ = axis.set_high_limit(&user, f64::NAN);
+        let _ = axis.set_low_limit(&user, -f64::NAN);
+        assert_eq!(rig.written()[1..], ["I113=nan", "I114=-nan"]);
     }
 
     /// `port`'s trace, address 0 included, without the prefix, so what it

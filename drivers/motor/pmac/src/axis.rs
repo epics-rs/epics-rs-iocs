@@ -30,6 +30,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::trace::TraceMask;
@@ -86,12 +87,15 @@ fn enable_limits_command(axis: i32) -> String {
 fn speed_preamble(axis: i32, velocity: f64, acceleration: f64) -> String {
     let mut preamble = String::new();
     if velocity != 0.0 {
-        preamble.push_str(&format!("I{axis}22={:.6} ", velocity.abs() / 1000.0));
+        preamble.push_str(&format!(
+            "I{axis}22={:.6} ",
+            CFloat(velocity.abs() / 1000.0)
+        ));
     }
     if velocity != 0.0 && acceleration != 0.0 {
         preamble.push_str(&format!(
             "I{axis}20={:.6} ",
-            (velocity / acceleration).abs() * 1000.0
+            CFloat((velocity / acceleration).abs() * 1000.0)
         ));
     }
     preamble
@@ -176,7 +180,10 @@ impl PmacAxis {
             );
         } else {
             let jog = if relative { "J^" } else { "J=" };
-            command.push_str(&format!("#{axis} {jog}{position:.2}"));
+            command.push_str(&format!(
+                "#{axis} {jog}{position:.2}",
+                position = CFloat(position)
+            ));
         }
 
         if self.limits_disabled {
@@ -277,6 +284,7 @@ impl PmacAxis {
                     flags.home_flag as i32,
                     flags.flag_mode,
                     flags.home_offset as i32,
+                    home_velocity = CFloat(home_velocity)
                 ),
             );
             Ok(String::new())
@@ -404,13 +412,19 @@ impl AsynMotor for PmacAxis {
     /// C `pmacController::writeFloat64`, `motorHighLimit_` branch.
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
-        lock(&self.controller).command(&format!("I{axis}13={position:.6}"))
+        lock(&self.controller).command(&format!(
+            "I{axis}13={position:.6}",
+            position = CFloat(position)
+        ))
     }
 
     /// C `pmacController::writeFloat64`, `motorLowLimit_` branch.
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
-        lock(&self.controller).command(&format!("I{axis}14={position:.6}"))
+        lock(&self.controller).command(&format!(
+            "I{axis}14={position:.6}",
+            position = CFloat(position)
+        ))
     }
 
     /// C `pmacController::writeInt32`, `motorDeferMoves_` branch, which C takes

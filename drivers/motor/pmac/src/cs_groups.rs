@@ -14,6 +14,7 @@
 //! [`crate::controller::PmacController`] sends them. That keeps the group logic
 //! testable without a controller and keeps the octet handle owned in one place.
 
+use epics_libcom_rs::cfmt::CFloat;
 use std::collections::BTreeMap;
 
 /// CS axis letter -> the Q variable PROG 101 reads its demand from
@@ -273,11 +274,12 @@ impl CsGroups {
 
         let mut move_str = String::new();
         for (q, value) in moves.values().chain(holds.values()) {
-            move_str.push_str(&format!(" Q{q}={value:.6}"));
+            move_str.push_str(&format!(" Q{q}={value:.6}", value = CFloat(*value)));
         }
         // C's "Q70=%f %s" puts a space before a move string that starts with one.
         Ok(format!(
-            "&{coord_sys} Q{Q_MOVE_TIME}={max_time_ms:.6} {move_str} B{COORD_MOVE_PROG}R"
+            "&{coord_sys} Q{Q_MOVE_TIME}={max_time_ms:.6} {move_str} B{COORD_MOVE_PROG}R",
+            max_time_ms = CFloat(max_time_ms)
         ))
     }
 
@@ -328,7 +330,7 @@ pub fn fast_deferred_command(deferred: &BTreeMap<i32, DeferredMove>) -> String {
     let mut cmd = String::new();
     for (axis, move_) in deferred {
         let op = if move_.relative { "J^" } else { "J=" };
-        cmd.push_str(&format!(" #{axis}{op}{:.2}", move_.position));
+        cmd.push_str(&format!(" #{axis}{op}{:.2}", CFloat(move_.position)));
     }
     cmd
 }
