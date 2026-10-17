@@ -2689,6 +2689,7 @@ name = "motor-common"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "tokio",
 ]
 
 [[package]]

@@ -110,10 +110,10 @@ impl Controller {
     }
 }
 
-/// Make `motor` the axis at `user` — [`asyn_user`] on a port the create
-/// command registered with [`register_port`], or [`TraceUser::Model1`] for
-/// a card of a model-1 driver — and start its poller, which polls from
-/// here on as C's poller thread does from controller creation.
+/// Make `motor` the axis at [`asyn_user`] on a port the create command
+/// registered with [`register_port`], and start its poller, which polls from
+/// here on as C's poller thread does from controller creation. A model-1
+/// card goes through [`model1::Model1::install`] instead.
 /// `forced_fast_polls` is the driver's own: C's `startPoller` has no default
 /// (asynMotorController.cpp:567).
 pub fn install(
