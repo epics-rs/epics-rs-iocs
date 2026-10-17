@@ -36,8 +36,7 @@ MM300Setup(1, 10)
 MM3000Config(0, "$(SERIAL)")
 
 # One motor record per configured axis, signal S of card 0.
-# The MM3000 wire is step-native, so MRES=1 (EGU = motor steps / encoder
-# counts) — like the AG-UC driver.
+# The template takes C's MM3000.substitutions values (MRES 5e-5 mm).
 dbLoadRecords("$(MM3000_IOC)/db/mm3000.template", "P=$(P),M=m1,C=0,S=0")
 
 iocInit()
@@ -45,4 +44,4 @@ iocInit()
 # Example:
 #   dbl
 #   camonitor MM3000:m1 MM3000:m1.RBV
-#   caput MM3000:m1 5000
+#   caput MM3000:m1 1.5
