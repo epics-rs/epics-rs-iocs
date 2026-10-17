@@ -19,9 +19,7 @@ use motor_common::iocsh::{
     req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{
-    Controller, asyn_user, install, model1_device, register_controller_port, register_port,
-};
+use motor_common::{Controller, asyn_user, model1_device, register_controller_port, register_port};
 
 use crate::acr::{AcrAxis, AcrController};
 use crate::drv_pc6k::{self, DrvPc6kAxis, PC6K_NUM_CARDS, Pc6kCard};
@@ -118,18 +116,13 @@ pub fn acr_create_controller_command() -> CommandDef {
             );
             let controller = Arc::new(Mutex::new(AcrController::new(handle)));
 
+            let poller = Controller::new();
             for index in 0..num_axes as usize {
                 let ax = AcrAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                install(
-                    ctx,
-                    asyn_user(&port_name, index as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, ACRMotorDriver.cpp:82
-                )?;
+                poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // ACRMotorDriver.cpp:82
             Ok(CommandOutcome::Continue)
         },
     )
@@ -256,5 +249,12 @@ mod one_poller {
     async fn oem_create_controller_polls_its_axes_on_one_poller() {
         let cmd = oem_create_controller_command();
         assert_eq!(pollers_after(cmd, create_args("oemOnePoller")).await, 1);
+    }
+
+    /// ACRMotorDriver.cpp:82: one startPoller after the axes.
+    #[epics_rs::base::epics_test]
+    async fn acr_create_controller_polls_its_axes_on_one_poller() {
+        let cmd = acr_create_controller_command();
+        assert_eq!(pollers_after(cmd, create_args("acrOnePoller")).await, 1);
     }
 }
