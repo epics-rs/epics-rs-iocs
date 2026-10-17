@@ -278,6 +278,9 @@ impl WriteHook for OemWriteHook {
     }
 }
 
+/// No `write_int32`/`write_float64`: C dereferences the null axis of an
+/// address with no axis (OEMMotorDriver.cpp:130-135, 171-175); rs refuses
+/// there as the base does.
 impl ControllerParams for OemParams {
     /// C `OEMController::report` (OEMMotorDriver.cpp:94-101); `OEMAxis::report`
     /// adds nothing.
