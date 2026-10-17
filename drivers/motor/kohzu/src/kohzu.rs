@@ -366,6 +366,18 @@ impl AsynMotor for KohzuAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        self.poll_status(None)
+    }
+
+    /// drvSC800.cc:278-282: a moving axis reports the record's CDIR.
+    fn poll_in_motion(&mut self, _user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
+        self.poll_status(Some(*cdir))
+    }
+}
+
+impl KohzuAxis {
+    /// C `set_status`; `cdir` is the record's while its move is held.
+    fn poll_status(&mut self, cdir: Option<bool>) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // Status: "C\tSTR<a>\t1\t<move>\t<norg>\t<orgg>\t<cw>\t<ccw>\t<swng>\t<err>"
@@ -396,11 +408,11 @@ impl AsynMotor for KohzuAxis {
                 f.get(2).and_then(|s| s.trim().parse::<i32>().ok())
             })
             .unwrap_or(self.prev_position);
-        let direction = if position != self.prev_position {
+        let direction = cdir.unwrap_or(if position != self.prev_position {
             position >= self.prev_position
         } else {
             self.last_status.direction
-        };
+        });
         self.prev_position = position;
 
         // Torque: "C\tRSY<a>\t21\t<torque>" (0 = enabled).
@@ -564,6 +576,22 @@ mod tests {
         line.sent();
         state.store(MOVING | CCW, Ordering::SeqCst);
         assert_eq!(poll_extra(&line, &mut axis), ["COF1/1"]);
+    }
+
+    /// drvSC800.cc:278-282: a held move reports its record's CDIR, and the
+    /// direction stays there at rest until the position moves.
+    #[test]
+    fn a_held_move_reports_the_record_cdir() {
+        let (_line, mut axis, state) = strings_rig("sc800Cdir");
+        let user = AsynUser::default();
+        state.store(MOVING | CCW, Ordering::SeqCst);
+        let mut cdir = false;
+        let s = axis.poll_in_motion(&user, &mut cdir).unwrap();
+        assert!(!s.direction && !cdir);
+        let mut cdir = true;
+        assert!(axis.poll_in_motion(&user, &mut cdir).unwrap().direction);
+        state.store(0, Ordering::SeqCst);
+        assert!(axis.poll(&user).unwrap().direction, "kept at rest");
     }
 
     #[test]
