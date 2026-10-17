@@ -1,30 +1,37 @@
 # CONEX-AGAP two-axis piezo goniometer: one motor record per axis (U, V).
-# Positions travel the driver boundary in EGU (controller units, mm/deg)
-# directly; MRES only sets the record's raw-count resolution
-# (display/deadband granularity).
+# Values from motor.substitutions.AGAP_CONEX. MRES must equal the driver's
+# fixed stepSize_ (1e-4): positions cross the driver boundary in steps.
 
 record(motor, "$(P)$(MU)") {
     field(DTYP, "asynMotor")
     field(OUT,  "@asyn($(PORT),0)")
     field(SCAN, "Passive")
-    field(VELO, "$(VELO=1.0)")
-    field(ACCL, "$(ACCL=0.5)")
-    field(DHLM, "$(HLM=1.0)")
-    field(DLLM, "$(LLM=-1.0)")
+    field(VELO, "$(VELO=0.5)")
+    field(VBAS, "$(VBAS=0.1)")
+    field(ACCL, "$(ACCL=0.25)")
+    field(DHLM, "$(HLM=2)")
+    field(DLLM, "$(LLM=-2)")
     field(MRES, "$(MRES=0.0001)")
-    field(EGU,  "$(EGU=deg)")
+    field(EGU,  "$(EGU=mm)")
     field(PREC, "$(PREC=4)")
+    field(BDST, "$(BDST=0)")
+    field(BVEL, "$(BVEL=1)")
+    field(BACC, "$(BACC=0.2)")
 }
 
 record(motor, "$(P)$(MV)") {
     field(DTYP, "asynMotor")
     field(OUT,  "@asyn($(PORT),1)")
     field(SCAN, "Passive")
-    field(VELO, "$(VELO=1.0)")
-    field(ACCL, "$(ACCL=0.5)")
-    field(DHLM, "$(HLM=1.0)")
-    field(DLLM, "$(LLM=-1.0)")
+    field(VELO, "$(VELO=0.5)")
+    field(VBAS, "$(VBAS=0.1)")
+    field(ACCL, "$(ACCL=0.25)")
+    field(DHLM, "$(HLM=2)")
+    field(DLLM, "$(LLM=-2)")
     field(MRES, "$(MRES=0.0001)")
-    field(EGU,  "$(EGU=deg)")
+    field(EGU,  "$(EGU=mm)")
     field(PREC, "$(PREC=4)")
+    field(BDST, "$(BDST=0)")
+    field(BVEL, "$(BVEL=1)")
+    field(BACC, "$(BACC=0.2)")
 }

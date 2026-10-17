@@ -43,4 +43,4 @@ iocInit()
 # Example:
 #   dbl
 #   camonitor AGAP:u AGAP:u.RBV AGAP:v AGAP:v.RBV
-#   caput AGAP:u 0.5
+#   caput AGAP:u 0.5   (MRES 1e-4 = the driver stepSize_)
