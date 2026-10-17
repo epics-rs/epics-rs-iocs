@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -365,8 +365,8 @@ impl AsynMotor for FaulhaberAxis {
         ctrl.write_cmd(self.node, "M")
     }
 
-    fn set_record_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
-        self.record_velocity = velocity;
+    fn set_record_fields(&mut self, _user: &AsynUser, fields: &RecordFields) -> AsynResult<()> {
+        self.record_velocity = fields.velocity;
         Ok(())
     }
 
@@ -598,7 +598,15 @@ mod tests {
         r.axis
             .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
             .unwrap();
-        r.axis.set_record_velocity(&r.user, 2000.0).unwrap();
+        r.axis
+            .set_record_fields(
+                &r.user,
+                &RecordFields {
+                    velocity: 2000.0,
+                    srev: 200,
+                },
+            )
+            .unwrap();
         r.axis.home(&r.user, 0.0, 1000.0, 0.0, false).unwrap();
         assert_eq!(
             r.line.sent(),
