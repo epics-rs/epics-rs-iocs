@@ -139,3 +139,85 @@ fn connect(asyn_port: &str) -> Option<SyncIOHandle> {
     }
     None
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod one_poller {
+    use super::*;
+    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::user::AsynUser;
+    use motor_common::testing::pollers_after;
+
+    /// A C-863 with axes `1` and `2`. GCS sends a command and its `\n` as two
+    /// writes, so a read answers the last write before the `\n`.
+    struct C863 {
+        base: PortDriverBase,
+        command: String,
+        sai_left: bool,
+    }
+
+    impl PortDriver for C863 {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn set_input_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+            self.base.set_input_eos(user.addr, eos);
+            Ok(())
+        }
+        fn set_output_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+            self.base.set_output_eos(user.addr, eos);
+            Ok(())
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            if data != b"\n" {
+                self.command = String::from_utf8_lossy(data).into_owned();
+                self.sai_left = self.command == "SAI?";
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = match self.command.as_str() {
+                "*IDN?" => "(c)2026 Physik Instrumente (PI) GmbH & Co. KG, C-863.11, 0, 1.0",
+                "SAI?" if self.sai_left => {
+                    self.sai_left = false;
+                    "1 "
+                }
+                "SAI?" => "2",
+                _ => "1=0",
+            };
+            buf[..reply.len()].copy_from_slice(reply.as_bytes());
+            Ok(reply.len())
+        }
+    }
+
+    /// C PIasynController's one asynMotorController poller for all its axes.
+    #[epics_rs::base::epics_test]
+    async fn pi_gcs2_create_controller_polls_its_axes_on_one_poller() {
+        let line = C863 {
+            base: PortDriverBase::new("c863Line", 1, PortFlags::default()),
+            command: String::new(),
+            sai_left: false,
+        };
+        let claim = claim_port("c863Line").unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, line, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        let args = vec![
+            ArgValue::String("c863".into()),
+            ArgValue::String("c863Line".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(0),
+            ArgValue::Int(0),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ];
+        let cmd = pigcs2_config_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+}
