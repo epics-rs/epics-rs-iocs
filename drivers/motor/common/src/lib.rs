@@ -38,7 +38,7 @@ pub mod util;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::{AsynMotor, PortSets};
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::driver_support::{DriverSupport, register_driver_support};
 use epics_rs::base::server::iocsh::registry::CommandContext;
@@ -122,8 +122,12 @@ impl Controller {
         Self::default()
     }
 
-    /// The driver's `asynMotorController::poll` override.
-    pub fn controller_poll(self, poll: impl FnMut() + Send + 'static) -> Self {
+    /// The driver's `asynMotorController::poll` override; what it returns
+    /// is what it set on its own port.
+    pub fn controller_poll<R: Into<PortSets>>(
+        self,
+        poll: impl FnMut() -> R + Send + 'static,
+    ) -> Self {
         let builder = self.builder.into_inner().unwrap_or_else(|e| e.into_inner());
         Self {
             builder: Mutex::new(builder.map(|b| b.controller_poll(poll))),
