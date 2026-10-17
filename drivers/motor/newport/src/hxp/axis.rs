@@ -18,7 +18,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::user::AsynUser;
 
-use super::controller::{HXP_GROUP, HxpController, MoveCoordSys};
+use super::controller::{HXP_GROUP, HxpController, MRES, MoveCoordSys};
 use crate::xps::rpc::{XpsError, XpsSocket};
 
 /// One hexapod coordinate as an asyn motor axis.
@@ -79,9 +79,7 @@ impl AsynMotor for HxpAxis {
         _velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        // Boundary EGU == hexapod mm/deg: no step scaling (see HXP_GROUP
-        // module Units note in `super::controller`).
-        let end_pos = position;
+        let end_pos = position * MRES;
         let (coord_sys, current) = {
             let ctrl = self.lock_controller();
             (ctrl.move_coord_sys(), ctrl.current_positions()?)
@@ -120,7 +118,7 @@ impl AsynMotor for HxpAxis {
             MoveCoordSys::Tool => "Tool",
         };
         let mut deltas = [0.0; 6];
-        deltas[self.axis_no] = distance;
+        deltas[self.axis_no] = distance * MRES;
         tolerate_dir_change(
             self.command(|s| s.hexapod_move_incremental(HXP_GROUP, cs_name, &deltas)),
         )
@@ -173,8 +171,8 @@ impl AsynMotor for HxpAxis {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let data = self.lock_controller().poll_data();
         Ok(MotorStatus {
-            position: data.setpoint[self.axis_no],
-            encoder_position: data.encoder[self.axis_no],
+            position: data.setpoint[self.axis_no] / MRES,
+            encoder_position: data.encoder[self.axis_no] / MRES,
             done: !data.moving,
             moving: data.moving,
             problem: data.problem,
@@ -188,5 +186,46 @@ impl AsynMotor for HxpAxis {
             vbas_supported: false,
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::xps::fake::FakeLine;
+    use crate::xps::rpc::SocketMode;
+
+    /// HXPDriver.cpp:605, 631, 766, 769: record steps times MRES go out,
+    /// and the readbacks come back divided by it.
+    #[test]
+    fn record_steps_scale_by_mres() {
+        let line = FakeLine::new("hxp_steps", "");
+        let controller = Arc::new(Mutex::new(HxpController::new(
+            line.socket(SocketMode::Query),
+            Duration::ZERO,
+        )));
+        let mut axis = HxpAxis::new(controller, line.socket(SocketMode::Fire), 0);
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 2e5, 0.0, 1.0, 1.0).unwrap();
+        axis.move_relative(&user, -1e5, 0.0, 1.0, 1.0).unwrap();
+        let log = std::mem::take(&mut *line.log.lock().unwrap());
+        assert!(
+            log.iter()
+                .any(|c| c == "HexapodMoveAbsolute (HEXAPOD,Work,2,0,0,0,0,0)"),
+            "{log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|c| c == "HexapodMoveIncremental (HEXAPOD,Work,-1,0,0,0,0,0)"),
+            "{log:?}"
+        );
+        // The fake reports 1.5 for the current position.
+        let status = axis.poll(&user).unwrap();
+        assert_eq!(
+            (status.position, status.encoder_position),
+            (150000.0, 150000.0)
+        );
     }
 }
