@@ -13,10 +13,6 @@ pub const TIMEOUT_POLL: Duration = Duration::from_secs(5);
 /// The timeout C passes to the two configuration PUTs.
 pub const TIMEOUT_CONFIG: Duration = Duration::from_secs(10);
 
-/// Serval's credentials (C `kServalAuth`, serval_http.cpp:36).
-const USER: &str = "user";
-const PASS: &str = "pass";
-
 #[derive(Debug)]
 pub enum HttpError {
     Transport(String),
@@ -97,10 +93,17 @@ pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
 pub struct ServalHttp {
     agent: ureq::Agent,
     base: String,
+    /// The `Authorization` header, sent only when credentials are configured.
+    auth: Option<String>,
 }
 
 impl ServalHttp {
     pub fn new(server_url: &str) -> Self {
+        Self::with_credentials(server_url, env_credentials())
+    }
+
+    /// A client sending Basic auth with `credentials` (user, password).
+    pub fn with_credentials(server_url: &str, credentials: Option<(String, String)>) -> Self {
         let agent = ureq::Agent::config_builder()
             // The driver inspects status codes itself.
             .http_status_as_error(false)
@@ -111,6 +114,7 @@ impl ServalHttp {
             agent,
             // A trailing slash would double up in every path.
             base: server_url.trim_end_matches('/').to_string(),
+            auth: credentials.map(|(user, pass)| basic_auth_header(&user, &pass)),
         }
     }
 
@@ -124,21 +128,16 @@ impl ServalHttp {
     /// string `?anon=true&key=value` — cpr sample-code parameters that mean
     /// nothing to Serval. They are not sent here.
     ///
-    /// UPSTREAM DEFECT (serval_http.cpp:77-87): C attaches HTTP Basic auth to
-    /// its GETs but not to `getJson`/`putJson`, so on a Serval that enforces
-    /// auth every PUT (and the measurement-config GET) would 401. Auth is
-    /// applied uniformly here.
-    ///
     /// UPSTREAM DEFECT (serval_http.cpp:185, 569, 1490, 2199, 2254): several C
     /// calls pass no timeout at all and can park the calling thread forever.
     /// Every request here carries one.
     pub fn get(&self, path: &str, timeout: Duration) -> HttpResult<String> {
         let url = format!("{}{path}", self.base);
-        let mut resp = self
-            .agent
-            .get(&url)
-            .header("Accept", "application/json")
-            .header("Authorization", basic_auth_header())
+        let mut req = self.agent.get(&url).header("Accept", "application/json");
+        if let Some(auth) = &self.auth {
+            req = req.header("Authorization", auth);
+        }
+        let mut resp = req
             .config()
             .timeout_global(Some(timeout))
             .build()
@@ -166,11 +165,14 @@ impl ServalHttp {
     pub fn put_json(&self, path: &str, body: &Value, timeout: Duration) -> HttpResult<String> {
         let url = format!("{}{path}", self.base);
         let text = body.to_string();
-        let mut resp = self
+        let mut req = self
             .agent
             .put(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", basic_auth_header())
+            .header("Content-Type", "application/json");
+        if let Some(auth) = &self.auth {
+            req = req.header("Authorization", auth);
+        }
+        let mut resp = req
             .config()
             .timeout_global(Some(timeout))
             .build()
@@ -192,12 +194,33 @@ impl ServalHttp {
     }
 }
 
-/// C sends Basic auth as a header built by cpr; `ureq` needs it spelled out.
-/// (Kept as a free function so the encoding is testable.)
-pub fn basic_auth_header() -> String {
+/// C `servalCredentials` (serval_http_client.cpp:21-35): read once from
+/// `ADTIMEPIX_SERVAL_USERNAME`/`ADTIMEPIX_SERVAL_PASSWORD`, and configured
+/// only when both are set and non-empty.
+fn env_credentials() -> Option<(String, String)> {
+    static CREDENTIALS: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
+    CREDENTIALS
+        .get_or_init(|| {
+            credentials_from(
+                std::env::var("ADTIMEPIX_SERVAL_USERNAME").ok(),
+                std::env::var("ADTIMEPIX_SERVAL_PASSWORD").ok(),
+            )
+        })
+        .clone()
+}
+
+fn credentials_from(user: Option<String>, pass: Option<String>) -> Option<(String, String)> {
+    match (user, pass) {
+        (Some(user), Some(pass)) if !user.is_empty() && !pass.is_empty() => Some((user, pass)),
+        _ => None,
+    }
+}
+
+/// cpr's `AuthMode::BASIC` header.
+fn basic_auth_header(user: &str, pass: &str) -> String {
     format!(
         "Basic {}",
-        encode_base64(format!("{USER}:{PASS}").as_bytes())
+        encode_base64(format!("{user}:{pass}").as_bytes())
     )
 }
 
@@ -265,7 +288,58 @@ mod tests {
     }
 
     #[test]
-    fn basic_auth_is_the_c_credential_pair() {
-        assert_eq!(basic_auth_header(), "Basic dXNlcjpwYXNz");
+    fn credentials_need_both_names_set_and_non_empty() {
+        let some = |v: &str| Some(v.to_owned());
+        assert_eq!(
+            credentials_from(some("u"), some("p")),
+            Some(("u".into(), "p".into()))
+        );
+        assert_eq!(credentials_from(some("u"), None), None);
+        assert_eq!(credentials_from(None, some("p")), None);
+        assert_eq!(credentials_from(some(""), some("p")), None);
+        assert_eq!(credentials_from(some("u"), some("")), None);
+        assert_eq!(basic_auth_header("user", "pass"), "Basic dXNlcjpwYXNz");
+    }
+
+    /// Basic auth goes on every request when credentials are configured and
+    /// on none otherwise (serval_http_client.cpp:44-95).
+    #[test]
+    fn auth_is_sent_only_when_configured() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let mut auth = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if line.to_ascii_lowercase().starts_with("authorization:") {
+                        auth = Some(line["authorization:".len()..].trim().to_owned());
+                    }
+                }
+                let _ = tx.send(auth);
+                let _ = reader.get_mut().write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        let timeout = Duration::from_secs(5);
+        let with = ServalHttp::with_credentials(&url, Some(("u".into(), "p".into())));
+        with.get("/a", timeout).unwrap();
+        with.put_json("/b", &serde_json::json!({}), timeout)
+            .unwrap();
+        let without = ServalHttp::with_credentials(&url, None);
+        without.get("/a", timeout).unwrap();
+        without
+            .put_json("/b", &serde_json::json!({}), timeout)
+            .unwrap();
+        let seen: Vec<_> = rx.iter().take(4).collect();
+        let basic = Some(basic_auth_header("u", "p"));
+        assert_eq!(seen, [basic.clone(), basic, None, None]);
     }
 }
