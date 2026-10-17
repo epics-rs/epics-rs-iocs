@@ -742,35 +742,41 @@ impl TimePix3Driver {
             tof_max: self.dbl(self.p.tof_max, 0),
         };
         let body = serval::measurement_config_body(&current, &cfg);
-        if let Err(e) = self
+        // WriteMsg is the PUT's reply body, accepted or not (serval_http.cpp:2308-2309).
+        let e = match self
             .http
             .put_json(serval::MEASUREMENT_CONFIG, &body, TIMEOUT_CONFIG)
         {
-            self.log_http(
-                &e,
-                HttpPrint::Failure(
-                    "sendMeasurementConfig PUT /measurement/config",
-                    "PUT",
-                    serval::MEASUREMENT_CONFIG,
+            Ok(reply) => {
+                self.http_ok();
+                return self.set_text(self.p.write_msg, &reply);
+            }
+            Err(e) => e,
+        };
+        self.log_http(
+            &e,
+            HttpPrint::Failure(
+                "sendMeasurementConfig PUT /measurement/config",
+                "PUT",
+                serval::MEASUREMENT_CONFIG,
+            ),
+        );
+        if self.get_measurement_config().is_err() {
+            self.ad.port_base.trace_print(
+                TraceMask::WARNING,
+                format_args!(
+                    "{}",
+                    adlog::warn(
+                        adlog::SEND_MEASUREMENT_CONFIG,
+                        "Failed to restore measurement configuration after rejected PUT",
+                    )
                 ),
             );
-            if self.get_measurement_config().is_err() {
-                self.ad.port_base.trace_print(
-                    TraceMask::WARNING,
-                    format_args!(
-                        "{}",
-                        adlog::warn(
-                            adlog::SEND_MEASUREMENT_CONFIG,
-                            "Failed to restore measurement configuration after rejected PUT",
-                        )
-                    ),
-                );
-            }
-            // The rejected PUT stays the operator-visible result.
-            return Err(self.http_failed("PUT /measurement/config", &e, HttpPrint::None));
         }
-        self.http_ok();
-        Ok(())
+        // The rejected PUT stays the operator-visible result.
+        let refused = self.http_failed("PUT /measurement/config", &e, HttpPrint::None);
+        self.set_text(self.p.write_msg, e.body())?;
+        Err(refused)
     }
 
     /// C `getMeasurementConfig` (serval_http.cpp:2198-2232).
@@ -3328,6 +3334,33 @@ mod tests {
         );
         assert!(is_readback(&measurement_config_of(&det)));
         assert_eq!(det.int(p.http_code, 0), 500);
+    }
+
+    /// WriteMsg carries the measurement-config PUT's reply, accepted or
+    /// rejected (serval_http.cpp:2308-2309, :2318-2319).
+    #[test]
+    fn the_measurement_config_put_reply_is_write_msg() {
+        for (fail, ok) in [("\0", true), ("PUT /measurement/config", false)] {
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+            let mut det = TimePix3Driver::new(
+                "TPX_MSMT_CFG_MSG",
+                Arc::new(ServalHttp::new(&fake_serval_with(
+                    fail,
+                    &[
+                        ("GET /measurement/config ", MEASUREMENT_CONFIG_READBACK),
+                        ("PUT /measurement/config ", "Serval says hi"),
+                    ],
+                ))),
+                Arc::new(Shared::new()),
+                0,
+                cmd_tx,
+            )
+            .unwrap();
+            let p = det.p;
+            let result = det.write_int32(&mut AsynUser::new(p.stem_scan_width), 5);
+            assert_eq!(result.is_ok(), ok);
+            assert_eq!(det.text(p.write_msg, 0), "Serval says hi");
+        }
     }
 
     /// A successful rotation re-reads `/detector` (ADTimePix.cpp:630-641).
