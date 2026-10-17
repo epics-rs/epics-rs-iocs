@@ -1695,6 +1695,11 @@ static MM4000: Model1 = Model1::new(&DEV_MM4000, MM4000_NUM_CARDS, SCAN_RATE);
 /// card count it clamps, between two 5 s sleeps (drvMM4000.cc:606-611).
 pub fn mm4000_setup_command() -> CommandDef {
     MM4000.register_row();
+    MM4000.register_report("drvMM4000", |cards| {
+        cards.report("MM4000", |card, line| {
+            format!("    MM4000 controller {card}, {line} \n")
+        })
+    });
     CommandDef::new(
         "MM4000Setup",
         vec![
@@ -1720,7 +1725,7 @@ pub fn mm4000_setup_command() -> CommandDef {
 /// `MM4000Config(card, name, addr)`: one signal per axis the controller's
 /// `TH;` reports.
 pub fn mm4000_config_command() -> CommandDef {
-    model1_config_command("MM4000Config", &MM4000, |ctx, card, port, _addr| {
+    model1_config_command("MM4000Config", &MM4000, |ctx, card, port, addr| {
         // C drops a card it cannot connect to without a word.
         let Ok(handle) = connect_serial(port, MM4000_TIMEOUT) else {
             return Ok(());
@@ -1739,12 +1744,14 @@ pub fn mm4000_config_command() -> CommandDef {
             Err(_) => return Ok(()),
         };
         let num_axes = controller.num_axes();
+        let line = format!("port={port}, address={addr}, id: {}", controller.firmware());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
             let mut ax = Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL1_POLL_FAILURE);
             ax.model1_set_status();
             MM4000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
+        MM4000.describe(card, line);
         Ok(())
     })
 }
@@ -2644,6 +2651,29 @@ mod report {
             driver_report("drvMM3000", 0),
             "    MM3000 controller 0 asyn port= mm3000RepLine, address=4, id: MM3000 Version \
              2.4 \n    MM3000 controller 1 connection failed.\n"
+        );
+    }
+
+    /// drvMM4000.cc's drvet `report` (drvMM4000.cc:198-224); `id` is the
+    /// `VE;` reply past "VE".
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mm4000_controller() {
+        use motor_common::testing::{LineRig, driver_report};
+        let setup = mm4000_setup_command();
+        let none = "    No MM4000 controllers configured.\n";
+        assert_eq!(driver_report("drvMM4000", 0), none);
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(1), int(10)]).await;
+        let (_line, _io) = LineRig::new("mm4000RepLine", |last| match last {
+            "TH;" => "1TH0".into(),
+            "VE;" => "VEMM4005 Version 2.0".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("mm4000RepLine".into()), int(0)];
+        run_command(mm4000_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvMM4000", 0),
+            "    MM4000 controller 0, port=mm4000RepLine, address=0, id: MM4005 Version 2.0 \n"
         );
     }
 
