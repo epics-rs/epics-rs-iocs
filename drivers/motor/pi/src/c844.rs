@@ -304,6 +304,10 @@ impl PIC844Axis {
 
     fn apply(&mut self, polled: PolledStatus) {
         let prev = self.last_status.position as i32;
+        // C set_status compares the double `motorData` against the integer
+        // `position`, so a fractional target whose NINT did not move forces
+        // RA_DIRECTION plus and it flickers on every poll of a slow move;
+        // that C defect is not copied.
         let direction = if polled.position != prev {
             polled.position >= prev
         } else {
