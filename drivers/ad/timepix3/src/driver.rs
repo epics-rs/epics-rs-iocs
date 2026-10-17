@@ -19,7 +19,7 @@ use crate::calibration::PathPolicy;
 use crate::coordinator::{Phase, Resource};
 use crate::destination;
 use crate::family::DetectorFamily;
-use crate::http::{HttpError, ServalHttp, TIMEOUT_CONFIG, TIMEOUT_POLL, decode_base64};
+use crate::http::{HttpError, HttpResult, ServalHttp, TIMEOUT_CONFIG, TIMEOUT_POLL, decode_base64};
 use crate::mask::{self, Geometry, PIXEL_CONFIG_BYTES};
 use crate::params::TimePixParams;
 use crate::serval;
@@ -618,6 +618,20 @@ impl TimePix3Driver {
         let _ = self.ad.port_base.set_int32_param(self.p.http_code, 0, 200);
     }
 
+    /// C's `setStringParam(ADTimePixWriteMsg, r.text)` after a request whose
+    /// reply the operator sees, accepted or not: empty when Serval never
+    /// answered, as cpr's text is.
+    fn write_msg_from(&mut self, reply: &HttpResult<String>) {
+        let text = match reply {
+            Ok(text) => text.as_str(),
+            Err(e) => e.body(),
+        };
+        let _ = self
+            .ad
+            .port_base
+            .set_string_param(self.p.write_msg, 0, text);
+    }
+
     /// C `mpx3BothCountersTriggerConflict` (ADTimePix.cpp:2135-2143).
     fn mpx3_trigger_conflict(&self, trigger_mode: i32) -> bool {
         self.shared.family() == DetectorFamily::Mpx3
@@ -652,7 +666,12 @@ impl TimePix3Driver {
         let current = self
             .http
             .get_json(serval::DETECTOR_CONFIG, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed("GET /detector/config", &e, HttpPrint::None))?;
+            .map_err(|e| {
+                // serval_http.cpp:2450-2452.
+                let refused = self.http_failed("GET /detector/config", &e, HttpPrint::None);
+                let _ = self.set_text(self.p.write_msg, e.body());
+                refused
+            })?;
 
         let cfg = serval::DetectorConfig {
             trigger_mode: self.int(self.ad.params.trigger_mode, 0),
@@ -677,9 +696,12 @@ impl TimePix3Driver {
             status: AsynStatus::Error,
             message: format!("timepix3: /detector/config: {m}"),
         })?;
-        self.http
-            .put_json(serval::DETECTOR_CONFIG, &body, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed("PUT /detector/config", &e, HttpPrint::None))?;
+        let reply = self
+            .http
+            .put_json(serval::DETECTOR_CONFIG, &body, TIMEOUT_CONFIG);
+        // serval_http.cpp:2626-2627.
+        self.write_msg_from(&reply);
+        reply.map_err(|e| self.http_failed("PUT /detector/config", &e, HttpPrint::None))?;
         self.http_ok();
         Ok(())
     }
@@ -991,19 +1013,22 @@ impl TimePix3Driver {
             status: AsynStatus::Error,
             message: format!("timepix3: /server/destination: {m}"),
         })?;
-        self.http
-            .put_json(serval::SERVER_DESTINATION, &body, TIMEOUT_CONFIG)
-            .map_err(|e| {
-                self.http_failed(
-                    "PUT /server/destination",
-                    &e,
-                    HttpPrint::Failure(
-                        "sendConfiguration PUT /server/destination",
-                        "PUT",
-                        serval::SERVER_DESTINATION,
-                    ),
-                )
-            })?;
+        let reply = self
+            .http
+            .put_json(serval::SERVER_DESTINATION, &body, TIMEOUT_CONFIG);
+        // serval_http.cpp:2182-2183.
+        self.write_msg_from(&reply);
+        reply.map_err(|e| {
+            self.http_failed(
+                "PUT /server/destination",
+                &e,
+                HttpPrint::Failure(
+                    "sendConfiguration PUT /server/destination",
+                    "PUT",
+                    serval::SERVER_DESTINATION,
+                ),
+            )
+        })?;
         self.http_ok();
         Ok(())
     }
@@ -1101,7 +1126,10 @@ impl TimePix3Driver {
     fn config_load(&mut self, format: &str, path: usize, name: usize) -> AsynResult<()> {
         let file = format!("{}{}", self.text(path, 0), self.text(name, 0));
         let url = serval::config_load(format, &file);
-        self.http.get(&url, TIMEOUT_CONFIG).map_err(|e| {
+        let reply = self.http.get(&url, TIMEOUT_CONFIG);
+        // serval_http.cpp:1690-1691, mask_io.cpp:559-560.
+        self.write_msg_from(&reply);
+        reply.map_err(|e| {
             let context = if format == "dacs" {
                 "uploadDACS GET /config/load dacs"
             } else {
@@ -4083,6 +4111,52 @@ mod tests {
             .write_octet(&mut AsynUser::new(det.p.write_msg).with_addr(20), b"x")
             .unwrap_err();
         assert_eq!(e.c_status_code(), 3);
+    }
+
+    /// WriteMsg is the reply body of the destination PUT, the detector
+    /// config GET and PUT, and the calibration loads, accepted or not
+    /// (serval_http.cpp:1691, :2183, :2452, :2627, mask_io.cpp:560).
+    #[test]
+    fn write_msg_is_the_serval_reply() {
+        let new = |fail: &'static str, routes: &'static [(&'static str, &'static str)]| {
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+            TimePix3Driver::new(
+                "TPX_WRITE_MSG",
+                Arc::new(ServalHttp::new(&fake_serval_with(fail, routes))),
+                Arc::new(Shared::new()),
+                0,
+                cmd_tx,
+            )
+            .unwrap()
+        };
+        let mut det = new("\0", &[("PUT /server/destination ", "destination set")]);
+        let _ = det.file_writer();
+        assert_eq!(det.text(det.p.write_msg, 0), "destination set");
+
+        let mut det = new(
+            "GET /detector/config ",
+            &[("GET /detector/config ", "no detector")],
+        );
+        assert!(det.init_acquisition().is_err());
+        assert_eq!(det.text(det.p.write_msg, 0), "no detector");
+
+        let mut det = new(
+            "PUT /detector/config ",
+            &[("PUT /detector/config ", "bad config")],
+        );
+        assert!(det.init_acquisition().is_err());
+        assert_eq!(det.text(det.p.write_msg, 0), "bad config");
+
+        for dacs in [false, true] {
+            let mut det = new("GET /config/load", &[("GET /config/load", "load refused")]);
+            let reason = if dacs {
+                det.p.write_da_cs_file
+            } else {
+                det.p.write_bp_c_file
+            };
+            assert!(det.write_int32(&mut AsynUser::new(reason), 1).is_err());
+            assert_eq!(det.text(det.p.write_msg, 0), "load refused");
+        }
     }
 
     /// The upload runs, and its status is the write's, even where the
