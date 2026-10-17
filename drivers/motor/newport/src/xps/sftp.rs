@@ -55,7 +55,7 @@ fn curl_command(
 
 /// `system()`'s answer: the wait status, or the shell's 127 when the
 /// program cannot be run.
-#[cfg(any(not(feature = "sftp"), test))]
+#[cfg(any(not(feature = "sftp"), all(test, unix)))]
 fn run(program: &str, args: &[String]) -> i32 {
     match std::process::Command::new(program).args(args).status() {
         #[cfg(unix)]
