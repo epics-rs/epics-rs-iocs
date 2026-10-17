@@ -784,16 +784,15 @@ impl AsynMotor for ImsMDrivePlusAxis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        // C reads `PR VI` to ensure a non-zero creep velocity when min_velocity
-        // is 0, but never re-sends it — the creep relies on the drive's stored
-        // VI. This port matches that (does not re-send VI).
         // HM 3 homes in the plus direction, HM 1 in the minus direction.
         let direction = if forward { 3 } else { 1 };
         // R1=0 resets the "homed" latch; poll sets it once the move completes.
+        // C reads `PR VI` to find the creep velocity and then drops the
+        // value (:316-322); only a failed read changes what happens.
         let checked = if min_velocity > 0.0 {
             self.check_base_velocity("home()", min_velocity, velocity)
         } else {
-            Ok(())
+            self.write_read("PR VI").map(drop)
         };
         let status = checked
             .and_then(|()| self.set_move_params(min_velocity, velocity, acceleration))
@@ -1025,6 +1024,32 @@ mod tests {
             lines,
             [base("home()"), error_line("home()", "homing motor")]
         );
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:314-322: a home with no base velocity
+    /// reads `PR VI` first, and a failed read bails before any move write.
+    #[test]
+    fn a_home_without_base_velocity_reads_pr_vi() {
+        let (sent, lines) = axis_error_lines(
+            "imsViHome",
+            "imsViHomeLine",
+            |_| false,
+            |axis| {
+                assert!(axis.home(&AsynUser::new(0), 0.0, 50.0, 0.0, true).is_ok());
+            },
+        );
+        assert_eq!(sent, ["PR VI", "VM=50", "ST=0", "HM 3", "R1=0"]);
+        assert!(lines.is_empty(), "{lines:?}");
+        let (sent, lines) = axis_error_lines(
+            "imsViDead",
+            "imsViDeadLine",
+            |l| l == "PR VI",
+            |axis| {
+                assert!(axis.home(&AsynUser::new(0), 0.0, 50.0, 0.0, false).is_err());
+            },
+        );
+        assert_eq!(sent, ["PR VI", "PR ER"]);
+        assert_eq!(lines, [error_line("home()", "homing motor")]);
     }
 
     /// The other axis bail sites: stop (:274-279), home (:344-349),
