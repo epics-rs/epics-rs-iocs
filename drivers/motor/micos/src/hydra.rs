@@ -32,8 +32,6 @@
 //! - `move_velocity` moves to the axis travel limit read fresh from `getnlimit`
 //!   (the hydra has no jog command); the C driver uses a construction-time cached
 //!   limit, which can be stale after homing.
-//! - The C poll issues `gnv`/`gna` reads whose replies are discarded; these dead
-//!   reads are omitted.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -316,6 +314,11 @@ impl AsynMotor for HydraAxis {
         let moving = (status & STATUS_MOVING) != 0;
         let powered = (status & STATUS_POWER_OFF) == 0;
         let problem = (status & STATUS_ESTOP_SWITCH) != 0;
+
+        // SMChydraAxis.cpp:276-281 reads the commanded velocity and
+        // acceleration, ignoring the replies and their status.
+        let _ = ctrl.query(&format!("{addr} gnv"));
+        let _ = ctrl.query(&format!("{addr} gna"));
 
         // Switch config: bit 1 (0x2) masks (disables) the switch.
         let sw = ctrl.query(&format!("{addr} getsw"))?;
