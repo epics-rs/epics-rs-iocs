@@ -1057,7 +1057,10 @@ mod tests {
         rig.submit(RequestOp::Int32Write { value: 7 }, McaReason::Sequence)
             .expect("write");
         rig.submit(
-            RequestOp::Int32ArrayRead { max_elements: 4 },
+            RequestOp::Int32ArrayRead {
+                buf: Default::default(),
+                max_elements: 4,
+            },
             McaReason::Data,
         )
         .expect("read");
@@ -1164,7 +1167,10 @@ mod tests {
         let rig = Rig::new("short", spectrum_reply);
         let read = || {
             rig.submit(
-                RequestOp::Int32ArrayRead { max_elements: 4 },
+                RequestOp::Int32ArrayRead {
+                    buf: Default::default(),
+                    max_elements: 4,
+                },
                 McaReason::Data,
             )
             .expect("short read is not an error")
@@ -1307,7 +1313,10 @@ mod tests {
             )
             .expect("set eos");
         rig.submit(
-            RequestOp::Int32ArrayRead { max_elements: 1 },
+            RequestOp::Int32ArrayRead {
+                buf: Default::default(),
+                max_elements: 1,
+            },
             McaReason::Data,
         )
         .expect("read");
