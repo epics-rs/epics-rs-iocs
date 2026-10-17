@@ -134,8 +134,13 @@ mod tests {
         std::fs::create_dir_all(dir.join("outside")).unwrap();
         std::fs::write(dir.join("root/sub/a.bpc"), b"x").unwrap();
         std::fs::write(dir.join("outside/b.bpc"), b"x").unwrap();
-        std::os::unix::fs::symlink(dir.join("outside/b.bpc"), dir.join("root/sub/link.bpc"))
-            .unwrap();
+        let (target, link) = (dir.join("outside/b.bpc"), dir.join("root/sub/link.bpc"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        // Windows needs a privilege to make a symlink; without it the
+        // link cases are skipped.
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_file(target, link);
         dir
     }
 
@@ -196,14 +201,16 @@ mod tests {
             Err(PathError::TargetUnavailable)
         );
         assert!(p.resolve(sub, "new.bpc", PathAccess::Write).is_ok());
-        assert_eq!(
-            p.resolve(sub, "link.bpc", PathAccess::Read),
-            Err(PathError::TargetOutsideRoot)
-        );
-        assert_eq!(
-            p.resolve(sub, "link.bpc", PathAccess::Write),
-            Err(PathError::TargetOutsideRoot)
-        );
+        if std::fs::symlink_metadata(t.join("root/sub/link.bpc")).is_ok() {
+            assert_eq!(
+                p.resolve(sub, "link.bpc", PathAccess::Read),
+                Err(PathError::TargetOutsideRoot)
+            );
+            assert_eq!(
+                p.resolve(sub, "link.bpc", PathAccess::Write),
+                Err(PathError::TargetOutsideRoot)
+            );
+        }
         let _ = std::fs::remove_dir_all(&t);
     }
 }
