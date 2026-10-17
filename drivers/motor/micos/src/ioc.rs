@@ -378,7 +378,7 @@ pub fn micos_config_command() -> CommandDef {
 #[cfg(all(test, target_os = "linux"))]
 mod one_poller {
     use super::*;
-    use motor_common::testing::pollers_after;
+    use motor_common::testing::{LineRig, pollers_after};
 
     fn args(port: &str, line: &str, num_axes: i64) -> Vec<ArgValue> {
         vec![
@@ -391,23 +391,27 @@ mod one_poller {
     }
 
     /// C asynMotorController's one poller for every axis of the controller.
-    /// No port has the line's name, so the controller carries on unconnected
-    /// as C's does, and still installs every axis.
     #[epics_rs::base::epics_test]
     async fn smc_corvus_create_controller_polls_its_axes_on_one_poller() {
+        let (line, _io) = LineRig::new("corvusLine", |_| "1.0 1.0 1.0".into());
         let cmd = corvus_create_controller_command();
         assert_eq!(pollers_after(cmd, args("corvus", "corvusLine", 3)).await, 1);
+        assert!(!line.sent().is_empty());
     }
 
     #[epics_rs::base::epics_test]
     async fn smc_hydra_create_controller_polls_its_axes_on_one_poller() {
+        let (line, _io) = LineRig::new("hydraLine", |_| "1".into());
         let cmd = hydra_create_controller_command();
         assert_eq!(pollers_after(cmd, args("hydra", "hydraLine", 2)).await, 1);
+        assert!(!line.sent().is_empty());
     }
 
     #[epics_rs::base::epics_test]
     async fn smc_taurus_create_controller_polls_its_axes_on_one_poller() {
+        let (line, _io) = LineRig::new("taurusLine", |_| "1".into());
         let cmd = taurus_create_controller_command();
         assert_eq!(pollers_after(cmd, args("taurus", "taurusLine", 3)).await, 1);
+        assert!(!line.sent().is_empty());
     }
 }
