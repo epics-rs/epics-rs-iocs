@@ -252,3 +252,39 @@ async fn writes_print_c_s_lines() {
         assert!(line.ends_with(want.as_str()), "{line:?} vs {want:?}");
     }
 }
+
+/// A refused move raises CommsError until the next poll rewrites it from
+/// its own status (smarActMCSMotorDriver.cpp:504-505, 599-604); the rig
+/// holds that poll back so the raised bit can be read.
+#[epics_rs::base::epics_test]
+async fn a_refused_move_raises_comms_error() {
+    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let set = refused.clone();
+    let reply = move |cmd: &str| {
+        let cmd = cmd.trim_end();
+        if cmd.starts_with(":MPA0,") {
+            set.store(true, std::sync::atomic::Ordering::SeqCst);
+            return ":E0,5\n".into();
+        }
+        if cmd == ":GS0" && set.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        mcs_reply(cmd)
+    };
+    let raised = on_line("mcsCommsError", reply, |port, _| {
+        port.write_float64_blocking(index::VELOCITY, 1, 1000.0)
+            .unwrap();
+        let _ = port.write_float64_blocking(index::MOVE_ABS, 1, 1234.0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let error = port.read_int32_blocking(index::STATUS_COMMS_ERROR, 1).ok();
+            if error == Some(1) || Instant::now() > deadline {
+                return error;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })
+    .await;
+    assert!(refused.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(raised, Some(1));
+}
