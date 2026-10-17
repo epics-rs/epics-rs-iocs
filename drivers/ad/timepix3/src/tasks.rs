@@ -210,6 +210,8 @@ impl Ctx {
     }
 
     /// [`Self::trace`] with a body that writes the line, raw bytes included.
+    /// C's `pasynUserSelf` is connected at address 0, so the line takes
+    /// device 0's trace config.
     fn trace_with(
         &self,
         mask: TraceMask,
@@ -217,7 +219,7 @@ impl Ctx {
     ) {
         self.handle.trace().print_with(
             Some(self.handle.port_name()),
-            None,
+            Some(0),
             0,
             mask,
             ("", 0),
@@ -4973,6 +4975,27 @@ mod tests {
             .trace()
             .set_trace_mask(Some(name), TraceMask::ERROR);
         path
+    }
+
+    /// A worker line goes through device 0's trace config, as C's
+    /// asynPrint(pasynUserSelf) (ADTimePixLog.h:41-71).
+    #[test]
+    fn a_worker_line_takes_device_zero_trace_config() {
+        let name = "TPX_DEVICE0_TRACE";
+        let ctx = idle_ctx(name);
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let trace = ctx.handle.trace();
+        trace.set_device_trace_file(
+            name,
+            0,
+            epics_rs::asyn::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        trace.set_device_trace_mask(name, 0, TraceMask::IO_DRIVER);
+        ctx.trace(TraceMask::IO_DRIVER, "device zero");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.ends_with("device zero\n"), "{text:?}");
     }
 
     /// A rejected dashboard read logs the HTTP reply and the parse verdict,
