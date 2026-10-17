@@ -54,6 +54,7 @@
 //!   commands. This port stores the last commanded direction and reports it.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
@@ -85,6 +86,10 @@ const FAULT: u8 = b'#';
 const AXISSTATUS_HOMED: u32 = 1 << 0;
 const AXISSTATUS_NOT_VIRTUAL: u32 = 1 << 13;
 const AXISSTATUS_MOVE_DONE: u32 = 1 << 22;
+
+/// C's delay after a move sets Done 0 "so controller has time to set
+/// MoveDone false" before the next poll (drvA3200Asyn.cc:553, :645).
+const MOVE_DONE_SETTLE: Duration = Duration::from_millis(10);
 
 /// Drive status word bits (C `DRIVESTATUS_*`).
 const DRIVESTATUS_ENABLED: u32 = 1 << 0;
@@ -457,6 +462,7 @@ impl A3200Axis {
         match self.move_io(position, relative, max_v, accel)? {
             None => {
                 self.set_started(posdir);
+                std::thread::sleep(MOVE_DONE_SETTLE);
                 Ok(())
             }
             Some(taskerr) => {
@@ -598,6 +604,7 @@ impl AsynMotor for A3200Axis {
         };
         // C sets them whatever FREERUN returned (drvA3200Asyn.cc:639-645).
         self.set_started(velocity > 0.0);
+        std::thread::sleep(MOVE_DONE_SETTLE);
         sent
     }
 
@@ -1140,6 +1147,39 @@ mod tests {
         let cw_active =
             !(((drive_status & DRIVESTATUS_CW_EOT) != 0) ^ ((swconfig & CW_EOT_SW_STATE) != 0));
         assert!(cw_active);
+    }
+
+    /// drvA3200Asyn.cc:553, :645: a move and a velocity move wait for the
+    /// controller to clear MoveDone, so the poll after them is not done.
+    #[test]
+    fn the_poll_after_a_move_is_not_done_early() {
+        use std::time::Instant;
+        let started: Arc<Mutex<Option<Instant>>> = Arc::default();
+        let reply = {
+            let started = started.clone();
+            move |cmd: &str| {
+                let mut started = started.lock().unwrap();
+                if cmd.starts_with("LINEAR") || cmd.starts_with("FREERUN") {
+                    *started = Some(Instant::now());
+                }
+                // MoveDone stays set until 10 ms after the move command.
+                let settled = started.is_some_and(|t| t.elapsed() >= MOVE_DONE_SETTLE);
+                if cmd.starts_with("~STATUS") && !settled {
+                    format!("%{AXISSTATUS_MOVE_DONE} 0 0 0 0 0")
+                } else if cmd.starts_with("~STATUS") {
+                    "%0 0 0 0 0 0".into()
+                } else {
+                    "%0".into()
+                }
+            }
+        };
+        let (_line, mut axis) = rig_axis("a32SettleLine", true, reply, |_| false);
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        assert!(!axis.poll(&user).unwrap().done);
+        *started.lock().unwrap() = None;
+        axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
+        assert!(!axis.poll(&user).unwrap().done);
     }
 
     #[test]
