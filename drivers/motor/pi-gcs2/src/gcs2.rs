@@ -329,6 +329,9 @@ pub struct PIGCS2Controller {
     axis_names: Vec<String>,
     /// `PIC702Controller::m_timeREFstarted`: one for the controller.
     ref_started: Option<Instant>,
+    /// `PIInterface::m_pCurrentLogSink`: the user of the axis entry point
+    /// that ran last, `(port, addr)`; the serial port's until one does.
+    log_sink: Option<(String, i32)>,
     /// `PIasynController::movesDeferred`.
     moves_deferred: bool,
     /// Each axis's `deferred_move`/`deferred_position`, by axis number.
@@ -358,6 +361,7 @@ impl PIGCS2Controller {
             knows_vel: false,
             axis_names: Vec::new(),
             ref_started: None,
+            log_sink: None,
             moves_deferred: false,
             deferred: BTreeMap::new(),
             released: BTreeMap::new(),
@@ -463,9 +467,13 @@ impl PIGCS2Controller {
 
     /// `asynPrint(pAsynCom, ASYN_TRACE_ERROR, ...)`.
     pub fn print(&self, args: std::fmt::Arguments<'_>) {
+        let (port, addr) = match &self.log_sink {
+            Some((port, addr)) => (port.as_str(), *addr),
+            None => (self.serial_port.as_str(), 0),
+        };
         PortManager::global().trace_manager().print(
-            Some(&self.serial_port),
-            Some(0),
+            Some(port),
+            Some(addr),
             0,
             TraceMask::ERROR,
             args,
@@ -826,6 +834,8 @@ pub struct PIGCS2Axis {
     /// 0-based creation-order index, used only for the `char(4)` status
     /// bitmask offset (`2 + axis_no*4`).
     axis_no: usize,
+    /// The controller port its user is on, C `pasynUser_`'s.
+    port_name: String,
     has_limit_switches: bool,
     has_reference: bool,
     homed: bool,
@@ -866,6 +876,7 @@ impl PIGCS2Axis {
             controller,
             axis_name,
             axis_no,
+            port_name: port_name.to_owned(),
             has_limit_switches: false,
             has_reference: false,
             homed: false,
@@ -883,6 +894,7 @@ impl PIGCS2Axis {
             max_acceleration: None,
             acceleration: 0.0,
         };
+        axis.log_here();
         let _ = axis.init_axis(port_name);
         let ctrl = axis.lock();
         // C `PIGCSMotorController::getResolution` stops at the first failed
@@ -960,6 +972,12 @@ impl PIGCS2Axis {
 
     fn lock(&self) -> MutexGuard<'_, PIGCS2Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// C `m_pCurrentLogSink = pasynUser_`, at the head of `Init` and of
+    /// each axis entry point and controller write.
+    fn log_here(&self) {
+        self.lock().log_sink = Some((self.port_name.clone(), self.axis_no as i32));
     }
 
     /// The controller class's `getStatus`: `(homing, moving, negLimit,
@@ -1116,6 +1134,7 @@ impl AsynMotor for PIGCS2Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.log_here();
         let mut ctrl = self.lock();
         if ctrl.moves_deferred {
             ctrl.deferred.insert(
@@ -1156,6 +1175,7 @@ impl AsynMotor for PIGCS2Axis {
         velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
+        self.log_here();
         // C `moveVelocity`: VEL, then MOV toward whichever travel limit the
         // sign of velocity selects (TMN/TMX, already controller units). No
         // acceleration write, and — unlike move_absolute — `m_lastDirection`
@@ -1178,6 +1198,7 @@ impl AsynMotor for PIGCS2Axis {
         _acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
+        self.log_here();
         // C sets m_isHoming=1 optimistically before attempting the reference
         // command; on failure it is left set until the next poll's real
         // status bitmask corrects it, matching upstream.
@@ -1186,6 +1207,7 @@ impl AsynMotor for PIGCS2Axis {
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        self.log_here();
         let mut ctrl = self.lock();
         ctrl.deferred.remove(&self.axis_no);
         match ctrl.model {
@@ -1195,17 +1217,20 @@ impl AsynMotor for PIGCS2Axis {
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.log_here();
         self.lock()
             .set_axis_position(&self.axis_name, position / self.cpu)
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
+        self.log_here();
         self.set_servo(enable)
     }
 
     /// C `PIasynController::writeInt32`, `motorDeferMoves_`: clearing a set
     /// deferral runs `processDeferredMoves`, whose status C ignores.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
+        self.log_here();
         let mut ctrl = self.lock();
         if !defer && ctrl.moves_deferred {
             let _ = ctrl.process_deferred_moves();
@@ -1414,6 +1439,7 @@ mod tests {
             knows_vel: false,
             axis_names: Vec::new(),
             ref_started: None,
+            log_sink: None,
             moves_deferred: false,
             deferred: BTreeMap::new(),
             released: BTreeMap::new(),
@@ -1481,6 +1507,7 @@ mod tests {
             knows_vel: false,
             axis_names: Vec::new(),
             ref_started: None,
+            log_sink: None,
             moves_deferred: false,
             deferred: BTreeMap::new(),
             released: BTreeMap::new(),
@@ -1489,6 +1516,7 @@ mod tests {
             controller: Arc::new(Mutex::new(ctrl)),
             axis_name: "1".into(),
             axis_no: 0,
+            port_name: "gcs2StatusRefused".into(),
             has_limit_switches: true,
             has_reference: true,
             homed: true,
@@ -1913,6 +1941,50 @@ mod tests {
         line.sent();
         first.set_deferred_moves(&user, false).unwrap();
         assert_eq!(sent_lines(&line), ["MOV 2 2.000000", "ERR?"]);
+    }
+
+    /// What prints on `port` (every address) while `f` runs.
+    fn traced(port: &str, f: impl FnOnce()) -> String {
+        use epics_rs::asyn::trace::TraceFile;
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(port), TraceMask::ERROR);
+        trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+        for addr in 0..2 {
+            trace.set_device_trace_file(port, addr, TraceFile::File(file.clone()));
+        }
+        f();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        text
+    }
+
+    /// `PIasynAxis::Init` (PIasynAxis.cpp:76-85) and each axis entry point
+    /// make the axis's user `PIInterface::m_pCurrentLogSink`, which every
+    /// controller print goes to from then on.
+    #[test]
+    fn controller_prints_go_to_the_last_axis_user() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2SinkLine", |last| {
+            if last == "ERR?" { "5" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2SinkLine")));
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 1, "gcs2SinkCtl");
+        let user = AsynUser::new(0);
+        axis.set_deferred_moves(&user, true).unwrap();
+        axis.move_absolute(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
+        let mut on_line = String::new();
+        let on_axis = traced("gcs2SinkCtl", || {
+            on_line = traced("gcs2SinkLine", || {
+                axis.set_deferred_moves(&user, false).unwrap();
+            });
+        });
+        assert!(
+            on_axis.contains("PIGCSController::moveCts(array) failed, GCS error 5\n"),
+            "{on_axis}"
+        );
+        assert!(!on_line.contains("moveCts"), "{on_line}");
     }
 
     #[test]
