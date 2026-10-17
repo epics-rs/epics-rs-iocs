@@ -39,8 +39,8 @@ dbLoadRecords("$(ADMYTHEN)/db/mythen.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT
 NDStdArraysConfigure("Image1", 3, 0, "$(PORT)", 0, 0)
 dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),NDARRAY_ADDR=0,TYPE=Int32,FTVL=LONG,NELEMENTS=2560")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+iocInit()
+
 # Example interactive commands:
 #   dbl                                      # List all PVs
 #   dbpf dp_mythen1K:cam1:Acquire 1          # Start acquisition

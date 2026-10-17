@@ -54,8 +54,8 @@ dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=I
 
 < $(ADCORE)/ioc/commonPlugins.cmd
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+iocInit()
+
 # Example interactive commands:
 #   dbl                                 # List all PVs
 #   dbpf 13ML1:cam1:Acquire 1           # Start acquisition
