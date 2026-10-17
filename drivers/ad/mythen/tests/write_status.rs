@@ -332,3 +332,30 @@ fn an_octet_written_to_a_mythen_int_param_is_wrong_type() {
         "{text}"
     );
 }
+
+/// mythen.cpp:361-367: a tau that is neither -1 nor positive prints the
+/// refusal with outString_, the last command written.
+#[test]
+fn a_refused_tau_prints_the_last_command() {
+    use epics_rs::asyn::services::PortServices;
+    use epics_rs::asyn::trace::TraceFile;
+    let port = "MYTHEN_WS_TAU";
+    let (mut driver, _received) = driver(port);
+    let manager = PortServices::global().trace().clone();
+    let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+    let file = std::fs::File::create(&log).unwrap();
+    manager.set_trace_file(
+        Some(port),
+        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+    );
+    let last = driver.det.out_string();
+    assert!(last.starts_with("-get "), "{last}");
+    let mut user = AsynUser::new(driver.p.tau);
+    assert!(driver.write_float64(&mut user, -2.0).is_err());
+    let text = std::fs::read_to_string(&log).unwrap();
+    let _ = std::fs::remove_file(&log);
+    assert!(
+        text.contains(&format!("error check if tau -1 or >0 (outString = {last})")),
+        "{text}"
+    );
+}

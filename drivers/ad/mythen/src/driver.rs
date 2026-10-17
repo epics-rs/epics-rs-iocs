@@ -499,6 +499,10 @@ impl PortDriver for MythenDriver {
                 Ok(false) => {
                     let _ = self.ad.port_base.set_float64_param(self.p.tau, 0, 0.0);
                     let _ = self.ad.port_base.call_param_callbacks(0);
+                    self.det.trace_error(&format!(
+                        "error check if tau -1 or >0 (outString = {})",
+                        self.det.out_string()
+                    ));
                     Err(AsynError::Status {
                         status: AsynStatus::Error,
                         message: format!("mythen: tau must be -1 or > 0, got {value}"),

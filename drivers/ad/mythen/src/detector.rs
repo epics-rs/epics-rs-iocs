@@ -66,6 +66,9 @@ pub struct Detector {
     pub state: DetState,
     /// The mythen port C's `pasynUserSelf` prints on.
     port_name: String,
+    /// C's `outString_`: the last command written to it, which C's
+    /// refusal lines print whether or not it was sent.
+    out_string: Mutex<String>,
     trace: Arc<TraceManager>,
 }
 
@@ -78,7 +81,12 @@ impl Detector {
             connected: AtomicBool::new(true),
             state: DetState::default(),
             port_name: port_name.to_string(),
+            out_string: Mutex::default(),
         }
+    }
+
+    pub fn out_string(&self) -> String {
+        self.out_string.lock().clone()
     }
 
     /// An `ASYN_TRACE_ERROR` line on the mythen port.
@@ -95,6 +103,7 @@ impl Detector {
         what: &str,
         exchange: impl FnOnce(&Transport) -> AsynResult<T>,
     ) -> AsynResult<T> {
+        *self.out_string.lock() = what.to_string();
         let result = self.io(what, exchange);
         if result.is_err() {
             self.trace_error("mythen:writeReadMeter: error!");
@@ -149,6 +158,7 @@ impl Detector {
     /// unusable until the IOC is restarted, because C's constructor is the only
     /// place that reads the module count (mythen.cpp:1363).
     pub fn probe(&self) -> AsynResult<String> {
+        *self.out_string.lock() = "-get version".to_string();
         let version = self
             .exchange(Transport::get_version)
             .inspect_err(|_| self.trace_error("mythen:writeReadMeter: error!"))?;
@@ -493,6 +503,7 @@ impl Detector {
         } else {
             "-readout"
         };
+        *self.out_string.lock() = command.to_string();
         self.io(command, |t| t.readout(command, expect, timeout))
     }
 }
