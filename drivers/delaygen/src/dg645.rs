@@ -534,7 +534,8 @@ impl Dg645Driver {
                 format_args!("{port} writeRead: error {} wrote \"{cmd}\"\n", f.status()),
             );
         }
-        // C's `%s` of inpBuf: the reply's bytes as sent, up to a NUL.
+        // C's `%s` of inpBuf: the reply's bytes as sent, up to a NUL. C defect
+        // not copied: after a failed read inpBuf is unterminated stale bytes.
         let read = result.as_deref().unwrap_or_default();
         let read = &read[..read.iter().position(|&b| b == 0).unwrap_or(read.len())];
         self.base
