@@ -1776,6 +1776,41 @@ mod tests {
         assert!(fake.pids().is_empty());
     }
 
+    /// `disconnect`'s `exceptionDisconnect(pasynUser)` (`drvAmptek.cpp:194`)
+    /// downs and announces only the caller's dpCommon.
+    #[test]
+    fn disconnect_announces_on_the_callers_dp_common_only() {
+        use epics_rs::asyn::exception::{AsynException, ExceptionEvent};
+        use epics_rs::asyn::registry::PortRegistry;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        type Heard = Arc<Mutex<Vec<(AsynException, i32)>>>;
+        fn recorder(heard: &Heard) -> impl Fn(&ExceptionEvent<'_>) + Send + Sync + 'static {
+            let heard = Arc::clone(heard);
+            move |ev| heard.lock().unwrap().push((ev.exception, ev.addr))
+        }
+
+        let status = [0u8; 64];
+        let (driver, _fake) = driver_with_fake(move |req| default_reply(req, &status));
+        let claim = PortRegistry::new().claim("fake").unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        let handle = runtime.port_handle();
+        let (device0, port): (Heard, Heard) = Default::default();
+        let _g0 = handle.exception_callback_add(0, recorder(&device0));
+        let _gp = handle.exception_callback_add(-1, recorder(&port));
+
+        handle.connect_addr_blocking(0).unwrap();
+        handle.disconnect_addr_blocking(0).unwrap();
+
+        let connect = AsynException::Connect;
+        assert_eq!(*device0.lock().unwrap(), [(connect, 0), (connect, 0)]);
+        assert!(port.lock().unwrap().is_empty());
+        assert!(!handle.connect_device(0).connected());
+        assert!(handle.connect_device(-1).connected());
+    }
+
     /// `checkFailedComm` disconnects `pasynUserSelf`, device 0.
     #[test]
     fn failed_comm_disconnects_device_0_not_the_port() {
