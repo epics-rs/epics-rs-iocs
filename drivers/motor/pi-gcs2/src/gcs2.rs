@@ -825,6 +825,38 @@ impl PIGCS2Axis {
         self.acceleration = accel;
         Ok(())
     }
+
+    /// C `setServo`: a servo turned on clears the problem flag.
+    fn set_servo(&mut self, enable: bool) -> AsynResult<()> {
+        self.lock().set_servo(&self.axis_name, enable)?;
+        self.servo_on = enable;
+        if enable {
+            self.problem = false;
+        }
+        Ok(())
+    }
+
+    /// C `PIGCSMotorController::referenceVelCts`: the reference velocity,
+    /// then `referenceAxis`.
+    fn reference_vel_cts(&mut self, velocity: f64, forward: bool) -> AsynResult<()> {
+        if velocity != 0.0 {
+            self.lock()
+                .set_reference_velocity(&self.axis_name, velocity / self.cpu)?;
+        }
+        self.reference_axis(forward)
+    }
+
+    /// C `PIGCSMotorController::referenceAxis`: servo on, then the
+    /// reference move.
+    fn reference_axis(&mut self, forward: bool) -> AsynResult<()> {
+        self.set_servo(true)?;
+        self.lock().reference_axis(
+            &self.axis_name,
+            forward,
+            self.has_reference,
+            self.has_limit_switches,
+        )
+    }
 }
 
 impl AsynMotor for PIGCS2Axis {
@@ -894,21 +926,7 @@ impl AsynMotor for PIGCS2Axis {
         // command; on failure it is left set until the next poll's real
         // status bitmask corrects it, matching upstream.
         self.is_homing = true;
-        let ctrl = self.lock();
-        ctrl.set_servo(&self.axis_name, true)?;
-        if velocity != 0.0 {
-            ctrl.set_reference_velocity(&self.axis_name, velocity / self.cpu)?;
-        }
-        ctrl.reference_axis(
-            &self.axis_name,
-            forward,
-            self.has_reference,
-            self.has_limit_switches,
-        )?;
-        drop(ctrl);
-        self.servo_on = true;
-        self.problem = false;
-        Ok(())
+        self.reference_vel_cts(velocity, forward)
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -921,12 +939,7 @@ impl AsynMotor for PIGCS2Axis {
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
-        self.lock().set_servo(&self.axis_name, enable)?;
-        self.servo_on = enable;
-        if enable {
-            self.problem = false;
-        }
-        Ok(())
+        self.set_servo(enable)
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -1287,6 +1300,32 @@ mod tests {
         }
         // 9 clamps to 5, so a second 9 differs from the stored 5.
         assert_eq!(sends, [1, 0, 1, 1, 1]);
+    }
+
+    /// C `PIGCSMotorController::referenceVelCts` (PIGCSMotorController.cpp:
+    /// 55-77) writes the reference velocity first; its `referenceAxis`
+    /// (:79-84) then turns the servo on before `FRF`.
+    #[test]
+    fn home_writes_the_reference_velocity_before_the_servo() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2HomeOrder", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = PIGCS2Controller::new(io, "gcs2HomeOrder");
+        let mut axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "1".into(), 0, "gcs2HomeOrder");
+        line.sent();
+        axis.home(&AsynUser::new(0), 0.0, 2.0, 0.0, true).unwrap();
+        let sent: Vec<String> = line.sent().into_iter().filter(|w| w != "\n").collect();
+        assert_eq!(
+            sent,
+            [
+                "SPA 1 0x50 2.000000",
+                "ERR?",
+                "SVO 1 1",
+                "ERR?",
+                "FRF 1",
+                "ERR?"
+            ]
+        );
     }
 
     #[test]
