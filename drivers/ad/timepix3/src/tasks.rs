@@ -310,12 +310,17 @@ async fn connection_poll(
     acq_tx: rt::CommandSender<()>,
 ) {
     let mut was_up = false;
+    // C waits on an event only its destructor signals, so the poll runs a
+    // period after the last one whatever the commands do
+    // (serval_http.cpp:400-402).
+    let mut next_poll = tokio::time::Instant::now() + CONNECTION_POLL;
     loop {
-        let command = match tokio::time::timeout(CONNECTION_POLL, cmd_rx.recv()).await {
+        let command = match tokio::time::timeout_at(next_poll, cmd_rx.recv()).await {
             Ok(Some(command)) => command,
             Ok(None) => return,
             Err(_) => {
                 was_up = poll_connection(&ctx, was_up).await;
+                next_poll = tokio::time::Instant::now() + CONNECTION_POLL;
                 continue;
             }
         };
@@ -3823,5 +3828,31 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    /// A 1 Hz Health scan does not hold the connection poll off
+    /// (serval_http.cpp:400-402).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commands_do_not_delay_the_connection_poll() {
+        let (url, log) = logging_serval(&[], |path| match path {
+            "/dashboard" => r#"{"Server":{},"Detector":{"DetectorType":"TPX3"}}"#,
+            _ => "{}",
+        });
+        let ctx = Arc::new(idle_ctx_at("TPX_POLL_TIMER", &url, None));
+        let (cmd_tx, cmd_rx) = rt::command_channel::<Command>(1);
+        let (acq_tx, _acq_rx) = rt::command_channel::<()>(1);
+        tokio::spawn(connection_poll(ctx.clone(), cmd_rx, acq_tx));
+        // Only the poll's reconnect refresh reads the destination.
+        let polled = || {
+            log.lock()
+                .iter()
+                .any(|r| r.starts_with("GET /server/destination "))
+        };
+        let start = std::time::Instant::now();
+        while !polled() && start.elapsed() < CONNECTION_POLL + Duration::from_secs(2) {
+            cmd_tx.send(Command::RefreshStatus).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert!(polled());
     }
 }
