@@ -368,15 +368,18 @@ impl LoveDriver {
         timeout: Duration,
         models: ModelTable,
     ) -> AsynResult<Self> {
-        let base = PortDriverBase::new(
+        // C registers the love port with the serial port's canBlock and
+        // autoConnect (drvLove.c:363-364).
+        let mut base = PortDriverBase::new(
             port_name,
             K_INSTRMAX + 1,
             PortFlags {
                 multi_device: true,
-                can_block: true,
+                can_block: serial.can_block(),
                 destructible: true,
             },
         );
+        base.set_auto_connect(serial.connect_device(ser_addr).auto_connect());
 
         Ok(Self {
             base,
@@ -872,6 +875,28 @@ mod tests {
             "drvLove::executeCommand retries exceeded",
         ] {
             assert!(out.contains(line), "missing {line:?} in {out:?}");
+        }
+    }
+
+    /// C registers the love port with the serial port's canBlock and
+    /// autoConnect (drvLove.c:363-364).
+    #[test]
+    fn the_love_port_takes_can_block_and_auto_connect_from_the_serial_port() {
+        for (can_block, auto_connect) in [(true, true), (false, false)] {
+            let name = format!("LOVETESTFLG{}", u8::from(can_block));
+            let mut base = PortDriverBase::new(
+                &name,
+                1,
+                PortFlags {
+                    multi_device: false,
+                    can_block,
+                    destructible: true,
+                },
+            );
+            base.set_auto_connect(auto_connect);
+            let love = love_on(TimeoutSerial { base }, &format!("{name}L"));
+            assert_eq!(love.base().flags.can_block, can_block);
+            assert_eq!(love.base().is_auto_connect(), auto_connect);
         }
     }
 
