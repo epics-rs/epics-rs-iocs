@@ -1632,6 +1632,23 @@ impl TimePix3Driver {
     /// serval_http.cpp:1668-1695): Serval loads the file from its own
     /// filesystem, so only the resolved path travels.
     fn config_load(&mut self, format: &str, path: usize, name: usize) -> AsynResult<()> {
+        // mask_io.cpp:535-539: the BPC is checked against the geometry first.
+        if format != "dacs" && self.read_bpc().is_none() {
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "{}",
+                    adlog::err(
+                        adlog::UPLOAD_BPC,
+                        "uploadBPC: local BPC validation failed; request not sent"
+                    )
+                ),
+            );
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "uploadBPC: local BPC validation failed; request not sent".into(),
+            });
+        }
         let (dir, file_name) = (self.text(path, 0), self.text(name, 0));
         let file = match self.resolve_calibration_file(&dir, &file_name, PathAccess::Read) {
             Ok(file) => file,
@@ -5836,6 +5853,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         std::fs::write(dir.join("cal.bpc"), &bpc).unwrap();
         // readBPCfile runs first, and its size needs PixCount.
+        det.ad.port_base.set_int32_param(p.pix_count, 0, 0).unwrap();
         let (r, msg) = read(&mut det);
         assert_eq!(r, Err("asynPortDriver:readArray not implemented".into()));
         assert_eq!(msg, "Invalid BPC geometry: pixels=0 bytes/pixel=2 slices=1");
@@ -6888,6 +6906,40 @@ mod tests {
         }
     }
 
+    /// uploadBPC sends nothing for a BPC off the geometry's size
+    /// (mask_io.cpp:535-539).
+    #[test]
+    fn upload_bpc_refuses_a_bpc_off_the_geometry() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let name = "TPX_BPC_UPLOAD_SIZE";
+        let mut det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        calibration_files(&mut det, name);
+        let p = det.p;
+        det.ad.port_base.set_int32_param(p.pix_count, 0, 2).unwrap();
+        let r = det.config_load("pixelconfig", p.bp_c_file_path, p.bp_c_file_name);
+        assert_eq!(
+            r.map_err(|e| e.message()),
+            Err("uploadBPC: local BPC validation failed; request not sent".into())
+        );
+        assert_eq!(det.int(p.http_code, 0), 0);
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        assert_eq!(
+            det.text(p.write_msg, 0),
+            format!(
+                "ReadBPC: BPC file size does not match detector geometry: {}",
+                dir.join("cal.bpc").display()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Point the BPC and DACS file PVs at real files, which C
     /// `resolveCalibrationFile` requires before an upload.
     /// uploadBPC logs the status and the file Serval was told to load,
@@ -6963,6 +7015,8 @@ mod tests {
         ] {
             det.set_text(reason, text).unwrap();
         }
+        // The one-byte cal.bpc is the geometry's size, as uploadBPC checks.
+        det.ad.port_base.set_int32_param(p.pix_count, 0, 1).unwrap();
     }
 
     /// The upload runs, and its status is the write's, even where the
