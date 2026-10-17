@@ -222,12 +222,16 @@ pub fn ang1_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
 
-            let params = Ang1Params {
-                moving_poll: moving_poll_ms as f64 / 1000.0,
-                idle_poll: idle_poll_ms as f64 / 1000.0,
-            };
-            register_port_with(ctx, &port_name, num_axes as i32, params)?;
+            // Connected ahead of the port, which writes through it; nothing
+            // shows before the port exists.
             let (controller, out_status) = Ang1Controller::new(&in_port, &out_port);
+            let controller = Arc::new(Mutex::new(controller));
+            let params = Ang1Params::new(
+                controller.clone(),
+                moving_poll_ms as f64 / 1000.0,
+                idle_poll_ms as f64 / 1000.0,
+            );
+            register_port_with(ctx, &port_name, num_axes as i32, params)?;
             if out_status.is_err() {
                 MotorTrace::new(port_name.clone(), 0).print_self(
                     TraceMask::ERROR,
@@ -236,7 +240,6 @@ pub fn ang1_create_controller_command() -> CommandDef {
                     ),
                 );
             }
-            let controller = Arc::new(Mutex::new(controller));
 
             let poller = Controller::new();
             for axis in 0..num_axes {
@@ -452,6 +455,24 @@ mod tests {
         assert!(crate::regs::fake::forced("anf2InfoIn").is_empty());
         assert_eq!(put_int32(port, "ANF2_GET_INFO", 1, 1).await, 1);
         assert_eq!(crate::regs::fake::forced("anf2InfoIn"), [10]);
+    }
+
+    /// C `ANG1Controller::writeInt32` (ANG1Driver.cpp:161-185): a write to
+    /// `ANG1_JERK` is stored and written to the `JERK` register (9).
+    #[epics_rs::base::epics_test]
+    async fn ang1_jerk_writes_the_jerk_register() {
+        let port = "ang1Jerk";
+        crate::regs::fake::publish("ang1JerkIn");
+        crate::regs::fake::publish("ang1JerkOut");
+        let cmd = (ang1_create_controller_command(), ang1_args(port));
+        report_after(vec![cmd], port, 0).await;
+        crate::regs::fake::written("ang1JerkOut");
+        assert_eq!(put_int32(port, "ANG1_JERK", 0, 1234).await, 1234);
+        let jerk: Vec<_> = crate::regs::fake::written("ang1JerkOut")
+            .into_iter()
+            .filter(|(reg, _)| *reg == 9)
+            .collect();
+        assert_eq!(jerk, [(9, vec![1234])]);
     }
 
     #[test]
