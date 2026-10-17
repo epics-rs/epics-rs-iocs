@@ -26,8 +26,8 @@ use crate::mcs::{self, McsAxis, McsController};
 use crate::mcs2::{self, Mcs2Axis, Mcs2Controller};
 use crate::scu::{ScuAxis, ScuController};
 
-/// Command timeout.
-const MCS2_TIMEOUT: Duration = Duration::from_secs(1);
+/// Command timeout (C `DEFAULT_CONTROLLER_TIMEOUT` = 2.0 s).
+const MCS2_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// SCU command timeout (C `DEFAULT_TIMEOUT` = 2.0 s).
 const SCU_TIMEOUT: Duration = Duration::from_secs(2);
