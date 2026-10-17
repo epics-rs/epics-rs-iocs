@@ -11,6 +11,7 @@ use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::motor::devices::register_axis;
 
 use crate::drv_motor_asyn::{Axis, DrvGet, DrvMotorAsyn, DrvSet};
 use crate::iocsh::{arg_int_req, arg_str_req};
@@ -267,11 +268,13 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                 println!("drvAsynMotorConfigure ERROR: Can't register port");
                 return Ok(CommandOutcome::Continue);
             };
-            register_drv_motor_asyn_port(&port_name, num_axes)?;
             // The driver's one task polls the card's axes in turn.
             let poller = driver.poller(card);
             let controller = poller.as_ref().map(Poller::controller);
             let mut axes = Vec::new();
+            // A record reaches its axis once the port it writes through
+            // exists (devMotorAsyn.c:689-708).
+            let mut records = Vec::new();
             for addr in 0..num_axes {
                 let (Some(controller), Some(axis)) = (&controller, driver.open(card, addr)) else {
                     println!("drvAsynMotorConfigure: Failed to open axis {addr}");
@@ -282,7 +285,9 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                     port: port_name.clone(),
                     addr,
                 };
-                let wakeup = controller.install(user, axis.motor.clone())?;
+                let opened = controller.open(user, axis.motor.clone())?;
+                records.push(opened.axis);
+                let wakeup = opened.poll_cmd_tx;
                 axis.log.attach(&port_name, addr);
                 axes.push(Some(Axis::new(
                     axis.motor,
@@ -297,6 +302,10 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
             let port = DrvMotorAsyn::new(&port_name, axes);
             let (rt, _thread) = create_port_runtime(&claim, port, RuntimeConfig::default())
                 .map_err(|e| e.to_string())?;
+            register_drv_motor_asyn_port(&port_name, num_axes, rt.port_handle().clone())?;
+            for axis in records {
+                register_axis(axis)?;
+            }
             claim
                 .publish(
                     rt.port_handle().clone(),

@@ -163,6 +163,17 @@ impl Controller {
         Ok(poll_cmd_tx)
     }
 
+    /// [`Self::install`]'s poller half: the axis polls, but no record reaches
+    /// it until its [`MotorAxis`] is registered, which a model-2 port's axes
+    /// wait for until the port exists.
+    pub(crate) fn open(
+        &self,
+        user: TraceUser,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+    ) -> Result<ControllerAxis, String> {
+        self.axes.add(motor, user)
+    }
+
     /// C `startPoller(movingPollPeriod, idlePollPeriod, forcedFastPolls)`:
     /// the startup pass over the axes so far, then the poller thread.
     /// `forced_fast_polls` is the driver's own, C has no default
