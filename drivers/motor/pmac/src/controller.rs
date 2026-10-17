@@ -131,8 +131,9 @@ pub fn pmac_err(message: impl Into<String>) -> AsynError {
 /// padding the read leaves behind (the input EOS has already taken the
 /// terminating `<ACK>`).
 ///
-/// **Upstream fix.** C `pmacController::lowLevelWriteRead` (and the CS driver's
-/// `motorAxisWriteRead`) report success for *any* reply the transport delivered,
+/// **Upstream fix.** C `pmacController::lowLevelWriteRead` (pmacController.cpp:308)
+/// and the CS driver's `motorAxisWriteRead` (pmacAsynCoord.c:345) report success
+/// for *any* reply the transport delivered,
 /// so a command the controller rejected — `<BELL>ERRxxx<CR>`, the error form its
 /// own `pmacAsynIPPort.c` header documents — is silently treated as done. Every
 /// move, stop, home and set-position goes through this path, so a rejected
