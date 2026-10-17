@@ -22,10 +22,10 @@ use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{Controller, asyn_user, model1_device, register_port};
+use motor_common::{Controller, asyn_user, model1_device, register_port_with};
 
 use crate::drv_mvp2001::{self, DrvMvp2001Axis, MVP2001_NUM_CARDS, Mvp2001Chain};
-use crate::mvp2001::{Mvp2001Axis, Mvp2001Controller};
+use crate::mvp2001::{Mvp2001Axis, Mvp2001Controller, Mvp2001Params};
 
 /// Command timeout (C `DEFAULT_CONTROLLER_TIMEOUT`).
 const MVP2001_TIMEOUT: Duration = Duration::from_secs(2);
@@ -66,7 +66,12 @@ pub fn mvp2001_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, num_axes as i32)?;
+            register_port_with(
+                ctx,
+                &port_name,
+                num_axes as i32,
+                Mvp2001Params::new(moving_poll_ms, idle_poll_ms),
+            )?;
 
             let (handle, _) = connect_controller(
                 &asyn_port,
@@ -132,8 +137,9 @@ pub fn mvp2001_create_axis_command() -> CommandDef {
                 max_curr as i32,
                 lim_pol as i32,
             );
+            let report = Arc::new(ax.report());
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            poller.install(asyn_user(&port_name, axis_no as i32), motor)?;
+            poller.install_with_report(asyn_user(&port_name, axis_no as i32), motor, report)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -147,6 +153,17 @@ static MVP2001: Model1 = Model1::new(&DEV_MVP2001, MVP2001_NUM_CARDS, SCAN_RATE)
 /// `MicroMoSetup(num_cards, scan_rate)`, MicroMoRegister.cc's name for
 /// `MVP2001Setup`.
 pub fn micromo_setup_command() -> CommandDef {
+    MVP2001.register_report("drvMVP2001", |cards| {
+        if cards.num_cards() <= 0 {
+            return "    No MVP2001 CHAINS configured.\n".into();
+        }
+        (0..cards.num_cards())
+            .map(|card| match cards.card(card) {
+                Some(line) => format!("    MVP2001 controller chain #{card}, {line} \n"),
+                None => format!("    MVP2001 controller chain #{card} connection failed.\n"),
+            })
+            .collect()
+    });
     MVP2001.setup_command("MicroMoSetup")
 }
 
@@ -178,6 +195,10 @@ pub fn micromo_config_command() -> CommandDef {
             )?;
             let chain = Mvp2001Chain::new(handle);
             let limits = drv_mvp2001::motor_init(&chain);
+            // drvMVP2001.cc:725: a chain with no controller is NULL again.
+            if limits.is_empty() {
+                return Ok(CommandOutcome::Continue);
+            }
             let chain = Arc::new(Mutex::new(chain));
             for (signal, limits) in limits.into_iter().enumerate() {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvMvp2001Axis::new(
@@ -187,6 +208,8 @@ pub fn micromo_config_command() -> CommandDef {
                 )));
                 MVP2001.install(ctx, card, signal as i32, motor)?;
             }
+            // C's `motor_init` clears `ident` and never fills it.
+            MVP2001.describe(card, format!("port={asyn_port}, id: "));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -221,5 +244,82 @@ mod one_poller {
             ];
             assert_eq!(pollers_after(mvp2001_create_axis_command(), args).await, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, port_report, run_command};
+
+    /// drvMVP2001.cc's drvet `report` (drvMVP2001.cc:207-231), which `dbior`
+    /// runs; `motor_init` leaves `ident` empty.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mvp2001_chain() {
+        let setup = micromo_setup_command();
+        assert_eq!(
+            driver_report("drvMVP2001", 0),
+            "    No MVP2001 CHAINS configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        // Each command answers once, terminator then reply, so a flush ends.
+        let reads = Mutex::new((String::new(), 0));
+        let (_line, _io) = LineRig::new("mvpChainLine", move |cmd| {
+            let mut reads = reads.lock().unwrap();
+            if reads.0 != cmd {
+                *reads = (cmd.to_string(), 0);
+            }
+            reads.1 += 1;
+            match (cmd.trim_end(), reads.1) {
+                ("1 ST", 1) => "\r".into(),
+                ("1 ST", 2) => "0001 0000".into(),
+                _ => String::new(),
+            }
+        });
+        let config = vec![int(1), ArgValue::String("mvpChainLine".into())];
+        run_command(micromo_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvMVP2001", 0),
+            "    MVP2001 controller chain #0 connection failed.\n    MVP2001 controller \
+             chain #1, port=mvpChainLine, id:  \n"
+        );
+    }
+
+    /// MVP2001Controller::report then MVP2001Axis::report
+    /// (MVP2001Driver.cpp:85-92, :235-248).
+    #[epics_rs::base::epics_test]
+    async fn mvp2001_report_prints_the_controller_then_each_axis_above_level_0() {
+        let (_line, _io) = LineRig::new("mvpRepLine", |cmd| match cmd.trim_end() {
+            "2 SR" => "0002 0190".into(),
+            _ => String::new(),
+        });
+        let args = vec![
+            ArgValue::String("mvpRep".into()),
+            ArgValue::String("mvpRepLine".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ];
+        run_command(mvp2001_create_controller_command(), args).await;
+        let args = vec![
+            ArgValue::String("mvpRep".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(512),
+            ArgValue::Int(5000),
+            ArgValue::Int(7),
+        ];
+        run_command(mvp2001_create_axis_command(), args).await;
+        let head = "MVP 2001 motor driver mvpRep, numAxes=2, moving poll period=0.100000, \
+                    idle poll period=1.000000\n";
+        let text = port_report("mvpRep", 0);
+        assert!(text.contains(&format!("{head}Port: mvpRep\n")), "{text}");
+        let text = port_report("mvpRep", 1);
+        let axis = "  axis 1\n  axis index 2\n  encoderLinesPerRev 512\n  maxCurrent 100 (mA)\n  \
+                    samplePeriod 400 (us)\n  limitPolarity 1\n";
+        assert!(
+            text.contains(&format!("{head}{axis}Port: mvpRep\n")),
+            "{text}"
+        );
     }
 }

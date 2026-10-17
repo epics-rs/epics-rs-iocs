@@ -14,6 +14,7 @@
 //! The XPS profile, position-compare and TCL commands are driver-private: C
 //! drives them from controller-level records this port does not serve.
 
+use std::fmt::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,7 +44,10 @@ use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 use motor_common::model2::Model2;
 use motor_common::util::atof;
-use motor_common::{Controller, asyn_user, install, register_controller_port, register_port};
+use motor_common::{
+    Controller, ControllerParams, ControllerReport, asyn_user, install_with_report,
+    register_controller_port, register_port, register_port_with,
+};
 
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
@@ -54,6 +58,7 @@ use crate::mm3000::{Mm3000Axis, Mm3000Controller};
 use crate::mm4000::{self, Mm4000Axis, Mm4000Controller, Mm4000Refusal};
 use crate::pm500::{Pm500Axis, Pm500Controller};
 use crate::pmnc::{PmncAxis, PmncController};
+use crate::report::{AxisLines, ControllerHead, period_s};
 use crate::smc100::Smc100Axis;
 use crate::xps::{
     ExecutionPlan, GatheringReadback, MoveMode, PcoParams, Profile, SocketMode, XpsAxis,
@@ -192,7 +197,18 @@ pub fn smc100_create_controller_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
 
-            register_port(ctx, &port_name, num_axes)?;
+            let (moving_s, idle_s) = (period_s(moving_poll_ms), period_s(idle_poll_ms));
+            // SMC100Controller::report (SMC100Driver.cpp:103-110).
+            let head = ControllerHead(move |ctx: &ControllerReport<'_>, out: &mut dyn Write| {
+                let _ = writeln!(
+                    out,
+                    "SMC100 motor driver {}, numAxes={}, moving poll period={moving_s:.6}, \
+                     idle poll period={idle_s:.6}",
+                    ctx.port_name(),
+                    ctx.num_axes()
+                );
+            });
+            register_port_with(ctx, &port_name, num_axes, head)?;
             let (handle, _) = connect_controller(
                 &serial_port,
                 SMC100_TIMEOUT,
@@ -219,7 +235,13 @@ pub fn smc100_create_controller_command() -> CommandDef {
                     (axis + 1) as u8,
                     step_size,
                 )));
-                poller.install(asyn_user(&port_name, axis), motor)?;
+                // SMC100Axis::report (SMC100Driver.cpp:150-159).
+                let report = Arc::new(AxisLines(move |out: &mut dyn Write, level| {
+                    if level > 0 {
+                        let _ = writeln!(out, "  axis {}", axis + 1);
+                    }
+                }));
+                poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
             }
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // SMC100Driver.cpp:67
             Ok(CommandOutcome::Continue)
@@ -238,6 +260,30 @@ fn conex_args() -> Vec<ArgDesc> {
     ]
 }
 
+/// `AG_CONEXController::report` / `AGAP_CONEXController::report`
+/// (AG_CONEX.cpp:138-146, AGAP_CONEX.cpp:137-145), its quote unclosed as
+/// C's, and the cell for C's `controllerVersion_`, unset until VE answers
+/// (empty here).
+fn conex_head(
+    controller_id: i32,
+    moving_poll_ms: u64,
+    idle_poll_ms: u64,
+) -> (Arc<Mutex<String>>, impl ControllerParams) {
+    let version = Arc::new(Mutex::new(String::new()));
+    let (moving_s, idle_s) = (period_s(moving_poll_ms), period_s(idle_poll_ms));
+    let shown = version.clone();
+    let head = ControllerHead(move |ctx: &ControllerReport<'_>, out: &mut dyn Write| {
+        let version = shown.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = write!(
+            out,
+            "CONEX motor driver {}, controllerID={controller_id}, version=\"{version}\n  \
+             moving poll period={moving_s:.6}, idle poll period={idle_s:.6}\n",
+            ctx.port_name()
+        );
+    });
+    (version, head)
+}
+
 /// `AG_CONEXCreateController(portName, serialPortName, controllerID,
 /// movingPollPeriod, idlePollPeriod)`: one axis, 0.
 pub fn ag_conex_create_controller_command() -> CommandDef {
@@ -252,7 +298,8 @@ pub fn ag_conex_create_controller_command() -> CommandDef {
             let controller_id = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, 1)?;
+            let (version, head) = conex_head(controller_id, moving_poll_ms, idle_poll_ms);
+            register_port_with(ctx, &port_name, 1, head)?;
             // C returns from the constructor here: the port has no axis.
             let (handle, connected) = connect_controller(
                 &serial_port,
@@ -269,11 +316,15 @@ pub fn ag_conex_create_controller_command() -> CommandDef {
             else {
                 return Ok(CommandOutcome::Continue);
             };
+            axis.version()
+                .clone_into(&mut version.lock().unwrap_or_else(|e| e.into_inner()));
+            let report = Arc::new(axis.report());
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            install(
+            install_with_report(
                 ctx,
                 asyn_user(&port_name, 0),
                 motor,
+                report,
                 moving_poll_ms,
                 idle_poll_ms,
                 2, // C startPoller, AG_CONEX.cpp:80
@@ -297,7 +348,8 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
             let controller_id = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, agap::NUM_AXES as i32)?;
+            let (version, head) = conex_head(controller_id, moving_poll_ms, idle_poll_ms);
+            register_port_with(ctx, &port_name, agap::NUM_AXES as i32, head)?;
             // C returns from the constructor here: the port has no axes.
             let (handle, connected) = connect_controller(
                 &serial_port,
@@ -315,12 +367,16 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
             else {
                 return Ok(CommandOutcome::Continue);
             };
+            controller
+                .version()
+                .clone_into(&mut version.lock().unwrap_or_else(|e| e.into_inner()));
             let controller = Arc::new(Mutex::new(controller));
             let poller = Controller::new();
             for axis in 0..agap::NUM_AXES {
-                let motor: Arc<Mutex<dyn AsynMotor>> =
-                    Arc::new(Mutex::new(AgapAxis::new(controller.clone(), axis)));
-                poller.install(asyn_user(&port_name, axis as i32), motor)?;
+                let ax = AgapAxis::new(controller.clone(), axis);
+                let report = Arc::new(ax.report());
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                poller.install_with_report(asyn_user(&port_name, axis as i32), motor, report)?;
             }
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // AGAP_CONEX.cpp:79
             Ok(CommandOutcome::Continue)
@@ -357,7 +413,22 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
             let serial_port = req_string(args, 1, "Serial port name")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, c_int(args, 2))?;
+            // Filled once the constructor has read the model and version.
+            let model_version = Arc::new(Mutex::new((0, String::new())));
+            let (moving_s, idle_s) = (period_s(moving_poll_ms), period_s(idle_poll_ms));
+            let shown = model_version.clone();
+            // AG_UCController::report (AG_UC.cpp:192-201).
+            let head = ControllerHead(move |ctx: &ControllerReport<'_>, out: &mut dyn Write| {
+                let (model, version) = &*shown.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = write!(
+                    out,
+                    "Agilis UC motor driver {}, model={model}, numAxes={}, moving poll \
+                     period={moving_s:.6}, idle poll period={idle_s:.6}\ncontroller version {version}\n",
+                    ctx.port_name(),
+                    ctx.num_axes()
+                );
+            });
+            register_port_with(ctx, &port_name, c_int(args, 2), head)?;
             // C goes on to RS/MR/VE on the unconnected user; VE then fails and
             // the controller is left without a poller.
             let (handle, _) = connect_controller(
@@ -369,6 +440,12 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
                 ),
             );
             let controller = AgUcController::new(handle, &MotorTrace::new(&port_name, 0));
+            // C prints an unset `AG_UCModel_` when VE failed or named no
+            // model; 0 stands for it.
+            *model_version.lock().unwrap_or_else(|e| e.into_inner()) = (
+                controller.model().map_or(0, |model| model as i32),
+                controller.version().to_string(),
+            );
             // C's constructor returns before startPoller without a model
             // (AG_UC.cpp:79, :96, :99); the axes created later stay unpolled.
             let poller = Arc::new(Controller::new());
@@ -420,8 +497,9 @@ pub fn ag_uc_create_axis_command() -> CommandDef {
                 c_int(args, 3),
                 c_int(args, 4),
             );
+            let report = Arc::new(ax.report());
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            poller.install(asyn_user(&port_name, axis), motor)?;
+            poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1403,7 +1481,7 @@ pub fn hxp_create_controller_command() -> CommandDef {
                 owner,
                 &port_name,
                 NUM_HXP_AXES as i32,
-                HxpControllerParams::new(controller.clone()),
+                HxpControllerParams::new(controller.clone(), moving_poll_ms, idle_poll_ms),
             )?;
             controller
                 .lock()
@@ -1434,7 +1512,14 @@ pub fn hxp_create_controller_command() -> CommandDef {
                     .add_line(axis_no, line.clone());
                 let motor: Arc<Mutex<dyn AsynMotor>> =
                     Arc::new(Mutex::new(HxpAxis::new(controller.clone(), line, axis_no)));
-                poller.install(asyn_user(&port_name, axis_no as i32), motor)?;
+                // HXPAxis::report (HXPDriver.cpp:578-587).
+                let name = char::from(b"XYZUVW"[axis_no]);
+                let report = Arc::new(AxisLines(move |out: &mut dyn Write, level| {
+                    if level > 0 {
+                        let _ = write!(out, "  axis {axis_no}\n    axisName {name}\n");
+                    }
+                }));
+                poller.install_with_report(asyn_user(&port_name, axis_no as i32), motor, report)?;
             }
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
@@ -2123,5 +2208,241 @@ mod one_poller {
             ];
             assert_eq!(pollers_after(xps_create_axis_command(), args).await, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{port_report, run_command};
+
+    /// AG_UCController::report then AG_UCAxis::report (AG_UC.cpp:192-201,
+    /// :255-267); currentPosition is the last poll's.
+    #[epics_rs::base::epics_test]
+    async fn ag_uc_report_prints_the_controller_then_each_axis_above_level_0() {
+        use motor_common::testing::LineRig;
+        let (_line, _io) = LineRig::new("agucRepLine", |cmd| {
+            match cmd.trim_end() {
+                "VE" => "AG-UC8 v2.2.1",
+                "1TP" => "1TP42",
+                "1TS" => "1TS0",
+                "PH" => "PH0",
+                _ => "",
+            }
+            .into()
+        });
+        let args = vec![
+            ArgValue::String("agucRep".into()),
+            ArgValue::String("agucRepLine".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(100),
+            ArgValue::Int(100),
+        ];
+        run_command(ag_uc_create_controller_command(), args).await;
+        let int = ArgValue::Int;
+        let axis = vec![
+            ArgValue::String("agucRep".into()),
+            int(0),
+            int(1),
+            int(30),
+            int(-20),
+        ];
+        run_command(ag_uc_create_axis_command(), axis).await;
+        let head = "Agilis UC motor driver agucRep, model=1, numAxes=2, moving poll \
+                    period=0.100000, idle poll period=0.100000\ncontroller version AG-UC8 v2.2.1\n";
+        let text = port_report("agucRep", 0);
+        assert!(text.contains(&format!("{head}Port: agucRep\n")), "{text}");
+        let axis = "  axisID=1, channelID=1, hasLimits=1\n  forwardAmplitude=30, \
+                    reverseAmplitude=-20\n  currentPosition=42, positionOffset=0\n";
+        let want = format!("{head}{axis}Port: agucRep\n");
+        let mut text = String::new();
+        for _ in 0..300 {
+            text = port_report("agucRep", 1);
+            if text.contains(&want) {
+                break;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(text.contains(&want), "{text}");
+    }
+
+    /// AG_CONEXController::report then AG_CONEXAxis::report, which reads
+    /// the gains (AG_CONEX.cpp:138-146, :283-319).
+    #[epics_rs::base::epics_test]
+    async fn ag_conex_report_prints_the_controller_then_reads_the_gains_above_level_0() {
+        use motor_common::testing::LineRig;
+        let (line, _io) = LineRig::new("cxRepLine", |cmd| {
+            match cmd.trim_end() {
+                "1VE" => "1VE CONEX-CC 2.0.1",
+                "1ID?" => "1IDMFA-CC",
+                "1SU?" => "1SU0.0001",
+                "1SL?" => "1SL-12.5",
+                "1SR?" => "1SR12.5",
+                "1TP" => "1TP1.5",
+                "1KP?" => "1KP12",
+                "1KI?" => "1KI3",
+                "1KD?" => "1KD0.5",
+                _ => "",
+            }
+            .into()
+        });
+        let args = vec![
+            ArgValue::String("cxRep".into()),
+            ArgValue::String("cxRepLine".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(100),
+            ArgValue::Int(100),
+        ];
+        run_command(ag_conex_create_controller_command(), args).await;
+        let head = "CONEX motor driver cxRep, controllerID=1, version=\"CONEX-CC 2.0.1\n  \
+                    moving poll period=0.100000, idle poll period=0.100000\n";
+        let text = port_report("cxRep", 0);
+        assert!(text.contains(&format!("{head}Port: cxRep\n")), "{text}");
+        let axis = "  stageID=MFA-CC\n  currentPosition=15000.000000, encoderIncrement=0.000100\n  \
+                    interpolationFactor=1.000000, stepSize=0.000100, lowLimit=-12.500000, \
+                    highLimit=12.500000\n  KP=12.000000, KI=3.000000, KD/LF=0.500000\n  \
+                    fullStepSize=0.000000, microStepsPerFullStep=0\n";
+        let want = format!("{head}{axis}Port: cxRep\n");
+        let mut text = String::new();
+        for _ in 0..300 {
+            line.sent();
+            text = port_report("cxRep", 1);
+            if text.contains(&want) {
+                break;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(text.contains(&want), "{text}");
+        let sent = line.sent();
+        for query in ["1KP?", "1KI?", "1KD?"] {
+            assert!(sent.iter().any(|s| s == query), "{sent:?}");
+        }
+    }
+
+    /// AGAP_CONEXController::report then AGAP_CONEXAxis::report, which reads
+    /// each axis's gains (AGAP_CONEX.cpp:137-145, :237-261).
+    #[epics_rs::base::epics_test]
+    async fn agap_conex_report_prints_the_controller_then_reads_each_axis_above_level_0() {
+        use motor_common::testing::LineRig;
+        let (_line, _io) = LineRig::new("agapRepLine", |cmd| {
+            match cmd.trim_end() {
+                "1VE" => "1VE CONEX-AGAP 1.0",
+                "1ID?" => "1IDAG-M100",
+                "1SU?" => "1SU0.00001",
+                "1SLU?" | "1SLV?" => "1SLU-0.75",
+                "1SRU?" | "1SRV?" => "1SRU0.75",
+                "1TPU" => "1TPU0.01",
+                "1TPV" => "1TPV-0.02",
+                "1KPU?" => "1KPU5",
+                "1KIU?" => "1KIU6",
+                "1LFU?" => "1LFU7",
+                "1KPV?" => "1KPV8",
+                "1KIV?" => "1KIV9",
+                "1LFV?" => "1LFV10",
+                _ => "",
+            }
+            .into()
+        });
+        let args = vec![
+            ArgValue::String("agapRep".into()),
+            ArgValue::String("agapRepLine".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(100),
+            ArgValue::Int(100),
+        ];
+        run_command(agap_conex_create_controller_command(), args).await;
+        let head = "CONEX motor driver agapRep, controllerID=1, version=\"CONEX-AGAP 1.0\n  \
+                    moving poll period=0.100000, idle poll period=0.100000\n";
+        let text = port_report("agapRep", 0);
+        assert!(text.contains(&format!("{head}Port: agapRep\n")), "{text}");
+        let axis = |name, position, kp, ki, lf| {
+            format!(
+                "axisName={name}\n  stageID=AG-M100\n  currentPosition={position}, \
+                 encoderIncrement=0.000010\n  interpolationFactor=0.000000, stepSize=0.000100, \
+                 lowLimit=-0.750000, highLimit=0.750000\n  KP={kp}, KI={ki}, KD/LF={lf}\n"
+            )
+        };
+        let want = format!(
+            "{head}{}{}Port: agapRep\n",
+            axis("U", "100.000000", "5.000000", "6.000000", "7.000000"),
+            axis("V", "-200.000000", "8.000000", "9.000000", "10.000000")
+        );
+        let mut text = String::new();
+        for _ in 0..300 {
+            text = port_report("agapRep", 1);
+            if text.contains(&want) {
+                break;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(text.contains(&want), "{text}");
+    }
+
+    /// HXPController::report then HXPAxis::report (HXPDriver.cpp:143-154,
+    /// :578-587); coordSys is the address-0 HXP_MOVE_COORD_SYS as written.
+    #[epics_rs::base::epics_test]
+    async fn hxp_report_prints_the_coord_sys_then_each_axis_above_level_0() {
+        let args = vec![
+            ArgValue::String("hxpRep".into()),
+            ArgValue::String("127.0.0.1".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ];
+        run_command(hxp_create_controller_command(), args).await;
+        let head = |cs| {
+            format!(
+                "Newport hexapod motor driver hxpRep, numAxes=6, moving poll period=0.100000, \
+                 idle poll period=1.000000, coordSys={cs}\n"
+            )
+        };
+        let text = port_report("hxpRep", 0);
+        assert!(
+            text.contains(&format!("{}Port: hxpRep\n", head(0))),
+            "{text}"
+        );
+        let port = epics_rs::asyn::manager::PortManager::global()
+            .find_port_handle("hxpRep")
+            .unwrap();
+        let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_secs(1));
+        let reason = io.drv_user_create("HXP_MOVE_COORD_SYS").unwrap();
+        io.write_int32(reason, 2).unwrap();
+        SyncIOHandle::from_handle(port, 1, Duration::from_secs(1))
+            .write_int32(reason, 1)
+            .unwrap();
+        let axes: String = "XYZUVW"
+            .chars()
+            .enumerate()
+            .map(|(n, name)| format!("  axis {n}\n    axisName {name}\n"))
+            .collect();
+        let text = port_report("hxpRep", 1);
+        assert!(
+            text.contains(&format!("{}{axes}Port: hxpRep\n", head(2))),
+            "{text}"
+        );
+    }
+
+    /// SMC100Controller::report then SMC100Axis::report
+    /// (SMC100Driver.cpp:103-110, :150-159).
+    #[epics_rs::base::epics_test]
+    async fn smc100_report_prints_the_controller_then_each_axis_above_level_0() {
+        let args = vec![
+            ArgValue::String("smcRep".into()),
+            ArgValue::String("smcRepNoLine".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+            ArgValue::String("0.001".into()),
+        ];
+        run_command(smc100_create_controller_command(), args).await;
+        let head = "SMC100 motor driver smcRep, numAxes=2, moving poll period=0.100000, \
+                    idle poll period=1.000000\n";
+        let text = port_report("smcRep", 0);
+        assert!(text.contains(&format!("{head}Port: smcRep\n")), "{text}");
+        let text = port_report("smcRep", 1);
+        assert!(
+            text.contains(&format!("{head}  axis 1\n  axis 2\nPort: smcRep\n")),
+            "{text}"
+        );
     }
 }

@@ -110,19 +110,17 @@ pub struct AxisLimits {
 
 /// `motor_init`'s probe and set-up of one card: `TREV` naming a 6K, echo
 /// off, all axes stopped, continuous commands on, then each answering axis's
-/// travel limits. `None` leaves the card unconfigured, as C does.
+/// travel limits, with the `TREV` reply C keeps as `brdptr->ident`. `None`
+/// leaves the card unconfigured, as C does.
 ///
 /// C keeps `cardFound` across cards, so a card after a found one counts as
 /// found whatever it answers, and counts axes with no bound past
 /// `MAX_AXIS`; each card is probed on its own here and stops at `MAX_AXIS`.
-pub fn motor_init(card: &Pc6kCard) -> Option<Vec<AxisLimits>> {
-    let found = (0..3).any(|_| {
+pub fn motor_init(card: &Pc6kCard) -> Option<(String, Vec<AxisLimits>)> {
+    let ident = (0..3).find_map(|_| {
         let reply = String::from_utf8_lossy(&card.ask("TREV")).into_owned();
-        reply.contains("TREV") && reply.contains("6K")
-    });
-    if !found {
-        return None;
-    }
+        (reply.contains("TREV") && reply.contains("6K")).then_some(reply)
+    })?;
     card.ask("ECHO0");
     card.ask("!K");
     // The 6K answers again only some time after the all-stop.
@@ -153,7 +151,7 @@ pub fn motor_init(card: &Pc6kCard) -> Option<Vec<AxisLimits>> {
             limits
         })
         .collect();
-    Some(limits)
+    Some((ident, limits))
 }
 
 /// `PC6KUpLoad`'s lines of `text`: each `fgets` of at most `BUFF_SIZE - 1`
