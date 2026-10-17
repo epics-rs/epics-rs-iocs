@@ -248,7 +248,7 @@ impl PIC844Axis {
     /// Construct one axis, seeding the initial status (C `motor_init`'s
     /// `set_status(card, motor_index)`). `signal` is 0-based; wire axis is
     /// `signal + 1`. A failed initial poll is not an error.
-    pub fn new(controller: Arc<Mutex<PIC844Controller>>, signal: u8) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<PIC844Controller>>, signal: u8) -> Self {
         let mut axis = Self {
             controller: controller.clone(),
             n: signal + 1,
@@ -267,7 +267,7 @@ impl PIC844Axis {
             drop(ctrl);
             axis.apply(polled);
         }
-        Ok(axis)
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, PIC844Controller> {
@@ -530,7 +530,7 @@ mod tests {
             _ => "0".into(),
         });
         let ctrl = PIC844Controller::new(io).unwrap();
-        let axis = PIC844Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let axis = PIC844Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
         (line, axis, cond)
     }
@@ -682,7 +682,7 @@ mod tests {
             }
         });
         let ctrl = PIC844Controller::new(io).unwrap();
-        let mut axis = PIC844Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let mut axis = PIC844Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());

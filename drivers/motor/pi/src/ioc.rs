@@ -397,9 +397,7 @@ pub fn pic844_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
 
                 for signal in 0..PIC844_NUM_AXES {
-                    let Ok(axis) = PIC844Axis::new(controller.clone(), signal) else {
-                        return;
-                    };
+                    let axis = PIC844Axis::new(controller.clone(), signal);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                     init.axis(signal as i32, motor);
                 }
