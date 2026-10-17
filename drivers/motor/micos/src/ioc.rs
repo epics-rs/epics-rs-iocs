@@ -83,6 +83,7 @@ pub fn corvus_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, SMCcorvusDriver.cpp:58
                 )?;
             }
             Ok(CommandOutcome::Continue)
@@ -134,6 +135,7 @@ pub fn hydra_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, SMChydraDriver.cpp:60
                 )?;
             }
             Ok(CommandOutcome::Continue)
@@ -185,6 +187,7 @@ pub fn taurus_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, SMCTaurusDriver.cpp:41
                 )?;
             }
             Ok(CommandOutcome::Continue)

@@ -228,6 +228,7 @@ fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
                 motor,
                 moving_poll_ms,
                 idle_poll_ms,
+                5, // C startPoller, phytronAxisMotor.cpp:240
             )?;
             Ok(CommandOutcome::Continue)
         },

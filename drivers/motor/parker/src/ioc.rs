@@ -71,6 +71,7 @@ pub fn oem_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, OEMMotorDriver.cpp:68
                 )?;
             }
             Ok(CommandOutcome::Continue)
@@ -120,6 +121,7 @@ pub fn acr_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, ACRMotorDriver.cpp:82
                 )?;
             }
             Ok(CommandOutcome::Continue)

@@ -101,6 +101,7 @@ pub fn acsmotion_config_command() -> CommandDef {
                     motor,
                     (moving_poll * 1000.0) as u64,
                     (idle_poll * 1000.0) as u64,
+                    2, // C startPoller, SPiiPlusDriver.cpp:269
                 )?;
             }
             Ok(CommandOutcome::Continue)

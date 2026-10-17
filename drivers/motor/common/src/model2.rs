@@ -21,16 +21,19 @@ pub struct Model2Axis {
 }
 
 /// One model-2 driver: the `motorAxisDrvSET_t` name `drvAsynMotorConfigure`
-/// finds it by, and the axes each card's `Config` built.
+/// finds it by, the fast polls its poller forces after a wakeup, and the
+/// axes each card's `Config` built.
 pub struct Model2 {
     name: &'static str,
+    forced_fast_polls: u32,
     cards: Mutex<Vec<(i32, Vec<Model2Axis>)>>,
 }
 
 impl Model2 {
-    pub const fn new(name: &'static str) -> Self {
+    pub const fn new(name: &'static str, forced_fast_polls: u32) -> Self {
         Self {
             name,
+            forced_fast_polls,
             cards: Mutex::new(Vec::new()),
         }
     }
@@ -111,6 +114,7 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                     axis.motor,
                     axis.moving_poll_ms,
                     axis.idle_poll_ms,
+                    driver.forced_fast_polls,
                 )?;
             }
             Ok(CommandOutcome::Continue)
@@ -123,7 +127,7 @@ mod tests {
     use super::*;
     use epics_rs::motor::sim_motor::SimMotor;
 
-    static DRIVER: Model2 = Model2::new("test");
+    static DRIVER: Model2 = Model2::new("test", 0);
 
     fn axis() -> Model2Axis {
         Model2Axis {

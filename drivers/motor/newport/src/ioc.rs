@@ -213,6 +213,7 @@ pub fn smc100_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, SMC100Driver.cpp:67
                 )?;
             }
             Ok(CommandOutcome::Continue)
@@ -269,6 +270,7 @@ pub fn ag_conex_create_controller_command() -> CommandDef {
                 motor,
                 moving_poll_ms,
                 idle_poll_ms,
+                2, // C startPoller, AG_CONEX.cpp:80
             )?;
             Ok(CommandOutcome::Continue)
         },
@@ -317,6 +319,7 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, AGAP_CONEX.cpp:79
                 )?;
             }
             Ok(CommandOutcome::Continue)
@@ -422,6 +425,7 @@ pub fn ag_uc_create_axis_command() -> CommandDef {
                 motor,
                 moving_poll_ms,
                 idle_poll_ms,
+                2, // C startPoller, AG_UC.cpp:99
             )?;
             Ok(CommandOutcome::Continue)
         },
@@ -594,6 +598,7 @@ pub fn xps_create_axis_command() -> CommandDef {
                 motor,
                 moving_poll_ms,
                 idle_poll_ms,
+                10, // C startPoller, XPSController.cpp:197
             )?;
             Ok(CommandOutcome::Continue)
         },
@@ -1425,6 +1430,7 @@ pub fn hxp_create_controller_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, HXPDriver.cpp:116
                 )?;
             }
 
@@ -1761,7 +1767,8 @@ pub fn mm4000_config_command() -> CommandDef {
 }
 
 /// drvMM4000Asyn.c's `motorAxisDrvSET_t`.
-pub static MOTOR_MM4000: Model2 = Model2::new("motorMM4000");
+/// Its poller forces 10 fast polls (drvMM4000Asyn.c:630).
+pub static MOTOR_MM4000: Model2 = Model2::new("motorMM4000", 10);
 
 /// `numMM4000Controllers`, which `MM4000AsynSetup` sets.
 static NUM_MM4000_ASYN: Mutex<i32> = Mutex::new(0);

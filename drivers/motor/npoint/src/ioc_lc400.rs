@@ -80,6 +80,7 @@ fn lc400_create_controller_command(registry: &Registry) -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    2, // C startPoller, LC400MotorDriver.cpp:156
                 )?;
             }
             registry

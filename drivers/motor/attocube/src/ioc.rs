@@ -23,7 +23,8 @@ const ANC150_TIMEOUT: Duration = Duration::from_secs(2);
 const ANC150_MAX_AXES: i32 = 6;
 
 /// drvANC150Asyn.cc's `motorAxisDrvSET_t`.
-pub static MOTOR_ANC150: Model2 = Model2::new("motorANC150");
+/// Its poller forces none (drvANC150Asyn.cc:580).
+pub static MOTOR_ANC150: Model2 = Model2::new("motorANC150", 0);
 
 /// `numANC150Controllers`, which `ANC150AsynSetup` sets.
 static NUM_CONTROLLERS: Mutex<i32> = Mutex::new(0);

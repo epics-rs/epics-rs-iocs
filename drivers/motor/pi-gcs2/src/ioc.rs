@@ -90,6 +90,7 @@ pub fn pigcs2_config_command() -> CommandDef {
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
+                    10, // C startPoller, PIasynController.cpp:192
                 )?;
             }
             Ok(CommandOutcome::Continue)
