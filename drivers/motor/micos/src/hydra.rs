@@ -318,6 +318,8 @@ impl AsynMotor for HydraAxis {
         let status = atoi(&ctrl.query(&format!("{addr} nst"))?);
         let moving = (status & STATUS_MOVING) != 0;
         let powered = (status & STATUS_POWER_OFF) == 0;
+        // C sets problem from 0x200 (SMChydraAxis.cpp:302-311), then
+        // overwrites it at :357 and :360, a dead store; not copied.
         let problem = (status & STATUS_ESTOP_SWITCH) != 0;
 
         // SMChydraAxis.cpp:276-281 reads the commanded velocity and
