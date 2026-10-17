@@ -184,11 +184,12 @@ impl OmsParams {
 
 impl ControllerParams for OmsParams {
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        // Address 0's list alone (omsBaseController.cpp:95-98).
         self.reasons = OmsReasons {
-            poll: base.create_param("OMS_POLL", ParamType::Int32)?,
-            send: base.create_param("OMS_STRING_SEND", ParamType::Octet)?,
-            send_receive: base.create_param("OMS_STRING_SENDRECV", ParamType::Octet)?,
-            receive: base.create_param("OMS_STRING_RECV", ParamType::Octet)?,
+            poll: base.create_param_in_list(0, "OMS_POLL", ParamType::Int32)?,
+            send: base.create_param_in_list(0, "OMS_STRING_SEND", ParamType::Octet)?,
+            send_receive: base.create_param_in_list(0, "OMS_STRING_SENDRECV", ParamType::Octet)?,
+            receive: base.create_param_in_list(0, "OMS_STRING_RECV", ParamType::Octet)?,
         };
         let r = self.reasons;
         for reason in [r.send, r.send_receive, r.receive] {
@@ -211,14 +212,15 @@ impl ControllerParams for OmsParams {
         let Some(axis) = self.axis(base, user) else {
             return ParamWrite::Handled(Err(oms_err("oms: no axis at this address")));
         };
-        let _ = base.set_int32_param(user.reason, axis, value);
+        // Past address 0 the set fails, and that is the write's status.
+        let set = base.set_int32_param(user.reason, axis, value);
         if value != 0
             && let Some(axes) = self.state.axes.get()
         {
             axes.wakeup();
         }
         let _ = base.call_param_callbacks(axis);
-        ParamWrite::Handled(Ok(()))
+        ParamWrite::Handled(set)
     }
 
     /// C `omsBaseController::writeOctet` (omsBaseController.cpp:178-219):
@@ -272,6 +274,8 @@ impl ControllerParams for OmsParams {
                 .find(|&i| reply.is_char_boundary(i))
                 .unwrap_or(0),
         );
+        // Past address 0 the set fails, and callParamCallbacks' status
+        // replaces its own (omsBaseController.cpp:197-198).
         let _ = base.set_string_param(r.receive, axis, &reply);
         let _ = base.call_param_callbacks(axis);
         print(format_args!(
@@ -942,9 +946,10 @@ mod tests {
     /// A controller port on the poller tests' one-axis MAXnet line.
     fn params_port(
         name: &str,
+        axes: usize,
         replies: &[(&str, &str)],
     ) -> (PortHandle, crate::poller::tests::Rig) {
-        let rig = crate::poller::tests::rig(&format!("{name}_IO"), 1, replies);
+        let rig = crate::poller::tests::rig(&format!("{name}_IO"), axes, replies);
         let (params, state) = OmsParams::new("MAXnet");
         let _ = state.controller.set(rig.controller.clone());
         let _ = state
@@ -972,7 +977,7 @@ mod tests {
     /// (omsBaseController.cpp:178-219).
     #[test]
     fn string_writes_go_to_the_controller() {
-        let (port, rig) = params_port("omsStrings", &[("AX RP", "1234")]);
+        let (port, rig) = params_port("omsStrings", 1, &[("AX RP", "1234")]);
         let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_secs(1));
         let send = reason(&port, "OMS_STRING_SEND");
         let send_receive = reason(&port, "OMS_STRING_SENDRECV");
@@ -994,7 +999,7 @@ mod tests {
     /// A non-zero OMS_POLL wakes the poller (omsBaseController.cpp:298-302).
     #[test]
     fn an_oms_poll_write_wakes_the_poller() {
-        let (port, rig) = params_port("omsPollWrite", &[]);
+        let (port, rig) = params_port("omsPollWrite", 1, &[]);
         let shared = rig.controller.lock().unwrap().poll_shared().clone();
         let poll = reason(&port, "OMS_POLL");
         port.write_int32_blocking(poll, 0, 0).unwrap();
@@ -1002,6 +1007,39 @@ mod tests {
         port.write_int32_blocking(poll, 0, 1).unwrap();
         assert!(shared.wait(Duration::ZERO));
         assert_eq!(port.read_int32_blocking(poll, 0).unwrap(), 1);
+    }
+
+    /// C creates OMS_POLL and the strings in address 0's list alone
+    /// (omsBaseController.cpp:95-98): another address cannot bind them, an
+    /// OMS_POLL write there wakes the poller and then fails on its set
+    /// (:264, :298-312), and a string write there goes to the line with its
+    /// reply set nowhere (:192-221).
+    #[test]
+    fn the_oms_parameters_live_in_address_0_s_list_alone() {
+        let (port, rig) = params_port("omsListOnly", 2, &[("AX RP", "1234")]);
+        let shared = rig.controller.lock().unwrap().poll_shared().clone();
+        for name in [
+            "OMS_POLL",
+            "OMS_STRING_SEND",
+            "OMS_STRING_SENDRECV",
+            "OMS_STRING_RECV",
+        ] {
+            let at_1 = epics_rs::asyn::port::DrvUserRequest::new(name, 1);
+            assert!(port.drv_user_create_blocking(&at_1).is_err(), "{name}");
+        }
+        let poll = reason(&port, "OMS_POLL");
+        assert!(port.write_int32_blocking(poll, 1, 1).is_err());
+        assert!(shared.wait(Duration::ZERO));
+        let io = SyncIOHandle::from_handle(port.clone(), 1, Duration::from_secs(1));
+        let receive = reason(&port, "OMS_STRING_RECV");
+        io.write_octet(reason(&port, "OMS_STRING_SEND"), b"AX ST;")
+            .unwrap();
+        io.write_octet(reason(&port, "OMS_STRING_SENDRECV"), b"AX RP")
+            .unwrap();
+        assert_eq!(*rig.written.lock().unwrap(), ["AX ST;", "AX RP"]);
+        assert!(io.read_octet(receive, 40).is_err());
+        let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
+        assert_eq!(io.read_octet(receive, 40).unwrap(), b"\0");
     }
 
     #[test]
