@@ -192,6 +192,15 @@ impl XpsAxis {
         trace_error(&self.trace, function, args);
     }
 
+    /// The same with `ASYN_TRACE_FLOW`.
+    fn flow(&self, function: &str, args: fmt::Arguments<'_>) {
+        self.trace.print(
+            TraceMask::FLOW,
+            0,
+            format_args!("{DRIVER_NAME}:{function}: {args}"),
+        );
+    }
+
     /// C's `pC_->portName` and `axisNo_`, as every `[%s,%d]` names them.
     fn port(&self) -> &str {
         self.trace.port()
@@ -268,9 +277,25 @@ impl XpsAxis {
     fn prepare_move(
         &self,
         ctrl: &XpsController,
+        position: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.flow(
+            "move",
+            format_args!(
+                "Set XPS {}, axis {} move to {:.6}, min vel={:.6}, max_vel={:.6}, accel={:.6}, minJerk={:.6}, maxJerk={:.6}\n",
+                self.port(),
+                self.axis_no(),
+                CFloat(position),
+                CFloat(min_velocity),
+                CFloat(velocity),
+                CFloat(acceleration),
+                CFloat(self.min_jerk),
+                CFloat(self.max_jerk)
+            ),
+        );
         let sock = ctrl.poll_socket();
         // Disabled state (20..=36): auto-enable, or refuse the move.
         if (20..=36).contains(&self.axis_status.load(Ordering::Relaxed)) {
@@ -519,14 +544,14 @@ impl AsynMotor for XpsAxis {
         &mut self,
         _user: &AsynUser,
         position: f64,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
         let device_units = position * self.step_size;
         {
             let ctrl = self.lock_controller();
-            self.prepare_move(&ctrl, velocity, acceleration)?;
+            self.prepare_move(&ctrl, position, min_velocity, velocity, acceleration)?;
             if self.defer(&ctrl, device_units, false) {
                 return Ok(());
             }
@@ -544,7 +569,7 @@ impl AsynMotor for XpsAxis {
         &mut self,
         _user: &AsynUser,
         distance: f64,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
@@ -553,7 +578,7 @@ impl AsynMotor for XpsAxis {
         let device_units = distance * self.step_size;
         {
             let ctrl = self.lock_controller();
-            self.prepare_move(&ctrl, velocity, acceleration)?;
+            self.prepare_move(&ctrl, distance, min_velocity, velocity, acceleration)?;
             if self.defer(&ctrl, device_units, true) {
                 return Ok(());
             }
@@ -649,7 +674,7 @@ impl AsynMotor for XpsAxis {
         Ok(())
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
         let stop_error = |command: &str, e: &XpsError| {
             trace_error(
                 &self.trace,
@@ -684,6 +709,15 @@ impl AsynMotor for XpsAxis {
                 .inspect_err(|e| stop_error("GroupKill", e))?;
         }
         self.lock_move_state().deferred = None;
+        self.flow(
+            "stopAxis",
+            format_args!(
+                "XPS {}, axis {} stop with accel={:.6}\n",
+                self.port(),
+                self.axis_no(),
+                CFloat(acceleration)
+            ),
+        );
         Ok(())
     }
 
@@ -786,6 +820,19 @@ impl AsynMotor for XpsAxis {
                 ),
             )
         })?;
+        let (prefix, state) = if enable {
+            ("", "enable")
+        } else {
+            ("motorAxisSetInteger ", "disable")
+        };
+        self.flow(
+            "setClosedLoop",
+            format_args!(
+                "{prefix}set XPS {}, axis {} closed loop {state}\n",
+                self.port(),
+                self.axis_no()
+            ),
+        );
         Ok(())
     }
 
@@ -810,6 +857,15 @@ impl AsynMotor for XpsAxis {
                     ),
                 )
             })?;
+        self.flow(
+            "setHighLimit",
+            format_args!(
+                "Set XPS {}, axis {} high limit to {:.6}\n",
+                self.port(),
+                self.axis_no(),
+                CFloat(device_value)
+            ),
+        );
         Ok(())
     }
 
@@ -834,6 +890,15 @@ impl AsynMotor for XpsAxis {
                     ),
                 )
             })?;
+        self.flow(
+            "setLowLimit",
+            format_args!(
+                "Set XPS {}, axis {} low limit to {:.6}\n",
+                self.port(),
+                self.axis_no(),
+                CFloat(device_value)
+            ),
+        );
         Ok(())
     }
 
@@ -1033,11 +1098,20 @@ impl XpsAxis {
         };
 
         // C prints the GroupStatusGet line for a failed GroupStatusStringGet too.
-        let axis_status = sock
+        let (axis_status, status_string) = sock
             .group_status_get(&self.group_name)
             .inspect(|&code| self.axis_status.store(code, Ordering::Relaxed))
-            .and_then(|code| sock.group_status_string_get(code).map(|_| code))
+            .and_then(|code| sock.group_status_string_get(code).map(|s| (code, s)))
             .inspect_err(|e| poll_error("GroupStatusGet", e))?;
+        self.flow(
+            "poll",
+            format_args!(
+                "[{},{}]: {} axisStatus={axis_status}, statusString={status_string}\n",
+                self.port(),
+                self.axis_no(),
+                self.positioner_name
+            ),
+        );
         let flags = StatusFlags::from_status(axis_status);
         // C reads the group state for every axis in the group; moving mode
         // instead waits for this axis's move socket to answer the move.
@@ -1047,8 +1121,21 @@ impl XpsAxis {
         } else if !moving_mode {
             self.moving = true;
         }
-        if moving_mode && self.moving && self.move_sock.read_pending() > 0 {
-            self.moving = false;
+        if moving_mode && self.moving {
+            let answer = self.move_sock.read_pending();
+            if !answer.is_empty() {
+                self.flow(
+                    "poll",
+                    format_args!(
+                        "[{},{}]: readXPSSocket returned nRead={}, [{}]\n",
+                        self.port(),
+                        self.axis_no(),
+                        answer.len(),
+                        String::from_utf8_lossy(&answer)
+                    ),
+                );
+                self.moving = false;
+            }
         }
         // C `*moving`, the poller's pace (XPSAxis.cpp:623-624).
         status.moving = self.moving || self.lock_move_state().deferred.is_some();
@@ -1063,8 +1150,30 @@ impl XpsAxis {
         let referencing = ctrl.is_group_referencing(&self.group_name);
         status.encoder_home = flags.encoder_home && !referencing;
         status.homed = flags.homed && !referencing;
+        // MotorStatus has no following-error bit for C's
+        // motorStatusFollowingError_; only the line is printed.
+        if matches!(axis_status, 21 | 22 | 24..=26 | 28 | 35) {
+            self.flow(
+                "poll",
+                format_args!(
+                    "[{},{}]: in following error. XPS State Code: {axis_status}\n",
+                    self.port(),
+                    self.axis_no()
+                ),
+            );
+        }
         status.powered = flags.powered;
         status.problem = flags.problem && !(ctrl.no_disable_error() && axis_status == 20);
+        if status.problem {
+            self.flow(
+                "poll",
+                format_args!(
+                    "[{},{}]: in unintialised/disabled/not referenced. XPS State Code: {axis_status}\n",
+                    self.port(),
+                    self.axis_no()
+                ),
+            );
+        }
 
         let encoder = sock
             .group_position_current_get(&self.positioner_name)
@@ -1123,6 +1232,18 @@ mod tests {
         enable_set_position: bool,
         positioners: &[&str],
     ) -> (Vec<XpsAxis>, Fail, Log) {
+        let (axes, line) = fake_line_axes(port, "MOTOR_T", fail, enable_set_position, positioners);
+        (axes, line.fail.clone(), line.log.clone())
+    }
+
+    /// [`fake_axes`] tracing on `trace_port`, with the line kept.
+    fn fake_line_axes(
+        port: &str,
+        trace_port: &str,
+        fail: &'static str,
+        enable_set_position: bool,
+        positioners: &[&str],
+    ) -> (Vec<XpsAxis>, FakeLine) {
         let line = FakeLine::new(port, fail);
         let controller = Arc::new(Mutex::new(
             XpsController::new(
@@ -1139,14 +1260,39 @@ mod tests {
                 XpsAxis::new(
                     controller.clone(),
                     line.socket(SocketMode::Fire),
-                    "MOTOR_T",
+                    trace_port,
                     n as i32,
                     p,
                     1.0,
                 )
             })
             .collect();
-        (axes, line.fail.clone(), line.log.clone())
+        (axes, line)
+    }
+
+    /// FLOW on `port` addrs `0..addrs` into a fresh file; returns its path.
+    fn trace_flow(port: &str, addrs: i32) -> std::path::PathBuf {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        for addr in 0..addrs {
+            trace.set_device_trace_mask(port, addr, TraceMask::FLOW);
+            trace.set_device_trace_info_mask(port, addr, TraceInfoMask::empty());
+            trace.set_device_trace_file(port, addr, TraceFile::File(file.clone()));
+        }
+        path
+    }
+
+    /// What the trace file gained since `seen`.
+    fn take_trace(path: &std::path::Path, seen: &mut usize) -> String {
+        let text = std::fs::read_to_string(path).unwrap();
+        let new = text[*seen..].to_string();
+        *seen = text.len();
+        new
     }
 
     /// XPSAxis.cpp:267, 718, 706: record steps times stepSize_ go out, and
@@ -1278,6 +1424,24 @@ mod tests {
         *answer.lock().unwrap() = true;
         assert!(mover.poll(&user).unwrap().done);
         assert!(mover.poll(&user).unwrap().done);
+    }
+
+    /// XPSAxis.cpp:613: the move socket's answer, on FLOW.
+    #[test]
+    fn the_move_socket_answer_traces_as_c() {
+        let (mut mover, _other, answer) = late_move_axes("xps_moving_trace", true);
+        let path = trace_flow("xps_moving_trace", 1);
+        let user = AsynUser::new(0);
+        *answer.lock().unwrap() = true;
+        mover.poll(&user).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains(
+                "XPSAxis:poll: [xps_moving_trace,0]: readXPSSocket returned nRead=10, [0,EndOfAPI]\n"
+            ),
+            "{text}"
+        );
     }
 
     /// Without moving mode every axis of a moving group is moving, and the
@@ -1611,6 +1775,8 @@ mod tests {
             &["G1.P1", "G1.P2"],
         );
         let user = AsynUser::default();
+        axes[1].set_deferred_moves(&user, true).unwrap();
+        axes[1].move_absolute(&user, 3.0, 0.0, 1.0, 1.0).unwrap();
         let path = std::env::temp_dir().join(format!("xps-defer-{}", std::process::id()));
         let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
         let manager = PortManager::global();
@@ -1619,8 +1785,6 @@ mod tests {
         trace.set_device_trace_info_mask("MOTOR_T", 0, TraceInfoMask::empty());
         trace.set_device_trace_file("MOTOR_T", 0, TraceFile::File(file));
 
-        axes[1].set_deferred_moves(&user, true).unwrap();
-        axes[1].move_absolute(&user, 3.0, 0.0, 1.0, 1.0).unwrap();
         assert!(axes[1].set_deferred_moves(&user, false).is_err());
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -1632,5 +1796,54 @@ mod tests {
              Error peforming GroupMoveAbsolute/Relative in processDeferredMovesInGroup. XPS Return code: -3\n\
              Processing deferred moves on XPS: MOTOR_T\n"
         );
+    }
+
+    /// XPSAxis.cpp:232, 549, 577, 661, 687, 788, 824, 863, 874: the axis's
+    /// FLOW lines, on its own user.
+    #[test]
+    fn the_axis_flow_traces_as_c() {
+        let (mut axes, line) = fake_line_axes("xps_flow_line", "xps_flow", "", false, &["G1.P1"]);
+        let axis = &mut axes[0];
+        let path = trace_flow("xps_flow", 1);
+        let mut seen = 0;
+        let user = AsynUser::new(0);
+
+        axis.move_absolute(&user, 4.0, 0.5, 6.0, 8.0).unwrap();
+        axis.move_relative(&user, -3.0, 0.5, 6.0, 8.0).unwrap();
+        axis.stop(&user, 2.5).unwrap();
+        assert_eq!(
+            take_trace(&path, &mut seen),
+            "XPSAxis:move: Set XPS xps_flow, axis 0 move to 4.000000, min vel=0.500000, max_vel=6.000000, accel=8.000000, minJerk=0.020000, maxJerk=0.020000\n\
+             XPSAxis:move: Set XPS xps_flow, axis 0 move to -3.000000, min vel=0.500000, max_vel=6.000000, accel=8.000000, minJerk=0.020000, maxJerk=0.020000\n\
+             XPSAxis:stopAxis: XPS xps_flow, axis 0 stop with accel=2.500000\n"
+        );
+
+        axis.set_low_limit(&user, -5.0).unwrap();
+        axis.set_high_limit(&user, 7.5).unwrap();
+        axis.set_closed_loop(&user, true).unwrap();
+        axis.set_closed_loop(&user, false).unwrap();
+        assert_eq!(
+            take_trace(&path, &mut seen),
+            "XPSAxis:setLowLimit: Set XPS xps_flow, axis 0 low limit to -5.000000\n\
+             XPSAxis:setHighLimit: Set XPS xps_flow, axis 0 high limit to 7.500000\n\
+             XPSAxis:setClosedLoop: set XPS xps_flow, axis 0 closed loop enable\n\
+             XPSAxis:setClosedLoop: motorAxisSetInteger set XPS xps_flow, axis 0 closed loop disable\n"
+        );
+
+        axis.poll(&user).unwrap();
+        assert_eq!(
+            take_trace(&path, &mut seen),
+            "XPSAxis:poll: [xps_flow,0]: G1.P1 axisStatus=12, statusString=0\n"
+        );
+        // 22 is a following error and a disabled state.
+        *line.group_status.lock().unwrap() = 22;
+        axis.poll(&user).unwrap();
+        assert_eq!(
+            take_trace(&path, &mut seen),
+            "XPSAxis:poll: [xps_flow,0]: G1.P1 axisStatus=22, statusString=0\n\
+             XPSAxis:poll: [xps_flow,0]: in following error. XPS State Code: 22\n\
+             XPSAxis:poll: [xps_flow,0]: in unintialised/disabled/not referenced. XPS State Code: 22\n"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

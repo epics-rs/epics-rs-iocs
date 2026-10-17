@@ -132,6 +132,7 @@ pub fn mvp2001_create_axis_command() -> CommandDef {
 
             let ax = Mvp2001Axis::new(
                 controller,
+                &port_name,
                 axis_no as usize,
                 enc_lpr as i32,
                 max_curr as i32,

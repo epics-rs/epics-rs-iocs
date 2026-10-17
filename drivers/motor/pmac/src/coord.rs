@@ -105,6 +105,9 @@ pub struct PmacCoordSystem {
     reference: i32,
     /// C `motorAxis::logParam` of each CS axis.
     logs: [Arc<AxisLog>; CS_AXES],
+    /// C `motorAxisCommError` of each CS axis: whether its last transfer
+    /// failed.
+    comms_error: [bool; CS_AXES],
 }
 
 impl PmacCoordSystem {
@@ -129,6 +132,7 @@ impl PmacCoordSystem {
             poll_ttl,
             step_size: [DEFAULT_STEP_SIZE; CS_AXES],
             logs: Default::default(),
+            comms_error: [false; CS_AXES],
         }
     }
 
@@ -191,13 +195,13 @@ impl PmacCoordSystem {
     /// C `motorAxisWriteRead` for 1-based `axis`: a failed transfer prints
     /// its line. C returns MOTOR_AXIS_OK on a refused (BELL) reply
     /// (pmacAsynCoord.c:345); that C defect is not copied (see the crate doc).
-    fn write_read(&self, axis: usize, command: &str) -> AsynResult<String> {
+    fn write_read(&mut self, axis: usize, command: &str) -> AsynResult<String> {
         checked_reply(command, self.transfer(axis, command, false)?)
     }
 
     /// [`Self::write_read`] without the BELL check: the reply as C sees it.
     /// Only a `log_global` read leaves the axis's log quiet.
-    fn transfer(&self, axis: usize, command: &str, log_global: bool) -> AsynResult<Vec<u8>> {
+    fn transfer(&mut self, axis: usize, command: &str, log_global: bool) -> AsynResult<Vec<u8>> {
         let log = (!log_global).then(|| &self.logs[axis - 1]);
         let reference = self.reference;
         if let Some(log) = log {
@@ -207,6 +211,7 @@ impl PmacCoordSystem {
             );
         }
         let reply = self.handle.write_read(0, command.as_bytes(), PMAC_MAXBUF);
+        self.comms_error[axis - 1] = reply.is_err();
         if let (Some(log), Ok(raw)) = (log, &reply)
             && !raw.is_empty()
         {
@@ -269,10 +274,24 @@ impl PmacCoordSystem {
         // A failed read leaves C's position buffer uninitialised; that
         // garbage is not posted here.
         let raw = self.transfer(1, &query, true)?;
-        let response = String::from_utf8_lossy(&raw);
-        // strtod reads 0 past the end of a short reply, which C posts.
-        let mut positions = parse_cs_positions(response.trim_matches('\0'), CS_AXES);
-        positions.resize(CS_AXES, 0.0);
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let response = String::from_utf8_lossy(&raw[..end]);
+        let positions = parse_cs_positions(&response, CS_AXES)
+            .into_iter()
+            .map(|(position, underflow)| {
+                if underflow {
+                    self.trace.print(
+                        TraceMask::ERROR,
+                        0,
+                        format_args!(
+                            "drvPmacAxisGetStatus: not all status values returned. Status: \
+                             0\nCommand :{query}\nResponse1:{response}\n"
+                        ),
+                    );
+                }
+                position
+            })
+            .collect();
 
         let [s0, s1, s2] = self.status;
         let poll = CsPoll {
@@ -341,10 +360,14 @@ impl PmacCsAxis {
 }
 
 impl AsynMotor for PmacCsAxis {
-    /// C `motorAxisWriteRead` sets only `motorAxisCommError`
-    /// (pmacAsynCoord.c).
+    /// The failed read ran for axis A (pmacAsynCoord.c:640); every other
+    /// axis keeps the comms error of its own last transfer.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::COMMS_ERROR
+        if self.axis == 1 {
+            PollFailure::COMMS_ERROR
+        } else {
+            PollFailure::NONE
+        }
     }
 
     /// C `motorAxisMove`: set the CS feed rate (`I{cs+50}89`, EGU/s) and
@@ -581,6 +604,7 @@ impl AsynMotor for PmacCsAxis {
             direction,
             slip_stall: flags.following_error,
             problem: flags.problem,
+            comms_error: system.comms_error[axis - 1],
             ..MotorStatus::default()
         })
     }
@@ -626,6 +650,8 @@ mod tests {
         base: epics_rs::asyn::port::PortDriverBase,
         reply: Vec<u8>,
         sent: Arc<Mutex<Vec<String>>>,
+        /// Commands starting with one of these fail on the wire.
+        fail: Arc<Mutex<Vec<String>>>,
     }
 
     impl epics_rs::asyn::port::PortDriver for Idle {
@@ -637,6 +663,18 @@ mod tests {
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data).into_owned();
+            if self
+                .fail
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|f| cmd.starts_with(f.as_str()))
+            {
+                return Err(AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Error,
+                    message: "down".into(),
+                });
+            }
             self.reply = match cmd.as_str() {
                 "&1??" => b"000000\r020000\r000000\r".to_vec(),
                 c if c.starts_with("&1Q81") => b"1.5 0 0 0 0 0 0 0 0\r".to_vec(),
@@ -656,6 +694,7 @@ mod tests {
         PmacCsAxis,
         Arc<Mutex<PmacCoordSystem>>,
         Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<String>>>,
     );
 
     /// CS 1 axis A on an [`Idle`] line, its system and the wire log.
@@ -665,10 +704,12 @@ mod tests {
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(Mutex::new(Vec::new()));
         let line = Idle {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             reply: Vec::new(),
             sent: sent.clone(),
+            fail: fail.clone(),
         };
         let (rt, _jh) =
             create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
@@ -683,14 +724,14 @@ mod tests {
             poll_ttl,
         )));
         let axis = PmacCsAxis::new(system.clone(), 1).unwrap();
-        (axis, system, sent)
+        (axis, system, sent, fail)
     }
 
     /// pmacAsynCoord.c: demand and feed rate are steps * stepSize, the
     /// readback Q8n / stepSize, a set position rounds to a whole step first.
     #[test]
     fn record_steps_scale_by_step_size() {
-        let (mut axis, system, sent) = idle_axis("pmac_cs_steps", Duration::ZERO);
+        let (mut axis, system, sent, _) = idle_axis("pmac_cs_steps", Duration::ZERO);
         let user = AsynUser::default();
         assert_eq!(axis.poll(&user).unwrap().position, 15000.0);
         sent.lock().unwrap().clear();
@@ -716,7 +757,7 @@ mod tests {
     /// one after it is served from that read again.
     #[test]
     fn the_poll_after_a_move_is_fresh_and_not_done() {
-        let (mut axis, _, sent) = idle_axis("pmac_cs_moved", Duration::from_secs(3600));
+        let (mut axis, _, sent, _) = idle_axis("pmac_cs_moved", Duration::from_secs(3600));
         let user = AsynUser::default();
         assert!(axis.poll(&user).unwrap().done);
         sent.lock().unwrap().clear();
@@ -734,6 +775,41 @@ mod tests {
         sent.lock().unwrap().clear();
         assert!(axis.poll(&user).unwrap().done);
         assert!(sent.lock().unwrap().is_empty());
+    }
+
+    /// pmacAsynCoord.c:336/345: each transfer sets `motorAxisCommError` on
+    /// the axis it ran for, and the poll's reads run for axis A
+    /// (pmacAsynCoord.c:631, 640). A failed position read posts nothing here.
+    #[test]
+    fn the_comms_error_is_the_last_transfer_of_its_axis() {
+        let (mut a, system, _, fail) = idle_axis("pmac_cs_comms", Duration::ZERO);
+        let mut b = PmacCsAxis::new(system, 2).unwrap();
+        let user = AsynUser::default();
+        let set_fail = |prefixes: &[&str]| {
+            *fail.lock().unwrap() = prefixes.iter().map(|p| p.to_string()).collect();
+        };
+
+        set_fail(&["&1A Q72"]);
+        assert!(b.stop(&user, 0.0).is_err());
+        assert!(!a.poll(&user).unwrap().comms_error);
+        assert!(b.poll(&user).unwrap().comms_error);
+        set_fail(&[]);
+        assert!(
+            b.poll(&user).unwrap().comms_error,
+            "a poll is not B's transfer"
+        );
+        b.stop(&user, 0.0).unwrap();
+        assert!(!b.poll(&user).unwrap().comms_error);
+
+        set_fail(&["&1Q81"]);
+        assert!(a.poll(&user).is_err());
+        assert_eq!(a.poll_failure(), PollFailure::COMMS_ERROR);
+        assert!(b.poll(&user).is_err());
+        assert_eq!(b.poll_failure(), PollFailure::NONE);
+        // The status read failing first does not outlast the position read.
+        set_fail(&["&1??"]);
+        assert!(!a.poll(&user).unwrap().comms_error);
+        assert!(!b.poll(&user).unwrap().comms_error);
     }
 
     #[test]

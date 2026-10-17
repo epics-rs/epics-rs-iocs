@@ -21,7 +21,9 @@
 //! `NINT(TP / drive_resolution)` steps. `drive_resolution` comes per axis
 //! from `ZB?` → `FR?`/`QS?` or `SU?`. A resolution of 0 or a non-finite one
 //! (a failed `FR?`/`SU?`, a `QS?` of 0) refuses commands and flags the
-//! poll a problem, where C sends `0`/`inf` and reads back `inf`.
+//! poll a problem, where C sends `0`/`inf` (devESP300.cc:187, a `QS?` of 0
+//! divides at drvESP300.cc:789) and reads back `inf` (drvESP300.cc:277).
+//! That C defect is not copied.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

@@ -265,6 +265,8 @@ mca-rs = "0.32.0"
 # float_roundtrip makes the parser correctly rounded, as C's strtod is;
 # without it some doubles parse 1 ULP off.
 serde_json = { version = "1", features = ["float_roundtrip"] }
+# libssh2, as C's HAVE_LIBSSH2 build links; motor-newport's `sftp` feature.
+ssh2 = { version = "0.9", default-features = false }
 
 # epics-rs rt/iocs-base, the single base every iocs panel builds against.
 [patch.crates-io]

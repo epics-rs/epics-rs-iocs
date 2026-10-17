@@ -21,8 +21,10 @@
 //! ∓ one `stepSize_`) and the CONEX-PP home velocity go out unscaled, as C
 //! sends them.
 //!
-//! C divides by a `stepSize_` of 0 or infinity (an `IF?`/`FRM?` reply of 0);
-//! this port refuses the axis's moves and polls instead.
+//! C divides by a `stepSize_` of 0 or infinity (an `IF?`/`FRM?` reply of 0
+//! makes it infinite at AG_CONEX.cpp:249/260, and the readback divides by it
+//! at :515); this port refuses the axis's moves and polls instead, a C
+//! defect not copied.
 //!
 //! ## Parity notes
 //!
