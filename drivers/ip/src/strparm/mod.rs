@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::adapter::parse_asyn_link;
-use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
@@ -281,6 +281,19 @@ impl CellBody for Job {
     }
 }
 
+/// `initCommon`'s `bad:` arm after a failed asynManager call: the line its
+/// `asynPrint` writes on the still unconnected asynUser, then `pact = 1`.
+fn bad(name: &str, message: &str) -> DeviceInitOutcome {
+    PortManager::global().trace_manager().print(
+        None,
+        None,
+        0,
+        TraceMask::ERROR,
+        format_args!("{name} asynManager error {message}\n"),
+    );
+    DeviceInitOutcome::dead()
+}
+
 /// `asynPrint` on the record's asynUser, connected to `port` at `addr`.
 fn print(handle: &PortHandle, addr: i32, mask: TraceMask, args: std::fmt::Arguments<'_>) {
     handle
@@ -541,13 +554,13 @@ impl DeviceSupport for DevStrParm {
                 errlog_vprintf(format_args!(
                     "devXxStrParm::initCommon {name} bad link {message}\n"
                 ));
-                return Ok(DeviceInitOutcome::dead());
+                return Ok(bad(&name, &message));
             }
         };
-        let Some(port) = get_port(&link.port_name) else {
-            return Ok(DeviceInitOutcome::dead());
+        let handle = match crate::connect_device(&link.port_name, link.addr) {
+            Ok(handle) => handle,
+            Err(message) => return Ok(bad(&name, &message)),
         };
-        let handle = port.handle.clone();
         let desc = match record.get_field("DESC") {
             Some(EpicsValue::String(s)) => s.to_string(),
             _ => String::new(),
@@ -861,5 +874,49 @@ mod tests {
             out: "",
         };
         assert!(factory(&ctx).is_none());
+    }
+
+    /// `initCommon` on `link`, the global asyn trace (an unconnected
+    /// asynUser's) captured: the outcome and what was printed.
+    fn init_traced(link: &str, name: &str) -> (DeviceInitOutcome, String) {
+        use epics_rs::asyn::trace::TraceFile;
+
+        let path = std::env::temp_dir().join(format!("strparm-{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let trace = PortManager::global().trace_manager().clone();
+        trace.set_trace_file(None, TraceFile::File(Arc::new(Mutex::new(file))));
+        let mut dev = DevStrParm::new(Kind::Ai, link);
+        dev.set_record_info(name, ScanType::Passive);
+        let outcome = dev.init(&mut AiRecord::default()).unwrap();
+        trace.set_trace_file(None, TraceFile::Stderr);
+        let log = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        (outcome, log)
+    }
+
+    /// `initCommon`'s `bad:` arm prints the failed `connectDevice`'s or
+    /// `parseLink`'s errorMessage (devXxStrParm.c:231-236) before
+    /// `pact = 1`.
+    #[test]
+    fn a_failed_connect_or_link_prints_the_asyn_manager_error() {
+        let (outcome, log) = init_traced("@asyn(SP_NO_SUCH_PORT 0)", "R:np");
+        assert_eq!(outcome, DeviceInitOutcome::dead());
+        assert!(
+            log.trim_end().ends_with(
+                "R:np asynManager error asynManager:connectDevice port SP_NO_SUCH_PORT not found"
+            ),
+            "{log:?}"
+        );
+        let message = match parse_asyn_link("not a link") {
+            Err(AsynError::InvalidLinkSyntax(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        let (outcome, log) = init_traced("not a link", "R:bl");
+        assert_eq!(outcome, DeviceInitOutcome::dead());
+        assert!(
+            log.trim_end()
+                .ends_with(&format!("R:bl asynManager error {message}")),
+            "{log:?}"
+        );
     }
 }

@@ -25,3 +25,16 @@ pub mod strparm;
 pub mod televac;
 pub mod tpg261;
 pub mod user_param;
+
+use epics_rs::asyn::manager::DeviceUser;
+use epics_rs::asyn::port_handle::PortHandle;
+
+/// C `pasynManager->connectDevice(pasynUser, port, addr)`: the port, or the
+/// `errorMessage` the failed call left.
+pub(crate) fn connect_device(port: &str, addr: i32) -> Result<PortHandle, String> {
+    let mut user = DeviceUser::default();
+    match user.connect_device(port, addr) {
+        Ok(entry) => Ok(entry.handle.clone()),
+        Err(_) => Err(user.error_message().to_owned()),
+    }
+}
