@@ -22,9 +22,10 @@
 //! than this doc for the full determination):
 //! * USB (`DppLibUsb.cpp`, `libusb`-based) -- needs a Rust USB crate
 //!   (`rusb`/`nusb`) not currently in this workspace.
-//! * Serial (`DppInterfaceSerial`) -- unimplemented even in the upstream
-//!   C driver itself (`ConnectDpp`'s and `SendCommand`'s serial branches
-//!   are both empty no-ops), so there is nothing to port.
+//!
+//! Serial (`DppInterfaceSerial`) is unimplemented in the C driver itself
+//! (`ConnectDpp`'s and `SendCommand`'s serial branches are empty), so a
+//! Serial port is built as C builds it and never connects.
 
 pub mod ascii_cmd;
 pub mod config;

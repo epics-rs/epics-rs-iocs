@@ -1,7 +1,7 @@
 //! `drvAmptek` -- the Amptek DP5/PX5/DP5G/MCA8000D/TB5/DP5-X asyn MCA/MCS
 //! driver, ported from `drvAmptek.cpp`/`drvAmptek.h` (`mcaApp/AmptekSrc`).
-//! Ethernet/UDP only -- see [`crate`]'s module doc for the USB/Serial
-//! feasibility gate.
+//! Ethernet/UDP and C's never-connecting Serial port -- see [`crate`]'s
+//! module doc for the USB feasibility gate.
 //!
 //! # Architecture
 //! Every dispatch (`write_int32`, `read_configuration_from_hardware`, ...)
@@ -14,18 +14,14 @@
 //! thread).
 //!
 //! # Restructuring vs. C
-//! - **USB/Serial rejected at construction**, not merely left to fail at
-//!   connect time. C's constructor switch (`drvAmptek.cpp:140-153`) forces
-//!   `directMode=0` for `DppInterfaceUSB`/`DppInterfaceSerial` and
-//!   *proceeds* -- the driver instance exists but can never actually
-//!   connect (`ConnectDpp`'s USB branch needs `libusb`, its Serial branch is
-//!   an empty no-op; see [`crate`]'s module doc). [`AmptekDriver::new`]
-//!   instead returns `Err` for anything but the Ethernet interface, making
-//!   the feasibility gate visible at IOC-startup time (an iocsh
-//!   config-command failure) rather than a confusing later connect failure.
-//!   C's genuinely-unrecognized-type arm (`drvAmptek.cpp:148-152`) is
-//!   followed: the line is traced, and the port exists with no address, so
-//!   every connect fails until a `hostInfo` option write gives it one.
+//! - **USB rejected at construction**, not merely left to fail at connect
+//!   time: [`AmptekDriver::new`] returns `Err` for `DppInterfaceUSB` (see
+//!   [`crate`]'s module doc). Serial follows C: the constructor forces
+//!   `directMode=0` (`drvAmptek.cpp:140-147`) and `ConnectDpp`'s Serial
+//!   branch is empty, so the port exists and every connect fails. C's
+//!   unrecognized-type arm (`drvAmptek.cpp:148-152`) is followed too: the
+//!   line is traced, and the port exists with no address, so every connect
+//!   fails until a `hostInfo` option write gives it one.
 //! - **A successful `connect` always marks the user's address connected.**
 //!   C's `connect` (`drvAmptek.cpp:161-183`) calls `exceptionConnect` only
 //!   when it opened the DPP link itself, so an address asked while the
@@ -109,10 +105,11 @@ use crate::transport::AmptekUdpTransport;
 /// read: list 0.
 const PARAM_ADDR: i32 = 0;
 
-/// `DppInterface_t` (`DppConst.h`): only `DppInterfaceEthernet` (`0`) is
-/// accepted by [`AmptekDriver::new`] -- see the module doc's "USB/Serial
-/// rejected at construction" note.
+/// `DppInterface_t` (`DppConst.h`); `DppInterfaceUSB` (`1`) is rejected by
+/// [`AmptekDriver::new`] -- see the module doc's "USB rejected at
+/// construction" note.
 const DPP_INTERFACE_ETHERNET: i32 = 0;
+const DPP_INTERFACE_SERIAL: i32 = 2;
 
 /// `drvAmptek.cpp:51`: `#define MAX_FAILED_SENDS 10`.
 const MAX_FAILED_SENDS: u32 = 10;
@@ -336,6 +333,8 @@ pub struct AmptekDriver {
     mca: [usize; McaReason::COUNT],
     amptek: [usize; AmptekReason::COUNT],
     transport: AmptekUdpTransport,
+    /// `drvAmptek::interfaceType_`.
+    interface_type: i32,
     /// `drvAmptek::addressInfo_`: `None` is C's NULL, left by an unknown
     /// interface type until a `hostInfo` option write sets it.
     address_info: Option<String>,
@@ -370,9 +369,9 @@ pub struct AmptekDriver {
 
 impl AmptekDriver {
     /// `drvAmptekConfigure(portName, interfaceType, addressInfo, directMode)`
-    /// (`drvAmptek.cpp:63-159`). Returns `Err` for USB (`1`) and Serial
-    /// (`2`) -- see the module doc's "USB/Serial rejected at construction"
-    /// note; an unknown type builds C's address-less port.
+    /// (`drvAmptek.cpp:63-159`). Returns `Err` for USB (`1`) -- see the
+    /// module doc's "USB rejected at construction" note; an unknown type
+    /// builds C's address-less port.
     pub fn new(
         port_name: &str,
         interface_type: i32,
@@ -405,10 +404,15 @@ impl AmptekDriver {
             ));
             return Ok(driver);
         }
+        if interface_type == DPP_INTERFACE_SERIAL {
+            let mut driver = Self::with_transport(port_name, address_info, false, transport)?;
+            driver.interface_type = interface_type;
+            return Ok(driver);
+        }
         if interface_type != DPP_INTERFACE_ETHERNET {
             return Err(protocol_error(format!(
-                "unsupported interface type={interface_type}: only Ethernet (0) is supported \
-                 by this port (USB/Serial are feasibility-gated -- see the mca-amptek crate doc)"
+                "unsupported interface type={interface_type}: USB (1) is feasibility-gated \
+                 -- see the mca-amptek crate doc"
             )));
         }
         Self::with_transport(port_name, address_info, direct_mode, transport)
@@ -442,6 +446,7 @@ impl AmptekDriver {
             mca,
             amptek,
             transport,
+            interface_type: DPP_INTERFACE_ETHERNET,
             address_info: Some(address_info.to_string()),
             direct_mode,
             target: None,
@@ -606,6 +611,12 @@ impl AmptekDriver {
         let Some(address_info) = self.address_info.clone() else {
             return Err(protocol_error(""));
         };
+        if self.interface_type == DPP_INTERFACE_SERIAL {
+            // `ConnectDpp`'s Serial branch is empty: nothing is found.
+            return Err(protocol_error(format!(
+                "DPP device {address_info} not found, total devices found=0"
+            )));
+        }
         let ip = resolve_ipv4(&address_info)
             .ok_or_else(|| protocol_error(format!("Cannot resolve address: {address_info}")))?;
 
@@ -1794,9 +1805,21 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_usb_and_serial() {
+    fn new_rejects_usb() {
         assert!(AmptekDriver::new("test1", 1, "192.168.0.1", false).is_err());
-        assert!(AmptekDriver::new("test2", 2, "192.168.0.1", false).is_err());
+    }
+
+    /// C builds a Serial port with `directMode=0` whose every connect finds
+    /// nothing (`drvAmptek.cpp:144-147`, `ConsoleHelper.cpp:57-58`).
+    #[test]
+    fn a_serial_port_builds_and_never_connects() {
+        let mut driver = AmptekDriver::new("test2", 2, "/dev/ttyS0", true).unwrap();
+        assert!(!driver.direct_mode);
+        assert_eq!(
+            err_message(&connect(&mut driver).unwrap_err()),
+            "DPP device /dev/ttyS0 not found, total devices found=0"
+        );
+        assert!(driver.target.is_none());
     }
 
     /// C traces an unknown interface type and leaves the port with a NULL

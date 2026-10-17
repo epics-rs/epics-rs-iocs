@@ -9,9 +9,9 @@
 //! iocsh commands:
 //! * `drvAmptekConfigure(portName, interface, addressInfo, directMode)` — C
 //!   `drvAmptekConfigure` (`drvAmptek.cpp:1095-1098`). `interface` `0` is
-//!   Ethernet; USB (`1`) and Serial (`2`) are feasibility-gated (see the
-//!   `mca-amptek` crate doc) and rejected by
-//!   [`mca_amptek::driver::AmptekDriver::new`].
+//!   Ethernet; USB (`1`) is feasibility-gated (see the `mca-amptek` crate
+//!   doc) and rejected by [`mca_amptek::driver::AmptekDriver::new`]; Serial
+//!   (`2`) builds a port that never connects, as in C.
 //!   `directMode` is optional, defaulting to `0` (broadcast-discovery
 //!   connect) like the upstream iocsh call, which omits it entirely in
 //!   `st_base.cmd`.
