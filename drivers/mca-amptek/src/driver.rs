@@ -1,11 +1,11 @@
 //! `drvAmptek` -- the Amptek DP5/PX5/DP5G/MCA8000D/TB5/DP5-X asyn MCA/MCS
 //! driver, ported from `drvAmptek.cpp`/`drvAmptek.h` (`mcaApp/AmptekSrc`).
-//! Ethernet/UDP and C's never-connecting Serial port -- see [`crate`]'s
-//! module doc for the USB feasibility gate.
+//! Ethernet/UDP, USB over a supplied [`crate::usb::UsbBus`], and C's
+//! never-connecting Serial port.
 //!
 //! # Architecture
 //! Every dispatch (`write_int32`, `read_configuration_from_hardware`, ...)
-//! runs its UDP round trip inline, on whichever thread asyn-rs's
+//! runs its UDP or USB round trip inline, on whichever thread asyn-rs's
 //! `can_block: true` worker calls it from -- there is no separate
 //! command/response thread, matching upstream C's own single-threaded
 //! `CConsoleHelper` (the vendor SDK has no internal concurrency either; the
@@ -14,9 +14,9 @@
 //! thread).
 //!
 //! # Restructuring vs. C
-//! - **USB rejected at construction**, not merely left to fail at connect
-//!   time: [`AmptekDriver::new`] returns `Err` for `DppInterfaceUSB` (see
-//!   [`crate`]'s module doc). Serial follows C: the constructor forces
+//! - **USB without a bus is rejected at construction**:
+//!   [`AmptekDriver::new`] returns `Err` for `DppInterfaceUSB`, and
+//!   [`AmptekDriver::with_usb_bus`] builds the port. Serial follows C: the constructor forces
 //!   `directMode=0` (`drvAmptek.cpp:140-147`) and `ConnectDpp`'s Serial
 //!   branch is empty, so the port exists and every connect fails. C's
 //!   unrecognized-type arm (`drvAmptek.cpp:148-152`) is followed too: the
@@ -97,17 +97,18 @@ use mca::interface::McaReason;
 
 use crate::ascii_cmd;
 use crate::config::{self, ConfigFields, MAX_SCAS, ScaFields};
+use crate::link::DppLink;
 use crate::protocol::{self, ReceivedPacket, TransmitPacketType};
 use crate::status::{self, Dp5Status};
 use crate::transport::AmptekUdpTransport;
+use crate::usb::{DppLibUsb, UsbBus};
 
 /// The address C's single-argument `getIntegerParam(index)` and friends
 /// read: list 0.
 const PARAM_ADDR: i32 = 0;
 
 /// `DppInterface_t` (`DppConst.h`); `DppInterfaceUSB` (`1`) is rejected by
-/// [`AmptekDriver::new`] -- see the module doc's "USB rejected at
-/// construction" note.
+/// [`AmptekDriver::new`] -- see the module doc's "USB without a bus" note.
 const DPP_INTERFACE_ETHERNET: i32 = 0;
 const DPP_INTERFACE_SERIAL: i32 = 2;
 
@@ -327,24 +328,51 @@ fn insert_crlf_after_semicolons(data: &[u8]) -> String {
     s
 }
 
+/// `CConsoleHelper::ReceiveData` (`ConsoleHelper.cpp:690-733`) on the
+/// `DP5Proto`/`DP5Stat` state it updates; see [`AmptekDriver::receive_data`].
+fn receive_packet(
+    pin: &mut protocol::PacketHeader,
+    last_status: &mut Dp5Status,
+    spectrum: &mut Vec<i32>,
+    raw: &[u8],
+) -> Option<ReceivedPacket> {
+    let packet = protocol::parse_packet(raw, pin);
+    match &packet {
+        ReceivedPacket::Status { data } => *last_status = status::process_status(data),
+
+        ReceivedPacket::Spectrum { pid2, data } => {
+            // `ProcessSpectrumEx` (`ConsoleHelper.cpp:736-754`): an even
+            // PID2 carries the status block after the channels.
+            let (channels, values) = protocol::decode_spectrum(*pid2, data);
+            if pid2 & 1 == 0
+                && let Some(block) = data.get(channels * 3..channels * 3 + 64)
+            {
+                *last_status = status::process_status(block);
+            }
+            *spectrum = values;
+        }
+        ReceivedPacket::ConfigReadback { .. } | ReceivedPacket::Ack { .. } => {}
+        ReceivedPacket::Error { .. } => {
+            // C spelling (`ConsoleHelper.cpp:725`).
+            eprintln!("Error recevied");
+            return None;
+        }
+        ReceivedPacket::Unprocessed => return None,
+    }
+    Some(packet)
+}
+
 /// C's `drvAmptek` (`drvAmptek.h`).
 pub struct AmptekDriver {
     base: PortDriverBase,
     mca: [usize; McaReason::COUNT],
     amptek: [usize; AmptekReason::COUNT],
-    transport: AmptekUdpTransport,
-    /// `drvAmptek::interfaceType_`.
-    interface_type: i32,
+    /// `CH_`'s interface, selected by `drvAmptek::interfaceType_`; its
+    /// connection state is `CConsoleHelper::isConnected`.
+    link: DppLink,
     /// `drvAmptek::addressInfo_`: `None` is C's NULL, left by an unknown
     /// interface type until a `hostInfo` option write sets it.
     address_info: Option<String>,
-    direct_mode: bool,
-    /// `CConsoleHelper::isConnected` -- the confirmed device address, once
-    /// [`AmptekDriver::connect_device`] has probed it; `None` before the
-    /// first connect and after every disconnect (`connectDevice` re-resolves
-    /// `addressInfo_` fresh on each attempt, `drvAmptek.cpp:290-301`, so
-    /// nothing here is cached across a disconnect/reconnect cycle).
-    target: Option<Ipv4Addr>,
     /// `drvAmptek::acquiring_`.
     acquiring: bool,
     /// `drvAmptek::failedSends_`.
@@ -370,8 +398,8 @@ pub struct AmptekDriver {
 impl AmptekDriver {
     /// `drvAmptekConfigure(portName, interfaceType, addressInfo, directMode)`
     /// (`drvAmptek.cpp:63-159`). Returns `Err` for USB (`1`) -- see the
-    /// module doc's "USB rejected at construction" note; an unknown type
-    /// builds C's address-less port.
+    /// module doc's "USB without a bus" note; an unknown type builds C's
+    /// address-less port.
     pub fn new(
         port_name: &str,
         interface_type: i32,
@@ -397,7 +425,8 @@ impl AmptekDriver {
     ) -> AsynResult<Self> {
         if !(0..=2).contains(&interface_type) {
             // `drvAmptek.cpp:148-152`: the port exists, with no address.
-            let mut driver = Self::with_transport(port_name, address_info, direct_mode, transport)?;
+            let link = DppLink::ethernet(transport, direct_mode);
+            let mut driver = Self::with_link(port_name, address_info, link)?;
             driver.address_info = None;
             driver.trace_error(&format!(
                 "drvAmptek::drvAmptek unknown interface type={interface_type}"
@@ -405,25 +434,32 @@ impl AmptekDriver {
             return Ok(driver);
         }
         if interface_type == DPP_INTERFACE_SERIAL {
-            let mut driver = Self::with_transport(port_name, address_info, false, transport)?;
-            driver.interface_type = interface_type;
-            return Ok(driver);
+            return Self::with_link(port_name, address_info, DppLink::Serial);
         }
         if interface_type != DPP_INTERFACE_ETHERNET {
             return Err(protocol_error(format!(
-                "unsupported interface type={interface_type}: USB (1) is feasibility-gated \
-                 -- see the mca-amptek crate doc"
+                "unsupported interface type={interface_type}: USB (1) needs a UsbBus \
+                 (AmptekDriver::with_usb_bus)"
             )));
         }
-        Self::with_transport(port_name, address_info, direct_mode, transport)
+        Self::with_link(
+            port_name,
+            address_info,
+            DppLink::ethernet(transport, direct_mode),
+        )
     }
 
-    fn with_transport(
+    /// A USB port (`interfaceType` 1) whose libusb calls go to `bus`.
+    /// `address_info` is empty for the first DP5, else its serial number.
+    pub fn with_usb_bus(
         port_name: &str,
         address_info: &str,
-        direct_mode: bool,
-        transport: AmptekUdpTransport,
+        bus: Box<dyn UsbBus>,
     ) -> AsynResult<Self> {
+        Self::with_link(port_name, address_info, DppLink::Usb(DppLibUsb::new(bus)))
+    }
+
+    fn with_link(port_name: &str, address_info: &str, link: DppLink) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
             port_name,
             MAX_SCAS,
@@ -445,11 +481,8 @@ impl AmptekDriver {
             base,
             mca,
             amptek,
-            transport,
-            interface_type: DPP_INTERFACE_ETHERNET,
+            link,
             address_info: Some(address_info.to_string()),
-            direct_mode,
-            target: None,
             acquiring: false,
             failed_sends: 0,
             num_devices: 0,
@@ -491,12 +524,14 @@ impl AmptekDriver {
     /// which `exceptionConnect` marks: -1 the port, otherwise that device.
     fn do_connect(&mut self, user: &AsynUser) -> AsynResult<()> {
         let addr = self.base.get_address(user.addr, user.reason)?;
-        if self.target.is_none() {
+        if !self.link.is_connected() {
             if addr > 0 {
                 return Err(protocol_error(""));
             }
             if let Err(e) = self.connect_device(user) {
-                self.target = None;
+                // C defect not copied: C leaves the link open here, and a
+                // USB device it keeps claimed fails its next connect.
+                self.link.close();
                 self.num_devices = 0;
                 return Err(e);
             }
@@ -511,10 +546,10 @@ impl AmptekDriver {
     /// `addr`; reached also from [`Self::check_failed_comm`] and the
     /// `hostInfo` option write.
     fn do_disconnect(&mut self, addr: i32) {
-        if self.target.is_none() {
+        if !self.link.is_connected() {
             return;
         }
-        self.target = None;
+        self.link.close();
         self.num_devices = 0;
         self.base.set_addr_connected(addr, false);
         let _ = self.set_params_alarm(alarm_status::COMM_ALARM, AlarmSeverity::Invalid as u16);
@@ -536,28 +571,27 @@ impl AmptekDriver {
         Ok(())
     }
 
-    /// `CConsoleHelper::SendCommand` (`ConsoleHelper.cpp:85-104`, Ethernet
-    /// branch): send the fixed-shape request packet for `cmd` to `target`
-    /// and wait for a response, with no bookkeeping and no parsing -- both
-    /// are the caller's decision (see [`Self::send_command`] and
-    /// [`Self::receive_data`]).
-    fn raw_send(&self, target: Ipv4Addr, cmd: TransmitPacketType) -> AsynResult<Vec<u8>> {
+    /// `CConsoleHelper::SendCommand` (`ConsoleHelper.cpp:85-104`): send the
+    /// fixed-shape request packet for `cmd` and wait for a response, with
+    /// no bookkeeping and no parsing -- both are the caller's decision (see
+    /// [`Self::send_command`] and [`Self::receive_data`]).
+    fn raw_send(&mut self, cmd: TransmitPacketType) -> AsynResult<Vec<u8>> {
         let expected_size = if cmd == TransmitPacketType::SendStatus {
             72
         } else {
             24648
         };
         Ok(self
-            .transport
-            .send_packet_inet(target, &protocol::build_command(cmd), expected_size)?)
+            .link
+            .send(&protocol::build_command(cmd), expected_size)?)
     }
 
     /// `drvAmptek::sendCommand` (`drvAmptek.cpp:361-382`): success means
     /// only "got any response bytes". The bytes are C's `DP5Proto.PacketIn`,
     /// returned for the callers that go on to [`Self::receive_data`].
     fn send_command(&mut self, cmd: TransmitPacketType) -> AsynResult<Vec<u8>> {
-        let target = self.target.ok_or_else(disconnected_error)?;
-        let raw = self.raw_send(target, cmd)?;
+        self.require_connected()?;
+        let raw = self.raw_send(cmd)?;
         if raw.is_empty() {
             let msg = format!(
                 "drvAmptek::sendCommand error calling CH_.SendCommand({})",
@@ -579,29 +613,20 @@ impl AmptekDriver {
     /// response and update the cached status/spectrum its packet carries.
     /// `None` is C's `false` (a framing error or an unrouted PID).
     fn receive_data(&mut self, raw: &[u8]) -> Option<ReceivedPacket> {
-        let packet = protocol::parse_packet(raw, &mut self.pin);
-        match &packet {
-            ReceivedPacket::Status { data } => self.last_status = status::process_status(data),
-            ReceivedPacket::Spectrum { pid2, data } => {
-                // `ProcessSpectrumEx` (`ConsoleHelper.cpp:736-754`): an even
-                // PID2 carries the status block after the channels.
-                let (channels, values) = protocol::decode_spectrum(*pid2, data);
-                if pid2 & 1 == 0
-                    && let Some(block) = data.get(channels * 3..channels * 3 + 64)
-                {
-                    self.last_status = status::process_status(block);
-                }
-                self.spectrum = values;
-            }
-            ReceivedPacket::ConfigReadback { .. } | ReceivedPacket::Ack { .. } => {}
-            ReceivedPacket::Error { .. } => {
-                // C spelling (`ConsoleHelper.cpp:725`).
-                eprintln!("Error recevied");
-                return None;
-            }
-            ReceivedPacket::Unprocessed => return None,
+        receive_packet(
+            &mut self.pin,
+            &mut self.last_status,
+            &mut self.spectrum,
+            raw,
+        )
+    }
+
+    fn require_connected(&self) -> AsynResult<()> {
+        if self.link.is_connected() {
+            Ok(())
+        } else {
+            Err(disconnected_error())
         }
-        Some(packet)
     }
 
     /// `drvAmptek::connectDevice` (`drvAmptek.cpp:279-359`), tracing on the
@@ -611,18 +636,44 @@ impl AmptekDriver {
         let Some(address_info) = self.address_info.clone() else {
             return Err(protocol_error(""));
         };
-        if self.interface_type == DPP_INTERFACE_SERIAL {
-            // `ConnectDpp`'s Serial branch is empty: nothing is found.
-            return Err(protocol_error(format!(
-                "DPP device {address_info} not found, total devices found=0"
-            )));
-        }
-        let ip = resolve_ipv4(&address_info)
-            .ok_or_else(|| protocol_error(format!("Cannot resolve address: {address_info}")))?;
+        // `ConnectDpp`'s result and `NumDevices`, and whether the direct
+        // path took it.
+        let (confirmed, num_devices, direct) = match &mut self.link {
+            DppLink::Ethernet {
+                udp,
+                direct_mode,
+                dpp_addr,
+            } => {
+                let ip = resolve_ipv4(&address_info).ok_or_else(|| {
+                    protocol_error(format!("Cannot resolve address: {address_info}"))
+                })?;
+                let (confirmed, num_devices) = if *direct_mode {
+                    udp.connect_direct(ip)?
+                } else {
+                    udp.connect_default(ip)?
+                };
+                if confirmed {
+                    *dpp_addr = Some(ip);
+                }
+                (confirmed, num_devices, *direct_mode)
+            }
+            DppLink::Usb(usb) => {
+                // C copies `addressInfo_` into a 16-byte buffer as a format
+                // string first; neither the truncation nor the format is
+                // copied.
+                let (pin, last_status, spectrum) =
+                    (&mut self.pin, &mut self.last_status, &mut self.spectrum);
+                let (confirmed, num_devices) = usb.connect(&address_info, |reply, sn| {
+                    receive_packet(pin, last_status, spectrum, reply).is_some()
+                        && last_status.serial_number == Some(sn)
+                });
+                (confirmed, num_devices, false)
+            }
+            DppLink::Serial => (false, 0, false),
+        };
+        self.num_devices = num_devices;
 
-        if self.direct_mode {
-            let (confirmed, num_devices) = self.transport.connect_direct(ip)?;
-            self.num_devices = num_devices;
+        if direct {
             if !confirmed {
                 return Err(protocol_error(format!(
                     "Network DPP device {} not found",
@@ -641,8 +692,6 @@ impl AmptekDriver {
                 ),
             );
         } else {
-            let (confirmed, num_devices) = self.transport.connect_default(ip)?;
-            self.num_devices = num_devices;
             if !confirmed {
                 return Err(protocol_error(format!(
                     "DPP device {} not found, total devices found={}",
@@ -661,20 +710,23 @@ impl AmptekDriver {
                 ),
             );
         }
+        self.after_connect()
+    }
 
+    /// `drvAmptek::connectDevice` past `ConnectDpp` (`drvAmptek.cpp:330-358`).
+    fn after_connect(&mut self) -> AsynResult<()> {
         // `CH_.DP5Stat.m_DP5_Status.SerialNumber = 0;` before the status
         // round trip (`drvAmptek.cpp:330`) -- reset the whole cached status
         // to its zeroed baseline here rather than just the one field, so a
         // status round-trip failure right after a successful discovery
         // cannot leave a stale *previous* connection's status behind.
         self.last_status = status::process_status(&[0u8; 64]);
-        let raw = self.raw_send(ip, TransmitPacketType::SendStatus)?;
+        let raw = self.raw_send(TransmitPacketType::SendStatus)?;
         if raw.is_empty() {
             return Err(protocol_error(
                 "error calling SendCommand for XMTPT_SEND_STATUS",
             ));
         }
-        self.target = Some(ip);
         if self.receive_data(&raw).is_none() {
             return Err(protocol_error(
                 "calling ReceiveData() for XMTPT_SEND_STATUS",
@@ -722,12 +774,12 @@ impl AmptekDriver {
 
     /// `drvAmptek::sendCommandString` (`drvAmptek.cpp:437-477`).
     fn send_command_string(&mut self, command_string: &str) -> AsynResult<()> {
-        let target = self.target.ok_or_else(disconnected_error)?;
+        self.require_connected()?;
         self.trace_io(&format!(
             "drvAmptek::sendCommandString sending configuration string:\n{command_string}\n"
         ));
         let packet = protocol::build_config_packet_ex(command_string);
-        let send_status: AsynResult<()> = match self.raw_config_round_trip(target, packet) {
+        let send_status: AsynResult<()> = match self.raw_config_round_trip(packet) {
             Ok(raw) if raw.is_empty() => {
                 let msg = format!(
                     "drvAmptek::sendCommandString error calling \
@@ -778,8 +830,8 @@ impl AmptekDriver {
         }
     }
 
-    fn raw_config_round_trip(&self, target: Ipv4Addr, packet: Vec<u8>) -> AsynResult<Vec<u8>> {
-        Ok(self.transport.send_packet_inet(target, &packet, 8)?)
+    fn raw_config_round_trip(&mut self, packet: Vec<u8>) -> AsynResult<Vec<u8>> {
+        Ok(self.link.send(&packet, 8)?)
     }
 
     /// `drvAmptek::saveConfigurationFile` (`drvAmptek.cpp:384-398`).
@@ -1018,7 +1070,7 @@ impl AmptekDriver {
 
     /// `drvAmptek::readConfigurationFromHardware` (`drvAmptek.cpp:1028-1066`).
     fn read_configuration_from_hardware(&mut self) -> AsynResult<()> {
-        let target = self.target.ok_or_else(disconnected_error)?;
+        self.require_connected()?;
         let dpp_type = self.last_status.dpp_type;
         let query = ascii_cmd::create_full_readback_cmd(
             self.last_status.pc5_present,
@@ -1035,7 +1087,7 @@ impl AmptekDriver {
         let mut raw = Vec::new();
         let mut sent = false;
         for _ in 0..100 {
-            raw = self.raw_config_round_trip(target, packet.clone())?;
+            raw = self.raw_config_round_trip(packet.clone())?;
             if !raw.is_empty() {
                 sent = true;
                 break;
@@ -1180,9 +1232,7 @@ impl PortDriver for AmptekDriver {
 
     /// `drvAmptek::writeInt32` (`drvAmptek.cpp:846-924`).
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        if self.target.is_none() {
-            return Err(disconnected_error());
-        }
+        self.require_connected()?;
         let addr = self.base.get_address(user.addr, user.reason)?;
         let reason = user.reason;
         let mut status = self.base.set_int32_param(reason, addr, value);
@@ -1274,9 +1324,7 @@ impl PortDriver for AmptekDriver {
     /// unconditionally sends the full configuration, regardless of which
     /// param changed.
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        if self.target.is_none() {
-            return Err(disconnected_error());
-        }
+        self.require_connected()?;
         let addr = self.base.get_address(user.addr, user.reason)?;
         self.base.set_float64_param(user.reason, addr, value)?;
         let status = self.send_configuration();
@@ -1422,7 +1470,8 @@ mod tests {
     ) -> (AmptekDriver, FakeDp5) {
         let (fake, port) = FakeDp5::spawn(reply);
         let transport = AmptekUdpTransport::bind_on_command_port(port).unwrap();
-        let driver = AmptekDriver::with_transport("fake", "127.0.0.1", true, transport).unwrap();
+        let link = DppLink::ethernet(transport, true);
+        let driver = AmptekDriver::with_link("fake", "127.0.0.1", link).unwrap();
         (driver, fake)
     }
 
@@ -1636,7 +1685,8 @@ mod tests {
         // No broadcast interface: the search finds nothing.
         let transport = AmptekUdpTransport::bind_on_command_port(1).unwrap();
         let mut driver =
-            AmptekDriver::with_transport("fake", "127.0.0.1", false, transport).unwrap();
+            AmptekDriver::with_link("fake", "127.0.0.1", DppLink::ethernet(transport, false))
+                .unwrap();
         let err = connect(&mut driver).unwrap_err();
         assert_eq!(
             err_message(&err),
@@ -1814,12 +1864,12 @@ mod tests {
     #[test]
     fn a_serial_port_builds_and_never_connects() {
         let mut driver = AmptekDriver::new("test2", 2, "/dev/ttyS0", true).unwrap();
-        assert!(!driver.direct_mode);
+        assert!(matches!(driver.link, DppLink::Serial));
         assert_eq!(
             err_message(&connect(&mut driver).unwrap_err()),
             "DPP device /dev/ttyS0 not found, total devices found=0"
         );
-        assert!(driver.target.is_none());
+        assert!(!driver.link.is_connected());
     }
 
     /// C traces an unknown interface type and leaves the port with a NULL
@@ -1975,6 +2025,88 @@ mod tests {
         );
     }
 
+    /// A USB driver over DP5s reporting serial numbers `serials`.
+    fn usb_driver(
+        address: &str,
+        serials: &[u8],
+    ) -> (AmptekDriver, Arc<Mutex<crate::usb::fake::Log>>) {
+        use crate::usb::fake::{FakeBus, FakeDevice};
+        let devices = serials
+            .iter()
+            .map(|&sn| {
+                let mut status = [0u8; 64];
+                status[26] = sn;
+                FakeDevice::dp5(move |req| {
+                    default_reply(req, &status).ok_or(crate::usb::UsbError::Timeout)
+                })
+            })
+            .collect();
+        let bus = FakeBus::new(devices);
+        let log = bus.log.clone();
+        let driver = AmptekDriver::with_usb_bus("usb", address, Box::new(bus)).unwrap();
+        (driver, log)
+    }
+
+    /// `LibUsb_Connect_DPP_by_SN` opens each DP5 until one reports the
+    /// serial; later commands go to that one.
+    #[test]
+    fn a_usb_serial_number_connects_the_device_that_reports_it() {
+        let (mut driver, log) = usb_driver("9", &[7, 9]);
+        connect(&mut driver).unwrap();
+        let idx = driver.amptek[AmptekReason::SerialNumber as usize];
+        assert_eq!(driver.base.get_int32_param(idx, 0).unwrap(), 9);
+        let log = log.lock().unwrap();
+        assert_eq!(log.opened, vec![0, 1]);
+        assert_eq!(log.released, vec![0]);
+        assert!(log.sent.iter().skip(1).all(|sent| sent.0 == 1));
+    }
+
+    #[test]
+    fn an_empty_usb_address_connects_the_first_dp5() {
+        let (mut driver, log) = usb_driver("", &[7, 9]);
+        connect(&mut driver).unwrap();
+        let idx = driver.amptek[AmptekReason::SerialNumber as usize];
+        assert_eq!(driver.base.get_int32_param(idx, 0).unwrap(), 7);
+        assert_eq!(log.lock().unwrap().opened, vec![0]);
+    }
+
+    #[test]
+    fn an_unmatched_usb_serial_number_is_not_found() {
+        let (mut driver, _) = usb_driver("5", &[7, 9]);
+        assert_eq!(
+            err_message(&connect(&mut driver).unwrap_err()),
+            "DPP device 5 not found, total devices found=0"
+        );
+    }
+
+    /// C keeps the device claimed when the status query after `ConnectDpp`
+    /// fails; it is released here, so the next connect can claim it.
+    #[test]
+    fn a_failed_usb_connect_releases_the_device() {
+        use crate::usb::fake::{FakeBus, FakeDevice};
+        let bus = FakeBus::new(vec![FakeDevice::dp5(|_| {
+            Err(crate::usb::UsbError::Timeout)
+        })]);
+        let log = bus.log.clone();
+        let mut driver = AmptekDriver::with_usb_bus("usb", "", Box::new(bus)).unwrap();
+        assert_eq!(
+            err_message(&connect(&mut driver).unwrap_err()),
+            "error calling SendCommand for XMTPT_SEND_STATUS"
+        );
+        assert!(!driver.link.is_connected());
+        assert_eq!(log.lock().unwrap().released, vec![0]);
+    }
+
+    /// `disconnect` closes the USB connection (`drvAmptek.cpp:190`).
+    #[test]
+    fn disconnect_releases_the_usb_device() {
+        let (mut driver, log) = usb_driver("", &[7]);
+        connect(&mut driver).unwrap();
+        driver.do_disconnect(0);
+        assert!(!driver.link.is_connected());
+        assert_eq!(log.lock().unwrap().released, vec![0]);
+    }
+
     /// `checkFailedComm` disconnects `pasynUserSelf`, device 0.
     #[test]
     fn failed_comm_disconnects_device_0_not_the_port() {
@@ -1983,7 +2115,7 @@ mod tests {
         driver.connect_addr(&AsynUser::new(0).with_addr(0)).unwrap();
         driver.failed_sends = MAX_FAILED_SENDS;
         driver.check_failed_comm("test");
-        assert!(driver.target.is_none());
+        assert!(!driver.link.is_connected());
         assert!(!driver.base.is_device_connected(0));
         assert!(driver.base.is_connected());
     }
@@ -1997,7 +2129,9 @@ mod tests {
             .base
             .set_param_status(gain, 3, AsynStatus::Timeout, 0, 0)
             .unwrap();
-        driver.target = Some(Ipv4Addr::LOCALHOST);
+        if let DppLink::Ethernet { dpp_addr, .. } = &mut driver.link {
+            *dpp_addr = Some(Ipv4Addr::LOCALHOST);
+        }
         driver.do_disconnect(0);
 
         let invalid = AlarmSeverity::Invalid as u16;

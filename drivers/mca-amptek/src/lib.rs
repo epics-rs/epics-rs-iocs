@@ -15,13 +15,12 @@
 //!   (`NetFinder.cpp`).
 //! * [`transport`] -- the Ethernet/UDP transport (`DppSocket.cpp`'s
 //!   `DppInterfaceEthernet` path).
+//! * [`usb`] -- the USB transport (`DppLibUsb.cpp` and `ConsoleHelper.cpp`'s
+//!   `LibUsb_*`) over a [`usb::UsbBus`]. [`driver::AmptekDriver::new`] has
+//!   no bus to give it and rejects interface 1;
+//!   [`driver::AmptekDriver::with_usb_bus`] takes one.
 //! * [`driver`] -- the asyn `PortDriver` implementation
 //!   (`drvAmptek.cpp`/`drvAmptek.h`).
-//!
-//! **Not ported** (feasibility-gated, see the crate's port report rather
-//! than this doc for the full determination):
-//! * USB (`DppLibUsb.cpp`, `libusb`-based) -- needs a Rust USB crate
-//!   (`rusb`/`nusb`) not currently in this workspace.
 //!
 //! Serial (`DppInterfaceSerial`) is unimplemented in the C driver itself
 //! (`ConnectDpp`'s and `SendCommand`'s serial branches are empty), so a
@@ -30,7 +29,9 @@
 pub mod ascii_cmd;
 pub mod config;
 pub mod driver;
+mod link;
 pub mod net_finder;
 pub mod protocol;
 pub mod status;
 pub mod transport;
+pub mod usb;

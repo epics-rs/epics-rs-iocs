@@ -2,8 +2,7 @@
 //! `CDppSocket`'s send/receive primitives (`DppSocket.cpp`) and the
 //! connect sequences `CConsoleHelper::DppSocket_Connect_Direct_DPP`/
 //! `DppSocket_Connect_Default_DPP` drive (`ConsoleHelper.cpp:300-374`).
-//! `DppLibUsb`/USB and `DppInterfaceSerial` are out of scope -- see the
-//! crate-level feasibility note in `lib.rs`.
+//! USB is [`crate::usb`].
 //!
 //! # Restructuring vs. C
 //! C's `CDppSocket::UDPRecvFrom` sets the socket non-blocking, attempts a
