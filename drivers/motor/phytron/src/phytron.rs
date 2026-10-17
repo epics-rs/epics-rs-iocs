@@ -456,6 +456,9 @@ pub struct PhytronController {
     axes: BTreeMap<i32, String>,
     /// C `lastStatus_`, the controller-wide status `CHECK_AXIS` compares.
     last_status: i32,
+    /// C's `motorEncoderRatio_` by axis prefix, which a controller reset
+    /// sets back to 1 (phytronAxisMotor.cpp:821-827); an absent axis's is 1.
+    encoder_ratios: HashMap<String, f64>,
 }
 
 impl PhytronController {
@@ -469,6 +472,7 @@ impl PhytronController {
             last_sui: String::new(),
             axes: BTreeMap::new(),
             last_status: 0,
+            encoder_ratios: HashMap::new(),
         }
     }
 
@@ -598,9 +602,6 @@ pub struct PhytronAxis {
     /// Limit-home state machine (C `homeState_`): 0 = idle, else bit0 = homing
     /// direction (1 = forward/high), bits>>1 = phase.
     home_state: i32,
-    /// C's `motorEncoderRatio_` (1 at phytronAxisMotor.cpp:1353): the poll
-    /// reports `P22R` times it (:2005-2006).
-    encoder_ratio: f64,
 }
 
 impl PhytronAxis {
@@ -636,7 +637,6 @@ impl PhytronAxis {
             axis_module_no,
             motor_enabled: false,
             home_state: 0,
-            encoder_ratio: 1.0,
         })
     }
 
@@ -704,8 +704,9 @@ impl AsynMotor for PhytronAxis {
     fn set_encoder_ratio(&mut self, _user: &AsynUser, ratio: f64) -> AsynResult<()> {
         // asynMotorController::writeFloat64 stores the ratio before
         // dispatching, so a refused command still scales the poll (:289).
-        self.encoder_ratio = ratio;
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
+        ctrl.encoder_ratios
+            .insert(self.axis_module_no.clone(), ratio);
         let set = ctrl.set_char();
         let m = self.axis_module_no.as_str();
         ctrl.command(&format!("{m}P22R"))?
@@ -836,7 +837,9 @@ impl AsynMotor for PhytronAxis {
         let (pos, enc, moving, status) = {
             let ctrl = self.lock();
             let m = self.axis_module_no.as_str();
-            match self.ctrl_type {
+            // The poll reports `P22R` times the ratio (:2005-2006).
+            let ratio = ctrl.encoder_ratios.get(m).copied().unwrap_or(1.0);
+            let (pos, enc, moving, status) = match self.ctrl_type {
                 CtrlType::Phymotion => {
                     let pos = atof(&ctrl.command(&format!("{m}P20R"))?);
                     let enc = atof(&ctrl.command(&format!("{m}P22R"))?);
@@ -854,7 +857,8 @@ impl AsynMotor for PhytronAxis {
                     let status = self.mcc_status_word(&perr, &ctrl.last_sui, moving)?;
                     (pos, enc, moving, status)
                 }
-            }
+            };
+            (pos, enc * ratio, moving, status)
         };
 
         // Limit-home state machine (C parseAnswer). `problem` is the axis
@@ -874,7 +878,7 @@ impl AsynMotor for PhytronAxis {
 
         Ok(MotorStatus {
             position: pos,
-            encoder_position: enc * self.encoder_ratio,
+            encoder_position: enc,
             done: !moving,
             moving,
             high_limit: high,
