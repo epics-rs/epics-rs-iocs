@@ -879,6 +879,12 @@ impl PortDriver for LoveDriver {
         self.do_write(user, value).map_err(|e| self.record_error(e))
     }
 
+    /// drvLove.c has no getBounds, so C's is asynInt32Base's
+    /// `*low = *high = 0` (asynInt32Base.c:99).
+    fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
+        Ok((0, 0))
+    }
+
     /// C `readUInt32` (`drvLove.c:1296-1333`) -- the `mask` argument is
     /// accepted but never applied by the C driver's own body (only used in
     /// a trace-log format string); the mask is applied here to match the
@@ -1735,5 +1741,21 @@ mod tests {
             at += found + line.len();
         }
         assert!(!dev.contains("drvLove::executeCommand"), "{dev:?}");
+    }
+
+    #[test]
+    fn get_bounds_is_asyn_int32_base_s() {
+        let mut base = PortDriverBase::new(
+            "LOVETESTBND",
+            1,
+            PortFlags {
+                multi_device: false,
+                can_block: true,
+                destructible: true,
+            },
+        );
+        base.set_auto_connect(false);
+        let love = love_on(TimeoutSerial { base }, "LOVETESTBNDL");
+        assert_eq!(love.get_bounds_int32(&AsynUser::default()).unwrap(), (0, 0));
     }
 }

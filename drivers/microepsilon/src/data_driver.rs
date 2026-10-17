@@ -390,6 +390,12 @@ impl PortDriver for DataDriver {
         )))
     }
 
+    /// capaNCDT6200Sup.c has no getBounds, so C's is asynInt32Base's
+    /// `*low = *high = 0` (asynInt32Base.c:99).
+    fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
+        Ok((0, 0))
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         if user.reason == PUSH_DISP_REASON {
             return self.apply_pending_push();
@@ -905,6 +911,15 @@ mod tests {
         // Second write must not attempt to re-take the (already-taken) handle.
         driver.write_int32(&mut user, 4).unwrap();
         assert_eq!(driver.shared.lock().unwrap().num_meas_chans_avail, 4);
+    }
+
+    #[test]
+    fn get_bounds_is_asyn_int32_base_s() {
+        let (driver, _keep_alive) = make_test_driver();
+        assert_eq!(
+            driver.get_bounds_int32(&AsynUser::default()).unwrap(),
+            (0, 0)
+        );
     }
 
     #[test]

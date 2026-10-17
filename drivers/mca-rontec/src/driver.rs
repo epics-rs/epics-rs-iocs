@@ -628,6 +628,11 @@ impl PortDriver for RontecDriver {
         Ok(())
     }
 
+    /// C `getBounds` (`drvMcaRontec.c:427-433`): `*low = *high = 0`.
+    fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
+        Ok((0, 0))
+    }
+
     /// C `drvUserCreate` (`drvMcaRontec.c:503-524`): case-insensitive
     /// (`epicsStrCaseCmp`).
     fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
@@ -815,6 +820,12 @@ mod tests {
 
     /// The division-by-zero fix: `NumChannels(0)` must not touch `binning`
     /// (module doc).
+    #[test]
+    fn get_bounds_is_c_s_zero_zero() {
+        let d = dummy_driver();
+        assert_eq!(d.get_bounds_int32(&AsynUser::default()).unwrap(), (0, 0));
+    }
+
     #[test]
     fn set_num_channels_guards_against_a_zero_value() {
         let mut d = dummy_driver();
