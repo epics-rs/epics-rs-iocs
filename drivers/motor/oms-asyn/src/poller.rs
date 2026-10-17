@@ -338,6 +338,8 @@ impl OmsPoller {
                 st.done = false;
                 st.moving = true;
             }
+            // One C param, motorStatusMoving_, is both the pace and the bit.
+            st.msta_moving = st.moving;
             self.any_moving |= st.moving;
 
             if let Some(flags) = limits {
@@ -647,14 +649,17 @@ mod tests {
 
         let user = AsynUser::default();
         let x = rig.axes[0].poll(&user).unwrap();
-        assert_eq!((x.done, x.moving, x.problem), (false, true, false));
+        assert_eq!(
+            (x.done, x.moving, x.msta_moving, x.problem),
+            (false, true, true, false)
+        );
         assert_eq!((x.position, x.encoder_position), (100.0, 7.0));
         assert!(x.slip_stall && x.direction && !x.home);
         assert!(!x.gain_support, "C sets 0 for an `on` field");
         assert!(!x.low_limit && !x.high_limit);
 
         let y = rig.axes[1].poll(&user).unwrap();
-        assert_eq!((y.done, y.moving), (true, false));
+        assert_eq!((y.done, y.moving, y.msta_moving), (true, false, false));
         assert_eq!((y.position, y.encoder_position), (-5.0, 0.0));
         assert!(!y.direction && y.home && y.gain_support);
         assert!(y.low_limit && y.high_limit, "LT? =l inverts a clear flag");

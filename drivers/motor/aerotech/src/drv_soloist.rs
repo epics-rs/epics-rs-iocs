@@ -381,6 +381,7 @@ impl AsynMotor for DrvSoloistAxis {
         status.powered = axis_status & ENABLED_BIT != 0;
         status.encoder_home = axis_status & HOME_MARKER_BIT != 0;
         status.moving = axis_status & IN_MOTION_BIT != 0;
+        status.msta_moving = status.moving;
         status.high_limit = fault & CW_FAULT_BIT != 0;
         status.low_limit = fault & CCW_FAULT_BIT != 0;
         let ls_active =
@@ -419,6 +420,34 @@ mod tests {
         assert_eq!(decimals(1.0), 2);
         assert_eq!(decimals(1.0 / 3.0), 2);
         assert_eq!(decimals(1000.0), 1);
+    }
+
+    #[test]
+    fn in_motion_sets_the_msta_moving_bit() {
+        use motor_common::testing::LineRig;
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let bits = Arc::new(AtomicI32::new(IN_MOTION_BIT));
+        let read = bits.clone();
+        let (_line, io) = LineRig::new("soloistMsta", move |sent| {
+            if sent.starts_with("AXISSTATUS()") {
+                format!("%{}", read.load(Ordering::Relaxed))
+            } else {
+                "%0".into()
+            }
+        });
+        let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+        let setup = AxisSetup {
+            encoder: false,
+            gain: false,
+            resolution: 1.0,
+            digits: 0,
+            home_dparam: 0,
+        };
+        let mut axis = DrvSoloistAxis::new(card, setup);
+        let user = AsynUser::new(0);
+        assert!(axis.poll(&user).unwrap().msta_moving);
+        bits.store(IN_POSITION_BIT, Ordering::Relaxed);
+        assert!(!axis.poll(&user).unwrap().msta_moving);
     }
 
     /// drvSoloist.cc:222-251: a first missed `AXISSTATUS()` is RETRY

@@ -517,6 +517,7 @@ impl AsynMotor for SpiiPlusAxis {
             velocity,
             done: d.done,
             moving: d.moving,
+            msta_moving: d.moving,
             high_limit: d.plus_ls,
             low_limit: d.minus_ls,
             direction: d.direction,
@@ -543,6 +544,27 @@ mod tests {
         assert!(matches!(CommandMode::parse("BUF"), CommandMode::Buffer));
         assert!(matches!(CommandMode::parse("xyz"), CommandMode::Buffer));
         assert!(matches!(CommandMode::parse(""), CommandMode::Buffer));
+    }
+
+    #[test]
+    fn inmotion_sets_the_msta_moving_bit() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let mst = Arc::new(AtomicI32::new(MST_INMOTION));
+        let read = mst.clone();
+        let (_rig, io) =
+            motor_common::testing::LineRig::new("acsT80Msta", move |sent| match sent {
+                "?VR" => "v1".into(),
+                "?APOS(0)" => "0".into(),
+                s if s.starts_with("?APOS(") => "?".into(),
+                "?D/MST(0)" => read.load(Ordering::Relaxed).to_string(),
+                _ => "0".into(),
+            });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
+        let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        assert!(axis.poll(&user).unwrap().msta_moving);
+        mst.store(MST_INPOSITION, Ordering::Relaxed);
+        assert!(!axis.poll(&user).unwrap().msta_moving);
     }
 
     #[test]
