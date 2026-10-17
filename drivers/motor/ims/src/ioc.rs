@@ -71,7 +71,7 @@ pub fn ims_create_controller_command() -> CommandDef {
                  IOPortName={io_port}, devName={device_name} "
             );
             set_eos_ignored(&handle, INPUT_EOS, OUTPUT_EOS);
-            let line = ImsLine::new(handle, device_name);
+            let line = ImsLine::new(handle, device_name, &motor_port);
             // The port C's constructor builds first; it needs the line here.
             let owner = ctx.db().scan_control().interrupt_gate();
             let port =
@@ -422,6 +422,44 @@ mod extra_params {
         io.write_int32(save, 1).unwrap();
         assert_eq!(not_polled(line.sent()), ["AS"]);
         assert_eq!(io.read_int32(save).unwrap(), 1);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:525, :552 and
+    /// ImsMDrivePlusMotorController.cpp:369: a sent `S` or `CF` prints its
+    /// writeController line, then its axis method's IO_DRIVER line.
+    #[epics_rs::base::epics_test]
+    async fn a_sent_ims_write_prints_its_io_driver_lines() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let (line, io) = failing_controller("imsIoNvm", "imsIoNvmLine", 3.6e6, |_| false).await;
+        let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
+        let clear = io.drv_user_create("IMS_CLEARLRERROR").unwrap();
+        let path = std::env::temp_dir().join(format!("imsIoNvm-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("imsIoNvm"), TraceMask::IO_DRIVER);
+        trace.set_trace_file(Some("imsIoNvm"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("imsIoNvm", 0, TraceFile::File(file));
+        line.sent();
+        io.write_int32(save, 1).unwrap();
+        io.write_int32(clear, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .filter(|l| !l.contains("writeInt32"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "ImsMDrivePlusMotorDriver:writeController(): deviceName=A, command=AS",
+                "ImsMDrivePlusMotorDriver:saveToNVM(): Saved to NVM",
+                "ImsMDrivePlusMotorDriver:writeController(): deviceName=A, command=ACF",
+                "ImsMDrivePlusMotorDriver:clearLockedRotor(): Clear Locked Rotor Error",
+            ],
+            "{text}"
+        );
     }
 
     /// ImsMDrivePlusMotorAxis.cpp:528-532 then
