@@ -135,9 +135,6 @@
 //! - **`recv_mess(..., FLUSH)`**: C flushes buffered input only before
 //!   retrying after a non-`NORMAL` comm state; this port flushes before every
 //!   query (`exchange`), a superset that also covers that retry.
-//! - **PREM/POST** (record pre/post-move command strings): handled generically
-//!   by this workspace's motor-rs record layer, not per-driver, matching
-//!   every other port here.
 //! - **`no_motion_count`**: purely a model-1 poll-rate scheduling counter
 //!   (decides how eagerly `motor_task` re-polls); the position/encoder
 //!   fields it gates are unconditionally set to the same value either way, so

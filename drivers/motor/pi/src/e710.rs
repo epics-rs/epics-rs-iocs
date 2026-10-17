@@ -84,9 +84,9 @@
 //!
 //! ## Not-modeled deviations
 //! `recv_mess(FLUSH)` (the pre-poll flush when comms are already errored) is
-//! replaced by a flush before every query (`exchange`). `no_motion_count` and post-move `PREM`/`POST` strings are not
-//! modeled — the moving/idle poll cadence and the record's own retry logic
-//! cover the same ground, as in the other PI ports.
+//! replaced by a flush before every query (`exchange`). `no_motion_count` is
+//! not modeled — the moving/idle poll cadence and the record's own retry
+//! logic cover the same ground, as in the other PI ports.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
