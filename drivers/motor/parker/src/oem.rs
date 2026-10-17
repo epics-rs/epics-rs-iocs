@@ -43,7 +43,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue,
+    ControllerParams, FinishedWrite, WriteHook, WriteOutcome, WriteValue,
 };
 
 use motor_common::util::{atof, leading_hex};
@@ -174,8 +174,7 @@ impl OemController {
     }
 }
 
-/// `OEMController::writeInt32` for `OEM_RESOLUTION`: `MR` to the
-/// controller and the axis's `pulsesPerUnit_`.
+/// `OEMController`'s `OEM_RESOLUTION` parameter; its write hook runs `MR`.
 pub struct OemParams {
     controller: Arc<Mutex<OemController>>,
     resolution: Option<usize>,
@@ -190,18 +189,31 @@ impl OemParams {
     }
 }
 
-/// `OEMController::writeInt32` / `writeFloat64`'s closing line, which the
-/// record's writes reach as well as the port's.
-struct OemWriteHook;
+/// `OEMController::writeInt32` / `writeFloat64` after the base: for
+/// `OEM_RESOLUTION` the `MR` command, whose status the write returns, then
+/// the closing line, which the record's writes reach as well as the port's.
+struct OemWriteHook {
+    controller: Arc<Mutex<OemController>>,
+    resolution: Option<usize>,
+}
 
 impl WriteHook for OemWriteHook {
     fn after_write(&self, write: &FinishedWrite<'_>) -> WriteOutcome {
         let function = write.function;
-        let (method, value) = match write.value {
-            WriteValue::Int32(v) => ("writeInt32", v.to_string()),
-            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}")),
+        let (method, value, mr) = match write.value {
+            WriteValue::Int32(v) => ("writeInt32", v.to_string(), Some(v)),
+            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}"), None),
         };
-        match write.status {
+        let status = match mr.filter(|_| self.resolution == Some(function)) {
+            Some(v) => {
+                let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+                let status = ctrl.command(&format!("{}MR{v}", write.addr + 1));
+                ctrl.pulses_per_unit[write.addr as usize] = f64::from(v);
+                Some(status)
+            }
+            None => None,
+        };
+        match status.as_ref().unwrap_or(write.status) {
             Err(e) => write.print(
                 TraceMask::ERROR,
                 format_args!(
@@ -214,7 +226,10 @@ impl WriteHook for OemWriteHook {
                 format_args!("OEMMotorDriver:{method}: function={function}, value={value}\n"),
             ),
         }
-        WriteOutcome::default()
+        WriteOutcome {
+            status,
+            ..WriteOutcome::default()
+        }
     }
 }
 
@@ -225,17 +240,10 @@ impl ControllerParams for OemParams {
     }
 
     fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
-        Some(Arc::new(OemWriteHook))
-    }
-
-    fn write_int32(&mut self, _: &mut PortDriverBase, user: &AsynUser, value: i32) -> ParamWrite {
-        if self.resolution != Some(user.reason) {
-            return ParamWrite::PassToBase(Ok(()));
-        }
-        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
-        let status = ctrl.command(&format!("{}MR{value}", user.addr + 1));
-        ctrl.pulses_per_unit[user.addr as usize] = f64::from(value);
-        status.into()
+        Some(Arc::new(OemWriteHook {
+            controller: self.controller.clone(),
+            resolution: self.resolution,
+        }))
     }
 }
 
@@ -425,6 +433,7 @@ mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::port::DrvUserRequest;
     use epics_rs::asyn::registry::open_owner;
     use epics_rs::asyn::trace::TraceFile;
     use epics_rs::motor::builder::MotorBuilder;
@@ -513,5 +522,50 @@ mod tests {
         for (line, want) in mine.iter().zip(&want) {
             assert!(line.ends_with(want.as_str()), "{line:?} vs {want:?}");
         }
+    }
+
+    #[test]
+    fn resolution_runs_mr_after_the_base_and_returns_its_status() {
+        let (handle, _) = SyncIOHandle::connect_port(
+            "OEM_NONE",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let ctrl = Arc::new(Mutex::new(OemController::new(handle, 2)));
+        let port =
+            register_controller_port(&open_owner(), "oemMr", 2, OemParams::new(ctrl.clone()))
+                .unwrap();
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(OemAxis::new(ctrl.clone(), 1)));
+        let user = TraceUser::Asyn {
+            port: "oemMr".into(),
+            addr: 1,
+        };
+        register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
+        let reason = port
+            .drv_user_create_blocking(&DrvUserRequest::new("OEM_RESOLUTION", 1))
+            .unwrap()
+            .reason;
+        let mut status = None;
+        let lines = traced("oemMr", || {
+            status = Some(port.write_int32_blocking(reason, 1, 4000));
+        });
+        // The base stored the value; MR to the missing port failed after it.
+        assert!(status.unwrap().is_err());
+        assert_eq!(port.read_int32_blocking(reason, 1).unwrap(), 4000);
+        assert_eq!(ctrl.lock().unwrap().pulses_per_unit[1], 4000.0);
+        // The base's line, then the closing line with MR's (disconnected) status.
+        let mine: Vec<_> = lines.iter().filter(|l| l.contains("writeInt32")).collect();
+        assert_eq!(mine.len(), 2, "{lines:?}");
+        assert!(
+            mine[0].contains("asynMotorController:writeInt32"),
+            "{lines:?}"
+        );
+        assert!(
+            mine[1].ends_with(&format!(
+                "OEMMotorDriver:writeInt32: error, status=3 function={reason}, value=4000"
+            )),
+            "{lines:?}"
+        );
     }
 }
