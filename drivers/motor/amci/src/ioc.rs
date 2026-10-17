@@ -443,6 +443,22 @@ mod tests {
         );
     }
 
+    /// A user at address -1 resets axis 0, getAddress's axis for it
+    /// (asynPortDriver.cpp:1901-1914).
+    #[epics_rs::base::epics_test]
+    async fn anf2_reset_errors_at_address_minus_one_resets_axis_0() {
+        anf2_report("anf2ResetM1", 0).await;
+        crate::regs::fake::written("anf2ResetM1Out");
+        assert_eq!(
+            put_int32("anf2ResetM1", "ANF2_RESET_ERRORS", -1, 1).await,
+            1
+        );
+        assert_eq!(
+            crate::regs::fake::written("anf2ResetM1Out"),
+            [(0, vec![0x800 << 16, 0, 0, 0, 0])]
+        );
+    }
+
     /// A 1 on `ANF2_GET_INFO` runs `getInfo` (ANF2Driver.cpp:498-513): a
     /// force read at the axis's input block. Unpolled, so the poller's own
     /// force reads cannot land in between.
