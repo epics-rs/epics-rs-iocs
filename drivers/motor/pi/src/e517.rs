@@ -287,6 +287,11 @@ pub struct PIE517Axis {
     controller: Arc<Mutex<PIE517Controller>>,
     axis: usize,
     prev_position: i32,
+    /// What the last failed poll raises: nothing on C `set_status`'s
+    /// first missed reply (RETRY, drvPIE517.cc:293), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :299). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
 }
@@ -299,6 +304,7 @@ impl PIE517Axis {
             controller: controller.clone(),
             axis,
             prev_position: 0,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -350,11 +356,8 @@ impl PIE517Axis {
 }
 
 impl AsynMotor for PIE517Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvPIE517.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -455,11 +458,12 @@ impl AsynMotor for PIE517Axis {
         let comm_err = ctrl.comm_state == CommState::CommErr;
 
         let Some(reading) = reading else {
-            if comm_err {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            self.failure = if comm_err {
+                PollFailure::PROBLEM_AND_COMMS_ERROR
+            } else {
+                PollFailure::NONE
+            };
+            return Err(pie517_err("no status reply"));
         };
         let last_direction = self.last_status.direction;
         self.last_status = fold_reading(&mut self.prev_position, last_direction, &reading);
@@ -637,5 +641,40 @@ mod tests {
     fn scan_int_gates_reads() {
         assert_eq!(scan_int("1"), Some(1));
         assert_eq!(scan_int(""), None);
+    }
+
+    /// drvPIE517.cc:284-305: a first failed status read is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good read clears it.
+    #[test]
+    fn a_failed_status_read_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("e517Retry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                return String::new();
+            }
+            match last {
+                "SVO? 1" => "1=1".into(),
+                "POS? 1" => "1=0.000".into(),
+                "ONT? 1" => "1=1".into(),
+                "OVF? 1" => "1=0".into(),
+                _ => String::new(),
+            }
+        });
+        let ctrl = PIE517Controller::new(io).unwrap();
+        let mut axis = PIE517Axis::new(Arc::new(Mutex::new(ctrl)), 0).unwrap();
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

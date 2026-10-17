@@ -108,6 +108,12 @@ pub struct DrvIm483Axis {
     sep: &'static str,
     /// What PRIMITIVE puts ahead of INIT: `"? "` on an IM483PL.
     init_prefix: &'static str,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// missed `^` (RETRY, drvIM483PL.cc:254, drvIM483SM.cc:252),
+    /// `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next (COMM_ERR, :260,
+    /// :258). Per axis, as the controller's state can move on under another
+    /// axis's poll.
+    failure: PollFailure,
     /// `motor_info->status`, which `set_status` starts from.
     status: MotorStatus,
     /// `motor_info->position`.
@@ -123,6 +129,7 @@ impl DrvIm483Axis {
             name: IM483PL_AXIS[signal],
             sep: " ",
             init_prefix: "? ",
+            failure: PollFailure::NONE,
             status: MotorStatus {
                 has_encoder: true,
                 ..MotorStatus::default()
@@ -139,6 +146,7 @@ impl DrvIm483Axis {
             name: "",
             sep: "",
             init_prefix: "",
+            failure: PollFailure::NONE,
             status: MotorStatus::default(),
             position: 0,
             strings: MoveStrings::default(),
@@ -194,9 +202,8 @@ impl DrvIm483Axis {
 }
 
 impl AsynMotor for DrvIm483Axis {
-    /// `poll` never fails: `set_status`'s missed replies are handled in it.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::NONE
+        self.failure
     }
 
     fn move_absolute(
@@ -286,21 +293,21 @@ impl AsynMotor for DrvIm483Axis {
 
     /// `set_status`: `^` for moving, `Z 0` for the position, `] 0` for the
     /// limits, `] 1` for home, `z 0` for the encoder. A first unanswered `^`
-    /// keeps the last status; a second raises the comms error.
+    /// fails the poll raising nothing; a second raises the comms error.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let ask = |ctrl: &Im483Controller, q: &str| ctrl.ask(self.line(b"", q));
         let moving = ask(&ctrl, "^");
         if moving.is_empty() {
-            if ctrl.comm == CommState::Normal {
-                ctrl.comm = CommState::Retry;
-            } else {
-                ctrl.comm = CommState::CommErr;
-                self.status.comms_error = true;
-                self.status.problem = true;
-            }
-            return Ok(self.status.clone());
+            (ctrl.comm, self.failure) = match ctrl.comm {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
+            };
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "IM483: no ^ reply".into(),
+            });
         }
         ctrl.comm = CommState::Normal;
         let position = ask(&ctrl, "Z 0");
@@ -563,5 +570,36 @@ mod tests {
     fn reply_offset_past_end_reads_as_empty() {
         assert_eq!(from("A ^ 1", 4), "1");
         assert_eq!(from("A ^", 4), "");
+    }
+
+    /// drvIM483PL.cc:245-265: a first unanswered `^` is RETRY (nothing
+    /// raised, nothing posted), the next COMM_ERR, and a reply clears it.
+    #[test]
+    fn an_unanswered_moving_query_is_retry_then_comm_error() {
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = motor_common::testing::LineRig::new("im483_retry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                String::new()
+            } else if last.ends_with('^') {
+                "A ^ 0".into()
+            } else {
+                "A Z 00".into()
+            }
+        });
+        let controller = Arc::new(Mutex::new(Im483Controller::new(io)));
+        let mut axis = DrvIm483Axis::im483pl(controller, 0);
+        let user = AsynUser::new(0);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

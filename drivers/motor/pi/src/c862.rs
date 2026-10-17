@@ -78,8 +78,8 @@
 //! active-low in that configuration).
 //!
 //! A comm failure on `TS` runs the C `NORMAL`/`RETRY`/`COMM_ERR` two-strike
-//! debounce (`CommState`): the first bad `TS` in a row is silently retried
-//! (cached status returned unchanged); a second consecutive one sets
+//! debounce (`CommState`): the first bad `TS` in a row fails the poll
+//! raising nothing (RETRY); a second consecutive one sets
 //! `comms_error`/`problem`. `TS` succeeding unconditionally proceeds to `TP`
 //! with **no further debounce tied to `TP`** — a genuine C asymmetry (`TP`'s
 //! `atof(&buff[2])` has no read-failure guard at all) ported as-is: a failed
@@ -335,8 +335,8 @@ impl PIC862Controller {
     /// C `set_status`: `TS` gated by the `NORMAL`/`RETRY`/`COMM_ERR` comm
     /// debounce, then (unconditionally on a good `TS`) `TP` with no further
     /// debounce — see the module docs' "Status" section for the exact C
-    /// asymmetry this reproduces. `None` means the caller should keep its
-    /// cached status (debounced retry) or flag a hard comm error, decided by
+    /// asymmetry this reproduces. `None` means the caller fails the poll,
+    /// raising nothing (RETRY) or a hard comm error, decided by
     /// [`Self::comm_state`] after the call.
     fn poll_status(&mut self) -> Option<PolledStatus> {
         let (ts_reply, ts_raw_len) = self.exchange("TS");
@@ -386,6 +386,11 @@ pub struct PIC862Axis {
     /// / DLLM the requested direction selects (C `JOG` case).
     high_limit: Option<f64>,
     low_limit: Option<f64>,
+    /// What the last failed poll raises: nothing on C `set_status`'s
+    /// first missed reply (RETRY, drvPIC862.cc:243), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :249). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
 }
@@ -400,6 +405,7 @@ impl PIC862Axis {
             controller: controller.clone(),
             high_limit: None,
             low_limit: None,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -436,11 +442,8 @@ impl PIC862Axis {
 }
 
 impl AsynMotor for PIC862Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvPIC862.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -563,11 +566,12 @@ impl AsynMotor for PIC862Axis {
         let comm_err = ctrl.comm_state == CommState::CommErr;
 
         let Some(polled) = polled else {
-            if comm_err {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            self.failure = if comm_err {
+                PollFailure::PROBLEM_AND_COMMS_ERROR
+            } else {
+                PollFailure::NONE
+            };
+            return Err(pic862_err("no status reply"));
         };
         self.last_status = status_from_polled(&polled);
         // drvPIC862.cc:299-340: POST once done or stopped by a limit in the
@@ -782,5 +786,38 @@ mod tests {
         assert!(!status.vbas_supported);
         assert!(!status.problem);
         assert!(!status.comms_error);
+    }
+
+    /// drvPIC862.cc:234-255: a first failed status read is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good read clears it.
+    #[test]
+    fn a_failed_status_read_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("c862Retry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                return String::new();
+            }
+            match last {
+                "TS" => format!("{DONE}\r"),
+                "TP" => "P:0\r".into(),
+                _ => "C-862\r".into(),
+            }
+        });
+        let ctrl = PIC862Controller::new(io, 1).unwrap();
+        let mut axis = PIC862Axis::new(Arc::new(Mutex::new(ctrl))).unwrap();
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

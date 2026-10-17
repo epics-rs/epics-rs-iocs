@@ -183,6 +183,11 @@ pub struct FaulhaberAxis {
     counts_per_rev: f64,
     /// Last integer position (counts); C `motor_info->position`.
     prev_position: i32,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// missed `GST` (RETRY, drvMCDC2805.cc:240), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :246). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
 }
@@ -218,6 +223,7 @@ impl FaulhaberAxis {
             node,
             counts_per_rev,
             prev_position: 0,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 gain_support: true,
@@ -269,11 +275,8 @@ impl FaulhaberAxis {
 }
 
 impl AsynMotor for FaulhaberAxis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvMCDC2805.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -385,25 +388,23 @@ impl AsynMotor for FaulhaberAxis {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        // C drvMCDC2805.cc:229-251: an empty or failed GST keeps the previous
-        // status once (RETRY); a second in a row raises COMM_ERR. Nothing else
-        // is sent on that poll.
+        // C drvMCDC2805.cc:229-251: an empty or failed GST fails the poll
+        // raising nothing once (RETRY); a second in a row raises COMM_ERR.
+        // Nothing else is sent on that poll.
         let gst = ctrl.query(self.node, "GST").ok().filter(|r| !r.is_empty());
         let Some(status_buff) = gst else {
-            let hard = ctrl.comm_state != CommState::Normal;
-            ctrl.comm_state = if hard {
-                CommState::CommErr
-            } else {
-                CommState::Retry
+            (ctrl.comm_state, self.failure) = match ctrl.comm_state {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
             };
-            drop(ctrl);
-            if hard {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            return Err(faulhaber_err(format!(
+                "MCDC2805 node {}: no GST reply",
+                self.node
+            )));
         };
         ctrl.comm_state = CommState::Normal;
+        // A later write's transport error, which C does not check, raises both.
+        self.failure = PollFailure::PROBLEM_AND_COMMS_ERROR;
         let pos = ctrl.query(self.node, "POS");
         let gast = ctrl.query(self.node, "GAST");
         let gv = ctrl.query(self.node, "GV");
@@ -623,5 +624,36 @@ mod tests {
         // 3000 counts/s² at 1000 counts/rev = 3 rev/s².
         assert_eq!(accel_to_rev(3000.0, 1000.0), 3);
         assert_eq!(accel_to_rev(3000.0, 0.0), 0);
+    }
+
+    /// drvMCDC2805.cc:229-251: a first missed `GST` is RETRY (nothing
+    /// raised, nothing posted), the next COMM_ERR, and a reply clears it.
+    #[test]
+    fn a_missed_gst_is_retry_then_comm_error() {
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("faulhaberRetry", move |last| {
+            match last.get(1..).unwrap_or_default() {
+                "VER" => "MCDC2805".into(),
+                "GST" if !q.load(Ordering::SeqCst) => "0000000".into(),
+                "POS" | "GV" => "0".into(),
+                "GAST" => "00".into(),
+                _ => String::new(),
+            }
+        });
+        let controller = Arc::new(Mutex::new(FaulhaberController::new(io, 2).unwrap()));
+        let mut axis = FaulhaberAxis::new(controller, 1, 1000.0).unwrap();
+        let user = AsynUser::new(0);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

@@ -35,8 +35,8 @@
 //! `*ESR?`.
 //!
 //! A failed `*ESR?` runs the same NORMAL/RETRY/COMM_ERR two-strike debounce as
-//! the C-862 (`CommState`): the first empty reply is silently retried (cached
-//! status kept), the second consecutive one sets `comms_error`/`problem`.
+//! the C-862 (`CommState`): the first empty reply fails the poll raising
+//! nothing (RETRY), the second consecutive one sets `comms_error`/`problem`.
 //!
 //! ## Position (`POS?`)
 //! `motorData = NINT(atof(buff) / drive_resolution)` — the reply is in physical
@@ -194,7 +194,7 @@ impl PIC662Controller {
     }
 
     /// C `set_status`: `*ESR?` (comm-debounced) then `POS?`. `None` means the
-    /// caller should keep its cached status (RETRY) or flag comm error
+    /// caller fails the poll, raising nothing (RETRY) or comm error
     /// (COMM_ERR), decided by [`Self::comm_state`] after the call.
     fn poll_status(&mut self) -> Option<PolledStatus> {
         let esr = self.query("*ESR?");
@@ -230,6 +230,11 @@ struct PolledStatus {
 /// The single axis of an E-662 controller. Implements [`AsynMotor`].
 pub struct PIC662Axis {
     controller: Arc<Mutex<PIC662Controller>>,
+    /// What the last failed poll raises: nothing on C `set_status`'s
+    /// first missed reply (RETRY, drvPIC662.cc:240), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :245). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
 }
@@ -241,6 +246,7 @@ impl PIC662Axis {
     pub fn new(controller: Arc<Mutex<PIC662Controller>>) -> AsynResult<Self> {
         let mut axis = Self {
             controller: controller.clone(),
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 done: true,
                 ..MotorStatus::default()
@@ -298,11 +304,8 @@ impl PIC662Axis {
 }
 
 impl AsynMotor for PIC662Axis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvPIC662.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -389,11 +392,12 @@ impl AsynMotor for PIC662Axis {
         let comm_err = ctrl.comm_state == CommState::CommErr;
 
         let Some(polled) = polled else {
-            if comm_err {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            self.failure = if comm_err {
+                PollFailure::PROBLEM_AND_COMMS_ERROR
+            } else {
+                PollFailure::NONE
+            };
+            return Err(pic662_err("no status reply"));
         };
         self.apply(polled);
         // drvPIC662.cc:338-344: POST once done; the E-662 has no limits.
@@ -513,5 +517,38 @@ mod tests {
         // um = counts * 0.001, printed with 3 decimals.
         assert_eq!(format!("{:.3}", 5012.0 * DRIVE_RESOLUTION), "5.012");
         assert_eq!(format!("{:.3}", -1500.0 * DRIVE_RESOLUTION), "-1.500");
+    }
+
+    /// drvPIC662.cc:231-251: a first failed status read is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good read clears it.
+    #[test]
+    fn a_failed_status_read_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("c662Retry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                return String::new();
+            }
+            match last {
+                "*IDN?" => "E-662".into(),
+                "*ESR?" => "1".into(),
+                _ => "0.000".into(),
+            }
+        });
+        let ctrl = PIC662Controller::new(io).unwrap();
+        let mut axis = PIC662Axis::new(Arc::new(Mutex::new(ctrl))).unwrap();
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

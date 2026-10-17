@@ -182,6 +182,11 @@ pub struct DrvPc6kAxis {
     /// The axis number, `signal + 1`.
     axis: usize,
     limits: AxisLimits,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// failed round (RETRY, drvPC6K.cc:320), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :323). Per axis, as the card's
+    /// state can move on under another axis's poll.
+    failure: PollFailure,
     status: MotorStatus,
     /// `motor_info->position`.
     position: i32,
@@ -204,6 +209,7 @@ impl DrvPc6kAxis {
             card,
             axis: signal + 1,
             limits,
+            failure: PollFailure::NONE,
             status: MotorStatus {
                 gain_support: true,
                 has_encoder: true,
@@ -284,9 +290,8 @@ fn refused(message: &str) -> AsynError {
 }
 
 impl AsynMotor for DrvPc6kAxis {
-    /// `poll` never fails: `set_status`'s missed replies are handled in it.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::NONE
+        self.failure
     }
 
     fn move_absolute(
@@ -405,8 +410,8 @@ impl AsynMotor for DrvPc6kAxis {
     }
 
     /// `set_status`: `TAS`, `TPC`, `TPE`, `TVELA` and `DRIVE`, each retried
-    /// once. A first failed round keeps the last status; a second raises
-    /// the comms error.
+    /// once. A first failed round fails the poll raising nothing; a second
+    /// raises the comms error.
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         if let Some(started) = self.started.take() {
             sleep(MOTION_DELAY.saturating_sub(started.elapsed()));
@@ -424,16 +429,19 @@ impl AsynMotor for DrvPc6kAxis {
         let [tas, tpc, tpe, tvela, drive] = match <[String; 5]>::try_from(replies) {
             Ok(replies) => replies,
             Err(_) => {
-                if ctrl.comm == CommState::Normal {
+                self.failure = if ctrl.comm == CommState::Normal {
                     ctrl.comm = CommState::Retry;
                     drop(ctrl);
                     sleep(MOTION_DELAY);
+                    PollFailure::NONE
                 } else {
                     ctrl.comm = CommState::CommErr;
-                    self.status.comms_error = true;
-                    self.status.problem = true;
-                }
-                return Ok(self.status.clone());
+                    PollFailure::PROBLEM_AND_COMMS_ERROR
+                };
+                return Err(refused(&format!(
+                    "PC6K axis {}: no status reply",
+                    self.axis
+                )));
             }
         };
         ctrl.comm = CommState::Normal;
@@ -486,5 +494,36 @@ mod tests {
         let lines = upload_lines(&long);
         assert_eq!(lines.len(), 2);
         assert_eq!((lines[0].len(), lines[1].len()), (119, 11));
+    }
+
+    /// drvPC6K.cc:312-337: a first failed round is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a reply clears it.
+    #[test]
+    fn a_failed_round_is_retry_then_comm_error() {
+        use motor_common::testing::LineRig;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("pc6kRetry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                String::new()
+            } else {
+                format!("*{last} 0")
+            }
+        });
+        let card = Arc::new(Mutex::new(Pc6kCard::new(io)));
+        let mut axis = DrvPc6kAxis::new(card, 0, AxisLimits::default());
+        let user = AsynUser::new(0);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }
