@@ -14,20 +14,23 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
-use epics_rs::motor::controller_port::{WriteValue, index};
+use epics_rs::asyn::trace::TraceMask;
+use epics_rs::motor::controller_port::index;
 use epics_rs::motor::devices::{
     motor_interface_device, register_motor_interface_device, register_motor_interface_driver,
 };
+use motor_common::drv_motor_asyn::{DrvGet, DrvSet};
 use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_int, req_string};
 use motor_common::model1::c_int;
-use motor_common::model2::Model2;
 pub use motor_common::model2::drv_asyn_motor_configure_command;
+use motor_common::model2::{AxisLog, Model2, Model2Axis};
 use motor_common::{
     Controller, ControllerParams, ControllerReport, TraceUser, asyn_user, register_port_with,
 };
 
 use crate::motorsim::{
-    DEFAULT_HI_LIMIT, DEFAULT_HOME, DEFAULT_LOW_LIMIT, DEFAULT_START, DrvMotorSimAxis, MotorSimAxis,
+    DEFAULT_HI_LIMIT, DEFAULT_HOME, DEFAULT_LOW_LIMIT, DEFAULT_START, Deferral, DrvMotorSimAxis,
+    MotorSimAxis, sim_log,
 };
 
 /// C's `motorSimTask` updates every axis each `DELTA` (motorSimDriver.cpp:244),
@@ -47,45 +50,81 @@ const DRIVER: &str = "motorSim";
 /// motorProcTask has no forced polls.
 pub static MOTOR_SIM: Model2 = Model2::new(DRIVER, 0);
 
-/// `motorAxisLowLimit` / `motorAxisHighLimit` (motor_interface.h:307-308).
-const MOTOR_AXIS_LOW_LIMIT: i32 = 3;
-const MOTOR_AXIS_HIGH_LIMIT: i32 = 4;
-
-/// An axis motorSimCreate built.
+/// An axis motorSimCreate built, as its device support, drvMotorAsyn's
+/// writes and its log reach it.
 struct SimAxis<A> {
     card: i32,
     signal: i32,
     motor: Arc<Mutex<A>>,
+    setter: Arc<Mutex<dyn DrvSet>>,
+    getter: Arc<dyn DrvGet>,
+    log: Arc<AxisLog>,
+}
+
+impl SimAxis<DrvMotorSimAxis> {
+    fn new(axis: DrvMotorSimAxis, card: i32, signal: i32) -> Self {
+        let log = axis.log();
+        let getter = axis.getter();
+        let motor = Arc::new(Mutex::new(axis));
+        Self {
+            card,
+            signal,
+            motor: motor.clone(),
+            setter: motor,
+            getter,
+            log,
+        }
+    }
 }
 
 /// drvMotorSim's `drv`: the axes in its `pFirst` list's creation order
-/// (drvMotorSim.c:719-735) and the one motorSimThread that runs them
+/// (drvMotorSim.c:719-735), the one motorSimThread that runs them
 /// (drvMotorSim.c:121, 790), which processes every axis from its creation
-/// (drvMotorSim.c:670-678), opened or not.
+/// (drvMotorSim.c:670-678), opened or not, the driver's own print and its
+/// deferral.
 struct SimDriver<A = DrvMotorSimAxis> {
     created: Mutex<Vec<SimAxis<A>>>,
     poller: Arc<Controller>,
+    log: Arc<AxisLog>,
+    deferral: Arc<Deferral>,
 }
 
-fn find<A>(created: &[SimAxis<A>], card: i32, signal: i32) -> Option<Arc<Mutex<A>>> {
+fn find<A>(created: &[SimAxis<A>], card: i32, signal: i32) -> Option<&SimAxis<A>> {
     created
         .iter()
         .find(|a| a.card == card && a.signal == signal)
-        .map(|a| a.motor.clone())
+}
+
+impl<A: AsynMotor + 'static> SimAxis<A> {
+    /// The axis as drvAsynMotorConfigure serves it.
+    fn model2(&self) -> Model2Axis {
+        Model2Axis {
+            motor: self.motor.clone(),
+            setter: self.setter.clone(),
+            getter: self.getter.clone(),
+            log: self.log.clone(),
+        }
+    }
 }
 
 impl<A: AsynMotor + 'static> SimDriver<A> {
+    fn new() -> Self {
+        Self {
+            created: Mutex::new(Vec::new()),
+            poller: Arc::new(Controller::new()),
+            log: Arc::new(AxisLog::with_own(sim_log)),
+            deferral: Arc::default(),
+        }
+    }
+
     /// motorSimCreateAxis (drvMotorSim.c:693-760): the axis joins `pFirst`,
     /// which motorProcTask walks each pass.
-    fn create(&self, card: i32, signal: i32, motor: Arc<Mutex<A>>) -> Result<(), String> {
+    fn create(&self, axis: SimAxis<A>) -> Result<(), String> {
+        let (card, signal, motor) = (axis.card, axis.signal, axis.motor.clone());
         self.created
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(SimAxis {
-                card,
-                signal,
-                motor: motor.clone(),
-            });
+            .push(axis);
         let user = TraceUser::MotorInterface {
             device: DEV_MOTOR_SIM.choice,
             driver: DRIVER,
@@ -114,6 +153,7 @@ impl SimDriver {
             card,
             signal,
             motor,
+            ..
         } in created.iter()
         {
             let _ = writeln!(
@@ -122,18 +162,10 @@ impl SimDriver {
                 Arc::as_ptr(motor)
             );
             if level > 0 {
-                let params = MOTOR_SIM.params(*card, *signal);
-                // C's locals stay 0.0 when getDouble finds no value.
-                let soft = |reason| match params.as_ref().and_then(|p| p.get(reason)) {
-                    Some(WriteValue::Float64(v)) => v,
-                    _ => 0.0,
-                };
-                let soft_limits = (soft(MOTOR_AXIS_LOW_LIMIT), soft(MOTOR_AXIS_HIGH_LIMIT));
                 motor
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .report(&mut out, soft_limits);
-                params.unwrap_or_default().dump(&mut out);
+                    .report(&mut out);
             }
         }
         out
@@ -144,10 +176,8 @@ impl SimDriver {
 /// startPosn)`: axes `signal..signal+nSignals` of cards `card..card+nCards`
 /// for `DTYP "Motor Simulation"`, `OUT "#C card S signal @motorSim"`.
 pub fn motor_sim_create_command() -> CommandDef {
-    let driver = Arc::new(SimDriver {
-        created: Mutex::new(Vec::new()),
-        poller: Arc::new(Controller::new()),
-    });
+    let driver = Arc::new(SimDriver::new());
+    MOTOR_SIM.set_driver_log(driver.log.clone());
     register_motor_interface_device(&DEV_MOTOR_SIM);
     let opener = driver.clone();
     register_motor_interface_driver(DRIVER, move |card, signal| opener.open(card, signal));
@@ -177,8 +207,11 @@ pub fn motor_sim_create_command() -> CommandDef {
             let home = c_int(args, 4);
             let num_cards = c_int(args, 5).max(1);
             let num_signals = c_int(args, 6).max(1);
-            println!(
-                "Creating motor simulator: card: {card}, axis: {signal}, hi: {hi}, low {low}, home: {home}, ncards: {num_cards}, naxis: {num_signals}"
+            driver.log.print(
+                TraceMask::FLOW,
+                format_args!(
+                    "Creating motor simulator: card: {card}, axis: {signal}, hi: {hi}, low {low}, home: {home}, ncards: {num_cards}, naxis: {num_signals}"
+                ),
             );
             // The first motorSimCreate starts drvMotorSim's one
             // motorSimThread, whose motorProcTask runs every axis each DELTA,
@@ -188,27 +221,40 @@ pub fn motor_sim_create_command() -> CommandDef {
                 for s in signal..signal.saturating_add(num_signals) {
                     let exists = {
                         let created = driver.created.lock().unwrap_or_else(|e| e.into_inner());
-                        find(&created, c, s).is_some()
+                        find(&created, c, s).map(|axis| axis.log.clone())
                     };
-                    if exists {
-                        println!("Motor for card {c}, signal {s} already exists");
+                    if let Some(log) = exists {
+                        log.print(
+                            TraceMask::ERROR,
+                            format_args!("Motor for card {c}, signal {s} already exists"),
+                        );
                         continue;
                     }
-                    let motor = Arc::new(Mutex::new(DrvMotorSimAxis::new(
-                        low as f64,
-                        hi as f64,
-                        home as f64,
-                    )));
-                    driver.create(c, s, motor)?;
-                    println!("Created motor for card {c}, signal {s} OK");
+                    let axis = SimAxis::new(
+                        DrvMotorSimAxis::new(
+                            c,
+                            s,
+                            low as f64,
+                            hi as f64,
+                            home as f64,
+                            driver.deferral.clone(),
+                        ),
+                        c,
+                        s,
+                    );
+                    let log = axis.log.clone();
+                    driver.create(axis)?;
+                    log.print(
+                        TraceMask::FLOW,
+                        format_args!("Created motor for card {c}, signal {s} OK"),
+                    );
                 }
                 let created = driver.created.lock().unwrap_or_else(|e| e.into_inner());
                 // Model2::open indexes by axis, so a card serves the axes
                 // from 0 up to its first gap; drvAsynMotorConfigure installs
                 // them on the driver's poller.
-                let axes = (0..)
-                    .map_while(|s| find(&created, c, s))
-                    .map(|motor| motor as Arc<Mutex<dyn AsynMotor>>)
+                let axes: Vec<_> = (0..)
+                    .map_while(|s| find(&created, c, s).map(SimAxis::model2))
                     .collect();
                 MOTOR_SIM.set_card_on(c, axes, driver.poller.clone());
             }
@@ -602,6 +648,91 @@ mod one_poller {
         );
     }
 
+    /// drvMotorSim.c:306-351, 389-409, 467, 514, 535, 562: once
+    /// drvAsynMotorConfigure sets an axis' log, its sets and motions print
+    /// their FLOW lines on the axis' user, without a newline as C's.
+    #[epics_rs::base::epics_test]
+    async fn configured_axes_print_the_c_flow_lines() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+        use motor_common::testing::run_command;
+
+        let args = [0, 0, -100, 100, 0, 1, 2, 0].map(ArgValue::Int).to_vec();
+        run_command(motor_sim_create_command(), args).await;
+        let args = vec![
+            ArgValue::String("simFlow".into()),
+            ArgValue::String("motorSim".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(2),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&MOTOR_SIM]), args).await;
+        let path = std::env::temp_dir().join(format!("simFlow-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("simFlow"), TraceMask::FLOW);
+        trace.set_device_trace_mask("simFlow", 0, TraceMask::FLOW);
+        trace.set_device_trace_info_mask("simFlow", 0, TraceInfoMask::empty());
+        trace.set_device_trace_file("simFlow", 0, TraceFile::File(file));
+        let port = manager.find_port_handle("simFlow").unwrap();
+        std::thread::spawn(move || {
+            let float = |reason, value| port.write_float64_blocking(reason, 0, value).unwrap();
+            for (reason, value) in [(100, 2.0), (101, 0.5), (102, 4.0), (104, 5.0), (105, 1.5)] {
+                float(reason, value);
+            }
+            port.write_int32_blocking(107, 0, 1).unwrap();
+            port.write_int32_blocking(106, 0, 1).unwrap();
+            for (reason, value) in [
+                (0, 3.0),
+                (1, 2.0),
+                (2, 2.0),
+                (3, -50.0),
+                (4, 50.0),
+                (5, 0.1),
+                (6, 0.2),
+                (7, 0.3),
+                (8, 1.0),
+                (26, 1.0),
+            ] {
+                float(reason, value);
+            }
+            for (reason, value) in [(0, 4), (3, -40), (4, 40), (8, 0), (26, 0)] {
+                port.write_int32_blocking(reason, 0, value).unwrap();
+            }
+        })
+        .join()
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut rest = text.as_str();
+        for line in [
+            "Set card 0, axis 0 move to 5.000000, min vel=0.500000, max_vel=2.000000, accel=4.000000",
+            "Set card 0, axis 0 move with velocity of 1.500000, accel=4.000000",
+            "Set card 0, axis 0 to stop with accel=4.000000",
+            "Set card 0, axis 0 to home FORWARDS, min vel=0.500000, max_vel=2.000000, accel=4.000000",
+            "Set card 0, axis 0 to position 3.000000",
+            "Set card 0, axis 0 resolution to 2.000000",
+            "Set card 0, axis 0 to enc. ratio to 2.000000",
+            "Set card 0, axis 0 low limit to -50.000000",
+            "Set card 0, axis 0 high limit to 50.000000",
+            "Set card 0, axis 0 pgain to 0.100000",
+            "Set card 0, axis 0 igain to 0.200000",
+            "Set card 0, axis 0 dgain to 0.300000",
+            "Set card 0, axis 0 closed loop to ON",
+            "Setting Deferred Move flag on PMAC card 0\n",
+            "Set card 0, axis 0 to position 4",
+            "Set card 0, axis 0 low limit to -40",
+            "Set card 0, axis 0 high limit to 40",
+            "Set card 0, axis 0 closed loop to OFF",
+            "Clearing Deferred Move flag on PMAC card 0\n",
+        ] {
+            let at = rest
+                .find(line)
+                .unwrap_or_else(|| panic!("{line:?} not in order in {text}"));
+            rest = &rest[at + line.len()..];
+        }
+    }
+
     /// Polls `motorProcTask` would process; never moves.
     struct Counted(Arc<Mutex<Vec<Instant>>>);
 
@@ -645,20 +776,27 @@ mod one_poller {
         static ONCE: Model2 = Model2::new("onceSim", 0);
         let polls = Arc::new(Mutex::new(Vec::new()));
         let counted = Arc::new(Mutex::new(Counted(polls.clone())));
-        let motor: Arc<Mutex<dyn AsynMotor>> = counted.clone();
-        let driver = Arc::new(SimDriver {
-            created: Mutex::new(Vec::new()),
-            poller: Arc::new(Controller::new()),
-        });
+        let driver = Arc::new(SimDriver::<Counted>::new());
+        // devMotorSim's open reaches only the axis' motor.
+        let unused = DrvMotorSimAxis::new(0, 0, 0.0, 0.0, 0.0, Arc::default());
+        let axis = SimAxis {
+            card: 0,
+            signal: 0,
+            motor: counted,
+            getter: unused.getter(),
+            setter: Arc::new(Mutex::new(unused)),
+            log: Arc::default(),
+        };
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
         driver.poller.start(&ctx, POLL_MS, POLL_MS, 0);
+        let model2 = axis.model2();
         let creator = driver.clone();
-        let create = std::thread::spawn(move || creator.create(0, 0, counted));
+        let create = std::thread::spawn(move || creator.create(axis));
         while !create.is_finished() {
             sleep(Duration::from_millis(5)).await;
         }
         create.join().unwrap().unwrap();
-        ONCE.set_card_on(0, vec![motor], driver.poller.clone());
+        ONCE.set_card_on(0, vec![model2], driver.poller.clone());
         let args = vec![
             ArgValue::String("onceP".into()),
             ArgValue::String("onceSim".into()),

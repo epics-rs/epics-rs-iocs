@@ -35,14 +35,17 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::drv_motor_asyn::{DrvSet, function};
 use motor_common::model2::AxisLog;
+use motor_common::param_lib::Params;
 use motor_common::util::nint;
 
 /// Response buffer size (C `BUFFER_SIZE` 100, padded for the multi-line reply).
@@ -216,7 +219,8 @@ pub struct Anc150Axis {
     /// Wall-clock deadline of the in-flight move, and its planned duration.
     move_deadline: Option<Instant>,
     move_interval: f64,
-    last_status: MotorStatus,
+    /// drvANC150Asyn.cc `pAxis->params`.
+    params: Arc<Params>,
 }
 
 impl Anc150Axis {
@@ -248,19 +252,26 @@ impl Anc150Axis {
             moving: false,
             move_deadline: None,
             move_interval: 0.0,
-            last_status: MotorStatus {
-                done: true,
-                gain_support: true,
-                ..MotorStatus::default()
+            // drvANC150Asyn.cc:773-775.
+            params: {
+                let params = Params::default();
+                let _ = params.set_integer(function::CLOSED_LOOP, 1);
+                let _ = params.set_integer(function::HAS_CLOSED_LOOP, 1);
+                Arc::new(params)
             },
         })
+    }
+
+    /// The store drvMotorAsyn reads the axis's parameters back from.
+    pub fn params(&self) -> Arc<Params> {
+        self.params.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, Anc150Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The log `Model2::set_axis_logs` attaches.
+    /// The log `drvAsynMotorConfigure` attaches.
     pub fn log(&self) -> Arc<AxisLog> {
         self.log.clone()
     }
@@ -268,6 +279,23 @@ impl Anc150Axis {
     /// The jog limit fields (kept for parity with C's non-storing behaviour).
     pub fn high_limit(&self) -> f64 {
         self.high_limit
+    }
+
+    /// drvANC150Asyn.cc:408-410: `motorAxisMove`'s FLOW line, which a jog
+    /// prints too (:489-494).
+    fn print_move(&self, position: f64, min_velocity: f64, velocity: f64, acceleration: f64) {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "Set card {}, axis {} move to {}, min vel={}, max_vel={}, accel={}\n",
+                self.card,
+                self.axis,
+                CFloat(position),
+                CFloat(min_velocity),
+                CFloat(velocity),
+                CFloat(acceleration)
+            ),
+        );
     }
 
     /// Issue a move to `arg` (absolute) or by `arg` (relative), tracking the
@@ -290,6 +318,13 @@ impl Anc150Axis {
 
         let ctrl = self.lock();
         ctrl.send_only(&format!("{} {} {}", move_command, self.axis + 1, imove))?;
+        drop(ctrl);
+        // drvANC150Asyn.cc:450-457.
+        let _ = self
+            .params
+            .set_integer(function::DIRECTION, i32::from(posdir));
+        let _ = self.params.set_integer(function::DONE, 0);
+        self.params.call_callback();
         Ok(())
     }
 }
@@ -309,10 +344,11 @@ impl AsynMotor for Anc150Axis {
         &mut self,
         _user: &AsynUser,
         position: f64,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
+        self.print_move(position, min_velocity, velocity, acceleration);
         self.do_move(position, false)
     }
 
@@ -320,27 +356,29 @@ impl AsynMotor for Anc150Axis {
         &mut self,
         _user: &AsynUser,
         distance: f64,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
+        self.print_move(distance, min_velocity, velocity, acceleration);
         self.do_move(distance, true)
     }
 
     fn move_velocity(
         &mut self,
         _user: &AsynUser,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
         // C: the ANC150 has no jog; move to a soft limit instead. The limit
         // fields are never set (module Deviations), so this targets 0.
-        let target = if velocity > 0.0 {
-            self.high_limit
+        let (target, speed) = if velocity > 0.0 {
+            (self.high_limit, velocity)
         } else {
-            self.low_limit
+            (self.low_limit, -velocity)
         };
+        self.print_move(target, min_velocity, speed, acceleration);
         self.do_move(target, false)
     }
 
@@ -356,7 +394,16 @@ impl AsynMotor for Anc150Axis {
         Err(anc_err("ANC150: home not supported"))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "Set card {}, axis {} to stop with accel={}\n",
+                self.card,
+                self.axis,
+                CFloat(acceleration)
+            ),
+        );
         let ctrl = self.lock();
         ctrl.send_only(&format!("stop {}", self.axis + 1))?;
         drop(ctrl);
@@ -381,6 +428,32 @@ impl AsynMotor for Anc150Axis {
         Ok(())
     }
 
+    /// drvANC150Asyn.cc:316-320: refused, as the ratio devMotorAsyn writes
+    /// at init.
+    fn set_encoder_ratio(&mut self, _user: &AsynUser, _ratio: f64) -> AsynResult<()> {
+        self.log.print(
+            TraceMask::ERROR,
+            format_args!("motorAxisSetDouble: ANC150 does not support setting encoder ratio\n"),
+        );
+        Err(anc_err("ANC150 does not support setting encoder ratio"))
+    }
+
+    /// drvANC150Asyn.cc:331-348: every gain is refused.
+    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, _gain: f64) -> AsynResult<()> {
+        let what = match kind {
+            PidGainKind::Proportional => "proportional",
+            PidGainKind::Integral => "integral",
+            PidGainKind::Derivative => "derivative",
+        };
+        self.log.print(
+            TraceMask::ERROR,
+            format_args!("ANC150 does not support setting {what} gain\n"),
+        );
+        Err(anc_err(format!(
+            "ANC150 does not support setting {what} gain"
+        )))
+    }
+
     /// C `motorAxisforceCallback`; the poll that follows is the poller's.
     fn force_callback(&mut self, _user: &AsynUser) {
         self.log.print(
@@ -390,11 +463,15 @@ impl AsynMotor for Anc150Axis {
                 self.card, self.axis
             ),
         );
+        self.params.force_callback();
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        // C's axisDone: a move in flight at the poll's start, even one whose
+        // timer has run out (drvANC150Asyn.cc:599-603).
+        let axis_done = !self.moving;
         // Interpolate the software position (C poller).
-        let (position, done) = if self.moving {
+        let position = if self.moving {
             let time_remaining = self
                 .move_deadline
                 .map(|d| {
@@ -417,11 +494,21 @@ impl AsynMotor for Anc150Axis {
                 self.move_deadline = None;
                 self.current_position = self.target_position;
             }
-            (pos, finished)
+            pos
         } else {
             self.current_position = self.target_position;
-            (self.current_position, true)
+            self.current_position
         };
+
+        // C `axisStatus` is never set (module Deviations).
+        self.log.print(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "ANC150Poller: axis {} axisStatus=0, position={}\n",
+                self.axis,
+                CFloat(position)
+            ),
+        );
 
         // Update the step frequency and power state. Read into locals first so
         // the controller lock is released before mutating `self.frequency`.
@@ -444,23 +531,90 @@ impl AsynMotor for Anc150Axis {
         };
         let powered = matches!(mode_reply, Ok(reply) if reply.starts_with("mode = stp"));
 
-        self.last_status = MotorStatus {
-            position,
-            encoder_position: position,
-            velocity: 0.0,
-            done,
-            moving: !done,
-            // ANC150 reports no home/limit switches (module Deviations).
-            high_limit: false,
-            low_limit: false,
-            home: false,
-            powered,
-            comms_error: !freq_ok,
-            problem: !freq_ok,
-            gain_support: true,
-            ..MotorStatus::default()
+        // drvANC150Asyn.cc:617-649; `axisStatus` is never set, so the switch
+        // parameters are 0.
+        let params = &self.params;
+        let _ = params.set_integer(function::DONE, i32::from(axis_done));
+        for f in [
+            function::HOME_SIGNAL,
+            function::HIGH_HARD_LIMIT,
+            function::LOW_HARD_LIMIT,
+        ] {
+            let _ = params.set_integer(f, 0);
+        }
+        let _ = params.set_double(function::POSITION, position);
+        let _ = params.set_double(function::ENCODER_POSN, position);
+        let _ = params.set_integer(function::COMM_ERROR, i32::from(!freq_ok));
+        let _ = params.set_integer(function::POWER_ON, i32::from(powered));
+        params.call_callback();
+
+        Ok(params.motor_status())
+    }
+}
+
+/// C `motorAxisSetDouble`/`motorAxisSetInteger` (drvANC150Asyn.cc:298-388),
+/// which drvMotorAsyn's writes reach.
+impl DrvSet for Anc150Axis {
+    fn set_double(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+        self.set_double_only(user, function, value)?;
+        let _ = self.params.set_double(function, value);
+        self.params.call_callback();
+        Ok(())
+    }
+
+    /// drvANC150Asyn.cc:389-390: stored without a callback.
+    fn set_integer(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+        self.set_integer_only(user, function, value)?;
+        let _ = self.params.set_integer(function, value);
+        Ok(())
+    }
+}
+
+impl Anc150Axis {
+    fn set_double_only(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
+        let kind = match function {
+            function::POSITION => return self.set_position(user, value),
+            function::ENCODER_RATIO => return self.set_encoder_ratio(user, value),
+            // C breaks out with its status still MOTOR_AXIS_ERROR.
+            function::LOW_LIMIT | function::HIGH_LIMIT => {
+                return Err(anc_err(format!("ANC150 does not set function {function}")));
+            }
+            function::P_GAIN => PidGainKind::Proportional,
+            function::I_GAIN => PidGainKind::Integral,
+            function::D_GAIN => PidGainKind::Derivative,
+            function::RESOLUTION => {
+                self.log.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "motorAxisSetDouble: ANC150 does not support setting resolution\n"
+                    ),
+                );
+                return Err(anc_err("ANC150 does not support setting resolution"));
+            }
+            _ => {
+                self.log.print(
+                    TraceMask::ERROR,
+                    format_args!("motorAxisSetDouble: unknown function {function}\n"),
+                );
+                return Err(anc_err(format!(
+                    "motorAxisSetDouble: unknown function {function}"
+                )));
+            }
         };
-        Ok(self.last_status.clone())
+        self.set_pid_gain(user, kind, value)
+    }
+
+    fn set_integer_only(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
+        if function == function::CLOSED_LOOP {
+            return self.set_closed_loop(user, value != 0);
+        }
+        self.log.print(
+            TraceMask::ERROR,
+            format_args!("motorAxisSetInteger: unknown function {function}\n"),
+        );
+        Err(anc_err(format!(
+            "motorAxisSetInteger: unknown function {function}"
+        )))
     }
 }
 
@@ -539,7 +693,7 @@ mod tests {
     async fn force_callback_prints_the_c_flow_line() {
         use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
         use epics_rs::base::server::iocsh::registry::ArgValue;
-        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::model2::{Model2, Model2Axis, drv_asyn_motor_configure_command};
         use motor_common::testing::{LineRig, run_command};
 
         static DRIVER: Model2 = Model2::new("ancForceTest", 0);
@@ -554,14 +708,18 @@ mod tests {
         let axes: Vec<_> = (0..2)
             .map(|axis| Anc150Axis::new(ctrl.clone(), 1, axis).unwrap())
             .collect();
-        let logs = axes.iter().map(Anc150Axis::log).collect();
         let axes: Vec<_> = axes.into_iter().map(|a| Arc::new(Mutex::new(a))).collect();
-        let motors = axes
+        let model2 = axes
             .iter()
-            .map(|a| a.clone() as Arc<Mutex<dyn AsynMotor>>)
+            .map(|a| {
+                let (getter, log) = {
+                    let a = a.lock().unwrap();
+                    (a.params(), a.log())
+                };
+                Model2Axis::new(a.clone(), getter, log)
+            })
             .collect();
-        DRIVER.set_card(1, motors, 100, 1000);
-        DRIVER.set_axis_logs(1, logs);
+        DRIVER.set_card(1, model2, 100, 1000);
         let args = vec![
             ArgValue::String("ancForce".into()),
             ArgValue::String("ancForceTest".into()),
@@ -585,5 +743,209 @@ mod tests {
             text,
             "motorAxisforceCallback: request card 1, axis 1 status update\n"
         );
+    }
+
+    /// Two axes of card 1 on port `port`, axis 1 at 12.5 steps, their logs
+    /// attached by drvAsynMotorConfigure, axis 1's trace going to a file
+    /// under `mask`.
+    async fn traced_axes(
+        port: &'static str,
+        mask: TraceMask,
+    ) -> (Vec<Arc<Mutex<Anc150Axis>>>, std::path::PathBuf) {
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::model2::{Model2, Model2Axis, drv_asyn_motor_configure_command};
+        use motor_common::testing::{LineRig, run_command};
+
+        let driver: &'static Model2 = Box::leak(Box::new(Model2::new(port, 0)));
+        let line: &'static str = Box::leak(format!("{port}Line").into_boxed_str());
+        let (_line, io) = LineRig::new(line, |last| match last {
+            "ver" => "ver\r\nattocube ANC150\r\nOK\r\n".into(),
+            c if c.starts_with("getf") => format!("{c}\r\nfrequency = 1000\r\nOK\r\n"),
+            c if c.starts_with("getm") => format!("{c}\r\nmode = stp\r\nOK\r\n"),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(Anc150Controller::new(io, line).unwrap()));
+        let mut axes: Vec<_> = (0..2)
+            .map(|axis| Anc150Axis::new(ctrl.clone(), 1, axis).unwrap())
+            .collect();
+        axes[1].set_position(&AsynUser::default(), 12.5).unwrap();
+        let axes: Vec<_> = axes.into_iter().map(|a| Arc::new(Mutex::new(a))).collect();
+        let model2 = axes
+            .iter()
+            .map(|a| {
+                let (getter, log) = {
+                    let a = a.lock().unwrap();
+                    (a.params(), a.log())
+                };
+                Model2Axis::new(a.clone(), getter, log)
+            })
+            .collect();
+        // Idle polls an hour apart: past the startup poll only the test's.
+        driver.set_card(1, model2, 3_600_000, 3_600_000);
+        let args = vec![
+            ArgValue::String(port.into()),
+            ArgValue::String(port.into()),
+            ArgValue::Int(1),
+            ArgValue::Int(2),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![driver]), args).await;
+
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(port), mask);
+        trace.set_device_trace_mask(port, 1, mask);
+        trace.set_device_trace_info_mask(port, 1, TraceInfoMask::empty());
+        trace.set_device_trace_file(port, 1, TraceFile::File(file));
+        (axes, path)
+    }
+
+    fn take_trace(path: &std::path::Path) -> String {
+        let text = std::fs::read_to_string(path).unwrap();
+        let _ = std::fs::remove_file(path);
+        text
+    }
+
+    /// drvANC150Asyn.cc:316-348: the encoder ratio and the gains are refused
+    /// with an ERROR line on the axis's log.
+    #[epics_rs::base::epics_test]
+    async fn refusals_print_the_c_error_lines() {
+        let (axes, path) = traced_axes("ancRefuse", TraceMask::ERROR).await;
+        let user = AsynUser::default();
+        let mut axis = axes[1].lock().unwrap();
+        assert!(axis.set_encoder_ratio(&user, 2.0).is_err());
+        for kind in [
+            PidGainKind::Proportional,
+            PidGainKind::Integral,
+            PidGainKind::Derivative,
+        ] {
+            assert!(axis.set_pid_gain(&user, kind, 0.5).is_err());
+        }
+        assert_eq!(
+            take_trace(&path),
+            "motorAxisSetDouble: ANC150 does not support setting encoder ratio\n\
+             ANC150 does not support setting proportional gain\n\
+             ANC150 does not support setting integral gain\n\
+             ANC150 does not support setting derivative gain\n"
+        );
+    }
+
+    /// drvANC150Asyn.cc:325, 350, 385: the asyn writes of a function the
+    /// driver does not set print an ERROR line and fail; the soft limits
+    /// fail with none.
+    #[epics_rs::base::epics_test]
+    async fn unknown_functions_print_the_c_error_lines() {
+        let (_axes, path) = traced_axes("ancUnknown", TraceMask::ERROR).await;
+        let port = PortManager::global()
+            .find_port_handle("ancUnknown")
+            .unwrap();
+        std::thread::spawn(move || {
+            assert!(port.write_int32_blocking(26, 1, 1).is_err());
+            assert!(port.write_float64_blocking(27, 1, 3.0).is_err());
+            assert!(port.write_float64_blocking(1, 1, 0.5).is_err());
+            assert!(port.write_float64_blocking(4, 1, 9.0).is_err());
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            take_trace(&path),
+            "motorAxisSetInteger: unknown function 26\n\
+             motorAxisSetDouble: unknown function 27\n\
+             motorAxisSetDouble: ANC150 does not support setting resolution\n"
+        );
+    }
+
+    /// drvANC150Asyn.cc:408-410, 489-494, 518: a move, a jog either way and a
+    /// stop print their FLOW lines, 0-based axis.
+    #[epics_rs::base::epics_test]
+    async fn motion_commands_print_the_c_flow_lines() {
+        let (axes, path) = traced_axes("ancMotion", TraceMask::FLOW).await;
+        let user = AsynUser::default();
+        let mut axis = axes[1].lock().unwrap();
+        axis.move_absolute(&user, 150.0, 10.0, 200.0, 400.0)
+            .unwrap();
+        axis.move_relative(&user, -25.5, 0.0, 100.0, 50.0).unwrap();
+        axis.move_velocity(&user, 1.0, 300.0, 60.0).unwrap();
+        axis.move_velocity(&user, 1.0, -0.0, 60.0).unwrap();
+        axis.stop(&user, 80.0).unwrap();
+        assert_eq!(
+            take_trace(&path),
+            "Set card 1, axis 1 move to 150.000000, min vel=10.000000, max_vel=200.000000, accel=400.000000\n\
+             Set card 1, axis 1 move to -25.500000, min vel=0.000000, max_vel=100.000000, accel=50.000000\n\
+             Set card 1, axis 1 move to 0.000000, min vel=1.000000, max_vel=300.000000, accel=60.000000\n\
+             Set card 1, axis 1 move to 0.000000, min vel=1.000000, max_vel=0.000000, accel=60.000000\n\
+             Set card 1, axis 1 to stop with accel=80.000000\n"
+        );
+    }
+
+    /// drvANC150Asyn.cc:389-390, 450-457, 617-649, 773-775: the store
+    /// drvMotorAsyn reads back holds what the C driver puts in it.
+    #[epics_rs::base::epics_test]
+    async fn the_port_reads_back_what_the_driver_keeps() {
+        let (axes, _path) = traced_axes("ancParams", TraceMask::empty()).await;
+        let user = AsynUser::default();
+        let mut axis = axes[1].lock().unwrap();
+        let params = axis.params();
+        assert_eq!(params.get_integer(function::CLOSED_LOOP), Ok(Some(1)));
+        assert_eq!(params.get_integer(function::HAS_CLOSED_LOOP), Ok(Some(1)));
+        axis.move_absolute(&user, 2.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(params.get_integer(function::DIRECTION), Ok(Some(0)));
+        assert_eq!(params.get_integer(function::DONE), Ok(Some(0)));
+        // drvANC150Asyn.cc:601-605: the poll that finds the timer run out
+        // still reports the axis moving.
+        axis.move_deadline = Some(Instant::now());
+        axis.poll(&user).unwrap();
+        assert_eq!(params.get_integer(function::DONE), Ok(Some(0)));
+        axis.poll(&user).unwrap();
+        assert_eq!(params.get_integer(function::DONE), Ok(Some(1)));
+        assert_eq!(params.get_double(function::POSITION), Ok(Some(2.0)));
+        assert_eq!(params.get_double(function::ENCODER_POSN), Ok(Some(2.0)));
+        assert_eq!(params.get_integer(function::HIGH_HARD_LIMIT), Ok(Some(0)));
+        assert_eq!(params.get_integer(function::COMM_ERROR), Ok(Some(0)));
+        assert_eq!(params.get_integer(function::POWER_ON), Ok(Some(1)));
+        axis.set_integer(&user, function::CLOSED_LOOP, 0).unwrap();
+        assert_eq!(params.get_integer(function::CLOSED_LOOP), Ok(Some(0)));
+        assert!(DrvSet::set_double(&mut *axis, &user, function::P_GAIN, 0.5).is_err());
+        assert_eq!(params.get_double(function::P_GAIN), Ok(None));
+    }
+
+    /// drvANC150Asyn.cc:599-649: the poll reports what it set in
+    /// `pAxis->params`; the pass that finds the timer run out is not done,
+    /// and a failed `getFreq` sets the comm error alone.
+    #[test]
+    fn the_poll_reports_the_axis_s_parameters() {
+        use motor_common::testing::LineRig;
+        let (_line, io) = LineRig::new("ancReport", |last| match last {
+            "ver" => "ver\r\nattocube ANC150\r\nOK\r\n".into(),
+            c if c.starts_with("getm") => format!("{c}\r\nmode = stp\r\nOK\r\n"),
+            c => format!("{c}\r\nERROR\r\n"),
+        });
+        let ctrl = Arc::new(Mutex::new(Anc150Controller::new(io, "ancReport").unwrap()));
+        let mut axis = Anc150Axis::new(ctrl, 1, 0).unwrap();
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 2.0, 0.0, 1.0, 1.0).unwrap();
+        axis.move_deadline = Some(Instant::now());
+        let polled = axis.poll(&user).unwrap();
+        assert_eq!(polled, axis.params().motor_status());
+        assert!(!polled.done && polled.comms_error && !polled.problem);
+    }
+
+    /// drvANC150Asyn.cc:633-634: each poll prints the axis's never-set
+    /// status and its software position.
+    #[epics_rs::base::epics_test]
+    async fn the_poll_prints_the_c_iodriver_line() {
+        let (axes, path) = traced_axes("ancPoll", TraceMask::IO_DRIVER).await;
+        axes[1].lock().unwrap().poll(&AsynUser::default()).unwrap();
+        // The poller's own startup poll may land in the file too.
+        let text = take_trace(&path);
+        assert!(!text.is_empty());
+        for line in text.split_inclusive('\n') {
+            assert_eq!(
+                line,
+                "ANC150Poller: axis 1 axisStatus=0, position=12.500000\n"
+            );
+        }
     }
 }
