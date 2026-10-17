@@ -315,8 +315,10 @@ impl XpsController {
                 TraceMask::FLOW,
                 format_args!("Processing deferred moves on XPS: {}\n", trace.port()),
             );
-            // C skips only a group equal to the previous axis's, so a group
-            // split by another moves twice, the second time to its setpoints.
+            // C's groupNames cache (XPSController.cpp:459-471) skips only a
+            // group equal to the previous axis's, so a group split by another
+            // moves twice, the second time to its setpoints; here each group
+            // moves once.
             if !done.contains(&a.group.as_str()) {
                 done.push(&a.group);
                 result = process_deferred_moves_in_group(&axes, &a.group, trace);
