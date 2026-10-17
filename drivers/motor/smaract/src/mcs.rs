@@ -55,7 +55,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::motor::controller_port::{
-    FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, has_motor_axis,
+    AxisUser, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, has_motor_axis,
 };
 use epics_rs::motor::trace::MotorTrace;
 
@@ -371,25 +371,22 @@ impl ControllerParams for McsParams {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         let function = user.reason;
         // C's getAxis, which prints an out-of-range address.
-        let found = has_motor_axis(base, user);
-        let axis = match base.resolve_address(user.addr) {
-            Ok(addr) if found => addr,
-            _ => {
-                MotorTrace::new(&*base.port_name, user.addr).print(
-                    TraceMask::ERROR,
-                    function as i32,
-                    format_args!(
-                        "SmarActMCSController:writeInt32: error, function: {function}. Invalid axis number.\n"
-                    ),
-                );
-                return ParamWrite::Handled(Err(mcs_err("MCS: invalid axis number")));
-            }
-        };
+        if !has_motor_axis(base, user) {
+            MotorTrace::new(&*base.port_name, user.asyn().addr).print(
+                TraceMask::ERROR,
+                function as i32,
+                format_args!(
+                    "SmarActMCSController:writeInt32: error, function: {function}. Invalid axis number.\n"
+                ),
+            );
+            return ParamWrite::Handled(Err(mcs_err("MCS: invalid axis number")));
+        }
+        let axis = user.addr;
         let Some(ctrl) = self.controller.get() else {
             return ParamWrite::PassToBase(Ok(()));
         };
