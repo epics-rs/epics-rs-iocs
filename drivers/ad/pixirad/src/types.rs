@@ -327,6 +327,18 @@ pub enum Asic {
     PIII,
 }
 
+impl Asic {
+    /// The ASIC a detector `maxSizeX` pixels wide is built on; C sets it
+    /// before it looks at `maxSizeY`.
+    pub fn from_size_x(max_size_x: i32) -> Option<Self> {
+        match max_size_x {
+            476 => Some(Self::PII),
+            402 => Some(Self::PIII),
+            _ => None,
+        }
+    }
+}
+
 /// Which detector of the family (C `DETECTOR_BUILD`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Build {
@@ -376,11 +388,8 @@ impl Sensor {
     /// The sensor a `maxSizeX` × `maxSizeY` detector has (C's constructor
     /// switch). X selects the ASIC, Y the number of modules.
     pub fn from_size(max_size_x: i32, max_size_y: i32) -> Option<Self> {
-        let (asic, rows) = match max_size_x {
-            476 => (Asic::PII, 476usize),
-            402 => (Asic::PIII, 402usize),
-            _ => return None,
-        };
+        let asic = Asic::from_size_x(max_size_x)?;
+        let rows = max_size_x as usize;
         let (build, modules, num_udp_packets, num_autocal_udp_packets) = match (asic, max_size_y) {
             (Asic::PII, 512) => (Build::PX1, 1, 360, 135),
             (Asic::PII, 1024) => (Build::PX2, 2, 720, 270),
