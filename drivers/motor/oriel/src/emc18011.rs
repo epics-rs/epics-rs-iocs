@@ -184,8 +184,8 @@ impl Emc18011Controller {
 
         let mut online = false;
         for _ in 0..3 {
-            ctrl.command("L")?; // local
-            let reply = ctrl.command("R")?; // remote
+            ctrl.send(b"L"); // local
+            let reply = ctrl.command("R").unwrap_or_default(); // remote
             if reply.contains(RTN_REMOTE) {
                 online = true;
                 break;
@@ -197,7 +197,7 @@ impl Emc18011Controller {
             ));
         }
 
-        ctrl.command("S")?; // ensure all motion stopped
+        ctrl.send(b"S"); // ensure all motion stopped
         Ok(ctrl)
     }
 
@@ -211,11 +211,15 @@ impl Emc18011Controller {
         MAX_MOTORS
     }
 
-    /// Send a command and return its reply (trimmed). Every command produces a
-    /// reply, so this is used for both queries and set commands (whose reply is
-    /// discarded) to keep the stream synchronized.
+    /// Send a query and return its reply (trimmed).
     fn command(&self, cmd: &str) -> AsynResult<String> {
         self.command_bytes(cmd.as_bytes())
+    }
+
+    /// A set command: written and its reply read, both statuses ignored as
+    /// C ignores send_recv_mess's and motordrvCom's getmsg.
+    fn send(&self, cmd: &[u8]) {
+        let _ = self.command_bytes(cmd);
     }
 
     /// [`command`](Self::command) for a record string's raw bytes.
@@ -236,7 +240,7 @@ impl Emc18011Controller {
                 a + 1
             ))),
             None => {
-                self.command(&format!("M{}", index + 1))?;
+                self.send(format!("M{}", index + 1).as_bytes());
                 self.active = Some(index);
                 Ok(())
             }
@@ -278,7 +282,7 @@ impl Emc18011Axis {
         };
         {
             let mut ctrl = axis.lock();
-            let _ = ctrl.command(&format!("M{}", index + 1));
+            ctrl.send(format!("M{}", index + 1).as_bytes());
             ctrl.active = Some(index);
         }
         let _ = axis.poll(&AsynUser::default());
@@ -296,20 +300,19 @@ impl Emc18011Axis {
         let prem = self.strings.arm();
         let mut ctrl = self.lock();
         ctrl.select(self.index)?;
-        ctrl.command(&vel_cmd(velocity * DRIVE_RESOLUTION))?;
-        send_prem(&ctrl, &prem)?;
-        ctrl.command(move_str)?;
-        ctrl.command("A")?;
+        ctrl.send(vel_cmd(velocity * DRIVE_RESOLUTION).as_bytes());
+        send_prem(&ctrl, &prem);
+        ctrl.send(move_str.as_bytes());
+        ctrl.send(b"A");
         Ok(())
     }
 }
 
 /// PREM as its own message ahead of the move's (devEMC18011.cc:251-264).
-fn send_prem(ctrl: &Emc18011Controller, prem: &[u8]) -> AsynResult<()> {
+fn send_prem(ctrl: &Emc18011Controller, prem: &[u8]) {
     if !prem.is_empty() {
-        ctrl.command_bytes(prem)?;
+        ctrl.send(prem);
     }
-    Ok(())
 }
 
 impl AsynMotor for Emc18011Axis {
@@ -351,13 +354,13 @@ impl AsynMotor for Emc18011Axis {
         let prem = self.strings.arm();
         let mut ctrl = self.lock();
         ctrl.select(self.index)?;
-        send_prem(&ctrl, &prem)?;
+        send_prem(&ctrl, &prem);
         // C prints the signed velocity, a `V-` the direction character
         // already carries; not copied.
-        ctrl.command(&vel_cmd((velocity * DRIVE_RESOLUTION).abs()))?;
+        ctrl.send(vel_cmd((velocity * DRIVE_RESOLUTION).abs()).as_bytes());
         // Direction character: '>' unless C's NINT(steps/s) is negative.
         let dir = if nint(velocity) >= 0 { ">" } else { "<" };
-        ctrl.command(dir)?;
+        ctrl.send(dir.as_bytes());
         Ok(())
     }
 
@@ -377,7 +380,7 @@ impl AsynMotor for Emc18011Axis {
         let ctrl = self.lock();
         // Only the selected (moving) motor can be stopped; otherwise no-op.
         if ctrl.active == Some(self.index) {
-            ctrl.command("S")?;
+            ctrl.send(b"S");
         }
         Ok(())
     }
@@ -393,7 +396,7 @@ impl AsynMotor for Emc18011Axis {
             return Ok(());
         }
         ctrl.select(self.index)?;
-        ctrl.command("CA")?;
+        ctrl.send(b"CA");
         Ok(())
     }
 
@@ -416,7 +419,7 @@ impl AsynMotor for Emc18011Axis {
             return Ok(());
         }
         ctrl.select(self.index)?;
-        ctrl.command_bytes(init)?;
+        ctrl.send(init);
         Ok(())
     }
 
@@ -480,7 +483,7 @@ impl AsynMotor for Emc18011Axis {
         if (z.done || z.plus_ls || z.minus_ls)
             && let Some(post) = self.strings.post_due()
         {
-            let _ = ctrl.command_bytes(&post);
+            ctrl.send(&post);
         }
         drop(ctrl);
 
