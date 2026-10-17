@@ -431,7 +431,7 @@ pub fn pic848_config_command() -> CommandDef {
             let controller = Arc::new(Mutex::new(controller));
 
             for signal in 0..num_axes {
-                let axis = PIC848Axis::new(controller.clone(), signal)
+                let axis = PIC848Axis::new(controller.clone(), card, signal)
                     .map_err(|e| format!("PIC848Config: {e}"))?;
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 PIC848.install(ctx, card, signal as i32, motor)?;
