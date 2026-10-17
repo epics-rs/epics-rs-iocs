@@ -3,8 +3,8 @@
 //! Ported from `motorParker/parkerApp/src/ACRMotorDriver.cpp` (a model-3
 //! `asynMotorController`/`asynMotorAxis` pair) — covers the ACR family including
 //! the Aries. Commands are ASCII, addressed by axis name (`AXIS<n>`), and
-//! CR-terminated (the startup script sets the input EOS; the driver owns output
-//! framing). Connects over a `drvAsynIPPort`.
+//! CR-terminated by the port's input and output EOS, which the startup script
+//! sets as C's does. Connects over a `drvAsynIPPort`.
 //!
 //! ## Echo and reply model
 //!
@@ -47,9 +47,6 @@ use motor_common::util::{atof, atoi};
 /// Response buffer size.
 const READ_BUF: usize = 64;
 
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
-
 /// Ctrl-Y — prefixes jog commands to clear the all-axis kill latch (C `CtlY`).
 const CTL_Y: char = '\u{19}';
 
@@ -77,22 +74,15 @@ impl AcrController {
         ctrl
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command with no reply expected (echo is disabled).
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Write a query and read its reply.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())
@@ -328,6 +318,9 @@ impl AsynMotor for AcrAxis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
     /// A failed PPU query keeps the axis with no encoder or gain support and
     /// refuses motion rather than dividing by an unset PPU.
@@ -347,6 +340,52 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.message(), "AXIS0: PPU was never read");
         assert!(axis.poll(&AsynUser::new(0)).is_err());
+    }
+
+    /// A port that records what it is sent and answers nothing.
+    struct Recorder {
+        base: PortDriverBase,
+        written: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl PortDriver for Recorder {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.written.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _: &AsynUser, _: &mut [u8]) -> AsynResult<usize> {
+            Err(acr_err("no reply"))
+        }
+    }
+
+    /// C writes its commands bare and leaves the CR to the port's output EOS
+    /// (ACRMotorDriver.cpp:68, st.cmd.acr).
+    #[test]
+    fn commands_go_out_without_a_terminator_of_their_own() {
+        let name = "ACR_BARE";
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let driver = Recorder {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            written: written.clone(),
+        };
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        let handle = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::ZERO);
+        let controller = Arc::new(Mutex::new(AcrController::new(handle)));
+        let _ = AcrAxis::new(controller, 0);
+        assert_eq!(
+            written.lock().unwrap()[..2],
+            [b"ECHO 4".to_vec(), b"AXIS0 PPU".to_vec()]
+        );
     }
 
     #[test]
