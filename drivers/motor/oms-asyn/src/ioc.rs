@@ -69,7 +69,8 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                 );
                 return Ok(CommandOutcome::Continue);
             };
-            let mut controller = OmsController::new(handle, &serial_port, controller_type);
+            let mut controller =
+                OmsController::new(handle, &port_name, &serial_port, controller_type);
             if let Err(e) = controller.watch_connection() {
                 println!("{who}: can't set exceptionCallback for {serial_port}: {e}");
                 return Ok(CommandOutcome::Continue);
