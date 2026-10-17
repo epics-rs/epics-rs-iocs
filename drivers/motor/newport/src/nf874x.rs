@@ -234,6 +234,7 @@ impl Nf874xAxis {
 
         status.done = atoi(skip(&ask("MD?")?, &name)) != 0;
         status.moving = !status.done;
+        status.msta_moving = status.moving;
         status.encoder_home = self.encoder_position == 0.0;
 
         if !ctrl.closed_loop {
@@ -538,6 +539,24 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         text.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn md_sets_the_msta_moving_bit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = Arc::new(AtomicBool::new(false));
+        let md = done.clone();
+        let (_rig, io) =
+            motor_common::testing::LineRig::new("nf874xMsta", move |sent| match sent {
+                "1 MD?" => if md.load(Ordering::Relaxed) { "1" } else { "0" }.into(),
+                _ => "0".into(),
+            });
+        let ctrl = Arc::new(Mutex::new(Nf874xController::new(Some(io))));
+        let mut axis = Nf874xAxis::new(ctrl, 1);
+        let user = AsynUser::default();
+        assert!(axis.poll(&user).unwrap().msta_moving);
+        done.store(true, Ordering::Relaxed);
+        assert!(!axis.poll(&user).unwrap().msta_moving);
     }
 
     #[test]
