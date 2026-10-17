@@ -28,7 +28,7 @@ use crate::drv_mvp2001::{self, DrvMvp2001Axis, MVP2001_NUM_CARDS, Mvp2001Chain};
 use crate::mvp2001::{Mvp2001Axis, Mvp2001Controller};
 
 /// Command timeout (C `DEFAULT_CONTROLLER_TIMEOUT`).
-const MVP2001_TIMEOUT: Duration = Duration::from_secs(1);
+const MVP2001_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A registered controller plus the poll intervals its axes should install with.
 struct Registered {
