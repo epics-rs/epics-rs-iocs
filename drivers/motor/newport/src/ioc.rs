@@ -30,6 +30,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::calc::engine::strtod::strtod;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
 use epics_rs::base::server::iocsh::registry::*;
@@ -45,7 +46,6 @@ use motor_common::iocsh::{
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 use motor_common::model2::Model2;
-use motor_common::util::atof;
 use motor_common::{
     Controller, ControllerParams, ControllerReport, asyn_user, install_with_report,
     register_controller_port, register_port_with,
@@ -209,14 +209,12 @@ pub fn smc100_create_controller_command() -> CommandDef {
             let num_axes = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
             let text = opt_string(args, 5)?.unwrap_or_default();
-            let step_size = atof(&text);
             // C prints this after building the controller, on an errno it never
-            // cleared; a zero or infinite step it builds, dividing every
-            // readback by it. Both are refused here before the build.
-            if !step_size.is_finite() || step_size == 0.0 {
+            // cleared; it is refused here before the build.
+            let Some(step_size) = step_size(&text) else {
                 println!("SMC100: Error invalid steps per unit={text}");
                 return Ok(CommandOutcome::Continue);
-            }
+            };
 
             let (moving_s, idle_s) = (period_s(moving_poll_ms), period_s(idle_poll_ms));
             // SMC100Controller::report (SMC100Driver.cpp:103-110).
@@ -742,13 +740,10 @@ pub fn xps_create_axis_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             let text = opt_string(args, 3)?.unwrap_or_default();
-            let steps_per_unit = atof(&text);
-            // An infinite strtod is C's ERANGE. C builds a zero with stepSize
-            // 1/0, so every move sends inf; that is refused here.
-            if !steps_per_unit.is_finite() || steps_per_unit == 0.0 {
+            let Some(steps_per_unit) = step_size(&text) else {
                 println!("XPSController:XPSCreateAxis: Error invalid steps per unit={text}");
                 return Ok(CommandOutcome::Continue);
-            }
+            };
             // C goes on with socket -1, whose TCP_SetTimeout prints
             // (XPSAxis.cpp:146-152).
             let move_sock = match connect_to_server(ctx, &ip, ip_port) {
@@ -2261,6 +2256,15 @@ fn xps_build_profile(
     Ok(directory)
 }
 
+/// C `strtod(text, NULL)` for a step size, `None` where C's `errno` refuses
+/// it (XPSController.cpp:1371-1376, SMC100Driver.cpp:84-89). C builds a
+/// zero, infinite or NaN step and divides by it on every move or readback;
+/// those are refused too.
+fn step_size(text: &str) -> Option<f64> {
+    let read = strtod(text.as_bytes());
+    (!read.erange && read.value.is_finite() && read.value != 0.0).then_some(read.value)
+}
+
 /// C `strerror(errno)`: the OS text without Rust's ` (os error N)`.
 fn strerror(e: &std::io::Error) -> String {
     let text = e.to_string();
@@ -2336,6 +2340,20 @@ fn xps_profile_failed(motor_port: &str, function: &str, message: &str) {
 mod tests {
     use super::*;
     use crate::xps::fake::FakeLine;
+
+    /// XPSController.cpp:1371-1376: C's strtod, refused on its ERANGE, a
+    /// subnormal included.
+    #[test]
+    fn a_step_size_is_cs_strtod() {
+        assert_eq!(step_size("0x10"), Some(16.0));
+        assert_eq!(step_size(" 2.5e3mm"), Some(2500.0));
+        assert_eq!(step_size("1e-310"), None);
+        assert_eq!(step_size("1e-400"), None);
+        assert_eq!(step_size("1e400"), None);
+        assert_eq!(step_size("inf"), None);
+        assert_eq!(step_size("nan"), None);
+        assert_eq!(step_size("abc"), None);
+    }
 
     /// XPSController.cpp:695-747: XPSBuildProfile uploads to the firmware's
     /// folder, over SFTP once an XPS-D build sets `useSFTP_` and over FTP
