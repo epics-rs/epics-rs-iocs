@@ -3855,9 +3855,15 @@ mod tests {
         .unwrap();
         let p = det.p;
         det.configure_calibration("").unwrap();
-        assert_eq!(det.text(p.calibration_root, 0), "/");
-        assert_eq!(det.text(p.calibration_policy, 0), "Permissive: /");
-        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        // "/" has no drive on Windows, so C's is_absolute() refuses it there.
+        let (root, policy) = if cfg!(windows) {
+            ("", "Blocked: calibration root is not absolute")
+        } else {
+            ("/", "Permissive: /")
+        };
+        assert_eq!(det.text(p.calibration_root, 0), root);
+        assert_eq!(det.text(p.calibration_policy, 0), policy);
+        let tmp = crate::calibration::canonical(&std::env::temp_dir()).unwrap();
         det.configure_calibration(tmp.to_str().unwrap()).unwrap();
         assert_eq!(
             det.text(p.calibration_policy, 0),
@@ -4072,12 +4078,20 @@ mod tests {
         )
         .unwrap();
         let p = det.p;
-        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        let tmp = crate::calibration::canonical(&std::env::temp_dir()).unwrap();
+        let tmp = tmp.to_str().unwrap();
+        // C takes `file:/…` only; on Windows that is the path on the current
+        // drive, without its `C:` and with '/' separators.
+        let tmp = if cfg!(windows) {
+            tmp[2..].replace('\\', "/")
+        } else {
+            tmp.to_string()
+        };
         let mut write = |reason, value: String| {
             det.write_octet(&mut AsynUser::new(reason), value.as_bytes())
                 .is_ok()
         };
-        assert!(write(p.raw_base, format!("file:{}", tmp.display())));
+        assert!(write(p.raw_base, format!("file:{tmp}")));
         assert!(!write(p.raw1_base, "file://tmp".into()));
         assert!(write(p.prv_hst_base, "tcp://localhost:8085".into()));
         assert!(!write(p.img1_base, "ftp://somewhere".into()));
@@ -4100,7 +4114,7 @@ mod tests {
         assert_eq!(det.int(p.img1_file_path_exists, 0), 0);
         assert_eq!(det.int(p.prv_img_file_path_exists, 0), 0);
         assert_eq!(det.int(p.img_file_path_exists, 0), 1);
-        assert_eq!(det.text(p.raw_base, 0), format!("file:{}", tmp.display()));
+        assert_eq!(det.text(p.raw_base, 0), format!("file:{tmp}"));
     }
 
     /// A calibration directory gains its trailing '/' and is refused outside
@@ -4117,10 +4131,9 @@ mod tests {
         )
         .unwrap();
         let p = det.p;
-        let tmp = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("tpx-calib-dir-{}", std::process::id()));
+        let tmp = crate::calibration::canonical(&std::env::temp_dir()).unwrap();
+        det.configure_calibration(tmp.to_str().unwrap()).unwrap();
+        let tmp = tmp.join(format!("tpx-calib-dir-{}", std::process::id()));
         std::fs::create_dir_all(tmp.join("root/sub")).unwrap();
         std::fs::create_dir_all(tmp.join("outside")).unwrap();
         let sub = tmp.join("root/sub");
@@ -5869,8 +5882,7 @@ mod tests {
         use epics_rs::asyn::runtime::port::create_port_runtime;
         use epics_rs::asyn::trace::{TraceFile, TraceMask};
         let name = "TPX_CALIB_RESOLVE";
-        let tmp = std::env::temp_dir()
-            .canonicalize()
+        let tmp = crate::calibration::canonical(&std::env::temp_dir())
             .unwrap()
             .join(format!("{name}-{}", std::process::id()));
         let (root, outside) = (tmp.join("root"), tmp.join("outside"));
@@ -6080,7 +6092,7 @@ mod tests {
             cmd_tx,
         )
         .unwrap();
-        calibration_files(&mut det, name);
+        let dir = calibration_files(&mut det, name);
         let p = det.p;
         det.ad.port_base.set_int32_param(p.mask_pel, 0, 1).unwrap();
         let read = |det: &mut TimePix3Driver| {
@@ -6111,7 +6123,6 @@ mod tests {
         shared.note_family(DetectorFamily::Mpx3);
         let mut bpc = vec![0u8; 65536 * 2];
         bpc[(4 * 256 + 3) * 2 + 1] = 1;
-        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         std::fs::write(dir.join("cal.bpc"), &bpc).unwrap();
         // readBPCfile runs first, and its size needs PixCount.
         det.ad.port_base.set_int32_param(p.pix_count, 0, 0).unwrap();
@@ -6188,8 +6199,7 @@ mod tests {
             cmd_tx,
         )
         .unwrap();
-        calibration_files(&mut det, name);
-        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let dir = calibration_files(&mut det, name);
         std::fs::write(dir.join("cal.bpc"), [0x81, 0x01, 0x00, 0x02]).unwrap();
         let p = det.p;
         let mut read = |family, pixels| {
@@ -6270,9 +6280,8 @@ mod tests {
             cmd_tx,
         )
         .unwrap();
-        calibration_files(&mut det, name);
+        let dir = calibration_files(&mut det, name);
         let p = det.p;
-        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
 
         assert!(det.write_bpc_file(&[1, 0]).is_none());
         assert_eq!(
@@ -7242,7 +7251,7 @@ mod tests {
             cmd_tx,
         )
         .unwrap();
-        calibration_files(&mut det, name);
+        let dir = calibration_files(&mut det, name);
         let p = det.p;
         det.ad.port_base.set_int32_param(p.pix_count, 0, 2).unwrap();
         let r = det.config_load("pixelconfig", p.bp_c_file_path, p.bp_c_file_name);
@@ -7251,7 +7260,6 @@ mod tests {
             Err("uploadBPC: local BPC validation failed; request not sent".into())
         );
         assert_eq!(det.int(p.http_code, 0), 0);
-        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         assert_eq!(
             det.text(p.write_msg, 0),
             format!(
@@ -7285,7 +7293,7 @@ mod tests {
                 cmd_tx,
             )
             .unwrap();
-            calibration_files(&mut det, name);
+            let dir = calibration_files(&mut det, name);
             let p = det.p;
             for (reason, value) in [
                 (p.pix_count, 65536),
@@ -7295,7 +7303,6 @@ mod tests {
             ] {
                 det.ad.port_base.set_int32_param(reason, 0, value).unwrap();
             }
-            let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
             match bpc {
                 Some(bpc) => std::fs::write(dir.join("cal.bpc"), bpc).unwrap(),
                 None => std::fs::remove_file(dir.join("cal.bpc")).unwrap(),
@@ -7385,7 +7392,7 @@ mod tests {
             cmd_tx,
         )
         .unwrap();
-        calibration_files(&mut det, name);
+        let dir = calibration_files(&mut det, name);
         let p = det.p;
         for (reason, value) in [
             (p.pix_count, 65536),
@@ -7397,7 +7404,6 @@ mod tests {
         }
         det.set_text(p.bp_c_file_name, "cal.BPC").unwrap();
         det.set_text(p.det_type, "TPX3").unwrap();
-        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         let mut bpc = vec![0u8; 65536];
         bpc[5] = 3;
         bpc[300] = 1;
@@ -7405,7 +7411,7 @@ mod tests {
         std::fs::write(dir.join("cal.BPC"), &bpc).unwrap();
 
         det.export_masked_pels_json(&bpc).unwrap();
-        let out = dir.canonicalize().unwrap().join("cal_masked_pels.json");
+        let out = dir.join("cal_masked_pels.json");
         assert_eq!(
             (
                 det.text(p.masked_pels_json_path, 0),
@@ -7425,11 +7431,7 @@ mod tests {
         assert_eq!(root["detector"]["type"], "TPX3");
         assert_eq!(
             root["source"]["bpc_path"],
-            dir.canonicalize()
-                .unwrap()
-                .join("cal.BPC")
-                .display()
-                .to_string()
+            dir.join("cal.BPC").display().to_string()
         );
         let stamp = root["source"]["exported_at_utc"].as_str().unwrap();
         assert_eq!((stamp.len(), &stamp[10..11], &stamp[19..]), (20, "T", "Z"));
@@ -7659,24 +7661,30 @@ mod tests {
         );
     }
 
-    fn calibration_files(det: &mut TimePix3Driver, name: &str) {
-        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    /// `name`'s calibration directory under a root of the temp directory, in
+    /// the canonical form the policy resolves to. The default "/" root is not
+    /// absolute on Windows, as in C, so the tests configure their own.
+    fn calibration_files(det: &mut TimePix3Driver, name: &str) -> std::path::PathBuf {
+        let tmp = crate::calibration::canonical(&std::env::temp_dir()).unwrap();
+        det.configure_calibration(tmp.to_str().unwrap()).unwrap();
+        let dir = tmp.join(format!("{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for file in ["cal.bpc", "cal.dacs"] {
             std::fs::write(dir.join(file), b"x").unwrap();
         }
         let p = det.p;
-        let dir = format!("{}/", dir.display());
+        let text = format!("{}/", dir.display());
         for (reason, text) in [
-            (p.bp_c_file_path, dir.as_str()),
+            (p.bp_c_file_path, text.as_str()),
             (p.bp_c_file_name, "cal.bpc"),
-            (p.da_cs_file_path, dir.as_str()),
+            (p.da_cs_file_path, text.as_str()),
             (p.da_cs_file_name, "cal.dacs"),
         ] {
             det.set_text(reason, text).unwrap();
         }
         // The one-byte cal.bpc is the geometry's size, as uploadBPC checks.
         det.ad.port_base.set_int32_param(p.pix_count, 0, 1).unwrap();
+        dir
     }
 
     /// The upload runs, and its status is the write's, even where the

@@ -188,12 +188,18 @@ mod tests {
         assert_eq!(p.validate_directory("/"), Err(PathError::RootNotConfigured));
         assert_eq!(p.configure(""), Err(PathError::RootNotConfigured));
         assert_eq!(p.configure("rel"), Err(PathError::RootNotAbsolute));
+        let missing = std::env::temp_dir().join("no/such/dir/anywhere");
         assert_eq!(
-            p.configure("/no/such/dir/anywhere"),
+            p.configure(missing.to_str().unwrap()),
             Err(PathError::RootUnavailable)
         );
-        p.configure("/").unwrap();
-        assert!(p.permissive());
+        // "/" has no drive on Windows, so C's is_absolute() refuses it there.
+        if cfg!(windows) {
+            assert_eq!(p.configure("/"), Err(PathError::RootNotAbsolute));
+        } else {
+            p.configure("/").unwrap();
+            assert!(p.permissive());
+        }
     }
 
     #[test]
