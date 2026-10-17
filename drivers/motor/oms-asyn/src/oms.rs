@@ -49,10 +49,12 @@
 //!   string once as a comms check and assumes the modern (>= 1.30) command
 //!   forms MAXnet mandates.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::exception::{AsynException, ExceptionCallbackGuard};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -118,6 +120,10 @@ pub struct OmsController {
     serial_port: String,
     /// `"MAXnet"` or `"MXA"` (label only; the protocol is identical).
     controller_type: &'static str,
+    /// C `portConnected`, kept by [`Self::watch_connection`]'s callback.
+    port_connected: Arc<AtomicBool>,
+    /// The `exceptionCallbackAdd` registration; dropped with the controller.
+    _connect_callback: Option<ExceptionCallbackGuard>,
 }
 
 impl OmsController {
@@ -127,7 +133,34 @@ impl OmsController {
             handle,
             serial_port: serial_port.to_owned(),
             controller_type,
+            port_connected: Arc::new(AtomicBool::new(false)),
+            _connect_callback: None,
         }
+    }
+
+    /// The constructor's `exceptionCallbackAdd(connectCallback)` and
+    /// `isConnected` (omsMAXnet.cpp:105-111, omsMXA.cpp:100-106), on the
+    /// serial user at addr 0. `connectCallback`'s trace lines are gated on
+    /// `motorMAXnetdebug`/`motorMXAdebug`, which the dbd never registers
+    /// (`#variable`), so they cannot fire and are not ported.
+    pub fn watch_connection(&mut self) -> AsynResult<()> {
+        let port = self.handle.port()?;
+        let cells = port.connect_device(0);
+        let flag = Arc::clone(&self.port_connected);
+        let callback = cells.clone();
+        self._connect_callback = Some(port.exception_callback_add(0, move |ev| {
+            if ev.exception == AsynException::Connect {
+                flag.store(callback.connected(), Ordering::Release);
+            }
+        }));
+        self.port_connected
+            .store(cells.connected(), Ordering::Release);
+        Ok(())
+    }
+
+    /// C `portConnected`.
+    pub fn port_connected(&self) -> bool {
+        self.port_connected.load(Ordering::Acquire)
     }
 
     /// Controller label, for logging.
@@ -561,6 +594,35 @@ mod tests {
         assert_eq!(OmsAxis::nint(-1.4), -1);
         assert_eq!(OmsAxis::nint(-1.5), -2);
         assert_eq!(OmsAxis::nint(0.0), 0);
+    }
+
+    /// `connectCallback` follows the serial port's connect exceptions.
+    #[test]
+    fn port_connected_follows_the_connect_exceptions() {
+        let name = "omsConnectCallback";
+        let base = epics_rs::asyn::port::PortDriverBase::new(
+            name,
+            1,
+            epics_rs::asyn::port::PortFlags::default(),
+        );
+        let (rt, _jh) = epics_rs::asyn::runtime::create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            DeadLine {
+                base,
+                written: Default::default(),
+            },
+            epics_rs::asyn::runtime::RuntimeConfig::default(),
+        )
+        .unwrap();
+        let port = rt.port_handle().clone();
+        let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_millis(100));
+        let mut controller = OmsController::new(io, name, "MXA");
+        controller.watch_connection().unwrap();
+        assert!(controller.port_connected());
+        port.disconnect_blocking().unwrap();
+        assert!(!controller.port_connected());
+        port.connect_blocking().unwrap();
+        assert!(controller.port_connected());
     }
 
     #[test]
