@@ -370,7 +370,7 @@ async fn connection_poll(
 /// memory. Here the edge starts from "down", so the first success always
 /// refreshes.
 async fn poll_connection(ctx: &Arc<Ctx>, was_up: bool) -> bool {
-    let reply = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL);
+    let reply = read_dashboard(ctx);
     let mut updates = Vec::new();
     let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
     let up = serval_ok && det_ok;
@@ -445,12 +445,11 @@ async fn refresh_measurement_config(ctx: &Arc<Ctx>) -> bool {
 /// C `checkConnection()` with its defaults, publishing the HTTP status and
 /// the connection status (serval_http.cpp:363-392).
 async fn check_connection(ctx: &Arc<Ctx>) -> bool {
-    let reply = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL);
-    let code = reply.as_ref().map_or_else(|e| e.code(), |_| 200);
+    let reply = read_dashboard(ctx);
     let mut updates = vec![ParamSetValue::new(
         ctx.p.http_code,
         0,
-        ParamValue::Int32(code),
+        ParamValue::Int32(reply.code),
     )];
     let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
     connection_status(ctx, serval_ok, det_ok, &mut updates);
@@ -458,25 +457,39 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
     serval_ok && det_ok
 }
 
+/// One `GET /dashboard`: cpr's status code and C `parseResponse`'s verdict.
+struct DashboardReply {
+    code: i32,
+    parsed: Result<serval::Dashboard, serval::DashboardError>,
+}
+
+fn read_dashboard(ctx: &Ctx) -> DashboardReply {
+    let (code, body) = match ctx.http.get(serval::DASHBOARD, TIMEOUT_POLL) {
+        Ok(body) => (200, body),
+        Err(e) => (e.code(), e.body().to_string()),
+    };
+    DashboardReply {
+        code,
+        parsed: serval::parse_dashboard_response(code, &body),
+    }
+}
+
 /// C `publishDashboardSnapshot` and `publishDashboardFailure`
 /// (serval_http.cpp:219-249), which every dashboard read runs; returns
-/// whether Serval and the detector are connected.
+/// whether Serval answered 200 and whether the detector is connected
+/// (serval_http.cpp:371-373).
 fn publish_dashboard(
     ctx: &Arc<Ctx>,
-    reply: &crate::http::HttpResult<Value>,
+    reply: &DashboardReply,
     updates: &mut Vec<ParamSetValue>,
 ) -> (bool, bool) {
     let p = ctx.p;
-    let (serval_ok, det_type) = match reply {
-        Ok(dashboard) => {
-            let detector = dashboard.get("Detector").unwrap_or(&Value::Null);
-            let det_type = (!detector.is_null()).then(|| {
-                serval::json_to_string(detector.get("DetectorType").unwrap_or(&Value::Null))
-            });
-            (true, det_type)
-        }
-        Err(_) => (false, None),
-    };
+    let serval_ok = reply.code == 200;
+    let det_type = reply
+        .parsed
+        .as_ref()
+        .ok()
+        .and_then(|d| d.detector_type.as_deref());
     let det_ok = det_type.is_some();
     updates.push(ParamSetValue::new(
         p.serval_connected,
@@ -488,24 +501,24 @@ fn publish_dashboard(
         0,
         ParamValue::Int32(i32::from(det_ok)),
     ));
-    let shown = det_type.as_deref().unwrap_or("null");
+    let shown = det_type.unwrap_or("null");
     updates.push(ParamSetValue::new(
         p.det_type,
         0,
         ParamValue::Octet(shown.as_bytes().to_vec().into()),
     ));
-    if let Some(det_type) = &det_type {
+    if let Some(det_type) = det_type {
         updates.push(ParamSetValue::new(
             ctx.ad.base.model,
             0,
             ParamValue::Octet(det_type.as_bytes().to_vec().into()),
         ));
     }
-    match reply {
+    match &reply.parsed {
         Ok(dashboard) => {
-            serval_version(ctx, dashboard, updates);
-            disk_space(ctx, dashboard, updates);
-            if let Some(status) = dashboard_measurement_status(dashboard) {
+            serval_version(ctx, &dashboard.response, updates);
+            disk_space(ctx, &dashboard.response, updates);
+            if let Some(status) = dashboard_measurement_status(&dashboard.response) {
                 measurement_status(p, status, updates);
             }
         }
@@ -644,7 +657,7 @@ fn as_bool_or_int(v: &Value) -> Option<i32> {
 
 /// C `getDashboard` (serval_http.cpp:431-454).
 async fn refresh_dashboard(ctx: &Arc<Ctx>) {
-    let reply = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL);
+    let reply = read_dashboard(ctx);
     let mut updates = Vec::new();
     let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
     connection_status(ctx, serval_ok, det_ok, &mut updates);
@@ -3684,6 +3697,75 @@ mod tests {
             }
         });
         (url, log)
+    }
+
+    /// A dashboard reply C `parseResponse` rejects is a dashboard failure as
+    /// a whole; a 200 still means Serval is reachable
+    /// (serval_http.cpp:363-392, serval_dashboard.cpp:49-98).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rejected_dashboard_reply_is_a_failure_with_serval_up() {
+        type Body = fn(&str) -> &'static str;
+        let cases: [(&str, Body); 3] = [
+            ("TPX_DASH_MALFORMED", |_| "{"),
+            (
+                "TPX_DASH_TYPE",
+                |_| r#"{"Server":{"SoftwareVersion":"3.3"},"Detector":{"DetectorType":5}}"#,
+            ),
+            (
+                "TPX_DASH_NODET",
+                |_| r#"{"Server":{"SoftwareVersion":"3.3"}}"#,
+            ),
+        ];
+        for (name, body_for) in cases {
+            let (url, _log) = logging_serval(&[], body_for);
+            let ctx = Arc::new(idle_ctx_at(name, &url, None));
+            let (h, p) = (&ctx.handle, ctx.p);
+            ctx.set(
+                0,
+                vec![
+                    ParamSetValue::new(
+                        ctx.ad.base.sdk_version,
+                        0,
+                        ParamValue::Octet(b"old".to_vec().into()),
+                    ),
+                    ParamSetValue::new(p.status, 0, ParamValue::Octet(b"DA_IDLE".to_vec().into())),
+                ],
+            )
+            .await;
+            assert!(!check_connection(&ctx).await, "{name}");
+            assert_eq!(h.read_int32(p.http_code, 0).await.unwrap(), 200, "{name}");
+            assert_eq!(
+                h.read_int32(p.serval_connected, 0).await.unwrap(),
+                1,
+                "{name}"
+            );
+            assert_eq!(h.read_int32(p.det_connected, 0).await.unwrap(), 0, "{name}");
+            assert_eq!(
+                h.read_octet(p.det_type, 0, 64).await.unwrap(),
+                b"null\0",
+                "{name}"
+            );
+            assert_eq!(
+                h.read_octet(ctx.ad.base.sdk_version, 0, 64).await.unwrap(),
+                b"old\0",
+                "{name}"
+            );
+            assert_eq!(
+                h.read_octet(p.status, 0, 64).await.unwrap(),
+                b"\0",
+                "{name}"
+            );
+            assert_eq!(
+                h.read_octet(ctx.ad.status_message, 0, 64).await.unwrap(),
+                b"Detector disconnected\0",
+                "{name}"
+            );
+            assert_eq!(
+                h.read_int32(ctx.ad.status, 0).await.unwrap(),
+                ADStatus::Disconnected as i32,
+                "{name}"
+            );
+        }
     }
 
     /// A `/detector` reply that passes C `parseResponse`.

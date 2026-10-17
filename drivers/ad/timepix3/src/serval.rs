@@ -591,6 +591,120 @@ pub fn parse_config_response(body: &str) -> Result<Value, ConfigResponseError> {
     }
 }
 
+/// C `ADTimePix3ServalDashboard::ResponseError` (serval_dashboard.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardError {
+    HttpFailure,
+    EmptyBody,
+    MalformedJson,
+    InvalidRoot,
+    MissingServer,
+    InvalidServer,
+    MissingDetector,
+    InvalidDetector,
+    InvalidDetectorType,
+    InvalidMeasurement,
+    InvalidSoftwareVersion,
+    InvalidSoftwareTimestamp,
+    InvalidDiskSpace,
+    InvalidDiskEntry,
+    InvalidDiskValue,
+}
+
+impl DashboardError {
+    /// C `responseErrorMessage` (serval_dashboard.cpp:100-121).
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::HttpFailure => "dashboard GET failed",
+            Self::EmptyBody => "empty dashboard response",
+            Self::MalformedJson => "malformed dashboard JSON",
+            Self::InvalidRoot => "dashboard root is not an object",
+            Self::MissingServer => "dashboard Server field is missing",
+            Self::InvalidServer => "dashboard Server field is not an object",
+            Self::MissingDetector => "dashboard Detector field is missing",
+            Self::InvalidDetector => "dashboard Detector field is neither null nor an object",
+            Self::InvalidDetectorType => "dashboard detector type is missing or invalid",
+            Self::InvalidMeasurement => "dashboard Measurement field is invalid",
+            Self::InvalidSoftwareVersion => "dashboard software version is invalid",
+            Self::InvalidSoftwareTimestamp => "dashboard software timestamp is invalid",
+            Self::InvalidDiskSpace => "dashboard DiskSpace field is not an array",
+            Self::InvalidDiskEntry => "dashboard DiskSpace entry is not an object",
+            Self::InvalidDiskValue => "dashboard DiskSpace value has an invalid type",
+        }
+    }
+}
+
+/// A `GET /dashboard` reply that passed C `parseResponse`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dashboard {
+    pub response: Value,
+    /// `Detector.DetectorType`; `None` when `Detector` is null.
+    pub detector_type: Option<String>,
+}
+
+/// C `ADTimePix3ServalDashboard::parseResponse` (serval_dashboard.cpp:49-98):
+/// the whole reply is checked before any of it is published.
+pub fn parse_dashboard_response(code: i32, body: &str) -> Result<Dashboard, DashboardError> {
+    use DashboardError as E;
+    if code != 200 {
+        return Err(E::HttpFailure);
+    }
+    if body.is_empty() {
+        return Err(E::EmptyBody);
+    }
+    let response: Value = serde_json::from_str(body).map_err(|_| E::MalformedJson)?;
+    let root = response.as_object().ok_or(E::InvalidRoot)?;
+    let server = root.get("Server").ok_or(E::MissingServer)?;
+    let server = server.as_object().ok_or(E::InvalidServer)?;
+    let detector_type = match root.get("Detector").ok_or(E::MissingDetector)? {
+        Value::Null => None,
+        Value::Object(detector) => Some(
+            detector
+                .get("DetectorType")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .ok_or(E::InvalidDetectorType)?
+                .to_string(),
+        ),
+        _ => return Err(E::InvalidDetector),
+    };
+    if root
+        .get("Measurement")
+        .is_some_and(|m| !m.is_null() && !m.is_object())
+    {
+        return Err(E::InvalidMeasurement);
+    }
+    let not_string = |key: &str| server.get(key).is_some_and(|v| !v.is_string());
+    if not_string("SoftwareVersion") {
+        return Err(E::InvalidSoftwareVersion);
+    }
+    if not_string("SoftwareTimestamp") {
+        return Err(E::InvalidSoftwareTimestamp);
+    }
+    if let Some(disks) = server.get("DiskSpace") {
+        for disk in disks.as_array().ok_or(E::InvalidDiskSpace)? {
+            let disk = disk.as_object().ok_or(E::InvalidDiskEntry)?;
+            // An absent or null value is accepted (`validOptional*`).
+            let valid = |key: &str, ok: fn(&Value) -> bool| {
+                disk.get(key).is_none_or(|v| v.is_null() || ok(v))
+            };
+            if !(valid("FreeSpace", |v| v.as_i64().is_some())
+                && valid("WriteSpeed", Value::is_number)
+                && valid("LowerLimit", |v| v.as_i64().is_some())
+                && valid("DiskLimitReached", |v| {
+                    v.is_boolean() || v.as_i64().and_then(|n| i32::try_from(n).ok()).is_some()
+                }))
+            {
+                return Err(E::InvalidDiskValue);
+            }
+        }
+    }
+    Ok(Dashboard {
+        response,
+        detector_type,
+    })
+}
+
 /// C `ADTimePix3ServalDetector::ParseError` (serval_detector.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectorParseError {
@@ -800,6 +914,85 @@ pub fn json_to_string(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `parseResponse` (serval_dashboard.cpp:49-98).
+    #[test]
+    fn the_dashboard_reply_is_validated_as_c() {
+        use DashboardError as E;
+        let parse = |body: &str| parse_dashboard_response(200, body).map(|d| d.detector_type);
+        assert_eq!(
+            parse(r#"{"Server":{},"Detector":{"DetectorType":"TPX3"}}"#),
+            Ok(Some("TPX3".into()))
+        );
+        assert_eq!(
+            parse(r#"{"Server":{},"Detector":null,"Measurement":null}"#),
+            Ok(None)
+        );
+        assert_eq!(
+            parse(
+                r#"{"Server":{"SoftwareVersion":"3","SoftwareTimestamp":"t","DiskSpace":[
+                {"FreeSpace":1,"WriteSpeed":1.5,"LowerLimit":null,"DiskLimitReached":true},
+                {"DiskLimitReached":1}]},"Detector":null}"#
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_dashboard_response(404, r#"{"Server":{},"Detector":null}"#),
+            Err(E::HttpFailure)
+        );
+        for (body, error) in [
+            ("", E::EmptyBody),
+            ("{", E::MalformedJson),
+            ("[]", E::InvalidRoot),
+            (r#"{"Detector":null}"#, E::MissingServer),
+            (r#"{"Server":1,"Detector":null}"#, E::InvalidServer),
+            (r#"{"Server":{}}"#, E::MissingDetector),
+            (r#"{"Server":{},"Detector":"TPX3"}"#, E::InvalidDetector),
+            (r#"{"Server":{},"Detector":{}}"#, E::InvalidDetectorType),
+            (
+                r#"{"Server":{},"Detector":{"DetectorType":""}}"#,
+                E::InvalidDetectorType,
+            ),
+            (
+                r#"{"Server":{},"Detector":null,"Measurement":1}"#,
+                E::InvalidMeasurement,
+            ),
+            (
+                r#"{"Server":{"SoftwareVersion":3},"Detector":null}"#,
+                E::InvalidSoftwareVersion,
+            ),
+            (
+                r#"{"Server":{"SoftwareTimestamp":3},"Detector":null}"#,
+                E::InvalidSoftwareTimestamp,
+            ),
+            (
+                r#"{"Server":{"DiskSpace":{}},"Detector":null}"#,
+                E::InvalidDiskSpace,
+            ),
+            (
+                r#"{"Server":{"DiskSpace":[1]},"Detector":null}"#,
+                E::InvalidDiskEntry,
+            ),
+            (
+                r#"{"Server":{"DiskSpace":[{"FreeSpace":1.5}]},"Detector":null}"#,
+                E::InvalidDiskValue,
+            ),
+            (
+                r#"{"Server":{"DiskSpace":[{"WriteSpeed":"x"}]},"Detector":null}"#,
+                E::InvalidDiskValue,
+            ),
+            (
+                r#"{"Server":{"DiskSpace":[{"LowerLimit":9223372036854775808}]},"Detector":null}"#,
+                E::InvalidDiskValue,
+            ),
+            (
+                r#"{"Server":{"DiskSpace":[{"DiskLimitReached":2147483648}]},"Detector":null}"#,
+                E::InvalidDiskValue,
+            ),
+        ] {
+            assert_eq!(parse(body), Err(error), "{body}");
+        }
+    }
 
     /// C `parseResponse` (serval_detector.cpp:60-88).
     #[test]
