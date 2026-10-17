@@ -158,12 +158,12 @@ impl Esp300Controller {
 }
 
 /// The velocity/acceleration preamble every motion transaction carries
-/// (record `SET_VEL_BASE`/`SET_VELOCITY`/`SET_ACCEL` before the move):
-/// `VB;VA;AC;AG` — the ESP300 takes acceleration and deceleration (`AG`)
-/// separately, C sends both. Values are controller units.
+/// in the motor record's order (`SET_VELOCITY`, `SET_VEL_BASE`,
+/// `SET_ACCEL`): `VA;VB;AC;AG` — the ESP300 takes acceleration and
+/// deceleration (`AG`) separately, C sends both. Values are controller units.
 fn motion_preamble(axis: usize, vel_base: f64, velocity: f64, acceleration: f64) -> String {
     format!(
-        "{axis:02}VB{vel_base:.6};{axis:02}VA{velocity:.6};{axis:02}AC{acceleration:.6};{axis:02}AG{acceleration:.6}"
+        "{axis:02}VA{velocity:.6};{axis:02}VB{vel_base:.6};{axis:02}AC{acceleration:.6};{axis:02}AG{acceleration:.6}"
     )
 }
 
@@ -314,18 +314,19 @@ impl AsynMotor for Esp300Axis {
     fn move_velocity(
         &mut self,
         _user: &AsynUser,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        // Record JOG transaction: SET_ACCEL then VA with the jog speed and a
-        // signed MV (C `JOG` case).
+        // Record JOG transaction: SET_VEL_BASE, SET_ACCEL, then VA with the
+        // jog speed and a signed MV (C `JOG` case).
         let a = self.axis;
         let res = self.resolution()?;
-        let (velocity, acceleration) = (velocity * res, acceleration * res);
+        let (vel_base, velocity, acceleration) =
+            (min_velocity * res, velocity * res, acceleration * res);
         let sign = if velocity > 0.0 { '+' } else { '-' };
         self.write_move(
-            &format!("{a:02}AC{acceleration:.6};{a:02}AG{acceleration:.6}"),
+            &format!("{a:02}VB{vel_base:.6};{a:02}AC{acceleration:.6};{a:02}AG{acceleration:.6}"),
             &format!("{a:02}VA{:.6};{a:02}MV{sign}", velocity.abs()),
         )
     }
@@ -697,7 +698,7 @@ mod tests {
     fn prem_leads_the_move_command() {
         let (line, mut axis, _) = strings_rig("esp300Prem");
         let user = AsynUser::default();
-        let parts = "01VB0.000000;01VA2.000000;01AC3.000000;01AG3.000000";
+        let parts = "01VA2.000000;01VB0.000000;01AC3.000000;01AG3.000000";
         axis.set_move_strings(&user, b"01MO", None).unwrap();
         axis.move_absolute(&user, 1.5, 0.0, 2.0, 3.0).unwrap();
         assert_eq!(line.sent(), [format!("{parts};01MO;01PA1.500000")]);
@@ -710,7 +711,7 @@ mod tests {
         axis.move_velocity(&user, 0.0, -2.0, 3.0).unwrap();
         assert_eq!(
             line.sent(),
-            ["01AC3.000000;01AG3.000000;01MO;01VA2.000000;01MV-"]
+            ["01VB0.000000;01AC3.000000;01AG3.000000;01MO;01VA2.000000;01MV-"]
         );
     }
 
@@ -784,11 +785,11 @@ mod tests {
         // both sent with the acceleration.
         assert_eq!(
             motion_preamble(1, 0.5, 2.0, 8.0),
-            "01VB0.500000;01VA2.000000;01AC8.000000;01AG8.000000"
+            "01VA2.000000;01VB0.500000;01AC8.000000;01AG8.000000"
         );
         assert_eq!(
             motion_preamble(12, 0.0, 1.0, 4.0),
-            "12VB0.000000;12VA1.000000;12AC4.000000;12AG4.000000"
+            "12VA1.000000;12VB0.000000;12AC4.000000;12AG4.000000"
         );
     }
 }
