@@ -1802,9 +1802,13 @@ impl TimePix3Driver {
         let addr = user.addr;
         let acquiring = self.int(self.ad.params.acquire, 0) != 0;
         // Acquire is published once the coordinator accepts the transition.
-        if reason != self.ad.params.acquire {
-            self.ad.port_base.set_int32_param(reason, addr, value)?;
-        }
+        // The set's status stands wherever C assigns no other
+        // (ADTimePix.cpp:507-509).
+        let set = if reason != self.ad.params.acquire {
+            self.ad.port_base.set_int32_param(reason, addr, value)
+        } else {
+            Ok(())
+        };
 
         let p = self.p;
         let result = if reason == self.ad.params.acquire {
@@ -1858,7 +1862,7 @@ impl TimePix3Driver {
                         message: "timepix3: the connection task is not running".into(),
                     })
             } else {
-                Ok(())
+                set
             }
         } else if reason == p.refresh_pixel_config {
             self.ad
@@ -1867,19 +1871,19 @@ impl TimePix3Driver {
             if addr == 0 && one_shot(value) {
                 self.refresh_pixel_config()
             } else {
-                Ok(())
+                set
             }
         } else if reason == p.apply_config {
             self.ad.port_base.set_int32_param(p.apply_config, 0, 0)?;
             if one_shot(value) {
                 self.file_writer().and_then(|()| self.get_server())
             } else {
-                Ok(())
+                set
             }
         } else if reason == p.write_bp_c_file || reason == p.write_da_cs_file {
             self.ad.port_base.set_int32_param(reason, addr, 0)?;
             if !one_shot(value) {
-                Ok(())
+                set
             } else if reason == p.write_bp_c_file {
                 self.config_load("pixelconfig", p.bp_c_file_path, p.bp_c_file_name)
             } else {
@@ -2000,7 +2004,8 @@ impl TimePix3Driver {
                     "Ignoring NumImages={value} in single mode, forcing NumImages=1"
                 ));
             }
-            self.init_acquisition()
+            // ADTimePix.cpp:726.
+            set.and_then(|()| self.init_acquisition())
         } else if reason == self.ad.params.image_mode {
             if acquiring {
                 let _ = self.acquire_stop();
@@ -2011,7 +2016,7 @@ impl TimePix3Driver {
                     .set_int32_param(self.ad.params.num_images, 0, 1)?;
                 self.init_acquisition()
             } else {
-                Ok(())
+                set
             }
         } else if reason == p.stem_scan_width
             || reason == p.stem_scan_height
@@ -2026,27 +2031,25 @@ impl TimePix3Driver {
             let value = value.clamp(low, high);
             self.ad.port_base.set_int32_param(reason, 0, value)?;
             if reason == p.img_frames_to_sum {
-                self.reconfigure_window(Accum::Img, true, |a| a.set_frames_to_sum(value))
+                self.reconfigure_window(Accum::Img, true, |a| a.set_frames_to_sum(value))?;
             } else if reason == p.img_retention_limit_mb {
-                self.reconfigure_window(Accum::Img, false, |a| a.set_retention_limit_mb(value))
+                self.reconfigure_window(Accum::Img, false, |a| a.set_retention_limit_mb(value))?;
             } else if reason == p.prv_hst_frames_to_sum {
-                self.reconfigure_window(Accum::PrvHst, false, |a| a.set_frames_to_sum(value))
+                self.reconfigure_window(Accum::PrvHst, false, |a| a.set_frames_to_sum(value))?;
             } else if reason == p.prv_hst_retention_limit_mb {
-                self.reconfigure_window(Accum::PrvHst, false, |a| a.set_retention_limit_mb(value))
-            } else {
-                if reason == p.img_sum_update_interval_frames {
-                    self.shared.img.lock().set_update_interval(value);
-                } else if reason == p.prv_hst_sum_update_interval {
-                    self.shared.hst.lock().set_update_interval(value);
-                }
-                Ok(())
+                self.reconfigure_window(Accum::PrvHst, false, |a| a.set_retention_limit_mb(value))?;
+            } else if reason == p.img_sum_update_interval_frames {
+                self.shared.img.lock().set_update_interval(value);
+            } else if reason == p.prv_hst_sum_update_interval {
+                self.shared.hst.lock().set_update_interval(value);
             }
+            set
         } else if reason == p.processed_img_output_type || reason == p.processed_hst_output_type {
             // ADTimePix.cpp:593-597, :605-609.
             if value != 0 && value != 1 {
                 self.ad.port_base.set_int32_param(reason, 0, 0)?;
             }
-            Ok(())
+            set
         } else if reason == p.img_image_data_reset {
             if value == 1 {
                 // C resetImgAccumulation (serval_stream.cpp:1421).
@@ -2071,7 +2074,7 @@ impl TimePix3Driver {
                     .port_base
                     .set_int32_param(p.img_image_data_reset, 0, 0)?;
             }
-            Ok(())
+            set
         } else if reason == p.write_processed_img {
             // ADTimePix.cpp:586-592; the task stores 0 once the arrays are out.
             if value == 1 {
@@ -2082,7 +2085,7 @@ impl TimePix3Driver {
                         message: "timepix3: the connection task is not running".into(),
                     })?;
             }
-            Ok(())
+            set
         } else if reason == p.write_processed_hst {
             // ADTimePix.cpp:598-604; the task stores 0 once the arrays are out.
             if value == 1 {
@@ -2093,7 +2096,7 @@ impl TimePix3Driver {
                         message: "timepix3: the connection task is not running".into(),
                     })?;
             }
-            Ok(())
+            set
         } else if reason == p.prv_hst_data_reset {
             if value == 1 {
                 // C resetPrvHstAccumulation (ADTimePix.cpp:1365-1416).
@@ -2130,7 +2133,7 @@ impl TimePix3Driver {
                     .port_base
                     .set_int32_param(p.prv_hst_data_reset, 0, 0)?;
             }
-            Ok(())
+            set
         } else if reason == p.mask_reset
             || reason == p.mask_rectangle
             || reason == p.mask_circle
@@ -2141,7 +2144,7 @@ impl TimePix3Driver {
             // These are one-shot triggers, exactly as the db's autosave-free
             // bo records expect.
             self.ad.port_base.set_int32_param(reason, 0, 0)?;
-            r
+            r.and(set)
         } else if reason == p.health {
             self.cmd_tx
                 .try_send(Command::RefreshStatus)
@@ -2154,7 +2157,7 @@ impl TimePix3Driver {
             // ADTimePix.cpp:860-863).
             return ADDriver::ad_write_int32(self, user, value).map_err(Refusal::Base);
         } else {
-            Ok(())
+            set
         };
         Ok(result?)
     }
@@ -2170,7 +2173,9 @@ impl TimePix3Driver {
         let addr = user.addr;
         let acquiring = self.int(self.ad.params.acquire, 0) != 0;
 
-        self.ad.port_base.set_float64_param(reason, addr, value)?;
+        // The set's status stands unless a branch assigns another
+        // (ADTimePix.cpp:1093-1106).
+        let set = self.ad.port_base.set_float64_param(reason, addr, value);
 
         let p = self.p;
         if reason == self.ad.params.acquire_time
@@ -2191,7 +2196,7 @@ impl TimePix3Driver {
                 .write_float64_param(user, value)
                 .map_err(Refusal::Base)
         } else {
-            Ok(())
+            Ok(set?)
         }
     }
 }
@@ -2974,6 +2979,31 @@ mod tests {
             .set_int32_param(ad.num_images, 0, 7)
             .unwrap();
         det.write_int32(&mut AsynUser::new(ad.image_mode), 0)
+            .unwrap();
+        assert_eq!(det.int(ad.num_images, 0), 1);
+    }
+
+    /// C keeps a refused set as the status and runs the action, whose status
+    /// replaces it (ADTimePix.cpp:508, :533-536, :1093-1097).
+    #[test]
+    fn a_refused_set_still_runs_the_action() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            "TPX_SET_ACTION",
+            Arc::new(ServalHttp::new(&fake_serval("nothing fails"))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let ad = det.ad.params;
+        det.write_float64(&mut AsynUser::new(ad.acquire_time).with_addr(20), 0.5)
+            .unwrap();
+        det.ad
+            .port_base
+            .set_int32_param(ad.num_images, 0, 7)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(ad.image_mode).with_addr(20), 0)
             .unwrap();
         assert_eq!(det.int(ad.num_images, 0), 1);
     }
