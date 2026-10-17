@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{PortDriverBase, param_list};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -845,10 +845,10 @@ impl ControllerParams for PmacControllerParams {
         user: &AsynUser,
         value: i32,
     ) -> ParamWrite {
-        if self.refuses(base, user, "writeInt32") {
+        let Some(addr) = self.get_axis(base, user, "writeInt32") else {
             return ParamWrite::PassToBase(Ok(()));
-        }
-        self.write_int32_own(base, user, value).into()
+        };
+        self.write_int32_own(base, addr, user.reason, value).into()
     }
 
     fn write_float64(
@@ -857,35 +857,38 @@ impl ControllerParams for PmacControllerParams {
         user: &AsynUser,
         _value: f64,
     ) -> ParamWrite {
-        self.refuses(base, user, "writeFloat64");
+        self.get_axis(base, user, "writeFloat64");
         ParamWrite::PassToBase(Ok(()))
     }
 }
 
 /// The driver's own write code, which then passes to the base.
 impl PmacControllerParams {
-    /// C's opening FLOW line and `getAxis` refusal at an address with no
-    /// axis (pmacController.cpp:396-400, :502-507); the [`PmacWriteHook`]
-    /// prints the line for a write that has one.
-    fn refuses(&self, base: &PortDriverBase, user: &AsynUser, method: &str) -> bool {
-        if has_motor_axis(base, user) || self.is_controller_axis(user.addr) {
-            return false;
+    /// C `getAxis(pasynUser)` (pmacController.cpp:570-576): the address
+    /// `getAddress` resolves, -1 being 0, or None with C's opening FLOW line
+    /// where no axis sits (:396-400, :502-507); the [`PmacWriteHook`] prints
+    /// the line for a write that has one.
+    fn get_axis(&self, base: &PortDriverBase, user: &AsynUser, method: &str) -> Option<i32> {
+        let addr = param_list(base.flags.multi_device, user.addr);
+        if has_motor_axis(base, user) || self.is_controller_axis(addr) {
+            return Some(addr);
         }
         base.trace_print(TraceMask::FLOW, format_args!("pmacController::{method}\n"));
-        true
+        None
     }
 
     fn write_int32_own(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        addr: i32,
+        reason: usize,
         value: i32,
     ) -> AsynResult<()> {
         let mut controller = lock(&self.controller);
         let Some(p) = controller.params else {
             return Ok(());
         };
-        match user.reason {
+        match reason {
             r if r == p.feed_rate_poll => controller.feed_rate_poll = value != 0,
             // C reads the limit parameter at each poll.
             r if r == p.feed_rate_limit => controller.feed_rate_limit = value,
@@ -893,7 +896,7 @@ impl PmacControllerParams {
             r if r == p.coord_sys_group => return controller.switch_cs_group(value),
             // An axis address reaches the same branch through
             // `PmacAxis::set_deferred_moves`.
-            index::DEFER_MOVES if user.addr == 0 => {
+            index::DEFER_MOVES if addr == 0 => {
                 let release = controller.set_moves_deferred(value);
                 if let Some(v) = release.comms_error {
                     let _ = base.set_int32_param(p.comms_error, 0, v);
@@ -978,6 +981,21 @@ mod tests {
             .filter_map(|l| l.split_once("pmacController::").map(|(_, m)| m))
             .collect();
         assert_eq!(mine, ["writeInt32", "writeFloat64"], "{lines:?}");
+    }
+
+    /// C getAxis maps address -1 to the controller axis 0 and runs pmac's
+    /// code there (pmacController.cpp:570-576).
+    #[test]
+    fn a_write_at_address_minus_1_runs_pmac_s_code_on_axis_0() {
+        let ctrl = Arc::new(Mutex::new(PmacController::new("pmacTest", "", 0, None)));
+        let params = PmacControllerParams::new(ctrl.clone(), 100, 1000);
+        let port = register_controller_port(&open_owner(), "pmacAddrM1", 2, params).unwrap();
+        let limit = lock(&ctrl).params.unwrap().feed_rate_limit;
+        port.write_int32_blocking(limit, -1, 7).unwrap();
+        assert_eq!(lock(&ctrl).feed_rate_limit, 7);
+        port.write_int32_blocking(index::DEFER_MOVES, -1, DEFERRED_COORDINATED_MOVES)
+            .unwrap();
+        assert!(lock(&ctrl).moves_deferred());
     }
 
     #[test]
