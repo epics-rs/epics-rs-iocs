@@ -260,9 +260,12 @@ pub struct Emc18011Axis {
 }
 
 impl Emc18011Axis {
-    /// Construct axis `index` (0-based; wire selection = `index + 1`).
+    /// Construct axis `index` (0-based; wire selection = `index + 1`) and
+    /// read its status as C `motor_init` does (drvEMC18011.cc:725-730):
+    /// select it, then `Z` and, once stopped, `A`, which releases it.
+    /// Performs blocking serial I/O; failures are ignored as in C.
     pub fn new(controller: Arc<Mutex<Emc18011Controller>>, index: usize) -> Self {
-        Self {
+        let mut axis = Self {
             controller,
             index,
             prev_position: 0.0,
@@ -272,7 +275,14 @@ impl Emc18011Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+        };
+        {
+            let mut ctrl = axis.lock();
+            let _ = ctrl.command(&format!("M{}", index + 1));
+            ctrl.active = Some(index);
         }
+        let _ = axis.poll(&AsynUser::default());
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, Emc18011Controller> {
@@ -526,6 +536,24 @@ mod tests {
             .into_iter()
             .filter(|l| l != "Z" && l != "A")
             .collect()
+    }
+
+    /// drvEMC18011.cc:725-730: each motor is selected and read at init, so
+    /// a motor away from zero reports its position before any move.
+    #[test]
+    fn init_reads_each_motors_position() {
+        let (line, io) = LineRig::new("emcInitPos", |last| match last {
+            "R" => RTN_REMOTE.into(),
+            "Z" => Z_STOPPED.to_string(),
+            "A" => "1.23".into(),
+            _ => "OK".into(),
+        });
+        let ctrl = Arc::new(Mutex::new(Emc18011Controller::new(io).unwrap()));
+        line.sent();
+        let mut axis = Emc18011Axis::new(ctrl.clone(), 1);
+        assert_eq!(line.sent(), ["M2", "Z", "A"]);
+        assert_eq!(ctrl.lock().unwrap().active, None);
+        assert_eq!(axis.poll(&AsynUser::default()).unwrap().position, 123.0);
     }
 
     /// devEMC18011.cc:243-249: INIT as its own message.
