@@ -6,8 +6,8 @@
 //! it binds to a parameter of the port instead. The port drives the device over
 //! a pre-configured octet port (`drvAsynSerialPortConfigure` /
 //! `drvAsynIPPortConfigure`), exactly as the C device support did. [`mks`],
-//! [`mpc`] and [`tpg261`] are the exceptions: they stay per-record device
-//! support, as `devAiMKS.c`, `devMPC.c` and `devTPG261.c` are.
+//! [`mpc`], [`tpg261`], [`strparm`] and [`eurotherm`] are the exceptions: they
+//! stay per-record device support, as their C files are.
 //!
 //! Ported so far:
 //!
@@ -19,6 +19,7 @@
 //! | `devAiMKS.c` | [`mks`] | MKS / HPS SensaVac 937 gauge controller |
 //! | `devAiHeidND261.c` | [`nd261`] | Heidenhain ND261 display unit |
 //! | `devXxEurotherm.c` | [`eurotherm`] | Eurotherm 800/2000 temperature controller |
+//! | `devXxStrParm.c` | [`strparm`] | generic string-parameter serial I/O |
 //!
 //! All device I/O runs on a plain `std::thread` worker owned by the port (see
 //! [`worker`]); the asyn write handlers only enqueue onto it. That keeps
@@ -35,6 +36,7 @@ pub mod runtime;
 pub mod strparm;
 pub mod televac;
 pub mod tpg261;
+pub mod user_param;
 pub mod worker;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};

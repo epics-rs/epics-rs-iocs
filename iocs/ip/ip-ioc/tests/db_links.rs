@@ -1,5 +1,6 @@
-//! The MPC and TPG261 databases are ipApp/Db's, whose device records carry
-//! the per-record links devMPC.c and devTPG261.c parse.
+//! The MPC, TPG261 and Eurotherm databases are ipApp/Db's, whose device
+//! records carry the per-record links devMPC.c, devTPG261.c and
+//! devXxStrParm.c parse.
 
 use std::path::Path;
 
@@ -7,6 +8,11 @@ use std::path::Path;
 fn device_records(file: &str) -> Vec<(String, String, String)> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("db").join(file);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    let text: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .map(|l| format!("{l}\n"))
+        .collect();
     let mut out = Vec::new();
     for block in text.split("record(").skip(1) {
         let rtyp = block.split(',').next().unwrap().trim().to_owned();
@@ -48,4 +54,16 @@ fn tpg261_records_use_dev_tpg261() {
         assert_eq!(dtyp, "asyn TPG261", "{rtyp} {link}");
         assert!(link.starts_with("@asyn($(PORT) $(ADDR))"), "{rtyp}: {link}");
     }
+}
+
+/// ipApp/Db's Eurotherm.db: the controller is read through devXxStrParm,
+/// and its devXxEurotherm records ship with DTYP `<none>`.
+#[test]
+fn eurotherm_records_read_through_dev_xx_str_parm() {
+    let records = device_records("Eurotherm.db");
+    assert_eq!(records.len(), 13, "{records:?}");
+    let count = |dtyp: &str| records.iter().filter(|(_, d, _)| d == dtyp).count();
+    assert_eq!(count("asyn ai stringParm"), 6, "{records:?}");
+    assert_eq!(count("asyn si stringParm"), 2, "{records:?}");
+    assert_eq!(count("<none>"), 5, "{records:?}");
 }

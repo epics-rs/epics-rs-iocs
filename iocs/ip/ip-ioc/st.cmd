@@ -88,17 +88,13 @@ ND261Config("ND261", "SerialND261", 1.0)
 dbLoadRecords("$(IP)/db/nd261.db", "P=$(PREFIX),AXIS=nd1,PORT=ND261")
 
 # --- Eurotherm 800/2000 temperature controller ------------------------------
-# The bisync frames carry their own EOT/STX/ETX/ENQ bytes and a block check
-# character, so the port must NOT append an EOS in either direction.
-# devXxEurotherm.c never reads the reply, so there is no input EOS either.
+# The ao/stringout records write bisync frames that carry their own
+# EOT/STX/ETX/ENQ bytes and block check character; the stringParm records
+# reading the reply set their own input EOS per request (TERM=).
 drvAsynSerialPortConfigure("SerialEuro", "/dev/ttyS5", 0, 0, 0)
 asynSetOption("SerialEuro", 0, "baud", "9600")
 asynSetOption("SerialEuro", 0, "bits", "7")
 asynSetOption("SerialEuro", 0, "parity", "even")
 asynSetOption("SerialEuro", 0, "stop", "1")
 
-# EurothermConfig(portName, octetPort, groupAddress). The asyn address of each
-# record is the controller's local address on the line (the C link's LAD=).
-EurothermConfig("EURO1", "SerialEuro", 0)
-
-dbLoadRecords("$(IP)/db/eurotherm.db", "P=$(PREFIX),ET=et1,PORT=EURO1,LADDR=1")
+dbLoadRecords("$(IP)/db/Eurotherm.db", "P=$(PREFIX)et1:,PORT=SerialEuro")

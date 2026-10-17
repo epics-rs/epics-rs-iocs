@@ -30,8 +30,9 @@ use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
-use crate::fmt::{format_c_double, format_c_int};
+use crate::fmt::{c_literal, format_c_double, format_c_int};
 use crate::mpc::protocol::{c_atoi, c_strtod};
+use crate::user_param::{after, c_str, term, up_to_comma};
 
 /// The `device(<type>,INST_IO,dev<Xx>StrParm,"asyn <xx> stringParm")` lines
 /// of `ipSupport.dbd`.
@@ -104,26 +105,6 @@ impl Kind {
     }
 }
 
-/// C `strstr(userParam, key)`, and what follows the key.
-fn after<'a>(user_param: &'a str, key: &str) -> Option<&'a str> {
-    user_param.find(key).map(|at| &user_param[at + key.len()..])
-}
-
-/// `for (i=0; i<31 && *p && *p != ','; ...)`: a value up to its comma.
-fn up_to_comma(value: &str) -> String {
-    value
-        .bytes()
-        .take_while(|&b| b != b',')
-        .take(31)
-        .map(char::from)
-        .collect()
-}
-
-/// A C string: the bytes up to the first NUL.
-fn c_str(bytes: &[u8]) -> &[u8] {
-    &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())]
-}
-
 /// `devStrParmPvt`'s configuration, as `initCommon` fills it.
 #[derive(Debug, Clone, PartialEq)]
 struct Parm {
@@ -154,17 +135,7 @@ impl Parm {
             one: String::new(),
         };
         if let Some(hex) = after(user_param, "TERM=") {
-            // `HEXCHAR2INT`, two digits a byte, at most nine bytes.
-            let digit = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
-            parm.term = hex
-                .as_bytes()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .take_while(|pair| pair.iter().all(u8::is_ascii_hexdigit))
-                .take(9)
-                .map(|&[high, low]| digit(high) * 16 + digit(low))
-                .collect();
+            parm.term = term(hex);
         }
         if let Some(v) = after(user_param, "IX=") {
             parm.index = c_atoi(v.as_bytes());
@@ -377,17 +348,16 @@ impl DevStrParm {
         };
         match formatted {
             Ok(text) => text.into_bytes(),
-            // No conversion at all: `sprintf` prints the text.
-            Err(_) if !parm.format.replace("%%", "").contains('%') => {
-                parm.format.replace("%%", "%").into_bytes()
-            }
-            Err(e) => {
-                self.print(
-                    TraceMask::ERROR,
-                    format_args!("devXxStrParm {} {e}\n", self.name),
-                );
-                Vec::new()
-            }
+            Err(e) => match c_literal(&parm.format) {
+                Some(text) => text.into_bytes(),
+                None => {
+                    self.print(
+                        TraceMask::ERROR,
+                        format_args!("devXxStrParm {} {e}\n", self.name),
+                    );
+                    Vec::new()
+                }
+            },
         }
     }
 

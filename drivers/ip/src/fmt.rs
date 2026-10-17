@@ -170,6 +170,11 @@ fn g_format(magnitude: f64, precision: usize, alt: bool) -> String {
 /// Format `value` with the C format string `format`, which must carry exactly
 /// one `double` conversion (`%f`, `%e`, `%E`, `%g`, `%G`, with the usual flags,
 /// width, precision and `l` modifier).
+/// `sprintf` of a format with no conversion: its text, `%%` printed as `%`.
+pub fn c_literal(format: &str) -> Option<String> {
+    (!format.replace("%%", "").contains('%')).then(|| format.replace("%%", "%"))
+}
+
 pub fn format_c_double(format: &str, value: f64) -> Result<String, String> {
     let (prefix, spec, suffix) = parse_format(format, DOUBLE_CONVERSIONS)?;
 

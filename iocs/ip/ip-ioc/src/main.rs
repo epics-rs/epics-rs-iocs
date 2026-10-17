@@ -10,7 +10,6 @@
 //! ```text
 //! TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
 //! ND261Config(port, octetPort, [pollPeriod])
-//! EurothermConfig(port, octetPort, groupAddress)
 //! ```
 
 use std::sync::{Arc, Mutex};
@@ -23,14 +22,14 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use ip_devices::eurotherm::create_eurotherm;
 use ip_devices::nd261::create_nd261;
 use ip_devices::runtime::IpPortRuntime;
 use ip_devices::televac::create_televac;
 
 /// `ipSupport.dbd`'s `devAiMKS` (`"HPS SensaVac 937"`), `dev<Type>MPC`
-/// (`"asyn MPC"`), `dev<Type>TPG261` (`"asyn TPG261"`) and `dev<Xx>StrParm`
-/// (`"asyn <xx> stringParm"`) rows; their dsets
+/// (`"asyn MPC"`), `dev<Type>TPG261` (`"asyn TPG261"`), `dev<Xx>StrParm`
+/// (`"asyn <xx> stringParm"`) and `dev<Xx>Eurotherm` (`"asyn <xx> Eurotherm"`)
+/// rows; their dsets
 /// are `{6, 0, 0, init, 0, read/write, convert}`, with no convert on the
 /// non-analog types.
 static DEVICES: &[(&str, &[DevSup])] = &[
@@ -83,6 +82,12 @@ static DEVICES: &[(&str, &[DevSup])] = &[
                 choice: "asyn ao stringParm",
                 link_type: DbLinkType::InstIo,
                 dset: Dset::new(6, &[2, 4, 5], false),
+            },
+            DevSup {
+                name: "devAoEurotherm",
+                choice: "asyn ao Eurotherm",
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
             },
         ],
     ),
@@ -196,6 +201,12 @@ static DEVICES: &[(&str, &[DevSup])] = &[
                 link_type: DbLinkType::InstIo,
                 dset: Dset::new(6, &[2, 4], false),
             },
+            DevSup {
+                name: "devSoEurotherm",
+                choice: "asyn so Eurotherm",
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
         ],
     ),
     (
@@ -287,17 +298,19 @@ async fn main() -> CaResult<()> {
         Box::new(epics_rs::base::server::records::scalcout::ScalcoutRecord::default())
     });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
-    // devAiMKS, devMPC, devTPG261 and devXxStrParm: per-record device
+    // devAiMKS, devMPC, devTPG261, devXxStrParm and devXxEurotherm: per-record device
     // support, bound by DTYP.
     let mks = ip_devices::mks::device_support_factory();
     let mpc = ip_devices::mpc::device_support_factory();
     let tpg = ip_devices::tpg261::device_support_factory();
     let strparm = ip_devices::strparm::device_support_factory();
+    let eurotherm = ip_devices::eurotherm::device_support_factory();
     app = app.register_dynamic_device_support(DEVICES, move |ctx| {
         mks(ctx)
             .or_else(|| mpc(ctx))
             .or_else(|| tpg(ctx))
             .or_else(|| strparm(ctx))
+            .or_else(|| eurotherm(ctx))
     });
 
     // TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
@@ -380,48 +393,6 @@ async fn main() -> CaResult<()> {
                 let claim = claim_port(&name).map_err(|e| format!("ND261Config failed: {e}"))?;
                 let port = create_nd261(&claim, &octet, poll)
                     .map_err(|e| format!("ND261Config failed: {e}"))?;
-                register(
-                    &ports,
-                    claim,
-                    ctx.db().scan_control().interrupt_gate(),
-                    port,
-                )?;
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
-
-    // EurothermConfig(port, octetPort, groupAddress)
-    {
-        let ports = ports.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "EurothermConfig",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "octetPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "groupAddress",
-                    arg_type: ArgType::Int,
-                },
-            ],
-            "EurothermConfig portName octetPort groupAddress - Eurotherm 800/2000 \
-             temperature controller (the asyn address is the local address)",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let name = string_arg(args, 0)?;
-                let octet = string_arg(args, 1)?;
-                let group = int_arg(args, 2)?;
-                let group = u8::try_from(group)
-                    .map_err(|_| format!("EurothermConfig: groupAddress {group} is not 0..9"))?;
-                let claim =
-                    claim_port(&name).map_err(|e| format!("EurothermConfig failed: {e}"))?;
-                let port = create_eurotherm(&claim, &octet, group)
-                    .map_err(|e| format!("EurothermConfig failed: {e}"))?;
                 register(
                     &ports,
                     claim,

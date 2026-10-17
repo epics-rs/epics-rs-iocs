@@ -880,7 +880,7 @@ bit addressing (`B <bit>`), and I/O-Intr driven records.
 
 **Ports from:** [epics-modules/ip](https://github.com/epics-modules/ip)
 (`ipApp/src`: `devMPC.c`, `devTPG261.c`, `devTelevac.c`, `devAiMKS.c`,
-`devAiHeidND261.c`, `devXxEurotherm.c`)
+`devAiHeidND261.c`, `devXxEurotherm.c`, `devXxStrParm.c`)
 
 `drivers/ip` (crate `ip-devices`) re-implements each C device-support file
 as an asyn **port driver**: the record link binds to a port parameter
@@ -889,7 +889,9 @@ over a pre-configured serial/IP octet port on its own worker thread. The
 exceptions are `devAiMKS.c`, kept as per-record ai device support
 (DTYP `HPS SensaVac 937`) on the upstream `MKS.db`, and `devMPC.c`, kept as
 per-record device support (DTYP `asyn MPC`) on the upstream `MPC.db` and
-`TSP.db`, and `devTPG261.c` (DTYP `asyn TPG261`) on the upstream `TPG261.db`.
+`TSP.db`, `devTPG261.c` (DTYP `asyn TPG261`) on the upstream `TPG261.db`,
+and `devXxStrParm.c` (DTYP `asyn <xx> stringParm`) with `devXxEurotherm.c`
+(DTYP `asyn ao Eurotherm` / `asyn so Eurotherm`) on the upstream `Eurotherm.db`.
 
 **Build/run:** `cargo run -p ip-ioc --release -- iocs/ip/ip-ioc/st.cmd`
 
@@ -902,7 +904,7 @@ per-record device support (DTYP `asyn MPC`) on the upstream `MPC.db` and
 | Televac relay outputs | `televac_relay.db` | `ON`, `OFF`, `STATE` (3 records) |
 | MKS / HPS SensaVac 937 gauge | `MKS.db` (upstream) | `$(CC1)`, `$(CC2)`, `$(PR1)`, `$(PR2)` and their `_log` calcs (8 records) |
 | Heidenhain ND261 display unit | `nd261.db` | `POS`, `STATUS` (2 records) |
-| Eurotherm 800/2000 temperature controller | `eurotherm.db` | `Setpoint`, `RampRate`, `ReadRequest` (3 records) |
+| Eurotherm 800/2000 temperature controller | `Eurotherm.db` (upstream) | `ET:Setpoint`, `ET:RampRate`, `ET:Temperature`, `ET:SetpointReadback`, `ET:RampRateRBV`, `ET:Read*`, `ET:Query*`, `ET:ack*`, `ET:trash*` (18 records) |
 
 ---
 
