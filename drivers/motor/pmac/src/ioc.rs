@@ -1219,6 +1219,43 @@ mod tests {
         assert_eq!(own.take(), "");
     }
 
+    /// pmacAsynCoord.c:584-592: an unparsed or failed `&{cs}??` prints
+    /// cmdStatus (0, or MOTOR_AXIS_ERROR) and the response buffer.
+    #[test]
+    fn a_bad_cs_status_read_prints_the_c_line() {
+        let (rt, rig) = publish_scripted("pmacCsStat");
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let trace = MotorTrace::new("pmacCsStat", 0);
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(
+            io,
+            trace,
+            9107,
+            2,
+            0,
+            Duration::ZERO,
+        )));
+        let mut axis = PmacCsAxis::new(system, 1).unwrap();
+        let own = TraceCapture::on("pmacCsStat");
+        let user = AsynUser::new(0);
+        rig.answer("&2??", b"zz\r");
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(
+            own.take(),
+            "drvPmacAxisGetStatus: not all status values returned. Status: 0\n\
+             Command :&2??\nResponse:zz\r"
+        );
+        rig.silence("&2??");
+        assert!(axis.poll(&user).is_err());
+        let text = own.take();
+        assert!(
+            text.ends_with(
+                "drvPmacAxisGetStatus: not all status values returned. Status: -1\n\
+                 Command :&2??\nResponse:"
+            ),
+            "{text}"
+        );
+    }
+
     /// pmacController.cpp:457/463 `%f`: glibc's nan, sign bit included.
     #[test]
     fn a_nan_soft_limit_is_written_as_c_prints_it() {

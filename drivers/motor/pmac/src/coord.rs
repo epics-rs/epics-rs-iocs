@@ -156,8 +156,12 @@ impl PmacCoordSystem {
     /// C `motorAxisWriteRead` for 1-based `axis`: a failed transfer prints
     /// its line; a refused (BELL) reply is a successful transfer there.
     fn write_read(&self, axis: usize, command: &str) -> AsynResult<String> {
-        let raw = self
-            .handle
+        checked_reply(command, self.transfer(axis, command)?)
+    }
+
+    /// [`Self::write_read`] without the BELL check: the reply as C sees it.
+    fn transfer(&self, axis: usize, command: &str) -> AsynResult<Vec<u8>> {
+        self.handle
             .write_read(0, command.as_bytes(), PMAC_MAXBUF)
             .inspect_err(|e| {
                 self.trace.print(
@@ -172,8 +176,7 @@ impl PmacCoordSystem {
                         e.message_display()
                     ),
                 );
-            })?;
-        checked_reply(command, raw)
+            })
     }
 
     /// C `drvPmacGetAxesStatus`: `&{cs}??` for the status words, then one
@@ -181,9 +184,29 @@ impl PmacCoordSystem {
     fn refresh(&mut self) -> AsynResult<CsPoll> {
         let cs = self.cs;
         // C `drvPmacGetCoordStatus(first_axis, ...)`.
-        let response = self.write_read(1, &format!("&{cs}??"))?;
-        let status = parse_cs_status(&response)
-            .ok_or_else(|| pmac_err(format!("could not parse CS {cs} status: {response:?}")))?;
+        let command = format!("&{cs}??");
+        let (cmd_status, response) = match self.transfer(1, &command) {
+            // C `MOTOR_AXIS_ERROR`, over the empty response buffer.
+            Err(_) => (-1, String::new()),
+            Ok(raw) => (
+                0,
+                String::from_utf8_lossy(&raw).trim_matches('\0').to_string(),
+            ),
+        };
+        let status = parse_cs_status(&response).filter(|_| cmd_status == 0);
+        let Some(status) = status else {
+            self.trace.print(
+                TraceMask::ERROR,
+                0,
+                format_args!(
+                    "drvPmacAxisGetStatus: not all status values returned. Status: \
+                     {cmd_status}\nCommand :{command}\nResponse:{response}"
+                ),
+            );
+            return Err(pmac_err(format!(
+                "could not parse CS {cs} status: {response:?}"
+            )));
+        };
 
         let mut query = format!("&{cs}");
         for axis in 1..=CS_AXES {
