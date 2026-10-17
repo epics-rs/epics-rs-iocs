@@ -94,12 +94,7 @@ pub fn acsmotion_config_command() -> CommandDef {
             }
             let polled = controller.clone();
             // C startPoller, SPiiPlusDriver.cpp:269
-            let mut poller = Controller::new(
-                (moving_poll * 1000.0) as u64,
-                (idle_poll * 1000.0) as u64,
-                2,
-            )
-            .controller_poll(move || {
+            let mut poller = Controller::new().controller_poll(move || {
                 // C's poller ignores poll()'s status.
                 let _ = polled.lock().unwrap_or_else(|e| e.into_inner()).poll();
             });
@@ -108,7 +103,12 @@ pub fn acsmotion_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
-            poller.start(ctx);
+            poller.start(
+                ctx,
+                (moving_poll * 1000.0) as u64,
+                (idle_poll * 1000.0) as u64,
+                2,
+            );
             Ok(CommandOutcome::Continue)
         },
     )

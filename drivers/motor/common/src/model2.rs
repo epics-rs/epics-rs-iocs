@@ -75,15 +75,11 @@ impl Model2 {
         true
     }
 
-    /// The poller of `card`'s axes, or `None` for an unconfigured card.
-    fn controller(&self, card: i32) -> Option<Controller> {
+    /// The poll periods of `card`, or `None` for an unconfigured card.
+    fn periods(&self, card: i32) -> Option<(u64, u64)> {
         let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
         let card = cards.iter().find(|c| c.card == card)?;
-        Some(Controller::new(
-            card.moving_poll_ms,
-            card.idle_poll_ms,
-            self.forced_fast_polls,
-        ))
+        Some((card.moving_poll_ms, card.idle_poll_ms))
     }
 
     /// The driver's `open(card, axis)`: `None` for an unconfigured card or an
@@ -122,7 +118,8 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
             };
             register_drv_motor_asyn_port(&port_name, num_axes)?;
             // The driver's one task polls the card's axes in turn.
-            let mut controller = driver.controller(card);
+            let periods = driver.periods(card);
+            let mut controller = periods.map(|_| Controller::new());
             for addr in 0..num_axes {
                 let (Some(controller), Some(motor)) = (&mut controller, driver.open(card, addr))
                 else {
@@ -135,8 +132,8 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                 };
                 controller.install(user, motor)?;
             }
-            if let Some(controller) = controller {
-                controller.start(ctx);
+            if let (Some(controller), Some((moving, idle))) = (controller, periods) {
+                controller.start(ctx, moving, idle, driver.forced_fast_polls);
             }
             Ok(CommandOutcome::Continue)
         },
@@ -161,11 +158,9 @@ mod tests {
         assert!(DRIVER.open(3, 2).is_none());
         assert!(DRIVER.open(3, -1).is_none());
         assert!(DRIVER.open(0, 0).is_none());
-        assert!(DRIVER.controller(0).is_none());
+        assert!(DRIVER.periods(0).is_none());
         assert!(DRIVER.set_poll_periods(3, Some(50), None));
         assert!(!DRIVER.set_poll_periods(0, Some(50), None));
-        let cards = DRIVER.cards.lock().unwrap();
-        let card = cards.iter().find(|c| c.card == 3).unwrap();
-        assert_eq!((card.moving_poll_ms, card.idle_poll_ms), (50, 500));
+        assert_eq!(DRIVER.periods(3), Some((50, 500)));
     }
 }

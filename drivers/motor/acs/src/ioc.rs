@@ -66,13 +66,13 @@ pub fn mcb4b_create_controller_command() -> CommandDef {
             let controller = Arc::new(Mutex::new(Mcb4bController::new(handle, num_axes)));
 
             // C startPoller, MCB4BDriver.cpp:58
-            let mut poller = Controller::new(moving_poll_ms, idle_poll_ms, 2);
+            let mut poller = Controller::new();
             for index in 0..num_axes {
                 let ax = Mcb4bAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
-            poller.start(ctx);
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )

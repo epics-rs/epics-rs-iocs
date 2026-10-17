@@ -66,22 +66,14 @@ pub fn asyn_user(port: &str, addr: i32) -> TraceUser {
 /// (asynMotorController.cpp:567-575, :615-695): each pass runs the
 /// controller poll, then every axis in the order [`Self::install`] added
 /// them, so a slow axis delays the rest as in C.
+#[derive(Default)]
 pub struct Controller {
     builder: ControllerBuilder,
 }
 
 impl Controller {
-    /// C `startPoller(movingPollPeriod, idlePollPeriod, forcedFastPolls)`'s
-    /// periods; `forced_fast_polls` is the driver's own, C has no default
-    /// (asynMotorController.cpp:567).
-    pub fn new(moving_poll_ms: u64, idle_poll_ms: u64, forced_fast_polls: u32) -> Self {
-        Self {
-            builder: ControllerBuilder::new(
-                Duration::from_millis(moving_poll_ms),
-                Duration::from_millis(idle_poll_ms),
-                forced_fast_polls,
-            ),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// The driver's `asynMotorController::poll` override.
@@ -102,11 +94,24 @@ impl Controller {
         Ok(poll_cmd_tx)
     }
 
-    /// C `startPoller`: the startup pass over the axes, then the poller
-    /// thread. A constructor that returns before it leaves its axes unpolled,
-    /// as C's does.
-    pub fn start(self, ctx: &CommandContext) {
-        ctx.bridge().spawn(self.builder.build().run());
+    /// C `startPoller(movingPollPeriod, idlePollPeriod, forcedFastPolls)`:
+    /// the startup pass over the axes, then the poller thread.
+    /// `forced_fast_polls` is the driver's own, C has no default
+    /// (asynMotorController.cpp:567). A constructor that returns before it
+    /// leaves its axes unpolled, as C's does.
+    pub fn start(
+        self,
+        ctx: &CommandContext,
+        moving_poll_ms: u64,
+        idle_poll_ms: u64,
+        forced_fast_polls: u32,
+    ) {
+        let poller = self.builder.build(
+            Duration::from_millis(moving_poll_ms),
+            Duration::from_millis(idle_poll_ms),
+            forced_fast_polls,
+        );
+        ctx.bridge().spawn(poller.run());
     }
 }
 

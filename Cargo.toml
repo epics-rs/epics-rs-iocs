@@ -267,18 +267,18 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # epics-rs rt/iocs-base, the single base every iocs panel builds against.
 [patch.crates-io]
-ad-core-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/ad-core-rs" }
-ad-plugins-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/ad-plugins-rs" }
-asyn-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/asyn-rs" }
-epics-base-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/epics-base-rs" }
-epics-bridge-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/epics-bridge-rs" }
-epics-ca-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/epics-ca-rs" }
-epics-libcom-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/epics-libcom-rs" }
-epics-macros-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/epics-macros-rs" }
-epics-modbus-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/modbus-rs" }
-epics-pva-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/epics-pva-rs" }
-epics-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/epics-rs" }
-epics-rtems-boot = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/epics-rtems-boot" }
-mca-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/mca-rs" }
-motor-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/motor-rs" }
-scaler-rs = { path = "/home/stevek/work/_tgt/tail/eprs-676/crates/scaler-rs" }
+ad-core-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/ad-core-rs" }
+ad-plugins-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/ad-plugins-rs" }
+asyn-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/asyn-rs" }
+epics-base-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/epics-base-rs" }
+epics-bridge-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/epics-bridge-rs" }
+epics-ca-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/epics-ca-rs" }
+epics-libcom-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/epics-libcom-rs" }
+epics-macros-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/epics-macros-rs" }
+epics-modbus-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/modbus-rs" }
+epics-pva-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/epics-pva-rs" }
+epics-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/epics-rs" }
+epics-rtems-boot = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/epics-rtems-boot" }
+mca-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/mca-rs" }
+motor-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/motor-rs" }
+scaler-rs = { path = "/home/stevek/work/_tgt/tail/eprs-b9a/crates/scaler-rs" }
