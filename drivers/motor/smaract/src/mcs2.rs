@@ -659,6 +659,10 @@ impl AsynMotor for Mcs2Axis {
             home: (state & REFERENCE_MARK) != 0,
             high_limit: end_stop,
             low_limit: end_stop,
+            // C sets PROBLEM from MOVEMENT_FAILED (smarActMCS2MotorDriver
+            // .cpp:508) and then overwrites it with the comms status at
+            // `skip` (:562), so a failed movement never shows: a C bug, not
+            // copied.
             problem: (state & MOVEMENT_FAILED) != 0,
             // C's motorStatusFollowingError_, MSTA bit 6.
             slip_stall: (state & FOLLOWING_LIMIT_REACHED) != 0,
