@@ -72,8 +72,10 @@ use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
-use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -273,6 +275,8 @@ struct Reasons {
     controller_status: usize,
     controller_status_reset: usize,
     controller_reset: usize,
+    axis_status_reset: usize,
+    axis_reset: usize,
 }
 
 impl PhytronParams {
@@ -365,6 +369,9 @@ impl ControllerParams for PhytronParams {
         r.controller_status_reset =
             base.create_param("CONTROLLER_STATUS_RESET", ParamType::Int32)?;
         r.controller_reset = base.create_param("CONTROLLER_RESET", ParamType::Int32)?;
+        r.axis_status_reset = base.create_param("AXIS_STATUS_RESET", ParamType::Int32)?;
+        r.axis_reset = base.create_param("AXIS_RESET", ParamType::Int32)?;
+        base.create_param("AXIS_STATUS", ParamType::Int32)?;
         for (name, p) in AXIS_P_PARAMS {
             self.p_regs
                 .insert(base.create_param(name, ParamType::Int32)?, p);
@@ -396,22 +403,34 @@ impl ControllerParams for PhytronParams {
                 ParamWrite::Handled(status)
             };
         }
-        let Some(&p) = self.p_regs.get(&user.reason) else {
+        let p = self.p_regs.get(&user.reason).copied();
+        if p.is_none() && user.reason != r.axis_reset && user.reason != r.axis_status_reset {
             return Self::refuses(base, user, "phytronAxis::writeInt32")
                 .unwrap_or(ParamWrite::PassToBase(Ok(())));
-        };
+        }
         let port = base.port_name.clone();
         let (mut ctrl, m) = match self.axis_controller(&port, "phytronAxis::writeInt32", user.addr)
         {
             Ok(found) => found,
             Err(e) => return ParamWrite::PassToBase(Err(e)),
         };
-        let value = match p {
-            36 => i32::from(value > 0),
-            p if is_current(p) => value / 10,
-            _ => value,
+        let cmd = match p {
+            Some(p) => {
+                let value = match p {
+                    36 => i32::from(value > 0),
+                    p if is_current(p) => value / 10,
+                    _ => value,
+                };
+                format!("{m}P{p:02}{}{value}", ctrl.set_char())
+            }
+            None if user.reason == self.reasons.axis_reset => format!("{m}C"),
+            None if ctrl.ctrl_type == CtrlType::Phymotion => format!("SEC{}", &m[1..]),
+            None => {
+                return ParamWrite::PassToBase(Err(phytron_err(
+                    "phytronAxis::writeInt32: an MCC has no axis status reset",
+                )));
+            }
         };
-        let cmd = format!("{m}P{p:02}{}{value}", ctrl.set_char());
         let sent = ctrl.axis_command(&port, "writeInt32", "Writing parameter", user.addr, &cmd);
         ParamWrite::PassToBase(sent.map(|_| ()))
     }
@@ -528,6 +547,8 @@ pub struct PhytronController {
     /// C's `motorEncoderRatio_` by axis prefix, which a controller reset
     /// sets back to 1 (phytronAxisMotor.cpp:821-827); an absent axis's is 1.
     encoder_ratios: HashMap<String, f64>,
+    /// The controller port and its AXIS_STATUS reason, which the poll sets.
+    axis_status: Option<(PortHandle, usize)>,
 }
 
 impl PhytronController {
@@ -542,6 +563,7 @@ impl PhytronController {
             axes: BTreeMap::new(),
             last_status: 0,
             encoder_ratios: HashMap::new(),
+            axis_status: None,
         }
     }
 
@@ -549,6 +571,11 @@ impl PhytronController {
     /// reads and writes find.
     pub fn add_axis(&mut self, axis_no: i32, module_no: &str) {
         self.axes.insert(axis_no, module_no.to_owned());
+    }
+
+    /// Let each axis poll set AXIS_STATUS on controller port `port`.
+    pub fn post_axis_status_to(&mut self, port: PortHandle, reason: usize) {
+        self.axis_status = Some((port, reason));
     }
 
     /// C `phytronController::poll` with the serial poll method: an MCC reads
@@ -693,6 +720,8 @@ impl PhytronController {
 /// One Phytron axis sharing a controller. Implements [`AsynMotor`].
 pub struct PhytronAxis {
     controller: Arc<Mutex<PhytronController>>,
+    /// `module * 10 + index`, the axis's address.
+    axis_no: i32,
     ctrl_type: CtrlType,
     /// Command prefix: `M<mod>.<idx>` (phyMOTION) or a single digit (MCC).
     axis_module_no: String,
@@ -734,6 +763,7 @@ impl PhytronAxis {
         };
         Ok(Self {
             controller,
+            axis_no,
             ctrl_type,
             axis_module_no,
             motor_enabled: false,
@@ -935,7 +965,7 @@ impl AsynMotor for PhytronAxis {
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         // Gather the raw readings while holding the controller lock.
-        let (pos, enc, moving, status) = {
+        let (pos, enc, moving, status, axis_status) = {
             let ctrl = self.lock();
             let m = self.axis_module_no.as_str();
             // The poll reports `P22R` times the ratio (:2005-2006).
@@ -959,7 +989,7 @@ impl AsynMotor for PhytronAxis {
                     (pos, enc, moving, status)
                 }
             };
-            (pos, enc * ratio, moving, status)
+            (pos, enc * ratio, moving, status, ctrl.axis_status.clone())
         };
 
         // Limit-home state machine (C parseAnswer). `problem` is the axis
@@ -976,6 +1006,12 @@ impl AsynMotor for PhytronAxis {
         } else {
             step.problem
         };
+
+        // phytronAxisMotor.cpp:2084; enqueued, so the controller lock is free.
+        if let Some((port, reason)) = axis_status {
+            let value = ParamSetValue::new(reason, self.axis_no, ParamValue::Int32(status));
+            let _ = port.set_params_and_notify_blocking(self.axis_no, vec![value]);
+        }
 
         Ok(MotorStatus {
             position: pos,
