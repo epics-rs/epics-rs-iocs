@@ -124,10 +124,12 @@ fn protocol_error(message: impl Into<String>) -> AsynError {
     }
 }
 
+/// C's `return asynDisconnected` on `!CH_.isConnected` leaves
+/// `errorMessage` empty.
 fn disconnected_error() -> AsynError {
     AsynError::Status {
         status: AsynStatus::Disconnected,
-        message: "not connected".to_string(),
+        message: String::new(),
     }
 }
 
