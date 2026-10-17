@@ -63,8 +63,6 @@
 //! - The `pollMethod` batching options (axis-parallel / controller-parallel):
 //!   this driver always polls serially (one command + reply each), the C
 //!   default `pollMethodSerial`.
-//! - The auto status-reset-on-error option (`SEC` via the `statusResetTime`
-//!   option): dormant by default, so `clearAxisError` is a no-op here.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -292,6 +290,49 @@ fn parse_int64(value: &str) -> Option<i64> {
     Some(if neg { -v } else { v })
 }
 
+/// C writeOption's boolean words (phytronAxisMotor.cpp:745-754).
+fn c_bool(value: &str) -> Option<bool> {
+    let is = |words: &[&str]| words.iter().any(|w| value.eq_ignore_ascii_case(w));
+    if is(&["t", "true", "y", "yes", "on"]) {
+        Some(true)
+    } else if is(&["f", "false", "n", "no", "off"]) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// C writeOption "clearAxisStatus" (phytronAxisMotor.cpp:743-756): seconds
+/// 0..10, a boolean (on is 1 us, no wait), or an axis's "default".
+fn parse_clear_axis_status(value: &str, axis: bool) -> Option<f32> {
+    // C `epicsParseFloat`.
+    let seconds = epics_libcom_rs::runtime::stdlib::epics_parse_double(value)
+        .ok()
+        .map(|v| v as f32)
+        .filter(|t| (0.0..=10.0).contains(t));
+    if seconds.is_some() {
+        return seconds;
+    }
+    if axis && value.eq_ignore_ascii_case("default") {
+        return Some(f32::INFINITY);
+    }
+    c_bool(value).map(|on| if on { 0.000001 } else { 0.0 })
+}
+
+/// C readOption "clearAxisStatus" (phytronAxisMotor.cpp:609-622).
+fn show_clear_axis_status(time: f32) -> String {
+    let time = time.abs();
+    if !time.is_finite() {
+        "default".to_owned()
+    } else if time >= 0.001 {
+        CFloat(f64::from(time)).g().to_string()
+    } else if time > 0.0 {
+        "on".to_owned()
+    } else {
+        "off".to_owned()
+    }
+}
+
 /// C `pollMethod` (phytronAxisMotor.h:96-101). An axis's `Default` takes
 /// the controller's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -448,6 +489,33 @@ impl PhytronParams {
         // C's callParamCallbacks() is address 0's.
         let _ = base.call_param_callbacks(0);
         sent
+    }
+
+    /// C writeOption "clearAxisStatus" (phytronAxisMotor.cpp:726-759): an
+    /// address above 0 is an axis's. A disarmed time stays disarmed.
+    fn write_clear_axis_status(&self, user: &AsynUser, key: &str, value: &str) -> AsynResult<()> {
+        let refuse = |why: &str| {
+            phytron_err(format!(
+                "phytronController:writeOption({key}, {value}) {why}"
+            ))
+        };
+        let mut ctrl = self.controller().map_err(|_| refuse("wrong axis"))?;
+        let axis = user.addr > 0;
+        if axis && ctrl.axis(user.addr).is_none() {
+            return Err(refuse("wrong axis"));
+        }
+        let Some(time) = parse_clear_axis_status(value, axis) else {
+            let default = if axis { " or \"default\"" } else { "" };
+            return Err(refuse(&format!(
+                "wrong value - allowed is seconds (0..10) or boolean{default}"
+            )));
+        };
+        let slot = match ctrl.axis_mut(user.addr).filter(|_| axis) {
+            Some(a) => &mut a.status_reset_time,
+            None => &mut ctrl.status_reset_time,
+        };
+        *slot = if *slot <= 0.0 { -time } else { time };
+        Ok(())
     }
 
     /// C's missing-axis refusal for a reason that is not a P register,
@@ -618,6 +686,14 @@ impl ControllerParams for PhytronParams {
         user: &AsynUser,
         key: &str,
     ) -> Option<AsynResult<String>> {
+        if key.eq_ignore_ascii_case("clearAxisStatus") {
+            return Some(self.controller().map(|ctrl| {
+                let time = ctrl
+                    .axis(user.addr)
+                    .map_or(ctrl.status_reset_time, |a| a.status_reset_time);
+                show_clear_axis_status(time)
+            }));
+        }
         if !key.eq_ignore_ascii_case("pollMethod") {
             return None;
         }
@@ -638,6 +714,9 @@ impl ControllerParams for PhytronParams {
         key: &str,
         value: &str,
     ) -> Option<AsynResult<()>> {
+        if key.eq_ignore_ascii_case("clearAxisStatus") {
+            return Some(self.write_clear_axis_status(user, key, value));
+        }
         if !key.eq_ignore_ascii_case("pollMethod") {
             return None;
         }
@@ -727,6 +806,10 @@ struct AxisState {
     module_no: String,
     /// C `iPollMethod_`.
     poll_method: PollMethod,
+    /// C `phytronAxis::statusResetTime_` (phytronAxisMotor.h:148): 0 off,
+    /// below 0 armed by the next limit-switch error, above 0 sends `SEC`
+    /// before the next motion; infinite takes the controller's.
+    status_reset_time: f32,
     /// C `phytronAxis::lastStatus_`, which the axis's `CHECK_AXIS` compares.
     last_status: i32,
     /// The controller-parallel poll's answers for this axis this pass, which
@@ -753,6 +836,9 @@ pub struct PhytronController {
     last_status: i32,
     /// C `iDefaultPollMethod_`.
     default_poll_method: PollMethod,
+    /// C `phytronController::statusResetTime_`, the time of an axis left
+    /// at "default"; only its magnitude is read.
+    status_reset_time: f32,
     /// C's `motorEncoderRatio_` by axis prefix, which a controller reset
     /// sets back to 1 (phytronAxisMotor.cpp:821-827); an absent axis's is 1.
     encoder_ratios: HashMap<String, f64>,
@@ -773,6 +859,7 @@ impl PhytronController {
             axes: Vec::new(),
             last_status: 0,
             default_poll_method: PollMethod::Serial,
+            status_reset_time: 0.0,
             encoder_ratios: HashMap::new(),
             axis_status: None,
         }
@@ -1130,6 +1217,7 @@ impl PhytronAxis {
             axis_no,
             module_no: axis_module_no.clone(),
             poll_method: PollMethod::Default,
+            status_reset_time: f32::INFINITY,
             last_status: 0,
             answers: None,
         });
@@ -1184,6 +1272,37 @@ impl PhytronAxis {
         }
     }
 
+    /// C `clearAxisError` (phytronAxisMotor.cpp:1391-1415) under the
+    /// motion methods' `CHECK_AXIS("move", "Clearing motor errors")`: an
+    /// armed phyMOTION axis disarms and sends `SEC`, at once with its wait
+    /// under the lock, or first on `commands` when there is no wait.
+    fn clear_axis_error(&self, commands: &mut Vec<String>) -> AsynResult<()> {
+        let mut ctrl = self.lock();
+        let shared = ctrl.status_reset_time.abs();
+        let phymotion = ctrl.ctrl_type == CtrlType::Phymotion;
+        let Some(a) = ctrl.axis_mut(self.axis_no).filter(|_| phymotion) else {
+            return Ok(());
+        };
+        let mut time = a.status_reset_time;
+        if !time.is_finite() && time > 0.0 {
+            time = shared;
+        }
+        if time <= 0.0 {
+            return Ok(());
+        }
+        a.status_reset_time = -a.status_reset_time;
+        let cmd = format!("SEC{}", self.se_suffix());
+        let sent = if time >= 0.001 {
+            let sent = ctrl.send(&cmd, true).map(|_| ());
+            std::thread::sleep(Duration::from_secs_f32(time.min(10.0)));
+            sent
+        } else {
+            commands.push(cmd);
+            Ok(())
+        };
+        ctrl.check_axis(self.axis_no, "move", "Clearing motor errors", sent)
+    }
+
     /// `commands` as one exchange under the axis's poll method, C's last
     /// `sendPhytronMultiCommand` of a motion method and its `CHECK_AXIS`.
     fn run(&self, commands: Vec<String>, func: &str, txt: &str) -> AsynResult<()> {
@@ -1204,6 +1323,7 @@ impl PhytronAxis {
     ) -> AsynResult<()> {
         let set = self.lock().set_char();
         let mut commands = Vec::new();
+        self.clear_axis_error(&mut commands)?;
         self.profile(&mut commands, set, (min_v, max_v), accel, false);
         self.release(&mut commands);
         let m = &self.axis_module_no;
@@ -1267,6 +1387,16 @@ impl PhytronAxis {
         } else {
             step.problem
         };
+
+        // A limit-switch error arms the next motion's `SEC` (:2070-2071).
+        if status & 0x1000 != 0 {
+            let mut ctrl = self.lock();
+            if let Some(a) = ctrl.axis_mut(self.axis_no)
+                && a.status_reset_time < 0.0
+            {
+                a.status_reset_time = -a.status_reset_time;
+            }
+        }
 
         // phytronAxisMotor.cpp:2084
         if let Some(reason) = axis_status {
@@ -1354,6 +1484,7 @@ impl AsynMotor for PhytronAxis {
     ) -> AsynResult<()> {
         let set = self.lock().set_char();
         let mut commands = Vec::new();
+        self.clear_axis_error(&mut commands)?;
         self.profile(
             &mut commands,
             set,
@@ -1379,6 +1510,7 @@ impl AsynMotor for PhytronAxis {
     ) -> AsynResult<()> {
         let set = self.lock().set_char();
         let mut commands = Vec::new();
+        self.clear_axis_error(&mut commands)?;
         self.profile(
             &mut commands,
             set,
@@ -1774,6 +1906,11 @@ mod tests {
     /// A phyMOTION on a fresh [`Lines`] port `name`, axes 1.1 and 1.2, and
     /// its line log.
     fn lines(name: &str) -> Rig {
+        lines_with(name, moving_axis)
+    }
+
+    /// [`lines`] answering `answer`.
+    fn lines_with(name: &str, answer: fn(&str) -> Option<String>) -> Rig {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -1782,7 +1919,7 @@ mod tests {
         let port = Lines {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             written: written.clone(),
-            answer: moving_axis,
+            answer,
             reply: Vec::new(),
         };
         let (rt, _actor) =
@@ -1903,6 +2040,94 @@ mod tests {
                 "M1.1P14=100.000000 M1.1P04=10.000000 M1.1P15=5000.000000 M1.1-3",
             ]
         );
+    }
+
+    /// C writeOption/readOption "clearAxisStatus" values
+    /// (phytronAxisMotor.cpp:609-622, 743-756).
+    #[test]
+    fn clear_axis_status_values_parse_and_show_as_c() {
+        let cases = [
+            ("0.5", false, Some(0.5)),
+            ("10", false, Some(10.0)),
+            ("11", false, None),
+            ("-1", false, None),
+            ("ON", false, Some(0.000001)),
+            ("no", false, Some(0.0)),
+            ("default", false, None),
+            ("Default", true, Some(f32::INFINITY)),
+            ("maybe", true, None),
+        ];
+        for (value, axis, want) in cases {
+            assert_eq!(
+                parse_clear_axis_status(value, axis),
+                want,
+                "{value:?} axis {axis}"
+            );
+        }
+        let shown = [f32::NEG_INFINITY, -0.5, 2.0, 0.000001, 0.0].map(show_clear_axis_status);
+        assert_eq!(shown, ["default", "0.5", "2", "on", "off"]);
+    }
+
+    /// An axis whose status word carries the limit-switch error 0x1000.
+    fn limit_error_axis(cmd: &str) -> Option<String> {
+        match cmd {
+            c if c.starts_with("SE") => Some("4096".to_owned()),
+            c => moving_axis(c),
+        }
+    }
+
+    /// C `clearAxisError` and the poll that arms it (phytronAxisMotor.cpp:
+    /// 1391-1415, 2070-2071): one `SEC` before the next motion, then none
+    /// until a limit-switch error.
+    #[test]
+    fn an_armed_axis_clears_its_status_once_before_a_motion() {
+        let (ctrl, [mut axis, _], written) = lines_with("phyClearStatus", limit_error_axis);
+        let user = AsynUser::new(0);
+        let secs = |written: &Arc<Mutex<Vec<String>>>| {
+            let sent = std::mem::take(&mut *written.lock().unwrap());
+            sent.iter().filter(|l| l.starts_with("SEC")).count()
+        };
+        axis.move_absolute(&user, 1.0, 10.0, 100.0, 5000.0).unwrap();
+        assert_eq!(secs(&written), 0, "off by default");
+        ctrl.lock().unwrap().axis_mut(11).unwrap().status_reset_time = 0.000001;
+        axis.move_absolute(&user, 1.0, 10.0, 100.0, 5000.0).unwrap();
+        assert_eq!(written.lock().unwrap()[0], "SEC1.1");
+        assert_eq!(secs(&written), 1);
+        axis.move_velocity(&user, 10.0, 100.0, 5000.0).unwrap();
+        assert_eq!(secs(&written), 0, "disarmed");
+        axis.poll(&user).unwrap();
+        written.lock().unwrap().clear();
+        axis.home(&user, 10.0, 100.0, 5000.0, true).unwrap();
+        assert_eq!(secs(&written), 1, "a limit-switch error re-arms it");
+
+        // A wait sends it alone, ahead of the motion's line.
+        ctrl.lock().unwrap().axis_mut(11).unwrap().status_reset_time = 0.002;
+        ctrl.lock().unwrap().axis_mut(11).unwrap().poll_method = PollMethod::AxisParallel;
+        axis.move_absolute(&user, 12.4, 10.0, 100.0, 5000.0)
+            .unwrap();
+        let sent = std::mem::take(&mut *written.lock().unwrap());
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0], "SEC1.1");
+
+        // "default" takes the controller's time, whatever its sign.
+        let mut c = ctrl.lock().unwrap();
+        c.axis_mut(11).unwrap().status_reset_time = f32::INFINITY;
+        c.status_reset_time = -0.000001;
+        drop(c);
+        axis.move_absolute(&user, 1.0, 10.0, 100.0, 5000.0).unwrap();
+        assert_eq!(secs(&written), 1);
+        axis.move_absolute(&user, 1.0, 10.0, 100.0, 5000.0).unwrap();
+        assert_eq!(secs(&written), 0);
+    }
+
+    /// An MCC has no `SEC` (phytronAxisMotor.cpp:1394-1395).
+    #[test]
+    fn an_mcc_never_clears_its_status() {
+        let (mut axis, written) = mcc_axis("phyMccClearStatus");
+        axis.lock().axis_mut(1).unwrap().status_reset_time = 0.000001;
+        axis.move_absolute(&AsynUser::new(0), 1.0, 10.0, 100.0, 5000.0)
+            .unwrap();
+        assert!(!written.lock().unwrap().iter().any(|c| c.starts_with("SEC")));
     }
 
     /// C writeOption's poll method values (phytronAxisMotor.cpp:676-708).

@@ -321,3 +321,40 @@ async fn the_poll_method_option_is_the_controllers_and_an_mcc_refuses_parallel()
     // The read resolves the axis from its address (phytronAxisMotor.cpp:596).
     assert_eq!(own, "-1/default");
 }
+
+/// C `phytronController::writeOption`/`readOption` "clearAxisStatus"
+/// (phytronAxisMotor.cpp:609-622, 726-759): an axis starts at "default",
+/// the controller "off", and only an axis takes "default".
+#[epics_rs::base::epics_test]
+async fn the_clear_axis_status_option_is_the_axis_s_or_the_controller_s() {
+    use epics_rs::asyn::user::AsynUser;
+    let (shown, _) = on_mcc("phyClearOption", |port| {
+        let at = |addr| AsynUser::default().with_addr(addr);
+        let get = |addr| {
+            port.get_option_blocking(at(addr), "clearaxisstatus")
+                .unwrap()
+        };
+        let start = (get(0), get(1));
+        let refused = [
+            port.set_option_blocking(at(0), "clearAxisStatus", "default"),
+            port.set_option_blocking(at(1), "clearAxisStatus", "11"),
+            port.set_option_blocking(at(2), "clearAxisStatus", "on"),
+        ]
+        .map(|r| r.is_err());
+        port.set_option_blocking(at(1), "clearAxisStatus", "0.5")
+            .unwrap();
+        port.set_option_blocking(at(0), "clearAxisStatus", "yes")
+            .unwrap();
+        (start, refused, get(1), get(0))
+    })
+    .await;
+    assert_eq!(
+        shown,
+        (
+            ("off".into(), "default".into()),
+            [true; 3],
+            "0.5".into(),
+            "on".into()
+        )
+    );
+}
