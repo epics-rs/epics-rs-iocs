@@ -3779,14 +3779,11 @@ impl PortDriver for TimePix3Driver {
         Ok((index, entries))
     }
 
-    /// C `readInt32Array` (mask_io.cpp:32-249). C draws into the record's own
-    /// buffer; the driver keeps that buffer here, one per waveform length.
+    /// C `readInt32Array` (mask_io.cpp:32-249); `buf` holds the record's VAL.
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
         let reason = user.reason;
         if reason == self.p.mask_bp_c {
-            // C draws into the record's value (mask_io.cpp:99-129), which
-            // `buf` holds. C leaves a failed draw part-drawn in VAL; an Err
-            // here leaves VAL unchanged, deliberately.
+            // C draws into the record's value (mask_io.cpp:99-129).
             return self.mask_bp_c(buf).map(|()| buf.len());
         }
         if reason == self.p.bp_c {
