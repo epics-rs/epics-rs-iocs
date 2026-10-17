@@ -42,7 +42,7 @@ use motor_common::iocsh::{
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
-use motor_common::model2::{Model2, Model2Axis};
+use motor_common::model2::Model2;
 use motor_common::util::atof;
 use motor_common::{asyn_user, install, register_port};
 
@@ -1872,18 +1872,16 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 }
             };
             let controller = Arc::new(Mutex::new(controller));
-            let axes = (1..=num_axes as usize)
-                .map(|axis| Model2Axis {
-                    motor: Arc::new(Mutex::new(Mm4000Axis::new(
-                        controller.clone(),
-                        axis,
-                        mm4000::MODEL2_POLL_FAILURE,
-                    ))),
-                    moving_poll_ms,
-                    idle_poll_ms,
-                })
-                .collect();
-            MOTOR_MM4000.set_card(card, axes);
+            let axes =
+                (1..=num_axes as usize)
+                    .map(|axis| {
+                        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
+                            Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL2_POLL_FAILURE),
+                        ));
+                        motor
+                    })
+                    .collect();
+            MOTOR_MM4000.set_card(card, axes, moving_poll_ms, idle_poll_ms);
             Ok(CommandOutcome::Continue)
         },
     )

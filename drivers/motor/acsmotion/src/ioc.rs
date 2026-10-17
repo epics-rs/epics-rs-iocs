@@ -21,7 +21,7 @@ use motor_common::iocsh::{
     req_int, req_string,
 };
 use motor_common::model1::c_int;
-use motor_common::{asyn_user, install, register_controller_port};
+use motor_common::{Controller, asyn_user, register_controller_port};
 
 use crate::comm::{SpiiPlusComm, register_comm_port};
 use crate::spiiplus::{AcsMotionParams, SpiiPlusAxis, SpiiPlusController};
@@ -92,18 +92,23 @@ pub fn acsmotion_config_command() -> CommandDef {
             if let Err(e) = profile_thread.spawn(port) {
                 println!("AcsMotionConfig: SPiiPlusProfile thread not started: {e}");
             }
+            let polled = controller.clone();
+            // C startPoller, SPiiPlusDriver.cpp:269
+            let poller = Controller::new().controller_poll(move || {
+                // C's poller ignores poll()'s status.
+                let _ = polled.lock().unwrap_or_else(|e| e.into_inner()).poll();
+            });
             for index in 0..num_axes {
                 let ax = SpiiPlusAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                install(
-                    ctx,
-                    asyn_user(&port_name, index as i32),
-                    motor,
-                    (moving_poll * 1000.0) as u64,
-                    (idle_poll * 1000.0) as u64,
-                    2, // C startPoller, SPiiPlusDriver.cpp:269
-                )?;
+                poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
+            poller.start(
+                ctx,
+                (moving_poll * 1000.0) as u64,
+                (idle_poll * 1000.0) as u64,
+                2,
+            );
             Ok(CommandOutcome::Continue)
         },
     )

@@ -21,7 +21,7 @@ use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{asyn_user, install, model1_device, register_port};
+use motor_common::{Controller, asyn_user, model1_device, register_port};
 
 use crate::drv_mcb4b::{DrvMcb4bAxis, MCB4B_NUM_AXES, MCB4B_NUM_CARDS, motor_init};
 use crate::mcb4b::{Mcb4bAxis, Mcb4bController};
@@ -65,18 +65,14 @@ pub fn mcb4b_create_controller_command() -> CommandDef {
             );
             let controller = Arc::new(Mutex::new(Mcb4bController::new(handle, num_axes)));
 
+            // C startPoller, MCB4BDriver.cpp:58
+            let poller = Controller::new();
             for index in 0..num_axes {
                 let ax = Mcb4bAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                install(
-                    ctx,
-                    asyn_user(&port_name, index as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, MCB4BDriver.cpp:58
-                )?;
+                poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )

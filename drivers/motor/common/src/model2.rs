@@ -10,14 +10,37 @@ use epics_rs::base::server::iocsh::registry::*;
 
 use crate::iocsh::{arg_int_req, arg_str_req};
 use crate::model1::c_int;
-use crate::{TraceUser, install, register_drv_motor_asyn_port};
+use crate::{Controller, TraceUser, register_drv_motor_asyn_port};
 
-/// One axis a `Config` built, with the poll periods of its driver's poller.
+/// The axes a card's `Config` built, and the poller they go on.
+struct Card {
+    card: i32,
+    axes: Vec<Arc<Mutex<dyn AsynMotor>>>,
+    poller: Poller,
+}
+
+/// drvMotorAsyn has no task of its own; each driver's task polls its axes.
 #[derive(Clone)]
-pub struct Model2Axis {
-    pub motor: Arc<Mutex<dyn AsynMotor>>,
-    pub moving_poll_ms: u64,
-    pub idle_poll_ms: u64,
+enum Poller {
+    /// `drvAsynMotorConfigure` starts one over the card's axes at these
+    /// periods, standing in for the driver's task.
+    Configured {
+        moving_poll_ms: u64,
+        idle_poll_ms: u64,
+    },
+    /// The driver's own, started by its `Config` (motorSim's
+    /// `motorSimThread`, drvMotorSim.c:790); the axes join it.
+    Driver(Arc<Controller>),
+}
+
+impl Poller {
+    /// The controller the card's axes are installed into.
+    fn controller(&self) -> Arc<Controller> {
+        match self {
+            Self::Configured { .. } => Arc::new(Controller::new()),
+            Self::Driver(poller) => poller.clone(),
+        }
+    }
 }
 
 /// One model-2 driver: the `motorAxisDrvSET_t` name `drvAsynMotorConfigure`
@@ -26,7 +49,7 @@ pub struct Model2Axis {
 pub struct Model2 {
     name: &'static str,
     forced_fast_polls: u32,
-    cards: Mutex<Vec<(i32, Vec<Model2Axis>)>>,
+    cards: Mutex<Vec<Card>>,
 }
 
 impl Model2 {
@@ -38,15 +61,48 @@ impl Model2 {
         }
     }
 
-    /// What `Config` built for `card`, replacing an earlier `Config` of it.
-    pub fn set_card(&self, card: i32, axes: Vec<Model2Axis>) {
+    /// What `Config` built for `card`, polled at `moving_poll_ms` and
+    /// `idle_poll_ms`, replacing an earlier `Config` of it.
+    pub fn set_card(
+        &self,
+        card: i32,
+        axes: Vec<Arc<Mutex<dyn AsynMotor>>>,
+        moving_poll_ms: u64,
+        idle_poll_ms: u64,
+    ) {
+        self.put_card(Card {
+            card,
+            axes,
+            poller: Poller::Configured {
+                moving_poll_ms,
+                idle_poll_ms,
+            },
+        });
+    }
+
+    /// What `Config` built for `card`, polled by the driver's own `poller`,
+    /// replacing an earlier `Config` of it.
+    pub fn set_card_on(
+        &self,
+        card: i32,
+        axes: Vec<Arc<Mutex<dyn AsynMotor>>>,
+        poller: Arc<Controller>,
+    ) {
+        self.put_card(Card {
+            card,
+            axes,
+            poller: Poller::Driver(poller),
+        });
+    }
+
+    fn put_card(&self, card: Card) {
         let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
-        cards.retain(|(c, _)| *c != card);
-        cards.push((card, axes));
+        cards.retain(|c| c.card != card.card);
+        cards.push(card);
     }
 
     /// Change the poll periods `card`'s axes will be installed with; false
-    /// for a card no `Config` built.
+    /// for a card no `Config` built or one on the driver's own poller.
     pub fn set_poll_periods(
         &self,
         card: i32,
@@ -54,22 +110,33 @@ impl Model2 {
         idle_ms: Option<u64>,
     ) -> bool {
         let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((_, axes)) = cards.iter_mut().find(|(c, _)| *c == card) else {
+        let Some(Poller::Configured {
+            moving_poll_ms,
+            idle_poll_ms,
+        }) = cards
+            .iter_mut()
+            .find(|c| c.card == card)
+            .map(|c| &mut c.poller)
+        else {
             return false;
         };
-        for axis in axes {
-            axis.moving_poll_ms = moving_ms.unwrap_or(axis.moving_poll_ms);
-            axis.idle_poll_ms = idle_ms.unwrap_or(axis.idle_poll_ms);
-        }
+        *moving_poll_ms = moving_ms.unwrap_or(*moving_poll_ms);
+        *idle_poll_ms = idle_ms.unwrap_or(*idle_poll_ms);
         true
+    }
+
+    /// The poller of `card`, or `None` for an unconfigured card.
+    fn poller(&self, card: i32) -> Option<Poller> {
+        let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
+        Some(cards.iter().find(|c| c.card == card)?.poller.clone())
     }
 
     /// The driver's `open(card, axis)`: `None` for an unconfigured card or an
     /// axis it does not have.
-    fn open(&self, card: i32, axis: i32) -> Option<Model2Axis> {
+    fn open(&self, card: i32, axis: i32) -> Option<Arc<Mutex<dyn AsynMotor>>> {
         let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
-        let (_, axes) = cards.iter().find(|(c, _)| *c == card)?;
-        axes.get(usize::try_from(axis).ok()?).cloned()
+        let card = cards.iter().find(|c| c.card == card)?;
+        card.axes.get(usize::try_from(axis).ok()?).cloned()
     }
 }
 
@@ -99,8 +166,11 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                 return Ok(CommandOutcome::Continue);
             };
             register_drv_motor_asyn_port(&port_name, num_axes)?;
+            // The driver's one task polls the card's axes in turn.
+            let poller = driver.poller(card);
+            let controller = poller.as_ref().map(Poller::controller);
             for addr in 0..num_axes {
-                let Some(axis) = driver.open(card, addr) else {
+                let (Some(controller), Some(motor)) = (&controller, driver.open(card, addr)) else {
                     println!("drvAsynMotorConfigure: Failed to open axis {addr}");
                     continue;
                 };
@@ -108,14 +178,17 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                     port: port_name.clone(),
                     addr,
                 };
-                install(
-                    ctx,
-                    user,
-                    axis.motor,
-                    axis.moving_poll_ms,
-                    axis.idle_poll_ms,
-                    driver.forced_fast_polls,
-                )?;
+                controller.install(user, motor)?;
+            }
+            if let (
+                Some(controller),
+                Some(Poller::Configured {
+                    moving_poll_ms,
+                    idle_poll_ms,
+                }),
+            ) = (controller, poller)
+            {
+                controller.start(ctx, moving_poll_ms, idle_poll_ms, driver.forced_fast_polls);
             }
             Ok(CommandOutcome::Continue)
         },
@@ -129,24 +202,84 @@ mod tests {
 
     static DRIVER: Model2 = Model2::new("test", 0);
 
-    fn axis() -> Model2Axis {
-        Model2Axis {
-            motor: Arc::new(Mutex::new(SimMotor::default())),
-            moving_poll_ms: 100,
-            idle_poll_ms: 500,
-        }
+    fn axis() -> Arc<Mutex<dyn AsynMotor>> {
+        Arc::new(Mutex::new(SimMotor::default()))
     }
 
     #[test]
     fn open_finds_only_built_axes_and_takes_later_poll_periods() {
-        DRIVER.set_card(3, vec![axis(), axis()]);
+        DRIVER.set_card(3, vec![axis(), axis()], 100, 500);
         assert!(DRIVER.open(3, 1).is_some());
         assert!(DRIVER.open(3, 2).is_none());
         assert!(DRIVER.open(3, -1).is_none());
         assert!(DRIVER.open(0, 0).is_none());
+        assert!(DRIVER.poller(0).is_none());
         assert!(DRIVER.set_poll_periods(3, Some(50), None));
         assert!(!DRIVER.set_poll_periods(0, Some(50), None));
-        let opened = DRIVER.open(3, 0).unwrap();
-        assert_eq!((opened.moving_poll_ms, opened.idle_poll_ms), (50, 500));
+        assert!(matches!(
+            DRIVER.poller(3),
+            Some(Poller::Configured {
+                moving_poll_ms: 50,
+                idle_poll_ms: 500
+            })
+        ));
+    }
+}
+
+#[cfg(all(test, feature = "testing", target_os = "linux"))]
+mod one_task {
+    use super::*;
+    use crate::testing::pollers_after;
+    use epics_rs::motor::sim_motor::SimMotor;
+
+    static DRIVER: Model2 = Model2::new("oneTask", 0);
+
+    /// drvMotorAsyn's driver task polls every axis of the card in turn.
+    #[epics_rs::base::epics_test]
+    async fn drv_asyn_motor_configure_polls_the_card_s_axes_on_one_poller() {
+        let axes = (0..3)
+            .map(|_| Arc::new(Mutex::new(SimMotor::default())) as Arc<Mutex<dyn AsynMotor>>)
+            .collect();
+        DRIVER.set_card(0, axes, 100, 1000);
+        let args = vec![
+            ArgValue::String("oneTaskPort".into()),
+            ArgValue::String("oneTask".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(3),
+        ];
+        let cmd = drv_asyn_motor_configure_command(vec![&DRIVER]);
+        assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    static OWN: Model2 = Model2::new("ownTask", 0);
+
+    /// motorSimCreate starts the driver's one task and builds the card;
+    /// drvAsynMotorConfigure only opens the axes onto it.
+    #[epics_rs::base::epics_test]
+    async fn a_driver_s_own_poller_is_the_only_one_after_configure() {
+        let create = CommandDef::new(
+            "ownCreate",
+            vec![],
+            "ownCreate()",
+            |_: &[ArgValue], ctx: &CommandContext| {
+                let poller = Arc::new(Controller::new());
+                poller.start(ctx, 100, 1000, 0);
+                let axes = (0..2)
+                    .map(|_| Arc::new(Mutex::new(SimMotor::default())) as Arc<Mutex<dyn AsynMotor>>)
+                    .collect();
+                OWN.set_card_on(0, axes, poller);
+                Ok(CommandOutcome::Continue)
+            },
+        );
+        assert_eq!(pollers_after(create, vec![]).await, 1);
+        let args = vec![
+            ArgValue::String("ownTaskPort".into()),
+            ArgValue::String("ownTask".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(2),
+        ];
+        let cmd = drv_asyn_motor_configure_command(vec![&OWN]);
+        assert_eq!(pollers_after(cmd, args).await, 1);
+        assert!(!OWN.set_poll_periods(0, Some(50), None));
     }
 }
