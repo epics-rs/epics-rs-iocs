@@ -942,7 +942,7 @@ impl PIGCS2Controller {
     /// C `getMoving`: `#5`'s hex word masked by the axis bit, C's
     /// `m_movingStateMask` as `PIGCSController::initAxis` sets it.
     fn get_moving(&self, axis_no: usize) -> AsynResult<bool> {
-        let state = leading_hex(self.query_char(5)?.trim_start()).unwrap_or(0);
+        let state = strtol(&self.query_char(5)?, 16);
         Ok(state & (1 << axis_no) != 0)
     }
 
@@ -2402,6 +2402,16 @@ mod tests {
         let ctrl = PIGCS2Controller::new(io, "gcs2CharMore");
         assert_eq!(ctrl.query_char(3).unwrap(), "X=1.5 \nY=2.5 \nZ=3.5");
         assert_eq!(line.sent(), ["\u{3}", "\u{3}", "\u{3}"]);
+    }
+
+    /// C `getMoving` (PIGCSController.cpp:591-605) reads `#5` with
+    /// `strtol(buf, &pStr, 16)`, which takes a `0x` prefix.
+    #[test]
+    fn a_moving_word_may_carry_0x() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2Moving0x", |_| "0x2".into());
+        let ctrl = PIGCS2Controller::new(io, "gcs2Moving0x");
+        assert!(ctrl.get_moving(1).unwrap());
+        assert!(!ctrl.get_moving(0).unwrap());
     }
 
     #[test]
