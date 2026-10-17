@@ -45,8 +45,8 @@ use motor_common::model1_device;
 use motor_common::model2::Model2;
 use motor_common::util::atof;
 use motor_common::{
-    Controller, ControllerReport, asyn_user, install_with_report, register_controller_port,
-    register_port, register_port_with,
+    Controller, ControllerParams, ControllerReport, asyn_user, install_with_report,
+    register_controller_port, register_port, register_port_with,
 };
 
 use crate::agap::{self, AgapAxis, AgapController};
@@ -260,6 +260,30 @@ fn conex_args() -> Vec<ArgDesc> {
     ]
 }
 
+/// `AG_CONEXController::report` / `AGAP_CONEXController::report`
+/// (AG_CONEX.cpp:138-146, AGAP_CONEX.cpp:137-145), its quote unclosed as
+/// C's, and the cell for C's `controllerVersion_`, unset until VE answers
+/// (empty here).
+fn conex_head(
+    controller_id: i32,
+    moving_poll_ms: u64,
+    idle_poll_ms: u64,
+) -> (Arc<Mutex<String>>, impl ControllerParams) {
+    let version = Arc::new(Mutex::new(String::new()));
+    let (moving_s, idle_s) = (period_s(moving_poll_ms), period_s(idle_poll_ms));
+    let shown = version.clone();
+    let head = ControllerHead(move |ctx: &ControllerReport<'_>, out: &mut dyn Write| {
+        let version = shown.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = write!(
+            out,
+            "CONEX motor driver {}, controllerID={controller_id}, version=\"{version}\n  \
+             moving poll period={moving_s:.6}, idle poll period={idle_s:.6}\n",
+            ctx.port_name()
+        );
+    });
+    (version, head)
+}
+
 /// `AG_CONEXCreateController(portName, serialPortName, controllerID,
 /// movingPollPeriod, idlePollPeriod)`: one axis, 0.
 pub fn ag_conex_create_controller_command() -> CommandDef {
@@ -274,21 +298,7 @@ pub fn ag_conex_create_controller_command() -> CommandDef {
             let controller_id = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            // C's `controllerVersion_`, unset until VE answers; empty here.
-            let version = Arc::new(Mutex::new(String::new()));
-            let (moving_s, idle_s) = (period_s(moving_poll_ms), period_s(idle_poll_ms));
-            let shown = version.clone();
-            // AG_CONEXController::report (AG_CONEX.cpp:138-146), its quote
-            // unclosed as C's.
-            let head = ControllerHead(move |ctx: &ControllerReport<'_>, out: &mut dyn Write| {
-                let version = shown.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = write!(
-                    out,
-                    "CONEX motor driver {}, controllerID={controller_id}, version=\"{version}\n  \
-                     moving poll period={moving_s:.6}, idle poll period={idle_s:.6}\n",
-                    ctx.port_name()
-                );
-            });
+            let (version, head) = conex_head(controller_id, moving_poll_ms, idle_poll_ms);
             register_port_with(ctx, &port_name, 1, head)?;
             // C returns from the constructor here: the port has no axis.
             let (handle, connected) = connect_controller(
@@ -338,7 +348,8 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
             let controller_id = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, agap::NUM_AXES as i32)?;
+            let (version, head) = conex_head(controller_id, moving_poll_ms, idle_poll_ms);
+            register_port_with(ctx, &port_name, agap::NUM_AXES as i32, head)?;
             // C returns from the constructor here: the port has no axes.
             let (handle, connected) = connect_controller(
                 &serial_port,
@@ -356,12 +367,16 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
             else {
                 return Ok(CommandOutcome::Continue);
             };
+            controller
+                .version()
+                .clone_into(&mut version.lock().unwrap_or_else(|e| e.into_inner()));
             let controller = Arc::new(Mutex::new(controller));
             let poller = Controller::new();
             for axis in 0..agap::NUM_AXES {
-                let motor: Arc<Mutex<dyn AsynMotor>> =
-                    Arc::new(Mutex::new(AgapAxis::new(controller.clone(), axis)));
-                poller.install(asyn_user(&port_name, axis as i32), motor)?;
+                let ax = AgapAxis::new(controller.clone(), axis);
+                let report = Arc::new(ax.report());
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                poller.install_with_report(asyn_user(&port_name, axis as i32), motor, report)?;
             }
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // AGAP_CONEX.cpp:79
             Ok(CommandOutcome::Continue)
@@ -2295,6 +2310,65 @@ mod report {
         for query in ["1KP?", "1KI?", "1KD?"] {
             assert!(sent.iter().any(|s| s == query), "{sent:?}");
         }
+    }
+
+    /// AGAP_CONEXController::report then AGAP_CONEXAxis::report, which reads
+    /// each axis's gains (AGAP_CONEX.cpp:137-145, :237-261).
+    #[epics_rs::base::epics_test]
+    async fn agap_conex_report_prints_the_controller_then_reads_each_axis_above_level_0() {
+        use motor_common::testing::LineRig;
+        let (_line, _io) = LineRig::new("agapRepLine", |cmd| {
+            match cmd.trim_end() {
+                "1VE" => "1VE CONEX-AGAP 1.0",
+                "1ID?" => "1IDAG-M100",
+                "1SU?" => "1SU0.00001",
+                "1SLU?" | "1SLV?" => "1SLU-0.75",
+                "1SRU?" | "1SRV?" => "1SRU0.75",
+                "1TPU" => "1TPU0.01",
+                "1TPV" => "1TPV-0.02",
+                "1KPU?" => "1KPU5",
+                "1KIU?" => "1KIU6",
+                "1LFU?" => "1LFU7",
+                "1KPV?" => "1KPV8",
+                "1KIV?" => "1KIV9",
+                "1LFV?" => "1LFV10",
+                _ => "",
+            }
+            .into()
+        });
+        let args = vec![
+            ArgValue::String("agapRep".into()),
+            ArgValue::String("agapRepLine".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(100),
+            ArgValue::Int(100),
+        ];
+        run_command(agap_conex_create_controller_command(), args).await;
+        let head = "CONEX motor driver agapRep, controllerID=1, version=\"CONEX-AGAP 1.0\n  \
+                    moving poll period=0.100000, idle poll period=0.100000\n";
+        let text = port_report("agapRep", 0);
+        assert!(text.contains(&format!("{head}Port: agapRep\n")), "{text}");
+        let axis = |name, position, kp, ki, lf| {
+            format!(
+                "axisName={name}\n  stageID=AG-M100\n  currentPosition={position}, \
+                 encoderIncrement=0.000010\n  interpolationFactor=0.000000, stepSize=0.000100, \
+                 lowLimit=-0.750000, highLimit=0.750000\n  KP={kp}, KI={ki}, KD/LF={lf}\n"
+            )
+        };
+        let want = format!(
+            "{head}{}{}Port: agapRep\n",
+            axis("U", "100.000000", "5.000000", "6.000000", "7.000000"),
+            axis("V", "-200.000000", "8.000000", "9.000000", "10.000000")
+        );
+        let mut text = String::new();
+        for _ in 0..300 {
+            text = port_report("agapRep", 1);
+            if text.contains(&want) {
+                break;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(text.contains(&want), "{text}");
     }
 
     /// SMC100Controller::report then SMC100Axis::report

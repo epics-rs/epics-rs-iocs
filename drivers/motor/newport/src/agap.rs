@@ -34,6 +34,8 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
+use motor_common::AxisReport;
+
 use crate::conex::LINUX_WRITE_DELAY;
 use crate::util::{leading_hex, parse_value_at};
 
@@ -123,6 +125,11 @@ impl AgapController {
         Some(ctrl)
     }
 
+    /// C `controllerVersion_`.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
     /// C `writeCONEX`: every write, failed or not, is followed by the Linux
     /// `LINUX_WRITE_DELAY` before the next command.
     fn write(&self, cmd: &str) -> AsynResult<()> {
@@ -153,6 +160,67 @@ pub struct AgapAxis {
     /// `'U'` (axis 0) or `'V'` (axis 1) — the letter embedded in per-axis
     /// commands (C `axisName_`).
     axis_name: char,
+    /// What only `report` prints. C leaves it unset for an unknown model.
+    shown: Shown,
+    /// C `currentPosition_`, which `poll` sets.
+    current_position: Arc<Mutex<f64>>,
+}
+
+/// The constructor's readings that only C's `report` prints.
+#[derive(Clone, Default)]
+struct Shown {
+    stage_id: String,
+    encoder_increment: f64,
+    step_size: f64,
+    low_limit: f64,
+    high_limit: f64,
+}
+
+/// C `AGAP_CONEXAxis::report` (AGAP_CONEX.cpp:237-261): the axis's gains,
+/// read off the controller at each report, then the constructor's
+/// readings.
+pub struct AgapAxisReport {
+    controller: Arc<Mutex<AgapController>>,
+    axis_name: char,
+    shown: Shown,
+    current_position: Arc<Mutex<f64>>,
+}
+
+impl AxisReport for AgapAxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level <= 0 {
+            return;
+        }
+        let (kp, ki, lf) = {
+            let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+            let id = ctrl.controller_id;
+            // C ignores each read's status; a failed one reads as 0.
+            let read = |letters: &str| {
+                let reply = ctrl.write_read(&format!("{id}{letters}{}?", self.axis_name));
+                parse_value_at(&reply.unwrap_or_default(), 4).unwrap_or(0.0)
+            };
+            (read("KP"), read("KI"), read("LF"))
+        };
+        let shown = &self.shown;
+        let current = *self
+            .current_position
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // C prints `interpolationFactor_`, which nothing sets; 0 stands for it.
+        let _ = write!(
+            out,
+            "axisName={}\n  stageID={}\n  currentPosition={current:.6}, encoderIncrement={:.6}\n  \
+             interpolationFactor={:.6}, stepSize={:.6}, lowLimit={:.6}, highLimit={:.6}\n  \
+             KP={kp:.6}, KI={ki:.6}, KD/LF={lf:.6}\n",
+            self.axis_name,
+            shown.stage_id,
+            shown.encoder_increment,
+            0.0,
+            shown.step_size,
+            shown.low_limit,
+            shown.high_limit
+        );
+    }
 }
 
 impl AgapAxis {
@@ -162,20 +230,23 @@ impl AgapAxis {
     pub fn new(controller: Arc<Mutex<AgapController>>, axis_index: u8) -> Self {
         let axis_name = axis_name(axis_index);
 
-        {
-            // C reads stage ID (ID?), system resolution (SU?) and the per-axis
-            // soft limits (SL/SR) here, but stores them only for report(),
-            // which has no analogue in this driver. Issue the queries for
-            // startup wire fidelity and discard the replies (C ignores their
-            // status); stepSize is the fixed 1e-4 constant regardless. An
-            // unknown model returns before the queries and is still polled.
+        let shown = {
+            // The stage ID, resolution and soft limits are kept for the
+            // report only (C ignores their status); poll uses the fixed 1e-4
+            // step. An unknown model returns before the queries and is
+            // still polled.
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             if ctrl.version.contains("CONEX-AGAP") {
                 let id = ctrl.controller_id;
-                let _ = ctrl.write_read(&format!("{id}ID?"));
-                let _ = ctrl.write_read(&format!("{id}SU?"));
-                let _ = ctrl.write_read(&format!("{id}SL{axis_name}?"));
-                let _ = ctrl.write_read(&format!("{id}SR{axis_name}?"));
+                let reply = |cmd: String| ctrl.write_read(&cmd).unwrap_or_default();
+                let value_at = |cmd: String, at| parse_value_at(&reply(cmd), at).unwrap_or(0.0);
+                Shown {
+                    stage_id: reply(format!("{id}ID?")).get(3..).unwrap_or("").to_string(),
+                    encoder_increment: value_at(format!("{id}SU?"), 3),
+                    step_size: STEP_SIZE,
+                    low_limit: value_at(format!("{id}SL{axis_name}?"), 4),
+                    high_limit: value_at(format!("{id}SR{axis_name}?"), 4),
+                }
             } else {
                 ctrl.trace.print_self(
                     TraceMask::ERROR,
@@ -184,12 +255,25 @@ impl AgapAxis {
                         ctrl.version
                     ),
                 );
+                Shown::default()
             }
-        }
+        };
 
         Self {
             controller,
             axis_name,
+            shown,
+            current_position: Arc::default(),
+        }
+    }
+
+    /// The axis's `report`.
+    pub fn report(&self) -> AgapAxisReport {
+        AgapAxisReport {
+            controller: self.controller.clone(),
+            axis_name: self.axis_name,
+            shown: self.shown.clone(),
+            current_position: self.current_position.clone(),
         }
     }
 
@@ -324,6 +408,10 @@ impl AsynMotor for AgapAxis {
         let position = parse_value_at(&ctrl.write_read(&format!("{id}TP{}", self.axis_name))?, 4)
             .ok_or_else(|| parse_error("TP"))?
             / STEP_SIZE;
+        *self
+            .current_position
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = position;
 
         // Moving status (controller-wide TS) and power-on (controller-wide MM?)
         // are shared by both axes. AGAP_CONEX.cpp:411 posts PROBLEM 0 on a bad
