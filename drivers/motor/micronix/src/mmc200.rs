@@ -475,7 +475,10 @@ impl AsynMotor for Mmc200Axis {
             (status & STA_HIGH_LIMIT != 0, status & STA_LOW_LIMIT != 0)
         };
         if status & STA_ERROR != 0 {
-            ctrl.write(&format!("{n}CER"))?;
+            // C stores this return in `status`, which nothing reads after
+            // done/limits were taken from it: a refused CER neither skips nor
+            // raises PROBLEM.
+            let _ = ctrl.write(&format!("{n}CER"));
         }
 
         let mot_reply = ctrl.query(&format!("{n}MOT?"))?;
@@ -519,6 +522,41 @@ mod tests {
         let left = axis.take_failed_poll_status().expect("the status C left");
         assert!(left.gain_support && left.has_encoder, "{left:?}");
         assert!(!left.comms_error, "{left:?}");
+    }
+
+    /// MMC200Driver.cpp:505 stores the `CER` write's return in `status`, not
+    /// `comStatus`, so a refused `CER` neither skips `MOT?` nor raises PROBLEM.
+    #[test]
+    fn rv4_a_refused_cer_does_not_fail_the_poll() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::failing(
+            "mmc200RefusedCer",
+            |cmd| {
+                match cmd.trim_end() {
+                    "1VER?" => "#MMC-200 v4.1",
+                    "1REZ?" => "#1000",
+                    "1UST?" => "#8",
+                    "1VMX?" => "#2.5",
+                    "1POS?" => "#1.000000,1.000000",
+                    "1STA?" => "#136",
+                    "1MOT?" => "#1",
+                    _ => "#0",
+                }
+                .into()
+            },
+            |cmd| cmd.trim_end() == "1CER",
+        );
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
+        let mut axis = Mmc200Axis::new(controller, 0, false);
+        rig.sent();
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert!(
+            status.done && status.powered && !status.problem,
+            "{status:?}"
+        );
+        let sent: Vec<String> = rig.sent().iter().map(|c| c.trim_end().to_owned()).collect();
+        assert!(sent.contains(&"1CER".to_owned()), "{sent:?}");
+        assert!(sent.contains(&"1MOT?".to_owned()), "{sent:?}");
     }
 
     /// C `sprintf("%dVEL%.3f")` / `"%dMVA%.6f"` spell a non-finite value
