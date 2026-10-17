@@ -143,6 +143,11 @@ static PC6K_CARDS: Mutex<BTreeMap<i32, Arc<Mutex<Pc6kCard>>>> = Mutex::new(BTree
 
 /// `PC6KSetup(num_cards, scan_rate)`.
 pub fn pc6k_setup_command() -> CommandDef {
+    PC6K.register_report("drvPC6K", |cards| {
+        cards.report("PC6K", |card, line| {
+            format!("    PC6K controller {card}, {line} \n")
+        })
+    });
     PC6K.setup_command("PC6KSetup")
 }
 
@@ -171,7 +176,7 @@ pub fn pc6k_config_command() -> CommandDef {
                 EosRefusal::Ignored,
             )?;
             let controller = Pc6kCard::new(handle);
-            let Some(axes) = drv_pc6k::motor_init(&controller) else {
+            let Some((ident, axes)) = drv_pc6k::motor_init(&controller) else {
                 return Ok(CommandOutcome::Continue);
             };
             let controller = Arc::new(Mutex::new(controller));
@@ -183,6 +188,10 @@ pub fn pc6k_config_command() -> CommandDef {
                 )));
                 PC6K.install(ctx, card, signal as i32, motor)?;
             }
+            // C prints `cntrl->asyn_address`, which PC6KConfig never sets
+            // (drvPC6K.cc:648-662), a read of uninitialized memory not
+            // copied; this is the address the line is opened at.
+            PC6K.describe(card, format!("port={asyn_port}, address=0, id: {ident}"));
             PC6K_CARDS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -267,7 +276,31 @@ mod one_poller {
 #[cfg(test)]
 mod report {
     use super::*;
-    use motor_common::testing::{LineRig, port_report, run_command};
+    use motor_common::testing::{LineRig, driver_report, port_report, run_command};
+
+    /// drvPC6K.cc's drvet `report` (drvPC6K.cc:199-225), which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pc6k_card() {
+        let setup = pc6k_setup_command();
+        assert_eq!(
+            driver_report("drvPC6K", 0),
+            "    No PC6K controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("pc6kRepLine", |cmd| match cmd.trim_end() {
+            "TREV" => "*TREV92-016740-01-6K4".into(),
+            "DRIVE" => "*DRIVE0000".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(1), ArgValue::String("pc6kRepLine".into())];
+        run_command(pc6k_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvPC6K", 0),
+            "    PC6K controller 0 connection failed.\n    PC6K controller 1, \
+             port=pc6kRepLine, address=0, id: *TREV92-016740-01-6K4 \n"
+        );
+    }
 
     /// OEMController::report; OEMAxis::report prints nothing
     /// (OEMMotorDriver.cpp:94-101, :222-226).
