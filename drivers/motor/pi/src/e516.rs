@@ -201,6 +201,7 @@ fn fold_reading(
         velocity: 0.0,
         done,
         moving: false,
+        msta_moving: false,
         // + limit only surfaces a servo overflow while on-target; no - LS.
         high_limit: done && reading.overflow,
         low_limit: false,

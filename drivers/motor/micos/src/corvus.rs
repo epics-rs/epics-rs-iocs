@@ -337,6 +337,8 @@ impl CorvusAxis {
         let moving = (atoi(&ctrl.query("st")?) & STATUS_MOVING) != 0;
         status.done = !moving;
         status.moving = moving;
+        // SMCcorvusDriver.cpp:432 motorStatusMoving_ = !done.
+        status.msta_moving = moving;
 
         // Limits and drive current are not read while moving (it would block
         // the controller's interpreter); they keep the last poll's values.

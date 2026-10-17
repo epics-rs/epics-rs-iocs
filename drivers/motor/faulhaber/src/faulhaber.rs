@@ -15,10 +15,10 @@
 //! counts: positions pass through with `NINT` rounding, the record's `MRES` is
 //! 1, and its `EGU` is counts. Velocities cross the boundary in counts/s and
 //! accelerations in counts/s²; the controller wants rev/min and rev/s², so they
-//! are converted with the axis's counts-per-rev (the `MCDC2805Config`
-//! `countsPerRev` argument, sent as `ENCRES` ahead of every `SP`/`AC`/`HOSP`
-//! as C does). This replaces the C driver's use of the record's `SREV` field,
-//! which is not visible at the asyn-rs boundary.
+//! are converted with the axis's counts-per-rev, sent as `ENCRES` ahead of
+//! every `SP`/`AC`/`HOSP` as C does. C takes it from the record's `SREV`,
+//! which is not visible at the asyn-rs boundary; the IOC passes `SREV`'s
+//! default, 200.
 //!
 //! ## Done detection
 //!
@@ -30,9 +30,11 @@
 //!
 //! - The C poller is a background thread; here the `GST`/`POS`/`GAST`/`GV`
 //!   reads and the limit-switch hold run inside [`poll`](AsynMotor::poll).
-//! - `countsPerRev` is a config argument rather than the record's `SREV`.
+//! - counts-per-rev is fixed at `SREV`'s default rather than read from the
+//!   record.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
@@ -43,6 +45,10 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, nint};
+
+/// Query read timeout (C `recv_mess` 1.0 s); writes use the caller's
+/// `COMM_TIMEOUT`.
+const RECV_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 128;
@@ -60,6 +66,7 @@ fn faulhaber_err(message: impl Into<String>) -> AsynError {
 /// Shared controller endpoint: owns the serial handle and node-prefixed framing.
 pub struct FaulhaberController {
     handle: SyncIOHandle,
+    reader: SyncIOHandle,
     ident: String,
     num_axes: usize,
     comm_state: CommState,
@@ -80,8 +87,10 @@ impl FaulhaberController {
     /// that never answers. The first node's reply becomes the identification.
     /// Performs blocking serial I/O.
     pub fn new(handle: SyncIOHandle, num_motors: usize) -> AsynResult<Self> {
+        let reader = SyncIOHandle::from_handle(handle.port()?.clone(), 0, RECV_TIMEOUT);
         let mut ctrl = Self {
             handle,
+            reader,
             ident: String::new(),
             num_axes: 0,
             comm_state: CommState::Normal,
@@ -147,7 +156,7 @@ impl FaulhaberController {
         // C send_mess/recv_mess write then read with no flush, so one stray
         // line shifts every later reply; write_read flushes first.
         let raw = self
-            .handle
+            .reader
             .write_read(0, &Self::framed(node, cmd), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text
@@ -180,6 +189,8 @@ pub struct FaulhaberAxis {
     /// 0-based node number prefixed to this axis's commands.
     node: usize,
     counts_per_rev: f64,
+    /// The record's VELO in counts/s, C `mr->velo` as HOME reads it.
+    record_velocity: f64,
     /// Last integer position (counts); C `motor_info->position`.
     prev_position: i32,
     /// What the last failed poll raises: nothing on C `set_status`'s first
@@ -217,6 +228,7 @@ impl FaulhaberAxis {
             controller,
             node,
             counts_per_rev,
+            record_velocity: 0.0,
             prev_position: 0,
             failure: PollFailure::NONE,
             last_status: MotorStatus {
@@ -316,6 +328,8 @@ impl AsynMotor for FaulhaberAxis {
         // The record's unguarded SET_ACCEL (motorRecord.cc:2141), then C JOG:
         // ENCRES, the speed, and velocity mode at the signed rate. C's SP is
         // signed too; a maximum speed is not, so that is not copied.
+        // C never sends that SP: its node keeps type UNDEFINED, which
+        // motor_send (motordrvCom.cc:563-576) refuses; that defect is not copied.
         self.set_accel(&self.lock(), acceleration)?;
         let rpm = vel_to_rpm(velocity, self.counts_per_rev);
         self.lead_move(&self.encres())?;
@@ -335,8 +349,12 @@ impl AsynMotor for FaulhaberAxis {
         // The record's SET_VELOCITY/SET_ACCEL (motorRecord.cc:872-875), then C
         // HOME_*: ENCRES, the homing speed signed by direction, the homing
         // sequence, and GO's `M`.
+        // C never sends HOSP: its node keeps type UNDEFINED, which motor_send
+        // (motordrvCom.cc:563-576) refuses; that defect is not copied.
         self.program_motion(velocity, acceleration)?;
-        let mut rpm = vel_to_rpm(velocity, self.counts_per_rev);
+        // HOSP runs at VELO, not HVEL (devMCDC2805.cc:224); C divides VELO's
+        // EGU/s by SREV without MRES, a unit mix not copied.
+        let mut rpm = vel_to_rpm(self.record_velocity, self.counts_per_rev);
         if !forward {
             rpm = -rpm;
         }
@@ -345,6 +363,11 @@ impl AsynMotor for FaulhaberAxis {
         ctrl.write_cmd(self.node, &format!("HOSP{rpm}"))?;
         ctrl.write_cmd(self.node, "GOHOSEQ")?;
         ctrl.write_cmd(self.node, "M")
+    }
+
+    fn set_record_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.record_velocity = velocity;
+        Ok(())
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -567,13 +590,15 @@ mod tests {
     }
 
     /// devMCDC2805.cc:222-236 and 286-300 lose PREM and POST on HOME and
-    /// JOG; rs sends both as for any other move.
+    /// JOG; rs sends both as for any other move. HOSP is VELO's, not the
+    /// HVEL the record sent (devMCDC2805.cc:224).
     #[test]
     fn home_and_jog_send_prem_and_post() {
         let mut r = Rig::new("mcdc_split");
         r.axis
             .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
             .unwrap();
+        r.axis.set_record_velocity(&r.user, 2000.0).unwrap();
         r.axis.home(&r.user, 0.0, 1000.0, 0.0, false).unwrap();
         assert_eq!(
             r.line.sent(),
@@ -581,7 +606,7 @@ mod tests {
                 "1ENCRES1000",
                 "1SP 60",
                 "1EN ENCRES1000",
-                "1HOSP-60",
+                "1HOSP-120",
                 "1GOHOSEQ",
                 "1M"
             ]
@@ -684,6 +709,22 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvMCDC2805.cc:446 reads at 1.0 s while send_mess writes at
+    /// COMM_TIMEOUT, so a silent node fails a poll in 1 s.
+    #[test]
+    fn queries_read_at_one_second_and_writes_keep_the_comm_timeout() {
+        let (_line, io) = LineRig::new("faulhaberTimeout", |last| {
+            match last.get(1..).unwrap_or_default() {
+                "VER" => "MCDC2805".into(),
+                _ => String::new(),
+            }
+        });
+        let write_timeout = io.timeout();
+        let ctrl = FaulhaberController::new(io, 1).unwrap();
+        assert_eq!(ctrl.reader.timeout(), Duration::from_secs(1));
+        assert_eq!(ctrl.handle.timeout(), write_timeout);
     }
 
     /// motorRecord.cc:938-945 with devMCDC2805.cc:248-274: SP before AC,

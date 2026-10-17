@@ -256,6 +256,7 @@ fn fold_reading(
         velocity: 0.0,
         done: reading.done,
         moving: false,
+        msta_moving: false,
         high_limit: reading.plus_ls,
         low_limit: reading.minus_ls,
         home: reading.done,

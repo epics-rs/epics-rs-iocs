@@ -345,6 +345,8 @@ impl AsynMotor for TaurusAxis {
             velocity: 0.0,
             done: !moving,
             moving,
+            // SMCTaurusAxis.cpp:263 motorStatusMoving_ = !done.
+            msta_moving: moving,
             gain_support: true,
             high_limit,
             low_limit,

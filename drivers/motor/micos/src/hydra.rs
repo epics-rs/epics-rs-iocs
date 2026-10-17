@@ -347,6 +347,8 @@ impl AsynMotor for HydraAxis {
             velocity: 0.0,
             done: !moving,
             moving,
+            // SMChydraAxis.cpp:273 motorStatusMoving_ = !done.
+            msta_moving: moving,
             gain_support: true,
             high_limit,
             low_limit,
