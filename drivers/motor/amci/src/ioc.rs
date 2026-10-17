@@ -293,6 +293,11 @@ mod tests {
     /// A two-axis ANF2 on fake Modbus ports whose input register `r` reads
     /// `r`, axis 0 configured `0x86280015`, polled at 100/1000 ms.
     async fn anf2_report(port: &str, level: i32) -> String {
+        report_after(anf2_commands(port, true), port, level).await
+    }
+
+    /// `anf2_report`'s st.cmd, with or without `ANF2StartPoller`.
+    fn anf2_commands(port: &str, start: bool) -> Vec<(CommandDef, Vec<ArgValue>)> {
         let s = |v: &str| ArgValue::String(v.into());
         let (inp, out) = (format!("{port}In"), format!("{port}Out"));
         crate::regs::fake::publish(&inp);
@@ -311,9 +316,11 @@ mod tests {
             ];
             cmds.push((anf2_create_axis_command(), args));
         }
-        let start = vec![s(port), ArgValue::Int(100), ArgValue::Int(1000)];
-        cmds.push((anf2_start_poller_command(), start));
-        report_after(cmds, port, level).await
+        if start {
+            let start = vec![s(port), ArgValue::Int(100), ArgValue::Int(1000)];
+            cmds.push((anf2_start_poller_command(), start));
+        }
+        cmds
     }
 
     const RULE: &str = "====================================\n";
@@ -431,6 +438,20 @@ mod tests {
             crate::regs::fake::written("anf2ResetOut"),
             [(10, vec![0x800 << 16, 0, 0, 0, 0])]
         );
+    }
+
+    /// A 1 on `ANF2_GET_INFO` runs `getInfo` (ANF2Driver.cpp:498-513): a
+    /// force read at the axis's input block. Unpolled, so the poller's own
+    /// force reads cannot land in between.
+    #[epics_rs::base::epics_test]
+    async fn anf2_get_info_force_reads_the_axis_on_1() {
+        let port = "anf2Info";
+        report_after(anf2_commands(port, false), port, 0).await;
+        crate::regs::fake::forced("anf2InfoIn");
+        assert_eq!(put_int32(port, "ANF2_GET_INFO", 1, 0).await, 0);
+        assert!(crate::regs::fake::forced("anf2InfoIn").is_empty());
+        assert_eq!(put_int32(port, "ANF2_GET_INFO", 1, 1).await, 1);
+        assert_eq!(crate::regs::fake::forced("anf2InfoIn"), [10]);
     }
 
     #[test]

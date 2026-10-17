@@ -16,14 +16,12 @@
 //! carry `CONFIGURATION`/`BASE_SPEED`/`HOME_TIMEOUT` instead of
 //! `COMMAND`/`POSITION`/`SPEED`.
 //!
-//! ## Not modeled (documented)
+//! ## Custom params
 //!
-//! `ANF2_GET_INFO` is a C custom asyn `Int32` param meant for an
-//! `ao`/`longout` record outside the motor record (a controller `writeInt32`
-//! override); `ANF2_RESET_ERRORS` is ported in [`Anf2Params`]. `resetErrors`
-//! also runs from `poll` on a command-error bit, exactly as C does.
-//! `has_encoder` is the only bit of `config` with a functional
-//! effect on `AsynMotor`; the rest is decoded for the report alone.
+//! `ANF2_RESET_ERRORS` and `ANF2_GET_INFO` are ported in [`Anf2Params`].
+//! `resetErrors` also runs from `poll` on a command-error bit, exactly as C
+//! does. `has_encoder` is the only bit of `config` with a functional effect
+//! on `AsynMotor`; the rest is decoded for the report alone.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -244,6 +242,8 @@ pub struct Anf2Params {
     controller: Arc<Mutex<Anf2Controller>>,
     /// C `ANF2ResetErrors_`, once created.
     reset_errors: Option<usize>,
+    /// C `ANF2GetInfo_`, once created.
+    get_info: Option<usize>,
 }
 
 impl Anf2Params {
@@ -251,6 +251,7 @@ impl Anf2Params {
         Self {
             controller,
             reset_errors: None,
+            get_info: None,
         }
     }
 }
@@ -258,6 +259,7 @@ impl Anf2Params {
 impl ControllerParams for Anf2Params {
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.reset_errors = Some(base.create_param("ANF2_RESET_ERRORS", ParamType::Int32)?);
+        self.get_info = Some(base.create_param("ANF2_GET_INFO", ParamType::Int32)?);
         Ok(())
     }
 
@@ -271,14 +273,20 @@ impl ControllerParams for Anf2Params {
         value: i32,
     ) -> ParamWrite {
         let addr = user.addr;
-        if Some(user.reason) != self.reset_errors {
+        let reset = Some(user.reason) == self.reset_errors;
+        if !reset && Some(user.reason) != self.get_info {
             return ParamWrite::PassToBase(Ok(()));
         }
         let _ = base.set_int32_param(user.reason, addr, value);
-        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         if value == 1 && ctrl.axes.contains_key(&addr) {
-            println!("ANF2Controller:writeInt32: Resetting errors for axis = {addr}");
-            let _ = ctrl.reset_errors(addr);
+            if reset {
+                println!("ANF2Controller:writeInt32: Resetting errors for axis = {addr}");
+                let _ = ctrl.reset_errors(addr);
+            } else {
+                println!("ANF2Controller:writeInt32: Getting info for axis = {addr}");
+                ctrl.get_info(addr);
+            }
         }
         drop(ctrl);
         let _ = base.call_param_callbacks(addr);

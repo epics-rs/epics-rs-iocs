@@ -188,6 +188,19 @@ pub(crate) mod fake {
             .collect()
     }
 
+    /// `addr` of each `MODBUS_READ` write, by port.
+    static FORCED: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
+
+    /// The `MODBUS_READ` writes to port `name` since the last call.
+    pub fn forced(name: &str) -> Vec<i32> {
+        let mut all = FORCED.lock().unwrap();
+        let (mine, rest) = std::mem::take(&mut *all)
+            .into_iter()
+            .partition(|(port, _)| port == name);
+        *all = rest;
+        mine.into_iter().map(|(_, addr)| addr).collect()
+    }
+
     struct Modbus {
         base: PortDriverBase,
         read_reason: usize,
@@ -215,6 +228,8 @@ pub(crate) mod fake {
         fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
             if user.reason == self.read_reason {
                 self.taken.lock().unwrap().push((user.reason, user.addr));
+                let port = self.base.port_name.to_string();
+                FORCED.lock().unwrap().push((port, user.addr));
             } else {
                 self.record(user.addr, vec![value]);
             }
