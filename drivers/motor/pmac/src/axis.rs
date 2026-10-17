@@ -416,7 +416,18 @@ impl AsynMotor for PmacAxis {
     /// C `pmacController::writeInt32`, `motorDeferMoves_` branch, which C takes
     /// at every address: the motor record defers with 1, releases with 0.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
-        lock(&self.controller).set_moves_deferred(i32::from(defer))
+        let (release, post) = {
+            let mut controller = lock(&self.controller);
+            let release = controller.set_moves_deferred(i32::from(defer));
+            let post = release
+                .comms_error
+                .and_then(|value| controller.comms_error_post(value));
+            (release, post)
+        };
+        if let Some(post) = post {
+            post();
+        }
+        release.status
     }
 
     /// C `pmacAxis::getAxisStatus`.

@@ -1159,6 +1159,43 @@ mod tests {
 
     /// pmacAxis.cpp:96, 136, 243-305, 497, 585: C's axis error lines on the
     /// controller's trace, the limits warning throttled as the feed rate's.
+    /// pmacController.cpp:871-877, pmacCsGroups.cpp:321-330: a deferred
+    /// release line sets `PMAC_C_COMMSERROR` from its status, on the port's
+    /// write and on the axis's.
+    #[test]
+    fn a_deferred_release_sets_the_comms_error() {
+        use crate::controller::DEFERRED_FAST_MOVES;
+        use epics_rs::motor::controller_port::index;
+
+        let (_rt, rig) = publish_scripted("pmacDeferCommsLow");
+        let (controller, io) = controller_port("pmacDeferCommsCtl", "pmacDeferCommsLow");
+        let comms_error = io.drv_user_create("PMAC_C_COMMSERROR").unwrap();
+        let comms = || io.read_int32(comms_error).unwrap();
+        assert_eq!(comms(), 0);
+        io.write_int32(index::DEFER_MOVES, DEFERRED_FAST_MOVES)
+            .unwrap();
+        assert!(io.write_int32(index::DEFER_MOVES, 0).is_err());
+        assert_eq!(comms(), 1);
+        rig.answer("", b"\x06");
+        io.write_int32(index::DEFER_MOVES, DEFERRED_FAST_MOVES)
+            .unwrap();
+        io.write_int32(index::DEFER_MOVES, 0).unwrap();
+        assert_eq!(comms(), 0);
+
+        let mut axis = PmacAxis::new(controller.clone(), 1);
+        let user = AsynUser::new(0).with_addr(1);
+        rig.silence("");
+        axis.set_deferred_moves(&user, true).unwrap();
+        controller
+            .lock()
+            .unwrap()
+            .set_moves_deferred(DEFERRED_FAST_MOVES)
+            .status
+            .unwrap();
+        assert!(axis.set_deferred_moves(&user, false).is_err());
+        assert_eq!(comms(), 1);
+    }
+
     /// pmacCsGroups.cpp:156-161: the group changes only once `undefine all`
     /// went through.
     #[test]
@@ -1200,17 +1237,21 @@ mod tests {
             time_ms: 0.0,
         };
         rig.written();
-        c.set_moves_deferred(DEFERRED_COORDINATED_MOVES).unwrap();
+        c.set_moves_deferred(DEFERRED_COORDINATED_MOVES)
+            .status
+            .unwrap();
         c.defer_move(1, to);
         c.defer_move(3, to);
-        assert!(c.set_moves_deferred(0).is_err());
+        assert!(c.set_moves_deferred(0).status.is_err());
         assert_eq!(rig.written(), ["&2A"]);
 
         let line = "&2 Q70=0.000000  Q77=1.000000 B101R";
         rig.answer(line, b"\x06");
-        c.set_moves_deferred(DEFERRED_COORDINATED_MOVES).unwrap();
+        c.set_moves_deferred(DEFERRED_COORDINATED_MOVES)
+            .status
+            .unwrap();
         c.defer_move(1, to);
-        c.set_moves_deferred(0).unwrap();
+        c.set_moves_deferred(0).status.unwrap();
         assert_eq!(rig.written(), ["&2A", line]);
     }
 
@@ -1245,11 +1286,13 @@ mod tests {
             time_ms: 0.0,
         };
         let release = |axes: &[i32], c: &mut PmacController| {
-            c.set_moves_deferred(DEFERRED_COORDINATED_MOVES).unwrap();
+            c.set_moves_deferred(DEFERRED_COORDINATED_MOVES)
+                .status
+                .unwrap();
             for &axis in axes {
                 c.defer_move(axis, to);
             }
-            assert!(c.set_moves_deferred(0).is_err());
+            assert!(c.set_moves_deferred(0).status.is_err());
             own.take()
         };
         let line = |text: &str| format!("pmacCsGroups::processDeferredCoordMoves {text}\n");
