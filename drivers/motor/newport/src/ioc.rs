@@ -1481,7 +1481,7 @@ pub fn hxp_create_controller_command() -> CommandDef {
                 owner,
                 &port_name,
                 NUM_HXP_AXES as i32,
-                HxpControllerParams::new(controller.clone()),
+                HxpControllerParams::new(controller.clone(), moving_poll_ms, idle_poll_ms),
             )?;
             controller
                 .lock()
@@ -1512,7 +1512,14 @@ pub fn hxp_create_controller_command() -> CommandDef {
                     .add_line(axis_no, line.clone());
                 let motor: Arc<Mutex<dyn AsynMotor>> =
                     Arc::new(Mutex::new(HxpAxis::new(controller.clone(), line, axis_no)));
-                poller.install(asyn_user(&port_name, axis_no as i32), motor)?;
+                // HXPAxis::report (HXPDriver.cpp:578-587).
+                let name = char::from(b"XYZUVW"[axis_no]);
+                let report = Arc::new(AxisLines(move |out: &mut dyn Write, level| {
+                    if level > 0 {
+                        let _ = write!(out, "  axis {axis_no}\n    axisName {name}\n");
+                    }
+                }));
+                poller.install_with_report(asyn_user(&port_name, axis_no as i32), motor, report)?;
             }
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
@@ -2369,6 +2376,50 @@ mod report {
             epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
         }
         assert!(text.contains(&want), "{text}");
+    }
+
+    /// HXPController::report then HXPAxis::report (HXPDriver.cpp:143-154,
+    /// :578-587); coordSys is the address-0 HXP_MOVE_COORD_SYS as written.
+    #[epics_rs::base::epics_test]
+    async fn hxp_report_prints_the_coord_sys_then_each_axis_above_level_0() {
+        let args = vec![
+            ArgValue::String("hxpRep".into()),
+            ArgValue::String("127.0.0.1".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ];
+        run_command(hxp_create_controller_command(), args).await;
+        let head = |cs| {
+            format!(
+                "Newport hexapod motor driver hxpRep, numAxes=6, moving poll period=0.100000, \
+                 idle poll period=1.000000, coordSys={cs}\n"
+            )
+        };
+        let text = port_report("hxpRep", 0);
+        assert!(
+            text.contains(&format!("{}Port: hxpRep\n", head(0))),
+            "{text}"
+        );
+        let port = epics_rs::asyn::manager::PortManager::global()
+            .find_port_handle("hxpRep")
+            .unwrap();
+        let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_secs(1));
+        let reason = io.drv_user_create("HXP_MOVE_COORD_SYS").unwrap();
+        io.write_int32(reason, 2).unwrap();
+        SyncIOHandle::from_handle(port, 1, Duration::from_secs(1))
+            .write_int32(reason, 1)
+            .unwrap();
+        let axes: String = "XYZUVW"
+            .chars()
+            .enumerate()
+            .map(|(n, name)| format!("  axis {n}\n    axisName {name}\n"))
+            .collect();
+        let text = port_report("hxpRep", 1);
+        assert!(
+            text.contains(&format!("{}{axes}Port: hxpRep\n", head(2))),
+            "{text}"
+        );
     }
 
     /// SMC100Controller::report then SMC100Axis::report

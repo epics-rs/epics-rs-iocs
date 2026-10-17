@@ -8,7 +8,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerParams, ParamWrite};
+use epics_rs::motor::controller_port::{ControllerParams, ControllerReport, ParamWrite};
 
 use super::axis::{MoveLine, xps_status};
 use super::controller::{HXP_GROUP, HxpController, MoveCoordSys};
@@ -63,11 +63,27 @@ impl HxpParams {
 
 pub struct HxpControllerParams {
     controller: Arc<Mutex<HxpController>>,
+    /// C's `movingPollPeriod_`/`idlePollPeriod_`, in seconds.
+    moving_poll_s: f64,
+    idle_poll_s: f64,
+    /// The address-0 `HXP_MOVE_COORD_SYS` as written, which C's report
+    /// reads. C prints an uninitialised int before the first write; 0
+    /// stands for it.
+    coord_sys: i32,
 }
 
 impl HxpControllerParams {
-    pub fn new(controller: Arc<Mutex<HxpController>>) -> Self {
-        Self { controller }
+    pub fn new(
+        controller: Arc<Mutex<HxpController>>,
+        moving_poll_ms: u64,
+        idle_poll_ms: u64,
+    ) -> Self {
+        Self {
+            controller,
+            moving_poll_s: moving_poll_ms as f64 / 1000.0,
+            idle_poll_s: idle_poll_ms as f64 / 1000.0,
+            coord_sys: 0,
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, HxpController> {
@@ -94,6 +110,21 @@ fn post_error(
 }
 
 impl ControllerParams for HxpControllerParams {
+    /// C `HXPController::report` (HXPDriver.cpp:143-154).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "Newport hexapod motor driver {}, numAxes={}, moving poll period={:.6}, idle poll \
+             period={:.6}, coordSys={}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll_s,
+            self.idle_poll_s,
+            self.coord_sys
+        );
+        ctx.report(out, level);
+    }
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let params = HxpParams::create(base)?;
         self.lock().params = Some(params);
@@ -111,6 +142,7 @@ impl ControllerParams for HxpControllerParams {
         };
         let reason = user.reason;
         if reason == p.move_coord_sys && user.addr == 0 {
+            self.coord_sys = value;
             // C `move()` reads it at address 0: 0 is Work, anything else Tool.
             let cs = if value == 0 {
                 MoveCoordSys::Work
@@ -225,7 +257,7 @@ mod tests {
         let controller = Arc::new(Mutex::new(HxpController::new(
             line.socket(SocketMode::Query),
         )));
-        let params = HxpControllerParams::new(controller.clone());
+        let params = HxpControllerParams::new(controller.clone(), 100, 1000);
         let port = register_controller_port(&open_owner(), name, 6, params).unwrap();
         controller.lock().unwrap().attach_port(port.clone());
         let axes = Controller::new();
