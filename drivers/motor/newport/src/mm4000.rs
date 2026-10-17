@@ -45,13 +45,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::util::{atof, atoi, max_digits};
+use motor_common::model1::MoveStrings;
 
 /// Response buffer size for a single controller reply (C `BUFFER_SIZE` 160).
 const READ_BUF: usize = 256;
@@ -551,6 +554,8 @@ pub struct Mm4000Axis {
     /// A move or home was sent since the last poll: drvMM4000Asyn.c clears
     /// `motorAxisDone` so the record's next status update is not done.
     motion_sent: bool,
+    /// The model-1 record's PREM and POST.
+    strings: MoveStrings,
 }
 
 /// C model-1 `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
@@ -618,6 +623,7 @@ impl Mm4000Axis {
                 ..MotorStatus::default()
             },
             motion_sent: false,
+            strings: MoveStrings::default(),
         }
     }
 
@@ -658,6 +664,16 @@ impl Mm4000Axis {
         Ok(())
     }
 
+    /// devMM4000.cc:196-206: a model-1 move's PREM and `;`, ahead of its
+    /// own command; its POST waits for the move to end.
+    fn model1_prem(&mut self) -> String {
+        let prem = self.strings.arm();
+        match prem.is_empty() {
+            true => String::new(),
+            false => format!("{};", String::from_utf8_lossy(&prem)),
+        }
+    }
+
     /// The record's SET_ACCEL part of a model-1 move or home, which it
     /// leaves out for a zero rate (motorRecord.cc:874, 940).
     fn model1_accel(&self, acceleration: f64) -> String {
@@ -673,7 +689,7 @@ impl Mm4000Axis {
     /// sends it), steps scaled to wire units at this axis's precision. On
     /// model 1 it is the record's SET_VELOCITY, SET_ACCEL, MOVE: `VA;AC;PA;`.
     fn move_command(
-        &self,
+        &mut self,
         cmd: &str,
         value: f64,
         velocity: f64,
@@ -683,8 +699,9 @@ impl Mm4000Axis {
         let (acceleration, velocity, value) = (acceleration * step, velocity * step, value * step);
         if self.model1 {
             return Ok(format!(
-                "{a}VA{velocity:.d$};{}{a}{cmd}{value:.d$};",
-                self.model1_accel(acceleration)
+                "{a}VA{velocity:.d$};{}{}{a}{cmd}{value:.d$};",
+                self.model1_accel(acceleration),
+                self.model1_prem()
             ));
         }
         Ok(format!(
@@ -739,8 +756,9 @@ impl AsynMotor for Mm4000Axis {
             } else {
                 self.jog_low
             };
+            let prem = self.model1_prem();
             return self.start_motion(&format!(
-                "{a}AC{acceleration:.d$};{a}VA{speed:.d$};{a}PA{target:.d$};"
+                "{a}AC{acceleration:.d$};{prem}{a}VA{speed:.d$};{a}PA{target:.d$};"
             ));
         }
         // C `motorAxisVelocityMove`: no jog command — move absolute to the
@@ -770,10 +788,9 @@ impl AsynMotor for Mm4000Axis {
         let (acceleration, velocity) = (acceleration * step, velocity * step);
         if self.model1 {
             // devMM4000.cc HOME after the record's SET_VELOCITY, SET_ACCEL.
-            return self.start_motion(&format!(
-                "{a}VA{velocity:.d$};{}{a}OR;",
-                self.model1_accel(acceleration)
-            ));
+            let accel = self.model1_accel(acceleration);
+            let prem = self.model1_prem();
+            return self.start_motion(&format!("{a}VA{velocity:.d$};{accel}{prem}{a}OR;"));
         }
         self.start_motion(&format!(
             "{a}AC{acceleration:.d$}; {a}VA{velocity:.d$};{a}OR;"
@@ -901,14 +918,45 @@ impl AsynMotor for Mm4000Axis {
         )))
     }
 
+    /// devMM4000.cc:188-192: a model-1 INIT and a CR.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        if !self.model1 {
+            return Ok(());
+        }
+        let init = format!("{}\r", String::from_utf8_lossy(init));
+        self.lock().write(&init)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        if self.model1 {
+            self.strings.set(prem, post);
+        }
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let step = self.step_size()?;
         // drvMM4000.cc has no such hold; only the asyn poll reads it.
         let motion_sent = std::mem::take(&mut self.motion_sent);
         let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(poll) = ctrl.model1_poll() {
-            self.last =
-                ctrl.set_status(&poll, self.axis - 1, self.encoder_present, step, &self.last);
+            let s = ctrl.set_status(&poll, self.axis - 1, self.encoder_present, step, &self.last);
+            // drvMM4000.cc:495-501: POST once the move is done or stopped by
+            // the limit in its direction, past an answered MS; and TE;.
+            let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
+            if poll.comm == CommStatus::Normal
+                && !s.problem
+                && (s.done || ls_active)
+                && let Some(post) = self.strings.post_due()
+            {
+                let _ = ctrl.write(&String::from_utf8_lossy(&post));
+            }
+            self.last = s;
             return Ok(self.last.clone());
         }
         let data = ctrl.poll_data();
@@ -1158,6 +1206,67 @@ mod tests {
             wire(&mut || axis.set_position(&user, 5.0).unwrap()),
             [] as [&str; 0]
         );
+    }
+
+    /// devMM4000.cc:188-206 and drvMM4000.cc:495-501: INIT alone, PREM
+    /// ahead of each move's own command, POST once after that move is done
+    /// or stopped by the limit in its direction.
+    #[test]
+    fn model1_init_prem_and_post_go_out_as_c_builds_them() {
+        let (axes, sent, _) = model1_card("mm4000_m1_strings", &[], Duration::ZERO);
+        let mut axes = axes.unwrap();
+        let user = AsynUser::default();
+        let post = |text: &[u8]| {
+            let p = PostMessage::default();
+            p.set(text);
+            Some(p)
+        };
+        let posts = |sent: &Arc<Mutex<Vec<String>>>| -> Vec<String> {
+            let wire = std::mem::take(&mut *sent.lock().unwrap());
+            wire.into_iter().filter(|c| c.contains('Y')).collect()
+        };
+        sent.lock().unwrap().clear();
+        axes[0].primitive(&user, b"1MO").unwrap();
+        axes[0]
+            .set_move_strings(&user, b"1XX", post(b"1YY"))
+            .unwrap();
+        axes[0]
+            .move_absolute(&user, 2000.0, 0.0, 1000.0, 500.0)
+            .unwrap();
+        axes[0]
+            .move_relative(&user, 2000.0, 0.0, 1000.0, 0.0)
+            .unwrap();
+        axes[0].set_move_strings(&user, b"1XX", None).unwrap();
+        axes[0].home(&user, 0.0, 1000.0, 500.0, true).unwrap();
+        axes[1].set_move_strings(&user, b"2XX", None).unwrap();
+        axes[1].move_velocity(&user, 0.0, 1000.0, 500.0).unwrap();
+        assert_eq!(
+            std::mem::take(&mut *sent.lock().unwrap()),
+            [
+                "1MO",
+                "1VA1.00000;1AC0.50000;1XX;1PA2.00000;",
+                "1VA1.00000;1PR2.00000;",
+                "1VA1.00000;1AC0.50000;1XX;1OR;",
+                "2AC0.50000;2XX;2VA1.00000;2PA0.00100;"
+            ]
+        );
+        // The home armed no POST, so axis 1 has none due.
+        axes[0].poll(&user).unwrap();
+        assert!(posts(&sent).is_empty());
+        axes[0].set_move_strings(&user, b"", post(b"1YY")).unwrap();
+        axes[0]
+            .move_absolute(&user, 0.0, 0.0, 1000.0, 500.0)
+            .unwrap();
+        axes[0].poll(&user).unwrap();
+        axes[0].poll(&user).unwrap();
+        assert_eq!(posts(&sent), ["1YY"], "sent once");
+        // Axis 2 is moving, but on its plus limit while moving plus.
+        axes[1].set_move_strings(&user, b"", post(b"2YY")).unwrap();
+        axes[1]
+            .move_absolute(&user, 0.0, 0.0, 1000.0, 500.0)
+            .unwrap();
+        axes[1].poll(&user).unwrap();
+        assert_eq!(posts(&sent), ["2YY"]);
     }
 
     /// devMM4000.cc STOP_AXIS sends `ST;` with no deceleration.
