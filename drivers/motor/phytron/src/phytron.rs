@@ -74,8 +74,6 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{PortDriverBase, param_list};
-use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -566,8 +564,8 @@ pub struct PhytronController {
     /// C's `motorEncoderRatio_` by axis prefix, which a controller reset
     /// sets back to 1 (phytronAxisMotor.cpp:821-827); an absent axis's is 1.
     encoder_ratios: HashMap<String, f64>,
-    /// The controller port and its AXIS_STATUS reason, which the poll sets.
-    axis_status: Option<(PortHandle, usize)>,
+    /// The AXIS_STATUS reason, which the poll sets.
+    axis_status: Option<usize>,
 }
 
 impl PhytronController {
@@ -591,9 +589,9 @@ impl PhytronController {
         self.axes.insert(axis_no);
     }
 
-    /// Let each axis poll set AXIS_STATUS on controller port `port`.
-    pub fn post_axis_status_to(&mut self, port: PortHandle, reason: usize) {
-        self.axis_status = Some((port, reason));
+    /// Let each axis poll set AXIS_STATUS, reason `reason`.
+    pub fn set_axis_status_reason(&mut self, reason: usize) {
+        self.axis_status = Some(reason);
     }
 
     /// C `phytronController::poll` with the serial poll method: an MCC reads
@@ -738,8 +736,6 @@ impl PhytronController {
 /// One Phytron axis sharing a controller. Implements [`AsynMotor`].
 pub struct PhytronAxis {
     controller: Arc<Mutex<PhytronController>>,
-    /// `module * 10 + index`, the axis's address.
-    axis_no: i32,
     ctrl_type: CtrlType,
     /// Command prefix: `M<mod>.<idx>` (phyMOTION) or a single digit (MCC).
     axis_module_no: String,
@@ -750,6 +746,8 @@ pub struct PhytronAxis {
     /// Limit-home state machine (C `homeState_`): 0 = idle, else bit0 = homing
     /// direction (1 = forward/high), bits>>1 = phase.
     home_state: i32,
+    /// AXIS_STATUS as the last poll set it, for the poller to post.
+    poll_params: Vec<(usize, ParamValue)>,
 }
 
 impl PhytronAxis {
@@ -771,11 +769,11 @@ impl PhytronAxis {
         let axis_module_no = axis_module_no(ctrl_type, axis_no)?;
         Ok(Self {
             controller,
-            axis_no,
             ctrl_type,
             axis_module_no,
             motor_enabled: false,
             home_state: 0,
+            poll_params: Vec::new(),
         })
     }
 
@@ -833,6 +831,10 @@ impl PhytronAxis {
 impl AsynMotor for PhytronAxis {
     /// C `phytronAxis::poll` sets only `motorStatusProblem_` on a failed
     /// exchange.
+    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
+        std::mem::take(&mut self.poll_params)
+    }
+
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM
     }
@@ -997,7 +999,7 @@ impl AsynMotor for PhytronAxis {
                     (pos, enc, moving, status)
                 }
             };
-            (pos, enc * ratio, moving, status, ctrl.axis_status.clone())
+            (pos, enc * ratio, moving, status, ctrl.axis_status)
         };
 
         // Limit-home state machine (C parseAnswer). `problem` is the axis
@@ -1015,10 +1017,9 @@ impl AsynMotor for PhytronAxis {
             step.problem
         };
 
-        // phytronAxisMotor.cpp:2084; enqueued, so the controller lock is free.
-        if let Some((port, reason)) = axis_status {
-            let value = ParamSetValue::new(reason, self.axis_no, ParamValue::Int32(status));
-            let _ = port.set_params_and_notify_blocking(self.axis_no, vec![value]);
+        // phytronAxisMotor.cpp:2084
+        if let Some(reason) = axis_status {
+            self.poll_params.push((reason, ParamValue::Int32(status)));
         }
 
         Ok(MotorStatus {

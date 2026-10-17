@@ -187,7 +187,7 @@ fn register_controller(
         .drv_user_create_blocking(&DrvUserRequest::new("AXIS_STATUS", 0))
         .map_err(|e| format!("{cmd_name}: {e}"))?
         .reason;
-    controller.post_axis_status_to(port, axis_status);
+    controller.set_axis_status_reason(axis_status);
     let controller = Arc::new(Mutex::new(controller));
     let _ = slot.set(controller.clone());
     let poller = Controller::new().controller_poll({
