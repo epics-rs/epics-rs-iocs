@@ -37,6 +37,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
@@ -240,7 +241,11 @@ impl Pm500Axis {
 
     /// A record step count as a wire position at command precision.
     fn wire(&self, steps: f64) -> AsynResult<String> {
-        Ok(format!("{:.1$}", steps * self.resolution()?, self.digits))
+        Ok(format!(
+            "{:.1$}",
+            CFloat(steps * self.resolution()?),
+            self.digits
+        ))
     }
 
     /// A record step rate as wire mm/sec(²), C's ÷1000.
@@ -252,9 +257,9 @@ impl Pm500Axis {
     /// sends SET_ACCEL only for a positive rate (motorRecord.cc:874, 940).
     fn speeds(&self, velocity: f64, acceleration: f64) -> AsynResult<String> {
         let (c, d) = (self.name, self.digits);
-        let mut msg = format!("{c}V{:.d$};", self.rate(velocity)?);
+        let mut msg = format!("{c}V{:.d$};", CFloat(self.rate(velocity)?));
         if acceleration > 0.0 {
-            msg += &format!("{c}ACCEL{:.d$};", self.rate(acceleration)?);
+            msg += &format!("{c}ACCEL{:.d$};", CFloat(self.rate(acceleration)?));
         }
         Ok(msg)
     }
@@ -307,8 +312,8 @@ impl AsynMotor for Pm500Axis {
         // Record JOG transaction: SET_ACCEL then the signed slew command
         // (C JOG case, `%f` — 6 decimals, unlike the other values).
         let (c, d) = (self.name, self.digits);
-        let accel = format!("{c}ACCEL{:.d$};", self.rate(acceleration)?);
-        let motion = format!("{c}S{:.6};", self.rate(velocity)?);
+        let accel = format!("{c}ACCEL{:.d$};", CFloat(self.rate(acceleration)?));
+        let motion = format!("{c}S{:.6};", CFloat(self.rate(velocity)?));
         self.transaction(accel, motion)
     }
 
@@ -629,6 +634,20 @@ mod tests {
                 "XACCEL0.2000;XS-0.050000;",
                 "XPSLIM10.0000;"
             ]
+        );
+    }
+
+    /// devPM500.cc `%.*f` / `%f`: glibc's nan, sign bit included.
+    #[test]
+    fn a_nan_move_goes_out_as_c_prints_it() {
+        let (mut axis, sent, _) = pm500_axis("pm500_nan");
+        let user = AsynUser::default();
+        sent.lock().unwrap().clear();
+        let _ = axis.move_absolute(&user, f64::NAN, 0.0, -f64::NAN, 20000.0);
+        let _ = axis.move_velocity(&user, 0.0, f64::NAN, -f64::NAN);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            ["XV-nan;XACCEL0.2000;XGnan;", "XACCEL-nan;XSnan;"]
         );
     }
 

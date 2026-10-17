@@ -743,7 +743,10 @@ impl Mm4000Axis {
     fn model1_accel(&self, acceleration: f64) -> String {
         let (a, d) = (self.axis, self.digits);
         if acceleration > 0.0 {
-            format!("{a}AC{acceleration:.d$};")
+            format!(
+                "{a}AC{acceleration:.d$};",
+                acceleration = CFloat(acceleration)
+            )
         } else {
             String::new()
         }
@@ -765,11 +768,16 @@ impl Mm4000Axis {
             return Ok(format!(
                 "{a}VA{velocity:.d$};{}{}{a}{cmd}{value:.d$};",
                 self.model1_accel(acceleration),
-                self.model1_prem()
+                self.model1_prem(),
+                velocity = CFloat(velocity),
+                value = CFloat(value)
             ));
         }
         Ok(format!(
-            "{a}AC{acceleration:.d$};{a}VA{velocity:.d$};{a}{cmd}{value:.d$};"
+            "{a}AC{acceleration:.d$};{a}VA{velocity:.d$};{a}{cmd}{value:.d$};",
+            acceleration = CFloat(acceleration),
+            velocity = CFloat(velocity),
+            value = CFloat(value)
         ))
     }
 }
@@ -825,7 +833,10 @@ impl AsynMotor for Mm4000Axis {
             };
             let prem = self.model1_prem();
             return self.start_motion(&format!(
-                "{a}AC{acceleration:.d$};{prem}{a}VA{speed:.d$};{a}PA{target:.d$};"
+                "{a}AC{acceleration:.d$};{prem}{a}VA{speed:.d$};{a}PA{target:.d$};",
+                acceleration = CFloat(acceleration),
+                speed = CFloat(speed),
+                target = CFloat(target)
             ));
         }
         // C `motorAxisVelocityMove`: no jog command — move absolute to the
@@ -857,10 +868,15 @@ impl AsynMotor for Mm4000Axis {
             // devMM4000.cc HOME after the record's SET_VELOCITY, SET_ACCEL.
             let accel = self.model1_accel(acceleration);
             let prem = self.model1_prem();
-            return self.start_motion(&format!("{a}VA{velocity:.d$};{accel}{prem}{a}OR;"));
+            return self.start_motion(&format!(
+                "{a}VA{velocity:.d$};{accel}{prem}{a}OR;",
+                velocity = CFloat(velocity)
+            ));
         }
         self.start_motion(&format!(
-            "{a}AC{acceleration:.d$}; {a}VA{velocity:.d$};{a}OR;"
+            "{a}AC{acceleration:.d$}; {a}VA{velocity:.d$};{a}OR;",
+            acceleration = CFloat(acceleration),
+            velocity = CFloat(velocity)
         ))
     }
 
@@ -874,7 +890,10 @@ impl AsynMotor for Mm4000Axis {
         let (d, step) = (self.digits, self.step_size()?);
         let acceleration = acceleration * step;
         let mut ctrl = self.lock();
-        ctrl.write(&format!("{a}AC{acceleration:.d$};{a}ST;"))
+        ctrl.write(&format!(
+            "{a}AC{acceleration:.d$};{a}ST;",
+            acceleration = CFloat(acceleration)
+        ))
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
@@ -889,7 +908,8 @@ impl AsynMotor for Mm4000Axis {
         let mut ctrl = self.lock();
         ctrl.write(&format!(
             "{a}SH{position:.d$};{a}DH;{a}SH{:.d$}",
-            self.home_preset
+            CFloat(self.home_preset),
+            position = CFloat(position)
         ))
     }
 
@@ -948,7 +968,7 @@ impl AsynMotor for Mm4000Axis {
             return Ok(());
         }
         let mut ctrl = self.lock();
-        ctrl.write(&format!("{a}SR{position:.d$}"))
+        ctrl.write(&format!("{a}SR{position:.d$}", position = CFloat(position)))
     }
 
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
@@ -966,7 +986,7 @@ impl AsynMotor for Mm4000Axis {
             return Ok(());
         }
         let mut ctrl = self.lock();
-        ctrl.write(&format!("{a}SL{position:.d$}"))
+        ctrl.write(&format!("{a}SL{position:.d$}", position = CFloat(position)))
     }
 
     fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
@@ -1355,6 +1375,19 @@ mod tests {
         sent.lock().unwrap().clear();
         axes[0].stop(&AsynUser::default(), 0.0).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["1ST;"]);
+    }
+
+    /// drvMM4000Asyn.c `%.*f`: glibc's nan, sign bit included.
+    #[test]
+    fn model1_a_nan_move_goes_out_as_c_prints_it() {
+        let (axes, sent, _) = model1_card("mm4000_m1_nan", &[], Duration::ZERO);
+        let mut axes = axes.unwrap();
+        let user = AsynUser::default();
+        sent.lock().unwrap().clear();
+        axes[0]
+            .move_absolute(&user, -f64::NAN, 0.0, f64::NAN, 0.0)
+            .unwrap();
+        assert_eq!(*sent.lock().unwrap(), ["1VAnan;1PA-nan;"]);
     }
 
     /// motorRecord.cc:874, 940: no SET_ACCEL for a zero move or home rate;

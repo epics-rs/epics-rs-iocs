@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::param::{ParamType, ParamValue};
@@ -199,8 +200,16 @@ impl Nf874xAxis {
     /// `AC` and `VA`, which every motion sends first.
     fn speeds(&self, velocity: f64, acceleration: f64) -> [String; 2] {
         [
-            format!("{} AC {acceleration:.6}", self.name),
-            format!("{} VA {velocity:.6}", self.name),
+            format!(
+                "{} AC {acceleration:.6}",
+                self.name,
+                acceleration = CFloat(acceleration)
+            ),
+            format!(
+                "{} VA {velocity:.6}",
+                self.name,
+                velocity = CFloat(velocity)
+            ),
         ]
     }
 
@@ -281,7 +290,15 @@ impl AsynMotor for Nf874xAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let [ac, va] = self.speeds(velocity, acceleration);
-        let result = self.send(&[ac, va, format!("{} PA {position:.6}", self.name)]);
+        let result = self.send(&[
+            ac,
+            va,
+            format!(
+                "{} PA {position:.6}",
+                self.name,
+                position = CFloat(position)
+            ),
+        ]);
         self.last_direction = position > self.encoder_position;
         result
     }
@@ -295,7 +312,15 @@ impl AsynMotor for Nf874xAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let [ac, va] = self.speeds(velocity, acceleration);
-        let result = self.send(&[ac, va, format!("{} PR {distance:.6}", self.name)]);
+        let result = self.send(&[
+            ac,
+            va,
+            format!(
+                "{} PR {distance:.6}",
+                self.name,
+                distance = CFloat(distance)
+            ),
+        ]);
         self.last_direction = distance > 0.0;
         result
     }
@@ -338,12 +363,20 @@ impl AsynMotor for Nf874xAxis {
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.send(&[format!("{} DH {position:.6}", self.name)])
+        self.send(&[format!(
+            "{} DH {position:.6}",
+            self.name,
+            position = CFloat(position)
+        )])
     }
 
     /// The same `DH` as [`Self::set_position`], as C's `setEncoderPosition`.
     fn set_encoder_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.send(&[format!("{} DH {position:.6}", self.name)])
+        self.send(&[format!(
+            "{} DH {position:.6}",
+            self.name,
+            position = CFloat(position)
+        )])
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
@@ -351,11 +384,19 @@ impl AsynMotor for Nf874xAxis {
     }
 
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.send(&[format!("{} SR {position:.6}", self.name)])
+        self.send(&[format!(
+            "{} SR {position:.6}",
+            self.name,
+            position = CFloat(position)
+        )])
     }
 
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.send(&[format!("{} SL {position:.6}", self.name)])
+        self.send(&[format!(
+            "{} SL {position:.6}",
+            self.name,
+            position = CFloat(position)
+        )])
     }
 
     /// `doMoveToHome`: to absolute 0, the position `DH` defined.
@@ -422,7 +463,7 @@ impl WriteHook for Nf874xWriteHook {
         let function = write.function;
         let (method, value) = match write.value {
             WriteValue::Int32(v) => ("writeInt32", v.to_string()),
-            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}")),
+            WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}", v = CFloat(v))),
         };
         match write.status {
             Err(e) => write.print(
@@ -449,8 +490,8 @@ impl ControllerParams for Nf874xControllerParams {
             "nf874x motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll_s,
-            self.idle_poll_s
+            CFloat(self.moving_poll_s),
+            CFloat(self.idle_poll_s)
         );
         ctx.report(out, level);
     }
@@ -505,7 +546,7 @@ impl ControllerParams for Nf874xControllerParams {
             return ParamWrite::PassToBase(Ok(()));
         }
         let _ = base.set_float64_param(user.reason, user.addr, value);
-        let status = self.send(user, "CL", format!("{value:.6}"));
+        let status = self.send(user, "CL", format!("{value:.6}", value = CFloat(value)));
         let _ = base.call_param_callbacks(user.addr);
         ParamWrite::Handled(status)
     }
@@ -618,6 +659,18 @@ mod tests {
         for (line, want) in mine.iter().zip(&want) {
             assert!(line.ends_with(want.as_str()), "{line:?} vs {want:?}");
         }
+    }
+
+    /// 874xMotorDriver.cpp `%f`: glibc's nan in the write trace.
+    #[test]
+    fn a_nan_write_traces_as_c_prints_it() {
+        let (port, _) = port("nf874xNan");
+        let lines = traced("nf874xNan", || {
+            let _ = port.write_float64_blocking(index::VELOCITY, 1, -f64::NAN);
+        });
+        let velocity = index::VELOCITY;
+        let want = format!("nf874xMotorDriver:writeFloat64: function={velocity}, value=-nan");
+        assert!(lines.iter().any(|l| l.ends_with(&want)), "{lines:?}");
     }
 
     #[test]
