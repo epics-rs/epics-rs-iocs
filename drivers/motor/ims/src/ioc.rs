@@ -21,14 +21,16 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string, req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{Controller, asyn_user, model1_device, register_port};
+use motor_common::{Controller, asyn_user, model1_device, register_port_with};
 
 use crate::drv_im483::{
     DrvIm483Axis, IM483PL_NUM_CARDS, IM483SM_NUM_CARDS, Im483Controller, im483pl_probe,
     im483sm_probe,
 };
 use crate::drv_mdrive::{DrvMDriveAxis, MDRIVE_NUM_CARDS, MDriveController, mdrive_probe};
-use crate::mdriveplus::{DRIVER_NAME, INPUT_EOS, ImsMDrivePlusAxis, OUTPUT_EOS};
+use crate::mdriveplus::{
+    DRIVER_NAME, INPUT_EOS, ImsLine, ImsMDrivePlusAxis, ImsParams, OUTPUT_EOS,
+};
 
 /// C `IMS_TIMEOUT` (ImsMDrivePlusMotorAxis.h:17).
 const IMS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -54,7 +56,6 @@ pub fn ims_create_controller_command() -> CommandDef {
             let moving_poll_ms = opt_double(args, 3, 0.0, "Moving poll period (ms)")?;
             let idle_poll_ms = opt_double(args, 4, 0.0, "Idle poll period (ms)")?;
 
-            register_port(ctx, &motor_port, 1)?;
             // C prints and carries on with the user of a missing port
             // (ImsMDrivePlusMotorController.cpp:69-74).
             let (handle, connected) =
@@ -70,7 +71,10 @@ pub fn ims_create_controller_command() -> CommandDef {
                  IOPortName={io_port}, devName={device_name} "
             );
             set_eos_ignored(&handle, INPUT_EOS, OUTPUT_EOS);
-            let axis = ImsMDrivePlusAxis::new(handle, &motor_port, device_name);
+            let line = ImsLine::new(handle, device_name);
+            // The port C's constructor builds first; it needs the line here.
+            register_port_with(ctx, &motor_port, 1, ImsParams::new(line.clone()))?;
+            let axis = ImsMDrivePlusAxis::new(line, &motor_port);
 
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             // C startPoller, ImsMDrivePlusMotorController.cpp:101
@@ -346,5 +350,57 @@ mod report {
                  port=im483smRepLine, id: {ident} \n"
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod extra_params {
+    use super::*;
+    use epics_rs::asyn::manager::PortManager;
+    use motor_common::testing::{LineRig, run_command};
+
+    /// A controller `port` on line `line` with device name `A`, and the
+    /// controller port's user at axis 0.
+    async fn controller(port: &str, line: &str) -> (LineRig, SyncIOHandle) {
+        let (rig, _io) = LineRig::new(line, |last| {
+            if last.contains("PR VR") {
+                "1.000".into()
+            } else {
+                "0".into()
+            }
+        });
+        let args = vec![
+            ArgValue::String(port.into()),
+            ArgValue::String(line.into()),
+            ArgValue::String("A".into()),
+            ArgValue::Double(100.0),
+            ArgValue::Double(1000.0),
+        ];
+        run_command(ims_create_controller_command(), args).await;
+        let handle = PortManager::global().find_port_handle(port).unwrap();
+        (rig, SyncIOHandle::from_handle(handle, 0, IMS_TIMEOUT))
+    }
+
+    /// The commands among `sent` that the poller does not send.
+    fn not_polled(sent: Vec<String>) -> Vec<String> {
+        sent.into_iter()
+            .filter(|s| !s.starts_with("APR "))
+            .collect()
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:325-333 and
+    /// ImsMDrivePlusMotorAxis.cpp:515-536: IMS_SAVETONVM 1 sends `S`, any
+    /// other value only stores it.
+    #[epics_rs::base::epics_test]
+    async fn save_to_nvm_sends_s_on_one() {
+        let (line, io) = controller("imsNvm", "imsNvmLine").await;
+        let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
+        line.sent();
+        io.write_int32(save, 0).unwrap();
+        assert_eq!(io.read_int32(save).unwrap(), 0);
+        assert!(not_polled(line.sent()).is_empty());
+        io.write_int32(save, 1).unwrap();
+        assert_eq!(not_polled(line.sent()), ["AS"]);
+        assert_eq!(io.read_int32(save).unwrap(), 1);
     }
 }
