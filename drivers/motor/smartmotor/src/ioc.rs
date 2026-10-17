@@ -83,7 +83,7 @@ pub fn smartmotor_config_command() -> CommandDef {
 #[cfg(all(test, target_os = "linux"))]
 mod report {
     use epics_rs::base::server::driver_support::find_driver_support;
-    use motor_common::testing::{LineRig, run_command};
+    use motor_common::testing::{LineRig, drvsup_init, run_command};
 
     use super::*;
 
@@ -101,6 +101,7 @@ mod report {
         let config = smartmotor_config_command();
         let args = vec![ArgValue::Int(1), ArgValue::String("smReportLine".into())];
         run_command(config, args).await;
+        drvsup_init().await;
         assert_eq!(
             drvet.report(0).unwrap(),
             "    SmartMotor controller 0 connection failed.\n    \
