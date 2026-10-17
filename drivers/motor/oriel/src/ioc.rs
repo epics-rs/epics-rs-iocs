@@ -30,6 +30,11 @@ static EMC18011: Model1 = Model1::new(&DEV_EMC18011, 16, SCAN_RATE);
 
 /// `EMC18011Setup(num_cards, scan_rate)`.
 pub fn emc18011_setup_command() -> CommandDef {
+    EMC18011.register_report("drvEMC18011", |cards| {
+        cards.report("EMC18011", |card, line| {
+            format!("    EMC18011 controller {card}, {line} \n")
+        })
+    });
     EMC18011.setup_command("EMC18011Setup")
 }
 
@@ -59,6 +64,10 @@ pub fn emc18011_config_command() -> CommandDef {
             let controller =
                 Emc18011Controller::new(handle).map_err(|e| format!("EMC18011Config: {e}"))?;
             let num_axes = controller.num_axes();
+            // C prints `cntrl->asyn_address`, which EMC18011Config never sets
+            // (drvEMC18011.cc:605-619), a read of uninitialized memory not
+            // copied; this is the address the line is opened at.
+            let line = format!("port={asyn_port}, address=0, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for index in 0..num_axes {
@@ -66,7 +75,38 @@ pub fn emc18011_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 EMC18011.install(ctx, card, index as i32, motor)?;
             }
+            EMC18011.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, run_command};
+
+    /// drvEMC18011.cc's drvet `report` (drvEMC18011.cc:153-180), which
+    /// `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_emc18011_card() {
+        let setup = emc18011_setup_command();
+        assert_eq!(
+            driver_report("drvEMC18011", 0),
+            "    No EMC18011 controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("emcRepLine", |cmd| match cmd {
+            "R" => "ON LINE".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(1), ArgValue::String("emcRepLine".into())];
+        run_command(emc18011_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvEMC18011", 0),
+            "    EMC18011 controller 0 connection failed.\n    EMC18011 controller 1, \
+             port=emcRepLine, address=0, id: Oriel Encoder Mike 18011 \n"
+        );
+    }
 }

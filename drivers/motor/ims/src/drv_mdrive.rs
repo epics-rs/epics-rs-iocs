@@ -85,8 +85,8 @@ pub struct MDriveDrive {
 
 /// `motor_init`'s probe: `PR VR` to each drive in turn, three tries each,
 /// until one does not answer; then each answering drive's encoder and
-/// switch inputs.
-pub fn mdrive_probe(ctrl: &MDriveController, card: i32) -> Vec<MDriveDrive> {
+/// switch inputs. With them, C's `ident`: the first drive's `PR VR`.
+pub fn mdrive_probe(ctrl: &MDriveController, card: i32) -> (String, Vec<MDriveDrive>) {
     let mut ident = String::new();
     let mut found = 0;
     for name in MDRIVE_AXIS {
@@ -99,7 +99,7 @@ pub fn mdrive_probe(ctrl: &MDriveController, card: i32) -> Vec<MDriveDrive> {
         }
         found += 1;
     }
-    (0..found)
+    let drives = (0..found)
         .map(|index| {
             let name = MDRIVE_AXIS[index];
             let encoder = ident.ends_with('E') || {
@@ -120,7 +120,8 @@ pub fn mdrive_probe(ctrl: &MDriveController, card: i32) -> Vec<MDriveDrive> {
             }
             MDriveDrive { encoder, inputs }
         })
-        .collect()
+        .collect();
+    (ident, drives)
 }
 
 /// `PR S1` .. `PR S4`: which input is the home (1), plus (2) or minus (3)

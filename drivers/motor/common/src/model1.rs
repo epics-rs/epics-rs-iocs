@@ -40,6 +40,46 @@ pub struct Model1 {
     /// The driver's one `motor_task`, gathering the cards `Config` fills
     /// until drvSup init starts it.
     task: Mutex<Task>,
+    /// What the driver's report prints for each card `Config` filled.
+    described: Mutex<Vec<(i32, String)>>,
+}
+
+/// What a model-1 drvet `report` reads: C's `<Drv>_num_cards` and the cards
+/// in `motor_state`.
+pub struct Model1Cards<'a> {
+    num_cards: i32,
+    described: &'a [(i32, String)],
+}
+
+impl Model1Cards<'_> {
+    /// C `<Drv>_num_cards`: 0 before `Setup`.
+    pub fn num_cards(&self) -> i32 {
+        self.num_cards
+    }
+
+    /// What [`Model1::describe`] gave for `card`; `None` is C's NULL
+    /// `motor_state[card]`, a card whose `Config` failed or never ran.
+    pub fn card(&self, card: i32) -> Option<&str> {
+        self.described
+            .iter()
+            .find(|(c, _)| *c == card)
+            .map(|(_, line)| line.as_str())
+    }
+
+    /// The report most model-1 drivers print (e.g. drvIM483PL.cc:147-171):
+    /// `line(card, description)` for each card, or the lines for no
+    /// `Setup` and a failed card naming the `driver`.
+    pub fn report(&self, driver: &str, line: impl Fn(i32, &str) -> String) -> String {
+        if self.num_cards <= 0 {
+            return format!("    No {driver} controllers configured.\n");
+        }
+        (0..self.num_cards)
+            .map(|card| match self.card(card) {
+                Some(description) => line(card, description),
+                None => format!("    {driver} controller {card} connection failed.\n"),
+            })
+            .collect()
+    }
 }
 
 enum Task {
@@ -61,7 +101,38 @@ impl Model1 {
             default_scan_rate,
             setup: Mutex::new(None),
             task: Mutex::new(Task::Empty),
+            described: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The driver's `driver(drvet)` line and its `report(level)`, which
+    /// `dbior` runs over the cards.
+    pub fn register_report(
+        &'static self,
+        drvet: &'static str,
+        report: fn(&Model1Cards<'_>) -> String,
+    ) {
+        crate::register_driver_report(drvet, move |_level| {
+            let num_cards = self
+                .setup
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map_or(0, |(num_cards, _)| num_cards);
+            let described = self.described.lock().unwrap_or_else(|e| e.into_inner());
+            report(&Model1Cards {
+                num_cards,
+                described: &described,
+            })
+        });
+    }
+
+    /// What the driver's report prints for `card`, which its `Config`
+    /// filled: C's `motor_state[card]`, read for `ident` and the
+    /// controller's port.
+    pub fn describe(&self, card: i32, line: impl Into<String>) {
+        let mut described = self.described.lock().unwrap_or_else(|e| e.into_inner());
+        described.retain(|(c, _)| *c != card);
+        described.push((card, line.into()));
     }
 
     /// `<name>(num_cards, scan_rate)`. Building it adds the driver's row to
@@ -278,5 +349,32 @@ mod tests {
             log: log.clone(),
         }));
         assert!(TASK.install(&ctx, 2, 0, late).is_err());
+    }
+
+    static DEV_REPORT: DevSup = model1_device("devTestReport", "TestReport");
+    static REPORT: Model1 = Model1::new(&DEV_REPORT, 4, SCAN_RATE);
+
+    fn report(cards: &Model1Cards<'_>) -> String {
+        cards.report("TestReport", |card, line| {
+            format!("    TestReport controller {card}, {line}\n")
+        })
+    }
+
+    /// C `dbior`'s `pdrvet->report(level)` over `motor_state`.
+    #[test]
+    fn dbior_reaches_the_model1_report_over_the_cards() {
+        use epics_rs::base::server::driver_support::find_driver_support;
+        REPORT.register_report("drvTestReport", report);
+        let drvet = find_driver_support("drvTestReport").unwrap();
+        assert_eq!(
+            drvet.report(0).unwrap(),
+            "    No TestReport controllers configured.\n"
+        );
+        REPORT.setup(2, 10);
+        REPORT.describe(1, "id: B");
+        assert_eq!(
+            drvet.report(0).unwrap(),
+            "    TestReport controller 0 connection failed.\n    TestReport controller 1, id: B\n"
+        );
     }
 }

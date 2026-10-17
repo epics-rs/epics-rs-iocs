@@ -53,8 +53,8 @@
 //!    errors out of `new` if the controller never reports online (C nulls
 //!    `motor_state[card]` in that case).
 //! 2. `VER?` identify → stored as `ident` (the `version >= 311` /
-//!    `versionSupport` flag C tracks is only used by `report()`, which this
-//!    port does not implement — computed-and-dropped, so not tracked).
+//!    `versionSupport` flag C sets is never read — computed-and-dropped, so
+//!    not tracked).
 //! 3. Probe axes 0..3 via `POS? {axis}`.
 //! 4. `VCO A1 B1 C1` (velocity-control mode ON — required for the `ONT?`
 //!    on-target reading to be meaningful).
@@ -106,8 +106,6 @@
 //!   by a flush before every query (`exchange`).
 //! - **`no_motion_count`** / poll-rate scheduling: not tracked (position is
 //!   updated unconditionally from `POS?`).
-//! - **`report()`** diagnostic: not implemented (the identify string is logged
-//!   once at `PIE516Config` time instead), matching every other port here.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

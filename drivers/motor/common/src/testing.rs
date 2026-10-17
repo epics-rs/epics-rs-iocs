@@ -104,13 +104,11 @@ pub fn pollers() -> usize {
         .count()
 }
 
-/// Run `cmd` with `args` as the shell does, on a thread of its own, and
-/// return the `motorPoller` count once the first has started.
-#[cfg(target_os = "linux")]
-pub async fn pollers_after(
+/// Run `cmd` with `args` as the shell does, on a thread of its own.
+pub async fn run_command(
     cmd: epics_rs::base::server::iocsh::registry::CommandDef,
     args: Vec<epics_rs::base::server::iocsh::registry::ArgValue>,
-) -> usize {
+) {
     use epics_rs::base::runtime::task::{BlockingBridge, sleep};
     use epics_rs::base::server::database::PvDatabase;
     use epics_rs::base::server::iocsh::registry::CommandContext;
@@ -126,6 +124,18 @@ pub async fn pollers_after(
         sleep(Duration::from_millis(5)).await;
     }
     shell.join().unwrap();
+}
+
+/// Run `cmd` with `args` as [`run_command`], and return the `motorPoller`
+/// count once the first has started.
+#[cfg(target_os = "linux")]
+pub async fn pollers_after(
+    cmd: epics_rs::base::server::iocsh::registry::CommandDef,
+    args: Vec<epics_rs::base::server::iocsh::registry::ArgValue>,
+) -> usize {
+    use epics_rs::base::runtime::task::sleep;
+
+    run_command(cmd, args).await;
     for _ in 0..100 {
         if pollers() > 0 {
             break;
@@ -134,6 +144,24 @@ pub async fn pollers_after(
     }
     sleep(Duration::from_millis(200)).await;
     pollers()
+}
+
+/// C `asynReport(level, port)`'s text for asyn port `port`.
+pub fn port_report(port: &str, level: i32) -> String {
+    epics_rs::asyn::manager::PortManager::global()
+        .find_port_handle(port)
+        .unwrap()
+        .report_blocking(level)
+        .unwrap()
+}
+
+/// C `dbior(driver, level)`'s text for the drvet `driver`, less its
+/// `Driver: ` header.
+pub fn driver_report(driver: &str, level: i32) -> String {
+    epics_rs::base::server::driver_support::find_driver_support(driver)
+        .unwrap()
+        .report(level)
+        .unwrap()
 }
 
 #[cfg(test)]

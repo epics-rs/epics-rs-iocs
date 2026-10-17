@@ -92,7 +92,6 @@
 //!   `HLT` is omitted (as the C-862 port omits its `no_motion_count`).
 //! - **`recv_mess(FLUSH)`** on comm recovery: replaced by a flush before every
 //!   query (`exchange`), a superset of C's error-path flush.
-//! - **`report()`**: not implemented, as elsewhere in this workspace.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

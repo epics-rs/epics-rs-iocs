@@ -29,6 +29,11 @@ static MCDC2805: Model1 = Model1::new(&DEV_MCDC2805, 8, SCAN_RATE);
 
 /// `MCDC2805Setup(num_cards, scan_rate)`.
 pub fn mcdc2805_setup_command() -> CommandDef {
+    MCDC2805.register_report("drvMCDC2805", |cards| {
+        cards.report("MCDC2805", |card, line| {
+            format!("    MCDC2805SM controller #{card}, {line} \n")
+        })
+    });
     MCDC2805.setup_command("MCDC2805Setup")
 }
 
@@ -57,6 +62,7 @@ pub fn mcdc2805_config_command() -> CommandDef {
             let controller = FaulhaberController::new(handle, num_motors as usize)
                 .map_err(|e| format!("MCDC2805Config: {e}"))?;
             let num_axes = controller.num_axes();
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for node in 0..num_axes {
@@ -65,7 +71,44 @@ pub fn mcdc2805_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 MCDC2805.install(ctx, card, node as i32, motor)?;
             }
+            if num_axes > 0 {
+                MCDC2805.describe(card, line);
+            }
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, run_command};
+
+    /// drvMCDC2805.cc's drvet `report` (drvMCDC2805.cc:129-153), which
+    /// `dbior` runs; C's per-card line says MCDC2805SM.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mcdc2805_chain() {
+        let setup = mcdc2805_setup_command();
+        assert_eq!(
+            driver_report("drvMCDC2805", 0),
+            "    No MCDC2805 controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("mcdcRepLine", |cmd| {
+            if cmd.ends_with("VER") {
+                "MCDC 2805"
+            } else {
+                "0"
+            }
+            .into()
+        });
+        let config = vec![int(1), int(1), ArgValue::String("mcdcRepLine".into())];
+        run_command(mcdc2805_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvMCDC2805", 0),
+            "    MCDC2805 controller 0 connection failed.\n    MCDC2805SM controller #1, \
+             port=mcdcRepLine, id: MCDC 2805 \n"
+        );
+    }
 }

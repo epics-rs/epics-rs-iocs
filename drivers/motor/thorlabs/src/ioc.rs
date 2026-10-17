@@ -29,6 +29,11 @@ static MDT695: Model1 = Model1::new(&DEV_MDT695, 16, SCAN_RATE);
 
 /// `MDT695Setup(num_cards, scan_rate)`.
 pub fn mdt695_setup_command() -> CommandDef {
+    MDT695.register_report("drvMDT695", |cards| {
+        cards.report("MDT695", |card, line| {
+            format!("    MDT695 controller {card}, {line} \n")
+        })
+    });
     MDT695.setup_command("MDT695Setup")
 }
 
@@ -58,6 +63,10 @@ pub fn mdt695_config_command() -> CommandDef {
             let controller =
                 Mdt695Controller::new(handle).map_err(|e| format!("MDT695Config: {e}"))?;
             let num_axes = controller.num_axes();
+            // C prints `cntrl->asyn_address`, which MDT695Config never sets
+            // (drvMDT695.cc:495-509), a read of uninitialized memory not
+            // copied; this is the address the line is opened at.
+            let line = format!("port={asyn_port}, address=0, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for index in 0..num_axes {
@@ -65,7 +74,38 @@ pub fn mdt695_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 MDT695.install(ctx, card, index as i32, motor)?;
             }
+            MDT695.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, run_command};
+
+    /// drvMDT695.cc's drvet `report` (drvMDT695.cc:145-172), which `dbior`
+    /// runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mdt695_card() {
+        let setup = mdt695_setup_command();
+        assert_eq!(
+            driver_report("drvMDT695", 0),
+            "    No MDT695 controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("mdtRepLine", |cmd| match cmd.trim_end() {
+            "D" => "MDT694".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(1), ArgValue::String("mdtRepLine".into())];
+        run_command(mdt695_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvMDT695", 0),
+            "    MDT695 controller 0 connection failed.\n    MDT695 controller 1, \
+             port=mdtRepLine, address=0, id: MDT694 \n"
+        );
+    }
 }

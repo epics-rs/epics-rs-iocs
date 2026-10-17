@@ -39,7 +39,7 @@ use epics_rs::motor::controller_port::{
 };
 use epics_rs::motor::trace::MotorTrace;
 
-use crate::cs_groups::{AxisPoll, CsGroups, DeferredMove, fast_deferred_command};
+use crate::cs_groups::{AxisPoll, CsGroups, DeferredMove, UNDEFINE_ALL, fast_deferred_command};
 use crate::protocol::{HARDWARE_PROB, parse_feedrate, parse_global_status};
 
 /// Response buffer size (C `PMAC_MAXBUF`).
@@ -499,18 +499,30 @@ impl PmacController {
     /// C `pmacController::writeInt32`, `motorDeferMoves_` branch: 0 releases
     /// the pending moves in the mode the last value armed, then `value` is the
     /// mode.
-    pub fn set_moves_deferred(&mut self, value: i32) -> AsynResult<()> {
-        let result = match (value, self.moves_deferred) {
+    pub fn set_moves_deferred(&mut self, value: i32) -> DeferRelease {
+        let release = match (value, self.moves_deferred) {
             (0, DEFERRED_FAST_MOVES) => self.process_deferred_moves(),
             (0, DEFERRED_COORDINATED_MOVES) => self.process_deferred_coord_moves(),
-            _ => Ok(()),
+            _ => DeferRelease::default(),
         };
         if value == 0 {
             // C clears the pending moves whether or not the command succeeded.
             self.deferred.clear();
         }
         self.moves_deferred = value;
-        result
+        release
+    }
+
+    /// C's `setIntegerParam(PMAC_C_CommsError_, …)` from an axis's
+    /// release, to run once the controller lock is dropped: the port's own
+    /// writes take that lock.
+    pub(crate) fn comms_error_post(&self, value: i32) -> Option<impl FnOnce() + use<>> {
+        let port = self.port.clone()?;
+        let reason = self.params?.comms_error;
+        Some(move || {
+            let update = ParamSetValue::new(reason, 0, ParamValue::Int32(value));
+            let _ = port.set_params_and_notify_blocking(0, vec![update]);
+        })
     }
 
     /// C `pmacController::writeInt32`, `PMAC_C_FeedRate_` branch: the PMAC
@@ -519,29 +531,48 @@ impl PmacController {
         self.write_read(&format!("%{value}")).map(drop)
     }
 
-    fn process_deferred_moves(&mut self) -> AsynResult<()> {
-        let Some(cmd) = fast_deferred_command(&self.deferred) else {
-            return Ok(());
-        };
-        self.command(&cmd).inspect_err(|_| {
-            self.own.print_self(
-                TraceMask::ERROR,
-                format_args!(
-                    "pmacController::processDeferredMoves ERROR Sending Deferred Move Command.\n"
-                ),
-            );
-        })
+    fn process_deferred_moves(&mut self) -> DeferRelease {
+        let status = self
+            .command(&fast_deferred_command(&self.deferred))
+            .inspect_err(|_| {
+                self.own.print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "pmacController::processDeferredMoves ERROR Sending Deferred Move Command.\n"
+                    ),
+                );
+            });
+        DeferRelease::sent(status)
     }
 
-    fn process_deferred_coord_moves(&mut self) -> AsynResult<()> {
-        let cmds = self
+    fn process_deferred_coord_moves(&mut self) -> DeferRelease {
+        const FUNCTION: &str = "pmacCsGroups::processDeferredCoordMoves";
+        let release = self
             .cs_groups
-            .coord_move_commands(&self.deferred, &self.poll_cache)
-            .map_err(pmac_err)?;
-        for cmd in cmds {
-            self.command(&cmd)?;
+            .coord_move_commands(&self.deferred, &self.poll_cache);
+        if let Some(abort) = &release.abort {
+            // C's abortMotion status is dropped (pmacCsGroups.cpp:232).
+            let _ = self.command(abort);
         }
-        Ok(())
+        let line = match release.line {
+            Ok(Some(line)) => line,
+            Ok(None) => return DeferRelease::default(),
+            Err(e) => {
+                self.own
+                    .print_self(TraceMask::ERROR, format_args!("{FUNCTION} Error: {e}\n"));
+                return DeferRelease {
+                    status: Err(pmac_err(e)),
+                    comms_error: None,
+                };
+            }
+        };
+        let status = self.command(&line).inspect_err(|_| {
+            self.own.print_self(
+                TraceMask::ERROR,
+                format_args!("{FUNCTION} ERROR Sending Deferred Move Command.\n"),
+            )
+        });
+        DeferRelease::sent(status)
     }
 
     // ---- coordinate-system groups ----
@@ -553,7 +584,20 @@ impl PmacController {
     /// C `pmacCreateCsGroup` + `pmacCsGroupAddAxis` are pure bookkeeping;
     /// `pmacCsGroups::switchToGroup` is the one that talks to the controller.
     pub fn switch_cs_group(&mut self, id: i32) -> AsynResult<()> {
-        let cmds = self.cs_groups.switch_commands(id).map_err(pmac_err)?;
+        let cmds = self
+            .cs_groups
+            .switch_commands(id)
+            .inspect_err(|_| {
+                self.own.print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "pmacCsGroups::switchToGroup: Invalid Coordinate System Group Number\n"
+                    ),
+                )
+            })
+            .map_err(pmac_err)?;
+        self.command(UNDEFINE_ALL)?;
+        self.cs_groups.select(id);
         for cmd in cmds {
             self.command(&cmd)?;
         }
@@ -605,6 +649,33 @@ impl PmacControllerParams {
 /// C `pmacController::PMAC_OK_` / `PMAC_ERROR_`.
 const PMAC_OK: i32 = 0;
 const PMAC_ERROR: i32 = 1;
+
+/// A deferred-move release: its status, and the `PMAC_C_CommsError_` C
+/// sets when a release line went out.
+#[derive(Debug)]
+pub struct DeferRelease {
+    pub status: AsynResult<()>,
+    pub comms_error: Option<i32>,
+}
+
+impl Default for DeferRelease {
+    fn default() -> Self {
+        Self {
+            status: Ok(()),
+            comms_error: None,
+        }
+    }
+}
+
+impl DeferRelease {
+    fn sent(status: AsynResult<()>) -> Self {
+        let comms_error = Some(if status.is_ok() { PMAC_OK } else { PMAC_ERROR });
+        Self {
+            status,
+            comms_error,
+        }
+    }
+}
 
 /// `pmacController::writeInt32` / `writeFloat64`'s opening FLOW line,
 /// which the record's speed, accel and GET_INFO writes reach as well as
@@ -685,7 +756,7 @@ impl ControllerParams for PmacControllerParams {
 impl PmacControllerParams {
     fn write_int32_own(
         &mut self,
-        _base: &mut PortDriverBase,
+        base: &mut PortDriverBase,
         user: &AsynUser,
         value: i32,
     ) -> AsynResult<()> {
@@ -701,7 +772,13 @@ impl PmacControllerParams {
             r if r == p.coord_sys_group => return controller.switch_cs_group(value),
             // An axis address reaches the same branch through
             // `PmacAxis::set_deferred_moves`.
-            index::DEFER_MOVES if user.addr == 0 => return controller.set_moves_deferred(value),
+            index::DEFER_MOVES if user.addr == 0 => {
+                let release = controller.set_moves_deferred(value);
+                if let Some(v) = release.comms_error {
+                    let _ = base.set_int32_param(p.comms_error, 0, v);
+                }
+                return release.status;
+            }
             _ => {}
         }
         Ok(())
@@ -780,16 +857,30 @@ mod tests {
         assert_eq!(comms(), PMAC_OK);
     }
 
+    /// pmacController.cpp:859-871: releasing a fast deferral with no axis
+    /// deferred still sends the (empty) combined line.
+    #[test]
+    fn releasing_fast_moves_sends_the_line_even_when_empty() {
+        let (rig, handle) =
+            motor_common::testing::LineRig::new("pmacEmptyDefer", |_| "\x06".into());
+        let mut c = PmacController::new("pmacEmptyDeferCtl", "pmacEmptyDefer", 0, Some(handle));
+        c.set_moves_deferred(DEFERRED_FAST_MOVES).status.unwrap();
+        c.set_moves_deferred(0).status.unwrap();
+        assert_eq!(rig.sent(), [""]);
+    }
+
     #[test]
     fn defer_value_arms_the_mode_and_zero_releases_it() {
         let mut c = PmacController::new("pmacTest", "", 0, None);
-        c.set_moves_deferred(DEFERRED_COORDINATED_MOVES).unwrap();
+        c.set_moves_deferred(DEFERRED_COORDINATED_MOVES)
+            .status
+            .unwrap();
         assert!(c.moves_deferred());
-        c.set_moves_deferred(0).unwrap();
+        c.set_moves_deferred(0).status.unwrap();
         assert!(!c.moves_deferred());
         // Releasing a fast deferral with a pending move sends the jog line,
         // which fails on a controller with no low-level port.
-        c.set_moves_deferred(DEFERRED_FAST_MOVES).unwrap();
+        c.set_moves_deferred(DEFERRED_FAST_MOVES).status.unwrap();
         c.defer_move(
             1,
             DeferredMove {
@@ -798,7 +889,7 @@ mod tests {
                 time_ms: 0.0,
             },
         );
-        assert!(c.set_moves_deferred(0).is_err());
+        assert!(c.set_moves_deferred(0).status.is_err());
         assert!(!c.is_deferred(1));
     }
 }

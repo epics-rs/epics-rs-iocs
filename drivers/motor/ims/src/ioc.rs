@@ -93,6 +93,12 @@ static IM483PL: Model1 = Model1::new(&DEV_IM483PL, IM483PL_NUM_CARDS, SCAN_RATE)
 
 /// `IM483PLSetup(num_cards, scan_rate)`.
 pub fn im483pl_setup_command() -> CommandDef {
+    IM483PL.register_report("drvIM483PL", |cards| {
+        cards.report("IM483PL", |card, port| {
+            // C clears `ident`: no identification message (drvIM483PL.cc:541).
+            format!("    IM483PL controller #{card}, port={port}, id:  \n")
+        })
+    });
     IM483PL.setup_command("IM483PLSetup")
 }
 
@@ -130,6 +136,9 @@ pub fn im483pl_config_command() -> CommandDef {
                 )));
                 IM483PL.install(ctx, card, signal as i32, motor)?;
             }
+            if axes > 0 {
+                IM483PL.describe(card, asyn_port);
+            }
             Ok(CommandOutcome::Continue)
         },
     )
@@ -142,6 +151,11 @@ static IM483SM: Model1 = Model1::new(&DEV_IM483SM, IM483SM_NUM_CARDS, SCAN_RATE)
 
 /// `IM483SMSetup(num_cards, scan_rate)`.
 pub fn im483sm_setup_command() -> CommandDef {
+    IM483SM.register_report("drvIM483SM", |cards| {
+        cards.report("IM483SM", |card, line| {
+            format!("    IM483SM controller #{card}, {line} \n")
+        })
+    });
     IM483SM.setup_command("IM483SMSetup")
 }
 
@@ -166,13 +180,14 @@ pub fn im483sm_config_command() -> CommandDef {
                 EosRefusal::Ignored,
             )?;
             let controller = Im483Controller::new(handle);
-            if !im483sm_probe(&controller) {
+            let Some(ident) = im483sm_probe(&controller) else {
                 return Ok(CommandOutcome::Continue);
-            }
+            };
             let controller = Arc::new(Mutex::new(controller));
             let motor: Arc<Mutex<dyn AsynMotor>> =
                 Arc::new(Mutex::new(DrvIm483Axis::im483sm(controller)));
             IM483SM.install(ctx, card, 0, motor)?;
+            IM483SM.describe(card, format!("port={asyn_port}, id: {ident}"));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -185,6 +200,11 @@ static MDRIVE: Model1 = Model1::new(&DEV_MDRIVE, MDRIVE_NUM_CARDS, SCAN_RATE);
 
 /// `MDriveSetup(num_cards, scan_rate)`.
 pub fn mdrive_setup_command() -> CommandDef {
+    MDRIVE.register_report("drvMDrive", |cards| {
+        cards.report("MDrive", |card, line| {
+            format!("    MDrive controller #{card}, {line} \n")
+        })
+    });
     MDRIVE.setup_command("MDriveSetup")
 }
 
@@ -209,7 +229,10 @@ pub fn mdrive_config_command() -> CommandDef {
                 EosRefusal::Ignored,
             )?;
             let controller = MDriveController::new(handle);
-            let drives = mdrive_probe(&controller, card);
+            let (ident, drives) = mdrive_probe(&controller, card);
+            if !drives.is_empty() {
+                MDRIVE.describe(card, format!("port={asyn_port}, id: {ident}"));
+            }
             let controller = Arc::new(Mutex::new(controller));
             for (signal, drive) in drives.into_iter().enumerate() {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvMDriveAxis::new(
@@ -249,5 +272,79 @@ mod one_poller {
         let cmd = ims_create_controller_command();
         assert_eq!(pollers_after(cmd, args).await, 1);
         assert!(!line.sent().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, run_command};
+
+    /// drvIM483PL.cc's drvet `report` (drvIM483PL.cc:147-171), which `dbior`
+    /// runs; the IM483PL has no identification message.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_im483pl_card() {
+        let setup = im483pl_setup_command();
+        assert_eq!(
+            driver_report("drvIM483PL", 0),
+            "    No IM483PL controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("im483plRepLine", |_| "0".into());
+        let config = vec![int(1), ArgValue::String("im483plRepLine".into())];
+        run_command(im483pl_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvIM483PL", 0),
+            "    IM483PL controller 0 connection failed.\n    IM483PL controller #1, \
+             port=im483plRepLine, id:  \n"
+        );
+    }
+
+    /// drvMDrive.cc's drvet `report` (drvMDrive.cc:162-186), which `dbior`
+    /// runs, naming the chain by its first drive's `PR VR`.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mdrive_chain() {
+        let setup = mdrive_setup_command();
+        assert_eq!(
+            driver_report("drvMDrive", 0),
+            "    No MDrive controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("mdriveRepLine", |cmd| {
+            if cmd.ends_with("PR VR") { "3.009" } else { "0" }.into()
+        });
+        let config = vec![int(1), ArgValue::String("mdriveRepLine".into())];
+        run_command(mdrive_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvMDrive", 0),
+            "    MDrive controller 0 connection failed.\n    MDrive controller #1, \
+             port=mdriveRepLine, id: 3.009 \n"
+        );
+    }
+
+    /// drvIM483SM.cc's drvet `report` (drvIM483SM.cc:145-169), which `dbior`
+    /// runs, naming the card by its sign-on.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_im483sm_card() {
+        let setup = im483sm_setup_command();
+        assert_eq!(
+            driver_report("drvIM483SM", 0),
+            "    No IM483SM controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("im483smRepLine", |_| "X".into());
+        let config = vec![int(1), ArgValue::String("im483smRepLine".into())];
+        run_command(im483sm_config_command(), config).await;
+        let ident = vec!["X"; 26].join(" ");
+        assert_eq!(
+            driver_report("drvIM483SM", 0),
+            format!(
+                "    IM483SM controller 0 connection failed.\n    IM483SM controller #1, \
+                 port=im483smRepLine, id: {ident} \n"
+            )
+        );
     }
 }

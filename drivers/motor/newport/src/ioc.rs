@@ -433,10 +433,9 @@ struct XpsRegistration {
     port_name: String,
     ip: String,
     ip_port: i32,
-    /// `None` when the poll socket could not be opened.
-    controller: Option<Arc<Mutex<XpsController>>>,
+    controller: Arc<Mutex<XpsController>>,
     /// The controller's `moveSocket_`, which runs profiles.
-    profile_sock: Option<Arc<XpsSocket>>,
+    profile_sock: Arc<XpsSocket>,
     /// The poller `XPSCreateController` starts; `XPSCreateAxis` joins it.
     poller: Arc<Controller>,
     /// `XPSCreateProfile`'s FTP account.
@@ -489,36 +488,34 @@ pub fn xps_create_controller_command() -> CommandDef {
             let settling = Duration::from_millis(c_int(args, 7).max(0) as u64);
 
             register_port(ctx, &port_name, c_int(args, 3))?;
-            let poll = connect_to_server(ctx, &ip, ip_port);
-            if poll.is_none() {
-                println!(
-                    "XPSController:XPSController: error calling TCP_ConnectToServer for pollSocket"
-                );
-            }
-            let profile_sock = connect_to_server(ctx, &ip, ip_port).map(|handle| {
-                Arc::new(XpsSocket::new(
-                    handle,
-                    &port_name,
-                    SocketMode::Query,
-                    XPS_PVT_EXEC_TIMEOUT,
-                ))
-            });
-            if profile_sock.is_none() {
-                println!(
-                    "XPSController:XPSController: error calling TCP_ConnectToServer for moveSocket"
-                );
-            }
-            let controller = match poll {
-                Some(handle) => Some(Arc::new(Mutex::new(
-                    XpsController::new(
-                        XpsSocket::new(handle, &port_name, SocketMode::Query, XPS_POLL_TIMEOUT),
-                        enable_set_position,
-                        settling,
-                    )
-                    .map_err(|e| format!("XPSCreateController: {e}"))?,
-                ))),
-                None => None,
+            // C goes on with socket -1 for either socket
+            // (XPSController.cpp:179-193).
+            let poll = match connect_to_server(ctx, &ip, ip_port) {
+                Some(handle) => {
+                    XpsSocket::new(handle, &port_name, SocketMode::Query, XPS_POLL_TIMEOUT)
+                }
+                None => {
+                    println!(
+                        "XPSController:XPSController: error calling TCP_ConnectToServer for pollSocket"
+                    );
+                    XpsSocket::invalid(&port_name, SocketMode::Query)
+                }
             };
+            let profile_sock = Arc::new(match connect_to_server(ctx, &ip, ip_port) {
+                Some(handle) => {
+                    XpsSocket::new(handle, &port_name, SocketMode::Query, XPS_PVT_EXEC_TIMEOUT)
+                }
+                None => {
+                    println!(
+                        "XPSController:XPSController: error calling TCP_ConnectToServer for moveSocket"
+                    );
+                    XpsSocket::invalid(&port_name, SocketMode::Query)
+                }
+            });
+            let controller = Arc::new(Mutex::new(
+                XpsController::new(poll, enable_set_position, settling)
+                    .map_err(|e| format!("XPSCreateController: {e}"))?,
+            ));
             // C starts the poller before any axis exists (XPSController.cpp:197).
             let poller = Arc::new(Controller::new());
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 10);
@@ -575,14 +572,21 @@ pub fn xps_create_axis_command() -> CommandDef {
                 println!("XPSController:XPSCreateAxis: Error invalid steps per unit={text}");
                 return Ok(CommandOutcome::Continue);
             }
-            let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
-                println!("XPSAxis:XPSAxis: error calling TCP_ConnectToServer for move socket");
-                return Ok(CommandOutcome::Continue);
+            // C goes on with socket -1, whose TCP_SetTimeout prints
+            // (XPSAxis.cpp:146-152).
+            let move_sock = match connect_to_server(ctx, &ip, ip_port) {
+                Some(handle) => {
+                    XpsSocket::new(handle, &port_name, SocketMode::Fire, XPS_MOVE_TIMEOUT)
+                }
+                None => {
+                    println!("XPSAxis:XPSAxis: error calling TCP_ConnectToServer for move socket");
+                    println!(
+                        "SetTCPTimeout, SocketIndex=-1, must be >=0 and < {}",
+                        NEXT_SOCKET.load(Ordering::Relaxed)
+                    );
+                    XpsSocket::invalid(&port_name, SocketMode::Fire)
+                }
             };
-            let Some(controller) = controller else {
-                return Ok(CommandOutcome::Continue);
-            };
-            let move_sock = XpsSocket::new(handle, &port_name, SocketMode::Fire, XPS_MOVE_TIMEOUT);
             let ax = XpsAxis::new(
                 controller,
                 move_sock,
@@ -651,9 +655,7 @@ fn xps_controller_flag_command(name: &'static str, set: fn(&mut XpsController)) 
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Controller port name")?;
             with_xps(&port_name, name, |reg| {
-                if let Some(controller) = &reg.controller {
-                    set(&mut controller.lock().unwrap_or_else(|e| e.into_inner()));
-                }
+                set(&mut reg.controller.lock().unwrap_or_else(|e| e.into_inner()));
             });
             Ok(CommandOutcome::Continue)
         },
@@ -666,7 +668,7 @@ fn xps_controller(motor_port: &str, cmd: &str) -> Result<Arc<Mutex<XpsController
     controllers
         .iter()
         .find(|r| r.port_name == motor_port)
-        .and_then(|r| r.controller.clone())
+        .map(|r| r.controller.clone())
         .ok_or_else(|| {
             format!("{cmd}: controller '{motor_port}' not found (call XPSCreateController first)")
         })
@@ -1114,8 +1116,7 @@ pub fn xps_execute_profile_command() -> CommandDef {
             let num_pulses = opt_int(args, 4, num_elements, "numPulses")?;
             let Some(exec_sock) = with_xps(&motor_port, "XPSExecuteProfile", |reg| {
                 reg.profile_sock.clone()
-            })
-            .flatten() else {
+            }) else {
                 return Ok(CommandOutcome::Continue);
             };
 
@@ -1979,6 +1980,43 @@ mod one_poller {
         ];
         let cmd = hxp_create_controller_command();
         assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// XPSController.cpp:179-197, XPSAxis.cpp:146-152: failed poll and
+    /// move sockets still build the controller and its axes.
+    #[epics_rs::base::epics_test]
+    async fn xps_create_axis_without_sockets_still_builds_the_axis() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::motor::controller_port::index;
+
+        // Every ConnectToServer takes socket 0, whose port name is held.
+        let _held = epics_rs::asyn::registry::claim_port("xps.nosocket:1:0").unwrap();
+        let args = vec![
+            ArgValue::String("xpsNoSocket".into()),
+            ArgValue::String("xps.nosocket".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(1),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+            ArgValue::Int(0),
+            ArgValue::Int(0),
+        ];
+        assert_eq!(
+            pollers_after(xps_create_controller_command(), args).await,
+            1
+        );
+        let args = vec![
+            ArgValue::String("xpsNoSocket".into()),
+            ArgValue::Int(0),
+            ArgValue::String("G1.P1".into()),
+            ArgValue::String("1000".into()),
+        ];
+        pollers_after(xps_create_axis_command(), args).await;
+        let port = PortManager::global()
+            .find_port_handle("xpsNoSocket")
+            .unwrap();
+        // A write to an address with no axis is refused.
+        port.write_float64(index::VELOCITY, 0, 1.0).await.unwrap();
     }
 
     /// SMC100Driver.cpp:67: one startPoller after the axes, which C builds

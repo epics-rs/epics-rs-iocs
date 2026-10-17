@@ -29,6 +29,11 @@ static PIJEDS: Model1 = Model1::new(&DEV_PIJEDS, 10, SCAN_RATE);
 
 /// `PIJEDSSetup(num_cards, scan_rate)`.
 pub fn pijeds_setup_command() -> CommandDef {
+    PIJEDS.register_report("drvPIJEDS", |cards| {
+        cards.report("PIJEDS", |card, line| {
+            format!("    PIJEDS controller #{card}, {line} \n")
+        })
+    });
     PIJEDS.setup_command("PIJEDSSetup")
 }
 
@@ -62,6 +67,7 @@ pub fn pijeds_config_command() -> CommandDef {
             if num_axes == 0 {
                 return Err("PIJEDSConfig: no axes detected".into());
             }
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
@@ -69,7 +75,42 @@ pub fn pijeds_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 PIJEDS.install(ctx, card, axis as i32, motor)?;
             }
+            PIJEDS.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, run_command};
+
+    /// drvPIJEDS.cc's drvet `report` (drvPIJEDS.cc:151-176), which `dbior`
+    /// runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pijeds_controller() {
+        let setup = pijeds_setup_command();
+        assert_eq!(
+            driver_report("drvPIJEDS", 0),
+            "    No PIJEDS controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("jedsRepLine", |cmd| {
+            match cmd.trim() {
+                "" => "DSM V1.959",
+                "mess,0" => "mess,0,1.000",
+                _ => "not present",
+            }
+            .into()
+        });
+        let config = vec![int(1), ArgValue::String("jedsRepLine".into()), int(0)];
+        run_command(pijeds_config_command(), config).await;
+        assert_eq!(
+            driver_report("drvPIJEDS", 0),
+            "    PIJEDS controller 0 connection failed.\n    PIJEDS controller #1, \
+             port=jedsRepLine, id: DSM V1.959 \n"
+        );
+    }
 }

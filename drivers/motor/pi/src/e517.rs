@@ -58,8 +58,8 @@
 //! ## Framing & not-modeled deviations
 //! Same as the E-516 port: port-owned EOS (`"\n"` both ways, set at Config),
 //! the redundant `EOL`+output-EOS trailing empty command on moves collapsed to
-//! a single terminator, and `recv_mess(FLUSH)` / `no_motion_count` / `report()`
-//! not modeled. See [`crate::e516`] for the full rationale.
+//! a single terminator, and `recv_mess(FLUSH)` / `no_motion_count` not
+//! modeled. See [`crate::e516`] for the full rationale.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 

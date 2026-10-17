@@ -19,9 +19,9 @@ use motor_common::iocsh::{
     req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{Controller, asyn_user, model1_device, register_controller_port, register_port};
+use motor_common::{Controller, asyn_user, model1_device, register_controller_port};
 
-use crate::acr::{AcrAxis, AcrController};
+use crate::acr::{AcrAxis, AcrController, AcrParams};
 use crate::drv_pc6k::{self, DrvPc6kAxis, PC6K_NUM_CARDS, Pc6kCard};
 use crate::oem::{OemAxis, OemController, OemParams};
 
@@ -106,8 +106,6 @@ pub fn acr_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, num_axes as i32)?;
-
             let (handle, _) = connect_controller(
                 &acr_port,
                 ACR_TIMEOUT,
@@ -115,12 +113,19 @@ pub fn acr_create_controller_command() -> CommandDef {
                 format_args!("ACRMotorDriver:ACRController: cannot connect to ACR controller"),
             );
             let controller = Arc::new(Mutex::new(AcrController::new(handle)));
+            register_controller_port(
+                ctx.db().scan_control().interrupt_gate(),
+                &port_name,
+                num_axes as i32,
+                AcrParams::new(controller.clone(), moving_poll_ms, idle_poll_ms),
+            )?;
 
             let poller = Controller::new();
             for index in 0..num_axes as usize {
                 let ax = AcrAxis::new(controller.clone(), index);
+                let report = Arc::new(ax.report());
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                poller.install(asyn_user(&port_name, index as i32), motor)?;
+                poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // ACRMotorDriver.cpp:82
             Ok(CommandOutcome::Continue)
@@ -256,5 +261,51 @@ mod one_poller {
     async fn acr_create_controller_polls_its_axes_on_one_poller() {
         let cmd = acr_create_controller_command();
         assert_eq!(pollers_after(cmd, create_args("acrOnePoller")).await, 1);
+    }
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, port_report, run_command};
+
+    /// ACRController::report then ACRAxis::report
+    /// (ACRMotorDriver.cpp:108-120, :317-333).
+    #[epics_rs::base::epics_test]
+    async fn acr_report_prints_the_controller_then_each_axis_above_level_0() {
+        let (_line, _io) = LineRig::new("acrRepLine", |cmd| {
+            match cmd.trim_end() {
+                "?P4096" => "5",
+                "?P4097" => "10",
+                "AXIS0 PPU" => "2000",
+                "?P12290" => "1.5",
+                "?P12294" => "2.5",
+                "?P4120" => "16777216",
+                "?P4600" => "-4",
+                "DRIVE AXIS0" => "ON",
+                _ => "0",
+            }
+            .into()
+        });
+        let args = vec![
+            ArgValue::String("acrRep".into()),
+            ArgValue::String("acrRepLine".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ];
+        run_command(acr_create_controller_command(), args).await;
+        let head = "ACR motor driver acrRep, numAxes=1, moving poll period=0.100000, \
+                    idle poll period=1.000000\n";
+        let text = port_report("acrRep", 0);
+        assert!(text.contains(&format!("{head}Port: acrRep\n")), "{text}");
+        let text = port_report("acrRep", 1);
+        let detail = "  binary input = 0x5\n  binary output readback = 0xa\n  axis 0\n    \
+                      pulsesPerUnit_ = 2000.000000\n    encoder position=1.500000\n    \
+                      theory position=2.500000\n    limits=0xfffffffc\n    flags=0x1000000\n";
+        assert!(
+            text.contains(&format!("{head}{detail}Port: acrRep\n")),
+            "{text}"
+        );
     }
 }
