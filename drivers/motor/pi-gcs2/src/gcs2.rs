@@ -1361,6 +1361,9 @@ pub struct PIGCS2Axis {
     max_acceleration: Option<f64>,
     /// C `m_acceleration`: the clamped acceleration last set.
     acceleration: f64,
+    /// The `PIasynController` parameters the last poll set on the axis,
+    /// for that poll's `callParamCallbacks`.
+    poll_params: Vec<(usize, ParamValue)>,
 }
 
 impl PIGCS2Axis {
@@ -1396,6 +1399,7 @@ impl PIGCS2Axis {
             high_limit: 0.0,
             max_acceleration: None,
             acceleration: 0.0,
+            poll_params: Vec::new(),
         };
         axis.log_here();
         let _ = axis.init_axis(port_name);
@@ -1740,6 +1744,10 @@ impl PIGCS2Axis {
 }
 
 impl AsynMotor for PIGCS2Axis {
+    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
+        std::mem::take(&mut self.poll_params)
+    }
+
     /// C `PIasynAxis::poll` ignores the controller's read status.
     fn poll_failure(&self) -> PollFailure {
         PollFailure::NONE
@@ -1918,21 +1926,14 @@ impl AsynMotor for PIGCS2Axis {
         } else {
             None
         };
-        if let Some((port, params)) = &self.lock().port {
-            let addr = self.axis_no as i32;
-            let mut updates = vec![ParamSetValue::new(
-                params.servo,
-                addr,
-                ParamValue::Int32(self.servo_on.into()),
-            )];
+        let params = self.lock().port.as_ref().map(|&(_, params)| params);
+        if let Some(params) = params {
             if let Some(real) = real {
-                updates.push(ParamSetValue::new(
-                    params.position,
-                    addr,
-                    ParamValue::Float64(real),
-                ));
+                self.poll_params
+                    .push((params.position, ParamValue::Float64(real)));
             }
-            let _ = port.set_params_and_notify_blocking(addr, updates);
+            self.poll_params
+                .push((params.servo, ParamValue::Int32(self.servo_on.into())));
         }
         let position = self.last_position;
 
@@ -2204,6 +2205,7 @@ mod tests {
             high_limit: 0.0,
             max_acceleration: None,
             acceleration: 0.0,
+            poll_params: Vec::new(),
         };
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         // POS? 2.5 in whole counts.
@@ -2798,9 +2800,10 @@ mod tests {
         );
     }
 
-    /// `PIasynAxis::poll` posts the second position read as
+    /// `PIasynAxis::poll` sets the second position read as
     /// `PI_SUP_POSITION` (PIasynAxis.cpp:162-165) and the servo state as
-    /// `PI_SUP_SERVO` (:204), at the axis's address.
+    /// `PI_SUP_SERVO` (:204) for the poll's own `callParamCallbacks`; the
+    /// axis posts nothing itself.
     #[test]
     fn the_axis_poll_posts_its_position_and_servo() {
         let (_line, io) = motor_common::testing::LineRig::new("gcs2SupPosLine", |last| {
@@ -2814,11 +2817,21 @@ mod tests {
             .into()
         });
         let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2SupPosLine")));
-        let (port, p) = controller_port("gcs2SupPos", &ctrl, "1");
+        let (_port, p) = controller_port("gcs2SupPos", &ctrl, "1");
         let mut axis = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, "gcs2SupPos");
         axis.poll(&AsynUser::new(0)).unwrap();
-        assert_eq!(port.read_float64_blocking(p.position, 0).unwrap(), 2.5);
-        assert_eq!(port.read_int32_blocking(p.servo, 0).unwrap(), 1);
+        let params = axis.take_poll_params();
+        assert!(
+            matches!(
+                params.as_slice(),
+                [
+                    (position, ParamValue::Float64(2.5)),
+                    (servo, ParamValue::Int32(1)),
+                ] if *position == p.position && *servo == p.servo
+            ),
+            "{params:?}"
+        );
+        assert!(axis.take_poll_params().is_empty());
     }
 
     /// `PIasynController::writeInt32` (PIasynController.cpp:305-308) logs
