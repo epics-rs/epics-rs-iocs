@@ -80,7 +80,9 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
-use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{
+    DpCells, DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags,
+};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::trace::TraceMask;
@@ -346,6 +348,9 @@ pub struct LoveDriver {
     ser_name: String,
     /// C `Serport::pasynUser`: the serial port, its address and timeout.
     serial: PortHandle,
+    /// The serial user's `dpCommon`, which C's `isConnected` reads without
+    /// queueing on the serial port (asynManager.c:2331-2342).
+    serial_dp: DpCells,
     ser_addr: i32,
     timeout: Duration,
     models: ModelTable,
@@ -384,6 +389,7 @@ impl LoveDriver {
         Ok(Self {
             base,
             ser_name: ser_name.to_owned(),
+            serial_dp: serial.connect_device(ser_addr),
             serial,
             ser_addr,
             timeout,
@@ -483,7 +489,7 @@ impl LoveDriver {
     /// C `connectIt` (drvLove.c:993-1044).
     fn connect_it(&mut self, user: &AsynUser) -> AsynResult<()> {
         let addr = user.addr;
-        if !self.serial.is_connected_blocking(self.ser_addr)? {
+        if !self.serial_dp.connected() {
             return Err(protocol_error(format!(
                 "port {} not connected to {}",
                 self.base.port_name, self.ser_name
@@ -876,6 +882,54 @@ mod tests {
         ] {
             assert!(out.contains(line), "missing {line:?} in {out:?}");
         }
+    }
+
+    /// A serial port whose write holds its actor for a second.
+    struct SlowSerial {
+        base: PortDriverBase,
+    }
+
+    impl PortDriver for SlowSerial {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+
+        fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            std::thread::sleep(Duration::from_secs(1));
+            Ok(data.len())
+        }
+    }
+
+    /// C `connectIt` asks `isConnected`, which reads the serial user's
+    /// `dpCommon` without queueing (drvLove.c:1003, asynManager.c:2331-2342),
+    /// so it answers while the serial port is busy.
+    #[test]
+    fn connect_it_does_not_wait_on_a_busy_serial_port() {
+        let base = PortDriverBase::new("LOVETESTBSY", 1, PortFlags::default());
+        let mut love = love_on(SlowSerial { base }, "LOVETESTBSYL");
+        let serial = love.serial.clone();
+        assert!(serial.is_connected_blocking(0).unwrap());
+        let write = std::thread::spawn(move || {
+            serial.submit_blocking(
+                RequestOp::OctetWrite {
+                    data: b"x".to_vec(),
+                },
+                AsynUser::new(OCTET_REASON),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let start = std::time::Instant::now();
+        love.connect_it(&AsynUser::default().with_addr(1)).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
+        );
+        write.join().unwrap().unwrap();
     }
 
     /// C registers the love port with the serial port's canBlock and
