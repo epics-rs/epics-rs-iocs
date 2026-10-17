@@ -18,9 +18,9 @@ use epics_rs::motor::trace::MotorTrace;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port};
+use motor_common::{Controller, asyn_user, register_port, register_port_with};
 
-use crate::anf2::{Anf2Axis, Anf2Controller, MAX_AXES};
+use crate::anf2::{Anf2Axis, Anf2AxisReport, Anf2Controller, Anf2Params, MAX_AXES};
 use crate::ang1::{Ang1Axis, Ang1Controller};
 
 /// An `ANF2CreateController` controller and its poller, which
@@ -62,8 +62,10 @@ pub fn anf2_create_controller_command() -> CommandDef {
             // and a negative C value both leave permanently un-satisfied.
             let num_axes = req_int(args, 3, "Number of axes")?.clamp(0, MAX_AXES as i64) as usize;
 
-            register_port(ctx, &port_name, num_axes as i32)?;
             let (controller, out_status) = Anf2Controller::new(&in_port, &out_port, num_axes);
+            let controller = Arc::new(Mutex::new(controller));
+            let params = Anf2Params(controller.clone());
+            register_port_with(ctx, &port_name, num_axes as i32, params)?;
             if out_status.is_err() {
                 MotorTrace::new(port_name.clone(), 0).print_self(
                     TraceMask::ERROR,
@@ -78,7 +80,7 @@ pub fn anf2_create_controller_command() -> CommandDef {
                 .insert(
                     port_name.clone(),
                     Anf2Port {
-                        controller: Arc::new(Mutex::new(controller)),
+                        controller,
                         poller: Arc::new(Controller::new()),
                     },
                 );
@@ -140,9 +142,13 @@ pub fn anf2_create_axis_command() -> CommandDef {
             let base_speed = req_int(args, 3, "Base speed")?.clamp(1, 1_000_000) as i32;
             let homing_timeout = req_int(args, 4, "Homing timeout")?.clamp(0, 300) as i32;
 
+            let report = Arc::new(Anf2AxisReport {
+                controller: controller.clone(),
+                axis: axis as i32,
+            });
             let ax = Anf2Axis::new(controller, axis as i32, config, base_speed, homing_timeout);
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            poller.install(asyn_user(&port_name, axis as i32), motor)?;
+            poller.install_with_report(asyn_user(&port_name, axis as i32), motor, report)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -161,7 +167,7 @@ pub fn anf2_start_poller_command() -> CommandDef {
         "ANF2StartPoller(ANF2Name, movingPollPeriod, idlePollPeriod)",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Port name")?;
-            let Some(Anf2Port { poller, .. }) = anf2_registry()
+            let Some(Anf2Port { controller, poller }) = anf2_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&port_name)
@@ -172,6 +178,10 @@ pub fn anf2_start_poller_command() -> CommandDef {
             };
             let moving_poll_ms = req_int(args, 1, "Moving poll period (ms)")?.max(0) as u64;
             let idle_poll_ms = req_int(args, 2, "Idle poll period (ms)")?.max(0) as u64;
+            controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_poll_periods(moving_poll_ms as f64 / 1000.0, idle_poll_ms as f64 / 1000.0);
             // C startPoller, ANF2Driver.cpp:129
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
@@ -242,7 +252,104 @@ pub fn ang1_create_controller_command() -> CommandDef {
 
 #[cfg(test)]
 mod tests {
-    use super::strtoul_hex;
+    use super::*;
+
+    /// `cmds` in turn on a thread of their own, then the asynReport of
+    /// `port` at `level`.
+    async fn report_after(
+        cmds: Vec<(CommandDef, Vec<ArgValue>)>,
+        port: &str,
+        level: i32,
+    ) -> String {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::base::runtime::task::{BlockingBridge, sleep};
+        use epics_rs::base::server::database::PvDatabase;
+
+        let bridge = BlockingBridge::capture();
+        let port = port.to_string();
+        let shell = std::thread::spawn(move || {
+            let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
+            for (cmd, args) in cmds {
+                cmd.handler.call(&args, &ctx).unwrap();
+            }
+            PortManager::global()
+                .find_port_handle(&port)
+                .unwrap()
+                .report_blocking(level)
+                .unwrap()
+        });
+        // An axis joining the poller waits on a task this runtime runs.
+        while !shell.is_finished() {
+            sleep(std::time::Duration::from_millis(5)).await;
+        }
+        shell.join().unwrap()
+    }
+
+    /// A two-axis ANF2 on fake Modbus ports whose input register `r` reads
+    /// `r`, axis 0 configured `0x86280015`, polled at 100/1000 ms.
+    async fn anf2_report(port: &str, level: i32) -> String {
+        let s = |v: &str| ArgValue::String(v.into());
+        let (inp, out) = (format!("{port}In"), format!("{port}Out"));
+        crate::regs::fake::publish(&inp);
+        crate::regs::fake::publish(&out);
+        let mut cmds = vec![(
+            anf2_create_controller_command(),
+            vec![s(port), s(&inp), s(&out), ArgValue::Int(2)],
+        )];
+        for (axis, config) in [(0, "0x86280015"), (1, "0x0")] {
+            let args = vec![
+                s(port),
+                ArgValue::Int(axis),
+                s(config),
+                ArgValue::Int(100),
+                ArgValue::Int(10),
+            ];
+            cmds.push((anf2_create_axis_command(), args));
+        }
+        let start = vec![s(port), ArgValue::Int(100), ArgValue::Int(1000)];
+        cmds.push((anf2_start_poller_command(), start));
+        report_after(cmds, port, level).await
+    }
+
+    const RULE: &str = "====================================\n";
+
+    /// The controller block and register table C's ANF2Controller::report
+    /// prints ahead of the base's (ANF2Driver.cpp:140-183).
+    fn anf2_head(port: &str) -> String {
+        let mut want = format!(
+            "{RULE}ANF2 motor driver:\n    asyn port: {port}\n    num axes: 2\n    \
+             axes created: 2\n    moving poll period: 0.100000\n    \
+             idle poll period: 1.000000\n\nInput registers:\n\n Reg\tAxis 0\tAxis 1\t\n"
+        );
+        for i in 0..10 {
+            want += &format!("  {i}\t0x{:04x}\t0x{:04x}\t\n", i, 10 + i);
+        }
+        want + "\n"
+    }
+
+    #[epics_rs::base::epics_test]
+    async fn the_anf2_report_prints_registers_then_each_axis_s_configuration() {
+        let text = anf2_report("anf2Report1", 1).await;
+        assert!(text.contains(&anf2_head("anf2Report1")), "{text}");
+        let axis0 = "Configuration for axis 0 [0x86280015]:\n  Base Speed: 100\n  \
+                     Homing Timeout: 10\n  Capture Input: 0 (Active State: 1)\n  \
+                     External Input: 0 (Active State: 0)\n  Home Input: 0 (Active State: 1)\n  \
+                     CW Input: 1 (Active State: 0)\n  CCW Input: 1 (Active State: 1)\n  \
+                     Backplane Home Proximity Operation: 0\n  Quadrature Encoder: 0\n  \
+                     Diagnostic Feedback: 1\n  Output Pulse Type: 1\n  Home Operation: 0\n  \
+                     Card Axis: 0\n  Operation Mode for Axis: 1\n\n";
+        assert!(text.contains(axis0), "{text}");
+        assert!(text.contains("Configuration for axis 1 [0x0]:\n"), "{text}");
+        assert!(text.ends_with(RULE), "{text}");
+    }
+
+    #[epics_rs::base::epics_test]
+    async fn a_level_0_anf2_report_prints_no_axis_configuration() {
+        let text = anf2_report("anf2Report0", 0).await;
+        assert!(text.contains(&anf2_head("anf2Report0")), "{text}");
+        assert!(!text.contains("Configuration for axis"), "{text}");
+        assert!(text.ends_with(RULE), "{text}");
+    }
 
     #[test]
     fn hex_config_reads_as_strtoul() {

@@ -186,8 +186,9 @@ pub(crate) mod fake {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
-        fn read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
-            Ok(0)
+        /// Register `addr` reads `addr`.
+        fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+            Ok(user.addr)
         }
         fn write_int32(&mut self, user: &mut AsynUser, _value: i32) -> AsynResult<()> {
             if user.reason == self.read_reason {

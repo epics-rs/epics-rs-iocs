@@ -25,11 +25,10 @@
 //! auxiliary parameters documented in `smaract::mcs2`). `resetErrors` is
 //! still wired internally: `poll` calls it automatically on a command-error
 //! bit, exactly as C does; only the *external*, user-triggered path is
-//! unmodeled. C's per-axis diagnostic decode fields (`CaptInput_`,
-//! `HomeInput_`, ... used only by C's `report()`) are also not modeled —
-//! `has_encoder` is the only bit of `config` with a functional effect on
-//! `AsynMotor`, so it alone is decoded.
+//! unmodeled. `has_encoder` is the only bit of `config` with a functional
+//! effect on `AsynMotor`; the rest is decoded for the report alone.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::Duration;
@@ -39,6 +38,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, Pol
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::nint;
+use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
 use crate::regs::{ForceRead, ModbusRegs};
 
@@ -67,6 +67,11 @@ const HOME_TIMEOUT: usize = 2;
 
 const ZERO5: [i32; 5] = [0; 5];
 
+/// C `MAX_INPUT_REGS`.
+const MAX_INPUT_REGS: usize = 10;
+
+const RULE: &str = "====================================";
+
 /// Shared controller state: the in/out Modbus register handles and the
 /// axis-created gate (C `axesCreated_`, guards `poll` until every axis
 /// configured on the controller has been constructed).
@@ -77,6 +82,22 @@ pub struct Anf2Controller {
     out_regs: ModbusRegs,
     num_axes: usize,
     axes_created: usize,
+    /// The axes `ANF2CreateAxis` made, by axis number.
+    axes: BTreeMap<i32, AxisSetup>,
+    /// C `movingPollPeriod_` / `idlePollPeriod_`, in seconds, once
+    /// `ANF2StartPoller` ran.
+    poll_periods: (f64, f64),
+}
+
+/// What C's `ANF2Axis` keeps of its creation, and its `inputReg_`.
+struct AxisSetup {
+    /// C `pasynUserForceRead_`.
+    force_read: ForceRead,
+    config: i32,
+    base_speed: i32,
+    homing_timeout: i32,
+    /// C `inputReg_`, as the last `getInfo` read it.
+    input_regs: [i32; MAX_INPUT_REGS],
 }
 
 impl Anf2Controller {
@@ -94,6 +115,8 @@ impl Anf2Controller {
             out_regs,
             num_axes,
             axes_created: 0,
+            axes: BTreeMap::new(),
+            poll_periods: (0.0, 0.0),
         };
         (ctrl, if num_axes == 0 { Ok(()) } else { out_status })
     }
@@ -116,13 +139,133 @@ impl Anf2Controller {
         self.out_regs
             .write_array(axis_no * AXIS_REG_OFFSET, data.to_vec())
     }
+
+    /// C `startPoller`'s periods, in seconds.
+    pub fn set_poll_periods(&mut self, moving: f64, idle: f64) {
+        self.poll_periods = (moving, idle);
+    }
+
+    /// C `ANF2Axis::getInfo` (ANF2Driver.cpp:498-513): a register whose
+    /// read fails keeps what it held.
+    fn get_info(&mut self, axis_no: i32) {
+        let Some(axis) = self.axes.get_mut(&axis_no) else {
+            return;
+        };
+        let _ = axis.force_read.write();
+        for (reg, value) in (0..).zip(axis.input_regs.iter_mut()) {
+            if let Ok(v) = self.in_regs.read16(axis_no * AXIS_REG_OFFSET + reg) {
+                *value = v;
+            }
+        }
+    }
+
+    /// C `ANF2Controller::report` ahead of the base's (ANF2Driver.cpp:
+    /// 140-183). C reads `getAxis(j)` of every address and crashes on one
+    /// `ANF2CreateAxis` never made; it has no column here.
+    fn report(&mut self, port: &str, out: &mut dyn std::fmt::Write) {
+        let (moving, idle) = self.poll_periods;
+        let _ = write!(
+            out,
+            "{RULE}\nANF2 motor driver:\n    asyn port: {port}\n    num axes: {}\n    \
+             axes created: {}\n    moving poll period: {moving:.6}\n    \
+             idle poll period: {idle:.6}\n\nInput registers:\n\n",
+            self.num_axes, self.axes_created,
+        );
+        let created: Vec<i32> = (0..self.num_axes as i32)
+            .filter(|j| self.axes.contains_key(j))
+            .collect();
+        for &j in &created {
+            self.get_info(j);
+        }
+        let _ = write!(out, " Reg\t");
+        for j in &created {
+            let _ = write!(out, "Axis {j}\t");
+        }
+        let _ = writeln!(out);
+        for i in 0..MAX_INPUT_REGS {
+            let _ = write!(out, "  {i}\t");
+            for j in &created {
+                let _ = write!(out, "0x{:04x}\t", self.axes[j].input_regs[i]);
+            }
+            let _ = writeln!(out);
+        }
+        let _ = writeln!(out);
+    }
+
+    /// C `ANF2Axis::report` (ANF2Driver.cpp:558-588), its fields decoded
+    /// from `config` as the constructor does (:363-380).
+    fn axis_report(&self, axis_no: i32, out: &mut dyn std::fmt::Write) {
+        let Some(axis) = self.axes.get(&axis_no) else {
+            return;
+        };
+        let config = axis.config;
+        let field = |mask: i32, shift: u32| ((config as u32 & mask as u32) >> shift) as i32;
+        let _ = write!(
+            out,
+            "Configuration for axis {axis_no} [0x{config:x}]:\n  Base Speed: {}\n  \
+             Homing Timeout: {}\n  Capture Input: {} (Active State: {})\n  \
+             External Input: {} (Active State: {})\n  Home Input: {} (Active State: {})\n  \
+             CW Input: {} (Active State: {})\n  CCW Input: {} (Active State: {})\n  \
+             Backplane Home Proximity Operation: {}\n  Quadrature Encoder: {}\n  \
+             Diagnostic Feedback: {}\n  Output Pulse Type: {}\n  Home Operation: {}\n  \
+             Card Axis: {}\n  Operation Mode for Axis: {}\n\n",
+            axis.base_speed,
+            axis.homing_timeout,
+            field(0x1 << 16, 16),
+            field(0x1, 0),
+            field(0x2 << 16, 17),
+            field(0x2, 1),
+            field(0x4 << 16, 18),
+            field(0x4, 2),
+            field(0x18 << 16, 19),
+            field(0x8, 3),
+            field(0x60 << 16, 21),
+            field(0x10, 4),
+            field(0x80 << 16, 23),
+            field(0x100 << 16, 24),
+            field(0x200 << 16, 25),
+            field(0x400 << 16, 26),
+            field(0x800 << 16, 27),
+            field(0x4000 << 16, 30),
+            field(0x8000 << 16, 31),
+        );
+    }
+}
+
+/// The ANF2 controller's report on its asyn port.
+pub struct Anf2Params(pub Arc<Mutex<Anf2Controller>>);
+
+impl ControllerParams for Anf2Params {
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        // Released before the base's report runs each axis's, which takes it.
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .report(ctx.port_name(), out);
+        ctx.report(out, level);
+        let _ = writeln!(out, "{RULE}");
+    }
+}
+
+/// C `ANF2Axis::report` for axis `axis`.
+pub struct Anf2AxisReport {
+    pub controller: Arc<Mutex<Anf2Controller>>,
+    pub axis: i32,
+}
+
+impl AxisReport for Anf2AxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+            ctrl.axis_report(self.axis, out);
+        }
+    }
 }
 
 /// One ANF2 axis. Implements [`AsynMotor`].
 pub struct Anf2Axis {
     controller: Arc<Mutex<Anf2Controller>>,
     axis_no: i32,
-    force_read: ForceRead,
     /// C `baseSpeed_` — used by [`Self::correct_accel`].
     base_speed: i32,
     /// C `jogging_` — `stop` skips the hold-move write while a jog is active.
@@ -165,7 +308,6 @@ impl Anf2Axis {
         let mut ax = Self {
             controller,
             axis_no,
-            force_read,
             base_speed,
             jogging: false,
             has_encoder: false,
@@ -192,7 +334,19 @@ impl Anf2Axis {
 
         let _ = ax.set_position(&AsynUser::new(0), 0.0);
 
-        ax.lock().axes_created += 1;
+        let mut ctrl = ax.lock();
+        ctrl.axes.insert(
+            axis_no,
+            AxisSetup {
+                force_read,
+                config,
+                base_speed,
+                homing_timeout,
+                input_regs: [0; MAX_INPUT_REGS],
+            },
+        );
+        ctrl.axes_created += 1;
+        drop(ctrl);
 
         ax
     }
@@ -407,7 +561,9 @@ impl AsynMotor for Anf2Axis {
         // `read_val`), and always return Ok so the framework publishes.
         let last = self.last.clone();
 
-        let _ = self.force_read.write();
+        if let Some(axis) = ctrl.axes.get(&self.axis_no) {
+            let _ = axis.force_read.write();
+        }
 
         let position = ctrl
             .read32(self.axis_no, POS_RD_UPR)
