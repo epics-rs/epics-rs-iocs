@@ -799,6 +799,9 @@ impl AsynMotor for ImsMDrivePlusAxis {
             .and_then(|()| self.write_only(&format!("HM {direction}")))
             .and_then(|()| self.write_only("R1=0"));
         self.bail("home()", "homing motor", status)?;
+        // C sets homing after its bail label even when the home failed
+        // (ImsMDrivePlusMotorAxis.cpp:351), so the next idle poll writes
+        // R1=1 and reports homed for a home that never ran; not copied.
         self.homing = true;
         Ok(())
     }
