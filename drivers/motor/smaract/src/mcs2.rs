@@ -44,7 +44,8 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
-use motor_common::util::atof;
+use motor_common::util::{atof, atoi};
+use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
 /// Response buffer size.
 const READ_BUF: usize = 128;
@@ -142,6 +143,72 @@ impl Mcs2Controller {
                 break;
             }
         }
+    }
+}
+
+/// The MCS2 controller's poll periods, in seconds, for its report.
+pub struct Mcs2Params {
+    pub moving_poll: f64,
+    pub idle_poll: f64,
+}
+
+impl ControllerParams for Mcs2Params {
+    /// C `MCS2Controller::report` (smarActMCS2MotorDriver.cpp:177-184).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "MCS2 motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll,
+            self.idle_poll,
+        );
+        ctx.report(out, level);
+    }
+}
+
+/// C `MCS2Axis::report` (smarActMCS2MotorDriver.cpp:287-349) for channel
+/// `channel`, which queries the controller at level > 0.
+pub struct Mcs2AxisReport {
+    pub controller: Arc<Mutex<Mcs2Controller>>,
+    pub channel: i32,
+}
+
+impl AxisReport for Mcs2AxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level == 0 {
+            return;
+        }
+        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let c = self.channel;
+        let query = |what: &str| ctrl.query(&format!(":CHAN{c}:{what}?"));
+        let int = |what: &str| atoi(&query(what).unwrap_or_default());
+        let pcode = int("PTYP");
+        // C copies its uninitialised `pname` over the reply
+        // (`strcpy(pC_->inString_, pname)`), a bug; the reply is printed.
+        let pname = query("PTYP:NAME").unwrap_or_default();
+        let (state, vel, acc, mclf, ferr, error) = (
+            int("STAT"),
+            int("VEL"),
+            int("ACC"),
+            int("MCLF"),
+            int("FERR"),
+            int("ERR"),
+        );
+        // C reports only the last query's status.
+        let temp = query("TEMP");
+        if let Err(e) = &temp {
+            let _ = writeln!(out, "  axis {c} -> asyn status error {}", e.status() as i32);
+        }
+        let temp = atoi(&temp.unwrap_or_default());
+        let _ = write!(
+            out,
+            "  axis {c}\n    positioner type {pcode}\n    positioner name {pname}\n    \
+             state {state}\n    velocity {vel}\n    acceleration {acc}\n    \
+             max closed loop frequency {mclf}\n    following error {ferr}\n    \
+             error {error}\n    temp {temp}\n",
+        );
+        ctrl.clear_errors();
     }
 }
 
