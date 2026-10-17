@@ -30,7 +30,7 @@ impl Trace {
     pub fn err(&self, function: &str, msg: &str) {
         self.out(
             TraceMask::ERROR,
-            &format!("eigerDetector::{function}: {msg}"),
+            &format!("eigerDetector::{function}: {msg}\n"),
         );
     }
 
@@ -39,7 +39,7 @@ impl Trace {
     pub fn warning(&self, function: &str, msg: &str) {
         self.out(
             TraceMask::WARNING,
-            &format!("eigerDetector:{function}: {msg}"),
+            &format!("eigerDetector:{function}: {msg}\n"),
         );
     }
 
@@ -47,7 +47,7 @@ impl Trace {
     pub fn param_err(&self, asyn_name: &str, function: &str, msg: &str) {
         self.out(
             TraceMask::ERROR,
-            &format!("Param[{asyn_name}]::{function}: {msg}"),
+            &format!("Param[{asyn_name}]::{function}: {msg}\n"),
         );
     }
 }

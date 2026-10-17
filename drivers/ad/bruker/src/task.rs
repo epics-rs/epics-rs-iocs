@@ -421,12 +421,13 @@ async fn finish(ctx: &AcquisitionContext, abort: Option<Abort>) {
             ParamValue::Octet("Acquisition aborted".as_bytes().into()),
         )),
         Some(Abort::Error(message)) => {
+            // C's line ends in a newline; ADStatusMessage below does not.
             ctx.handle.trace().output_device(
                 ctx.handle.port_name(),
                 Some(0),
                 0,
                 TraceMask::ERROR,
-                message,
+                &format!("{message}\n"),
             );
             updates.push(ParamSetValue::new(
                 ctx.ad_params.status_message,

@@ -114,7 +114,7 @@ impl PhotonIIDetector {
                 self.ad.port_base.trace_print(
                     TraceMask::ERROR,
                     format_args!(
-                        "PhotonII::writePhotonII, status={}, sent\n{command}",
+                        "PhotonII::writePhotonII, status={}, sent\n{command}\n",
                         status as i32
                     ),
                 );
@@ -192,7 +192,7 @@ impl PortDriver for PhotonIIDetector {
                 file!(),
                 line!(),
                 format_args!(
-                    "PhotonII::writeInt32: error, status={} function={reason}, value={value}",
+                    "PhotonII::writeInt32: error, status={} function={reason}, value={value}\n",
                     e.status() as i32
                 ),
             ),
@@ -200,7 +200,7 @@ impl PortDriver for PhotonIIDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("PhotonII::writeInt32: function={reason}, value={value}"),
+                format_args!("PhotonII::writeInt32: function={reason}, value={value}\n"),
             ),
         }
         status
@@ -227,7 +227,7 @@ impl PortDriver for PhotonIIDetector {
                 file!(),
                 line!(),
                 format_args!(
-                    "PhotonII::writeFloat64: error, status={} function={reason}, value={value:.6}",
+                    "PhotonII::writeFloat64: error, status={} function={reason}, value={value:.6}\n",
                     e.status() as i32
                 ),
             ),
@@ -235,7 +235,7 @@ impl PortDriver for PhotonIIDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("PhotonII::writeFloat64: function={reason}, value={value:.6}"),
+                format_args!("PhotonII::writeFloat64: function={reason}, value={value:.6}\n"),
             ),
         }
         status

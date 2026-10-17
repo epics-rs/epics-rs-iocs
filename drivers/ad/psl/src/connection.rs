@@ -164,7 +164,7 @@ impl ServerIo {
             0,
             TraceMask::ERROR,
             format_args!(
-                "PSL:writeReadServer, status={}, sent\n{command}",
+                "PSL:writeReadServer, status={}, sent\n{command}\n",
                 e.status()
             ),
         );

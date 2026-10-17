@@ -723,7 +723,7 @@ pub fn xps_tcl_script_execute_command() -> CommandDef {
                 MotorTrace::new(&motor_port, 0).print_self(
                     TraceMask::ERROR,
                     format_args!(
-                        "TCLScriptExecute returned error {}, on XPS: {motor_port}",
+                        "TCLScriptExecute returned error {}, on XPS: {motor_port}\n",
                         e.code()
                     ),
                 );
@@ -2018,7 +2018,7 @@ fn parse_move_mode(arg: Option<String>) -> Result<MoveMode, String> {
 fn xps_profile_failed(motor_port: &str, function: &str, message: &str) {
     MotorTrace::new(motor_port, 0).print_self(
         TraceMask::ERROR,
-        format_args!("XPSController:{function}: {message}"),
+        format_args!("XPSController:{function}: {message}\n"),
     );
 }
 

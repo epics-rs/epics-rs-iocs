@@ -374,7 +374,7 @@ impl PortDriver for PilatusDriver {
             TraceMask::IO_DRIVER,
             file!(),
             line!(),
-            format_args!("pilatusDetector:writeOctet: function={function}, value={value}"),
+            format_args!("pilatusDetector:writeOctet: function={function}, value={value}\n"),
         );
         Ok(data.len())
     }

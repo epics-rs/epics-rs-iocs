@@ -197,7 +197,7 @@ impl MythenDriver {
             // constructor (mythen.cpp:1367-1372); the port survives either way.
             Some(n) => {
                 self.det.trace_error(&format!(
-                    "mythen:mythen: error, outString=-get nmodules, inString={n}"
+                    "mythen:mythen: error, outString=-get nmodules, inString={n}\n"
                 ));
                 q.fail();
                 camera_params_failed = false;
@@ -385,7 +385,7 @@ impl PortDriver for MythenDriver {
         if reason != acquire && self.det.state.acquiring.load(Ordering::Acquire) {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
-                format_args!("mythen:writeInt32: detector is busy"),
+                format_args!("mythen:writeInt32: detector is busy\n"),
             );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
@@ -448,7 +448,7 @@ impl PortDriver for MythenDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "mythen:writeInt32: error, status={} function={reason}, value={value}",
+                    "mythen:writeInt32: error, status={} function={reason}, value={value}\n",
                     status.bits
                 ),
             );
@@ -457,7 +457,7 @@ impl PortDriver for MythenDriver {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("mythen:writeInt32: function={reason}, value={value}"),
+                format_args!("mythen:writeInt32: function={reason}, value={value}\n"),
             );
         }
         status.into_result()
@@ -472,7 +472,7 @@ impl PortDriver for MythenDriver {
         if self.det.state.acquiring.load(Ordering::Acquire) {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
-                format_args!("mythen:writeFloat64: detector is busy"),
+                format_args!("mythen:writeFloat64: detector is busy\n"),
             );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
@@ -528,7 +528,7 @@ impl PortDriver for MythenDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "mythen:writeFloat64: error, status={} function={reason}, value={g}",
+                    "mythen:writeFloat64: error, status={} function={reason}, value={g}\n",
                     status.bits
                 ),
             );
@@ -537,7 +537,7 @@ impl PortDriver for MythenDriver {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("mythen:writeFloat64: function={reason}, value={g}"),
+                format_args!("mythen:writeFloat64: function={reason}, value={g}\n"),
             );
         }
         status.into_result()
@@ -562,7 +562,7 @@ impl PortDriver for MythenDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "mythen:writeOctet: error, status={} function={reason}, value={value}",
+                    "mythen:writeOctet: error, status={} function={reason}, value={value}\n",
                     status.bits
                 ),
             );
@@ -571,7 +571,7 @@ impl PortDriver for MythenDriver {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("mythen:writeOctet: function={reason}, value={value}"),
+                format_args!("mythen:writeOctet: function={reason}, value={value}\n"),
             );
         }
         status.into_result().map(|()| data.len())

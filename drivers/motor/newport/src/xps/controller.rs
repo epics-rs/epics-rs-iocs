@@ -66,8 +66,9 @@ pub enum SetPositionFailure {
     /// `GroupKill`/`GroupInitialize`: the position was not set. `grouped`
     /// picks C's line, which differs between the two branches.
     Initialize { code: i32, grouped: bool },
-    /// `GroupReferencingStop`: C reports it and returns success.
-    ReferencingStop(i32),
+    /// `GroupReferencingStop`: C reports it and returns success. `grouped`
+    /// picks C's line: only the grouped branch's ends in a newline.
+    ReferencingStop { code: i32, grouped: bool },
 }
 
 /// C `buildProfile`'s message for a failed `MultipleAxesPVTVerification`.
@@ -281,7 +282,10 @@ impl XpsController {
         }
         self.poll
             .group_referencing_stop(group)
-            .map_err(|e| SetPositionFailure::ReferencingStop(e.code()))
+            .map_err(|e| SetPositionFailure::ReferencingStop {
+                code: e.code(),
+                grouped,
+            })
     }
 
     /// Whether `setPosition` is enabled (C `enableSetPosition_`).

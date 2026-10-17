@@ -614,7 +614,7 @@ fn qe_write_result(
         asyn_print!(
             *base,
             IO_DRIVER,
-            "drvQuadEM:{function_name}: function={reason}, name={name}, value={value}"
+            "drvQuadEM:{function_name}: function={reason}, name={name}, value={value}\n"
         );
     }
     status.into_result(|code| {
@@ -711,7 +711,7 @@ impl QuadEmShared {
             asyn_print!(
                 *port,
                 ERROR,
-                "drvQuadEM::triggerCallbacks, error calling epicsMessageQueueSend"
+                "drvQuadEM::triggerCallbacks, error calling epicsMessageQueueSend\n"
             );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
@@ -745,7 +745,7 @@ impl QuadEmShared {
             asyn_print!(
                 *handle,
                 WARNING,
-                "drvQuadEM::computePositions warning ring buffer overflow"
+                "drvQuadEM::computePositions warning ring buffer overflow\n"
             );
             let _ = handle.set_params_and_notify_blocking(
                 0,
@@ -1128,7 +1128,7 @@ impl QuadEmBase {
             asyn_print!(
                 self.port_base,
                 ERROR,
-                "drvQuadEM::connect_downstream: address {addr} out of range"
+                "drvQuadEM::connect_downstream: address {addr} out of range\n"
             );
             return;
         };
@@ -1167,7 +1167,7 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
             asyn_print!(
                 ctx.handle,
                 ERROR,
-                "drvQuadEM::doDataCallbacks: not enough bytes in ring buffer, expecting {num_read} actually {ring_size}, rawCount_={raw_count}, ringCount_={ring_count}"
+                "drvQuadEM::doDataCallbacks: not enough bytes in ring buffer, expecting {num_read} actually {ring_size}, rawCount_={raw_count}, ringCount_={ring_count}\n"
             );
             return false;
         }

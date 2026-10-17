@@ -127,7 +127,7 @@ impl MarccdDriver {
             Ok(_) => CamStatus::Success,
             Err(e) => {
                 self.trace_server_error(&format!(
-                    "marCCD:writeServer, status={}, sent\n{output}",
+                    "marCCD:writeServer, status={}, sent\n{output}\n",
                     e.status() as i32
                 ));
                 classify(&e)
@@ -161,7 +161,7 @@ impl MarccdDriver {
                 // which is 0 on a failed read.
                 self.from.clear();
                 self.trace_server_error(&format!(
-                    "marCCD:readServer, timeout={timeout:.6}, status={} received 0 bytes\n",
+                    "marCCD:readServer, timeout={timeout:.6}, status={} received 0 bytes\n\n",
                     e.status() as i32
                 ));
                 classify(&e)

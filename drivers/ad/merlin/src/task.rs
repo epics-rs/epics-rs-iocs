@@ -116,7 +116,7 @@ async fn data_loop(ctx: AcquisitionContext) {
             Err(ChannelError::Timeout) => continue,
             Err(e) => {
                 ctx.data.trace(&format!(
-                    "merlinDetector:merlinTask: error in Labview data channel response, status={}",
+                    "merlinDetector:merlinTask: error in Labview data channel response, status={}\n",
                     e.code()
                 ));
                 let _ = ctx
@@ -209,7 +209,7 @@ pub(crate) async fn handle_frame(
                 publish_profiles(ctx, body, array_counter, start, acquisition_header).await
             }
             DataHeader::Unknown => {
-                trace(&ctx.handle, "Unknown header type 3");
+                trace(&ctx.handle, "Unknown header type 3\n");
                 true
             }
         };
@@ -309,7 +309,7 @@ async fn publish_image(
     if !matches!(header.pixel_depth, 8 | 16 | 32) {
         trace(
             &ctx.handle,
-            &format!("Unsupported bit depth {}", header.pixel_depth),
+            &format!("Unsupported bit depth {}\n", header.pixel_depth),
         );
         set_status_message(ctx, "Error: Unsupported bit depth").await;
         return false;
@@ -340,7 +340,7 @@ async fn publish_image(
         trace(
             &ctx.handle,
             &format!(
-                "merlinDetector:copyToNDArray{}: unable to allocate NDArray from pool",
+                "merlinDetector:copyToNDArray{}: unable to allocate NDArray from pool\n",
                 header.pixel_depth
             ),
         );
@@ -374,7 +374,7 @@ async fn publish_profiles(
         trace(
             &ctx.handle,
             &format!(
-                "merlinDetector:merlinTask: unsupported PROFILES mode {}",
+                "merlinDetector:merlinTask: unsupported PROFILES mode {}\n",
                 header.profile_select
             ),
         );
@@ -403,7 +403,7 @@ async fn publish_profiles(
         profiles.image,
     ) else {
         ctx.data
-            .trace("merlinDetector:copyProfileToNDArray32: unable to allocate NDArray from pool");
+            .trace("merlinDetector:copyProfileToNDArray32: unable to allocate NDArray from pool\n");
         set_status_message(ctx, "Error: run out of buffers in detector driver").await;
         return false;
     };

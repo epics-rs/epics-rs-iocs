@@ -517,12 +517,12 @@ fn reader_thread(
                 Ok(_) => {
                     port_open = true;
                     print_error(format_args!(
-                        "{rbk} Successfully connected to MicroEpsilon port: {common_error}."
+                        "{rbk} Successfully connected to MicroEpsilon port: {common_error}.\n"
                     ));
                 }
                 Err(e) => {
                     common_error = e.message();
-                    print_error(format_args!("{rbk} can't connect port: {common_error}"));
+                    print_error(format_args!("{rbk} can't connect port: {common_error}\n"));
                     long_wait();
                 }
             }
@@ -581,7 +581,7 @@ fn reader_thread(
                     }
                 }
                 Err(e) => {
-                    print_error(format_args!("{rbk}: port read failed: {}", e.message()));
+                    print_error(format_args!("{rbk}: port read failed: {}\n", e.message()));
                     if is_asyn_timeout(&e) {
                         ReadOutcome::Timeout
                     } else {
@@ -597,7 +597,7 @@ fn reader_thread(
 
             if outcome == ReadOutcome::BadPreamble {
                 print_error(format_args!(
-                    "{rbk}: Could not find correct Preamble string: {common_error}"
+                    "{rbk}: Could not find correct Preamble string: {common_error}\n"
                 ));
             }
             let push = packet::read_pass(
@@ -635,7 +635,7 @@ fn reader_thread(
                     }
                     Err(e) => {
                         common_error = e.message();
-                        print_error(format_args!("{rbk} can't disconnect: {common_error}"));
+                        print_error(format_args!("{rbk} can't disconnect: {common_error}\n"));
                     }
                 }
             }

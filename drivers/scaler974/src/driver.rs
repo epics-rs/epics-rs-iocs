@@ -161,7 +161,7 @@ impl Scaler974Driver {
             handle.print_self(
                 TraceMask::ERROR,
                 format_args!(
-                    "Scaler974:Scaler974: error connecting to port {serial_port} address {serial_addr}"
+                    "Scaler974:Scaler974: error connecting to port {serial_port} address {serial_addr}\n"
                 ),
             );
             return None;
@@ -274,7 +274,7 @@ fn send_command(
         link.print_self(
             TraceMask::ERROR,
             format_args!(
-                "Scaler974:sendCommand: writing command {command}, error={}",
+                "Scaler974:sendCommand: writing command {command}, error={}\n",
                 e.message_display()
             ),
         );

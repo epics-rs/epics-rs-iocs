@@ -71,7 +71,7 @@ fn poller_loop(
                     Err(e) => trace.print(
                         TraceMask::ERROR,
                         format_args!(
-                            "USBCTR:pollerThread: ERROR calling cbDIn, status={}",
+                            "USBCTR:pollerThread: ERROR calling cbDIn, status={}\n",
                             e.code
                         ),
                     ),

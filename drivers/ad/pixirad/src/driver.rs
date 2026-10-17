@@ -392,7 +392,7 @@ impl PortDriver for PixiradDetector {
                 file!(),
                 line!(),
                 format_args!(
-                    "pixirad:writeInt32: error, status={} function={reason}, value={value}",
+                    "pixirad:writeInt32: error, status={} function={reason}, value={value}\n",
                     e.status() as i32
                 ),
             ),
@@ -400,7 +400,7 @@ impl PortDriver for PixiradDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("pixirad:writeInt32: function={reason}, value={value}"),
+                format_args!("pixirad:writeInt32: function={reason}, value={value}\n"),
             ),
         }
         status
@@ -430,7 +430,7 @@ impl PortDriver for PixiradDetector {
                 file!(),
                 line!(),
                 format_args!(
-                    "pixirad:writeFloat64 error, status={} function={reason}, value={value:.6}",
+                    "pixirad:writeFloat64 error, status={} function={reason}, value={value:.6}\n",
                     e.status() as i32
                 ),
             ),
@@ -438,7 +438,7 @@ impl PortDriver for PixiradDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("pixirad:writeFloat64: function={reason}, value={value:.6}"),
+                format_args!("pixirad:writeFloat64: function={reason}, value={value:.6}\n"),
             ),
         }
         let _ = self.ad.port_base.call_param_callbacks(0);

@@ -136,7 +136,7 @@ async fn acquire_one_image(
                     Some(0),
                     0,
                     TraceMask::ERROR,
-                    &format!("URLDriver:readImage: {message}"),
+                    &format!("URLDriver:readImage: {message}\n"),
                 );
             }
             return Err(());

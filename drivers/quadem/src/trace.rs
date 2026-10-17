@@ -32,7 +32,7 @@ impl AsynPrint for PortHandle {
     }
 }
 
-/// `asynPrint(pasynUserSelf, ASYN_TRACE_<MASK>, ...)`; the newline is added.
+/// `asynPrint(pasynUserSelf, ASYN_TRACE_<MASK>, ...)`, printed as given.
 #[macro_export]
 macro_rules! asyn_print {
     ($target:expr, $mask:ident, $($arg:tt)*) => {
@@ -81,7 +81,7 @@ pub fn print_read_error(handle: &PortHandle, origin: &str, read: &AsynResult<Rea
     asyn_print!(
         *handle,
         ERROR,
-        "{origin}: unexpected error reading meter status={}, nRead={n_read}, eomReason={eom}",
+        "{origin}: unexpected error reading meter status={}, nRead={n_read}, eomReason={eom}\n",
         status as i32
     );
 }
@@ -94,7 +94,7 @@ pub fn ensure_input_eos(io: &OctetIo, port: &PortDriverBase, origin: &str) -> As
         asyn_print!(
             *port,
             ERROR,
-            "{origin}: error calling pasynOctetSyncIO->setInputEos, status={}",
+            "{origin}: error calling pasynOctetSyncIO->setInputEos, status={}\n",
             e.c_status_code()
         );
         AsynError::Status {
@@ -178,7 +178,7 @@ mod tests {
             TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
         );
 
-        crate::asyn_print!(handle, ERROR, "drvQuadEM::readThread: line");
+        crate::asyn_print!(handle, ERROR, "drvQuadEM::readThread: line\n");
 
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);

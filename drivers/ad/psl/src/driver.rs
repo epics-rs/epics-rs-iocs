@@ -119,9 +119,9 @@ impl PslDetector {
         let reply = self.command("GetVersion")?;
         if let Err(e) = protocol::parse_version(&reply) {
             self.server.trace_error(&format!(
-                "PSL:getVersion, ERROR, unexpected version string = {reply}."
+                "PSL:getVersion, ERROR, unexpected version string = {reply}.\n"
             ));
-            self.trace_error("PSL:PSL: ERROR, incorrect server version");
+            self.trace_error("PSL:PSL: ERROR, incorrect server version\n");
             self.ad.port_base.set_string_param(
                 self.ad.params.status_message,
                 0,
@@ -176,13 +176,13 @@ impl PslDetector {
         let (reply, status) = self.command_status(command)?;
         if let Err(e) = &status {
             self.trace_error(&format!(
-                "PSL::getChoices error in write/read to server {}",
+                "PSL::getChoices error in write/read to server {}\n",
                 e.status()
             ));
         }
         let choices = protocol::parse_choices(&reply, multi);
         if choices.is_empty() {
-            self.trace_error("PSL::getChoices Options are NULL");
+            self.trace_error("PSL::getChoices Options are NULL\n");
         }
         Ok(choices)
     }
@@ -252,7 +252,7 @@ impl PslDetector {
                 base.set_int32_param(self.ad.params.base.color_mode, 0, color_mode as i32)?;
             }
             Err(_) if status.is_ok() => {
-                self.trace_error(&format!("PSL:getConfig: unknown mode={reply}"));
+                self.trace_error(&format!("PSL:getConfig: unknown mode={reply}\n"));
             }
             Err(_) => {}
         }
@@ -267,7 +267,7 @@ impl PslDetector {
                         .set_int32_param(self.ad.params.trigger_mode, 0, index)?;
                 }
                 None if status.is_ok() => {
-                    self.trace_error(&format!("PSL:getConfig: unknown trigger mode={mode}"));
+                    self.trace_error(&format!("PSL:getConfig: unknown trigger mode={mode}\n"));
                 }
                 None => {}
             }
@@ -372,7 +372,7 @@ impl PslDetector {
                 }
                 None if status.is_ok() => {
                     self.trace_error(&format!(
-                        "PSL:getConfig: error, unknown file format string = {format}"
+                        "PSL:getConfig: error, unknown file format string = {format}\n"
                     ));
                 }
                 None => {}
@@ -530,7 +530,7 @@ impl PortDriver for PslDetector {
                 file!(),
                 line!(),
                 format_args!(
-                    "PSL:writeInt32: error, status={} function={reason}, value={value}",
+                    "PSL:writeInt32: error, status={} function={reason}, value={value}\n",
                     e.status() as i32
                 ),
             ),
@@ -538,7 +538,7 @@ impl PortDriver for PslDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("PSL:writeInt32: function={reason}, value={value}"),
+                format_args!("PSL:writeInt32: function={reason}, value={value}\n"),
             ),
         }
         status
@@ -571,7 +571,7 @@ impl PortDriver for PslDetector {
                 file!(),
                 line!(),
                 format_args!(
-                    "PSL:writeFloat64: error, status={} function={reason}, value={value:.6}",
+                    "PSL:writeFloat64: error, status={} function={reason}, value={value:.6}\n",
                     e.status() as i32
                 ),
             ),
@@ -579,7 +579,7 @@ impl PortDriver for PslDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("PSL:writeFloat64: function={reason}, value={value:.6}"),
+                format_args!("PSL:writeFloat64: function={reason}, value={value:.6}\n"),
             ),
         }
         status
@@ -623,7 +623,7 @@ impl PortDriver for PslDetector {
                     TraceMask::IO_DRIVER,
                     file!(),
                     line!(),
-                    format_args!("PSL:writeOctet: function={reason}, value={text}"),
+                    format_args!("PSL:writeOctet: function={reason}, value={text}\n"),
                 );
                 Ok(value.len())
             }

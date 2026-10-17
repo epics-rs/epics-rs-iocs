@@ -285,11 +285,11 @@ async fn wait_for_frame(
             Err(ChannelError::Timeout) => {}
             Err(ChannelError::Transport(e)) => {
                 let status = e.status() as i32;
-                trace_error(ctx, &format!("PhotonII::readPhotonII, status={status}"));
+                trace_error(ctx, &format!("PhotonII::readPhotonII, status={status}\n"));
                 trace_error(
                     ctx,
                     &format!(
-                        "PhotonII::PhotonIITask: error reading file written message status={status}"
+                        "PhotonII::PhotonIITask: error reading file written message status={status}\n"
                     ),
                 );
                 return Err(Abort::Error(format!("error reading from p2util: {e}")));
@@ -299,7 +299,7 @@ async fn wait_for_frame(
         if poll_start.elapsed() > deadline {
             trace_error(
                 ctx,
-                "PhotonII::PhotonIITask: timeout waiting for file written message",
+                "PhotonII::PhotonIITask: timeout waiting for file written message\n",
             );
             return Err(Abort::Timeout(
                 "timeout waiting for the file-written message".into(),
@@ -344,7 +344,7 @@ async fn publish_frame(
         trace_error(
             ctx,
             &format!(
-                "PhotonII::PhotonIITask, error calling readRaw(), status={}",
+                "PhotonII::PhotonIITask, error calling readRaw(), status={}\n",
                 AsynStatus::Error as i32
             ),
         );
@@ -364,10 +364,10 @@ async fn publish_frame(
         if poll_start.elapsed() > deadline {
             trace_error(
                 ctx,
-                &format!("PhotonII::readRaw timeout waiting for file to be created {file_name}"),
+                &format!("PhotonII::readRaw timeout waiting for file to be created {file_name}\n"),
             );
             if file_exists {
-                trace_error(ctx, "  file exists but is either old or the wrong size");
+                trace_error(ctx, "  file exists but is either old or the wrong size\n");
             }
             return Err(read_raw_failed(Abort::Timeout(format!(
                 "timeout waiting for the frame file {file_name}"
