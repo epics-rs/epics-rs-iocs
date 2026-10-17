@@ -423,9 +423,7 @@ fn a_write_waits_for_the_task_sequence() {
     let fake = Fake::start("SPECS_WS_HOLD");
     fake.answer(&[("ValidateSpectrum", Act::Slow(300))]);
     let turns = fake.reason("TURNS");
-    let ad = &fake.runtime.ad_params;
-    fake.write_int32(ad.num_exposures, 1).unwrap();
-    fake.write_int32(ad.acquire, 1).unwrap();
+    fake.write_int32(fake.runtime.ad_params.acquire, 1).unwrap();
     let mut heard = Vec::new();
     while !heard.iter().any(|c: &String| c == "ValidateSpectrum") {
         let (_, command) = fake

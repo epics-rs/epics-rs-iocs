@@ -50,6 +50,7 @@ struct Task {
     /// decide whether the wait branch may overwrite `ADStatusMessage`/
     /// `ADStatus` (`specsAnalyser.cpp:307-313`).
     last_status_ok: bool,
+    l: Locals,
 }
 
 /// Current time as an f64 epoch second count (C `secPastEpoch + nsec/1e9`).
@@ -60,30 +61,45 @@ fn now_epoch_f64() -> f64 {
     }
 }
 
-/// State carried from the preamble (`specsAnalyser.cpp:300-432`) into the
-/// acquisition body (`specsAnalyser.cpp:441-704`). These are function-scope
-/// locals in C (`specsAnalyser.cpp:270-294`) that persist across outer-loop
-/// passes where `ADAcquire` was already 1 at the top of `while(1)`
-/// (`specsAnalyser.cpp:301-303`) — e.g. `ImageMode::Continuous`, which never
-/// resets `ADAcquire` between batches — so the preamble (and the
-/// `start`/wait) is skipped and the previous pass's values are reused
-/// verbatim; see `Task::run`.
+/// C `specsAnalyserTask`'s function-scope locals (`specsAnalyser.cpp:270-294`)
+/// that `getIntegerParam`/`getDoubleParam` read into. They persist across
+/// outer-loop passes, so a pass that finds `ADAcquire` already 1 (e.g.
+/// `ImageMode::Continuous`) reruns the body on the previous pass's values,
+/// and a read of an undefined parameter leaves the local as it was.
 #[derive(Clone, Copy)]
-struct Prepared {
-    iterations: i32,
+struct Locals {
     acquire: i32,
+    iterations: i32,
+    run_mode: i32,
     non_energy_channels: i32,
     energy_channels: i32,
+    acquire_time: f64,
+    acquire_period: f64,
+    num_images: i32,
+    image_mode: i32,
+    safe_state: i32,
+    array_callbacks: i32,
+    image_counter: i32,
+    num_images_counter: i32,
 }
 
-impl Prepared {
-    /// The C locals' initial values, which an `ADAcquire` already 1 at the
-    /// first pass runs with.
-    const C_LOCALS: Prepared = Prepared {
-        iterations: 1,
+impl Locals {
+    /// The initial values C declares (`acquire`, `acquireTime` and
+    /// `acquirePeriod` are uninitialised there).
+    const C: Locals = Locals {
         acquire: 0,
+        iterations: 1,
+        run_mode: 0,
         non_energy_channels: 0,
         energy_channels: 0,
+        acquire_time: 0.0,
+        acquire_period: 0.0,
+        num_images: 0,
+        image_mode: 0,
+        safe_state: 1,
+        array_callbacks: 0,
+        image_counter: 0,
+        num_images_counter: 0,
     };
 }
 
@@ -148,14 +164,21 @@ impl Task {
         });
     }
 
-    fn get_i32(&mut self, reason: usize) -> i32 {
-        self.driver(move |d| d.ad.port_base.get_int32_param(reason, 0).unwrap_or(0))
-            .unwrap_or(0)
+    /// C `getIntegerParam(reason, &local)`: the value, or `local` when the
+    /// read fails (an undefined parameter).
+    fn get_i32(&mut self, reason: usize, local: i32) -> i32 {
+        self.driver(move |d| d.ad.port_base.get_int32_param(reason, 0).ok())
+            .ok()
+            .flatten()
+            .unwrap_or(local)
     }
 
-    fn get_f64(&mut self, reason: usize) -> f64 {
-        self.driver(move |d| d.ad.port_base.get_float64_param(reason, 0).unwrap_or(0.0))
-            .unwrap_or(0.0)
+    /// C `getDoubleParam(reason, &local)`.
+    fn get_f64(&mut self, reason: usize, local: f64) -> f64 {
+        self.driver(move |d| d.ad.port_base.get_float64_param(reason, 0).ok())
+            .ok()
+            .flatten()
+            .unwrap_or(local)
     }
 
     fn wire<R: Send + 'static>(
@@ -176,15 +199,15 @@ impl Task {
     // -----------------------------------------------------------------------
 
     /// The "not acquiring" branch through the end of the preamble
-    /// (`specsAnalyser.cpp:300-432`). Returns `None` if the preamble itself
+    /// (`specsAnalyser.cpp:300-432`). Returns `false` if the preamble itself
     /// failed (C's `status != asynSuccess` branch, `specsAnalyser.cpp:436-440`)
     /// — the caller then simply loops back to the wait branch, exactly as C's
     /// `while(1)` falls through with `ADAcquire` already 0.
-    fn wait_and_prepare(&mut self) -> Option<Prepared> {
+    fn wait_and_prepare(&mut self) -> bool {
         self.set_i32(self.w.p.pause_acq, 0);
         if self.last_status_ok {
             self.set_str(self.w.ad.status_message, "Waiting for the acquire command");
-            let adstatus = self.get_i32(self.w.ad.status);
+            let adstatus = self.get_i32(self.w.ad.status, 0);
             if adstatus != ADStatus::Aborted as i32 && adstatus != ADStatus::Error as i32 {
                 self.set_i32(self.w.ad.status, ADStatus::Idle as i32);
             }
@@ -196,15 +219,15 @@ impl Task {
         let start = self.w.start.clone();
         self.unlocked(|| start.wait());
 
-        let acquire = self.get_i32(self.w.ad.acquire);
+        self.l.acquire = self.get_i32(self.w.ad.acquire, self.l.acquire);
         self.set_i32(self.w.p.pause_acq, 0);
-        let iterations = self.get_i32(self.w.ad.num_exposures);
+        self.l.iterations = self.get_i32(self.w.ad.num_exposures, self.l.iterations);
+        let iterations = self.l.iterations;
 
         let mut ok = true;
-        let mut non_energy_channels = 0;
         match self.wire(|link| link.get_analyser_parameter_int("NumNonEnergyChannels")) {
             Ok(v) => {
-                non_energy_channels = v;
+                self.l.non_energy_channels = v;
                 self.set_i32(self.w.p.non_energy_channels, v);
             }
             Err(_) => ok = false,
@@ -213,8 +236,8 @@ impl Task {
         let run_mode = if ok {
             // C discards `sendSimpleCommand(SPECS_CMD_CLEAR)`'s own status.
             let _ = self.command_response("ClearSpectrum");
-            let run_mode_val = self.get_i32(self.w.p.run_mode);
-            let run_mode = RunMode::from_i32(run_mode_val);
+            self.l.run_mode = self.get_i32(self.w.p.run_mode, self.l.run_mode);
+            let run_mode = RunMode::from_i32(self.l.run_mode);
             if run_mode.is_some() {
                 ok = self.run_define();
             }
@@ -228,7 +251,7 @@ impl Task {
         // case — the C `default:` branch only skips Define, not Validate.
         let mut validated: Option<ValidateResult> = None;
         if ok {
-            let kinetic_energy = self.get_f64(self.w.p.kinetic_energy);
+            let kinetic_energy = self.get_f64(self.w.p.kinetic_energy, 0.0);
             let validated_now = self.driver(move |d| d.validate_spectrum(run_mode, kinetic_energy));
             match validated_now.and_then(|r| r) {
                 Ok(result) => validated = Some(result),
@@ -236,7 +259,6 @@ impl Task {
             }
         }
 
-        let mut energy_channels = 0;
         if ok {
             let result = validated.expect("ok implies validated is Some");
             self.set_f64(self.w.p.start_energy, result.start_energy);
@@ -247,7 +269,7 @@ impl Task {
             self.set_f64(self.w.p.pass_energy, result.pass_energy);
             self.set_i32(self.w.p.lens_mode, result.lens_mode);
             self.set_i32(self.w.p.scan_range, result.scan_range);
-            energy_channels = result.samples;
+            let mut energy_channels = result.samples;
             self.set_i32(self.w.p.samples, energy_channels * iterations);
 
             if run_mode == Some(RunMode::Sfat) {
@@ -263,6 +285,8 @@ impl Task {
                 self.set_i32(self.w.p.samples, energy_channels * iterations);
             }
 
+            self.l.energy_channels = energy_channels;
+            let non_energy_channels = self.l.non_energy_channels;
             let nbytes = (energy_channels.max(0) as i64) * (non_energy_channels.max(0) as i64) * 8;
             self.set_i32(self.w.ad.base.array_size_x, energy_channels);
             self.set_i32(self.w.ad.base.array_size_y, non_energy_channels);
@@ -275,15 +299,8 @@ impl Task {
             self.set_i32(self.w.ad.acquire, 0);
             self.set_i32(self.w.ad.status, ADStatus::Error as i32);
             self.callbacks();
-            return None;
         }
-
-        Some(Prepared {
-            iterations,
-            acquire,
-            non_energy_channels,
-            energy_channels,
-        })
+        ok
     }
 
     /// The `DefineSpectrum*` command for the current run mode
@@ -293,13 +310,13 @@ impl Task {
     }
 
     /// The acquisition body (`specsAnalyser.cpp:441-704`).
-    async fn run_acquisition(&mut self, prepared: Prepared) {
-        let Prepared {
+    async fn run_acquisition(&mut self) {
+        let Locals {
             iterations,
-            mut acquire,
             non_energy_channels,
             energy_channels,
-        } = prepared;
+            ..
+        } = self.l;
         let nx = energy_channels.max(0) as usize;
         let ny = non_energy_channels.max(0) as usize;
         let mut image = vec![0.0f64; nx * ny];
@@ -313,11 +330,16 @@ impl Task {
         let acq_start_epoch = now_epoch_f64();
         let acq_start_instant = Instant::now();
 
-        let acquire_time = self.get_f64(self.w.ad.acquire_time);
-        let acquire_period = self.get_f64(self.w.ad.acquire_period);
-        let num_images = self.get_i32(self.w.ad.num_images);
-        let image_mode = self.get_i32(self.w.ad.image_mode);
-        let safe_state = self.get_i32(self.w.p.safe_state);
+        self.l.acquire_time = self.get_f64(self.w.ad.acquire_time, self.l.acquire_time);
+        self.l.acquire_period = self.get_f64(self.w.ad.acquire_period, self.l.acquire_period);
+        self.l.num_images = self.get_i32(self.w.ad.num_images, self.l.num_images);
+        self.l.image_mode = self.get_i32(self.w.ad.image_mode, self.l.image_mode);
+        self.l.safe_state = self.get_i32(self.w.p.safe_state, self.l.safe_state);
+        let (acquire_time, acquire_period, safe_state) = (
+            self.l.acquire_time,
+            self.l.acquire_period,
+            self.l.safe_state,
+        );
 
         self.set_i32(self.w.ad.status, ADStatus::Initializing as i32);
         self.set_str(self.w.ad.status_message, "Executing pre-scan...");
@@ -325,7 +347,7 @@ impl Task {
         let mut ok = true;
         let mut iteration = 0i32;
         let mut last_data: HashMap<String, String> = HashMap::new();
-        while iteration < iterations && acquire == 1 {
+        while iteration < iterations && self.l.acquire == 1 {
             let _ = self.command_response("ClearSpectrum");
             let _ = self.command_response(&codec::start_command(safe_state != 0));
 
@@ -343,7 +365,7 @@ impl Task {
                     .get("ControllerState")
                     .map(String::as_str)
                     .unwrap_or("");
-                let should_continue = acquire != 0
+                let should_continue = self.l.acquire != 0
                     && ok
                     && (controller_state != "finished" || current_data_point < energy_channels)
                     && controller_state != "aborted"
@@ -393,7 +415,7 @@ impl Task {
                         self.set_i32(self.w.ad.status, ADStatus::Acquire as i32);
                         self.set_str(self.w.ad.status_message, "Acquiring data...");
 
-                        let data_delay_max = self.get_f64(self.w.p.data_delay_max);
+                        let data_delay_max = self.get_f64(self.w.p.data_delay_max, 0.0);
                         let period = acquire_time.min(data_delay_max);
                         // C sleeps here holding the lock (specsAnalyser.cpp:525).
                         std::thread::sleep(secs(period));
@@ -497,7 +519,7 @@ impl Task {
                     // here (distinct from the `acquireTime` captured once
                     // before the iteration loop) so a client changing it
                     // mid-scan is reflected in the estimate immediately.
-                    let current_acquire_time = self.get_f64(self.w.ad.acquire_time);
+                    let current_acquire_time = self.get_f64(self.w.ad.acquire_time, 0.0);
                     let remaining_iter =
                         ((energy_channels - current_data_point) as f64) * current_acquire_time;
                     self.set_f64(self.w.p.remaining_time_iteration, remaining_iter);
@@ -510,7 +532,7 @@ impl Task {
                     self.callbacks();
                 }
 
-                acquire = self.get_i32(self.w.ad.acquire);
+                self.l.acquire = self.get_i32(self.w.ad.acquire, self.l.acquire);
             }
 
             if last_data.get("ControllerState").map(String::as_str) == Some("error") {
@@ -525,17 +547,24 @@ impl Task {
                 }
             }
 
-            acquire = self.get_i32(self.w.ad.acquire);
+            self.l.acquire = self.get_i32(self.w.ad.acquire, self.l.acquire);
             iteration += 1;
         }
         let _ = &last_data;
 
-        let array_counter = self.get_i32(self.w.ad.base.array_counter) + 1;
-        let num_images_counter = self.get_i32(self.w.ad.num_images_counter) + 1;
+        self.l.array_callbacks =
+            self.get_i32(self.w.ad.base.array_callbacks, self.l.array_callbacks);
+        self.l.image_counter = self.get_i32(self.w.ad.base.array_counter, self.l.image_counter) + 1;
+        self.l.num_images_counter =
+            self.get_i32(self.w.ad.num_images_counter, self.l.num_images_counter) + 1;
+        let (array_counter, num_images_counter, array_callbacks) = (
+            self.l.image_counter,
+            self.l.num_images_counter,
+            self.l.array_callbacks,
+        );
         self.set_i32(self.w.ad.base.array_counter, array_counter);
         self.set_i32(self.w.ad.num_images_counter, num_images_counter);
 
-        let array_callbacks = self.get_i32(self.w.ad.base.array_callbacks);
         // C dereferences a refused alloc unchecked (specsAnalyser.cpp:454, :493);
         // here the frame is dropped after the pool's limit line.
         if array_callbacks != 0
@@ -557,14 +586,15 @@ impl Task {
 
         self.last_status_ok = ok;
         if ok {
+            let (image_mode, num_images) = (self.l.image_mode, self.l.num_images);
             if image_mode == 0 /* Single */ || (image_mode == 1 /* Multiple */ && num_images_counter >= num_images)
             {
                 self.set_i32(self.w.ad.acquire, 0);
             }
             self.callbacks();
-            acquire = self.get_i32(self.w.ad.acquire);
+            self.l.acquire = self.get_i32(self.w.ad.acquire, self.l.acquire);
 
-            if acquire != 0 {
+            if self.l.acquire != 0 {
                 let elapsed = acq_start_instant.elapsed().as_secs_f64();
                 let delay = acquire_period - elapsed;
                 if delay >= 0.0 {
@@ -581,20 +611,14 @@ impl Task {
     /// The preamble only runs when `ADAcquire` reads 0 at the top of the
     /// pass; otherwise (e.g. `ImageMode::Continuous`, which never resets
     /// `ADAcquire` between batches) it falls straight through to rerun the
-    /// acquisition body against the previous pass's `Prepared` state.
+    /// acquisition body against the previous pass's [`Locals`].
     async fn run(mut self) {
-        let mut prepared = Prepared::C_LOCALS;
         while self.hold.is_some() {
-            let acquire = self.get_i32(self.w.ad.acquire);
-            if acquire == 0 {
-                match self.wait_and_prepare() {
-                    Some(p) => prepared = p,
-                    None => continue,
-                }
-            } else {
-                prepared.acquire = acquire;
+            self.l.acquire = self.get_i32(self.w.ad.acquire, self.l.acquire);
+            if self.l.acquire == 0 && !self.wait_and_prepare() {
+                continue;
             }
-            self.run_acquisition(prepared).await;
+            self.run_acquisition().await;
         }
     }
 }
@@ -608,6 +632,7 @@ pub(crate) fn start_task(w: Worker) -> std::thread::JoinHandle<()> {
             w,
             hold,
             last_status_ok: true,
+            l: Locals::C,
         }
         .run()
         .await
