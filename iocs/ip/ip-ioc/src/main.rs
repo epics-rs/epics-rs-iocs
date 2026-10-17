@@ -8,7 +8,6 @@
 //! `drvAsynIPPortConfigure`:
 //!
 //! ```text
-//! TPG261Config(port, octetPort, [pollPeriod])
 //! TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
 //! ND261Config(port, octetPort, [pollPeriod])
 //! EurothermConfig(port, octetPort, groupAddress)
@@ -28,11 +27,11 @@ use ip_devices::eurotherm::create_eurotherm;
 use ip_devices::nd261::create_nd261;
 use ip_devices::runtime::IpPortRuntime;
 use ip_devices::televac::create_televac;
-use ip_devices::tpg261::create_tpg261;
 
-/// `ipSupport.dbd`'s `devAiMKS` (`"HPS SensaVac 937"`) and `dev<Type>MPC`
-/// (`"asyn MPC"`) rows; their dsets are `{6, 0, 0, init, 0, read/write,
-/// convert}`, with no convert on the non-analog MPC types.
+/// `ipSupport.dbd`'s `devAiMKS` (`"HPS SensaVac 937"`), `dev<Type>MPC`
+/// (`"asyn MPC"`) and `dev<Type>TPG261` (`"asyn TPG261"`) rows; their dsets
+/// are `{6, 0, 0, init, 0, read/write, convert}`, with no convert on the
+/// non-analog types.
 static DEVICES: &[(&str, &[DevSup])] = &[
     (
         "ai",
@@ -49,52 +48,107 @@ static DEVICES: &[(&str, &[DevSup])] = &[
                 link_type: DbLinkType::InstIo,
                 dset: Dset::new(6, &[2, 4, 5], false),
             },
+            DevSup {
+                name: "devAiTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4, 5], false),
+            },
         ],
     ),
     (
         "ao",
-        &[DevSup {
-            name: "devAoMPC",
-            choice: ip_devices::mpc::DTYP,
-            link_type: DbLinkType::InstIo,
-            dset: Dset::new(6, &[2, 4, 5], false),
-        }],
+        &[
+            DevSup {
+                name: "devAoMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4, 5], false),
+            },
+            DevSup {
+                name: "devAoTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4, 5], false),
+            },
+        ],
     ),
     (
         "bi",
-        &[DevSup {
-            name: "devBiMPC",
-            choice: ip_devices::mpc::DTYP,
-            link_type: DbLinkType::InstIo,
-            dset: Dset::new(6, &[2, 4], false),
-        }],
+        &[
+            DevSup {
+                name: "devBiMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+            DevSup {
+                name: "devBiTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+        ],
     ),
     (
         "bo",
+        &[
+            DevSup {
+                name: "devBoMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+            DevSup {
+                name: "devBoTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+        ],
+    ),
+    (
+        "mbbi",
         &[DevSup {
-            name: "devBoMPC",
-            choice: ip_devices::mpc::DTYP,
+            name: "devMbbiTPG261",
+            choice: ip_devices::tpg261::DTYP,
             link_type: DbLinkType::InstIo,
             dset: Dset::new(6, &[2, 4], false),
         }],
     ),
     (
         "mbbo",
-        &[DevSup {
-            name: "devMbboMPC",
-            choice: ip_devices::mpc::DTYP,
-            link_type: DbLinkType::InstIo,
-            dset: Dset::new(6, &[2, 4], false),
-        }],
+        &[
+            DevSup {
+                name: "devMbboMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+            DevSup {
+                name: "devMbboTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+        ],
     ),
     (
         "stringin",
-        &[DevSup {
-            name: "devSiMPC",
-            choice: ip_devices::mpc::DTYP,
-            link_type: DbLinkType::InstIo,
-            dset: Dset::new(6, &[2, 4], false),
-        }],
+        &[
+            DevSup {
+                name: "devSiMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+            DevSup {
+                name: "devSiTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+        ],
     ),
     (
         "stringout",
@@ -176,48 +230,13 @@ async fn main() -> CaResult<()> {
         Box::new(epics_rs::base::server::records::scalcout::ScalcoutRecord::default())
     });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
-    // devAiMKS and devMPC: per-record device support, bound by DTYP.
+    // devAiMKS, devMPC and devTPG261: per-record device support, bound by DTYP.
     let mks = ip_devices::mks::device_support_factory();
     let mpc = ip_devices::mpc::device_support_factory();
-    app = app.register_dynamic_device_support(DEVICES, move |ctx| mks(ctx).or_else(|| mpc(ctx)));
-
-    // TPG261Config(port, octetPort, [pollPeriod])
-    {
-        let ports = ports.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "TPG261Config",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "octetPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "pollPeriod",
-                    arg_type: ArgType::Double,
-                },
-            ],
-            "TPG261Config portName octetPort [pollPeriod] - Pfeiffer TPG261/TPG262 gauge controller",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let name = string_arg(args, 0)?;
-                let octet = string_arg(args, 1)?;
-                let poll = poll_arg(args, 2, 2.0)?;
-                let claim = claim_port(&name).map_err(|e| format!("TPG261Config failed: {e}"))?;
-                let port = create_tpg261(&claim, &octet, poll)
-                    .map_err(|e| format!("TPG261Config failed: {e}"))?;
-                register(
-                    &ports,
-                    claim,
-                    ctx.db().scan_control().interrupt_gate(),
-                    port,
-                )?;
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
+    let tpg = ip_devices::tpg261::device_support_factory();
+    app = app.register_dynamic_device_support(DEVICES, move |ctx| {
+        mks(ctx).or_else(|| mpc(ctx)).or_else(|| tpg(ctx))
+    });
 
     // TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
     {

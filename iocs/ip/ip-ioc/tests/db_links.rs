@@ -1,5 +1,5 @@
-//! The MPC databases are ipApp/Db's: every device record is `asyn MPC` with
-//! devMPC.c's `@asyn(port address)COMMAND supply` link.
+//! The MPC and TPG261 databases are ipApp/Db's, whose device records carry
+//! the per-record links devMPC.c and devTPG261.c parse.
 
 use std::path::Path;
 
@@ -37,5 +37,15 @@ fn mpc_and_tsp_records_use_dev_mpc() {
                 .unwrap_or_else(|| panic!("{file} {rtyp}: {link}"));
             assert!(command.ends_with(&format!(" {supply}")), "{file}: {link}");
         }
+    }
+}
+
+#[test]
+fn tpg261_records_use_dev_tpg261() {
+    let records = device_records("TPG261.db");
+    assert_eq!(records.len(), 12, "{records:?}");
+    for (rtyp, dtyp, link) in records {
+        assert_eq!(dtyp, "asyn TPG261", "{rtyp} {link}");
+        assert!(link.starts_with("@asyn($(PORT) $(ADDR))"), "{rtyp}: {link}");
     }
 }

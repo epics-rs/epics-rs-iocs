@@ -33,12 +33,10 @@ asynSetOption("SerialTPG", 0, "parity", "none")
 asynSetOption("SerialTPG", 0, "stop", "1")
 asynOctetSetInputEos("SerialTPG", 0, "\r\n")
 
-# TPG261Config(portName, octetPort, pollPeriodSeconds). The <ENQ> byte and the
-# command CR are written by the driver, so the port has no output EOS.
-TPG261Config("TPG1", "SerialTPG", 2.0)
-
-dbLoadRecords("$(IP)/db/tpg261.db", "P=$(PREFIX),GAUGE=gauge1,PORT=TPG1,ADDR=0")
-dbLoadRecords("$(IP)/db/tpg261.db", "P=$(PREFIX),GAUGE=gauge2,PORT=TPG1,ADDR=1")
+# devTPG261 takes the gauge from each record's INP/OUT, on the octet port
+# itself; it writes the command CR and the <ENQ>, so the port has no output EOS.
+dbLoadRecords("$(IP)/db/TPG261.db", "P=$(PREFIX),GAUGE=gauge1,PORT=SerialTPG,ADDR=0")
+dbLoadRecords("$(IP)/db/TPG261.db", "P=$(PREFIX),GAUGE=gauge2,PORT=SerialTPG,ADDR=1")
 
 # --- Televac vacuum gauge controller ----------------------------------------
 # The controller answers with a CR-terminated line; devTelevac.c relied on the
