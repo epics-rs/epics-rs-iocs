@@ -14,7 +14,7 @@ use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use love::connect::{init_serial_port, set_default_eos};
+use love::connect::{follow_serial_port, init_serial_port, set_default_eos};
 use love::driver::{INPUT_EOS, LoveDriver, OUTPUT_EOS};
 use love::registry::{K_INSTRMAX, Model};
 
@@ -103,18 +103,19 @@ async fn main() -> CaResult<()> {
                     )?;
                     let (runtime_handle, _actor_jh) =
                         create_port_runtime(&claim, driver, RuntimeConfig::default())?;
-                    claim.publish(
-                        runtime_handle.port_handle().clone(),
-                        ctx.db().scan_control().interrupt_gate(),
-                    )
+                    let love = runtime_handle.port_handle().clone();
+                    claim.publish(love.clone(), ctx.db().scan_control().interrupt_gate())?;
+                    Ok(love)
                 });
-                if registered.is_err() {
+                let Ok(love) = registered else {
                     ctx.println(&format!(
                         "drvLoveInit::failure to register love port {lov_port}"
                     ));
                     return Ok(CommandOutcome::Continue);
-                }
-                love::registry::register(&lov_port, models);
+                };
+                // C `exceptionCallbackAdd(pser->pasynUser,exceptCallback)` (drvLove.c:442).
+                let follow = follow_serial_port(&port, ser_addr, &love);
+                love::registry::register(&lov_port, models, follow);
 
                 // C `setDefaultEos` (drvLove.c:640-660).
                 let (lines, ok) = set_default_eos(&port, ser_addr, INPUT_EOS, OUTPUT_EOS);
