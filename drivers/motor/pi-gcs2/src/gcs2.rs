@@ -1252,9 +1252,11 @@ impl PIGCS2Controller {
 
     /// C `sendAndReceive(char)`: a short write is asynError. The byte is
     /// written again for each line that ends in a space, whose failure C
-    /// does not print. Failures end as in [`Self::send_and_receive`]. C defect not copied: it appends each line with no
-    /// separator, so `PIHexapodController`'s `#3` parse sees only the first
-    /// line; rs joins them with `\n`, as the string `sendAndReceive` does.
+    /// does not print. Failures end as in
+    /// [`Self::send_and_receive_buffer`]. C defect not copied: it appends
+    /// each line with no separator, so `PIHexapodController`'s `#3` parse
+    /// sees only the first line; rs joins them with `\n`, as the string
+    /// `sendAndReceive` does.
     fn send_and_receive_char(&self, c: u8) -> AsynResult<Vec<u8>> {
         self.trace(
             TraceMask::IO_DRIVER,
