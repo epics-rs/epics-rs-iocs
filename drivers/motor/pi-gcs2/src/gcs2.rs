@@ -140,6 +140,23 @@ const READ_BUF: usize = 256;
 /// PIInterface's error prints: `ASYN_TRACE_ERROR|ASYN_TRACEIO_DRIVER`.
 const IO_ERROR: TraceMask = TraceMask::ERROR.union(TraceMask::IO_DRIVER);
 
+/// Appends a read's line to `reply`, or the bytes a failed read had
+/// transferred, which is what C's buffer holds after the call.
+fn append_read(reply: &mut Vec<u8>, read: AsynResult<Vec<u8>>) -> AsynResult<()> {
+    match read {
+        Ok(line) => {
+            reply.extend(line);
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(partial) = e.partial_read() {
+                reply.extend(&partial.data);
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Output command terminator (C sets input EOS `"\n"` and appends a bare
 /// `"\n"` write after every command in `PIInterface::sendOnly`/
 /// `sendAndReceive`); the driver owns this framing.
@@ -737,7 +754,9 @@ impl PIGCS2Controller {
     /// C `sendAndReceive(const char*)`: the command, then a writeRead of its
     /// `\n`. Either write falling short is asynError. PI GCS marks a
     /// non-final reply line with a trailing space: each line after one is a
-    /// plain read, joined on `\n`, whose failure C does not print.
+    /// plain read, joined on `\n`, whose failure C does not print. A failed
+    /// read still ends in the `received` line, and the last read's status is
+    /// the result.
     fn send_and_receive(&self, cmd: &str) -> AsynResult<Vec<u8>> {
         self.trace(
             TraceMask::IO_DRIVER,
@@ -754,26 +773,25 @@ impl PIGCS2Controller {
             Ok(_) => return Err(short_write(0, "")),
             Err(e) => return Err(short_write(e.status() as i32, &e.message())),
         }
-        let mut reply = self
-            .handle
-            .write_read(0, TERMINATOR, READ_BUF)
-            .map_err(|e| match e.octet_step() {
-                Some(OctetStep::Read) => {
-                    self.trace(IO_ERROR, format_args!(
-                        "PIGCSController:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
-                        e.status() as i32,
-                        e.message()
-                    ));
-                    e
-                }
-                _ => short_write(e.status() as i32, &e.message()),
-            })?;
+        let read = self.handle.write_read(0, TERMINATOR, READ_BUF);
+        if let Err(e) = &read {
+            if e.octet_step() != Some(OctetStep::Read) {
+                return Err(short_write(e.status() as i32, &e.message()));
+            }
+            self.trace(IO_ERROR, format_args!(
+                "PIGCSController:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
+                e.status() as i32,
+                e.message()
+            ));
+        }
+        let mut reply = Vec::new();
+        let mut status = append_read(&mut reply, read);
         while reply.last() == Some(&b' ') {
             reply.push(b'\n');
-            reply.extend(self.handle.read_octet(0, READ_BUF)?);
+            status = append_read(&mut reply, self.handle.read_octet(0, READ_BUF));
         }
         self.trace_received(&reply);
-        Ok(reply)
+        status.map(|()| reply)
     }
 
     /// `asynPrint(pAsynCom, ASYN_TRACE_ERROR, ...)`.
@@ -1199,7 +1217,7 @@ impl PIGCS2Controller {
 
     /// C `sendAndReceive(char)`: a short write is asynError. The byte is
     /// written again for each line that ends in a space, whose failure C
-    /// does not print. C defect not copied: it appends each line with no
+    /// does not print. Failures end as in [`Self::send_and_receive`]. C defect not copied: it appends each line with no
     /// separator, so `PIHexapodController`'s `#3` parse sees only the first
     /// line; rs joins them with `\n`, as the string `sendAndReceive` does.
     fn send_and_receive_char(&self, c: u8) -> AsynResult<Vec<u8>> {
@@ -1215,19 +1233,21 @@ impl PIGCS2Controller {
                     _ => pigcs2_err(e.message()),
                 })
         };
-        let mut reply = write_read().inspect_err(|e| {
+        let read = write_read().inspect_err(|e| {
             self.trace(IO_ERROR, format_args!(
                 "PIInterface::sendAndReceive error calling writeRead, output={c} status={}, error={}\n",
                 e.status() as i32,
                 e.message()
             ));
-        })?;
+        });
+        let mut reply = Vec::new();
+        let mut status = append_read(&mut reply, read);
         while reply.last() == Some(&b' ') {
             reply.push(b'\n');
-            reply.extend(write_read()?);
+            status = append_read(&mut reply, write_read());
         }
         self.trace_received(&reply);
-        Ok(reply)
+        status.map(|()| reply)
     }
 
     /// [`Self::send_and_receive_char`]'s reply line.
@@ -3596,6 +3616,118 @@ mod tests {
         ] {
             assert!(printed.contains(line), "{line:?} not in {printed}");
         }
+    }
+
+    /// The `received` line of a failed `sendAndReceive` exchange, printed
+    /// with what C's buffer holds (PIInterface.cpp:127-143, :210-229).
+    fn received_after_failure(port: &str, run: impl FnOnce(&PIGCS2Controller) -> bool) -> String {
+        let (_line, io) = motor_common::testing::LineRig::queued(port, |cmd| match cmd {
+            "SAI?" => vec!["1 ".into()],
+            _ => vec![],
+        });
+        let ctrl = PIGCS2Controller::new(io, port);
+        let mut failed = false;
+        let printed = traced_mask(port, TraceMask::IO_DRIVER, || failed = run(&ctrl));
+        assert!(failed, "the exchange returns its error: {printed}");
+        printed
+    }
+
+    #[test]
+    fn a_query_with_no_reply_prints_an_empty_received_line() {
+        let printed =
+            received_after_failure("gcs2RecvNone", |c| c.send_and_receive("ERR?").is_err());
+        assert!(
+            printed.contains("PIInterface::sendAndReceive() received \"\"\n"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn a_failed_continuation_read_prints_the_lines_before_it() {
+        let printed =
+            received_after_failure("gcs2RecvCont", |c| c.send_and_receive("SAI?").is_err());
+        assert!(
+            printed.contains("PIInterface::sendAndReceive() received \"1 \n\"\n"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn a_char_query_with_no_reply_prints_an_empty_received_line() {
+        let printed =
+            received_after_failure("gcs2RecvChar", |c| c.send_and_receive_char(4).is_err());
+        assert!(
+            printed.contains("PIInterface::sendAndReceive() received \"\"\n"),
+            "{printed}"
+        );
+    }
+
+    /// Answers every read with `1=0` and then a timeout, as a line that
+    /// stops mid-reply does.
+    struct CutReply(epics_rs::asyn::port::PortDriverBase);
+
+    impl epics_rs::asyn::port::PortDriver for CutReply {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, epics_rs::asyn::interpose::EomReason)> {
+            use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+            buf[..3].copy_from_slice(b"1=0");
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".into(),
+            }
+            .with_partial_read(PartialOctetRead {
+                data: b"1=0".to_vec(),
+                eom_reason: EomReason::empty(),
+            }))
+        }
+    }
+
+    /// A read that times out mid-line leaves its bytes in C's buffer, so
+    /// the `received` line shows them.
+    #[test]
+    fn a_timed_out_read_prints_the_bytes_it_got() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("gcs2RecvCut").unwrap(),
+            CutReply(PortDriverBase::new("gcs2RecvCut", 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl = PIGCS2Controller::new(
+            SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                std::time::Duration::from_secs(1),
+            ),
+            "gcs2RecvCut",
+        );
+        let mut failed = (false, false);
+        let printed = traced_mask("gcs2RecvCut", TraceMask::IO_DRIVER, || {
+            failed = (
+                ctrl.send_and_receive("ERR?").is_err(),
+                ctrl.send_and_receive_char(4).is_err(),
+            );
+        });
+        assert_eq!(failed, (true, true), "{printed}");
+        let received = printed
+            .matches("PIInterface::sendAndReceive() received \"1=0\"\n")
+            .count();
+        assert_eq!(received, 2, "{printed}");
     }
 
     /// `PIGCSMotorController::getStatus` and `PIC885Controller::getStatus`
