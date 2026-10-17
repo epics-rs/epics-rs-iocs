@@ -172,9 +172,38 @@ pub fn new_outputs() -> Outputs {
         .collect()
 }
 
+/// What a Serval read needs, on the connection task or the port thread.
+#[derive(Clone, Copy)]
+pub(crate) struct Reader<'a> {
+    pub http: &'a ServalHttp,
+    pub shared: &'a Shared,
+    pub p: TimePixParams,
+    pub ad: ADDriverParams,
+}
+
 impl Ctx {
+    fn reader(&self) -> Reader<'_> {
+        Reader {
+            http: &self.http,
+            shared: &self.shared,
+            p: self.p,
+            ad: self.ad,
+        }
+    }
+
     async fn set(&self, addr: i32, updates: Vec<ParamSetValue>) {
         let _ = self.handle.set_params_and_notify(addr, updates).await;
+    }
+
+    /// A read's steps in C order; whether it succeeded.
+    async fn apply(&self, read: DetectorRead) -> bool {
+        for step in read.steps {
+            match step {
+                DetectorStep::Trace(mask, line) => self.trace(mask, &line),
+                DetectorStep::Post(addr, updates) => self.set(addr, updates).await,
+            }
+        }
+        read.ok
     }
 
     /// [`adlog::print`] off the port thread.
@@ -400,16 +429,6 @@ async fn connection_poll(
                 let _ = acq_tx.try_send(());
                 continue;
             }
-            Command::RefreshStatus => {
-                refresh_dashboard(&ctx).await;
-                refresh_detector(&ctx).await;
-                refresh_measurement_config(&ctx).await;
-                continue;
-            }
-            Command::RefreshDetector => {
-                refresh_detector(&ctx).await;
-                continue;
-            }
             Command::PushProcessedImg => {
                 push_processed_img(&ctx).await;
                 ctx.set_int(ctx.p.write_processed_img, ADDR, 0).await;
@@ -418,12 +437,6 @@ async fn connection_poll(
             Command::PushProcessedHst => {
                 push_processed_hst(&ctx).await;
                 ctx.set_int(ctx.p.write_processed_hst, ADDR, 0).await;
-                continue;
-            }
-            // C runs checkConnection() from writeInt32, outside the poll's
-            // edge tracking (ADTimePix.cpp:563-568).
-            Command::RefreshConnection => {
-                check_connection(&ctx).await;
             }
         }
     }
@@ -434,15 +447,15 @@ async fn connection_poll(
 /// read-only state, and a partial reconciliation keeps the edge open for the
 /// next poll. Returns the new "was up".
 async fn poll_connection(ctx: &Arc<Ctx>, was_up: bool) -> bool {
-    let reply = read_dashboard(ctx, TIMEOUT_5000_MS);
+    let reply = read_dashboard(ctx.reader(), TIMEOUT_5000_MS);
     let mut updates = Vec::new();
-    let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
+    let (serval_ok, det_ok) = publish_dashboard(ctx.reader(), &reply, &mut updates);
     let up = serval_ok && det_ok;
     let complete = if up && !was_up {
         ctx.set(0, updates).await;
         refresh_on_reconnect(ctx).await
     } else {
-        connection_status(ctx, serval_ok, det_ok, &mut updates);
+        connection_status(ctx.reader(), serval_ok, det_ok, &mut updates);
         ctx.set(0, updates).await;
         true
     };
@@ -463,7 +476,7 @@ async fn refresh_on_reconnect(ctx: &Arc<Ctx>) -> bool {
 
     let mut updates = Vec::new();
     if complete {
-        connection_status(ctx, true, true, &mut updates);
+        connection_status(ctx.reader(), true, true, &mut updates);
     } else {
         ctx.trace(
             TraceMask::ERROR,
@@ -497,8 +510,8 @@ async fn refresh_on_reconnect(ctx: &Arc<Ctx>) -> bool {
     complete
 }
 
-/// C `getMeasurementConfig`, which the Health scan and the reconnect refresh
-/// run (ADTimePix.cpp:560, serval_http.cpp:297-298).
+/// C `getMeasurementConfig` from the reconnect refresh
+/// (serval_http.cpp:297-298).
 async fn refresh_measurement_config(ctx: &Arc<Ctx>) -> bool {
     ctx.handle
         .with_driver::<TimePix3Driver, _>(|d| d.get_measurement_config().is_ok())
@@ -508,24 +521,27 @@ async fn refresh_measurement_config(ctx: &Arc<Ctx>) -> bool {
 
 /// C `checkConnection()` with its defaults, publishing the HTTP status and
 /// the connection status (serval_http.cpp:363-392).
-async fn check_connection(ctx: &Arc<Ctx>) -> bool {
-    let reply = read_dashboard(ctx, TIMEOUT_5000_MS);
-    let mut updates = vec![ParamSetValue::new(
-        ctx.p.http_code,
-        0,
-        ParamValue::Int32(reply.code),
-    )];
-    log_dashboard_failure(
-        ctx,
+pub(crate) fn check_connection(r: Reader<'_>) -> DetectorRead {
+    let reply = read_dashboard(r, TIMEOUT_5000_MS);
+    let mut steps = dashboard_failure(
+        r,
         adlog::CHECK_CONNECTION,
         "checkConnection",
         "checkConnection",
         &reply,
     );
-    let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
-    connection_status(ctx, serval_ok, det_ok, &mut updates);
-    ctx.set(0, updates).await;
-    serval_ok && det_ok
+    let mut updates = vec![ParamSetValue::new(
+        r.p.http_code,
+        0,
+        ParamValue::Int32(reply.code),
+    )];
+    let (serval_ok, det_ok) = publish_dashboard(r, &reply, &mut updates);
+    connection_status(r, serval_ok, det_ok, &mut updates);
+    steps.push(DetectorStep::Post(0, updates));
+    DetectorRead {
+        ok: serval_ok && det_ok,
+        steps,
+    }
 }
 
 /// C `initialServerCheckConnection` (serval_http.cpp:315-354), which the
@@ -543,14 +559,18 @@ pub fn initial_server_check_connection(ctx: &Arc<Ctx>) -> bool {
     }
     let reply = match ctx.http.get("", DEFAULT_TIMEOUT) {
         Ok(_) => {
-            let reply = read_dashboard(ctx, DEFAULT_TIMEOUT);
-            log_dashboard_failure(
-                ctx,
+            let reply = read_dashboard(ctx.reader(), DEFAULT_TIMEOUT);
+            for step in dashboard_failure(
+                ctx.reader(),
                 adlog::INITIAL_SERVER_CHECK_CONNECTION,
                 "initialServerCheckConnection",
                 "initialServerCheckConnection dashboard",
                 &reply,
-            );
+            ) {
+                if let DetectorStep::Trace(mask, line) = step {
+                    ctx.trace(mask, &line);
+                }
+            }
             reply
         }
         Err(e) => {
@@ -577,8 +597,8 @@ pub fn initial_server_check_connection(ctx: &Arc<Ctx>) -> bool {
         0,
         ParamValue::Int32(reply.code),
     )];
-    let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
-    connection_status(ctx, serval_ok, det_ok, &mut updates);
+    let (serval_ok, det_ok) = publish_dashboard(ctx.reader(), &reply, &mut updates);
+    connection_status(ctx.reader(), serval_ok, det_ok, &mut updates);
     let _ = ctx.handle.set_params_and_notify_blocking(0, updates);
     if !det_ok {
         ctx.trace(
@@ -599,8 +619,8 @@ struct DashboardReply {
     parsed: Result<serval::Dashboard, serval::DashboardError>,
 }
 
-fn read_dashboard(ctx: &Ctx, timeout: Duration) -> DashboardReply {
-    let (code, body) = match ctx.http.get(serval::DASHBOARD, timeout) {
+fn read_dashboard(r: Reader<'_>, timeout: Duration) -> DashboardReply {
+    let (code, body) = match r.http.get(serval::DASHBOARD, timeout) {
         Ok(body) => (200, body),
         Err(e) => (e.code(), e.body().to_string()),
     };
@@ -610,23 +630,27 @@ fn read_dashboard(ctx: &Ctx, timeout: Duration) -> DashboardReply {
 
 /// C `logHttpFailure` plus `ERR_ARGS("<context>: %s", responseErrorMessage)`
 /// for a rejected dashboard reply (serval_http.cpp:382-384, :442-443).
-fn log_dashboard_failure(
-    ctx: &Ctx,
+fn dashboard_failure(
+    r: Reader<'_>,
     func: &str,
     context: &str,
     http_context: &str,
     reply: &DashboardReply,
-) {
-    let Err(error) = &reply.parsed else { return };
-    let url = format!("{}{}", ctx.http.base_url(), serval::DASHBOARD);
-    ctx.trace(
-        TraceMask::ERROR,
-        &adlog::http_failure_reply(http_context, "GET", &url, reply.code, &reply.body),
-    );
-    ctx.trace(
-        TraceMask::ERROR,
-        &adlog::err(func, &format!("{context}: {}", error.message())),
-    );
+) -> Vec<DetectorStep> {
+    let Err(error) = &reply.parsed else {
+        return Vec::new();
+    };
+    let url = format!("{}{}", r.http.base_url(), serval::DASHBOARD);
+    vec![
+        DetectorStep::Trace(
+            TraceMask::ERROR,
+            adlog::http_failure_reply(http_context, "GET", &url, reply.code, &reply.body),
+        ),
+        DetectorStep::Trace(
+            TraceMask::ERROR,
+            adlog::err(func, &format!("{context}: {}", error.message())),
+        ),
+    ]
 }
 
 /// C `publishDashboardSnapshot` and `publishDashboardFailure`
@@ -634,11 +658,11 @@ fn log_dashboard_failure(
 /// whether Serval answered 200 and whether the detector is connected
 /// (serval_http.cpp:371-373).
 fn publish_dashboard(
-    ctx: &Arc<Ctx>,
+    r: Reader<'_>,
     reply: &DashboardReply,
     updates: &mut Vec<ParamSetValue>,
 ) -> (bool, bool) {
-    let p = ctx.p;
+    let p = r.p;
     let serval_ok = reply.code == 200;
     let det_type = reply
         .parsed
@@ -664,15 +688,15 @@ fn publish_dashboard(
     ));
     if let Some(det_type) = det_type {
         updates.push(ParamSetValue::new(
-            ctx.ad.base.model,
+            r.ad.base.model,
             0,
             ParamValue::Octet(det_type.as_bytes().to_vec().into()),
         ));
     }
     match &reply.parsed {
         Ok(dashboard) => {
-            serval_version(ctx, &dashboard.response, updates);
-            disk_space(ctx, &dashboard.response, updates);
+            serval_version(r, &dashboard.response, updates);
+            disk_space(r, &dashboard.response, updates);
             if let Some(status) = dashboard_measurement_status(&dashboard.response) {
                 measurement_status(p, status, updates);
             }
@@ -725,14 +749,14 @@ fn pipeline_state_index(status: &str) -> i32 {
 /// C `updateStatusFromConnection` (serval_http.cpp:251-285): a connected
 /// detector reports the acquisition phase.
 fn connection_status(
-    ctx: &Arc<Ctx>,
+    r: Reader<'_>,
     serval_ok: bool,
     det_ok: bool,
     updates: &mut Vec<ParamSetValue>,
 ) {
     let (message, status) = match (serval_ok, det_ok) {
         (true, true) => {
-            let acquisition = ctx.shared.acquisition.snapshot();
+            let acquisition = r.shared.acquisition.snapshot();
             let status = match acquisition.phase {
                 Phase::Starting | Phase::Running | Phase::Stopping => ADStatus::Acquire,
                 Phase::Fault => ADStatus::Error,
@@ -745,19 +769,19 @@ fn connection_status(
         (true, false) => ("Detector disconnected", ADStatus::Disconnected),
     };
     updates.push(ParamSetValue::new(
-        ctx.ad.status_message,
+        r.ad.status_message,
         0,
         ParamValue::Octet(message.as_bytes().to_vec().into()),
     ));
     updates.push(ParamSetValue::new(
-        ctx.ad.status,
+        r.ad.status,
         0,
         ParamValue::Int32(status as i32),
     ));
 }
 
 /// C `updateServalVersionFromDashboard` (serval_http.cpp:133).
-fn serval_version(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
+fn serval_version(r: Reader<'_>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
     let Some(server) = dashboard.get("Server").filter(|s| s.is_object()) else {
         return;
     };
@@ -771,20 +795,20 @@ fn serval_version(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetV
     if let Some(ver) = server.get("SoftwareVersion").map(serval::json_to_string)
         && !ver.is_empty()
     {
-        octet(ctx.ad.base.sdk_version, &ver);
-        octet(ctx.ad.base.manufacturer, "ASI");
+        octet(r.ad.base.sdk_version, &ver);
+        octet(r.ad.base.manufacturer, "ASI");
     }
     if let Some(ts) = server.get("SoftwareTimestamp").map(serval::json_to_string)
         && !ts.is_empty()
     {
-        octet(ctx.p.fw_time_stamp, &ts);
+        octet(r.p.fw_time_stamp, &ts);
     }
 }
 
 /// The first disk in `Server.DiskSpace`, which is empty until raw file writing
 /// is configured (C `publishDashboardSnapshot`, serval_http.cpp:228-239).
-fn disk_space(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
-    let p = ctx.p;
+fn disk_space(r: Reader<'_>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
+    let p = r.p;
     let Some(disk) = dashboard.pointer("/Server/DiskSpace/0") else {
         return;
     };
@@ -810,33 +834,35 @@ fn as_bool_or_int(v: &Value) -> Option<i32> {
     }
 }
 
-/// C `getDashboard` (serval_http.cpp:431-454).
-async fn refresh_dashboard(ctx: &Arc<Ctx>) {
-    let reply = read_dashboard(ctx, TIMEOUT_5000_MS);
-    log_dashboard_failure(
-        ctx,
+/// C `getDashboard` (serval_http.cpp:430-453).
+pub(crate) fn get_dashboard(r: Reader<'_>) -> DetectorRead {
+    let mut steps = vec![DetectorStep::Trace(
+        TraceMask::FLOW,
+        adlog::log(adlog::GET_DASHBOARD, "Collecting detector information"),
+    )];
+    let reply = read_dashboard(r, TIMEOUT_5000_MS);
+    steps.extend(dashboard_failure(
+        r,
         adlog::GET_DASHBOARD,
         "getDashboard",
         "getDashboard",
         &reply,
-    );
+    ));
     let mut updates = Vec::new();
-    let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
-    connection_status(ctx, serval_ok, det_ok, &mut updates);
-    ctx.set(0, updates).await;
+    let (serval_ok, det_ok) = publish_dashboard(r, &reply, &mut updates);
+    connection_status(r, serval_ok, det_ok, &mut updates);
+    steps.push(DetectorStep::Post(0, updates));
+    DetectorRead {
+        ok: reply.parsed.is_ok(),
+        steps,
+    }
 }
 
 /// C `getDetector` (serval_http.cpp:1293) from the task; false when
 /// `/detector` failed.
 async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
-    let read = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad, false);
-    for step in read.steps {
-        match step {
-            DetectorStep::Trace(mask, line) => ctx.trace(mask, &line),
-            DetectorStep::Post(addr, updates) => ctx.set(addr, updates).await,
-        }
-    }
-    read.ok
+    ctx.apply(read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad, false))
+        .await
 }
 
 /// One step of C `getDetector`, in C order: a trace line, or the param
@@ -3372,7 +3398,7 @@ mod tests {
         assert!(coordinator.note_resource(crate::coordinator::Resource::MonitorThread));
         assert!(coordinator.commit_start());
         let mut updates = Vec::new();
-        connection_status(&ctx, true, true, &mut updates);
+        connection_status(ctx.reader(), true, true, &mut updates);
         assert_eq!(
             octet_set(&updates, ctx.ad.status_message).as_deref(),
             Some("Acquisition running")
@@ -3385,7 +3411,7 @@ mod tests {
         coordinator.begin_stop(true);
         coordinator.finish_stop(true, true);
         let mut updates = Vec::new();
-        connection_status(&ctx, true, true, &mut updates);
+        connection_status(ctx.reader(), true, true, &mut updates);
         assert_eq!(
             octet_set(&updates, ctx.ad.status_message).as_deref(),
             Some("Acquisition fault; retry acquisition")
@@ -4495,11 +4521,11 @@ mod tests {
         let get = |path: &str, t| (format!("GET {path}"), t);
         initial_server_check_connection(&ctx);
         assert_eq!(sent(), [get("", default), get("/dashboard", default)]);
-        check_connection(&ctx).await;
+        ctx.apply(check_connection(ctx.reader())).await;
         assert_eq!(sent(), [get("/dashboard", short)]);
         poll_connection(&ctx, false).await;
         assert_eq!(sent(), [get("/dashboard", short)]);
-        refresh_dashboard(&ctx).await;
+        ctx.apply(get_dashboard(ctx.reader())).await;
         assert_eq!(sent(), [get("/dashboard", short)]);
         let _ = read_detector(&ctx.http, &ctx.shared, ctx.p, ctx.ad, false);
         assert_eq!(sent()[0], get("/detector", short));
@@ -4540,7 +4566,7 @@ mod tests {
                 ],
             )
             .await;
-            assert!(!check_connection(&ctx).await, "{name}");
+            assert!(!ctx.apply(check_connection(ctx.reader())).await, "{name}");
             assert_eq!(h.read_int32(p.http_code, 0).await.unwrap(), 200, "{name}");
             assert_eq!(
                 h.read_int32(p.serval_connected, 0).await.unwrap(),
@@ -4929,7 +4955,7 @@ mod tests {
         let path = capture_errors(&ctx, "TPX_DASH_LOG");
         poll_connection(&ctx, false).await;
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
-        check_connection(&ctx).await;
+        ctx.apply(check_connection(ctx.reader())).await;
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let dashboard = format!("{url}/dashboard");
@@ -4946,7 +4972,7 @@ mod tests {
         let (url, _log) = logging_serval(&["/dashboard"], |_| "{}");
         let ctx = Arc::new(idle_ctx_at("TPX_DASH_LOG500", &url, None));
         let path = capture_errors(&ctx, "TPX_DASH_LOG500");
-        refresh_dashboard(&ctx).await;
+        ctx.apply(get_dashboard(ctx.reader())).await;
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let dashboard = format!("{url}/dashboard");
@@ -5614,7 +5640,7 @@ mod tests {
         });
         let ctx = Arc::new(idle_ctx_at("TPX_DASH_MEAS", &url, None));
         let (h, p) = (&ctx.handle, ctx.p);
-        assert!(check_connection(&ctx).await);
+        assert!(ctx.apply(check_connection(ctx.reader())).await);
         assert_eq!(h.read_int64(p.free_space, 0).await.unwrap(), 7_000_000_000);
         assert_eq!(h.read_int64(p.lower_limit, 0).await.unwrap(), 42);
         assert_eq!(
@@ -5633,44 +5659,40 @@ mod tests {
             ],
         )
         .await;
-        assert!(!check_connection(&ctx).await);
+        assert!(!ctx.apply(check_connection(ctx.reader())).await);
         assert_eq!(h.read_octet(p.status, 0, 64).await.unwrap(), b"\0");
         assert_eq!(h.read_int32(p.pipeline_state, 0).await.unwrap(), -1);
     }
 
-    /// RefreshConnection is C checkConnection(): it publishes the HTTP status
-    /// and runs no reconnect refresh, while the periodic poll leaves the
-    /// last operator HTTP status alone (serval_http.cpp:363-420,
-    /// ADTimePix.cpp:563-568).
+    /// RefreshConnection is C checkConnection() in writeInt32: it publishes
+    /// the HTTP status, runs no reconnect refresh and its status is the
+    /// write's (serval_http.cpp:363-392, ADTimePix.cpp:563-568).
     #[tokio::test(flavor = "multi_thread")]
-    async fn only_refresh_connection_publishes_the_http_status() {
-        let (url, log) = logging_serval(&[], |path| match path {
+    async fn refresh_connection_is_check_connection_in_the_write() {
+        let up: fn(&str) -> &'static str = |path| match path {
             "/dashboard" => r#"{"Server":{},"Detector":{"DetectorType":"TPX3"}}"#,
             _ => "{}",
-        });
-        let ctx = Arc::new(idle_ctx_at("TPX_REFRESH_CONN", &url, None));
-        let (h, p) = (&ctx.handle, ctx.p);
-        let (cmd_tx, cmd_rx) = rt::command_channel::<Command>(1);
-        let (acq_tx, _acq_rx) = rt::command_channel::<()>(1);
-        tokio::spawn(connection_poll(ctx.clone(), cmd_rx, acq_tx, false, false));
-
-        ctx.set_int(p.http_code, 0, 409).await;
-        cmd_tx.send(Command::RefreshConnection).await.unwrap();
-        for _ in 0..200 {
-            if h.read_int32(p.http_code, 0).await.unwrap() == 200 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let down: fn(&str) -> &'static str = |path| match path {
+            "/dashboard" => r#"{"Server":{},"Detector":null}"#,
+            _ => "{}",
+        };
+        for (body_for, ok) in [(up, true), (down, false)] {
+            let (url, log) = logging_serval(&[], body_for);
+            let name = format!("TPX_REFRESH_CONN_{ok}");
+            let ctx = Arc::new(idle_ctx_at(&name, &url, None));
+            let (h, p) = (&ctx.handle, ctx.p);
+            ctx.set_int(p.http_code, 0, 409).await;
+            assert_eq!(h.write_int32(p.refresh_connection, 0, 1).await.is_ok(), ok);
+            assert_eq!(h.read_int32(p.http_code, 0).await.unwrap(), 200);
+            assert_eq!(
+                log.lock()
+                    .iter()
+                    .filter(|r| !r.starts_with("GET /dashboard "))
+                    .count(),
+                0
+            );
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(h.read_int32(p.http_code, 0).await.unwrap(), 200);
-        assert_eq!(
-            log.lock()
-                .iter()
-                .filter(|r| !r.starts_with("GET /dashboard "))
-                .count(),
-            0
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5695,7 +5717,7 @@ mod tests {
         );
     }
 
-    /// A 1 Hz Health scan does not hold the connection poll off
+    /// A 1 Hz command does not hold the connection poll off
     /// (serval_http.cpp:400-402).
     #[tokio::test(flavor = "multi_thread")]
     async fn commands_do_not_delay_the_connection_poll() {
@@ -5715,7 +5737,7 @@ mod tests {
         };
         let start = std::time::Instant::now();
         while !polled() && start.elapsed() < CONNECTION_POLL + Duration::from_secs(2) {
-            cmd_tx.send(Command::RefreshStatus).await.unwrap();
+            cmd_tx.send(Command::PushProcessedImg).await.unwrap();
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         assert!(polled());

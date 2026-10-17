@@ -28,13 +28,6 @@ use crate::worker::WorkerState;
 pub enum Command {
     /// Wake the measurement monitor (C creates `timePixCallback`).
     AcquisitionStarted,
-    /// C `checkConnection` on demand (`TPX3_REFRESH_CONNECTION`).
-    RefreshConnection,
-    /// C's `TPX3_HEALTH` write: re-read the dashboard, the detector and the
-    /// measurement config.
-    RefreshStatus,
-    /// C `getDetector(false)` after a layout rotation: re-read `/detector`.
-    RefreshDetector,
     /// C `pushProcessedHstToPlugins` on a `TPX3_HST_WRITE_PROCESSED` write of 1.
     PushProcessedHst,
     /// C `pushProcessedImgToPlugins` on a `TPX3_IMG_WRITE_PROCESSED` write of 1.

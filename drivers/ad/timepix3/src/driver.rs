@@ -856,18 +856,7 @@ impl TimePix3Driver {
         // serval_http.cpp:2477-2479: the trigger and depth checks below need
         // the family.
         if self.shared.family() == DetectorFamily::Unknown {
-            let read = crate::tasks::read_detector(&self.http, &self.shared, p, ad, true);
-            let base = &mut self.ad.port_base;
-            for step in &read.steps {
-                match step {
-                    crate::tasks::DetectorStep::Trace(mask, line) => {
-                        adlog::print(base, *mask, line);
-                    }
-                    crate::tasks::DetectorStep::Post(addr, updates) => {
-                        crate::tasks::apply_updates(base, *addr, updates);
-                    }
-                }
-            }
+            let _ = self.get_detector(true);
         }
 
         let mut trigger_mode = self.int(ad.trigger_mode, 0);
@@ -1092,6 +1081,49 @@ impl TimePix3Driver {
         let refused = self.http_failed("PUT /measurement/config", &e, HttpPrint::None);
         self.set_text(self.p.write_msg, e.body())?;
         Err(refused)
+    }
+
+    fn reader(&self) -> crate::tasks::Reader<'_> {
+        crate::tasks::Reader {
+            http: &self.http,
+            shared: &self.shared,
+            p: self.p,
+            ad: self.ad.params,
+        }
+    }
+
+    /// A Serval read's steps on the port thread, in C order; `what` names the
+    /// C function whose asynError a failed read is.
+    fn apply_read(&mut self, read: crate::tasks::DetectorRead, what: &str) -> AsynResult<()> {
+        let base = &mut self.ad.port_base;
+        for step in &read.steps {
+            match step {
+                crate::tasks::DetectorStep::Trace(mask, line) => adlog::print(base, *mask, line),
+                crate::tasks::DetectorStep::Post(addr, updates) => {
+                    crate::tasks::apply_updates(base, *addr, updates);
+                }
+            }
+        }
+        if read.ok {
+            Ok(())
+        } else {
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("timepix3: {what} failed"),
+            })
+        }
+    }
+
+    /// C `getDetector` (serval_http.cpp:1293-1576) on the port thread.
+    fn get_detector(&mut self, publish_http_status: bool) -> AsynResult<()> {
+        let read = crate::tasks::read_detector(
+            &self.http,
+            &self.shared,
+            self.p,
+            self.ad.params,
+            publish_http_status,
+        );
+        self.apply_read(read, "getDetector")
     }
 
     /// C `getMeasurementConfig` (serval_http.cpp:2198-2232).
@@ -3213,12 +3245,8 @@ impl TimePix3Driver {
                 .port_base
                 .set_int32_param(p.refresh_connection, 0, 0)?;
             if one_shot(value) {
-                self.cmd_tx
-                    .try_send(Command::RefreshConnection)
-                    .map_err(|_| AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: "timepix3: the connection task is not running".into(),
-                    })
+                let read = crate::tasks::check_connection(self.reader());
+                self.apply_read(read, "checkConnection")
             } else {
                 set
             }
@@ -3257,12 +3285,7 @@ impl TimePix3Driver {
                 .set_int32_param(p.detector_orientation, 0, value)?;
             self.rotate_layout(value)?;
             // The rotation changes Layout.Rotated.Chips (ADTimePix.cpp:635-640).
-            self.cmd_tx
-                .try_send(Command::RefreshDetector)
-                .map_err(|_| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: "timepix3: the connection task is not running".into(),
-                })
+            self.get_detector(false)
         } else if reason == p.bias_volt
             || reason == p.bias_enable
             || reason == p.trigger_in
@@ -3495,12 +3518,12 @@ impl TimePix3Driver {
             }
             set
         } else if reason == p.health {
-            self.cmd_tx
-                .try_send(Command::RefreshStatus)
-                .map_err(|_| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: "timepix3: the connection task is not running".into(),
-                })
+            // ADTimePix.cpp:553-561: only getDetector's status stands.
+            let read = crate::tasks::get_dashboard(self.reader());
+            let _ = self.apply_read(read, "getDashboard");
+            let status = self.get_detector(false);
+            let _ = self.get_measurement_config();
+            status
         } else if reason < p.http_code {
             // ADTIMEPIX_FIRST_PARAM is ADTimePixHttpCode (ADTimePix.h:467,
             // ADTimePix.cpp:860-863).
@@ -6340,7 +6363,8 @@ mod tests {
     }
 
     /// The Health scan re-reads Measurement.Config into the Stem and
-    /// TimeOfFlight PVs (ADTimePix.cpp:560, serval_http.cpp:2198-2232).
+    /// TimeOfFlight PVs in the write, even after a failed `/detector` read
+    /// (ADTimePix.cpp:560, serval_http.cpp:2198-2232).
     #[test]
     fn the_health_scan_reads_back_the_measurement_config() {
         let runtime = crate::create_timepix3_detector(
@@ -6356,17 +6380,10 @@ mod tests {
         let health = handle
             .with_driver_blocking::<TimePix3Driver, _>(|d| d.p.health)
             .unwrap();
-        handle.write_int32_blocking(health, 0, 1).unwrap();
-        let mut seen = None;
-        for _ in 0..500 {
-            seen = handle
-                .with_driver_blocking::<TimePix3Driver, _>(|d| measurement_config_of(d))
-                .ok();
-            if seen.as_ref().is_some_and(is_readback) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        assert!(handle.write_int32_blocking(health, 0, 1).is_err());
+        let seen = handle
+            .with_driver_blocking::<TimePix3Driver, _>(|d| measurement_config_of(d))
+            .ok();
         assert!(seen.as_ref().is_some_and(is_readback), "{seen:?}");
     }
 
@@ -6452,23 +6469,62 @@ mod tests {
         }
     }
 
-    /// A successful rotation re-reads `/detector` (ADTimePix.cpp:630-641).
+    const DETECTOR_READBACK: &str = r#"{"Info":{"MpxType":0,"PixCount":65536,"RowLen":1,"NumberOfChips":1,"NumberOfRows":256},"Config":{}}"#;
+
+    /// A successful rotation re-reads `/detector` in the write, and the
+    /// write's status is getDetector's (ADTimePix.cpp:630-641).
     #[test]
     fn a_rotation_rereads_the_detector() {
-        let url = fake_serval("\0");
-        let (cmd_tx, mut cmd_rx) = rt::command_channel::<Command>(1);
-        let mut det = TimePix3Driver::new(
-            "TPX_ROTATE",
-            Arc::new(ServalHttp::new(&url)),
-            Arc::new(Shared::new()),
-            0,
-            cmd_tx,
-        )
-        .unwrap();
-        let p = det.p;
-        det.write_int32(&mut AsynUser::new(p.detector_orientation), 3)
+        for (fail, ok) in [("\0", true), ("GET /detector ", false)] {
+            let url = fake_serval_with(fail, &[("GET /detector ", DETECTOR_READBACK)]);
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+            let http = Arc::new(ServalHttp::new(&url));
+            let mut det = TimePix3Driver::new(
+                "TPX_ROTATE",
+                http.clone(),
+                Arc::new(Shared::new()),
+                0,
+                cmd_tx,
+            )
             .unwrap();
-        assert!(matches!(cmd_rx.try_recv(), Ok(Command::RefreshDetector)));
+            let p = det.p;
+            let result = det.write_int32(&mut AsynUser::new(p.detector_orientation), 3);
+            assert_eq!(result.is_ok(), ok, "{fail}");
+            let sent: Vec<_> = http.sent.lock().iter().map(|(r, _)| r.clone()).collect();
+            assert_eq!(
+                sent.last().map(String::as_str),
+                Some("GET /detector"),
+                "{fail}"
+            );
+        }
+    }
+
+    /// The Health scan's status is getDetector's: a failed dashboard read
+    /// does not fail it, a failed detector read does (ADTimePix.cpp:553-561).
+    #[test]
+    fn the_health_scan_returns_the_detector_status() {
+        for (fail, ok) in [("GET /dashboard ", true), ("GET /detector ", false)] {
+            let url = fake_serval_with(fail, &[("GET /detector ", DETECTOR_READBACK)]);
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+            let http = Arc::new(ServalHttp::new(&url));
+            let mut det = TimePix3Driver::new(
+                "TPX_HEALTH",
+                http.clone(),
+                Arc::new(Shared::new()),
+                0,
+                cmd_tx,
+            )
+            .unwrap();
+            let p = det.p;
+            let result = det.write_int32(&mut AsynUser::new(p.health), 1);
+            assert_eq!(result.is_ok(), ok, "{fail}");
+            let sent: Vec<_> = http.sent.lock().iter().map(|(r, _)| r.clone()).collect();
+            assert_eq!(
+                sent,
+                ["GET /dashboard", "GET /detector", "GET /measurement/config"],
+                "{fail}"
+            );
+        }
     }
 
     /// A DAC other than the two thresholds is stored without a Serval
