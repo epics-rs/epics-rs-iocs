@@ -20,9 +20,9 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port};
+use motor_common::{Controller, asyn_user, register_port_with};
 
-use crate::phytron::{CtrlType, PhytronAxis, PhytronController};
+use crate::phytron::{CtrlType, PhytronAxis, PhytronAxisReport, PhytronController, PhytronParams};
 
 /// Default communication timeout when the `timeoutMs` arg is omitted.
 const DEFAULT_TIMEOUT_MS: f64 = 1000.0;
@@ -160,7 +160,11 @@ fn register_controller(
             "{cmd_name}: controller '{name}' already registered"
         ));
     }
-    register_port(ctx, &name, PHYTRON_PORT_AXES)?;
+    let params = PhytronParams {
+        moving_poll: moving_poll_ms as f64 / 1000.0,
+        idle_poll: idle_poll_ms as f64 / 1000.0,
+    };
+    register_port_with(ctx, &name, PHYTRON_PORT_AXES, params)?;
     // C leaves a controller that misses its port out of the list
     // phytronCreateAxis searches, and skips the reset; its port stays.
     let (handle, connected) = connect_controller(
@@ -230,8 +234,13 @@ fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
 
             let axis = PhytronAxis::new(controller, module as i32, index as i32)
                 .map_err(|e| format!("phytronCreateAxis: {e}"))?;
+            let axis_no = (module * 10 + index) as i32;
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            poller.install(asyn_user(&name, (module * 10 + index) as i32), motor)?;
+            poller.install_with_report(
+                asyn_user(&name, axis_no),
+                motor,
+                Arc::new(PhytronAxisReport(axis_no)),
+            )?;
             Ok(CommandOutcome::Continue)
         },
     )

@@ -79,6 +79,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::{atof, atoi, nint};
+use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
 /// Reply read buffer size (C expects up to ~2010 bytes: 2000 data + framing).
 const READ_BUF: usize = 2048;
@@ -202,6 +203,41 @@ fn parse_reply(raw: &[u8]) -> AsynResult<String> {
 
 /// A Phytron controller endpoint owning the asyn octet handle. Shared by all of
 /// its axes behind a mutex so command/reply pairs stay atomic.
+/// The controller's poll periods, in seconds, for its report.
+pub struct PhytronParams {
+    pub moving_poll: f64,
+    pub idle_poll: f64,
+}
+
+impl ControllerParams for PhytronParams {
+    /// C `phytronController::report` (phytronAxisMotor.cpp:836-843), which
+    /// says phyMOTION for an MCC too.
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "Phytron phyMOTION motor driver {}, numAxes={}, moving poll period={:.6}, \
+             idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            self.moving_poll,
+            self.idle_poll,
+        );
+        ctx.report(out, level);
+    }
+}
+
+/// C `phytronAxis::report` (phytronAxisMotor.cpp:1377-1384): the axis
+/// number, `module*10 + index`.
+pub struct PhytronAxisReport(pub i32);
+
+impl AxisReport for PhytronAxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let _ = writeln!(out, "  axis {}", self.0);
+        }
+    }
+}
+
 pub struct PhytronController {
     handle: SyncIOHandle,
     ctrl_type: CtrlType,
