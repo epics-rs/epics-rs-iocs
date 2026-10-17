@@ -51,6 +51,9 @@ const READ_BUF: usize = 256;
 // C `CONEX_TIMEOUT` (2 s) is applied where the transport is opened —
 // `SyncIOHandle::from_handle` in `crate::ioc` — not per write here.
 
+/// C `LINUX_WRITE_DELAY` (AG_CONEX.cpp and AGAP_CONEX.cpp).
+pub(crate) const LINUX_WRITE_DELAY: Duration = Duration::from_millis(100);
+
 /// C `HOME_TYPE_MINUS_EOR` — minus end-of-run home type forced for CONEX-PP.
 const HOME_TYPE_MINUS_EOR: i32 = 4;
 
@@ -283,9 +286,14 @@ fn parse_error(what: &str) -> AsynError {
 
 // --- Raw serial I/O (usable before `ConexAxis` exists, e.g. in `new`).
 
+/// C `writeCONEX`: every write, failed or not, is followed by the Linux
+/// `LINUX_WRITE_DELAY` before the next command.
 fn write_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
-    handle.write_octet(0, cmd.as_bytes())?;
-    Ok(())
+    let status = handle.write_octet(0, cmd.as_bytes()).map(drop);
+    if cfg!(target_os = "linux") {
+        thread::sleep(LINUX_WRITE_DELAY);
+    }
+    status
 }
 
 fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
@@ -640,6 +648,26 @@ mod tests {
             ]
         );
         assert_eq!(axis.poll(&user).unwrap().position, 25000.0);
+    }
+
+    /// AG_CONEX.cpp `writeCONEX`: the poll after a move waits out
+    /// `LINUX_WRITE_DELAY` per write (AC, VA, PA on a CONEX-CC).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn each_write_holds_the_line_for_the_write_delay() {
+        let (_line, io) = LineRig::new("conex_delay", |last| {
+            match last {
+                "1VE" => "1VE CONEX-CC 2.0",
+                "1SU?" => "1SU0.0001",
+                _ => "",
+            }
+            .to_string()
+        });
+        let mut axis = ConexAxis::new(io, 1, &MotorTrace::new("conex_delay", 0)).unwrap();
+        let start = std::time::Instant::now();
+        axis.move_absolute(&AsynUser::default(), 100.0, 0.0, 5000.0, 10000.0)
+            .unwrap();
+        assert!(start.elapsed() >= 3 * LINUX_WRITE_DELAY);
     }
 
     #[test]

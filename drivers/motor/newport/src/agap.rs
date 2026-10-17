@@ -34,6 +34,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
+use crate::conex::LINUX_WRITE_DELAY;
 use crate::util::{leading_hex, parse_value_at};
 
 /// Response buffer size for a single controller reply.
@@ -122,9 +123,14 @@ impl AgapController {
         Some(ctrl)
     }
 
+    /// C `writeCONEX`: every write, failed or not, is followed by the Linux
+    /// `LINUX_WRITE_DELAY` before the next command.
     fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
-        Ok(())
+        let status = self.handle.write_octet(0, cmd.as_bytes()).map(drop);
+        if cfg!(target_os = "linux") {
+            std::thread::sleep(LINUX_WRITE_DELAY);
+        }
+        status
     }
 
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
@@ -408,6 +414,28 @@ mod tests {
             ["1PAV1.500000", "1PRV-0.010000", "1JAV5000.000000"]
         );
         assert_eq!(axis.poll(&user).unwrap().position, 2500.0);
+    }
+
+    /// AGAP_CONEX.cpp `writeCONEX`: the next command waits out
+    /// `LINUX_WRITE_DELAY` after a write.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_holds_the_line_for_the_write_delay() {
+        use motor_common::testing::LineRig;
+        let (_line, io) = LineRig::new("agap_delay", |last| {
+            match last {
+                "1VE" => "1VE CONEX-AGAP 1.0",
+                _ => "",
+            }
+            .to_string()
+        });
+        let ctrl = Arc::new(Mutex::new(
+            AgapController::new(io, 1, MotorTrace::new("agap_delay", 0)).unwrap(),
+        ));
+        let mut axis = AgapAxis::new(ctrl, 0);
+        let start = std::time::Instant::now();
+        axis.stop(&AsynUser::default(), 0.0).unwrap();
+        assert!(start.elapsed() >= LINUX_WRITE_DELAY);
     }
 
     #[test]
