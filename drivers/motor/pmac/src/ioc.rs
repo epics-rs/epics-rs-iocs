@@ -199,7 +199,8 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
                 low_level_addr,
                 low_level_port_connect(&name, &low_level_port, low_level_addr),
             )));
-            let params = PmacControllerParams::new(controller.clone());
+            let params =
+                PmacControllerParams::new(controller.clone(), moving_poll_ms, idle_poll_ms);
             let owner = ctx.db().scan_control().interrupt_gate();
             let handle = register_controller_port(owner, &name, num_axes + 1, params)?;
             controller
@@ -1032,6 +1033,32 @@ mod tests {
         assert_eq!(rig.disconnects(), 1);
     }
 
+    /// pmacController.cpp:355-375: the head, then axis 0 and every created
+    /// axis, before the base report.
+    #[test]
+    fn port_report_prints_the_controller_then_each_axis() {
+        let (_rt, _rig) = publish_scripted("pmacRepLow");
+        let controller = Arc::new(Mutex::new(controller_on("pmacRepLow")));
+        let params = PmacControllerParams::new(controller.clone(), 200, 3000);
+        let port = epics_rs::motor::devices::register_controller_port(
+            &open_owner(),
+            "pmacRepCtl",
+            4,
+            params,
+        )
+        .unwrap();
+        controller.lock().unwrap().attach_port(port);
+        controller.lock().unwrap().add_axis(2).unwrap();
+        let head = "pmac motor driver pmacRepCtl, numAxes=4, moving poll period=0.200000, \
+                    idle poll period=3.000000\n";
+        let text = motor_common::testing::port_report("pmacRepCtl", 0);
+        assert!(text.contains(head), "{text}");
+        assert!(!text.contains("scale"), "{text}");
+        let text = motor_common::testing::port_report("pmacRepCtl", 1);
+        let axes = "  axis 0\n    scale = 1\n  axis 2\n    scale = 1\n";
+        assert!(text.contains(&format!("{head}{axes}")), "{text}");
+    }
+
     /// pmacController.cpp:594-708: an unread global status is 0, the feed
     /// rate is still read after a failed `???`, and the feed-rate read's
     /// verdict is the comms error.
@@ -1041,7 +1068,7 @@ mod tests {
         rig.answer("???", b"008000\r");
         rig.answer("%", b"100\r");
         let controller = Arc::new(Mutex::new(controller_on("pmacGlobalLow")));
-        let params = PmacControllerParams::new(controller.clone());
+        let params = PmacControllerParams::new(controller.clone(), 100, 1000);
         let port = epics_rs::motor::devices::register_controller_port(
             &open_owner(),
             "pmacGlobalCtl",
@@ -1162,7 +1189,7 @@ mod tests {
     fn controller_port(name: &str, low: &str) -> (Arc<Mutex<PmacController>>, SyncIOHandle) {
         let connected = low_level_port_connect(name, low, 0);
         let controller = Arc::new(Mutex::new(PmacController::new(name, low, 0, connected)));
-        let params = PmacControllerParams::new(controller.clone());
+        let params = PmacControllerParams::new(controller.clone(), 100, 1000);
         let port =
             epics_rs::motor::devices::register_controller_port(&open_owner(), name, 2, params)
                 .unwrap();
