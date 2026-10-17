@@ -494,6 +494,8 @@ fn coord_report(level: i32) -> String {
                     "axis {name}:\ndrvPmac->axisMutex = {:p}\n",
                     Arc::as_ptr(motor).cast::<()>()
                 );
+                // C's level > 1 `motorParam->dump` (pmacAsynCoord.c:169-171)
+                // is skipped: a model-3 axis has no motorParam table.
             }
         }
     }
