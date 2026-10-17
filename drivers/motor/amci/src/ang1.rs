@@ -117,9 +117,9 @@ impl Ang1Controller {
             TraceMask::IO_DRIVER,
             format_args!("writeReg16: writing {value} to register {reg}\n"),
         );
-        self.out_regs.write16(reg, value)?;
+        let status = self.out_regs.write16(reg, value);
         sleep(Duration::from_millis(10));
-        Ok(())
+        status
     }
 
     /// C `writeReg32`: decimal base-1000 split (written as two `writeReg16`
@@ -533,6 +533,16 @@ mod tests {
             1,
             "{text}"
         );
+    }
+
+    /// C `writeReg16` sleeps after the write whatever it returned
+    /// (ANG1Driver.cpp:204-205).
+    #[test]
+    fn a_failed_register_write_still_waits_10_ms() {
+        let (ctrl, _) = Ang1Controller::new("ang1FailWait", "ang1FailWaitIn", "ang1FailWaitOut");
+        let started = std::time::Instant::now();
+        assert!(ctrl.write16(CMD_MSW, 0).is_err());
+        assert!(started.elapsed() >= Duration::from_millis(10));
     }
 
     #[test]
