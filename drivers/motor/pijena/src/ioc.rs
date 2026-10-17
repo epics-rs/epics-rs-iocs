@@ -68,10 +68,8 @@ pub fn pijeds_config_command() -> CommandDef {
                 let Ok(controller) = PiJedsController::new(handle) else {
                     return;
                 };
+                // A card with no stage stays (drvPIJEDS.cc:650-675).
                 let num_axes = controller.num_axes();
-                if num_axes == 0 {
-                    return;
-                }
                 let line = format!("port={asyn_port}, id: {}", controller.ident());
                 let controller = Arc::new(Mutex::new(controller));
                 for axis in 0..num_axes {
@@ -118,5 +116,54 @@ mod report {
             "    PIJEDS controller 0 connection failed.\n    PIJEDS controller #1, \
              port=jedsRepLine, id: DSM V1.959 \n"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
+
+    /// drvPIJEDS.cc:643-678: once `DSM` answered, only a `not present`
+    /// reply ends the axis count, and a card with no axes stays.
+    #[epics_rs::base::epics_test]
+    async fn a_card_answering_dsm_survives_its_axis_count() {
+        let int = ArgValue::Int;
+        run_command(pijeds_setup_command(), vec![int(2), int(10)]).await;
+        let rig = |name: &str, axis0: &'static str| {
+            LineRig::new(name, move |cmd| match cmd.trim_end() {
+                "" => "DSM V1.959".into(),
+                "mess,0" => axis0.into(),
+                _ => String::new(),
+            })
+        };
+        let (_a, _) = rig("edsSilentMess", "");
+        let (_b, _) = rig("edsNoStage", "mess,0,not present");
+        for (card, port) in [(0, "edsSilentMess"), (1, "edsNoStage")] {
+            let config = vec![int(card), ArgValue::String(port.into()), int(0)];
+            run_command(pijeds_config_command(), config).await;
+        }
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvPIJEDS", 0),
+            "    PIJEDS controller #0, port=edsSilentMess, id: DSM V1.959 \n    \
+             PIJEDS controller #1, port=edsNoStage, id: DSM V1.959 \n"
+        );
+    }
+
+    /// drvPIJEDS.cc:461-487: a failed `mess,n` reads as an empty reply,
+    /// which is no `not present`, so the axis counts.
+    #[epics_rs::base::epics_test]
+    async fn a_refused_axis_query_still_counts_the_axis() {
+        let (_line, io) = LineRig::failing(
+            "edsRefusedMess",
+            |cmd| match cmd.trim_end() {
+                "" => "DSM V1.959".into(),
+                _ => "mess,0,not present".into(),
+            },
+            |cmd| cmd.starts_with("mess,0"),
+        );
+        let controller = PiJedsController::new(io).unwrap();
+        assert_eq!(controller.num_axes(), 1);
     }
 }

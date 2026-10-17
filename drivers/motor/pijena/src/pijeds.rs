@@ -126,16 +126,15 @@ impl PiJedsController {
         if let Some(pos) = ctrl.ident.find('V') {
             ctrl.version = motor_common::util::nint(atof(&ctrl.ident[pos + 1..]) * 1000.0);
         }
-        // Count axes: probe until a stage answers "not present".
-        let mut total = 0;
-        for axis in 0..MAX_MOTORS {
-            match ctrl.query(&format!("mess,{axis}")) {
-                Ok(reply) if reply.contains("not present") => break,
-                Ok(_) => total += 1,
-                Err(_) => break,
-            }
-        }
-        ctrl.num_axes = total;
+        // Count axes: probe until a stage answers "not present". A failed
+        // query is C's empty `buff` (drvPIJEDS.cc:479-483) and counts.
+        ctrl.num_axes = (0..MAX_MOTORS)
+            .take_while(|axis| {
+                !ctrl
+                    .query(&format!("mess,{axis}"))
+                    .is_ok_and(|reply| reply.contains("not present"))
+            })
+            .count();
         Ok(ctrl)
     }
 
