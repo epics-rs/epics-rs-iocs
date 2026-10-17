@@ -1582,22 +1582,32 @@ impl TimePix3Driver {
         };
         let url = serval::config_load(format, &file.to_string_lossy());
         let reply = self.http.get(&url, TIMEOUT_CONFIG);
-        // serval_http.cpp:1690-1691, mask_io.cpp:559-560.
-        self.write_msg_from(&reply);
-        reply.map_err(|e| {
+        let (code, text) = match &reply {
+            Ok(text) => (200, text.as_str()),
+            Err(e) => (e.code(), e.body()),
+        };
+        if let Err(e) = &reply {
             let context = if format == "dacs" {
                 "uploadDACS GET /config/load dacs"
             } else {
                 "uploadBPC GET /config/load pixelconfig"
             };
-            self.http_failed(
-                &format!("GET /config/load ({format})"),
-                &e,
-                HttpPrint::Failure(context, "GET", &url),
-            )
-        })?;
-        self.http_ok();
-        Ok(())
+            self.log_http(e, HttpPrint::Failure(context, "GET", &url));
+        }
+        if format == "dacs" {
+            // serval_http.cpp:1688-1689.
+            println!("\nuploadDACS: http_code = {code}");
+            println!("Text dacs_file: {text}");
+        }
+        // serval_http.cpp:1690-1691, mask_io.cpp:559-560.
+        self.ad
+            .port_base
+            .set_int32_param(self.p.http_code, 0, code)?;
+        self.write_msg_from(&reply);
+        reply.map(drop).map_err(|e| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("timepix3: GET /config/load ({format}): {e}"),
+        })
     }
 
     // -- Mask ----------------------------------------------------------------
