@@ -19,6 +19,7 @@ pub mod nf874x;
 pub mod pm500;
 pub mod pmnc;
 pub mod protocol;
+mod report;
 pub mod smc100;
 mod util;
 pub mod xps;

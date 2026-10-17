@@ -14,6 +14,7 @@
 //! The XPS profile, position-compare and TCL commands are driver-private: C
 //! drives them from controller-level records this port does not serve.
 
+use std::fmt::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,7 +44,10 @@ use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 use motor_common::model2::Model2;
 use motor_common::util::atof;
-use motor_common::{Controller, asyn_user, install, register_controller_port, register_port};
+use motor_common::{
+    Controller, ControllerReport, asyn_user, install, register_controller_port, register_port,
+    register_port_with,
+};
 
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
@@ -54,6 +58,7 @@ use crate::mm3000::{Mm3000Axis, Mm3000Controller};
 use crate::mm4000::{self, Mm4000Axis, Mm4000Controller, Mm4000Refusal};
 use crate::pm500::{Pm500Axis, Pm500Controller};
 use crate::pmnc::{PmncAxis, PmncController};
+use crate::report::{AxisLines, ControllerHead, period_s};
 use crate::smc100::Smc100Axis;
 use crate::xps::{
     ExecutionPlan, GatheringReadback, MoveMode, PcoParams, Profile, SocketMode, XpsAxis,
@@ -192,7 +197,18 @@ pub fn smc100_create_controller_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
 
-            register_port(ctx, &port_name, num_axes)?;
+            let (moving_s, idle_s) = (period_s(moving_poll_ms), period_s(idle_poll_ms));
+            // SMC100Controller::report (SMC100Driver.cpp:103-110).
+            let head = ControllerHead(move |ctx: &ControllerReport<'_>, out: &mut dyn Write| {
+                let _ = writeln!(
+                    out,
+                    "SMC100 motor driver {}, numAxes={}, moving poll period={moving_s:.6}, \
+                     idle poll period={idle_s:.6}",
+                    ctx.port_name(),
+                    ctx.num_axes()
+                );
+            });
+            register_port_with(ctx, &port_name, num_axes, head)?;
             let (handle, _) = connect_controller(
                 &serial_port,
                 SMC100_TIMEOUT,
@@ -219,7 +235,13 @@ pub fn smc100_create_controller_command() -> CommandDef {
                     (axis + 1) as u8,
                     step_size,
                 )));
-                poller.install(asyn_user(&port_name, axis), motor)?;
+                // SMC100Axis::report (SMC100Driver.cpp:150-159).
+                let report = Arc::new(AxisLines(move |out: &mut dyn Write, level| {
+                    if level > 0 {
+                        let _ = writeln!(out, "  axis {}", axis + 1);
+                    }
+                }));
+                poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
             }
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // SMC100Driver.cpp:67
             Ok(CommandOutcome::Continue)
@@ -2123,5 +2145,35 @@ mod one_poller {
             ];
             assert_eq!(pollers_after(xps_create_axis_command(), args).await, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{port_report, run_command};
+
+    /// SMC100Controller::report then SMC100Axis::report
+    /// (SMC100Driver.cpp:103-110, :150-159).
+    #[epics_rs::base::epics_test]
+    async fn smc100_report_prints_the_controller_then_each_axis_above_level_0() {
+        let args = vec![
+            ArgValue::String("smcRep".into()),
+            ArgValue::String("smcRepNoLine".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+            ArgValue::String("0.001".into()),
+        ];
+        run_command(smc100_create_controller_command(), args).await;
+        let head = "SMC100 motor driver smcRep, numAxes=2, moving poll period=0.100000, \
+                    idle poll period=1.000000\n";
+        let text = port_report("smcRep", 0);
+        assert!(text.contains(&format!("{head}Port: smcRep\n")), "{text}");
+        let text = port_report("smcRep", 1);
+        assert!(
+            text.contains(&format!("{head}  axis 1\n  axis 2\nPort: smcRep\n")),
+            "{text}"
+        );
     }
 }
