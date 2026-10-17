@@ -15,7 +15,7 @@ use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, opt_int, poll_intervals, req_int, req_string,
 };
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{Controller, asyn_user, register_port};
 
 use crate::mmc200::{Mmc200Axis, Mmc200Controller};
 
@@ -60,18 +60,14 @@ pub fn mmc200_create_controller_command() -> CommandDef {
             );
             let controller = Arc::new(Mutex::new(Mmc200Controller::new(handle)));
 
+            let poller = Controller::new();
             for index in 0..num_axes as usize {
                 let ax = Mmc200Axis::new(controller.clone(), index, ignore_limits);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                install(
-                    ctx,
-                    asyn_user(&motor_port, index as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, MMC200Driver.cpp:62
-                )?;
+                poller.install(asyn_user(&motor_port, index as i32), motor)?;
             }
+            // C startPoller, MMC200Driver.cpp:62
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )

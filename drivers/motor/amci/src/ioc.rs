@@ -16,19 +16,26 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::iocsh::{
-    DEFAULT_IDLE_POLL_MS, DEFAULT_MOVING_POLL_MS, arg_int_opt, arg_int_req, arg_str_req,
-    poll_intervals, req_int, req_string,
+    arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{Controller, asyn_user, register_port};
 
 use crate::anf2::{Anf2Axis, Anf2Controller, MAX_AXES};
 use crate::ang1::{Ang1Axis, Ang1Controller};
 
+/// An `ANF2CreateController` controller and its poller, which
+/// `ANF2StartPoller` starts.
+#[derive(Clone)]
+struct Anf2Port {
+    controller: Arc<Mutex<Anf2Controller>>,
+    poller: Arc<Controller>,
+}
+
 /// ANF2 controllers registered by `ANF2CreateController`, keyed by port name
 /// (C `findAsynPortDriver(ANF2Name)` — the C driver looks the controller back
 /// up by its own asyn port name, not a numeric card).
-fn anf2_registry() -> &'static Mutex<HashMap<String, Arc<Mutex<Anf2Controller>>>> {
-    static REG: OnceLock<Mutex<HashMap<String, Arc<Mutex<Anf2Controller>>>>> = OnceLock::new();
+fn anf2_registry() -> &'static Mutex<HashMap<String, Anf2Port>> {
+    static REG: OnceLock<Mutex<HashMap<String, Anf2Port>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -68,7 +75,13 @@ pub fn anf2_create_controller_command() -> CommandDef {
             anf2_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(port_name.clone(), Arc::new(Mutex::new(controller)));
+                .insert(
+                    port_name.clone(),
+                    Anf2Port {
+                        controller: Arc::new(Mutex::new(controller)),
+                        poller: Arc::new(Controller::new()),
+                    },
+                );
             Ok(CommandOutcome::Continue)
         },
     )
@@ -93,8 +106,7 @@ fn strtoul_hex(text: &str) -> Option<u64> {
 }
 
 /// Build `ANF2CreateAxis(ANF2Name, axis, hexConfig, baseSpeed, homingTimeout)`,
-/// printing what C's does. C starts no poller until `ANF2StartPoller`; here the
-/// axis polls at the default periods from `iocInit`.
+/// printing what C's does. The axis is polled once `ANF2StartPoller` runs.
 pub fn anf2_create_axis_command() -> CommandDef {
     CommandDef::new(
         "ANF2CreateAxis",
@@ -106,11 +118,11 @@ pub fn anf2_create_axis_command() -> CommandDef {
             arg_int_req("Homing timeout"),
         ],
         "ANF2CreateAxis(ANF2Name, axis, hexConfig, baseSpeed, homingTimeout)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Port name")?;
             let axis = req_int(args, 1, "Axis number")?;
             let hex_config = req_string(args, 2, "Hex config")?;
-            let Some(controller) = anf2_registry()
+            let Some(Anf2Port { controller, poller }) = anf2_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&port_name)
@@ -130,22 +142,14 @@ pub fn anf2_create_axis_command() -> CommandDef {
 
             let ax = Anf2Axis::new(controller, axis as i32, config, base_speed, homing_timeout);
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            install(
-                ctx,
-                asyn_user(&port_name, axis as i32),
-                motor,
-                DEFAULT_MOVING_POLL_MS,
-                DEFAULT_IDLE_POLL_MS,
-                2, // C startPoller, ANF2Driver.cpp:129
-            )?;
+            poller.install(asyn_user(&port_name, axis as i32), motor)?;
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build `ANF2StartPoller(ANF2Name, movingPollPeriod, idlePollPeriod)`. The
-/// axes already poll from `iocInit` at the default periods, so only the port
-/// lookup and its error line are C's.
+/// Build `ANF2StartPoller(ANF2Name, movingPollPeriod, idlePollPeriod)`, which
+/// starts the controller's poller at these periods.
 pub fn anf2_start_poller_command() -> CommandDef {
     CommandDef::new(
         "ANF2StartPoller",
@@ -155,15 +159,21 @@ pub fn anf2_start_poller_command() -> CommandDef {
             arg_int_req("Idle poll period (ms)"),
         ],
         "ANF2StartPoller(ANF2Name, movingPollPeriod, idlePollPeriod)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Port name")?;
-            if !anf2_registry()
+            let Some(Anf2Port { poller, .. }) = anf2_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .contains_key(&port_name)
-            {
+                .get(&port_name)
+                .cloned()
+            else {
                 println!("ANF2MotorDriver:ANF2StartPoller: Error port {port_name} not found");
-            }
+                return Ok(CommandOutcome::Continue);
+            };
+            let moving_poll_ms = req_int(args, 1, "Moving poll period (ms)")?.max(0) as u64;
+            let idle_poll_ms = req_int(args, 2, "Idle poll period (ms)")?.max(0) as u64;
+            // C startPoller, ANF2Driver.cpp:129
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -214,20 +224,16 @@ pub fn ang1_create_controller_command() -> CommandDef {
             }
             let controller = Arc::new(Mutex::new(controller));
 
+            let poller = Controller::new();
             for axis in 0..num_axes {
                 // Infallible, matching C: axis construction ignores the
                 // initial setPosition status and never aborts this command.
                 let ax = Ang1Axis::new(controller.clone(), axis as i32);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, ANG1Driver.cpp:98
-                )?;
+                poller.install(asyn_user(&port_name, axis as i32), motor)?;
             }
+            // C startPoller, ANG1Driver.cpp:98
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
 
             Ok(CommandOutcome::Continue)
         },

@@ -15,7 +15,7 @@ use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{Controller, asyn_user, register_port};
 
 use crate::c300::{C300Axis, C300Controller};
 
@@ -56,18 +56,14 @@ pub fn c300_create_controller_command() -> CommandDef {
             let controller = C300Controller::new(handle, num_axes as usize);
             let controller = Arc::new(Mutex::new(controller));
 
+            let poller = Controller::new();
             for index in 0..num_axes as usize {
                 let ax = C300Axis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                install(
-                    ctx,
-                    asyn_user(&port_name, index as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, C300MotorDriver.cpp:82
-                )?;
+                poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
+            // C startPoller, C300MotorDriver.cpp:82
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )

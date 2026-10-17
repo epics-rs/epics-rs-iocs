@@ -20,7 +20,7 @@ use epics_rs::motor::trace::MotorTrace;
 use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{arg_double_req, arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{Controller, asyn_user, register_port};
 
 use crate::mcs::{self, McsAxis, McsController};
 use crate::mcs2::{self, Mcs2Axis, Mcs2Controller};
@@ -81,21 +81,17 @@ pub fn mcs2_create_controller_command() -> CommandDef {
                 handle,
                 &MotorTrace::new(&port_name, 0),
             )));
+            let poller = Controller::new();
             for axis in 0..num_axes {
                 if unused_mask & (1 << axis) != 0 {
                     continue;
                 }
                 let motor: Arc<Mutex<dyn AsynMotor>> =
                     Arc::new(Mutex::new(Mcs2Axis::new(controller.clone(), axis as usize)));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, smarActMCS2MotorDriver.cpp:95
-                )?;
+                poller.install(asyn_user(&port_name, axis), motor)?;
             }
+            // C startPoller, smarActMCS2MotorDriver.cpp:95
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -106,8 +102,7 @@ pub fn mcs2_create_controller_command() -> CommandDef {
 struct Registered<C> {
     port_name: String,
     controller: Arc<Mutex<C>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
+    poller: Controller,
     axes: BTreeSet<i32>,
 }
 
@@ -137,7 +132,8 @@ fn create_axis_args() -> Vec<ArgDesc> {
 }
 
 /// Register `port_name`, then connect its controller on it, as C's
-/// asynMotorController base constructor runs before the driver's own.
+/// asynMotorController base constructor runs before the driver's own, and
+/// start its poller, which the `CreateAxis` axes join.
 fn register<C>(
     ctx: &CommandContext,
     registry: &Registry<C>,
@@ -147,14 +143,16 @@ fn register<C>(
     let port_name = req_string(args, 0, "Port name [string]")?;
     register_port(ctx, &port_name, c_int(args, 2))?;
     let controller = connect(&port_name);
+    let poller = Controller::new();
+    // C startPoller, smarActSCUMotorDriver.cpp:114, smarActMCSMotorDriver.cpp:215
+    poller.start(ctx, period_ms(args, 3), period_ms(args, 4), 0);
     registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(Registered {
             port_name,
             controller: Arc::new(Mutex::new(controller)),
-            moving_poll_ms: period_ms(args, 3),
-            idle_poll_ms: period_ms(args, 4),
+            poller,
             axes: BTreeSet::new(),
         });
     Ok(())
@@ -167,7 +165,6 @@ fn create_axis<C>(
     command: &str,
     duplicate: &str,
     args: &[ArgValue],
-    ctx: &CommandContext,
     build: impl FnOnce(Arc<Mutex<C>>, i32, i32) -> Arc<Mutex<dyn AsynMotor>>,
 ) -> Result<(), String> {
     let controller_port = req_string(args, 0, "Controller Port name [string]")?;
@@ -184,14 +181,9 @@ fn create_axis<C>(
     }
     let controller = reg.controller.clone();
     let motor = build(controller, axis, channel);
-    install(
-        ctx,
-        asyn_user(&controller_port, axis),
-        motor,
-        reg.moving_poll_ms,
-        reg.idle_poll_ms,
-        0, // C startPoller, smarActSCUMotorDriver.cpp:114, smarActMCSMotorDriver.cpp:215
-    )
+    reg.poller
+        .install(asyn_user(&controller_port, axis), motor)
+        .map(drop)
 }
 
 /// `smarActSCUCreateController(motorPortName, ioPortName, numAxes,
@@ -232,14 +224,13 @@ pub fn scu_create_axis_command() -> CommandDef {
         "smarActSCUCreateAxis",
         create_axis_args(),
         "smarActSCUCreateAxis(controllerPortName, axisNumber, channel)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let port = req_string(args, 0, "Controller Port name [string]")?;
             create_axis(
                 &SCU_CONTROLLERS,
                 "smarActSCUCreateAxis",
                 "SmarActSCUCreateAxis",
                 args,
-                ctx,
                 |controller, axis, channel| {
                     let (ax, probed) = ScuAxis::new(controller, channel, &port, axis);
                     if let Err(e) = probed {
@@ -291,13 +282,12 @@ pub fn mcs_create_axis_command() -> CommandDef {
         "smarActMCSCreateAxis",
         create_axis_args(),
         "smarActMCSCreateAxis(controllerPortName, axisNumber, channel)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             create_axis(
                 &MCS_CONTROLLERS,
                 "smarActMCSCreateAxis",
                 "SmarActMCSCreateAxis",
                 args,
-                ctx,
                 |controller, axis, channel| {
                     let (ax, probed) = McsAxis::new(controller, channel);
                     if let Err(e) = probed {

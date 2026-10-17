@@ -16,7 +16,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_str_req, opt_double, poll_intervals, req_string,
 };
 use motor_common::model1::c_int;
-use motor_common::{asyn_user, install, register_controller_port};
+use motor_common::{Controller, asyn_user, register_controller_port};
 
 use crate::lc400::{LC400_TIMEOUT, Lc400Axis, Lc400Controller, Lc400ControllerParams, config_axis};
 
@@ -69,20 +69,16 @@ fn lc400_create_controller_command(registry: &Registry) -> CommandDef {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .attach_port(port);
+            let poller = Controller::new();
             for axis in 0..num_axes {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Lc400Axis::new(
                     controller.clone(),
                     axis as usize,
                 )));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, LC400MotorDriver.cpp:156
-                )?;
+                poller.install(asyn_user(&port_name, axis), motor)?;
             }
+            // C startPoller, LC400MotorDriver.cpp:156
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
