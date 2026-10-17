@@ -29,6 +29,7 @@ pub const CONFIGURE_PRV_HST_ROLLING_WINDOW: &str =
 pub const PROCESS_PRV_HST_FRAME: &str = "void ADTimePix::processPrvHstFrame(const HistogramData&)";
 pub const VALIDATE_DESTINATION: &str =
     "asynStatus ADTimePix::validateDestination(const std::string&)";
+pub const GET_SERVER: &str = "asynStatus ADTimePix::getServer()";
 pub const CHECK_IMG_PATH: &str = "asynStatus ADTimePix::checkImgPath()";
 pub const CHECK_PRV_IMG_PATH: &str = "asynStatus ADTimePix::checkPrvImgPath()";
 pub const CHECK_PRV_IMG1_PATH: &str = "asynStatus ADTimePix::checkPrvImg1Path()";

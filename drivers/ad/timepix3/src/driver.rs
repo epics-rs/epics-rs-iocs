@@ -1033,43 +1033,62 @@ impl TimePix3Driver {
         Ok(())
     }
 
-    /// C `getServer` (serval_http.cpp:1420): read back the configured channels.
+    /// C `getServer` (serval_http.cpp:1583-1653): an unset destination reads
+    /// as no channels; any other refused reply leaves the readbacks alone.
     pub(crate) fn get_server(&mut self) -> AsynResult<()> {
-        let dest = self
-            .http
-            .get_json(serval::SERVER_DESTINATION, TIMEOUT_POLL)
-            .map_err(|e| self.http_failed("GET /server/destination", &e, HttpPrint::None))?;
-        self.http_ok();
-
-        let raw = dest.get("Raw").and_then(|v| v.as_array());
-        for (n, param) in [(0, self.p.write_raw_read), (1, self.p.write_raw1_read)] {
-            let on = raw.is_some_and(|a| a.len() > n);
-            self.ad.port_base.set_int32_param(param, 0, i32::from(on))?;
-        }
-        let img = dest.get("Image").and_then(|v| v.as_array());
-        for (n, param) in [(0, self.p.write_img_read), (1, self.p.write_img1_read)] {
-            let on = img.is_some_and(|a| a.len() > n);
-            self.ad.port_base.set_int32_param(param, 0, i32::from(on))?;
-        }
-        let prv = dest
-            .pointer("/Preview/ImageChannels")
-            .and_then(|v| v.as_array());
-        for (n, param) in [
-            (0, self.p.write_prv_img_read),
-            (1, self.p.write_prv_img1_read),
+        let reply = self.http.get(serval::SERVER_DESTINATION, TIMEOUT_POLL);
+        let (code, body) = match &reply {
+            Ok(body) => (200, body.as_str()),
+            Err(e) => (e.code(), e.body()),
+        };
+        let snapshot = match serval::parse_destination_response(code, body) {
+            Ok(s) => s,
+            Err(serval::DestinationError::NotConfigured) => serval::DestinationSnapshot::default(),
+            Err(e) => {
+                let http_failure = e == serval::DestinationError::HttpFailure;
+                let msg = if http_failure && !body.is_empty() {
+                    body
+                } else {
+                    e.message()
+                };
+                let base = &mut self.ad.port_base;
+                let _ = base.set_int32_param(self.p.http_code, 0, code);
+                let _ = base.set_string_param(self.p.write_msg, 0, msg);
+                let line = if http_failure {
+                    adlog::http_failure_reply(
+                        "getServer GET /server/destination",
+                        "GET",
+                        &format!("{}{}", self.http.base_url(), serval::SERVER_DESTINATION),
+                        code,
+                        body,
+                    )
+                } else {
+                    adlog::err(adlog::GET_SERVER, &format!("getServer: {}", e.message()))
+                };
+                let base = &mut self.ad.port_base;
+                base.trace_print(TraceMask::ERROR, format_args!("{line}"));
+                base.call_param_callbacks(0)?;
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("timepix3: GET /server/destination: {}", e.message()),
+                });
+            }
+        };
+        let p = self.p;
+        for (param, channels, n) in [
+            (p.write_raw_read, snapshot.raw_channels, 1),
+            (p.write_raw1_read, snapshot.raw_channels, 2),
+            (p.write_img_read, snapshot.image_channels, 1),
+            (p.write_img1_read, snapshot.image_channels, 2),
+            (p.write_prv_img_read, snapshot.preview_image_channels, 1),
+            (p.write_prv_img1_read, snapshot.preview_image_channels, 2),
+            (p.write_prv_hst_read, snapshot.preview_histogram_channels, 1),
         ] {
-            let on = prv.is_some_and(|a| a.len() > n);
-            self.ad.port_base.set_int32_param(param, 0, i32::from(on))?;
+            self.ad
+                .port_base
+                .set_int32_param(param, 0, i32::from(channels >= n))?;
         }
-        let hst = dest
-            .pointer("/Preview/HistogramChannels")
-            .and_then(|v| v.as_array());
-        self.ad.port_base.set_int32_param(
-            self.p.write_prv_hst_read,
-            0,
-            i32::from(hst.is_some_and(|a| !a.is_empty())),
-        )?;
-        Ok(())
+        self.ad.port_base.call_param_callbacks(0)
     }
 
     /// C `writeDac` (serval_http.cpp:2199).
@@ -3336,6 +3355,149 @@ mod tests {
             assert!(text.contains(&line), "{line}: {text:?}");
         }
         std::mem::forget(runtime);
+    }
+
+    /// C `getServer` (serval_http.cpp:1611-1653): the wrapped Serval 4.x
+    /// reply is read, an unset destination clears the readbacks, and a
+    /// refused reply keeps them and reports HttpCode, WriteMsg and its line.
+    #[test]
+    fn the_server_destination_reply_is_validated_as_c() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        type Routes = &'static [(&'static str, &'static str)];
+        // (port, failing route, routes, ok, readbacks, HttpCode, WriteMsg)
+        type Case = (
+            &'static str,
+            &'static str,
+            Routes,
+            bool,
+            [i32; 7],
+            i32,
+            &'static str,
+        );
+        let cases: [Case; 4] = [
+            (
+                "TPX_DEST_WRAPPED",
+                "\0",
+                &[(
+                    "GET /server/destination",
+                    r#"{"Destination":{"Raw":[{}],"Image":[{},{}],
+                       "Preview":{"ImageChannels":[{}],"HistogramChannels":[{}]}}}"#,
+                )],
+                true,
+                [1, 0, 1, 1, 1, 0, 1],
+                -1,
+                "",
+            ),
+            (
+                "TPX_DEST_UNSET",
+                "/server/destination",
+                &[("GET /server/destination", "Destination is not set")],
+                true,
+                [0; 7],
+                -1,
+                "",
+            ),
+            (
+                "TPX_DEST_BAD",
+                "\0",
+                &[("GET /server/destination", r#"{"Raw":[{}],"Image":{}}"#)],
+                false,
+                [1; 7],
+                200,
+                "server destination Image field is not an array",
+            ),
+            (
+                "TPX_DEST_500",
+                "/server/destination",
+                &[("GET /server/destination", "boom")],
+                false,
+                [1; 7],
+                500,
+                "boom",
+            ),
+        ];
+        for (name, fail, routes, ok, reads, code, msg) in cases {
+            let url = fake_serval_with(fail, routes);
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+            let mut det = TimePix3Driver::new(
+                name,
+                Arc::new(ServalHttp::new(&url)),
+                Arc::new(Shared::new()),
+                0,
+                cmd_tx,
+            )
+            .unwrap();
+            let p = det.p;
+            let params = [
+                p.write_raw_read,
+                p.write_raw1_read,
+                p.write_img_read,
+                p.write_img1_read,
+                p.write_prv_img_read,
+                p.write_prv_img1_read,
+                p.write_prv_hst_read,
+            ];
+            for param in params {
+                det.ad.port_base.set_int32_param(param, 0, 1).unwrap();
+            }
+            det.ad
+                .port_base
+                .set_int32_param(p.http_code, 0, -1)
+                .unwrap();
+            let (runtime, _) = create_port_runtime(
+                &epics_rs::asyn::registry::claim_port(name).unwrap(),
+                det,
+                RuntimeConfig::default(),
+            )
+            .unwrap();
+            let h = runtime.port_handle().clone();
+            let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let file = std::fs::File::create(&path).unwrap();
+            h.trace().set_trace_file(
+                Some(name),
+                TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+            h.trace().set_trace_mask(Some(name), TraceMask::ERROR);
+            let (result, got, got_code, got_msg) = h
+                .with_driver_blocking::<TimePix3Driver, _>(move |d| {
+                    let result = d.get_server();
+                    let got: Vec<i32> = params.iter().map(|&r| d.int(r, 0)).collect();
+                    let base = &d.ad.port_base;
+                    (
+                        result.is_ok(),
+                        got,
+                        base.get_int32_param(p.http_code, 0).unwrap(),
+                        d.text(p.write_msg, 0),
+                    )
+                })
+                .unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(
+                (result, got.as_slice(), got_code, got_msg.as_str()),
+                (ok, reads.as_slice(), code, msg),
+                "{name}"
+            );
+            let line = match code {
+                200 => adlog::err(adlog::GET_SERVER, &format!("getServer: {msg}")),
+                500 => adlog::http_failure_reply(
+                    "getServer GET /server/destination",
+                    "GET",
+                    &format!("{url}/server/destination"),
+                    500,
+                    "boom",
+                ),
+                _ => String::new(),
+            };
+            if line.is_empty() {
+                assert!(!text.contains("ERROR"), "{name}: {text:?}");
+            } else {
+                assert!(text.contains(&line), "{name}: {line}: {text:?}");
+            }
+            std::mem::forget(runtime);
+        }
     }
 
     const MEASUREMENT_CONFIG_READBACK: &str = r#"{"Stem": {"Scan": {"Width": 64,

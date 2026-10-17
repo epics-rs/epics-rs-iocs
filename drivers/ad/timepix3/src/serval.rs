@@ -911,9 +911,153 @@ pub fn json_to_string(v: &Value) -> String {
     }
 }
 
+/// C `ADTimePix3ServalDestination::Snapshot` (serval_destination.h): the
+/// number of configured channels of each kind.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DestinationSnapshot {
+    pub raw_channels: usize,
+    pub image_channels: usize,
+    pub preview_image_channels: usize,
+    pub preview_histogram_channels: usize,
+}
+
+/// C `ADTimePix3ServalDestination::ResponseError` (serval_destination.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationError {
+    NotConfigured,
+    HttpFailure,
+    EmptyBody,
+    MalformedJson,
+    InvalidRoot,
+    InvalidDestination,
+    InvalidRawChannels,
+    InvalidImageChannels,
+    InvalidPreview,
+    InvalidPreviewImageChannels,
+    InvalidPreviewHistogramChannels,
+}
+
+impl DestinationError {
+    /// C `responseErrorMessage` (serval_destination.cpp:77-105).
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "Serval destination is not configured",
+            Self::HttpFailure => "failed to read Serval destination",
+            Self::EmptyBody => "empty server destination response",
+            Self::MalformedJson => "malformed server destination JSON",
+            Self::InvalidRoot => "server destination JSON root is not an object",
+            Self::InvalidDestination => "server destination wrapper is not an object",
+            Self::InvalidRawChannels => "server destination Raw field is not an array",
+            Self::InvalidImageChannels => "server destination Image field is not an array",
+            Self::InvalidPreview => "server destination Preview field is not an object",
+            Self::InvalidPreviewImageChannels => {
+                "server destination preview ImageChannels field is not an array"
+            }
+            Self::InvalidPreviewHistogramChannels => {
+                "server destination preview HistogramChannels field is not an array"
+            }
+        }
+    }
+}
+
+/// C `ADTimePix3ServalDestination::parseResponse` (serval_destination.cpp:
+/// 23-75): the channel lists may sit under a `Destination` wrapper, and a
+/// present field of the wrong type refuses the whole reply.
+pub fn parse_destination_response(
+    code: i32,
+    body: &str,
+) -> Result<DestinationSnapshot, DestinationError> {
+    use DestinationError as E;
+    if code != 200 {
+        return Err(if body.contains("Destination is not set") {
+            E::NotConfigured
+        } else {
+            E::HttpFailure
+        });
+    }
+    if body.is_empty() {
+        return Err(E::EmptyBody);
+    }
+    let parsed: Value = serde_json::from_str(body).map_err(|_| E::MalformedJson)?;
+    if !parsed.is_object() {
+        return Err(E::InvalidRoot);
+    }
+    let destination = match parsed.get("Destination") {
+        Some(d) if d.is_object() => d,
+        Some(_) => return Err(E::InvalidDestination),
+        None => &parsed,
+    };
+    let count = |v: Option<&Value>, error| match v {
+        None => Ok(0),
+        Some(Value::Array(a)) => Ok(a.len()),
+        Some(_) => Err(error),
+    };
+    let mut snapshot = DestinationSnapshot {
+        raw_channels: count(destination.get("Raw"), E::InvalidRawChannels)?,
+        image_channels: count(destination.get("Image"), E::InvalidImageChannels)?,
+        ..DestinationSnapshot::default()
+    };
+    if let Some(preview) = destination.get("Preview") {
+        if !preview.is_object() {
+            return Err(E::InvalidPreview);
+        }
+        snapshot.preview_image_channels =
+            count(preview.get("ImageChannels"), E::InvalidPreviewImageChannels)?;
+        snapshot.preview_histogram_channels = count(
+            preview.get("HistogramChannels"),
+            E::InvalidPreviewHistogramChannels,
+        )?;
+    }
+    Ok(snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `parseResponse` (serval_destination.cpp:23-75).
+    #[test]
+    fn the_destination_reply_is_validated_as_c() {
+        use DestinationError as E;
+        let ok = |raw, image, preview_image, preview_histogram| {
+            Ok(DestinationSnapshot {
+                raw_channels: raw,
+                image_channels: image,
+                preview_image_channels: preview_image,
+                preview_histogram_channels: preview_histogram,
+            })
+        };
+        let parse = |body| parse_destination_response(200, body);
+        assert_eq!(
+            parse_destination_response(404, "Destination is not set"),
+            Err(E::NotConfigured)
+        );
+        assert_eq!(parse_destination_response(500, "x"), Err(E::HttpFailure));
+        assert_eq!(parse(""), Err(E::EmptyBody));
+        assert_eq!(parse("{"), Err(E::MalformedJson));
+        assert_eq!(parse("[]"), Err(E::InvalidRoot));
+        assert_eq!(parse(r#"{"Destination":[]}"#), Err(E::InvalidDestination));
+        assert_eq!(parse(r#"{"Raw":{}}"#), Err(E::InvalidRawChannels));
+        assert_eq!(parse(r#"{"Image":1}"#), Err(E::InvalidImageChannels));
+        assert_eq!(parse(r#"{"Preview":[]}"#), Err(E::InvalidPreview));
+        assert_eq!(
+            parse(r#"{"Preview":{"ImageChannels":{}}}"#),
+            Err(E::InvalidPreviewImageChannels)
+        );
+        assert_eq!(
+            parse(r#"{"Preview":{"HistogramChannels":0}}"#),
+            Err(E::InvalidPreviewHistogramChannels)
+        );
+        assert_eq!(parse("{}"), ok(0, 0, 0, 0));
+        assert_eq!(
+            parse(
+                r#"{"Destination":{"Raw":[{}],"Image":[{},{}],
+                   "Preview":{"ImageChannels":[{}],"HistogramChannels":[{}]}}}"#
+            ),
+            ok(1, 2, 1, 1)
+        );
+        assert_eq!(parse(r#"{"Raw":[{},{}]}"#), ok(2, 0, 0, 0));
+    }
 
     /// C `parseResponse` (serval_dashboard.cpp:49-98).
     #[test]
