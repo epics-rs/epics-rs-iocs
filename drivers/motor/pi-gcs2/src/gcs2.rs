@@ -1450,7 +1450,8 @@ impl ControllerParams for PIGCS2Params {
     }
 
     /// C `PIasynController::writeOctet`: the C-887's coordinate-system
-    /// commands. C ignores their status and stores no value.
+    /// commands. C ignores their status and, never calling the base, stores
+    /// no value for any parameter.
     fn write_octet(
         &mut self,
         _base: &mut PortDriverBase,
@@ -1458,7 +1459,7 @@ impl ControllerParams for PIGCS2Params {
         data: &[u8],
     ) -> ParamWrite {
         let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
-            return ParamWrite::PassToBase(Ok(()));
+            return ParamWrite::Handled(Ok(()));
         };
         let commands = [
             (params.cs_activate, "KEN"),
@@ -1467,7 +1468,7 @@ impl ControllerParams for PIGCS2Params {
             (params.cs_ksw, "KSW"),
         ];
         let Some(&(_, command)) = commands.iter().find(|(r, _)| *r == user.reason) else {
-            return ParamWrite::PassToBase(Ok(()));
+            return ParamWrite::Handled(Ok(()));
         };
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         if ctrl.model == Model::CoordinateSystem {
@@ -3117,6 +3118,39 @@ mod tests {
             };
             assert_eq!(sent, want, "{name}");
         }
+    }
+
+    /// C `PIasynController::writeOctet` never calls the base, so no octet
+    /// write is stored: not the base's profile messages, and not a
+    /// coordinate-system parameter on a port with no controller, where C
+    /// dereferences its NULL `m_pGCSController` (a C defect not copied).
+    #[test]
+    fn an_octet_write_stores_nothing() {
+        use epics_rs::asyn::request::RequestOp;
+        use epics_rs::motor::controller_port::index::PROFILE_BUILD_MESSAGE;
+        let write = |port: &PortHandle, reason: usize| {
+            let data = b"text".to_vec();
+            let user = AsynUser::new(reason).with_addr(0);
+            let done = port
+                .submit_blocking(RequestOp::OctetWrite { data }, user)
+                .unwrap();
+            assert_eq!(done.nbytes, 4);
+            assert!(port.get_string_param_blocking(reason, 0, 255).is_err());
+        };
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2OctNoneLine", hexapod_reply);
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2OctNone")));
+        let (port, _, _) = controller_port("gcs2OctNone", &ctrl, "X");
+        write(&port, PROFILE_BUILD_MESSAGE);
+
+        let params = PIGCS2Params::default();
+        let port = motor_common::register_controller_port(
+            &epics_rs::asyn::registry::open_owner(),
+            "gcs2OctNoCtl",
+            1,
+            params.clone(),
+        )
+        .unwrap();
+        write(&port, params.params.get().unwrap().cs_activate);
     }
 
     /// `PIasynController::writeInt32` and `writeFloat64` make the asynUser
