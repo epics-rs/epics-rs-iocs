@@ -58,9 +58,6 @@
 //!   twos-complement target it silently wraps back to `INT32_MIN`, which
 //!   `wrapping_neg` reproduces as defined behavior instead of a Rust debug
 //!   panic. Not reachable by any real PID setpoint.
-//! - **An address is marked connected for `reportIt` by its first
-//!   request as well as by `connectIt`**: asyn-rs devices start connected,
-//!   so `connectIt` is reached only after a `disconnectIt`.
 //! - **`drv_user_create` bounds-checks `addr` against `1..=K_INSTRMAX`**
 //!   before use. C's `create()` (`drvLove.c:1106-1138`) computes
 //!   `&pport->instr[addr-1]` with *no* range check at all -- an
@@ -352,8 +349,7 @@ pub struct LoveDriver {
     ser_addr: i32,
     timeout: Duration,
     models: ModelTable,
-    /// C `Instr::isConn`: set by `connectIt` or the address's first request,
-    /// cleared by `disconnectIt`.
+    /// C `Instr::isConn`: set by `connectIt`, cleared by `disconnectIt`.
     is_conn: [bool; K_INSTRMAX],
 }
 
@@ -372,7 +368,7 @@ impl LoveDriver {
         timeout: Duration,
         models: ModelTable,
     ) -> AsynResult<Self> {
-        let mut base = PortDriverBase::new(
+        let base = PortDriverBase::new(
             port_name,
             K_INSTRMAX + 1,
             PortFlags {
@@ -381,10 +377,6 @@ impl LoveDriver {
                 destructible: true,
             },
         );
-        // C registers a bare asynDriver port, which starts down
-        // (asynManager.c:523); only `connectIt` brings it up, and it refuses
-        // while the serial port is down.
-        base.init_connected(false);
 
         Ok(Self {
             base,
@@ -513,10 +505,12 @@ impl LoveDriver {
     fn disconnect_it(&mut self, user: &AsynUser) -> AsynResult<()> {
         let addr = user.addr;
         self.check_addr("disconnectIt", addr)?;
-        // A device asyn-rs started connected has not set `is_conn`, and is
-        // still connected.
-        let conn = addr > 0 && std::mem::take(&mut self.is_conn[(addr - 1) as usize]);
-        if !conn && !self.base.dp_connected(addr) {
+        let conn = if addr < 0 {
+            self.base.dp_connected(addr)
+        } else {
+            std::mem::take(&mut self.is_conn[(addr - 1) as usize])
+        };
+        if !conn {
             return Err(protocol_error("not connected"));
         }
         self.base.set_addr_connected(addr, false);
@@ -552,7 +546,6 @@ impl LoveDriver {
         if !(1..=K_INSTRMAX as i32).contains(&addr) {
             return Err(AsynError::AddressOutOfRange(addr));
         }
-        self.is_conn[(addr - 1) as usize] = true;
         let spec = &COMMANDS[reason];
         let model = self.model_for(addr);
         let read_cmd = spec.read[model as usize];
@@ -570,7 +563,6 @@ impl LoveDriver {
         if !(1..=K_INSTRMAX as i32).contains(&addr) {
             return Err(AsynError::AddressOutOfRange(addr));
         }
-        self.is_conn[(addr - 1) as usize] = true;
         let spec = &COMMANDS[reason];
         let write_cmd = match spec.write_conv {
             WriteConv::Null => {
@@ -1043,8 +1035,9 @@ mod tests {
         out
     }
 
-    /// C `disconnectIt` (drvLove.c:1086-1093) clears `isConn`, so `reportIt`
-    /// stops listing the address until `connectIt` sets it again.
+    /// Only C `connectIt` sets `isConn` and only `disconnectIt` clears it
+    /// (drvLove.c:1031, :1086-1093), so a request does not list the address in
+    /// `reportIt`.
     #[test]
     fn disconnect_drops_the_address_from_the_report() {
         let mut love = reply_love("LOVETESTDIS", EomReason::EOS);
@@ -1053,6 +1046,9 @@ mod tests {
         let unlisted = "    LOVETESTDIS is connected to SER\n";
 
         love.do_read(2, 0).unwrap();
+        assert_eq!(report_of(&mut love), unlisted);
+        assert!(love.disconnect_addr(&addr2).is_err());
+        love.connect_addr(&addr2).unwrap();
         assert_eq!(report_of(&mut love), listed);
         love.disconnect_addr(&addr2).unwrap();
         assert_eq!(report_of(&mut love), unlisted);
