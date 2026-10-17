@@ -339,7 +339,7 @@ fn an_octet_written_to_a_mythen_int_param_is_wrong_type() {
 fn a_refused_tau_prints_the_last_command() {
     use epics_rs::asyn::services::PortServices;
     use epics_rs::asyn::trace::TraceFile;
-    let port = "MYTHEN_WS_TAU";
+    let port = "MYTHEN_WS_TAULINE";
     let (mut driver, _received) = driver(port);
     let manager = PortServices::global().trace().clone();
     let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
