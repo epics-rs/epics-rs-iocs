@@ -1188,6 +1188,8 @@ impl PIGCS2Controller {
 /// C `PIasynController`'s parameters (PIasynController.cpp:68-102).
 #[derive(Clone, Copy, Debug)]
 struct PiParams {
+    position: usize,
+    servo: usize,
     last_err: usize,
     clear_err: usize,
     pivot_x: usize,
@@ -1233,6 +1235,8 @@ impl ControllerParams for PIGCS2Params {
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let mut create = |name, kind| base.create_param(name, kind);
         let params = PiParams {
+            position: create("PI_SUP_POSITION", ParamType::Float64)?,
+            servo: create("PI_SUP_SERVO", ParamType::Int32)?,
             last_err: create("PI_SUP_LAST_ERR", ParamType::Int32)?,
             clear_err: create("PI_SUP_CLEAR_ERR", ParamType::Int32)?,
             pivot_x: create("PI_SUP_PIVOT_X", ParamType::Float64)?,
@@ -1663,8 +1667,9 @@ impl PIGCS2Axis {
     }
 
     /// C `PIasynAxis::poll`'s reads after the status, skipped while a
-    /// controller that cannot talk while homing homes.
-    fn poll_reads(&mut self, old_homing: bool, servo_control: bool) {
+    /// controller that cannot talk while homing homes; the
+    /// `PI_SUP_POSITION` read when it ran and answered.
+    fn poll_reads(&mut self, old_homing: bool, servo_control: bool) -> Option<f64> {
         let homing = self.is_homing;
         // C only re-queries FRF? (the homed flag) right when homing just
         // finished (oldHoming true, new homing false) — not every cycle.
@@ -1692,15 +1697,20 @@ impl PIGCS2Axis {
             let position = ctrl
                 .get_axis_position(&self.axis_name, self.last_position / self.cpu)
                 .map_or(self.last_position, |p| p * self.cpu);
-            // C reads it again for PI_SUP_POSITION, not modeled yet.
-            let _ = ctrl.get_axis_position(&self.axis_name, position / self.cpu);
+            // C defect not copied: a failed read posts C's uninitialized
+            // realPosition (PIasynAxis.cpp:163); rs posts nothing.
+            let real = ctrl
+                .get_axis_position(&self.axis_name, position / self.cpu)
+                .ok();
             let (mut low_limit, mut high_limit) = (self.low_limit, self.high_limit);
             let _ = ctrl.get_travel_limits(&self.axis_name, &mut low_limit, &mut high_limit);
             drop(ctrl);
             self.last_position = position;
             self.low_limit = low_limit;
             self.high_limit = high_limit;
+            return real;
         }
+        None
     }
 
     /// C `PIGCSMotorController::referenceAxis`: servo on, then the
@@ -1890,8 +1900,26 @@ impl AsynMotor for PIGCS2Axis {
         self.pos_limit = pos_limit;
         self.is_homing = homing;
         let model = self.lock().model;
-        if !homing || model.can_communicate_while_homing() {
-            self.poll_reads(old_homing, servo_control);
+        let real = if !homing || model.can_communicate_while_homing() {
+            self.poll_reads(old_homing, servo_control)
+        } else {
+            None
+        };
+        if let Some((port, params)) = &self.lock().port {
+            let addr = self.axis_no as i32;
+            let mut updates = vec![ParamSetValue::new(
+                params.servo,
+                addr,
+                ParamValue::Int32(self.servo_on.into()),
+            )];
+            if let Some(real) = real {
+                updates.push(ParamSetValue::new(
+                    params.position,
+                    addr,
+                    ParamValue::Float64(real),
+                ));
+            }
+            let _ = port.set_params_and_notify_blocking(addr, updates);
         }
         let position = self.last_position;
 
@@ -2716,6 +2744,29 @@ mod tests {
         assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
         poll();
         assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
+    }
+
+    /// `PIasynAxis::poll` posts the second position read as
+    /// `PI_SUP_POSITION` (PIasynAxis.cpp:162-165) and the servo state as
+    /// `PI_SUP_SERVO` (:204), at the axis's address.
+    #[test]
+    fn the_axis_poll_posts_its_position_and_servo() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2SupPosLine", |last| {
+            match last {
+                "ERR?" => "0",
+                "POS? 1" => "1=2.5",
+                // Servo on.
+                "\u{4}" => "001000",
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2SupPosLine")));
+        let (port, p) = controller_port("gcs2SupPos", &ctrl, "1");
+        let mut axis = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, "gcs2SupPos");
+        axis.poll(&AsynUser::new(0)).unwrap();
+        assert_eq!(port.read_float64_blocking(p.position, 0).unwrap(), 2.5);
+        assert_eq!(port.read_int32_blocking(p.servo, 0).unwrap(), 1);
     }
 
     /// `PIasynController::writeInt32` (PIasynController.cpp:305-308) logs
