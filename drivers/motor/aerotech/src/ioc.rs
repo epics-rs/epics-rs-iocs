@@ -299,6 +299,7 @@ pub fn a3200_config_command() -> CommandDef {
 
             let mut axes = Vec::new();
             let mut reports: Vec<Arc<dyn AxisReport>> = Vec::new();
+            let mut logs = Vec::new();
             for axis in 0..num_axes {
                 let axis_name = controller
                     .lock()
@@ -308,6 +309,7 @@ pub fn a3200_config_command() -> CommandDef {
                 let ax = A3200Axis::new(controller.clone(), axis_name.clone())
                     .map_err(|e| format!("A3200AsynConfig: axis {axis} ({axis_name}): {e}"))?;
                 reports.push(ax.report());
+                logs.push(ax.log());
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 axes.push(motor);
             }
@@ -318,6 +320,7 @@ pub fn a3200_config_command() -> CommandDef {
                 .map_err(|e| format!("A3200AsynConfig: finalize failed: {e}"))?;
             lock_cards(&A3200_CARDS)[card as usize].axes = reports;
             MOTOR_A3200.set_card(card, axes, moving_poll_ms, idle_poll_ms);
+            MOTOR_A3200.set_axis_logs(card, logs);
             Ok(CommandOutcome::Continue)
         },
     )

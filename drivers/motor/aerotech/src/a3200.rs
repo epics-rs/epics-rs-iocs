@@ -56,10 +56,12 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model2::AxisLog;
 use motor_common::util::{atof, atoi, atol};
 
 use crate::axis_report::AxisMembers;
@@ -258,6 +260,7 @@ pub struct A3200Axis {
     /// Last commanded direction; the poller does not refresh it.
     last_direction: bool,
     report: Arc<AxisMembers>,
+    log: Arc<AxisLog>,
 }
 
 impl A3200Axis {
@@ -317,6 +320,7 @@ impl A3200Axis {
             problem: false,
             current_cmd_pos: 0.0,
             last_direction: false,
+            log: Arc::default(),
         })
     }
 
@@ -325,8 +329,22 @@ impl A3200Axis {
         self.report.clone()
     }
 
+    /// The user C's `PRINT(pAxis->logParam, ...)` lines go through.
+    pub fn log(&self) -> Arc<AxisLog> {
+        self.log.clone()
+    }
+
     fn lock(&self) -> MutexGuard<'_, A3200Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A `motorAxisSetDouble` case C answers with only a TERROR line
+    /// (drvA3200Asyn.cc:348-382).
+    fn refuse(&self, what: &str) {
+        self.log.print(
+            TraceMask::ERROR,
+            format_args!("motorAxisSetDouble: {what}\n"),
+        );
     }
 
     /// A record step value in user units, formatted as C's `%.*f`.
@@ -515,6 +533,30 @@ impl AsynMotor for A3200Axis {
             .command(&format!("POSOFFSET SET {name} {}", self.units(position)))
     }
 
+    fn set_encoder_ratio(&mut self, _user: &AsynUser, _ratio: f64) -> AsynResult<()> {
+        self.refuse("A3200 does not support setting encoder ratio");
+        Ok(())
+    }
+
+    fn set_low_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        self.refuse("Driver does not set A3200's Low Limit");
+        Ok(())
+    }
+
+    fn set_high_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        self.refuse("Driver does not set A3200's High Limit");
+        Ok(())
+    }
+
+    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, _gain: f64) -> AsynResult<()> {
+        self.refuse(match kind {
+            PidGainKind::Proportional => "A3200 does not support setting proportional gain",
+            PidGainKind::Integral => "A3200 does not support setting integral gain",
+            PidGainKind::Derivative => "A3200 does not support setting derivative gain",
+        });
+        Ok(())
+    }
+
     fn set_closed_loop(&mut self, _user: &AsynUser, closed_loop: bool) -> AsynResult<()> {
         let name = self.axis_name.clone();
         let last_fault = self.last_fault;
@@ -633,6 +675,73 @@ mod tests {
         assert_eq!(max_digits(0.0004), 5);
         assert_eq!(fmt(1.5, 5), "1.50000");
         assert_eq!(step_size(Err(a3200_err("refused"))), 1.0);
+    }
+
+    /// drvA3200Asyn.cc:348-382: the setters the A3200 refuses print their
+    /// TERROR line on the axis's drvAsynMotorConfigure user.
+    #[epics_rs::base::epics_test]
+    async fn refused_setters_print_on_the_axis_s_log_user() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::model2::{Model2, drv_asyn_motor_configure_command};
+        use motor_common::testing::{LineRig, run_command};
+
+        static DRIVER: Model2 = Model2::new("a32LogTest", 0);
+        let (_line, io) = LineRig::new("a32LogLine", |_| "%0".into());
+        let controller = A3200Controller::new(io, "a32LogLine", "0", 1, true);
+        let axis = A3200Axis::new(Arc::new(Mutex::new(controller)), "X".into()).unwrap();
+        let axis = Arc::new(Mutex::new(axis));
+        let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
+        DRIVER.set_card(0, vec![motor], 100, 1000);
+        DRIVER.set_axis_logs(0, vec![axis.lock().unwrap().log()]);
+        let args = vec![
+            ArgValue::String("a32Log".into()),
+            ArgValue::String("a32LogTest".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(1),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&DRIVER]), args).await;
+
+        let path = std::env::temp_dir().join(format!("a32-log-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("a32Log"), TraceMask::ERROR);
+        trace.set_trace_file(Some("a32Log"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("a32Log", 0, TraceFile::File(file.clone()));
+        let user = AsynUser::new(0);
+        {
+            let mut axis = axis.lock().unwrap();
+            axis.set_encoder_ratio(&user, 1.0).unwrap();
+            axis.set_low_limit(&user, -1.0).unwrap();
+            axis.set_high_limit(&user, 1.0).unwrap();
+            axis.set_pid_gain(&user, PidGainKind::Proportional, 1.0)
+                .unwrap();
+            axis.set_pid_gain(&user, PidGainKind::Integral, 1.0)
+                .unwrap();
+            axis.set_pid_gain(&user, PidGainKind::Derivative, 1.0)
+                .unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // Each line follows asynPrint's timestamp.
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "motorAxisSetDouble: A3200 does not support setting encoder ratio",
+                "motorAxisSetDouble: Driver does not set A3200's Low Limit",
+                "motorAxisSetDouble: Driver does not set A3200's High Limit",
+                "motorAxisSetDouble: A3200 does not support setting proportional gain",
+                "motorAxisSetDouble: A3200 does not support setting integral gain",
+                "motorAxisSetDouble: A3200 does not support setting derivative gain",
+            ],
+            "{text}"
+        );
     }
 
     #[test]
