@@ -43,10 +43,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -147,9 +148,9 @@ impl Pm304Controller {
         self.use_encoder.get(index).copied().unwrap_or(true)
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
+    fn framed(cmd: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
+        out.extend_from_slice(cmd);
         out.extend_from_slice(TERMINATOR);
         out
     }
@@ -173,7 +174,9 @@ impl Pm304Controller {
     fn write_read_raw(&self, cmd: &str) -> AsynResult<String> {
         // C send_mess/send_recv_mess: pasynOctetSyncIO->writeRead, which
         // flushes first so a stray line cannot shift every later reply.
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self
+            .handle
+            .write_read(0, &Self::framed(cmd.as_bytes()), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_end_matches(['\r', '\n', '\0']).to_string())
     }
@@ -184,6 +187,15 @@ impl Pm304Controller {
     fn command(&self, cmd: &str) -> AsynResult<String> {
         let raw = self.write_read_raw(cmd)?;
         Ok(self.strip_echo(&raw).trim().to_string())
+    }
+
+    /// C `send_mess`: each `;`-separated piece of `msg` is its own command,
+    /// its reply read and dropped.
+    fn send_mess(&self, msg: &[u8]) -> AsynResult<()> {
+        for piece in msg.split(|&b| b == b';').filter(|p| !p.is_empty()) {
+            self.handle.write_read(0, &Self::framed(piece), READ_BUF)?;
+        }
+        Ok(())
     }
 }
 
@@ -241,6 +253,7 @@ pub struct Pm304Axis {
     index: usize,
     prev_position: i32,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl Pm304Axis {
@@ -255,11 +268,19 @@ impl Pm304Axis {
                 done: true,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         }
     }
 
     fn lock(&self) -> MutexGuard<'_, Pm304Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// PREM, which devPM304.cc puts just ahead of the motion command; it
+    /// goes out piece by piece like the rest of the message.
+    fn send_prem(&mut self, ctrl: &Pm304Controller) -> AsynResult<()> {
+        let prem = self.strings.arm();
+        ctrl.send_mess(&prem)
     }
 
     /// Program the speeds before a move or home (C sends `SV`/`SA`/`SD` as
@@ -298,8 +319,10 @@ impl AsynMotor for Pm304Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
+        self.send_prem(&ctrl)?;
         ctrl.command(&format!("{}MA{}", self.axis, nint(position)))?;
         Ok(())
     }
@@ -312,8 +335,10 @@ impl AsynMotor for Pm304Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
+        self.send_prem(&ctrl)?;
         ctrl.command(&format!("{}MR{}", self.axis, nint(distance)))?;
         Ok(())
     }
@@ -325,12 +350,14 @@ impl AsynMotor for Pm304Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // The record's jog sends SET_ACCEL whatever the rate
         // (motorRecord.cc:2141), so SA/SD always lead.
         let accel = nint(acceleration);
         ctrl.command(&format!("{}SA{accel}", self.axis))?;
         ctrl.command(&format!("{}SD{accel}", self.axis))?;
+        self.send_prem(&ctrl)?;
         match ctrl.model {
             Model::Pm304 => {
                 // PM304: set the (unsigned) slew speed, then a signed direction.
@@ -357,8 +384,10 @@ impl AsynMotor for Pm304Axis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
+        self.send_prem(&ctrl)?;
         let cmd = match (ctrl.model, forward) {
             (Model::Pm304, true) => format!("{}IX", self.axis),
             (Model::Pm304, false) => format!("{}IX-1", self.axis),
@@ -386,8 +415,26 @@ impl AsynMotor for Pm304Axis {
         Ok(())
     }
 
+    /// `PRIMITIVE`: INIT and a CR (devPM304.cc:194-198), split on `;`.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let mut msg = init.to_vec();
+        msg.push(b'\r');
+        self.lock().send_mess(&msg)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let use_encoder = ctrl.use_encoder(self.index);
         let model = ctrl.model;
 
@@ -400,6 +447,16 @@ impl AsynMotor for Pm304Axis {
             format!("{}OC", self.axis)
         };
         let pos_reply = ctrl.command(&pos_cmd)?;
+
+        // drvPM304.cc:330-338: POST and a CR once done or on a limit; only
+        // the PM304 branch sets ls_active.
+        let ls_active = model == Model::Pm304 && (bits.plus_ls || bits.minus_ls);
+        if (bits.done || ls_active)
+            && let Some(mut post) = self.strings.post_due()
+        {
+            post.push(b'\r');
+            let _ = ctrl.send_mess(&post);
+        }
         drop(ctrl);
 
         let position = parse_position(&pos_reply);
@@ -484,6 +541,33 @@ mod tests {
         assert_eq!(line.sent(), ["1SV400\r", "1SA800\r", "1SD800\r", "1IX\r"]);
         axis.move_velocity(&user, 0.0, -300.0, 600.0).unwrap();
         assert_eq!(line.sent(), ["1SA600\r", "1SD600\r", "1SV300\r", "1CV-1\r"]);
+    }
+
+    /// devPM304.cc: INIT and a CR, PREM just ahead of the motion command,
+    /// POST and a CR once done, each `;` piece its own command.
+    #[test]
+    fn init_prem_and_post_go_out_piece_by_piece() {
+        let (line, io) = LineRig::new("pm304_strings", |last| match last {
+            "1ID\r" => "Mclennan PM304".into(),
+            "1OS\r" => "00010000".into(),
+            "1OA\r" => "AP=10".into(),
+            _ => "OK".into(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        let user = AsynUser::default();
+        axis.primitive(&user, b"1RS;1KP5").unwrap();
+        assert_eq!(line.sent(), ["1RS\r", "1KP5\r\r"]);
+        let post = PostMessage::default();
+        post.set(b"1AB");
+        axis.set_move_strings(&user, b"1RS;1SC", Some(post))
+            .unwrap();
+        axis.move_absolute(&user, 50.0, 0.0, 400.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["1SV400\r", "1RS\r", "1SC\r", "1MA50\r"]);
+        axis.poll(&user).unwrap();
+        axis.poll(&user).unwrap();
+        assert_eq!(line.sent(), ["1OS\r", "1OA\r", "1AB\r\r", "1OS\r", "1OA\r"]);
     }
 
     #[test]
