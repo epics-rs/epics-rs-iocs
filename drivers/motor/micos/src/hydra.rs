@@ -29,14 +29,11 @@
 //!   but then unconditionally overwrites the problem flag to `0` a few lines
 //!   later (a latent bug that discards it). This port honours the intent and
 //!   reports bit `0x200` as a problem.
-//! - `move_velocity` moves to the axis travel limit read fresh from `getnlimit`
-//!   (the hydra has no jog command); the C driver uses a construction-time cached
-//!   limit, which can be stale after homing.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -60,13 +57,6 @@ const REGULATOR_MODE_DEFAULT: i32 = 0;
 
 /// Delay required by the controller after an `init` command.
 const INIT_DELAY: Duration = Duration::from_millis(200);
-
-fn hydra_err(message: impl Into<String>) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message: message.into(),
-    }
-}
 
 /// Shared hydra controller endpoint owning the asyn octet handle.
 pub struct HydraController {
@@ -105,6 +95,17 @@ fn axis_res(motor_form: i32, pitch: f64, pole_pairs: i32, cl_period: f64) -> f64
     }
 }
 
+/// `sscanf(reply, "%lf %lf", &neg, &pos)` (SMChydraAxis.cpp:57). A value
+/// sscanf does not convert is 0 here; C leaves the member uninitialized, a
+/// defect not copied.
+fn travel_limits(reply: &str) -> (f64, f64) {
+    let mut values = reply
+        .split_whitespace()
+        .map_while(|tok| tok.parse::<f64>().ok());
+    let neg = values.next().unwrap_or(0.0);
+    (neg, values.next().unwrap_or(0.0))
+}
+
 /// One hydra axis sharing a controller. Implements [`AsynMotor`].
 pub struct HydraAxis {
     controller: Arc<Mutex<HydraController>>,
@@ -115,32 +116,35 @@ pub struct HydraAxis {
     motor_form: i32,
     /// C `axisRes_`: controller units per record step.
     axis_res: f64,
+    /// C `negTravelLimit_`/`posTravelLimit_`, the `getnlimit` the
+    /// constructor read; `move_velocity` moves to one (no jog command).
+    travel_limits: (f64, f64),
 }
 
 impl HydraAxis {
     /// Construct axis `axis_no` (0-based) and read its motor form, pitch,
-    /// pole pairs and closed-loop period for `axisRes`, as C's constructor.
+    /// pole pairs and closed-loop period for `axisRes`, then its travel
+    /// limits, as C's constructor.
     /// C ignores the queries' status (SMChydraAxis.cpp:15-17), so a controller
     /// that does not answer leaves each at `atoi("")`/`atof("")`, 0.
     pub fn new(controller: Arc<Mutex<HydraController>>, axis_no: usize) -> Self {
         let addr = axis_no + 1;
-        let (motor_form, axis_res) = {
+        let (motor_form, axis_res, travel_limits) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let read = |verb: &str| ctrl.query(&format!("{addr} {verb}")).unwrap_or_default();
             let motor_form = atoi(&read("getmotor"));
             let pitch = atof(&read("getpitch"));
             let pole_pairs = atoi(&read("getpolepairs"));
             let cl_period = atof(&read("getclperiod"));
-            (
-                motor_form,
-                axis_res(motor_form, pitch, pole_pairs, cl_period),
-            )
+            let axis_res = axis_res(motor_form, pitch, pole_pairs, cl_period);
+            (motor_form, axis_res, travel_limits(&read("getnlimit")))
         };
         Self {
             controller,
             axis_no,
             motor_form,
             axis_res,
+            travel_limits,
         }
     }
 
@@ -225,21 +229,9 @@ impl AsynMotor for HydraAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        // No jog command — move to the axis travel limit (read fresh).
-        let reply = ctrl.query(&format!("{} getnlimit", self.addr()))?;
-        let bounds: Vec<f64> = reply
-            .split_whitespace()
-            .filter_map(|tok| tok.parse::<f64>().ok())
-            .collect();
-        let (neg, pos) = match bounds.as_slice() {
-            [neg, pos, ..] => (*neg, *pos),
-            _ => {
-                return Err(hydra_err(format!(
-                    "hydra: getnlimit returned {reply:?}, expected two values"
-                )));
-            }
-        };
+        // No jog command: move to the travel limit the constructor read.
         self.send_accel_velocity(&ctrl, velocity, acceleration)?;
+        let (neg, pos) = self.travel_limits;
         let target = if velocity > 0.0 { pos } else { neg };
         ctrl.write_only(&format!("{target:.6} {} nm", self.addr()))
     }
@@ -386,6 +378,13 @@ mod tests {
         assert!(powered(0x1));
         assert!(problem(0x200));
         assert!(!problem(0x1));
+    }
+
+    #[test]
+    fn travel_limits_scan_as_c_sscanf() {
+        assert_eq!(travel_limits("-100.0 100.0"), (-100.0, 100.0));
+        assert_eq!(travel_limits("-5 x"), (-5.0, 0.0));
+        assert_eq!(travel_limits(""), (0.0, 0.0));
     }
 
     #[test]
