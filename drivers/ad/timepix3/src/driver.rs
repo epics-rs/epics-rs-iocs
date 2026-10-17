@@ -375,7 +375,7 @@ impl TimePix3Driver {
         let Some((name, func)) = channel.tcp.filter(|_| path.starts_with("tcp://")) else {
             return Ok(());
         };
-        let (mask, line) = match crate::stream::parse_tcp_path(&path) {
+        let (mask, line) = match self.parse_tcp_path(&path) {
             Some((host, port)) => (
                 TraceMask::IO_DRIVER,
                 adlog::log(
@@ -398,6 +398,22 @@ impl TimePix3Driver {
             return Err(refused());
         }
         Ok(())
+    }
+
+    /// C `parseTcpPath`, printing its ERR line for a refused port.
+    fn parse_tcp_path(&mut self, path: &str) -> Option<(String, u16)> {
+        match crate::stream::parse_tcp_path(path) {
+            Ok(endpoint) => Some(endpoint),
+            Err(line) => {
+                if let Some(line) = line {
+                    self.ad.port_base.trace_print(
+                        TraceMask::ERROR,
+                        format_args!("{}", adlog::err(adlog::PARSE_TCP_PATH, &line)),
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// C `checkBPCPath` (mask_io.cpp:502) and `checkDACSPath`
@@ -2125,7 +2141,7 @@ impl TimePix3Driver {
         });
         if prv_hst
             .as_deref()
-            .is_some_and(|path| crate::stream::parse_tcp_path(path).is_none())
+            .is_some_and(|path| self.parse_tcp_path(path).is_none())
         {
             return Err("Histogram TCP path is invalid");
         }
@@ -2172,7 +2188,7 @@ impl TimePix3Driver {
             if self.int(write, 0) == 0 {
                 continue;
             }
-            let Some((host, port)) = crate::stream::parse_tcp_path(&self.text(base, 0)) else {
+            let Some((host, port)) = self.parse_tcp_path(&self.text(base, 0)) else {
                 continue;
             };
             let port = u32::from(port);
@@ -4468,6 +4484,77 @@ mod tests {
             message,
             "Preview TCP port in use (Serval did not release a prior listener)"
         );
+    }
+
+    /// A refused tcp:// port prints C `parseTcpPath`'s ERR line before the
+    /// path check's own (serval_stream.cpp:672-681, ADTimePix.cpp:346-354).
+    #[test]
+    fn a_bad_tcp_port_logs_parse_tcp_path_errors() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "TPX_PORT_PARSE";
+        let (url, _rx) = capturing_serval();
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new(&url)),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let results = h
+            .with_driver_blocking::<TimePix3Driver, _>(move |d| {
+                let channel = CHANNEL_PATHS
+                    .iter()
+                    .find(|c| (c.base)(&p) == p.prv_img_base)
+                    .unwrap();
+                ["tcp://h:x1", "tcp://h:0", "tcp://listen@h: 8089junk"].map(|base| {
+                    d.ad.port_base
+                        .set_string_param(p.prv_img_base, 0, base)
+                        .unwrap();
+                    d.check_channel_path(channel).is_ok()
+                })
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        std::mem::forget(runtime);
+        assert_eq!(results, [false, false, true]);
+        for line in [
+            adlog::err(adlog::PARSE_TCP_PATH, "Failed to parse port: x1"),
+            adlog::err(
+                adlog::CHECK_PRV_IMG_PATH,
+                "Failed to parse PrvImg TCP path: tcp://h:x1",
+            ),
+            adlog::err(
+                adlog::PARSE_TCP_PATH,
+                "Invalid port number: 0 (must be 1-65535)",
+            ),
+            adlog::log(
+                adlog::CHECK_PRV_IMG_PATH,
+                "Parsed PrvImg TCP path: host=h, port=8089",
+            ),
+        ] {
+            assert!(text.contains(&line), "{line}\n{text}");
+        }
     }
 
     /// An enabled tcp:// channel whose port is bound locally moves to the

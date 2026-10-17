@@ -1483,7 +1483,13 @@ async fn stream_run(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation) {
     let worker = kind.worker(&ctx.shared);
     let name = kind.name();
     while worker.running(run) {
-        let Some((host, port)) = kind.path(&ctx.shared).and_then(|p| parse_tcp_path(&p)) else {
+        // C parses the path at its check and skips the connect while the
+        // host is empty (serval_stream.cpp:548-550, histogram_io.cpp:1004-1008).
+        let Some((host, port)) = kind
+            .path(&ctx.shared)
+            .and_then(|p| parse_tcp_path(&p).ok())
+            .filter(|(host, _)| !host.is_empty())
+        else {
             worker.wait_for_stop_for(run, RECONNECT_WAIT);
             continue;
         };

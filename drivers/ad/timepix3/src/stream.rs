@@ -645,22 +645,43 @@ fn histogram_header(header: Option<&Value>) -> Result<(usize, Pending), String> 
 }
 
 /// Split Serval's `tcp://[listen@]host:port` into a host and a port (C
-/// `parseTcpPath`, serval_stream.cpp:30).
+/// `parseTcpPath`, serval_stream.cpp:647-684): everything up to the first
+/// `@` is dropped, the host ends at the first `:` and may be empty, and the
+/// port is read as `std::stoi`. `Err(Some(line))` is the ERR text C prints;
+/// `Err(None)` a path C refuses silently.
 ///
-/// `listen@` means *Serval* listens; the IOC is the client either way, so the
-/// marker is dropped.
-pub fn parse_tcp_path(path: &str) -> Option<(String, u16)> {
-    let rest = path.strip_prefix("tcp://")?;
-    let rest = rest.rsplit_once('@').map_or(rest, |(_, after)| after);
-    let (host, port) = rest.rsplit_once(':')?;
-    if host.is_empty() {
+/// `listen@` means *Serval* listens; the IOC is the client either way.
+pub fn parse_tcp_path(path: &str) -> Result<(String, u16), Option<String>> {
+    let rest = path.strip_prefix("tcp://").ok_or(None)?;
+    let rest = rest.split_once('@').map_or(rest, |(_, after)| after);
+    let (host, port) = rest.split_once(':').ok_or(None)?;
+    let Some(n) = stoi(port) else {
+        return Err(Some(format!("Failed to parse port: {port}")));
+    };
+    match u16::try_from(n) {
+        Ok(port) if port != 0 => Ok((host.to_string(), port)),
+        _ => Err(Some(format!("Invalid port number: {n} (must be 1-65535)"))),
+    }
+}
+
+/// `std::stoi`: leading C whitespace, an optional sign, at least one digit,
+/// and anything after the digits ignored; `None` where it throws.
+fn stoi(s: &str) -> Option<i32> {
+    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
         return None;
     }
-    let port: u16 = port.parse().ok()?;
-    if port == 0 {
-        return None;
+    let mut n: i64 = 0;
+    for d in s[..digits].bytes() {
+        n = n.checked_mul(10)?.checked_add(i64::from(d - b'0'))?;
     }
-    Some((host.to_string(), port))
+    i32::try_from(if negative { -n } else { n }).ok()
 }
 
 #[cfg(test)]
@@ -1071,19 +1092,52 @@ mod tests {
 
     #[test]
     fn tcp_paths_parse_with_and_without_listen() {
+        let ok = |h: &str, p| Ok((h.to_string(), p));
         assert_eq!(
             parse_tcp_path("tcp://listen@localhost:8089"),
-            Some(("localhost".to_string(), 8089))
+            ok("localhost", 8089)
         );
         assert_eq!(
             parse_tcp_path("tcp://127.0.0.1:8451"),
-            Some(("127.0.0.1".to_string(), 8451))
+            ok("127.0.0.1", 8451)
         );
-        assert_eq!(parse_tcp_path("http://localhost:8089"), None);
-        assert_eq!(parse_tcp_path("tcp://localhost"), None);
-        assert_eq!(parse_tcp_path("tcp://localhost:0"), None);
-        assert_eq!(parse_tcp_path("tcp://localhost:70000"), None);
-        assert_eq!(parse_tcp_path("tcp://:8089"), None);
-        assert_eq!(parse_tcp_path("file:///data"), None);
+        assert_eq!(parse_tcp_path("http://localhost:8089"), Err(None));
+        assert_eq!(parse_tcp_path("tcp://localhost"), Err(None));
+        assert_eq!(parse_tcp_path("file:///data"), Err(None));
+    }
+
+    /// C `parseTcpPath` (serval_stream.cpp:658-683): the first `@` and the
+    /// first `:` split, the host may be empty, and `std::stoi` reads the port.
+    #[test]
+    fn a_tcp_path_splits_and_parses_as_c() {
+        let ok = |h: &str, p| Ok((h.to_string(), p));
+        assert_eq!(parse_tcp_path("tcp://a@b@host:1"), ok("b@host", 1));
+        assert_eq!(
+            parse_tcp_path("tcp://[::1]:8089"),
+            Err(Some("Failed to parse port: :1]:8089".into()))
+        );
+        assert_eq!(parse_tcp_path("tcp://host:1:2"), ok("host", 1));
+        assert_eq!(parse_tcp_path("tcp://:8089"), ok("", 8089));
+        assert_eq!(parse_tcp_path("tcp://h: +8089x"), ok("h", 8089));
+        assert_eq!(
+            parse_tcp_path("tcp://h:0"),
+            Err(Some("Invalid port number: 0 (must be 1-65535)".into()))
+        );
+        assert_eq!(
+            parse_tcp_path("tcp://h:-5"),
+            Err(Some("Invalid port number: -5 (must be 1-65535)".into()))
+        );
+        assert_eq!(
+            parse_tcp_path("tcp://h:70000"),
+            Err(Some("Invalid port number: 70000 (must be 1-65535)".into()))
+        );
+        assert_eq!(
+            parse_tcp_path("tcp://h:x1"),
+            Err(Some("Failed to parse port: x1".into()))
+        );
+        assert_eq!(
+            parse_tcp_path("tcp://h:2147483648"),
+            Err(Some("Failed to parse port: 2147483648".into()))
+        );
     }
 }
