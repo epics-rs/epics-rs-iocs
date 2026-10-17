@@ -285,6 +285,178 @@ impl DppLibUsb {
     }
 }
 
+/// The host's USB stack as a [`UsbBus`], or `None` in a build without
+/// one (the `usb` feature off, or a target nusb does not support).
+#[cfg(all(
+    feature = "usb",
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "windows",
+        target_os = "macos"
+    )
+))]
+pub fn host_bus() -> Option<Box<dyn UsbBus>> {
+    Some(Box::new(host::HostBus::default()))
+}
+
+#[cfg(not(all(
+    feature = "usb",
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "windows",
+        target_os = "macos"
+    )
+)))]
+pub fn host_bus() -> Option<Box<dyn UsbBus>> {
+    None
+}
+
+/// [`UsbBus`] on nusb, standing in for libusb.
+#[cfg(all(
+    feature = "usb",
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "windows",
+        target_os = "macos"
+    )
+))]
+mod host {
+    use std::time::Duration;
+
+    use nusb::transfer::{Buffer, Bulk, In, Out, TransferError};
+    use nusb::{Endpoint, Interface, MaybeFuture};
+
+    use super::{UsbBus, UsbError, UsbHandle};
+
+    fn from_error(e: nusb::Error) -> UsbError {
+        match e.kind() {
+            nusb::ErrorKind::Disconnected => UsbError::NoDevice,
+            nusb::ErrorKind::Busy => UsbError::Busy,
+            nusb::ErrorKind::PermissionDenied => UsbError::Access,
+            nusb::ErrorKind::NotFound => UsbError::NotFound,
+            nusb::ErrorKind::Unsupported => UsbError::NotSupported,
+            _ => UsbError::Other,
+        }
+    }
+
+    /// libusb's code for a transfer's status; nusb reports a timed-out
+    /// transfer as cancelled.
+    fn from_transfer(e: TransferError) -> UsbError {
+        match e {
+            TransferError::Cancelled => UsbError::Timeout,
+            TransferError::Stall => UsbError::Pipe,
+            TransferError::Disconnected => UsbError::NoDevice,
+            TransferError::Fault => UsbError::Io,
+            TransferError::InvalidArgument => UsbError::InvalidParam,
+            _ => UsbError::Other,
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct HostBus {
+        listed: Vec<nusb::DeviceInfo>,
+    }
+
+    impl UsbBus for HostBus {
+        fn devices(&mut self) -> Result<Vec<(u16, u16)>, UsbError> {
+            self.listed = nusb::list_devices().wait().map_err(from_error)?.collect();
+            Ok(self
+                .listed
+                .iter()
+                .map(|d| (d.vendor_id(), d.product_id()))
+                .collect())
+        }
+
+        fn open(&mut self, index: usize) -> Result<Box<dyn UsbHandle>, UsbError> {
+            let info = self.listed.get(index).ok_or(UsbError::NoDevice)?;
+            let device = info.open().wait().map_err(from_error)?;
+            Ok(Box::new(HostHandle {
+                device,
+                claimed: None,
+            }))
+        }
+    }
+
+    /// An open device; dropping it closes it.
+    struct HostHandle {
+        device: nusb::Device,
+        claimed: Option<Claimed>,
+    }
+
+    /// A claimed interface and the bulk endpoints opened on it, each on
+    /// its first transfer as libusb addresses them.
+    struct Claimed {
+        interface: Interface,
+        bulk_out: Option<Endpoint<Bulk, Out>>,
+        bulk_in: Option<Endpoint<Bulk, In>>,
+    }
+
+    impl HostHandle {
+        fn claimed(&mut self) -> Result<&mut Claimed, UsbError> {
+            self.claimed.as_mut().ok_or(UsbError::NotFound)
+        }
+    }
+
+    impl UsbHandle for HostHandle {
+        fn claim_interface(&mut self, interface: u8) -> Result<(), UsbError> {
+            let interface = self
+                .device
+                .claim_interface(interface)
+                .wait()
+                .map_err(from_error)?;
+            self.claimed = Some(Claimed {
+                interface,
+                bulk_out: None,
+                bulk_in: None,
+            });
+            Ok(())
+        }
+
+        fn release_interface(&mut self, _interface: u8) -> Result<(), UsbError> {
+            match self.claimed.take() {
+                Some(claimed) => claimed.interface.release().wait().map_err(from_error),
+                None => Err(UsbError::NotFound),
+            }
+        }
+
+        fn bulk_out(
+            &mut self,
+            endpoint: u8,
+            data: &[u8],
+            timeout: Duration,
+        ) -> Result<(), UsbError> {
+            let claimed = self.claimed()?;
+            if claimed.bulk_out.is_none() {
+                claimed.bulk_out = Some(claimed.interface.endpoint(endpoint).map_err(from_error)?);
+            }
+            let ep = claimed.bulk_out.as_mut().ok_or(UsbError::NotFound)?;
+            let done = ep.transfer_blocking(Buffer::from(data), timeout);
+            done.status.map_err(from_transfer)
+        }
+
+        fn bulk_in(
+            &mut self,
+            endpoint: u8,
+            buf: &mut [u8],
+            timeout: Duration,
+        ) -> Result<usize, UsbError> {
+            let claimed = self.claimed()?;
+            if claimed.bulk_in.is_none() {
+                claimed.bulk_in = Some(claimed.interface.endpoint(endpoint).map_err(from_error)?);
+            }
+            let ep = claimed.bulk_in.as_mut().ok_or(UsbError::NotFound)?;
+            let done = ep.transfer_blocking(Buffer::new(buf.len()), timeout);
+            done.status.map_err(from_transfer)?;
+            let n = done.buffer.len().min(buf.len());
+            buf[..n].copy_from_slice(&done.buffer[..n]);
+            Ok(n)
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod fake {
     //! A [`UsbBus`] over scripted devices.

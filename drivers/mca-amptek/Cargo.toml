@@ -9,5 +9,14 @@ mca = { path = "../mca" }
 epics-rs = { workspace = true, features = ["asyn"] }
 asyn-rs = { workspace = true, features = ["epics"] }
 
+# nusb's platform backends; C builds its libusb transport on Linux and Windows.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "windows", target_os = "macos"))'.dependencies]
+nusb = { version = "0.2.8", optional = true }
+
+[features]
+# C builds DppLibUsb.cpp into every drvAmptek library, so USB is on by default.
+default = ["usb"]
+usb = ["dep:nusb"]
+
 [dev-dependencies]
 tempfile = "3"

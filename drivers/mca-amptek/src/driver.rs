@@ -1,7 +1,6 @@
 //! `drvAmptek` -- the Amptek DP5/PX5/DP5G/MCA8000D/TB5/DP5-X asyn MCA/MCS
 //! driver, ported from `drvAmptek.cpp`/`drvAmptek.h` (`mcaApp/AmptekSrc`).
-//! Ethernet/UDP, USB over a supplied [`crate::usb::UsbBus`], and C's
-//! never-connecting Serial port.
+//! Ethernet/UDP, USB, and C's never-connecting Serial port.
 //!
 //! # Architecture
 //! Every dispatch (`write_int32`, `read_configuration_from_hardware`, ...)
@@ -14,9 +13,9 @@
 //! thread).
 //!
 //! # Restructuring vs. C
-//! - **USB without a bus is rejected at construction**:
-//!   [`AmptekDriver::new`] returns `Err` for `DppInterfaceUSB`, and
-//!   [`AmptekDriver::with_usb_bus`] builds the port. Serial follows C: the constructor forces
+//! - **USB in a build without it is rejected at construction**:
+//!   [`AmptekDriver::new`] returns `Err` for `DppInterfaceUSB` when the
+//!   `usb` feature is off, where C would not build at all. Serial follows C: the constructor forces
 //!   `directMode=0` (`drvAmptek.cpp:140-147`) and `ConnectDpp`'s Serial
 //!   branch is empty, so the port exists and every connect fails. C's
 //!   unrecognized-type arm (`drvAmptek.cpp:148-152`) is followed too: the
@@ -101,15 +100,15 @@ use crate::link::DppLink;
 use crate::protocol::{self, ReceivedPacket, TransmitPacketType};
 use crate::status::{self, Dp5Status};
 use crate::transport::AmptekUdpTransport;
-use crate::usb::{DppLibUsb, UsbBus};
+use crate::usb::{self, DppLibUsb, UsbBus};
 
 /// The address C's single-argument `getIntegerParam(index)` and friends
 /// read: list 0.
 const PARAM_ADDR: i32 = 0;
 
-/// `DppInterface_t` (`DppConst.h`); `DppInterfaceUSB` (`1`) is rejected by
-/// [`AmptekDriver::new`] -- see the module doc's "USB without a bus" note.
+/// `DppInterface_t` (`DppConst.h`).
 const DPP_INTERFACE_ETHERNET: i32 = 0;
+const DPP_INTERFACE_USB: i32 = 1;
 const DPP_INTERFACE_SERIAL: i32 = 2;
 
 /// `drvAmptek.cpp:51`: `#define MAX_FAILED_SENDS 10`.
@@ -397,9 +396,8 @@ pub struct AmptekDriver {
 
 impl AmptekDriver {
     /// `drvAmptekConfigure(portName, interfaceType, addressInfo, directMode)`
-    /// (`drvAmptek.cpp:63-159`). Returns `Err` for USB (`1`) -- see the
-    /// module doc's "USB without a bus" note; an unknown type builds C's
-    /// address-less port.
+    /// (`drvAmptek.cpp:63-159`). Returns `Err` for USB (`1`) only in a
+    /// build without USB; an unknown type builds C's address-less port.
     pub fn new(
         port_name: &str,
         interface_type: i32,
@@ -423,30 +421,28 @@ impl AmptekDriver {
         direct_mode: bool,
         transport: AmptekUdpTransport,
     ) -> AsynResult<Self> {
-        if !(0..=2).contains(&interface_type) {
-            // `drvAmptek.cpp:148-152`: the port exists, with no address.
-            let link = DppLink::ethernet(transport, direct_mode);
-            let mut driver = Self::with_link(port_name, address_info, link)?;
-            driver.address_info = None;
-            driver.trace_error(&format!(
-                "drvAmptek::drvAmptek unknown interface type={interface_type}"
-            ));
-            return Ok(driver);
-        }
-        if interface_type == DPP_INTERFACE_SERIAL {
-            return Self::with_link(port_name, address_info, DppLink::Serial);
-        }
-        if interface_type != DPP_INTERFACE_ETHERNET {
-            return Err(protocol_error(format!(
-                "unsupported interface type={interface_type}: USB (1) needs a UsbBus \
-                 (AmptekDriver::with_usb_bus)"
-            )));
-        }
-        Self::with_link(
-            port_name,
-            address_info,
-            DppLink::ethernet(transport, direct_mode),
-        )
+        // `drvAmptek.cpp:140-153`; C forces `directMode=0` off Ethernet.
+        let link = match interface_type {
+            DPP_INTERFACE_ETHERNET => DppLink::ethernet(transport, direct_mode),
+            DPP_INTERFACE_USB => {
+                let bus = usb::host_bus().ok_or_else(|| {
+                    protocol_error("unsupported interface type=1: built without the usb feature")
+                })?;
+                DppLink::Usb(DppLibUsb::new(bus))
+            }
+            DPP_INTERFACE_SERIAL => DppLink::Serial,
+            _ => {
+                // The port exists, with no address.
+                let link = DppLink::ethernet(transport, direct_mode);
+                let mut driver = Self::with_link(port_name, address_info, link)?;
+                driver.address_info = None;
+                driver.trace_error(&format!(
+                    "drvAmptek::drvAmptek unknown interface type={interface_type}"
+                ));
+                return Ok(driver);
+            }
+        };
+        Self::with_link(port_name, address_info, link)
     }
 
     /// A USB port (`interfaceType` 1) whose libusb calls go to `bus`.
@@ -1855,8 +1851,12 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_usb() {
-        assert!(AmptekDriver::new("test1", 1, "192.168.0.1", false).is_err());
+    fn new_builds_usb_only_with_a_host_bus() {
+        let built = AmptekDriver::new("test1", 1, "", false);
+        assert_eq!(built.is_ok(), usb::host_bus().is_some());
+        if let Ok(driver) = built {
+            assert!(matches!(driver.link, DppLink::Usb(_)));
+        }
     }
 
     /// C builds a Serial port with `directMode=0` whose every connect finds

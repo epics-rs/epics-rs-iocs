@@ -31,8 +31,8 @@
 # to this IOC crate's CARGO_MANIFEST_DIR.
 
 # drvAmptekConfigure(portName, interface, addressInfo, directMode)
-# interface: 0 = Ethernet (only supported interface -- USB is
-# feasibility-gated, see the mca-amptek crate doc).
+# interface: 0 = Ethernet, 1 = USB (addressInfo "" or the serial number),
+# 2 = Serial (never connects, as in C).
 drvAmptekConfigure("Amptek1", 0, "127.0.0.1", 1)
 
 # ---- records ----

@@ -16,9 +16,8 @@
 //! * [`transport`] -- the Ethernet/UDP transport (`DppSocket.cpp`'s
 //!   `DppInterfaceEthernet` path).
 //! * [`usb`] -- the USB transport (`DppLibUsb.cpp` and `ConsoleHelper.cpp`'s
-//!   `LibUsb_*`) over a [`usb::UsbBus`]. [`driver::AmptekDriver::new`] has
-//!   no bus to give it and rejects interface 1;
-//!   [`driver::AmptekDriver::with_usb_bus`] takes one.
+//!   `LibUsb_*`) over a [`usb::UsbBus`], on nusb with the default `usb`
+//!   feature.
 //! * [`driver`] -- the asyn `PortDriver` implementation
 //!   (`drvAmptek.cpp`/`drvAmptek.h`).
 //!
