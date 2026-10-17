@@ -229,6 +229,10 @@ impl A3200Controller {
 /// One A3200 axis sharing a controller. Implements [`AsynMotor`].
 pub struct A3200Axis {
     controller: Arc<Mutex<A3200Controller>>,
+    /// C `pAxis->card`, the `A3200AsynConfig` card.
+    card: i32,
+    /// C `pAxis->axis`, the axis's place on the card.
+    axis: i32,
     /// Controller axis name string (the `X`/`Y`/… address).
     axis_name: String,
     /// `HomeSetup` word; bit 0 is the home direction, updated by [`Self::home`].
@@ -261,7 +265,12 @@ pub struct A3200Axis {
 impl A3200Axis {
     /// Construct the named axis and probe its feedback type, home/limit setup and
     /// reverse-direction parameters, then set `RAMP MODE RATE`.
-    pub fn new(controller: Arc<Mutex<A3200Controller>>, axis_name: String) -> Self {
+    pub fn new(
+        controller: Arc<Mutex<A3200Controller>>,
+        card: i32,
+        axis: i32,
+        axis_name: String,
+    ) -> Self {
         let (has_encoder, step_size, home_preset, home_direction, reverse_direc, swconfig) = {
             let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let has_encoder = ctrl
@@ -296,6 +305,8 @@ impl A3200Axis {
 
         Self {
             controller,
+            card,
+            axis,
             report: Arc::new(AxisMembers::new(
                 axis_name.clone(),
                 step_size,
@@ -408,7 +419,26 @@ impl A3200Axis {
         ))))
     }
 
-    fn do_move(&mut self, position: f64, relative: bool, max_v: f64, accel: f64) -> AsynResult<()> {
+    fn do_move(
+        &mut self,
+        position: f64,
+        relative: bool,
+        min_v: f64,
+        max_v: f64,
+        accel: f64,
+    ) -> AsynResult<()> {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "Set card {}, axis {} move to {:.6}, min vel={:.6}, max_vel={:.6}, accel={:.6}\n",
+                self.card,
+                self.axis_name,
+                CFloat(position),
+                CFloat(min_v),
+                CFloat(max_v),
+                CFloat(accel)
+            ),
+        );
         let posdir = if relative {
             position >= 0.0
         } else {
@@ -508,22 +538,22 @@ impl AsynMotor for A3200Axis {
         &mut self,
         _user: &AsynUser,
         position: f64,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(position, false, velocity, acceleration)
+        self.do_move(position, false, min_velocity, velocity, acceleration)
     }
 
     fn move_relative(
         &mut self,
         _user: &AsynUser,
         distance: f64,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(distance, true, velocity, acceleration)
+        self.do_move(distance, true, min_velocity, velocity, acceleration)
     }
 
     fn move_velocity(
@@ -552,6 +582,15 @@ impl AsynMotor for A3200Axis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "motorAxisHome: set card {}, axis {} to home, forwards = {}\n",
+                self.card,
+                self.axis,
+                i32::from(forward)
+            ),
+        );
         // Adjust home direction for the reverse-direction parameter (C posdir).
         let posdir = forward == self.reverse_direc;
         let hparam = if posdir {
@@ -579,6 +618,10 @@ impl AsynMotor for A3200Axis {
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!("Abort on card {}, axis {}\n", self.card, self.axis),
+        );
         let name = self.axis_name.clone();
         let mut ctrl = self.lock();
         let task = ctrl.task_number;
@@ -715,7 +758,7 @@ mod tests {
         let (line, io) = LineRig::new("a32ProbeLine", |_| "%0".into());
         let controller = A3200Controller::new(io, "a32ProbeLine", "0", 1, true);
         line.sent();
-        A3200Axis::new(Arc::new(Mutex::new(controller)), "X".into());
+        A3200Axis::new(Arc::new(Mutex::new(controller)), 0, 0, "X".into());
         assert_eq!(
             line.sent(),
             [
@@ -743,7 +786,7 @@ mod tests {
         static DRIVER: Model2 = Model2::new("a32LogTest", 0);
         let (_line, io) = LineRig::new("a32LogLine", |_| "%0".into());
         let controller = A3200Controller::new(io, "a32LogLine", "0", 1, true);
-        let axis = A3200Axis::new(Arc::new(Mutex::new(controller)), "X".into());
+        let axis = A3200Axis::new(Arc::new(Mutex::new(controller)), 0, 0, "X".into());
         let axis = Arc::new(Mutex::new(axis));
         let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
         DRIVER.set_card(0, vec![motor], 100, 1000);
@@ -807,7 +850,7 @@ mod tests {
     ) -> (motor_common::testing::LineRig, A3200Axis) {
         let (line, io) = motor_common::testing::LineRig::failing(name, reply, fails);
         let controller = A3200Controller::new(io, name, "0", 1, linear);
-        let axis = A3200Axis::new(Arc::new(Mutex::new(controller)), "X".into());
+        let axis = A3200Axis::new(Arc::new(Mutex::new(controller)), 0, 0, "X".into());
         line.sent();
         (line, axis)
     }
@@ -1072,5 +1115,44 @@ mod tests {
         assert!(FAULT_ACK_ALL_CODES.contains(&52));
         assert!(FAULT_ACK_ALL_CODES.contains(&78));
         assert!(!FAULT_ACK_ALL_CODES.contains(&1));
+    }
+
+    /// drvA3200Asyn.cc:488-489, :575-576, :675: move, home and abort print
+    /// their FLOW line with the card the config gave the axis; the move
+    /// names the axis, home and abort number it.
+    #[epics_rs::base::epics_test]
+    async fn commands_print_their_flow_line_with_the_card() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        use motor_common::testing::LineRig;
+
+        let (_line, io) = LineRig::new("a32FlowLine", |_| "%0".into());
+        let controller = A3200Controller::new(io, "a32FlowLine", "3", 1, true);
+        let mut axis = A3200Axis::new(Arc::new(Mutex::new(controller)), 3, 2, "Y".into());
+        let path = std::env::temp_dir().join(format!("a32-flow-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(None, TraceMask::FLOW);
+        trace.set_trace_file(None, TraceFile::File(file));
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 1.5, 0.5, 2.0, 3.0).unwrap();
+        axis.home(&user, 0.0, 1.0, 1.0, false).unwrap();
+        axis.stop(&user, 1.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Set card 3, axis Y move to 1.500000, min vel=0.500000, max_vel=2.000000, accel=3.000000",
+                "motorAxisHome: set card 3, axis 2 to home, forwards = 0",
+                "Abort on card 3, axis 2",
+            ],
+            "{text}"
+        );
     }
 }

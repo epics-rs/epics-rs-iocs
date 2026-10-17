@@ -181,6 +181,8 @@ impl EnsembleController {
 /// One Ensemble axis sharing a controller. Implements [`AsynMotor`].
 pub struct EnsembleAxis {
     controller: Arc<Mutex<EnsembleController>>,
+    /// C `pAxis->card`, the `EnsembleAsynConfig` card.
+    card: i32,
     /// Controller axis number (the `@n` address).
     axis: i32,
     /// The axis's place among the controller's, C `itera`.
@@ -213,6 +215,7 @@ impl EnsembleAxis {
     /// reverse-direction parameters, then set `RAMP MODE RATE`.
     pub fn new(
         controller: Arc<Mutex<EnsembleController>>,
+        card: i32,
         axis: i32,
         index: i32,
     ) -> AsynResult<Self> {
@@ -250,6 +253,7 @@ impl EnsembleAxis {
 
         Ok(Self {
             controller,
+            card,
             axis,
             index,
             last_fault: 0,
@@ -300,8 +304,26 @@ impl EnsembleAxis {
         fmt(v * self.step, self.digits)
     }
 
-    fn do_move(&mut self, position: f64, relative: bool, max_v: f64, accel: f64) -> AsynResult<()> {
+    fn do_move(
+        &mut self,
+        position: f64,
+        relative: bool,
+        min_v: f64,
+        max_v: f64,
+        accel: f64,
+    ) -> AsynResult<()> {
         let axis = self.axis;
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "Set card {}, axis {axis} move to {:.6}, min vel={:.6}, max_vel={:.6}, accel={:.6}\n",
+                self.card,
+                CFloat(position),
+                CFloat(min_v),
+                CFloat(max_v),
+                CFloat(accel)
+            ),
+        );
         let mode = if relative { "INC" } else { "ABS" };
         let mut ctrl = self.lock();
         ctrl.send(mode)?;
@@ -422,22 +444,22 @@ impl AsynMotor for EnsembleAxis {
         &mut self,
         _user: &AsynUser,
         position: f64,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(position, false, velocity, acceleration)
+        self.do_move(position, false, min_velocity, velocity, acceleration)
     }
 
     fn move_relative(
         &mut self,
         _user: &AsynUser,
         distance: f64,
-        _min_velocity: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.do_move(distance, true, velocity, acceleration)
+        self.do_move(distance, true, min_velocity, velocity, acceleration)
     }
 
     fn move_velocity(
@@ -466,6 +488,14 @@ impl AsynMotor for EnsembleAxis {
         forward: bool,
     ) -> AsynResult<()> {
         let axis = self.axis;
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "motorAxisHome: set card {}, axis {axis} to home, forwards = {}\n",
+                self.card,
+                i32::from(forward)
+            ),
+        );
         // Adjust home direction for the reverse-direction parameter (C posdir).
         let posdir = forward == self.reverse_direc;
         let hparam = if posdir {
@@ -499,6 +529,10 @@ impl AsynMotor for EnsembleAxis {
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let axis = self.axis;
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!("Abort on card {}, axis {axis}\n", self.card),
+        );
         self.lock().send(&format!("ABORT @{axis}"))
     }
 
@@ -654,7 +688,7 @@ mod tests {
         static DRIVER: Model2 = Model2::new("ensLogTest", 0);
         let (_line, io) = LineRig::new("ensLogLine", |_| "%0".into());
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensLogLine", "0")));
-        let axis = EnsembleAxis::new(controller, 0, 0).unwrap();
+        let axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
         let log = axis.log();
         let axis = Arc::new(Mutex::new(axis));
         let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
@@ -729,7 +763,7 @@ mod tests {
         };
         let (_line, io) = LineRig::new("ensFaultLine", reply);
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensFaultLine", "0")));
-        let mut axis = EnsembleAxis::new(controller, 0, 2).unwrap();
+        let mut axis = EnsembleAxis::new(controller, 0, 0, 2).unwrap();
         let path = std::env::temp_dir().join(format!("ens-fault-{}", std::process::id()));
         let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
         let manager = PortManager::global();
@@ -781,7 +815,7 @@ mod tests {
         let (line, io) = LineRig::new("ensProbeLine", |_| "%0".into());
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensProbeLine", "0")));
         line.sent();
-        EnsembleAxis::new(controller, 0, 0).unwrap();
+        EnsembleAxis::new(controller, 0, 0, 0).unwrap();
         assert_eq!(
             line.sent(),
             [
@@ -809,7 +843,7 @@ mod tests {
             _ => "%0".into(),
         });
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensAckLine", "0")));
-        let mut axis = EnsembleAxis::new(controller, 0, 0).unwrap();
+        let mut axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
         let path = std::env::temp_dir().join(format!("ens-ack-{}", std::process::id()));
         let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
         let manager = PortManager::global();
@@ -852,7 +886,7 @@ mod tests {
         };
         let (line, io) = LineRig::failing("ensPowerLine", reply, fails);
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensPowerLine", "0")));
-        let mut axis = EnsembleAxis::new(controller, 0, 0).unwrap();
+        let mut axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
         let user = AsynUser::new(0);
         line.sent();
         axis.set_closed_loop(&user, true).unwrap();
@@ -874,7 +908,7 @@ mod tests {
     ) -> (motor_common::testing::LineRig, EnsembleAxis) {
         let (line, io) = motor_common::testing::LineRig::failing(name, reply, fails);
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, name, "0")));
-        let axis = EnsembleAxis::new(controller, 0, 0).unwrap();
+        let axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
         line.sent();
         (line, axis)
     }
@@ -905,7 +939,7 @@ mod tests {
         // RAMP MODE's NAK does not refuse the axis.
         let (_line, io) = motor_common::testing::LineRig::new("ensNakProbe", nak);
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensNakProbe", "0")));
-        assert!(EnsembleAxis::new(controller, 0, 0).is_ok());
+        assert!(EnsembleAxis::new(controller, 0, 0, 0).is_ok());
     }
 
     /// drvEnsembleAsyn.cc:510-533, :584-597, :619-629: a failed exchange
@@ -1124,5 +1158,45 @@ mod tests {
     #[test]
     fn travel_limit_fault_mask_value() {
         assert_eq!(TRAVEL_LIMIT_FAULT_MASK, 0x0C);
+    }
+
+    /// drvEnsembleAsyn.cc:497-498, :562-563, :662: move, home and abort
+    /// print their FLOW line with the card the config gave the axis.
+    #[epics_rs::base::epics_test]
+    async fn commands_print_their_flow_line_with_the_card() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        use motor_common::testing::LineRig;
+
+        let (_line, io) = LineRig::new("ensFlowLine", |_| "%0".into());
+        let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensFlowLine", "3")));
+        let mut axis = EnsembleAxis::new(controller, 3, 2, 0).unwrap();
+        let path = std::env::temp_dir().join(format!("ens-flow-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(None, TraceMask::FLOW);
+        trace.set_trace_file(None, TraceFile::File(file));
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 1.5, 0.5, 2.0, 3.0).unwrap();
+        axis.move_relative(&user, -1.0, 0.0, 2.0, 0.0).unwrap();
+        axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
+        axis.stop(&user, 1.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Set card 3, axis 2 move to 1.500000, min vel=0.500000, max_vel=2.000000, accel=3.000000",
+                "Set card 3, axis 2 move to -1.000000, min vel=0.000000, max_vel=2.000000, accel=0.000000",
+                "motorAxisHome: set card 3, axis 2 to home, forwards = 1",
+                "Abort on card 3, axis 2",
+            ],
+            "{text}"
+        );
     }
 }

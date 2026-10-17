@@ -213,7 +213,7 @@ pub fn ensemble_config_command() -> CommandDef {
                     .unwrap_or_else(|e| e.into_inner())
                     .axis_exists(axis);
                 if exists {
-                    let ax = EnsembleAxis::new(controller.clone(), axis, axes.len() as i32)
+                    let ax = EnsembleAxis::new(controller.clone(), card, axis, axes.len() as i32)
                         .map_err(|e| format!("EnsembleAsynConfig: axis {axis}: {e}"))?;
                     reports.push(ax.report());
                     logs.push(ax.log());
@@ -313,7 +313,7 @@ pub fn a3200_config_command() -> CommandDef {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .discover_axis_name(axis);
-                let ax = A3200Axis::new(controller.clone(), axis_name);
+                let ax = A3200Axis::new(controller.clone(), card, axis, axis_name);
                 reports.push(ax.report());
                 logs.push(ax.log());
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
