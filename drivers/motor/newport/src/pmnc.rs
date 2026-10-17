@@ -407,7 +407,8 @@ impl PmncAxis {
     /// C clamps velocity to `MAX_VELOCITY` and acceleration to
     /// `[MIN_ACCEL, MAX_ACCEL]`; an 8753 additionally programs the minimum
     /// profile velocity (`MPV`) after parking `VEL` at max to dodge an
-    /// out-of-range error.
+    /// out-of-range error. The record sends no SET_ACCEL for a zero rate
+    /// (motorRecord.cc:874, 940), so there is no `ACC` then.
     fn send_speed(
         &self,
         ctrl: &PmncController,
@@ -417,7 +418,6 @@ impl PmncAxis {
     ) -> AsynResult<()> {
         let (d, m) = (self.def.driver_num, self.def.motor_num);
         let vel = nint(velocity).unsigned_abs().min(MAX_VELOCITY as u32) as i64;
-        let accel = i64::from(nint(acceleration)).clamp(MIN_ACCEL, MAX_ACCEL);
         if self.is_8753() {
             let mpv = nint(min_velocity)
                 .unsigned_abs()
@@ -426,7 +426,10 @@ impl PmncAxis {
             ctrl.command(&format!("MPV A{d} {m}={mpv}"))?;
         }
         ctrl.command(&format!("VEL A{d} {m}={vel}"))?;
-        ctrl.command(&format!("ACC A{d} {m}={accel}"))?;
+        if acceleration > 0.0 {
+            let accel = i64::from(nint(acceleration)).clamp(MIN_ACCEL, MAX_ACCEL);
+            ctrl.command(&format!("ACC A{d} {m}={accel}"))?;
+        }
         Ok(())
     }
 
@@ -809,6 +812,25 @@ mod tests {
         let (line, mut axis, _) = strings_rig("pmncInit");
         axis.primitive(&AsynUser::default(), b"SER A0").unwrap();
         assert_eq!(line.sent(), ["SER A0"]);
+    }
+
+    #[test]
+    fn a_zero_rate_move_has_no_acc() {
+        let (line, mut axis, _) = strings_rig("pmncZeroAcc");
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 5.0, 0.0, 100.0, 0.0).unwrap();
+        axis.move_relative(&user, 5.0, 0.0, 100.0, 0.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL A0 0=100",
+                "ABS A0=5",
+                "GO A0",
+                "VEL A0 0=100",
+                "REL A0=5",
+                "GO A0"
+            ]
+        );
     }
 
     #[test]
