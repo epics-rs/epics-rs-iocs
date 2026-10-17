@@ -716,7 +716,10 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
         }
         Err((reason, None)) => {
             let message = format!("Invalid detector response: {reason}");
-            ctx.trace(TraceMask::ERROR, &adlog::err("getDetector", &message));
+            ctx.trace(
+                TraceMask::ERROR,
+                &adlog::err("getDetector", &format!("getDetector: {message}")),
+            );
             let updates = failure(message.clone(), &message, ADStatus::Error);
             ctx.set(0, updates).await;
             return false;
@@ -3931,7 +3934,10 @@ mod tests {
                 ADStatus::Error as i32
             );
             assert!(
-                text.contains(&adlog::err("getDetector", &message)),
+                text.contains(&adlog::err(
+                    "getDetector",
+                    &format!("getDetector: {message}")
+                )),
                 "{text}"
             );
         }
