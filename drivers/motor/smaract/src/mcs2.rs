@@ -72,6 +72,7 @@ const SENSOR_PRESENT: i64 = 0x0020;
 const IS_CALIBRATED: i64 = 0x0040;
 const IS_REFERENCED: i64 = 0x0080;
 const END_STOP_REACHED: i64 = 0x0100;
+const FOLLOWING_LIMIT_REACHED: i64 = 0x0400;
 const MOVEMENT_FAILED: i64 = 0x0800;
 const REFERENCE_MARK: i64 = 0x8000;
 
@@ -618,6 +619,8 @@ impl AsynMotor for Mcs2Axis {
             high_limit: end_stop,
             low_limit: end_stop,
             problem: (state & MOVEMENT_FAILED) != 0,
+            // C's motorStatusFollowingError_, MSTA bit 6.
+            slip_stall: (state & FOLLOWING_LIMIT_REACHED) != 0,
             powered,
             ..MotorStatus::default()
         })
@@ -657,6 +660,23 @@ mod tests {
                 "{want}: {sent:?}"
             );
         }
+    }
+
+    /// C sets `motorStatusFollowingError_` from FOLLOWING_LIMIT_REACHED
+    /// (smarActMCS2MotorDriver.cpp:492, 505).
+    #[test]
+    fn the_poll_reports_the_following_limit() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("mcs2FollowLimit", |cmd| {
+            match cmd.trim_end() {
+                ":CHAN0:STAT?" => "1024\r\n",
+                _ => "0\r\n",
+            }
+            .to_string()
+        });
+        let ctrl = Mcs2Controller::new(io, &MotorTrace::new("mcs2FollowLimit", 0));
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        assert!(axis.poll(&AsynUser::default()).unwrap().slip_stall);
     }
 
     #[test]
