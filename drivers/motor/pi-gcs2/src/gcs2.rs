@@ -1361,6 +1361,22 @@ impl PIGCS2Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// `PIasynController::writeInt32`'s FLOW line for a flag write. C
+    /// defect not copied: its format takes the verb first, printing
+    /// "Sett:PIasynDriver: writeInt32ing ...".
+    fn flag_write_flow(&self, verb: &str, flag: &str) {
+        PortManager::global().trace_manager().print(
+            Some(&self.port_name),
+            Some(self.axis_no as i32),
+            0,
+            TraceMask::FLOW,
+            format_args!(
+                "PIasynDriver:writeInt32: {verb}ing {flag} flag on driver {}\n",
+                self.port_name
+            ),
+        );
+    }
+
     /// C `m_pCurrentLogSink = pasynUser_`, at the head of `Init` and of
     /// each axis entry point and controller write.
     fn log_here(&self) {
@@ -1719,6 +1735,10 @@ impl AsynMotor for PIGCS2Axis {
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
         self.log_here();
+        self.flag_write_flow(
+            if enable { "Enabl" } else { "Disabl" },
+            "Closed-Loop Control",
+        );
         self.set_servo(enable)
     }
 
@@ -1726,19 +1746,7 @@ impl AsynMotor for PIGCS2Axis {
     /// deferral runs `processDeferredMoves`, whose status C ignores.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
         self.log_here();
-        // C defect not copied: its format puts the "Sett"/"Clear" argument
-        // first, printing "Sett:PIasynDriver: writeInt32ing ...".
-        PortManager::global().trace_manager().print(
-            Some(&self.port_name),
-            Some(self.axis_no as i32),
-            0,
-            TraceMask::FLOW,
-            format_args!(
-                "PIasynDriver:writeInt32: {}ing Deferred Move flag on driver {}\n",
-                if defer { "Sett" } else { "Clear" },
-                self.port_name
-            ),
-        );
+        self.flag_write_flow(if defer { "Sett" } else { "Clear" }, "Deferred Move");
         let mut ctrl = self.lock();
         if !defer && ctrl.moves_deferred {
             let _ = ctrl.process_deferred_moves();
@@ -2555,6 +2563,30 @@ mod tests {
             .unwrap();
         first.set_deferred_moves(&user, false).unwrap();
         assert_eq!(sent_lines(&line)[0], "MOV 1 3.000000 2 -3.000000");
+    }
+
+    /// `PIasynController::writeInt32` (PIasynController.cpp:295-298) logs a
+    /// closed-loop write on the writer's user, its misordered arguments put
+    /// back in place.
+    #[test]
+    fn a_closed_loop_write_is_logged() {
+        let (_line, mut first, _second) = two_axes("gcs2ServoLog");
+        let user = AsynUser::new(0);
+        let printed = traced_mask("gcs2ServoLog", TraceMask::FLOW, || {
+            let _ = first.set_closed_loop(&user, true);
+            let _ = first.set_closed_loop(&user, false);
+        });
+        let mine: Vec<_> = messages(&printed)
+            .into_iter()
+            .filter(|m| m.contains("Closed-Loop"))
+            .collect();
+        assert_eq!(
+            mine,
+            [
+                "PIasynDriver:writeInt32: Enabling Closed-Loop Control flag on driver gcs2ServoLog\n",
+                "PIasynDriver:writeInt32: Disabling Closed-Loop Control flag on driver gcs2ServoLog\n",
+            ]
+        );
     }
 
     /// `PIasynAxis::stop` (:310-316) drops the axis's deferred move.
