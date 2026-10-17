@@ -1598,6 +1598,18 @@ impl TimePix3Driver {
             // serval_http.cpp:1688-1689.
             println!("\nuploadDACS: http_code = {code}");
             println!("Text dacs_file: {text}");
+        } else {
+            // mask_io.cpp:557.
+            self.ad.port_base.trace_print(
+                TraceMask::IO_DRIVER,
+                format_args!(
+                    "{}",
+                    adlog::log(
+                        adlog::UPLOAD_BPC,
+                        &format!("uploadBPC: http_code={code} file={}", file.display())
+                    )
+                ),
+            );
         }
         // serval_http.cpp:1690-1691, mask_io.cpp:559-560.
         self.ad
@@ -5579,6 +5591,63 @@ mod tests {
 
     /// Point the BPC and DACS file PVs at real files, which C
     /// `resolveCalibrationFile` requires before an upload.
+    /// uploadBPC logs the status and the file Serval was told to load,
+    /// accepted or not (mask_io.cpp:557).
+    #[test]
+    fn upload_bpc_logs_its_status_and_file() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        for (name, fail, code) in [
+            ("TPX_BPC_LOG_OK", "\0", 200),
+            ("TPX_BPC_LOG_BAD", "GET /config/load", 500),
+        ] {
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+            let mut det = TimePix3Driver::new(
+                name,
+                Arc::new(ServalHttp::new(&fake_serval(fail))),
+                Arc::new(Shared::new()),
+                0,
+                cmd_tx,
+            )
+            .unwrap();
+            calibration_files(&mut det, name);
+            let p = det.p;
+            let (runtime, _) = create_port_runtime(
+                &epics_rs::asyn::registry::claim_port(name).unwrap(),
+                det,
+                RuntimeConfig::default(),
+            )
+            .unwrap();
+            let h = runtime.port_handle().clone();
+            let path = std::env::temp_dir().join(format!("{name}-{}.trace", std::process::id()));
+            let file = std::fs::File::create(&path).unwrap();
+            h.trace().set_trace_file(
+                Some(name),
+                TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+            h.trace().set_trace_mask(Some(name), TraceMask::IO_DRIVER);
+            let resolved = h
+                .with_driver_blocking::<TimePix3Driver, _>(move |d| {
+                    let _ = d.config_load("pixelconfig", p.bp_c_file_path, p.bp_c_file_name);
+                    let (dir, file) = (d.text(p.bp_c_file_path, 0), d.text(p.bp_c_file_name, 0));
+                    d.resolve_calibration_file(&dir, &file, PathAccess::Read)
+                        .unwrap()
+                })
+                .unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            std::mem::forget(runtime);
+            assert!(
+                text.contains(&adlog::log(
+                    adlog::UPLOAD_BPC,
+                    &format!("uploadBPC: http_code={code} file={}", resolved.display())
+                )),
+                "{text}"
+            );
+        }
+    }
+
     fn calibration_files(det: &mut TimePix3Driver, name: &str) {
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
