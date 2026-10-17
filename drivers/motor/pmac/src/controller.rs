@@ -34,7 +34,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteValue, index,
+    ControllerParams, FinishedWrite, ParamDelta, ParamWrite, WriteHook, WriteValue, index,
 };
 
 use crate::cs_groups::{AxisPoll, CsGroups, DeferredMove, fast_deferred_command};
@@ -473,12 +473,13 @@ impl PmacControllerParams {
 struct PmacWriteHook;
 
 impl WriteHook for PmacWriteHook {
-    fn after_write(&self, write: &FinishedWrite<'_>) {
+    fn after_write(&self, write: &FinishedWrite<'_>) -> ParamDelta {
         let method = match write.value {
             WriteValue::Int32(_) => "writeInt32",
             WriteValue::Float64(_) => "writeFloat64",
         };
         write.print(TraceMask::FLOW, format_args!("pmacController::{method}\n"));
+        ParamDelta::default()
     }
 }
 

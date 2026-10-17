@@ -43,7 +43,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteValue,
+    ControllerParams, FinishedWrite, ParamDelta, ParamWrite, WriteHook, WriteValue,
 };
 
 use motor_common::util::{atof, leading_hex};
@@ -195,7 +195,7 @@ impl OemParams {
 struct OemWriteHook;
 
 impl WriteHook for OemWriteHook {
-    fn after_write(&self, write: &FinishedWrite<'_>) {
+    fn after_write(&self, write: &FinishedWrite<'_>) -> ParamDelta {
         let function = write.function;
         let (method, value) = match write.value {
             WriteValue::Int32(v) => ("writeInt32", v.to_string()),
@@ -214,6 +214,7 @@ impl WriteHook for OemWriteHook {
                 format_args!("OEMMotorDriver:{method}: function={function}, value={value}\n"),
             ),
         }
+        ParamDelta::default()
     }
 }
 
