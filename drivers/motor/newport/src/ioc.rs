@@ -202,6 +202,7 @@ pub fn smc100_create_controller_command() -> CommandDef {
                 ),
             );
             // C builds every axis on pasynUserController_, connected or not.
+            let poller = Controller::new();
             let mut controller_user = Some(handle);
             for axis in 0..num_axes {
                 let handle = controller_user.take().unwrap_or_else(|| {
@@ -218,15 +219,9 @@ pub fn smc100_create_controller_command() -> CommandDef {
                     (axis + 1) as u8,
                     step_size,
                 )));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, SMC100Driver.cpp:67
-                )?;
+                poller.install(asyn_user(&port_name, axis), motor)?;
             }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // SMC100Driver.cpp:67
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1934,6 +1929,22 @@ mod one_poller {
             ArgValue::Int(1000),
         ];
         let cmd = hxp_create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+    }
+
+    /// SMC100Driver.cpp:67: one startPoller after the axes, which C builds
+    /// on an unconnected line too.
+    #[epics_rs::base::epics_test]
+    async fn smc100_create_controller_polls_its_axes_on_one_poller() {
+        let args = vec![
+            ArgValue::String("smcOnePoller".into()),
+            ArgValue::String("smcOnePollerNoLine".into()),
+            ArgValue::Int(3),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+            ArgValue::String("0.001".into()),
+        ];
+        let cmd = smc100_create_controller_command();
         assert_eq!(pollers_after(cmd, args).await, 1);
     }
 
