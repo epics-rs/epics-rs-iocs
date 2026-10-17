@@ -135,6 +135,9 @@ use motor_common::{ControllerParams, ControllerReport};
 /// Response buffer size for a single reply line.
 const READ_BUF: usize = 256;
 
+/// PIInterface's error prints: `ASYN_TRACE_ERROR|ASYN_TRACEIO_DRIVER`.
+const IO_ERROR: TraceMask = TraceMask::ERROR.union(TraceMask::IO_DRIVER);
+
 /// Output command terminator (C sets input EOS `"\n"` and appends a bare
 /// `"\n"` write after every command in `PIInterface::sendOnly`/
 /// `sendAndReceive`); the driver owns this framing.
@@ -700,16 +703,23 @@ impl PIGCS2Controller {
     /// Write a command with no reply expected (C `sendOnly`): the command,
     /// then its `\n` as a second write whose status alone decides.
     fn send_only(&self, cmd: &str) -> AsynResult<()> {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("PIInterface::sendOnly() sending \"{cmd}\"\n"),
+        );
         let _ = self.handle.write_octet(0, cmd.as_bytes());
         let e = match self.handle.write_octet(0, TERMINATOR) {
             Ok(_) => return Ok(()),
             Err(e) => e,
         };
-        self.print(format_args!(
-            "PIGCSController:sendOnly: error sending command {cmd}, sent={}, status={}\n",
-            e.partial_write().unwrap_or(0),
-            e.status() as i32
-        ));
+        self.trace(
+            IO_ERROR,
+            format_args!(
+                "PIGCSController:sendOnly: error sending command {cmd}, sent={}, status={}\n",
+                e.partial_write().unwrap_or(0),
+                e.status() as i32
+            ),
+        );
         Err(e)
     }
 
@@ -727,8 +737,12 @@ impl PIGCS2Controller {
     /// non-final reply line with a trailing space: each line after one is a
     /// plain read, joined on `\n`, whose failure C does not print.
     fn send_and_receive(&self, cmd: &str) -> AsynResult<Vec<u8>> {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("PIInterface::sendAndReceive() sending \"{cmd}\"\n"),
+        );
         let short_write = |status: i32, message: &str| {
-            self.print(format_args!(
+            self.trace(IO_ERROR, format_args!(
                 "PIGCSController:sendAndReceive error calling write, output={cmd} status={status}, error={message}\n"
             ));
             pigcs2_err(message)
@@ -743,7 +757,7 @@ impl PIGCS2Controller {
             .write_read(0, TERMINATOR, READ_BUF)
             .map_err(|e| match e.octet_step() {
                 Some(OctetStep::Read) => {
-                    self.print(format_args!(
+                    self.trace(IO_ERROR, format_args!(
                         "PIGCSController:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
                         e.status() as i32,
                         e.message()
@@ -756,6 +770,7 @@ impl PIGCS2Controller {
             reply.push(b'\n');
             reply.extend(self.handle.read_octet(0, READ_BUF)?);
         }
+        self.trace_received(&reply);
         Ok(reply)
     }
 
@@ -773,6 +788,17 @@ impl PIGCS2Controller {
         PortManager::global()
             .trace_manager()
             .print(Some(port), Some(addr), 0, mask, args);
+    }
+
+    /// PIInterface's `sendAndReceive() received` line.
+    fn trace_received(&self, reply: &[u8]) {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "PIInterface::sendAndReceive() received \"{}\"\n",
+                String::from_utf8_lossy(reply)
+            ),
+        );
     }
 
     /// `SAI?`: every connected axis name, one per reply line less its
@@ -932,6 +958,10 @@ impl PIGCS2Controller {
     /// C `sendOnly(char)`: the byte alone, no terminator; a byte not
     /// written is asynError whatever the write returned.
     fn send_only_char(&self, c: u8) -> AsynResult<()> {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("PIInterface::sendOnly() sending \"#{c}\"\n"),
+        );
         let e = match self.handle.write_octet(0, &[c]) {
             Ok(1) => return Ok(()),
             Ok(n) => pigcs2_err(format!("{n} bytes written")).with_partial_write(n),
@@ -941,11 +971,14 @@ impl PIGCS2Controller {
                 pigcs2_err(e.to_string()).with_partial_write(sent)
             }
         };
-        self.print(format_args!(
-            "PIGCSController:sendOnly: error sending command {c}, sent={}, status={}\n",
-            e.partial_write().unwrap_or(0),
-            e.status() as i32
-        ));
+        self.trace(
+            IO_ERROR,
+            format_args!(
+                "PIGCSController:sendOnly: error sending command {c}, sent={}, status={}\n",
+                e.partial_write().unwrap_or(0),
+                e.status() as i32
+            ),
+        );
         Err(e)
     }
 
@@ -1168,6 +1201,10 @@ impl PIGCS2Controller {
     /// separator, so `PIHexapodController`'s `#3` parse sees only the first
     /// line; rs joins them with `\n`, as the string `sendAndReceive` does.
     fn send_and_receive_char(&self, c: u8) -> AsynResult<Vec<u8>> {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("PIInterface::sendAndReceive() sending \"#{c}\"\n"),
+        );
         let write_read = || {
             self.handle
                 .write_read(0, &[c], READ_BUF)
@@ -1177,7 +1214,7 @@ impl PIGCS2Controller {
                 })
         };
         let mut reply = write_read().inspect_err(|e| {
-            self.print(format_args!(
+            self.trace(IO_ERROR, format_args!(
                 "PIInterface::sendAndReceive error calling writeRead, output={c} status={}, error={}\n",
                 e.status() as i32,
                 e.message()
@@ -1187,6 +1224,7 @@ impl PIGCS2Controller {
             reply.push(b'\n');
             reply.extend(write_read()?);
         }
+        self.trace_received(&reply);
         Ok(reply)
     }
 
@@ -3211,6 +3249,57 @@ mod tests {
             ],
             "{printed}"
         );
+    }
+
+    /// PIInterface.cpp prints each command it sends and each reply it reads
+    /// on ASYN_TRACEIO_DRIVER (:51, :75, :101, :142, :201, :228), and its
+    /// error lines on ASYN_TRACE_ERROR|ASYN_TRACEIO_DRIVER.
+    #[test]
+    fn interface_io_prints_its_c_traceio_driver_lines() {
+        let (_line, io) = motor_common::testing::LineRig::queued("gcs2IoTrace", |cmd| match cmd {
+            "SAI?" => vec!["1 ".into(), "2".into()],
+            _ => vec!["0".into()],
+        });
+        let ctrl = PIGCS2Controller::new(io, "gcs2IoTrace");
+        let printed = traced_mask("gcs2IoTrace", TraceMask::IO_DRIVER, || {
+            ctrl.send_only("MOV 1 1.000000").unwrap();
+            ctrl.send_only_char(24).unwrap();
+            ctrl.send_and_receive("SAI?").unwrap();
+            ctrl.send_and_receive_char(4).unwrap();
+        });
+        let want = [
+            "PIInterface::sendOnly() sending \"MOV 1 1.000000\"\n",
+            "PIInterface::sendOnly() sending \"#24\"\n",
+            "PIInterface::sendAndReceive() sending \"SAI?\"\n",
+            "PIInterface::sendAndReceive() received \"1 \n2\"\n",
+            "PIInterface::sendAndReceive() sending \"#4\"\n",
+            "PIInterface::sendAndReceive() received \"0\"\n",
+        ];
+        let mut rest = printed.as_str();
+        for line in want {
+            let at = rest
+                .find(line)
+                .unwrap_or_else(|| panic!("{line:?} not in {printed}"));
+            rest = &rest[at + line.len()..];
+        }
+
+        let (_line, io) =
+            motor_common::testing::LineRig::failing("gcs2IoTraceErr", |_| "0".into(), |_| true);
+        let ctrl = PIGCS2Controller::new(io, "gcs2IoTraceErr");
+        let printed = traced_mask("gcs2IoTraceErr", TraceMask::IO_DRIVER, || {
+            let _ = ctrl.send_only("MOV 1 1.000000");
+            let _ = ctrl.send_only_char(24);
+            let _ = ctrl.send_and_receive("ERR?");
+            let _ = ctrl.send_and_receive_char(4);
+        });
+        for line in [
+            "PIGCSController:sendOnly: error sending command MOV 1 1.000000",
+            "PIGCSController:sendOnly: error sending command 24",
+            "PIGCSController:sendAndReceive error calling write, output=ERR?",
+            "PIInterface::sendAndReceive error calling writeRead, output=4",
+        ] {
+            assert!(printed.contains(line), "{line:?} not in {printed}");
+        }
     }
 
     /// `PIGCSMotorController::getStatus` and `PIC885Controller::getStatus`
