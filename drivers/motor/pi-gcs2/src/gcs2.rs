@@ -127,7 +127,9 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
-use epics_rs::motor::controller_port::{AxisUser, ParamWrite, WriteHook, index};
+use epics_rs::motor::controller_port::{
+    AxisUser, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, index,
+};
 use epics_rs::motor::flags::{DriverCall, MotorCommand};
 use motor_common::util::{atof, atoi, nint};
 use motor_common::{ControllerParams, ControllerReport};
@@ -1374,6 +1376,78 @@ impl WriteHook for PiWriteHook {
         ]
         .contains(&function)
     }
+
+    /// The closing line; a servo or target write prints its own from the
+    /// axis call [`queue_axis_write`] runs.
+    fn after_write(&self, write: &FinishedWrite<'_>) -> WriteOutcome {
+        if write.function != self.0.servo && write.function != self.0.target {
+            write_trailer(
+                &|mask, args| write.print(mask, args),
+                write.function,
+                write.value,
+                write.status,
+            );
+        }
+        WriteOutcome::default()
+    }
+}
+
+/// `PIasynController::writeInt32`/`writeFloat64`'s closing line.
+fn write_trailer(
+    print: &dyn Fn(TraceMask, std::fmt::Arguments<'_>),
+    function: usize,
+    value: WriteValue,
+    status: &AsynResult<()>,
+) {
+    let (method, value) = match value {
+        WriteValue::Int32(v) => ("writeInt32", v.to_string()),
+        WriteValue::Float64(v) => ("writeFloat64", format!("{:.6}", CFloat(v))),
+    };
+    match status {
+        Err(e) => print(
+            TraceMask::ERROR,
+            format_args!(
+                "PIasynDriver:{method}: error, status={} function={function}, value={value}\n",
+                e.c_status_code()
+            ),
+        ),
+        Ok(()) => print(
+            TraceMask::IO_DRIVER,
+            format_args!("PIasynDriver:{method}: function={function}, value={value}\n"),
+        ),
+    }
+}
+
+/// A write C runs on the axis inside the port's write, queued to the
+/// axis's poller: `run`, then the write's closing line with its status.
+fn queue_axis_write(
+    base: &PortDriverBase,
+    user: AxisUser<'_>,
+    value: WriteValue,
+    run: impl Fn(&mut PIGCS2Axis, &AsynUser) -> AsynResult<()> + Send + Sync + 'static,
+) -> ParamWrite {
+    let port = base.port_name.to_string();
+    let addr = user.asyn().addr;
+    let function = user.reason;
+    let call = DriverCall::new(move |motor, asyn| {
+        let any: &mut dyn std::any::Any = motor;
+        let status = any
+            .downcast_mut::<PIGCS2Axis>()
+            .ok_or_else(|| pigcs2_err("a PI write on a non-PI axis"))
+            .and_then(|axis| run(axis, asyn));
+        let print = |mask, args: std::fmt::Arguments<'_>| {
+            PortManager::global().trace_manager().print(
+                Some(&port),
+                Some(addr),
+                function as i32,
+                mask,
+                args,
+            )
+        };
+        write_trailer(&print, function, value, &status);
+        status
+    });
+    ParamWrite::PassToBase(user.queue(base, MotorCommand::Driver(call)))
 }
 
 impl ControllerParams for PIGCS2Params {
@@ -1426,9 +1500,9 @@ impl ControllerParams for PIGCS2Params {
         if user.reason == params.servo {
             drop(ctrl);
             // As motorClosedLoop: the axis's set_closed_loop runs C's setServo.
-            return ParamWrite::PassToBase(
-                user.queue(base, MotorCommand::SetClosedLoop { enable: value != 0 }),
-            );
+            return queue_axis_write(base, user, WriteValue::Int32(value), move |axis, asyn| {
+                axis.set_closed_loop(asyn, value != 0)
+            });
         }
         // Each also sets its address-0 value, as C's setIntegerParam(0, ...).
         let (reason, value) = if user.reason == params.clear_err {
@@ -1466,14 +1540,9 @@ impl ControllerParams for PIGCS2Params {
         }
         let Some(index) = pivot else {
             drop(ctrl);
-            let call = DriverCall::new(move |motor, _user| {
-                let any: &mut dyn std::any::Any = motor;
-                let axis = any
-                    .downcast_mut::<PIGCS2Axis>()
-                    .ok_or_else(|| pigcs2_err("PI_SUP_TARGET on a non-PI axis"))?;
+            return queue_axis_write(base, user, WriteValue::Float64(value), move |axis, _| {
                 axis.move_cts(target_counts(value * axis.cpu))
             });
-            return ParamWrite::PassToBase(user.queue(base, MotorCommand::Driver(call)));
         };
         ParamWrite::PassToBase(ctrl.set_pivot(index, value))
     }
@@ -1483,28 +1552,38 @@ impl ControllerParams for PIGCS2Params {
     /// no value for any parameter.
     fn write_octet(
         &mut self,
-        _base: &mut PortDriverBase,
+        base: &mut PortDriverBase,
         user: AxisUser<'_>,
         data: &[u8],
     ) -> ParamWrite {
-        let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
-            return ParamWrite::Handled(Ok(()));
-        };
-        let commands = [
-            (params.cs_activate, "KEN"),
-            (params.cs_link, "KLN"),
-            (params.cs_kst, "KST"),
-            (params.cs_ksw, "KSW"),
-        ];
-        let Some(&(_, command)) = commands.iter().find(|(r, _)| *r == user.reason) else {
-            return ParamWrite::Handled(Ok(()));
-        };
-        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if ctrl.model == Model::CoordinateSystem {
-            // C's `const char *value`: the bytes up to a NUL.
-            let value = data.split(|&b| b == 0).next().unwrap_or_default();
-            let _ = ctrl.send_only(&format!("{command} {}", String::from_utf8_lossy(value)));
+        // C's `const char *value`: the bytes up to a NUL.
+        let value = data.split(|&b| b == 0).next().unwrap_or_default();
+        let value = String::from_utf8_lossy(value);
+        if let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) {
+            let commands = [
+                (params.cs_activate, "KEN"),
+                (params.cs_link, "KLN"),
+                (params.cs_kst, "KST"),
+                (params.cs_ksw, "KSW"),
+            ];
+            if let Some(&(_, command)) = commands.iter().find(|(r, _)| *r == user.reason) {
+                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                if ctrl.model == Model::CoordinateSystem {
+                    let _ = ctrl.send_only(&format!("{command} {value}"));
+                }
+            }
         }
+        // C's status is never set: the success line.
+        PortManager::global().trace_manager().print(
+            Some(&base.port_name),
+            Some(user.asyn().addr),
+            user.reason as i32,
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "PIasynDriver:writeOctet: function={}, value={value}\n",
+                user.reason
+            ),
+        );
         ParamWrite::Handled(Ok(()))
     }
 
@@ -3220,6 +3299,72 @@ mod tests {
             printed.contains("asynMotorController:writeFloat64"),
             "{printed}"
         );
+    }
+
+    /// Each `PIasynController` write closes with its status line
+    /// (PIasynController.cpp:327-334, :397-404, :433-440): asynError on
+    /// ASYN_TRACE_ERROR, else the function and value on
+    /// ASYN_TRACEIO_DRIVER; a queued servo or target write prints its
+    /// own function with the axis call's status.
+    #[test]
+    fn writes_print_their_c_trailers() {
+        use epics_rs::asyn::request::RequestOp;
+        for (name, err, ok) in [("gcs2Trail", "0", true), ("gcs2TrailErr", "5", false)] {
+            let (_line, io) =
+                motor_common::testing::LineRig::new(&format!("{name}Line"), move |last| {
+                    if last == "ERR?" { err } else { "1=1" }.into()
+                });
+            let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, name)));
+            let (port, p, mut poll_loop) = controller_port(name, &ctrl, "1");
+            let printed = traced_mask(name, TraceMask::IO_DRIVER | TraceMask::ERROR, || {
+                port.write_int32_blocking(p.target_mode, 0, 1).unwrap();
+                let _ = port.write_int32_blocking(p.servo, 0, 1);
+                poll_loop.run_queued_commands();
+                let _ = port.write_float64_blocking(p.target, 0, 2.7);
+                poll_loop.run_queued_commands();
+                let user = AsynUser::new(p.cs_activate).with_addr(0);
+                let data = b"KS1".to_vec();
+                port.submit_blocking(RequestOp::OctetWrite { data }, user)
+                    .unwrap();
+            });
+            let mut want = vec![
+                format!(
+                    "PIasynDriver:writeInt32: function={}, value=1\n",
+                    p.target_mode
+                ),
+                format!(
+                    "PIasynDriver:writeOctet: function={}, value=KS1\n",
+                    p.cs_activate
+                ),
+            ];
+            if ok {
+                want.push(format!(
+                    "PIasynDriver:writeInt32: function={}, value=1\n",
+                    p.servo
+                ));
+                want.push(format!(
+                    "PIasynDriver:writeFloat64: function={}, value=2.700000\n",
+                    p.target
+                ));
+            } else {
+                want.push(format!(" function={}, value=1\n", p.servo));
+                want.push(format!(" function={}, value=2.700000\n", p.target));
+            }
+            for line in &want {
+                assert!(
+                    printed.contains(line.as_str()),
+                    "{name}: {line:?} not in {printed}"
+                );
+            }
+            let trailers = printed.matches("PIasynDriver:write").count();
+            assert_eq!(trailers, 4, "{name}: one trailer per write in {printed}");
+            assert_eq!(
+                printed.matches(": error, status=").count(),
+                if ok { 0 } else { 2 },
+                "{name}: {printed}"
+            );
+            assert!(!printed.contains(&format!("function={}, value", index::CLOSED_LOOP)));
+        }
     }
 
     /// `PIasynController::writeInt32` and `writeFloat64` make the asynUser
