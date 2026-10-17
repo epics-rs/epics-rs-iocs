@@ -1030,6 +1030,17 @@ mod tests {
         );
     }
 
+    /// pmacAxis.cpp:578-579: a failed `i{n}24` read skips the limits check.
+    #[test]
+    fn a_failed_limits_read_is_no_poll_failure() {
+        let (_rt, rig) = publish_scripted("pmacIx24Silent");
+        rig.answer("#1 ? F P", b"882000000001\r0\r100.0\r");
+        let controller = Arc::new(Mutex::new(controller_on("pmacIx24Silent")));
+        let mut axis = PmacAxis::new(controller, 1);
+        let status = axis.poll(&AsynUser::new(0).with_addr(1)).unwrap();
+        assert!(status.powered && !status.problem);
+    }
+
     /// pmacController.cpp:201: one poller from pmacCreateController, which
     /// pmacCreateAxes joins.
     #[epics_rs::base::epics_test]

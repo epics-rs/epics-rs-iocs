@@ -418,7 +418,12 @@ impl AsynMotor for PmacAxis {
         // something else did: that is a problem the operator must see.
         if !config.limits_check_disabled
             && !self.limits_disabled
-            && let Some(ix24) = parse_ix24(&controller.write_read(&format!("i{axis}24"))?)
+            // C skips the check when the read fails (pmacAxis.cpp:578-579).
+            && let Some(ix24) = controller
+                .write_read(&format!("i{axis}24"))
+                .ok()
+                .as_deref()
+                .and_then(parse_ix24)
             && ix24 & IX24_LIMITS_DISABLED != 0
         {
             problem = true;
