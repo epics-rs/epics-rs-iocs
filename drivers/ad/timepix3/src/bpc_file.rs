@@ -105,7 +105,9 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Status {
     if status == Status::Ok && file.sync_all().is_err() {
         status = Status::SyncFailed;
     }
-    drop(file);
+    if close(file).is_err() && status == Status::Ok {
+        status = Status::WriteFailed;
+    }
     if status == Status::Ok && std::fs::rename(&staged, path).is_err() {
         status = Status::RenameFailed;
     }
@@ -155,6 +157,23 @@ fn permission_bits(meta: &std::fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn permission_bits(_: &std::fs::Metadata) -> u32 {
     0o640
+}
+
+/// `close(2)` with its error, which dropping a `File` discards.
+#[cfg(unix)]
+fn close(file: File) -> std::io::Result<()> {
+    use std::os::fd::IntoRawFd;
+    // SAFETY: the descriptor is owned and closed exactly once here.
+    if unsafe { libc::close(file.into_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn close(file: File) -> std::io::Result<()> {
+    drop(file);
+    Ok(())
 }
 
 /// `fchmod`.
