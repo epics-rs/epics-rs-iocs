@@ -130,23 +130,18 @@ impl Mdt695Controller {
 
         ctrl.num_axes = if model.contains("694") { 1 } else { 3 };
 
-        // Multi-line identification (Model / Version lines).
-        let mut ident_parts = Vec::new();
+        // drvMDT695.cc:590-606: read until a read fails; a Model line
+        // replaces the ident, a Version line appends to it.
         let mut next = ctrl.query("I");
         while let Ok(line) = next {
-            if line.is_empty() {
-                break;
-            }
-            if line.contains("Model") || line.contains("Version") {
-                ident_parts.push(line);
+            if line.contains("Model") {
+                ctrl.ident = line;
+            } else if line.contains("Version") {
+                ctrl.ident.push_str(", ");
+                ctrl.ident.push_str(&line);
             }
             next = ctrl.read_line();
         }
-        ctrl.ident = if ident_parts.is_empty() {
-            model
-        } else {
-            ident_parts.join(", ")
-        };
 
         Ok(ctrl)
     }
@@ -423,10 +418,10 @@ mod tests {
     use motor_common::testing::LineRig;
 
     fn rig(name: &str) -> (LineRig, Mdt695Axis) {
-        let (line, io) = LineRig::new(name, |last| match last {
-            "D" => "MDT695".into(),
-            "YR?" => "Y 1.5".into(),
-            _ => String::new(),
+        let (line, io) = LineRig::queued(name, |last| match last {
+            "D" => vec!["MDT695".into()],
+            "YR?" => vec!["Y 1.5".into()],
+            _ => Vec::new(),
         });
         let ctrl = Mdt695Controller::new(io).unwrap();
         let axis = Mdt695Axis::new(Arc::new(Mutex::new(ctrl)), 1);
@@ -455,6 +450,21 @@ mod tests {
         assert_eq!(line.sent(), ["D", "E", "D", "I"]);
     }
 
+    /// drvMDT695.cc:590-606: an empty line does not end the I reply, and
+    /// the ident is the Model line with each Version line after it.
+    #[test]
+    fn the_ident_is_read_to_the_end_of_the_i_reply() {
+        let (_line, io) = LineRig::queued("mdt695Ident", |last| match last {
+            "D" => vec!["MDT694".into()],
+            "I" => ["", "Model MDT694B", "Firmware", "Version 1.08"]
+                .map(String::from)
+                .to_vec(),
+            _ => Vec::new(),
+        });
+        let ctrl = Mdt695Controller::new(io).unwrap();
+        assert_eq!(ctrl.ident(), "Model MDT694B, Version 1.08");
+    }
+
     /// drvMDT695.cc:250-283: a first missed `R?` is RETRY (nothing raised,
     /// nothing posted), the next COMM_ERR, and a reading clears it.
     #[test]
@@ -462,10 +472,10 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let quiet = Arc::new(AtomicBool::new(false));
         let q = quiet.clone();
-        let (line, io) = LineRig::new("mdt695Retry", move |last| match last {
-            "D" => "MDT695".into(),
-            "YR?" if !q.load(Ordering::SeqCst) => "Y 1.5".into(),
-            _ => String::new(),
+        let (line, io) = LineRig::queued("mdt695Retry", move |last| match last {
+            "D" => vec!["MDT695".into()],
+            "YR?" if !q.load(Ordering::SeqCst) => vec!["Y 1.5".into()],
+            _ => Vec::new(),
         });
         let ctrl = Mdt695Controller::new(io).unwrap();
         let mut axis = Mdt695Axis::new(Arc::new(Mutex::new(ctrl)), 1);

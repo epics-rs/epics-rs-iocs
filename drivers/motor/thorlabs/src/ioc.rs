@@ -102,16 +102,16 @@ mod report {
         );
         let int = ArgValue::Int;
         run_command(setup, vec![int(2), int(10)]).await;
-        let (_line, _io) = LineRig::new("mdtRepLine", |cmd| match cmd.trim_end() {
-            "D" => "MDT694".into(),
-            _ => String::new(),
+        let (_line, _io) = LineRig::queued("mdtRepLine", |cmd| match cmd.trim_end() {
+            "D" => vec!["MDT694".into()],
+            _ => Vec::new(),
         });
         let config = vec![int(1), ArgValue::String("mdtRepLine".into())];
         run_command(mdt695_config_command(), config).await;
         assert_eq!(
             driver_report("drvMDT695", 0),
             "    MDT695 controller 0 connection failed.\n    MDT695 controller 1, \
-             port=mdtRepLine, address=0, id: MDT694 \n"
+             port=mdtRepLine, address=0, id:  \n"
         );
     }
 }
