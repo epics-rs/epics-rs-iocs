@@ -36,6 +36,10 @@ pub const CHECK_BPC_PATH: &str = "asynStatus ADTimePix::checkBPCPath()";
 pub const CHECK_DACS_PATH: &str = "asynStatus ADTimePix::checkDACSPath()";
 pub const GET_MEASUREMENT_CONFIG: &str = "asynStatus ADTimePix::getMeasurementConfig()";
 pub const SEND_MEASUREMENT_CONFIG: &str = "asynStatus ADTimePix::sendMeasurementConfig()";
+pub const REFRESH_ON_RECONNECT: &str = "asynStatus ADTimePix::refreshOnReconnect()";
+pub const CHECK_CONNECTION: &str = "asynStatus ADTimePix::checkConnection(bool, bool)";
+pub const GET_DASHBOARD: &str = "asynStatus ADTimePix::getDashboard()";
+pub const GET_DETECTOR: &str = "asynStatus ADTimePix::getDetector(bool)";
 pub const WRITE_INT32: &str = "virtual asynStatus ADTimePix::writeInt32(asynUser*, epicsInt32)";
 pub const WRITE_FLOAT64: &str =
     "virtual asynStatus ADTimePix::writeFloat64(asynUser*, epicsFloat64)";

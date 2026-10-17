@@ -404,7 +404,7 @@ async fn refresh_on_reconnect(ctx: &Arc<Ctx>) -> bool {
         ctx.trace(
             TraceMask::ERROR,
             &adlog::err(
-                "refreshOnReconnect",
+                adlog::REFRESH_ON_RECONNECT,
                 &format!(
                     "Reconnect state refresh incomplete: destination={} detector={} \
                      measurementConfig={}",
@@ -451,7 +451,7 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
         0,
         ParamValue::Int32(reply.code),
     )];
-    log_dashboard_failure(ctx, "checkConnection", &reply);
+    log_dashboard_failure(ctx, adlog::CHECK_CONNECTION, "checkConnection", &reply);
     let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
     connection_status(ctx, serval_ok, det_ok, &mut updates);
     ctx.set(0, updates).await;
@@ -476,7 +476,7 @@ fn read_dashboard(ctx: &Ctx) -> DashboardReply {
 
 /// C `logHttpFailure` plus `ERR_ARGS("<context>: %s", responseErrorMessage)`
 /// for a rejected dashboard reply (serval_http.cpp:382-384, :442-443).
-fn log_dashboard_failure(ctx: &Ctx, context: &str, reply: &DashboardReply) {
+fn log_dashboard_failure(ctx: &Ctx, func: &str, context: &str, reply: &DashboardReply) {
     let Err(error) = &reply.parsed else { return };
     let url = format!("{}{}", ctx.http.base_url(), serval::DASHBOARD);
     ctx.trace(
@@ -485,7 +485,7 @@ fn log_dashboard_failure(ctx: &Ctx, context: &str, reply: &DashboardReply) {
     );
     ctx.trace(
         TraceMask::ERROR,
-        &adlog::err(context, &format!("{context}: {}", error.message())),
+        &adlog::err(func, &format!("{context}: {}", error.message())),
     );
 }
 
@@ -673,7 +673,7 @@ fn as_bool_or_int(v: &Value) -> Option<i32> {
 /// C `getDashboard` (serval_http.cpp:431-454).
 async fn refresh_dashboard(ctx: &Arc<Ctx>) {
     let reply = read_dashboard(ctx);
-    log_dashboard_failure(ctx, "getDashboard", &reply);
+    log_dashboard_failure(ctx, adlog::GET_DASHBOARD, "getDashboard", &reply);
     let mut updates = Vec::new();
     let (serval_ok, det_ok) = publish_dashboard(ctx, &reply, &mut updates);
     connection_status(ctx, serval_ok, det_ok, &mut updates);
@@ -718,7 +718,7 @@ async fn refresh_detector(ctx: &Arc<Ctx>) -> bool {
             let message = format!("Invalid detector response: {reason}");
             ctx.trace(
                 TraceMask::ERROR,
-                &adlog::err("getDetector", &format!("getDetector: {message}")),
+                &adlog::err(adlog::GET_DETECTOR, &format!("getDetector: {message}")),
             );
             let updates = failure(message.clone(), &message, ADStatus::Error);
             ctx.set(0, updates).await;
@@ -3817,7 +3817,7 @@ mod tests {
         for line in [
             adlog::http_failure_reply("checkConnection", "GET", &dashboard, 200, "{"),
             adlog::err(
-                "checkConnection",
+                "asynStatus ADTimePix::checkConnection(bool, bool)",
                 "checkConnection: malformed dashboard JSON",
             ),
         ] {
@@ -3833,7 +3833,10 @@ mod tests {
         let dashboard = format!("{url}/dashboard");
         for line in [
             adlog::http_failure_reply("getDashboard", "GET", &dashboard, 500, ""),
-            adlog::err("getDashboard", "getDashboard: dashboard GET failed"),
+            adlog::err(
+                "asynStatus ADTimePix::getDashboard()",
+                "getDashboard: dashboard GET failed",
+            ),
         ] {
             assert!(text.contains(&line), "{text}");
         }
@@ -3935,7 +3938,7 @@ mod tests {
             );
             assert!(
                 text.contains(&adlog::err(
-                    "getDetector",
+                    "asynStatus ADTimePix::getDetector(bool)",
                     &format!("getDetector: {message}")
                 )),
                 "{text}"
@@ -3989,7 +3992,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let line = adlog::err(
-            "refreshOnReconnect",
+            "asynStatus ADTimePix::refreshOnReconnect()",
             "Reconnect state refresh incomplete: destination=0 detector=1 measurementConfig=1",
         );
         assert_eq!(text.matches(&line).count(), 2, "{text}");
