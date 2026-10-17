@@ -32,6 +32,16 @@ impl PortDriver for Line {
         self.sent.lock().unwrap().push(line);
         Ok(data.len())
     }
+    // A line takes any terminator, as a port with `asynInterposeEos` does, so
+    // a driver that sets EOS on connect can be tested on it.
+    fn set_input_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+        self.base.set_input_eos(user.addr, eos);
+        Ok(())
+    }
+    fn set_output_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+        self.base.set_output_eos(user.addr, eos);
+        Ok(())
+    }
     fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         let last = self
             .sent
@@ -131,5 +141,22 @@ mod tests {
         let io = SyncIOHandle::from_handle(port.handle.clone(), 0, Duration::from_secs(1));
         io.write_octet(0, b"hello").unwrap();
         assert_eq!(rig.sent(), ["hello"]);
+    }
+
+    #[test]
+    fn the_rig_s_port_takes_the_eos_a_driver_sets() {
+        use crate::connect::{EosRefusal, connect_with_eos};
+        let (_rig, _io) = LineRig::new("lineRigEos", |_| String::new());
+        let io = connect_with_eos(
+            "lineRigEos",
+            Duration::from_secs(1),
+            b"\n",
+            b"",
+            EosRefusal::BothFatal,
+        );
+        assert!(io.is_ok());
+        let port = epics_rs::asyn::asyn_record::get_port("lineRigEos").unwrap();
+        let user = AsynUser::new(0).with_addr(0);
+        assert_eq!(port.handle.get_input_eos_blocking(user).unwrap(), b"\n");
     }
 }
