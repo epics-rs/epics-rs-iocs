@@ -21,7 +21,7 @@ use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::driver::ndarray_driver::handle_write_int32;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
+use epics_rs::ad_core::ndarray_pool::{DriverPool, PersistentArray, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
@@ -53,7 +53,7 @@ pub struct NdStdArraysDriver {
     pub ndsa: NdsaParams,
     publish_tx: rt::CommandSender<PublishedArray>,
     /// C `pArrays[0]` — the working buffer that waveform writes append into.
-    current: Option<DriverArray>,
+    current: Option<PersistentArray>,
     /// C `arrayDimensions_` — the requested dimensions, written via the
     /// `NDDimensions` (`ARRAY_DIMENSIONS`) waveform.
     array_dimensions: [usize; ND_ARRAY_MAX_DIMS],
@@ -137,6 +137,9 @@ impl NdStdArraysDriver {
         let dims: Vec<NDDimension> = (0..ndims)
             .map(|i| NDDimension::new(self.array_dimensions[i]))
             .collect();
+        // C releases pArrays[0] before allocating its successor
+        // (NDDriverStdArrays.cpp:153).
+        self.current = None;
         let mut array = self.ad.pool.alloc(dims, data_type).map_err(|e| {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
@@ -197,7 +200,7 @@ impl NdStdArraysDriver {
                 .set_int32_param(self.ndsa.next_element, 0, 0)?;
         }
 
-        self.current = Some(array);
+        self.current = Some(PersistentArray::new(array));
         Ok(())
     }
 
@@ -254,7 +257,7 @@ impl NdStdArraysDriver {
         let stride = self.get_i32(self.ndsa.stride).max(0) as usize;
 
         if let Some(array) = self.current.as_mut() {
-            convert::copy_buffer(&mut array.data, next_element, stride, &input[..n]);
+            convert::copy_buffer(&mut array.refill().data, next_element, stride, &input[..n]);
         }
 
         let new_next = next_element + n;
@@ -327,36 +330,24 @@ impl NdStdArraysDriver {
         if self.current.is_none() {
             return Ok(());
         }
-        // DEVIATION: C stamps `pArrays[0]` itself and hands the live pointer to
-        // the plugin, so append-mode re-publishes share one growing buffer.
-        // This port snapshots the buffer per publish, giving each queued frame
-        // an independent copy (identical observable data, no shared-buffer race).
-        // The copy comes from the pool so it is counted on this driver as
-        // `pArrays[0]` is, under the pool's limit; C allocates nothing here,
-        // so a snapshot the pool refuses is dropped uncounted after the
-        // pool's limit line.
-        let current = self.current.as_ref().unwrap();
-        let Ok(mut snapshot) = self
-            .ad
-            .pool
-            .alloc_with(current.dims.clone(), current.data.clone())
-        else {
-            return Ok(());
-        };
         let counter = self.get_i32(self.ad.params.base.array_counter) + 1;
         self.ad
             .port_base
             .set_int32_param(self.ad.params.base.array_counter, 0, counter)?;
-        snapshot.attributes = current.attributes.clone();
-        snapshot.codec = current.codec.clone();
-        snapshot.unique_id = counter;
-        snapshot.time_stamp = EpicsTimestamp::now().as_f64();
-        snapshot.timestamp = self.ad.port_base.update_time_stamp().into();
+        let timestamp = self.ad.port_base.update_time_stamp().into();
+        let current = self.current.as_mut().unwrap();
+        let array = current.refill();
+        array.unique_id = counter;
+        array.time_stamp = EpicsTimestamp::now().as_f64();
+        array.timestamp = timestamp;
         // DEVIATION: C calls getAttributes(pArray->pAttributeList) here; the
         // NDAttributesFile machinery is not wired for this driver, so only the
         // ColorMode attribute added at allocation is attached.
 
-        let _ = self.publish_tx.try_send(snapshot.share());
+        // C hands `pArrays[0]` itself to the plugins; the publish is a copy
+        // that shares its one pool charge, so later writes never reach a
+        // queued frame.
+        let _ = self.publish_tx.try_send(current.published());
         Ok(())
     }
 
@@ -556,8 +547,12 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_max_memory(0)
+        }
+
+        fn with_max_memory(max_memory: usize) -> Self {
             let (publish_tx, publish_rx) = rt::command_channel::<PublishedArray>(PUBLISH_QUEUE);
-            let mut det = NdStdArraysDriver::new("NDSATEST", 0, publish_tx).unwrap();
+            let mut det = NdStdArraysDriver::new("NDSATEST", max_memory, publish_tx).unwrap();
             // The ArrayCallbacks record's PINI; the driver leaves it undefined.
             det.ad
                 .port_base
@@ -796,6 +791,40 @@ mod tests {
         // Single image mode: acquisition self-clears after one complete array.
         assert_eq!(f.get_i32(f.det.ad.params.acquire), 0);
         assert_eq!(f.get_i32(f.det.ad.params.status), ADStatus::Idle as i32);
+    }
+
+    /// C publishes `pArrays[0]` itself (NDDriverStdArrays.cpp:310-329), so a
+    /// pool holding exactly that one array still delivers every update, and
+    /// a new array reuses its buffer once the driver and plugins let go.
+    #[test]
+    fn a_pool_holding_exactly_the_array_still_publishes() {
+        let mut f = Fixture::with_max_memory(6 * 8);
+        f.set_i32(
+            f.det.ad.params.base.data_type,
+            NDDataType::Float64 as u8 as i32,
+        );
+        f.set_i32(f.det.ad.params.base.n_dimensions, 1);
+        f.set_i32(f.det.ndsa.append_mode, 1);
+        f.set_i32(f.det.ad.params.image_mode, ImageMode::Continuous as i32);
+        f.write_dims(&[6]);
+        f.write_i32(f.det.ad.params.acquire, 1);
+
+        f.write_f64_array(&[1.0, 2.0, 3.0]);
+        f.write_f64_array(&[4.0, 5.0, 6.0]);
+        let published = f.drain_publish();
+        assert_eq!(published.len(), 2, "every update goes out");
+        assert_eq!(f64s(&published[0]), vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0]);
+        assert_eq!(f64s(&published[1]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let pool = f.det.ad.pool.clone();
+        assert_eq!((pool.num_alloc_buffers(), pool.allocated_bytes()), (1, 48));
+
+        drop(published);
+        f.write_i32(f.det.ndsa.new_array, 1);
+        f.write_f64_array(&[7.0]);
+        let published = f.drain_publish();
+        assert_eq!(published.len(), 1, "the new array reuses the one buffer");
+        assert_eq!(f64s(&published[0])[0], 7.0);
+        assert_eq!(pool.num_alloc_buffers(), 1);
     }
 
     #[test]
