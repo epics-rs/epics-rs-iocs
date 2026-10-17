@@ -1872,17 +1872,15 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             // C fills its controller as it goes, so a Config stopping below
-            // leaves what the report then prints.
+            // leaves what the report then prints; a re-Config keeps the
+            // firmware and model until VE; answers (drvMM4000Asyn.c:804-808).
             let shown = |f: &mut dyn FnMut(&mut Mm4000AsynCard)| {
                 f(&mut MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner())[card as usize]);
             };
             shown(&mut |c| {
-                *c = Mm4000AsynCard {
-                    moving_s: f64::from(c_int(args, 4)) / 1000.0,
-                    idle_s: f64::from(c_int(args, 5)) / 1000.0,
-                    axes: (0..num_axes).map(|_| Mm4000AxisReport::default()).collect(),
-                    ..Mm4000AsynCard::default()
-                }
+                c.axes = (0..num_axes).map(|_| Mm4000AxisReport::default()).collect();
+                c.moving_s = f64::from(c_int(args, 4)) / 1000.0;
+                c.idle_s = f64::from(c_int(args, 5)) / 1000.0;
             });
             let Ok(handle) = connect_serial(&port_name, MM4000_TIMEOUT) else {
                 println!("MM4000AsynConfig: cannot connect to asyn port {port_name}");
@@ -2872,6 +2870,12 @@ mod report {
                 detail(2, "", 0, "0.000000", "0.000000"),
             )
         );
+        // drvMM4000Asyn.c:804-808: a re-Config resets only the axes and the
+        // poll periods before it connects; the firmware and model stay.
+        run_command(cmd(), config(0, "mm4kAsynNoPort", 2, 300, 3000)).await;
+        let text = driver_report("motorMM4000", 1);
+        let again = detail(0, "MM4005 Version 2.0", 1, "0.300000", "3.000000");
+        assert!(text.starts_with(&format!("{again}{zero}{zero}")), "{text}");
     }
 
     /// SMC100Controller::report then SMC100Axis::report
