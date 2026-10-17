@@ -467,9 +467,14 @@ impl PmacControllerParams {
     }
 }
 
+/// C `pmacController::PMAC_OK_` / `PMAC_ERROR_`.
+const PMAC_OK: i32 = 0;
+const PMAC_ERROR: i32 = 1;
+
 /// `pmacController::writeInt32` / `writeFloat64`'s opening FLOW line,
 /// which the record's speed, accel and GET_INFO writes reach as well as
-/// the port's. It prints once the write is done, not before.
+/// the port's. It prints once the write is done, not before. Then their
+/// closing `motorStatusCommsError_`, whose status covers `setClosedLoop`.
 struct PmacWriteHook;
 
 impl WriteHook for PmacWriteHook {
@@ -479,7 +484,16 @@ impl WriteHook for PmacWriteHook {
             WriteValue::Float64(_) => "writeFloat64",
         };
         write.print(TraceMask::FLOW, format_args!("pmacController::{method}\n"));
-        ParamDelta::default()
+        let mut delta = ParamDelta::default();
+        delta.set_int32(
+            index::STATUS_COMMS_ERROR,
+            if write.status.is_ok() {
+                PMAC_OK
+            } else {
+                PMAC_ERROR
+            },
+        );
+        delta
     }
 }
 
@@ -604,6 +618,28 @@ mod tests {
             ["writeFloat64", "writeFloat64", "writeFloat64", "writeInt32"],
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn every_write_sets_motor_status_comms_error_from_its_status() {
+        let ctrl = Arc::new(Mutex::new(PmacController::new(None, Duration::ZERO)));
+        let params = PmacControllerParams::new(ctrl.clone());
+        let port = register_controller_port(&open_owner(), "pmacComms", 2, params).unwrap();
+        let group = lock(&ctrl).params.unwrap().coord_sys_group;
+        let comms = || {
+            port.read_int32_blocking(index::STATUS_COMMS_ERROR, 0)
+                .unwrap()
+        };
+
+        port.write_float64_blocking(index::VELOCITY, 0, 2.5)
+            .unwrap();
+        assert_eq!(comms(), PMAC_OK);
+        // C's switchToGroup refuses group 0.
+        assert!(port.write_int32_blocking(group, 0, 0).is_err());
+        assert_eq!(comms(), PMAC_ERROR);
+        port.write_float64_blocking(index::VELOCITY, 0, 2.5)
+            .unwrap();
+        assert_eq!(comms(), PMAC_OK);
     }
 
     #[test]
