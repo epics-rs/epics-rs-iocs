@@ -115,6 +115,11 @@ static PIC663: Model1 = Model1::new(&DEV_PIC663, 8, SCAN_RATE);
 
 /// `PIC663Setup(num_cards, scan_rate)`.
 pub fn pic663_setup_command() -> CommandDef {
+    PIC663.register_report("drvPIC663", |cards| {
+        cards.report("PIC663", |card, line| {
+            format!("    PIC663 controller #{card}, {line} \n")
+        })
+    });
     PIC663.setup_command("PIC663Setup")
 }
 
@@ -149,11 +154,13 @@ pub fn pic663_config_command() -> CommandDef {
             )?;
             let controller = PIC663Controller::new(handle, addr as u8)
                 .map_err(|e| format!("PIC663Config: {e}"))?;
+            let line = format!("port={asyn_port}, id: {}", controller.ident());
             let controller = Arc::new(Mutex::new(controller));
 
             let axis = PIC663Axis::new(controller).map_err(|e| format!("PIC663Config: {e}"))?;
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             PIC663.install(ctx, card, 0, motor)?;
+            PIC663.describe(card, line);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -689,6 +696,31 @@ mod report {
             after,
             "    PIC662 controller 0 connection failed.\n    PIC662 controller #1, \
              port=c662RepLine, id: E-662 \n"
+        );
+    }
+
+    /// drvPIC663.cc:108-133, which `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pic663_controller() {
+        let setup = pic663_setup_command();
+        let (_line, _io) = LineRig::new("c663RepLine", |last| match last {
+            "TP" => "P:0\r".into(),
+            _ => "C-663\r".into(),
+        });
+        let (before, after) = reports(
+            "drvPIC663",
+            (setup, vec![int(2), int(10)]),
+            (
+                pic663_config_command(),
+                vec![int(1), port("c663RepLine"), int(1)],
+            ),
+        )
+        .await;
+        assert_eq!(before, "    No PIC663 controllers configured.\n");
+        assert_eq!(
+            after,
+            "    PIC663 controller 0 connection failed.\n    PIC663 controller #1, \
+             port=c663RepLine, id: C-663 \n"
         );
     }
 }

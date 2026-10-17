@@ -89,7 +89,6 @@
 //!   every query (`exchange`), a superset of C's error-path flush.
 //! - **`GET_IDENT` dead macro** (`#define GET_IDENT 0x01`, never referenced
 //!   in the C source — a vestige of the C-862 copy-paste): not ported.
-//! - **`report()`**: not implemented, matching every other port here.
 //! - **`no_motion_count`**: pure poll-rate scheduling counter, not tracked.
 
 use std::sync::{Arc, Mutex, MutexGuard};
