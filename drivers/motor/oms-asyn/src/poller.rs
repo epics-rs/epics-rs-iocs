@@ -1,8 +1,7 @@
 //! C `omsBaseController::omsPoller` (omsBaseController.cpp:584-844): one
 //! thread per controller reads every axis at once — one command per quantity —
-//! and writes the axes' status parameters. [`crate::oms::OmsAxis::poll`] only
-//! reads those parameters back for the motor poll loops, which deliver them
-//! to the records as `callParamCallbacks` does.
+//! writes the axes' status parameters and posts each axis, as its
+//! `callParamCallbacks` does, through the axis's motor poll loop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -12,7 +11,9 @@ use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::MotorStatus;
 use epics_rs::base::runtime::exit::at_exit;
 use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
+use epics_rs::motor::poll_loop::PollCommand;
 
 use motor_common::util::leading_hex;
 
@@ -89,7 +90,7 @@ impl PollShared {
     }
 
     /// C `epicsEventSignal(pollEventId_)`.
-    fn wakeup(&self) {
+    pub(crate) fn wakeup(&self) {
         *self.event.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.signal.notify_one();
     }
@@ -110,13 +111,19 @@ impl PollShared {
 }
 
 /// C `startPoller` and the constructor's `epicsAtExit(callShutdown)`.
+/// `posters` are the axes' poll loops, in axis order.
 pub fn start(
     controller: &Arc<Mutex<OmsController>>,
+    posters: Vec<mpsc::Sender<PollCommand>>,
     moving_poll: Duration,
     idle_poll: Duration,
     fw_minor: i32,
 ) {
-    let poller = OmsPoller::new(controller.clone(), moving_poll, idle_poll, fw_minor);
+    let mut poller = OmsPoller::new(controller.clone(), moving_poll, idle_poll, fw_minor);
+    poller.posters = posters;
+    // C creates the event with the controller; the axes' startup polls
+    // signalled this one before the poller existed.
+    poller.shared.wait(Duration::ZERO);
     let shared = poller.shared.clone();
     at_exit(format!("omsPoller {}", poller.port_name), move || {
         shared.shutting_down.store(true, Ordering::Release)
@@ -151,6 +158,8 @@ struct OmsPoller {
     enabled: bool,
     /// C `closedLoopStatus`, an array that keeps its values across loops.
     closed_loop: [bool; OMS_MAX_AXES],
+    /// Each axis's poll loop, which posts its status on change.
+    posters: Vec<mpsc::Sender<PollCommand>>,
 }
 
 impl OmsPoller {
@@ -183,6 +192,7 @@ impl OmsPoller {
             fast_polls: 0,
             enabled: true,
             closed_loop: [false; OMS_MAX_AXES],
+            posters: Vec::new(),
         }
     }
 
@@ -271,6 +281,7 @@ impl OmsPoller {
 
         self.any_moving = false;
         let status = status.as_bytes();
+        let mut posts = Vec::with_capacity(self.num_axes);
         let mut axes = self.shared.axes();
         for (i, axis) in axes.iter_mut().enumerate() {
             if !self.enabled || self.shared.shutting_down() {
@@ -338,8 +349,14 @@ impl OmsPoller {
             if have_closed_loop {
                 st.gain_support = self.closed_loop[i];
             }
+            posts.push(st.clone());
         }
         drop(axes);
+        // `callParamCallbacks`, sent outside the parameter lock: a poll loop
+        // reading the parameters must not hold up a full channel.
+        for (poster, status) in self.posters.iter().zip(posts) {
+            let _ = poster.blocking_send(PollCommand::Post(status));
+        }
 
         Some(if self.fast_polls > 0 {
             self.fast_polls -= 1;
@@ -630,6 +647,26 @@ mod tests {
             rig.axes[1].poll(&user).unwrap().home,
             "untouched until the next loop"
         );
+    }
+
+    /// Each axis is posted at the end of the loop; a status poll wakes the
+    /// poller as C `omsBaseAxis::poll` does.
+    #[test]
+    fn the_loop_posts_every_axis_and_a_poll_wakes_it() {
+        let mut rig = rig("omsPollerPosts", 2, &HEALTHY);
+        let mut poller = poller(&rig);
+        let (tx, mut rx): (Vec<_>, Vec<_>) = (0..2).map(|_| mpsc::channel(4)).unzip();
+        poller.posters = tx;
+        poller.pass();
+        for (i, rx) in rx.iter_mut().enumerate() {
+            let Ok(PollCommand::Post(status)) = rx.try_recv() else {
+                panic!("axis {i} not posted");
+            };
+            assert_eq!(status, rig.axes[i].poll(&AsynUser::default()).unwrap());
+            assert!(rx.try_recv().is_err());
+        }
+        assert!(poller.shared.wait(Duration::ZERO));
+        assert!(!poller.shared.wait(Duration::ZERO));
     }
 
     /// A status that never comes: six `RI` reads for the whole controller,
