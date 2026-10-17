@@ -80,6 +80,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -315,7 +316,7 @@ impl AsynMotor for PIC662Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let um = position * DRIVE_RESOLUTION;
-        self.write_move(&format!("DEV:CONT REM\nPOS {um:.3}"))
+        self.write_move(&format!("DEV:CONT REM\nPOS {:.3}", CFloat(um)))
     }
 
     fn move_relative(
@@ -327,7 +328,7 @@ impl AsynMotor for PIC662Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let um = distance * DRIVE_RESOLUTION;
-        self.write_move(&format!("DEV:CONT REM\nPOS:REL {um:.3}"))
+        self.write_move(&format!("DEV:CONT REM\nPOS:REL {:.3}", CFloat(um)))
     }
 
     fn move_velocity(
@@ -414,6 +415,27 @@ mod tests {
     use super::*;
     use motor_common::testing::LineRig;
     use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
+    /// `-nan`, `+nan`.
+    #[test]
+    fn floats_go_out_as_c_sprintf() {
+        let nan = f64::NAN;
+        let neg = -f64::NAN;
+        let (line, mut axis, _) = strings_rig("c662CFloat");
+        let user = AsynUser::default();
+        let mut sent = String::new();
+        let mut run = |f: &mut dyn FnMut(&mut PIC662Axis)| {
+            f(&mut axis);
+            sent.extend(line.sent().into_iter().map(|w| w + "|"));
+        };
+        run(&mut |a| drop(a.move_absolute(&user, nan, 0.0, 1.0, 1.0)));
+        run(&mut |a| drop(a.move_relative(&user, neg, 0.0, 1.0, 1.0)));
+        assert!(!sent.contains("NaN"), "{sent}");
+        for want in ["POS nan", "POS:REL -nan"] {
+            assert!(sent.contains(want), "{want}: {sent}");
+        }
+    }
 
     /// An E-662 on a [`LineRig`] whose `*ESR?` reply follows `esr`.
     fn strings_rig(name: &str) -> (LineRig, PIC662Axis, Arc<AtomicU8>) {

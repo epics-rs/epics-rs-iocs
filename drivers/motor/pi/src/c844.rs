@@ -77,6 +77,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
@@ -295,9 +296,9 @@ impl PIC844Axis {
     /// The `MVEL {v};[ACC {a};]` move/home preamble (C `SET_VELOCITY` +
     /// `SET_ACCEL` when `acc > 0`).
     fn move_preamble(velocity: f64, acceleration: f64) -> String {
-        let mut p = format!("MVEL {velocity:.2};");
+        let mut p = format!("MVEL {:.2};", CFloat(velocity));
         if acceleration > 0.0 {
-            p.push_str(&format!("ACC {acceleration:.2};"));
+            p.push_str(&format!("ACC {:.2};", CFloat(acceleration)));
         }
         p
     }
@@ -344,7 +345,7 @@ impl AsynMotor for PIC844Axis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let body = Self::move_preamble(velocity, acceleration);
-        self.write_move(&body, &format!("TARG {position:.2}"))
+        self.write_move(&body, &format!("TARG {:.2}", CFloat(position)))
     }
 
     fn move_relative(
@@ -356,7 +357,7 @@ impl AsynMotor for PIC844Axis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let body = Self::move_preamble(velocity, acceleration);
-        self.write_move(&body, &format!("TARG:RPOS {distance:+.2}"))
+        self.write_move(&body, &format!("TARG:RPOS {:+.2}", CFloat(distance)))
     }
 
     fn move_velocity(
@@ -368,8 +369,8 @@ impl AsynMotor for PIC844Axis {
     ) -> AsynResult<()> {
         // Jog: SET_ACCEL unconditional (motorRecord), then TARG:VEL (signed).
         self.write_move(
-            &format!("ACC {acceleration:.2};"),
-            &format!("TARG:VEL {velocity:.2}"),
+            &format!("ACC {:.2};", CFloat(acceleration)),
+            &format!("TARG:VEL {:.2}", CFloat(velocity)),
         )
     }
 
@@ -394,7 +395,7 @@ impl AsynMotor for PIC844Axis {
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let pre = self.prefix();
         self.lock()
-            .send(&format!("{pre}AXIS:POS {position:+.2};TARG CURR"))
+            .send(&format!("{pre}AXIS:POS {:+.2};TARG CURR", CFloat(position)))
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
@@ -407,9 +408,9 @@ impl AsynMotor for PIC844Axis {
         let g = gain * 32767.0;
         let pre = self.prefix();
         let body = match kind {
-            PidGainKind::Proportional => format!("PID {g:.2},,"),
-            PidGainKind::Integral => format!("PID ,{g:.2},"),
-            PidGainKind::Derivative => format!("PID ,,{g:.2}"),
+            PidGainKind::Proportional => format!("PID {:.2},,", CFloat(g)),
+            PidGainKind::Integral => format!("PID ,{:.2},", CFloat(g)),
+            PidGainKind::Derivative => format!("PID ,,{:.2}", CFloat(g)),
         };
         self.lock().send(&format!("{pre}{body}"))
     }
@@ -471,6 +472,44 @@ mod tests {
     use super::*;
     use motor_common::testing::LineRig;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
+    /// `-nan`, `+nan`.
+    #[test]
+    fn floats_go_out_as_c_sprintf() {
+        let nan = f64::NAN;
+        let neg = -f64::NAN;
+        let (line, mut axis, _) = strings_rig("c844CFloat");
+        let user = AsynUser::default();
+        let mut sent = String::new();
+        let mut run = |f: &mut dyn FnMut(&mut PIC844Axis)| {
+            f(&mut axis);
+            sent.extend(line.sent().into_iter().map(|w| w + "|"));
+        };
+        run(&mut |a| drop(a.move_absolute(&user, nan, 0.0, neg, 1.0)));
+        run(&mut |a| drop(a.move_relative(&user, nan, 0.0, 1.0, 1.0)));
+        run(&mut |a| drop(a.move_relative(&user, neg, 0.0, 1.0, 1.0)));
+        run(&mut |a| drop(a.move_velocity(&user, 0.0, neg, nan)));
+        run(&mut |a| drop(a.set_position(&user, nan)));
+        run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Proportional, nan)));
+        run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Integral, neg)));
+        run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Derivative, nan)));
+        assert!(!sent.contains("NaN"), "{sent}");
+        for want in [
+            "MVEL -nan;",
+            "TARG nan",
+            "TARG:RPOS +nan",
+            "TARG:RPOS -nan",
+            "ACC nan;",
+            "TARG:VEL -nan",
+            "AXIS:POS +nan;TARG CURR",
+            "PID nan,,",
+            "PID ,-nan,",
+            "PID ,,nan",
+        ] {
+            assert!(sent.contains(want), "{want}: {sent}");
+        }
+    }
 
     /// `MOT:COND?` for axis 1: done, moving, and moving into the -limit.
     const DONE: u32 = 0;

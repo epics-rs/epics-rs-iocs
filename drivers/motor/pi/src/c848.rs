@@ -95,6 +95,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
@@ -416,10 +417,10 @@ impl AsynMotor for PIC848Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let l = self.letter;
-        let line = self.move_line(&format!("MOV  {l}{:.5}", position * POS_RES));
+        let line = self.move_line(&format!("MOV  {l}{:.5}", CFloat(position * POS_RES)));
         let ctrl = self.lock();
         // SET_VELOCITY ("VEL  L {v}") then MOVE_ABS ("MOV  L{p}") — two writes.
-        ctrl.send(&format!("VEL  {l} {:.5}", velocity * POS_RES))?;
+        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
         ctrl.send_bytes(&line)
     }
 
@@ -432,9 +433,9 @@ impl AsynMotor for PIC848Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let l = self.letter;
-        let line = self.move_line(&format!("MVR  {l}{:+.5}", distance * POS_RES));
+        let line = self.move_line(&format!("MVR  {l}{:+.5}", CFloat(distance * POS_RES)));
         let ctrl = self.lock();
-        ctrl.send(&format!("VEL  {l} {:.5}", velocity * POS_RES))?;
+        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
         ctrl.send_bytes(&line)
     }
 
@@ -447,7 +448,7 @@ impl AsynMotor for PIC848Axis {
     ) -> AsynResult<()> {
         // JOG: "VEL  L{v}" (no space after L, signed value). No SET_VELOCITY.
         let l = self.letter;
-        let line = self.move_line(&format!("VEL  {l}{:.5}", velocity * POS_RES));
+        let line = self.move_line(&format!("VEL  {l}{:.5}", CFloat(velocity * POS_RES)));
         self.lock().send_bytes(&line)
     }
 
@@ -463,7 +464,7 @@ impl AsynMotor for PIC848Axis {
         let l = self.letter;
         let line = self.move_line(&format!("REF  {l}"));
         let ctrl = self.lock();
-        ctrl.send(&format!("VEL  {l} {:.5}", velocity * POS_RES))?;
+        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
         ctrl.send_bytes(&line)
     }
 
@@ -485,7 +486,7 @@ impl AsynMotor for PIC848Axis {
             }
         } else {
             self.lock()
-                .send(&format!("POS  {l}{:+.5}", position * POS_RES))
+                .send(&format!("POS  {l}{:+.5}", CFloat(position * POS_RES)))
         }
     }
 
@@ -507,9 +508,9 @@ impl AsynMotor for PIC848Axis {
         let l = self.letter;
         let g = gain * 32767.0;
         let body = match kind {
-            PidGainKind::Proportional => format!("SPA  {l}1 {g:.5}"),
-            PidGainKind::Integral => format!("SPA  {l}2 {g:.5}"),
-            PidGainKind::Derivative => format!("SPA  {l}3 {g:.5}"),
+            PidGainKind::Proportional => format!("SPA  {l}1 {:.5}", CFloat(g)),
+            PidGainKind::Integral => format!("SPA  {l}2 {:.5}", CFloat(g)),
+            PidGainKind::Derivative => format!("SPA  {l}3 {:.5}", CFloat(g)),
         };
         self.lock().send(&body)
     }
@@ -565,6 +566,43 @@ mod tests {
     use super::*;
     use motor_common::testing::LineRig;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
+    /// `-nan`, `+nan`.
+    #[test]
+    fn floats_go_out_as_c_sprintf() {
+        let nan = f64::NAN;
+        let neg = -f64::NAN;
+        let (line, mut axis, _) = strings_rig("c848CFloat");
+        let user = AsynUser::default();
+        let mut sent = String::new();
+        let mut run = |f: &mut dyn FnMut(&mut PIC848Axis)| {
+            f(&mut axis);
+            sent.extend(line.sent().into_iter().map(|w| w + "|"));
+        };
+        run(&mut |a| drop(a.move_absolute(&user, nan, 0.0, neg, 0.0)));
+        run(&mut |a| drop(a.move_relative(&user, nan, 0.0, 1.0, 0.0)));
+        run(&mut |a| drop(a.move_velocity(&user, 0.0, neg, 0.0)));
+        run(&mut |a| drop(a.home(&user, 0.0, nan, 0.0, true)));
+        run(&mut |a| drop(a.set_position(&user, neg)));
+        run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Proportional, nan)));
+        run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Integral, neg)));
+        run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Derivative, nan)));
+        assert!(!sent.contains("NaN"), "{sent}");
+        for want in [
+            "VEL  A -nan",
+            "MOV  Anan",
+            "MVR  A+nan",
+            "VEL  A-nan",
+            "VEL  A nan",
+            "POS  A-nan",
+            "SPA  A1 nan",
+            "SPA  A2 -nan",
+            "SPA  A3 nan",
+        ] {
+            assert!(sent.contains(want), "{want}: {sent}");
+        }
+    }
 
     /// `STA? A` registers, torque on: done, moving, and moving into the
     /// -limit.

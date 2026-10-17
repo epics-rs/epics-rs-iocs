@@ -90,6 +90,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -224,17 +225,17 @@ struct AxisReading {
 /// `{axis}SV{v},` velocity message; a move scales `velocity` by `res`, a jog
 /// sends it raw.
 fn sv_msg(label: &str, velocity: f64) -> String {
-    substitute_axis(&format!("#SV{velocity:.MAX_DIGITS$},"), label)
+    substitute_axis(&format!("#SV{:.MAX_DIGITS$},", CFloat(velocity)), label)
 }
 
 /// `{axis}MA{p},` absolute-move message (`res`-scaled controller units).
 fn ma_msg(label: &str, position: f64) -> String {
-    substitute_axis(&format!("#MA{position:.MAX_DIGITS$},"), label)
+    substitute_axis(&format!("#MA{:.MAX_DIGITS$},", CFloat(position)), label)
 }
 
 /// `{axis}MR{d},` relative-move message (`MR` forces a sign, C `%+.*f`).
 fn mr_msg(label: &str, distance: f64) -> String {
-    substitute_axis(&format!("#MR{distance:+.MAX_DIGITS$},"), label)
+    substitute_axis(&format!("#MR{:+.MAX_DIGITS$},", CFloat(distance)), label)
 }
 
 /// Fold one raw reading into a [`MotorStatus`] (C `set_status` tail). Updates
@@ -625,6 +626,18 @@ mod tests {
     use super::*;
     use motor_common::testing::LineRig;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
+    /// `-nan`, `+nan`.
+    #[test]
+    fn floats_go_out_as_c_sprintf() {
+        let nan = f64::NAN;
+        let neg = -f64::NAN;
+        assert_eq!(sv_msg("1", nan), "1SVnan,");
+        assert_eq!(ma_msg("1", neg), "1MA-nan,");
+        assert_eq!(mr_msg("1", nan), "1MR+nan,");
+        assert_eq!(mr_msg("1", neg), "1MR-nan,");
+    }
 
     /// `#GI8` status words (no shift, firmware V5): done, and moving.
     const DONE: u32 = 0;
