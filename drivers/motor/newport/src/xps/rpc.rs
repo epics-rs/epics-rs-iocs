@@ -144,7 +144,7 @@ impl XpsReply {
     /// C string out-params take everything up to the next comma; for XPS values
     /// (numbers, and status strings that never contain commas) that equals this
     /// split.
-    fn field(&self, n: usize) -> Option<&str> {
+    pub(crate) fn field(&self, n: usize) -> Option<&str> {
         self.0.split(',').nth(n)
     }
 

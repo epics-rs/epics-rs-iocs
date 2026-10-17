@@ -12,10 +12,7 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_newport::ioc::{
-    hxp_coord_sys_read_command, hxp_coord_sys_set_command, hxp_create_controller_command,
-    hxp_move_all_command, hxp_set_move_coord_sys_command,
-};
+use motor_newport::ioc::hxp_create_controller_command;
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -35,17 +32,21 @@ async fn main() -> CaResult<()> {
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
 
+    // asyn's devEpics, for HXP_extra.db / HXP_coords.db at address 0, and
+    // the sseq HXP_coords.db syncs the motors with after setting a
+    // coordinate system (opt-in in epics-rs).
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+    app = app.register_record_type("sseq", || {
+        Box::new(epics_rs::base::server::records::sseq::SseqRecord::default())
+    });
+
     // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`.
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // HXP controller create command (creates all six axes), the
-    // driver-private hexapod commands, and the motor device support.
+    // HXP controller create command (creates all six axes) and the motor
+    // device support.
     app = app.register_startup_command(hxp_create_controller_command());
-    app = app.register_startup_command(hxp_move_all_command());
-    app = app.register_startup_command(hxp_coord_sys_read_command());
-    app = app.register_startup_command(hxp_coord_sys_set_command());
-    app = app.register_startup_command(hxp_set_move_coord_sys_command());
     app = app.register_dynamic_device_support(
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),

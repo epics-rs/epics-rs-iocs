@@ -5,9 +5,9 @@
 //! six-coordinate hexapod move: the absolute branch reads all six current
 //! positions (poll socket), replaces this axis's target, and sends
 //! `HexapodMoveAbsolute`; the relative branch sends `HexapodMoveIncremental`
-//! with only this axis's delta. Moves go out the shared `Fire`-mode move
-//! socket (C gives each axis its own move socket with a `-0.1` timeout);
-//! status comes from the controller's cached group poll.
+//! with only this axis's delta. Moves go out the axis's own `Fire`-mode move
+//! socket (C's `-0.1` timeout); status comes from the controller's group
+//! poll.
 //!
 //! The hexapod plans its own trajectory, so velocity/acceleration arguments
 //! are ignored (C never sends them).
@@ -16,28 +16,66 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::user::AsynUser;
 
 use super::controller::{HXP_GROUP, HxpController, MRES, MoveCoordSys};
-use crate::xps::rpc::{XpsError, XpsSocket};
+use crate::xps::rpc::{XpsError, XpsResult, XpsSocket};
+
+/// C's longest `errorDesc_`, the `HXP_ERROR_DESC` a record shows.
+const ERROR_DESC_LEN: usize = 39;
+
+/// The `int` a C HXP wrapper returns for `result`.
+pub(super) fn xps_status(result: &XpsResult<()>) -> i32 {
+    result.as_ref().err().map_or(0, XpsError::code)
+}
+
+/// An axis's move socket and C `errorDescFull_`, which its moves and the
+/// controller's parameter writes on its address share.
+pub struct MoveLine {
+    sock: XpsSocket,
+    desc_full: Mutex<String>,
+}
+
+impl MoveLine {
+    pub fn new(sock: XpsSocket) -> Self {
+        Self {
+            sock,
+            desc_full: Mutex::default(),
+        }
+    }
+
+    pub fn sock(&self) -> &XpsSocket {
+        &self.sock
+    }
+
+    /// `HXP_ERROR` and `HXP_ERROR_DESC` for `status`: a failure's
+    /// ErrorStringGet text on this socket cut to 39 bytes, or both cleared
+    /// (HXPDriver.cpp:193-215, :350-371).
+    pub fn error_values(&self, status: i32) -> (i32, Vec<u8>) {
+        if status >= 0 {
+            return (0, Vec::new());
+        }
+        let mut full = self.desc_full.lock().unwrap_or_else(|e| e.into_inner());
+        self.sock.error_string_get_into(status, &mut full);
+        let bytes = full.as_bytes();
+        (status, bytes[..bytes.len().min(ERROR_DESC_LEN)].to_vec())
+    }
+}
 
 /// One hexapod coordinate as an asyn motor axis.
 pub struct HxpAxis {
     controller: Arc<Mutex<HxpController>>,
-    move_sock: XpsSocket,
+    line: Arc<MoveLine>,
     /// 0..=5 → X, Y, Z, U, V, W.
     axis_no: usize,
 }
 
 impl HxpAxis {
-    pub fn new(
-        controller: Arc<Mutex<HxpController>>,
-        move_sock: XpsSocket,
-        axis_no: usize,
-    ) -> Self {
+    pub fn new(controller: Arc<Mutex<HxpController>>, line: Arc<MoveLine>, axis_no: usize) -> Self {
         Self {
             controller,
-            move_sock,
+            line,
             axis_no,
         }
     }
@@ -45,14 +83,28 @@ impl HxpAxis {
     fn lock_controller(&self) -> MutexGuard<'_, HxpController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
-}
 
-/// C `move()` tolerates error `-27` (raised when the motor record reverses
-/// direction, aborting an in-flight move); every other error propagates.
-fn tolerate_dir_change(result: Result<(), XpsError>) -> AsynResult<()> {
-    match result {
-        Ok(()) | Err(XpsError::Api(-27)) => Ok(()),
-        Err(e) => Err(e.into()),
+    /// C `move()`'s close: the error at the controller's address 0, flushed
+    /// at this axis's, so another axis's shows at the next controller poll.
+    /// `-27` (the record reversing, which aborts the move) is posted but
+    /// not failed.
+    fn finish_move(&self, result: XpsResult<()>) -> AsynResult<()> {
+        let status = xps_status(&result);
+        let (code, desc) = self.line.error_values(status);
+        let ctrl = self.lock_controller();
+        if let Some(p) = ctrl.params {
+            ctrl.post(
+                self.axis_no as i32,
+                vec![
+                    (p.error, ParamValue::Int32(code)),
+                    (p.error_desc, ParamValue::Octet(desc.into())),
+                ],
+            );
+        }
+        match result {
+            Ok(()) | Err(XpsError::Api(-27)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -80,8 +132,9 @@ impl AsynMotor for HxpAxis {
             MoveCoordSys::Work => {
                 let mut targets = current;
                 targets[self.axis_no] = end_pos;
-                tolerate_dir_change(
-                    self.move_sock
+                self.finish_move(
+                    self.line
+                        .sock
                         .hexapod_move_absolute(HXP_GROUP, "Work", &targets),
                 )
             }
@@ -90,8 +143,9 @@ impl AsynMotor for HxpAxis {
             MoveCoordSys::Tool => {
                 let mut deltas = [0.0; 6];
                 deltas[self.axis_no] = end_pos - current[self.axis_no];
-                tolerate_dir_change(
-                    self.move_sock
+                self.finish_move(
+                    self.line
+                        .sock
                         .hexapod_move_incremental(HXP_GROUP, "Tool", &deltas),
                 )
             }
@@ -113,8 +167,9 @@ impl AsynMotor for HxpAxis {
         };
         let mut deltas = [0.0; 6];
         deltas[self.axis_no] = distance * MRES;
-        tolerate_dir_change(
-            self.move_sock
+        self.finish_move(
+            self.line
+                .sock
                 .hexapod_move_incremental(HXP_GROUP, cs_name, &deltas),
         )
     }
@@ -128,15 +183,15 @@ impl AsynMotor for HxpAxis {
         _forward: bool,
     ) -> AsynResult<()> {
         // C `home()`: kill, initialize, home search — return codes ignored.
-        let _ = self.move_sock.group_kill(HXP_GROUP);
-        let _ = self.move_sock.group_initialize(HXP_GROUP);
-        let _ = self.move_sock.group_home_search(HXP_GROUP);
+        let _ = self.line.sock.group_kill(HXP_GROUP);
+        let _ = self.line.sock.group_initialize(HXP_GROUP);
+        let _ = self.line.sock.group_home_search(HXP_GROUP);
         Ok(())
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         // C `stop()`: abort the group move, return code ignored.
-        let _ = self.move_sock.group_move_abort(HXP_GROUP);
+        let _ = self.line.sock.group_move_abort(HXP_GROUP);
         Ok(())
     }
 
@@ -196,7 +251,11 @@ mod tests {
         let controller = Arc::new(Mutex::new(HxpController::new(
             line.socket(SocketMode::Query),
         )));
-        let mut axis = HxpAxis::new(controller, line.socket(SocketMode::Fire), 0);
+        let mut axis = HxpAxis::new(
+            controller,
+            Arc::new(MoveLine::new(line.socket(SocketMode::Fire))),
+            0,
+        );
         let user = AsynUser::new(0);
         axis.move_absolute(&user, 2e5, 0.0, 1.0, 1.0).unwrap();
         axis.move_relative(&user, -1e5, 0.0, 1.0, 1.0).unwrap();
