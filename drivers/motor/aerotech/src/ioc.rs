@@ -327,6 +327,11 @@ static SOLOIST: Model1 = Model1::new(&DEV_SOLOIST, SOLOIST_NUM_CARDS, SCAN_RATE)
 
 /// `SoloistSetup(num_cards, scan_rate)`.
 pub fn soloist_setup_command() -> CommandDef {
+    SOLOIST.register_report("drvSoloist", |cards| {
+        cards.report("Soloist", |card, line| {
+            format!("    Soloist controller {card}, {line} \n")
+        })
+    });
     SOLOIST.setup_command("SoloistSetup")
 }
 
@@ -361,7 +366,15 @@ pub fn soloist_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let controller = SoloistCard::new(handle, addr);
-            let Some(setup) = drv_soloist::motor_init(&controller) else {
+            let Some(init) = drv_soloist::motor_init(&controller) else {
+                return Ok(CommandOutcome::Continue);
+            };
+            let ident = init.user_string.unwrap_or_else(|| format!("Soloist{card}"));
+            SOLOIST.describe(
+                card,
+                format!("port={asyn_port}, address={addr}, id: {ident}"),
+            );
+            let Some(setup) = init.axis else {
                 return Ok(CommandOutcome::Continue);
             };
             let controller = Arc::new(Mutex::new(controller));
@@ -490,5 +503,48 @@ mod report {
         run_command(drv_asyn_motor_configure_command(vec![&MOTOR_A3200]), args).await;
         let text = reported("motorA3200", 1, "axisStatus:  0x5\n").await;
         assert!(text.contains("Axis X\n   axisStatus:  0x5\n"), "{text}");
+    }
+
+    /// drvSoloist.cc's drvet `report` (:148-172). A card that answered
+    /// `NONE` is reported though it has no axis, as C's `motor_state` keeps
+    /// it; its ident is UserString1, else `Soloist<card>` (:606-615).
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_soloist_card() {
+        let setup = soloist_setup_command();
+        assert_eq!(
+            driver_report("drvSoloist", 0),
+            "    No Soloist controllers configured.\n"
+        );
+        run_command(setup, vec![ArgValue::Int(3), ArgValue::Int(10)]).await;
+        let (_a, _io_a) = LineRig::new("solRepA", |cmd| {
+            if cmd.trim_end() == "GETPARM(265)" {
+                "!"
+            } else {
+                "%0"
+            }
+            .into()
+        });
+        let (_b, _io_b) = LineRig::new("solRepB", |cmd| {
+            match cmd.trim_end() {
+                "GETPARM(265)" => "%MySoloist",
+                "GETPARM(257)" => "!",
+                _ => "%0",
+            }
+            .into()
+        });
+        for (card, line) in [(0, "solRepA"), (1, "solRepB")] {
+            let args = vec![
+                ArgValue::Int(card),
+                ArgValue::String(line.into()),
+                ArgValue::Int(0),
+            ];
+            run_command(soloist_config_command(), args).await;
+        }
+        assert_eq!(
+            driver_report("drvSoloist", 0),
+            "    Soloist controller 0, port=solRepA, address=0, id: Soloist0 \n    \
+             Soloist controller 1, port=solRepB, address=0, id: MySoloist \n    \
+             Soloist controller 2 connection failed.\n"
+        );
     }
 }

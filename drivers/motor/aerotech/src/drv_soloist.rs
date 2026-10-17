@@ -109,16 +109,31 @@ pub struct AxisSetup {
     home_dparam: u32,
 }
 
+/// What `motor_init` found of a card that answered.
+pub struct CardInit {
+    /// UserString1, C's report ident; `None` when refused.
+    pub user_string: Option<String>,
+    /// The card's one axis; `None` leaves the card without it, as C does.
+    pub axis: Option<AxisSetup>,
+}
+
 /// `motor_init`'s probe and set-up of one card: any reply to `NONE` finds
 /// it, an acknowledged `AxisName` its one axis, then the axis is stopped and
-/// its parameters read. `None` leaves the card without an axis, as C does.
-pub fn motor_init(card: &SoloistCard) -> Option<AxisSetup> {
+/// its parameters read. `None` for a card that never answered.
+pub fn motor_init(card: &SoloistCard) -> Option<CardInit> {
     card.flush();
     if !(0..3).any(|_| !card.ask(b"NONE").is_empty()) {
         return None;
     }
-    // UserString1, C's report ident.
-    card.query("GETPARM(265)");
+    let user_string = card.query("GETPARM(265)");
+    Some(CardInit {
+        user_string,
+        axis: axis_init(card),
+    })
+}
+
+/// The `AxisName` probe and the axis's set-up.
+fn axis_init(card: &SoloistCard) -> Option<AxisSetup> {
     card.query("GETPARM(257)")?;
     let encoder = card.query("GETPARM(58)").is_some_and(|v| atoi(&v) > 0);
     let gain = card.query("GETPARM(33)").is_some_and(|v| atoi(&v) != 3);
