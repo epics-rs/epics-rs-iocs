@@ -11,7 +11,9 @@
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_motorsim::ioc::{MotorSimHolder, motor_sim_create_command};
+use motor_motorsim::ioc::{
+    MOTOR_SIM, MotorSimHolder, drv_asyn_motor_configure_command, motor_sim_create_command,
+};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -39,6 +41,9 @@ async fn main() -> CaResult<()> {
     app = app.register_startup_command(holder.config_axis_command());
     // motorSimCreate and its "Motor Simulation" DTYP (drvMotorSim.c).
     app = app.register_startup_command(motor_sim_create_command());
+    // drvAsynMotorConfigure(port, "motorSim", card, nAxes): the same axes
+    // through drvMotorAsyn (model 2).
+    app = app.register_startup_command(drv_asyn_motor_configure_command(vec![&MOTOR_SIM]));
     app = app.register_dynamic_device_support(
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),

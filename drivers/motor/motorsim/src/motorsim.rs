@@ -234,6 +234,7 @@ impl MotorSimAxis {
             velocity: 0.0,
             done,
             moving: !done,
+            msta_moving: !done,
             direction: self.nextpoint.v > 0.0,
             high_limit: self.nextpoint.p >= self.hi_hard_limit,
             low_limit: self.nextpoint.p <= self.low_hard_limit,
@@ -478,6 +479,18 @@ mod tests {
         let (pos, done) = run_to_done(&mut axis, 0.05, 1000);
         assert!(done, "move did not finish");
         assert!((pos - 5.0).abs() < 1e-3, "final position {pos}");
+    }
+
+    /// C motorSimDriver.cpp:476 / drvMotorSim.c:652: MSTA RA_MOVING is
+    /// `!done`.
+    #[test]
+    fn msta_moving_follows_not_done() {
+        let mut axis = MotorSimAxis::new(DEFAULT_LOW_LIMIT, DEFAULT_HI_LIMIT, 0.0, 0.0);
+        axis.move_absolute(&user(), 5.0, 0.0, 2.0, 1.0).unwrap();
+        axis.process(0.05);
+        assert!(axis.last_status.msta_moving);
+        run_to_done(&mut axis, 0.05, 1000);
+        assert!(!axis.last_status.msta_moving);
     }
 
     #[test]
