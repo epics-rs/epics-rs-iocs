@@ -130,7 +130,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::motor::controller_port::{AxisUser, ParamWrite};
-use epics_rs::motor::flags::MotorCommand;
+use epics_rs::motor::flags::{DriverCall, MotorCommand};
 use motor_common::util::{atof, atoi, nint};
 use motor_common::{ControllerParams, ControllerReport};
 
@@ -1203,6 +1203,7 @@ impl PIGCS2Controller {
 #[derive(Clone, Copy, Debug)]
 struct PiParams {
     position: usize,
+    target: usize,
     servo: usize,
     last_err: usize,
     clear_err: usize,
@@ -1250,6 +1251,7 @@ impl ControllerParams for PIGCS2Params {
         let mut create = |name, kind| base.create_param(name, kind);
         let params = PiParams {
             position: create("PI_SUP_POSITION", ParamType::Float64)?,
+            target: create("PI_SUP_TARGET", ParamType::Float64)?,
             servo: create("PI_SUP_SERVO", ParamType::Int32)?,
             last_err: create("PI_SUP_LAST_ERR", ParamType::Int32)?,
             clear_err: create("PI_SUP_CLEAR_ERR", ParamType::Int32)?,
@@ -1307,12 +1309,24 @@ impl ControllerParams for PIGCS2Params {
             return ParamWrite::PassToBase(Ok(()));
         };
         let pivots = [params.pivot_x, params.pivot_y, params.pivot_z];
-        let Some(index) = pivots.iter().position(|&r| r == user.reason) else {
+        let pivot = pivots.iter().position(|&r| r == user.reason);
+        if pivot.is_none() && user.reason != params.target {
             return ParamWrite::PassToBase(Ok(()));
-        };
+        }
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // C's sink is the asynUser itself, a `-1` address included.
         ctrl.log_sink = Some((base.port_name.to_string(), user.asyn().addr));
+        let Some(index) = pivot else {
+            drop(ctrl);
+            let call = DriverCall::new(move |motor, _user| {
+                let any: &mut dyn std::any::Any = motor;
+                let axis = any
+                    .downcast_mut::<PIGCS2Axis>()
+                    .ok_or_else(|| pigcs2_err("PI_SUP_TARGET on a non-PI axis"))?;
+                axis.move_cts(target_counts(value * axis.cpu))
+            });
+            return ParamWrite::PassToBase(user.queue(base, MotorCommand::Driver(call)));
+        };
         ParamWrite::PassToBase(ctrl.set_pivot(index, value))
     }
 
@@ -1603,6 +1617,33 @@ impl PIGCS2Axis {
         Ok(())
     }
 
+    /// C `moveCts(pAxis, targetCts)`: the move to `counts`, by the
+    /// hexapod's target mode or a plain `MOV`.
+    fn move_cts(&mut self, counts: f64) -> AsynResult<()> {
+        let mut ctrl = self.lock();
+        if ctrl.model.is_hexapod() {
+            // PIHexapodController::moveCts by m_targetMode, the distance
+            // from the polled position. C defect not copied: another mode
+            // sends an uninitialized command; rs refuses the move.
+            let (cmd, value) = match ctrl.target_mode {
+                0 => ("MOV", counts),
+                1 => ("MRT", counts - self.last_position),
+                2 => ("MRW", counts - self.last_position),
+                mode => return Err(pigcs2_err(format!("target mode {mode}"))),
+            };
+            ctrl.hexapod_move(&format!(
+                "{cmd} {} {}",
+                self.axis_name,
+                CFloat(value / self.cpu)
+            ))?;
+        } else {
+            ctrl.mov(&self.axis_name, counts / self.cpu)?;
+        }
+        drop(ctrl);
+        self.last_direction = counts > self.last_position;
+        Ok(())
+    }
+
     /// C `setServo`: a servo turned on clears the problem flag.
     fn set_servo(&mut self, enable: bool) -> AsynResult<()> {
         self.lock().set_servo(&self.axis_name, enable)?;
@@ -1796,28 +1837,7 @@ impl AsynMotor for PIGCS2Axis {
         if acceleration != 0.0 {
             self.apply_acceleration(acceleration)?;
         }
-        let mut ctrl = self.lock();
-        if ctrl.model.is_hexapod() {
-            // PIHexapodController::moveCts by m_targetMode, the distance
-            // from the polled position. C defect not copied: another mode
-            // sends an uninitialized command; rs refuses the move.
-            let (cmd, value) = match ctrl.target_mode {
-                0 => ("MOV", position),
-                1 => ("MRT", position - self.last_position),
-                2 => ("MRW", position - self.last_position),
-                mode => return Err(pigcs2_err(format!("target mode {mode}"))),
-            };
-            ctrl.hexapod_move(&format!(
-                "{cmd} {} {}",
-                self.axis_name,
-                CFloat(value / self.cpu)
-            ))?;
-        } else {
-            ctrl.mov(&self.axis_name, position / self.cpu)?;
-        }
-        drop(ctrl);
-        self.last_direction = position > self.last_position;
-        Ok(())
+        self.move_cts(position)
     }
 
     // move_relative: C's own `move(position, relative, ...)` never branches
@@ -2731,6 +2751,27 @@ mod tests {
             poll_loop.run_queued_commands();
             assert_eq!(sent_lines(&line), [format!("SVO 1 {value}"), "ERR?".into()]);
             assert_eq!(port.read_int32_blocking(p.servo, 0).unwrap(), value);
+        }
+    }
+
+    /// `PIasynController::writeFloat64`'s `PI_SUP_TARGET` (PIasynController
+    /// .cpp:375-378): `moveCts` to the written value in counts, whole as
+    /// [`target_counts`] makes them, `MOV` + `ERR?` (PIGCSController.cpp:
+    /// 230-257): no VEL/SPA, and no deferral.
+    #[test]
+    fn a_target_write_moves_the_axis_by_whole_counts() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2TargetLine", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2TargetLine")));
+        let (port, p, mut poll_loop) = controller_port("gcs2Target", &ctrl, "1");
+        ctrl.lock().unwrap().moves_deferred = true;
+        for (value, sent) in [(2.7, "MOV 1 3.000000"), (-2.7, "MOV 1 -3.000000")] {
+            line.sent();
+            port.write_float64_blocking(p.target, 0, value).unwrap();
+            poll_loop.run_queued_commands();
+            assert_eq!(sent_lines(&line), [sent, "ERR?"]);
+            assert_eq!(port.read_float64_blocking(p.target, 0).unwrap(), value);
         }
     }
 
