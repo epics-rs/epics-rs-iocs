@@ -306,6 +306,11 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
             for axis in records {
                 register_axis(axis)?;
             }
+            // C's driver task calls intCallback before iocInit, when no I/O Intr
+            // record has subscribed (drvMotorAsyn.c:412, drvMotorSim.c:677),
+            // and paramLib calls back only changes after that, so C's status
+            // and done records read 0 until the axis moves. The gate holds
+            // those interrupts for iocInit; that C defect is not copied.
             claim
                 .publish(
                     rt.port_handle().clone(),
