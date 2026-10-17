@@ -29,8 +29,6 @@
 //!   into the travel-limit cache that `getnlimit` filled in controller units,
 //!   and send it as such through `setnlimit` and the jog `nm`. This port scales
 //!   the record limit by `axisRes`, so the cache stays in controller units.
-//! - The C poll issues `gnv`/`gna` reads whose replies are discarded; these dead
-//!   reads are omitted.
 //! - The Taurus-specific limit-switch type parameters (`setsw`/`getsw` driven by
 //!   the `SMCTaurusLimit*Type` aux PVs, commented out in the C poll) are not
 //!   modeled.
@@ -84,6 +82,17 @@ impl TaurusController {
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
         self.handle.write_octet(0, &Self::framed(cmd))?;
         Ok(())
+    }
+
+    /// C's run of `status = writeController()`: every command is sent,
+    /// whatever the one before returned, and the last one's status is the
+    /// caller's.
+    fn write_all<const N: usize>(&self, cmds: [String; N]) -> AsynResult<()> {
+        let mut status = Ok(());
+        for cmd in &cmds {
+            status = self.write_only(cmd);
+        }
+        status
     }
 
     /// Write a query and read one reply line.
@@ -153,22 +162,21 @@ impl TaurusAxis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Send the per-axis velocity and acceleration (`snv`/`sna`).
-    fn send_accel_velocity(
+    /// C `sendAccelAndVelocity`'s `snv`/`sna`, then `cmd`, as one
+    /// [`TaurusController::write_all`].
+    fn write_after_accel_velocity(
         &self,
         ctrl: &TaurusController,
         velocity: f64,
         acceleration: f64,
+        cmd: String,
     ) -> AsynResult<()> {
         let addr = self.addr();
-        ctrl.write_only(&format!(
-            "{:.6} {addr} snv",
-            (velocity * self.axis_res).abs()
-        ))?;
-        ctrl.write_only(&format!(
-            "{:.6} {addr} sna",
-            (acceleration * self.axis_res).abs()
-        ))
+        ctrl.write_all([
+            format!("{:.6} {addr} snv", (velocity * self.axis_res).abs()),
+            format!("{:.6} {addr} sna", (acceleration * self.axis_res).abs()),
+            cmd,
+        ])
     }
 
     /// Push the current travel-limit pair to the controller (`setnlimit`).
@@ -197,13 +205,8 @@ impl AsynMotor for TaurusAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
-        ctrl.write_only(&format!(
-            "{:.6} {} nm",
-            position * self.axis_res,
-            self.addr()
-        ))
+        let cmd = format!("{:.6} {} nm", position * self.axis_res, self.addr());
+        self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
     fn move_relative(
@@ -214,13 +217,8 @@ impl AsynMotor for TaurusAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
-        ctrl.write_only(&format!(
-            "{:.6} {} nr",
-            distance * self.axis_res,
-            self.addr()
-        ))
+        let cmd = format!("{:.6} {} nr", distance * self.axis_res, self.addr());
+        self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
     fn move_velocity(
@@ -230,15 +228,14 @@ impl AsynMotor for TaurusAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
         // No jog command — move to the cached axis travel limit.
-        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
         let target = if velocity > 0.0 {
             self.pos_travel_limit
         } else {
             self.neg_travel_limit
         };
-        ctrl.write_only(&format!("{target:.6} {} nm", self.addr()))
+        let cmd = format!("{target:.6} {} nm", self.addr());
+        self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
     fn home(
@@ -249,10 +246,9 @@ impl AsynMotor for TaurusAxis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.send_accel_velocity(&ctrl, velocity, acceleration)?;
         let verb = if forward { "nrm" } else { "ncal" };
-        ctrl.write_only(&format!("{} {verb}", self.addr()))
+        let cmd = format!("{} {verb}", self.addr());
+        self.write_after_accel_velocity(&self.lock(), velocity, acceleration, cmd)
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -275,13 +271,12 @@ impl AsynMotor for TaurusAxis {
         let ctrl = self.lock();
         let addr = self.addr();
         if enable {
-            // C sends the closed-loop flag itself (1) as the regulator mode.
-            ctrl.write_only(&format!("1 {addr} setcloop"))?;
-            // Reinit so the closed-loop setting takes effect (powers the motor);
-            // the controller needs a delay after init.
-            ctrl.write_only(&format!("{addr} init"))?;
+            // C sends the closed-loop flag itself (1) as the regulator mode,
+            // then reinits so it takes effect (powers the motor); the
+            // controller needs a delay after init.
+            let status = ctrl.write_all([format!("1 {addr} setcloop"), format!("{addr} init")]);
             std::thread::sleep(INIT_DELAY);
-            Ok(())
+            status
         } else {
             ctrl.write_only(&format!("{addr} motoroff"))
         }
@@ -314,6 +309,11 @@ impl AsynMotor for TaurusAxis {
         let moving = (status & STATUS_MOVING) != 0;
         let powered = (status & STATUS_POWER_OFF) == 0;
         let problem = (status & STATUS_ESTOP_SWITCH) != 0;
+
+        // SMCTaurusAxis.cpp:267-271 reads the commanded velocity and
+        // acceleration, ignoring the replies and their status.
+        let _ = ctrl.query(&format!("{addr} gnv"));
+        let _ = ctrl.query(&format!("{addr} gna"));
 
         // Switch config: bit 1 (0x2) masks (disables) the switch.
         let sw = ctrl.query(&format!("{addr} getsw"))?;
@@ -369,6 +369,90 @@ mod tests {
         let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
         let axis = TaurusAxis::new(controller, 0);
         assert_eq!((axis.neg_travel_limit, axis.pos_travel_limit), (0.0, 0.0));
+    }
+
+    /// Refuses every setting write (`snv`, `sna`, `setcloop`); records
+    /// every write.
+    struct SettingsRefused {
+        base: epics_rs::asyn::port::PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    const REFUSED: [&str; 3] = ["snv", "sna", "setcloop"];
+
+    impl epics_rs::asyn::port::PortDriver for SettingsRefused {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let line = String::from_utf8_lossy(data).trim_end().to_string();
+            let refused = REFUSED.iter().any(|verb| line.ends_with(verb));
+            self.written.lock().unwrap().push(line);
+            if refused {
+                Err(epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Error,
+                    message: "refused".into(),
+                })
+            } else {
+                Ok(data.len())
+            }
+        }
+    }
+
+    /// C overwrites each write's status with the next one's
+    /// (SMCTaurusAxis.cpp:52-111, :134-154), so a refused setting still
+    /// sends the command after it, and that command's status is returned.
+    #[test]
+    fn a_refused_setting_still_sends_the_command_after_it() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let port = SettingsRefused {
+            base: PortDriverBase::new("taurusRefused", 1, PortFlags::default()),
+            written: written.clone(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("taurusRefused").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let mut axis = TaurusAxis {
+            controller: Arc::new(Mutex::new(TaurusController::new(handle))),
+            axis_no: 0,
+            neg_travel_limit: -100.0,
+            pos_travel_limit: 100.0,
+            axis_res: 0.5,
+        };
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 2.0, 0.0, 2.0, 4.0).unwrap();
+        axis.move_relative(&user, -2.0, 0.0, 2.0, 4.0).unwrap();
+        axis.move_velocity(&user, 0.0, 2.0, 4.0).unwrap();
+        axis.home(&user, 0.0, 2.0, 4.0, false).unwrap();
+        axis.set_closed_loop(&user, true).unwrap();
+        let written = written.lock().unwrap();
+        let tails: Vec<&String> = written
+            .iter()
+            .filter(|w| !REFUSED.iter().any(|v| w.ends_with(v)))
+            .collect();
+        assert_eq!(
+            tails,
+            [
+                "1.000000 1 nm",
+                "-1.000000 1 nr",
+                "100.000000 1 nm",
+                "1 ncal",
+                "1 init"
+            ]
+        );
+        // Four moves of three writes, then closed-loop's two.
+        assert_eq!(written.len(), 4 * 3 + 2);
     }
 
     #[test]

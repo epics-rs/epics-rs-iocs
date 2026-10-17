@@ -21,7 +21,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string, req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{asyn_user, install, model1_device, register_port};
+use motor_common::{Controller, asyn_user, model1_device, register_port};
 
 use crate::drv_im483::{
     DrvIm483Axis, IM483PL_NUM_CARDS, IM483SM_NUM_CARDS, Im483Controller, im483pl_probe,
@@ -73,14 +73,10 @@ pub fn ims_create_controller_command() -> CommandDef {
             let axis = ImsMDrivePlusAxis::new(handle, &motor_port, device_name);
 
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            install(
-                ctx,
-                asyn_user(&motor_port, 0),
-                motor,
-                moving_poll_ms as u64,
-                idle_poll_ms as u64,
-                2, // C startPoller, ImsMDrivePlusMotorController.cpp:101
-            )?;
+            // C startPoller, ImsMDrivePlusMotorController.cpp:101
+            let poller = Controller::new();
+            poller.install(asyn_user(&motor_port, 0), motor)?;
+            poller.start(ctx, moving_poll_ms as u64, idle_poll_ms as u64, 2);
 
             Ok(CommandOutcome::Continue)
         },
@@ -226,4 +222,32 @@ pub fn mdrive_config_command() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod one_poller {
+    use super::*;
+    use motor_common::testing::{LineRig, pollers_after};
+
+    /// C ImsMDrivePlusMotorController's one asynMotorController poller.
+    #[epics_rs::base::epics_test]
+    async fn ims_mdrive_plus_create_controller_polls_on_one_poller() {
+        let (line, _io) = LineRig::new("mdrivePlusLine", |last| {
+            if last.contains("PR VR") {
+                "1.000".into()
+            } else {
+                "0".into()
+            }
+        });
+        let args = vec![
+            ArgValue::String("mdrivePlus".into()),
+            ArgValue::String("mdrivePlusLine".into()),
+            ArgValue::String("".into()),
+            ArgValue::Double(100.0),
+            ArgValue::Double(1000.0),
+        ];
+        let cmd = ims_create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+        assert!(!line.sent().is_empty());
+    }
 }

@@ -22,7 +22,7 @@ use motor_common::iocsh::{
     req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{asyn_user, install, model1_device, register_port};
+use motor_common::{Controller, asyn_user, model1_device, register_port};
 
 use crate::corvus::{CorvusAxis, CorvusController};
 use crate::drv_micos::{
@@ -162,21 +162,17 @@ pub fn corvus_create_controller_command() -> CommandDef {
             );
             let controller = Arc::new(Mutex::new(CorvusController::new(handle, num_axes as usize)));
 
+            // C startPoller, SMCcorvusDriver.cpp:58
+            let poller = Controller::new();
             for index in 0..num_axes as usize {
                 let ax = CorvusAxis::new(controller.clone(), index)
                     .map_err(|e| format!("SMCcorvusCreateController: axis {index}: {e}"))?;
                 let ax = Arc::new(Mutex::new(ax));
                 register_resolution_axis(&port_name, ax.clone());
                 let motor: Arc<Mutex<dyn AsynMotor>> = ax;
-                install(
-                    ctx,
-                    asyn_user(&port_name, index as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, SMCcorvusDriver.cpp:58
-                )?;
+                poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -227,19 +223,15 @@ pub fn hydra_create_controller_command() -> CommandDef {
             );
             let controller = Arc::new(Mutex::new(HydraController::new(handle)));
 
+            // C startPoller, SMChydraDriver.cpp:60
+            let poller = Controller::new();
             for index in 0..num_axes as usize {
                 let ax = Arc::new(Mutex::new(HydraAxis::new(controller.clone(), index)));
                 register_resolution_axis(&port_name, ax.clone());
                 let motor: Arc<Mutex<dyn AsynMotor>> = ax;
-                install(
-                    ctx,
-                    asyn_user(&port_name, index as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, SMChydraDriver.cpp:60
-                )?;
+                poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -290,19 +282,15 @@ pub fn taurus_create_controller_command() -> CommandDef {
             );
             let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
 
+            // C startPoller, SMCTaurusDriver.cpp:41
+            let poller = Controller::new();
             for index in 0..num_axes as usize {
                 let ax = Arc::new(Mutex::new(TaurusAxis::new(controller.clone(), index)));
                 register_resolution_axis(&port_name, ax.clone());
                 let motor: Arc<Mutex<dyn AsynMotor>> = ax;
-                install(
-                    ctx,
-                    asyn_user(&port_name, index as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, SMCTaurusDriver.cpp:41
-                )?;
+                poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -385,4 +373,45 @@ pub fn micos_config_command() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod one_poller {
+    use super::*;
+    use motor_common::testing::{LineRig, pollers_after};
+
+    fn args(port: &str, line: &str, num_axes: i64) -> Vec<ArgValue> {
+        vec![
+            ArgValue::String(port.into()),
+            ArgValue::String(line.into()),
+            ArgValue::Int(num_axes),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ]
+    }
+
+    /// C asynMotorController's one poller for every axis of the controller.
+    #[epics_rs::base::epics_test]
+    async fn smc_corvus_create_controller_polls_its_axes_on_one_poller() {
+        let (line, _io) = LineRig::new("corvusLine", |_| "1.0 1.0 1.0".into());
+        let cmd = corvus_create_controller_command();
+        assert_eq!(pollers_after(cmd, args("corvus", "corvusLine", 3)).await, 1);
+        assert!(!line.sent().is_empty());
+    }
+
+    #[epics_rs::base::epics_test]
+    async fn smc_hydra_create_controller_polls_its_axes_on_one_poller() {
+        let (line, _io) = LineRig::new("hydraLine", |_| "1".into());
+        let cmd = hydra_create_controller_command();
+        assert_eq!(pollers_after(cmd, args("hydra", "hydraLine", 2)).await, 1);
+        assert!(!line.sent().is_empty());
+    }
+
+    #[epics_rs::base::epics_test]
+    async fn smc_taurus_create_controller_polls_its_axes_on_one_poller() {
+        let (line, _io) = LineRig::new("taurusLine", |_| "1".into());
+        let cmd = taurus_create_controller_command();
+        assert_eq!(pollers_after(cmd, args("taurus", "taurusLine", 3)).await, 1);
+        assert!(!line.sent().is_empty());
+    }
 }

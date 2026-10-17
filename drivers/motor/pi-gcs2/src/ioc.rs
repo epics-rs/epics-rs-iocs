@@ -22,7 +22,7 @@ use motor_common::connect::{EosConnectError, EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{Controller, asyn_user, register_port};
 
 use crate::gcs2::{PIGCS2Axis, PIGCS2Controller, is_known_controller};
 
@@ -81,18 +81,18 @@ pub fn pigcs2_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let controller = Arc::new(Mutex::new(controller));
+            // C startPoller, PIasynController.cpp:192. Its poll()
+            // (PIasynController.cpp:579) reads nothing on a motor controller:
+            // getGlobalState is PIGCSController's no-op, and the pivot,
+            // coordinate-system and last-error parameters it posts are not
+            // modeled here.
+            let poller = Controller::new();
             for (index, axis_name) in found.into_iter().take(num_axes).enumerate() {
                 let axis = PIGCS2Axis::new(controller.clone(), axis_name, index, &port_name);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                install(
-                    ctx,
-                    asyn_user(&port_name, index as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    10, // C startPoller, PIasynController.cpp:192
-                )?;
+                poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 10);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -138,4 +138,40 @@ fn connect(asyn_port: &str) -> Option<SyncIOHandle> {
         ),
     }
     None
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod one_poller {
+    use super::*;
+    use motor_common::testing::{LineRig, pollers_after};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// C PIasynController's one asynMotorController poller for all its axes.
+    #[epics_rs::base::epics_test]
+    async fn pi_gcs2_create_controller_polls_its_axes_on_one_poller() {
+        // A C-863 with axes `1` and `2`: `SAI?` answers `1 `, whose trailing
+        // space asks for the plain read that answers `2`.
+        let sai_left = AtomicBool::new(false);
+        let (line, _io) = LineRig::new("c863Line", move |command| {
+            match command {
+                "*IDN?" => "(c)2026 Physik Instrumente (PI) GmbH & Co. KG, C-863.11, 0, 1.0",
+                "SAI?" if !sai_left.swap(true, Ordering::Relaxed) => "1 ",
+                "SAI?" => "2",
+                _ => "1=0",
+            }
+            .into()
+        });
+        let args = vec![
+            ArgValue::String("c863".into()),
+            ArgValue::String("c863Line".into()),
+            ArgValue::Int(2),
+            ArgValue::Int(0),
+            ArgValue::Int(0),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ];
+        let cmd = pigcs2_config_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+        assert!(line.sent().iter().any(|w| w == "SAI?"));
+    }
 }
