@@ -91,10 +91,8 @@
 //!
 //! ## Not modeled (documented deviations from the full C module)
 //!
-//! - **Hexapod**: the `PIasynController` parameters that set and read back
-//!   the pivot point, the target mode and the coordinate systems are not
-//!   modeled, so a hexapod moves only with `MOV` and its pivot only reads
-//!   at init.
+//! - **Hexapod**: the `PIasynController` target-mode and coordinate-system
+//!   parameters are not modeled, so a hexapod moves only with `MOV`.
 //! - **Piezo**: `PIGCSPiezoController`, `PIGCS2PiezoCL` — closed-loop piezo
 //!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
 //!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
@@ -410,6 +408,9 @@ pub struct PIGCS2Controller {
     port: Option<(PortHandle, PiParams)>,
     /// `PIGCSController::m_LastError`: the last nonzero `ERR?` code.
     last_error: Cell<i32>,
+    /// `PIHexapodController::m_PivotX/Y/Z`; `PIGCSController`'s `GetPivot*`
+    /// are 0.
+    pivot: [f64; 3],
 }
 
 /// `PIHexapodController`'s platform state, one for all its axes.
@@ -453,6 +454,7 @@ impl PIGCS2Controller {
             released: BTreeMap::new(),
             port: None,
             last_error: Cell::new(0),
+            pivot: [0.0; 3],
         }
     }
 
@@ -484,11 +486,13 @@ impl PIGCS2Controller {
             let _ = self.query("KLN?");
         }
         if let Some((port, params)) = &self.port {
-            let updates = vec![ParamSetValue::new(
-                params.last_err,
-                0,
-                ParamValue::Int32(self.last_error.get()),
-            )];
+            let [x, y, z] = self.pivot;
+            let updates = vec![
+                ParamSetValue::new(params.rbpivot_x, 0, ParamValue::Float64(x)),
+                ParamSetValue::new(params.rbpivot_y, 0, ParamValue::Float64(y)),
+                ParamSetValue::new(params.rbpivot_z, 0, ParamValue::Float64(z)),
+                ParamSetValue::new(params.last_err, 0, ParamValue::Int32(self.last_error.get())),
+            ];
             let _ = port.set_params_and_notify_blocking(0, updates);
         }
     }
@@ -575,17 +579,73 @@ impl PIGCS2Controller {
         self.hexapod.reads_status = self.answers_char(4);
         self.hexapod.reads_position = self.answers_char(3);
         self.hexapod.homing = false;
-        // ReadPivotSettings: the R/S/T it parses feed only PIasynController's
-        // pivot readback parameters, which are not modeled.
-        // GetReadPivotCommand.
+        // ReadPivotSettings, with GetReadPivotCommand's query.
         let read_pivot = if self.model == Model::Hexapod {
             "SPI? RST"
         } else {
             "SPI? R S T"
         };
-        if self.query(read_pivot).is_ok() {
-            let _ = self.get_gcs_error();
+        let Ok(reply) = self.query(read_pivot) else {
+            return;
+        };
+        if !matches!(self.get_gcs_error(), Ok(0)) {
+            return;
         }
+        // One "R = 1.0 " line per pivot coordinate; one unparsed keeps all.
+        let mut pivot = [0.0; 3];
+        for line in reply.split('\n').map(|line| line.trim_start_matches(' ')) {
+            let Ok(value) = get_value_f64(line) else {
+                return;
+            };
+            match line.bytes().next() {
+                Some(b'R') => pivot[0] = value,
+                Some(b'S') => pivot[1] = value,
+                Some(b'T') => pivot[2] = value,
+                _ => {}
+            }
+        }
+        self.pivot = pivot;
+    }
+
+    /// C `SetPivotX/Y/Z` for coordinate `index` (`R`/`S`/`T`): a hexapod
+    /// sends `SPI` + `ERR?` unless its platform moves (`SetPivot`); the
+    /// others only log it. C's FLOW lines have no newline.
+    fn set_pivot(&mut self, index: usize, value: f64) -> AsynResult<()> {
+        let xyz = ["X", "Y", "Z"][index];
+        if !self.model.is_hexapod() {
+            self.trace(
+                TraceMask::FLOW,
+                format_args!("PIGCSController::SetPivot{xyz}() ignored"),
+            );
+            return Ok(());
+        }
+        self.trace(
+            TraceMask::FLOW,
+            format_args!(
+                "PIHexapodController::SetPivot{xyz}() value {}",
+                CFloat(value)
+            ),
+        );
+        if self.hexapod.any_moving {
+            self.trace(
+                TraceMask::FLOW,
+                format_args!(
+                    "PIHexapodController::SetPivot() cannot change pivot point while platform is moving"
+                ),
+            );
+            return Err(pigcs2_err("platform is moving"));
+        }
+        let rst = ["R", "S", "T"][index];
+        self.send_only(&format!("SPI {rst} {}", CFloat(value)))?;
+        let err = self.get_gcs_error()?;
+        if err != 0 {
+            self.print(format_args!(
+                "PIHexapodController::SetPivot() failed, GCS error {err}\n"
+            ));
+            return Err(pigcs2_err(format!("SPI failed, GCS error {err}")));
+        }
+        self.pivot[index] = value;
+        Ok(())
     }
 
     /// Whether byte `c` is answered; a timeout's `ERR?` clears the unknown
@@ -681,17 +741,18 @@ impl PIGCS2Controller {
 
     /// `asynPrint(pAsynCom, ASYN_TRACE_ERROR, ...)`.
     pub fn print(&self, args: std::fmt::Arguments<'_>) {
+        self.trace(TraceMask::ERROR, args);
+    }
+
+    /// `asynPrint(m_pCurrentLogSink, mask, ...)`.
+    fn trace(&self, mask: TraceMask, args: std::fmt::Arguments<'_>) {
         let (port, addr) = match &self.log_sink {
             Some((port, addr)) => (port.as_str(), *addr),
             None => (self.serial_port.as_str(), 0),
         };
-        PortManager::global().trace_manager().print(
-            Some(port),
-            Some(addr),
-            0,
-            TraceMask::ERROR,
-            args,
-        );
+        PortManager::global()
+            .trace_manager()
+            .print(Some(port), Some(addr), 0, mask, args);
     }
 
     /// `SAI?`: every connected axis name, one per reply line less its
@@ -1125,6 +1186,12 @@ impl PIGCS2Controller {
 struct PiParams {
     last_err: usize,
     clear_err: usize,
+    pivot_x: usize,
+    pivot_y: usize,
+    pivot_z: usize,
+    rbpivot_x: usize,
+    rbpivot_y: usize,
+    rbpivot_z: usize,
 }
 
 /// What C `PIasynController` adds to the `asynMotorController` port: its
@@ -1159,9 +1226,16 @@ impl PIGCS2Params {
 
 impl ControllerParams for PIGCS2Params {
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        let mut create = |name, kind| base.create_param(name, kind);
         let params = PiParams {
-            last_err: base.create_param("PI_SUP_LAST_ERR", ParamType::Int32)?,
-            clear_err: base.create_param("PI_SUP_CLEAR_ERR", ParamType::Int32)?,
+            last_err: create("PI_SUP_LAST_ERR", ParamType::Int32)?,
+            clear_err: create("PI_SUP_CLEAR_ERR", ParamType::Int32)?,
+            pivot_x: create("PI_SUP_PIVOT_X", ParamType::Float64)?,
+            pivot_y: create("PI_SUP_PIVOT_Y", ParamType::Float64)?,
+            pivot_z: create("PI_SUP_PIVOT_Z", ParamType::Float64)?,
+            rbpivot_x: create("PI_SUP_RBPIVOT_X", ParamType::Float64)?,
+            rbpivot_y: create("PI_SUP_RBPIVOT_Y", ParamType::Float64)?,
+            rbpivot_z: create("PI_SUP_RBPIVOT_Z", ParamType::Float64)?,
         };
         let _ = self.params.set(params);
         Ok(())
@@ -1186,6 +1260,25 @@ impl ControllerParams for PIGCS2Params {
             }
         }
         ParamWrite::PassToBase(Ok(()))
+    }
+
+    /// C `PIasynController::writeFloat64`'s own parameters.
+    fn write_float64(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: f64,
+    ) -> ParamWrite {
+        let (Some(controller), Some(params)) = (self.controller.get(), self.params.get()) else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        let pivots = [params.pivot_x, params.pivot_y, params.pivot_z];
+        let Some(index) = pivots.iter().position(|&r| r == user.reason) else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        ctrl.log_sink = Some((base.port_name.to_string(), user.addr));
+        ParamWrite::PassToBase(ctrl.set_pivot(index, value))
     }
 
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
@@ -2447,6 +2540,106 @@ mod tests {
         assert!(sent_lines(&line).is_empty());
     }
 
+    /// `ctrl`'s `PIasynController` port `name` with axis `axis` at address
+    /// 0, as `PI_GCS2_CreateController` makes it.
+    fn controller_port(
+        name: &str,
+        ctrl: &Arc<Mutex<PIGCS2Controller>>,
+        axis: &str,
+    ) -> (PortHandle, PiParams) {
+        let params = PIGCS2Params::default();
+        let port = motor_common::register_controller_port(
+            &epics_rs::asyn::registry::open_owner(),
+            name,
+            1,
+            params.clone(),
+        )
+        .unwrap();
+        params.attach(ctrl.clone(), port.clone());
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(PIGCS2Axis::new(
+            ctrl.clone(),
+            axis.into(),
+            0,
+            name,
+        )));
+        epics_rs::motor::devices::register_axis(
+            epics_rs::motor::builder::MotorBuilder::new(motor)
+                .trace_user(motor_common::asyn_user(name, 0))
+                .build_axis()
+                .axis,
+        )
+        .unwrap();
+        let params = *params.params.get().unwrap();
+        (port, params)
+    }
+
+    /// `PIHexapodController::ReadPivotSettings` (PIHexapodController.cpp:
+    /// 370-425) keeps the init's `SPI?` point, `PIasynController::poll`
+    /// posts it as `PI_SUP_RBPIVOT_*` (PIasynController.cpp:583-585), and a
+    /// `PI_SUP_PIVOT_*` write sends `SPI` + `ERR?` (:381-392, :338-367)
+    /// unless the platform moves.
+    #[test]
+    fn a_hexapod_pivot_reads_back_and_takes_writes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let more = AtomicUsize::new(0);
+        let (line, ctrl) = hexapod("gcs2PivotLine", move |last| match last {
+            // The continuation reads see the command they follow.
+            "SPI? RST" => match more.fetch_add(1, Ordering::Relaxed) % 3 {
+                0 => "R=1.5 ",
+                1 => "S=2.5 ",
+                _ => "T=3.5",
+            }
+            .into(),
+            last => hexapod_reply(last),
+        });
+        let (port, p) = controller_port("gcs2Pivot", &ctrl, "X");
+        let read = |reason| port.read_float64_blocking(reason, 0).unwrap();
+        ctrl.lock().unwrap().poll();
+        assert_eq!(
+            [read(p.rbpivot_x), read(p.rbpivot_y), read(p.rbpivot_z)],
+            [1.5, 2.5, 3.5]
+        );
+        line.sent();
+        port.write_float64_blocking(p.pivot_y, 0, 4.0).unwrap();
+        assert_eq!(sent_lines(&line), ["SPI S 4.000000", "ERR?"]);
+        ctrl.lock().unwrap().poll();
+        assert_eq!(read(p.rbpivot_y), 4.0);
+        ctrl.lock().unwrap().hexapod.any_moving = true;
+        line.sent();
+        let printed = traced_mask("gcs2Pivot", TraceMask::FLOW, || {
+            assert!(port.write_float64_blocking(p.pivot_z, 0, 1.0).is_err());
+        });
+        assert!(sent_lines(&line).is_empty());
+        assert!(
+            printed.contains(
+                "PIHexapodController::SetPivot() cannot change pivot point while platform is moving"
+            ),
+            "{printed}"
+        );
+    }
+
+    /// `PIGCSController::SetPivotX` (PIGCSController.cpp:768-776): a
+    /// controller with no pivot only logs the write.
+    #[test]
+    fn a_motor_controller_ignores_a_pivot_write() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2NoPivotLine", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2NoPivotLine")));
+        let (port, p) = controller_port("gcs2NoPivot", &ctrl, "1");
+        line.sent();
+        let printed = traced_mask("gcs2NoPivot", TraceMask::FLOW, || {
+            port.write_float64_blocking(p.pivot_x, 0, 4.0).unwrap();
+        });
+        assert!(sent_lines(&line).is_empty());
+        assert!(
+            printed.contains("PIGCSController::SetPivotX() ignored"),
+            "{printed}"
+        );
+        ctrl.lock().unwrap().poll();
+        assert_eq!(port.read_float64_blocking(p.rbpivot_x, 0).unwrap(), 0.0);
+    }
+
     /// `PIGCSController::getGCSError` keeps the last nonzero `ERR?` code
     /// (PIGCSController.cpp:274-276), `PIasynController::poll` posts it as
     /// `PI_SUP_LAST_ERR` (PIasynController.cpp:612) and a `PI_SUP_CLEAR_ERR`
@@ -2462,30 +2655,7 @@ mod tests {
                 _ => "1=1".into(),
             });
         let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2LastErrLine")));
-        let params = PIGCS2Params::default();
-        let port = motor_common::register_controller_port(
-            &epics_rs::asyn::registry::open_owner(),
-            "gcs2LastErr",
-            1,
-            params.clone(),
-        )
-        .unwrap();
-        params.attach(ctrl.clone(), port.clone());
-        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(PIGCS2Axis::new(
-            ctrl.clone(),
-            "1".into(),
-            0,
-            "gcs2LastErr",
-        )));
-        let user = motor_common::asyn_user("gcs2LastErr", 0);
-        epics_rs::motor::devices::register_axis(
-            epics_rs::motor::builder::MotorBuilder::new(motor)
-                .trace_user(user)
-                .build_axis()
-                .axis,
-        )
-        .unwrap();
-        let p = *params.params.get().unwrap();
+        let (port, p) = controller_port("gcs2LastErr", &ctrl, "1");
         let poll = || ctrl.lock().unwrap().poll();
         poll();
         assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
