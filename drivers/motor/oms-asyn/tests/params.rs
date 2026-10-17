@@ -243,3 +243,51 @@ async fn writes_print_c_s_closing_line() {
     expected.sort_unstable();
     assert_eq!(lines, expected, "{text}");
 }
+
+/// The writes C takes itself never reach asynMotorController, whose lines
+/// print only for one it returns to the base (omsBaseController.cpp:262-305,
+/// 333-406).
+#[epics_rs::base::epics_test]
+async fn only_a_write_c_returns_to_the_base_prints_the_base_s_lines() {
+    let name = "omsBaseLines";
+    let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+    let text = on_maxnet(name, move |port, _| {
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_device_trace_mask(
+            name,
+            0,
+            TraceMask::ERROR | TraceMask::FLOW | TraceMask::IO_DRIVER,
+        );
+        trace.set_device_trace_file(name, 0, TraceFile::File(file));
+        port.write_int32_blocking(index::CLOSED_LOOP, 0, 1).unwrap();
+        port.write_int32_blocking(index::DEFER_MOVES, 0, 0).unwrap();
+        port.write_float64_blocking(index::ENCODER_POSITION, 0, 12.7)
+            .unwrap();
+        port.write_float64_blocking(index::PGAIN, 0, 0.5).unwrap();
+        port.write_float64_blocking(index::HIGH_LIMIT, 0, 9.0)
+            .unwrap();
+        port.write_float64_blocking(index::RESOLUTION, 0, 0.001)
+            .unwrap();
+        port.write_float64_blocking(index::VELOCITY, 0, 2.0)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        text
+    })
+    .await;
+    let base: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.split_once("asynMotorController:").map(|(_, tail)| tail))
+        .collect();
+    assert_eq!(
+        base,
+        [format!(
+            "writeFloat64:: axis=0, function={}, value=2.000000",
+            index::VELOCITY
+        )],
+        "{text}"
+    );
+}
