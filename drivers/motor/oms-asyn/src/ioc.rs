@@ -75,7 +75,7 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                 println!("{who}: can't set exceptionCallback for {serial_port}: {e}");
                 return Ok(CommandOutcome::Continue);
             }
-            let (fw_major, fw_minor) = match controller.firmware_version() {
+            let fw = match controller.firmware_version() {
                 Ok(version) => version,
                 Err(e) => {
                     println!(
@@ -85,10 +85,10 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if fw_minor < min_fw_minor {
+            if fw.minor < min_fw_minor {
                 println!(
                     "{}",
-                    unsupported_firmware(controller_type, fw_major, fw_minor)
+                    unsupported_firmware(controller_type, fw.major, fw.minor)
                 );
             }
             controller.init(&init_string);
@@ -134,7 +134,7 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                 posters,
                 Duration::from_millis(moving_poll_ms),
                 Duration::from_millis(idle_poll_ms),
-                fw_minor,
+                fw.minor,
             );
             Ok(CommandOutcome::Continue)
         },

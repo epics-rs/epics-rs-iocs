@@ -82,15 +82,31 @@ const MAX_HOME_VELOCITY: i32 = 1_000_000;
 const MAX_ACCEL: i32 = 8_000_000;
 const MAX_POSITION: i32 = 67_000_000;
 
+/// C `fwMajor`, `fwMinor`, `fwRevision`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirmwareVersion {
+    pub major: i32,
+    pub minor: i32,
+    pub revision: i32,
+}
+
 /// `sscanf(p, "ver:%d.%d.%d,")` after C's `ver:B`, `ver:S`, `ver:` search,
-/// needing the first two numbers.
-fn parse_firmware_version(reply: &str) -> Option<(i32, i32)> {
+/// needing the first two numbers; the revision stays 0 when absent.
+fn parse_firmware_version(reply: &str) -> Option<FirmwareVersion> {
     let at = ["ver:B", "ver:S", "ver:"]
         .iter()
         .find_map(|tag| reply.find(tag).map(|i| i + tag.len()))?;
     let (major, rest) = scan_int(&reply[at..])?;
-    let (minor, _) = scan_int(rest.strip_prefix('.')?)?;
-    Some((major, minor))
+    let (minor, rest) = scan_int(rest.strip_prefix('.')?)?;
+    let revision = rest
+        .strip_prefix('.')
+        .and_then(scan_int)
+        .map_or(0, |(revision, _)| revision);
+    Some(FirmwareVersion {
+        major,
+        minor,
+        revision,
+    })
 }
 
 /// `sscanf`'s `%d`: blanks, an optional sign, at least one digit.
@@ -289,10 +305,10 @@ impl OmsController {
     }
 
     /// C `omsBaseController::getFirmwareVersion`: up to three `WY` tries a
-    /// second apart, each reply logged, then `(major, minor)` from its `ver:`
+    /// second apart, each reply logged, then the version from its `ver:`
     /// field. An unparsable reply fails with an empty message, as C's caller
     /// prints the user's untouched `errorMessage`.
-    pub fn firmware_version(&self) -> AsynResult<(i32, i32)> {
+    pub fn firmware_version(&self) -> AsynResult<FirmwareVersion> {
         let (mut reply, mut status) = (String::new(), Err(oms_err("")));
         for _ in 0..3 {
             std::thread::sleep(Duration::from_secs(1));
@@ -753,12 +769,20 @@ mod tests {
 
     #[test]
     fn the_firmware_version_is_read_as_c_sscanf_reads_it() {
+        let v = |major, minor, revision| {
+            Some(FirmwareVersion {
+                major,
+                minor,
+                revision,
+            })
+        };
         assert_eq!(
             parse_firmware_version("MAXnet ver:1.33.4, s/n:1"),
-            Some((1, 33))
+            v(1, 33, 4)
         );
-        assert_eq!(parse_firmware_version("MAXnet ver:B1.29.0,"), Some((1, 29)));
-        assert_eq!(parse_firmware_version("MXA ver:S2.0"), Some((2, 0)));
+        assert_eq!(parse_firmware_version("MAXnet ver:B1.29.7,"), v(1, 29, 7));
+        assert_eq!(parse_firmware_version("MXA ver:S2.0"), v(2, 0, 0));
+        assert_eq!(parse_firmware_version("MXA ver:2.1.x"), v(2, 1, 0));
         assert_eq!(parse_firmware_version("MAXnet ver:1"), None);
         assert_eq!(parse_firmware_version("garbage"), None);
     }
