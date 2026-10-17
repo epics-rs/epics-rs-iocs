@@ -19,7 +19,7 @@ use motor_common::iocsh::{
     DEFAULT_IDLE_POLL_MS, DEFAULT_MOVING_POLL_MS, arg_int_opt, arg_int_req, arg_str_req,
     poll_intervals, req_int, req_string,
 };
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{Controller, asyn_user, install, register_port};
 
 use crate::anf2::{Anf2Axis, Anf2Controller, MAX_AXES};
 use crate::ang1::{Ang1Axis, Ang1Controller};
@@ -214,20 +214,16 @@ pub fn ang1_create_controller_command() -> CommandDef {
             }
             let controller = Arc::new(Mutex::new(controller));
 
+            let poller = Controller::new();
             for axis in 0..num_axes {
                 // Infallible, matching C: axis construction ignores the
                 // initial setPosition status and never aborts this command.
                 let ax = Ang1Axis::new(controller.clone(), axis as i32);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, ANG1Driver.cpp:98
-                )?;
+                poller.install(asyn_user(&port_name, axis as i32), motor)?;
             }
+            // C startPoller, ANG1Driver.cpp:98
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
 
             Ok(CommandOutcome::Continue)
         },
