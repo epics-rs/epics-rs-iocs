@@ -44,7 +44,7 @@ use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 use motor_common::model2::Model2;
 use motor_common::util::atof;
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{Controller, asyn_user, install, register_port};
 
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
@@ -1424,10 +1424,11 @@ pub fn hxp_create_controller_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             let poll_sock = XpsSocket::new(handle, &port_name, SocketMode::Query, HXP_POLL_TIMEOUT);
-            // One group poll serves all six axis polls per period: cache for
-            // half the fastest poll interval.
-            let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
-            let controller = Arc::new(Mutex::new(HxpController::new(poll_sock, cache_ttl)));
+            let controller = Arc::new(Mutex::new(HxpController::new(poll_sock)));
+            // C startPoller, HXPDriver.cpp:116.
+            let polled = controller.clone();
+            let poller = Controller::new()
+                .controller_poll(move || polled.lock().unwrap_or_else(|e| e.into_inner()).poll());
 
             for axis_no in 0..NUM_HXP_AXES {
                 let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
@@ -1440,15 +1441,9 @@ pub fn hxp_create_controller_command() -> CommandDef {
                     move_sock,
                     axis_no,
                 )));
-                install(
-                    ctx,
-                    asyn_user(&port_name, axis_no as i32),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    2, // C startPoller, HXPDriver.cpp:116
-                )?;
+                poller.install(asyn_user(&port_name, axis_no as i32), motor)?;
             }
+            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
 
             let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
                 return Ok(CommandOutcome::Continue);
@@ -2108,5 +2103,36 @@ mod tests {
         *line.fail.lock().unwrap() = "TCLScriptExecute";
         assert_eq!(tclcall(Some(&socket), "a.tcl", "t", "1"), -3);
         assert_eq!(tclcall(None, "a.tcl", "t", "1"), -22);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod one_poller {
+    use std::net::TcpListener;
+
+    use epics_rs::base::server::iocsh::registry::ArgValue;
+    use motor_common::testing::pollers_after;
+
+    use super::*;
+
+    /// HXPDriver.cpp:116: one startPoller for the six axes.
+    #[epics_rs::base::epics_test]
+    async fn hxp_create_controller_polls_its_axes_on_one_poller() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(8).collect();
+            std::thread::park();
+            drop(held);
+        });
+        let args = vec![
+            ArgValue::String("hxpOnePoller".into()),
+            ArgValue::String("127.0.0.1".into()),
+            ArgValue::Int(port.into()),
+            ArgValue::Int(200),
+            ArgValue::Int(1000),
+        ];
+        let cmd = hxp_create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
     }
 }

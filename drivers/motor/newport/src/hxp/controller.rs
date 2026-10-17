@@ -3,12 +3,9 @@
 //! Port of the controller half of `HXPDriver.cpp`. The hexapod is a single
 //! six-axis group, so C polls at the *controller* level (`HXPController::poll`:
 //! firmware probe, `GroupStatusGet`, two position-array reads) and each axis
-//! just reads its slice. Here every [`HxpAxis`](super::HxpAxis) polls
-//! independently, so the controller refreshes the group poll at most once per
-//! cache window and serves the cached [`HxpPollData`] to the other five axes —
-//! keeping the RPC traffic at C's controller-poll rate.
-
-use std::time::{Duration, Instant};
+//! just reads its slice. [`HxpController::poll`] is that controller poll, run
+//! once per pass of the axes' one poller ahead of the
+//! [`HxpAxis`](super::HxpAxis) polls.
 
 use crate::xps::rpc::{XpsResult, XpsSocket};
 
@@ -39,7 +36,7 @@ pub struct HxpPollData {
     /// Current encoder positions, device units (C `encoderPosition_`).
     pub encoder: [f64; 6],
     /// "Setpoint" positions, device units (C `setpointPosition_`; see the
-    /// upstream quirk note in [`HxpController::poll_data`]).
+    /// upstream quirk note in [`HxpController::poll`]).
     pub setpoint: [f64; 6],
     pub moving: bool,
     pub problem: bool,
@@ -117,26 +114,21 @@ pub struct HxpController {
     /// Firmware is HXP-D (C `is_firmware_hxpd_`): different status decoding
     /// and position RPC name.
     is_hxpd: bool,
-    cache: HxpPollData,
-    fetched_at: Option<Instant>,
-    /// Serve the cache within this window so six axis polls per period cost
-    /// one group poll (C polls once per period at the controller level).
-    cache_ttl: Duration,
+    /// What the last controller poll read, for the axis polls after it.
+    data: HxpPollData,
 }
 
 impl HxpController {
     /// Build the controller over a connected `Query`-mode poll socket. The
     /// firmware probe happens lazily on the first poll (C probes in `poll()`,
     /// not the constructor).
-    pub fn new(poll: XpsSocket, cache_ttl: Duration) -> Self {
+    pub fn new(poll: XpsSocket) -> Self {
         Self {
             poll,
             move_coord_sys: MoveCoordSys::Work,
             firmware: String::new(),
             is_hxpd: false,
-            cache: HxpPollData::default(),
-            fetched_at: None,
-            cache_ttl,
+            data: HxpPollData::default(),
         }
     }
 
@@ -167,37 +159,28 @@ impl HxpController {
         self.poll.hexapod_positions_get(HXP_GROUP, self.is_hxpd)
     }
 
-    /// Drop the poll snapshot: a command sent since makes it stale, and C
-    /// wakes its poller after one.
-    pub fn invalidate(&mut self) {
-        self.fetched_at = None;
+    /// What the last [`Self::poll`] read.
+    pub fn data(&self) -> &HxpPollData {
+        &self.data
     }
 
-    /// The group-wide poll, refreshed when the cache window has passed
-    /// (C `HXPController::poll`). On an RPC failure the firmware probe is
+    /// C `HXPController::poll`. On an RPC failure the firmware probe is
     /// reset and every axis reports problem + comms error until a poll
     /// succeeds, exactly as C's `done:` path.
-    pub fn poll_data(&mut self) -> HxpPollData {
-        if let Some(at) = self.fetched_at
-            && at.elapsed() < self.cache_ttl
-        {
-            return self.cache.clone();
-        }
+    pub fn poll(&mut self) {
         match self.poll_once() {
-            Ok(data) => self.cache = data,
+            Ok(data) => self.data = data,
             Err(_) => {
                 // C: status error → firmware re-probed next poll; all axes get
                 // problem=1, commsError=1, homed/powerOn=0; positions and the
                 // moving flag keep their last values.
                 self.firmware.clear();
-                self.cache.problem = true;
-                self.cache.comms_error = true;
-                self.cache.powered = false;
-                self.cache.homed = false;
+                self.data.problem = true;
+                self.data.comms_error = true;
+                self.data.powered = false;
+                self.data.homed = false;
             }
         }
-        self.fetched_at = Some(Instant::now());
-        self.cache.clone()
     }
 
     fn poll_once(&mut self) -> XpsResult<HxpPollData> {

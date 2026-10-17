@@ -45,14 +45,6 @@ impl HxpAxis {
     fn lock_controller(&self) -> MutexGuard<'_, HxpController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
-
-    /// Run a command on the move socket; the next poll reads the group
-    /// again instead of the snapshot from before it.
-    fn command<T>(&self, f: impl FnOnce(&XpsSocket) -> T) -> T {
-        let result = f(&self.move_sock);
-        self.lock_controller().invalidate();
-        result
-    }
 }
 
 /// C `move()` tolerates error `-27` (raised when the motor record reverses
@@ -89,7 +81,8 @@ impl AsynMotor for HxpAxis {
                 let mut targets = current;
                 targets[self.axis_no] = end_pos;
                 tolerate_dir_change(
-                    self.command(|s| s.hexapod_move_absolute(HXP_GROUP, "Work", &targets)),
+                    self.move_sock
+                        .hexapod_move_absolute(HXP_GROUP, "Work", &targets),
                 )
             }
             // Tool coordinates have no absolute form: C converts to a
@@ -98,7 +91,8 @@ impl AsynMotor for HxpAxis {
                 let mut deltas = [0.0; 6];
                 deltas[self.axis_no] = end_pos - current[self.axis_no];
                 tolerate_dir_change(
-                    self.command(|s| s.hexapod_move_incremental(HXP_GROUP, "Tool", &deltas)),
+                    self.move_sock
+                        .hexapod_move_incremental(HXP_GROUP, "Tool", &deltas),
                 )
             }
         }
@@ -120,7 +114,8 @@ impl AsynMotor for HxpAxis {
         let mut deltas = [0.0; 6];
         deltas[self.axis_no] = distance * MRES;
         tolerate_dir_change(
-            self.command(|s| s.hexapod_move_incremental(HXP_GROUP, cs_name, &deltas)),
+            self.move_sock
+                .hexapod_move_incremental(HXP_GROUP, cs_name, &deltas),
         )
     }
 
@@ -133,17 +128,15 @@ impl AsynMotor for HxpAxis {
         _forward: bool,
     ) -> AsynResult<()> {
         // C `home()`: kill, initialize, home search — return codes ignored.
-        self.command(|s| {
-            let _ = s.group_kill(HXP_GROUP);
-            let _ = s.group_initialize(HXP_GROUP);
-            let _ = s.group_home_search(HXP_GROUP);
-        });
+        let _ = self.move_sock.group_kill(HXP_GROUP);
+        let _ = self.move_sock.group_initialize(HXP_GROUP);
+        let _ = self.move_sock.group_home_search(HXP_GROUP);
         Ok(())
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         // C `stop()`: abort the group move, return code ignored.
-        let _ = self.command(|s| s.group_move_abort(HXP_GROUP));
+        let _ = self.move_sock.group_move_abort(HXP_GROUP);
         Ok(())
     }
 
@@ -157,8 +150,7 @@ impl AsynMotor for HxpAxis {
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
-        let mut ctrl = self.lock_controller();
-        ctrl.invalidate();
+        let ctrl = self.lock_controller();
         let sock = ctrl.poll_socket();
         if enable {
             sock.group_motion_enable(HXP_GROUP)?;
@@ -169,7 +161,8 @@ impl AsynMotor for HxpAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let data = self.lock_controller().poll_data();
+        // C `HXPAxis::poll` reads what the controller poll before it read.
+        let data = self.lock_controller().data().clone();
         Ok(MotorStatus {
             position: data.setpoint[self.axis_no] / MRES,
             encoder_position: data.encoder[self.axis_no] / MRES,
@@ -191,8 +184,6 @@ impl AsynMotor for HxpAxis {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::xps::fake::FakeLine;
     use crate::xps::rpc::SocketMode;
@@ -204,7 +195,6 @@ mod tests {
         let line = FakeLine::new("hxp_steps", "");
         let controller = Arc::new(Mutex::new(HxpController::new(
             line.socket(SocketMode::Query),
-            Duration::ZERO,
         )));
         let mut axis = HxpAxis::new(controller, line.socket(SocketMode::Fire), 0);
         let user = AsynUser::new(0);
@@ -222,6 +212,7 @@ mod tests {
             "{log:?}"
         );
         // The fake reports 1.5 for the current position.
+        axis.lock_controller().poll();
         let status = axis.poll(&user).unwrap();
         assert_eq!(
             (status.position, status.encoder_position),
