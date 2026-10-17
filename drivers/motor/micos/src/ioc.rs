@@ -16,10 +16,9 @@ use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
-use epics_rs::motor::controller_port::{ParamWrite, has_motor_axis};
+use epics_rs::motor::controller_port::{AxisUser, ParamWrite, has_motor_axis};
 
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -102,18 +101,17 @@ impl ControllerParams for HydraParams {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         // SMChydra has no writeInt32: the base refuses a missing axis.
         if !has_motor_axis(base, user) {
             return ParamWrite::PassToBase(Ok(()));
         }
-        if Some(user.reason) == self.regulator_mode {
-            let addr = base.get_address(user.addr, user.reason);
-            if let Some(mode) = addr.ok().and_then(|a| self.modes.get(a as usize)) {
-                mode.store(value, Ordering::Relaxed);
-            }
+        if Some(user.reason) == self.regulator_mode
+            && let Some(mode) = self.modes.get(user.addr as usize)
+        {
+            mode.store(value, Ordering::Relaxed);
         }
         ParamWrite::PassToBase(Ok(()))
     }
@@ -141,10 +139,10 @@ impl TaurusParams {
     fn on_axis<T>(
         &self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         call: impl FnOnce(&TaurusController, usize) -> T,
     ) -> Option<T> {
-        let addr = base.get_address(user.addr, user.reason).ok()?;
+        let addr = user.addr;
         let ctrl = self.controller.get()?;
         let out = call(
             &ctrl.lock().unwrap_or_else(|e| e.into_inner()),
@@ -169,7 +167,7 @@ impl ControllerParams for TaurusParams {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         if Some(user.reason) != self.limit_type {
@@ -181,16 +179,16 @@ impl ControllerParams for TaurusParams {
         ParamWrite::Handled(Ok(()))
     }
 
-    fn read_int32(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<i32> {
+    fn read_int32(&mut self, base: &mut PortDriverBase, user: AxisUser<'_>) -> AsynResult<i32> {
         let index = if Some(user.reason) == self.limit1_type {
             0
         } else if Some(user.reason) == self.limit2_type {
             1
         } else {
-            return base.read_int32_param(user);
+            return base.read_int32_param(user.asyn());
         };
         self.on_axis(base, user, |ctrl, addr| ctrl.limit_switches(addr, index))
-            .unwrap_or_else(|| base.read_int32_param(user))
+            .unwrap_or_else(|| base.read_int32_param(user.asyn()))
     }
 
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
