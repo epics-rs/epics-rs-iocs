@@ -21,7 +21,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string, req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{asyn_user, install, model1_device, register_port};
+use motor_common::{Controller, asyn_user, model1_device, register_port};
 
 use crate::drv_im483::{
     DrvIm483Axis, IM483PL_NUM_CARDS, IM483SM_NUM_CARDS, Im483Controller, im483pl_probe,
@@ -73,14 +73,10 @@ pub fn ims_create_controller_command() -> CommandDef {
             let axis = ImsMDrivePlusAxis::new(handle, &motor_port, device_name);
 
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            install(
-                ctx,
-                asyn_user(&motor_port, 0),
-                motor,
-                moving_poll_ms as u64,
-                idle_poll_ms as u64,
-                2, // C startPoller, ImsMDrivePlusMotorController.cpp:101
-            )?;
+            // C startPoller, ImsMDrivePlusMotorController.cpp:101
+            let poller = Controller::new();
+            poller.install(asyn_user(&motor_port, 0), motor)?;
+            poller.start(ctx, moving_poll_ms as u64, idle_poll_ms as u64, 2);
 
             Ok(CommandOutcome::Continue)
         },
