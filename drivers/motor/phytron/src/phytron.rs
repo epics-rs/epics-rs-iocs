@@ -1469,9 +1469,12 @@ impl AsynMotor for PhytronAxis {
             .send(&format!("{m}P22R"), true)
             .and_then(|reply| reply.trim().parse::<f64>().map_err(|_| 6));
         let func = "setEncoderRatio";
-        ctrl.check_axis(self.axis_no, func, "Reading encoder position", read)?;
+        let encoder = ctrl.check_axis(self.axis_no, func, "Reading encoder position", read)?;
         let sent = ctrl.send(&format!("{m}P39{set}{}", fmt6(1.0 / ratio)), true);
         ctrl.check_axis(self.axis_no, func, "Setting ratio", sent)?;
+        drop(ctrl);
+        self.status_writes
+            .push(StatusWrite::EncoderPosition(encoder * ratio));
         Ok(())
     }
 
@@ -1811,6 +1814,19 @@ mod tests {
         let (mut axis, written) = mcc_axis("phytronEncoderRatio");
         axis.set_encoder_ratio(&AsynUser::new(0), 0.5).unwrap();
         assert_eq!(*written.lock().unwrap(), ["1P22R", "1P39S2.000000"]);
+    }
+
+    /// C sets the encoder position the read gave times the new ratio
+    /// (phytronAxisMotor.cpp:1776-1777).
+    #[test]
+    fn set_encoder_ratio_posts_the_scaled_encoder_position() {
+        let (mut axis, _) = mcc_axis("phytronEncoderRatioPost");
+        let _ = axis.take_status_writes();
+        axis.set_encoder_ratio(&AsynUser::new(0), 0.5).unwrap();
+        assert_eq!(
+            axis.take_status_writes(),
+            [StatusWrite::EncoderPosition(500.0)]
+        );
     }
 
     /// C `CHECK_AXIS("setEncoderRatio", "Reading encoder position")`
