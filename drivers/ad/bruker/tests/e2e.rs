@@ -24,6 +24,10 @@ use epics_rs::ad_core::plugin::channel::ndarray_channel;
 
 use bruker::{BrukerRuntime, create_bruker_detector};
 
+/// Privileged port 1: no test can bind it, so a connect is always refused.
+/// A freed ephemeral port can be taken by a concurrent test's listener.
+const DEAD_ADDR: &str = "127.0.0.1:1";
+
 /// A 4 x 2 frame of 16-bit pixels, 1..=8.
 fn sfrm_file() -> Vec<u8> {
     const LINE: usize = 80;
@@ -385,11 +389,8 @@ fn a_stop_during_the_exposure_publishes_no_frame() {
 #[test]
 fn a_binning_write_does_not_depend_on_bis() {
     let closed = |name: &str| {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-        drop(listener);
         // The EOS setters need a connection, which a dead BIS never gives.
-        let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
+        let driver = DrvAsynIPPort::new(name, DEAD_ADDR).expect("ip port");
         let (runtime, _) =
             create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
                 .expect("ip port runtime");
@@ -424,10 +425,7 @@ fn a_binning_write_does_not_depend_on_bis() {
 fn a_base_class_write_runs_both_base_class_write_int32s() {
     use epics_rs::asyn::trace::{TraceFile, TraceMask};
     let closed = |name: &str| {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-        drop(listener);
-        let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
+        let driver = DrvAsynIPPort::new(name, DEAD_ADDR).expect("ip port");
         let (runtime, _) =
             create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
                 .expect("ip port runtime");
@@ -467,10 +465,7 @@ fn a_base_class_write_runs_both_base_class_write_int32s() {
 /// A detector whose BIS sockets refuse every connection.
 /// An IP port whose peer is gone.
 fn closed_port(name: &str) -> PortHandle {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-    drop(listener);
-    let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
+    let driver = DrvAsynIPPort::new(name, DEAD_ADDR).expect("ip port");
     let (runtime, _) =
         create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
             .expect("ip port runtime");

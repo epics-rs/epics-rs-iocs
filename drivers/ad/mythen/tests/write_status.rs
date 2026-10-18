@@ -20,6 +20,10 @@ use mythen::detector::Detector;
 use mythen::driver::MythenDriver;
 use mythen::transport::Transport;
 
+/// Privileged port 1: no test can bind it, so a connect is always refused.
+/// A freed ephemeral port can be taken by a concurrent test's listener.
+const DEAD_ADDR: &str = "127.0.0.1:1";
+
 /// A healthy detector whose module count is unknown (`-get nmodules` = -1), so
 /// every module loop runs zero times while the `getSettings` queries still
 /// succeed.
@@ -158,10 +162,7 @@ fn a_failed_write_hands_the_record_no_message() {
 fn a_failed_get_settings_is_an_error_status() {
     // Nothing listens, so the detector boots disconnected and getSettings is
     // refused at the gate with Disconnected.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-    drop(listener);
-    let ip = DrvAsynIPPort::new("MYTHEN_WS_DEAD_IP", &addr).expect("ip port");
+    let ip = DrvAsynIPPort::new("MYTHEN_WS_DEAD_IP", DEAD_ADDR).expect("ip port");
     let (runtime, _) = create_port_runtime(
         &claim_port("MYTHEN_WS_DEAD_IP").unwrap(),
         ip,

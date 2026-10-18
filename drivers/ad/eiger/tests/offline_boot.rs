@@ -6,8 +6,6 @@
 //! that and then fails the state fetch keeps its full port: C logs "Eiger
 //! FAILED TO CONNECT" and returns (eigerDetector.cpp:231-235).
 
-use std::net::TcpListener;
-
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::asyn::error::AsynError;
 
@@ -18,12 +16,10 @@ use eiger::rest::{ApiVersion, RestApi};
 use eiger::tasks;
 
 /// A TCP port nothing is listening on — the same thing the driver sees when the
-/// detector is powered off.
+/// detector is powered off. Privileged port 1, because no test can bind it; a
+/// freed ephemeral port can be taken by a concurrent test's listener.
 fn dead_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+    1
 }
 
 #[test]
