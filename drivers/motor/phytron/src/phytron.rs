@@ -822,9 +822,7 @@ struct AxisState {
     /// The controller-parallel poll's answers for this axis this pass, which
     /// its own poll parses (C parses them in the controller poll).
     answers: Option<Vec<String>>,
-    /// The axis has been polled. C's hook waits on the controller poll
-    /// alone, which polls an axis that exists for it; an rs axis joins the
-    /// poller only once phytronCreateAxis returns, maybe past that pass.
+    /// The axis has been polled, for [`PhytronController::did_initial_readout`].
     read_once: bool,
 }
 
@@ -879,8 +877,12 @@ impl PhytronController {
         }
     }
 
-    /// What C `epicsInithookFunction` waits for (phytronAxisMotor.cpp:
-    /// 1014-1021): the controller and each of its axes read once.
+    /// What C `epicsInithookFunction` (phytronAxisMotor.cpp:1003-1024)
+    /// means to wait for: the controller and each of its axes read once.
+    /// C waits on `do_initial_readout_` alone, which the startup pass clears
+    /// before any axis exists, so whether the axis read lands before
+    /// init_record is a race; that defeats the hook's purpose (:183-185),
+    /// so the axes are waited for here.
     pub fn did_initial_readout(&self) -> bool {
         !self.do_initial_readout && self.axes.iter().all(|a| a.read_once)
     }
