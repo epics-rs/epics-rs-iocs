@@ -2597,6 +2597,7 @@ impl AsynMotor for PIGCS2Axis {
             _ => ctrl.halt(&self.axis_name),
         };
         drop(ctrl);
+        self.port_sets.wakeup_poller();
         self.flow(format_args!(
             "PIasynAxis:stopAxis: Set axis {} to stop with accel={}",
             self.axis_no,
@@ -2618,6 +2619,7 @@ impl AsynMotor for PIGCS2Axis {
         );
         let result = ctrl.set_axis_position(&self.axis_name, position / self.cpu);
         drop(ctrl);
+        self.port_sets.wakeup_poller();
         self.flow(format_args!(
             "PIasynAxis:setPositionAxis: Set driver {}, axis {} set position to {} - status={}\n",
             self.port_name,
@@ -2645,6 +2647,9 @@ impl AsynMotor for PIGCS2Axis {
         let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         if !defer && ctrl.moves_deferred {
             let _ = ctrl.process_deferred_moves(&mut self.port_sets);
+            // C processDeferredMoves signals even with no move deferred
+            // (PIasynController.cpp:268).
+            self.port_sets.wakeup_poller();
         }
         ctrl.moves_deferred = defer;
         Ok(())
@@ -3582,6 +3587,7 @@ mod tests {
             [
                 "Status { addr: 0, field: Done(false) }",
                 "Status { addr: 1, field: Done(false) }",
+                "WakeupPoller",
             ]
         );
         assert!(first.take_port_sets().is_empty());
@@ -3592,6 +3598,25 @@ mod tests {
         line.sent();
         first.set_deferred_moves(&user, false).unwrap();
         assert!(sent_lines(&line).is_empty());
+    }
+
+    /// C signals the poller after `stop` (PIasynAxis.cpp:318), after
+    /// `setPosition` (:357) and whenever `processDeferredMoves` runs, with
+    /// or without a deferred move (PIasynController.cpp:268).
+    #[test]
+    fn stop_set_position_and_a_released_deferral_wake_the_poller() {
+        let (_line, mut first, _second) = two_axes("gcs2Wake");
+        let user = AsynUser::new(0);
+        first.stop(&user, 0.0).unwrap();
+        assert_eq!(steps(first.take_port_sets()), ["WakeupPoller"]);
+        first.set_position(&user, 7.0).unwrap();
+        assert_eq!(steps(first.take_port_sets()), ["WakeupPoller"]);
+        first.set_deferred_moves(&user, true).unwrap();
+        assert!(first.take_port_sets().is_empty());
+        first.set_deferred_moves(&user, false).unwrap();
+        assert_eq!(steps(first.take_port_sets()), ["WakeupPoller"]);
+        first.set_deferred_moves(&user, false).unwrap();
+        assert!(first.take_port_sets().is_empty());
     }
 
     /// A port whose constructor returned before `m_pGCSController` was set
