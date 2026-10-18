@@ -987,19 +987,6 @@ impl AsynMotor for OmsAxis {
         moved
     }
 
-    /// C keeps MOVE_TO_HOME from asynMotorController's move-to-home thread
-    /// (omsBaseController.cpp:293-295), so no move is made.
-    fn move_to_home(
-        &mut self,
-        _user: &AsynUser,
-        _position: f64,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        Ok(())
-    }
-
     fn move_relative(
         &mut self,
         _user: &AsynUser,
