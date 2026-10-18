@@ -50,19 +50,19 @@ impl ChannelError {
     }
 }
 
-/// What C's `mpxSet`/`mpxCommand` return to `writeInt32`/`writeFloat64`.
+/// What C's `mpxSet`/`mpxCommand` return to `writeInt32`/`writeFloat64`:
+/// the status alone. mpxConnection talks on its own asynUser, so the record's
+/// `errorMessage` stays empty.
 impl From<ChannelError> for AsynError {
     fn from(e: ChannelError) -> Self {
-        match e {
-            ChannelError::Transport(e) => e,
-            ChannelError::Timeout => AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "timeout".into(),
-            },
-            ChannelError::Protocol(e) => AsynError::Status {
-                status: AsynStatus::Error,
-                message: e.to_string(),
-            },
+        let status = match e {
+            ChannelError::Transport(e) => e.status(),
+            ChannelError::Timeout => AsynStatus::Timeout,
+            ChannelError::Protocol(_) => AsynStatus::Error,
+        };
+        AsynError::Status {
+            status,
+            message: String::new(),
         }
     }
 }

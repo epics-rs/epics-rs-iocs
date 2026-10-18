@@ -957,6 +957,16 @@ mod tests {
         );
     }
 
+    /// merlinDetector never writes `pasynUser->errorMessage`, so a refused
+    /// SET reaches the record as its status alone.
+    #[test]
+    fn a_refused_threshold_write_hands_the_record_no_message() {
+        let mut det = detector("MERLIN_WRITE_MESSAGE");
+        let mut user = AsynUser::new(det.params.thresholds[0]);
+        let e = det.write_float64(&mut user, 9.0).unwrap_err();
+        assert_eq!(e.message(), "");
+    }
+
     /// The last frame of a Single acquisition under a software trigger;
     /// returns ADAcquire, SoftwareTrigger and NDArrayCounter after it.
     fn last_software_triggered_frame(name: &str, max_memory: usize) -> (i32, i32, i32) {
