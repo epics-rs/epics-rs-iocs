@@ -22,7 +22,7 @@ use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{Controller, asyn_user, model1_device, register_port_with};
+use motor_common::{AxisReport, Controller, asyn_user, model1_device, register_port_with};
 
 use crate::drv_mvp2001::{self, DrvMvp2001Axis, MVP2001_NUM_CARDS, Mvp2001Chain};
 use crate::mvp2001::{Mvp2001Axis, Mvp2001Controller, Mvp2001Params};
@@ -130,17 +130,19 @@ pub fn mvp2001_create_axis_command() -> CommandDef {
                 (entry.controller.clone(), entry.poller.clone())
             };
 
-            let ax = Mvp2001Axis::new(
-                controller,
-                &port_name,
-                axis_no as usize,
-                enc_lpr as i32,
-                max_curr as i32,
-                lim_pol as i32,
-            );
-            let report = Arc::new(ax.report());
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            poller.install_with_report(asyn_user(&port_name, axis_no as i32), motor, report)?;
+            // C constructs the axis under pC->lock() (MVP2001Driver.cpp:222-224).
+            poller.install_built(asyn_user(&port_name, axis_no as i32), || {
+                let ax = Mvp2001Axis::new(
+                    controller,
+                    &port_name,
+                    axis_no as usize,
+                    enc_lpr as i32,
+                    max_curr as i32,
+                    lim_pol as i32,
+                );
+                let report: Arc<dyn AxisReport> = Arc::new(ax.report());
+                Ok((Arc::new(Mutex::new(ax)), Some(report)))
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )

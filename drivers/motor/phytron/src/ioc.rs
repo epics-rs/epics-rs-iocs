@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
@@ -23,7 +22,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port_with};
+use motor_common::{AxisReport, Controller, asyn_user, register_port_with};
 
 use crate::phytron::{CtrlType, PhytronAxis, PhytronAxisReport, PhytronController, PhytronParams};
 
@@ -265,15 +264,15 @@ fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
             let poller = entry.poller.clone();
             drop(reg);
 
-            let axis = PhytronAxis::new(controller.clone(), module as i32, index as i32)
-                .map_err(|e| format!("phytronCreateAxis: {e}"))?;
             let axis_no = (module * 10 + index) as i32;
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            poller.install_with_report(
-                asyn_user(&name, axis_no),
-                motor,
-                Arc::new(PhytronAxisReport(axis_no)),
-            )?;
+            // C constructs the axis under pC->lock() (phytronAxisMotor.cpp:
+            // 1262-1265).
+            poller.install_built(asyn_user(&name, axis_no), || {
+                let axis = PhytronAxis::new(controller.clone(), module as i32, index as i32)
+                    .map_err(|e| format!("phytronCreateAxis: {e}"))?;
+                let report: Arc<dyn AxisReport> = Arc::new(PhytronAxisReport(axis_no));
+                Ok((Arc::new(Mutex::new(axis)), Some(report)))
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )

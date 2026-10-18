@@ -18,7 +18,7 @@ use epics_rs::motor::trace::MotorTrace;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port_with};
+use motor_common::{AxisReport, Controller, asyn_user, register_port_with};
 
 use crate::anf2::{Anf2Axis, Anf2AxisReport, Anf2Controller, Anf2Params, MAX_AXES};
 use crate::ang1::{Ang1Axis, Ang1AxisReport, Ang1Controller, Ang1Params};
@@ -142,13 +142,15 @@ pub fn anf2_create_axis_command() -> CommandDef {
             let base_speed = req_int(args, 3, "Base speed")?.clamp(1, 1_000_000) as i32;
             let homing_timeout = req_int(args, 4, "Homing timeout")?.clamp(0, 300) as i32;
 
-            let report = Arc::new(Anf2AxisReport {
-                controller: controller.clone(),
-                axis: axis as i32,
-            });
-            let ax = Anf2Axis::new(controller, axis as i32, config, base_speed, homing_timeout);
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            poller.install_with_report(asyn_user(&port_name, axis as i32), motor, report)?;
+            // C constructs the axis under pC->lock() (ANF2Driver.cpp:464-466).
+            poller.install_built(asyn_user(&port_name, axis as i32), || {
+                let report: Arc<dyn AxisReport> = Arc::new(Anf2AxisReport {
+                    controller: controller.clone(),
+                    axis: axis as i32,
+                });
+                let ax = Anf2Axis::new(controller, axis as i32, config, base_speed, homing_timeout);
+                Ok((Arc::new(Mutex::new(ax)), Some(report)))
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )

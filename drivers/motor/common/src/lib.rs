@@ -156,6 +156,20 @@ impl Controller {
         self.add(user, motor, Some(report))
     }
 
+    /// [`Self::install`] for a driver whose C constructs the axis under
+    /// `pC->lock()` (MVP2001Driver.cpp:222-224): `build` runs under the
+    /// controller lock, so a pass due meanwhile waits for it and then polls
+    /// the axis, before iocInit as in C.
+    pub fn install_built(
+        &self,
+        user: TraceUser,
+        build: impl FnOnce() -> Result<(Arc<Mutex<dyn AsynMotor>>, Option<Arc<dyn AxisReport>>), String>,
+    ) -> Result<mpsc::Sender<PollCommand>, String> {
+        let (ControllerAxis { axis, poll_cmd_tx }, report) = self.axes.add_built(user, build)?;
+        epics_rs::motor::devices::register_axis(with_report(axis, report))?;
+        Ok(poll_cmd_tx)
+    }
+
     fn add(
         &self,
         user: TraceUser,

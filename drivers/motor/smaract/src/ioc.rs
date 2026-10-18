@@ -195,9 +195,12 @@ fn create_axis<C>(
         return Ok(());
     }
     let controller = reg.controller.clone();
-    let motor = build(controller, axis, channel);
+    // C constructs the axis under pC->lock() (smarActMCSMotorDriver.cpp:
+    // 816-818, smarActSCUMotorDriver.cpp:617-619).
     reg.poller
-        .install(asyn_user(&controller_port, axis), motor)
+        .install_built(asyn_user(&controller_port, axis), || {
+            Ok((build(controller, axis, channel), None))
+        })
         .map(drop)
 }
 
