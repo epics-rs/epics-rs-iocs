@@ -108,7 +108,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
+};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
@@ -1091,14 +1093,16 @@ impl PIGCS2Controller {
 
     /// C `PIasynController::processDeferredMoves` and
     /// `PIGCSController::moveCts(array)`: one `MOV` for every deferred
-    /// axis, then `ERR?`.
-    fn process_deferred_moves(&mut self) -> AsynResult<()> {
+    /// axis, then `ERR?`. Each deferred axis posts DONE=0 into `sets`
+    /// (PIasynController.cpp:251-252).
+    fn process_deferred_moves(&mut self, sets: &mut PortSets) -> AsynResult<()> {
         let deferred = std::mem::take(&mut self.deferred);
         if deferred.is_empty() {
             return Ok(());
         }
         let mut cmd = String::from("MOV");
         for (&axis_no, mv) in &deferred {
+            sets.status(axis_no as i32, StatusWrite::Done(false));
             cmd.push_str(&format!(" {} {}", mv.axis, CFloat(mv.counts / mv.cpu)));
             self.released.insert(axis_no, mv.counts);
         }
@@ -2638,9 +2642,9 @@ impl AsynMotor for PIGCS2Axis {
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
         self.log_here();
         self.flag_write_flow(if defer { "Sett" } else { "Clear" }, "Deferred Move");
-        let mut ctrl = self.lock();
+        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         if !defer && ctrl.moves_deferred {
-            let _ = ctrl.process_deferred_moves();
+            let _ = ctrl.process_deferred_moves(&mut self.port_sets);
         }
         ctrl.moves_deferred = defer;
         Ok(())
@@ -3560,8 +3564,9 @@ mod tests {
 
     /// `PIasynAxis::move` (PIasynAxis.cpp:232-239) only records a move
     /// while moves are deferred; releasing them at any axis runs
-    /// `processDeferredMoves` (PIasynController.cpp:236-270): one `MOV` for
-    /// every deferred axis, in axis order, and each axis's direction.
+    /// `processDeferredMoves` (PIasynController.cpp:236-270): DONE=0 on
+    /// every deferred axis, one `MOV` for them in axis order, and each
+    /// axis's direction.
     #[test]
     fn deferred_moves_go_out_in_one_mov_on_release() {
         let (line, mut first, mut second) = two_axes("gcs2Defer");
@@ -3572,6 +3577,14 @@ mod tests {
         assert!(sent_lines(&line).is_empty());
         second.set_deferred_moves(&user, false).unwrap();
         assert_eq!(sent_lines(&line), ["MOV 1 5.000000 2 -3.000000", "ERR?"]);
+        assert_eq!(
+            steps(second.take_port_sets()),
+            [
+                "Status { addr: 0, field: Done(false) }",
+                "Status { addr: 1, field: Done(false) }",
+            ]
+        );
+        assert!(first.take_port_sets().is_empty());
         first.last_position = 0.0;
         second.last_position = 0.0;
         assert!(first.poll(&user).unwrap().direction);
@@ -4812,6 +4825,10 @@ mod tests {
                 other => panic!("not an axis set: {other:?}"),
             })
             .collect()
+    }
+
+    fn steps(sets: PortSets) -> Vec<String> {
+        sets.into_iter().map(|set| format!("{set:?}")).collect()
     }
 
     fn traced(port: &str, f: impl FnOnce()) -> String {
