@@ -1068,6 +1068,24 @@ pub struct QuadEmBase {
     pub owner: Arc<ArrayOwner>,
 }
 
+/// drvQuadEM.cpp:54; NDArrayDriverBase::new ORs in asynNDArrayDriver's own
+/// (asynNDArrayDriver.cpp:866).
+const QUAD_EM_INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::ENUM)
+    .or(InterfaceMask::GENERIC_POINTER)
+    .or(InterfaceMask::DRV_USER);
+
+/// drvQuadEM.cpp:55.
+const QUAD_EM_INTERRUPTS: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::ENUM)
+    .or(InterfaceMask::GENERIC_POINTER);
+
 impl QuadEmBase {
     pub fn new(port_name: &str, max_memory: usize) -> AsynResult<Self> {
         // asynNDArrayDriver(portName, QE_MAX_DATA+1, ..., ASYN_CANBLOCK |
@@ -1087,8 +1105,8 @@ impl QuadEmBase {
                 multi_device: true,
                 ..Default::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            QUAD_EM_INTERFACES,
+            QUAD_EM_INTERRUPTS,
         )?;
         let params = QuadEmParams::create(&mut port_base)?;
 
@@ -1324,6 +1342,30 @@ mod tests {
             position_scale: [1.0; 2],
             ..Default::default()
         }
+    }
+
+    /// drvQuadEM.cpp:54-55 ORed into asynNDArrayDriver.cpp:866-867: no
+    /// asynOption or asynUInt32Digital, so asynRecord's OPTIONIV and UI32IV
+    /// read 0.
+    #[test]
+    fn port_carries_the_c_interface_and_interrupt_masks() {
+        let base = QuadEmBase::new("QE_MASK", 0).unwrap();
+        let m = |bits: &[InterfaceMask]| bits.iter().fold(InterfaceMask::NONE, |a, b| a | *b);
+        use InterfaceMask as I;
+        let interrupts = m(&[
+            I::INT32,
+            I::INT32_ARRAY,
+            I::FLOAT64,
+            I::FLOAT64_ARRAY,
+            I::ENUM,
+            I::GENERIC_POINTER,
+            I::OCTET,
+        ]);
+        assert_eq!(base.port_base.interrupt_mask(), interrupts);
+        assert_eq!(
+            base.port_base.interface_mask(),
+            interrupts | I::DRV_USER | I::COMMON
+        );
     }
 
     #[test]
