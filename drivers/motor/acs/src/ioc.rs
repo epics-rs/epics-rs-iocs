@@ -77,7 +77,7 @@ pub fn mcb4b_create_controller_command() -> CommandDef {
                 let report = Arc::new(Mcb4bAxisReport(index));
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )

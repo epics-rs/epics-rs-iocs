@@ -190,15 +190,12 @@ fn register_controller(
     controller.set_axis_status_reason(axis_status);
     let controller = Arc::new(Mutex::new(controller));
     let _ = slot.set(controller.clone());
-    let poller = Controller::new()
-        .controller_poll({
-            let controller = controller.clone();
-            move || controller.lock().unwrap_or_else(|e| e.into_inner()).poll()
-        })
-        // Its axes join later, from phytronCreateAxis.
-        .port(&name);
+    let poller = Controller::new().controller_poll({
+        let controller = controller.clone();
+        move || controller.lock().unwrap_or_else(|e| e.into_inner()).poll()
+    });
     // C startPoller, phytronAxisMotor.cpp:240
-    poller.start(ctx, moving_poll_ms, idle_poll_ms, 5);
+    poller.start(ctx, &name, moving_poll_ms, idle_poll_ms, 5);
     registry_lock(registry).insert(
         name.clone(),
         ControllerReg {

@@ -78,7 +78,7 @@ pub fn oem_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // OEMMotorDriver.cpp:68
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2); // OEMMotorDriver.cpp:68
             Ok(CommandOutcome::Continue)
         },
     )
@@ -128,7 +128,7 @@ pub fn acr_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // ACRMotorDriver.cpp:82
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2); // ACRMotorDriver.cpp:82
             Ok(CommandOutcome::Continue)
         },
     )

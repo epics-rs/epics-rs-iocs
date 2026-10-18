@@ -138,7 +138,7 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_dev));
                 posters.push(axes_poller.install(asyn_user(&port_name, axis as i32), motor)?);
             }
-            axes_poller.start(ctx, 0, 0, 0);
+            axes_poller.start(ctx, &port_name, 0, 0, 0);
             crate::poller::start(
                 &controller,
                 posters,

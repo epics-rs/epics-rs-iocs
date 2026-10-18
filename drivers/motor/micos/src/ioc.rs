@@ -334,7 +334,7 @@ pub fn corvus_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = ax;
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -401,7 +401,7 @@ pub fn hydra_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = ax;
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -471,7 +471,7 @@ pub fn taurus_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = ax;
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )

@@ -84,7 +84,13 @@ pub fn ims_create_controller_command() -> CommandDef {
             // C startPoller, ImsMDrivePlusMotorController.cpp:101
             let poller = Controller::new();
             poller.install(asyn_user(&motor_port, 0), motor)?;
-            poller.start(ctx, moving_poll_ms as u64, idle_poll_ms as u64, 2);
+            poller.start(
+                ctx,
+                &motor_port,
+                moving_poll_ms as u64,
+                idle_poll_ms as u64,
+                2,
+            );
 
             Ok(CommandOutcome::Continue)
         },

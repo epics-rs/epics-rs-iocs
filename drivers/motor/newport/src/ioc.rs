@@ -265,7 +265,7 @@ pub fn smc100_create_controller_command() -> CommandDef {
                 }));
                 poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
             }
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // SMC100Driver.cpp:67
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2); // SMC100Driver.cpp:67
             Ok(CommandOutcome::Continue)
         },
     )
@@ -402,7 +402,7 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 poller.install_with_report(asyn_user(&port_name, axis as i32), motor, report)?;
             }
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2); // AGAP_CONEX.cpp:79
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2); // AGAP_CONEX.cpp:79
             Ok(CommandOutcome::Continue)
         },
     )
@@ -476,7 +476,7 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
             // (AG_UC.cpp:79, :96, :99); the axes created later stay unpolled.
             let poller = Arc::new(Controller::new());
             if controller.model().is_some() {
-                poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+                poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
             }
             AG_UC_CONTROLLERS
                 .lock()
@@ -693,7 +693,7 @@ pub fn xps_create_controller_command() -> CommandDef {
             ));
             // C starts the poller before any axis exists (XPSController.cpp:197).
             let poller = Arc::new(Controller::new());
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 10);
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 10);
             // XPSController.cpp:200, the only C driver that starts it.
             poller
                 .start_move_to_home_thread()
@@ -1715,7 +1715,7 @@ pub fn hxp_create_controller_command() -> CommandDef {
                 }));
                 poller.install_with_report(asyn_user(&port_name, axis_no as i32), motor, report)?;
             }
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )

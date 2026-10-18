@@ -216,7 +216,7 @@ pub fn motor_sim_create_command() -> CommandDef {
             // The first motorSimCreate starts drvMotorSim's one
             // motorSimThread, whose motorProcTask runs every axis each DELTA,
             // moving or idle (drvMotorSim.c:657-690, 788-800).
-            driver.poller.start(ctx, POLL_MS, POLL_MS, 0);
+            driver.poller.start_driver_thread(ctx, POLL_MS, POLL_MS, 0);
             for c in card..card.saturating_add(num_cards) {
                 for s in signal..signal.saturating_add(num_signals) {
                     let exists = {
@@ -355,7 +355,7 @@ impl MotorSimHolder {
                 }
                 // motorSimController's one motorSimTask polls every axis
                 // each DELTA (motorSimDriver.cpp:244), forcing none.
-                poller.start(ctx, POLL_MS, POLL_MS, 0);
+                poller.start(ctx, &port_name, POLL_MS, POLL_MS, 0);
                 Ok(CommandOutcome::Continue)
             },
         )
@@ -788,7 +788,7 @@ mod one_poller {
             log: Arc::default(),
         };
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
-        driver.poller.start(&ctx, POLL_MS, POLL_MS, 0);
+        driver.poller.start_driver_thread(&ctx, POLL_MS, POLL_MS, 0);
         let model2 = axis.model2();
         let creator = driver.clone();
         let create = std::thread::spawn(move || creator.create(axis));

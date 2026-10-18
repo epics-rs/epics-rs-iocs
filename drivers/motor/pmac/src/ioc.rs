@@ -209,7 +209,7 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
             let poller = Controller::new()
                 .controller_poll(move || polled.lock().unwrap_or_else(|e| e.into_inner()).poll());
             // pmacController.cpp:201, before any axis exists.
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 10);
+            poller.start(ctx, &name, moving_poll_ms, idle_poll_ms, 10);
             registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

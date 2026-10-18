@@ -325,7 +325,13 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                 }),
             ) = (controller, poller)
             {
-                controller.start(ctx, moving_poll_ms, idle_poll_ms, driver.forced_fast_polls);
+                controller.start(
+                    ctx,
+                    &port_name,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                    driver.forced_fast_polls,
+                );
             }
             Ok(CommandOutcome::Continue)
         },
@@ -440,7 +446,7 @@ mod one_task {
             "ownCreate()",
             |_: &[ArgValue], ctx: &CommandContext| {
                 let poller = Arc::new(Controller::new());
-                poller.start(ctx, 100, 1000, 0);
+                poller.start_driver_thread(ctx, 100, 1000, 0);
                 let axes = (0..2).map(|_| sim_axis(Arc::default())).collect();
                 OWN.set_card_on(0, axes, poller);
                 Ok(CommandOutcome::Continue)

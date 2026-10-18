@@ -110,6 +110,7 @@ pub fn acsmotion_config_command() -> CommandDef {
             }
             poller.start(
                 ctx,
+                &port_name,
                 (moving_poll * 1000.0) as u64,
                 (idle_poll * 1000.0) as u64,
                 2,

@@ -73,7 +73,7 @@ pub fn mmc200_create_controller_command() -> CommandDef {
                 poller.install_with_report(asyn_user(&motor_port, index as i32), motor, report)?;
             }
             // C startPoller, MMC200Driver.cpp:62
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(ctx, &motor_port, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )

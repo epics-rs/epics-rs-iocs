@@ -88,7 +88,7 @@ pub fn mvp2001_create_controller_command() -> CommandDef {
 
             // MVP2001Driver.cpp:57, before any axis exists.
             let poller = Arc::new(Controller::new());
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
             registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

@@ -67,7 +67,7 @@ pub fn c300_create_controller_command() -> CommandDef {
                 poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
             // C startPoller, C300MotorDriver.cpp:82
-            poller.start(ctx, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
