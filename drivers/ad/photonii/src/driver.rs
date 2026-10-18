@@ -85,10 +85,9 @@ impl PhotonIIDetector {
         base.set_int32_param(ad.params.base.array_size_x, 0, PII_SIZE_X as i32)?;
         base.set_int32_param(ad.params.base.array_size_y, 0, PII_SIZE_Y as i32)?;
         base.set_int32_param(ad.params.base.array_size, 0, raw::frame_bytes() as i32)?;
-        // C advertised NDUInt32 here while allocating every frame as NDInt32,
-        // so the DataType readback disagreed with the arrays the plugins got.
-        // The frames are signed 32-bit; say so.
-        base.set_int32_param(ad.params.base.data_type, 0, NDDataType::Int32 as u8 as i32)?;
+        // C's own inconsistency, kept on both sides: it seeds NDUInt32 here
+        // (PhotonII.cpp:124) and allocates every frame NDInt32 (:416).
+        base.set_int32_param(ad.params.base.data_type, 0, NDDataType::UInt32 as u8 as i32)?;
         base.set_int32_param(ad.params.image_mode, 0, 2)?; // ADImageContinuous
         base.set_int32_param(ad.params.status, 0, ADStatus::Idle as i32)?;
 
@@ -368,6 +367,22 @@ mod tests {
         });
         let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
         PhotonIIDetector::new(name, p2, 0, shared, tx).unwrap()
+    }
+
+    /// Both C halves: DataType starts NDUInt32 (PhotonII.cpp:124) and the
+    /// frames are NDInt32 (:416).
+    #[test]
+    fn data_type_is_cs_seed_and_frames_are_cs_int32() {
+        let det = detector("PII_DTYPE");
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(det.ad.params.base.data_type, 0)
+                .unwrap(),
+            NDDataType::UInt32 as i32
+        );
+        let frame = crate::raw::decode_raw(&vec![0u8; crate::raw::frame_bytes()]).unwrap();
+        assert_eq!(frame.data_type(), NDDataType::Int32);
     }
 
     #[test]
