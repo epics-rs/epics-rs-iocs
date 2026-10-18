@@ -162,7 +162,7 @@ impl HydraAxis {
             trace: MotorTrace::new(port, axis_no as i32),
             last_status: MotorStatus {
                 gain_support: true,
-                ..MotorStatus::default()
+                ..motor_common::status_before_poll()
             },
         }
     }
@@ -465,6 +465,21 @@ mod tests {
         assert_eq!(
             HydraAxis::new(controller, 0, Arc::default(), "").motor_form,
             0
+        );
+    }
+
+    /// C's status_ starts at 0 plus GainSupport (SMChydraAxis.cpp:52); only
+    /// a good poll sets Done (:272).
+    #[test]
+    fn an_unanswering_controller_s_axis_polls_problem_without_done() {
+        let (handle, _) =
+            SyncIOHandle::connect_port("HYDRA_DEAD", 0, Duration::ZERO, InterfaceType::Octet);
+        let controller = Arc::new(Mutex::new(HydraController::new(handle)));
+        let mut axis = HydraAxis::new(controller, 0, Arc::default(), "");
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert!(
+            status.problem && status.gain_support && !status.done,
+            "{status:?}"
         );
     }
 
