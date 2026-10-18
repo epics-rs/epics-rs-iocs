@@ -801,15 +801,17 @@ mod asyn_reads {
         run_command(drv_asyn_motor_configure_command(vec![&READ]), args).await;
         let port = PortManager::global().find_port_handle("readPort").unwrap();
         let subscribe = |reason: usize, iface| {
-            port.interrupts().register_interrupt_user(
-                InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(0),
-                    iface: Some(iface),
-                    ..InterruptFilter::default()
-                },
-                0,
-            )
+            port.interrupts()
+                .register_interrupt_user(
+                    InterruptFilter {
+                        reason: Some(reason),
+                        addr: Some(0),
+                        iface: Some(iface),
+                        ..InterruptFilter::default()
+                    },
+                    0,
+                )
+                .unwrap()
         };
         let (_p, mut position) = subscribe(0, InterfaceType::Float64);
         let (_d, mut done) = subscribe(12, InterfaceType::Int32);

@@ -141,9 +141,13 @@ impl Params {
             StatusWrite::Direction(v) => bit(function::DIRECTION, v),
             StatusWrite::HighHardLimit(v) => bit(function::HIGH_HARD_LIMIT, v),
             StatusWrite::HomeSignal(v) => bit(function::HOME_SIGNAL, v),
+            StatusWrite::EncoderHome(v) => bit(function::HOME_ENCODER, v),
             StatusWrite::Moving(v) => bit(function::MOVING, v),
             StatusWrite::LowHardLimit(v) => bit(function::LOW_HARD_LIMIT, v),
             StatusWrite::CommsError(v) => bit(function::COMM_ERROR, v),
+            StatusWrite::Homed(v) => bit(function::HOMED, v),
+            StatusWrite::HasEncoder(v) => bit(function::HAS_ENCODER, v),
+            StatusWrite::GainSupport(v) => bit(function::HAS_CLOSED_LOOP, v),
         };
     }
 
@@ -201,6 +205,23 @@ mod tests {
             sink.lock().unwrap().push(changed.to_vec());
         }));
         calls
+    }
+
+    #[test]
+    fn a_homed_write_sets_motor_axis_homed() {
+        let params = Params::default();
+        params.apply(StatusWrite::Homed(true));
+        assert!(params.motor_status().homed);
+        assert!(!params.motor_status().home);
+    }
+
+    #[test]
+    fn has_encoder_and_gain_support_writes_set_their_motor_axis_params() {
+        let params = Params::default();
+        params.apply(StatusWrite::HasEncoder(true));
+        params.apply(StatusWrite::GainSupport(true));
+        let status = params.motor_status();
+        assert!(status.has_encoder && status.gain_support);
     }
 
     #[test]
