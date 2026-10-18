@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::adapter::parse_asyn_link;
-use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::QueuePriority;
@@ -38,6 +37,7 @@ use epics_rs::base::server::recgbl::alarm_status::READ_ALARM;
 use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
+use crate::Unconnected;
 use protocol::{GaugeType, Reading};
 
 /// `device(ai,INST_IO,devAiMKS,"HPS SensaVac 937")` (`ipSupport.dbd`).
@@ -292,13 +292,21 @@ impl DeviceSupport for DevAiMks {
             }
         };
         let port_name = link.port_name;
-        let Some(port) = get_port(&port_name) else {
-            errlog_vprintf(format_args!(
-                "devAiMKS::initAi {name} cannot connect to device {port_name}\n"
-            ));
-            return Ok(DeviceInitOutcome::dead());
+        let handle = match crate::connect_octet(&port_name, 0) {
+            Ok(handle) => handle,
+            Err(Unconnected::Device(_)) => {
+                errlog_vprintf(format_args!(
+                    "devAiMKS::initAi {name} cannot connect to device {port_name}\n"
+                ));
+                return Ok(DeviceInitOutcome::dead());
+            }
+            Err(Unconnected::NoOctet) => {
+                errlog_vprintf(format_args!(
+                    "devAiMKS::initAi {name} cannot find asynOctet interface\n"
+                ));
+                return Ok(DeviceInitOutcome::dead());
+            }
         };
-        let handle = port.handle.clone();
 
         if record.get_field("PREC") == Some(EpicsValue::Short(0)) {
             record.put_field("PREC", EpicsValue::Short(1))?;
@@ -554,6 +562,29 @@ mod tests {
             dev.init(&mut AiRecord::default()).unwrap(),
             DeviceInitOutcome::dead()
         );
+    }
+
+    /// A port without asynOctet fails `findInterface`: C prints its line and
+    /// takes `bad:` before any I/O (devAiMKS.c:152-156).
+    #[test]
+    fn a_port_without_octet_kills_the_record_before_any_io() {
+        use epics_rs::base::runtime::log::{
+            errlog_add_listener, errlog_flush, errlog_remove_listener,
+        };
+
+        crate::no_octet_port("MKS_INT32_ONLY");
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let id = errlog_add_listener({
+            let lines = lines.clone();
+            move |line: &str| lines.lock().unwrap().push(line.to_string())
+        });
+        let (_, outcome) = init("MKS_INT32_ONLY", "R:i32", 1);
+        errlog_flush();
+        errlog_remove_listener(id);
+        assert_eq!(outcome, DeviceInitOutcome::dead());
+        let lines = lines.lock().unwrap();
+        let want = "devAiMKS::initAi R:i32 cannot find asynOctet interface\n";
+        assert!(lines.iter().any(|l| l == want), "{lines:#?}");
     }
 
     fn decode(dev: &mut DevAiMks, reply: Option<&[u8]>, val: f64) -> (f64, Option<u16>) {
