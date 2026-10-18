@@ -51,11 +51,12 @@ pub(crate) enum Unconnected {
 }
 
 /// C `pasynManager->connectDevice(pasynUser, port, addr)`, then
-/// `findInterface(pasynUser, asynOctetType, 1)`.
+/// `findInterface(pasynUser, asynOctetType, 1)`. `port` is never C's NULL:
+/// `parseLink` mallocs it on every success (asynEpicsUtils.c:80, :101).
 pub(crate) fn connect_octet(port: &str, addr: i32) -> Result<PortHandle, Unconnected> {
     let mut user = DeviceUser::default();
     let entry = user
-        .connect_device(port, addr)
+        .connect_device(Some(port), addr)
         .map_err(|_| Unconnected::Device(user.error_message().to_owned()))?;
     if !entry.handle.has_interface(InterfaceType::Octet) {
         return Err(Unconnected::NoOctet);
