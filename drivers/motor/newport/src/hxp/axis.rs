@@ -211,10 +211,11 @@ impl AsynMotor for HxpAxis {
         let ctrl = self.lock_controller();
         let sock = ctrl.poll_socket();
         if enable {
-            sock.group_motion_enable(HXP_GROUP)?;
+            sock.group_motion_enable(HXP_GROUP)
         } else {
-            sock.group_motion_disable(HXP_GROUP)?;
+            sock.group_motion_disable(HXP_GROUP)
         }
+        .map_err(XpsError::into_c_status)?;
         Ok(())
     }
 
@@ -262,6 +263,25 @@ mod tests {
         line.log.lock().unwrap().clear();
         axis.set_position(&AsynUser::new(0), 5.0).unwrap();
         assert!(line.log.lock().unwrap().is_empty());
+    }
+
+    /// setClosedLoop returns the XPS code as its asynStatus
+    /// (HXPDriver.cpp:742).
+    #[test]
+    fn a_closed_loop_failure_returns_the_xps_code() {
+        for (call, enable) in [("GroupMotionEnable", true), ("GroupMotionDisable", false)] {
+            let line = FakeLine::new(&format!("hxp_code_{call}"), call);
+            let controller = Arc::new(Mutex::new(HxpController::new(
+                line.socket(SocketMode::Query),
+            )));
+            let mut axis = HxpAxis::new(
+                controller,
+                Arc::new(MoveLine::new(line.socket(SocketMode::Fire))),
+                0,
+            );
+            let e = axis.set_closed_loop(&AsynUser::new(0), enable).unwrap_err();
+            assert_eq!(e.c_status_code(), -3, "{call}");
+        }
     }
 
     /// HXPDriver.cpp:605, 631, 766, 769: record steps times MRES go out,

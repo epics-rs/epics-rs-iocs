@@ -947,17 +947,19 @@ impl AsynMotor for XpsAxis {
                 sock.group_motion_disable(&self.group_name),
             )
         };
-        result.inspect_err(|e| {
-            self.error(
-                "setClosedLoop",
-                format_args!(
-                    "[{},{}]: error calling {command} status={}\n",
-                    self.port(),
-                    self.axis_no(),
-                    e.code()
-                ),
-            )
-        })?;
+        result
+            .inspect_err(|e| {
+                self.error(
+                    "setClosedLoop",
+                    format_args!(
+                        "[{},{}]: error calling {command} status={}\n",
+                        self.port(),
+                        self.axis_no(),
+                        e.code()
+                    ),
+                )
+            })
+            .map_err(XpsError::into_c_status)?;
         let (prefix, state) = if enable {
             ("", "enable")
         } else {
@@ -982,7 +984,8 @@ impl AsynMotor for XpsAxis {
         let sock = ctrl.poll_socket();
         let (low, _high) = sock
             .positioner_user_travel_limits_get(&self.positioner_name)
-            .inspect_err(|e| self.limits_get_error("setHighLimit", e))?;
+            .inspect_err(|e| self.limits_get_error("setHighLimit", e))
+            .map_err(XpsError::into_c_status)?;
         sock.positioner_user_travel_limits_set(&self.positioner_name, low, device_value)
             .inspect_err(|e| {
                 self.error(
@@ -994,7 +997,8 @@ impl AsynMotor for XpsAxis {
                         e.code(), device_value = CFloat(device_value)
                     ),
                 )
-            })?;
+            })
+            .map_err(XpsError::into_c_status)?;
         self.flow(
             "setHighLimit",
             format_args!(
@@ -1015,7 +1019,8 @@ impl AsynMotor for XpsAxis {
         let sock = ctrl.poll_socket();
         let (_low, high) = sock
             .positioner_user_travel_limits_get(&self.positioner_name)
-            .inspect_err(|e| self.limits_get_error("setLowLimit", e))?;
+            .inspect_err(|e| self.limits_get_error("setLowLimit", e))
+            .map_err(XpsError::into_c_status)?;
         sock.positioner_user_travel_limits_set(&self.positioner_name, device_value, high)
             .inspect_err(|e| {
                 self.error(
@@ -1027,7 +1032,8 @@ impl AsynMotor for XpsAxis {
                         e.code(), device_value = CFloat(device_value)
                     ),
                 )
-            })?;
+            })
+            .map_err(XpsError::into_c_status)?;
         self.flow(
             "setLowLimit",
             format_args!(
@@ -1504,6 +1510,31 @@ mod tests {
         let s = axis.poll(&user).unwrap();
         assert!(s.comms_error && s.homed && !s.problem);
         assert_eq!(s.position, 1.25);
+    }
+
+    /// setHighLimit, setLowLimit and setClosedLoop return the XPS code as
+    /// their asynStatus (XPSAxis.cpp:793, :829, :879).
+    #[test]
+    fn limit_and_closed_loop_failures_return_the_xps_code() {
+        let user = AsynUser::new(0);
+        for call in [
+            "PositionerUserTravelLimitsGet",
+            "PositionerUserTravelLimitsSet",
+        ] {
+            let (mut axis, _, _) = fake_axis(&format!("xps_code_{call}"), call);
+            let high = axis.set_high_limit(&user, 1.0).unwrap_err();
+            let low = axis.set_low_limit(&user, -1.0).unwrap_err();
+            assert_eq!(
+                (high.c_status_code(), low.c_status_code()),
+                (-3, -3),
+                "{call}"
+            );
+        }
+        for (call, enable) in [("GroupMotionEnable", true), ("GroupMotionDisable", false)] {
+            let (mut axis, _, _) = fake_axis(&format!("xps_code_{call}"), call);
+            let e = axis.set_closed_loop(&user, enable).unwrap_err();
+            assert_eq!(e.c_status_code(), -3, "{call}");
+        }
     }
 
     /// The C constructor ignores a failed PositionerSGammaParametersGet and a

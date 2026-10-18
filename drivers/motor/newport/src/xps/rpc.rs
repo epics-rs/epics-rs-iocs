@@ -86,6 +86,15 @@ impl XpsError {
             XpsError::Api(code) => *code,
         }
     }
+
+    /// C `return (asynStatus)status` (XPSAxis.cpp:793): the int itself.
+    pub fn into_c_status(self) -> AsynError {
+        let message = match &self {
+            XpsError::Transport(e) => e.message(),
+            XpsError::Api(_) => self.to_string(),
+        };
+        AsynError::from_c_status_code(self.code(), message).expect("an XPS failure is nonzero")
+    }
 }
 
 impl From<AsynError> for XpsError {
@@ -94,16 +103,19 @@ impl From<AsynError> for XpsError {
     }
 }
 
-/// Convert back into an `AsynError` so RPC calls can be used with `?` inside
-/// `AsynMotor` methods (which return `AsynResult`).
+/// C `return asynError` / `status ? asynError : asynSuccess` after an XPS
+/// call, so RPC calls can be used with `?` inside `AsynMotor` methods. C
+/// never sees the transport's asynStatus, only the call's -1; a method that
+/// returns the int itself uses [`XpsError::into_c_status`].
 impl From<XpsError> for AsynError {
     fn from(e: XpsError) -> Self {
-        match e {
-            XpsError::Transport(a) => a,
-            XpsError::Api(code) => AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("XPS API error {code}"),
-            },
+        let message = match e {
+            XpsError::Transport(a) => a.message(),
+            XpsError::Api(code) => format!("XPS API error {code}"),
+        };
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message,
         }
     }
 }
@@ -456,6 +468,22 @@ mod tests {
         // Missing field → defaults.
         assert_eq!(r.double(9), 0.0);
         assert_eq!(r.string(9), "");
+    }
+
+    /// C sees only the int an XPS call returns: a transport failure is its
+    /// -1, and a method returns it as is or as asynError.
+    #[test]
+    fn an_xps_failure_is_its_c_int() {
+        let transport = || {
+            XpsError::Transport(AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: "not connected".into(),
+            })
+        };
+        assert_eq!(transport().into_c_status().c_status_code(), -1);
+        assert_eq!(XpsError::Api(-17).into_c_status().c_status_code(), -17);
+        assert_eq!(AsynError::from(transport()).c_status_code(), 3);
+        assert_eq!(AsynError::from(XpsError::Api(-17)).c_status_code(), 3);
     }
 
     #[test]
