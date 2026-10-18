@@ -492,7 +492,7 @@ impl MoveToHome {
             .set_group_referencing(&self.group_name, true);
         let mut sets = PortSets::default();
         sets.status(self.axis_no, StatusWrite::Homed(false));
-        sets.status(self.axis_no, StatusWrite::HomeSignal(false));
+        sets.status(self.axis_no, StatusWrite::EncoderHome(false));
         under_lock(sets);
 
         // Pick the search direction from which side of the home switch we start.
@@ -1578,7 +1578,7 @@ mod tests {
             posted,
             [
                 (0, StatusWrite::Homed(false)),
-                (0, StatusWrite::HomeSignal(false))
+                (0, StatusWrite::EncoderHome(false))
             ]
         );
         let log = line.log.lock().unwrap();
