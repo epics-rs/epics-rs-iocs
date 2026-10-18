@@ -92,7 +92,8 @@ impl PixiradDetector {
 
         let base = &mut ad.port_base;
         base.set_string_param(p.base.manufacturer, 0, "Pixirad")?;
-        base.set_string_param(p.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
+        // pixirad.cpp:40-42.
+        base.set_string_param(p.base.driver_version, 0, "2.2.0")?;
         base.set_int32_param(p.size_x, 0, max_size_x)?;
         base.set_int32_param(p.size_y, 0, max_size_y)?;
         base.set_int32_param(p.base.array_size_x, 0, max_size_x)?;
@@ -718,6 +719,20 @@ mod tests {
         .expect("C builds the driver whatever the box answers");
         let q = det.params;
         assert!(det.write_int32(&mut AsynUser::new(q.hv_state), 0).is_err());
+    }
+
+    /// pixirad.cpp:557-559 formats DRIVER_VERSION.REVISION.MODIFICATION
+    /// (pixirad.cpp:40-42).
+    #[test]
+    fn the_driver_version_is_the_c_driver_release() {
+        let det = detector("PIXI_VERSION", None);
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_string_param(det.ad.params.base.driver_version, 0)
+                .unwrap(),
+            b"2.2.0"
+        );
     }
 
     #[test]
