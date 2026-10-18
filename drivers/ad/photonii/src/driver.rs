@@ -79,7 +79,8 @@ impl PhotonIIDetector {
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Bruker")?;
         base.set_string_param(ad.params.base.model, 0, "PhotonII")?;
-        base.set_string_param(ad.params.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
+        // PhotonII.h:16-18.
+        base.set_string_param(ad.params.base.driver_version, 0, "1.0.0")?;
 
         base.set_int32_param(ad.params.max_size_x, 0, PII_SIZE_X as i32)?;
         base.set_int32_param(ad.params.max_size_y, 0, PII_SIZE_Y as i32)?;
@@ -371,6 +372,20 @@ mod tests {
         });
         let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
         PhotonIIDetector::new(name, p2, 0, shared, tx).unwrap()
+    }
+
+    /// PhotonII.cpp:103-105 formats DRIVER_VERSION.REVISION.MODIFICATION
+    /// (PhotonII.h:16-18).
+    #[test]
+    fn the_driver_version_is_the_c_driver_release() {
+        let det = detector("PII_VERSION");
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_string_param(det.ad.params.base.driver_version, 0)
+                .unwrap(),
+            b"1.0.0"
+        );
     }
 
     #[test]

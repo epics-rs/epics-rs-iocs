@@ -327,13 +327,12 @@ impl EigerDriver {
 
     /// C sets `NDDriverVersion` before it first talks to the detector
     /// (eigerDetector.cpp:214), so it is filled in even on a port that never
-    /// reaches the rest of the constructor.
+    /// reaches the rest of the constructor. The value is C's `DRIVER_VERSION`
+    /// (eigerDetector.cpp:71).
     fn set_driver_version(&mut self) -> AsynResult<()> {
-        self.ad.port_base.set_string_param(
-            self.ad.params.base.driver_version,
-            0,
-            env!("CARGO_PKG_VERSION"),
-        )
+        self.ad
+            .port_base
+            .set_string_param(self.ad.params.base.driver_version, 0, "3.6.0")
     }
 
     fn status_message(&mut self, msg: &str) -> AsynResult<()> {

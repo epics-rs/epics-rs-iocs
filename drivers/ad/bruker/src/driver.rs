@@ -97,7 +97,6 @@ impl BrukerDetector {
         let base = &mut ad.port_base;
         base.set_string_param(p.base.manufacturer, 0, "Bruker")?;
         base.set_string_param(p.base.model, 0, "BIS")?;
-        base.set_string_param(p.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
         // BIS says how big a frame is on the status socket; until it does, the
         // geometry is unknown.
         base.set_int32_param(p.size_x, 0, 0)?;

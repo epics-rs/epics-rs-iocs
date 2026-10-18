@@ -193,8 +193,10 @@ impl PslDetector {
     fn open_camera(&mut self, index: i32) -> AsynResult<()> {
         let name = match protocol::choice_from_index(&self.state.camera_names, index) {
             Ok(name) => name.to_string(),
-            // C walked its std::set past the end and dereferenced the end
-            // iterator, so an out-of-range CameraName was undefined behaviour.
+            // C bug not copied: getChoiceFromIndex (PSL.cpp:275-282)
+            // dereferences end() for an out-of-range index, as the init-time
+            // CameraName=0 write does on a port whose GetCamList never ran;
+            // C then publishes an uninitialised ADModel.
             Err(_) => return Ok(()),
         };
 

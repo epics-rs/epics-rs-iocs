@@ -69,7 +69,7 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
     assert_eq!(
         base.get_string_param(driver.ad.params.base.driver_version, 0)
             .unwrap(),
-        env!("CARGO_PKG_VERSION").as_bytes()
+        b"3.6.0"
     );
 }
 
