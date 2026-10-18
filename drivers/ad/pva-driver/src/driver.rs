@@ -322,4 +322,14 @@ mod tests {
             "ADShutterControl did not reach ADDriver::setShutter"
         );
     }
+
+    /// pvaDriver.cpp:86: C sets MaxSize to 0 over ADDriver's 1.
+    #[test]
+    fn max_size_is_zero() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel(1);
+        let det = PvaDriver::new("PVA_MAX_SIZE", "", 1 << 20, cmd_tx).unwrap();
+        let (p, base) = (det.ad.params, &det.ad.port_base);
+        assert_eq!(base.get_int32_param(p.max_size_x, 0).unwrap(), 0);
+        assert_eq!(base.get_int32_param(p.max_size_y, 0).unwrap(), 0);
+    }
 }

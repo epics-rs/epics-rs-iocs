@@ -1059,4 +1059,13 @@ mod tests {
             .unwrap();
         assert_eq!(det.ad.port_base.get_float64_param(t, 0).unwrap(), 1.5);
     }
+
+    /// merlinDetector.cpp:1489: MaxSize is merlinDetectorConfig's maxSizeX/Y.
+    #[test]
+    fn max_size_is_the_configured_size() {
+        let det = detector("MERLIN_MAX_SIZE");
+        let (p, base) = (det.ad.params, &det.ad.port_base);
+        assert_eq!(base.get_int32_param(p.max_size_x, 0).unwrap(), 512);
+        assert_eq!(base.get_int32_param(p.max_size_y, 0).unwrap(), 512);
+    }
 }

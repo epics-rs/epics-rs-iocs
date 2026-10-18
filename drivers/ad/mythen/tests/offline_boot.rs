@@ -71,7 +71,18 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
         base.get_string_param(driver.p.firmware_version, 0).unwrap(),
         b""
     );
-    // The fixed parameters C sets regardless of the detector are still there.
+    // The fixed parameters C sets regardless of the detector are still there,
+    // MaxSize among them (mythen.cpp:1332-1335).
+    assert_eq!(
+        base.get_int32_param(driver.ad.params.max_size_x, 0)
+            .unwrap(),
+        1280
+    );
+    assert_eq!(
+        base.get_int32_param(driver.ad.params.max_size_y, 0)
+            .unwrap(),
+        1
+    );
     assert_eq!(
         base.get_string_param(driver.ad.params.base.manufacturer, 0)
             .unwrap(),
