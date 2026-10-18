@@ -96,6 +96,10 @@ pub fn asyn_user(port: &str, addr: i32) -> TraceUser {
     }
 }
 
+/// What a [`Controller::install_built`] build returns: C's constructed
+/// axis, and its `asynMotorAxis::report` override if it has one.
+pub type AxisBuilt = Result<(Arc<Mutex<dyn AsynMotor>>, Option<Arc<dyn AxisReport>>), String>;
+
 /// A C `asynMotorController`'s axes and its one poller thread
 /// (asynMotorController.cpp:567-575, :615-695): each pass runs the
 /// controller poll, then every axis in address order, so a slow axis delays
@@ -163,11 +167,31 @@ impl Controller {
     pub fn install_built(
         &self,
         user: TraceUser,
-        build: impl FnOnce() -> Result<(Arc<Mutex<dyn AsynMotor>>, Option<Arc<dyn AxisReport>>), String>,
+        build: impl FnOnce() -> AxisBuilt,
     ) -> Result<mpsc::Sender<PollCommand>, String> {
         let (ControllerAxis { axis, poll_cmd_tx }, report) = self.axes.add_built(user, build)?;
         epics_rs::motor::devices::register_axis(with_report(axis, report))?;
         Ok(poll_cmd_tx)
+    }
+
+    /// [`Self::install_built`] for every `(user, build)` under one hold of
+    /// the controller lock, as pmacCreateAxes constructs its axes
+    /// (pmacController.cpp:974-979). A build's error ends the batch; the
+    /// axes built before it stay installed.
+    pub fn install_built_all<F>(
+        &self,
+        builds: impl IntoIterator<Item = (TraceUser, F)>,
+    ) -> Result<Vec<mpsc::Sender<PollCommand>>, String>
+    where
+        F: FnOnce() -> AxisBuilt,
+    {
+        let (added, done) = self.axes.add_built_all(builds);
+        let mut senders = Vec::new();
+        for (ControllerAxis { axis, poll_cmd_tx }, report) in added {
+            epics_rs::motor::devices::register_axis(with_report(axis, report))?;
+            senders.push(poll_cmd_tx);
+        }
+        done.map(|()| senders)
     }
 
     fn add(

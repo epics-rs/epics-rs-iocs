@@ -25,7 +25,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
-use epics_rs::motor::trace::MotorTrace;
+use epics_rs::motor::trace::{MotorTrace, TraceUser};
 
 use motor_common::drv_motor_asyn::DrvSet;
 use motor_common::iocsh::{
@@ -33,7 +33,7 @@ use motor_common::iocsh::{
 };
 use motor_common::model1::c_int;
 use motor_common::model2::{Model2, Model2Axis};
-use motor_common::{Controller, asyn_user, register_controller_port};
+use motor_common::{AxisBuilt, Controller, asyn_user, register_controller_port};
 
 use crate::axis::PmacAxis;
 use crate::controller::{PMAC_TIMEOUT, PmacController, PmacControllerParams};
@@ -223,18 +223,25 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
     )
 }
 
-/// Create axis `axis` of controller `reg` as `@asyn(name,axis)`.
-fn create_axis(reg: &ControllerReg, command: &str, axis: i32) -> Result<(), String> {
-    reg.controller
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .add_axis(axis)
-        .map_err(|e| format!("{command}: {e}"))?;
-    let motor: Arc<Mutex<dyn AsynMotor>> =
-        Arc::new(Mutex::new(PmacAxis::new(reg.controller.clone(), axis)));
-    reg.poller
-        .install(asyn_user(&reg.name, axis), motor)
-        .map(drop)
+/// Axis `axis` of controller `reg` as `@asyn(name,axis)`, and C's
+/// `new pmacAxis(pC, axis)`, which reads the axis's initial status and which
+/// the create commands run under `pC->lock()`.
+fn axis_build<'a>(
+    reg: &'a ControllerReg,
+    command: &'a str,
+    axis: i32,
+) -> (TraceUser, impl FnOnce() -> AxisBuilt + 'a) {
+    let build = move || {
+        reg.controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add_axis(axis)
+            .map_err(|e| format!("{command}: {e}"))?;
+        let motor: Arc<Mutex<dyn AsynMotor>> =
+            Arc::new(Mutex::new(PmacAxis::new(reg.controller.clone(), axis)));
+        Ok((motor, None))
+    };
+    (asyn_user(&reg.name, axis), build)
 }
 
 /// C `pmacCreateAxis(pmacName, axis)`, printing what C's does.
@@ -258,7 +265,9 @@ fn pmac_create_axis_command(registry: &Registry) -> CommandDef {
                     );
                     return Ok(());
                 }
-                create_axis(reg, "pmacCreateAxis", axis)
+                // pmacController.cpp:944-947.
+                let (user, build) = axis_build(reg, "pmacCreateAxis", axis);
+                reg.poller.install_built(user, build).map(drop)
             });
             match created {
                 Some(result) => result?,
@@ -283,7 +292,9 @@ fn pmac_create_axes_command(registry: &Registry) -> CommandDef {
             let name = req_string(args, 0, "Controller port name")?;
             let num_axes = c_int(args, 1);
             let created = find(&registry, &name, |reg| {
-                (1..=num_axes).try_for_each(|axis| create_axis(reg, "pmacCreateAxes", axis))
+                // One pC->lock() over every axis (pmacController.cpp:974-979).
+                let builds = (1..=num_axes).map(|axis| axis_build(reg, "pmacCreateAxes", axis));
+                reg.poller.install_built_all(builds).map(drop)
             });
             match created {
                 Some(result) => result?,
@@ -1033,6 +1044,8 @@ mod tests {
         replies: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         written: Arc<Mutex<Vec<String>>>,
         disconnects: Arc<AtomicUsize>,
+        /// Commands the port takes this long to answer.
+        slow: Arc<Mutex<HashMap<String, Duration>>>,
     }
 
     impl Rig {
@@ -1071,6 +1084,9 @@ mod tests {
         fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data).into_owned();
             self.reply = self.rig.replies.lock().unwrap().get(&cmd).cloned();
+            if let Some(&delay) = self.rig.slow.lock().unwrap().get(&cmd) {
+                std::thread::sleep(delay);
+            }
             self.rig.written.lock().unwrap().push(cmd);
             Ok(data.len())
         }
@@ -2093,6 +2109,46 @@ mod tests {
             own.take(),
             "pmacAxis::home: Error: Cannot disable limits to home PMAC controller \
              pmacAxErrCtl, axis 1, type:0, flag:$0, vel:-0.002000, mode:0x0, offset: 0\n"
+        );
+    }
+
+    /// pmacController.cpp:974-979: pmacCreateAxes constructs every axis
+    /// under one pC->lock(), so the controller poll of a pass due meanwhile
+    /// comes after the last axis's initial status read, not between two.
+    #[epics_rs::base::epics_test]
+    async fn pmac_create_axes_polls_no_pass_between_two_axes() {
+        use motor_common::testing::run_command;
+
+        let (_rt, rig) = publish_scripted("pmacBatchLow");
+        // A pass comes due during axis 1's construction and waits on the lock.
+        rig.slow
+            .lock()
+            .unwrap()
+            .insert("I113 I114 I130 I131 I133".into(), Duration::from_millis(20));
+        let commands = pmac_commands();
+        let command = |name: &str| commands.iter().find(|c| c.name == name).unwrap().clone();
+        let args = vec![
+            ArgValue::String("pmacBatch".into()),
+            ArgValue::String("pmacBatchLow".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(3),
+            ArgValue::Int(1),
+            ArgValue::Int(1),
+        ];
+        run_command(command("pmacCreateController"), args).await;
+        let args = vec![ArgValue::String("pmacBatch".into()), ArgValue::Int(3)];
+        run_command(command("pmacCreateAxes"), args).await;
+        let written = rig.written();
+        let initial: Vec<usize> = (1..=3)
+            .map(|n| {
+                let read = format!("I{n}13 I{n}14 I{n}30 I{n}31 I{n}33");
+                written.iter().position(|w| *w == read).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            initial,
+            [initial[0], initial[0] + 1, initial[0] + 2],
+            "{written:?}"
         );
     }
 
