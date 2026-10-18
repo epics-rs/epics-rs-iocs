@@ -618,19 +618,20 @@ mod extra_params {
         let (_line, io) = failing_controller("imsComms", "imsCommsLine", 1000.0, fails).await;
         let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
         let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
-        let until = |want: i32| {
+        // Awaited: a thread sleep here starves the runtime the poller needs.
+        let until = async |want: i32| {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while io.read_int32(comms).unwrap_or(-1) != want {
                 assert!(std::time::Instant::now() < deadline, "comms never {want}");
-                std::thread::sleep(Duration::from_millis(10));
+                epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
             }
         };
-        until(0);
+        until(0).await;
         dead.store(true, Ordering::Relaxed);
-        until(1);
+        until(1).await;
         assert_eq!(io.read_int32(msta).unwrap() & 1 << 12, 0);
         dead.store(false, Ordering::Relaxed);
-        until(0);
+        until(0).await;
     }
 
     /// ImsMDrivePlusMotorController.cpp:403-406, ImsMDrivePlusMotorAxis.cpp:
