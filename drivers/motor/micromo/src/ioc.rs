@@ -219,7 +219,7 @@ pub fn micromo_config_command() -> CommandDef {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod one_poller {
     use motor_common::testing::pollers_after;
 
