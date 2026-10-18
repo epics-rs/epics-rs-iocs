@@ -396,7 +396,9 @@ mod tests {
             }))
         };
         register_port(&ctx, "joinAfterStart", 2).unwrap();
-        let controller = Controller::new();
+        // -1 marks each pass: its controller poll comes first.
+        let pass = log.clone();
+        let controller = Controller::new().controller_poll(move || pass.lock().unwrap().push(-1));
         let _a1 = controller
             .install(asyn_user("joinAfterStart", 1), motor(1))
             .unwrap();
@@ -404,13 +406,28 @@ mod tests {
         let _a0 = controller
             .install(asyn_user("joinAfterStart", 0), motor(0))
             .unwrap();
-        let joined = log.lock().unwrap().len();
+        // The startup pass polls A0 or not by when the add lands, as C's
+        // may; every pass that starts after A0's first poll polls both.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while log.lock().unwrap()[joined..].len() < 4 && Instant::now() < deadline {
+        while epics_rs::motor::devices::first_polls_pending("joinAfterStart") != Some(0) {
+            assert!(Instant::now() < deadline, "a first poll never ran");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let joined = log.lock().unwrap().len();
+        let passes_after = || {
+            let log = log.lock().unwrap();
+            let start = log[joined..]
+                .iter()
+                .position(|&a| a == -1)
+                .map(|p| joined + p);
+            start.map_or_else(Vec::new, |start| log[start..].to_vec())
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while passes_after().len() < 6 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let passes = log.lock().unwrap()[joined..].to_vec();
-        assert_eq!(passes[..4], [0, 1, 0, 1], "{passes:?}");
+        let passes = passes_after();
+        assert_eq!(passes[..6], [-1, 0, 1, -1, 0, 1], "{passes:?}");
     }
 
     /// C setIdlePollPeriod finds the controller by its port, so a poller
