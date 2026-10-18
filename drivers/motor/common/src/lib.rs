@@ -178,6 +178,11 @@ impl Controller {
         self.axes.add(motor, user)
     }
 
+    /// C `startMoveToHomeThread` (asynMotorController.cpp:703-710).
+    pub fn start_move_to_home_thread(&self) -> std::io::Result<()> {
+        self.axes.start_move_to_home_thread()
+    }
+
     /// C `startPoller(movingPollPeriod, idlePollPeriod, forcedFastPolls)`:
     /// the startup pass over the axes so far, then the poller thread.
     /// `forced_fast_polls` is the driver's own, C has no default
