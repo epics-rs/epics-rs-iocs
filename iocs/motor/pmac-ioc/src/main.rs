@@ -37,6 +37,10 @@ async fn main() -> CaResult<()> {
     // Motor record type.
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
+    // motorSupport.dbd's asynMotorControllerRegister.
+    for cmd in epics_rs::motor::ioc::asyn_motor_controller_commands() {
+        app = app.register_startup_command(cmd);
+    }
 
     // asyn's devEpics, for the controller records at address 0.
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);

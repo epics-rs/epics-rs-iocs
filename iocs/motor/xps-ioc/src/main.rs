@@ -37,6 +37,10 @@ async fn main() -> CaResult<()> {
     // Motor record type.
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
+    // motorSupport.dbd's asynMotorControllerRegister.
+    for cmd in epics_rs::motor::ioc::asyn_motor_controller_commands() {
+        app = app.register_startup_command(cmd);
+    }
 
     // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`.
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
@@ -45,7 +49,6 @@ async fn main() -> CaResult<()> {
     // XPS controller + per-axis create commands + motor device support.
     app = app.register_startup_command(xps_create_controller_command());
     app = app.register_startup_command(xps_create_axis_command());
-    app = app.register_startup_command(epics_rs::motor::ioc::enable_move_to_home_command());
     app = app.register_startup_command(xps_create_profile_command());
     app = app.register_startup_command(xps_disable_auto_enable_command());
     app = app.register_startup_command(xps_no_disable_error_command());
