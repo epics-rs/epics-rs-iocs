@@ -83,11 +83,13 @@ impl PslDetector {
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<(Self, bool)> {
+        // C's ADDriver constructor sets ADMaxSizeX/Y to 1 (ADDriver.cpp:180-181);
+        // openCamera replaces them from GetMaximumSize.
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            0,
-            0,
+            1,
+            1,
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -215,6 +217,8 @@ impl PslDetector {
 
         // C returns this exchange's status (PSL.cpp:230).
         let (reply, status) = self.command_status("GetMaximumSize")?;
+        // C bug not copied: a reply sscanf cannot parse publishes the
+        // uninitialised maxSizeX/maxSizeY (PSL.cpp:231-233).
         let size = protocol::parse_ints(&reply);
         if size.len() >= 2 {
             let base = &mut self.ad.port_base;
@@ -768,6 +772,31 @@ mod tests {
         )
         .unwrap()
         .0
+    }
+
+    /// ADDriver.cpp:180-181: ADMaxSizeX/Y start at 1, which a port whose
+    /// server never answered keeps.
+    #[test]
+    fn max_size_starts_at_addrivers_1() {
+        let det = detector("PSLMAXSIZE");
+        assert_eq!(det.get_i32(det.ad.params.max_size_x), 1);
+        assert_eq!(det.get_i32(det.ad.params.max_size_y), 1);
+    }
+
+    /// A failed server exchange leaves the write's `errorMessage` empty, as
+    /// C's `writeReadServer` on `pasynUserServer_` does (PSL.cpp:298-320).
+    #[test]
+    fn a_server_write_failure_carries_no_message() {
+        let mut det = detector("PSL_ERRMSG");
+        let p = det.ad.params;
+        let err = det
+            .write_float64(&mut AsynUser::new(p.acquire_time), 1.0)
+            .unwrap_err();
+        assert_eq!(
+            err.status(),
+            epics_rs::asyn::error::AsynStatus::Disconnected
+        );
+        assert_eq!(err.message(), "");
     }
 
     /// C ignores the `pasynOctetSyncIO->connect` status (PSL.cpp:166): with no

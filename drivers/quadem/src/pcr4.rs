@@ -132,7 +132,7 @@ impl Pcr4Driver {
             asyn_print!(
                 self.base.port_base,
                 ERROR,
-                "drvPCR4::sendCommand: error, outString={out} expected ACK, received {resp}"
+                "drvPCR4::sendCommand: error, outString={out} expected ACK, received {resp}\n"
             );
             return Err(error(format!("PCR4: {out} -> {resp}, expected ACK")));
         }
@@ -224,6 +224,11 @@ impl Pcr4Driver {
     /// As in the other quadEM ports the `goto error` path skips the
     /// `setAcquire(1)` restore, so a status read that fails leaves the meter
     /// stopped.
+    ///
+    /// A failed exchange returns its own status. C discards each
+    /// `writeReadMeter` status (drvPCR4.cpp:641-663) and reports the empty
+    /// reply as asynError (:689), so a disconnected meter alarms WRITE there
+    /// and COMM here. C defect, not copied.
     fn read_status_inner(&mut self, last: &mut trace::StatusExchange) -> AsynResult<()> {
         let p = self.params();
         let bad = |what: &str, resp: &str| error(format!("PCR4: bad {what} response: {resp}"));
@@ -332,7 +337,7 @@ impl QuadEmDevice for Pcr4Driver {
                             asyn_print!(
                                 self.base.port_base,
                                 WARNING,
-                                "drvPCR4::setAcquire waiting for ACK response, nread={}",
+                                "drvPCR4::setAcquire waiting for ACK response, nread={}\n",
                                 outcome.data.len()
                             );
                         }
@@ -340,7 +345,7 @@ impl QuadEmDevice for Pcr4Driver {
                             asyn_print!(
                                 self.base.port_base,
                                 ERROR,
-                                "drvPCR4::setAcquire error waiting for ACK response, status={}",
+                                "drvPCR4::setAcquire error waiting for ACK response, status={}\n",
                                 e.c_status_code()
                             );
                             status = Err(e);
@@ -440,7 +445,7 @@ impl QuadEmDevice for Pcr4Driver {
             asyn_print!(
                 self.base.port_base,
                 ERROR,
-                "drvPCR4::getStatus: error, outString={}, inString={}",
+                "drvPCR4::getStatus: error, outString={}, inString={}\n",
                 last.out,
                 last.inp
             );
@@ -479,7 +484,7 @@ impl QuadEmDevice for Pcr4Driver {
             asyn_print!(
                 self.base.port_base,
                 ERROR,
-                "drvPCR4::reset: error, no response from meter after {} seconds",
+                "drvPCR4::reset: error, no response from meter after {} seconds\n",
                 proto::RESET_WAIT_LOOPS
             );
         }
@@ -608,7 +613,7 @@ fn read_thread(ctx: ReadContext) {
                         ctx.handle,
                         ERROR,
                         "drvPCR4::readThread Extra trigger start, numTrigStarts={num_trig_starts}, \
-                         numTrigsEnds={num_trig_ends}"
+                         numTrigsEnds={num_trig_ends}\n"
                     );
                 }
                 next_expected_edge = 1;
@@ -620,7 +625,7 @@ fn read_thread(ctx: ReadContext) {
                         ctx.handle,
                         ERROR,
                         "drvPCR4::readThread Extra trigger end, numTrigStarts={num_trig_starts}, \
-                         numTrigsEnds={num_trig_ends}"
+                         numTrigsEnds={num_trig_ends}\n"
                     );
                 }
                 next_expected_edge = 0;
@@ -804,6 +809,63 @@ mod tests {
         )
         .unwrap();
         assert!(rt._read_thread.is_none());
+    }
+
+    /// A down meter link fails a write with the link's asynDisconnected, not
+    /// C's asynError from parsing an empty status reply.
+    #[test]
+    fn a_status_read_on_a_down_meter_keeps_the_link_status() {
+        let (_io, _meter) = create_ip_port(
+            "QE_PCR4_DOWN_IP",
+            "127.0.0.1:1",
+            Duration::from_millis(200),
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_pcr4(
+            &claim_port("QE_PCR4_DOWN").unwrap(),
+            "QE_PCR4_DOWN_IP",
+            4,
+            0,
+        )
+        .unwrap();
+        // BiasState is 0, so only readStatus talks to the meter.
+        let err = rt
+            .port_handle()
+            .write_float64_blocking(rt.params.bias_voltage, 0, 0.0)
+            .unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Disconnected, "{err:?}");
+    }
+
+    /// C ends each `asynPrint` line with `\n` (drvPCR4.cpp:686-688).
+    #[test]
+    fn a_status_read_error_ends_its_line() {
+        let (_io, _meter) = create_ip_port(
+            "QE_PCR4_EOL_IP",
+            "127.0.0.1:1",
+            Duration::from_millis(200),
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_pcr4(&claim_port("QE_PCR4_EOL").unwrap(), "QE_PCR4_EOL_IP", 4, 0).unwrap();
+        let handle = rt.port_handle();
+        let path = std::env::temp_dir().join(format!("qe-pcr4-eol-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        handle.trace().set_trace_file(
+            Some(handle.port_name()),
+            epics_rs::asyn::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let _ = handle.write_float64_blocking(rt.params.bias_voltage, 0, 0.0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.ends_with("drvPCR4::getStatus: error, outString=RANGE:?, inString=\n"),
+            "{text:?}"
+        );
     }
 
     /// C++ sets the input EOS only in setAcquire (drvPCR4.cpp:356-363): a port

@@ -58,14 +58,16 @@ impl From<AsynError> for ServerError {
     }
 }
 
+/// C's `writeReadServer` returns only a status: the exchange runs on
+/// `pasynUserServer_`, so the caller's `errorMessage` stays empty.
 impl From<ServerError> for AsynError {
     fn from(e: ServerError) -> Self {
-        match e {
-            ServerError::Timeout => AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "timeout".into(),
+        AsynError::Status {
+            status: match e {
+                ServerError::Timeout => AsynStatus::Timeout,
+                ServerError::Transport(e) => e.status(),
             },
-            ServerError::Transport(e) => e,
+            message: String::new(),
         }
     }
 }
@@ -138,9 +140,9 @@ impl Session<'_> {
     /// configured it. C reconnects the socket before every command, so nothing
     /// can be left in the input buffer from the previous exchange.
     pub fn request_image(&mut self) -> ServerResult<Vec<u8>> {
+        self.io.reconnect();
         self.io
-            .reconnect()
-            .and_then(|()| self.io.write("GetImage", GET_IMAGE_TIMEOUT))
+            .write("GetImage", GET_IMAGE_TIMEOUT)
             .and_then(|()| self.io.read_binary(MAX_MESSAGE_SIZE, GET_IMAGE_TIMEOUT))
             .inspect_err(|e| self.io.write_read_failed(e, "GetImage"))
     }
@@ -175,15 +177,14 @@ impl ServerIo {
     }
 
     /// The server expects a fresh connection for every command
-    /// (C `pasynCommonSyncIO->disconnectDevice` + `connectDevice`).
-    fn reconnect(&mut self) -> ServerResult<()> {
-        self.handle
-            .port()?
-            .submit_blocking(RequestOp::Disconnect, self.user(SERVER_TIMEOUT))?;
-        self.handle
-            .port()?
-            .submit_blocking(RequestOp::Connect, self.user(SERVER_TIMEOUT))?;
-        Ok(())
+    /// (C `pasynCommonSyncIO->disconnectDevice` + `connectDevice`). C ignores
+    /// both statuses (PSL.cpp:304-305): a failed connect surfaces as the
+    /// exchange's asynDisconnected.
+    fn reconnect(&mut self) {
+        if let Ok(port) = self.handle.port() {
+            let _ = port.submit_blocking(RequestOp::Disconnect, self.user(SERVER_TIMEOUT));
+            let _ = port.submit_blocking(RequestOp::Connect, self.user(SERVER_TIMEOUT));
+        }
     }
 
     fn write_read(
@@ -192,7 +193,7 @@ impl ServerIo {
         buf_size: usize,
         timeout: Duration,
     ) -> ServerResult<Vec<u8>> {
-        self.reconnect()?;
+        self.reconnect();
         let result = self.handle.port()?.submit_blocking(
             RequestOp::OctetWriteRead {
                 data: command.as_bytes().to_vec(),
@@ -220,6 +221,35 @@ impl ServerIo {
             .port()?
             .submit_blocking(RequestOp::OctetReadBinary { buf_size }, self.user(timeout))?;
         Ok(result.data.unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::create_port_runtime;
+
+    /// A refused connect fails the command with the exchange's
+    /// asynDisconnected, as C's ignored `connectDevice` does.
+    #[test]
+    fn a_refused_connect_fails_the_command_disconnected() {
+        let driver = DrvAsynIPPort::new("PSL_REFUSED_IP", "127.0.0.1:1").unwrap();
+        let (runtime, _) = create_port_runtime(
+            &claim_port("PSL_REFUSED_IP").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let server = PslServer::new(SyncIOHandle::from_handle(
+            runtime.port_handle().clone(),
+            0,
+            Duration::ZERO,
+        ));
+        let err = server.command("GetVersion").unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Disconnected as i32, "{err}");
     }
 }
 

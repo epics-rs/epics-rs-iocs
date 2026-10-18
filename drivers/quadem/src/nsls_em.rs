@@ -138,7 +138,7 @@ fn find_module(
             asyn_print!(
                 *base,
                 ERROR,
-                "drvNSLS_EM::drvNSLS_EM error calling drvAsynIPPortConfigure for broadcast port={udp_name}, IP={udp_host}, status={}",
+                "drvNSLS_EM::drvNSLS_EM error calling drvAsynIPPortConfigure for broadcast port={udp_name}, IP={udp_host}, status={}\n",
                 e.c_status_code()
             );
             return transport;
@@ -151,7 +151,7 @@ fn find_module(
             asyn_print!(
                 *base,
                 ERROR,
-                "drvNSLS_EM::drvNSLS_EM error finding module, running asynReport to list modules found"
+                "drvNSLS_EM::drvNSLS_EM error finding module, running asynReport to list modules found\n"
             );
             transport.find_failed = true;
         }
@@ -190,7 +190,7 @@ fn discover(
         asyn_print!(
             *base,
             ERROR,
-            "drvNSLS_EM:findModules: cannot find requested module {module_id} on network"
+            "drvNSLS_EM:findModules: cannot find requested module {module_id} on network\n"
         );
         return Err(());
     };
@@ -201,7 +201,7 @@ fn discover(
             asyn_print!(
                 *base,
                 ERROR,
-                "drvNSLS_EM:findModules: error calling drvAsyIPPortConfigure for TCP port {name}, IP={ip}, status={}",
+                "drvNSLS_EM:findModules: error calling drvAsyIPPortConfigure for TCP port {name}, IP={ip}, status={}\n",
                 e.c_status_code()
             );
         })
@@ -280,7 +280,7 @@ impl NslsEmDriver {
                     asyn_print!(
                         self.base.port_base,
                         ERROR,
-                        "drvNSLS_EM:writeReadMeter: error calling writeRead, outString={out} status={}, nread={n_read}, eomReason={eom}, inString={in_string}",
+                        "drvNSLS_EM:writeReadMeter: error calling writeRead, outString={out} status={}, nread={n_read}, eomReason={eom}, inString={in_string}\n",
                         e.c_status_code()
                     );
                     return Err(e);
@@ -290,7 +290,7 @@ impl NslsEmDriver {
                 asyn_print!(
                     self.base.port_base,
                     ERROR,
-                    "drvNSLS_EM:writeReadMeter: error, outString={out} expected OK>, received {reply}"
+                    "drvNSLS_EM:writeReadMeter: error, outString={out} expected OK>, received {reply}\n"
                 );
                 return Err(error(format!("NSLS_EM: {out} -> {reply}, expected OK>")));
             }
@@ -352,7 +352,7 @@ impl NslsEmDriver {
                 asyn_print!(
                     self.base.port_base,
                     ERROR,
-                    "drvNSLS_EM::getStatus error, numItems={items}, ipAddress={}, moduleID={}, firmwareVersion={}, mode={}, valuesPerRead={}, range={}, period={:.6}",
+                    "drvNSLS_EM::getStatus error, numItems={items}, ipAddress={}, moduleID={}, firmwareVersion={}, mode={}, valuesPerRead={}, range={}, period={:.6}\n",
                     s.ip,
                     s.module_id,
                     s.firmware,
@@ -793,6 +793,34 @@ mod tests {
         assert!(transport.link.is_none());
         assert!(transport.find_failed);
         assert!(transport.modules.is_empty());
+    }
+
+    /// C ends each `asynPrint` line with `\n` (drvNSLS_EM.cpp:117-119).
+    #[test]
+    fn a_find_failure_line_ends_with_a_newline() {
+        let base = QuadEmBase::new("QE_NSLS_EOL", 0).unwrap();
+        let path = std::env::temp_dir().join(format!("qe-nsls-eol-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .set_trace_file(
+                Some("QE_NSLS_EOL"),
+                epics_rs::asyn::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+        let transport = find_module(
+            &base.port_base,
+            "QE_NSLS_EOL",
+            "127.0.0.3",
+            9,
+            &InterruptGate::opened(),
+        );
+        assert!(transport.find_failed);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.ends_with("running asynReport to list modules found\n"),
+            "{text:?}"
+        );
     }
 
     #[test]
