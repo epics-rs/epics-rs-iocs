@@ -62,6 +62,7 @@ use parking_lot::Mutex;
 use asyn_rs::asyn_record::PortClaim;
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::InterfaceType;
+use asyn_rs::interpose::EomReason;
 use asyn_rs::interrupt::{InterruptManager, InterruptValue};
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::InterfaceMask;
@@ -999,6 +1000,13 @@ fn interrupt_for(reason: usize, p: &ParamState) -> Option<InterruptValue> {
         alarm_status: p.alarm.0,
         alarm_severity: p.alarm.1,
         iface: p.iface,
+        // A string goes out through setStringParam + callParamCallbacks, whose
+        // octetCallback passes ASYN_EOM_END (adsAsynPortDriver.cpp:4841-4843).
+        eom_reason: if matches!(p.value, ParamValue::Octet(_)) {
+            EomReason::END
+        } else {
+            EomReason::empty()
+        },
     })
 }
 
@@ -2270,6 +2278,37 @@ mod tests {
         assert_eq!(iface, Some(InterfaceType::Float64));
         assert_eq!(severity, NO_ALARM_SEV);
         assert_eq!(d.read_float64(&user(reason)).unwrap(), 2.5);
+    }
+
+    #[test]
+    fn a_string_sample_fires_with_eom_end_and_a_number_with_none() {
+        let mut d = driver();
+        let text = bind(
+            &mut d,
+            "ADSPORT=851/.ADR.16#4020,16#0,8,30?",
+            InterfaceType::Octet,
+        );
+        let number = bind(
+            &mut d,
+            "ADSPORT=851/.ADR.16#4020,16#8,8,5?",
+            InterfaceType::Float64,
+        );
+        let (tx, rx) = mpsc::channel();
+        let _sub = d
+            .shared
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                let _ = tx.send((iv.reason, iv.eom_reason));
+            })
+            .unwrap();
+        // What the PLC-info refresh sets for every ADST_STRING.
+        d.shared.params.lock()[text].as_mut().unwrap().is_array = true;
+
+        d.shared.publish(text, b"abc\0\0\0\0\0", 0);
+        d.shared.publish(number, &2.5f64.to_le_bytes(), 0);
+
+        assert_eq!(rx.try_recv().unwrap(), (text, EomReason::END));
+        assert_eq!(rx.try_recv().unwrap(), (number, EomReason::empty()));
     }
 
     #[test]
