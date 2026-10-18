@@ -267,6 +267,7 @@ impl OctetInterpose for PmacIpInterpose {
             return Ok(OctetReadResult {
                 nbytes_transferred: 0,
                 eom_reason: EomReason::CNT,
+                taken_back: 0,
             });
         }
 
@@ -338,12 +339,14 @@ impl OctetInterpose for PmacIpInterpose {
             return Ok(OctetReadResult {
                 nbytes_transferred: n_read,
                 eom_reason: EomReason::CNT,
+                taken_back: 0,
             });
         }
         status?;
         Ok(OctetReadResult {
             nbytes_transferred: 0,
             eom_reason: EomReason::empty(),
+            taken_back: 0,
         })
     }
 
@@ -489,6 +492,7 @@ mod tests {
             Ok(OctetReadResult {
                 nbytes_transferred: n,
                 eom_reason: EomReason::empty(),
+                taken_back: 0,
             })
         }
 
