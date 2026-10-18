@@ -58,14 +58,16 @@ impl From<AsynError> for ServerError {
     }
 }
 
+/// C's `writeReadServer` returns only a status: the exchange runs on
+/// `pasynUserServer_`, so the caller's `errorMessage` stays empty.
 impl From<ServerError> for AsynError {
     fn from(e: ServerError) -> Self {
-        match e {
-            ServerError::Timeout => AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "timeout".into(),
+        AsynError::Status {
+            status: match e {
+                ServerError::Timeout => AsynStatus::Timeout,
+                ServerError::Transport(e) => e.status(),
             },
-            ServerError::Transport(e) => e,
+            message: String::new(),
         }
     }
 }

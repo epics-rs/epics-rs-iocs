@@ -783,6 +783,22 @@ mod tests {
         assert_eq!(det.get_i32(det.ad.params.max_size_y), 1);
     }
 
+    /// A failed server exchange leaves the write's `errorMessage` empty, as
+    /// C's `writeReadServer` on `pasynUserServer_` does (PSL.cpp:298-320).
+    #[test]
+    fn a_server_write_failure_carries_no_message() {
+        let mut det = detector("PSL_ERRMSG");
+        let p = det.ad.params;
+        let err = det
+            .write_float64(&mut AsynUser::new(p.acquire_time), 1.0)
+            .unwrap_err();
+        assert_eq!(
+            err.status(),
+            epics_rs::asyn::error::AsynStatus::Disconnected
+        );
+        assert_eq!(err.message(), "");
+    }
+
     /// C ignores the `pasynOctetSyncIO->connect` status (PSL.cpp:166): with no
     /// server port configured, getVersion fails and the port stays up, but the
     /// constructor returns there (PSL.cpp:168-173): ADStatus keeps the base
