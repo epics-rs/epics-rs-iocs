@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::adapter::parse_asyn_link;
-use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -631,10 +630,9 @@ impl DeviceSupport for DevMpc {
                 return Ok(DeviceInitOutcome::dead());
             }
         };
-        let Some(port) = get_port(&link.port_name) else {
+        let Ok(handle) = crate::connect_octet(&link.port_name, 0) else {
             return Ok(DeviceInitOutcome::dead());
         };
-        let handle = port.handle.clone();
         let user_param = link.drv_info.trim();
         if user_param.is_empty() {
             errlog_vprintf(format_args!(
@@ -800,6 +798,18 @@ mod tests {
             parameter: 1,
         });
         (dev, handle)
+    }
+
+    /// A port without `asynOctet` fails `findInterface`: `bad:`, `pact = 1`
+    /// (devMPC.c:228-229).
+    #[test]
+    fn a_port_without_octet_kills_the_record() {
+        crate::no_octet_port("MPC_INT32_ONLY");
+        let mut dev = DevMpc::new(Kind::Ai, "@asyn(MPC_INT32_ONLY 5)GET_PRESSURE 1");
+        dev.set_record_info("R:x", ScanType::Passive);
+        let outcome = dev.init(&mut AiRecord::default()).unwrap();
+        assert_eq!(outcome, DeviceInitOutcome::dead());
+        assert!(!dev.holds_dpvt());
     }
 
     fn landed(dev: &DevMpc, ok: bool, rec_buf: impl AsRef<[u8]>) {
