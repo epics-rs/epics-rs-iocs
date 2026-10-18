@@ -46,8 +46,9 @@ use crate::ethernet::pmac_asyn_ip_configure_command;
 const POLL_CACHE_TTL: Duration = Duration::from_millis(50);
 
 /// pmacAsynCoord.c's `motorAxisDrvSET_t`, its cards keyed by `reference`.
-/// pmacAsynCoord.c:729's poller forces no fast polls.
-pub static PMAC_ASYN_COORD: Model2 = Model2::new("pmacAsynCoord", 0);
+/// A woken pass waits the moving period even when done, so one fast poll
+/// is forced (pmacAsynCoord.c:719-728).
+pub static PMAC_ASYN_COORD: Model2 = Model2::new("pmacAsynCoord", 1);
 
 /// `defaultMovingPollPeriod` / `defaultIdlePollPeriod` (pmacAsynCoord.c:122).
 const COORD_MOVING_POLL_MS: u64 = 100;
@@ -1379,6 +1380,29 @@ mod tests {
         rig.answer("&3Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"0 0 0 0 0 0 0 0 0\r");
         axis.lock().unwrap().poll(&user).unwrap();
         assert_eq!(own.take(), "");
+    }
+
+    /// pmacAsynCoord.c:719-728: a woken pass waits the moving period even
+    /// when it read done, so the poll after a move's comes 100 ms on, not
+    /// the idle 500.
+    #[epics_rs::base::epics_test]
+    async fn the_poll_after_a_woken_done_poll_is_at_the_moving_period() {
+        use epics_rs::base::runtime::task::sleep;
+        let (_rt, rig, _own, _axis) =
+            configured_cs("pmacCsFast", "pmacCsFastM", 9305, TraceMask::ERROR).await;
+        rig.answer("&3??", b"000000\r020000\r000000\r");
+        rig.answer("&3Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"0 0 0 0 0 0 0 0 0\r");
+        sleep(Duration::from_millis(600)).await;
+        rig.written();
+        let port = PortManager::global()
+            .find_port_handle("pmacCsFastM")
+            .unwrap();
+        // MOTOR_MOVE_ABS (drvMotorAsyn.c:101-106); a failed send still wakes.
+        let mover = std::thread::spawn(move || port.write_float64_blocking(104, 0, 1.0));
+        sleep(Duration::from_millis(350)).await;
+        let _ = mover.join().unwrap();
+        let polls = rig.written().iter().filter(|c| *c == "&3??").count();
+        assert_eq!(polls, 2);
     }
 
     /// pmacAsynCoord.c:386-437: every motorAxisSetDouble case prints its FLOW
