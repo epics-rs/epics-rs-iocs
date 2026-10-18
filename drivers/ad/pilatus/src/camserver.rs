@@ -422,7 +422,7 @@ mod tests {
                         1,
                         PortFlags::default(),
                         InterfaceMask::UNMIGRATED_ALL,
-                        InterfaceMask::UNMIGRATED_ALL,
+                        InterfaceMask::UNMIGRATED_INTERRUPTS,
                     ),
                     status,
                 },

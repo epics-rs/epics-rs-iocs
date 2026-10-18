@@ -298,7 +298,7 @@ impl DrvMotorAsyn {
                 destructible: false,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         for (addr, axis) in axes.iter().enumerate() {
             let Some(Axis { getter, status, .. }) = axis else {

@@ -2848,7 +2848,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             written: Arc::default(),
             status: AsynStatus::Timeout,
@@ -4539,7 +4539,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             )),
             RuntimeConfig::default(),
         )

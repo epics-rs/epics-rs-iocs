@@ -1096,7 +1096,7 @@ mod tests {
             MAX_SIGNALS,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let params = MultiFunctionParams::create(&mut base).unwrap();
         let usb_2408 = Resolution {

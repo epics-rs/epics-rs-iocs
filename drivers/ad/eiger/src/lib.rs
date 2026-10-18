@@ -191,7 +191,7 @@ fn create_inert(
             ..ASYN_CANBLOCK
         },
         InterfaceMask::UNMIGRATED_SUBCLASS,
-        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
     )?;
     let pool = ad.pool.clone();
     let (runtime_handle, _) =

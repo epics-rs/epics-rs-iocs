@@ -88,7 +88,7 @@ pub(crate) fn no_octet_port(name: &str) {
         1,
         PortFlags::default(),
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     ));
     let runtime = PortManager::new()
         .register_port(claim_port_driver(name).unwrap(), driver, &open_owner())
