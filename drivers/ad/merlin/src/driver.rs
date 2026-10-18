@@ -128,7 +128,7 @@ impl MerlinDetector {
         base.set_int32_param(params.profile_control, 0, MPXPROFILES_IMAGE)?;
         base.set_int32_param(ad.params.status, 0, ADStatus::Initializing as i32)?;
 
-        Ok(Self {
+        let mut det = Self {
             ad,
             params,
             init_param,
@@ -136,7 +136,33 @@ impl MerlinDetector {
             cmd,
             shared,
             _flat_field,
-        })
+        };
+        // The STOPACQUISITION create_merlin_detector sent before the port existed.
+        det.apply_echo()?;
+        Ok(det)
+    }
+
+    /// The only flush: C sets the server strings inline on every exchange,
+    /// which no callback can see before the next callParamCallbacks.
+    fn flush(&mut self) -> AsynResult<()> {
+        self.apply_echo()?;
+        self.ad.port_base.call_param_callbacks(0)
+    }
+
+    fn apply_echo(&mut self) -> AsynResult<()> {
+        let echo = self.cmd.take_echo();
+        let p = self.ad.params;
+        if let Some(s) = echo.to_server {
+            self.ad
+                .port_base
+                .set_string_param(p.string_to_server, 0, s)?;
+        }
+        if let Some(s) = echo.from_server {
+            self.ad
+                .port_base
+                .set_string_param(p.string_from_server, 0, s)?;
+        }
+        Ok(())
     }
 
     fn get_i32(&self, reason: usize) -> i32 {
@@ -235,7 +261,7 @@ impl MerlinDetector {
                 acquire_period,
             )?;
         }
-        self.ad.port_base.call_param_callbacks(0)?;
+        self.flush()?;
 
         self.try_set(MPXVAR_NUMFRAMESPERTRIGGER, &num_exposures.to_string());
         self.try_set(MPXVAR_COUNTERDEPTH, &counter_depth.to_string());
@@ -337,7 +363,7 @@ impl MerlinDetector {
                 .port_base
                 .set_float64_param(self.params.operating_energy, 0, v)?;
         }
-        self.ad.port_base.call_param_callbacks(0)?;
+        self.flush()?;
         Ok(())
     }
 
@@ -545,7 +571,7 @@ impl PortDriver for MerlinDetector {
             // The Labview server cannot be reconnected to after a reset, so C
             // exits the IOC and relies on a supervisor to restart it. Keeping
             // the IOC up would leave every channel dead with no way back.
-            self.ad.port_base.call_param_callbacks(0)?;
+            self.flush()?;
             std::process::exit(0);
         } else if reason == self.params.quad_merlin_mode {
             self.set_quad_mode(value)
@@ -581,7 +607,7 @@ impl PortDriver for MerlinDetector {
             Ok(())
         };
 
-        self.ad.port_base.call_param_callbacks(0)?;
+        self.flush()?;
         match &status {
             Err(e) => user.print(
                 TraceMask::ERROR,
@@ -667,7 +693,7 @@ impl PortDriver for MerlinDetector {
                 format_args!("merlinDetector:writeFloat64: function={reason}, value={value:.6}\n"),
             ),
         }
-        let _ = self.ad.port_base.call_param_callbacks(0);
+        let _ = self.flush();
         status
     }
 }
@@ -965,6 +991,85 @@ mod tests {
         let mut user = AsynUser::new(det.params.thresholds[0]);
         let e = det.write_float64(&mut user, 9.0).unwrap_err();
         assert_eq!(e.message(), "");
+    }
+
+    /// mpxWrite hands every request to toLabViewStr (mpxConnection.cpp:571),
+    /// the constructor's STOPACQUISITION included, whether or not it went out.
+    #[test]
+    fn the_constructors_stop_is_the_string_to_server() {
+        let (cmd, _) =
+            SyncIOHandle::connect_port("MERLIN_ECHO_CMD", 0, Duration::ZERO, InterfaceType::Octet);
+        let (data, _) =
+            SyncIOHandle::connect_port("MERLIN_ECHO_DATA", 0, Duration::ZERO, InterfaceType::Octet);
+        let rt = create_merlin_detector(
+            &claim_port("MERLIN_ECHO").unwrap(),
+            cmd,
+            data,
+            512,
+            512,
+            DetectorType::MerlinQuad,
+            1 << 20,
+        )
+        .unwrap();
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let text = sync.read_octet(rt.ad_params.string_to_server, 256).unwrap();
+        // NORD 35 in C: the 34 characters and the NUL.
+        assert_eq!(text, b"MPX,0000000020,CMD,STOPACQUISITION\0");
+    }
+
+    /// mpxReadCmd hands every reply it reads to fromLabViewStr
+    /// (mpxConnection.cpp:763), and the write's callbacks carry both strings.
+    #[test]
+    fn a_command_reply_is_the_string_from_server() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut header = [0u8; 15];
+            s.read_exact(&mut header).unwrap();
+            let len: usize = std::str::from_utf8(&header[4..14])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut body = vec![0u8; len - 1];
+            s.read_exact(&mut body).unwrap();
+            let reply = "CMD,SWTRIGGER,0";
+            write!(s, "MPX,{:010},{reply}", reply.len() + 1).unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let ip = "MERLIN_REPLY_CMD";
+        let driver = DrvAsynIPPort::new(ip, &addr).unwrap();
+        let (runtime, _) =
+            create_port_runtime(&claim_port(ip).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        let mut det = MerlinDetector::new(
+            "MERLIN_REPLY",
+            MpxConnection::new(
+                SyncIOHandle::from_handle(handle, 0, Duration::from_secs(1)),
+                MPX_MAXLINE,
+            ),
+            512,
+            512,
+            DetectorType::MerlinQuad,
+            1 << 20,
+            Arc::new(SharedState::new()),
+        )
+        .unwrap();
+        let mut user = AsynUser::new(det.params.software_trigger);
+        det.write_int32(&mut user, 1).unwrap();
+        let p = det.ad.params;
+        let base = &det.ad.port_base;
+        assert_eq!(
+            base.get_string_param(p.string_to_server, 0).unwrap(),
+            b"MPX,0000000014,CMD,SWTRIGGER"
+        );
+        assert_eq!(
+            base.get_string_param(p.string_from_server, 0).unwrap(),
+            b"MPX,0000000016,CMD,SWTRIGGER,0"
+        );
     }
 
     /// The last frame of a Single acquisition under a software trigger;

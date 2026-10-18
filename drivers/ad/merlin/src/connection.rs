@@ -85,15 +85,33 @@ impl From<AsynError> for ChannelError {
     }
 }
 
+/// The last request sent and the last reply read, which C hands its parent
+/// as ADStringToServer / ADStringFromServer (mpxConnection.cpp:571, :763).
+#[derive(Default)]
+pub struct Echo {
+    pub to_server: Option<String>,
+    pub from_server: Option<String>,
+}
+
 /// A framed MPX channel on top of one asyn octet port.
 pub struct MpxConnection {
     io: SyncIOHandle,
     max_frame: usize,
+    echo: parking_lot::Mutex<Echo>,
 }
 
 impl MpxConnection {
     pub fn new(io: SyncIOHandle, max_frame: usize) -> Self {
-        Self { io, max_frame }
+        Self {
+            io,
+            max_frame,
+            echo: parking_lot::Mutex::new(Echo::default()),
+        }
+    }
+
+    /// What the exchanges since the last call sent and read.
+    pub fn take_echo(&self) -> Echo {
+        std::mem::take(&mut *self.echo.lock())
     }
 
     fn user(&self, timeout: Duration) -> AsynUser {
@@ -250,10 +268,15 @@ impl MpxConnection {
                 ChannelError::from(e).code()
             ));
         }
+        self.echo.lock().to_server = Some(msg.clone());
 
         loop {
             let mut header = String::new();
             let read = self.read_frame_into(&mut header, timeout);
+            if let Ok(body) = &read {
+                self.echo.lock().from_server =
+                    Some(format!("{header}{}", String::from_utf8_lossy(body)));
+            }
             let (code, body) = match &read {
                 Ok(body) if protocol::response_echoes(body, kind, name) => break read,
                 Ok(body) => (0, String::from_utf8_lossy(body).into_owned()),
