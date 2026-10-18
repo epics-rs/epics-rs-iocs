@@ -689,7 +689,7 @@ impl DeviceSupport for GmDevice {
         instrument.enqueue(
             command,
             Box::new(move || {
-                let _ = write_done.complete(priority, Ok(()));
+                let _ = write_done.complete(priority);
             }),
         );
         Ok(WriteStart::Pending)

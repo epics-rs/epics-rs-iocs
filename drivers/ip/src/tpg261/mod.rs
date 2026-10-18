@@ -259,7 +259,7 @@ impl CellBody for Job {
         let armed = self.reentry.lock().unwrap().clone();
         if let Some((done, prio, write)) = armed {
             let _ = if write {
-                done.complete(prio, Ok(()))
+                done.complete(prio)
             } else {
                 done.reprocess(prio)
             };

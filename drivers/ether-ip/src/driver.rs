@@ -127,7 +127,7 @@ impl TagInfo {
         for l in listeners.iter() {
             match l.write_done.lock().take() {
                 Some((done, prio)) => {
-                    let _ = done.complete(prio, Ok(()));
+                    let _ = done.complete(prio);
                 }
                 None => {
                     let _ = l.tx.try_send(());

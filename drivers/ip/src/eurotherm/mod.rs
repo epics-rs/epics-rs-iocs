@@ -142,7 +142,7 @@ impl CellBody for Job {
     fn done(self: Arc<Self>) {
         let armed = self.reentry.lock().unwrap().clone();
         if let Some((done, prio)) = armed {
-            let _ = done.complete(prio, Ok(()));
+            let _ = done.complete(prio);
         }
     }
 

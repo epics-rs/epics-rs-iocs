@@ -523,7 +523,7 @@ impl Actor {
                     let _ = tx.send(());
                 }
                 Done::Process(done) => {
-                    let _ = done.complete(done.priority(), Ok(()));
+                    let _ = done.complete(done.priority());
                 }
                 Done::NoRecord => {}
             }
