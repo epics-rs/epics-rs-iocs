@@ -624,7 +624,6 @@ mod extra_params {
         let (_line, io) = failing_controller("imsComms", "imsCommsLine", 1000.0, fails).await;
         let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
         let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
-        // Awaited: a thread sleep here starves the runtime the poller needs.
         let until = async |want: i32| {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while io.read_int32(comms).unwrap_or(-1) != want {

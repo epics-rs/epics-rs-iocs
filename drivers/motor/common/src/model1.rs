@@ -23,7 +23,6 @@ pub fn c_int(args: &[ArgValue], i: usize) -> i32 {
 use std::time::Duration;
 
 use epics_rs::base::runtime::log::errlog_vprintf;
-use epics_rs::base::runtime::task::BlockingBridge;
 use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::motor::builder::{ControllerAxis, MotorTaskBuilder};
 use epics_rs::motor::device_support::BuildTrans;
@@ -137,7 +136,7 @@ enum Task {
     /// No card yet.
     Empty,
     /// Each configured card's init, and where to spawn the task.
-    Filling(BTreeMap<i32, Init>, BlockingBridge),
+    Filling(BTreeMap<i32, Init>),
     /// drvSup init ran.
     Started,
 }
@@ -240,20 +239,20 @@ impl Model1 {
     /// drvSup init then starts as C `motor_init` starts `motor_task`.
     pub fn config(
         &'static self,
-        ctx: &CommandContext,
+        _ctx: &CommandContext,
         card: i32,
         init: impl FnOnce(&mut CardInit) + Send + 'static,
     ) -> Result<(), String> {
         let mut task = self.task.lock().unwrap_or_else(|e| e.into_inner());
         if matches!(*task, Task::Empty) {
-            *task = Task::Filling(BTreeMap::new(), ctx.bridge().clone());
+            *task = Task::Filling(BTreeMap::new());
             init_hook_register(Arc::new(move |state| {
                 if state == InitHookState::AfterInitDrvSup {
                     self.start();
                 }
             }));
         }
-        let Task::Filling(cards, _) = &mut *task else {
+        let Task::Filling(cards) = &mut *task else {
             // Deliberate deviation from a C defect: C's Config fills the slot
             // after drvSup init without a word, and that card is never
             // initialized or polled; refuse it instead.
@@ -269,10 +268,10 @@ impl Model1 {
     /// drvSup init: each card's `motor_init` pass, then the task over the
     /// axes they found.
     fn start(&self) {
-        let (cards, bridge) = {
+        let cards = {
             let mut task = self.task.lock().unwrap_or_else(|e| e.into_inner());
             match std::mem::replace(&mut *task, Task::Started) {
-                Task::Filling(cards, bridge) => (cards, bridge),
+                Task::Filling(cards) => cards,
                 _ => return,
             }
         };
@@ -311,7 +310,7 @@ impl Model1 {
             }
         }
         if any_axis {
-            bridge.spawn(builder.build().run());
+            builder.build().start();
         }
     }
 }

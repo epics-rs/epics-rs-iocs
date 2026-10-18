@@ -192,19 +192,13 @@ impl Controller {
     /// leaves its axes unpolled, as C's does. The poller starts once.
     pub fn start(
         &self,
-        ctx: &CommandContext,
+        _ctx: &CommandContext,
         port: &str,
         moving_poll_ms: u64,
         idle_poll_ms: u64,
         forced_fast_polls: u32,
     ) {
-        self.spawn(
-            ctx,
-            Some(port),
-            moving_poll_ms,
-            idle_poll_ms,
-            forced_fast_polls,
-        );
+        self.spawn(Some(port), moving_poll_ms, idle_poll_ms, forced_fast_polls);
     }
 
     /// A model-2 driver's own thread, which no port names until
@@ -212,17 +206,16 @@ impl Controller {
     /// drvMotorSim.c:788-800).
     pub fn start_driver_thread(
         &self,
-        ctx: &CommandContext,
+        _ctx: &CommandContext,
         moving_poll_ms: u64,
         idle_poll_ms: u64,
         forced_fast_polls: u32,
     ) {
-        self.spawn(ctx, None, moving_poll_ms, idle_poll_ms, forced_fast_polls);
+        self.spawn(None, moving_poll_ms, idle_poll_ms, forced_fast_polls);
     }
 
     fn spawn(
         &self,
-        ctx: &CommandContext,
         port: Option<&str>,
         moving_poll_ms: u64,
         idle_poll_ms: u64,
@@ -244,7 +237,7 @@ impl Controller {
             Duration::from_millis(idle_poll_ms),
             forced_fast_polls,
         );
-        ctx.bridge().spawn(poller.run());
+        poller.start();
     }
 }
 
@@ -255,7 +248,7 @@ impl Controller {
 /// `forced_fast_polls` is the driver's own: C's `startPoller` has no default
 /// (asynMotorController.cpp:567).
 pub fn install(
-    ctx: &CommandContext,
+    _ctx: &CommandContext,
     user: TraceUser,
     motor: Arc<Mutex<dyn AsynMotor>>,
     moving_poll_ms: u64,
@@ -263,7 +256,6 @@ pub fn install(
     forced_fast_polls: u32,
 ) -> Result<(), String> {
     install_axis(
-        ctx,
         user,
         motor,
         None,
@@ -275,7 +267,7 @@ pub fn install(
 
 /// [`install`] for an axis with C's `asynMotorAxis::report` override.
 pub fn install_with_report(
-    ctx: &CommandContext,
+    _ctx: &CommandContext,
     user: TraceUser,
     motor: Arc<Mutex<dyn AsynMotor>>,
     report: Arc<dyn AxisReport>,
@@ -284,7 +276,6 @@ pub fn install_with_report(
     forced_fast_polls: u32,
 ) -> Result<(), String> {
     install_axis(
-        ctx,
         user,
         motor,
         Some(report),
@@ -295,7 +286,6 @@ pub fn install_with_report(
 }
 
 fn install_axis(
-    ctx: &CommandContext,
     user: TraceUser,
     motor: Arc<Mutex<dyn AsynMotor>>,
     report: Option<Arc<dyn AxisReport>>,
@@ -314,7 +304,7 @@ fn install_axis(
         .forced_fast_polls(forced_fast_polls)
         .build_axis();
     epics_rs::motor::devices::register_axis(with_report(axis, report))?;
-    ctx.bridge().spawn(poll_loop.run());
+    poll_loop.start();
     Ok(())
 }
 
