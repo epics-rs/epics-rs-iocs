@@ -81,9 +81,9 @@ struct DriverLinks {
 
 impl MarccdDriver {
     fn new(port_name: &str, max_memory: usize, links: DriverLinks) -> AsynResult<Self> {
-        // marCCDConfig passes no sensor size; C's ADDriver base leaves
-        // ADMaxSizeX/Y at 0 and `getConfig` fills them from the server.
-        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
+        // C's ADDriver constructor sets ADMaxSizeX/Y to 1; `getConfig` fills
+        // them from the server.
+        let mut ad = ADDriverBase::new(port_name, 1, 1, 1, max_memory, ASYN_CANBLOCK)?;
         let p = MarccdParams::create(&mut ad.port_base)?;
 
         Ok(Self {
@@ -675,6 +675,16 @@ pub(crate) mod tests {
         assert_eq!(names(table(&mut det, p.readout_mode)).len(), 6);
 
         assert!(det.read_enum(&AsynUser::new(p.frame_shift)).is_err());
+    }
+
+    /// ADDriver.cpp:180-181: C's ADDriver constructor sets ADMaxSizeX/Y to 1,
+    /// which is what the port keeps when `getServerMode` fails and C never
+    /// reaches `getConfig`.
+    #[test]
+    fn max_size_starts_at_addrivers_1() {
+        let det = driver("MARMAXSIZE");
+        assert_eq!(det.get_i32(det.ad.params.max_size_x), 1);
+        assert_eq!(det.get_i32(det.ad.params.max_size_y), 1);
     }
 
     /// marCCD.cpp:1250-1357 talks to marServer inside writeInt32 /
