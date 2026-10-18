@@ -694,6 +694,10 @@ pub fn xps_create_controller_command() -> CommandDef {
             // C starts the poller before any axis exists (XPSController.cpp:197).
             let poller = Arc::new(Controller::new());
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 10);
+            // XPSController.cpp:200, the only C driver that starts it.
+            poller
+                .start_move_to_home_thread()
+                .map_err(|e| format!("XPSCreateController: {e}"))?;
             XPS_CONTROLLERS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

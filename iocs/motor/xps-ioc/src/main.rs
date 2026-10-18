@@ -45,6 +45,7 @@ async fn main() -> CaResult<()> {
     // XPS controller + per-axis create commands + motor device support.
     app = app.register_startup_command(xps_create_controller_command());
     app = app.register_startup_command(xps_create_axis_command());
+    app = app.register_startup_command(epics_rs::motor::ioc::enable_move_to_home_command());
     app = app.register_startup_command(xps_create_profile_command());
     app = app.register_startup_command(xps_disable_auto_enable_command());
     app = app.register_startup_command(xps_no_disable_error_command());

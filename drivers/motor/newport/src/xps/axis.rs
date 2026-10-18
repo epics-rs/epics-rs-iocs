@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, MoveToHomeTask, PidGainKind, PollFailure, PortSets, StatusWrite,
+};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
@@ -56,11 +58,6 @@ const XPS_REFERENCING_SETTLE: Duration = Duration::from_millis(50);
 /// Poll interval while waiting for the move-to-home search to reach the switch
 /// (C `epicsThreadSleep(0.2)`).
 const XPS_REFERENCING_POLL: Duration = Duration::from_millis(200);
-
-/// Safety cap on the move-to-home switch-crossing wait. C's loop is unbounded
-/// (isolated on its own thread); the synchronous port bounds it so a switch
-/// that is never reached cannot hang the async worker. 300 × 0.2 s = 60 s.
-const XPS_REFERENCING_MAX_POLLS: u32 = 300;
 
 /// `XPSAxis::report` (XPSAxis.cpp:207-219), at every level.
 pub struct XpsAxisReport {
@@ -245,30 +242,6 @@ impl XpsAxis {
             self.lock_move_state().deferred = Some(DeferredMove { position, relative });
         }
         ctrl.moves_deferred()
-    }
-
-    /// Read the group status over the poll socket, holding the controller lock
-    /// only for the single exchange (used by the move-to-home step sequence,
-    /// which must release the lock between RPCs and sleeps).
-    /// C `GroupStatusGet(pollSocket_, groupName_, &groupStatus)` with its
-    /// status ignored: a failed call leaves `group_status` as it was.
-    fn refresh_group_status(&self, group_status: &mut i32) {
-        let ctrl = self.lock_controller();
-        if let Ok(status) = ctrl.poll_socket().group_status_get(&self.group_name) {
-            *group_status = status;
-        }
-    }
-
-    /// `PositionerHardwareStatusGet` into an out-parameter, as
-    /// [`Self::refresh_group_status`].
-    fn refresh_hardware_status(&self, hardware_status: &mut i32) {
-        let ctrl = self.lock_controller();
-        if let Ok(status) = ctrl
-            .poll_socket()
-            .positioner_hardware_status_get(&self.positioner_name)
-        {
-            *hardware_status = status;
-        }
     }
 
     /// Shared move preamble (C `XPSAxis::move`, before the `GroupMove*` call):
@@ -461,11 +434,176 @@ impl XpsAxis {
             ),
         }
     }
+}
+
+/// What C's `doMoveToHome` reads of its axis, off the axis lock.
+struct MoveToHome {
+    controller: Arc<Mutex<XpsController>>,
+    move_sock: Arc<XpsSocket>,
+    positioner_name: String,
+    group_name: String,
+    port: String,
+    axis_no: i32,
+}
+
+impl MoveToHome {
+    fn run(self, referencing_mode_move: i32, under_lock: &dyn Fn(PortSets)) -> AsynResult<()> {
+        if referencing_mode_move == 0 {
+            let message = format!(
+                "This function has not been enabled for axis {}",
+                self.axis_no
+            );
+            return Err(self.failed(&message, false));
+        }
+        // C hands the distance to GroupMoveRelative as it was enabled,
+        // without stepSize_.
+        let mut distance = f64::from(referencing_mode_move);
+
+        // C ignores the status of every call here but GroupInitialize and the
+        // ones it prints for; a failed read leaves C's out-parameter unchanged.
+        let mut group_status = 0;
+        // A Ready group (10..=18) refuses the sequence; kill it (move socket).
+        self.refresh_group_status(&mut group_status);
+        if (10..=18).contains(&group_status) {
+            let _ = self.move_sock.group_kill(&self.group_name);
+        }
+        thread::sleep(XPS_REFERENCING_SETTLE);
+        if self
+            .lock_controller()
+            .poll_socket()
+            .group_initialize(&self.group_name)
+            .is_err()
+        {
+            return Err(self.failed("error calling GroupInitialize", false));
+        }
+        thread::sleep(XPS_REFERENCING_SETTLE);
+        let _ = self.move_sock.group_referencing_start(&self.group_name);
+        thread::sleep(XPS_REFERENCING_SETTLE);
+        let _ = self.move_sock.group_referencing_stop(&self.group_name);
+        thread::sleep(XPS_REFERENCING_SETTLE);
+
+        // Must now be in referencing mode (status 11).
+        self.refresh_group_status(&mut group_status);
+        if group_status != XPS_STATUS_HOMING_DONE {
+            return Err(self.failed("error putting axis into referencing mode.", false));
+        }
+        // Flag referencing for the whole group (poll suppresses home/homed).
+        self.lock_controller()
+            .set_group_referencing(&self.group_name, true);
+        let mut sets = PortSets::default();
+        sets.status(self.axis_no, StatusWrite::Homed(false));
+        sets.status(self.axis_no, StatusWrite::HomeSignal(false));
+        under_lock(sets);
+
+        // Pick the search direction from which side of the home switch we start.
+        let initial_hw = self
+            .lock_controller()
+            .poll_socket()
+            .positioner_hardware_status_get(&self.positioner_name);
+        let Ok(initial_hw) = initial_hw else {
+            return Err(self.failed("error calling PositionerHardwareStatusGet.", false));
+        };
+        distance = referencing_distance(distance, initial_hw);
+
+        // Halve the velocity so the user can intervene before an overrun.
+        let slowed = {
+            let ctrl = self.lock_controller();
+            let sock = ctrl.poll_socket();
+            match sock.positioner_sgamma_parameters_get(&self.positioner_name) {
+                Err(_) => Err("Error performing PositionerSGammaParametersGet."),
+                Ok((vel, accel, min_jerk, max_jerk)) => sock
+                    .positioner_sgamma_parameters_set(
+                        &self.positioner_name,
+                        vel / 2.0,
+                        accel,
+                        min_jerk,
+                        max_jerk,
+                    )
+                    .map_err(|_| "Error performing PositionerSGammaParametersSet."),
+            }
+        };
+        if let Err(message) = slowed {
+            return Err(self.failed(message, true));
+        }
+        thread::sleep(XPS_REFERENCING_SETTLE);
+
+        // Move toward the home switch (move socket).
+        if self
+            .move_sock
+            .group_move_relative(&self.positioner_name, distance)
+            .is_err()
+        {
+            return Err(self.failed("Error performing GroupMoveRelative.", true));
+        }
+        thread::sleep(XPS_REFERENCING_POLL);
+
+        // Must be moving (status 44) to begin the switch-crossing wait.
+        self.refresh_group_status(&mut group_status);
+        if group_status != 44 {
+            return Err(self.failed("Error performing GroupMoveRelative.", true));
+        }
+        // Wait until the hardware status flips (crossed the switch), aborting
+        // if the move stops for any other reason.
+        let mut hardware_status = 0;
+        loop {
+            thread::sleep(XPS_REFERENCING_POLL);
+            self.refresh_hardware_status(&mut hardware_status);
+            if hardware_status != initial_hw {
+                break;
+            }
+            self.refresh_group_status(&mut group_status);
+            if group_status != 44 {
+                // Move finished for some other reason.
+                return Err(self.failed("Error performing GroupMoveRelative.", true));
+            }
+        }
+        // Reached the switch: abort the move (poll socket, as C does).
+        if self
+            .lock_controller()
+            .poll_socket()
+            .group_move_abort(&self.group_name)
+            .is_err()
+        {
+            return Err(self.failed("Error performing GroupMoveAbort.", true));
+        }
+        Ok(())
+    }
+
+    fn lock_controller(&self) -> MutexGuard<'_, XpsController> {
+        self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// C `GroupStatusGet(pollSocket_, groupName_, &groupStatus)` with its
+    /// status ignored: a failed call leaves `group_status` as it was.
+    fn refresh_group_status(&self, group_status: &mut i32) {
+        if let Ok(status) = self
+            .lock_controller()
+            .poll_socket()
+            .group_status_get(&self.group_name)
+        {
+            *group_status = status;
+        }
+    }
+
+    /// `PositionerHardwareStatusGet` into an out-parameter.
+    fn refresh_hardware_status(&self, hardware_status: &mut i32) {
+        if let Ok(status) = self
+            .lock_controller()
+            .poll_socket()
+            .positioner_hardware_status_get(&self.positioner_name)
+        {
+            *hardware_status = status;
+        }
+    }
 
     /// C `doMoveToHome`'s failure exit: print, then `GroupKill` on the move
     /// socket when C issues one.
-    fn move_to_home_failed(&self, message: &str, kill: bool) -> AsynError {
-        self.error("XPSAxis::doMoveToHome", format_args!("{message}\n"));
+    fn failed(&self, message: &str, kill: bool) -> AsynError {
+        trace_error(
+            &MotorTrace::new(&self.port, self.axis_no),
+            "XPSAxis::doMoveToHome",
+            format_args!("{message}\n"),
+        );
         if kill {
             let _ = self.move_sock.group_kill(&self.group_name);
         }
@@ -915,154 +1053,20 @@ impl AsynMotor for XpsAxis {
         )
     }
 
-    fn move_to_home(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        // Port of XPSAxis::doMoveToHome. The trait `position` is the referencing
-        // move distance (C getReferencingModeMove); zero means "not enabled".
-        // C computes velocity/2 from SGamma and ignores the passed vel/accel.
-        //
-        // Runs synchronously. C uses a dedicated background thread; here the
-        // controller lock is released between every RPC and during sleeps, so
-        // sibling axes keep polling and only this axis's own command task
-        // blocks while homing. DEVIATION: C's final wait loop is unbounded
-        // (safe on its own thread); we cap it (below) so a home switch that is
-        // never reached cannot hang the async worker forever.
-        if position == 0.0 {
-            let message = format!(
-                "This function has not been enabled for axis {}",
-                self.axis_no()
-            );
-            return Err(self.move_to_home_failed(&message, false));
-        }
-        let mut distance = position * self.step_size;
-
-        // C ignores the status of every call here but GroupInitialize and the
-        // ones it prints for; a failed read leaves C's out-parameter unchanged.
-        let mut group_status = 0;
-        // A Ready group (10..=18) refuses the sequence; kill it (move socket).
-        self.refresh_group_status(&mut group_status);
-        if (10..=18).contains(&group_status) {
-            let _ = self.move_sock.group_kill(&self.group_name);
-        }
-        thread::sleep(XPS_REFERENCING_SETTLE);
-        let initialized = {
-            let ctrl = self.lock_controller();
-            ctrl.poll_socket().group_initialize(&self.group_name)
+    /// C `XPSAxis::doMoveToHome`, which the controller's moveToHome thread
+    /// runs (XPSAxis.cpp:1607-1753).
+    fn move_to_home_task(&mut self, referencing_mode_move: i32) -> Option<MoveToHomeTask> {
+        let home = MoveToHome {
+            controller: self.controller.clone(),
+            move_sock: self.move_sock.clone(),
+            positioner_name: self.positioner_name.clone(),
+            group_name: self.group_name.clone(),
+            port: self.port().to_owned(),
+            axis_no: self.axis_no(),
         };
-        if initialized.is_err() {
-            return Err(self.move_to_home_failed("error calling GroupInitialize", false));
-        }
-        thread::sleep(XPS_REFERENCING_SETTLE);
-        let _ = self.move_sock.group_referencing_start(&self.group_name);
-        thread::sleep(XPS_REFERENCING_SETTLE);
-        let _ = self.move_sock.group_referencing_stop(&self.group_name);
-        thread::sleep(XPS_REFERENCING_SETTLE);
-
-        // Must now be in referencing mode (status 11).
-        self.refresh_group_status(&mut group_status);
-        if group_status != XPS_STATUS_HOMING_DONE {
-            return Err(
-                self.move_to_home_failed("error putting axis into referencing mode.", false)
-            );
-        }
-        // Flag referencing for the whole group (poll suppresses home/homed).
-        {
-            let mut ctrl = self.lock_controller();
-            ctrl.set_group_referencing(&self.group_name, true);
-        }
-
-        // Pick the search direction from which side of the home switch we start.
-        let initial_hw = {
-            let ctrl = self.lock_controller();
-            ctrl.poll_socket()
-                .positioner_hardware_status_get(&self.positioner_name)
-        };
-        let Ok(initial_hw) = initial_hw else {
-            return Err(
-                self.move_to_home_failed("error calling PositionerHardwareStatusGet.", false)
-            );
-        };
-        distance = referencing_distance(distance, initial_hw);
-
-        // Halve the velocity so the user can intervene before an overrun.
-        let slowed = {
-            let ctrl = self.lock_controller();
-            let sock = ctrl.poll_socket();
-            match sock.positioner_sgamma_parameters_get(&self.positioner_name) {
-                Err(_) => Err("Error performing PositionerSGammaParametersGet."),
-                Ok((vel, accel, min_jerk, max_jerk)) => sock
-                    .positioner_sgamma_parameters_set(
-                        &self.positioner_name,
-                        vel / 2.0,
-                        accel,
-                        min_jerk,
-                        max_jerk,
-                    )
-                    .map_err(|_| "Error performing PositionerSGammaParametersSet."),
-            }
-        };
-        if let Err(message) = slowed {
-            return Err(self.move_to_home_failed(message, true));
-        }
-        thread::sleep(XPS_REFERENCING_SETTLE);
-
-        // Move toward the home switch (move socket).
-        if self
-            .move_sock
-            .group_move_relative(&self.positioner_name, distance)
-            .is_err()
-        {
-            return Err(self.move_to_home_failed("Error performing GroupMoveRelative.", true));
-        }
-        thread::sleep(XPS_REFERENCING_POLL);
-
-        // Must be moving (status 44) to begin the switch-crossing wait.
-        self.refresh_group_status(&mut group_status);
-        if group_status != 44 {
-            return Err(self.move_to_home_failed("Error performing GroupMoveRelative.", true));
-        }
-        // Wait until the hardware status flips (crossed the switch), aborting
-        // if the move stops for any other reason. Bounded (see DEVIATION above).
-        let mut hardware_status = 0;
-        let mut polls = 0;
-        loop {
-            thread::sleep(XPS_REFERENCING_POLL);
-            self.refresh_hardware_status(&mut hardware_status);
-            if hardware_status != initial_hw {
-                break;
-            }
-            self.refresh_group_status(&mut group_status);
-            if group_status != 44 {
-                // Move finished for some other reason.
-                return Err(self.move_to_home_failed("Error performing GroupMoveRelative.", true));
-            }
-            polls += 1;
-            if polls >= XPS_REFERENCING_MAX_POLLS {
-                let _ = self.move_sock.group_kill(&self.group_name);
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!(
-                        "XPS move-to-home for {} timed out before reaching home",
-                        self.group_name
-                    ),
-                });
-            }
-        }
-        // Reached the switch: abort the move (poll socket, as C does).
-        let aborted = {
-            let ctrl = self.lock_controller();
-            ctrl.poll_socket().group_move_abort(&self.group_name)
-        };
-        if aborted.is_err() {
-            return Err(self.move_to_home_failed("Error performing GroupMoveAbort.", true));
-        }
-        Ok(())
+        Some(Box::new(move |under_lock: &dyn Fn(PortSets)| {
+            home.run(referencing_mode_move, under_lock)
+        }))
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -1515,6 +1519,45 @@ mod tests {
         }
     }
 
+    /// In referencing mode C clears homed and home under the controller lock
+    /// (XPSAxis.cpp:1670-1674), and moves the enabled distance unscaled
+    /// toward the switch (:1683-1685, :1712-1713).
+    #[test]
+    fn move_to_home_clears_homed_and_moves_the_enabled_distance() {
+        use epics_rs::asyn::interfaces::motor::PortSet;
+        let (mut axes, line) = fake_line_axes("xps_mth_homed", "MOTOR_T", "", false, &["G1.P1"]);
+        let mut axis = axes.remove(0);
+        axis.step_size = 0.5;
+        *line.group_status.lock().unwrap() = 11;
+        line.log.lock().unwrap().clear();
+        let posted = Mutex::new(Vec::new());
+        let task = axis.move_to_home_task(5).unwrap();
+        // Group status stays 11, not 44: the move is refused after it is sent.
+        assert!(task(&|sets: PortSets| posted.lock().unwrap().extend(sets)).is_err());
+        let posted: Vec<_> = posted
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .map(|set| match set {
+                PortSet::Status { addr, field } => (addr, field),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            posted,
+            [
+                (0, StatusWrite::Homed(false)),
+                (0, StatusWrite::HomeSignal(false))
+            ]
+        );
+        let log = line.log.lock().unwrap();
+        assert!(
+            log.iter()
+                .any(|c| c.starts_with("GroupMoveRelative (G1.P1,-5")),
+            "{log:?}"
+        );
+    }
+
     /// C doMoveToHome ignores GroupKill and GroupReferencingStart/Stop
     /// (XPSAxis.cpp:1633-1652); the status-11 check is what refuses.
     #[test]
@@ -1525,10 +1568,10 @@ mod tests {
             ("xps_mth_status", "GroupStatusGet"),
         ] {
             let (mut axis, fail, log) = fake_axis(port, "");
-            let user = AsynUser::new(0);
             *fail.lock().unwrap() = call;
             log.lock().unwrap().clear();
-            assert!(axis.move_to_home(&user, 1.0, 0.0, 1.0, 1.0).is_err());
+            let task = axis.move_to_home_task(1).unwrap();
+            assert!(task(&|_| ()).is_err());
             let log = log.lock().unwrap();
             for sent in [
                 "GroupInitialize",
