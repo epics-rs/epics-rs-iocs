@@ -151,7 +151,7 @@ impl CtrParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::asyn::port::PortFlags;
+    use epics_rs::asyn::port::{InterfaceMask, PortFlags};
 
     #[test]
     fn the_mca_params_are_c_s_table() {

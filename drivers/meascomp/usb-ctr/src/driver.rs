@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::asyn_record::PortClaim;
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
