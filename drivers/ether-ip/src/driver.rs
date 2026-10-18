@@ -515,7 +515,6 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
                     *conn = Some(c);
                     disconnect(plc, conn);
                     crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
-                    plc.stats.lock().plc_errors += 1;
                     return Some(timeout());
                 }
                 plc.connected.store(true, Ordering::Relaxed);
@@ -1242,6 +1241,63 @@ mod registry_tests {
         assert!(scan_pass(&plc, &mut None).is_some());
         assert_eq!(tag.data.lock().valid_data_size, 4);
         assert!(rx.try_recv().is_err(), "no record was processed");
+    }
+
+    /// A PLC on `ip`:ETHERIP_PORT that registers a session and then fails
+    /// every request, so the scan-list completion reads no tag.
+    #[cfg(target_os = "linux")]
+    fn plc_that_reads_nothing(ip: &str) -> std::thread::JoinHandle<()> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind((ip, encap::ETHERIP_PORT)).unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut header = [0u8; encap::HEADER_SIZE];
+            while s.read_exact(&mut header).is_ok() {
+                let length = u16::from_le_bytes([header[2], header[3]]) as usize;
+                let mut body = vec![0u8; length];
+                if s.read_exact(&mut body).is_err() {
+                    break;
+                }
+                let command = u16::from_le_bytes([header[0], header[1]]);
+                let tid = encap::TransactionId(header[12..20].try_into().unwrap());
+                let (status, data) = match command {
+                    encap::EC_LIST_SERVICES => {
+                        let mut d = vec![1, 0, 0x00, 0x01, 20, 0, 1, 0, 0x20, 0];
+                        d.extend_from_slice(b"Communications\0\0");
+                        (0, d)
+                    }
+                    encap::EC_REGISTER_SESSION => (0, vec![1, 0, 0, 0]),
+                    encap::EC_UNREGISTER_SESSION => break,
+                    _ => (1, Vec::new()),
+                };
+                let mut reply = Vec::new();
+                encap::encode_header(&mut reply, command, data.len() as u16, 1, tid, 0);
+                reply[8..12].copy_from_slice(&u32::to_le_bytes(status));
+                reply.extend_from_slice(&data);
+                if s.write_all(&reply).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// drvEtherIP.c:503-510: a scan-list completion failure runs
+    /// disconnect_PLC, which invalidates the tags, and counts no PLC error;
+    /// only a transfer failure does (:887).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_completion_failure_invalidates_the_tags_and_counts_nothing() {
+        let ip = format!("127.{}.{}.7", std::process::id() % 250 + 1, line!() % 250);
+        let server = plc_that_reads_nothing(&ip);
+        let plc = Arc::new(Plc::new("nocomplete", &ip, 0));
+        let tag = plc.add_tag(1.0, "T", 1).unwrap();
+        tag.data.lock().is_writing = true;
+        let mut conn = None;
+        assert!(scan_pass(&plc, &mut conn).is_some());
+        assert!(conn.is_none(), "the session is closed");
+        assert!(!tag.data.lock().is_writing, "invalidate_PLC_tags ran");
+        assert_eq!(plc.stats.lock().plc_errors, 0);
+        server.join().unwrap();
     }
 
     /// drvEtherIP.c:1234: a redefinition keeps the PLC and its place in
