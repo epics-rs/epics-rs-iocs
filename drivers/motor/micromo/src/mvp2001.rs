@@ -273,7 +273,7 @@ impl Mvp2001Axis {
             status: MotorStatus {
                 gain_support: true,
                 has_encoder: true,
-                ..MotorStatus::default()
+                ..motor_common::status_before_poll()
             },
         }
     }
@@ -515,6 +515,8 @@ mod tests {
         assert!(axis.poll(&AsynUser::default()).is_err());
         let left = axis.take_failed_poll_status().expect("the status C left");
         assert!(left.gain_support && left.has_encoder, "{left:?}");
+        // C's status_ starts at 0; only a good poll sets Done (:467).
+        assert!(!left.done, "{left:?}");
     }
 
     #[test]
