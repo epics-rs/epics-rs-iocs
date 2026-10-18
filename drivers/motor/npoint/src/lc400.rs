@@ -865,8 +865,10 @@ mod tests {
 
     use epics_rs::asyn::interfaces::motor::PortSet;
     use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::port::{PortDriver, PortFlags};
     use epics_rs::asyn::port_handle::PortHandle;
-    use epics_rs::asyn::registry::open_owner;
+    use epics_rs::asyn::registry::{claim_port, open_owner};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
     use epics_rs::asyn::trace::TraceFile;
     use epics_rs::motor::builder::MotorBuilder;
     use epics_rs::motor::controller_port::index;
@@ -954,6 +956,121 @@ mod tests {
                 p.d_gain
             ]
         );
+    }
+
+    /// An LC400 register map: words written by `A2`/`A3` read back by
+    /// `A0`/`A4`, and a table played (`WAV_ACTIVE` 1) starts at index 1.
+    struct Lc400Sim {
+        base: PortDriverBase,
+        words: std::collections::HashMap<u32, i32>,
+        next: u32,
+        reply: std::collections::VecDeque<u8>,
+    }
+
+    impl PortDriver for Lc400Sim {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let word = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+            let mut at = 0;
+            while at < data.len() {
+                match data[at] {
+                    0xA0 => {
+                        let addr = word(at + 1);
+                        let value = self.words.get(&addr).copied().unwrap_or_default();
+                        self.reply.extend(&data[at..at + 5]);
+                        self.reply.extend(value.to_le_bytes());
+                        self.reply.push_back(EOS);
+                        at += 6;
+                    }
+                    0xA2 => {
+                        let (addr, value) = (word(at + 1), word(at + 5) as i32);
+                        self.words.insert(addr, value);
+                        if addr == base_address(0).unwrap() + WAV_ACTIVE && value == 1 {
+                            self.words.insert(addr - WAV_ACTIVE + WAV_INDEX, 1);
+                        }
+                        self.next = addr + 4;
+                        at += 10;
+                    }
+                    0xA3 => {
+                        self.words.insert(self.next, word(at + 1) as i32);
+                        self.next += 4;
+                        at += 6;
+                    }
+                    0xA4 => {
+                        let (addr, count) = (word(at + 1), word(at + 5));
+                        self.reply.extend(&data[at..at + 5]);
+                        for i in 0..count {
+                            let value = self.words.get(&(addr + 4 * i)).copied();
+                            self.reply.extend(value.unwrap_or_default().to_le_bytes());
+                        }
+                        self.reply.push_back(EOS);
+                        at += 10;
+                    }
+                    other => panic!("frame {other:#x}"),
+                }
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let n = self.reply.len().min(buf.len());
+            for (slot, byte) in buf.iter_mut().zip(self.reply.drain(..n)) {
+                *slot = byte;
+            }
+            Ok(n)
+        }
+    }
+
+    /// LC400MotorDriver.cpp:779-795 move: the wavetable readbacks, on the
+    /// axis's own address in the order C sets them.
+    #[test]
+    fn a_move_s_wavetable_readbacks_go_out_on_the_axis_in_c_s_order() {
+        let name = "lc400MoveSim";
+        let claim = claim_port(name).unwrap();
+        let sim = Lc400Sim {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            words: Default::default(),
+            next: 0,
+            reply: Default::default(),
+        };
+        let (rt, _jh) = create_port_runtime(&claim, sim, RuntimeConfig::default()).unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(Some(io), 1)));
+        let params = Lc400ControllerParams::new(controller.clone(), 0.0, 0.0);
+        let _port =
+            register_controller_port(&open_owner(), "lc400MoveSetsPort", 1, params).unwrap();
+        let p = lock(&controller).params.unwrap();
+        lock(&controller).axes[0].max_pts = 8;
+        let mut axis = Lc400Axis::new(controller, 0);
+        axis.move_absolute(&AsynUser::new(0), 1000.0, 0.0, 1000.0, 4000.0)
+            .unwrap();
+        let sets: Vec<(usize, i32)> = axis
+            .take_port_sets()
+            .into_iter()
+            .map(|set| match set {
+                PortSet::Axis {
+                    reason,
+                    value: ParamValue::Int32(value),
+                    ..
+                } => (reason, value),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let table = gen_trapezoid(0.0, 1000.0, 1000.0, 4000.0, 8);
+        let expected = [
+            (p.w_active, 0),
+            (p.w_enable, 2),
+            (p.w_index, 0),
+            (p.w_delay, table.cycle_count as i32),
+            (p.w_end_idx, table.points.len() as i32 - 1),
+            (p.w_iter, 1),
+            (p.w_iter_cts, 1),
+        ];
+        assert_eq!(sets, expected);
     }
 
     /// C dereferences the null axis of an address with no axis
