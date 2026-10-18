@@ -822,6 +822,10 @@ struct AxisState {
     /// The controller-parallel poll's answers for this axis this pass, which
     /// its own poll parses (C parses them in the controller poll).
     answers: Option<Vec<String>>,
+    /// The axis has been polled. C's hook waits on the controller poll
+    /// alone, which polls an axis that exists for it; an rs axis joins the
+    /// poller only once phytronCreateAxis returns, maybe past that pass.
+    read_once: bool,
 }
 
 /// A Phytron controller endpoint owning the asyn octet handle. Shared by all of
@@ -851,6 +855,8 @@ pub struct PhytronController {
     encoder_ratios: HashMap<String, f64>,
     /// The AXIS_STATUS reason, which the poll sets.
     axis_status: Option<usize>,
+    /// C `do_initial_readout_`, cleared by the first controller poll.
+    do_initial_readout: bool,
 }
 
 impl PhytronController {
@@ -869,7 +875,14 @@ impl PhytronController {
             status_reset_time: 0.0,
             encoder_ratios: HashMap::new(),
             axis_status: None,
+            do_initial_readout: true,
         }
+    }
+
+    /// What C `epicsInithookFunction` waits for (phytronAxisMotor.cpp:
+    /// 1014-1021): the controller and each of its axes read once.
+    pub fn did_initial_readout(&self) -> bool {
+        !self.do_initial_readout && self.axes.iter().all(|a| a.read_once)
     }
 
     /// Let each axis poll set AXIS_STATUS, reason `reason`.
@@ -897,6 +910,7 @@ impl PhytronController {
     /// reads the `SUI` limit-switch word once for every axis's poll to
     /// parse; a phyMOTION reads every controller-parallel axis on one line.
     pub fn poll(&mut self) {
+        self.do_initial_readout = false;
         let mut commands = Vec::new();
         let mut todo = Vec::new();
         for a in &mut self.axes {
@@ -1234,6 +1248,7 @@ impl PhytronAxis {
             status_reset_time: f32::INFINITY,
             last_status: 0,
             answers: None,
+            read_once: false,
         });
         drop(ctrl);
         Ok(Self {
@@ -1594,6 +1609,9 @@ impl AsynMotor for PhytronAxis {
                 let read = ctrl.multi_command(commands, false, method == PollMethod::Serial);
                 ctrl.check_axis(self.axis_no, "poll", "Reading axis", read)
             };
+            if let Some(a) = ctrl.axis_mut(self.axis_no) {
+                a.read_once = true;
+            }
             (method, answers)
         };
         self.parse_answer(&answers?, method)

@@ -15,6 +15,7 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::DrvUserRequest;
+use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::connect::connect_controller;
@@ -196,7 +197,17 @@ fn register_controller(
     });
     // C startPoller, phytronAxisMotor.cpp:240
     poller.start(&name, moving_poll_ms, idle_poll_ms, 5);
-    registry_lock(registry).insert(
+    let mut controllers = registry_lock(registry);
+    // C registers its hook with the first controller (:186-187).
+    if controllers.is_empty() {
+        let registry = registry.clone();
+        init_hook_register(Arc::new(move |state| {
+            if state == InitHookState::AfterInitDevSup {
+                wait_for_initial_readout(&registry);
+            }
+        }));
+    }
+    controllers.insert(
         name.clone(),
         ControllerReg {
             controller,
@@ -204,6 +215,25 @@ fn register_controller(
         },
     );
     Ok(CommandOutcome::Continue)
+}
+
+/// C `phytronController::epicsInithookFunction` (phytronAxisMotor.cpp:
+/// 1003-1024): before motorRecord init_record pass 1, wait until every
+/// controller has been read once. The shell thread waits; the pollers run.
+fn wait_for_initial_readout(registry: &Registry) {
+    let controllers: Vec<_> = registry_lock(registry)
+        .values()
+        .map(|reg| reg.controller.clone())
+        .collect();
+    for controller in controllers {
+        while !controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .did_initial_readout()
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 /// `phytronCreateAxis(controllerName, module, index)`, printing C's error lines.
