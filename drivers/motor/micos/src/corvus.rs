@@ -186,7 +186,7 @@ impl CorvusAxis {
             members: Arc::new(members),
             num_axes,
             trace: MotorTrace::new(port, axis_no as i32),
-            last_status: MotorStatus::default(),
+            last_status: motor_common::status_before_poll(),
             high_limit: 0.0,
             low_limit: 0.0,
         })
@@ -420,6 +420,23 @@ impl CorvusAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C's status_ starts at 0 and the constructor sets no status bit; only
+    /// a good poll sets Done (SMCcorvusDriver.cpp:431).
+    #[test]
+    fn an_unanswering_controller_s_axis_polls_problem_without_done() {
+        use epics_rs::asyn::interfaces::InterfaceType;
+        let (handle, _) = SyncIOHandle::connect_port(
+            "CORVUS_DEAD",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let controller = Arc::new(Mutex::new(CorvusController::new(handle, 1)));
+        let mut axis = CorvusAxis::new(controller, 0, "").unwrap();
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert!(status.problem && !status.done, "{status:?}");
+    }
 
     /// C `SMCcorvusAxis::moveVelocity`'s FLOW line, on the axis's
     /// `pasynUser_` (SMCcorvusDriver.cpp:304-306).
