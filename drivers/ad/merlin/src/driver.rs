@@ -112,7 +112,6 @@ impl MerlinDetector {
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, det_type.manufacturer())?;
         base.set_string_param(ad.params.base.model, 0, det_type.model())?;
-        base.set_string_param(ad.params.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
         base.set_string_param(params.select_gui, 0, det_type.gui())?;
 
         base.set_int32_param(ad.params.max_size_x, 0, max_size_x)?;
@@ -844,6 +843,19 @@ mod tests {
         let p = rt.ad_params;
         sync.write_int32(p.num_images, 3).unwrap();
         assert_eq!(sync.read_int32(p.num_images).unwrap(), 3);
+    }
+
+    /// merlinDetector.cpp never sets NDDriverVersion, so it keeps the ADCore
+    /// version asynNDArrayDriver gave it (asynNDArrayDriver.cpp:966).
+    #[test]
+    fn the_driver_version_is_left_to_adcore() {
+        let det = detector("MERLIN_VERSION");
+        let base = &det.ad.port_base;
+        let p = det.ad.params.base;
+        assert_eq!(
+            base.get_string_param(p.driver_version, 0).unwrap(),
+            base.get_string_param(p.ad_core_version, 0).unwrap()
+        );
     }
 
     /// The constructor allocates the flat-field buffer from the driver's pool
