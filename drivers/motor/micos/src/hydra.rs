@@ -162,7 +162,7 @@ impl HydraAxis {
             trace: MotorTrace::new(port, axis_no as i32),
             last_status: MotorStatus {
                 gain_support: true,
-                ..motor_common::status_before_poll()
+                ..MotorStatus::default()
             },
         }
     }

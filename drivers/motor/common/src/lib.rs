@@ -88,16 +88,6 @@ pub fn register_driver_report(
     register_driver_support(name, Arc::new(Drvet(report)));
 }
 
-/// C `asynMotorAxis::status_` before any poll: every bit 0 (asynMotorAxis.cpp
-/// :46), where `MotorStatus::default` has `done` set. A driver's own copy
-/// of the status params starts here.
-pub fn status_before_poll() -> epics_rs::asyn::interfaces::motor::MotorStatus {
-    epics_rs::asyn::interfaces::motor::MotorStatus {
-        done: false,
-        ..Default::default()
-    }
-}
-
 /// The trace user of an axis a C asyn driver serves: its port and address.
 pub fn asyn_user(port: &str, addr: i32) -> TraceUser {
     TraceUser::Asyn {

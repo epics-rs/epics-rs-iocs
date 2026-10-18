@@ -186,7 +186,7 @@ impl CorvusAxis {
             members: Arc::new(members),
             num_axes,
             trace: MotorTrace::new(port, axis_no as i32),
-            last_status: motor_common::status_before_poll(),
+            last_status: MotorStatus::default(),
             high_limit: 0.0,
             low_limit: 0.0,
         })

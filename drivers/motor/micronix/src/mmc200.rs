@@ -258,7 +258,7 @@ impl Mmc200Axis {
                 max_velocity: 0.0,
                 resolution: 1.0,
                 ignore_limits,
-                last_status: motor_common::status_before_poll(),
+                last_status: MotorStatus::default(),
                 probed: Arc::new(probed),
             };
         }
@@ -304,7 +304,7 @@ impl Mmc200Axis {
                 problem: error,
                 gain_support: true,
                 has_encoder: true,
-                ..motor_common::status_before_poll()
+                ..MotorStatus::default()
             },
             probed: Arc::new(probed),
         }
@@ -517,7 +517,7 @@ mod tests {
         let mut axis = Mmc200Axis::new(controller, 0, false);
         assert_eq!(axis.model, MODEL_ETH);
         let status = axis.poll(&AsynUser::default()).unwrap();
-        assert_eq!(status, motor_common::status_before_poll());
+        assert_eq!(status, MotorStatus::default());
     }
 
     /// C sets GAIN_SUPPORT and EA_PRESENT once, in the constructor
