@@ -87,7 +87,7 @@ impl PilatusDriver {
         base.set_int32_param(params.base.array_size_x, 0, max_size_x)?;
         base.set_int32_param(params.base.array_size_y, 0, max_size_y)?;
         base.set_int32_param(params.base.array_size, 0, 0)?;
-        base.set_int32_param(params.base.data_type, 0, NDDataType::UInt32 as i32)?;
+        base.set_int32_param(params.base.data_type, 0, NDDataType::Int32 as i32)?;
         base.set_int32_param(params.image_mode, 0, ImageMode::Continuous as i32)?;
         base.set_int32_param(params.trigger_mode, 0, TriggerMode::Internal as i32)?;
 
@@ -524,6 +524,25 @@ pub fn create_pilatus_detector(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// pilatusDetector.cpp:1796 seeds NDDataType NDInt32, the type of
+    /// every array the driver reads.
+    #[test]
+    fn data_type_starts_at_int32() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let links = DriverLinks {
+            cmd_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        let det = PilatusDriver::new("PILATUS_DATA_TYPE", 8, 8, 0, links).unwrap();
+        let data_type = det.ad.params.base.data_type;
+        assert_eq!(
+            det.ad.port_base.get_int32_param(data_type, 0).unwrap(),
+            NDDataType::Int32 as i32
+        );
+    }
 
     #[test]
     fn a_base_class_write_reaches_addriver() {
