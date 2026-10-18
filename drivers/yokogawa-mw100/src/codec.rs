@@ -6,7 +6,7 @@
 //! which indexes from the frame start).
 
 use epics_libcom_rs::cfmt::CFloat;
-use epics_rs::base::calc::engine::strtod::strtod;
+use epics_rs::base::runtime::stdlib::strtod;
 
 // ---------------------------------------------------------------------
 // Command builders

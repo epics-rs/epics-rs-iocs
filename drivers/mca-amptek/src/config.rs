@@ -8,7 +8,7 @@
 use std::fmt::Write as _;
 
 use epics_rs::asyn::drivers::option_parse::sscanf_int;
-use epics_rs::base::calc::engine::strtod::strtod;
+use epics_rs::base::runtime::stdlib::strtod;
 
 use crate::status::DppType;
 

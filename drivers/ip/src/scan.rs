@@ -1,7 +1,7 @@
 //! C `sscanf` over a device reply, one conversion at a time, for the formats
 //! `devTPG261.c` and `devTelevac.c` scan.
 
-use epics_rs::base::calc::engine::strtod::strtod;
+use epics_rs::base::runtime::stdlib::strtod;
 
 /// A failed conversion stops the scan and leaves the rest unassigned.
 pub struct Scan<'a> {

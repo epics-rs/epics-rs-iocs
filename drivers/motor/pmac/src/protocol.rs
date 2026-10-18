@@ -6,7 +6,7 @@
 //! `pmacAsynCoord.c`. Keeping the parsers here — free functions over `&str` —
 //! is what makes the wire formats testable without a controller.
 
-use epics_rs::base::calc::engine::strtod::strtod;
+use epics_rs::base::runtime::stdlib::strtod;
 
 /// Motor status word 1 (`#n ?`, first 6 hex digits).
 pub const STATUS1_HOMING: u32 = 1 << 10;

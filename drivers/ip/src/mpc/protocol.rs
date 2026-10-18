@@ -5,7 +5,7 @@
 //! constant `00` checksum C sends ("the device is happy with just 00"). The
 //! `<CR>` on both directions is the octet port's EOS.
 
-use epics_rs::base::calc::engine::strtod::strtod;
+use epics_rs::base::runtime::stdlib::strtod;
 
 /// `devMPC.h`'s command numbers, by `mpcCommands[]`'s names (`devMPC.c:90-126`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
