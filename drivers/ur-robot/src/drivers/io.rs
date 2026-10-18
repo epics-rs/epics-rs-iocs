@@ -65,7 +65,7 @@ impl IoDriver {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let params = IoParams::create(&mut base)?;
         let mut me = Self {

@@ -359,7 +359,7 @@ impl FastSweepDriver {
                 destructible: false,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let reasons = McaReason::create_params(&mut base)?;
         let max_channels_idx = base.create_param(FAST_SWEEP_MAX_CHANNELS, ParamType::Int32)?;

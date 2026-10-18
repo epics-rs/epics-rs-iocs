@@ -126,7 +126,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let p = SpecsParams::create(&mut base).unwrap();
         assert_eq!(base.find_param("SPECS_CONNECT"), Some(p.connect));

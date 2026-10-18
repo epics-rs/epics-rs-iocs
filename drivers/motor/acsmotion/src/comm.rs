@@ -456,7 +456,7 @@ pub fn register_comm_port(
             destructible: true,
         },
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     let claim = claim_port(name).map_err(|e| format!("{name}: {e}"))?;
     let (runtime, _actor) = create_port_runtime(&claim, CommPort(base), RuntimeConfig::default())

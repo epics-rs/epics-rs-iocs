@@ -213,7 +213,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let claim = claim_port(name).unwrap();
         let (rt, _actor) =

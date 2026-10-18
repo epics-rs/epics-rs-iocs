@@ -841,7 +841,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             pending: pending.to_vec(),
             log: log.clone(),

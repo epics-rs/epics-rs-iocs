@@ -1106,7 +1106,7 @@ impl AdsPortDriver {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
 
         // Reason 0 — the ASCII command channel (C constructor, :372).
@@ -2212,6 +2212,29 @@ mod tests {
         assert_eq!(p.plc_size, 8);
         assert_eq!(p.param_type, ParamType::Float64);
         assert!(p.info.has_input);
+    }
+
+    /// adsAsynPortDriver.cpp:289-292 names the array interfaces as interrupt
+    /// sources, and the port refuses a client outside its mask
+    /// (`getInterruptPvt`, asynManager.c:2492-2497).
+    #[test]
+    fn an_array_interrupt_client_registers() {
+        let d = driver();
+        for iface in [InterfaceType::Float64Array, InterfaceType::Int32Array] {
+            let refused = d
+                .base()
+                .interrupts
+                .register_interrupt_user(
+                    InterruptFilter {
+                        iface: Some(iface),
+                        ..Default::default()
+                    },
+                    0,
+                )
+                .err()
+                .map(|e| e.message_display().to_string());
+            assert_eq!(refused, None, "{iface:?}");
+        }
     }
 
     #[test]

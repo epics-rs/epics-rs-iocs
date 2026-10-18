@@ -97,7 +97,7 @@ pub fn connect(
             destructible: true,
         },
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     let data_reason = base.create_param(DEMO_SOURCE_DATA, ParamType::Int32Array)?;
     let period_reason = base.create_param(DEMO_SOURCE_SCAN_PERIOD, ParamType::Float64)?;

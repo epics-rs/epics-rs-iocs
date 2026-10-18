@@ -690,7 +690,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.install_octet_interpose(Box::new(PmacIpInterpose::new()));
         assert_eq!(base.exception_user_count(-1), 1);

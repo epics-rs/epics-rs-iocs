@@ -155,7 +155,7 @@ impl DashboardDriver {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let params = DashboardParams::create(&mut base)?;
 
@@ -543,7 +543,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let p = DashboardParams::create(&mut base).expect("params create");
 
@@ -587,7 +587,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let p = DashboardParams::create(&mut base).expect("params create");
 

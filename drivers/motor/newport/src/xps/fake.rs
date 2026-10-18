@@ -113,7 +113,7 @@ impl FakeLine {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             reply: None,
             fail: fail.clone(),

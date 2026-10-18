@@ -1241,7 +1241,7 @@ mod tests {
             1,
             epics_rs::asyn::port::PortFlags::default(),
             epics_rs::asyn::port::InterfaceMask::UNMIGRATED_ALL,
-            epics_rs::asyn::port::InterfaceMask::UNMIGRATED_ALL,
+            epics_rs::asyn::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let (rt, _jh) = epics_rs::asyn::runtime::create_port_runtime(
             &epics_rs::asyn::registry::claim_port(name).unwrap(),
@@ -1323,7 +1323,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             written: written.clone(),
             reply: Vec::new(),
@@ -1365,7 +1365,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             written: Arc::new(Mutex::new(Vec::new())),
             reply: Vec::new(),
@@ -1417,7 +1417,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             written: written.clone(),
         };
@@ -1521,7 +1521,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             partial: b"0,0",
         };
@@ -1550,7 +1550,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             written: Arc::new(Mutex::new(Vec::new())),
         };

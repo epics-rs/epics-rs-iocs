@@ -160,7 +160,7 @@ mod tests {
             MAX_MCS_COUNTERS,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let p = CtrParams::create(&mut base).unwrap();
         // drvUSBCTR.cpp's createParam order: MCA_START_ACQUIRE is the 29th.

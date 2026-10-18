@@ -170,7 +170,7 @@ pub fn line(name: &str) -> Arc<Mutex<Controller>> {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         ),
         controller: controller.clone(),
         reply: Vec::new(),

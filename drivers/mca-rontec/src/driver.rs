@@ -274,7 +274,7 @@ impl RontecDriver {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let reasons = McaReason::create_params(&mut base)?;
 
@@ -788,7 +788,7 @@ mod tests {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let serial_base = PortDriverBase::new(
             "TESTRONTECSERIAL",
@@ -799,7 +799,7 @@ mod tests {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let (serial_runtime, _serial_thread) = create_port_runtime(
             &PortRegistry::new().claim("TESTRONTECSERIAL").unwrap(),
@@ -954,7 +954,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 reply,
                 pending: Vec::new(),
@@ -1360,7 +1360,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.set_auto_connect(false);
         base.init_connected(false);
@@ -1399,7 +1399,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 reply: rontec_reply,
                 pending: Vec::new(),

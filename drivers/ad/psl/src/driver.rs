@@ -976,7 +976,7 @@ mod tests {
             1,
             Default::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.init_connected(true);
         let server = FakeServer {

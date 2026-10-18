@@ -166,7 +166,7 @@ mod tests {
                 2,
                 flags,
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             )),
             RuntimeConfig::default(),
         )

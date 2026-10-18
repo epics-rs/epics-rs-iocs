@@ -809,7 +809,7 @@ mod tests {
                 destructible: false,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         if let Some(addr) = down {
             base.set_auto_connect_addr(addr, false);

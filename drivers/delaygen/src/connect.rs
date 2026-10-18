@@ -99,7 +99,7 @@ pub(crate) fn mute_link(io: &str) -> OctetLink {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         )),
     )
 }
@@ -140,7 +140,7 @@ pub(crate) fn replying_link(io: &str, reply: &'static [u8]) -> OctetLink {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             reply,
         ),

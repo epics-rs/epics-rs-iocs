@@ -80,7 +80,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let (ad, _) = ADDriverParams::create(&mut base).unwrap();
         let ndsa = NdsaParams::create(&mut base).unwrap();

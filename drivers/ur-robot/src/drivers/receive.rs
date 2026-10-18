@@ -255,7 +255,7 @@ impl ReceiveDriver {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let params = ReceiveParams::create(&mut base)?;
 
@@ -888,7 +888,7 @@ mod tests {
             NUM_JOINTS,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let params = ReceiveParams::create(&mut base).expect("params create");
         let mut driver = ReceiveDriver {
@@ -922,7 +922,7 @@ mod tests {
             NUM_JOINTS,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let p = ReceiveParams::create(&mut base).expect("params create");
 
@@ -992,7 +992,7 @@ mod tests {
             NUM_JOINTS,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let p = ReceiveParams::create(&mut base).expect("params create");
 

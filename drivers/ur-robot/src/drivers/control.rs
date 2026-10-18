@@ -371,7 +371,7 @@ impl ControlDriver {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let params = ControlParams::create(&mut base)?;
 
@@ -1468,7 +1468,7 @@ mod tests {
             NUM_JOINTS,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let p = ControlParams::create(&mut base).expect("params create");
 
@@ -1513,7 +1513,7 @@ mod tests {
             NUM_JOINTS,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let p = ControlParams::create(&mut base).expect("params create");
 

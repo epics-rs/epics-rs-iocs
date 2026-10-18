@@ -236,7 +236,7 @@ pub fn config(
             destructible: true,
         },
         InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
     );
     let created = |e: AsynError| format!("{port}: {e}");
     let params = AuxParams {

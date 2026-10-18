@@ -257,7 +257,7 @@ impl ConfigDriver {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         for (name, sink) in SINK_NAMES {
             base.create_param(name, sink_param_type(*sink))?;

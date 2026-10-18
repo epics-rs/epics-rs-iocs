@@ -126,7 +126,7 @@ mod tests {
                 ..Default::default()
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let (nd, _) = NDArrayDriverParams::create(&mut base).unwrap();
         let sim = CSimParams::create(&mut base).unwrap();

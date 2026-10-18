@@ -253,7 +253,7 @@ pub(crate) mod fake {
             100,
             flags,
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         base.create_param(MODBUS_DATA, ParamType::Int32).unwrap();
         let read_reason = base.create_param(MODBUS_READ, ParamType::Int32).unwrap();

@@ -154,7 +154,7 @@ impl LineRig {
                 max_addr,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             sent: sent.clone(),
             addrs: addrs.clone(),

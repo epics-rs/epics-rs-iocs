@@ -493,7 +493,7 @@ mod tests {
                     1,
                     PortFlags::default(),
                     InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 sent: sent.clone(),
                 moving: moving.clone(),

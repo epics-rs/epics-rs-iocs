@@ -118,7 +118,7 @@ mod tests {
             1,
             PortFlags::default(),
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let (rt, _actor) =
             create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();

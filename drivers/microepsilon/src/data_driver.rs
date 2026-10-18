@@ -296,7 +296,7 @@ impl DataDriver {
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         let disp_reason = base.create_param("DispChan", ParamType::Float64)?;
         Ok(Self {
@@ -825,7 +825,7 @@ mod tests {
                 1,
                 PortFlags::default(),
                 InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
         };
         let claim = asyn_record::claim_port("dummy_rbk_for_test").unwrap();
