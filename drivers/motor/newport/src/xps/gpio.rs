@@ -438,15 +438,17 @@ mod tests {
         let seen: Arc<Mutex<Vec<String>>> = Arc::default();
         let on = |reason, addr, mask| {
             let seen = seen.clone();
-            port.interrupts().register_sync_callback(
-                InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(addr),
-                    uint32_mask: mask,
-                    ..Default::default()
-                },
-                move |v| seen.lock().unwrap().push(format!("{:?}", v.value)),
-            )
+            port.interrupts()
+                .register_sync_callback(
+                    InterruptFilter {
+                        reason: Some(reason),
+                        addr: Some(addr),
+                        uint32_mask: mask,
+                        ..Default::default()
+                    },
+                    move |v| seen.lock().unwrap().push(format!("{:?}", v.value)),
+                )
+                .unwrap()
         };
         let _bits = on(BINARY_INPUT, 1, Some(0x3));
         let _analog = on(ANALOG_INPUT, 2, None);

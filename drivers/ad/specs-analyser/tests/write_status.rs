@@ -379,7 +379,8 @@ fn a_write_posts_the_counter_for_each_exchange() {
         .runtime
         .port_handle()
         .interrupts()
-        .subscribe_async_filtered(filter, 16, 0);
+        .subscribe_async_filtered(filter, 16, 0)
+        .unwrap();
     fake.write_int32(turns, 9).unwrap();
     let mut posted = Vec::new();
     while let Ok(v) = posts.try_recv() {

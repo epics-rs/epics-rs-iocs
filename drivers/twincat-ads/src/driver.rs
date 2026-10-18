@@ -2224,15 +2224,19 @@ mod tests {
         );
 
         let (tx, rx) = mpsc::channel();
-        let _sub = d.shared.interrupts.register_sync_callback(
-            InterruptFilter {
-                reason: Some(reason),
-                ..Default::default()
-            },
-            move |iv| {
-                let _ = tx.send((iv.value.clone(), iv.iface, iv.alarm_severity));
-            },
-        );
+        let _sub = d
+            .shared
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(reason),
+                    ..Default::default()
+                },
+                move |iv| {
+                    let _ = tx.send((iv.value.clone(), iv.iface, iv.alarm_severity));
+                },
+            )
+            .unwrap();
 
         d.shared.publish(reason, &2.5f64.to_le_bytes(), 0);
 

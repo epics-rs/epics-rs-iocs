@@ -865,8 +865,7 @@ mod tests {
     fn a_push_of_an_unchanged_value_still_reaches_the_records() {
         let (mut driver, _keep_alive) = make_test_driver();
         // A record only sees a push once iocInit has opened the gate.
-        driver.base.interrupts =
-            epics_rs::asyn::interrupt::InterruptManager::owned_by(InterruptGate::opened());
+        driver.base.own_interrupts(InterruptGate::opened());
         let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
         for _ in 0..2 {
             driver.shared.lock().unwrap().pending_push = Some(PushUpdate {

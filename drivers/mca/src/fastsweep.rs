@@ -432,14 +432,18 @@ fn connect_input(
         trace_error(port, format_args!("error in drvUser for {data_drv_info}"));
         return (None, None);
     };
-    let data = input.handle.interrupts().register_interrupt_user(
-        InterruptFilter {
-            reason: Some(data_info.reason),
-            ..Default::default()
-        },
-        // Only the first `maxSignals` elements are read.
-        max_signals * std::mem::size_of::<i32>(),
-    );
+    let data = input
+        .handle
+        .interrupts()
+        .register_interrupt_user(
+            InterruptFilter {
+                reason: Some(data_info.reason),
+                ..Default::default()
+            },
+            // Only the first `maxSignals` elements are read.
+            max_signals * std::mem::size_of::<i32>(),
+        )
+        .ok();
 
     let interval_req = DrvUserRequest::new(interval_drv_info, 0).with_iface(InterfaceType::Float64);
     let Ok(interval_info) = input.handle.drv_user_create_blocking(&interval_req) else {
@@ -447,21 +451,25 @@ fn connect_input(
             port,
             format_args!("cannot connect to asynFloat64SyncIO for input {input_port_name}"),
         );
-        return (Some(data), None);
+        return (data, None);
     };
-    let interval = input.handle.interrupts().register_interrupt_user(
-        InterruptFilter {
-            reason: Some(interval_info.reason),
-            ..Default::default()
-        },
-        0,
-    );
+    let interval = input
+        .handle
+        .interrupts()
+        .register_interrupt_user(
+            InterruptFilter {
+                reason: Some(interval_info.reason),
+                ..Default::default()
+            },
+            0,
+        )
+        .ok();
     // C's one-time `pasynFloat64SyncIO->read` seed, status ignored
     // (`drvFastSweep.cpp:207`).
     if let Ok(seed) = input.handle.read_float64_blocking(interval_info.reason, 0) {
         shared.state.lock().unwrap().callback_interval = seed;
     }
-    (Some(data), Some(interval))
+    (data, interval)
 }
 
 /// Starts the data/interval publisher threads against `handle` -- the

@@ -680,19 +680,19 @@ mod tests {
         // `call_param_callbacks` is gated on the owning database's
         // `interruptAccept`. This test drives the write path with no
         // database, so the port gets an already-open gate.
-        drv.base_mut().interrupts = epics_rs::asyn::interrupt::InterruptManager::owned_by(
-            epics_rs::base::runtime::interrupt_accept::InterruptGate::opened(),
-        );
+        drv.base_mut()
+            .own_interrupts(epics_rs::base::runtime::interrupt_accept::InterruptGate::opened());
         let p = drv.params();
 
         let seen: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_cb = Arc::clone(&seen);
-        let _sub = drv.base().interrupts.register_sync_callback(
-            InterruptFilter::default(),
-            move |iv: &InterruptValue| {
+        let _sub = drv
+            .base()
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv: &InterruptValue| {
                 seen_cb.lock().unwrap().push(iv.reason);
-            },
-        );
+            })
+            .unwrap();
 
         // A successful write flushes immediately.
         drv.write_float64(&mut AsynUser::new(p.set_speed), 0.5)

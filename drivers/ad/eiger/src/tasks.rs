@@ -1865,7 +1865,7 @@ mod tests {
     /// another address still posts what is pending at address 0.
     #[test]
     fn a_write_to_another_address_posts_address_zero() {
-        use epics_rs::asyn::interrupt::{InterruptFilter, InterruptManager, InterruptValue};
+        use epics_rs::asyn::interrupt::{InterruptFilter, InterruptValue};
         use epics_rs::asyn::port::PortDriver;
         use epics_rs::asyn::user::AsynUser;
         use epics_rs::base::runtime::interrupt_accept::InterruptGate;
@@ -1881,16 +1881,21 @@ mod tests {
         };
         let rest = RestApi::new("127.0.0.1", agreeable_detector());
         let mut det = crate::driver::EigerDriver::new(cfg, rest, signals).expect("driver");
-        det.ad.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+        det.ad.port_base.own_interrupts(InterruptGate::opened());
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_cb = std::sync::Arc::clone(&seen);
-        let _sub = det.ad.port_base.interrupts.register_sync_callback(
-            InterruptFilter {
-                addr: Some(0),
-                ..Default::default()
-            },
-            move |iv: &InterruptValue| seen_cb.lock().unwrap().push(iv.reason),
-        );
+        let _sub = det
+            .ad
+            .port_base
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                move |iv: &InterruptValue| seen_cb.lock().unwrap().push(iv.reason),
+            )
+            .unwrap();
         let pending = det.ad.params.shutter_close_delay;
         // A store marks the parameter changed only when the value differs.
         let pend = |det: &mut crate::driver::EigerDriver, value: f64| {

@@ -3513,13 +3513,16 @@ mod tests {
             pool: DriverPool::standalone(0),
         };
 
-        let (_sub, mut rx) = handle.interrupts().register_interrupt_user(
-            InterruptFilter {
-                reason: Some(p.prv_hst_histogram_data),
-                ..Default::default()
-            },
-            1024,
-        );
+        let (_sub, mut rx) = handle
+            .interrupts()
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(p.prv_hst_histogram_data),
+                    ..Default::default()
+                },
+                1024,
+            )
+            .unwrap();
         ctx.post_int64_array(p.prv_hst_histogram_data, 0, vec![3, 1, 4]);
         let v = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await

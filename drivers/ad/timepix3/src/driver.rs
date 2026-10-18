@@ -4343,7 +4343,7 @@ mod tests {
 
     /// A driver whose Int64Array callbacks are recorded.
     fn array_recording_driver(name: &str) -> (TimePix3Driver, Arc<Shared>, Recorded) {
-        use epics_rs::asyn::interrupt::{InterruptFilter, InterruptManager};
+        use epics_rs::asyn::interrupt::InterruptFilter;
         use epics_rs::base::runtime::interrupt_accept::InterruptGate;
         let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
         let shared = Arc::new(Shared::new());
@@ -4355,20 +4355,26 @@ mod tests {
             cmd_tx,
         )
         .unwrap();
-        det.ad.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+        det.ad.port_base.own_interrupts(InterruptGate::opened());
         let arrays = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let seen = arrays.clone();
-        std::mem::forget(det.ad.port_base.interrupts.register_sync_callback(
-            InterruptFilter {
-                addr: Some(0),
-                ..Default::default()
-            },
-            move |iv| {
-                if let ParamValue::Int64Array(a) = &iv.value {
-                    seen.lock().push((iv.reason, a.to_vec()));
-                }
-            },
-        ));
+        std::mem::forget(
+            det.ad
+                .port_base
+                .interrupts
+                .register_sync_callback(
+                    InterruptFilter {
+                        addr: Some(0),
+                        ..Default::default()
+                    },
+                    move |iv| {
+                        if let ParamValue::Int64Array(a) = &iv.value {
+                            seen.lock().push((iv.reason, a.to_vec()));
+                        }
+                    },
+                )
+                .unwrap(),
+        );
         (det, shared, arrays)
     }
 
@@ -7144,7 +7150,7 @@ mod tests {
     /// reason but the two it answers first (mask_io.cpp:38-91, :239-247).
     #[test]
     fn a_waveform_read_posts_pending_params_as_c() {
-        use epics_rs::asyn::interrupt::{InterruptFilter, InterruptManager};
+        use epics_rs::asyn::interrupt::InterruptFilter;
         use epics_rs::base::runtime::interrupt_accept::InterruptGate;
         let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
         let mut det = TimePix3Driver::new(
@@ -7156,20 +7162,26 @@ mod tests {
         )
         .unwrap();
         let p = det.p;
-        det.ad.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+        det.ad.port_base.own_interrupts(InterruptGate::opened());
         let posted = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let seen = posted.clone();
-        std::mem::forget(det.ad.port_base.interrupts.register_sync_callback(
-            InterruptFilter {
-                reason: Some(p.http_code),
-                ..Default::default()
-            },
-            move |iv| {
-                if let ParamValue::Int32(v) = iv.value {
-                    seen.lock().push(v);
-                }
-            },
-        ));
+        std::mem::forget(
+            det.ad
+                .port_base
+                .interrupts
+                .register_sync_callback(
+                    InterruptFilter {
+                        reason: Some(p.http_code),
+                        ..Default::default()
+                    },
+                    move |iv| {
+                        if let ParamValue::Int32(v) = iv.value {
+                            seen.lock().push(v);
+                        }
+                    },
+                )
+                .unwrap(),
+        );
         for (reason, value, posts) in [
             (p.pixel_config_diff, 1, false),
             (p.img_image_frame, 2, false),
