@@ -865,7 +865,7 @@ mod tests {
 
     use epics_rs::asyn::interfaces::motor::PortSet;
     use epics_rs::asyn::manager::PortManager;
-    use epics_rs::asyn::port::{PortDriver, PortFlags};
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortFlags};
     use epics_rs::asyn::port_handle::PortHandle;
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -1032,7 +1032,13 @@ mod tests {
         let name = "lc400MoveSim";
         let claim = claim_port(name).unwrap();
         let sim = Lc400Sim {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             words: Default::default(),
             next: 0,
             reply: Default::default(),
