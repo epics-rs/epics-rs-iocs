@@ -83,8 +83,6 @@ fn the_driver_is_created_when_the_detector_stops_answering_after_the_state_fetch
         port_name: "EIGER_FLAKY".to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
 
@@ -126,8 +124,6 @@ fn an_unread_description_still_sets_the_defaults() {
         port_name: "EIGER_NODESC".to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
 

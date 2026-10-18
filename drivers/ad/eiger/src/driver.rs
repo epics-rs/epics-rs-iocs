@@ -40,8 +40,6 @@ pub struct EigerConfig {
     pub port_name: String,
     pub api: ApiVersion,
     pub model: Model,
-    pub max_size_x: i32,
-    pub max_size_y: i32,
     pub max_memory: usize,
 }
 
@@ -51,15 +49,11 @@ impl EigerDriver {
             port_name,
             api,
             model,
-            max_size_x,
-            max_size_y,
             max_memory,
         } = cfg;
         let mut ad = ADDriverBase::new(
             &port_name,
             MAX_ASYN_ADDRESS,
-            max_size_x,
-            max_size_y,
             max_memory,
             PortFlags {
                 multi_device: true,

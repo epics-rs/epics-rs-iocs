@@ -84,14 +84,7 @@ impl MerlinDetector {
         max_memory: usize,
         shared: Arc<SharedState>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(
-            port_name,
-            1,
-            max_size_x,
-            max_size_y,
-            max_memory,
-            ASYN_CANBLOCK,
-        )?;
+        let mut ad = ADDriverBase::new(port_name, 1, max_memory, ASYN_CANBLOCK)?;
         // A refusal leaves C's pointer NULL; the pool has printed its line.
         let _flat_field = ad
             .pool

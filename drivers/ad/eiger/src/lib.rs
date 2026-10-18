@@ -107,23 +107,10 @@ pub fn create_eiger_detector_on_port(
 
     let (signals, receivers) = tasks::signals();
 
-    // The sensor size is only known once the parameters have been fetched, so
-    // the pool starts from the detector's own x/y_pixels_in_detector.
-    let sensor_size = |param: &str| {
-        rest.get_value(rest::Sys::DetConfig, param)
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(0)
-    };
-    let max_size_x = sensor_size("x_pixels_in_detector");
-    let max_size_y = sensor_size("y_pixels_in_detector");
-
     let cfg = driver::EigerConfig {
         port_name: port_name.to_string(),
         api,
         model,
-        max_size_x,
-        max_size_y,
         max_memory,
     };
     let det = EigerDriver::new(cfg, rest, signals.clone())?;
@@ -183,8 +170,6 @@ fn create_inert(
     let ad = ADDriverBase::new(
         claim.name(),
         MAX_ASYN_ADDRESS,
-        0,
-        0,
         max_memory,
         PortFlags {
             multi_device: true,

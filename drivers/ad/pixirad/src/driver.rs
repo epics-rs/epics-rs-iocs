@@ -79,20 +79,15 @@ impl PixiradDetector {
         max_memory: usize,
         shared: Arc<SharedState>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(
-            port_name,
-            1,
-            max_size_x,
-            max_size_y,
-            max_memory,
-            ASYN_CANBLOCK,
-        )?;
+        let mut ad = ADDriverBase::new(port_name, 1, max_memory, ASYN_CANBLOCK)?;
         let params = PixiradParams::create(&mut ad.port_base)?;
         let p = ad.params;
 
         let base = &mut ad.port_base;
         base.set_string_param(p.base.manufacturer, 0, "Pixirad")?;
         base.set_string_param(p.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
+        base.set_int32_param(p.max_size_x, 0, max_size_x)?;
+        base.set_int32_param(p.max_size_y, 0, max_size_y)?;
         base.set_int32_param(p.size_x, 0, max_size_x)?;
         base.set_int32_param(p.size_y, 0, max_size_y)?;
         base.set_int32_param(p.base.array_size_x, 0, max_size_x)?;

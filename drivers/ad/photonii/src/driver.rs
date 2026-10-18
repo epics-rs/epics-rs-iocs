@@ -63,14 +63,7 @@ impl PhotonIIDetector {
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(
-            port_name,
-            1,
-            PII_SIZE_X as i32,
-            PII_SIZE_Y as i32,
-            max_memory,
-            ASYN_CANBLOCK,
-        )?;
+        let mut ad = ADDriverBase::new(port_name, 1, max_memory, ASYN_CANBLOCK)?;
         let params = PhotonIIParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;

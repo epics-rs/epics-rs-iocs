@@ -72,8 +72,6 @@ impl NdStdArraysDriver {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            0,
-            0,
             max_memory,
             PortFlags {
                 can_block: false,

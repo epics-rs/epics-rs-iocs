@@ -303,8 +303,6 @@ impl TimePix3Driver {
         let mut ad = ADDriverBase::new(
             port_name,
             MAX_ADDR,
-            0,
-            0,
             max_memory,
             PortFlags {
                 can_block: true,

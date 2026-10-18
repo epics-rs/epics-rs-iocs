@@ -43,14 +43,7 @@ impl D435iColorDriver {
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
         caps: CameraCapabilities,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(
-            port_name,
-            1,
-            max_size_x,
-            max_size_y,
-            max_memory,
-            ASYN_CANBLOCK,
-        )?;
+        let mut ad = ADDriverBase::new(port_name, 1, max_memory, ASYN_CANBLOCK)?;
         let rs_params = D435iParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
@@ -59,6 +52,8 @@ impl D435iColorDriver {
         base.set_string_param(ad.params.base.serial_number, 0, "Not connected")?;
         base.set_string_param(ad.params.base.firmware_version, 0, "Unknown")?;
         base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION"))?;
+        base.set_int32_param(ad.params.max_size_x, 0, max_size_x)?;
+        base.set_int32_param(ad.params.max_size_y, 0, max_size_y)?;
 
         // Default stream config. The enum choices are the camera's own modes,
         // so RSStreamMode never offers one it will reject.
@@ -322,14 +317,7 @@ impl D435iDepthDriver {
         max_size_y: i32,
         max_memory: usize,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(
-            port_name,
-            1,
-            max_size_x,
-            max_size_y,
-            max_memory,
-            ASYN_CANBLOCK,
-        )?;
+        let mut ad = ADDriverBase::new(port_name, 1, max_memory, ASYN_CANBLOCK)?;
 
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Intel")?;
@@ -337,6 +325,8 @@ impl D435iDepthDriver {
         base.set_string_param(ad.params.base.serial_number, 0, "Not connected")?;
         base.set_string_param(ad.params.base.firmware_version, 0, "Unknown")?;
         base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION"))?;
+        base.set_int32_param(ad.params.max_size_x, 0, max_size_x)?;
+        base.set_int32_param(ad.params.max_size_y, 0, max_size_y)?;
 
         // Image size and ROI. The depth port has no mode of its own; it
         // follows the colour port's stream, so start it at the preferred mode.

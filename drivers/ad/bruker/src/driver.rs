@@ -80,8 +80,7 @@ impl BrukerDetector {
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<Self> {
-        let mut ad =
-            ADDriverBase::new(port_name, 1, MAX_SIZE, MAX_SIZE, max_memory, ASYN_CANBLOCK)?;
+        let mut ad = ADDriverBase::new(port_name, 1, max_memory, ASYN_CANBLOCK)?;
         let params = BrukerParams::create(&mut ad.port_base)?;
         let p = ad.params;
 
@@ -89,6 +88,8 @@ impl BrukerDetector {
         base.set_string_param(p.base.manufacturer, 0, "Bruker")?;
         base.set_string_param(p.base.model, 0, "BIS")?;
         base.set_string_param(p.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
+        base.set_int32_param(p.max_size_x, 0, MAX_SIZE)?;
+        base.set_int32_param(p.max_size_y, 0, MAX_SIZE)?;
         // BIS says how big a frame is on the status socket; until it does, the
         // geometry is unknown.
         base.set_int32_param(p.size_x, 0, 0)?;

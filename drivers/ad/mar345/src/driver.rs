@@ -72,7 +72,7 @@ impl Mar345Driver {
     fn new(port_name: &str, max_memory: usize, links: DriverLinks) -> AsynResult<Self> {
         // C's ADDriver base takes no sensor size; ADMaxSizeX/Y are set to 3450
         // explicitly below, and ADSizeX/Y are left at the base default of 0.
-        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
+        let mut ad = ADDriverBase::new(port_name, 1, max_memory, ASYN_CANBLOCK)?;
         let p = Mar345Params::create(&mut ad.port_base)?;
 
         let params = ad.params;

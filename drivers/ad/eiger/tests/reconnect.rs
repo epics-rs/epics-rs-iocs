@@ -128,8 +128,6 @@ fn an_acquisition_reconnects_a_detector_that_was_offline_at_boot() {
         port_name: "EIGER_RECONNECT".to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
 

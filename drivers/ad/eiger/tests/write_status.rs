@@ -23,8 +23,6 @@ fn offline_driver(name: &str) -> EigerDriver {
         port_name: name.to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
     EigerDriver::new(cfg, RestApi::new("127.0.0.1", port), signals).expect("driver")

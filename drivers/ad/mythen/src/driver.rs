@@ -117,8 +117,6 @@ impl MythenDriver {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            SENSOR_SIZE_X,
-            SENSOR_SIZE_Y,
             max_memory,
             PortFlags {
                 multi_device: true,

@@ -46,8 +46,6 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
         port_name: "EIGER_OFFLINE_DRV".to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
 
@@ -94,8 +92,6 @@ fn the_port_has_cs_eleven_addresses() {
         port_name: "EIGER_MAX_ADDR".to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
     let driver = EigerDriver::new(cfg, rest, signals).expect("driver");
@@ -130,8 +126,6 @@ fn a_refused_write_prints_the_param_librarys_status() {
         port_name: port.to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
     let mut driver = EigerDriver::new(cfg, rest, signals).expect("driver");
@@ -177,8 +171,6 @@ fn an_unplaceable_eig_name_is_traced_with_no_message() {
         port_name: port.to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
     let mut driver = EigerDriver::new(cfg, rest, signals).expect("driver");
@@ -228,8 +220,6 @@ fn a_failed_put_prints_only_the_parameter_chain() {
         port_name: port.to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
     let mut driver = EigerDriver::new(cfg, rest, signals).expect("driver");

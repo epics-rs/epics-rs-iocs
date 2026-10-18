@@ -82,7 +82,7 @@ impl PslDetector {
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<(Self, bool)> {
-        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
+        let mut ad = ADDriverBase::new(port_name, 1, max_memory, ASYN_CANBLOCK)?;
         // C PSL never sets NDDriverVersion: it keeps asynNDArrayDriver's
         // ADCore version string.
         let params = PslParams::create(&mut ad.port_base)?;

@@ -227,6 +227,15 @@ impl Drop for Fixture {
     }
 }
 
+/// BISDetector.cpp:765-766 sets ADMaxSizeX/Y to 4096 over ADDriver's 1.
+#[test]
+fn max_size_is_bis_4096() {
+    let fixture = Fixture::new("APX_MAXSIZE");
+    let ad = fixture.detector.ad_params;
+    assert_eq!(fixture.sync.read_int32(ad.max_size_x).unwrap(), 4096);
+    assert_eq!(fixture.sync.read_int32(ad.max_size_y).unwrap(), 4096);
+}
+
 #[test]
 fn one_scan_reaches_the_plugins() {
     let fixture = Fixture::new("APX_SCAN");
