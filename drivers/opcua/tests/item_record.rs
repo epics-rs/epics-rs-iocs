@@ -161,6 +161,7 @@ fn bind(registry: &Arc<Registry>, name: &str, record: &mut dyn Record, link: &st
     let mut device = OpcuaDevice::new(registry.clone(), link.to_string(), record.record_type());
     device.set_record_info(name, ScanType::IoIntr);
     device.init(record).expect("the link binds");
+    record.after_dset_init();
     device
 }
 

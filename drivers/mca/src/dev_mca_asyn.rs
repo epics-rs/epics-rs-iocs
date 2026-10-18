@@ -752,6 +752,7 @@ mod tests {
         rec.init_record(0).unwrap();
         rec.init_record(1).unwrap();
         let outcome = dev.init(&mut rec).unwrap();
+        rec.after_dset_init();
         (dev, rec, outcome)
     }
 
