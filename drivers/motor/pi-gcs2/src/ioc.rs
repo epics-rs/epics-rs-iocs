@@ -58,8 +58,7 @@ pub fn pigcs2_config_command() -> CommandDef {
             // constructor's early returns.
             let report = PIGCS2Params::default();
             let owner = ctx.db().scan_control().interrupt_gate();
-            let port =
-                register_controller_port(owner, &port_name, num_axes as i32, report.clone())?;
+            register_controller_port(owner, &port_name, num_axes as i32, report.clone())?;
             let Some(handle) = connect(&asyn_port) else {
                 return Ok(CommandOutcome::Continue);
             };
@@ -85,7 +84,7 @@ pub fn pigcs2_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let controller = Arc::new(Mutex::new(controller));
-            report.attach(controller.clone(), port);
+            report.attach(controller.clone());
             // C startPoller, PIasynController.cpp:192.
             let polled = controller.clone();
             let poller = Controller::new()

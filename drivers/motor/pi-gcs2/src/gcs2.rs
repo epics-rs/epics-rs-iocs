@@ -114,8 +114,6 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -477,9 +475,9 @@ pub struct PIGCS2Controller {
     /// to, for its `m_lastDirection` against the position its next poll
     /// starts from (no poll ran in between, so C's `m_positionCts`).
     released: BTreeMap<usize, f64>,
-    /// The controller port and its `PIasynController` parameters, which
-    /// the poll posts.
-    port: Option<(PortHandle, PiParams)>,
+    /// The controller port's `PIasynController` parameters, which the
+    /// poll sets.
+    params: Option<PiParams>,
     /// `PIGCSController::m_LastError`: the last nonzero `ERR?` code.
     last_error: Cell<i32>,
     /// `PIHexapodController::m_PivotX/Y/Z`; `PIGCSController`'s `GetPivot*`
@@ -548,7 +546,7 @@ impl PIGCS2Controller {
             moves_deferred: false,
             deferred: BTreeMap::new(),
             released: BTreeMap::new(),
-            port: None,
+            params: None,
             last_error: Cell::new(0),
             pivot: [0.0; 3],
             target_mode: 0,
@@ -572,8 +570,9 @@ impl PIGCS2Controller {
     }
 
     /// C `PIasynController::poll`'s `getGlobalState`, run before the axes';
-    /// `PIGCSController`'s is a no-op.
-    pub fn poll(&mut self) {
+    /// `PIGCSController`'s is a no-op. Its sets and `callParamCallbacks`
+    /// go to the poller, which applies them on the port.
+    pub fn poll(&mut self) -> PortSets {
         if self.model.is_hexapod() {
             let _ = self.get_global_state();
         }
@@ -590,23 +589,23 @@ impl PIGCS2Controller {
                 .replace('\n', "")
                 .replace('\t', " ");
         }
-        if let Some((port, params)) = &self.port {
+        let mut sets = PortSets::default();
+        if let Some(params) = &self.params {
             let [x, y, z] = self.pivot;
-            let updates = vec![
-                ParamSetValue::new(params.rbpivot_x, 0, ParamValue::Float64(x)),
-                ParamSetValue::new(params.rbpivot_y, 0, ParamValue::Float64(y)),
-                ParamSetValue::new(params.rbpivot_z, 0, ParamValue::Float64(z)),
-                ParamSetValue::new(params.target_mode, 0, ParamValue::Int32(self.target_mode)),
-                ParamSetValue::new(params.last_err, 0, ParamValue::Int32(self.last_error.get())),
-                ParamSetValue::new(
-                    params.cs_activate,
-                    0,
-                    ParamValue::Octet(activate.as_bytes().into()),
-                ),
-                ParamSetValue::new(params.cs_link, 0, ParamValue::Octet(link.as_bytes().into())),
-            ];
-            let _ = port.set_params_and_notify_blocking(0, updates);
+            sets.set(0, params.rbpivot_x, ParamValue::Float64(x));
+            sets.set(0, params.rbpivot_y, ParamValue::Float64(y));
+            sets.set(0, params.rbpivot_z, ParamValue::Float64(z));
+            sets.set(0, params.target_mode, ParamValue::Int32(self.target_mode));
+            sets.set(
+                0,
+                params.cs_activate,
+                ParamValue::Octet(activate.as_bytes().into()),
+            );
+            sets.set(0, params.cs_link, ParamValue::Octet(link.as_bytes().into()));
+            sets.set(0, params.last_err, ParamValue::Int32(self.last_error.get()));
+            sets.call_param_callbacks(0);
         }
+        sets
     }
 
     /// C `AcceptsNewTarget`: a GCS 1 hexapod takes none while its platform
@@ -1579,10 +1578,10 @@ pub struct PIGCS2Params {
 
 impl PIGCS2Params {
     /// C `m_pGCSController = CreateGCSController(...)`: `controller` takes
-    /// the port's writes and posts its poll to `port`.
-    pub fn attach(&self, controller: Arc<Mutex<PIGCS2Controller>>, port: PortHandle) {
+    /// the port's writes and sets its poll on the port's parameters.
+    pub fn attach(&self, controller: Arc<Mutex<PIGCS2Controller>>) {
         if let Some(&params) = self.params.get() {
-            controller.lock().unwrap_or_else(|e| e.into_inner()).port = Some((port, params));
+            controller.lock().unwrap_or_else(|e| e.into_inner()).params = Some(params);
         }
         let _ = self.controller.set(controller);
     }
@@ -2688,7 +2687,7 @@ impl AsynMotor for PIGCS2Axis {
                 self.axis_no
             ));
         }
-        let params = self.lock().port.as_ref().map(|&(_, params)| params);
+        let params = self.lock().params;
         if let (Some(params), Some(reads)) = (params, reads) {
             if let Some(real) = reads.real {
                 self.sets.axis(params.position, ParamValue::Float64(real));
@@ -2734,6 +2733,28 @@ impl AsynMotor for PIGCS2Axis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::motor::PortSet;
+    use epics_rs::asyn::port_handle::PortHandle;
+    use epics_rs::asyn::request::ParamSetValue;
+
+    /// The controller poll, its sets applied as the poller does.
+    fn post_poll(ctrl: &Mutex<PIGCS2Controller>, port: &PortHandle) {
+        let updates = ctrl
+            .lock()
+            .unwrap()
+            .poll()
+            .into_iter()
+            .filter_map(|set| match set {
+                PortSet::Set {
+                    addr,
+                    reason,
+                    value,
+                } => Some(ParamSetValue::new(reason, addr, value)),
+                PortSet::Callbacks(0) => None,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        port.set_params_and_notify_blocking(0, updates).unwrap();
+    }
 
     /// The axis params a poll set; it sets nothing else on the port.
     fn axis_params(sets: PortSets) -> Vec<(usize, ParamValue)> {
@@ -3695,7 +3716,7 @@ mod tests {
             params.clone(),
         )
         .unwrap();
-        params.attach(ctrl.clone(), port.clone());
+        params.attach(ctrl.clone());
         let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(PIGCS2Axis::new(
             ctrl.clone(),
             axis.into(),
@@ -3876,7 +3897,7 @@ mod tests {
         });
         let (port, p, _) = controller_port("gcs2Pivot", &ctrl, "X");
         let read = |reason| port.read_float64_blocking(reason, 0).unwrap();
-        ctrl.lock().unwrap().poll();
+        post_poll(&ctrl, &port);
         assert_eq!(
             [read(p.rbpivot_x), read(p.rbpivot_y), read(p.rbpivot_z)],
             [1.5, 2.5, 3.5]
@@ -3884,7 +3905,7 @@ mod tests {
         line.sent();
         port.write_float64_blocking(p.pivot_y, 0, 4.0).unwrap();
         assert_eq!(sent_lines(&line), ["SPI S 4.000000", "ERR?"]);
-        ctrl.lock().unwrap().poll();
+        post_poll(&ctrl, &port);
         assert_eq!(read(p.rbpivot_y), 4.0);
         ctrl.lock().unwrap().hexapod.any_moving = true;
         line.sent();
@@ -3989,7 +4010,7 @@ mod tests {
         ctrl.set_model(Model::CoordinateSystem);
         let ctrl = Arc::new(Mutex::new(ctrl));
         let (port, p, _) = controller_port("gcs2Cs", &ctrl, "X");
-        ctrl.lock().unwrap().poll();
+        post_poll(&ctrl, &port);
         let read = |reason| port.get_string_param_blocking(reason, 0, 255).unwrap();
         assert_eq!(read(p.cs_activate), b"KS1");
         assert_eq!(read(p.cs_link), b"KS1 KS2 ZERO");
@@ -4009,7 +4030,7 @@ mod tests {
         ctrl.set_model(Model::CoordinateSystem);
         let ctrl = Arc::new(Mutex::new(ctrl));
         let (port, p, _) = controller_port("gcs2CsCut", &ctrl, "X");
-        ctrl.lock().unwrap().poll();
+        post_poll(&ctrl, &port);
         let read = |reason| port.get_string_param_blocking(reason, 0, 255).unwrap();
         assert_eq!(read(p.cs_activate), b"KS1 ");
         assert_eq!(read(p.cs_link), b"KS1 KS2 ");
@@ -4624,7 +4645,7 @@ mod tests {
             ["MRT X 1.000000", "MRW X 1.000000", "MOV X 1.500000"]
         );
         port.write_int32_blocking(p.target_mode, 0, 2).unwrap();
-        ctrl.lock().unwrap().poll();
+        post_poll(&ctrl, &port);
         assert_eq!(port.read_int32_blocking(p.target_mode, 0).unwrap(), 2);
     }
 
@@ -4646,7 +4667,7 @@ mod tests {
             printed.contains("PIGCSController::SetPivotX() ignored"),
             "{printed}"
         );
-        ctrl.lock().unwrap().poll();
+        post_poll(&ctrl, &port);
         assert_eq!(port.read_float64_blocking(p.rbpivot_x, 0).unwrap(), 0.0);
     }
 
@@ -4666,7 +4687,7 @@ mod tests {
             });
         let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2LastErrLine")));
         let (port, p, _) = controller_port("gcs2LastErr", &ctrl, "1");
-        let poll = || ctrl.lock().unwrap().poll();
+        let poll = || post_poll(&ctrl, &port);
         poll();
         assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
         code.store(5, Ordering::Relaxed);
@@ -5039,7 +5060,7 @@ mod tests {
         });
         let mut axis = PIGCS2Axis::new(ctrl.clone(), "Y".into(), 1, "gcs2HexGlobal");
         line.sent();
-        ctrl.lock().unwrap().poll();
+        let _ = ctrl.lock().unwrap().poll();
         assert_eq!(sent_lines(&line), ["\u{5}"]);
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         // PIasynAxis::poll reads the position twice (PIasynAxis.cpp:162-164).
@@ -5047,7 +5068,7 @@ mod tests {
         assert!(status.moving && !status.done && status.powered);
         assert_eq!(status.position, 20000.0);
         moving.store(false, std::sync::atomic::Ordering::Relaxed);
-        ctrl.lock().unwrap().poll();
+        let _ = ctrl.lock().unwrap().poll();
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         assert_eq!(sent_lines(&line), ["\u{5}", "POS? Y", "POS? Y"]);
         assert!(status.done && !status.moving);
@@ -5072,13 +5093,13 @@ mod tests {
         });
         let mut axis = PIGCS2Axis::new(ctrl.clone(), "X".into(), 0, "gcs2HexHoming");
         ctrl.lock().unwrap().hexapod.homing = true;
-        ctrl.lock().unwrap().poll();
+        let _ = ctrl.lock().unwrap().poll();
         line.sent();
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         assert!(sent_lines(&line).is_empty());
         assert!(axis.is_homing && !status.done);
         moving.store(false, std::sync::atomic::Ordering::Relaxed);
-        ctrl.lock().unwrap().poll();
+        let _ = ctrl.lock().unwrap().poll();
         let status = axis.poll(&AsynUser::new(0)).unwrap();
         assert_eq!(sent_lines(&line), ["\u{5}", "\u{4}", "POS? X", "POS? X"]);
         assert!(!axis.is_homing && status.done && status.homed);
@@ -5135,7 +5156,7 @@ mod tests {
             "{printed}"
         );
         moving.store(false, std::sync::atomic::Ordering::Relaxed);
-        ctrl.lock().unwrap().poll();
+        let _ = ctrl.lock().unwrap().poll();
         line.sent();
         axis.move_absolute(&user, 0.0, 0.0, 0.0, 0.0).unwrap();
         assert_eq!(sent_lines(&line), ["MOV X 0.000000", "\u{5}", "ERR?"]);
@@ -5405,7 +5426,7 @@ mod tests {
         let user = AsynUser::new(0);
         axis.home(&user, 0.0, 1.0, 0.0, true).unwrap();
         assert_eq!(sent_lines(&line), ["INI X"]);
-        ctrl.lock().unwrap().poll();
+        let _ = ctrl.lock().unwrap().poll();
         assert!(!axis.poll(&user).unwrap().done && axis.is_homing);
         line.sent();
         axis.stop(&user, 0.0).unwrap();
@@ -5473,7 +5494,7 @@ mod tests {
             last => hexapod_reply(last),
         });
         let user = AsynUser::new(0);
-        ctrl.lock().unwrap().poll();
+        let _ = ctrl.lock().unwrap().poll();
         line.sent();
         axis.move_absolute(&user, 20000.0, 0.0, -10000.0, 5.0)
             .unwrap();
@@ -5546,7 +5567,7 @@ mod tests {
             ]
         );
         assert_eq!((axis.low_limit, axis.high_limit), (-12.5, 12.5));
-        ctrl.lock().unwrap().poll();
+        let _ = ctrl.lock().unwrap().poll();
         assert_eq!(sent_lines(&line), ["\u{5}", "KEN?", "KLN?"]);
     }
 
