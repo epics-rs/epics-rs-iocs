@@ -79,8 +79,8 @@ struct DriverLinks {
 
 impl MarccdDriver {
     fn new(port_name: &str, max_memory: usize, links: DriverLinks) -> AsynResult<Self> {
-        // marCCDConfig passes no sensor size; C's ADDriver base leaves
-        // ADMaxSizeX/Y at 0 and `getConfig` fills them from the server.
+        // marCCDConfig passes no sensor size; ADMaxSizeX/Y keep ADDriver's 1
+        // until `getConfig` fills them from the server.
         let mut ad = ADDriverBase::new(port_name, 1, max_memory, ASYN_CANBLOCK)?;
         let p = MarccdParams::create(&mut ad.port_base)?;
 
