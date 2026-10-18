@@ -34,10 +34,8 @@ pub struct PvaDriver {
 impl PvaDriver {
     /// `max_memory`: NDArrayPool byte budget (C++ `maxMemory`).
     ///
-    /// C++ `pvaDriver::pvaDriver` never sets `ADMaxSizeX`/`ADMaxSizeY` up
-    /// front (they track the most recently received frame's shape instead,
-    /// starting at 0) — matches `ADDriverBase::new`'s own `max_size_x =
-    /// max_size_y = 0` default.
+    /// C++ `pvaDriver::pvaDriver` sets `ADMaxSizeX`/`ADMaxSizeY` to 0 over
+    /// ADDriver's 1; they then track the most recently received frame.
     pub fn new(
         port_name: &str,
         pv_name: &str,
@@ -47,8 +45,6 @@ impl PvaDriver {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            0,
-            0,
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -71,6 +67,8 @@ impl PvaDriver {
         base.set_string_param(ad.params.base.sdk_version, 0, epics_rs::pva::VERSION)?;
         base.set_string_param(ad.params.base.serial_number, 0, "No serial number")?;
         base.set_string_param(ad.params.base.firmware_version, 0, "No firmware")?;
+        base.set_int32_param(ad.params.max_size_x, 0, 0)?;
+        base.set_int32_param(ad.params.max_size_y, 0, 0)?;
         base.set_string_param(pva_params.pv_name, 0, pv_name)?;
 
         Ok(Self {
@@ -331,5 +329,15 @@ mod tests {
             1,
             "ADShutterControl did not reach ADDriver::setShutter"
         );
+    }
+
+    /// pvaDriver.cpp:86: C sets MaxSize to 0 over ADDriver's 1.
+    #[test]
+    fn max_size_is_zero() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel(1);
+        let det = PvaDriver::new("PVA_MAX_SIZE", "", 1 << 20, cmd_tx).unwrap();
+        let (p, base) = (det.ad.params, &det.ad.port_base);
+        assert_eq!(base.get_int32_param(p.max_size_x, 0).unwrap(), 0);
+        assert_eq!(base.get_int32_param(p.max_size_y, 0).unwrap(), 0);
     }
 }

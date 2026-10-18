@@ -40,10 +40,8 @@ pub struct URLDriver {
 impl URLDriver {
     /// `max_memory`: NDArrayPool byte budget (C++ `maxMemory`).
     ///
-    /// C++ `URLDriver::URLDriver` never sets `ADMaxSizeX`/`ADMaxSizeY` — the
-    /// image size is unknown until the first successful fetch, so this
-    /// driver constructs `ADDriverBase` with `max_size_x = max_size_y = 0`
-    /// (matching upstream) rather than requiring a fixed size up front.
+    /// C++ `URLDriver::URLDriver` never sets `ADMaxSizeX`/`ADMaxSizeY`, so
+    /// they keep ADDriver's 1.
     pub fn new(
         port_name: &str,
         max_memory: usize,
@@ -52,8 +50,6 @@ impl URLDriver {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            0,
-            0,
             max_memory,
             ASYN_NONE,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -224,6 +220,16 @@ mod tests {
             1,
             "ADShutterControl did not reach ADDriver::setShutter"
         );
+    }
+
+    /// URLDriver.cpp sets no ADMaxSizeX/Y: they stay at ADDriver.cpp:180-181's 1.
+    #[test]
+    fn max_size_keeps_addrivers_1() {
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let det = URLDriver::new("URL_MAX_SIZE", 1 << 20, acq_tx).unwrap();
+        let p = det.ad.params;
+        let get = |r| det.ad.port_base.get_int32_param(r, 0).unwrap();
+        assert_eq!((get(p.max_size_x), get(p.max_size_y)), (1, 1));
     }
 
     /// URLDriver.cpp:305-319: setIntegerParam(function, value) is list 0,

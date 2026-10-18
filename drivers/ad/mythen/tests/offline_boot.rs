@@ -5,7 +5,6 @@
 //! `iocInit` runs. This is the regression test for the Rust port having turned
 //! those queries into `?`-propagation, which aborted the whole IOC.
 
-use std::net::TcpListener;
 use std::sync::Arc;
 
 use epics_rs::ad_core::driver::ADStatus;
@@ -21,14 +20,14 @@ use mythen::detector::Detector;
 use mythen::driver::MythenDriver;
 use mythen::transport::Transport;
 
+/// Privileged port 1: no test can bind it, so a connect is always refused.
+/// A freed ephemeral port can be taken by a concurrent test's listener.
+const DEAD_ADDR: &str = "127.0.0.1:1";
+
 /// An asyn IP port aimed at a TCP port nothing is listening on — the same thing
 /// the driver sees when the detector is powered off.
 fn dead_ip_port(name: &str) -> PortHandle {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-    drop(listener);
-
-    let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
+    let driver = DrvAsynIPPort::new(name, DEAD_ADDR).expect("ip port");
     let (runtime, _) =
         create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
             .expect("ip port runtime");
@@ -71,7 +70,18 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
         base.get_string_param(driver.p.firmware_version, 0).unwrap(),
         b""
     );
-    // The fixed parameters C sets regardless of the detector are still there.
+    // The fixed parameters C sets regardless of the detector are still there,
+    // MaxSize among them (mythen.cpp:1332-1335).
+    assert_eq!(
+        base.get_int32_param(driver.ad.params.max_size_x, 0)
+            .unwrap(),
+        1280
+    );
+    assert_eq!(
+        base.get_int32_param(driver.ad.params.max_size_y, 0)
+            .unwrap(),
+        1
+    );
     assert_eq!(
         base.get_string_param(driver.ad.params.base.manufacturer, 0)
             .unwrap(),

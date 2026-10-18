@@ -908,6 +908,10 @@ impl ParamOps {
 mod tests {
     use super::*;
 
+    /// Privileged port 1: no test can bind it, so a connect is always refused.
+    /// A freed ephemeral port can be taken by a concurrent test's listener.
+    const DEAD_PORT: u16 = 1;
+
     fn meta_of(body: &str, sys: Sys) -> Meta {
         let v: Value = serde_json::from_str(body).unwrap();
         parse_meta(&v, sys, false, &Meta::default()).unwrap()
@@ -923,10 +927,11 @@ mod tests {
         reg.add(7, "ROI_MODE", AsynType::Int32, Sys::DetConfig, "roi_mode");
         reg.set_enum_values(7, &["disabled", "4M"]);
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let ops = ParamOps::new(RestApi::new("127.0.0.1", port), reg, Trace::new("EIGTEST"));
+        let ops = ParamOps::new(
+            RestApi::new("127.0.0.1", DEAD_PORT),
+            reg,
+            Trace::new("EIGTEST"),
+        );
 
         assert_eq!(ops.enum_index_of(7, "disabled"), Some(0));
         assert_eq!(ops.enum_index_of(7, "4M"), Some(1));
@@ -938,13 +943,13 @@ mod tests {
     /// The port it belongs to never came up, whatever the detector answered.
     #[test]
     fn fetch_all_does_not_deadlock_on_the_registry() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
         let mut reg = ParamRegistry::new();
         reg.add(0, "STATE", AsynType::Octet, Sys::DetStatus, "state");
-        let ops = ParamOps::new(RestApi::new("127.0.0.1", port), reg, Trace::new("EIGTEST"));
+        let ops = ParamOps::new(
+            RestApi::new("127.0.0.1", DEAD_PORT),
+            reg,
+            Trace::new("EIGTEST"),
+        );
 
         // Every request fails against a closed port, which is the point: the
         // call has to *return*.

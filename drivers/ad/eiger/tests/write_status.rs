@@ -1,8 +1,6 @@
 //! Statuses `eigerDetector::writeInt32` / `writeFloat64` ignore must not end
 //! the write (eigerDetector.cpp:513-571, 627-654).
 
-use std::net::TcpListener;
-
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::user::AsynUser;
@@ -12,10 +10,11 @@ use eiger::params::Model;
 use eiger::rest::{ApiVersion, RestApi};
 use eiger::tasks;
 
+/// Privileged port 1: no test can bind it, so a connect is always refused.
+/// A freed ephemeral port can be taken by a concurrent test's listener.
+const DEAD_PORT: u16 = 1;
+
 fn offline_driver(name: &str) -> EigerDriver {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
     let (signals, receivers) = tasks::signals();
     // The task ends must outlive the test.
     std::mem::forget(receivers);
@@ -23,11 +22,9 @@ fn offline_driver(name: &str) -> EigerDriver {
         port_name: name.to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
-    EigerDriver::new(cfg, RestApi::new("127.0.0.1", port), signals).expect("driver")
+    EigerDriver::new(cfg, RestApi::new("127.0.0.1", DEAD_PORT), signals).expect("driver")
 }
 
 #[test]

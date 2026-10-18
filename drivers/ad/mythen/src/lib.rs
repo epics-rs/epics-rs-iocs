@@ -33,7 +33,7 @@ pub mod task;
 pub mod transport;
 
 use crate::detector::Detector;
-use crate::driver::{MythenDriver, SENSOR_SIZE_X, SENSOR_SIZE_Y};
+use crate::driver::MythenDriver;
 use crate::transport::Transport;
 
 /// Everything an IOC needs to keep alive and to wire plugins to.
@@ -137,8 +137,6 @@ fn create_unconnected(claim: &PortClaim, max_memory: usize) -> AsynResult<Mythen
     let ad = ADDriverBase::new(
         claim.name(),
         1,
-        SENSOR_SIZE_X,
-        SENSOR_SIZE_Y,
         max_memory,
         PortFlags {
             multi_device: true,

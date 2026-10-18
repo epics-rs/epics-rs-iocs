@@ -234,8 +234,6 @@ mod tests {
         let mut ad = ADDriverBase::new(
             "SIMTEST",
             1,
-            64,
-            64,
             0,
             ASYN_NONE,
             InterfaceMask::UNMIGRATED_SUBCLASS,

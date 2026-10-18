@@ -76,8 +76,6 @@ impl Mar345Driver {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            0,
-            0,
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -565,5 +563,14 @@ pub(crate) mod tests {
         let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
         sync.write_int32(rt.ad_params.num_images, 3).unwrap();
         assert_eq!(sync.read_int32(rt.ad_params.num_images).unwrap(), 3);
+    }
+
+    /// mar345.cpp:745: MaxSize is the 3450 x 3450 plate.
+    #[test]
+    fn max_size_is_the_plate() {
+        let d = driver("MAR345_MAX_SIZE", 0);
+        let (p, base) = (d.ad.params, &d.ad.port_base);
+        assert_eq!(base.get_int32_param(p.max_size_x, 0).unwrap(), 3450);
+        assert_eq!(base.get_int32_param(p.max_size_y, 0).unwrap(), 3450);
     }
 }

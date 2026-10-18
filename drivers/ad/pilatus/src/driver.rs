@@ -69,8 +69,6 @@ impl PilatusDriver {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            max_size_x,
-            max_size_y,
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -733,5 +731,23 @@ mod tests {
         let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
         sync.write_int32(rt.ad_params.num_images, 3).unwrap();
         assert_eq!(sync.read_int32(rt.ad_params.num_images).unwrap(), 3);
+    }
+
+    /// pilatusDetector.cpp:1788: MaxSize is pilatusDetectorConfig's maxSizeX/Y.
+    #[test]
+    fn max_size_is_the_configured_size() {
+        use epics_rs::asyn::registry::claim_port;
+
+        let rt = create_pilatus_detector(
+            &claim_port("PILATUS_MAX_SIZE").unwrap(),
+            "PILATUS_MAX_SIZE_CAM",
+            487,
+            195,
+            0,
+        )
+        .expect("the detector port");
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        assert_eq!(sync.read_int32(rt.ad_params.max_size_x).unwrap(), 487);
+        assert_eq!(sync.read_int32(rt.ad_params.max_size_y).unwrap(), 195);
     }
 }

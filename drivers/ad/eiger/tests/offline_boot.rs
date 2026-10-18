@@ -6,8 +6,6 @@
 //! that and then fails the state fetch keeps its full port: C logs "Eiger
 //! FAILED TO CONNECT" and returns (eigerDetector.cpp:231-235).
 
-use std::net::TcpListener;
-
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::asyn::error::AsynError;
 
@@ -18,12 +16,10 @@ use eiger::rest::{ApiVersion, RestApi};
 use eiger::tasks;
 
 /// A TCP port nothing is listening on — the same thing the driver sees when the
-/// detector is powered off.
+/// detector is powered off. Privileged port 1, because no test can bind it; a
+/// freed ephemeral port can be taken by a concurrent test's listener.
 fn dead_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+    1
 }
 
 #[test]
@@ -46,8 +42,6 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
         port_name: "EIGER_OFFLINE_DRV".to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
 
@@ -94,8 +88,6 @@ fn the_port_has_cs_eleven_addresses() {
         port_name: "EIGER_MAX_ADDR".to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
     let driver = EigerDriver::new(cfg, rest, signals).expect("driver");
@@ -130,8 +122,6 @@ fn a_refused_write_prints_the_param_librarys_status() {
         port_name: port.to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
     let mut driver = EigerDriver::new(cfg, rest, signals).expect("driver");
@@ -177,8 +167,6 @@ fn an_unplaceable_eig_name_is_traced_with_no_message() {
         port_name: port.to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
     let mut driver = EigerDriver::new(cfg, rest, signals).expect("driver");
@@ -228,8 +216,6 @@ fn a_failed_put_prints_only_the_parameter_chain() {
         port_name: port.to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
     let mut driver = EigerDriver::new(cfg, rest, signals).expect("driver");

@@ -84,8 +84,6 @@ impl BrukerDetector {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            MAX_SIZE,
-            MAX_SIZE,
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -97,6 +95,8 @@ impl BrukerDetector {
         let base = &mut ad.port_base;
         base.set_string_param(p.base.manufacturer, 0, "Bruker")?;
         base.set_string_param(p.base.model, 0, "BIS")?;
+        base.set_int32_param(p.max_size_x, 0, MAX_SIZE)?;
+        base.set_int32_param(p.max_size_y, 0, MAX_SIZE)?;
         // BIS says how big a frame is on the status socket; until it does, the
         // geometry is unknown.
         base.set_int32_param(p.size_x, 0, 0)?;

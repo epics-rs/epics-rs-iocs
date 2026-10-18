@@ -83,8 +83,6 @@ impl PixiradDetector {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            max_size_x,
-            max_size_y,
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -97,6 +95,8 @@ impl PixiradDetector {
         base.set_string_param(p.base.manufacturer, 0, "Pixirad")?;
         // pixirad.cpp:40-42.
         base.set_string_param(p.base.driver_version, 0, "2.2.0")?;
+        base.set_int32_param(p.max_size_x, 0, max_size_x)?;
+        base.set_int32_param(p.max_size_y, 0, max_size_y)?;
         base.set_int32_param(p.size_x, 0, max_size_x)?;
         base.set_int32_param(p.size_y, 0, max_size_y)?;
         base.set_int32_param(p.base.array_size_x, 0, max_size_x)?;

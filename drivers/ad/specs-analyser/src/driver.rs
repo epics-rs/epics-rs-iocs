@@ -76,8 +76,6 @@ impl SpecsAnalyserDriver {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            0,
-            0,
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,

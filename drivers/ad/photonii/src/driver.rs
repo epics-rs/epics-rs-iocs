@@ -67,8 +67,6 @@ impl PhotonIIDetector {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            PII_SIZE_X as i32,
-            PII_SIZE_Y as i32,
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -458,5 +456,14 @@ mod tests {
         let p = rt.ad_params;
         sync.write_int32(p.num_images, 3).unwrap();
         assert_eq!(sync.read_int32(p.num_images).unwrap(), 3);
+    }
+
+    /// PhotonII.cpp:117: MaxSize is the sensor, 768 x 1024.
+    #[test]
+    fn max_size_is_the_sensor() {
+        let det = detector("PII_MAX_SIZE");
+        let (p, base) = (det.ad.params, &det.ad.port_base);
+        assert_eq!(base.get_int32_param(p.max_size_x, 0).unwrap(), 768);
+        assert_eq!(base.get_int32_param(p.max_size_y, 0).unwrap(), 1024);
     }
 }

@@ -88,8 +88,6 @@ impl MerlinDetector {
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            max_size_x,
-            max_size_y,
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -1080,5 +1078,14 @@ mod tests {
         det.write_float64(&mut AsynUser::new(t).with_addr(0), 1.5)
             .unwrap();
         assert_eq!(det.ad.port_base.get_float64_param(t, 0).unwrap(), 1.5);
+    }
+
+    /// merlinDetector.cpp:1489: MaxSize is merlinDetectorConfig's maxSizeX/Y.
+    #[test]
+    fn max_size_is_the_configured_size() {
+        let det = detector("MERLIN_MAX_SIZE");
+        let (p, base) = (det.ad.params, &det.ad.port_base);
+        assert_eq!(base.get_int32_param(p.max_size_x, 0).unwrap(), 512);
+        assert_eq!(base.get_int32_param(p.max_size_y, 0).unwrap(), 512);
     }
 }

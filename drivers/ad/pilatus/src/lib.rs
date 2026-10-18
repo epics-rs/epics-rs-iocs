@@ -31,8 +31,6 @@
 //!   unchecked.
 //! * **Float-to-int conversions saturate** (`as i32`) rather than invoking C's
 //!   undefined behaviour on out-of-range values.
-//! * **The flat-field `NDArray` is `NDInt32`.** C allocates it as `NDUInt32`
-//!   but only ever accesses it through an `epicsInt32 *`.
 //! * **Driver attributes (`NDAttributesFile`) are not attached** to published
 //!   arrays; C calls `getAttributes(pImage->pAttributeList)`. The
 //!   `TIFFImageDescription` attribute read from the file *is* attached.

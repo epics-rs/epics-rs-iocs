@@ -82,8 +82,6 @@ fn boot(name: &str, init_fails: bool) -> (EigerDriver, Vec<String>) {
         port_name: name.to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
     let driver = EigerDriver::new(cfg, rest, signals).expect("driver");

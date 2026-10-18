@@ -1654,8 +1654,6 @@ mod tests {
             port_name: "EIGER_BASE_WRITE".to_string(),
             api: ApiVersion::V1_6_0,
             model: Model::Eiger1,
-            max_size_x: 0,
-            max_size_y: 0,
             max_memory: 0,
         };
         let rest = RestApi::new("127.0.0.1", agreeable_detector());
@@ -1692,8 +1690,6 @@ mod tests {
             port_name: port.to_string(),
             api: ApiVersion::V1_6_0,
             model: Model::Eiger1,
-            max_size_x: 0,
-            max_size_y: 0,
             max_memory: 0,
         };
         let rest = RestApi::new("127.0.0.1", agreeable_detector());
@@ -1741,8 +1737,6 @@ mod tests {
             port_name: name.to_string(),
             api: ApiVersion::V1_6_0,
             model: Model::Eiger1,
-            max_size_x: 0,
-            max_size_y: 0,
             max_memory: 0,
         };
         let rest = RestApi::new("127.0.0.1", agreeable_detector());
@@ -1796,8 +1790,6 @@ mod tests {
             port_name: name.to_string(),
             api: ApiVersion::V1_6_0,
             model: Model::Eiger1,
-            max_size_x: 0,
-            max_size_y: 0,
             max_memory: 0,
         };
         let rest = RestApi::new("127.0.0.1", agreeable_detector());
@@ -1875,8 +1867,6 @@ mod tests {
             port_name: "EIGER_ADDR0_POST".to_string(),
             api: ApiVersion::V1_6_0,
             model: Model::Eiger1,
-            max_size_x: 0,
-            max_size_y: 0,
             max_memory: 0,
         };
         let rest = RestApi::new("127.0.0.1", agreeable_detector());
