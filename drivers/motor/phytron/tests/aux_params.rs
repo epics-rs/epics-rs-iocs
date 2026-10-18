@@ -73,7 +73,6 @@ async fn on_mcc<T: Send + 'static>(
         rig.lock().unwrap().sent();
         body(PortManager::global().find_port_handle(&port).unwrap())
     });
-    // An axis joining the poller waits on a task this runtime runs.
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;
     }

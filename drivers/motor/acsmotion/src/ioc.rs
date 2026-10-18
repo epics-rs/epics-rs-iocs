@@ -235,7 +235,6 @@ mod tests {
                 .report_blocking(level)
                 .unwrap()
         });
-        // The poller's thread is spawned by a task this runtime runs.
         while !shell.is_finished() {
             sleep(std::time::Duration::from_millis(5)).await;
         }

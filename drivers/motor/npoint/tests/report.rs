@@ -35,7 +35,6 @@ async fn report_after(
             std::thread::sleep(Duration::from_millis(20));
         }
     });
-    // An axis joining the poller waits on a task this runtime runs.
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;
     }

@@ -50,7 +50,6 @@ async fn mcs2_report(port: &str, level: i32) -> String {
             .report_blocking(level)
             .unwrap()
     });
-    // An axis joining the poller waits on a task this runtime runs.
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;
     }

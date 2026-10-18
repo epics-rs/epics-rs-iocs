@@ -280,9 +280,8 @@ pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
     lines.lock().unwrap().clone()
 }
 
-/// Run `f` on a thread of its own. Awaited, not joined: an axis joining a
-/// started poller waits on it, and the poller's thread is spawned by a task
-/// this runtime has to run.
+/// Run `f` on a thread of its own, awaited so this runtime keeps running
+/// while it does.
 async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     use epics_rs::base::runtime::task::sleep;
     let shell = std::thread::spawn(f);
