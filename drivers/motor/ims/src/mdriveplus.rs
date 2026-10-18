@@ -458,7 +458,7 @@ impl ImsMDrivePlusAxis {
             status: MotorStatus {
                 // IMS honours a base velocity (VI).
                 vbas_supported: true,
-                ..Default::default()
+                ..motor_common::status_before_poll()
             },
             failed: None,
             status_writes: Vec::new(),
@@ -1032,7 +1032,9 @@ mod tests {
             ImsLine::new(handle, String::new(), "IMS_MOTOR"),
             "IMS_MOTOR",
         );
-        assert!(!axis.status.has_encoder);
+        // C's status_ starts at 0 and only a good PR MV sets Done
+        // (ImsMDrivePlusMotorAxis.cpp:422).
+        assert!(!axis.status.has_encoder && !axis.status.done);
         assert_eq!(
             (
                 axis.home_switch,
