@@ -88,9 +88,8 @@ pub fn pigcs2_config_command() -> CommandDef {
             report.attach(controller.clone(), port);
             // C startPoller, PIasynController.cpp:192.
             let polled = controller.clone();
-            let poller = Controller::new().controller_poll(move || {
-                polled.lock().unwrap_or_else(|e| e.into_inner()).poll();
-            });
+            let poller = Controller::new()
+                .controller_poll(move || polled.lock().unwrap_or_else(|e| e.into_inner()).poll());
             for (index, axis_name) in found.into_iter().take(num_axes).enumerate() {
                 let axis = PIGCS2Axis::new(controller.clone(), axis_name, index, &port_name);
                 let axis = Arc::new(Mutex::new(axis));
