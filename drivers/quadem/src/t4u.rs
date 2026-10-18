@@ -283,7 +283,7 @@ impl T4uParams {
 /// thread to drain.
 #[derive(Clone)]
 enum CmdSink {
-    Immediate(OctetIo),
+    Immediate(Box<OctetIo>),
     Queued(SyncSender<String>),
 }
 
@@ -1267,7 +1267,7 @@ pub fn create_t4u_em(
             ring_buffer_size,
             max_memory,
         },
-        CmdSink::Immediate(cmd),
+        CmdSink::Immediate(Box::new(cmd)),
         claim,
     )
 }
