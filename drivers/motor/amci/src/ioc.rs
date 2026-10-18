@@ -522,9 +522,13 @@ mod tests {
         crate::regs::fake::publish("ang1NoAxisOut");
         let cmd = (ang1_create_controller_command(), ang1_args(port));
         report_after(vec![cmd], port, 0).await;
-        crate::regs::fake::written("ang1NoAxisOut");
         assert!(!put_int32_status(port, "ANG1_JERK", 5, 1234).await);
-        assert_eq!(crate::regs::fake::written("ang1NoAxisOut"), []);
+        // The poller thread's startup pass may still be writing CMD_MSW.
+        let written = crate::regs::fake::written("ang1NoAxisOut");
+        assert!(
+            !written.iter().any(|(reg, _)| *reg == crate::ang1::JERK),
+            "{written:?}"
+        );
     }
 
     #[test]
