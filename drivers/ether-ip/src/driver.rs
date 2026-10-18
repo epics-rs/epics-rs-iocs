@@ -510,8 +510,10 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
                     errlog_vprintf(format_args!(
                         "EIP error during scan list completion for {ip_addr}:{ETHERIP_PORT}\n"
                     ));
-                    crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
-                    c.shutdown();
+                    // C disconnect_PLC: the session is open, so the tags
+                    // are invalidated.
+                    *conn = Some(c);
+                    disconnect(plc, conn);
                     crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
                     plc.stats.lock().plc_errors += 1;
                     return Some(timeout());
@@ -523,9 +525,10 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
                 errlog_vprintf(format_args!(
                     "EIP connection failed for {ip_addr}:{ETHERIP_PORT}\n"
                 ));
+                // C's EIP_startup leaves no socket, so disconnect_PLC
+                // never runs and the records keep their state.
                 crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
                 plc.connected.store(false, Ordering::Relaxed);
-                plc.invalidate_tags();
                 return Some(timeout());
             }
         }
@@ -1226,6 +1229,20 @@ pub fn help() {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    /// drvEtherIP.c:494-501: a PLC that never connects leaves no socket, so
+    /// disconnect_PLC does not run and no record is told its tag is invalid.
+    #[test]
+    fn a_failed_connect_leaves_the_records_alone() {
+        let plc = Arc::new(Plc::new("noconnect", "", 0));
+        let tag = plc.add_tag(1.0, "T", 1).unwrap();
+        tag.data.lock().valid_data_size = 4;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tag.add_listener(tx);
+        assert!(scan_pass(&plc, &mut None).is_some());
+        assert_eq!(tag.data.lock().valid_data_size, 4);
+        assert!(rx.try_recv().is_err(), "no record was processed");
+    }
 
     /// drvEtherIP.c:1234: a redefinition keeps the PLC and its place in
     /// the list but takes the new address.
