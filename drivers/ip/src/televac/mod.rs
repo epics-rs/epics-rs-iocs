@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::adapter::parse_asyn_link;
-use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -288,10 +287,9 @@ impl DeviceSupport for DevTelevac {
                 return Ok(DeviceInitOutcome::dead());
             }
         };
-        let Some(port) = get_port(&link.port_name) else {
+        let Ok(handle) = crate::connect_octet(&link.port_name, 0) else {
             return Ok(DeviceInitOutcome::dead());
         };
-        let handle = port.handle.clone();
         let user_param = link.drv_info.trim();
         if user_param.is_empty() {
             errlog_vprintf(format_args!(
@@ -548,5 +546,16 @@ mod tests {
         assert!(factory(&ctx("bi", DTYP)).is_some());
         assert!(factory(&ctx("ao", DTYP)).is_none());
         assert!(factory(&ctx("ai", "asyn TPG261")).is_none());
+    }
+
+    /// A port without `asynOctet` fails `findInterface`: `bad:`, `pact = 1`
+    /// (devTelevac.c:136-137).
+    #[test]
+    fn a_port_without_octet_kills_the_record() {
+        crate::no_octet_port("TV_INT32_ONLY");
+        let mut dev = DevTelevac::new(true, "@asyn(TV_INT32_ONLY 0)GET_PRESSURE 1");
+        dev.set_record_info("R:i32", ScanType::Passive);
+        let outcome = dev.init(&mut AiRecord::default()).unwrap();
+        assert_eq!(outcome, DeviceInitOutcome::dead());
     }
 }
