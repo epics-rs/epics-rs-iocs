@@ -213,7 +213,6 @@ impl PiJedsAxis {
             no_motion_count: 0,
             moving: false,
             last_status: MotorStatus {
-                done: true,
                 // C motor_init: encoder_present = YES, EA_PRESENT = 1.
                 has_encoder: true,
                 gain_support: true,

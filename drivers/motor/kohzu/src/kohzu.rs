@@ -243,7 +243,6 @@ impl KohzuAxis {
             prev_position: 0,
             failure: PollFailure::NONE,
             last_status: MotorStatus {
-                done: true,
                 gain_support: true,
                 ..MotorStatus::default()
             },

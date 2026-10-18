@@ -262,7 +262,6 @@ impl SpiiPlusAxis {
             axis: index,
             prev_position: 0,
             last_status: MotorStatus {
-                done: true,
                 has_encoder: true,
                 gain_support: true,
                 ..MotorStatus::default()

@@ -260,10 +260,7 @@ impl PIC630Axis {
             addr,
             high_limit: None,
             low_limit: None,
-            last_status: MotorStatus {
-                done: true,
-                ..MotorStatus::default()
-            },
+            last_status: MotorStatus::default(),
             strings: MoveStrings::default(),
         };
 
