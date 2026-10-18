@@ -126,7 +126,6 @@ impl MerlinDetector {
         base.set_int32_param(ad.params.image_mode, 0, MerlinImageMode::Continuous as i32)?;
         base.set_int32_param(ad.params.trigger_mode, 0, TriggerMode::Internal as i32)?;
         base.set_int32_param(params.profile_control, 0, MPXPROFILES_IMAGE)?;
-        base.set_int32_param(params.counter_depth, 0, 12)?;
         base.set_int32_param(ad.params.status, 0, ADStatus::Initializing as i32)?;
 
         Ok(Self {
@@ -858,6 +857,18 @@ mod tests {
         assert_eq!(base.get_int32_param(p.pool_alloc_buffers, 0).unwrap(), 1);
         assert_eq!(base.get_int32_param(p.pool_free_buffers, 0).unwrap(), 0);
         assert_eq!(base.get_float64_param(p.pool_used_memory, 0).unwrap(), 1.0);
+    }
+
+    /// C's constructor leaves COUNTERDEPTH unset (merlinDetector.cpp:1434);
+    /// only setAcquireParams defaults it to 12, so the output record boots UDF.
+    #[test]
+    fn counter_depth_starts_undefined() {
+        let det = detector("MERLIN_COUNTER_DEPTH");
+        let reason = det.params.counter_depth;
+        assert!(matches!(
+            det.ad.port_base.get_int32_param(reason, 0),
+            Err(AsynError::ParamUndefined(r)) if r == reason
+        ));
     }
 
     #[test]
