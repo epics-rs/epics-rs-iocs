@@ -11,8 +11,8 @@ pub mod protocol;
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::adapter::parse_asyn_link;
-use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynError;
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
@@ -29,6 +29,7 @@ use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
+use crate::Unconnected;
 use crate::fmt::{c_literal, format_c_double};
 use crate::mpc::protocol::{c_atoi, c_strtod};
 use crate::user_param::{after, c_str, term, up_to_comma};
@@ -222,6 +223,19 @@ fn print(handle: &PortHandle, mask: TraceMask, args: std::fmt::Arguments<'_>) {
         .print(Some(handle.port_name()), Some(ADDR), 0, mask, args);
 }
 
+/// `initCommon`'s `bad:` arm after a failed asynManager call: the line its
+/// `asynPrint` writes on the still unconnected asynUser, then `pact = 1`.
+fn bad(name: &str, message: &str) -> DeviceInitOutcome {
+    PortManager::global().trace_manager().print(
+        None,
+        None,
+        0,
+        TraceMask::ERROR,
+        format_args!("{name} asynManager error {message}\n"),
+    );
+    DeviceInitOutcome::dead()
+}
+
 impl DeviceSupport for DevEurotherm {
     fn dtyp(&self) -> &str {
         match self.kind {
@@ -251,13 +265,14 @@ impl DeviceSupport for DevEurotherm {
                 errlog_vprintf(format_args!(
                     "devXxEurotherm::initCommon {name} bad link {message}\n"
                 ));
-                return Ok(DeviceInitOutcome::dead());
+                return Ok(bad(&name, &message));
             }
         };
-        let Some(port) = get_port(&link.port_name) else {
-            return Ok(DeviceInitOutcome::dead());
+        let handle = match crate::connect_octet(&link.port_name, 0) {
+            Ok(handle) => handle,
+            Err(Unconnected::Device(message)) => return Ok(bad(&name, &message)),
+            Err(Unconnected::NoOctet) => return Ok(DeviceInitOutcome::dead()),
         };
-        let handle = port.handle.clone();
         let user_param = link.drv_info.as_str();
         let parm = Parm::parse(self.kind, user_param);
         let trace = |args: std::fmt::Arguments<'_>| print(&handle, TraceMask::IO_DEVICE, args);
@@ -363,6 +378,58 @@ mod tests {
             parm,
         });
         dev
+    }
+
+    fn init_traced(link: &str, name: &str) -> (DeviceInitOutcome, String) {
+        use epics_rs::asyn::trace::TraceFile;
+
+        let path = std::env::temp_dir().join(format!("eurotherm-{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let trace = PortManager::global().trace_manager().clone();
+        trace.set_trace_file(None, TraceFile::File(Arc::new(Mutex::new(file))));
+        let mut dev = DevEurotherm::new(Kind::Ao, link);
+        dev.set_record_info(name, ScanType::Passive);
+        let outcome = dev.init(&mut AoRecord::default()).unwrap();
+        trace.set_trace_file(None, TraceFile::Stderr);
+        let log = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        (outcome, log)
+    }
+
+    /// `initCommon`'s `bad:` arm prints the failed `connectDevice`'s or
+    /// `parseLink`'s errorMessage (devXxEurotherm.c:180-184) before
+    /// `pact = 1`.
+    #[test]
+    fn a_failed_connect_or_link_prints_the_asyn_manager_error() {
+        let (outcome, log) = init_traced("@asyn(EU_NO_SUCH_PORT)", "R:np");
+        assert_eq!(outcome, DeviceInitOutcome::dead());
+        assert!(
+            log.trim_end().ends_with(
+                "R:np asynManager error asynManager:connectDevice port EU_NO_SUCH_PORT not found"
+            ),
+            "{log:?}"
+        );
+        let message = match parse_asyn_link("not a link") {
+            Err(AsynError::InvalidLinkSyntax(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        let (outcome, log) = init_traced("not a link", "R:bl");
+        assert_eq!(outcome, DeviceInitOutcome::dead());
+        assert!(
+            log.trim_end()
+                .ends_with(&format!("R:bl asynManager error {message}")),
+            "{log:?}"
+        );
+    }
+
+    /// A port without `asynOctet` fails `findInterface` with asynSuccess:
+    /// `bad:` prints nothing and sets `pact = 1` (devXxEurotherm.c:110).
+    #[test]
+    fn a_port_without_octet_kills_the_record_silently() {
+        crate::no_octet_port("EU_INT32_ONLY");
+        let (outcome, log) = init_traced("@asyn(EU_INT32_ONLY)", "R:i32");
+        assert_eq!(outcome, DeviceInitOutcome::dead());
+        assert_eq!(log, "");
     }
 
     fn frame(dev: &DevEurotherm, record: &dyn Record) -> Vec<u8> {
