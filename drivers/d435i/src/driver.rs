@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase};
+use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
