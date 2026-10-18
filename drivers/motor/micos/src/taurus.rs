@@ -183,7 +183,7 @@ impl TaurusAxis {
             trace: MotorTrace::new(port, axis_no as i32),
             last_status: MotorStatus {
                 gain_support: true,
-                ..MotorStatus::default()
+                ..motor_common::status_before_poll()
             },
         }
     }
@@ -495,6 +495,21 @@ mod tests {
         let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
         let axis = TaurusAxis::new(controller, 0, "");
         assert_eq!(axis.members.state().travel_limits, (0.0, 0.0));
+    }
+
+    /// C's status_ starts at 0 plus GainSupport (SMCTaurusAxis.cpp:23); only
+    /// a good poll sets Done (:262).
+    #[test]
+    fn an_unanswering_controller_s_axis_polls_problem_without_done() {
+        let (handle, _) =
+            SyncIOHandle::connect_port("TAURUS_DEAD", 0, Duration::ZERO, InterfaceType::Octet);
+        let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
+        let mut axis = TaurusAxis::new(controller, 0, "");
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert!(
+            status.problem && status.gain_support && !status.done,
+            "{status:?}"
+        );
     }
 
     /// Refuses every setting write (`snv`, `sna`, `setcloop`); records
