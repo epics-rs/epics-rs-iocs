@@ -670,6 +670,21 @@ impl PortDriver for Dg645Driver {
             .map_err(|e| wire::record_error(e.status()))
     }
 
+    /// drvAsynDG645.cpp:185 registers asynInt32 with no getBounds, so C's
+    /// is asynInt32Base's (asynInt32Base.c:88-103).
+    fn get_bounds_int32(&self, user: &AsynUser) -> AsynResult<(i32, i32)> {
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "{} {} getBounds setting low=high=0\n",
+                self.base.port_name, user.addr
+            ),
+        );
+        Ok((0, 0))
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.do_write_int32(user, value)
             .map_err(|e| wire::record_error(e.status()))
@@ -1002,6 +1017,14 @@ mod init_tests {
             "{}",
             String::from_utf8_lossy(&out)
         );
+    }
+
+    /// drvAsynDG645.cpp:185 registers asynInt32 with no getBounds, so C's
+    /// is asynInt32Base's `*low = *high = 0` (asynInt32Base.c:99).
+    #[test]
+    fn int32_bounds_are_asyn_int32_base_defaults() {
+        let dg = Dg645Driver::new("DG645_BOUNDS", mute_link("DG645_BOUNDS_IO")).unwrap();
+        assert_eq!(dg.get_bounds_int32(&AsynUser::default()).unwrap(), (0, 0));
     }
 
     /// C never writes the record's errorMessage: a failed transfer carries
