@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, MoveToHomeTask, PollFailure, PortSets,
+};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -384,18 +386,16 @@ impl AsynMotor for Nf874xAxis {
         )])
     }
 
-    /// `doMoveToHome`: to absolute 0, the position `DH` defined.
-    fn move_to_home(
-        &mut self,
-        _user: &AsynUser,
-        _position: f64,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        let result = self.send(&[format!("{} PA 0", self.name)]);
+    /// `doMoveToHome`: to absolute 0, the position `DH` defined
+    /// (874xMotorDriver.cpp:419-427). C sets `lastDirection_` after the
+    /// write, off the lock; it is set here, under it.
+    fn move_to_home_task(&mut self, _referencing_mode_move: i32) -> Option<MoveToHomeTask> {
         self.last_direction = self.encoder_position < 0.0;
-        result
+        let controller = self.controller.clone();
+        let command = format!("{} PA 0", self.name);
+        Some(Box::new(move |_: &dyn Fn(PortSets)| {
+            lock(&controller).write(&command)
+        }))
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -613,6 +613,19 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         text.lines().map(str::to_owned).collect()
+    }
+
+    /// 874xMotorDriver.cpp:419-427, which only a started moveToHome thread
+    /// runs; this controller starts none.
+    #[test]
+    fn the_move_to_home_task_moves_to_absolute_0() {
+        let (rig, io) = motor_common::testing::LineRig::new("nf874xHome", |_| "0".into());
+        let ctrl = Arc::new(Mutex::new(Nf874xController::new(Some(io))));
+        let mut axis = Nf874xAxis::new(ctrl, 1);
+        rig.sent();
+        let task = axis.move_to_home_task(0).expect("C's doMoveToHome");
+        task(&|_| ()).unwrap();
+        assert_eq!(rig.sent(), ["1 PA 0"]);
     }
 
     #[test]
