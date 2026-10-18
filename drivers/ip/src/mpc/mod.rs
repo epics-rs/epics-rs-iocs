@@ -696,6 +696,21 @@ impl DeviceSupport for DevMpc {
         Ok(ReadStart::Pending)
     }
 
+    /// C `MPCConvert`, the slot of both devAiMPC and devAoMPC.
+    fn has_special_linconv(&self) -> bool {
+        matches!(self.kind, Kind::Ai | Kind::Ao)
+    }
+
+    /// `MPCConvert` writes through an `aiRecord *` cast (`devMPC.c:914`), which on
+    /// an ao lands on LOPR and the low half of ASLO; that C defect is not
+    /// copied, so an ao keeps only the record's EOFF rebase.
+    fn special_linconv(&mut self, record: &mut dyn Record, _after: bool) -> CaResult<()> {
+        if self.kind == Kind::Ai {
+            crate::unit_slope(record)?;
+        }
+        Ok(())
+    }
+
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         match self.kind {
             Kind::Ai => self.read_ai(record),

@@ -356,6 +356,15 @@ impl DeviceSupport for DevTelevac {
         Ok(ReadStart::Pending)
     }
 
+    /// C `TelevacConvert`, devAiTelevac's slot; devBiTelevac has none.
+    fn has_special_linconv(&self) -> bool {
+        self.ai
+    }
+
+    fn special_linconv(&mut self, record: &mut dyn Record, _after: bool) -> CaResult<()> {
+        crate::unit_slope(record)
+    }
+
     /// `readAi` / `readBi` with `pact == 1`. Both clear UDF whatever the
     /// reply; `readAi` returns 2, `readBi` 0 so RVAL converts.
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

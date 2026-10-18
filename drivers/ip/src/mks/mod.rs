@@ -467,6 +467,12 @@ impl DeviceSupport for DevAiMks {
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         Ok(())
     }
+
+    /// C `convertAi` fills the slot and does nothing; the record still
+    /// rebases EOFF to EGUL around the call.
+    fn has_special_linconv(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
