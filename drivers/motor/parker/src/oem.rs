@@ -33,11 +33,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PortSets,
+};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -66,9 +66,8 @@ pub struct OemController {
     /// The last `OEM_SELECT_SWITCH` write, per axis, for the poll to read
     /// without asking the port.
     select_switch: Vec<i32>,
-    /// `OEM_SWITCH_DETEC`'s index, and the port the poll posts it to.
+    /// `OEM_SWITCH_DETEC`'s index.
     switch_detected: Option<usize>,
-    port: Option<PortHandle>,
 }
 
 impl OemController {
@@ -83,13 +82,7 @@ impl OemController {
             // polls on an uninitialised `selectSwitch` (:338); rs starts at 0.
             select_switch: vec![0; num_axes],
             switch_detected: None,
-            port: None,
         }
-    }
-
-    /// Post the poll's `OEM_SWITCH_DETEC` to `port` from here on.
-    pub fn attach_port(&mut self, port: PortHandle) {
-        self.port = Some(port);
     }
 
     fn trimmed(raw: &[u8]) -> String {
@@ -128,6 +121,8 @@ pub struct OemAxis {
     direction: bool,
     /// The switch flags as C's parameter library holds them.
     switches: SwitchFlags,
+    /// The poll's `OEM_SWITCH_DETEC`, for [`AsynMotor::take_port_sets`].
+    sets: PortSets,
 }
 
 /// The poll's switch-driven status bits. C sets each only where the switch
@@ -154,6 +149,7 @@ impl OemAxis {
             position: 0.0,
             direction: false,
             switches: SwitchFlags::default(),
+            sets: PortSets::default(),
         };
         // C ignores configureController's status (OEMMotorDriver.cpp:208).
         let _ = axis.lock().configure(axis.axis_no);
@@ -334,6 +330,10 @@ impl AsynMotor for OemAxis {
         PollFailure::PROBLEM
     }
 
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -414,7 +414,8 @@ impl AsynMotor for OemAxis {
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let addr = self.address;
-        let ctrl = self.lock();
+        // The field, not `self`: the poll pushes its params with it held.
+        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         ctrl.configure(self.axis_no)?;
 
         // Moving flags: "*B"/"*C" mean in motion.
@@ -446,7 +447,11 @@ impl AsynMotor for OemAxis {
         let is = ctrl.query(&format!("{addr}IS"))?;
         let switch_detected = switch_from_is(&is);
         let select_switch = ctrl.select_switch[self.axis_no];
-        let post = ctrl.port.clone().zip(ctrl.switch_detected);
+        // Set ahead of the PZ that may fail: C's poll posts it either way
+        // (OEMMotorDriver.cpp:387-395, :422-423).
+        if let Some(reason) = ctrl.switch_detected {
+            self.sets.axis(reason, ParamValue::Int32(switch_detected));
+        }
 
         let mut switches = self.switches;
         if switch_detected > 0 {
@@ -466,12 +471,6 @@ impl AsynMotor for OemAxis {
             switches.home = false;
         }
         drop(ctrl);
-        // Posted with the controller unlocked: the port's write hook locks it.
-        if let Some((port, reason)) = post {
-            let value = ParamValue::Int32(switch_detected);
-            let update = ParamSetValue::new(reason, self.axis_no as i32, value);
-            let _ = port.set_params_and_notify_blocking(self.axis_no as i32, vec![update]);
-        }
 
         self.encoder_base = new_base;
         self.position = new_position;
@@ -516,6 +515,7 @@ mod tests {
     use std::collections::HashMap;
 
     use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::interfaces::motor::PortSet;
     use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::port::DrvUserRequest;
     use epics_rs::asyn::registry::open_owner;
@@ -669,7 +669,6 @@ mod tests {
             OemParams::new(ctrl.clone(), 100, 1000),
         )
         .unwrap();
-        ctrl.lock().unwrap().attach_port(port.clone());
         let reason = |param| {
             port.drv_user_create_blocking(&DrvUserRequest::new(param, 0))
                 .unwrap()
@@ -685,9 +684,30 @@ mod tests {
         register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
         let poll = || axis.lock().unwrap().poll(&AsynUser::new(0)).unwrap();
 
-        let status = poll();
+        // UPDATE_STATUS: the port's poll sets it, as C's poll does.
+        port.write_int32_blocking(index::UPDATE_STATUS, 0, 1)
+            .unwrap();
         assert_eq!(port.read_int32_blocking(detected, 0).unwrap(), 2);
+        let status = poll();
         assert!(status.high_limit && !status.low_limit && !status.home);
+        // The poll's only step on the port, on the axis's own address.
+        let sets: Vec<_> = axis
+            .lock()
+            .unwrap()
+            .take_port_sets()
+            .into_iter()
+            .map(|set| format!("{set:?}"))
+            .collect();
+        assert_eq!(
+            sets,
+            [format!(
+                "{:?}",
+                PortSet::Axis {
+                    reason: detected,
+                    value: ParamValue::Int32(2)
+                }
+            )]
+        );
 
         // C writes only the flags the switch names; the rest keep their
         // last value (OEMMotorDriver.cpp:398-419).

@@ -272,7 +272,6 @@ mod tests {
         )));
         let params = HxpControllerParams::new(controller.clone(), 100, 1000);
         let port = register_controller_port(&open_owner(), name, 6, params).unwrap();
-        controller.lock().unwrap().attach_port(port.clone());
         let axes = Controller::new();
         for axis_no in axes_made {
             let move_line = Arc::new(MoveLine::new(line.socket(SocketMode::Fire)));
@@ -409,21 +408,23 @@ mod tests {
     /// address 0, and its next good move clears it.
     #[test]
     fn an_axis_move_sets_the_address_0_error() {
-        use epics_rs::asyn::interfaces::motor::AsynMotor;
-        use epics_rs::asyn::user::AsynUser;
+        use epics_rs::motor::controller_port::index;
 
         let r = rig("hxpAxisError");
-        let line = r.controller.lock().unwrap().line(1).unwrap();
-        let mut axis = HxpAxis::new(r.controller.clone(), line, 1);
-        let user = AsynUser::new(0);
         *r.line.fail.lock().unwrap() = "HexapodMoveIncremental";
-        assert!(axis.move_relative(&user, 1.0, 0.0, 1.0, 1.0).is_err());
+        assert!(
+            r.port
+                .write_float64_blocking(index::MOVE_REL, 1, 1.0)
+                .is_err()
+        );
         assert_eq!(
             r.error(),
             (-3, b"Error in the command parameters of a he".to_vec())
         );
         *r.line.fail.lock().unwrap() = "";
-        axis.move_relative(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        r.port
+            .write_float64_blocking(index::MOVE_REL, 1, 1.0)
+            .unwrap();
         assert_eq!(r.error(), (0, Vec::new()));
     }
 

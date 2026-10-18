@@ -35,7 +35,9 @@
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PortSets,
+};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{DrvUserRequest, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -413,7 +415,7 @@ pub struct Mcs2Axis {
     /// Software-tracked position for open-loop step moves (driver units).
     tracked_position: f64,
     /// The channel parameters the last poll set, for the poller to post.
-    poll_params: Vec<(usize, ParamValue)>,
+    sets: PortSets,
 }
 
 impl Mcs2Axis {
@@ -429,7 +431,7 @@ impl Mcs2Axis {
             channel: axis_no as i32,
             has_encoder: false,
             tracked_position: 0.0,
-            poll_params: Vec::new(),
+            sets: PortSets::default(),
         }
     }
 
@@ -510,12 +512,12 @@ impl Mcs2Axis {
 }
 
 impl AsynMotor for Mcs2Axis {
-    /// C `MCS2Axis::poll`'s `skip` label sets only `motorStatusProblem_`
-    /// (smarActMCS2MotorDriver.cpp).
-    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
-        std::mem::take(&mut self.poll_params)
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
     }
 
+    /// C `MCS2Axis::poll`'s `skip` label sets only `motorStatusProblem_`
+    /// (smarActMCS2MotorDriver.cpp).
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM
     }
@@ -630,10 +632,9 @@ impl AsynMotor for Mcs2Axis {
         drop(ctrl);
         // C's `skip:` posts what was set before a failed query.
         if posts {
-            self.poll_params.extend(
-                set.into_iter()
-                    .map(|(reason, value)| (reason, ParamValue::Int32(value))),
-            );
+            for (reason, value) in set {
+                self.sets.axis(reason, ParamValue::Int32(value));
+            }
         }
         let (state, sensor_present, encoder_position, theory_position, ampl) = polled?;
 
@@ -756,6 +757,44 @@ mod tests {
         let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2FollowLimit", 0));
         let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         assert!(axis.poll(&AsynUser::default()).unwrap().slip_stall);
+    }
+
+    /// smarActMCS2MotorDriver.cpp:479-555: an idle poll sets PSTAT,
+    /// PTYP_RB, CAL, MCLF and HOLD on the axis's own address in that order.
+    #[test]
+    fn the_poll_s_params_go_out_on_the_axis_in_c_s_order() {
+        use epics_rs::asyn::interfaces::motor::PortSet;
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("mcs2PollSets", |cmd| {
+            match cmd.trim_end() {
+                ":CHAN0:STAT?" => "128\r\n",
+                ":CHAN0:PTYP?" => "300\r\n",
+                ":CHAN0:MCLF?" => "4000\r\n",
+                ":CHAN0:HOLD?" => "50\r\n",
+                _ => "0\r\n",
+            }
+            .to_string()
+        });
+        let mut ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2PollSets", 0));
+        ctrl.set_reasons(Mcs2Reasons::from_slice([10, 11, 12, 13, 14, 15]));
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        axis.poll(&AsynUser::default()).unwrap();
+        let sets: Vec<(usize, i32)> = axis
+            .take_port_sets()
+            .into_iter()
+            .map(|set| match set {
+                PortSet::Axis {
+                    reason,
+                    value: ParamValue::Int32(v),
+                } => (reason, v),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let cal = i32::from(128 & IS_CALIBRATED != 0);
+        assert_eq!(
+            sets,
+            [(12, 128), (11, 300), (15, cal), (13, 4000), (14, 50)]
+        );
     }
 
     #[test]

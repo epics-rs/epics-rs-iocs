@@ -204,15 +204,10 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
             let params =
                 PmacControllerParams::new(controller.clone(), moving_poll_ms, idle_poll_ms);
             let owner = ctx.db().scan_control().interrupt_gate();
-            let handle = register_controller_port(owner, &name, num_axes + 1, params)?;
-            controller
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .attach_port(handle);
+            register_controller_port(owner, &name, num_axes + 1, params)?;
             let polled = controller.clone();
-            let poller = Controller::new().controller_poll(move || {
-                polled.lock().unwrap_or_else(|e| e.into_inner()).poll();
-            });
+            let poller = Controller::new()
+                .controller_poll(move || polled.lock().unwrap_or_else(|e| e.into_inner()).poll());
             // pmacController.cpp:201, before any axis exists.
             poller.start(ctx, moving_poll_ms, idle_poll_ms, 10);
             registry
@@ -746,8 +741,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use epics_rs::asyn::error::{AsynResult, AsynStatus};
-    use epics_rs::asyn::interfaces::motor::MotorStatus;
+    use epics_rs::asyn::interfaces::motor::{MotorStatus, PortSet};
     use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::param::ParamValue;
     use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
@@ -1129,14 +1125,13 @@ mod tests {
         let (_rt, _rig) = publish_scripted("pmacRepLow");
         let controller = Arc::new(Mutex::new(controller_on("pmacRepLow")));
         let params = PmacControllerParams::new(controller.clone(), 200, 3000);
-        let port = epics_rs::motor::devices::register_controller_port(
+        let _port = epics_rs::motor::devices::register_controller_port(
             &open_owner(),
             "pmacRepCtl",
             4,
             params,
         )
         .unwrap();
-        controller.lock().unwrap().attach_port(port);
         controller.lock().unwrap().add_axis(2).unwrap();
         let head = "pmac motor driver pmacRepCtl, numAxes=4, moving poll period=0.200000, \
                     idle poll period=3.000000\n";
@@ -1166,37 +1161,46 @@ mod tests {
             params,
         )
         .unwrap();
-        controller.lock().unwrap().attach_port(port.clone());
         let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
-        let read = |name| io.read_int32(io.drv_user_create(name).unwrap()).unwrap();
-        let posted = || {
-            (
-                read("PMAC_C_GLOBALSTATUS"),
-                read("PMAC_C_COMMSERROR"),
-                read("PMAC_C_FEEDRATE"),
-            )
+        let reason = |name| io.drv_user_create(name).unwrap();
+        let reasons = [
+            reason("PMAC_C_GLOBALSTATUS"),
+            reason("PMAC_C_COMMSERROR"),
+            reason("PMAC_C_FEEDRATE"),
+        ];
+        // What the poll hands its owner for each of `reasons`.
+        let poll = || {
+            let mut posted = [None; 3];
+            for set in controller.lock().unwrap().poll() {
+                if let PortSet::Set {
+                    addr: 0,
+                    reason,
+                    value: ParamValue::Int32(v),
+                } = set
+                    && let Some(i) = reasons.iter().position(|r| *r == reason)
+                {
+                    posted[i] = Some(v);
+                }
+            }
+            posted
         };
-        let poll = || controller.lock().unwrap().poll();
         let problem = || controller.lock().unwrap().controller_problem();
         let feed_rate_poll = io.drv_user_create("PMAC_C_FEEDRATE_POLL").unwrap();
         io.write_int32(feed_rate_poll, 1).unwrap();
 
-        poll();
+        assert_eq!(poll(), [Some(1), Some(0), Some(100)]);
         assert_eq!(rig.written(), ["???", "%"]);
         assert!(problem());
-        assert_eq!(posted(), (1, 0, 100));
 
         rig.silence("???");
         rig.answer("%", b"50\r");
-        poll();
+        assert_eq!(poll(), [Some(0), Some(0), Some(50)]);
         assert_eq!(rig.written(), ["???", "%"]);
         assert!(!problem());
-        assert_eq!(posted(), (0, 0, 50));
 
         rig.answer("???", b"008000\r");
         rig.silence("%");
-        poll();
-        assert_eq!(posted(), (1, 1, 50));
+        assert_eq!(poll(), [Some(1), Some(1), None]);
     }
 
     /// pmacAxis.cpp:494-498, 606-613: a failed status read keeps the status
@@ -1633,10 +1637,15 @@ mod tests {
             params,
         )
         .unwrap();
-        controller.lock().unwrap().attach_port(port.clone());
         controller.lock().unwrap().add_axis(1).unwrap();
-        let _axis = PmacAxis::new(controller, 1);
+        let axis = Arc::new(Mutex::new(PmacAxis::new(controller, 1)));
+        Controller::new()
+            .install(asyn_user("pmacInitCtl", 1), axis)
+            .unwrap();
         let io = SyncIOHandle::from_handle(port, 1, Duration::from_secs(1));
+        // The first call into the axis hands its sets to the owner.
+        io.write_int32(epics_rs::motor::controller_port::index::UPDATE_STATUS, 1)
+            .unwrap();
         let read = |name| io.read_float64(io.drv_user_create(name).unwrap()).unwrap();
         assert_eq!(read("MOTOR_HIGH_LIMIT"), 10.0);
         assert_eq!(read("MOTOR_LOW_LIMIT"), -10.0);
@@ -1781,7 +1790,6 @@ mod tests {
         let port =
             epics_rs::motor::devices::register_controller_port(&open_owner(), name, 2, params)
                 .unwrap();
-        controller.lock().unwrap().attach_port(port.clone());
         (
             controller,
             SyncIOHandle::from_handle(port, 0, Duration::from_secs(1)),
@@ -1877,17 +1885,16 @@ mod tests {
         io.write_int32(index::DEFER_MOVES, 0).unwrap();
         assert_eq!(comms(), 0);
 
-        let mut axis = PmacAxis::new(controller.clone(), 1);
-        let user = AsynUser::new(0).with_addr(1);
-        rig.silence("");
-        axis.set_deferred_moves(&user, true).unwrap();
-        controller
-            .lock()
-            .unwrap()
-            .set_moves_deferred(DEFERRED_FAST_MOVES)
-            .status
+        let axis = Arc::new(Mutex::new(PmacAxis::new(controller.clone(), 1)));
+        Controller::new()
+            .install(asyn_user("pmacDeferCommsCtl", 1), axis)
             .unwrap();
-        assert!(axis.set_deferred_moves(&user, false).is_err());
+        let axis_io = SyncIOHandle::from_handle(io.port().unwrap().clone(), 1, io.timeout());
+        rig.silence("");
+        axis_io
+            .write_int32(index::DEFER_MOVES, DEFERRED_FAST_MOVES)
+            .unwrap();
+        assert!(axis_io.write_int32(index::DEFER_MOVES, 0).is_err());
         assert_eq!(comms(), 1);
     }
 

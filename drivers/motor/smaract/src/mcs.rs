@@ -45,7 +45,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PortSets, StatusWrite,
 };
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{DrvUserRequest, PortDriverBase};
@@ -435,7 +435,7 @@ pub struct McsAxis {
     vel_cached: i32,
     /// What the constructor or the last poll set, for the poller's
     /// callParamCallbacks.
-    poll_params: Vec<(usize, ParamValue)>,
+    sets: PortSets,
     /// The status bits the last failed command raised.
     status_writes: Vec<StatusWrite>,
 }
@@ -473,7 +473,7 @@ impl McsAxis {
             has_encoder: false,
             disable_speed,
             vel_cached: 0,
-            poll_params: Vec::new(),
+            sets: PortSets::default(),
             status_writes: Vec::new(),
         };
         let probed = axis.probe();
@@ -495,10 +495,8 @@ impl McsAxis {
 
         // smarActMCSMotorDriver.cpp:367-368
         if let Some(r) = ctrl.reasons {
-            self.poll_params.extend([
-                (r.auto_zero, ParamValue::Int32(1)),
-                (r.hold, ParamValue::Int32(0)),
-            ]);
+            self.sets.axis(r.auto_zero, ParamValue::Int32(1));
+            self.sets.axis(r.hold, ParamValue::Int32(0));
         }
 
         ctrl.check_type(axis_no);
@@ -723,8 +721,7 @@ impl AsynMotor for McsAxis {
         // (smarActMCSMotorDriver.cpp:495-502).
         let sensor = ctrl.get_val("GST", ch)?;
         if let Some(r) = ctrl.reasons {
-            self.poll_params
-                .push((r.ptyp_rb, ParamValue::Int32(sensor)));
+            self.sets.axis(r.ptyp_rb, ParamValue::Int32(sensor));
         }
         ctrl.get_val("GST", ch)?;
         drop(ctrl);
@@ -742,8 +739,8 @@ impl AsynMotor for McsAxis {
         })
     }
 
-    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
-        std::mem::take(&mut self.poll_params)
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
     }
 
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
@@ -876,6 +873,47 @@ mod tests {
         let log = publish("mcsRawLink", b"");
         connect_link("MCS1", "mcsRawLink", Duration::from_secs(1));
         assert_drained_first(&log.lock().unwrap());
+    }
+
+    /// smarActMCSMotorDriver.cpp:367-368 and :495-498: the constructor's
+    /// AUTO_ZERO and HOLD, then the poll's PTYP_RB, on the axis's own
+    /// address in the order C sets them.
+    #[test]
+    fn the_axis_s_params_go_out_on_the_axis_in_c_s_order() {
+        use epics_rs::asyn::interfaces::motor::PortSet;
+        let (_rig, io) = motor_common::testing::LineRig::new("mcsAxisSets", |cmd| {
+            match cmd.trim_end() {
+                ":GCLS0" => ":CLS0,0\n",
+                ":GS0" => ":S0,0\n",
+                ":GP0" => ":P0,0\n",
+                ":GST0" => ":ST0,300\n",
+                ":GPPK0" => ":PPK0,1\n",
+                _ => ":E0,0\n",
+            }
+            .into()
+        });
+        let controller = Arc::new(Mutex::new(McsController::new(io, false)));
+        controller
+            .lock()
+            .unwrap()
+            .set_reasons(McsReasons::from_slice([10, 11, 12, 13, 14, 15]));
+        let (mut axis, probed) = McsAxis::new(controller, 1, 0);
+        probed.unwrap();
+        let sets = |axis: &mut McsAxis| -> Vec<(usize, i32)> {
+            axis.take_port_sets()
+                .into_iter()
+                .map(|set| match set {
+                    PortSet::Axis {
+                        reason,
+                        value: ParamValue::Int32(v),
+                    } => (reason, v),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(sets(&mut axis), [(12, 1), (13, 0)]);
+        axis.poll(&AsynUser::new(0)).unwrap();
+        assert_eq!(sets(&mut axis), [(11, 300)]);
     }
 
     /// smarActMCSMotorDriver.cpp:187-215 and :385-393: a missing link keeps

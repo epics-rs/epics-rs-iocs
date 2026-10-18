@@ -16,7 +16,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -391,7 +391,7 @@ pub struct Lc400Axis {
     controller: Arc<Mutex<Lc400Controller>>,
     axis: usize,
     /// What the last poll or move set, for the poller's callParamCallbacks.
-    poll_params: Vec<(usize, ParamValue)>,
+    sets: PortSets,
 }
 
 impl Lc400Axis {
@@ -399,7 +399,7 @@ impl Lc400Axis {
         Self {
             controller,
             axis,
-            poll_params: Vec::new(),
+            sets: PortSets::default(),
         }
     }
 
@@ -427,7 +427,9 @@ impl Lc400Axis {
         drop(ctrl);
         // C sets each readback as it reads it; whatever was read before a
         // failure reaches the next callParamCallbacks.
-        self.poll_params.extend(updates);
+        for (reason, value) in updates {
+            self.sets.axis(reason, value);
+        }
         result
     }
 }
@@ -669,12 +671,14 @@ impl AsynMotor for Lc400Axis {
             ..MotorStatus::default()
         };
         drop(ctrl);
-        self.poll_params.extend(updates);
+        for (reason, value) in updates {
+            self.sets.axis(reason, value);
+        }
         Ok(status)
     }
 
-    fn take_poll_params(&mut self) -> Vec<(usize, ParamValue)> {
-        std::mem::take(&mut self.poll_params)
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
     }
 }
 
@@ -859,6 +863,7 @@ impl ControllerParams for Lc400ControllerParams {
 mod tests {
     use std::sync::Mutex;
 
+    use epics_rs::asyn::interfaces::motor::PortSet;
     use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::port_handle::PortHandle;
     use epics_rs::asyn::registry::open_owner;
@@ -907,6 +912,48 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         text.lines().map(str::to_owned).collect()
+    }
+
+    /// LC400MotorDriver.cpp poll / updateAuxParams: the digital position,
+    /// then, once every axis is done, the aux params, all on the axis's own
+    /// address in the order C sets them.
+    #[test]
+    fn a_poll_s_params_go_out_on_the_axis_in_c_s_order() {
+        // Every register reads 0: position 0, WAV_ACTIVE 0 (done).
+        let (_rig, io) =
+            motor_common::testing::LineRig::new("lc400PollSets", |_| "AAAAA\0\0\0\0Z".into());
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(Some(io), 1)));
+        let params = Lc400ControllerParams::new(controller.clone(), 0.0, 0.0);
+        let _port =
+            register_controller_port(&open_owner(), "lc400PollSetsPort", 1, params).unwrap();
+        let p = lock(&controller).params.unwrap();
+        let mut axis = Lc400Axis::new(controller, 0);
+        let user = AsynUser::new(0);
+        let reasons = |axis: &mut Lc400Axis| -> Vec<usize> {
+            axis.take_port_sets()
+                .into_iter()
+                .map(|set| match set {
+                    PortSet::Axis { reason, .. } => reason,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        // The first poll finds the axis done; the aux params wait for it.
+        axis.poll(&user).unwrap();
+        assert_eq!(reasons(&mut axis), [p.digital_pos]);
+        axis.poll(&user).unwrap();
+        assert_eq!(
+            reasons(&mut axis),
+            [
+                p.digital_pos,
+                p.range,
+                p.range_type,
+                p.servo_state,
+                p.p_gain,
+                p.i_gain,
+                p.d_gain
+            ]
+        );
     }
 
     /// C dereferences the null axis of an address with no axis

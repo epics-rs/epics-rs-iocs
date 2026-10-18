@@ -1667,16 +1667,12 @@ pub fn hxp_create_controller_command() -> CommandDef {
             };
             let controller = Arc::new(Mutex::new(HxpController::new(poll_sock)));
             let owner = ctx.db().scan_control().interrupt_gate();
-            let port = register_controller_port(
+            register_controller_port(
                 owner,
                 &port_name,
                 NUM_HXP_AXES as i32,
                 HxpControllerParams::new(controller.clone(), moving_poll_ms, idle_poll_ms),
             )?;
-            controller
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .attach_port(port);
             // C startPoller, HXPDriver.cpp:116.
             let polled = controller.clone();
             let poller = Controller::new()
