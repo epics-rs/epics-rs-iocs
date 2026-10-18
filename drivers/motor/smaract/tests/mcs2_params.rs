@@ -105,9 +105,10 @@ async fn the_poll_reads_the_channel_parameters_back() {
         let reasons: Vec<usize> = names.iter().map(|n| reason(&port, n)).collect();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
+            // Undefined until the poller thread's startup pass sets it.
             let values: Vec<i32> = reasons
                 .iter()
-                .map(|&r| port.read_int32_blocking(r, 0).unwrap())
+                .map(|&r| port.read_int32_blocking(r, 0).unwrap_or(0))
                 .collect();
             if values.iter().all(|&v| v != 0) || Instant::now() > deadline {
                 return values;

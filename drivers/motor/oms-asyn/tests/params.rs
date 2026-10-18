@@ -347,14 +347,15 @@ async fn an_unknown_axis_type_or_limit_state_keeps_the_axis() {
 #[epics_rs::base::epics_test]
 async fn int32_position_reads_ask_the_controller() {
     let (position, encoder) = on_maxnet("omsReadInt32", |port, _| {
+        // MOTOR_STATUS_HAS_ENCODER, set by the poller thread's first pass.
+        let has_encoder = index::STATUS_DIRECTION + 8;
         let deadline = Instant::now() + Duration::from_secs(5);
-        let encoder = loop {
-            let read = port.read_int32_blocking(index::ENCODER_POSITION, 0);
-            if read.is_ok() || Instant::now() > deadline {
-                break read;
-            }
+        while port.read_int32_blocking(has_encoder, 0).unwrap_or(0) == 0
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(20));
-        };
+        }
+        let encoder = port.read_int32_blocking(index::ENCODER_POSITION, 0);
         (port.read_int32_blocking(index::POSITION, 0), encoder)
     })
     .await;
