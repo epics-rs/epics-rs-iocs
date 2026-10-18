@@ -421,6 +421,10 @@ impl TetrAmmDriver {
         Ok(())
     }
 
+    /// A failed exchange returns its own status. C discards each
+    /// `writeReadMeter` status (drvTetrAMM.cpp:793-842) and reports the empty
+    /// reply as asynError (:865), so a disconnected meter alarms WRITE there
+    /// and COMM here. C defect, not copied.
     fn read_status_inner(&mut self, last: &mut trace::StatusExchange) -> AsynResult<()> {
         let p = self.params();
         let err = || AsynError::Status {
@@ -1013,6 +1017,34 @@ mod tests {
     }
 
     /// C++ sets the input EOS only in setAcquire (drvTetrAMM.cpp:464-471): a
+    /// A down meter link fails a write with the link's asynDisconnected, not
+    /// C's asynError from parsing an empty status reply.
+    #[test]
+    fn a_status_read_on_a_down_meter_keeps_the_link_status() {
+        let (_io, _meter) = create_ip_port(
+            "QE_TETRA_DOWN_IP",
+            "127.0.0.1:1",
+            Duration::from_millis(200),
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_tetramm(
+            &claim_port("QE_TETRA_DOWN").unwrap(),
+            "QE_TETRA_DOWN_IP",
+            4,
+            0,
+        )
+        .unwrap();
+        // BiasState is 0, so only readStatus talks to the meter.
+        let err = rt
+            .port_handle()
+            .write_float64_blocking(rt.params.bias_voltage, 0, 0.0)
+            .unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Disconnected, "{err:?}");
+    }
+
     /// port that refuses it keeps the driver and fails the acquire instead.
     #[test]
     fn an_input_eos_refusal_fails_the_acquire_not_the_port() {
