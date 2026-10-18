@@ -1464,11 +1464,14 @@ impl AsynMotor for PhytronAxis {
             .insert(self.axis_module_no.clone(), ratio);
         let set = ctrl.set_char();
         let m = self.axis_module_no.as_str();
-        ctrl.command(&format!("{m}P22R"))?
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| phytron_err("phytron: setEncoderRatio: invalid encoder position"))?;
-        ctrl.command(&format!("{m}P39{set}{}", fmt6(1.0 / ratio)))?;
+        // An unparsable reply is phytronInvalidReturn (:1767-1769).
+        let read = ctrl
+            .send(&format!("{m}P22R"), true)
+            .and_then(|reply| reply.trim().parse::<f64>().map_err(|_| 6));
+        let func = "setEncoderRatio";
+        ctrl.check_axis(self.axis_no, func, "Reading encoder position", read)?;
+        let sent = ctrl.send(&format!("{m}P39{set}{}", fmt6(1.0 / ratio)), true);
+        ctrl.check_axis(self.axis_no, func, "Setting ratio", sent)?;
         Ok(())
     }
 
@@ -1720,6 +1723,8 @@ mod tests {
         written: Arc<Mutex<Vec<String>>>,
         reply: Vec<u8>,
         crc: bool,
+        /// The `P22R` encoder reply.
+        encoder: &'static [u8],
     }
 
     impl epics_rs::asyn::port::PortDriver for Mcc {
@@ -1735,7 +1740,7 @@ mod tests {
             let cmd = String::from_utf8_lossy(&data[2..data.len() - tail]).into_owned();
             let payload: &[u8] = match cmd.as_str() {
                 c if self.crc && c.starts_with("SE") => b"16384",
-                c if c.ends_with("P22R") => b"1000",
+                c if c.ends_with("P22R") => self.encoder,
                 c if c.ends_with("P20R") || c.ends_with("=E") => b"0",
                 c if c.ends_with("=H") => b"E",
                 "SUI" => b"I=00000000",
@@ -1754,6 +1759,14 @@ mod tests {
 
     /// MCC axis 1 on a fresh [`Mcc`] port `name`, and its command log.
     fn mcc_axis(name: &str) -> (PhytronAxis, Arc<Mutex<Vec<String>>>) {
+        mcc_axis_reading(name, b"1000")
+    }
+
+    /// [`mcc_axis`] whose controller answers `P22R` with `encoder`.
+    fn mcc_axis_reading(
+        name: &str,
+        encoder: &'static [u8],
+    ) -> (PhytronAxis, Arc<Mutex<Vec<String>>>) {
         use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
@@ -1771,6 +1784,7 @@ mod tests {
             written: written.clone(),
             reply: Vec::new(),
             crc: false,
+            encoder,
         };
         let (rt, _actor) =
             create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
@@ -1797,6 +1811,19 @@ mod tests {
         let (mut axis, written) = mcc_axis("phytronEncoderRatio");
         axis.set_encoder_ratio(&AsynUser::new(0), 0.5).unwrap();
         assert_eq!(*written.lock().unwrap(), ["1P22R", "1P39S2.000000"]);
+    }
+
+    /// C `CHECK_AXIS("setEncoderRatio", "Reading encoder position")`
+    /// (phytronAxisMotor.cpp:1770): an unparsable reply is
+    /// phytronInvalidReturn, printed once and kept as the axis's last status,
+    /// and P39 is never sent.
+    #[test]
+    fn set_encoder_ratio_checks_the_encoder_read_on_the_axis() {
+        let (mut axis, written) = mcc_axis_reading("phytronEncoderRatioBad", b"x");
+        assert!(axis.set_encoder_ratio(&AsynUser::new(0), 0.5).is_err());
+        assert_eq!(*written.lock().unwrap(), ["1P22R"]);
+        let mut ctrl = axis.lock();
+        assert_eq!(ctrl.axis_mut(axis.axis_no).unwrap().last_status, 6);
     }
 
     /// C `std::to_string(double)` is `%f`, which spells a NaN `nan`.
@@ -1826,6 +1853,7 @@ mod tests {
             written: Arc::new(Mutex::new(Vec::new())),
             reply: Vec::new(),
             crc: false,
+            encoder: b"1000",
         };
         let (rt, _actor) = create_port_runtime(
             &claim_port("phytronEncoderPoll").unwrap(),
@@ -1889,6 +1917,7 @@ mod tests {
             written: Arc::new(Mutex::new(Vec::new())),
             reply: Vec::new(),
             crc: true,
+            encoder: b"1000",
         };
         let (rt, _actor) = create_port_runtime(
             &claim_port("phytronSlip").unwrap(),
