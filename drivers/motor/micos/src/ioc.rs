@@ -621,7 +621,6 @@ mod one_poller {
 
 #[cfg(test)]
 mod report {
-    use std::time::{Duration, Instant};
 
     use super::*;
     use motor_common::testing::{LineRig, port_report, run_command};
@@ -636,21 +635,11 @@ mod report {
         ]
     }
 
-    /// Wait for the poller to have sent `cmd`, the poll that reads the
-    /// limit configuration C's report prints.
-    async fn polled(line: &LineRig, cmd: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !line.sent().iter().any(|s| s.trim_end() == cmd) {
-            assert!(Instant::now() < deadline, "no {cmd}");
-            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
     /// SMCcorvusController::report then SMCcorvusAxis::report
     /// (SMCcorvusDriver.cpp:128-135, :202-217).
     #[epics_rs::base::epics_test]
     async fn smc_corvus_report_prints_the_controller_then_each_axis() {
-        let (line, _io) = LineRig::new("corvusRepLine", |cmd| {
+        let (_line, _io) = LineRig::new("corvusRepLine", |cmd| {
             let verb = cmd.rsplit(' ').next().unwrap_or_default();
             match verb {
                 "getpitch" => "1.0",
@@ -668,7 +657,6 @@ mod report {
             args("corvusRep", "corvusRepLine", 1),
         )
         .await;
-        polled(&line, "1 getsw").await;
         let text = port_report("corvusRep", 1);
         let want = "SMC corvus motor driver corvusRep, numAxes=1, moving poll period=0.100000, \
                     idle poll period=1.000000\n  axis 0\n    pitch 1.000000\n    \
@@ -682,7 +670,7 @@ mod report {
     /// (SMCTaurusDriver.cpp:54-58, SMCTaurusAxis.cpp:37-50).
     #[epics_rs::base::epics_test]
     async fn smc_taurus_report_prints_the_controller_then_each_axis() {
-        let (line, _io) = LineRig::new("taurusRepLine", |cmd| {
+        let (_line, _io) = LineRig::new("taurusRepLine", |cmd| {
             let verb = cmd.trim_end().rsplit(' ').next().unwrap_or_default();
             match verb {
                 "getclperiod" => "0.0001",
@@ -697,7 +685,6 @@ mod report {
             args("taurusRep", "taurusRepLine", 1),
         )
         .await;
-        polled(&line, "1 getsw").await;
         let text = port_report("taurusRep", 1);
         let want = "SMC Taurus motor driver taurusRep, numAxes=1, moving poll period=0.100000, \
                     idle poll period=1.000000\n  axis 0\n    clPeriod 0.000100\n    \
@@ -732,7 +719,7 @@ mod report {
     /// (SMChydraDriver.cpp:86-93, SMChydraAxis.cpp:76-94).
     #[epics_rs::base::epics_test]
     async fn smc_hydra_report_prints_the_controller_then_each_axis() {
-        let (line, _io) = LineRig::new("hydraRepLine", |cmd| {
+        let (_line, _io) = LineRig::new("hydraRepLine", |cmd| {
             let verb = cmd.rsplit(' ').next().unwrap_or_default();
             match verb {
                 "getmotor" => "0",
@@ -750,7 +737,6 @@ mod report {
             args("hydraRep", "hydraRepLine", 1),
         )
         .await;
-        polled(&line, "1 getsw").await;
         let text = port_report("hydraRep", 1);
         let want = "SMC hydra motor driver hydraRep, numAxes=1, moving poll period=0.100000, \
                     idle poll period=1.000000\n  axis 0\n    motorForm 0\n    pitch 1.000000\n    \

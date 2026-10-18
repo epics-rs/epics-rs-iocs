@@ -70,6 +70,7 @@ async fn on_mcc<T: Send + 'static>(
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         create_mcc.handler.call(&mcc_args, &ctx).unwrap();
         create_axis.handler.call(&axis_args, &ctx).unwrap();
+        motor_common::testing::await_first_polls();
         rig.lock().unwrap().sent();
         body(PortManager::global().find_port_handle(&port).unwrap())
     });
@@ -278,14 +279,7 @@ async fn an_axis_reset_sends_c_and_an_mcc_refuses_a_status_reset() {
 async fn the_poll_sets_axis_status() {
     let (status, _) = on_mcc("phyAxisStatus", |port| {
         let axis_status = reason(&port, "AXIS_STATUS");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let status = port.read_int32_blocking(axis_status, 1).unwrap();
-            if status != 0 || std::time::Instant::now() > deadline {
-                return status;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        port.read_int32_blocking(axis_status, 1).unwrap()
     })
     .await;
     assert_eq!(status, 0x10, "the positive limit switch");

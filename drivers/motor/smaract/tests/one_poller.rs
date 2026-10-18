@@ -35,6 +35,7 @@ fn run(lines: Vec<(CommandDef, Vec<ArgValue>)>) {
         for (cmd, args) in lines {
             cmd.handler.call(&args, &ctx).unwrap();
         }
+        motor_common::testing::await_first_polls();
     })
     .join()
     .unwrap();

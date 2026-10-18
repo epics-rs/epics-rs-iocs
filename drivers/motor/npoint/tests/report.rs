@@ -11,29 +11,19 @@ use epics_rs::base::server::iocsh::registry::{ArgValue, CommandContext, CommandD
 use motor_common::testing::LineRig;
 
 /// `cmd` with `args` on a thread of its own, then the asynReport of
-/// `port` at `level` once it is `settled`: the poller thread's startup
-/// poll lands in its own time.
-async fn report_after(
-    cmd: CommandDef,
-    args: Vec<ArgValue>,
-    port: &str,
-    level: i32,
-    settled: fn(&str) -> bool,
-) -> String {
+/// `port` at `level` once the poller thread's startup poll has run.
+async fn report_after(cmd: CommandDef, args: Vec<ArgValue>, port: &str, level: i32) -> String {
     let bridge = BlockingBridge::capture();
     let port = port.to_string();
     let shell = std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         cmd.handler.call(&args, &ctx).unwrap();
-        let handle = PortManager::global().find_port_handle(&port).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let text = handle.report_blocking(level).unwrap();
-            if settled(&text) || std::time::Instant::now() > deadline {
-                break text;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        motor_common::testing::await_first_polls();
+        PortManager::global()
+            .find_port_handle(&port)
+            .unwrap()
+            .report_blocking(level)
+            .unwrap()
     });
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;
@@ -53,7 +43,7 @@ fn create_args(port: &str, line: &str) -> Vec<ArgValue> {
 
 /// A one-axis C300 whose stage spans 400 units and whose startup poll reads
 /// encoder 20 and set point 100.
-async fn c300_report(port: &str, level: i32, settled: fn(&str) -> bool) -> String {
+async fn c300_report(port: &str, level: i32) -> String {
     let line = format!("{port}Line");
     let (_rig, _io) = LineRig::new(&line, |cmd| {
         match cmd.trim_end() {
@@ -66,13 +56,12 @@ async fn c300_report(port: &str, level: i32, settled: fn(&str) -> bool) -> Strin
         }
     });
     let cmd = motor_npoint::ioc::c300_create_controller_command();
-    report_after(cmd, create_args(port, &line), port, level, settled).await
+    report_after(cmd, create_args(port, &line), port, level).await
 }
 
 #[epics_rs::base::epics_test]
 async fn the_c300_report_prints_each_axis_at_level_1() {
-    let polled = |text: &str| text.contains("encoder position=20.000000");
-    let text = c300_report("c300Report1", 1, polled).await;
+    let text = c300_report("c300Report1", 1).await;
     let want = "C300 motor driver c300Report1, numAxes=1, moving poll period=0.100000, \
                 idle poll period=1.000000\n  axis 0\n  bitsPerUnit_ = 2621.440000\n    \
                 encoder position=20.000000\n    theory position=100.000000\n    limits=0x0\n";
@@ -81,7 +70,7 @@ async fn the_c300_report_prints_each_axis_at_level_1() {
 
 #[epics_rs::base::epics_test]
 async fn a_level_0_c300_report_prints_the_driver_line_alone() {
-    let text = c300_report("c300Report0", 0, |_| true).await;
+    let text = c300_report("c300Report0", 0).await;
     let want = "C300 motor driver c300Report0, numAxes=1, moving poll period=0.100000, \
                 idle poll period=1.000000\n";
     assert!(text.contains(want), "{text}");
@@ -94,7 +83,7 @@ async fn lc400_report(port: &str, level: i32) -> String {
     let mut args = create_args(port, &format!("{port}None"));
     args[2] = ArgValue::Int(2);
     let cmd = motor_npoint::ioc_lc400::lc400_commands().remove(0);
-    report_after(cmd, args, port, level, |_| true).await
+    report_after(cmd, args, port, level).await
 }
 
 #[epics_rs::base::epics_test]

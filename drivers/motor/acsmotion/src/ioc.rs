@@ -228,7 +228,7 @@ mod tests {
                 .handler
                 .call(&args, &ctx)
                 .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            motor_common::testing::await_first_polls();
             PortManager::global()
                 .find_port_handle(&name)
                 .unwrap()

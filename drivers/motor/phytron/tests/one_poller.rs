@@ -68,6 +68,7 @@ fn run(create_axis: CommandDef, name: &str, n: i64) {
             ];
             create_axis.handler.call(&args, &ctx).unwrap();
         }
+        motor_common::testing::await_first_polls();
     })
     .join()
     .unwrap();

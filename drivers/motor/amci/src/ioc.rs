@@ -280,6 +280,7 @@ mod tests {
             for (cmd, args) in cmds {
                 cmd.handler.call(&args, &ctx).unwrap();
             }
+            motor_common::testing::await_first_polls();
             PortManager::global()
                 .find_port_handle(&port)
                 .unwrap()
@@ -522,7 +523,7 @@ mod tests {
         let cmd = (ang1_create_controller_command(), ang1_args(port));
         report_after(vec![cmd], port, 0).await;
         assert!(!put_int32_status(port, "ANG1_JERK", 5, 1234).await);
-        // The poller thread's startup pass may still be writing CMD_MSW.
+        // The poller thread's startup pass wrote CMD_MSW.
         let written = crate::regs::fake::written("ang1NoAxisOut");
         assert!(
             !written.iter().any(|(reg, _)| *reg == crate::ang1::JERK),

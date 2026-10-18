@@ -5,7 +5,7 @@
 #![cfg(target_os = "linux")]
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::DrvUserRequest;
@@ -57,6 +57,7 @@ async fn on_mcs2<T: Send + 'static>(
     let shell = std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         cmd.handler.call(&args, &ctx).unwrap();
+        motor_common::testing::await_first_polls();
         rig.lock().unwrap().sent();
         body(PortManager::global().find_port_handle(&port).unwrap())
     });
@@ -103,18 +104,10 @@ async fn the_poll_reads_the_channel_parameters_back() {
     let (values, _) = on_mcs2("mcs2AuxPoll", |port| {
         let names = ["PTYP_RB", "PSTAT", "CAL", "MCLF", "HOLD"];
         let reasons: Vec<usize> = names.iter().map(|n| reason(&port, n)).collect();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            // Undefined until the poller thread's startup pass sets it.
-            let values: Vec<i32> = reasons
-                .iter()
-                .map(|&r| port.read_int32_blocking(r, 0).unwrap_or(0))
-                .collect();
-            if values.iter().all(|&v| v != 0) || Instant::now() > deadline {
-                return values;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        reasons
+            .iter()
+            .map(|&r| port.read_int32_blocking(r, 0).unwrap())
+            .collect::<Vec<i32>>()
     })
     .await;
     assert_eq!(values, [300, 96, 1, 5000, 60]);

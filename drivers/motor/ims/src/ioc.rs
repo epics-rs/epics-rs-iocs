@@ -574,11 +574,7 @@ mod extra_params {
         let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
         let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
         let locked = io.drv_user_create("IMS_LOCKEDROTOR").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while io.read_int32(locked).unwrap_or(0) != 1 {
-            assert!(std::time::Instant::now() < deadline);
-            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
-        }
+        assert_eq!(io.read_int32(locked).unwrap(), 1);
         assert_eq!(io.read_int32(problem).unwrap(), 0);
         assert!(io.write_int32(clear, 1).is_err());
         assert_eq!(io.read_int32(problem).unwrap(), 1);
@@ -625,7 +621,7 @@ mod extra_params {
                 epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
             }
         };
-        until(0).await;
+        assert_eq!(io.read_int32(comms).unwrap(), 0);
         dead.store(true, Ordering::Relaxed);
         until(1).await;
         assert_eq!(io.read_int32(msta).unwrap() & 1 << 12, 0);
@@ -642,11 +638,7 @@ mod extra_params {
             failing_controller("imsComms1", "imsComms1Line", 3.6e6, |l| l == "APR P").await;
         let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
         let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while io.read_int32(problem).unwrap_or(0) != 1 {
-            assert!(std::time::Instant::now() < deadline, "problem never 1");
-            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
-        }
+        assert_eq!(io.read_int32(problem).unwrap(), 1);
         assert_eq!(io.read_int32(comms).unwrap(), 1);
     }
 
@@ -670,11 +662,7 @@ mod extra_params {
     async fn the_poll_reads_the_locked_rotor_flag() {
         let (line, io) = controller("imsLr", "imsLrLine").await;
         let locked = io.drv_user_create("IMS_LOCKEDROTOR").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while io.read_int32(locked).unwrap_or(0) != 1 {
-            assert!(std::time::Instant::now() < deadline);
-            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
-        }
+        assert_eq!(io.read_int32(locked).unwrap(), 1);
         let sent = line.sent();
         let c2 = sent.iter().position(|s| s == "APR C2").unwrap();
         assert_eq!(sent[c2 + 1], "APR LR", "{sent:?}");
