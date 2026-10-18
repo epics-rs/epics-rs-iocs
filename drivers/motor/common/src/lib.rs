@@ -135,6 +135,17 @@ impl Controller {
         }
     }
 
+    /// The controller port this is, for a driver whose axes join after
+    /// [`Self::start`]: setMovingPollPeriod and setIdlePollPeriod find the
+    /// poller by it.
+    pub fn port(self, port: &str) -> Self {
+        let builder = self.builder.into_inner().unwrap_or_else(|e| e.into_inner());
+        Self {
+            builder: Mutex::new(builder.map(|b| b.port(port))),
+            axes: self.axes,
+        }
+    }
+
     /// Register `motor` as the axis at `user`; the sender reaches its
     /// poller, for a driver thread's [`PollCommand::Post`] or wakeup.
     pub fn install(

@@ -96,3 +96,39 @@ async fn an_mcc_poll_pass_reads_sui_once_for_all_its_axes() {
         assert_eq!(axes, ["1", "2", "3", "4"], "{sent:?}");
     }
 }
+
+/// C finds the controller by its port, so setMovingPollPeriod and
+/// setIdlePollPeriod pace the poller phytronCreateMCC started before any
+/// phytronCreateAxis.
+#[epics_rs::base::epics_test]
+async fn the_poll_periods_pace_a_controller_with_no_axes_yet() {
+    let name = "PHY_PERIOD";
+    let io_port = format!("{name}_IO");
+    let (line, _io) = LineRig::new(&io_port, mcc_reply);
+    let create_mcc = motor_phytron::ioc::phytron_commands()
+        .into_iter()
+        .nth(1)
+        .unwrap();
+    let args = vec![
+        ArgValue::String(name.into()),
+        ArgValue::String(io_port.into()),
+        ArgValue::Int(0),
+        ArgValue::Int(3_600_000),
+        ArgValue::Int(3_600_000),
+        ArgValue::Double(1000.0),
+        ArgValue::Int(1),
+    ];
+    pollers_after(create_mcc, args).await;
+    line.sent();
+    // The wakeup reloads the 5 forced fast polls, at the moving period.
+    for set in [
+        epics_rs::motor::ioc::set_moving_poll_period_command(),
+        epics_rs::motor::ioc::set_idle_poll_period_command(),
+    ] {
+        let args = vec![ArgValue::String(name.into()), ArgValue::Double(0.01)];
+        motor_common::testing::run_command(set, args).await;
+    }
+    sleep(Duration::from_millis(300)).await;
+    let suis = line.sent().iter().filter(|f| command(f) == "SUI").count();
+    assert!(suis >= 10, "{suis} SUI");
+}
