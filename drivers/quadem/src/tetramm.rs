@@ -86,12 +86,12 @@ impl TetrAmmDriver {
         let _ = io.set_input_eos(b"\r\n");
 
         // C++ constructor: resolution_ = 24, model = TetrAMM, valuesPerRead = 5.
+        // Only the member is 24; QE_RESOLUTION keeps drvQuadEM's 16
+        // (drvTetrAMM.cpp:81).
         base.port_base
             .set_int32_param(base.params.model, 0, QeModel::TetrAmm as i32)?;
         base.port_base
             .set_int32_param(base.params.values_per_read, 0, 5)?;
-        base.port_base
-            .set_int32_param(base.params.resolution, 0, 24)?;
         {
             let mut acq = shared.acq.lock();
             acq.resolution = 24;
@@ -1017,6 +1017,33 @@ mod tests {
     }
 
     /// C++ sets the input EOS only in setAcquire (drvTetrAMM.cpp:464-471): a
+    /// C sets `resolution_ = 24` but not the QE_RESOLUTION parameter, which
+    /// keeps drvQuadEM's 16.
+    #[test]
+    fn the_resolution_parameter_keeps_the_base_default() {
+        let (_io, _meter) = create_ip_port(
+            "QE_TETRA_RES_IP",
+            "127.0.0.1:1",
+            Duration::from_millis(200),
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_tetramm(
+            &claim_port("QE_TETRA_RES").unwrap(),
+            "QE_TETRA_RES_IP",
+            4,
+            0,
+        )
+        .unwrap();
+        let res = rt
+            .port_handle()
+            .read_int32_blocking(rt.params.resolution, 0)
+            .unwrap();
+        assert_eq!(res, 16);
+    }
+
     /// A down meter link fails a write with the link's asynDisconnected, not
     /// C's asynError from parsing an empty status reply.
     #[test]
