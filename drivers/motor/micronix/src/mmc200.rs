@@ -258,10 +258,7 @@ impl Mmc200Axis {
                 max_velocity: 0.0,
                 resolution: 1.0,
                 ignore_limits,
-                last_status: MotorStatus {
-                    done: true,
-                    ..MotorStatus::default()
-                },
+                last_status: motor_common::status_before_poll(),
                 probed: Arc::new(probed),
             };
         }
@@ -307,7 +304,7 @@ impl Mmc200Axis {
                 problem: error,
                 gain_support: true,
                 has_encoder: true,
-                ..MotorStatus::default()
+                ..motor_common::status_before_poll()
             },
             probed: Arc::new(probed),
         }
@@ -506,7 +503,21 @@ mod tests {
         let controller = Arc::new(Mutex::new(Mmc200Controller::new(handle)));
         let axis = Mmc200Axis::new(controller, 0, false);
         assert_eq!(axis.model, -1);
-        assert!(axis.last_status.problem);
+        // C's status_ starts at 0; only a good STA? sets Done (:482).
+        assert!(axis.last_status.problem && !axis.last_status.done);
+    }
+
+    /// C's constructor returns early for an MMC-ETH module and its poll
+    /// returns at once (MMC200Driver.cpp:191-193, :447-448): status_ stays 0.
+    #[test]
+    fn an_ethernet_module_axis_keeps_a_zero_status() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("mmc200Eth", |_| "#MMC-ETH v1".into());
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
+        let mut axis = Mmc200Axis::new(controller, 0, false);
+        assert_eq!(axis.model, MODEL_ETH);
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert_eq!(status, motor_common::status_before_poll());
     }
 
     /// C sets GAIN_SUPPORT and EA_PRESENT once, in the constructor
