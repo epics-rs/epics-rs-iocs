@@ -91,17 +91,9 @@
 //!
 //! ## Not modeled (documented deviations from the full C module)
 //!
-//! - **Piezo**: `PIGCSPiezoController`, `PIGCS2PiezoCL` — closed-loop piezo
-//!   gain/notch-filter parameters and the ~20 aux PVs `PIasynController` wires
-//!   for them (`KP`/`KI`/`KFF`/`NTCHFR*`/`RBONT`/`RBOVF`/…).
-//! - **Per-model controllers**: `PIE517Controller` and `PIE727Controller`
-//!   (piezo-based, each with its own init and status quirks); those
-//!   controllers run on [`Model::Motor`].
-//! - **`SVO?` (`getServo`)**: as upstream, only the C-887's status asks it;
-//!   the generic motor axis's servo state comes from the `char(4)` status
-//!   bitmask. `PIGCSPiezoController`'s use of it is not ported.
-//! - **`getAxisOnt`/`getAxisOvf`**: base-class no-ops (on-target/overflow
-//!   status meaningful only for the piezo closed-loop path); not ported.
+//! - **`SVO?` (`getServo`)**: as upstream, only the C-887's status and
+//!   a piezo's without `SRG?` ask it; the generic motor axis's servo
+//!   state comes from the `char(4)` status bitmask.
 //! - **`getMoving`/`getBusy`** (`char(5)`/`char(7)`): the base class's
 //!   fallback status transport for controllers that don't understand
 //!   `char(4)`; unreachable once `PIGCSMotorController::getStatus` overrides
@@ -216,6 +208,14 @@ fn pigcs2_err(message: impl Into<String>) -> AsynError {
     }
 }
 
+/// The `errorMessage` C's `referenceVelCts` writes on a failure, as the
+/// error. C defect not copied: it writes it through `pAxis->m_pasynUser`,
+/// which is never set (NULL at PIasynAxis.cpp:54; the assignment at
+/// PIasynController.cpp:230 is commented out), so C crashes instead.
+fn reference_err(status: AsynStatus, message: String) -> AsynError {
+    AsynError::Status { status, message }
+}
+
 /// `PIGCSController::getValue`: return the substring after the first `=`, or
 /// `None` if there is no `=` at all (an empty tail, e.g. `"1="`, is `Some("")`
 /// — `atof`/`atoi` on an empty string parse as `0`, matching C `atof("")`).
@@ -230,16 +230,23 @@ fn get_value_f64(reply: &str) -> AsynResult<f64> {
 }
 
 /// C `strtol(s, NULL, radix)`: leading blanks, a sign and, in base 16, a
-/// `0x` are read; no digit is 0 and an overflow saturates.
+/// `0x` are read; base 0 reads a `0x` as 16 and a leading `0` as 8; no
+/// digit is 0 and an overflow saturates.
 fn strtol(s: &str, radix: u32) -> i64 {
     let t = s.trim_start();
     let (negative, t) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    let t = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        Some(rest) if radix == 16 && rest.starts_with(|c: char| c.is_ascii_hexdigit()) => rest,
-        _ => t,
+    let (t, radix) = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(rest)
+            if matches!(radix, 0 | 16) && rest.starts_with(|c: char| c.is_ascii_hexdigit()) =>
+        {
+            (rest, 16)
+        }
+        _ if radix == 0 && t.starts_with('0') => (t, 8),
+        _ if radix == 0 => (t, 10),
+        _ => (t, radix),
     };
     let n = t.chars().take_while(|c| c.is_digit(radix)).count();
     if n == 0 {
@@ -295,6 +302,25 @@ fn busy_from_reply(raw: &[u8]) -> bool {
 /// C `PIGCSController::MAX_NR_AXES`.
 const MAX_NR_AXES: usize = 64;
 
+/// The closed-loop parameters, as `PI_SUP_{name}` and `PI_SUP_RB{name}`, with
+/// the E-727 parameter each sets (`PIGCS2PiezoCLParams` and
+/// `PI727_CL_PARAM_ADDR::All`, PIGCS2PiezoCL.h).
+const CL_PARAMS: [(&str, u32); 10] = [
+    ("KP", 0x0700_0300),
+    ("KI", 0x0700_0301),
+    ("KFF", 0x0703_0600),
+    ("NTCHFR1", 0x0800_0100),
+    ("NTCHFR2", 0x0800_0101),
+    ("NTCHRJT1", 0x0700_0200),
+    ("NTCHRJT2", 0x0700_0201),
+    ("NTCHBDWDT1", 0x0800_0300),
+    ("NTCHBDWDT2", 0x0800_0301),
+    ("ANALOGTARGET", 0x0600_0500),
+];
+
+/// `PIE727Controller::m_CCL_ADVANCED_ID`/`m_CCL_ADVANCED_PWD`.
+const CCL_ADVANCED: &str = "CCL 1 advanced";
+
 /// `PIGCSController::getStatusFromBitMask`.
 fn status_from_bitmask(mask: u32) -> (bool, bool, bool, bool, bool) {
     let homing = mask & STATUS_HOMING != 0;
@@ -337,18 +363,29 @@ pub enum Model {
     Gcs2Hexapod,
     /// `PICoordinateSystem` (C-887).
     CoordinateSystem,
+    /// `PIGCSPiezoController` (E-753/754/709/712/725).
+    Piezo,
+    /// `PIE517Controller` (E-517/518).
+    E517,
+    /// `PIE727Controller` (E-727).
+    E727,
 }
 
 impl Model {
     /// `PIGCSMotorController::getResolution`'s `SPA?` CPU reads; the others
     /// run the base's fixed one.
     fn reads_cpu(self) -> bool {
-        !matches!(self, Self::C885 | Self::E755) && !self.is_hexapod()
+        !matches!(self, Self::C885 | Self::E755) && !self.is_hexapod() && !self.is_piezo()
     }
 
     /// `PIGCSMotorController::setAccelerationCts`; the others' is a no-op.
     fn sets_acceleration(self) -> bool {
-        !matches!(self, Self::C885 | Self::E755) && !self.is_hexapod()
+        !matches!(self, Self::C885 | Self::E755) && !self.is_hexapod() && !self.is_piezo()
+    }
+
+    /// `PIGCSPiezoController` or a class built on it.
+    fn is_piezo(self) -> bool {
+        matches!(self, Self::Piezo | Self::E517 | Self::E727)
     }
 
     /// `PIHexapodController` or the GCS 2 class built on it.
@@ -389,13 +426,17 @@ impl Model {
         if idn.contains("E-873.3QTU") {
             Some(Self::MotorNoRefVel)
         } else if any(&[
-            "C-663", "C-863", "C-867", "C-884", "E-861", "E-871", "E-873", "E-517", "E-518",
+            "C-663", "C-863", "C-867", "C-884", "E-861", "E-871", "E-873",
         ]) {
             Some(Self::Motor)
+        } else if any(&["E-517", "E-518"]) {
+            Some(Self::E517)
         } else if idn.contains("C-885") {
             Some(Self::C885)
-        } else if any(&["E-753", "E-754", "E-709", "E-712", "E-725", "E-727"]) {
-            Some(Self::Motor)
+        } else if any(&["E-753", "E-754", "E-709", "E-712", "E-725"]) {
+            Some(Self::Piezo)
+        } else if idn.contains("E-727") {
+            Some(Self::E727)
         } else if idn.contains("E-755") {
             Some(Self::E755)
         } else if idn.contains("C-702") {
@@ -444,6 +485,26 @@ pub struct PIGCS2Controller {
     pivot: [f64; 3],
     /// `PIGCSController::m_targetMode`, `PI_CS_TARGETMODE`.
     target_mode: i32,
+    /// `PIGCSPiezoController::m_hasqFRF/m_hasqTRS/m_hasqSRG`.
+    piezo: PiezoQueries,
+}
+
+/// Which of `FRF?`, `TRS?` and `SRG?` a piezo controller has not yet
+/// answered with an unknown command.
+struct PiezoQueries {
+    frf: Cell<bool>,
+    trs: Cell<bool>,
+    srg: Cell<bool>,
+}
+
+impl Default for PiezoQueries {
+    fn default() -> Self {
+        Self {
+            frf: Cell::new(true),
+            trs: Cell::new(true),
+            srg: Cell::new(true),
+        }
+    }
 }
 
 /// `PIHexapodController`'s platform state, one for all its axes.
@@ -489,6 +550,7 @@ impl PIGCS2Controller {
             last_error: Cell::new(0),
             pivot: [0.0; 3],
             target_mode: 0,
+            piezo: PiezoQueries::default(),
         }
     }
 
@@ -592,6 +654,13 @@ impl PIGCS2Controller {
     /// The class C's `CreateGCSController` picked from the `*IDN?`.
     pub fn set_model(&mut self, model: Model) {
         self.model = model;
+        if matches!(model, Model::E517 | Model::E727) {
+            self.piezo.frf.set(false);
+            self.piezo.trs.set(false);
+        }
+        if model == Model::E727 {
+            self.piezo.srg.set(false);
+        }
     }
 
     /// The constructor's `*IDN?` into an emptied buffer: empty when the
@@ -618,6 +687,22 @@ impl PIGCS2Controller {
         self.axis_names = self.find_connected_axes().unwrap_or_default();
         if self.model.is_hexapod() {
             self.init_hexapod();
+        }
+        if self.model == Model::E517 {
+            self.set_outputs_online();
+        }
+    }
+
+    /// `PIE517Controller::init` after the base's: each of `TPC?`'s output
+    /// channels `ONL`, which the E-517 needs before it takes commands.
+    fn set_outputs_online(&self) {
+        let Ok(reply) = self.query("TPC?") else {
+            return;
+        };
+        for channel in 1..=atoi(&reply) {
+            if self.send_only(&format!("ONL {channel} 1")).is_err() {
+                return;
+            }
         }
     }
 
@@ -909,6 +994,20 @@ impl PIGCS2Controller {
         Err(pigcs2_err(format!("GCS error {err}")))
     }
 
+    /// `referenceVelCts`'s `ERR? == 0`: any other code prints `{class}`'s
+    /// `failed` line and is C's `GCS Error` [`reference_err`].
+    fn check_reference(&self, class: &str) -> AsynResult<()> {
+        let err = self.get_gcs_error();
+        if err == 0 {
+            return Ok(());
+        }
+        self.print(format_args!("{class}::referenceVelCts() failed\n"));
+        Err(reference_err(
+            AsynStatus::Error,
+            format!("{class}::referenceVelCts() failed - GCS Error {err}"),
+        ))
+    }
+
     /// C `move`'s `MOV {axis} {position}` and its FLOW line.
     fn send_mov(&self, axis: &str, position: f64) -> AsynResult<()> {
         let cmd = format!("MOV {axis} {}", CFloat(position));
@@ -951,6 +1050,45 @@ impl PIGCS2Controller {
         get_value_f64(&reply)
     }
 
+    /// C `setCLAxisParam`: the E-727's sets `param_id` at command level 1
+    /// and returns to 0 whatever the `SPA` did; the base's does nothing.
+    fn set_cl_axis_param(&self, axis: &str, param_id: u32, value: f64) -> AsynResult<()> {
+        if self.model != Model::E727 {
+            return Ok(());
+        }
+        self.send_only(CCL_ADVANCED)?;
+        let status = self.set_gcs_parameter(axis, param_id as i32, value);
+        self.trace(
+            TraceMask::FLOW,
+            format_args!("PIGCSPiezoController::setCLAxisParam(), param: 0x{param_id:08x} \r\n"),
+        );
+        let restored = self.send_only("CCL 0");
+        status.and(restored)
+    }
+
+    /// C `getCLAxisParam`: the E-727's `SPA?`; the base's 0. A failed read
+    /// is the 0 C's poll starts from.
+    fn get_cl_axis_param(&self, axis: &str, param_id: u32) -> f64 {
+        if self.model != Model::E727 {
+            return 0.0;
+        }
+        self.get_gcs_parameter(axis, param_id as i32).unwrap_or(0.0)
+    }
+
+    /// C `getAxisOnt`/`getAxisOvf`: the E-727's `ONT?`/`OVF?` `{axis}`; the
+    /// base's read nothing. C defect not copied: the poll's `axisont` is
+    /// uninitialized, so the base and a failed `ONT?` post garbage; rs posts
+    /// 0, as C does for `axisovf`.
+    fn get_axis_flag(&self, query: &str, axis: &str) -> i32 {
+        if self.model != Model::E727 {
+            return 0;
+        }
+        self.query(&format!("{query} {axis}"))
+            .ok()
+            .and_then(|reply| value_str(&reply).map(atoi))
+            .unwrap_or(0)
+    }
+
     /// C `PIasynController::processDeferredMoves` and
     /// `PIGCSController::moveCts(array)`: one `MOV` for every deferred
     /// axis, then `ERR?`.
@@ -978,12 +1116,12 @@ impl PIGCS2Controller {
         Ok(())
     }
 
-    /// `STP` + `ERR? == PI_CNTR_STOP`: stops every axis (C
-    /// `PIC885Controller::haltAxis`).
-    fn stop_all(&self) -> AsynResult<()> {
+    /// `STP` + `ERR? == PI_CNTR_STOP`: stops every axis (C `class`'s
+    /// `haltAxis`, `PIC885Controller` or `PIGCSPiezoController`).
+    fn stop_all(&self, class: &str) -> AsynResult<()> {
         self.send_only("STP")?;
         self.check(PI_CNTR_STOP, |err| {
-            format!("PIC885Controller::haltAxis() failed, GCS error {err}")
+            format!("{class}::haltAxis() failed, GCS error {err}")
         })
     }
 
@@ -1047,11 +1185,14 @@ impl PIGCS2Controller {
     /// whatever the axis.
     fn init_platform(&mut self) -> AsynResult<()> {
         if let Err(e) = self.send_only("INI X") {
-            self.get_gcs_error();
+            let err = self.get_gcs_error();
             self.print(format_args!(
                 "PIHexapodController::referenceVelCts() failed\n"
             ));
-            return Err(e);
+            return Err(reference_err(
+                e.status(),
+                format!("PIHexapodController::referenceVelCts() failed - GCS Error {err}"),
+            ));
         }
         self.hexapod.homing = true;
         Ok(())
@@ -1068,6 +1209,10 @@ impl PIGCS2Controller {
     /// `RON {axis} 0` / `POS {axis} {position}` / `RON {axis} 1`, one
     /// `ERR? == 0` after all three (C `setAxisPosition`).
     fn set_axis_position(&self, axis: &str, position: f64) -> AsynResult<()> {
+        if self.model.is_piezo() {
+            // PIGCSPiezoController::setAxisPosition: no RON or POS.
+            return Ok(());
+        }
         let pos = format!("POS {axis} {}", CFloat(position));
         for cmd in [&format!("RON {axis} 0"), &pos, &format!("RON {axis} 1")] {
             self.send_only(cmd)?;
@@ -1192,7 +1337,20 @@ impl PIGCS2Controller {
         if self.model == Model::C702 {
             return Ok(self.get_gcs_parameter(axis, PARA_C702_REFERENCED)? > 0.1);
         }
-        get_value_bool(&self.query(&format!("FRF? {axis}"))?)
+        let frf = || get_value_bool(&self.query(&format!("FRF? {axis}"))?);
+        if !self.model.is_piezo() {
+            return frf();
+        }
+        // PIGCSPiezoController::getReferencedState: a controller without
+        // FRF? has absolute sensors and reads as referenced.
+        if self.piezo.frf.get() {
+            match frf() {
+                Ok(homed) => return Ok(homed),
+                Err(e) if self.get_gcs_error() != PI_CNTR_UNKNOWN_COMMAND => return Err(e),
+                Err(_) => self.piezo.frf.set(false),
+            }
+        }
+        Ok(true)
     }
 
     /// `SVO? {axis}`.
@@ -1215,9 +1373,7 @@ impl PIGCS2Controller {
             "SPA {axis} {REF_VEL_PARAM_HEX} {}",
             CFloat(velocity.abs())
         ));
-        self.check(0, |_| {
-            "PIGCSMotorController::referenceVelCts() failed\n".into()
-        })
+        self.check_reference("PIGCSMotorController")
     }
 
     /// `FRF`/`FPL`/`FNL {axis}` + `ERR? == 0` (C `referenceAxis`, and the
@@ -1243,11 +1399,12 @@ impl PIGCS2Controller {
             self.print(format_args!(
                 "{class}::referenceVelCts() failed - axis has no reference/limit switch\n"
             ));
-            return Err(pigcs2_err(format!(
-                "axis {axis} has no reference sensor or limit switch to home against"
-            )));
+            return Err(reference_err(
+                AsynStatus::Error,
+                format!("{class}::referenceVelCts() failed - axis has no reference/limit switch"),
+            ));
         }
-        self.check(0, |_| format!("{class}::referenceVelCts() failed\n"))
+        self.check_reference(class)
     }
 
     /// C `sendAndReceive(char)`: a short write is asynError. The byte is
@@ -1306,6 +1463,37 @@ impl PIGCS2Controller {
         Ok(strtol(&self.query_char(5)?, 16) & mask != 0)
     }
 
+    /// `PIGCSPiezoController::getStatus`: `SRG? {axis} 1`'s mask, no limits;
+    /// once `SRG?` fails, `#5` against `mask` and `SVO?`.
+    fn get_piezo_status(
+        &self,
+        axis: &str,
+        mask: i64,
+    ) -> AsynResult<(bool, bool, bool, bool, bool)> {
+        if !self.piezo.srg.get() {
+            let moving = self.get_moving(mask)?;
+            let servo = self.get_servo(axis)?;
+            return Ok((false, moving, false, false, servo));
+        }
+        let reply = self.query(&format!("SRG? {axis} 1")).inspect_err(|_| {
+            self.piezo.srg.set(false);
+        })?;
+        let Some(value) = value_str(&reply) else {
+            self.piezo.srg.set(false);
+            return Err(pigcs2_err(format!("no '=' in reply {reply:?}")));
+        };
+        let (homing, moving, _, _, servo) = status_from_bitmask(strtol(value, 0) as u32);
+        self.trace(
+            TraceMask::FLOW,
+            format_args!(
+                "PIGCSPiezoController::getStatus() buf:{reply} moving {}, svo: {}\n",
+                i32::from(moving),
+                i32::from(servo)
+            ),
+        );
+        Ok((homing, moving, false, false, servo))
+    }
+
     /// `CST? {axis}` (C `initAxis`'s stage-configuration probe, logged only —
     /// C keeps it purely to surface mis/non-configured controllers in the
     /// log).
@@ -1361,6 +1549,12 @@ struct PiParams {
     rbpivot_x: usize,
     rbpivot_y: usize,
     rbpivot_z: usize,
+    /// `PI_SUP_{name}` of each [`CL_PARAMS`].
+    cl: [usize; 10],
+    /// `PI_SUP_RB{name}` of each [`CL_PARAMS`].
+    rb_cl: [usize; 10],
+    rbont: usize,
+    rbovf: usize,
     target_mode: usize,
     cs_activate: usize,
     cs_link: usize,
@@ -1398,6 +1592,18 @@ impl PIGCS2Params {
     }
 }
 
+/// A Float64 `{prefix}{name}` for each [`CL_PARAMS`].
+fn create_each(
+    create: &mut impl FnMut(&str, ParamType) -> AsynResult<usize>,
+    prefix: &str,
+) -> AsynResult<[usize; 10]> {
+    let mut reasons = [0; 10];
+    for (reason, (name, _)) in reasons.iter_mut().zip(CL_PARAMS) {
+        *reason = create(&format!("{prefix}{name}"), ParamType::Float64)?;
+    }
+    Ok(reasons)
+}
+
 /// C `PIasynController::writeInt32`/`writeFloat64` with no
 /// `m_pGCSController`: asynError before anything is stored.
 fn not_initialized(base: &PortDriverBase, user: &AxisUser<'_>, method: &str) -> ParamWrite {
@@ -1420,24 +1626,29 @@ impl WriteHook for PiWriteHook {
     /// (PIasynController.cpp:294-322, :364-394).
     fn handles(&self, function: usize) -> bool {
         let p = &self.0;
-        [
-            index::CLOSED_LOOP,
-            index::DEFER_MOVES,
-            p.servo,
-            p.clear_err,
-            p.target_mode,
-            p.target,
-            p.pivot_x,
-            p.pivot_y,
-            p.pivot_z,
-        ]
-        .contains(&function)
+        p.cl.contains(&function)
+            || [
+                index::CLOSED_LOOP,
+                index::DEFER_MOVES,
+                p.servo,
+                p.clear_err,
+                p.target_mode,
+                p.target,
+                p.pivot_x,
+                p.pivot_y,
+                p.pivot_z,
+            ]
+            .contains(&function)
     }
 
     /// The closing line; a servo or target write prints its own from the
     /// axis call [`queue_axis_write`] runs.
     fn after_write(&self, write: &FinishedWrite<'_>) -> WriteOutcome {
-        if write.function != self.0.servo && write.function != self.0.target {
+        let p = &self.0;
+        if write.function != p.servo
+            && write.function != p.target
+            && !p.cl.contains(&write.function)
+        {
             write_trailer(
                 &|mask, args| write.print(mask, args),
                 write.function,
@@ -1514,7 +1725,8 @@ impl ControllerParams for PIGCS2Params {
     }
 
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
-        let mut create = |name, kind| base.create_param(name, kind);
+        let mut create = |name: &str, kind| base.create_param(name, kind);
+        // Struct fields evaluate in order: C's creation order.
         let params = PiParams {
             position: create("PI_SUP_POSITION", ParamType::Float64)?,
             target: create("PI_SUP_TARGET", ParamType::Float64)?,
@@ -1527,6 +1739,10 @@ impl ControllerParams for PIGCS2Params {
             rbpivot_x: create("PI_SUP_RBPIVOT_X", ParamType::Float64)?,
             rbpivot_y: create("PI_SUP_RBPIVOT_Y", ParamType::Float64)?,
             rbpivot_z: create("PI_SUP_RBPIVOT_Z", ParamType::Float64)?,
+            cl: create_each(&mut create, "PI_SUP_")?,
+            rb_cl: create_each(&mut create, "PI_SUP_RB")?,
+            rbont: create("PI_SUP_RBONT", ParamType::Int32)?,
+            rbovf: create("PI_SUP_RBOVF", ParamType::Int32)?,
             target_mode: create("PI_CS_TARGETMODE", ParamType::Int32)?,
             cs_activate: create("PI_CS_ACTIVATE", ParamType::Octet)?,
             cs_link: create("PI_CS_LINK", ParamType::Octet)?,
@@ -1590,6 +1806,14 @@ impl ControllerParams for PIGCS2Params {
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // C's sink is the asynUser itself, a `-1` address included.
         ctrl.log_sink = Some((base.port_name.to_string(), user.asyn().addr));
+        if let Some(n) = params.cl.iter().position(|&r| r == user.reason) {
+            drop(ctrl);
+            let param_id = CL_PARAMS[n].1;
+            return queue_axis_write(base, user, WriteValue::Float64(value), move |axis, _| {
+                axis.lock()
+                    .set_cl_axis_param(&axis.axis_name, param_id, value)
+            });
+        }
         let pivots = [params.pivot_x, params.pivot_y, params.pivot_z];
         let pivot = pivots.iter().position(|&r| r == user.reason);
         if pivot.is_none() && user.reason != params.target {
@@ -1663,6 +1887,17 @@ impl ControllerParams for PIGCS2Params {
         }
         ctx.report(out, level);
     }
+}
+
+/// What `PIasynAxis::poll` reads once the axis may be talked to.
+struct PollReads {
+    /// `PI_SUP_POSITION`, when it answered.
+    real: Option<f64>,
+    /// `PI_SUP_RBONT`/`PI_SUP_RBOVF`.
+    ont: i32,
+    ovf: i32,
+    /// Each [`CL_PARAMS`]' readback.
+    cl: [f64; 10],
 }
 
 /// One GCS2 axis sharing a controller. Implements [`AsynMotor`].
@@ -1780,6 +2015,9 @@ impl PIGCS2Axis {
             // PIHexapodController::initAxis: no LIM?/TRS?/CST?.
             return self.set_servo(true);
         }
+        if self.lock().model.is_piezo() {
+            return self.init_piezo_axis();
+        }
         if self.lock().model == Model::C885 {
             // C PIC885Controller::initAxis: a reference sensor by
             // construction, no LIM?/CST? and no servo-on.
@@ -1819,6 +2057,43 @@ impl PIGCS2Axis {
         ctrl.set_servo(&self.axis_name, true)?;
         self.servo_on = true;
         Ok(())
+    }
+
+    /// C `PIGCSPiezoController::initAxis`: `TRS?` while it is known, then
+    /// the servo on only if the axis reads as referenced.
+    fn init_piezo_axis(&mut self) -> AsynResult<()> {
+        self.has_reference = false;
+        let trs = {
+            let ctrl = self.lock();
+            if !ctrl.piezo.trs.get() {
+                None
+            } else {
+                match ctrl.has_reference_sensor(&self.axis_name) {
+                    Err(e) if ctrl.get_gcs_error() != PI_CNTR_UNKNOWN_COMMAND => return Err(e),
+                    Err(_) => {
+                        ctrl.piezo.trs.set(false);
+                        None
+                    }
+                    Ok(has_reference) => Some(has_reference),
+                }
+            }
+        };
+        if let Some(has_reference) = trs {
+            self.has_reference = has_reference;
+            self.flow(format_args!(
+                "PIGCSController::hasReferenceSwitch() axis has {}reference sensor\n",
+                if has_reference { "" } else { "no " }
+            ));
+        }
+        let homed = self.lock().get_referenced_state(&self.axis_name);
+        let servo = match homed {
+            Ok(homed) => {
+                self.homed = homed;
+                homed
+            }
+            Err(_) => true,
+        };
+        self.set_servo(servo)
     }
 
     fn lock(&self) -> MutexGuard<'_, PIGCS2Controller> {
@@ -1869,6 +2144,16 @@ impl PIGCS2Axis {
             // last servo state.
             let moving = ctrl.hexapod.moving || ctrl.deferred.contains_key(&self.axis_no);
             return Ok((ctrl.hexapod.homing, moving, false, false, self.servo_on));
+        }
+        if matches!(ctrl.model, Model::Piezo | Model::E727) {
+            return ctrl.get_piezo_status(&self.axis_name, 1 << self.axis_no);
+        }
+        if ctrl.model == Model::E517 {
+            // PIE517Controller::getStatus: #5 alone. C defect not copied: it
+            // never sets servoControl, which poll then reads uninitialized;
+            // rs keeps the last servo state.
+            let moving = ctrl.get_moving(1 << self.axis_no)?;
+            return Ok((false, moving, false, false, self.servo_on));
         }
         if !matches!(ctrl.model, Model::E755 | Model::C702) {
             return ctrl.get_status(&self.axis_name, self.axis_no);
@@ -2002,12 +2287,13 @@ impl PIGCS2Axis {
             self.set_servo(true)?;
             let ctrl = self.lock();
             ctrl.send_only(&format!("FRF {}", self.axis_name))?;
-            return ctrl.check(0, |_| {
-                "PIGCS2_HexapodController::referenceVelCts() failed\n".into()
-            });
+            return ctrl.check_reference("PIGCS2_HexapodController");
         }
         if model == Model::C702 {
             return self.reference_c702(velocity, forward);
+        }
+        if model.is_piezo() {
+            return self.reference_piezo();
         }
         if model == Model::C885 {
             return self
@@ -2019,6 +2305,28 @@ impl PIGCS2Axis {
                 .set_reference_velocity(&self.axis_name, velocity / self.cpu)?;
         }
         self.reference_axis(forward)
+    }
+
+    /// C `PIGCSPiezoController::referenceVelCts`: nothing without `FRF?`,
+    /// else the servo off, then `FRF` on an axis with a reference sensor.
+    fn reference_piezo(&mut self) -> AsynResult<()> {
+        if !self.lock().piezo.frf.get() {
+            return Ok(());
+        }
+        self.set_servo(false)?;
+        let ctrl = self.lock();
+        if !self.has_reference {
+            ctrl.print(format_args!(
+                "PIGCSPiezoController::referenceVelCts() failed - axis has no reference switch\n"
+            ));
+            return Err(reference_err(
+                AsynStatus::Error,
+                "PIGCSPiezoController::referenceVelCts() failed - axis has no reference switch"
+                    .into(),
+            ));
+        }
+        ctrl.send_only(&format!("FRF {}", self.axis_name))?;
+        ctrl.check_reference("PIGCSPiezoController")
     }
 
     /// C `PIC702Controller::referenceVelCts`: servo on, `VEL`, then
@@ -2036,8 +2344,10 @@ impl PIGCS2Axis {
             self.lock().print(format_args!(
                 "PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch\n"
             ));
-            return Err(pigcs2_err(
-                "PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch",
+            return Err(reference_err(
+                AsynStatus::Error,
+                "PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch"
+                    .into(),
             ));
         };
         let mut ctrl = self.lock();
@@ -2070,7 +2380,7 @@ impl PIGCS2Axis {
     /// C `PIasynAxis::poll`'s reads after the status, skipped while a
     /// controller that cannot talk while homing homes; the
     /// `PI_SUP_POSITION` read when it ran and answered.
-    fn poll_reads(&mut self, old_homing: bool, servo_control: bool) -> Option<f64> {
+    fn poll_reads(&mut self, old_homing: bool, servo_control: bool) -> Option<PollReads> {
         let homing = self.is_homing;
         // C only re-queries FRF? (the homed flag) right when homing just
         // finished (oldHoming true, new homing false) — not every cycle.
@@ -2108,14 +2418,17 @@ impl PIGCS2Axis {
             let real = ctrl
                 .get_axis_position(&self.axis_name, position / self.cpu)
                 .ok();
+            let ont = ctrl.get_axis_flag("ONT?", &self.axis_name);
+            let ovf = ctrl.get_axis_flag("OVF?", &self.axis_name);
             let (mut low_limit, mut high_limit) = (self.low_limit, self.high_limit);
             let _ = ctrl.get_travel_limits(&self.axis_name, &mut low_limit, &mut high_limit);
+            let cl = CL_PARAMS.map(|(_, id)| ctrl.get_cl_axis_param(&self.axis_name, id));
             drop(ctrl);
             self.position = units;
             self.last_position = position;
             self.low_limit = low_limit;
             self.high_limit = high_limit;
-            return real;
+            return Some(PollReads { real, ont, ovf, cl });
         }
         None
     }
@@ -2273,7 +2586,8 @@ impl AsynMotor for PIGCS2Axis {
         ctrl.deferred.remove(&self.axis_no);
         // C returns asynSuccess whatever haltAxis returned.
         let _ = match ctrl.model {
-            Model::C885 => ctrl.stop_all(),
+            Model::C885 => ctrl.stop_all("PIC885Controller"),
+            Model::Piezo | Model::E727 => ctrl.stop_all("PIGCSPiezoController"),
             model if model.is_hexapod() => ctrl.halt_platform(),
             _ => ctrl.halt(&self.axis_name),
         };
@@ -2354,7 +2668,7 @@ impl AsynMotor for PIGCS2Axis {
         self.pos_limit = pos_limit;
         self.is_homing = homing;
         let model = self.lock().model;
-        let real = if !homing || model.can_communicate_while_homing() {
+        let reads = if !homing || model.can_communicate_while_homing() {
             self.poll_reads(old_homing, servo_control)
         } else {
             None
@@ -2366,11 +2680,20 @@ impl AsynMotor for PIGCS2Axis {
             ));
         }
         let params = self.lock().port.as_ref().map(|&(_, params)| params);
-        if let Some(params) = params {
-            if let Some(real) = real {
+        if let (Some(params), Some(reads)) = (params, reads) {
+            if let Some(real) = reads.real {
                 self.poll_params
                     .push((params.position, ParamValue::Float64(real)));
             }
+            self.poll_params
+                .push((params.rbont, ParamValue::Int32(reads.ont)));
+            self.poll_params
+                .push((params.rbovf, ParamValue::Int32(reads.ovf)));
+            for (&reason, value) in params.rb_cl.iter().zip(reads.cl) {
+                self.poll_params.push((reason, ParamValue::Float64(value)));
+            }
+        }
+        if let Some(params) = params {
             self.poll_params
                 .push((params.servo, ParamValue::Int32(self.servo_on.into())));
         }
@@ -2789,6 +3112,220 @@ mod tests {
         line.sent().into_iter().filter(|w| w != "\n").collect()
     }
 
+    /// A controller `idn` picks, with axis `1` built on it.
+    fn piezo(
+        port: &str,
+        idn: &str,
+        reply: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (
+        motor_common::testing::LineRig,
+        Arc<Mutex<PIGCS2Controller>>,
+        PIGCS2Axis,
+    ) {
+        let (line, io) = motor_common::testing::LineRig::new(port, reply);
+        let mut ctrl = PIGCS2Controller::new(io, port);
+        ctrl.set_model(Model::from_idn(idn).unwrap());
+        ctrl.init();
+        line.sent();
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let axis = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, port);
+        (line, ctrl, axis)
+    }
+
+    fn piezo_reply(last: &str) -> String {
+        match last {
+            "ERR?" => "0",
+            "SAI?" => "1",
+            "SRG? 1 1" => "1 1=0x3000",
+            "POS? 1" => "1=2.5",
+            _ => "1=1",
+        }
+        .into()
+    }
+
+    /// `PIGCSPiezoController::initAxis` (PIGCSPiezoController.cpp:101-125):
+    /// `TRS?`, then the servo set to `FRF?`'s homed state, with no LIM? or
+    /// CST?, and the base `getResolution`, which reads no CPU.
+    #[test]
+    fn a_piezo_controller_inits_its_axis_as_pigcs_piezo_controller() {
+        for idn in ["E-753", "E-754", "E-709", "E-712", "E-725"] {
+            let port = format!("gcs2Piezo{}", &idn[2..]);
+            let (line, _ctrl, axis) = piezo(&port, idn, piezo_reply);
+            assert_eq!(
+                sent_lines(&line),
+                [
+                    "TRS? 1", "FRF? 1", "SVO 1 1", "ERR?", "VEL? 1", "POS? 1", "TMN? 1", "TMX? 1",
+                    "FRF? 1"
+                ],
+                "{idn}"
+            );
+            assert_eq!(axis.cpu, 10000.0, "{idn}");
+            assert!(axis.has_reference && axis.homed && axis.servo_on, "{idn}");
+        }
+    }
+
+    /// `PIGCSPiezoController::getStatus` (:23-73): `SRG? {axis} 1` with
+    /// `strtol` base 0, and no limits; once `SRG?` fails, `#5` and `SVO?`.
+    #[test]
+    fn a_piezo_controller_polls_srg_then_falls_back_to_char5_and_svo() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let srg = Arc::new(AtomicBool::new(true));
+        let answers = srg.clone();
+        let (line, _ctrl, mut axis) = piezo("gcs2PiezoPoll", "E-712", move |last| match last {
+            "SRG? 1 1" if !answers.load(Ordering::Relaxed) => "1 1".into(),
+            "\u{5}" => "1".into(),
+            last => piezo_reply(last),
+        });
+        let user = AsynUser::new(0);
+        line.sent();
+        let status = axis.poll(&user).unwrap();
+        let sent = sent_lines(&line);
+        assert!(sent.contains(&"SRG? 1 1".to_string()), "{sent:?}");
+        assert!(!sent.contains(&"\u{4}".to_string()), "{sent:?}");
+        assert!(
+            status.moving && status.powered,
+            "0x3000 is moving, servo on"
+        );
+
+        srg.store(false, Ordering::Relaxed);
+        let _ = axis.poll(&user);
+        line.sent();
+        let status = axis.poll(&user).unwrap();
+        let sent = sent_lines(&line);
+        assert!(!sent.contains(&"SRG? 1 1".to_string()), "{sent:?}");
+        assert!(
+            sent.contains(&"\u{5}".to_string()) && sent.contains(&"SVO? 1".to_string()),
+            "{sent:?}"
+        );
+        assert!(status.moving);
+    }
+
+    /// `PIGCSPiezoController::haltAxis` stops with `STP` (:139-155),
+    /// `setAxisPosition` sends nothing (:131-134), and `referenceVelCts`
+    /// turns the servo off before `FRF` (:157-198).
+    #[test]
+    fn a_piezo_controller_halts_with_stp_sets_no_position_and_homes_servo_off() {
+        let (line, _ctrl, mut axis) = piezo("gcs2PiezoCmds", "E-712", piezo_reply);
+        let user = AsynUser::new(0);
+        line.sent();
+        axis.stop(&user, 0.0).unwrap();
+        assert_eq!(sent_lines(&line), ["STP", "ERR?"]);
+        axis.set_position(&user, 100.0).unwrap();
+        assert!(sent_lines(&line).is_empty());
+        axis.home(&user, 0.0, 1.0, 0.0, false).unwrap();
+        assert_eq!(sent_lines(&line), ["SVO 1 0", "ERR?", "FRF 1", "ERR?"]);
+        assert!(!axis.servo_on);
+    }
+
+    /// `PIE517Controller::init` (PIE517Controller.cpp:25-51): every `TPC?`
+    /// output channel set online, stopping at the first refused `ONL`.
+    #[test]
+    fn an_e517_controller_sets_its_output_channels_online() {
+        for idn in ["E-517", "E-518"] {
+            let port = format!("gcs2Online{}", &idn[2..]);
+            let reply = |last: &str| match last {
+                "TPC?" => "3".into(),
+                last => piezo_reply(last),
+            };
+            // sendOnly's status is its terminator write's.
+            let last = Mutex::new(String::new());
+            let refused = move |cmd: &str| {
+                let mut last = last.lock().unwrap();
+                if cmd == "\n" {
+                    return *last == "ONL 2 1";
+                }
+                *last = cmd.into();
+                false
+            };
+            let (line, io) = motor_common::testing::LineRig::failing(&port, reply, refused);
+            let mut ctrl = PIGCS2Controller::new(io, &port);
+            ctrl.set_model(Model::from_idn(idn).unwrap());
+            ctrl.init();
+            assert_eq!(
+                sent_lines(&line),
+                ["VEL?", "SAI?", "TPC?", "ONL 1 1", "ONL 2 1"],
+                "{idn}"
+            );
+        }
+    }
+
+    /// An E-517 asks no `TRS?` or `FRF?` (PIE517Controller.h:35-36), halts
+    /// one axis with `HLT`, and polls `#5` alone (PIE517Controller.cpp:74-87).
+    #[test]
+    fn an_e517_axis_polls_char5_halts_with_hlt_and_homes_with_nothing() {
+        let (line, _ctrl, mut axis) = piezo("gcs2E517Axis", "E-517", |last| match last {
+            "\u{5}" => "1".into(),
+            last => piezo_reply(last),
+        });
+        assert_eq!(
+            sent_lines(&line),
+            ["SVO 1 1", "ERR?", "VEL? 1", "POS? 1", "TMN? 1", "TMX? 1"]
+        );
+        assert!(axis.homed && axis.servo_on && !axis.has_reference);
+        let user = AsynUser::new(0);
+        let status = axis.poll(&user).unwrap();
+        let sent = sent_lines(&line);
+        assert_eq!(sent.first().map(String::as_str), Some("\u{5}"));
+        assert!(
+            !sent
+                .iter()
+                .any(|c| c.starts_with("SRG?") || c.starts_with("SVO?")),
+            "{sent:?}"
+        );
+        assert!(status.moving && status.powered);
+        axis.stop(&user, 0.0).unwrap();
+        assert_eq!(sent_lines(&line), ["HLT 1", "ERR?"]);
+        axis.home(&user, 0.0, 1.0, 0.0, false).unwrap();
+        assert!(sent_lines(&line).is_empty());
+    }
+
+    /// An E-727 is a `PIGCSPiezoController` without `FRF?`, `TRS?` or
+    /// `SRG?` (PIE727Controller.cpp:23-33): `#5` and `SVO?`, `STP`, and no
+    /// homing.
+    #[test]
+    fn an_e727_axis_runs_as_a_piezo_without_frf_trs_or_srg() {
+        let (line, _ctrl, mut axis) = piezo("gcs2E727Axis", "E-727", |last| match last {
+            "\u{5}" => "1".into(),
+            last => piezo_reply(last),
+        });
+        assert_eq!(
+            sent_lines(&line),
+            ["SVO 1 1", "ERR?", "VEL? 1", "POS? 1", "TMN? 1", "TMX? 1"]
+        );
+        assert!(axis.homed && axis.servo_on && !axis.has_reference);
+        let user = AsynUser::new(0);
+        let status = axis.poll(&user).unwrap();
+        assert_eq!(sent_lines(&line)[..2], ["\u{5}", "SVO? 1"]);
+        assert!(status.moving && status.powered);
+        axis.stop(&user, 0.0).unwrap();
+        assert_eq!(sent_lines(&line), ["STP", "ERR?"]);
+        axis.home(&user, 0.0, 1.0, 0.0, false).unwrap();
+        assert!(sent_lines(&line).is_empty());
+    }
+
+    /// A piezo whose `FRF?` is an unknown command reads as homed and from
+    /// then on asks no `FRF?` and homes with nothing (:75-99, :159-163).
+    #[test]
+    fn a_piezo_without_frf_reads_as_homed_and_skips_homing() {
+        let (line, _ctrl, mut axis) = piezo("gcs2PiezoNoFrf", "E-712", |last| {
+            match last {
+                "FRF? 1" => "",
+                "ERR?" => "2",
+                last => return piezo_reply(last),
+            }
+            .into()
+        });
+        assert!(axis.homed);
+        let sent = sent_lines(&line);
+        assert_eq!(
+            sent.iter().filter(|c| *c == "FRF? 1").count(),
+            1,
+            "{sent:?}"
+        );
+        axis.home(&AsynUser::new(0), 0.0, 1.0, 0.0, false).unwrap();
+        assert!(sent_lines(&line).is_empty());
+    }
+
     /// C `PIC885Controller::initAxis` (PIC885Controller.cpp:51-70) asks no
     /// LIM?/TRS?/CST? and turns no servo on: it enables the axis through
     /// its `setEnableAxis` (:93-113), and the base `getResolution`
@@ -3104,6 +3641,151 @@ mod tests {
         epics_rs::motor::devices::register_axis(setup.axis).unwrap();
         let params = *params.params.get().unwrap();
         (port, params, setup.poll_loop)
+    }
+
+    /// `port`'s reason for `name`, as a record's `drvUserCreate` finds it.
+    fn reason(port: &PortHandle, name: &str) -> usize {
+        use epics_rs::asyn::port::DrvUserRequest;
+        port.drv_user_create_blocking(&DrvUserRequest::new(name, 0))
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .reason
+    }
+
+    /// The `PI_SUP_*` closed-loop parameters PI_SupportCL.db's records link
+    /// to, created after `PI_SUP_RBPIVOT_Z` in PIasynController.cpp:80-101
+    /// order.
+    const CL_PARAM_NAMES: [&str; 22] = [
+        "PI_SUP_KP",
+        "PI_SUP_KI",
+        "PI_SUP_KFF",
+        "PI_SUP_NTCHFR1",
+        "PI_SUP_NTCHFR2",
+        "PI_SUP_NTCHRJT1",
+        "PI_SUP_NTCHRJT2",
+        "PI_SUP_NTCHBDWDT1",
+        "PI_SUP_NTCHBDWDT2",
+        "PI_SUP_ANALOGTARGET",
+        "PI_SUP_RBKP",
+        "PI_SUP_RBKI",
+        "PI_SUP_RBKFF",
+        "PI_SUP_RBNTCHFR1",
+        "PI_SUP_RBNTCHFR2",
+        "PI_SUP_RBNTCHRJT1",
+        "PI_SUP_RBNTCHRJT2",
+        "PI_SUP_RBNTCHBDWDT1",
+        "PI_SUP_RBNTCHBDWDT2",
+        "PI_SUP_RBANALOGTARGET",
+        "PI_SUP_RBONT",
+        "PI_SUP_RBOVF",
+    ];
+
+    #[test]
+    fn the_closed_loop_parameters_follow_the_pivot_readbacks() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2ClNamesLine", piezo_reply);
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2ClNamesLine")));
+        let (port, _, _) = controller_port("gcs2ClNames", &ctrl, "1");
+        let first = reason(&port, "PI_SUP_RBPIVOT_Z") + 1;
+        for (n, name) in CL_PARAM_NAMES.iter().enumerate() {
+            assert_eq!(reason(&port, name), first + n, "{name}");
+        }
+        assert_eq!(
+            reason(&port, "PI_CS_TARGETMODE"),
+            first + CL_PARAM_NAMES.len()
+        );
+    }
+
+    /// `PIasynController::writeFloat64` (PIasynController.cpp:362-372) hands
+    /// a closed-loop write to `setCLAxisParam`: the E-727's sends the
+    /// `PI727_CL_PARAM_ADDR` parameter between `CCL 1 advanced` and `CCL 0`
+    /// (PIE727Controller.cpp:36-91); the base's sends nothing.
+    #[test]
+    fn a_closed_loop_write_sets_the_e727_parameter_at_command_level_1() {
+        for (idn, name) in [("E-727", "gcs2ClW727"), ("E-712", "gcs2ClW712")] {
+            let (line, io) =
+                motor_common::testing::LineRig::new(&format!("{name}Line"), piezo_reply);
+            let mut ctrl = PIGCS2Controller::new(io, &format!("{name}Line"));
+            ctrl.set_model(Model::from_idn(idn).unwrap());
+            let ctrl = Arc::new(Mutex::new(ctrl));
+            let (port, _, mut poll_loop) = controller_port(name, &ctrl, "1");
+            for (param, sent) in [
+                ("PI_SUP_KP", "SPA 1 117441280 0.25"),
+                ("PI_SUP_NTCHRJT2", "SPA 1 117441025 0.25"),
+                ("PI_SUP_ANALOGTARGET", "SPA 1 100664576 0.25"),
+            ] {
+                let reason = reason(&port, param);
+                line.sent();
+                let printed = traced_mask(name, TraceMask::FLOW, || {
+                    port.write_float64_blocking(reason, 0, 0.25).unwrap();
+                    poll_loop.run_queued_commands();
+                });
+                let want: &[&str] = if idn == "E-727" {
+                    &["CCL 1 advanced", sent, "CCL 0"]
+                } else {
+                    &[]
+                };
+                assert_eq!(sent_lines(&line), want, "{idn} {param}");
+                assert_eq!(port.read_float64_blocking(reason, 0).unwrap(), 0.25);
+                assert_eq!(
+                    printed.contains("PIGCSPiezoController::setCLAxisParam(), param: 0x"),
+                    idn == "E-727",
+                    "{printed}"
+                );
+            }
+        }
+    }
+
+    /// `PIasynAxis::poll` (PIasynAxis.cpp:167-182) posts `ONT?`/`OVF?` as
+    /// `PI_SUP_RBONT`/`RBOVF` and each `getCLAxisParam` as its readback: on
+    /// an E-727 `SPA?` (PIE727Controller.cpp:93-150).
+    #[test]
+    fn an_e727_poll_posts_on_target_overflow_and_closed_loop_readbacks() {
+        let (line, io) = motor_common::testing::LineRig::new("gcs2ClPollLine", |last| match last {
+            "ONT? 1" => "1=1".into(),
+            "OVF? 1" => "1=0".into(),
+            "SPA? 1 117441280" => "1 0x7000300=0.75".into(),
+            "\u{5}" => "0".into(),
+            last => piezo_reply(last),
+        });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2ClPollLine");
+        ctrl.set_model(Model::from_idn("E-727").unwrap());
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let (port, _, _) = controller_port("gcs2ClPoll", &ctrl, "1");
+        let mut axis = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, "gcs2ClPoll");
+        line.sent();
+        axis.poll(&AsynUser::new(0)).unwrap();
+        let sent = sent_lines(&line);
+        let ont = sent.iter().position(|c| c == "ONT? 1");
+        let tmn = sent.iter().position(|c| c == "TMN? 1");
+        assert!(ont.is_some() && ont < tmn, "{sent:?}");
+        assert_eq!(
+            sent.iter().filter(|c| c.starts_with("SPA? 1 ")).count(),
+            10,
+            "{sent:?}"
+        );
+        let params = axis.take_poll_params();
+        let posted = |name| {
+            let reason = reason(&port, name);
+            params
+                .iter()
+                .find(|(r, _)| *r == reason)
+                .map(|(_, v)| v.clone())
+        };
+        assert!(
+            matches!(posted("PI_SUP_RBONT"), Some(ParamValue::Int32(1))),
+            "{params:?}"
+        );
+        assert!(
+            matches!(posted("PI_SUP_RBOVF"), Some(ParamValue::Int32(0))),
+            "{params:?}"
+        );
+        assert!(
+            matches!(posted("PI_SUP_RBKP"), Some(ParamValue::Float64(v)) if v == 0.75),
+            "{params:?}"
+        );
+        assert!(
+            matches!(posted("PI_SUP_RBKI"), Some(ParamValue::Float64(v)) if v == 1.0),
+            "{params:?}"
+        );
     }
 
     /// `PIHexapodController::ReadPivotSettings` (PIHexapodController.cpp:
@@ -3964,9 +4646,10 @@ mod tests {
     }
 
     /// `PIasynAxis::poll` sets the second position read as
-    /// `PI_SUP_POSITION` (PIasynAxis.cpp:162-165) and the servo state as
-    /// `PI_SUP_SERVO` (:204) for the poll's own `callParamCallbacks`; the
-    /// axis posts nothing itself.
+    /// `PI_SUP_POSITION` (PIasynAxis.cpp:162-165), the base class's 0
+    /// on-target, overflow and closed-loop readbacks (:167-182) and the servo
+    /// state as `PI_SUP_SERVO` (:204) for the poll's own
+    /// `callParamCallbacks`; the axis posts nothing itself.
     #[test]
     fn the_axis_poll_posts_its_position_and_servo() {
         let (_line, io) = motor_common::testing::LineRig::new("gcs2SupPosLine", |last| {
@@ -3984,16 +4667,14 @@ mod tests {
         let mut axis = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, "gcs2SupPos");
         axis.poll(&AsynUser::new(0)).unwrap();
         let params = axis.take_poll_params();
-        assert!(
-            matches!(
-                params.as_slice(),
-                [
-                    (position, ParamValue::Float64(2.5)),
-                    (servo, ParamValue::Int32(1)),
-                ] if *position == p.position && *servo == p.servo
-            ),
-            "{params:?}"
-        );
+        let mut want = vec![
+            (p.position, ParamValue::Float64(2.5)),
+            (p.rbont, ParamValue::Int32(0)),
+            (p.rbovf, ParamValue::Int32(0)),
+        ];
+        want.extend(p.rb_cl.map(|r| (r, ParamValue::Float64(0.0))));
+        want.push((p.servo, ParamValue::Int32(1)));
+        assert_eq!(format!("{params:?}"), format!("{want:?}"));
         assert!(axis.take_poll_params().is_empty());
     }
 
@@ -4499,7 +5180,7 @@ mod tests {
             assert!(ctrl.reference_axis("1", true, true, false).is_err());
             assert!(ctrl.reference_axis("1", true, false, false).is_err());
             ctrl.set_model(Model::C885);
-            assert!(ctrl.stop_all().is_err());
+            assert!(ctrl.stop_all("PIC885Controller").is_err());
             assert!(ctrl.reference_axis("1", true, true, false).is_err());
             assert!(ctrl.reference_axis("1", true, false, false).is_err());
         });
@@ -4535,6 +5216,98 @@ mod tests {
         assert_eq!(
             messages(&printed),
             ["PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch\n"]
+        );
+    }
+
+    /// A failed `referenceVelCts` is the `errorMessage` C writes
+    /// (PIGCSMotorController.cpp:69-70, 110-111, 128-129;
+    /// PIC885Controller.cpp:137-138, 152-153; PIGCSPiezoController.cpp:
+    /// 179-180, 193-194; PIHexapodController.cpp:435-436;
+    /// PIGCS2_HexapodController.cpp:77-78; PIC702Controller.cpp:182-183).
+    #[test]
+    fn a_failed_reference_is_cs_error_message() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let message = |r: AsynResult<()>| r.unwrap_err().message();
+
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2RefMsg", |_| "1=5".into());
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2RefMsg");
+        let gcs = "PIGCSMotorController::referenceVelCts() failed - GCS Error 1";
+        assert_eq!(message(ctrl.set_reference_velocity("1", 1.0)), gcs);
+        assert_eq!(message(ctrl.reference_axis("1", true, true, false)), gcs);
+        assert_eq!(
+            message(ctrl.reference_axis("1", true, false, false)),
+            "PIGCSMotorController::referenceVelCts() failed - axis has no reference/limit switch"
+        );
+        ctrl.set_model(Model::C885);
+        assert_eq!(
+            message(ctrl.reference_axis("1", true, true, false)),
+            "PIC885Controller::referenceVelCts() failed - GCS Error 1"
+        );
+        assert_eq!(
+            message(ctrl.reference_axis("1", true, false, false)),
+            "PIC885Controller::referenceVelCts() failed - axis has no reference/limit switch"
+        );
+
+        // send_only's status is its terminator's, so the `\n` after
+        // `INI X` fails.
+        let after_ini = std::sync::atomic::AtomicBool::new(false);
+        let (_line, io) = motor_common::testing::LineRig::failing(
+            "gcs2RefMsgHex",
+            |_| "5".into(),
+            move |line| {
+                let failed = line == "\n" && after_ini.load(Ordering::SeqCst);
+                after_ini.store(line == "INI X", Ordering::SeqCst);
+                failed
+            },
+        );
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2RefMsgHex");
+        ctrl.set_model(Model::Hexapod);
+        assert_eq!(
+            message(ctrl.init_platform()),
+            "PIHexapodController::referenceVelCts() failed - GCS Error 5"
+        );
+
+        // `ERR?` reads 0 until `ok` runs out, then 5: the servo write
+        // passes and the `FRF` fails.
+        let ok = Arc::new(AtomicUsize::new(usize::MAX));
+        let reply = |ok: Arc<AtomicUsize>, base: fn(&str) -> String| {
+            move |last: &str| match last {
+                "ERR?" if ok.fetch_sub(1, Ordering::SeqCst) == 0 => "5".into(),
+                last => base(last),
+            }
+        };
+        let (_line, _ctrl, mut axis) =
+            piezo("gcs2RefMsgPiezo", "E-712", reply(ok.clone(), piezo_reply));
+        ok.store(1, Ordering::SeqCst);
+        assert_eq!(
+            message(axis.reference_piezo()),
+            "PIGCSPiezoController::referenceVelCts() failed - GCS Error 5"
+        );
+        axis.has_reference = false;
+        assert_eq!(
+            message(axis.reference_piezo()),
+            "PIGCSPiezoController::referenceVelCts() failed - axis has no reference switch"
+        );
+
+        let ok = Arc::new(AtomicUsize::new(usize::MAX));
+        let (_line, _ctrl, mut axis) = gcs2_hexapod(
+            "gcs2RefMsgGcs2Hex",
+            "X",
+            0,
+            reply(ok.clone(), hexapod_reply),
+        );
+        ok.store(1, Ordering::SeqCst);
+        assert_eq!(
+            message(axis.reference_vel_cts(1.0, true)),
+            "PIGCS2_HexapodController::referenceVelCts() failed - GCS Error 5"
+        );
+
+        let (_line, mut axis) = c702_axis("gcs2RefMsgC702", true);
+        axis.has_reference = false;
+        axis.has_limit_switches = false;
+        assert_eq!(
+            message(axis.reference_c702(1.0, true)),
+            "PIC702Controller::referenceVelCts() failed - axis has no reference/limit switch"
         );
     }
 
