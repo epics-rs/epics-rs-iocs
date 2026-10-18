@@ -633,3 +633,24 @@ fn every_status_read_is_posted_as_read() {
     assert_eq!(got.0, 1024);
     assert_eq!(got.1.as_deref(), Some(&b"\0"[..]));
 }
+
+/// BISDetector.cpp never sets NDDriverVersion, so it keeps the ADCore version
+/// asynNDArrayDriver gave it (asynNDArrayDriver.cpp:966).
+#[test]
+fn the_driver_version_is_left_to_adcore() {
+    let missing =
+        |name| SyncIOHandle::connect_port(name, 0, Duration::ZERO, InterfaceType::Octet).0;
+    let detector = create_bruker_detector(
+        &claim_port("BISVERSION").unwrap(),
+        missing("BISVERSION_COMMAND"),
+        missing("BISVERSION_STATUS"),
+        0,
+    )
+    .expect("the detector port");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let ad = detector.ad_params;
+    assert_eq!(
+        sync.read_octet(ad.base.driver_version, 64).unwrap(),
+        sync.read_octet(ad.base.ad_core_version, 64).unwrap()
+    );
+}
