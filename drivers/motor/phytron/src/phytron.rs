@@ -69,7 +69,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
+};
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -1204,6 +1206,8 @@ pub struct PhytronAxis {
     home_state: i32,
     /// AXIS_STATUS as the last poll set it, for the poller to post.
     sets: PortSets,
+    /// What the constructor set on the axis's status.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl PhytronAxis {
@@ -1240,6 +1244,8 @@ impl PhytronAxis {
             motor_enabled: false,
             home_state: 0,
             sets: PortSets::default(),
+            // phytronAxisMotor.cpp:1352: the controller always has an encoder.
+            status_writes: vec![StatusWrite::HasEncoder(true)],
         })
     }
 
@@ -1434,6 +1440,10 @@ impl PhytronAxis {
 impl AsynMotor for PhytronAxis {
     fn take_port_sets(&mut self) -> PortSets {
         std::mem::take(&mut self.sets)
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 
     /// C sets motorStatusProblem_ and returns asynSuccess on every failure:
@@ -1773,6 +1783,13 @@ mod tests {
             0,
         )));
         (PhytronAxis::new(controller, 0, 1).unwrap(), written)
+    }
+
+    /// MSTA EA_PRESENT before any poll and under a failed one's PROBLEM.
+    #[test]
+    fn the_constructor_sets_has_encoder() {
+        let (mut axis, _) = mcc_axis("phytronHasEncoder");
+        assert_eq!(axis.take_status_writes(), [StatusWrite::HasEncoder(true)]);
     }
 
     #[test]
