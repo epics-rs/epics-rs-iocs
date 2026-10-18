@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use epics_rs::asyn::asyn_record::PortClaim;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
@@ -1091,7 +1091,13 @@ mod tests {
 
     #[test]
     fn get_bounds_is_the_converter_range_of_an_analog_value() {
-        let mut base = PortDriverBase::new("MFBOUNDS", MAX_SIGNALS, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "MFBOUNDS",
+            MAX_SIGNALS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let params = MultiFunctionParams::create(&mut base).unwrap();
         let usb_2408 = Resolution {
             adc_bits: 24,

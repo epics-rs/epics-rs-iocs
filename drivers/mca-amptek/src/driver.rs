@@ -86,7 +86,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::recgbl::alarm_status;
@@ -464,6 +464,8 @@ impl AmptekDriver {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         // C's registration connect runs while asynPortDriver's constructor
         // waits in waitConnect, so the base asynPortDriver::connect answers it

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::manager::PortManager;
-use epics_rs::asyn::port::{DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{DrvUserRequest, InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::registry::{claim_port, open_owner};
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -54,7 +54,13 @@ async fn a_poll_s_digital_position_lands_in_the_parameter_library() {
     let line = "lc400ReadbackLine";
     let claim = claim_port(line).unwrap();
     let wire = Wire {
-        base: PortDriverBase::new(line, 1, PortFlags::default()),
+        base: PortDriverBase::new(
+            line,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        ),
         frame: Vec::new(),
     };
     let (rt, _jh) = create_port_runtime(&claim, wire, RuntimeConfig::default()).unwrap();

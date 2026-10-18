@@ -412,7 +412,13 @@ pub(crate) mod tests {
             let (server, _) = create_port_runtime(
                 &claim_port(&name).unwrap(),
                 RefusingPort {
-                    base: PortDriverBase::new(&name, 1, Default::default()),
+                    base: PortDriverBase::new(
+                        &name,
+                        1,
+                        Default::default(),
+                        InterfaceMask::UNMIGRATED_ALL,
+                        InterfaceMask::UNMIGRATED_ALL,
+                    ),
                     status,
                 },
                 RuntimeConfig::default(),

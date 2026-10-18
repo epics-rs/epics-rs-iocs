@@ -15,7 +15,9 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::interrupt::{InterruptManager, InterruptValue};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::ParamValue;
-use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{
+    DrvUserInfo, DrvUserRequest, InterfaceMask, PortDriver, PortDriverBase, PortFlags,
+};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::sync::mpsc;
@@ -295,6 +297,8 @@ impl DrvMotorAsyn {
                 can_block: true,
                 destructible: false,
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         for (addr, axis) in axes.iter().enumerate() {
             let Some(Axis { getter, status, .. }) = axis else {

@@ -2827,12 +2827,19 @@ mod tests {
     /// written is asynError, whatever the write returned.
     #[test]
     fn a_char_not_written_is_an_asyn_error() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let port = FirstWriteRefused {
-            base: PortDriverBase::new("gcs2CharTimeout", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "gcs2CharTimeout",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: Arc::default(),
             status: AsynStatus::Timeout,
         };
@@ -4481,13 +4488,20 @@ mod tests {
     /// the `received` line shows them.
     #[test]
     fn a_timed_out_read_prints_the_bytes_it_got() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let (rt, _actor) = create_port_runtime(
             &claim_port("gcs2RecvCut").unwrap(),
-            CutReply(PortDriverBase::new("gcs2RecvCut", 1, PortFlags::default())),
+            CutReply(PortDriverBase::new(
+                "gcs2RecvCut",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .unwrap();

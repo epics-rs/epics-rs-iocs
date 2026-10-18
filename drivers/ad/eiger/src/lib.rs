@@ -14,7 +14,7 @@ use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -190,6 +190,8 @@ fn create_inert(
             multi_device: true,
             ..ASYN_CANBLOCK
         },
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
     )?;
     let pool = ad.pool.clone();
     let (runtime_handle, _) =

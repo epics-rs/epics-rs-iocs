@@ -68,7 +68,7 @@ pub(crate) fn connect_octet(port: &str, addr: i32) -> Result<PortHandle, Unconne
 pub(crate) fn no_octet_port(name: &str) {
     use epics_rs::asyn::interfaces::Capability;
     use epics_rs::asyn::manager::{PortManager, claim_port_driver};
-    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::open_owner;
 
     struct Int32Only(PortDriverBase);
@@ -83,7 +83,13 @@ pub(crate) fn no_octet_port(name: &str) {
             vec![Capability::Int32Read, Capability::Int32Write]
         }
     }
-    let driver = Int32Only(PortDriverBase::new(name, 1, PortFlags::default()));
+    let driver = Int32Only(PortDriverBase::new(
+        name,
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    ));
     let runtime = PortManager::new()
         .register_port(claim_port_driver(name).unwrap(), driver, &open_owner())
         .unwrap();

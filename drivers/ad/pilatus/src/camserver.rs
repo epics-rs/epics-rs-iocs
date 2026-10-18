@@ -354,7 +354,7 @@ mod tests {
     use crate::task::{Cmd, Shared};
     use epics_rs::ad_core::runtime as rt;
     use epics_rs::asyn::error::AsynError;
-    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::create_port_runtime;
 
@@ -417,7 +417,13 @@ mod tests {
             let (cam, _) = create_port_runtime(
                 &epics_rs::asyn::registry::claim_port(&name).unwrap(),
                 RefusingPort {
-                    base: PortDriverBase::new(&name, 1, PortFlags::default()),
+                    base: PortDriverBase::new(
+                        &name,
+                        1,
+                        PortFlags::default(),
+                        InterfaceMask::UNMIGRATED_ALL,
+                        InterfaceMask::UNMIGRATED_ALL,
+                    ),
                     status,
                 },
                 RuntimeConfig::default(),

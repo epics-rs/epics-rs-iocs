@@ -1840,12 +1840,19 @@ mod tests {
     /// MSTA bit 4, not the following error.
     #[test]
     fn status_bit_0x4000_is_slip() {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let port = Mcc {
-            base: PortDriverBase::new("phytronSlip", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "phytronSlip",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: Arc::new(Mutex::new(Vec::new())),
             reply: Vec::new(),
             crc: true,
@@ -1936,13 +1943,20 @@ mod tests {
 
     /// [`lines`] answering `answer`.
     fn lines_with(name: &str, answer: fn(&str) -> Option<String>) -> Rig {
+        use epics_rs::asyn::port::InterfaceMask;
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let written = Arc::new(Mutex::new(Vec::new()));
         let port = Lines {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             written: written.clone(),
             answer,
             reply: Vec::new(),
