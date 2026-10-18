@@ -74,7 +74,7 @@ async fn on_line<T: Send + 'static>(
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         create.handler.call(&controller_args, &ctx).unwrap();
         axis.handler.call(&axis_args, &ctx).unwrap();
-        motor_common::testing::await_first_polls();
+        motor_common::testing::await_first_polls(&port);
         let line = Mutex::new(line);
         line.lock().unwrap().sent();
         body(

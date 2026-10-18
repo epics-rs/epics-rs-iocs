@@ -142,6 +142,7 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
             crate::poller::start(
                 &controller,
                 posters,
+                axes_poller.first_poll_pending(),
                 Duration::from_millis(moving_poll_ms),
                 Duration::from_millis(idle_poll_ms),
                 fw.minor,

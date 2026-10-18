@@ -131,17 +131,19 @@ impl PollShared {
 }
 
 /// C `startPoller` and the constructor's `epicsAtExit(callShutdown)`.
-/// `posters` are the axes' poll loops, in axis order.
+/// `posters` are the axes' poll loops, in axis order; `first_pass` counts
+/// the poller's first pass on the axes' controller.
 pub fn start(
     controller: &Arc<Mutex<OmsController>>,
     posters: Vec<mpsc::Sender<PollCommand>>,
+    first_pass: FirstPollPending,
     moving_poll: Duration,
     idle_poll: Duration,
     fw_minor: i32,
 ) {
     let mut poller = OmsPoller::new(controller.clone(), moving_poll, idle_poll, fw_minor);
     poller.posters = posters;
-    poller.first_pass = Some(FirstPollPending::begin());
+    poller.first_pass = Some(first_pass);
     // C creates the event with the controller; the axes' startup polls
     // signalled this one before the poller existed.
     poller.shared.wait(Duration::ZERO);

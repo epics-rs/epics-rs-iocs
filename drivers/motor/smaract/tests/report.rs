@@ -44,7 +44,7 @@ async fn mcs2_report(port: &str, level: i32) -> String {
     let shell = std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         cmd.handler.call(&args, &ctx).unwrap();
-        motor_common::testing::await_first_polls();
+        motor_common::testing::await_first_polls(&port);
         PortManager::global()
             .find_port_handle(&port)
             .unwrap()

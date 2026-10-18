@@ -66,10 +66,11 @@ async fn maxnet(port: &str) {
         ArgValue::String("".into()),
     ];
     let bridge = BlockingBridge::capture();
+    let port = port.to_owned();
     let shell = std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         config.handler.call(&args, &ctx).unwrap();
-        motor_common::testing::await_first_polls();
+        motor_common::testing::await_first_polls(&port);
     });
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;

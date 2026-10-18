@@ -197,6 +197,12 @@ impl Controller {
         self.axes.start_move_to_home_thread()
     }
 
+    /// Count a first poll pending on this controller until the guard drops,
+    /// for a driver whose own thread polls (omsBaseController's omsPoller).
+    pub fn first_poll_pending(&self) -> epics_rs::motor::poll_loop::FirstPollPending {
+        self.axes.first_poll_pending()
+    }
+
     /// C `startPoller(movingPollPeriod, idlePollPeriod, forcedFastPolls)`
     /// on controller port `port`: the startup pass over the axes so far,
     /// then the poller thread, which setMovingPollPeriod and

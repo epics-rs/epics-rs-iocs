@@ -228,7 +228,7 @@ mod tests {
                 .handler
                 .call(&args, &ctx)
                 .unwrap();
-            motor_common::testing::await_first_polls();
+            motor_common::testing::await_first_polls(&name);
             PortManager::global()
                 .find_port_handle(&name)
                 .unwrap()

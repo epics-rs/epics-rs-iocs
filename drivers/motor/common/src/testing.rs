@@ -280,15 +280,25 @@ pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
     lines.lock().unwrap().clone()
 }
 
-/// Block until every poller a create command started has ended its startup
-/// pass, and every axis it added to a running poller has had its first poll.
-/// Both run on the poller's own thread as C's do
-/// (asynMotorController.cpp:630), so what they set or trace is there to read
-/// once this returns. Call it off the test's runtime.
-pub fn await_first_polls() {
-    use epics_rs::motor::poll_loop::first_polls_pending;
+/// Block until controller port `port`'s poller has ended its startup pass,
+/// and every axis added to it running has had its first poll. Both run on
+/// the poller's own thread as C's do (asynMotorController.cpp:630), so what
+/// they set or trace is there to read once this returns. Call it off the
+/// test's runtime.
+pub fn await_first_polls(port: &str) {
+    use epics_rs::motor::devices::first_polls_pending;
+    await_zero(|| first_polls_pending(port).unwrap_or_else(|| panic!("no controller port {port}")));
+}
+
+/// [`await_first_polls`] for every controller in the process: what a shell
+/// command started or added to, which the command does not name.
+fn await_every_first_poll() {
+    await_zero(epics_rs::motor::poll_loop::first_polls_pending_in_process);
+}
+
+fn await_zero(pending: impl Fn() -> usize) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while first_polls_pending() > 0 {
+    while pending() > 0 {
         assert!(
             std::time::Instant::now() < deadline,
             "a first poll never ran"
@@ -303,7 +313,7 @@ async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) 
     use epics_rs::base::runtime::task::sleep;
     let shell = std::thread::spawn(move || {
         let out = f();
-        await_first_polls();
+        await_every_first_poll();
         out
     });
     while !shell.is_finished() {

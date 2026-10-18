@@ -70,7 +70,7 @@ async fn on_mcc<T: Send + 'static>(
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         create_mcc.handler.call(&mcc_args, &ctx).unwrap();
         create_axis.handler.call(&axis_args, &ctx).unwrap();
-        motor_common::testing::await_first_polls();
+        motor_common::testing::await_first_polls(&port);
         rig.lock().unwrap().sent();
         body(PortManager::global().find_port_handle(&port).unwrap())
     });

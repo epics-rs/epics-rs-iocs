@@ -82,7 +82,7 @@ async fn a_poll_s_digital_position_lands_in_the_parameter_library() {
     let shell = std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         cmd.handler.call(&args, &ctx).unwrap();
-        motor_common::testing::await_first_polls();
+        motor_common::testing::await_first_polls("lc400Readback");
         let port = PortManager::global()
             .find_port_handle("lc400Readback")
             .unwrap();

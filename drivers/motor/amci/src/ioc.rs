@@ -282,7 +282,7 @@ mod tests {
             for (cmd, args) in cmds {
                 cmd.handler.call(&args, &ctx).unwrap();
             }
-            motor_common::testing::await_first_polls();
+            motor_common::testing::await_first_polls(&port);
             PortManager::global()
                 .find_port_handle(&port)
                 .unwrap()
