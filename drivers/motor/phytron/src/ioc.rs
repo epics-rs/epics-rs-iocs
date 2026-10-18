@@ -195,7 +195,7 @@ fn register_controller(
         move || controller.lock().unwrap_or_else(|e| e.into_inner()).poll()
     });
     // C startPoller, phytronAxisMotor.cpp:240
-    poller.start(ctx, &name, moving_poll_ms, idle_poll_ms, 5);
+    poller.start(&name, moving_poll_ms, idle_poll_ms, 5);
     registry_lock(registry).insert(
         name.clone(),
         ControllerReg {

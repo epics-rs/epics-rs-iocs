@@ -78,7 +78,7 @@ pub fn oem_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2); // OEMMotorDriver.cpp:68
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2); // OEMMotorDriver.cpp:68
             Ok(CommandOutcome::Continue)
         },
     )
@@ -128,7 +128,7 @@ pub fn acr_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2); // ACRMotorDriver.cpp:82
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2); // ACRMotorDriver.cpp:82
             Ok(CommandOutcome::Continue)
         },
     )
@@ -162,13 +162,13 @@ pub fn pc6k_config_command() -> CommandDef {
             arg_str_req("asyn port name"),
         ],
         "PC6KConfig(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PC6K.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            PC6K.config(ctx, card, move |init| {
+            PC6K.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     // C connects at an asyn_address PC6KConfig never sets (drvPC6K.cc:782).

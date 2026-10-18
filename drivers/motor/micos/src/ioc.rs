@@ -334,7 +334,7 @@ pub fn corvus_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = ax;
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -401,7 +401,7 @@ pub fn hydra_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = ax;
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -471,7 +471,7 @@ pub fn taurus_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = ax;
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -539,7 +539,7 @@ pub fn micos_config_command() -> CommandDef {
             arg_str_req("asyn port name"),
         ],
         "MicosConfig(card, name)",
-        |args: &[ArgValue], ctx: &CommandContext| {
+        |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !MICOS.has_card(card) {
                 return Ok(CommandOutcome::Continue);
@@ -548,7 +548,7 @@ pub fn micos_config_command() -> CommandDef {
             // The MoCo ends a reply with CR LF ETX. C asks for all three as
             // the input EOS, which asyn refuses (eoslen > 2), so its reads
             // end only on timeout; the ETX alone ends one here.
-            MICOS.config(ctx, card, move |init| {
+            MICOS.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,

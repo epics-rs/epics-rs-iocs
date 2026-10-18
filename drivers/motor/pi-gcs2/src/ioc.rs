@@ -96,7 +96,7 @@ pub fn pigcs2_config_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = axis;
                 poller.install(asyn_user(&port_name, index as i32), motor)?;
             }
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 10);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 10);
             Ok(CommandOutcome::Continue)
         },
     )

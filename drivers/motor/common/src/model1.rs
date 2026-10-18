@@ -239,7 +239,6 @@ impl Model1 {
     /// drvSup init then starts as C `motor_init` starts `motor_task`.
     pub fn config(
         &'static self,
-        _ctx: &CommandContext,
         card: i32,
         init: impl FnOnce(&mut CardInit) + Send + 'static,
     ) -> Result<(), String> {
@@ -354,8 +353,6 @@ mod tests {
     use epics_rs::asyn::error::AsynResult;
     use epics_rs::asyn::interfaces::motor::{MotorStatus, PollFailure};
     use epics_rs::asyn::user::AsynUser;
-    use epics_rs::base::runtime::task::BlockingBridge;
-    use epics_rs::base::server::database::PvDatabase;
     use epics_rs::base::server::ioc_app::{InitHookState, init_hook_announce};
 
     use super::*;
@@ -406,7 +403,6 @@ mod tests {
             .build()
             .unwrap();
         let _entered = rt.enter();
-        let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
         let log = Log::default();
         let inits = Log::default();
         TASK.setup(2, 10);
@@ -416,7 +412,7 @@ mod tests {
                 log: log.clone(),
             }));
             let inits = inits.clone();
-            TASK.config(&ctx, card, move |init| {
+            TASK.config(card, move |init| {
                 inits.lock().unwrap().push(init.card());
                 init.axis(0, motor);
             })
@@ -430,7 +426,7 @@ mod tests {
             [0, 1],
             "drvSup init's startup pass over the axes motor_init found"
         );
-        assert!(TASK.config(&ctx, 2, |_| {}).is_err());
+        assert!(TASK.config(2, |_| {}).is_err());
     }
 
     static DEV_SILENT: DevSup = model1_device("devTestSilent", "TestSilent");
@@ -444,15 +440,12 @@ mod tests {
             .build()
             .unwrap();
         let _entered = rt.enter();
-        let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
         SILENT.register_report("drvTestSilent", |cards| {
             cards.report("TestSilent", |card, line| format!("{card} {line}\n"))
         });
         SILENT.setup(2, 10);
-        SILENT.config(&ctx, 0, |_| {}).unwrap();
-        SILENT
-            .config(&ctx, 1, |init| init.describe("id: B"))
-            .unwrap();
+        SILENT.config(0, |_| {}).unwrap();
+        SILENT.config(1, |init| init.describe("id: B")).unwrap();
         init_hook_announce(InitHookState::AfterInitDrvSup);
         let drvet =
             epics_rs::base::server::driver_support::find_driver_support("drvTestSilent").unwrap();

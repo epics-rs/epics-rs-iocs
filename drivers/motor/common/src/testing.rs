@@ -354,7 +354,7 @@ mod tests {
             move |_: &[ArgValue], ctx: &CommandContext| {
                 crate::register_port(ctx, "joinStarted", 1)?;
                 let controller = crate::Controller::new();
-                controller.start(ctx, "joinStarted", 10, 100, 0);
+                controller.start("joinStarted", 10, 100, 0);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::default()));
                 let tx = controller.install(crate::asyn_user("joinStarted", 0), motor)?;
                 kept.lock().unwrap().push(tx);

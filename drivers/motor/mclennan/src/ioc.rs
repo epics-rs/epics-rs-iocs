@@ -56,7 +56,7 @@ pub fn pm304_config_command() -> CommandDef {
             arg_int_req("Number of axes"),
         ],
         "PM304Config(card, name, n_axes)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PM304.has_card(card) {
                 return Ok(CommandOutcome::Continue);
@@ -68,7 +68,7 @@ pub fn pm304_config_command() -> CommandDef {
             }
             let n_axes = usize::try_from(n_axes).map_err(|_| "PM304Config: n_axes < 0")?;
 
-            PM304.config(ctx, card, move |init| {
+            PM304.config(card, move |init| {
                 let Ok(handle) = connect_serial(&asyn_port, 0, PM304_TIMEOUT) else {
                     return;
                 };

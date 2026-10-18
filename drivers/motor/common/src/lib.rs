@@ -192,7 +192,6 @@ impl Controller {
     /// leaves its axes unpolled, as C's does. The poller starts once.
     pub fn start(
         &self,
-        _ctx: &CommandContext,
         port: &str,
         moving_poll_ms: u64,
         idle_poll_ms: u64,
@@ -206,7 +205,6 @@ impl Controller {
     /// drvMotorSim.c:788-800).
     pub fn start_driver_thread(
         &self,
-        _ctx: &CommandContext,
         moving_poll_ms: u64,
         idle_poll_ms: u64,
         forced_fast_polls: u32,
@@ -248,7 +246,6 @@ impl Controller {
 /// `forced_fast_polls` is the driver's own: C's `startPoller` has no default
 /// (asynMotorController.cpp:567).
 pub fn install(
-    _ctx: &CommandContext,
     user: TraceUser,
     motor: Arc<Mutex<dyn AsynMotor>>,
     moving_poll_ms: u64,
@@ -267,7 +264,6 @@ pub fn install(
 
 /// [`install`] for an axis with C's `asynMotorAxis::report` override.
 pub fn install_with_report(
-    _ctx: &CommandContext,
     user: TraceUser,
     motor: Arc<Mutex<dyn AsynMotor>>,
     report: Arc<dyn AxisReport>,
@@ -384,7 +380,7 @@ mod tests {
         let _a1 = controller
             .install(asyn_user("joinAfterStart", 1), motor(1))
             .unwrap();
-        controller.start(&ctx, "joinAfterStart", 5, 5, 0);
+        controller.start("joinAfterStart", 5, 5, 0);
         let _a0 = controller
             .install(asyn_user("joinAfterStart", 0), motor(0))
             .unwrap();
@@ -411,7 +407,7 @@ mod tests {
             counted.fetch_add(1, Ordering::Relaxed);
             PortSets::default()
         });
-        controller.start(&ctx, "periodNoAxes", 3_600_000, 3_600_000, 0);
+        controller.start("periodNoAxes", 3_600_000, 3_600_000, 0);
         std::thread::sleep(Duration::from_millis(100));
         for set in [
             epics_rs::motor::ioc::set_moving_poll_period_command(),
@@ -531,7 +527,7 @@ mod poller_count {
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Idle));
                     controller.install(asyn_user("countPollers", addr), motor)?;
                 }
-                controller.start(ctx, "countPollers", 10, 10, 0);
+                controller.start("countPollers", 10, 10, 0);
                 Ok(CommandOutcome::Continue)
             },
         );

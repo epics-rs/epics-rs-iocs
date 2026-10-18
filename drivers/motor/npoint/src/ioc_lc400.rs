@@ -78,7 +78,7 @@ fn lc400_create_controller_command(registry: &Registry) -> CommandDef {
                 poller.install(asyn_user(&port_name, axis), motor)?;
             }
             // C startPoller, LC400MotorDriver.cpp:156
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
             registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

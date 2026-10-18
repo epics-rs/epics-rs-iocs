@@ -165,7 +165,7 @@ pub fn anf2_start_poller_command() -> CommandDef {
             arg_int_req("Idle poll period (ms)"),
         ],
         "ANF2StartPoller(ANF2Name, movingPollPeriod, idlePollPeriod)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Port name")?;
             let Some(Anf2Port { controller, poller }) = anf2_registry()
                 .lock()
@@ -183,7 +183,7 @@ pub fn anf2_start_poller_command() -> CommandDef {
                 .unwrap_or_else(|e| e.into_inner())
                 .set_poll_periods(moving_poll_ms as f64 / 1000.0, idle_poll_ms as f64 / 1000.0);
             // C startPoller, ANF2Driver.cpp:129
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -251,7 +251,7 @@ pub fn ang1_create_controller_command() -> CommandDef {
                 poller.install_with_report(asyn_user(&port_name, axis as i32), motor, report)?;
             }
             // C startPoller, ANG1Driver.cpp:98
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
 
             Ok(CommandOutcome::Continue)
         },

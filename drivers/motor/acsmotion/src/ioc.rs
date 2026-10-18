@@ -109,7 +109,6 @@ pub fn acsmotion_config_command() -> CommandDef {
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
             poller.start(
-                ctx,
                 &port_name,
                 (moving_poll * 1000.0) as u64,
                 (idle_poll * 1000.0) as u64,

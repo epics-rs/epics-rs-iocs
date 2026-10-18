@@ -88,7 +88,7 @@ pub fn mvp2001_create_controller_command() -> CommandDef {
 
             // MVP2001Driver.cpp:57, before any axis exists.
             let poller = Arc::new(Controller::new());
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
             registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -181,13 +181,13 @@ pub fn micromo_config_command() -> CommandDef {
             arg_str_req("asyn port name"),
         ],
         "MicroMoConfig(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !MVP2001.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            MVP2001.config(ctx, card, move |init| {
+            MVP2001.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,

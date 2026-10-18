@@ -84,13 +84,7 @@ pub fn ims_create_controller_command() -> CommandDef {
             // C startPoller, ImsMDrivePlusMotorController.cpp:101
             let poller = Controller::new();
             poller.install(asyn_user(&motor_port, 0), motor)?;
-            poller.start(
-                ctx,
-                &motor_port,
-                moving_poll_ms as u64,
-                idle_poll_ms as u64,
-                2,
-            );
+            poller.start(&motor_port, moving_poll_ms as u64, idle_poll_ms as u64, 2);
 
             Ok(CommandOutcome::Continue)
         },
@@ -131,13 +125,13 @@ pub fn im483pl_config_command() -> CommandDef {
         "IM483PLConfig",
         config_args(),
         "IM483PLConfig(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !IM483PL.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            IM483PL.config(ctx, card, move |init| {
+            IM483PL.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -188,13 +182,13 @@ pub fn im483sm_config_command() -> CommandDef {
         "IM483SMConfig",
         config_args(),
         "IM483SMConfig(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !IM483SM.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            IM483SM.config(ctx, card, move |init| {
+            IM483SM.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -242,13 +236,13 @@ pub fn mdrive_config_command() -> CommandDef {
         "MDriveConfig",
         config_args(),
         "MDriveConfig(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !MDRIVE.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            MDRIVE.config(ctx, card, move |init| {
+            MDRIVE.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,

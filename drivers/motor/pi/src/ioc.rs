@@ -82,7 +82,7 @@ pub fn pic862_config_command() -> CommandDef {
             arg_int_req("asyn address (GPIB)"),
         ],
         "PIC862Config(card, name, address)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PIC862.has_card(card) {
                 return Ok(CommandOutcome::Continue);
@@ -93,7 +93,7 @@ pub fn pic862_config_command() -> CommandDef {
                 return Err("PIC862Config: addr must be 0-15".into());
             }
 
-            PIC862.config(ctx, card, move |init| {
+            PIC862.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -147,7 +147,7 @@ pub fn pic663_config_command() -> CommandDef {
             arg_int_req("asyn address (GPIB)"),
         ],
         "PIC663Config(card, name, address)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PIC663.has_card(card) {
                 return Ok(CommandOutcome::Continue);
@@ -158,7 +158,7 @@ pub fn pic663_config_command() -> CommandDef {
                 return Err("PIC663Config: addr must be 0-15".into());
             }
 
-            PIC663.config(ctx, card, move |init| {
+            PIC663.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -247,7 +247,7 @@ pub fn pic630_config_command() -> CommandDef {
         "PIC630Config",
         arg_defs,
         "PIC630Config(card, name, cur0, ..., cur8)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PIC630.has_card(card) {
                 return Ok(CommandOutcome::Continue);
@@ -256,7 +256,7 @@ pub fn pic630_config_command() -> CommandDef {
             let num_axes = PIC630_AXES.load(Ordering::Relaxed);
             let currents: Vec<i32> = (0..num_axes).map(|s| c_int(args, 2 + s as usize)).collect();
 
-            PIC630.config(ctx, card, move |init| {
+            PIC630.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -310,14 +310,14 @@ pub fn pic662_config_command() -> CommandDef {
             arg_str_req("asyn port name"),
         ],
         "PIC662Config(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PIC662.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            PIC662.config(ctx, card, move |init| {
+            PIC662.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -370,14 +370,14 @@ pub fn pic844_config_command() -> CommandDef {
             arg_int_req("asyn address (GPIB)"),
         ],
         "PIC844Config(card, name, address)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PIC844.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            PIC844.config(ctx, card, move |init| {
+            PIC844.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -432,14 +432,14 @@ pub fn pic848_config_command() -> CommandDef {
             arg_int_req("asyn address (GPIB)"),
         ],
         "PIC848Config(card, name, address)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PIC848.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            PIC848.config(ctx, card, move |init| {
+            PIC848.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -498,14 +498,14 @@ pub fn pie516_config_command() -> CommandDef {
             arg_int_req("asyn address (GPIB)"),
         ],
         "PIE516Config(card, name, address)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PIE516.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            PIE516.config(ctx, card, move |init| {
+            PIE516.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -561,14 +561,14 @@ pub fn pie517_config_command() -> CommandDef {
             arg_int_req("asyn address (GPIB)"),
         ],
         "PIE517Config(card, name, address)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PIE517.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            PIE517.config(ctx, card, move |init| {
+            PIE517.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -625,14 +625,14 @@ pub fn pie710_config_command() -> CommandDef {
             arg_int_req("asyn address (GPIB)"),
         ],
         "PIE710Config(card, name, address)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PIE710.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            PIE710.config(ctx, card, move |init| {
+            PIE710.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -688,14 +688,14 @@ pub fn pie816_config_command() -> CommandDef {
             arg_int_req("asyn address (GPIB)"),
         ],
         "PIE816Config(card, name, address)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PIE816.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            PIE816.config(ctx, card, move |init| {
+            PIE816.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
