@@ -114,6 +114,15 @@ const DPP_INTERFACE_SERIAL: i32 = 2;
 /// `drvAmptek.cpp:51`: `#define MAX_FAILED_SENDS 10`.
 const MAX_FAILED_SENDS: u32 = 10;
 
+/// drvAmptek.cpp:66-67.
+const AMPTEK_INTERRUPTS: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::OCTET);
+const AMPTEK_INTERFACES: InterfaceMask = AMPTEK_INTERRUPTS
+    .or(InterfaceMask::DRV_USER)
+    .or(InterfaceMask::OPTION);
+
 fn protocol_error(message: impl Into<String>) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
@@ -464,8 +473,8 @@ impl AmptekDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            AMPTEK_INTERFACES,
+            AMPTEK_INTERRUPTS,
         );
         // C's registration connect runs while asynPortDriver's constructor
         // waits in waitConnect, so the base asynPortDriver::connect answers it
@@ -1471,6 +1480,18 @@ mod tests {
         let link = DppLink::ethernet(transport, true);
         let driver = AmptekDriver::with_link("fake", "127.0.0.1", link).unwrap();
         (driver, fake)
+    }
+
+    #[test]
+    fn port_carries_the_c_interface_and_interrupt_masks() {
+        use InterfaceMask as I;
+        let (driver, _fake) = driver_with_fake(|req| default_reply(req, &[0; 64]));
+        let interrupts = I::INT32 | I::INT32_ARRAY | I::FLOAT64 | I::OCTET;
+        assert_eq!(driver.base.interrupt_mask(), interrupts);
+        assert_eq!(
+            driver.base.interface_mask(),
+            interrupts | I::DRV_USER | I::OPTION | I::COMMON
+        );
     }
 
     fn err_message(err: &AsynError) -> &str {
