@@ -186,6 +186,12 @@ impl AhxxxDriver {
     ///
     /// As in `drvTetrAMM`, the `goto error` path skips the `setAcquire(1)`
     /// restore, so a status read that fails leaves the meter stopped.
+    ///
+    /// A failed exchange returns its own status. C discards each
+    /// `writeReadMeter` status (drvAHxxx.cpp:697-772) and reports the empty
+    /// reply as asynError (:801), which `drvQuadEM::writeFloat64` ORs with the
+    /// setter's asynDisconnected into status=7: a disconnected meter alarms
+    /// WRITE there and COMM here. C defect, not copied.
     fn read_status_inner(&mut self, last: &mut trace::StatusExchange) -> AsynResult<()> {
         let p = self.params();
         let bad = |what: &str, resp: &str| error(format!("AHxxx: bad {what} response: {resp}"));
@@ -968,6 +974,35 @@ mod tests {
                 rt.nd_params.acquire
             )
         );
+    }
+
+    /// A down meter link fails a write with the link's asynDisconnected, not
+    /// C's asynError from parsing an empty status reply.
+    #[test]
+    fn a_status_read_on_a_down_meter_keeps_the_link_status() {
+        let (_io, _meter) = crate::octet::create_ip_port(
+            "QE_AH_DOWN_IP",
+            "127.0.0.1:1",
+            Duration::from_millis(200),
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_DOWN").unwrap(),
+            "QE_AH_DOWN_IP",
+            4,
+            0,
+            "AH401B",
+        )
+        .unwrap();
+        // The AH401B has no bias supply, so only readStatus talks to the meter.
+        let err = rt
+            .port_handle()
+            .write_float64_blocking(rt.params.bias_voltage, 0, 0.0)
+            .unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Disconnected, "{err:?}");
     }
 
     #[test]
