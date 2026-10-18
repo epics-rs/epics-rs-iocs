@@ -1072,6 +1072,36 @@ mod tests {
         );
     }
 
+    /// C's writeFloat64 error line for THRESHOLD0 reads `function=99`: the
+    /// ADDriver params, then DELAY_TIME, then the thresholds.
+    #[test]
+    fn a_threshold_error_line_prints_cs_function_number() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "MERLIN_FUNCTION_NO";
+        let det = detector(name);
+        let threshold = det.params.thresholds[0];
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace().set_trace_mask(Some(name), TraceMask::ERROR);
+        assert!(h.write_float64_blocking(threshold, 0, 10.0).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains(
+                "merlinDetector:writeFloat64 error, status=4 function=99, value=10.000000"
+            ),
+            "{text:?}"
+        );
+        std::mem::forget(runtime);
+    }
+
     /// The last frame of a Single acquisition under a software trigger;
     /// returns ADAcquire, SoftwareTrigger and NDArrayCounter after it.
     fn last_software_triggered_frame(name: &str, max_memory: usize) -> (i32, i32, i32) {
