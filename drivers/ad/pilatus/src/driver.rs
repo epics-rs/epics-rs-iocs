@@ -74,7 +74,7 @@ impl PilatusDriver {
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         let p = PilatusParams::create(&mut ad.port_base)?;
 

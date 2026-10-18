@@ -51,7 +51,7 @@ impl D435iColorDriver {
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         let rs_params = D435iParams::create(&mut ad.port_base)?;
 
@@ -332,7 +332,7 @@ impl D435iDepthDriver {
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
 
         let base = &mut ad.port_base;

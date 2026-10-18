@@ -89,7 +89,7 @@ impl BrukerDetector {
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         let params = BrukerParams::create(&mut ad.port_base)?;
         let p = ad.params;

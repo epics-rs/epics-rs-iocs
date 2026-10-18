@@ -52,7 +52,7 @@ impl PvaDriver {
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         let pva_params = PvaParams::create(&mut ad.port_base)?;
 

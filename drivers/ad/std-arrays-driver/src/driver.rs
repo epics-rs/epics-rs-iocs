@@ -82,7 +82,7 @@ impl NdStdArraysDriver {
                 ..Default::default()
             },
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         let port_base = &mut ad.port_base;
         let params = ad.params;

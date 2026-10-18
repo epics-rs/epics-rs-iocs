@@ -57,7 +57,7 @@ impl URLDriver {
             max_memory,
             ASYN_NONE,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         let url_params = URLParams::create(&mut ad.port_base)?;
 

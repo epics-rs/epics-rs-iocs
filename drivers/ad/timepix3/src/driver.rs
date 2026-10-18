@@ -313,7 +313,7 @@ impl TimePix3Driver {
                 ..Default::default()
             },
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         let p = TimePixParams::create(&mut ad.port_base)?;
 

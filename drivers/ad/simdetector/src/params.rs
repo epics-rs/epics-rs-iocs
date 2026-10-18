@@ -239,7 +239,7 @@ mod tests {
             0,
             ASYN_NONE,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )
         .unwrap();
         let sim = SimParams::create(&mut ad.port_base).unwrap();

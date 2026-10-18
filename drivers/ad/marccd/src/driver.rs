@@ -90,7 +90,7 @@ impl MarccdDriver {
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         let p = MarccdParams::create(&mut ad.port_base)?;
 
@@ -521,6 +521,28 @@ pub(crate) mod tests {
             );
             std::mem::forget(server);
         }
+    }
+
+    /// marCCD.cpp:1467 adds asynEnumMask to ADDriver's interrupt mask, and
+    /// the port refuses a client outside it (`getInterruptPvt`,
+    /// asynManager.c:2492-2497): the enum callbacks must register.
+    #[test]
+    fn an_enum_interrupt_client_registers() {
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        let d = driver("MARCCD_ENUMINT");
+        let refused =
+            d.ad.port_base
+                .interrupts
+                .register_interrupt_user(
+                    InterruptFilter {
+                        iface: Some(InterfaceType::Enum),
+                        ..Default::default()
+                    },
+                    0,
+                )
+                .err()
+                .map(|e| e.message_display().to_string());
+        assert_eq!(refused, None);
     }
 
     /// marCCD.cpp:1261, :1336: setIntegerParam / setDoubleParam(function,

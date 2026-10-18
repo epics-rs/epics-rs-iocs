@@ -93,7 +93,7 @@ impl MerlinDetector {
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         // A refusal leaves C's pointer NULL; the pool has printed its line.
         let _flat_field = ad

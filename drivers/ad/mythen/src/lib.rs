@@ -145,7 +145,7 @@ fn create_unconnected(claim: &PortClaim, max_memory: usize) -> AsynResult<Mythen
             ..ASYN_CANBLOCK
         },
         InterfaceMask::UNMIGRATED_SUBCLASS,
-        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
     )?;
     let pool = ad.pool.clone();
     let (runtime_handle, _) =

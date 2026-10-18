@@ -91,7 +91,7 @@ impl PslDetector {
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
         // C PSL never sets NDDriverVersion: it keeps asynNDArrayDriver's
         // ADCore version string.
