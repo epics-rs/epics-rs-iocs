@@ -7,8 +7,9 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::error::{AsynResult, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::param::EnumEntry;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -33,8 +34,9 @@ use crate::protocol::{
 };
 use crate::task::{Worker, start_det_task, start_image_task};
 use crate::types::{
-    Event, FrameType, TASK_ACQUIRE, TASK_STATUS_EXECUTING, TASK_STATUS_QUEUED, TriggerMode,
-    test_task_status,
+    Event, FrameType, GATE_MODE_STRINGS, IMAGE_MODE_STRINGS, NUM_GATE_MODES, NUM_IMAGE_MODES,
+    NUM_READOUT_MODES, NUM_TRIGGER_MODES, READOUT_MODE_STRINGS, TASK_ACQUIRE,
+    TASK_STATUS_EXECUTING, TASK_STATUS_QUEUED, TRIGGER_MODE_STRINGS, TriggerMode, test_task_status,
 };
 
 const INT32_TAIL: WriteTail = WriteTail {
@@ -80,13 +82,13 @@ struct DriverLinks {
 
 impl MarccdDriver {
     fn new(port_name: &str, max_memory: usize, links: DriverLinks) -> AsynResult<Self> {
-        // marCCDConfig passes no sensor size; C's ADDriver base leaves
-        // ADMaxSizeX/Y at 0 and `getConfig` fills them from the server.
+        // C's ADDriver constructor sets ADMaxSizeX/Y to 1; `getConfig` fills
+        // them from the server.
         let mut ad = ADDriverBase::new(
             port_name,
             1,
-            0,
-            0,
+            1,
+            1,
             max_memory,
             ASYN_CANBLOCK,
             InterfaceMask::UNMIGRATED_SUBCLASS,
@@ -219,6 +221,41 @@ impl PortDriver for MarccdDriver {
             }
             status
         })
+    }
+
+    /// C `readEnum` (marCCD.cpp:1361-1419): the mode tables are cut to
+    /// `serverMode`'s length, and an empty one is the single choice "N.A.".
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        let (params, p) = (self.ad.params, self.p);
+        let server_mode = self.get_i32(p.server_mode) as usize;
+        let (strings, counts): (&[&str], [usize; 3]) = match user.reason {
+            r if r == params.image_mode => (&IMAGE_MODE_STRINGS, NUM_IMAGE_MODES),
+            r if r == params.trigger_mode => (&TRIGGER_MODE_STRINGS, NUM_TRIGGER_MODES),
+            r if r == p.gate_mode => (&GATE_MODE_STRINGS, NUM_GATE_MODES),
+            r if r == p.readout_mode => (&READOUT_MODE_STRINGS, NUM_READOUT_MODES),
+            _ => {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "no enum table".into(),
+                });
+            }
+        };
+        let mut entries: Vec<EnumEntry> = (0..)
+            .zip(&strings[..counts[server_mode]])
+            .map(|(value, s)| EnumEntry {
+                string: s.to_string(),
+                value,
+                severity: 0,
+            })
+            .collect();
+        if entries.is_empty() {
+            entries.push(EnumEntry {
+                string: "N.A.".into(),
+                value: 0,
+                severity: 0,
+            });
+        }
+        Ok((0, entries.into()))
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -630,6 +667,62 @@ pub(crate) mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// marCCD.cpp:1361-1419: `readEnum` cuts the mode tables to
+    /// `serverMode`'s length and answers an empty one with C's single "N.A.";
+    /// other parameters have no table, so their records keep the db strings.
+    #[test]
+    fn read_enum_is_cs_per_server_mode() {
+        let mut det = driver("MARENUM");
+        let (params, p) = (det.ad.params, det.p);
+        let table = |det: &mut MarccdDriver, reason: usize| {
+            let (_, entries) = det.read_enum(&AsynUser::new(reason)).unwrap();
+            entries
+                .iter()
+                .map(|e| (e.string.clone(), e.value, e.severity))
+                .collect::<Vec<_>>()
+        };
+        let names = |t: Vec<(String, i32, u16)>| t.into_iter().map(|e| e.0).collect::<Vec<_>>();
+
+        det.ad
+            .port_base
+            .set_int32_param(p.server_mode, 0, 1)
+            .unwrap();
+        assert_eq!(
+            names(table(&mut det, params.image_mode)),
+            ["Single", "Multiple", "Continuous"]
+        );
+        assert_eq!(
+            table(&mut det, params.trigger_mode),
+            [("Internal".into(), 0, 0), ("Frame".into(), 1, 0)]
+        );
+        assert_eq!(table(&mut det, p.gate_mode), [("N.A.".into(), 0, 0)]);
+        assert_eq!(table(&mut det, p.readout_mode), [("N.A.".into(), 0, 0)]);
+
+        det.ad
+            .port_base
+            .set_int32_param(p.server_mode, 0, 2)
+            .unwrap();
+        assert_eq!(names(table(&mut det, params.image_mode)).len(), 5);
+        assert_eq!(
+            names(table(&mut det, params.trigger_mode)),
+            ["Internal", "Frame", "Bulb", "Timed"]
+        );
+        assert_eq!(names(table(&mut det, p.gate_mode)), ["None", "Gated"]);
+        assert_eq!(names(table(&mut det, p.readout_mode)).len(), 6);
+
+        assert!(det.read_enum(&AsynUser::new(p.frame_shift)).is_err());
+    }
+
+    /// ADDriver.cpp:180-181: C's ADDriver constructor sets ADMaxSizeX/Y to 1,
+    /// which is what the port keeps when `getServerMode` fails and C never
+    /// reaches `getConfig`.
+    #[test]
+    fn max_size_starts_at_addrivers_1() {
+        let det = driver("MARMAXSIZE");
+        assert_eq!(det.get_i32(det.ad.params.max_size_x), 1);
+        assert_eq!(det.get_i32(det.ad.params.max_size_y), 1);
     }
 
     /// marCCD.cpp:1250-1357 talks to marServer inside writeInt32 /
