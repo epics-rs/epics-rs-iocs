@@ -43,25 +43,37 @@ const CPF_NULL_ADDRESS: u16 = 0x0000;
 /// CPF item id: unconnected message data.
 const CPF_UNCONNECTED_DATA: u16 = 0x00B2;
 
-/// The "sender context" the C fills with an ASCII, zero-padded, monotonically
-/// increasing counter (`ether_ip.c:generateTransactionId`). The PLC echoes it
-/// verbatim; we compare request and reply to detect a desynchronized stream.
+/// The "sender context" the C fills with a process-wide counter in eight
+/// uppercase hex ASCII digits (`ether_ip.c:generateTransactionId`). The PLC
+/// echoes it verbatim; we compare request and reply to detect a
+/// desynchronized stream.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TransactionId(pub [u8; TRANS_ID_LEN]);
 
-static NEXT_TRANS_ID: AtomicU32 = AtomicU32::new(1);
+/// `EIP_TRANS_ID_MIN_NUM` / `EIP_TRANS_ID_MAX_NUM`.
+const TRANS_ID_MIN: u32 = 1;
+const TRANS_ID_MAX: u32 = 0x7FFF_FFFF;
+
+static NEXT_TRANS_ID: AtomicU32 = AtomicU32::new(TRANS_ID_MIN);
 
 impl TransactionId {
-    /// Next id in the sequence. Wraps at 10^8 so the ASCII form always fits.
+    /// Next id in the sequence; back to 1 once the counter reaches
+    /// `TRANS_ID_MAX`, so it runs 1..=0x7FFFFFFE as in the C.
     pub fn generate() -> TransactionId {
-        let n = NEXT_TRANS_ID.fetch_add(1, Ordering::Relaxed) % 100_000_000;
+        let n = NEXT_TRANS_ID.update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            if n + 1 >= TRANS_ID_MAX {
+                TRANS_ID_MIN
+            } else {
+                n + 1
+            }
+        });
         TransactionId::from_counter(n)
     }
 
     /// The pure function behind [`generate`](Self::generate), so tests can pin
     /// the encoding without touching the global counter.
     pub fn from_counter(n: u32) -> TransactionId {
-        let s = format!("{:08}", n % 100_000_000);
+        let s = format!("{n:08X}");
         let mut id = [0u8; TRANS_ID_LEN];
         id.copy_from_slice(s.as_bytes());
         TransactionId(id)
