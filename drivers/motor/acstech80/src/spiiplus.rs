@@ -252,12 +252,16 @@ pub struct SpiiPlusAxis {
     prev_position: i32,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl SpiiPlusAxis {
-    /// Construct axis `index` (0-based; used directly as the wire axis number).
+    /// Construct axis `index` (0-based; used directly as the wire axis
+    /// number) and read its status, as `motor_init` does for each axis in
+    /// turn (drvSPiiPlus.cc:749).
     pub fn new(controller: Arc<Mutex<SpiiPlusController>>, index: usize) -> Self {
-        Self {
+        let mut axis = Self {
             controller,
             axis: index,
             prev_position: 0,
@@ -267,7 +271,10 @@ impl SpiiPlusAxis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        };
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, SpiiPlusController> {
@@ -522,6 +529,10 @@ impl AsynMotor for SpiiPlusAxis {
         };
         self.last_status = status.clone();
         Ok(status)
+    }
+
+    fn take_init_status(&mut self) -> Option<AsynResult<MotorStatus>> {
+        self.init_status.take()
     }
 }
 
