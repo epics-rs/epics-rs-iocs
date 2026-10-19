@@ -112,6 +112,40 @@ mod setup_security {
         );
     }
 
+    /// `SessionOpen62541::setupSecurity` discovers only over `opc.tcp`, and says
+    /// so whatever the debug level (`SessionOpen62541.cpp:1155-1158`).
+    #[tokio::test]
+    async fn a_secured_session_on_another_scheme_is_fatal() {
+        use std::sync::Arc;
+
+        use epics_rs::base::runtime::log::{
+            errlog_add_listener, errlog_flush, errlog_remove_listener,
+        };
+        use parking_lot::Mutex;
+
+        let pki = std::env::temp_dir().join(format!("opcua-fatal-{}", std::process::id()));
+        let mut config = SessionConfig::new("s", "http://127.0.0.1:4840");
+        config.pki_dir = Some(pki.to_string_lossy().into_owned());
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let id = errlog_add_listener({
+            let lines = lines.clone();
+            move |line: &str| lines.lock().push(line.to_string())
+        });
+        let err = AsyncOpcuaConnector::new()
+            .connect(&config, &Identity::Anonymous)
+            .await
+            .err()
+            .unwrap();
+        errlog_flush();
+        errlog_remove_listener(id);
+        let _ = std::fs::remove_dir_all(&pki);
+        assert_eq!(err, "security discovery and setup failed with status fatal");
+        assert_eq!(
+            *lines.lock(),
+            ["OPC UA session s: fatal - only URLs of type 'opc.tcp' supported\n"]
+        );
+    }
+
     /// C `SessionOpen62541::connect` prints `UA_Client_connect`'s status on
     /// every failed connect (`SessionOpen62541.cpp:586-589`).
     #[tokio::test]

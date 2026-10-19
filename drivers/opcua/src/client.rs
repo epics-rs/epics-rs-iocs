@@ -212,6 +212,13 @@ impl UaConnector for AsyncOpcuaConnector {
         let connected = if config.security_mode == SecurityMode::None {
             client.connect_to_endpoint_directly(config.unsecured_endpoint(), identity)
         } else {
+            if !config.url.starts_with("opc.tcp") {
+                errlog_vprintf(format_args!(
+                    "OPC UA session {}: fatal - only URLs of type 'opc.tcp' supported\n",
+                    config.name
+                ));
+                return Err("security discovery and setup failed with status fatal".to_string());
+            }
             let endpoints = client
                 .get_server_endpoints_from_url(config.url.as_str())
                 .await
