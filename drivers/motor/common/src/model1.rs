@@ -451,7 +451,7 @@ mod tests {
             epics_rs::base::server::driver_support::find_driver_support("drvTestSilent").unwrap();
         assert_eq!(
             drvet.report(0).unwrap(),
-            "    TestSilent controller 0 connection failed.\n1 id: B\n"
+            b"    TestSilent controller 0 connection failed.\n1 id: B\n"
         );
     }
 
@@ -472,13 +472,13 @@ mod tests {
         let drvet = find_driver_support("drvTestReport").unwrap();
         assert_eq!(
             drvet.report(0).unwrap(),
-            "    No TestReport controllers configured.\n"
+            b"    No TestReport controllers configured.\n"
         );
         REPORT.setup(2, 10);
         REPORT.describe(1, "id: B".into());
         assert_eq!(
             drvet.report(0).unwrap(),
-            "    TestReport controller 0 connection failed.\n    TestReport controller 1, id: B\n"
+            b"    TestReport controller 0 connection failed.\n    TestReport controller 1, id: B\n"
         );
     }
 }

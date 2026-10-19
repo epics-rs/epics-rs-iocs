@@ -354,10 +354,11 @@ pub fn port_report(port: &str, level: i32) -> String {
 /// C `dbior(driver, level)`'s text for the drvet `driver`, less its
 /// `Driver: ` header.
 pub fn driver_report(driver: &str, level: i32) -> String {
-    epics_rs::base::server::driver_support::find_driver_support(driver)
+    let report = epics_rs::base::server::driver_support::find_driver_support(driver)
         .unwrap()
         .report(level)
-        .unwrap()
+        .unwrap();
+    String::from_utf8(report).unwrap()
 }
 
 #[cfg(test)]

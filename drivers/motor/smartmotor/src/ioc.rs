@@ -94,7 +94,7 @@ mod report {
         let drvet = find_driver_support("drvSmartMotor").unwrap();
         assert_eq!(
             drvet.report(0).unwrap(),
-            "    No SmartMotor controllers configured.\n"
+            b"    No SmartMotor controllers configured.\n"
         );
         run_command(setup, vec![ArgValue::Int(2), ArgValue::Int(10)]).await;
         let (_line, _io) = LineRig::new("smReportLine", |_| "0".into());
@@ -104,7 +104,7 @@ mod report {
         drvsup_init().await;
         assert_eq!(
             drvet.report(0).unwrap(),
-            "    SmartMotor controller 0 connection failed.\n    \
+            b"    SmartMotor controller 0 connection failed.\n    \
              SmartMotorSM controller #1, port=smReportLine, id:  \n"
         );
     }

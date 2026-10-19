@@ -1099,7 +1099,7 @@ fn valid_device_name(name: &[u8]) -> bool {
 
 /// `mw100_report` (`drvMW100.c:459-505`).
 impl DriverSupport for Registry {
-    fn report(&self, level: i32) -> Option<String> {
+    fn report(&self, level: i32) -> Option<Vec<u8>> {
         let mut out = String::new();
         for (cnt, device) in self.devices.lock().iter().enumerate() {
             let _ = writeln!(
@@ -1120,7 +1120,7 @@ impl DriverSupport for Registry {
                 }
             }
         }
-        Some(out)
+        Some(out.into_bytes())
     }
 }
 
@@ -1456,7 +1456,7 @@ mod tests {
         }
         assert!(!registry.init_mw100(Some(b"dau1"), None));
         assert!(!registry.init_mw100(Some(b"dau1"), Some(b"localhost")));
-        assert_eq!(registry.report(1).as_deref(), Some(""));
+        assert_eq!(registry.report(1).as_deref(), Some(&b""[..]));
     }
 
     #[test]
@@ -1467,7 +1467,7 @@ mod tests {
         assert!(!registry.init_mw100(Some(b"dau1"), Some(b"192.0.2.1")));
         assert_eq!(
             registry.report(0).as_deref(),
-            Some("    Yokogawa MW100 #1: dau1 @ 127.0.0.1\n")
+            Some(&b"    Yokogawa MW100 #1: dau1 @ 127.0.0.1\n"[..])
         );
     }
 
@@ -1492,7 +1492,7 @@ mod tests {
         assert!(!registry.init_mw100(Some(b"dau2"), Some(b"192.0.2.1")));
         assert_eq!(
             registry.report(1).unwrap(),
-            "    Yokogawa MW100 #1: dau2 @ 127.0.0.2\n\
+            b"    Yokogawa MW100 #1: dau2 @ 127.0.0.2\n\
              \x20       Modules:\n\
              \x20       #1: MX110-UNV-M06\n\
              \x20       #2: empty\n\

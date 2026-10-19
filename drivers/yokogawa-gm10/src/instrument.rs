@@ -1030,7 +1030,7 @@ impl Registry {
 
 /// `drvGM10.report`, `gm10_report` (`drvGM10.c:265-311`).
 impl DriverSupport for Registry {
-    fn report(&self, level: i32) -> Option<String> {
+    fn report(&self, level: i32) -> Option<Vec<u8>> {
         let mut out = String::new();
         for (cnt, (name, instrument)) in self.instruments.lock().iter().enumerate() {
             out += &format!(
@@ -1050,7 +1050,7 @@ impl DriverSupport for Registry {
                 }
             }
         }
-        Some(out)
+        Some(out.into_bytes())
     }
 }
 
@@ -1418,9 +1418,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             registry.report(0).unwrap(),
-            "    Yokogawa GM10 #1: second @ 127.0.0.1\n    Yokogawa GM10 #2: first @ 10.0.0.1\n"
+            b"    Yokogawa GM10 #1: second @ 127.0.0.1\n    Yokogawa GM10 #2: first @ 10.0.0.1\n"
         );
-        let level1 = registry.report(1).unwrap();
+        let level1 = String::from_utf8(registry.report(1).unwrap()).unwrap();
         assert!(level1.starts_with(
             "    Yokogawa GM10 #1: second @ 127.0.0.1\n        Modules:\n        #1: GX90XA-06\n        #2: empty\n"
         ));
