@@ -579,7 +579,8 @@ impl AsynMotor for SpiiPlusAxis {
         let status = MotorStatus {
             position,
             encoder_position: fpos.trunc(),
-            velocity,
+            // C `(int)vel` (drvSPiiPlus.cc:397), the record's RVEL.
+            velocity: velocity.trunc(),
             done: d.done,
             moving: d.moving,
             msta_moving: d.moving,
@@ -647,6 +648,30 @@ mod tests {
         let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         let status = axis.poll(&AsynUser::default()).unwrap();
         assert_eq!((status.position, status.encoder_position), (12.0, -12.0));
+    }
+
+    /// C keeps `?FVEL` as `(int)vel` (drvSPiiPlus.cc:397), which the record
+    /// shows as RVEL: -10.7 is -10 where the record's floor makes -11. The
+    /// direction is read from the double first (:311-312), so -0.5 reads 0
+    /// and minus.
+    #[test]
+    fn velocity_truncates_as_c_casts() {
+        let vel = Arc::new(Mutex::new("-10.7"));
+        let read = vel.clone();
+        let (_rig, io) = motor_common::testing::LineRig::new("acsT80Vel", move |sent| match sent {
+            "?VR" => "v1".into(),
+            "?APOS(0)" => "0".into(),
+            s if s.starts_with("?APOS(") => "?".into(),
+            "?FVEL(0)" => read.lock().unwrap().to_string(),
+            _ => "0".into(),
+        });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
+        let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        assert_eq!(axis.poll(&user).unwrap().velocity, -10.0);
+        *vel.lock().unwrap() = "-0.5";
+        let status = axis.poll(&user).unwrap();
+        assert_eq!((status.velocity, status.direction), (0.0, false));
     }
 
     #[test]
