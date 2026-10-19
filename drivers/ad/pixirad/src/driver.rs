@@ -975,17 +975,21 @@ mod tests {
     #[test]
     fn the_status_task_posts_its_cooling_off_in_one_pass() {
         let st = StatusTask::start("PIXI_STATUS_PASS");
-        // The open flush has run by the time the actor answers.
-        st.published(st.ad.string_to_server);
         let mut posts = st.handle.interrupts().subscribe_async(256, 0);
         st.overheat();
         let mut reasons = Vec::new();
         while let Ok(v) = posts.try_recv() {
             reasons.push(v.reason);
         }
+        // The open flush can still be delivering when the subscription starts;
+        // the status pass is what follows its last reading.
+        let pass = reasons
+            .iter()
+            .rposition(|&r| r == st.ad.temperature_actual)
+            .map_or(&[][..], |at| &reasons[at..]);
         let p = st.params;
         assert_eq!(
-            reasons,
+            pass,
             [
                 st.ad.temperature_actual,
                 p.hot_temperature,
