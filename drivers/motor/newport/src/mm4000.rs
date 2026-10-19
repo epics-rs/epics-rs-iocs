@@ -255,6 +255,8 @@ impl Mm4000Controller {
         ctrl.model = model;
 
         // C ignores the `TP;` status; a failed read leaves an empty buffer.
+        // C defect, not copied: a refused write leaves inputBuff the `VE;`
+        // reply, which drvMM4000Asyn.c:846-850 counts as axes.
         let tp = ctrl.write_read("TP;").unwrap_or_default();
         let total_axes = strtok_count(&tp);
         if total_axes < num_axes {
@@ -632,8 +634,10 @@ impl Mm4000Axis {
     /// drvMM4000Asyn.c stores unused),
     /// `TU` (drive resolution → command precision), `XH` (home preset),
     /// `TL`/`TR` (travel limits). C checks none of these replies, so a
-    /// failed one reads as an empty buffer (`atof` → 0). Performs blocking
-    /// serial I/O under the controller lock.
+    /// failed one reads as an empty buffer (`atof` → 0). drvMM4000Asyn.c
+    /// defect, not copied: a refused write leaves inputBuff the previous
+    /// reply, which :869-896 then parse. Performs blocking serial I/O under
+    /// the controller lock.
     pub fn new(
         controller: Arc<Mutex<Mm4000Controller>>,
         card: i32,

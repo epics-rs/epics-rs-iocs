@@ -195,7 +195,9 @@ impl AxisReport for AgapAxisReport {
         let (kp, ki, lf) = {
             let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
             let id = ctrl.controller_id;
-            // C ignores each read's status; a failed one reads as 0.
+            // C ignores each read's status; a failed one reads as 0. C defect,
+            // not copied: a refused write leaves inString_ the previous reply,
+            // which AGAP_CONEX.cpp:240-248 then parse.
             let read = |letters: &str| {
                 let reply = ctrl.write_read(&format!("{id}{letters}{}?", self.axis_name));
                 parse_value_at(&reply.unwrap_or_default(), 4).unwrap_or(0.0)
@@ -239,7 +241,9 @@ impl AgapAxis {
             // The stage ID, resolution and soft limits are kept for the
             // report only (C ignores their status); poll uses the fixed 1e-4
             // step. An unknown model returns before the queries and is
-            // still polled.
+            // still polled. C defect, not copied: a refused write leaves
+            // inString_ the previous reply, which AGAP_CONEX.cpp:206-227
+            // then parse; here it is empty.
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             if ctrl.version.contains("CONEX-AGAP") {
                 let id = ctrl.controller_id;
