@@ -147,7 +147,11 @@ pub fn encode_header(
     out.extend_from_slice(&options.to_le_bytes());
 }
 
-/// `ListServices` request: header only.
+/// `ListServices` request: header only, session 0.
+///
+/// C defect not copied: `make_EncapsulationHeader` packs `c->session`, which
+/// drvEtherIP's reconnect reuses uncleared, so C's ListServices and
+/// RegisterSession after a reconnect carry the previous session handle.
 pub fn encode_list_services(trans_id: TransactionId) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_SIZE);
     encode_header(&mut out, EC_LIST_SERVICES, 0, 0, trans_id, 0);
@@ -202,7 +206,8 @@ pub fn decode_list_services(body: &[u8]) -> Option<Vec<ServiceItem>> {
     Some(items)
 }
 
-/// `RegisterSession` request: header + protocol_version(1) + options(0).
+/// `RegisterSession` request: header (session 0, see
+/// [`encode_list_services`]) + protocol_version(1) + options(0).
 pub fn encode_register_session(trans_id: TransactionId) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_SIZE + 4);
     encode_header(&mut out, EC_REGISTER_SESSION, 4, 0, trans_id, 0);
