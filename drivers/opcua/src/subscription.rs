@@ -1,5 +1,6 @@
 //! Subscription configuration (`Subscription.cpp`, `SubscriptionOpen62541.cpp`).
 
+use async_opcua::types::{CreateSubscriptionRequest, RequestHeader};
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::defaults;
@@ -38,6 +39,19 @@ impl SubscriptionConfig {
     /// undefined; this saturates.
     pub fn lifetime_count(&self) -> u32 {
         (500.0 * 10000.0 / self.publishing_interval) as u32
+    }
+
+    /// The CreateSubscription request `SubscriptionOpen62541::create` sends.
+    pub fn request(&self, request_header: RequestHeader) -> CreateSubscriptionRequest {
+        CreateSubscriptionRequest {
+            request_header,
+            requested_publishing_interval: self.publishing_interval,
+            requested_lifetime_count: self.lifetime_count(),
+            requested_max_keep_alive_count: Self::MAX_KEEP_ALIVE_COUNT,
+            max_notifications_per_publish: Self::MAX_NOTIFICATIONS_PER_PUBLISH,
+            publishing_enabled: true,
+            priority: self.priority,
+        }
     }
 
     /// One `key=value` subscription option (`SubscriptionOpen62541::setOption`);

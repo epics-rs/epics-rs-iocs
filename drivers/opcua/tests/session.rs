@@ -523,6 +523,20 @@ fn subscription_options_are_parsed() {
     assert_eq!(config.priority, 5);
 }
 
+#[test]
+fn a_subscription_requests_its_interval_unrounded() {
+    let mut config = SubscriptionConfig::new("subs", "sess");
+    config.publishing_interval = 33.3;
+    config.priority = 4;
+    let request = config.request(Default::default());
+    assert_eq!(request.requested_publishing_interval, 33.3);
+    assert_eq!(request.requested_lifetime_count, 150_150);
+    assert_eq!(request.requested_max_keep_alive_count, 10);
+    assert_eq!(request.max_notifications_per_publish, 0);
+    assert!(request.publishing_enabled);
+    assert_eq!(request.priority, 4);
+}
+
 // -------------------------------------------------------------------- connecting
 
 #[tokio::test]

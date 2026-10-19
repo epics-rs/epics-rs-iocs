@@ -13,10 +13,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_opcua::client::custom_types::DataTypeTreeBuilder;
-use async_opcua::client::services::{Read, Write};
+use async_opcua::client::services::{CreateSubscription, Read, Write};
 use async_opcua::client::{
-    ClientBuilder, IdentityToken, Session, SubscriptionCallbacks, UARequest,
+    ClientBuilder, IdentityToken, Session, Subscription, SubscriptionCallbacks, UARequest,
 };
+use async_opcua::core::ResponseMessage;
 use async_opcua::crypto::SecurityPolicy;
 use async_opcua::types::{
     DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
@@ -339,35 +340,60 @@ impl UaConnection for AsyncOpcuaConnection {
         config: &SubscriptionConfig,
         sink: mpsc::UnboundedSender<Notification>,
     ) -> Result<u32, StatusCode> {
+        // `Session::create_subscription` sends the interval in whole
+        // milliseconds; this is its body with the C's request.
+        let header = CreateSubscription::new(&self.session).header().clone();
+        let timeout = Duration::from_millis(header.timeout_hint.into());
+        let response = match self
+            .session
+            .channel()
+            .send(config.request(header), timeout)
+            .await?
+        {
+            ResponseMessage::CreateSubscription(response) => response,
+            ResponseMessage::ServiceFault(fault) => {
+                return Err(fault.response_header.service_result);
+            }
+            _ => return Err(StatusCode::BadUnknownResponse),
+        };
+        if response.response_header.service_result.is_bad() {
+            return Err(response.response_header.service_result);
+        }
+
         let name = config.name.clone();
+        let subscription = Subscription::new(
+            response.subscription_id,
+            Duration::from_millis(response.revised_publishing_interval.max(0.0).floor() as u64),
+            response.revised_lifetime_count,
+            response.revised_max_keep_alive_count,
+            SubscriptionConfig::MAX_NOTIFICATIONS_PER_PUBLISH,
+            config.priority,
+            true,
+            Box::new(SubscriptionCallbacks::new(
+                // `SubscriptionOpen62541::subscriptionStatusChanged`.
+                move |change| {
+                    errlog_vprintf(format_args!(
+                        "Subscription {name} status changed to {}\n",
+                        status_name(change.status)
+                    ))
+                },
+                move |value, item| {
+                    // The channel is closed only when the driver is shutting the
+                    // session down, so a failed send is not worth logging.
+                    let _ = sink.send(Notification {
+                        client_handle: item.client_handle(),
+                        value,
+                    });
+                },
+                |_, _| {},
+            )),
+        );
         self.session
-            .create_subscription(
-                Duration::from_secs_f64(config.publishing_interval / 1000.0),
-                config.lifetime_count(),
-                SubscriptionConfig::MAX_KEEP_ALIVE_COUNT,
-                SubscriptionConfig::MAX_NOTIFICATIONS_PER_PUBLISH,
-                config.priority,
-                true,
-                SubscriptionCallbacks::new(
-                    // `SubscriptionOpen62541::subscriptionStatusChanged`.
-                    move |change| {
-                        errlog_vprintf(format_args!(
-                            "Subscription {name} status changed to {}\n",
-                            status_name(change.status)
-                        ))
-                    },
-                    move |value, item| {
-                        // The channel is closed only when the driver is shutting the
-                        // session down, so a failed send is not worth logging.
-                        let _ = sink.send(Notification {
-                            client_handle: item.client_handle(),
-                            value,
-                        });
-                    },
-                    |_, _| {},
-                ),
-            )
-            .await
+            .subscription_state()
+            .lock()
+            .add_subscription(subscription);
+        self.session.trigger_publish_now();
+        Ok(response.subscription_id)
     }
 
     async fn create_monitored_items(
