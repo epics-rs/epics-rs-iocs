@@ -12,11 +12,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
-use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
+use epics_rs::ad_core::driver::{ADDriver, ADStatus};
 use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -521,7 +521,13 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
     }
 
     s.set_str(s.ad.status_message, "Arming").await;
-    let sequence_id = match s.rest().arm() {
+    let arm_start = std::time::Instant::now();
+    let armed = s.rest().arm();
+    s.trace().flow(
+        "controlTask",
+        format_args!("arming time {:.6}", arm_start.elapsed().as_secs_f64()),
+    );
+    let sequence_id = match armed {
         Ok(id) => id,
         Err(_) => {
             s.trace().err("controlTask", "Failed to arm the detector");
@@ -605,9 +611,18 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
             }
 
             if do_trigger {
+                s.trace().flow(
+                    "controlTask",
+                    format_args!(
+                        "sending trigger {}/{num_triggers}. timeout={trigger_timeout:.6}, exposure={acquire_time:.6}",
+                        triggers + 1
+                    ),
+                );
+                set_shutter(s, true).await;
                 let exposure = (trigger_mode == TRIGGER_MODE_INTE).then_some(acquire_time);
                 let timeout = Duration::from_secs_f64(trigger_timeout.max(0.0));
                 let _ = s.rest().trigger(timeout, exposure);
+                set_shutter(s, false).await;
                 triggers += 1;
             }
         }
@@ -615,6 +630,10 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
 
     // Wait for the detector to leave the acquisition states, for the expected
     // image count to arrive, or for a stop.
+    s.trace().flow(
+        "controlTask",
+        format_args!("waiting for detector state or numImages = expectedImages"),
+    );
     let expected_images = num_images.saturating_mul(num_triggers.max(1));
     loop {
         let state = s.fetch_str(p.state).await;
@@ -637,6 +656,8 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
 
     if wait_poll {
         // Let the FileWriter finish writing before telling the poll task to stop.
+        s.trace()
+            .flow("controlTask", format_args!("waiting for FileWriter"));
         loop {
             if s.fetch_str(p.fw_state).await != "acquire" {
                 break;
@@ -646,11 +667,25 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
         rt::sleep(Duration::from_millis(500)).await;
 
         s.poll_stop.store(true, Ordering::Release);
+        s.trace()
+            .flow("controlTask", format_args!("waiting for pollTask"));
         let _ = ch.poll_done_rx.recv().await;
+        let complete = s.poll_complete.load(Ordering::Acquire);
+        s.trace().flow(
+            "controlTask",
+            format_args!("pollTask complete = {}", i32::from(complete)),
+        );
     }
 
     if wait_stream {
+        s.trace()
+            .flow("controlTask", format_args!("waiting for streamTask"));
         let _ = ch.stream_done_rx.recv().await;
+        let complete = s.stream_complete.load(Ordering::Acquire);
+        s.trace().flow(
+            "controlTask",
+            format_args!("streamTask complete = {}", i32::from(complete)),
+        );
     }
 
     if saved_num_images != num_images {
@@ -669,6 +704,15 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
         s.set_int(s.ad.acquire, 0).await;
     }
     false
+}
+
+/// ADDriver::setShutter, run on the port: C calls it under the lock, so the
+/// EPICS-mode delay holds the port too.
+async fn set_shutter(s: &Shared, open: bool) {
+    let _ = s
+        .handle
+        .with_driver(move |d: &mut crate::driver::EigerDriver| d.set_shutter(open))
+        .await;
 }
 
 /// Wait up to `timeout` for a flag to be set, clearing it if it was.
@@ -736,8 +780,12 @@ async fn poll_task(
         let mut retries = 0;
         while i < total_files && retries <= MAX_RETRIES {
             let file = &files[i];
+            s.trace()
+                .flow("pollTask", format_args!("file={}", file.name));
             match s.rest().wait_file(&file.name, Duration::from_secs(1)) {
                 Ok(true) => {
+                    s.trace()
+                        .flow("pollTask", format_args!("file={} exists", file.name));
                     if file.save || file.parse {
                         s.add_pending(1).await;
                         if download_tx.send(file.clone()).await.is_err() {
@@ -753,11 +801,13 @@ async fn poll_task(
                 // means the acquisition was aborted and the file will never come.
                 Ok(false) => {
                     if s.poll_stop.load(Ordering::Acquire) {
+                        not_found_on_stop(&s, &file.name);
                         retries += 1;
                     }
                 }
                 Err(_) => {
                     if s.poll_stop.load(Ordering::Acquire) {
+                        not_found_on_stop(&s, &file.name);
                         retries += 1;
                     } else {
                         rt::sleep(Duration::from_millis(100)).await;
@@ -767,13 +817,25 @@ async fn poll_task(
         }
 
         // Every file we did claim must be reaped before the acquisition is over.
+        s.trace()
+            .flow("pollTask", format_args!("waiting for pending files"));
         while s.pending_files.load(Ordering::Acquire) > 0 {
             rt::sleep(Duration::from_millis(100)).await;
         }
+        s.trace()
+            .flow("pollTask", format_args!("done waiting for pending files"));
 
         s.poll_complete.store(i == total_files, Ordering::Release);
         let _ = done_tx.send(i == total_files).await;
     }
+}
+
+/// C's `waitFile` fails alike for a missing file and a failed request.
+fn not_found_on_stop(s: &Shared, name: &str) {
+    s.trace().flow(
+        "pollTask",
+        format_args!("file={name} not found and pollTask asked to stop"),
+    );
 }
 
 async fn download_task(
@@ -784,6 +846,8 @@ async fn download_task(
     reap_tx: rt::CommandSender<Arc<FileJob>>,
 ) {
     while let Some(file) = rx.recv().await {
+        s.trace()
+            .flow("downloadTask", format_args!("file={}", file.name));
         match s.rest().get_file(&file.name) {
             Err(_) => {
                 s.trace().err(
@@ -815,6 +879,8 @@ async fn parse_task(
     reap_tx: rt::CommandSender<Arc<FileJob>>,
 ) {
     while let Some(file) = rx.recv().await {
+        s.trace()
+            .flow("parseTask", format_args!("file={}", file.name));
         let data = file.data.lock().clone();
         if let Some(data) = data
             && parse_h5(&s, &data).await.is_err()
@@ -837,7 +903,8 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
     // The thresholds that were enabled for this acquisition, in order — the
     // Nth frame of a 4-D dataset belongs to the Nth *active* threshold.
     let active = active_thresholds(s).await;
-    let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
+    // Once per file, counted on locally (eigerDetector.cpp:1841-1842, :1903-1904).
+    let mut counters = Counters::read(s).await;
 
     // C `break`s out of the threshold loop on a refused alloc
     // (eigerDetector.cpp:1849), dropping the rest of that image's thresholds.
@@ -857,24 +924,26 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
         attrs.add(threshold_number_attr(number));
         attrs.add(threshold_energy_attr(energy));
 
-        if publish(
-            s,
-            Image {
-                dims: frame.dims,
-                data: frame.data,
-                codec: None,
-                attributes: attrs,
-                threshold_index: frame.threshold,
-                timestamp: None,
-            },
-            array_callbacks,
-        )
-        .await
-        .is_err()
-        {
+        // Per frame, after its updateTimeStamps (eigerDetector.cpp:1880, :1892).
+        let timestamp = port_stamp(&s.handle).await;
+        let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
+        let image = Image {
+            dims: frame.dims,
+            data: frame.data,
+            codec: None,
+            attributes: attrs,
+            threshold_index: frame.threshold,
+            timestamp: Some(timestamp),
+        };
+        let Ok(array) = prepare(s, image, &counters).await else {
             trace.err("parseH5File", "couldn't allocate NDArray");
             skip_image = true;
+            continue;
+        };
+        if array_callbacks {
+            trace.flow_single_colon("parseH5File", "calling NDArray callback");
         }
+        deliver(s, array, frame.threshold, array_callbacks, &mut counters).await;
     }
     Ok(())
 }
@@ -919,6 +988,7 @@ async fn save_task(
     reap_tx: rt::CommandSender<Arc<FileJob>>,
 ) {
     while let Some(file) = rx.recv().await {
+        save_flow(&s, &file.name);
         let data = file.data.lock().clone();
         let Some(data) = data else {
             let _ = reap_tx.send(file).await;
@@ -946,6 +1016,20 @@ async fn save_task(
     }
 }
 
+/// saveTask's first line. Without `FILE_OWNER` (see [`write_file`]) the owner
+/// is always the IOC's own uid and gid, C's `mFsUid`/`mFsGid` defaults.
+fn save_flow(s: &Shared, name: &str) {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid and getgid cannot fail and touch no memory.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        s.trace()
+            .flow("saveTask", format_args!("file={name} uid={uid} gid={gid}"));
+    }
+    #[cfg(not(unix))]
+    s.trace().flow("saveTask", format_args!("file={name}"));
+}
+
 /// Write one downloaded file to `FilePath` with `FILE_PERMISSIONS`.
 ///
 /// SCOPED GAP: C additionally honours `FILE_OWNER` / `FILE_OWNER_GROUP` by
@@ -953,7 +1037,7 @@ async fn save_task(
 /// `setfsuid`/`setfsgid` (eigerDetector.cpp:719, 1266-1267). That is a Linux-only,
 /// libc-dependent path with no portable Rust equivalent; it is not ported. The
 /// two PVs still exist and hold their strings, but they do not change the owner
-/// of the written file.
+/// of the written file, and C's "setting FS UID/GID" FLOW lines never print.
 ///
 /// Returns whether the whole file was written. Failures print C's
 /// `saveTask` lines and the `perror` that follows each; a failed `fchmod`
@@ -964,6 +1048,8 @@ fn write_file(s: &Shared, name: &str, path: &str, data: &[u8], perms: u32) -> bo
     let perror =
         |call: &str, e: &std::io::Error| epics_rs::base::stderr_println!("{call}: {}", strerror(e));
     let mut opts = std::fs::OpenOptions::new();
+    // C DEFECT, not copied: C opens without O_TRUNC (eigerDetector.cpp:1293),
+    // so a shorter file written over an existing one keeps the old tail.
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
@@ -1031,14 +1117,22 @@ fn strerror(e: &std::io::Error) -> String {
 /// Drop one reference to a file; the last one deletes it from the detector
 /// (C `reapTask`, eigerDetector.cpp:1331).
 async fn reap(s: &Arc<Shared>, file: Arc<FileJob>) {
-    if file.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
+    let refs = file.refs.fetch_sub(1, Ordering::AcqRel);
+    s.trace().flow(
+        "reapTask",
+        format_args!("file={} refCount={refs}", file.name),
+    );
+    if refs != 1 {
         return;
     }
     if file.remove.load(Ordering::Acquire) {
         let _ = s.rest().delete_file(&file.name);
     }
     s.fetch(s.p.fw_free).await;
-    *file.data.lock() = None;
+    if file.data.lock().take().is_some() {
+        s.trace()
+            .flow("reapTask", format_args!("file={} reaped", file.name));
+    }
     s.add_pending(-1).await;
 }
 
@@ -1157,21 +1251,31 @@ async fn stream_task(
     }
 }
 
+fn stream_timeout(s: &Shared) {
+    s.trace()
+        .flow("streamTask", format_args!("got stream timeout"));
+}
+
+fn end_frame(s: &Shared) {
+    s.trace().flow("streamTask", format_args!("got end frame"));
+}
+
 /// Receive one whole series. Returns whether it ended with a `dseries_end`
 /// (C `mStreamComplete`).
 async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
-    let decompress = s.get_int(s.p.stream_decompress).await != 0;
     let timeout = Duration::from_secs(1);
 
-    // Wait out the series header.
+    // Wait out the series header. Only the header or an error ends the wait;
+    // C leaves no Stop exit, which would strand this series in the socket
+    // for the next acquisition (eigerDetector.cpp:1441-1455).
     loop {
-        match stream.recv(timeout, decompress).await {
-            Ok(Some(StreamMessage::Header(_))) => break,
-            Ok(Some(StreamMessage::End)) => return true,
-            Ok(Some(StreamMessage::Image(_))) => {
-                s.trace().err("streamTask", "got stray packet, ignoring");
-            }
-            Ok(None) => {}
+        match stream
+            .recv(timeout)
+            .await
+            .and_then(|m| m.map(|m| m.header()).transpose())
+        {
+            Ok(Some(_)) => break,
+            Ok(None) => stream_timeout(s),
             Err(crate::stream::StreamError::WrongHtype(h)) => {
                 epics_rs::base::stderr_println!(
                     "StreamApi::getHeader: wrong header type, htype={h}"
@@ -1183,18 +1287,27 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                 return false;
             }
         }
-        if s.flags.stop.load(Ordering::Acquire) {
-            return false;
-        }
     }
 
-    let signed_data = s.get_int(s.p.signed_data).await != 0;
-    let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
-
     loop {
-        let msg = match stream.recv(timeout, decompress).await {
+        let received = match stream.recv(timeout).await {
             Ok(Some(m)) => m,
-            Ok(None) => continue,
+            Ok(None) => {
+                stream_timeout(s);
+                continue;
+            }
+            Err(_) => {
+                s.trace().err("streamTask", "failed to get frame packet");
+                return false;
+            }
+        };
+        // C reads these per frame, once waitFrame has it (eigerDetector.cpp:1497-1517).
+        let decompress = s.get_int(s.p.stream_decompress).await != 0;
+        let signed_data = s.get_int(s.p.signed_data).await != 0;
+        let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
+        let mut counters = Counters::read(s).await;
+        let msg = match received.decode(decompress) {
+            Ok(m) => m,
             Err(crate::stream::StreamError::WrongHtype(_)) => continue,
             // UPSTREAM DEFECT (streamApi.cpp:1503-1507 in the caller): C assigns
             // `err = mStreamAPI->getFrame(&pArray, ...)` and then dereferences
@@ -1207,7 +1320,10 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
         };
 
         match msg {
-            StreamMessage::End => return true,
+            StreamMessage::End => {
+                end_frame(s);
+                return true;
+            }
             StreamMessage::Header(_) => {}
             StreamMessage::Image(frame) => {
                 // Stream v1 carries one image per message and no threshold axis
@@ -1227,9 +1343,14 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                 };
                 // A refused alloc is getFrame's STREAM_ERROR (streamApi.cpp:370),
                 // which ends the series like any other failed frame above.
-                if publish(s, image.signed_if(signed_data), array_callbacks)
-                    .await
-                    .is_err()
+                if publish(
+                    s,
+                    image.signed_if(signed_data),
+                    array_callbacks,
+                    &mut counters,
+                )
+                .await
+                .is_err()
                 {
                     epics_rs::base::stderr_println!(
                         "StreamApi::getFrame: failed to allocate NDArray for frame {number}"
@@ -1249,12 +1370,13 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
     let ts_source = s.get_int(s.p.stream_as_ts_source).await != 0;
 
     // C reads the status as an int in streamApi.h's code space
-    // (`Stream2Error::code`): 1 timeout, 2 stray packet, 3 error.
+    // (`Stream2Error::code`): 1 timeout, 2 stray packet, 3 error. No Stop
+    // exit, as in stream_series.
     loop {
         match stream.get_header(timeout).await {
             Ok(()) => break,
             Err(e) => match e.code() {
-                1 => {}
+                1 => stream_timeout(s),
                 2 => s.trace().err("streamTask", "got stray packet, ignoring"),
                 3 => {
                     s.trace().err("streamTask", "failed to get header packet");
@@ -1267,17 +1389,20 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
                 }
             },
         }
-        if s.flags.stop.load(Ordering::Acquire) {
-            return false;
-        }
     }
 
     loop {
         let num_thresholds = match stream.wait_frame(timeout).await {
-            Ok(Frame::End) => return true,
+            Ok(Frame::End) => {
+                end_frame(s);
+                return true;
+            }
             Ok(Frame::Image(n)) => n,
             Err(e) => match e.code() {
-                1 => continue,
+                1 => {
+                    stream_timeout(s);
+                    continue;
+                }
                 3 => {
                     s.trace().err("streamTask", "failed to get frame packet");
                     return false;
@@ -1300,6 +1425,7 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
             };
             let signed_data = s.get_int(s.p.signed_data).await != 0;
             let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
+            let mut counters = Counters::read(s).await;
             let mut attributes = NDAttributeList::new();
             if let Some((number, energy)) = frame.threshold {
                 attributes.add(threshold_number_attr(number));
@@ -1315,9 +1441,14 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
             };
             // A refused alloc is getFrame's STREAM_ERROR (stream2Api.cpp:290),
             // skipped like the other failed frames above.
-            if publish(s, image.signed_if(signed_data), array_callbacks)
-                .await
-                .is_err()
+            if publish(
+                s,
+                image.signed_if(signed_data),
+                array_callbacks,
+                &mut counters,
+            )
+            .await
+            .is_err()
             {
                 epics_rs::base::stderr_println!(
                     "Stream2Api::getFrame: failed to allocate NDArray for frame"
@@ -1364,9 +1495,6 @@ fn build_array(
     Ok(array)
 }
 
-/// Publish one image on the main output and on its threshold's output
-/// (C `doCallbacksGenericPointer(pArray, NDArrayData, 0)` plus the
-/// `thresh + 1` address).
 /// One image on its way out: what [`publish`] needs to build the NDArray and to
 /// pick the threshold output it also goes to.
 struct Image {
@@ -1377,8 +1505,9 @@ struct Image {
     /// 0-based threshold index; picks `outputs.thresholds[i]`, which is C's
     /// asyn address `thresh + 1`.
     threshold_index: usize,
-    /// The stream2 frame time when STREAM_AS_TIMESTAMP_SOURCE is set; `None`
-    /// stamps the array now.
+    /// A stamp the caller already took: the stream2 frame time when
+    /// STREAM_AS_TIMESTAMP_SOURCE is set, or parseH5File's own. `None` stamps
+    /// the array now.
     timestamp: Option<EpicsTimestamp>,
 }
 
@@ -1415,29 +1544,68 @@ impl Image {
     }
 }
 
+/// C's `imageCounter` / `numImagesCounter` locals: each path reads them where
+/// C does and [`publish`] counts them on.
+struct Counters {
+    image: i32,
+    num_images: i32,
+}
+
+impl Counters {
+    async fn read(s: &Shared) -> Self {
+        Self {
+            image: s.get_int(s.ad.base.array_counter).await,
+            num_images: s.get_int(s.ad.num_images_counter).await,
+        }
+    }
+}
+
 /// `Err` when the pool refuses the frame (C's `alloc` returning NULL); the
-/// caller prints C's line for its path.
-async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) -> ADResult<()> {
+/// caller prints C's line for its path, and the counters stay as they were.
+async fn publish(
+    s: &Arc<Shared>,
+    image: Image,
+    array_callbacks: bool,
+    counters: &mut Counters,
+) -> ADResult<()> {
+    let threshold_index = image.threshold_index;
+    let array = prepare(s, image, counters).await?;
+    deliver(s, array, threshold_index, array_callbacks, counters).await;
+    Ok(())
+}
+
+/// Stamp and allocate one image; [`publish`]'s first half.
+async fn prepare(s: &Arc<Shared>, image: Image, counters: &Counters) -> ADResult<PublishedArray> {
     let Image {
         dims,
         data,
         codec,
         attributes,
-        threshold_index,
+        threshold_index: _,
         timestamp,
     } = image;
     // C stamps the counter before its `++imageCounter` (eigerDetector.cpp:1537,
     // :1878), so the first array of an IOC's life is uniqueId 0.
-    let unique_id = s.get_int(s.ad.base.array_counter).await;
-    let counter = unique_id + 1;
+    let unique_id = counters.image;
     // C calls updateTimeStamps only when stream2 left the ts unset
     // (eigerDetector.cpp:1539-1541).
     let timestamp = match timestamp {
         Some(ts) => ts,
         None => port_stamp(&s.handle).await,
     };
-    let array = build_array(&s.pool, dims, data, codec, attributes, unique_id, timestamp)?.share();
+    Ok(build_array(&s.pool, dims, data, codec, attributes, unique_id, timestamp)?.share())
+}
 
+/// Publish one image on the main output and on its threshold's output
+/// (C `doCallbacksGenericPointer(pArray, NDArrayData, 0)` plus the
+/// `thresh + 1` address), then count it.
+async fn deliver(
+    s: &Arc<Shared>,
+    array: PublishedArray,
+    threshold_index: usize,
+    array_callbacks: bool,
+    counters: &mut Counters,
+) {
     if array_callbacks {
         ArrayPublisher::new(s.outputs.main.clone())
             .publish(array.clone())
@@ -1464,10 +1632,11 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) -> ADResu
         .unwrap_or("")
         .to_string();
 
-    let num_images_counter = s.get_int(s.ad.num_images_counter).await + 1;
+    counters.image += 1;
+    counters.num_images += 1;
     s.apply(vec![
-        ParamUpdate::Int32(s.ad.base.array_counter, counter),
-        ParamUpdate::Int32(s.ad.num_images_counter, num_images_counter),
+        ParamUpdate::Int32(s.ad.base.array_counter, counters.image),
+        ParamUpdate::Int32(s.ad.num_images_counter, counters.num_images),
         ParamUpdate::Float64(s.ad.base.timestamp_rbv, array.time_stamp),
         ParamUpdate::Int32(s.ad.base.epics_ts_sec, array.timestamp.sec as i32),
         ParamUpdate::Int32(s.ad.base.epics_ts_nsec, array.timestamp.nsec as i32),
@@ -1485,7 +1654,6 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) -> ADResu
         ),
     ])
     .await;
-    Ok(())
 }
 
 /// Build the shared state the tasks run on, plus the driver's signal handles.
@@ -1629,7 +1797,9 @@ mod tests {
                     }
                 }
                 let _ = reader.read_exact(&mut vec![0u8; length]);
-                let body = if request.starts_with("PUT") {
+                let body = if request.contains("/command/arm ") {
+                    r#"{"sequence id":1}"#
+                } else if request.starts_with("PUT") {
                     "[]"
                 } else {
                     r#"{"value":"disabled","value_type":"string","access_mode":"rw",
@@ -1769,9 +1939,15 @@ mod tests {
         );
 
         for _ in 0..2 {
-            publish(&s, image(NDDataBuffer::U16(vec![1, 2]), None), true)
-                .await
-                .unwrap();
+            let mut counters = Counters::read(&s).await;
+            publish(
+                &s,
+                image(NDDataBuffer::U16(vec![1, 2]), None),
+                true,
+                &mut counters,
+            )
+            .await
+            .unwrap();
         }
         let mut ids = Vec::new();
         for _ in 0..2 {
@@ -1780,6 +1956,518 @@ mod tests {
         assert_eq!(ids, [0, 1]);
         assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
         std::mem::forget(runtime);
+    }
+
+    /// C streamTask reads StreamDecompress, SignedData and ArrayCallbacks for
+    /// every frame, once waitFrame has it (eigerDetector.cpp:1497-1517).
+    #[tokio::test]
+    async fn stream_v1_reads_its_frame_params_per_frame() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use zeromq::{Socket, SocketSend};
+
+        let name = "EIGER_STREAM_PER_FRAME";
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: name.to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let det = crate::driver::EigerDriver::new(cfg, rest, signals.clone()).expect("driver");
+        let (p, ad, ops) = (det.p, det.ad.params, det.ops.clone());
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
+                .expect("runtime");
+        let outputs = Outputs::new();
+        let (tx, mut rx) = ndarray_channel("STREAM_PER_FRAME_SINK", 8);
+        // Frame 3 passes through compressed.
+        rx.admission().set_compression_aware(true);
+        outputs.main.lock().add(tx);
+        let s = shared(
+            ops,
+            runtime.port_handle().clone(),
+            p,
+            ad,
+            Model::Eiger1,
+            ApiVersion::V1_6_0,
+            "127.0.0.1".to_string(),
+            outputs,
+            DriverPool::standalone(0),
+            &signals,
+        );
+
+        let mut push = zeromq::PushSocket::new();
+        let endpoint = push.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut stream = StreamApi::connect_to(&endpoint.to_string())
+            .await
+            .expect("connect");
+        let task = {
+            let s = Arc::clone(&s);
+            tokio::spawn(async move { stream_series(&s, &mut stream).await })
+        };
+        let message = |parts: Vec<Vec<u8>>| {
+            zeromq::ZmqMessage::try_from(
+                parts
+                    .into_iter()
+                    .map(bytes::Bytes::from)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let raw: Vec<u8> = [1u16, 0xffff]
+            .iter()
+            .flat_map(|p| p.to_le_bytes())
+            .collect();
+        let image = |frame: u64, compressed: bool| {
+            let (enc, blob) = if compressed {
+                ("lz4<", lz4_flex::block::compress(&raw))
+            } else {
+                ("<", raw.clone())
+            };
+            message(vec![
+                format!(r#"{{"htype":"dimage-1.0","series":1,"frame":{frame},"hash":"x"}}"#)
+                    .into_bytes(),
+                format!(
+                    r#"{{"htype":"dimage_d-1.0","shape":[2,1],"type":"uint16","encoding":"{enc}","size":{}}}"#,
+                    blob.len()
+                )
+                .into_bytes(),
+                blob,
+            ])
+        };
+        let frame_done = |n: i32| {
+            let s = Arc::clone(&s);
+            async move {
+                for _ in 0..500 {
+                    if s.get_int(s.ad.base.array_counter).await == n {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                panic!("frame {n} never published");
+            }
+        };
+        let set = |updates: Vec<ParamUpdate>| {
+            let s = Arc::clone(&s);
+            async move { s.apply(updates).await }
+        };
+
+        set(vec![
+            ParamUpdate::Int32(s.ad.base.array_callbacks, 1),
+            ParamUpdate::Int32(s.p.signed_data, 0),
+            ParamUpdate::Int32(s.p.stream_decompress, 1),
+        ])
+        .await;
+        // A PUSH socket refuses to send until the PULL side has connected.
+        let header = br#"{"htype":"dheader-1.0","series":1,"header_detail":"none"}"#;
+        while push.send(message(vec![header.to_vec()])).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        push.send(image(0, false)).await.unwrap();
+        frame_done(1).await;
+        let a = rx.recv().await.expect("frame 0");
+        assert!(matches!(a.data, NDDataBuffer::U16(_)));
+
+        set(vec![ParamUpdate::Int32(s.ad.base.array_callbacks, 0)]).await;
+        push.send(image(1, false)).await.unwrap();
+        frame_done(2).await;
+        assert_eq!(
+            rx.pending(),
+            0,
+            "ArrayCallbacks=0 on frame 1 still published it"
+        );
+
+        set(vec![
+            ParamUpdate::Int32(s.ad.base.array_callbacks, 1),
+            ParamUpdate::Int32(s.p.signed_data, 1),
+        ])
+        .await;
+        push.send(image(2, false)).await.unwrap();
+        frame_done(3).await;
+        let a = rx.recv().await.expect("frame 2");
+        assert!(
+            matches!(a.data, NDDataBuffer::I16(_)),
+            "SignedData=1 on frame 2"
+        );
+
+        set(vec![
+            ParamUpdate::Int32(s.p.signed_data, 0),
+            ParamUpdate::Int32(s.p.stream_decompress, 0),
+        ])
+        .await;
+        push.send(image(3, true)).await.unwrap();
+        frame_done(4).await;
+        let a = rx.recv().await.expect("frame 3");
+        assert!(a.codec.is_some(), "StreamDecompress=0 on frame 3");
+
+        push.send(message(vec![
+            br#"{"htype":"dseries_end-1.0","series":1}"#.to_vec(),
+        ]))
+        .await
+        .unwrap();
+        assert!(task.await.unwrap(), "dseries_end completes the series");
+        std::mem::forget(runtime);
+    }
+
+    /// A FileWriter-shaped file: `/entry/data/data` of u16 images, `[n, h, w]`.
+    fn h5_file(shape: [usize; 3]) -> Vec<u8> {
+        let path = std::env::temp_dir().join(format!(
+            "eiger-h5-{}-{:?}.h5",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = rust_hdf5::H5File::create(&path).unwrap();
+        let data = file
+            .create_group("entry")
+            .unwrap()
+            .create_group("data")
+            .unwrap();
+        let n: usize = shape.iter().product();
+        data.new_dataset::<u16>()
+            .shape(shape)
+            .create("data")
+            .unwrap()
+            .write_raw(&(0..n as u16).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        bytes
+    }
+
+    /// An Eiger1 port with its interrupts open and its main output wired to
+    /// the returned sink.
+    fn h5_rig(
+        name: &str,
+    ) -> (
+        Arc<Shared>,
+        epics_rs::ad_core::plugin::channel::NDArrayReceiver,
+    ) {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: name.to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let mut det = crate::driver::EigerDriver::new(cfg, rest, signals.clone()).expect("driver");
+        det.ad.port_base.own_interrupts(InterruptGate::opened());
+        let (p, ad, ops) = (det.p, det.ad.params, det.ops.clone());
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
+                .expect("runtime");
+        let outputs = Outputs::new();
+        let (tx, rx) = ndarray_channel(&format!("{name}_SINK"), 4);
+        outputs.main.lock().add(tx);
+        let s = shared(
+            ops,
+            runtime.port_handle().clone(),
+            p,
+            ad,
+            Model::Eiger1,
+            ApiVersion::V1_6_0,
+            "127.0.0.1".to_string(),
+            outputs,
+            DriverPool::standalone(0),
+            &signals,
+        );
+        std::mem::forget(runtime);
+        (s, rx)
+    }
+
+    /// A client's store of `updates`, sent from the port thread as frame 0
+    /// posts ArrayCounter: it reaches the port ahead of everything frame 1
+    /// sends. A direct op, so the asyn queue cannot reorder it.
+    fn store_after_frame_0(
+        s: &Shared,
+        updates: Vec<ParamSetValue>,
+    ) -> epics_rs::asyn::interrupt::SyncCallbackSubscription {
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::asyn::request::RequestOp;
+        use epics_rs::asyn::user::AsynUser;
+
+        let pending = parking_lot::Mutex::new(Some(updates));
+        let client = s.handle.clone();
+        s.handle
+            .interrupts()
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(s.ad.base.array_counter),
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                move |iv| {
+                    if matches!(iv.value, ParamValue::Int32(1))
+                        && let Some(updates) = pending.lock().take()
+                    {
+                        client
+                            .try_submit(
+                                RequestOp::CallParamCallbacks {
+                                    addr: 0,
+                                    updates,
+                                    time_stamp: None,
+                                },
+                                AsynUser::new(0),
+                            )
+                            .expect("client store");
+                    }
+                },
+            )
+            .unwrap()
+    }
+
+    /// C parseH5File reads NDArrayCounter and ADNumImagesCounter once per file
+    /// and counts on from there (eigerDetector.cpp:1841-1842, :1903-1904): a
+    /// client store between two frames is overwritten, not counted on from.
+    #[tokio::test]
+    async fn parse_h5_counts_on_from_the_counters_read_at_file_start() {
+        let (s, mut rx) = h5_rig("EIGER_H5_COUNTERS");
+        let (counter, images) = (s.ad.base.array_counter, s.ad.num_images_counter);
+        let _sub = store_after_frame_0(
+            &s,
+            [counter, images]
+                .map(|r| ParamSetValue::new(r, 0, ParamValue::Int32(100)))
+                .to_vec(),
+        );
+
+        s.set_int(s.ad.base.array_callbacks, 1).await;
+        parse_h5(&s, &h5_file([2, 1, 2])).await.expect("parse");
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            ids.push(rx.recv().await.expect("array").unique_id);
+        }
+        assert_eq!(ids, [0, 1]);
+        assert_eq!(s.get_int(counter).await, 2);
+        assert_eq!(s.get_int(images).await, 2);
+    }
+
+    /// C parseH5File reads NDArrayCallbacks for every frame, after its
+    /// updateTimeStamps (eigerDetector.cpp:1880, :1892).
+    #[tokio::test]
+    async fn parse_h5_reads_array_callbacks_per_frame() {
+        let (s, mut rx) = h5_rig("EIGER_H5_CALLBACKS");
+        let callbacks = s.ad.base.array_callbacks;
+        let _sub = store_after_frame_0(
+            &s,
+            vec![ParamSetValue::new(callbacks, 0, ParamValue::Int32(0))],
+        );
+
+        s.set_int(callbacks, 1).await;
+        parse_h5(&s, &h5_file([2, 1, 2])).await.expect("parse");
+        assert_eq!(rx.recv().await.expect("frame 0").unique_id, 0);
+        assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
+        assert_eq!(rx.pending(), 0, "ArrayCallbacks=0 before frame 1");
+    }
+
+    /// One single-part stream v1 message; a PUSH socket refuses to send until
+    /// the PULL side has connected.
+    async fn push_v1(push: &mut zeromq::PushSocket, part: &[u8]) {
+        use zeromq::SocketSend;
+        let message = || zeromq::ZmqMessage::from(part.to_vec());
+        while push.send(message()).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// C's header wait has no Stop exit (eigerDetector.cpp:1424-1462): a Stop
+    /// while the header is pending leaves both stream versions waiting.
+    #[tokio::test]
+    async fn a_stop_does_not_end_the_stream_header_wait() {
+        use zeromq::Socket;
+
+        let (s, _rx) = h5_rig("EIGER_HEADER_STOP");
+        s.flags.stop.store(true, Ordering::Release);
+        let mut push = zeromq::PushSocket::new();
+        let v1 = push.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut push2 = zeromq::PushSocket::new();
+        let v2 = push2.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut stream = StreamApi::connect_to(&v1.to_string()).await.unwrap();
+        let mut stream2 = Stream2Api::connect_to(&v2.to_string()).await.unwrap();
+        let series = [
+            tokio::spawn({
+                let s = Arc::clone(&s);
+                async move { stream_series(&s, &mut stream).await }
+            }),
+            tokio::spawn({
+                let s = Arc::clone(&s);
+                async move { stream2_series(&s, &mut stream2).await }
+            }),
+        ];
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let finished = series.each_ref().map(|t| t.is_finished());
+        series.iter().for_each(|t| t.abort());
+        assert_eq!(finished, [false, false], "[v1, v2] ended under Stop");
+    }
+
+    /// C getHeader takes a series end as a wrong header type
+    /// (streamApi.cpp:226-231), so the header wait goes on to the real header.
+    #[tokio::test]
+    async fn a_series_end_before_the_header_is_a_stray_packet() {
+        use zeromq::Socket;
+
+        let (s, rx) = h5_rig("EIGER_HEADER_END");
+        s.set_int(s.ad.base.array_callbacks, 1).await;
+        let mut push = zeromq::PushSocket::new();
+        let endpoint = push.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut stream = StreamApi::connect_to(&endpoint.to_string()).await.unwrap();
+        let series = tokio::spawn({
+            let s = Arc::clone(&s);
+            async move { stream_series(&s, &mut stream).await }
+        });
+        push_v1(&mut push, br#"{"htype":"dseries_end-1.0","series":0}"#).await;
+        push_v1(&mut push, br#"{"htype":"dheader-1.0","series":1}"#).await;
+        let pixels: Vec<u8> = [1u16, 2].iter().flat_map(|p| p.to_le_bytes()).collect();
+        let image = zeromq::ZmqMessage::try_from(vec![
+            bytes::Bytes::from_static(br#"{"htype":"dimage-1.0","series":1,"frame":0}"#),
+            bytes::Bytes::from_static(
+                br#"{"htype":"dimage_d-1.0","shape":[2,1],"type":"uint16","encoding":"<"}"#,
+            ),
+            bytes::Bytes::from(pixels),
+        ])
+        .unwrap();
+        {
+            use zeromq::SocketSend;
+            push.send(image).await.unwrap();
+        }
+        push_v1(&mut push, br#"{"htype":"dseries_end-1.0","series":1}"#).await;
+        assert!(series.await.unwrap());
+        assert_eq!(rx.pending(), 1, "the series after the stray end");
+    }
+
+    /// C opens the shutter before each internal trigger and closes it after
+    /// (eigerDetector.cpp:1003, :1007).
+    #[tokio::test]
+    async fn each_internal_trigger_is_wrapped_in_set_shutter() {
+        use epics_rs::ad_core::driver::ShutterMode;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+
+        let (s, _rx) = h5_rig("EIGER_SHUTTER");
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _sub = {
+            let seen = seen.clone();
+            s.handle
+                .interrupts()
+                .register_sync_callback(
+                    InterruptFilter {
+                        reason: Some(s.ad.shutter_control_epics),
+                        addr: Some(0),
+                        ..Default::default()
+                    },
+                    move |iv| {
+                        if let ParamValue::Int32(v) = iv.value {
+                            seen.lock().push(v);
+                        }
+                    },
+                )
+                .unwrap()
+        };
+        s.apply(vec![
+            ParamUpdate::Int32(s.ad.shutter_mode, ShutterMode::EpicsOnly as i32),
+            ParamUpdate::Int32(s.p.data_source, crate::params::SOURCE_NONE),
+            ParamUpdate::Int32(s.p.trigger_mode, TRIGGER_MODE_INTS),
+            ParamUpdate::Int32(s.p.n_triggers, 2),
+            ParamUpdate::Int32(s.p.num_images, 1),
+            ParamUpdate::Int32(s.ad.status, ADStatus::Acquire as i32),
+        ])
+        .await;
+        let (_ctl_tx, ctl_rx) = rt::command_channel::<CtlCommand>(1);
+        let (poll_tx, _poll_rx) = rt::command_channel::<Acquisition>(1);
+        let (_poll_done_tx, poll_done_rx) = rt::command_channel::<bool>(1);
+        let (stream_start_tx, _stream_start_rx) = rt::command_channel::<()>(1);
+        let (_stream_done_tx, stream_done_rx) = rt::command_channel::<bool>(1);
+        let mut ch = TaskChannels {
+            ctl_rx,
+            poll_tx,
+            poll_done_rx,
+            stream_start_tx,
+            stream_done_rx,
+        };
+
+        assert!(!acquire(&s, &mut ch).await);
+        assert_eq!(*seen.lock(), [1, 0, 1, 0]);
+    }
+
+    /// eigerDetector.cpp's and eigerParam.cpp's ASYN_TRACE_FLOW lines, in the
+    /// order C prints them.
+    #[tokio::test]
+    async fn flow_lines_print_under_the_ports_flow_mask() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use zeromq::Socket;
+
+        let port = "EIGER_FLOW";
+        let (s, mut rx) = h5_rig(port);
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::FLOW);
+
+        s.ops.fetch(s.p.fw_enable).unwrap();
+        s.ops.fetch(s.p.file_owner).unwrap();
+        s.ops.put_int(s.p.fw_enable, 1).unwrap();
+        s.set_int(s.ad.base.array_callbacks, 1).await;
+        parse_h5(&s, &h5_file([1, 1, 2])).await.expect("parse");
+        rx.recv().await.expect("array");
+        let job = Arc::new(FileJob {
+            name: "f.h5".into(),
+            save: false,
+            parse: true,
+            remove: AtomicBool::new(false),
+            perms: 0o644,
+            refs: AtomicUsize::new(1),
+            data: parking_lot::Mutex::new(Some(Vec::new())),
+        });
+        reap(&s, job).await;
+        // A stream silent past one timeout, then a header and the series end.
+        let mut push = zeromq::PushSocket::new();
+        let endpoint = push.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut stream = StreamApi::connect_to(&endpoint.to_string())
+            .await
+            .expect("connect");
+        let series = tokio::spawn({
+            let s = Arc::clone(&s);
+            async move { stream_series(&s, &mut stream).await }
+        });
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        push_v1(&mut push, br#"{"htype":"dheader-1.0","series":1}"#).await;
+        push_v1(&mut push, br#"{"htype":"dseries_end-1.0","series":1}"#).await;
+        assert!(series.await.unwrap());
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut from = 0;
+        for line in [
+            "Param[FW_ENABLE]::baseFetch: disabled\n",
+            "Param[FW_ENABLE]::fetch<int>: 0\n",
+            "Param[FILE_OWNER]::fetch<string>: \n",
+            "Param[FW_ENABLE]::put<int>: 1\n",
+            "Param[FW_ENABLE]::basePut: '",
+            "eigerDetector:parseH5File: calling NDArray callback\n",
+            "eigerDetector::reapTask: file=f.h5 refCount=1\n",
+            "eigerDetector::reapTask: file=f.h5 reaped\n",
+            "eigerDetector::streamTask: got stream timeout\n",
+        ] {
+            let at = text[from..]
+                .find(line)
+                .unwrap_or_else(|| panic!("{line:?} after byte {from}: {text:?}"));
+            from += at + line.len();
+        }
     }
 
     /// Arming with SaveFiles runs `checkPath()` and then reads NDFilePathExists

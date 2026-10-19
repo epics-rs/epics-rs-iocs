@@ -904,11 +904,14 @@ pub struct Stream2Api {
 
 impl Stream2Api {
     pub async fn connect(hostname: &str) -> Result<Self, String> {
+        Self::connect_to(&format!("tcp://{hostname}:{ZMQ_PORT}")).await
+    }
+
+    pub(crate) async fn connect_to(addr: &str) -> Result<Self, String> {
         use zeromq::Socket;
         let mut socket = zeromq::PullSocket::new();
-        let addr = format!("tcp://{hostname}:{ZMQ_PORT}");
         socket
-            .connect(&addr)
+            .connect(addr)
             .await
             .map_err(|e| format!("connect {addr}: {e}"))?;
         Ok(Self {
