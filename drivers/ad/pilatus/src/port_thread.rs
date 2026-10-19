@@ -711,4 +711,24 @@ mod tests {
         assert_eq!(commands(&log), ["version", "thread"]);
         std::mem::forget(rt);
     }
+
+    /// pilatusDetector.cpp:249-250: an empty name zeroes NumBadPixels, so no
+    /// pixel of the previous file is replaced any more.
+    #[test]
+    fn an_empty_bad_pixel_file_name_clears_the_list() {
+        let (mut det, log) = rig("PILATUS_BAD_PIXEL_CLEAR", ok);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bad.txt");
+        std::fs::write(&file, "1,2 3,4\n").unwrap();
+        let reason = det.p.num_bad_pixels;
+
+        det.read_bad_pixel_file(file.to_str().unwrap());
+        assert_eq!(det.shared.lock().bad_pixels.len(), 1);
+        assert_eq!(det.get_i32(reason).unwrap(), 1);
+
+        det.read_bad_pixel_file("");
+        assert!(det.shared.lock().bad_pixels.is_empty());
+        assert_eq!(det.get_i32(reason).unwrap(), 0);
+        assert!(commands(&log).is_empty());
+    }
 }
