@@ -1,5 +1,5 @@
 # GM10 VarConst channel — address family "W" (W1-W100).
-# Macros: P, DAU, HANDLE, ADDRESS (bare "W"-prefixed address, e.g. W1).
+# Macros: P, DAU, HANDLE, ADDRESS (bare "W"-prefixed address, e.g. W001).
 # Port of yokogawaDasApp/Db/GM10_varconstant_channel.db.
 
 record(ai,"$(P)$(DAU):$(ADDRESS)")
