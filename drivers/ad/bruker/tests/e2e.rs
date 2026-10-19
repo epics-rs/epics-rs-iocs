@@ -318,6 +318,21 @@ fn one_scan_reaches_the_plugins() {
         ADStatus::Idle as i32
     );
 
+    // BISTask never sets the array geometry params: they keep the 0 the
+    // constructors set (BISDetector.cpp:769-771, asynNDArrayDriver.cpp:967-971).
+    for reason in [
+        ad.base.array_size_x,
+        ad.base.array_size_y,
+        ad.base.array_size,
+        ad.base.n_dimensions,
+    ] {
+        assert_eq!(
+            fixture.sync.read_int32(reason).unwrap(),
+            0,
+            "reason {reason}"
+        );
+    }
+
     // The status socket was read: BIS said how big a frame is and how cold it
     // is.
     assert_eq!(fixture.sync.read_int32(ad.size_x).expect("size x"), 1024);
