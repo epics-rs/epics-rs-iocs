@@ -34,7 +34,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
@@ -150,9 +152,8 @@ pub struct TaurusAxis {
     /// The travel limits are cached in controller units, as `setnlimit`
     /// takes them as a pair; `axisRes` starts as `clPeriod`.
     members: Arc<SmcMembers>,
-    /// What the last poll left: a failed exchange keeps every parameter
-    /// the poll did not reach.
-    last_status: MotorStatus,
+    /// What the constructor set on the axis's status.
+    status_writes: Vec<StatusWrite>,
     /// C's `pasynUser_`, which the axis's lines print on.
     trace: MotorTrace,
 }
@@ -185,10 +186,8 @@ impl TaurusAxis {
                 state: Mutex::new(state),
             }),
             trace: MotorTrace::new(port, axis_no as i32),
-            last_status: MotorStatus {
-                gain_support: true,
-                ..MotorStatus::default()
-            },
+            // SMCTaurusAxis.cpp:23.
+            status_writes: vec![StatusWrite::GainSupport(true)],
         }
     }
 
@@ -364,23 +363,13 @@ impl AsynMotor for TaurusAxis {
         Ok(())
     }
 
-    /// C `SMCTaurusAxis::poll`: a failed exchange skips the rest and sets
-    /// Problem, and the parameters set before it are still posted
-    /// (SMCTaurusAxis.cpp:215-343).
-    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
-        let mut status = self.last_status.clone();
-        if self.poll_into(&mut status).is_err() {
-            status.problem = true;
-        }
-        self.last_status = status.clone();
-        *out = status;
-        Ok(())
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
-}
 
-impl TaurusAxis {
-    /// Write each field as C sets its parameter, in C's order.
-    fn poll_into(&self, status: &mut MotorStatus) -> AsynResult<()> {
+    /// C `SMCTaurusAxis::poll`: each field is set as C sets its parameter,
+    /// and a failed exchange skips the rest (SMCTaurusAxis.cpp:215-343).
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
         let addr = self.addr();
 
@@ -512,12 +501,47 @@ mod tests {
         let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
         let mut axis = TaurusAxis::new(controller, 0, "");
         let res = axis.axis_res();
-        let status = axis.polled(&AsynUser::default()).unwrap();
+        let mut status = axis.constructed();
+        assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
         assert_eq!(status.position, 2.5 / res);
         assert_eq!(status.encoder_position, 2.5 / res);
-        assert!(status.problem);
         assert!(status.gain_support);
     }
+    /// SMCTaurusAxis.cpp:216-343 sets only what it read before a failed
+    /// read's `skip`, over the params as they stood, the Done=0 a move start
+    /// set included (asynMotorController.cpp:301).
+    #[test]
+    fn a_failed_read_leaves_the_done_a_move_start_set() {
+        use motor_common::testing::LineRig;
+        let refused = Arc::new(Mutex::new(String::new()));
+        let pick = refused.clone();
+        let (_line, handle) = LineRig::failing(
+            "taurusMoveStartDone",
+            |cmd| match cmd.trim_end() {
+                "1 getclperiod" => "0.5".into(),
+                "1 np" => "2.5".into(),
+                "1 nst" => "0".into(),
+                "1 getsw" | "1 getswst" => "0 0".into(),
+                _ => String::new(),
+            },
+            move |cmd| *pick.lock().unwrap() == cmd.trim_end(),
+        );
+        let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
+        let mut axis = TaurusAxis::new(controller, 0, "");
+        let user = AsynUser::default();
+        // The PROBLEM the poller raised over an earlier failure; `skip` clears it.
+        let mut status = MotorStatus {
+            problem: true,
+            ..MotorStatus::default()
+        };
+        axis.poll(&user, &mut status).unwrap();
+        assert!(status.done && !status.problem, "{status:?}");
+        status.done = false;
+        *refused.lock().unwrap() = "1 np".into();
+        assert!(axis.poll(&user, &mut status).is_err());
+        assert!(!status.done, "{status:?}");
+    }
+
     #[test]
     fn an_axis_of_an_unanswering_controller_is_still_built() {
         let (handle, _) =
@@ -530,16 +554,14 @@ mod tests {
     /// C's status_ starts at 0 plus GainSupport (SMCTaurusAxis.cpp:23); only
     /// a good poll sets Done (:262).
     #[test]
-    fn an_unanswering_controller_s_axis_polls_problem_without_done() {
+    fn an_unanswering_controller_s_axis_fails_its_poll_without_done() {
         let (handle, _) =
             SyncIOHandle::connect_port("TAURUS_DEAD", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
         let mut axis = TaurusAxis::new(controller, 0, "");
-        let status = axis.polled(&AsynUser::default()).unwrap();
-        assert!(
-            status.problem && status.gain_support && !status.done,
-            "{status:?}"
-        );
+        let mut status = axis.constructed();
+        assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
+        assert!(status.gain_support && !status.done, "{status:?}");
     }
 
     /// Refuses every setting write (`snv`, `sna`, `setcloop`); records
@@ -615,7 +637,7 @@ mod tests {
                     ..SmcState::default()
                 }),
             }),
-            last_status: MotorStatus::default(),
+            status_writes: Vec::new(),
             trace: MotorTrace::default(),
         };
         let user = AsynUser::default();
