@@ -428,6 +428,21 @@ fn no_limit_anywhere_means_no_limit() {
     assert_eq!(config.read_batch_size(&ServerInfo::default()), usize::MAX);
 }
 
+/// C exports `opcua_MaxOperationsPerServiceCall` (`iocshIntegration.cpp:45`)
+/// but no session reads it.
+#[test]
+fn the_max_operations_variable_does_not_bound_a_batch() {
+    assert!(opcua::defaults::set_variable(
+        "opcua_MaxOperationsPerServiceCall",
+        "1"
+    ));
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    assert_eq!(config.read_batch_size(&ServerInfo::default()), usize::MAX);
+    config.set_option("nodes-max", "10").unwrap();
+    assert_eq!(config.read_batch_size(&ServerInfo::default()), 10);
+    assert_eq!(config.write_batch_size(&ServerInfo::default()), 10);
+}
+
 // ----------------------------------------------------------------- session options
 
 #[test]

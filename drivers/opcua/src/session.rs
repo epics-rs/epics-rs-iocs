@@ -392,13 +392,9 @@ fn batcher_text(max: u32, min_hold_off: f64, max_hold_off: f64) -> String {
 }
 
 fn batch_size(server_limit: u32, session_limit: u32) -> usize {
-    let max = node_limit(server_limit, session_limit);
-    let global = defaults::MAX_OPERATIONS_PER_SERVICE_CALL.load(Ordering::Relaxed);
-    let global = u32::try_from(global.max(0)).unwrap_or(0);
-    match (max, global) {
-        (0, 0) => usize::MAX,
-        (m, 0) | (0, m) => m as usize,
-        (a, b) => a.min(b) as usize,
+    match node_limit(server_limit, session_limit) {
+        0 => usize::MAX,
+        max => max as usize,
     }
 }
 
