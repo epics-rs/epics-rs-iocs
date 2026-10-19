@@ -28,6 +28,10 @@
 //!   axis' absolute position from `pos`, so a relative move of one axis moves
 //!   the others by their own position; this port neither sends that `pos`
 //!   query nor moves the idle axes.
+//! - `move`, `rmove` and `setpos` carry `num_axes` values. C defect, not
+//!   copied: C always formats three (SMCcorvusDriver.cpp:266-271, :351-356),
+//!   the slots past `numAxes` being `pos2`/`pos3` that its `sscanf` never
+//!   wrote.
 //! - Limit and drive-power status are read only when the axis is done (matching
 //!   C, which avoids polling switches mid-move to keep the interpreter
 //!   responsive); while moving they are reported as not-triggered / powered.
