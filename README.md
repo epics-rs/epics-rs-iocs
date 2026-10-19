@@ -234,7 +234,7 @@ Records (`iocs/ad/bruker-ioc/db/BIS.template`, includes `ADBase.template` + `NDF
 - `ReadSFRMTimeout` (ao) — timeout waiting for the SFRM file beyond the exposure time
 - `BISStatus` (waveform, I/O Intr) — last status line BIS broadcast
 - `NumDarks` / `NumDarks_RBV` — number of dark frames
-- `FileFormat` redefined to just `SFRM`/`Invalid`
+- `FileFormat` redefined to just `SRFM` (upstream's spelling)/`Invalid`
 - `FrameType` redefined: `Normal`/`Dark`/`Raw`/`DblCorrelation`
 - `BISAsyn` (asyn record) — interactive access to the BIS command port
 
