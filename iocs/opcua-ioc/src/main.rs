@@ -560,7 +560,7 @@ mod tests {
         for after in [false, true] {
             for (record_type, rows) in DEVICES {
                 for row in *rows {
-                    let init = row.dset.init;
+                    let init = row.dset.init();
                     assert_eq!(
                         init.map(|f| f as usize),
                         (row.name != "devItemOpcua").then_some(opcua_init as usize),
