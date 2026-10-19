@@ -290,6 +290,8 @@ pub struct AgUcAxis {
     reverse_amplitude: i32,
     /// Shared with the axis's [`AgUcAxisReport`].
     steps: Arc<Mutex<Steps>>,
+    /// The params C's poll last set, which a failed read's `skip` posts.
+    last_status: MotorStatus,
 }
 
 /// The step counts `AG_UCAxis::poll` and `setPosition` keep.
@@ -361,6 +363,7 @@ impl AgUcAxis {
             forward_amplitude,
             reverse_amplitude,
             steps: Arc::default(),
+            last_status: MotorStatus::default(),
         }
     }
 
@@ -463,7 +466,8 @@ impl AsynMotor for AgUcAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
+        let controller = Arc::clone(&self.controller);
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // C never starts the poller: the axis reports its initial status only.
         if ctrl.model.is_none() {
             return Ok(MotorStatus::default());
@@ -476,6 +480,8 @@ impl AsynMotor for AgUcAxis {
         // C indexes `inString_`, which asyn ends with a NUL: a reply as long
         // as its offset reads 0, or for TS the terminator. A shorter one
         // reads an earlier reply's bytes there, a C defect refused here.
+        // A failed read is C's `goto skip`: what was set before it stays, and
+        // `poll_failure` adds PROBLEM.
         // Position (TP): accumulated step count at offset 3 ("1TP").
         let position = parse_int_at(&ctrl.write_read(&format!("{}TP", self.axis_id))?, 3)
             .ok_or_else(|| parse_error("TP"))?;
@@ -484,6 +490,7 @@ impl AsynMotor for AgUcAxis {
             steps.current = position + steps.offset;
             steps.current
         };
+        self.last_status.position = current as f64;
 
         // Moving status (TS): state char at index 3; '0' means done.
         let ts = ctrl.write_read(&format!("{}TS", self.axis_id))?;
@@ -491,20 +498,18 @@ impl AsynMotor for AgUcAxis {
             return Err(parse_error("TS"));
         }
         let moving = ts.as_bytes().get(3) != Some(&b'0');
+        (self.last_status.done, self.last_status.moving) = (!moving, moving);
 
         // Limit status (PH, controller-wide): value at offset 2.
         let lim = parse_int_at(&ctrl.write_read("PH")?, 2).ok_or_else(|| parse_error("PH"))?;
         let limit = ph_limit(self.axis_id, lim);
+        // C sets both low and high limit to the same flag.
+        (self.last_status.low_limit, self.last_status.high_limit) = (limit, limit);
+        Ok(self.last_status.clone())
+    }
 
-        Ok(MotorStatus {
-            position: current as f64,
-            done: !moving,
-            moving,
-            // C sets both low and high limit to the same flag.
-            low_limit: limit,
-            high_limit: limit,
-            ..Default::default()
-        })
+    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+        Some(self.last_status.clone())
     }
 }
 
@@ -627,6 +632,51 @@ mod tests {
         let status = axis.poll(&user).unwrap();
         assert_eq!(status.position, 7.0);
         assert_eq!(line.sent(), ["CC1", "1TP", "1TS", "PH"]);
+    }
+
+    /// AG_UC.cpp:354-389: a failed read jumps to `skip`, whose
+    /// callParamCallbacks still posts what the poll set before it.
+    #[test]
+    fn a_failed_read_leaves_what_was_read_before_it() {
+        use motor_common::testing::LineRig;
+        let refused = Arc::new(Mutex::new(String::new()));
+        let pick = refused.clone();
+        let (line, io) = LineRig::failing(
+            "ag_uc_skip",
+            |last| match last {
+                "VE" => "AG-UC8 v2.2.1".into(),
+                "1TP" => "1TP7".into(),
+                "1TS" => "1TS1".into(),
+                "PH" => "PH1".into(),
+                _ => String::new(),
+            },
+            move |last| *pick.lock().unwrap() == last,
+        );
+        let controller = AgUcController::new(io, &MotorTrace::new("AG_UC_SKIP", 0));
+        let mut axis = AgUcAxis::new(Arc::new(Mutex::new(controller)), 0, true, 50, -50);
+        let user = AsynUser::new(0);
+        line.sent();
+        *refused.lock().unwrap() = "1TS".into();
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(line.sent(), ["CC1", "1TP", "1TS"]);
+        let left = axis.take_failed_poll_status().unwrap();
+        assert!(
+            left.position == 7.0 && !left.moving && !left.problem,
+            "{left:?}"
+        );
+        *refused.lock().unwrap() = "PH".into();
+        assert!(axis.poll(&user).is_err());
+        let left = axis.take_failed_poll_status().unwrap();
+        assert!(left.moving && !left.done && !left.low_limit, "{left:?}");
+        refused.lock().unwrap().clear();
+        assert!(axis.poll(&user).unwrap().low_limit);
+        *refused.lock().unwrap() = "1TP".into();
+        assert!(axis.poll(&user).is_err());
+        let left = axis.take_failed_poll_status().unwrap();
+        assert!(
+            left.position == 7.0 && left.moving && left.low_limit,
+            "{left:?}"
+        );
     }
 
     /// AG_UC.cpp:359,370,381 index `inString_`, which asyn ends with a NUL
