@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
-use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
+use epics_rs::ad_core::driver::{ADDriver, ADStatus};
 use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
@@ -618,9 +618,11 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
                         triggers + 1
                     ),
                 );
+                set_shutter(s, true).await;
                 let exposure = (trigger_mode == TRIGGER_MODE_INTE).then_some(acquire_time);
                 let timeout = Duration::from_secs_f64(trigger_timeout.max(0.0));
                 let _ = s.rest().trigger(timeout, exposure);
+                set_shutter(s, false).await;
                 triggers += 1;
             }
         }
@@ -702,6 +704,15 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
         s.set_int(s.ad.acquire, 0).await;
     }
     false
+}
+
+/// ADDriver::setShutter, run on the port: C calls it under the lock, so the
+/// EPICS-mode delay holds the port too.
+async fn set_shutter(s: &Shared, open: bool) {
+    let _ = s
+        .handle
+        .with_driver(move |d: &mut crate::driver::EigerDriver| d.set_shutter(open))
+        .await;
 }
 
 /// Wait up to `timeout` for a flag to be set, clearing it if it was.
@@ -1786,7 +1797,9 @@ mod tests {
                     }
                 }
                 let _ = reader.read_exact(&mut vec![0u8; length]);
-                let body = if request.starts_with("PUT") {
+                let body = if request.contains("/command/arm ") {
+                    r#"{"sequence id":1}"#
+                } else if request.starts_with("PUT") {
                     "[]"
                 } else {
                     r#"{"value":"disabled","value_type":"string","access_mode":"rw",
@@ -2255,6 +2268,59 @@ mod tests {
         assert_eq!(rx.recv().await.expect("frame 0").unique_id, 0);
         assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
         assert_eq!(rx.pending(), 0, "ArrayCallbacks=0 before frame 1");
+    }
+
+    /// C opens the shutter before each internal trigger and closes it after
+    /// (eigerDetector.cpp:1003, :1007).
+    #[tokio::test]
+    async fn each_internal_trigger_is_wrapped_in_set_shutter() {
+        use epics_rs::ad_core::driver::ShutterMode;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+
+        let (s, _rx) = h5_rig("EIGER_SHUTTER");
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _sub = {
+            let seen = seen.clone();
+            s.handle
+                .interrupts()
+                .register_sync_callback(
+                    InterruptFilter {
+                        reason: Some(s.ad.shutter_control_epics),
+                        addr: Some(0),
+                        ..Default::default()
+                    },
+                    move |iv| {
+                        if let ParamValue::Int32(v) = iv.value {
+                            seen.lock().push(v);
+                        }
+                    },
+                )
+                .unwrap()
+        };
+        s.apply(vec![
+            ParamUpdate::Int32(s.ad.shutter_mode, ShutterMode::EpicsOnly as i32),
+            ParamUpdate::Int32(s.p.data_source, crate::params::SOURCE_NONE),
+            ParamUpdate::Int32(s.p.trigger_mode, TRIGGER_MODE_INTS),
+            ParamUpdate::Int32(s.p.n_triggers, 2),
+            ParamUpdate::Int32(s.p.num_images, 1),
+            ParamUpdate::Int32(s.ad.status, ADStatus::Acquire as i32),
+        ])
+        .await;
+        let (_ctl_tx, ctl_rx) = rt::command_channel::<CtlCommand>(1);
+        let (poll_tx, _poll_rx) = rt::command_channel::<Acquisition>(1);
+        let (_poll_done_tx, poll_done_rx) = rt::command_channel::<bool>(1);
+        let (stream_start_tx, _stream_start_rx) = rt::command_channel::<()>(1);
+        let (_stream_done_tx, stream_done_rx) = rt::command_channel::<bool>(1);
+        let mut ch = TaskChannels {
+            ctl_rx,
+            poll_tx,
+            poll_done_rx,
+            stream_start_tx,
+            stream_done_rx,
+        };
+
+        assert!(!acquire(&s, &mut ch).await);
+        assert_eq!(*seen.lock(), [1, 0, 1, 0]);
     }
 
     /// eigerDetector.cpp's and eigerParam.cpp's ASYN_TRACE_FLOW lines, in the
