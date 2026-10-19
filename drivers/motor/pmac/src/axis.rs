@@ -396,6 +396,9 @@ impl AsynMotor for PmacAxis {
         controller.command(&format!(
             "#{axis}K M{axis}61={counts}*I{axis}08 M{axis}62={counts}*I{axis}08"
         ))?;
+        // C defect not copied: with no encoder axis `command` still holds
+        // this J/ when the closing write meant for the encoder's J/ runs, so
+        // C sends it twice (pmacController.cpp:423-427, :448-449, :469-471).
         controller.command(&format!("#{axis}J/"))?;
 
         let config = controller.axis_config(axis);
