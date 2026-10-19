@@ -47,7 +47,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::model1::MoveStrings;
-use motor_common::util::nint;
+use motor_common::util::{nint, strtol};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 160;
@@ -88,17 +88,30 @@ enum CommState {
     CommErr,
 }
 
-/// The model and version an IDN reply `C\tIDN0\t<model>\t<version>` names.
-fn identify(reply: &str) -> AsynResult<(i32, String)> {
-    let fields: Vec<&str> = reply.split('\t').collect();
-    match fields.get(2).and_then(|s| s.trim().parse::<i32>().ok()) {
-        Some(model @ (800 | 400 | 200)) => {
-            Ok((model, fields.get(3).map_or("", |s| s.trim()).to_owned()))
-        }
-        _ => Err(kohzu_err(format!(
-            "SC800: unrecognized IDN reply '{reply}'"
-        ))),
+/// The model and version an IDN reply names: C's `sscanf(buff,
+/// "C\tIDN0\t<model>\t%d", &version) == 1` for 800, 400 and 200
+/// (drvSC800.cc:565-567), each `\t` taking any run of blanks, none included.
+fn identify(reply: &str) -> AsynResult<(i32, i32)> {
+    fn literal<'a>(s: &'a [u8], lit: &str) -> Option<&'a [u8]> {
+        let blanks = s
+            .iter()
+            .take_while(|&&c| matches!(c, b' ' | b'\t'..=b'\r'))
+            .count();
+        s[blanks..].strip_prefix(lit.as_bytes())
     }
+    let idn = reply
+        .as_bytes()
+        .strip_prefix(b"C")
+        .and_then(|s| literal(s, "IDN0"));
+    [800, 400, 200]
+        .into_iter()
+        .find_map(
+            |model| match strtol(literal(idn?, &model.to_string())?, 10) {
+                (_, 0) => None,
+                (version, _) => Some((model, version as i32)),
+            },
+        )
+        .ok_or_else(|| kohzu_err(format!("SC800: unrecognized IDN reply '{reply}'")))
 }
 
 impl KohzuController {
@@ -538,6 +551,34 @@ mod tests {
         let axis = KohzuAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
         (line, axis, state)
+    }
+
+    /// drvSC800.cc:565-567 scan `C\tIDN0\t<model>\t%d`: a scanf `\t` takes
+    /// any blank run, none included, and `1.0` is Ver1.
+    #[test]
+    fn idn_is_scanned_as_c_sscanf() {
+        let ident = |name: &str, reply: &'static str| {
+            let (_line, io) =
+                LineRig::new(name, move |last| match last.trim_start_matches('\u{2}') {
+                    "IDN" => reply.into(),
+                    c => format!("C\t{c}"),
+                });
+            KohzuController::new(io).map(|c| c.ident().to_owned())
+        };
+        assert_eq!(
+            ident("kohzuIdnDot", "C\tIDN0\t200\t1.0").unwrap(),
+            "SC-200 Ver1"
+        );
+        assert_eq!(
+            ident("kohzuIdnBlank", "C IDN0 400 7").unwrap(),
+            "SC-400 Ver7"
+        );
+        assert_eq!(
+            ident("kohzuIdnRun", "C\tIDN0\t8000\t1").unwrap(),
+            "SC-800 Ver0"
+        );
+        assert!(ident("kohzuIdnText", "C\tIDN0\t200\tVer1").is_err());
+        assert!(ident("kohzuIdnLead", " C\tIDN0\t200\t1").is_err());
     }
 
     fn post(text: &[u8]) -> PostMessage {
