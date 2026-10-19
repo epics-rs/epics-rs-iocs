@@ -3548,7 +3548,9 @@ mod tests {
             .with_driver(move |d: &mut TimePix3Driver| {
                 let base = &mut d.ad.port_base;
                 base.set_time_stamp(stamp);
-                base.set_param_status(reason, 0, AsynStatus::Error, 3, 2)
+                base.set_param_status(reason, 0, AsynStatus::Error)?;
+                base.set_param_alarm_status(reason, 0, 3)?;
+                base.set_param_alarm_severity(reason, 0, 2)
             })
             .await
             .unwrap()

@@ -220,9 +220,11 @@ pub(crate) fn do_callbacks_int64_array(
     addr: i32,
     data: Vec<i64>,
 ) {
-    let (aux_status, alarm_status, alarm_severity) = base
+    let aux_status = base
         .get_param_status(reason, addr)
-        .unwrap_or((AsynStatus::Success, 0, 0));
+        .unwrap_or(AsynStatus::Success);
+    let alarm_status = base.get_param_alarm_status(reason, addr).unwrap_or(0);
+    let alarm_severity = base.get_param_alarm_severity(reason, addr).unwrap_or(0);
     base.interrupts.notify(InterruptValue {
         reason,
         addr,
