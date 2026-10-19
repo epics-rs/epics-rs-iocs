@@ -1264,18 +1264,16 @@ fn end_frame(s: &Shared) {
 async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
     let timeout = Duration::from_secs(1);
 
-    // Wait out the series header.
+    // Wait out the series header. Only the header or an error ends the wait;
+    // C leaves no Stop exit, which would strand this series in the socket
+    // for the next acquisition (eigerDetector.cpp:1441-1455).
     loop {
         match stream
             .recv(timeout)
             .await
-            .and_then(|m| m.map(|m| m.decode(false)).transpose())
+            .and_then(|m| m.map(|m| m.header()).transpose())
         {
-            Ok(Some(StreamMessage::Header(_))) => break,
-            Ok(Some(StreamMessage::End)) => return true,
-            Ok(Some(StreamMessage::Image(_))) => {
-                s.trace().err("streamTask", "got stray packet, ignoring");
-            }
+            Ok(Some(_)) => break,
             Ok(None) => stream_timeout(s),
             Err(crate::stream::StreamError::WrongHtype(h)) => {
                 eprintln!("StreamApi::getHeader: wrong header type, htype={h}");
@@ -1285,9 +1283,6 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                 s.trace().err("streamTask", "failed to get header packet");
                 return false;
             }
-        }
-        if s.flags.stop.load(Ordering::Acquire) {
-            return false;
         }
     }
 
@@ -1370,7 +1365,8 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
     let ts_source = s.get_int(s.p.stream_as_ts_source).await != 0;
 
     // C reads the status as an int in streamApi.h's code space
-    // (`Stream2Error::code`): 1 timeout, 2 stray packet, 3 error.
+    // (`Stream2Error::code`): 1 timeout, 2 stray packet, 3 error. No Stop
+    // exit, as in stream_series.
     loop {
         match stream.get_header(timeout).await {
             Ok(()) => break,
@@ -1387,9 +1383,6 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
                     return false;
                 }
             },
-        }
-        if s.flags.stop.load(Ordering::Acquire) {
-            return false;
         }
     }
 
@@ -2270,6 +2263,81 @@ mod tests {
         assert_eq!(rx.pending(), 0, "ArrayCallbacks=0 before frame 1");
     }
 
+    /// One single-part stream v1 message; a PUSH socket refuses to send until
+    /// the PULL side has connected.
+    async fn push_v1(push: &mut zeromq::PushSocket, part: &[u8]) {
+        use zeromq::SocketSend;
+        let message = || zeromq::ZmqMessage::from(part.to_vec());
+        while push.send(message()).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// C's header wait has no Stop exit (eigerDetector.cpp:1424-1462): a Stop
+    /// while the header is pending leaves both stream versions waiting.
+    #[tokio::test]
+    async fn a_stop_does_not_end_the_stream_header_wait() {
+        use zeromq::Socket;
+
+        let (s, _rx) = h5_rig("EIGER_HEADER_STOP");
+        s.flags.stop.store(true, Ordering::Release);
+        let mut push = zeromq::PushSocket::new();
+        let v1 = push.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut push2 = zeromq::PushSocket::new();
+        let v2 = push2.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut stream = StreamApi::connect_to(&v1.to_string()).await.unwrap();
+        let mut stream2 = Stream2Api::connect_to(&v2.to_string()).await.unwrap();
+        let series = [
+            tokio::spawn({
+                let s = Arc::clone(&s);
+                async move { stream_series(&s, &mut stream).await }
+            }),
+            tokio::spawn({
+                let s = Arc::clone(&s);
+                async move { stream2_series(&s, &mut stream2).await }
+            }),
+        ];
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let finished = series.each_ref().map(|t| t.is_finished());
+        series.iter().for_each(|t| t.abort());
+        assert_eq!(finished, [false, false], "[v1, v2] ended under Stop");
+    }
+
+    /// C getHeader takes a series end as a wrong header type
+    /// (streamApi.cpp:226-231), so the header wait goes on to the real header.
+    #[tokio::test]
+    async fn a_series_end_before_the_header_is_a_stray_packet() {
+        use zeromq::Socket;
+
+        let (s, rx) = h5_rig("EIGER_HEADER_END");
+        s.set_int(s.ad.base.array_callbacks, 1).await;
+        let mut push = zeromq::PushSocket::new();
+        let endpoint = push.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut stream = StreamApi::connect_to(&endpoint.to_string()).await.unwrap();
+        let series = tokio::spawn({
+            let s = Arc::clone(&s);
+            async move { stream_series(&s, &mut stream).await }
+        });
+        push_v1(&mut push, br#"{"htype":"dseries_end-1.0","series":0}"#).await;
+        push_v1(&mut push, br#"{"htype":"dheader-1.0","series":1}"#).await;
+        let pixels: Vec<u8> = [1u16, 2].iter().flat_map(|p| p.to_le_bytes()).collect();
+        let image = zeromq::ZmqMessage::try_from(vec![
+            bytes::Bytes::from_static(br#"{"htype":"dimage-1.0","series":1,"frame":0}"#),
+            bytes::Bytes::from_static(
+                br#"{"htype":"dimage_d-1.0","shape":[2,1],"type":"uint16","encoding":"<"}"#,
+            ),
+            bytes::Bytes::from(pixels),
+        ])
+        .unwrap();
+        {
+            use zeromq::SocketSend;
+            push.send(image).await.unwrap();
+        }
+        push_v1(&mut push, br#"{"htype":"dseries_end-1.0","series":1}"#).await;
+        assert!(series.await.unwrap());
+        assert_eq!(rx.pending(), 1, "the series after the stray end");
+    }
+
     /// C opens the shutter before each internal trigger and closes it after
     /// (eigerDetector.cpp:1003, :1007).
     #[tokio::test]
@@ -2359,14 +2427,20 @@ mod tests {
             data: parking_lot::Mutex::new(Some(Vec::new())),
         });
         reap(&s, job).await;
-        // A silent stream times out once; the stop then ends the header wait.
+        // A stream silent past one timeout, then a header and the series end.
         let mut push = zeromq::PushSocket::new();
         let endpoint = push.bind("tcp://127.0.0.1:0").await.expect("bind");
         let mut stream = StreamApi::connect_to(&endpoint.to_string())
             .await
             .expect("connect");
-        s.flags.stop.store(true, Ordering::Release);
-        assert!(!stream_series(&s, &mut stream).await);
+        let series = tokio::spawn({
+            let s = Arc::clone(&s);
+            async move { stream_series(&s, &mut stream).await }
+        });
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        push_v1(&mut push, br#"{"htype":"dheader-1.0","series":1}"#).await;
+        push_v1(&mut push, br#"{"htype":"dseries_end-1.0","series":1}"#).await;
+        assert!(series.await.unwrap());
 
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
