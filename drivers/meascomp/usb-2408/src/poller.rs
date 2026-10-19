@@ -9,6 +9,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use meascomp::device::DaqDevice;
 
+use crate::board_enums::{AI_CHAN_TYPE_TC, AI_CHAN_TYPE_VOLTAGE, map_range};
 use crate::driver::MultiFunctionDriver;
 use crate::params::*;
 use crate::trace::{SelfTrace, status_of};
@@ -203,30 +204,29 @@ fn poller_loop(
                             // One call per channel, chosen by its configured
                             // type: ulAIn rejects a thermocouple channel with
                             // ERR_BAD_RANGE and ulTIn rejects a voltage one.
-                            // C drvMultiFunction skips each the same way.
-                            if in_types[ch] != 0 {
+                            // C drvMultiFunction skips each the same way, and
+                            // a channel of neither type (ANALOG_IN_TYPE unset)
+                            // in both loops.
+                            if in_types[ch] != AI_CHAN_TYPE_VOLTAGE {
                                 continue;
                             }
+                            let range = map_range(&trace, in_ranges[ch]);
                             // C does not report a failed ulAIn; its status is
                             // the raw read's (C has no scaled read).
                             let raw = dev.analog_in(
                                 ch_i,
                                 input_mode,
-                                in_ranges[ch],
+                                range,
                                 uldaq_sys::AIN_FF_NOSCALEDATA,
                             );
                             status = status_of(&raw);
                             snap.ai_raw[ch] = raw.ok().map(|v| v as i32);
-                            let volts = dev.analog_in(
-                                ch_i,
-                                input_mode,
-                                in_ranges[ch],
-                                uldaq_sys::AIN_FF_DEFAULT,
-                            );
+                            let volts =
+                                dev.analog_in(ch_i, input_mode, range, uldaq_sys::AIN_FF_DEFAULT);
                             snap.ai_volts[ch] = volts.ok();
                         }
                         for ch in 0..MAX_ANALOG_IN {
-                            if in_types[ch] == 0 {
+                            if in_types[ch] != AI_CHAN_TYPE_TC {
                                 continue;
                             }
                             // An open or broken thermocouple is expected,

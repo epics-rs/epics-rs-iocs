@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::asyn_record::PortClaim;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::param::{EnumEntry, ParamValue};
 use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -13,6 +13,7 @@ use epics_rs::asyn::user::AsynUser;
 use meascomp::device::DaqDevice;
 use uldaq_sys::UlError;
 
+use crate::board_enums::{self, AI_CHAN_TYPE_TC, AI_CHAN_TYPE_VOLTAGE, map_range};
 use crate::params::*;
 use crate::poller::{self, PollerState};
 use crate::trace::{self, DRIVER_NAME, SelfTrace};
@@ -209,8 +210,9 @@ impl MultiFunctionDriver {
         base.set_int32_param(params.wave_dig_num_points, 0, 1)?;
         base.set_int32_param(params.wave_dig_run, 0, 0)?;
         base.set_int32_param(params.wave_gen_run, 0, 0)?;
+        // The first output range of the model (:1284-1287).
         for ch in 0..MAX_ANALOG_OUT as i32 {
-            base.set_int32_param(params.analog_out_range, ch, uldaq_sys::BIP10VOLTS)?;
+            base.set_int32_param(params.analog_out_range, ch, board_enums::OUTPUT_RANGE[0].1)?;
         }
         for ch in 0..MAX_ANALOG_IN {
             base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
@@ -589,7 +591,7 @@ impl MultiFunctionDriver {
     /// rejects the TC settings with ERR_BAD_AI_CHAN_TYPE otherwise, so C
     /// writes them only then.
     fn is_thermocouple(&self, chan: i32) -> bool {
-        self.int(self.params.analog_in_type, chan) != 0
+        self.int(self.params.analog_in_type, chan) == AI_CHAN_TYPE_TC
     }
 
     /// C `setOpenThermocoupleDetect`.
@@ -622,6 +624,26 @@ impl PortDriver for MultiFunctionDriver {
 
     fn get_bounds_int32(&self, user: &AsynUser) -> AsynResult<(i32, i32)> {
         self.board.resolution.bounds(&self.params, user.reason)
+    }
+
+    /// C `readEnum` (drvMultiFunction.cpp:2531-2577) for the USB-2408-2AO;
+    /// a parameter without a table is asynError.
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        let p = &self.params;
+        let reason = user.reason;
+        let table = if reason == p.analog_in_range || reason == p.voltage_in_range {
+            board_enums::INPUT_RANGE
+        } else if reason == p.analog_out_range {
+            board_enums::OUTPUT_RANGE
+        } else if reason == p.analog_in_type {
+            board_enums::INPUT_TYPE
+        } else {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: String::new(),
+            });
+        };
+        Ok((0, board_enums::entries(table).into()))
     }
 
     fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
@@ -693,7 +715,7 @@ impl PortDriver for MultiFunctionDriver {
                     return trace::asyn_status(-1);
                 }
                 let dev = self.device.lock().unwrap();
-                let range = self.int(self.params.analog_out_range, addr);
+                let range = map_range(&trace, self.int(self.params.analog_out_range, addr));
                 status = trace.report(
                     &dev.analog_out(addr, range, uldaq_sys::AOUT_FF_NOSCALEDATA, value as f64),
                     FUNCTION,
@@ -708,7 +730,8 @@ impl PortDriver for MultiFunctionDriver {
                 let mut ranges = vec![uldaq_sys::BIP10VOLTS; MAX_ANALOG_OUT];
                 for ch in 0..MAX_ANALOG_OUT {
                     values[ch] = self.int(self.params.analog_out_value, ch as i32) as f64;
-                    ranges[ch] = self.int(self.params.analog_out_range, ch as i32);
+                    ranges[ch] =
+                        map_range(&trace, self.int(self.params.analog_out_range, ch as i32));
                 }
                 // C `writeAnalogOutSync` does not print its status.
                 status = trace::status_of(&dev.analog_out_array(
@@ -728,17 +751,17 @@ impl PortDriver for MultiFunctionDriver {
             };
         } else if reason == self.params.analog_in_type {
             let dev = self.device.lock().unwrap();
-            let chan_type = if value != 0 {
-                uldaq_sys::AI_TC
-            } else {
+            let chan_type = if value == AI_CHAN_TYPE_VOLTAGE {
                 uldaq_sys::AI_VOLTAGE
+            } else {
+                uldaq_sys::AI_TC
             };
             status = trace.report(
                 &dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TYPE, addr as u32, chan_type),
                 FUNCTION,
                 "Setting analog input type",
             );
-            if value != 0 {
+            if value == AI_CHAN_TYPE_TC {
                 // The TC type and open-detect settings the records already
                 // hold could not be pushed while the channel read volts.
                 let tc = self.int(self.params.thermocouple_type, addr);
@@ -1112,6 +1135,41 @@ mod tests {
             (0, 16_777_215)
         );
         assert!(usb_2408.bounds(&params, params.counter_reset).is_err());
+    }
+
+    #[test]
+    fn read_enum_serves_the_usb_2408_tables_c_does() {
+        let mut drv = MultiFunctionDriver::new("MFENUM", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        let mut menu = |reason| -> Vec<(String, i32)> {
+            let (_, entries) = drv.read_enum(&AsynUser::new(reason)).unwrap();
+            entries
+                .iter()
+                .map(|e| (e.string.clone(), e.value))
+                .collect()
+        };
+        let input_range: Vec<_> = [
+            ("+= 10V", 1),
+            ("+= 5V", 0),
+            ("+= 2.5V", 2),
+            ("+= 1.25V", 3),
+            ("+= 0.625V", 5),
+            ("+= 0.312V", 17),
+            ("+= 0.156V", 18),
+            ("+= 0.078V", 19),
+        ]
+        .map(|(s, v)| (s.to_owned(), v))
+        .into();
+        assert_eq!(menu(p.analog_in_range), input_range);
+        assert_eq!(menu(p.voltage_in_range), input_range);
+        assert_eq!(menu(p.analog_out_range), [("+= 10V".to_owned(), 1)]);
+        assert_eq!(
+            menu(p.analog_in_type),
+            [("Volts".to_owned(), 1), ("TC deg.".to_owned(), 2)]
+        );
+        assert!(drv.read_enum(&AsynUser::new(p.analog_in_mode)).is_err());
+        // C's ctor writes the first output range's gain code.
+        assert_eq!(drv.base.get_int32_param(p.analog_out_range, 1).unwrap(), 1);
     }
 
     #[test]

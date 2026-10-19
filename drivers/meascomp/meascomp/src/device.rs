@@ -63,6 +63,16 @@ impl DaqDevice {
         Ok(Self { handle, descriptor })
     }
 
+    /// A device on uldaq's null handle, for tests that build a driver with
+    /// no hardware: every call on it fails with ERR_BAD_DEV_HANDLE.
+    #[doc(hidden)]
+    pub fn unconnected() -> Self {
+        Self {
+            handle: 0,
+            descriptor: DaqDeviceDescriptor::default(),
+        }
+    }
+
     /// Raw device handle for direct FFI calls.
     #[inline]
     pub fn handle(&self) -> DaqDeviceHandle {

@@ -1,5 +1,6 @@
 pub mod analog_in;
 pub mod analog_out;
+pub mod board_enums;
 pub mod driver;
 pub mod params;
 pub mod poller;

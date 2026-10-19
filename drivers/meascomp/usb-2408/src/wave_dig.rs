@@ -7,6 +7,7 @@ use meascomp::analog_in::AInScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
+use crate::board_enums::map_range;
 use crate::params::*;
 use crate::trace::{DRIVER_NAME, SelfTrace};
 
@@ -140,11 +141,11 @@ pub fn start_wave_dig(
 
     // Load input queue for multi-channel scanning (required by uldaq)
     let mut queue = Vec::with_capacity(num_chans);
-    for (i, &range) in ranges.iter().enumerate() {
+    for (i, &gain) in ranges.iter().enumerate() {
         queue.push(AiQueueElement {
             channel: (first_chan + i) as i32,
             input_mode,
-            range,
+            range: map_range(trace, gain),
             ..AiQueueElement::default()
         });
     }

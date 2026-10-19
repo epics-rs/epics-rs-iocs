@@ -4,11 +4,10 @@ record(ao, "$(P)$(R)") {
     field(PREC, "4")
 }
 
+# The driver constructs the enum fields (readEnum).
 record(mbbo, "$(P)$(R)Range") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_OUT_RANGE")
-    field(ZRST, "+/-10V")
-    field(ZRVL, "5")
     field(PINI, "YES")
 }
 
