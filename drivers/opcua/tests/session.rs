@@ -1272,6 +1272,52 @@ async fn an_item_shows_what_the_server_revised() {
     assert!(line.contains(" qsize=4(4) "), "{line}");
 }
 
+/// C++ streams print a double with 6 significant digits (`%g`), in
+/// `ItemOpen62541::show` and in the monitored-item debug line
+/// (`SubscriptionOpen62541.cpp:186-191`).
+#[tokio::test]
+async fn sampling_and_deadband_print_as_a_cpp_stream_does() {
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item(
+        "subs ns=2;s=Sensor sampling=33.3333333 deadband=1e20 qsize=4",
+        INPUT,
+    );
+    let mut subscription = SubscriptionConfig::new("subs", "sess");
+    subscription.set_option("debug", "5");
+
+    let sink = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs each test in its own process, so fd 1 is this
+    // test's alone.
+    let saved = unsafe {
+        let saved = libc::dup(1);
+        libc::dup2(std::os::fd::AsRawFd::as_raw_fd(sink.as_file()), 1);
+        saved
+    };
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone()],
+    );
+    handle.subscriptions.lock().push(subscription);
+    until(|| item0.lock().revised_queue_size == 4).await;
+    // SAFETY: restoring what this test replaced.
+    unsafe {
+        libc::dup2(saved, 1);
+        libc::close(saved);
+    }
+
+    let line = item0.lock().show_line();
+    assert!(
+        line.contains(" sampling=33.3333(33.3333) deadband=1e+20 "),
+        "{line}"
+    );
+    let out = std::fs::read_to_string(sink.path()).unwrap();
+    assert!(
+        out.contains(" revised sampling interval 33.3333 revised queue size 4"),
+        "{out}"
+    );
+}
+
 #[test]
 fn an_item_shows_the_size_of_its_element_tree() {
     const ITEM: RecordKind = RecordKind {

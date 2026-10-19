@@ -24,7 +24,7 @@ use crate::client::{
     Identity, SecurityMode, ServerInfo, UaConnection, UaConnector, security_policy_string,
 };
 use crate::defaults;
-use crate::item::Item;
+use crate::item::{Item, stream_double};
 use crate::queue::{ConnectionStatus, ProcessReason};
 use crate::subscription::SubscriptionConfig;
 
@@ -1093,7 +1093,7 @@ impl SessionWorker {
                                 item.addressing_record(),
                                 item.wire_node_id(),
                                 result.monitored_item_id,
-                                result.revised_sampling_interval,
+                                stream_double(result.revised_sampling_interval),
                                 result.revised_queue_size
                             );
                         }

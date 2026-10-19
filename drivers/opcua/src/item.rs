@@ -20,6 +20,7 @@ use async_opcua::types::{
     DataValue, DateTime, ExpandedMessageInfo, ExtensionObject, NodeId, StatusCode, StructureType,
     Variant,
 };
+use epics_rs::base::calc::cvt::fmt_g;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -559,9 +560,9 @@ impl Item {
             yn(self.has_dirty_leaf()),
             link.subscription().unwrap_or(""),
             self.session.as_ref().map_or("", |s| s.name.as_str()),
-            self.revised_sampling_interval,
-            link.sampling_interval,
-            link.deadband,
+            stream_double(self.revised_sampling_interval),
+            stream_double(link.sampling_interval),
+            stream_double(link.deadband),
             self.revised_queue_size,
             link.queue_size,
             link.client_queue_size,
@@ -752,4 +753,9 @@ fn element_nodes(paths: &[Vec<String>]) -> Vec<&[String]> {
 
 fn yn(flag: bool) -> &'static str {
     if flag { "y" } else { "n" }
+}
+
+/// A double as `std::cout << v` prints it: `%g` at the default precision 6.
+pub(crate) fn stream_double(v: f64) -> String {
+    fmt_g(v, 6, false, false)
 }
