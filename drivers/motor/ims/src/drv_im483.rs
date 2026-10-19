@@ -18,6 +18,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
 };
+use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -71,6 +72,13 @@ impl Im483Controller {
             (_, Err(_)) => String::new(),
         }
     }
+
+    /// `pasynOctetSyncIO->flush`.
+    fn flush(&self) {
+        if let Ok(port) = self.handle.port() {
+            let _ = port.submit_blocking(RequestOp::Flush, AsynUser::new(0));
+        }
+    }
 }
 
 /// `motor_init`'s probe of an IM483PL: ` Z 0` to each axis in turn, three
@@ -82,23 +90,18 @@ pub fn im483pl_probe(ctrl: &Im483Controller) -> usize {
         .count()
 }
 
-/// `motor_init`'s probe of an IM483SM, three tries: reset with ETX, wait a
-/// second, send a space and read the sign-on. Its identification when it
-/// answered, which C keeps only for `dbior`.
+/// `motor_init`'s probe of an IM483SM, three tries: flush, reset with ETX,
+/// wait a second, send a space and read the sign-on. Its identification
+/// when it answered, which C keeps only for `dbior`.
 pub fn im483sm_probe(ctrl: &Im483Controller) -> Option<String> {
     (0..3).find_map(|_| {
+        ctrl.flush();
         let _ = ctrl.handle.write_octet(0, b"\x03");
         sleep(Duration::from_secs(1));
-        let mut first = Some(ctrl.ask(" "));
-        sign_on_ident(|| {
-            let line = match first.take() {
-                Some(line) => line.into_bytes(),
-                None => match ctrl.handle.read_octet(0, BUFF_SIZE).into_parts() {
-                    (line, Ok(())) => line,
-                    (_, Err(_)) => Vec::new(),
-                },
-            };
-            Some(line).filter(|l| !l.is_empty())
+        let _ = ctrl.handle.write_octet(0, b" ");
+        sign_on_ident(|| match ctrl.handle.read_octet(0, BUFF_SIZE).into_parts() {
+            (line, Ok(())) => Some(line).filter(|l| !l.is_empty()),
+            (_, Err(_)) => None,
         })
     })
 }
@@ -453,6 +456,22 @@ mod tests {
         );
         let endless = sign_on_ident(|| Some(b"ab".to_vec())).unwrap();
         assert_eq!(endless, vec!["ab"; 17].join(" "));
+    }
+
+    /// drvIM483SM.cc:551-555: the probe flushes ahead of the ETX, not after
+    /// its 1 s wait, so junk already on the line is dropped and what the
+    /// reset sends is read.
+    #[test]
+    fn the_sm_probe_flushes_before_the_reset_not_after_it() {
+        let (_line, io) =
+            motor_common::testing::LineRig::held("im483smProbeLine", |cmd| match cmd {
+                "junk" => vec!["stale".into()],
+                "\u{3}" => vec!["IM483SM".into()],
+                _ => Vec::new(),
+            });
+        let _ = io.write_octet(0, b"junk");
+        let ctrl = Im483Controller::new(io);
+        assert_eq!(im483sm_probe(&ctrl).as_deref(), Some("IM483SM"));
     }
     use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};

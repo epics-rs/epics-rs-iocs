@@ -44,6 +44,9 @@ enum Answer {
     /// A command queues its lines; a read takes the next one and times out
     /// once none is left, as a real line does.
     Queued(Lines, VecDeque<String>),
+    /// [`Self::Queued`], but a command's lines go behind any still unread,
+    /// and a flush drops them all.
+    Held(Lines, VecDeque<String>),
 }
 
 impl PortDriver for Line {
@@ -58,8 +61,10 @@ impl PortDriver for Line {
         self.addrs.lock().unwrap().push(user.addr);
         if !data.iter().all(|b| matches!(b, b'\r' | b'\n')) {
             self.command.clone_from(&line);
-            if let Answer::Queued(lines, queue) = &mut self.answer {
-                *queue = lines(&self.command).into();
+            match &mut self.answer {
+                Answer::Queued(lines, queue) => *queue = lines(&self.command).into(),
+                Answer::Held(lines, queue) => queue.extend(lines(&self.command)),
+                Answer::Last(_) => {}
             }
         }
         let failed = (self.fails)(&line);
@@ -91,7 +96,7 @@ impl PortDriver for Line {
     fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         let reply = match &mut self.answer {
             Answer::Last(reply) => reply(&self.command),
-            Answer::Queued(_, queue) => match queue.pop_front() {
+            Answer::Queued(_, queue) | Answer::Held(_, queue) => match queue.pop_front() {
                 Some(reply) => reply,
                 None => {
                     return OctetReadResult::failed(AsynError::Status {
@@ -114,6 +119,12 @@ impl PortDriver for Line {
             };
         }
         read
+    }
+    fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+        if let Answer::Held(_, queue) = &mut self.answer {
+            queue.clear();
+        }
+        Ok(())
     }
 }
 
@@ -170,6 +181,21 @@ impl LineRig {
             name,
             1,
             Answer::Queued(Box::new(lines), VecDeque::new()),
+            no(),
+            no(),
+        )
+    }
+
+    /// [`Self::queued`] for a line that keeps what was not read: each
+    /// command's lines wait behind earlier ones until read or flushed.
+    pub fn held(
+        name: &str,
+        lines: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
+    ) -> (Self, SyncIOHandle) {
+        Self::open(
+            name,
+            1,
+            Answer::Held(Box::new(lines), VecDeque::new()),
             no(),
             no(),
         )
