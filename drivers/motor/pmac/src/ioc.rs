@@ -935,10 +935,17 @@ mod tests {
             self.written.lock().unwrap().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = std::mem::take(&mut self.reply);
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -1090,13 +1097,22 @@ mod tests {
             self.rig.written.lock().unwrap().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-            let reply = self.reply.take().ok_or_else(|| AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "timeout".into(),
-            })?;
+        fn io_read_octet(
+            &mut self,
+            _: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            let Some(reply) = self.reply.take() else {
+                return epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "timeout".into(),
+                });
+            };
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

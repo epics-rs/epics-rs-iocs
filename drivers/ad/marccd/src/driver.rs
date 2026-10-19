@@ -503,8 +503,12 @@ pub(crate) mod tests {
                 message: "refused".into(),
             })
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
-            Err(AsynError::Status {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            _buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
                 status: self.status,
                 message: "refused".into(),
             })
@@ -568,7 +572,7 @@ pub(crate) mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.0
         }
-        fn io_read_octet_eom(
+        fn io_read_octet(
             &mut self,
             _user: &AsynUser,
             buf: &mut [u8],

@@ -158,15 +158,22 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             if self.reads.fetch_add(1, Ordering::SeqCst) < self.timeouts {
-                return Err(AsynError::Status {
+                return epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "timeout".into(),
                 });
             }
             buf[..2].copy_from_slice(b"%1");
-            Ok(2)
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                2,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

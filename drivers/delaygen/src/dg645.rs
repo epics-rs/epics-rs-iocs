@@ -39,6 +39,7 @@
 //!   check_errors state. See [`Dg645Driver::error`] usage in `read_int32`.
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
@@ -700,9 +701,11 @@ impl PortDriver for Dg645Driver {
             .map_err(|e| wire::record_error(e.status()))
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        self.do_read_octet(user, buf)
-            .map_err(|e| wire::record_error(e.status()))
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        match self.do_read_octet(user, buf) {
+            Ok(n) => OctetReadResult::ok(n, EomReason::empty()),
+            Err(e) => OctetReadResult::failed(wire::record_error(e.status())),
+        }
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {

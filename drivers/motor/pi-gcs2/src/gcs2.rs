@@ -2956,10 +2956,17 @@ mod tests {
             }
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = std::mem::take(&mut self.reply);
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -4522,7 +4529,7 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet_eom(
+        fn io_read_octet(
             &mut self,
             _user: &AsynUser,
             buf: &mut [u8],
@@ -5707,8 +5714,12 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
-            Err(pigcs2_err("timeout"))
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            _buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            epics_rs::asyn::interpose::OctetReadResult::failed(pigcs2_err("timeout"))
         }
     }
 

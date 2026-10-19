@@ -1335,13 +1335,22 @@ mod tests {
             };
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             if self.dead.load(Ordering::SeqCst) {
-                return Err(mm_err("timeout".into()));
+                return epics_rs::asyn::interpose::OctetReadResult::failed(mm_err(
+                    "timeout".into(),
+                ));
             }
             let n = self.reply.len();
             buf[..n].copy_from_slice(&self.reply);
-            Ok(n)
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                n,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -1380,13 +1389,22 @@ mod tests {
             };
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = std::mem::take(&mut self.reply);
             if reply.is_empty() {
-                return Err(mm_err("timeout".into()));
+                return epics_rs::asyn::interpose::OctetReadResult::failed(mm_err(
+                    "timeout".into(),
+                ));
             }
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

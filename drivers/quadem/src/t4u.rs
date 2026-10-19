@@ -1496,7 +1496,7 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             buf[..3].copy_from_slice(b"abc");
             OctetReadResult {
                 status: Err(timeout()),

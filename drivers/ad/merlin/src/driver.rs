@@ -1142,7 +1142,7 @@ mod tests {
             }
             Ok(data.len())
         }
-        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let n = buf.len().min(self.pending.len());
             for (dst, src) in buf.iter_mut().zip(self.pending.drain(..n)) {
                 *dst = src;

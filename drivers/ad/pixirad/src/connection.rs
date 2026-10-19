@@ -245,7 +245,7 @@ mod from_server_tests {
             }
             Ok(data.len())
         }
-        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             match self.exchange {
                 1 => {
                     let reply = b"GOT: OK \0x";

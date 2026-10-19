@@ -57,6 +57,7 @@
 //! needs it, upstream or ported).
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -235,6 +236,79 @@ impl TeledyneDriver {
     }
 }
 
+impl TeledyneDriver {
+    fn read_octet_text(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        let cmd = self.command(user.reason)?;
+        let pump = pump_letter(user.addr)?;
+
+        if cmd == Command::SendCmd {
+            let text = self.last_send_cmd_reply.take().ok_or_else(|| {
+                protocol_error("SendCmd: no reply cached -- write a command first")
+            })?;
+            let bytes = text.as_bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            return Ok(n);
+        }
+
+        let text = match (self.family, cmd) {
+            (Family::D, Command::GetStatus) => {
+                let reply = self.execute(&wire_d::format_get_status(self.unit, pump))?;
+                wire_d::parse_get_status(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
+            }
+            (Family::H, Command::GetStatus) => {
+                let reply = self.execute(&wire_h::format_get_status(self.unit, pump))?;
+                wire_h::parse_get_status(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
+            }
+            (Family::H, Command::GetUnit) => {
+                let reply = self.execute(&wire_h::format_get_unit(self.unit))?;
+                wire_h::parse_captured_string(&reply)
+                    .map_err(|e| protocol_error(format!("{e:?}")))?
+            }
+            (Family::H, Command::GetMode) => {
+                let reply = self.execute(&wire_h::format_get_mode(self.unit))?;
+                wire_h::parse_captured_string(&reply)
+                    .map_err(|e| protocol_error(format!("{e:?}")))?
+            }
+            (Family::H, Command::GetId) => {
+                let reply = self.execute(&wire_h::format_get_id(self.unit))?;
+                wire_h::parse_captured_string(&reply)
+                    .map_err(|e| protocol_error(format!("{e:?}")))?
+            }
+            (Family::H, Command::GetVol) => {
+                let reply = self.execute(&wire_h::format_get_vol(self.unit, pump))?;
+                wire_h::parse_get_vol(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
+            }
+            (Family::H, Command::GetPress) => {
+                let reply = self.execute(&wire_h::format_get_press(self.unit, pump))?;
+                wire_h::parse_get_press(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
+            }
+            (Family::H, Command::GetSetPress) => {
+                let reply = self.execute(&wire_h::format_get_set_press(self.unit, pump))?;
+                wire_h::parse_get_set_press(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
+            }
+            (Family::H, Command::GetFlow) => {
+                let reply = self.execute(&wire_h::format_get_flow(self.unit, pump))?;
+                wire_h::parse_get_flow(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
+            }
+            (Family::H, Command::GetMFlow) => {
+                let reply = self.execute(&wire_h::format_get_mflow(self.unit, pump))?;
+                wire_h::parse_get_mflow(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
+            }
+            _ => {
+                return Err(protocol_error(format!(
+                    "{cmd:?} does not support Octet read on {:?}-series",
+                    self.family
+                )));
+            }
+        };
+        let bytes = text.as_bytes();
+        let n = bytes.len().min(buf.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+}
+
 impl PortDriver for TeledyneDriver {
     fn base(&self) -> &PortDriverBase {
         &self.base
@@ -356,75 +430,10 @@ impl PortDriver for TeledyneDriver {
         self.parse_ack(&reply)
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let cmd = self.command(user.reason)?;
-        let pump = pump_letter(user.addr)?;
-
-        if cmd == Command::SendCmd {
-            let text = self.last_send_cmd_reply.take().ok_or_else(|| {
-                protocol_error("SendCmd: no reply cached -- write a command first")
-            })?;
-            let bytes = text.as_bytes();
-            let n = bytes.len().min(buf.len());
-            buf[..n].copy_from_slice(&bytes[..n]);
-            return Ok(n);
-        }
-
-        let text = match (self.family, cmd) {
-            (Family::D, Command::GetStatus) => {
-                let reply = self.execute(&wire_d::format_get_status(self.unit, pump))?;
-                wire_d::parse_get_status(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
-            }
-            (Family::H, Command::GetStatus) => {
-                let reply = self.execute(&wire_h::format_get_status(self.unit, pump))?;
-                wire_h::parse_get_status(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
-            }
-            (Family::H, Command::GetUnit) => {
-                let reply = self.execute(&wire_h::format_get_unit(self.unit))?;
-                wire_h::parse_captured_string(&reply)
-                    .map_err(|e| protocol_error(format!("{e:?}")))?
-            }
-            (Family::H, Command::GetMode) => {
-                let reply = self.execute(&wire_h::format_get_mode(self.unit))?;
-                wire_h::parse_captured_string(&reply)
-                    .map_err(|e| protocol_error(format!("{e:?}")))?
-            }
-            (Family::H, Command::GetId) => {
-                let reply = self.execute(&wire_h::format_get_id(self.unit))?;
-                wire_h::parse_captured_string(&reply)
-                    .map_err(|e| protocol_error(format!("{e:?}")))?
-            }
-            (Family::H, Command::GetVol) => {
-                let reply = self.execute(&wire_h::format_get_vol(self.unit, pump))?;
-                wire_h::parse_get_vol(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
-            }
-            (Family::H, Command::GetPress) => {
-                let reply = self.execute(&wire_h::format_get_press(self.unit, pump))?;
-                wire_h::parse_get_press(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
-            }
-            (Family::H, Command::GetSetPress) => {
-                let reply = self.execute(&wire_h::format_get_set_press(self.unit, pump))?;
-                wire_h::parse_get_set_press(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
-            }
-            (Family::H, Command::GetFlow) => {
-                let reply = self.execute(&wire_h::format_get_flow(self.unit, pump))?;
-                wire_h::parse_get_flow(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
-            }
-            (Family::H, Command::GetMFlow) => {
-                let reply = self.execute(&wire_h::format_get_mflow(self.unit, pump))?;
-                wire_h::parse_get_mflow(&reply).map_err(|e| protocol_error(format!("{e:?}")))?
-            }
-            _ => {
-                return Err(protocol_error(format!(
-                    "{cmd:?} does not support Octet read on {:?}-series",
-                    self.family
-                )));
-            }
-        };
-        let bytes = text.as_bytes();
-        let n = bytes.len().min(buf.len());
-        buf[..n].copy_from_slice(&bytes[..n]);
-        Ok(n)
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        self.read_octet_text(user, buf)
+            .map(|n| (n, EomReason::empty()))
+            .into()
     }
 
     /// `sendCmd`'s write half -- see the module doc's "SendCmd" section.

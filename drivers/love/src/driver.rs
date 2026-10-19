@@ -1320,7 +1320,7 @@ mod tests {
             Ok(data.len())
         }
 
-        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let body = b"L010000";
             let reply = format!("\u{2}L010000{:02X}", calc_checksum(body));
             buf[..reply.len()].copy_from_slice(reply.as_bytes());
@@ -1458,7 +1458,7 @@ mod tests {
             Ok(data.len())
         }
 
-        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let reply = b"\x02L01\xff000000";
             buf[..reply.len()].copy_from_slice(reply);
             OctetReadResult::ok(reply.len(), EomReason::EOS)
@@ -1572,7 +1572,7 @@ mod tests {
             Ok(data.len())
         }
 
-        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             self.log.lock().unwrap().push("read".into());
             let body = b"L010000";
             let reply = format!("\u{2}L010000{:02X}", calc_checksum(body));

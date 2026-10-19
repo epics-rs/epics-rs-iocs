@@ -634,8 +634,12 @@ mod tests {
             self.written.lock().unwrap().push(data.to_vec());
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _: &AsynUser, _: &mut [u8]) -> AsynResult<usize> {
-            Err(acr_err("no reply"))
+        fn io_read_octet(
+            &mut self,
+            _: &AsynUser,
+            _: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            epics_rs::asyn::interpose::OctetReadResult::failed(acr_err("no reply"))
         }
     }
 
@@ -699,10 +703,19 @@ mod tests {
             self.written.lock().unwrap().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-            let reply = self.reply.take().ok_or_else(|| acr_err("no reply"))?;
+        fn io_read_octet(
+            &mut self,
+            _: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            let Some(reply) = self.reply.take() else {
+                return epics_rs::asyn::interpose::OctetReadResult::failed(acr_err("no reply"));
+            };
             buf[..reply.len()].copy_from_slice(reply.as_bytes());
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

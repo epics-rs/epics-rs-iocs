@@ -81,17 +81,29 @@ impl PortDriver for Line {
     fn get_output_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
         Ok(self.base.output_eos(user.addr).to_vec())
     }
-    fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn io_read_octet(
+        &mut self,
+        _user: &AsynUser,
+        buf: &mut [u8],
+    ) -> epics_rs::asyn::interpose::OctetReadResult {
         let reply = match &mut self.answer {
             Answer::Last(reply) => reply(&self.command),
-            Answer::Queued(_, queue) => queue.pop_front().ok_or_else(|| AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "LineRig: nothing to read".into(),
-            })?,
+            Answer::Queued(_, queue) => match queue.pop_front() {
+                Some(reply) => reply,
+                None => {
+                    return epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "LineRig: nothing to read".into(),
+                    });
+                }
+            },
         };
         let n = reply.len().min(buf.len());
         buf[..n].copy_from_slice(&reply.as_bytes()[..n]);
-        Ok(n)
+        epics_rs::asyn::interpose::OctetReadResult::ok(
+            n,
+            epics_rs::asyn::interpose::EomReason::empty(),
+        )
     }
 }
 

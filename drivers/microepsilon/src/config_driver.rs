@@ -42,6 +42,7 @@
 //! four sink reasons.
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
@@ -362,6 +363,43 @@ impl ConfigDriver {
     }
 }
 
+impl ConfigDriver {
+    fn read_octet_text(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        let text = if let Ok(cmd) = self.command(user.reason) {
+            match cmd {
+                Command::GrabWelcomeText => {
+                    // No `out` clause upstream -- a pure "read whatever line
+                    // is waiting" primitive, no write first.
+                    let (reply, status) = self
+                        .handle
+                        .read_octet(TRANSPORT_REASON, REPLY_BUF_SIZE)
+                        .into_parts();
+                    status?;
+                    wire::parse_welcome_text(&reply).map_err(Self::wire_err)?
+                }
+                Command::QueryVer => {
+                    let reply = self.execute(&wire::format_query_ver())?;
+                    let (v1, v2) = wire::parse_query_ver(&reply).map_err(Self::wire_err)?;
+                    self.set_sink_string(Sink::Version2, v2)?;
+                    self.base.call_param_callbacks(0)?;
+                    v1
+                }
+                _ => {
+                    return Err(protocol_error(format!(
+                        "{cmd:?} does not support Octet read"
+                    )));
+                }
+            }
+            .into_bytes()
+        } else {
+            self.base.get_string_param(user.reason, user.addr)?.to_vec()
+        };
+        let n = text.len().min(buf.len());
+        buf[..n].copy_from_slice(&text[..n]);
+        Ok(n)
+    }
+}
+
 impl PortDriver for ConfigDriver {
     fn base(&self) -> &PortDriverBase {
         &self.base
@@ -513,39 +551,10 @@ impl PortDriver for ConfigDriver {
         }
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let text = if let Ok(cmd) = self.command(user.reason) {
-            match cmd {
-                Command::GrabWelcomeText => {
-                    // No `out` clause upstream -- a pure "read whatever line
-                    // is waiting" primitive, no write first.
-                    let (reply, status) = self
-                        .handle
-                        .read_octet(TRANSPORT_REASON, REPLY_BUF_SIZE)
-                        .into_parts();
-                    status?;
-                    wire::parse_welcome_text(&reply).map_err(Self::wire_err)?
-                }
-                Command::QueryVer => {
-                    let reply = self.execute(&wire::format_query_ver())?;
-                    let (v1, v2) = wire::parse_query_ver(&reply).map_err(Self::wire_err)?;
-                    self.set_sink_string(Sink::Version2, v2)?;
-                    self.base.call_param_callbacks(0)?;
-                    v1
-                }
-                _ => {
-                    return Err(protocol_error(format!(
-                        "{cmd:?} does not support Octet read"
-                    )));
-                }
-            }
-            .into_bytes()
-        } else {
-            self.base.get_string_param(user.reason, user.addr)?.to_vec()
-        };
-        let n = text.len().min(buf.len());
-        buf[..n].copy_from_slice(&text[..n]);
-        Ok(n)
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        self.read_octet_text(user, buf)
+            .map(|n| (n, EomReason::empty()))
+            .into()
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {

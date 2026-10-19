@@ -564,9 +564,16 @@ mod tests {
             self.written.lock().unwrap().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             buf[0] = b'\r';
-            Ok(1)
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                1,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -628,10 +635,17 @@ mod tests {
             }
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let line = self.queued.pop_front().unwrap_or_else(|| "\r".into());
             buf[..line.len()].copy_from_slice(line.as_bytes());
-            Ok(line.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                line.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

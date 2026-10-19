@@ -147,9 +147,13 @@ impl PortDriver for Line {
         };
         Ok(data.len())
     }
-    fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn io_read_octet(
+        &mut self,
+        _: &AsynUser,
+        buf: &mut [u8],
+    ) -> epics_rs::asyn::interpose::OctetReadResult {
         if self.reply.is_empty() {
-            return Err(AsynError::Status {
+            return epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
                 status: AsynStatus::Timeout,
                 message: "no reply".into(),
             });
@@ -157,7 +161,10 @@ impl PortDriver for Line {
         let n = self.reply.len().min(buf.len());
         buf[..n].copy_from_slice(&self.reply[..n]);
         self.reply.drain(..n);
-        Ok(n)
+        epics_rs::asyn::interpose::OctetReadResult::ok(
+            n,
+            epics_rs::asyn::interpose::EomReason::empty(),
+        )
     }
 }
 

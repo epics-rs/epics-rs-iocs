@@ -1018,12 +1018,19 @@ mod tests {
             }
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let n = self.reply.len().min(buf.len());
             for (slot, byte) in buf.iter_mut().zip(self.reply.drain(..n)) {
                 *slot = byte;
             }
-            Ok(n)
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                n,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

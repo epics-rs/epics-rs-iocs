@@ -551,8 +551,8 @@ mod tests {
             &mut self,
             _user: &epics_rs::asyn::user::AsynUser,
             _buf: &mut [u8],
-        ) -> epics_rs::asyn::error::AsynResult<usize> {
-            Err(AsynError::Status {
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
                 status: AsynStatus::Timeout,
                 message: "no reply".into(),
             })

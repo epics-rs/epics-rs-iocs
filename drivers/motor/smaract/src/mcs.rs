@@ -812,10 +812,14 @@ mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             self.log.lock().unwrap().push("read");
             if self.pending.is_empty() {
-                return Err(AsynError::Status {
+                return epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "timeout".into(),
                 });
@@ -823,7 +827,10 @@ mod tests {
             let n = self.pending.len().min(buf.len());
             buf[..n].copy_from_slice(&self.pending[..n]);
             self.pending.drain(..n);
-            Ok(n)
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                n,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
         fn set_input_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
             self.log.lock().unwrap().push("input eos");

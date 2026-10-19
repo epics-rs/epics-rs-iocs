@@ -649,7 +649,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
             &mut self.0
         }
-        fn io_read_octet_eom(
+        fn io_read_octet(
             &mut self,
             _user: &AsynUser,
             buf: &mut [u8],

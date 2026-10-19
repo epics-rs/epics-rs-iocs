@@ -461,7 +461,11 @@ mod tests {
             self.sent.lock().unwrap().push(line);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let last = self
                 .sent
                 .lock()
@@ -477,7 +481,10 @@ mod tests {
                 "A Z 00".to_string()
             };
             buf[..reply.len()].copy_from_slice(reply.as_bytes());
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
