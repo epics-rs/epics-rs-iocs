@@ -304,7 +304,7 @@ fn refused(message: &str) -> AsynError {
 impl Model1Motor for DrvMvp2001Axis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.status.clone(), self.poll_failure())
     }
 }
 
@@ -486,6 +486,30 @@ mod tests {
         assert_eq!(hex_at("0001 FFFFFFF6", 8) as i32, -10);
         assert_eq!(hex_at("0001 00000010junk", 8), 16);
         assert_eq!(hex_at("", 8), 0);
+    }
+
+    /// drvMVP2001.cc:675-720: a failed `motor_init` read stores the
+    /// GAIN_SUPPORT `motor_init` set, with EA_PRESENT off, the first raising
+    /// nothing (RETRY) and the next CNTRL_COMM_ERR and RA_PROBLEM
+    /// (:316-330).
+    #[test]
+    fn a_failed_init_read_keeps_gain_support() {
+        let (_line, io) = motor_common::testing::LineRig::new("mvpInitFail", |_| String::new());
+        let chain = Arc::new(Mutex::new(Mvp2001Chain::new(io)));
+        let init = |signal| DrvMvp2001Axis::new(chain.clone(), signal).take_init_status();
+        let prepared = MotorStatus {
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init(0), prepared);
+        assert_eq!(
+            init(1),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 
     /// devMVP2001.cc:430-448: a raw limit at the controller's is built, one
