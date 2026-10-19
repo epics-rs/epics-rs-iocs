@@ -33,7 +33,7 @@ asynSetOption("SerialTPG", 0, "bits", "8")
 asynSetOption("SerialTPG", 0, "parity", "none")
 asynSetOption("SerialTPG", 0, "stop", "1")
 
-# devTPG261 takes the gauge, 1 or 2 (devTPG261.c:12-13), from each record's INP/OUT.
+# devTPG261 takes the gauge, 1 or 2 (devTPG261.c:10), from each record's INP/OUT.
 dbLoadRecords("$(IP)/db/TPG261.db", "P=$(PREFIX),GAUGE=gauge1,PORT=SerialTPG,ADDR=1")
 dbLoadRecords("$(IP)/db/TPG261.db", "P=$(PREFIX),GAUGE=gauge2,PORT=SerialTPG,ADDR=2")
 

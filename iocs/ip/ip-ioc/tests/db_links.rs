@@ -82,8 +82,8 @@ fn heid_nd261_reads_through_dev_ai_heid_nd261() {
     );
 }
 
-/// devTPG261.c:12-13: the gauge address is 1 or 2; any other makes readBi
-/// index `vals[]` outside the array.
+/// devTPG261.c:10: the gauge address is 1 or 2; any other indexes `vals[]`
+/// outside the array (:395-406).
 #[test]
 fn st_cmd_tpg261_gauges_are_1_and_2() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("st.cmd");
