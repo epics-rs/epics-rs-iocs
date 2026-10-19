@@ -183,9 +183,9 @@ pub struct MultiFunctionDriver {
     pub state: Arc<Mutex<PollerState>>,
     pub max_input_points: usize,
     pub max_output_points: usize,
-    /// Whether AUXPORT accepts a direction change at all (`DPIOT_IO` /
-    /// `DPIOT_BITIO`). The USB-2408 reports `DPIOT_NONCONFIG`.
-    dio_configurable: bool,
+    /// C `digitalIOBitConfigurable_`: AUXPORT is `DPIOT_BITIO`. The
+    /// USB-2408 reports `DPIOT_NONCONFIG`.
+    dio_bit_configurable: bool,
     board: BoardInfo,
 }
 
@@ -253,16 +253,10 @@ impl MultiFunctionDriver {
             base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
         }
 
-        // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
-        // ulDConfigPort and ulDConfigBit reject anything else outright, so ask
-        // the device instead of assuming.
-        let dio_configurable = matches!(
-            device.digital_port_io_type(0),
-            Ok(uldaq_sys::DPIOT_IO) | Ok(uldaq_sys::DPIOT_BITIO)
-        );
-        if dio_configurable {
-            let _ = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT);
-        }
+        // drvMultiFunction.cpp:1069-1071. C configures no port on Linux
+        // (digitalIOPortConfigurable_ stays 0 for the 2408).
+        let dio_bit_configurable =
+            matches!(device.digital_port_io_type(0), Ok(uldaq_sys::DPIOT_BITIO));
 
         // Seed DIGITAL_INPUT so the bi records have a value to read at init.
         // The poller only pushes on a changed bit, and its one forced first
@@ -285,7 +279,7 @@ impl MultiFunctionDriver {
             state,
             max_input_points,
             max_output_points,
-            dio_configurable,
+            dio_bit_configurable,
             board,
         })
     }
@@ -1055,10 +1049,13 @@ impl PortDriver for MultiFunctionDriver {
                     }
                 }
             }
-        } else if reason == self.params.digital_direction && self.dio_configurable {
+        } else if reason == self.params.digital_direction {
             let dev = self.device.lock().unwrap();
             for bit in 0..NUM_IO_BITS {
-                if mask & (1 << bit) != 0 {
+                if mask & (1 << bit) == 0 {
+                    continue;
+                }
+                if self.dio_bit_configurable {
                     let dir = if (value >> bit) & 1 != 0 {
                         uldaq_sys::DD_OUTPUT
                     } else {
@@ -1068,6 +1065,14 @@ impl PortDriver for MultiFunctionDriver {
                         &dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir),
                         FUNCTION,
                         "Calling ConfigBit",
+                    );
+                } else {
+                    // C: the direction cannot be programmed, so the
+                    // open-collector output is set to 0.
+                    status = trace.report(
+                        &dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, false),
+                        FUNCTION,
+                        "Calling BitOut",
                     );
                 }
             }
@@ -1252,6 +1257,15 @@ mod tests {
         let mut user = AsynUser::new(drv.params.wave_dig_read_wf);
         drv.write_int32(&mut user, 0).unwrap();
         assert!(drv.base.params.is_param_defined(abs_time_wf, 0).unwrap());
+    }
+
+    #[test]
+    fn a_direction_write_on_a_fixed_port_zeroes_the_output_bit() {
+        let mut drv = MultiFunctionDriver::new("MFDIR", DaqDevice::unconnected(), 16, 16).unwrap();
+        assert!(!drv.dio_bit_configurable);
+        let mut user = AsynUser::new(drv.params.digital_direction);
+        // Only a write that reaches ulDBitOut fails on the null handle.
+        assert!(drv.write_uint32_digital(&mut user, 0, 0x01).is_err());
     }
 
     #[test]
