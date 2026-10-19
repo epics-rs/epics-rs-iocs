@@ -101,16 +101,18 @@ impl OemController {
         Ok(())
     }
 
-    /// Send a query and read the echo line then the data line (returned).
-    fn query(&self, cmd: &str) -> AsynResult<String> {
+    /// Send a query and read the echo line, then the data line with its own
+    /// status: C parses `inString_` after `readController` whatever it
+    /// returned (OEMMotorDriver.cpp:349-385), and a failed read leaves there
+    /// what it delivered. Only the echo's failure fails the query.
+    fn query(&self, cmd: &str) -> AsynResult<(String, AsynResult<()>)> {
         let (_echo, status) = self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
         status?;
         let (raw, status) = self.handle.read_octet(0, READ_BUF).into_parts();
-        status?;
-        Ok(Self::trimmed(&raw))
+        Ok((Self::trimmed(&raw), status))
     }
 }
 
@@ -132,6 +134,9 @@ pub struct OemAxis {
     switches: SwitchFlags,
     /// The poll's `OEM_SWITCH_DETEC`, for [`AsynMotor::take_port_sets`].
     sets: PortSets,
+    /// What a poll whose last step failed had set, for
+    /// [`AsynMotor::take_failed_poll_status`].
+    left: Option<MotorStatus>,
 }
 
 /// The poll's switch-driven status bits. C sets each only where the switch
@@ -159,6 +164,7 @@ impl OemAxis {
             direction: false,
             switches: SwitchFlags::default(),
             sets: PortSets::default(),
+            left: None,
         };
         // C ignores configureController's status (OEMMotorDriver.cpp:208).
         let _ = axis.lock().configure(axis.axis_no);
@@ -428,20 +434,25 @@ impl AsynMotor for OemAxis {
         ctrl.configure(self.axis_no)?;
 
         // Moving flags: "*B"/"*C" mean in motion.
-        let flags = ctrl.query(&format!("{addr}R"))?;
+        let (flags, _) = ctrl.query(&format!("{addr}R"))?;
         let done = flags != "*B" && flags != "*C";
 
         let mut new_base = self.encoder_base;
         let mut new_direction = self.direction;
 
         let new_position = if done {
-            // Position readback (skip the leading status char).
-            let pr = ctrl.query(&format!("{addr}PR"))?;
-            new_base = atof(pr.get(1..).unwrap_or(""));
-            new_base
+            // Position readback (skip the leading status char); C posts it
+            // only from a good read (:357-361).
+            let (pr, read) = ctrl.query(&format!("{addr}PR"))?;
+            if read.is_ok() {
+                new_base = atof(pr.get(1..).unwrap_or(""));
+                new_base
+            } else {
+                self.position
+            }
         } else {
             // Live step count in hex (skip the leading char); "*F" flags negative.
-            let w3 = ctrl.query(&format!("{addr}W3"))?;
+            let (w3, _) = ctrl.query(&format!("{addr}W3"))?;
             let mut step = leading_hex(w3.get(1..).unwrap_or("")).unwrap_or(0) as f64;
             if w3.contains("*F") {
                 step -= TWO_POW_32;
@@ -453,7 +464,8 @@ impl AsynMotor for OemAxis {
         };
 
         // Switch status (character flags at fixed offsets 6 and 7).
-        let is = ctrl.query(&format!("{addr}IS"))?;
+        // C's poll fails on this read's status, or on the PZ's below.
+        let (is, mut status) = ctrl.query(&format!("{addr}IS"))?;
         let switch_detected = switch_from_is(&is);
         let select_switch = ctrl.select_switch[self.axis_no];
         // Set ahead of the PZ that may fail: C's poll posts it either way
@@ -466,7 +478,7 @@ impl AsynMotor for OemAxis {
         if switch_detected > 0 {
             if select_switch == switch_detected - 1 {
                 if self.homed {
-                    ctrl.command(&format!("{addr}PZ"))?;
+                    status = ctrl.command(&format!("{addr}PZ"));
                     switches.homed = true;
                 }
                 switches.low_limit = true;
@@ -486,7 +498,7 @@ impl AsynMotor for OemAxis {
         self.direction = new_direction;
         self.switches = switches;
 
-        Ok(MotorStatus {
+        let polled = MotorStatus {
             position: new_position,
             encoder_position: new_position,
             velocity: 0.0,
@@ -500,7 +512,17 @@ impl AsynMotor for OemAxis {
             encoder_home: switches.home,
             homed: switches.homed,
             ..MotorStatus::default()
-        })
+        };
+        // C sets every parameter before its skip label.
+        if let Err(e) = status {
+            self.left = Some(polled);
+            return Err(e);
+        }
+        Ok(polled)
+    }
+
+    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+        self.left.take()
     }
 }
 
@@ -613,11 +635,13 @@ mod tests {
     }
 
     /// A port that acknowledges every command and answers the poll's
-    /// queries (`R`, `PR`, `IS`) with an echo line then `replies`' line.
+    /// queries (`R`, `PR`, `IS`) with an echo line then `replies`' line, or
+    /// `cut`'s line ended by a timeout.
     struct Polled {
         base: PortDriverBase,
         replies: Arc<Mutex<HashMap<&'static str, &'static str>>>,
-        queued: std::collections::VecDeque<String>,
+        cut: Arc<Mutex<HashMap<&'static str, &'static str>>>,
+        queued: std::collections::VecDeque<(String, bool)>,
     }
 
     impl epics_rs::asyn::port::PortDriver for Polled {
@@ -629,9 +653,11 @@ mod tests {
         }
         fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data).into_owned();
-            self.queued.push_back("\r".into());
-            if let Some(reply) = self.replies.lock().unwrap().get(&cmd[1..]) {
-                self.queued.push_back(format!("{reply}\r"));
+            self.queued.push_back(("\r".into(), false));
+            if let Some(partial) = self.cut.lock().unwrap().get(&cmd[1..]) {
+                self.queued.push_back((partial.to_string(), true));
+            } else if let Some(reply) = self.replies.lock().unwrap().get(&cmd[1..]) {
+                self.queued.push_back((format!("{reply}\r"), false));
             }
             Ok(data.len())
         }
@@ -640,12 +666,22 @@ mod tests {
             _: &AsynUser,
             buf: &mut [u8],
         ) -> epics_rs::asyn::interpose::OctetReadResult {
-            let line = self.queued.pop_front().unwrap_or_else(|| "\r".into());
+            let (line, cut) = self.queued.pop_front().unwrap_or(("\r".into(), false));
             buf[..line.len()].copy_from_slice(line.as_bytes());
-            epics_rs::asyn::interpose::OctetReadResult::ok(
+            let read = epics_rs::asyn::interpose::OctetReadResult::ok(
                 line.len(),
                 epics_rs::asyn::interpose::EomReason::empty(),
-            )
+            );
+            if !cut {
+                return read;
+            }
+            epics_rs::asyn::interpose::OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Timeout,
+                    message: "timeout".into(),
+                }),
+                ..read
+            }
         }
     }
 
@@ -672,6 +708,7 @@ mod tests {
                 InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             replies: replies.clone(),
+            cut: Default::default(),
             queued: Default::default(),
         };
         let claim = claim_port(name).unwrap();
@@ -755,6 +792,75 @@ mod tests {
             .move_absolute(&AsynUser::new(0), 5.0, 0.0, 1.0, 1.0)
             .unwrap();
         assert!(poll().homed);
+    }
+
+    /// OEMMotorDriver.cpp:345-424: each data line is parsed whatever its
+    /// read returned and the poll goes on; it fails on the `IS` read or the
+    /// `PZ` after it, having set everything first.
+    #[test]
+    fn data_lines_cut_by_a_timeout_are_still_parsed() {
+        use epics_rs::asyn::port::PortFlags;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let name = "OEM_CUT_LINE";
+        let replies = Arc::new(Mutex::new(HashMap::from([
+            ("R", "*R"),
+            ("PR", "*+40"),
+            ("W3", "*10"),
+            ("IS", "*ABCD000"),
+        ])));
+        let cut = Arc::new(Mutex::new(HashMap::new()));
+        let driver = Polled {
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
+            replies,
+            cut: cut.clone(),
+            queued: Default::default(),
+        };
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        let handle = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_secs(1),
+        );
+        let ctrl = Arc::new(Mutex::new(OemController::new(handle, 1)));
+        let mut axis = OemAxis::new(ctrl, 0);
+        let user = AsynUser::new(0);
+        assert_eq!(axis.poll(&user).unwrap().position, 40.0);
+
+        cut.lock().unwrap().insert("R", "*B");
+        let status = axis.poll(&user).unwrap();
+        assert!(!status.done);
+        assert_eq!(status.position, 56.0);
+
+        let cut_only = |query, partial| {
+            let mut cut = cut.lock().unwrap();
+            cut.clear();
+            cut.insert(query, partial);
+        };
+        cut_only("PR", "*+7");
+        let status = axis.poll(&user).unwrap();
+        assert!(status.done);
+        assert_eq!(status.position, 56.0);
+
+        cut_only("IS", "*ABCD01");
+        assert!(axis.poll(&user).is_err());
+        let left = axis.take_failed_poll_status().unwrap();
+        assert!(left.low_limit && left.home && !left.homed);
+        assert_eq!(left.position, 40.0);
+
+        axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
+        assert!(axis.poll(&user).unwrap().homed);
     }
 
     #[test]
