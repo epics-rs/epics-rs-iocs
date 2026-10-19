@@ -1922,6 +1922,33 @@ mod tests {
         assert_eq!(axis.failed_poll_moving(), Some(true));
     }
 
+    // Every start clears Done, not only the absolute move
+    // (asynMotorController.cpp:301-353).
+    #[test]
+    fn each_start_clears_what_a_failed_poll_reads_as_done() {
+        let (mut axis, _) = mcc_axis("phytronStartsClearDone");
+        let user = AsynUser::new(0);
+        type Start = fn(&mut PhytronAxis, &AsynUser);
+        let starts: [(&str, Start); 3] = [
+            ("move_relative", |a, u| {
+                let _ = a.move_relative(u, 10.0, 1.0, 2.0, 1.0);
+            }),
+            ("move_velocity", |a, u| {
+                let _ = a.move_velocity(u, 1.0, 2.0, 1.0);
+            }),
+            ("home", |a, u| {
+                let _ = a.home(u, 1.0, 2.0, 1.0, true);
+            }),
+        ];
+        for (name, start) in starts {
+            axis.controller.lock().unwrap().poll();
+            assert!(!axis.poll(&user).unwrap().moving, "{name}");
+            assert_eq!(axis.failed_poll_moving(), Some(false), "{name}");
+            start(&mut axis, &user);
+            assert_eq!(axis.failed_poll_moving(), Some(true), "{name}");
+        }
+    }
+
     #[test]
     fn the_poll_reports_the_encoder_times_the_encoder_ratio() {
         use epics_rs::asyn::port::InterfaceMask;
