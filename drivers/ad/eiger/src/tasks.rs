@@ -837,7 +837,6 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
     // The thresholds that were enabled for this acquisition, in order — the
     // Nth frame of a 4-D dataset belongs to the Nth *active* threshold.
     let active = active_thresholds(s).await;
-    let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
     // Once per file, counted on locally (eigerDetector.cpp:1841-1842, :1903-1904).
     let mut counters = Counters::read(s).await;
 
@@ -859,6 +858,9 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
         attrs.add(threshold_number_attr(number));
         attrs.add(threshold_energy_attr(energy));
 
+        // Per frame, after its updateTimeStamps (eigerDetector.cpp:1880, :1892).
+        let timestamp = port_stamp(&s.handle).await;
+        let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
         if publish(
             s,
             Image {
@@ -867,7 +869,7 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
                 codec: None,
                 attributes: attrs,
                 threshold_index: frame.threshold,
-                timestamp: None,
+                timestamp: Some(timestamp),
             },
             array_callbacks,
             &mut counters,
@@ -1398,8 +1400,9 @@ struct Image {
     /// 0-based threshold index; picks `outputs.thresholds[i]`, which is C's
     /// asyn address `thresh + 1`.
     threshold_index: usize,
-    /// The stream2 frame time when STREAM_AS_TIMESTAMP_SOURCE is set; `None`
-    /// stamps the array now.
+    /// A stamp the caller already took: the stream2 frame time when
+    /// STREAM_AS_TIMESTAMP_SOURCE is set, or parseH5File's own. `None` stamps
+    /// the array now.
     timestamp: Option<EpicsTimestamp>,
 }
 
@@ -2011,21 +2014,20 @@ mod tests {
         bytes
     }
 
-    /// C parseH5File reads NDArrayCounter and ADNumImagesCounter once per file
-    /// and counts on from there (eigerDetector.cpp:1841-1842, :1903-1904): a
-    /// client write between two frames is overwritten, not counted on from.
-    #[tokio::test]
-    async fn parse_h5_counts_on_from_the_counters_read_at_file_start() {
+    /// An Eiger1 port with its interrupts open and its main output wired to
+    /// the returned sink.
+    fn h5_rig(
+        name: &str,
+    ) -> (
+        Arc<Shared>,
+        epics_rs::ad_core::plugin::channel::NDArrayReceiver,
+    ) {
         use epics_rs::ad_core::plugin::channel::ndarray_channel;
-        use epics_rs::asyn::interrupt::InterruptFilter;
         use epics_rs::asyn::registry::claim_port;
-        use epics_rs::asyn::request::RequestOp;
         use epics_rs::asyn::runtime::config::RuntimeConfig;
         use epics_rs::asyn::runtime::port::create_port_runtime;
-        use epics_rs::asyn::user::AsynUser;
         use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
-        let name = "EIGER_H5_COUNTERS";
         let (signals, _receivers) = signals();
         let cfg = crate::driver::EigerConfig {
             port_name: name.to_string(),
@@ -2041,12 +2043,11 @@ mod tests {
             create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
                 .expect("runtime");
         let outputs = Outputs::new();
-        let (tx, mut rx) = ndarray_channel("H5_COUNTERS_SINK", 4);
+        let (tx, rx) = ndarray_channel(&format!("{name}_SINK"), 4);
         outputs.main.lock().add(tx);
-        let handle = runtime.port_handle().clone();
         let s = shared(
             ops,
-            handle.clone(),
+            runtime.port_handle().clone(),
             p,
             ad,
             Model::Eiger1,
@@ -2056,28 +2057,35 @@ mod tests {
             DriverPool::standalone(0),
             &signals,
         );
+        std::mem::forget(runtime);
+        (s, rx)
+    }
 
-        // A client's store of both counters, sent from the port thread as frame
-        // 0 posts its counter: it reaches the port ahead of everything frame 1
-        // sends. A direct op, so the asyn queue cannot reorder it.
-        let (counter, images) = (ad.base.array_counter, ad.num_images_counter);
-        let written = AtomicBool::new(false);
-        let client = handle.clone();
-        let _sub = handle
+    /// A client's store of `updates`, sent from the port thread as frame 0
+    /// posts ArrayCounter: it reaches the port ahead of everything frame 1
+    /// sends. A direct op, so the asyn queue cannot reorder it.
+    fn store_after_frame_0(
+        s: &Shared,
+        updates: Vec<ParamSetValue>,
+    ) -> epics_rs::asyn::interrupt::SyncCallbackSubscription {
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::asyn::request::RequestOp;
+        use epics_rs::asyn::user::AsynUser;
+
+        let pending = parking_lot::Mutex::new(Some(updates));
+        let client = s.handle.clone();
+        s.handle
             .interrupts()
             .register_sync_callback(
                 InterruptFilter {
-                    reason: Some(counter),
+                    reason: Some(s.ad.base.array_counter),
                     addr: Some(0),
                     ..Default::default()
                 },
                 move |iv| {
                     if matches!(iv.value, ParamValue::Int32(1))
-                        && !written.swap(true, Ordering::AcqRel)
+                        && let Some(updates) = pending.lock().take()
                     {
-                        let updates = [counter, images]
-                            .map(|r| ParamSetValue::new(r, 0, ParamValue::Int32(100)))
-                            .to_vec();
                         client
                             .try_submit(
                                 RequestOp::CallParamCallbacks {
@@ -2087,11 +2095,26 @@ mod tests {
                                 },
                                 AsynUser::new(0),
                             )
-                            .expect("client write");
+                            .expect("client store");
                     }
                 },
             )
-            .unwrap();
+            .unwrap()
+    }
+
+    /// C parseH5File reads NDArrayCounter and ADNumImagesCounter once per file
+    /// and counts on from there (eigerDetector.cpp:1841-1842, :1903-1904): a
+    /// client store between two frames is overwritten, not counted on from.
+    #[tokio::test]
+    async fn parse_h5_counts_on_from_the_counters_read_at_file_start() {
+        let (s, mut rx) = h5_rig("EIGER_H5_COUNTERS");
+        let (counter, images) = (s.ad.base.array_counter, s.ad.num_images_counter);
+        let _sub = store_after_frame_0(
+            &s,
+            [counter, images]
+                .map(|r| ParamSetValue::new(r, 0, ParamValue::Int32(100)))
+                .to_vec(),
+        );
 
         s.set_int(s.ad.base.array_callbacks, 1).await;
         parse_h5(&s, &h5_file([2, 1, 2])).await.expect("parse");
@@ -2102,7 +2125,24 @@ mod tests {
         assert_eq!(ids, [0, 1]);
         assert_eq!(s.get_int(counter).await, 2);
         assert_eq!(s.get_int(images).await, 2);
-        std::mem::forget(runtime);
+    }
+
+    /// C parseH5File reads NDArrayCallbacks for every frame, after its
+    /// updateTimeStamps (eigerDetector.cpp:1880, :1892).
+    #[tokio::test]
+    async fn parse_h5_reads_array_callbacks_per_frame() {
+        let (s, mut rx) = h5_rig("EIGER_H5_CALLBACKS");
+        let callbacks = s.ad.base.array_callbacks;
+        let _sub = store_after_frame_0(
+            &s,
+            vec![ParamSetValue::new(callbacks, 0, ParamValue::Int32(0))],
+        );
+
+        s.set_int(callbacks, 1).await;
+        parse_h5(&s, &h5_file([2, 1, 2])).await.expect("parse");
+        assert_eq!(rx.recv().await.expect("frame 0").unique_id, 0);
+        assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
+        assert_eq!(rx.pending(), 0, "ArrayCallbacks=0 before frame 1");
     }
 
     /// Arming with SaveFiles runs `checkPath()` and then reads NDFilePathExists
