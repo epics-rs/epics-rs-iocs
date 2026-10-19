@@ -265,7 +265,7 @@ fn commands(
                     // Unlocked: the errlog thread prints to stderr while this
                     // waits for it.
                     &mut std::io::stdout(),
-                    &mut std::io::stderr(),
+                    &mut epics_rs::base::runtime::log::StagedStderr,
                 );
                 Ok(CommandOutcome::Continue)
             }
