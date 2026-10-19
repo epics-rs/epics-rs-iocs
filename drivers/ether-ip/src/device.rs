@@ -473,6 +473,10 @@ impl EtherIpDevice {
 
         // One I/O Intr pulse per new tag value. Depth 1: a pending pulse
         // already says "re-read", and the record reads the current value.
+        // Whatever the SCAN: C adds `scan_callback` only to a record that is
+        // I/O Intr when the link binds (`devEtherIP.c:1125-1133`) yet hands
+        // its IOSCANPVT to `get_ioint_info` (`:790-796`), so a record switched
+        // to I/O Intr later joins a list nothing ever posts. Not copied.
         let (tx, rx) = mpsc::channel(1);
         self.listener = Some(tag.add_listener(tx));
         self.io_intr_rx = Some(rx);
@@ -1294,6 +1298,23 @@ mod tests {
         b.notify();
         assert!(old_rx.try_recv().is_err(), "the old tag still calls back");
         assert!(new_rx.try_recv().is_ok());
+    }
+
+    /// A record bound while Passive still hears its tag, so a later switch
+    /// to I/O Intr is served (C's `devEtherIP.c:1125-1133` gate is not
+    /// copied).
+    #[test]
+    fn a_record_bound_while_passive_still_hears_its_tag() {
+        use epics_rs::base::server::records::ai::AiRecord;
+
+        define_plc("passive", "127.0.0.1", 0);
+        let mut record = AiRecord::default();
+        let mut dev = EtherIpDevice::new("@passive PASSIVE_A", false);
+        dev.set_record_info("AI", ScanType::Passive);
+        dev.init(&mut record).unwrap();
+        let mut rx = dev.io_intr_receiver().unwrap();
+        dev.tag.clone().unwrap().notify();
+        assert!(rx.try_recv().is_ok());
     }
 
     /// A link `analyze_link` refuses refuses the put through `add_record`.
