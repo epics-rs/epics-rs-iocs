@@ -177,7 +177,8 @@ impl AhxxxDriver {
     /// As in `drvTetrAMM`, the `goto error` path skips the `setAcquire(1)`
     /// restore, so a status read that fails leaves the meter stopped.
     ///
-    /// A failed exchange returns its own status. C discards each
+    /// A failed exchange's reply is still parsed ([`trace::Reply::parse`]);
+    /// one that does not parse returns its own status. C discards each
     /// `writeReadMeter` status (drvAHxxx.cpp:697-772) and reports the empty
     /// reply as asynError (:801), which `drvQuadEM::writeFloat64` ORs with the
     /// setter's asynDisconnected into status=7: a disconnected meter alarms
@@ -186,36 +187,41 @@ impl AhxxxDriver {
         let p = self.params();
         let bad = |what: &str, resp: &str| error(format!("AHxxx: bad {what} response: {resp}"));
 
-        let resp = last.query(&self.io, "RNG ?", proto::MAX_COMMAND_LEN)?;
-        let range = proto::parse_range(&resp).ok_or_else(|| bad("RNG", &resp))?;
+        let range = last
+            .query(&self.io, "RNG ?", proto::MAX_COMMAND_LEN)
+            .parse(proto::parse_range, |r| bad("RNG", r))?;
         self.base.port_base.set_int32_param(p.range, 0, range)?;
 
         let read_format =
             QeReadFormat::from_i32(qe::int_param(&self.base.port_base, p.read_format, 0));
         let mut sample_time;
         if self.is_ah401() {
-            let resp = last.query(&self.io, "HLF ?", proto::MAX_COMMAND_LEN)?;
-            let ping_pong = proto::parse_hlf(&resp).ok_or_else(|| bad("HLF", &resp))?;
+            let ping_pong = last
+                .query(&self.io, "HLF ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_hlf, |r| bad("HLF", r))?;
             self.base
                 .port_base
                 .set_int32_param(p.ping_pong, 0, ping_pong)?;
 
-            let resp = last.query(&self.io, "ITM ?", proto::MAX_COMMAND_LEN)?;
-            let integration_time = proto::parse_itm(&resp).ok_or_else(|| bad("ITM", &resp))?;
+            let integration_time = last
+                .query(&self.io, "ITM ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_itm, |r| bad("ITM", r))?;
             self.base
                 .port_base
                 .set_float64_param(p.integration_time, 0, integration_time)?;
             sample_time = proto::sample_time_ah401(ping_pong, integration_time);
         } else {
-            let resp = last.query(&self.io, "CHN ?", proto::MAX_COMMAND_LEN)?;
-            let num_channels = proto::parse_chn(&resp).ok_or_else(|| bad("CHN", &resp))?;
+            let num_channels = last
+                .query(&self.io, "CHN ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_chn, |r| bad("CHN", r))?;
             self.base
                 .port_base
                 .set_int32_param(p.num_channels, 0, num_channels)?;
             self.shared.acq.lock().num_channels = num_channels;
 
-            let resp = last.query(&self.io, "RES ?", proto::MAX_COMMAND_LEN)?;
-            let resolution = proto::parse_res(&resp).ok_or_else(|| bad("RES", &resp))?;
+            let resolution = last
+                .query(&self.io, "RES ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_res, |r| bad("RES", r))?;
             self.base
                 .port_base
                 .set_int32_param(p.resolution, 0, resolution)?;
@@ -225,8 +231,10 @@ impl AhxxxDriver {
         }
 
         if proto::reads_bias_status(self.model) {
-            let resp = last.query(&self.io, "HVS ?", proto::MAX_COMMAND_LEN)?;
-            match proto::parse_hvs(&resp).ok_or_else(|| bad("HVS", &resp))? {
+            match last
+                .query(&self.io, "HVS ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_hvs, |r| bad("HVS", r))?
+            {
                 None => self.base.port_base.set_int32_param(p.bias_state, 0, 0)?,
                 Some(volts) => {
                     self.base.port_base.set_int32_param(p.bias_state, 0, 1)?;
@@ -508,6 +516,12 @@ impl QuadEmDevice for AhxxxDriver {
         self.ah401_series
             .store(proto::is_ah401_series(self.model), Ordering::Release);
         self.base_reset()
+    }
+
+    /// C++ `drvAHxxx::exitHandler` (drvAHxxx.cpp:805-810): the meter stops
+    /// streaming when the IOC goes.
+    fn exit_handler(&mut self) {
+        let _ = self.set_acquire(0);
     }
 }
 
@@ -832,7 +846,7 @@ pub fn create_ahxxx(
             .expect("failed to spawn drvAHxxxTask")
     });
 
-    let callback_thread = qe::start_callback_task(CallbackContext {
+    let callback_thread = qe::start_callback_task::<AhxxxDriver>(CallbackContext {
         trigger_rx,
         handle,
         params,
@@ -936,6 +950,60 @@ mod tests {
             .read_int32_blocking(rt.params.model, 0)
             .unwrap();
         assert_eq!(model, QeModel::Ah501d as i32);
+    }
+
+    /// C++ `drvAHxxx::exitHandler` is `setAcquire(0)` (drvAHxxx.cpp:805-810),
+    /// so the hook drvQuadEM arms at IOC exit sends the meter `ACQ OFF`.
+    #[test]
+    fn the_exit_handler_stops_the_meter() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let reply: &[u8] = if buf[..n].starts_with(b"VER") {
+                    b"AH401D 2.0\r\n"
+                } else {
+                    b"ACK\r\n"
+                };
+                if sock.write_all(reply).is_err() {
+                    break;
+                }
+            }
+        });
+        let (_io, _meter) = crate::octet::create_ip_port(
+            "QE_AH_EXIT_IP",
+            &addr.to_string(),
+            proto::AHXXX_TIMEOUT,
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_EXIT").unwrap(),
+            "QE_AH_EXIT_IP",
+            4,
+            0,
+            "AH401D",
+        )
+        .unwrap();
+        // reset() already stopped the meter once.
+        let _ = rx.try_iter().count();
+
+        rt.port_handle()
+            .with_driver_blocking(|d: &mut AhxxxDriver| d.exit_handler())
+            .unwrap();
+        let sent: String = rx.try_iter().collect();
+        assert!(sent.starts_with("ACQ OFF"), "{sent:?}");
     }
 
     /// C++ sets the input EOS only in setAcquire (drvAHxxx.cpp:465-472): a

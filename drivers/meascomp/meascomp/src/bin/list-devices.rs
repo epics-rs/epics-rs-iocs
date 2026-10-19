@@ -3,6 +3,11 @@
 //! Usage:
 //!   cargo run -p meascomp --bin list-devices
 
+#![expect(
+    clippy::disallowed_macros,
+    reason = "single-threaded device-listing CLI: no second writer to interleave with"
+)]
+
 fn main() {
     match meascomp::device::discover_devices() {
         Ok(devs) if devs.is_empty() => {

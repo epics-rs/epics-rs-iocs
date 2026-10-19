@@ -94,7 +94,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::error::{AsynError, AsynResult, OctetStep};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::scaler::MAX_SCALER_CHANNELS;
@@ -209,10 +209,10 @@ impl Scaler974Driver {
             .map_err(asyn_to_ca)
     }
 
-    /// C `eventThread` (`drvScaler974.cpp:217-254`). `response` and
-    /// `counts` are the thread's locals there, declared outside the loop:
-    /// a failed `SHOW_COUNTS` leaves both as the last poll left them, so
-    /// the record keeps its counts while the port is down.
+    /// C `eventThread` (`drvScaler974.cpp:217-254`). `counts` is the
+    /// thread's local there, declared outside the loop: a field the reply
+    /// does not convert keeps the last poll's value, so the record keeps its
+    /// counts while the port is down.
     fn poll_loop(
         handle: OctetLink,
         state: Arc<Mutex<PollState>>,
@@ -249,7 +249,9 @@ impl Scaler974Driver {
 }
 
 /// C `Scaler974::sendCommand` (`drvScaler974.cpp:103-127`): a `writeRead`
-/// into `reply`, which a failure leaves untouched; with `status_read`, a
+/// into `reply`, which holds what the read delivered whatever its status
+/// (the EOS layer NUL-terminates every read, asynInterposeEos.c:251), so
+/// `eventThread` parses a cut reply as C does; with `status_read`, a
 /// second `read` (the `SHOW_COUNTS` status line, never inspected) only
 /// after the `writeRead` succeeded. Either failure prints C's one error
 /// line.
@@ -264,8 +266,16 @@ fn send_command(
         .sync
         .write_read(OCTET_REASON, command.as_bytes(), reply_buf)
         .into_parts();
-    let result = status.and_then(|()| {
+    // A failed write skips the read and leaves `response` as it was
+    // (asynOctetSyncIO.c:254-257).
+    let read = match &status {
+        Err(e) => e.octet_step() == Some(OctetStep::Read),
+        Ok(()) => true,
+    };
+    if read {
         *reply = data;
+    }
+    let result = status.and_then(|()| {
         match status_read {
             // The status line is never inspected, only its status.
             Some(status_buf) => {
@@ -372,6 +382,151 @@ impl ScalerDriver for Scaler974Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::error::AsynStatus;
+    use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::create_port_runtime;
+    use epics_rs::asyn::user::AsynUser;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+    /// A meter whose every read is cut by a timeout after `12;34;`.
+    struct CutReply(PortDriverBase);
+
+    impl PortDriver for CutReply {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            buf[..6].copy_from_slice(b"12;34;");
+            OctetReadResult {
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }),
+                ..OctetReadResult::ok(6, EomReason::empty())
+            }
+        }
+    }
+
+    /// drvScaler974.cpp:232-235: `eventThread` ignores `sendCommand`'s status
+    /// and scans `response`, which holds the bytes the timed-out read
+    /// delivered.
+    #[test]
+    fn a_show_counts_reply_cut_by_a_timeout_is_still_scanned() {
+        let name = "SCALER974_CUT_REPLY";
+        let claim = claim_port(name).unwrap();
+        let (runtime, _actor) = create_port_runtime(
+            &claim,
+            CutReply(PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            )),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        let (link, status) = connect_octet(name, 0, Duration::from_millis(100));
+        status.unwrap();
+
+        let mut response = Vec::new();
+        let sent = send_command(
+            &link,
+            "SHOW_COUNTS",
+            &mut response,
+            SHOW_COUNTS_DATA_BUF,
+            Some(SHOW_COUNTS_STATUS_BUF),
+        );
+        assert_eq!(sent.unwrap_err().status(), AsynStatus::Timeout);
+        let mut counts = [7, 8, 9, 10];
+        scan_show_counts(&response, &mut counts);
+        assert_eq!(counts, [12, 34, 9, 10]);
+    }
+
+    /// A scaler that answers `12;34;` once, then fails every write.
+    struct DeadAfterOne(PortDriverBase, usize);
+
+    impl PortDriver for DeadAfterOne {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.1 += 1;
+            if self.1 > 1 {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "write failed".into(),
+                });
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            buf[..6].copy_from_slice(b"12;34;");
+            OctetReadResult::ok(6, EomReason::empty())
+        }
+    }
+
+    /// drvScaler974.cpp:232-235: a failed write leaves `response` as the
+    /// last poll left it.
+    #[test]
+    fn a_failed_write_leaves_the_last_response() {
+        let name = "SCALER974_DEAD_AFTER_ONE";
+        let claim = claim_port(name).unwrap();
+        let (runtime, _actor) = create_port_runtime(
+            &claim,
+            DeadAfterOne(
+                PortDriverBase::new(
+                    name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                0,
+            ),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        let (link, status) = connect_octet(name, 0, Duration::from_millis(100));
+        status.unwrap();
+
+        let mut response = Vec::new();
+        send_command(
+            &link,
+            "SHOW_COUNTS",
+            &mut response,
+            SHOW_COUNTS_DATA_BUF,
+            None,
+        )
+        .unwrap();
+        let sent = send_command(
+            &link,
+            "SHOW_COUNTS",
+            &mut response,
+            SHOW_COUNTS_DATA_BUF,
+            None,
+        );
+        assert_eq!(sent.unwrap_err().status(), AsynStatus::Error);
+        assert_eq!(response, b"12;34;");
+    }
 
     #[test]
     fn a_missing_octet_port_leaves_no_driver() {

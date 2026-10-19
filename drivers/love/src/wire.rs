@@ -5,11 +5,8 @@
 //! checksum itself (host->device frames also insert a literal `'L'` after
 //! STX; device->device replies do not).
 //!
-//! Unlike the delaygen drivers' `wire::atoi`/`atof` (plain, unbounded C
-//! `atoi`/`atof`), every numeric field here comes from a *fixed-width*
-//! `sscanf("%Nx"/"%Nd", ...)` in C — [`parse_hex`]/[`parse_dec`] mirror that
-//! by taking an already-width-sliced `&[u8]` (see [`field`]) rather than an
-//! unbounded string.
+//! Every numeric field comes from a `sscanf("%Nx"/"%Nd", ...)` in C at the
+//! field's offset — [`scan_hex`]/[`scan_dec`].
 
 /// C `calcChecksum`: sum of bytes mod 256 (C accumulates into `unsigned
 /// long` then truncates with `& 0xFF`; wrapping `u8` addition is the same
@@ -18,57 +15,44 @@ pub fn calc_checksum(data: &[u8]) -> u8 {
     data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b))
 }
 
-/// C `sscanf(s,"%Nx",&v)` restricted to an already width-sliced buffer:
-/// parse the leading run of hex digits, `0` if none.
-pub fn parse_hex(s: &[u8]) -> u32 {
-    let mut i = 0;
-    while i < s.len() && s[i].is_ascii_hexdigit() {
-        i += 1;
-    }
-    if i == 0 {
-        return 0;
-    }
-    u32::from_str_radix(std::str::from_utf8(&s[..i]).unwrap(), 16).unwrap_or(0)
+/// C locale `isspace`, which `sscanf` and `atol` skip.
+fn is_c_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
-/// C `sscanf(s,"%Nd",&v)` restricted to an already width-sliced buffer:
-/// parse an optionally-signed leading run of decimal digits, `0` if none.
-pub fn parse_dec(s: &[u8]) -> i32 {
-    let mut i = 0;
-    let neg = match s.first() {
-        Some(b'-') => {
-            i = 1;
-            true
-        }
-        Some(b'+') => {
-            i = 1;
-            false
-        }
-        _ => false,
+/// C `sscanf(&reply[start],"%<width>x"|"%<width>d",&v)` on a reply that ends,
+/// as C's buffer does, at its NUL. Leading whitespace does not count toward
+/// `width`, so the conversion can run on into the next field; a sign, and
+/// for hex a `0x` prefix, does. C leaves `v` unset when nothing converts;
+/// that reads as 0 here.
+fn scan(reply: &[u8], start: usize, width: usize, radix: u32) -> i64 {
+    let s = reply.get(start..).unwrap_or(&[]);
+    let s = &s[s.iter().take_while(|&&b| is_c_space(b)).count()..];
+    let s = &s[..s.len().min(width)];
+    let (neg, s) = match s {
+        [b'-', rest @ ..] => (true, rest),
+        [b'+', rest @ ..] => (false, rest),
+        _ => (false, s),
     };
-    let start = i;
-    while i < s.len() && s[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == start {
-        return 0;
-    }
-    let magnitude: i32 = std::str::from_utf8(&s[start..i])
-        .unwrap()
-        .parse()
-        .unwrap_or(0);
+    let s = match s {
+        [b'0', b'x' | b'X', rest @ ..] if radix == 16 => rest,
+        _ => s,
+    };
+    let magnitude = s
+        .iter()
+        .map_while(|&b| (b as char).to_digit(radix))
+        .fold(0i64, |acc, d| acc * i64::from(radix) + i64::from(d));
     if neg { -magnitude } else { magnitude }
 }
 
-/// Slice `payload[start..start+width]`, clamped to what's actually
-/// available (never panics on a short/malformed device reply) — the Rust
-/// equivalent of `sscanf`'s width cap combined with C's implicit
-/// null-terminator stop.
-pub fn field(payload: &[u8], start: usize, width: usize) -> &[u8] {
-    payload
-        .get(start..)
-        .map(|s| &s[..s.len().min(width)])
-        .unwrap_or(&[])
+/// C `sscanf(&reply[start],"%<width>x",&v)` into an `unsigned int`.
+pub fn scan_hex(reply: &[u8], start: usize, width: usize) -> u32 {
+    scan(reply, start, width, 16) as u32
+}
+
+/// C `sscanf(&reply[start],"%<width>d",&v)` into an `int`.
+pub fn scan_dec(reply: &[u8], start: usize, width: usize) -> i32 {
+    scan(reply, start, width, 10) as i32
 }
 
 /// C `static char* errCodes[]` (`drvLove.c:231-244`) — indexed by the
@@ -121,7 +105,8 @@ pub fn eval_message(raw: &[u8]) -> Result<&[u8], EvalError> {
         return Err(EvalError::TooShort);
     }
     if raw.len() == 7 {
-        let err_num = parse_dec(&raw[5..7]) as usize;
+        // C `atol(pinp + 5)`: the frame ends two bytes on.
+        let err_num = scan_dec(raw, 5, 2) as usize;
         let text = ERR_CODES
             .get(err_num)
             .copied()
@@ -132,7 +117,7 @@ pub fn eval_message(raw: &[u8]) -> Result<&[u8], EvalError> {
     let len = raw.len() - 3; // minus STX and the 2-byte checksum
     let cs_pos = raw.len() - 2;
     let cs_val = calc_checksum(&raw[1..1 + len]);
-    let cs_msg = parse_hex(&raw[cs_pos..cs_pos + 2]);
+    let cs_msg = scan_hex(raw, cs_pos, 2);
     if cs_msg != cs_val as u32 {
         return Err(EvalError::ChecksumMismatch);
     }
@@ -160,26 +145,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_hex_stops_at_first_non_hex_and_defaults_to_zero() {
-        assert_eq!(parse_hex(b"1A"), 0x1A);
-        assert_eq!(parse_hex(b"ZZ"), 0);
-        assert_eq!(parse_hex(b""), 0);
+    fn scan_stops_at_first_non_digit_and_defaults_to_zero() {
+        assert_eq!(scan_hex(b"1A", 0, 2), 0x1A);
+        assert_eq!(scan_hex(b"ZZ", 0, 2), 0);
+        assert_eq!(scan_hex(b"", 0, 2), 0);
+        assert_eq!(scan_dec(b"1234", 0, 4), 1234);
+        assert_eq!(scan_dec(b"-007", 0, 4), -7);
+        assert_eq!(scan_dec(b"+42", 0, 4), 42);
+        assert_eq!(scan_dec(b"xx", 0, 4), 0);
+        assert_eq!(scan_dec(b"0102", 10, 4), 0);
     }
 
     #[test]
-    fn parse_dec_handles_sign_and_junk() {
-        assert_eq!(parse_dec(b"1234"), 1234);
-        assert_eq!(parse_dec(b"-007"), -7);
-        assert_eq!(parse_dec(b"+42"), 42);
-        assert_eq!(parse_dec(b"xx"), 0);
+    fn scan_takes_width_after_whitespace_and_runs_past_the_field() {
+        assert_eq!(scan_dec(b"01020304", 2, 4), 203);
+        assert_eq!(scan_hex(b"  0101", 0, 4), 0x0101);
+        assert_eq!(scan_dec(b"\x0b\x0c7", 0, 1), 7);
+        assert_eq!(scan_dec(b"-123", 0, 2), -1);
     }
 
     #[test]
-    fn field_clamps_to_available_length_without_panicking() {
-        assert_eq!(field(b"0102", 0, 4), b"0102");
-        assert_eq!(field(b"01", 0, 4), b"01");
-        assert_eq!(field(b"0102", 2, 4), b"02");
-        assert_eq!(field(b"0102", 10, 4), b"");
+    fn scan_hex_takes_a_sign_and_a_0x_prefix_like_percent_x() {
+        assert_eq!(scan_hex(b"0x1F", 0, 4), 0x1F);
+        assert_eq!(scan_hex(b"0x1F", 0, 3), 0x1);
+        assert_eq!(scan_hex(b"-1", 0, 2), u32::MAX);
     }
 
     #[test]
@@ -221,6 +210,30 @@ mod tests {
         raw.extend_from_slice(format!("{cs:02X}").as_bytes());
 
         assert_eq!(eval_message(&raw), Ok(&b"0064"[..]));
+    }
+
+    #[test]
+    fn eval_message_accepts_the_space_padded_checksum_sscanf_reads() {
+        // C `sscanf(&pinp[csPos],"%2x")` skips the pad `sendCommand`'s own
+        // `%2X` writes for a checksum below 0x10.
+        let body = b"X01999980";
+        let cs = calc_checksum(body);
+        assert!(cs < 0x10);
+        let mut raw = vec![0x02u8];
+        raw.extend_from_slice(body);
+        raw.extend_from_slice(format!("{cs:2X}").as_bytes());
+
+        assert_eq!(eval_message(&raw), Ok(&b"999980"[..]));
+    }
+
+    #[test]
+    fn eval_message_error_code_skips_leading_whitespace_like_atol() {
+        assert_eq!(
+            eval_message(b"\x02XXXX 2"),
+            Err(EvalError::DeviceError(
+                "02 - Checksum error on received data from Host."
+            ))
+        );
     }
 
     #[test]

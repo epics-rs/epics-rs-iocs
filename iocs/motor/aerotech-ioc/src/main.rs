@@ -27,7 +27,7 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: aerotech-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: aerotech-ioc <st.cmd>");
         std::process::exit(1);
     };
 

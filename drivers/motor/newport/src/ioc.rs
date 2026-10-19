@@ -1027,7 +1027,7 @@ pub fn xps_aux_config_command() -> CommandDef {
                     }
                 });
             let Some(port) = registered else {
-                eprintln!("XPSAuxConfig ERROR: Can't register port");
+                epics_rs::base::stderr_println!("XPSAuxConfig ERROR: Can't register port");
                 return Ok(CommandOutcome::Continue);
             };
             if spawn_dedicated_thread(
@@ -1038,7 +1038,7 @@ pub fn xps_aux_config_command() -> CommandDef {
             )
             .is_err()
             {
-                eprintln!("XPSAuxConfig, epicsThreadCreate failed");
+                epics_rs::base::stderr_println!("XPSAuxConfig, epicsThreadCreate failed");
             }
             Ok(CommandOutcome::Continue)
         },
@@ -2001,7 +2001,6 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
             let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
             let controller = match Mm4000Controller::new(
                 handle,
-                &port_name,
                 &port_name,
                 num_axes as usize,
                 cache_ttl,
@@ -3290,6 +3289,7 @@ mod report {
                 _ => "",
             }
             .to_string()
+                + "\r"
         });
         let config = vec![int(1), ArgValue::String("esp300RepLine".into()), int(3)];
         run_command(esp300_config_command(), config).await;

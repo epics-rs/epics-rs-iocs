@@ -129,27 +129,7 @@ enum Locking {
 /// a failed one reported, then the callbacks for `addr`.
 pub(crate) fn apply_updates(base: &mut PortDriverBase, addr: i32, updates: &[ParamSetValue]) {
     for u in updates {
-        let outcome = match u {
-            ParamSetValue::Value {
-                reason,
-                addr,
-                value,
-            } => base.set_param_value(*reason, *addr, value.clone()),
-            ParamSetValue::UInt32Digital {
-                reason,
-                addr,
-                value,
-                mask,
-                interrupt_mask,
-            } => base.set_uint32_param(*reason, *addr, *value, *mask, *interrupt_mask),
-            ParamSetValue::Status {
-                reason,
-                addr,
-                status,
-                alarm_status,
-                alarm_severity,
-            } => base.set_param_status(*reason, *addr, *status, *alarm_status, *alarm_severity),
-        };
+        let outcome = base.set_param(u);
         if let Err(e) = outcome {
             adlog::print(
                 base,
@@ -1946,7 +1926,9 @@ async fn stream_run(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation) {
                         Some([connect, ..]) => {
                             ctx.trace(TraceMask::ERROR, &adlog::err(connect, &msg))
                         }
-                        None => eprintln!("ERROR | ADTimePix::prvHstConnect: {msg}"),
+                        None => epics_rs::base::stderr_println!(
+                            "ERROR | ADTimePix::prvHstConnect: {msg}"
+                        ),
                     }
                 }
                 disconnected(ctx, kind);
@@ -2011,7 +1993,9 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stre
                         Some([_, worker, _]) => {
                             ctx.trace(TraceMask::ERROR, &adlog::err(worker, &msg))
                         }
-                        None => eprintln!("ERROR | ADTimePix::prvHstWorkerThread: {msg}"),
+                        None => epics_rs::base::stderr_println!(
+                            "ERROR | ADTimePix::prvHstWorkerThread: {msg}"
+                        ),
                     }
                 }
                 println!("{} TCP connection closed by peer", kind.name());
@@ -2032,7 +2016,7 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stre
                         Some([_, worker, _]) => {
                             ctx.trace(TraceMask::IO_DRIVER, &adlog::log(worker, &msg))
                         }
-                        None => eprintln!("{msg}"),
+                        None => epics_rs::base::stderr_println!("{msg}"),
                     }
                 }
                 return;
@@ -2234,7 +2218,7 @@ fn framing_failed(ctx: &Ctx, kind: StreamKind, e: &FrameError) {
     let msg = format!("{} rejected TCP stream: {e}", kind.name());
     match kind.c_functions() {
         Some([_, worker, _]) => ctx.trace(TraceMask::ERROR, &adlog::err(worker, &msg)),
-        None => eprintln!("ERROR | ADTimePix::prvHstWorkerThread: {msg}"),
+        None => epics_rs::base::stderr_println!("ERROR | ADTimePix::prvHstWorkerThread: {msg}"),
     }
 }
 

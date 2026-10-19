@@ -272,7 +272,21 @@ async fn wait_for_frame(
         )
         .await;
 
-        match ctx.p2.read(FILE_READ_DELAY) {
+        // readPhotonII posts every read's line, a timeout's included
+        // (PhotonII.cpp:259-260).
+        let (line, status) = ctx.p2.read(FILE_READ_DELAY);
+        if let Some(line) = &line {
+            set_params(
+                ctx,
+                vec![ParamSetValue::new(
+                    ctx.ad_params.string_from_server,
+                    0,
+                    ParamValue::Octet(line.as_bytes().into()),
+                )],
+            )
+            .await;
+        }
+        match status.map(|()| line.unwrap_or_default()) {
             Ok(line) if protocol::is_file_written(&line) => {
                 return protocol::parse_file_written(&line)
                     .map(|s| s.to_string())
