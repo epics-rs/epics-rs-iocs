@@ -42,8 +42,7 @@
 //! defaults:
 //!
 //! - The auxiliary controller/axis parameters other than the P registers
-//!   (the `AXIS_STATUS`/`CONTROLLER_STATUS` records, the resets, the
-//!   direct-command passthrough, ...).
+//!   (the `AXIS_STATUS`/`CONTROLLER_STATUS` records, the resets, ...).
 //! - The `phytronIO` digital/analog I/O subsystem (`phytronIOctrl.cpp`).
 //! - The fake-HOMED-bit feature (Phytron registers 1001..1020, enabled by the
 //!   `fakeHomedEnable` option): disabled by default, so HOMED is reported from
@@ -182,10 +181,10 @@ fn clamp_acceleration(a: f64) -> f64 {
 }
 
 /// Wrap a command as `STX <addr> <cmd> [":" <CRC>] ETX` (CRC only on phyMOTION).
-fn build_frame(ctrl_type: CtrlType, address: u8, cmd: &str) -> Vec<u8> {
+fn build_frame(ctrl_type: CtrlType, address: u8, cmd: &[u8]) -> Vec<u8> {
     let mut inner: Vec<u8> = Vec::with_capacity(cmd.len() + 8);
     inner.push(hex_upper(address));
-    inner.extend_from_slice(cmd.as_bytes());
+    inner.extend_from_slice(cmd);
     if ctrl_type == CtrlType::Phymotion {
         inner.push(b':');
         let mut crc: u8 = 0;
@@ -244,13 +243,14 @@ fn parse_frame(raw: &[u8]) -> AsynResult<Vec<u8>> {
 /// C `sendPhytronCommand`'s reply check (phytronAxisMotor.cpp:1081-1126):
 /// with `ack_only` an ACK reply, stripped; without, an ACK or NAK reply,
 /// kept. Anything else is `phytronInvalidReturn` (6).
-fn reply_payload(raw: &[u8], ack_only: bool) -> Result<String, i32> {
-    let resp = parse_frame(raw).map_err(|_| 6)?;
+fn reply_bytes(raw: &[u8], ack_only: bool) -> Result<Vec<u8>, i32> {
+    let mut resp = parse_frame(raw).map_err(|_| 6)?;
     match (resp.first(), ack_only) {
-        (Some(&ACK), true) => Ok(String::from_utf8_lossy(&resp[1..]).into_owned()),
-        (Some(&ACK), false) | (Some(&NAK), false) => {
-            Ok(String::from_utf8_lossy(&resp).into_owned())
+        (Some(&ACK), true) => {
+            resp.remove(0);
+            Ok(resp)
         }
+        (Some(&ACK | &NAK), false) => Ok(resp),
         _ => Err(6),
     }
 }
@@ -419,6 +419,9 @@ struct Reasons {
     disable_motor: usize,
     brake_engage_time: usize,
     brake_release_time: usize,
+    direct_command: usize,
+    direct_reply: usize,
+    direct_status: usize,
 }
 
 impl PhytronParams {
@@ -562,7 +565,48 @@ impl ControllerParams for PhytronParams {
         r.disable_motor = base.create_param("AXIS_DISABLE_MOTOR", ParamType::Int32)?;
         r.brake_engage_time = base.create_param("AXIS_BRAKE_ENGAGE_TIME", ParamType::Float64)?;
         r.brake_release_time = base.create_param("AXIS_BRAKE_RELEASE_TIME", ParamType::Float64)?;
+        r.direct_command = base.create_param("DIRECT_COMMAND", ParamType::Octet)?;
+        r.direct_reply = base.create_param("DIRECT_REPLY", ParamType::Octet)?;
+        r.direct_status = base.create_param("DIRECT_STATUS", ParamType::Int32)?;
+        base.set_string_param(r.direct_reply, 0, "")?;
+        base.set_int32_param(r.direct_status, 0, 0)?;
         Ok(())
+    }
+
+    /// C `phytronController::writeOctet` (phytronAxisMotor.cpp:550-578):
+    /// DIRECT_COMMAND's bytes go to the controller as they are; the reply
+    /// lands in DIRECT_REPLY less its ACK or NAK, which DIRECT_STATUS names
+    /// (1, 2; 3 for neither, kept). C writes the base only on success.
+    fn write_octet(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        data: &[u8],
+    ) -> ParamWrite {
+        let r = &self.reasons;
+        if user.reason == r.direct_reply || user.reason == r.direct_status {
+            return ParamWrite::Handled(Err(phytron_err(
+                "phytronController::writeOctet: read-only parameter",
+            )));
+        }
+        if user.reason != r.direct_command {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        let sent = self
+            .controller()
+            .and_then(|ctrl| ctrl.send_bytes(data, false).map_err(phy_to_asyn));
+        let reply = match sent {
+            Ok(reply) => reply,
+            Err(e) => return ParamWrite::Handled(Err(e)),
+        };
+        let (status, text) = match reply.first() {
+            Some(&ACK) => (1, &reply[1..]),
+            Some(&NAK) => (2, &reply[1..]),
+            _ => (3, &reply[..]),
+        };
+        let _ = base.set_string_param(r.direct_reply, 0, text);
+        let _ = base.set_int32_param(r.direct_status, 0, status);
+        ParamWrite::PassToBase(Ok(()))
     }
 
     /// C `phytronController::writeInt32` (phytronAxisMotor.cpp:365-466),
@@ -1255,6 +1299,12 @@ impl PhytronController {
     /// an ACK (or a NAK when `ack_only` is false, when the reply keeps it),
     /// `phytronInvalidCommand` (7) past 994 bytes.
     fn send(&self, cmd: &str, ack_only: bool) -> Result<String, i32> {
+        let reply = self.send_bytes(cmd.as_bytes(), ack_only)?;
+        Ok(String::from_utf8_lossy(&reply).into_owned())
+    }
+
+    /// [`Self::send`] of the bytes a DIRECT_COMMAND write holds.
+    fn send_bytes(&self, cmd: &[u8], ack_only: bool) -> Result<Vec<u8>, i32> {
         if cmd.len() > 994 {
             return Err(7);
         }
@@ -1263,7 +1313,7 @@ impl PhytronController {
             .handle
             .write_read(0, &frame, READ_BUF)
             .map_err(|e| e.status() as i32)?;
-        reply_payload(&raw, ack_only)
+        reply_bytes(&raw, ack_only)
     }
 
     /// C `sendPhytronMultiCommand` (phytronAxisMotor.cpp:1151-1216):
@@ -2762,7 +2812,7 @@ mod tests {
     #[test]
     fn phymotion_frame_has_stx_etx_and_crc() {
         // "0" + "M1.2P20R" + ":" then XOR-CRC over those bytes, wrapped STX..ETX.
-        let frame = build_frame(CtrlType::Phymotion, 0, "M1.2P20R");
+        let frame = build_frame(CtrlType::Phymotion, 0, b"M1.2P20R");
         assert_eq!(frame[0], STX);
         assert_eq!(*frame.last().unwrap(), ETX);
         let inner = &frame[1..frame.len() - 1];
@@ -2779,12 +2829,12 @@ mod tests {
     #[test]
     fn mcc_frame_has_address_no_crc() {
         // Address F (15), no CRC on the MCC.
-        let frame = build_frame(CtrlType::Mcc, 15, "1P20R");
+        let frame = build_frame(CtrlType::Mcc, 15, b"1P20R");
         assert_eq!(frame, b"\x02F1P20R\x03");
     }
 
     #[test]
-    fn reply_payload_roundtrips_a_phymotion_frame() {
+    fn reply_bytes_roundtrips_a_phymotion_frame() {
         // A controller reply: STX ACK "12345" ':' CRC ETX. Reuse build_frame's
         // CRC by framing "\x0612345" as the inner payload.
         let mut payload = vec![ACK];
@@ -2804,37 +2854,37 @@ mod tests {
         resp.push(hex_upper(crc >> 4));
         resp.push(hex_upper(crc & 0x0F));
         resp.push(ETX);
-        assert_eq!(reply_payload(&resp, true).unwrap(), "12345");
+        assert_eq!(reply_bytes(&resp, true).unwrap(), b"12345");
     }
 
     #[test]
-    fn reply_payload_rejects_a_reply_without_etx() {
+    fn reply_bytes_rejects_a_reply_without_etx() {
         // A read that ended before ETX (an input EOS that consumed it, or a
         // short raw read): C returns phytronInvalidReturn, not "678".
         let mut resp = vec![STX, ACK];
         resp.extend_from_slice(b"678");
-        assert_eq!(reply_payload(&resp, true), Err(6));
+        assert_eq!(reply_bytes(&resp, true), Err(6));
     }
 
     #[test]
-    fn reply_payload_rejects_nak() {
+    fn reply_bytes_rejects_nak() {
         let resp = vec![STX, NAK, ETX];
-        assert!(reply_payload(&resp, true).is_err());
-        assert_eq!(reply_payload(&resp, false).unwrap(), "\x15");
+        assert!(reply_bytes(&resp, true).is_err());
+        assert_eq!(reply_bytes(&resp, false).unwrap(), [NAK]);
     }
 
     #[test]
-    fn reply_payload_rejects_crc_mismatch() {
+    fn reply_bytes_rejects_crc_mismatch() {
         // STX ACK "5" ':' "00" ETX — CRC "00" is wrong for the payload.
         let resp = vec![STX, ACK, b'5', b':', b'0', b'0', ETX];
-        assert!(reply_payload(&resp, true).is_err());
+        assert!(reply_bytes(&resp, true).is_err());
     }
 
     #[test]
-    fn reply_payload_xx_disables_crc_check() {
+    fn reply_bytes_xx_disables_crc_check() {
         // ":XX" marks the CRC as disabled; payload is accepted verbatim.
         let resp = vec![STX, ACK, b'9', b':', b'X', b'X', ETX];
-        assert_eq!(reply_payload(&resp, true).unwrap(), "9");
+        assert_eq!(reply_bytes(&resp, true).unwrap(), b"9");
     }
 
     #[test]
