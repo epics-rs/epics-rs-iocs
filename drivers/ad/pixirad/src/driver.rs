@@ -1107,6 +1107,29 @@ mod tests {
         assert!(second.timestamp.as_f64() > first.timestamp.as_f64());
     }
 
+    /// dataTask stores no array size, dimension or time-stamp param per
+    /// image; the constructor's values stand (pixirad.cpp:1051-1079).
+    #[test]
+    fn an_image_leaves_the_array_params_alone() {
+        let mut t = DataTask::start("PIXI_PARAMS", 1 << 20);
+        t.handle
+            .write_int32_blocking(t.ad.base.array_callbacks, 0, 1)
+            .unwrap();
+        t.send_frame();
+        t.arrays.blocking_recv().unwrap();
+        let int = |reason| t.handle.read_int32_blocking(reason, 0).unwrap();
+        assert_eq!(int(t.ad.base.array_size), 0);
+        assert_eq!(int(t.ad.base.n_dimensions), 0);
+        assert_eq!(int(t.ad.base.epics_ts_sec), 0);
+        assert_eq!(int(t.ad.base.epics_ts_nsec), 0);
+        assert_eq!(
+            t.handle
+                .read_float64_blocking(t.ad.base.timestamp_rbv, 0)
+                .unwrap(),
+            0.0
+        );
+    }
+
     /// C bumps NDArrayCounter only after the colour-0 alloc
     /// (pixirad.cpp:1033, :1055-1057).
     #[test]

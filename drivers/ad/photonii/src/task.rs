@@ -16,7 +16,6 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 
-use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDimension;
 use epics_rs::ad_core::ndarray_pool::DriverPool;
@@ -397,7 +396,6 @@ async fn publish_frame(
         .await
         .unwrap_or_else(|_| SystemTime::now())
         .into();
-    let data_type = data.data_type();
     // C dereferences a refused alloc unchecked (PhotonII.cpp:416); here the frame
     // is dropped after the pool's limit line.
     let Ok(mut array) = ctx.pool.alloc_with(
@@ -412,54 +410,8 @@ async fn publish_frame(
     // time, not the frame's; keep that, it is the exposure start.
     array.time_stamp = start_ts.as_f64();
 
-    set_params(
-        ctx,
-        vec![
-            ParamSetValue::new(
-                ctx.ad_params.base.timestamp_rbv,
-                0,
-                ParamValue::Float64(ts.as_f64()),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.epics_ts_sec,
-                0,
-                ParamValue::Int32(ts.sec as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.epics_ts_nsec,
-                0,
-                ParamValue::Int32(ts.nsec as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size_x,
-                0,
-                ParamValue::Int32(PII_SIZE_X as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size_y,
-                0,
-                ParamValue::Int32(PII_SIZE_Y as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size,
-                0,
-                ParamValue::Int32(raw::frame_bytes() as i32),
-            ),
-            ParamSetValue::new(ctx.ad_params.base.n_dimensions, 0, ParamValue::Int32(2)),
-            ParamSetValue::new(
-                ctx.ad_params.base.color_mode,
-                0,
-                ParamValue::Int32(NDColorMode::Mono as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.data_type,
-                0,
-                ParamValue::Int32(data_type as u8 as i32),
-            ),
-        ],
-    )
-    .await;
-
+    // C stores no array size, type or time-stamp param per frame; the
+    // constructor's values stand (PhotonII.cpp:398-440).
     ctx.output.publish(array).await;
     Ok(())
 }
@@ -664,5 +616,36 @@ mod tests {
         .unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(rx.recv().unwrap());
+    }
+
+    /// PhotonIITask stores no array size, dimension, colour, type or time
+    /// stamp param per frame (PhotonII.cpp:398-440).
+    #[test]
+    fn a_frame_leaves_the_array_params_alone() {
+        let (ctx, _listener) = silent_ctx("PII_FRAME_PARAMS");
+        let handle = ctx.handle.clone();
+        let base = ctx.ad_params.base;
+        let path = std::env::temp_dir().join(format!("pii-frame-{}.raw", std::process::id()));
+        std::fs::write(&path, vec![0u8; raw::frame_bytes()]).unwrap();
+        let file = path.to_string_lossy().into_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt::run_thread(move || async move {
+            let start = SystemTime::now() - Duration::from_secs(5);
+            let outcome =
+                publish_frame(&ctx, &setup(0.0), &file, start, EpicsTimestamp::now(), 1).await;
+            let _ = tx.send(outcome.is_ok());
+        })
+        .join()
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(rx.recv().unwrap());
+        let int = |reason| handle.read_int32_blocking(reason, 0).unwrap();
+        assert_eq!(int(base.n_dimensions), 0);
+        assert_eq!(int(base.epics_ts_sec), 0);
+        assert_eq!(int(base.epics_ts_nsec), 0);
+        assert_eq!(
+            handle.read_float64_blocking(base.timestamp_rbv, 0).unwrap(),
+            0.0
+        );
     }
 }

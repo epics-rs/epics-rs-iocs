@@ -282,7 +282,6 @@ async fn publish_frame(
         .unwrap_or_else(|_| std::time::SystemTime::now())
         .into();
     let dims: Vec<NDDimension> = header.dims().into_iter().map(NDDimension::new).collect();
-    let n_dims = dims.len();
     let mut attributes = epics_rs::ad_core::attributes::NDAttributeList::new();
     attributes.add(NDAttribute {
         name: "ColorMode".into(),
@@ -302,6 +301,8 @@ async fn publish_frame(
     array.time_stamp = now.as_f64();
     array.attributes = attributes;
 
+    // C stores DataType and the sizes per frame, and no other array param
+    // (PSL.cpp:555-577).
     set_params(
         ctx,
         vec![
@@ -321,34 +322,9 @@ async fn publish_frame(
                 ParamValue::Int32(array.data_size as i32),
             ),
             ParamSetValue::new(
-                ctx.ad_params.base.n_dimensions,
-                0,
-                ParamValue::Int32(n_dims as i32),
-            ),
-            ParamSetValue::new(
                 ctx.ad_params.base.data_type,
                 0,
                 ParamValue::Int32(header.data_type as u8 as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.color_mode,
-                0,
-                ParamValue::Int32(header.color_mode as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.timestamp_rbv,
-                0,
-                ParamValue::Float64(ts.as_f64()),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.epics_ts_sec,
-                0,
-                ParamValue::Int32(ts.sec as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.epics_ts_nsec,
-                0,
-                ParamValue::Int32(ts.nsec as i32),
             ),
         ],
     )
@@ -391,4 +367,71 @@ async fn finish(ctx: &AcquisitionContext, abort: Option<Abort>) {
 
 async fn set_params(ctx: &AcquisitionContext, values: Vec<ParamSetValue>) {
     let _ = ctx.handle.set_params_and_notify(0, values).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::create_psl_detector;
+    use epics_rs::ad_core::color::NDColorMode;
+    use epics_rs::ad_core::ndarray::NDDataType;
+    use epics_rs::ad_core::plugin::channel::{NDArrayOutput, ndarray_channel};
+    use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::registry::claim_port;
+    use std::sync::atomic::AtomicBool;
+
+    /// PSL::readImage stores DataType and the array sizes per frame and no
+    /// other array param (PSL.cpp:555-577, :603-618).
+    #[test]
+    fn a_frame_stores_only_the_array_params_c_stores() {
+        let server = || {
+            SyncIOHandle::connect_port("PSL_FRAME_IP", 0, Duration::ZERO, InterfaceType::Octet).0
+        };
+        let det = create_psl_detector(&claim_port("PSL_FRAME").unwrap(), server(), 0).unwrap();
+        let handle = det.port_handle().clone();
+        let base = det.ad_params.base;
+        let (sink, mut arrays) = ndarray_channel("PSL_FRAME_SINK", 4);
+        let mut output = NDArrayOutput::new();
+        output.add(sink);
+        let (_tx, commands) = rt::command_channel::<TaskCommand>(4);
+        let ctx = AcquisitionContext {
+            server: PslServer::new(server()),
+            handle: handle.clone(),
+            output: ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(output))),
+            pool: DriverPool::standalone(0),
+            ad_params: det.ad_params,
+            shared: Arc::new(SharedState {
+                stop_requested: AtomicBool::new(false),
+            }),
+            commands,
+        };
+        let header = ImageHeader {
+            data_type: NDDataType::UInt16,
+            color_mode: NDColorMode::Mono,
+            width: 2,
+            height: 1,
+            data_len: 4,
+            header_len: 0,
+        };
+        rt::run_thread(move || async move {
+            publish_frame(&ctx, &header, vec![1, 0, 2, 0], 1).await;
+        })
+        .join()
+        .unwrap();
+        arrays.blocking_recv().unwrap();
+        std::mem::forget(det);
+
+        let int = |reason| handle.read_int32_blocking(reason, 0).unwrap();
+        assert_eq!(int(base.array_size_x), 2);
+        assert_eq!(int(base.array_size_y), 1);
+        assert_eq!(int(base.array_size), 4);
+        assert_eq!(int(base.data_type), NDDataType::UInt16 as u8 as i32);
+        assert_eq!(int(base.n_dimensions), 0);
+        assert_eq!(int(base.epics_ts_sec), 0);
+        assert_eq!(int(base.epics_ts_nsec), 0);
+        assert_eq!(
+            handle.read_float64_blocking(base.timestamp_rbv, 0).unwrap(),
+            0.0
+        );
+    }
 }

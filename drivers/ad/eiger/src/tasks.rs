@@ -1610,41 +1610,13 @@ async fn deliver(
         }
     }
 
-    let n_elements: i64 = array.dims.iter().map(|d| d.size as i64).product();
-    let element_size = array.data.data_type().element_size() as i64;
-    let array_size = array
-        .codec
-        .as_ref()
-        .map(|c| c.compressed_size as i64)
-        .unwrap_or(n_elements * element_size)
-        .min(i64::from(i32::MAX)) as i32;
-    let codec_name = array
-        .codec
-        .as_ref()
-        .map(|c| c.name.as_str())
-        .unwrap_or("")
-        .to_string();
-
     counters.image += 1;
     counters.num_images += 1;
+    // C stores no array size, type, codec or time-stamp param per frame
+    // (eigerDetector.cpp:1553-1554, :1902-1903).
     s.apply(vec![
         ParamUpdate::Int32(s.ad.base.array_counter, counters.image),
         ParamUpdate::Int32(s.ad.num_images_counter, counters.num_images),
-        ParamUpdate::Float64(s.ad.base.timestamp_rbv, array.time_stamp),
-        ParamUpdate::Int32(s.ad.base.epics_ts_sec, array.timestamp.sec as i32),
-        ParamUpdate::Int32(s.ad.base.epics_ts_nsec, array.timestamp.nsec as i32),
-        ParamUpdate::Int32(s.ad.base.array_size, array_size),
-        ParamUpdate::Int32(s.ad.base.n_dimensions, array.dims.len() as i32),
-        ParamUpdate::Int32(s.ad.base.data_type, array.data.data_type() as u8 as i32),
-        ParamUpdate::Octet(s.ad.base.codec, codec_name),
-        ParamUpdate::Int32(
-            s.ad.base.compressed_size,
-            array
-                .codec
-                .as_ref()
-                .map(|c| c.compressed_size.min(i32::MAX as usize) as i32)
-                .unwrap_or(0),
-        ),
     ])
     .await;
 }
@@ -1970,6 +1942,67 @@ mod tests {
         }
         assert_eq!(ids, [0, 1]);
         assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
+        std::mem::forget(runtime);
+    }
+
+    /// C streamTask and the file reader store only NDArrayCounter and
+    /// ADNumImagesCounter per frame (eigerDetector.cpp:1536-1556, :1877-1904).
+    #[tokio::test]
+    async fn a_frame_leaves_the_array_params_alone() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let name = "EIGER_FRAME_PARAMS";
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: name.to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let det = crate::driver::EigerDriver::new(cfg, rest, signals.clone()).expect("driver");
+        let (p, ad, ops) = (det.p, det.ad.params, det.ops.clone());
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
+                .expect("runtime");
+        let outputs = Outputs::new();
+        let (tx, mut rx) = ndarray_channel("FRAME_PARAMS_SINK", 4);
+        outputs.main.lock().add(tx);
+        let s = shared(
+            ops,
+            runtime.port_handle().clone(),
+            p,
+            ad,
+            Model::Eiger1,
+            ApiVersion::V1_6_0,
+            "127.0.0.1".to_string(),
+            outputs,
+            DriverPool::standalone(0),
+            &signals,
+        );
+
+        let mut counters = Counters::read(&s).await;
+        publish(
+            &s,
+            image(NDDataBuffer::U16(vec![1, 2]), None),
+            true,
+            &mut counters,
+        )
+        .await
+        .unwrap();
+        rx.recv().await.expect("array");
+        assert_eq!(s.get_int(s.ad.base.array_counter).await, 1);
+        assert_eq!(s.get_int(s.ad.base.array_size).await, 0);
+        assert_eq!(s.get_int(s.ad.base.n_dimensions).await, 0);
+        assert_eq!(
+            s.get_int(s.ad.base.data_type).await,
+            NDDataType::UInt32 as u8 as i32
+        );
+        assert_eq!(s.get_int(s.ad.base.epics_ts_sec).await, 0);
+        assert_eq!(s.get_f64(s.ad.base.timestamp_rbv).await, 0.0);
         std::mem::forget(runtime);
     }
 

@@ -285,11 +285,6 @@ async fn data_loop(ctx: DataContext) {
                 0,
                 ParamValue::Int32(images_taken),
             ),
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size,
-                0,
-                ParamValue::Int32((array.data.len() * 2) as i32),
-            ),
         ];
         if images_taken >= num_images {
             updates.push(ParamSetValue::new(
@@ -314,7 +309,6 @@ async fn data_loop(ctx: DataContext) {
 }
 
 async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, unique_id: i32) {
-    let n_dims = array.dims.len();
     let ts = array.timestamp;
 
     let mut attributes = NDAttributeList::new();
@@ -339,35 +333,8 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
     array.time_stamp = ts.as_f64();
     array.attributes = attributes;
 
-    let _ = ctx
-        .handle
-        .set_params_and_notify(
-            0,
-            vec![
-                ParamSetValue::new(
-                    ctx.ad_params.base.n_dimensions,
-                    0,
-                    ParamValue::Int32(n_dims as i32),
-                ),
-                ParamSetValue::new(
-                    ctx.ad_params.base.timestamp_rbv,
-                    0,
-                    ParamValue::Float64(ts.as_f64()),
-                ),
-                ParamSetValue::new(
-                    ctx.ad_params.base.epics_ts_sec,
-                    0,
-                    ParamValue::Int32(epics_ts.sec as i32),
-                ),
-                ParamSetValue::new(
-                    ctx.ad_params.base.epics_ts_nsec,
-                    0,
-                    ParamValue::Int32(epics_ts.nsec as i32),
-                ),
-            ],
-        )
-        .await;
-
+    // C stores no array size, dimension or time-stamp param per image; the
+    // constructor's values stand (pixirad.cpp:1051-1079).
     ctx.output.publish(array).await;
 }
 
