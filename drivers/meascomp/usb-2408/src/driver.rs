@@ -755,29 +755,26 @@ impl PortDriver for MultiFunctionDriver {
                 "Setting analog out master",
             );
         } else if reason == self.params.analog_out_sync_write {
-            // Simultaneous write of all analog outputs
-            if value != 0 {
-                let dev = self.device.lock().unwrap();
-                let mut values = vec![0.0f64; MAX_ANALOG_OUT];
-                let mut ranges = vec![uldaq_sys::BIP10VOLTS; MAX_ANALOG_OUT];
-                for ch in 0..MAX_ANALOG_OUT {
-                    values[ch] = self.int(self.params.analog_out_value, ch as i32) as f64;
-                    ranges[ch] =
-                        map_range(&trace, self.int(self.params.analog_out_range, ch as i32));
-                }
-                // C `writeAnalogOutSync` does not print its status. Its
-                // AOUTARRAY_FF_SIMULTANEOUS (drvMultiFunction.cpp:2259) is a
-                // flag the 2408 refuses with ERR_BAD_FLAG (AoUsb24xx.cpp:18),
-                // so C's sync write never reaches the DACs. Not copied: the
-                // 2408 updates both DACs together without it.
-                status = trace::status_of(&dev.analog_out_array(
-                    0,
-                    (MAX_ANALOG_OUT - 1) as i32,
-                    &ranges,
-                    uldaq_sys::AOUTARRAY_FF_NOSCALEDATA,
-                    &mut values,
-                ));
+            // C writes the outputs on any value, "Done" (0) included.
+            let dev = self.device.lock().unwrap();
+            let mut values = vec![0.0f64; MAX_ANALOG_OUT];
+            let mut ranges = vec![uldaq_sys::BIP10VOLTS; MAX_ANALOG_OUT];
+            for ch in 0..MAX_ANALOG_OUT {
+                values[ch] = self.int(self.params.analog_out_value, ch as i32) as f64;
+                ranges[ch] = map_range(&trace, self.int(self.params.analog_out_range, ch as i32));
             }
+            // C `writeAnalogOutSync` does not print its status. Its
+            // AOUTARRAY_FF_SIMULTANEOUS (drvMultiFunction.cpp:2259) is a
+            // flag the 2408 refuses with ERR_BAD_FLAG (AoUsb24xx.cpp:18),
+            // so C's sync write never reaches the DACs. Not copied: the
+            // 2408 updates both DACs together without it.
+            status = trace::status_of(&dev.analog_out_array(
+                0,
+                (MAX_ANALOG_OUT - 1) as i32,
+                &ranges,
+                uldaq_sys::AOUTARRAY_FF_NOSCALEDATA,
+                &mut values,
+            ));
         } else if reason == self.params.analog_in_mode {
             // C's DIFFERENTIAL is the record's menu value 0 (:225, :1989).
             self.state.lock().unwrap().ai_input_mode = if value == 0 {
@@ -857,10 +854,10 @@ impl PortDriver for MultiFunctionDriver {
                 );
             }
         } else if reason == self.params.wave_dig_read_wf {
-            if value != 0 {
-                let st = self.state.lock().unwrap();
-                wave_arrays = wave_dig::waveform_updates(&self.params, &st.wave_dig, &trace);
-            }
+            // On any value: the ReadWF busy record writes 0 every second
+            // while a scan runs.
+            let st = self.state.lock().unwrap();
+            wave_arrays = wave_dig::waveform_updates(&self.params, &st.wave_dig, &trace);
         } else if reason == self.params.wave_gen_run {
             let device = self.device.clone();
             let dev = device.lock().unwrap();
@@ -1235,6 +1232,26 @@ mod tests {
         // A 2408 refuses AO_CFG_SYNC_MODE as the null handle does
         // (uldaq AoDevice::setCfg_SyncMode), so the record takes WRITE/INVALID.
         assert!(drv.write_int32(&mut user, 0).is_err());
+    }
+
+    #[test]
+    fn a_sync_write_of_done_still_writes_the_outputs() {
+        let mut drv =
+            MultiFunctionDriver::new("MFSYNCW", DaqDevice::unconnected(), 16, 16).unwrap();
+        let mut user = AsynUser::new(drv.params.analog_out_sync_write);
+        // Only a write that reaches ulAOutArray fails on the null handle.
+        assert!(drv.write_int32(&mut user, 0).is_err());
+    }
+
+    #[test]
+    fn a_read_request_of_zero_posts_the_waveforms() {
+        let mut drv =
+            MultiFunctionDriver::new("MFREADWF", DaqDevice::unconnected(), 16, 16).unwrap();
+        let abs_time_wf = drv.params.wave_dig_abs_time_wf;
+        assert!(!drv.base.params.is_param_defined(abs_time_wf, 0).unwrap());
+        let mut user = AsynUser::new(drv.params.wave_dig_read_wf);
+        drv.write_int32(&mut user, 0).unwrap();
+        assert!(drv.base.params.is_param_defined(abs_time_wf, 0).unwrap());
     }
 
     #[test]
