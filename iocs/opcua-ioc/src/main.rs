@@ -259,7 +259,13 @@ fn commands(
             let registry = registry.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let pattern = sval(args, 0).unwrap_or_else(|| "*".to_string());
-                print!("{}", ioc::show(&registry, &pattern, ival(args, 1) as i32));
+                let _ = ioc::show(
+                    &registry,
+                    &pattern,
+                    ival(args, 1) as i32,
+                    &mut std::io::stdout().lock(),
+                    &mut std::io::stderr().lock(),
+                );
                 Ok(CommandOutcome::Continue)
             }
         },

@@ -6,6 +6,7 @@
 //! framework's `CommandDef` is assembled; what each one does lives here, so it
 //! can be tested without an IOC.
 
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use epics_rs::base::runtime::log::errlog_vprintf;
@@ -14,7 +15,6 @@ use epics_rs::base::server::RecordFactory;
 use crate::client::ClientSecurity;
 use crate::defaults;
 use crate::link::split_escaped;
-use crate::queue::ConnectionStatus;
 use crate::record::OpcuaItemRecord;
 use crate::registry::Registry;
 use crate::session::{Control, SessionConfig, strtoul};
@@ -442,70 +442,33 @@ pub fn options_command(registry: &Registry, pattern: Option<&str>, options: &[&s
     }
 }
 
-/// `opcuaShow(pattern, verbosity)` (`iocshIntegration.cpp:379-410`): what every
-/// matching session and subscription is, and — from verbosity 1 — the items on
-/// it and the records bound to them.
-pub fn show(registry: &Registry, pattern: &str, level: i32) -> String {
+/// `opcuaShow(pattern, verbosity)` (`iocshIntegration.cpp:379-410`): every
+/// matching session, and every matching subscription of the others.
+pub fn show(
+    registry: &Registry,
+    pattern: &str,
+    level: i32,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> io::Result<()> {
     let pattern = if pattern.is_empty() { "*" } else { pattern };
-    let mut out = String::new();
     let mut sessions = registry.sessions();
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
 
     for session in sessions {
+        if glob_match(pattern, &session.name) {
+            session.show(level, out, err)?;
+            continue;
+        }
         let subscriptions = session.subscriptions.lock().clone();
-        let items = session.items.lock().clone();
-        let matched = glob_match(pattern, &session.name);
-        let matched_subscriptions: Vec<_> = subscriptions
+        for subscription in subscriptions
             .iter()
             .filter(|s| glob_match(pattern, &s.name))
-            .collect();
-        if !matched && matched_subscriptions.is_empty() {
-            continue;
-        }
-
-        if matched {
-            let config = session.config.lock().clone();
-            out.push_str(&format!(
-                "session {} ({}) {} items={} subscriptions={} status={}\n",
-                session.name,
-                config.url,
-                if config.autoconnect {
-                    "autoconnect"
-                } else {
-                    "manual"
-                },
-                items.len(),
-                subscriptions.len(),
-                status_of(*session.status.lock()),
-            ));
-        }
-        for subscription in matched_subscriptions {
-            out += &subscription.show(&session, level);
-        }
-        if level < 1 || !matched {
-            continue;
-        }
-        for item in &items {
-            let item = item.lock();
-            out.push_str(&format!(
-                "  item {} status={} records={}\n",
-                item.node_id,
-                status_of(item.state),
-                item.leaves.len(),
-            ));
-            if level < 2 {
-                continue;
-            }
-            for leaf in &item.leaves {
-                let leaf = leaf.lock();
-                out.push_str(&format!(
-                    "    record {} element='{}'\n",
-                    leaf.record, leaf.link.element,
-                ));
-            }
+        {
+            out.write_all(subscription.show(&session, level).as_bytes())?;
         }
     }
-    out
+    Ok(())
 }
 
 /// `opcuaShowSecurity` (`iocshIntegration.cpp:576-590`), as far as it is
@@ -547,15 +510,6 @@ pub fn show_security(
         ));
     }
     out
-}
-
-fn status_of(status: ConnectionStatus) -> &'static str {
-    match status {
-        ConnectionStatus::Down => "down",
-        ConnectionStatus::InitialRead => "initial read",
-        ConnectionStatus::InitialWrite => "initial write",
-        ConnectionStatus::Up => "up",
-    }
 }
 
 /// `epicsStrGlobMatch` — `*` matches any run of characters, `?` matches one.

@@ -29,7 +29,7 @@ use epics_rs::base::server::records::stringin::StringinRecord;
 use epics_rs::base::server::records::waveform::{ArrayKind, WaveformRecord};
 use epics_rs::base::types::{DbFieldType, EpicsValue};
 
-use opcua::client::{UaConnection, UaConnector};
+use opcua::client::{ConnectError, UaConnection, UaConnector};
 use opcua::device_support::OpcuaDevice;
 use opcua::item::Leaf;
 use opcua::queue::{ConnectionStatus, ProcessReason, Update};
@@ -49,8 +49,8 @@ impl UaConnector for NoConnector {
         &self,
         _config: &SessionConfig,
         _identity: &opcua::client::Identity,
-    ) -> Result<Arc<dyn UaConnection>, String> {
-        Err("no server".to_string())
+    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
+        Err(ConnectError::setup("no server"))
     }
 }
 

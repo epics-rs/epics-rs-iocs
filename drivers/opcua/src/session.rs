@@ -7,6 +7,7 @@
 //! items. Records never touch the connection.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -21,8 +22,8 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::client::{
-    CreatedSubscription, Identity, SecurityMode, ServerInfo, UaConnection, UaConnector,
-    security_policy_string,
+    ConnectError, CreatedSubscription, Identity, SecurityMode, ServerInfo, UaConnection,
+    UaConnector, security_policy_string,
 };
 use crate::defaults;
 use crate::item::{Item, stream_double};
@@ -355,12 +356,35 @@ impl SessionConfig {
     }
 }
 
-fn batch_size(server_limit: u32, session_limit: u32) -> usize {
-    let max = match (server_limit, session_limit) {
+/// The C batcher's limit (`SessionOpen62541.cpp:2461-2465`): the smaller of
+/// the two limits, or whichever is set.
+fn node_limit(server_limit: u32, session_limit: u32) -> u32 {
+    match (server_limit, session_limit) {
         (0, 0) => 0,
         (s, 0) | (0, s) => s,
         (a, b) => a.min(b),
+    }
+}
+
+/// `RequestQueueBatcher`'s parameters as `SessionOpen62541::show` prints them:
+/// the batch limit, then the hold-off after a batch of one and after a full
+/// batch [ms], in the C's arithmetic (`RequestQueueBatcher.h:197-227`).
+fn batcher_text(max: u32, min_hold_off: f64, max_hold_off: f64) -> String {
+    let fix = min_hold_off / 1e3;
+    let var = if max > 0 && max_hold_off != 0.0 {
+        (max_hold_off - min_hold_off) / (f64::from(max) * 1e3)
+    } else {
+        0.0
     };
+    format!(
+        "{max}/{}-{}ms",
+        (fix * 1e3) as u32,
+        ((fix + var * f64::from(max)) * 1e3) as u32
+    )
+}
+
+fn batch_size(server_limit: u32, session_limit: u32) -> usize {
+    let max = node_limit(server_limit, session_limit);
     let global = defaults::MAX_OPERATIONS_PER_SERVICE_CALL.load(Ordering::Relaxed);
     let global = u32::try_from(global.max(0)).unwrap_or(0);
     match (max, global) {
@@ -415,8 +439,67 @@ pub struct SessionHandle {
     /// when the C shows the requested interval (`SubscriptionOpen62541.cpp:48`).
     pub revised_publishing_intervals: Mutex<HashMap<String, f64>>,
     pub status: Mutex<ConnectionStatus>,
+    /// The client underneath, as the worker last left it.
+    pub client: Mutex<ClientState>,
     commands: mpsc::UnboundedSender<(Priority, Request)>,
     control: mpsc::UnboundedSender<Control>,
+}
+
+/// What `SessionOpen62541::show` reports of the open62541 client under the
+/// session (`SessionOpen62541.cpp:1232-1253`). Only the worker writes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientState {
+    /// `connectStatus`: what the last connect attempt, or the connection, ended
+    /// with.
+    pub connect_status: StatusCode,
+    pub link: Link,
+    /// `securityInfo`: the security the session last connected with.
+    pub security_mode: MessageSecurityMode,
+    pub security_policy_uri: String,
+    /// The server's limits and namespaces, as last read.
+    pub server: ServerInfo,
+    /// `nsIndexMap`: local namespace index to the server's, as last mapped.
+    pub namespace_indices: HashMap<u16, u16>,
+    /// `registeredItemsNo`.
+    pub registered: usize,
+}
+
+impl Default for ClientState {
+    fn default() -> Self {
+        Self {
+            connect_status: StatusCode::BadInvalidState,
+            link: Link::Closed,
+            security_mode: MessageSecurityMode::None,
+            security_policy_uri: String::new(),
+            server: ServerInfo::default(),
+            namespace_indices: HashMap::new(),
+            registered: 0,
+        }
+    }
+}
+
+/// open62541's session and secure channel states where the worker leaves
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Link {
+    /// Never connected, or disconnected on request.
+    Closed,
+    Activated,
+    /// The server went away: the channel was reset and the session survives
+    /// it (`closeSecureChannel`, open62541.c:45716-45739).
+    Lost,
+}
+
+impl Link {
+    /// (`sessionState`, `channelState`) as `SessionOpen62541.cpp:154-188`
+    /// names them.
+    fn names(self) -> (&'static str, &'static str) {
+        match self {
+            Link::Closed => ("Closed", "Closed"),
+            Link::Activated => ("Activated", "Open"),
+            Link::Lost => ("Created", "Fresh"),
+        }
+    }
 }
 
 /// Out-of-band commands from iocsh.
@@ -451,6 +534,85 @@ impl SessionHandle {
     pub fn add_namespace_mapping(&self, index: u16, uri: &str) {
         self.config.lock().add_namespace_mapping(index, uri);
     }
+
+    /// `SessionOpen62541::show` (`SessionOpen62541.cpp:1232-1292`), on the
+    /// streams the C uses.
+    pub fn show(&self, level: i32, out: &mut dyn Write, err: &mut dyn Write) -> io::Result<()> {
+        let config = self.config.lock().clone();
+        let client = self.client.lock().clone();
+        let items = self.items.lock().clone();
+        let mut subscriptions = self.subscriptions.lock().clone();
+        subscriptions.sort_by(|a, b| a.name.cmp(&b.name));
+        let (session_state, channel_state) = client.link.names();
+        let server = &client.server;
+        writeln!(
+            out,
+            "session={} url={} connect status={} sessionState={session_state} \
+             channelState={channel_state} sec-mode={:?}({}) sec-policy={}({}) debug={} \
+             batch r/w={}/{}({}/{}) autoconnect={} items={} registered={} subscriptions={} \
+             reader={} writer={}",
+            self.name,
+            config.url,
+            status_name(client.connect_status),
+            client.security_mode,
+            config.security_mode.as_str(),
+            security_policy_string(&client.security_policy_uri),
+            config
+                .security_policy
+                .as_deref()
+                .unwrap_or(SecurityPolicy::None.to_uri()),
+            config.debug,
+            server.max_nodes_per_read,
+            server.max_nodes_per_write,
+            config.read_nodes_max,
+            config.write_nodes_max,
+            if config.autoconnect { "y" } else { "n" },
+            items.len(),
+            client.registered,
+            subscriptions.len(),
+            batcher_text(
+                node_limit(server.max_nodes_per_read, config.read_nodes_max),
+                config.read_timeout_min,
+                config.read_timeout_max,
+            ),
+            batcher_text(
+                node_limit(server.max_nodes_per_write, config.write_nodes_max),
+                config.write_timeout_min,
+                config.write_timeout_max,
+            ),
+        )?;
+
+        if level >= 3 && !config.namespace_map.is_empty() {
+            writeln!(
+                out,
+                "Configured Namespace Mapping (local -> Namespace URI -> server)"
+            )?;
+            for (uri, local) in &config.namespace_map {
+                let server = client.namespace_indices.get(local).unwrap_or(local);
+                writeln!(out, " {local} -> {uri} -> {server}")?;
+            }
+        }
+        if level >= 1 {
+            for subscription in &subscriptions {
+                out.write_all(subscription.show(self, level - 1).as_bytes())?;
+            }
+        }
+        if level >= 2 && !items.is_empty() {
+            writeln!(err, "subscription=[none]")?;
+            for item in &items {
+                let item = item.lock();
+                if !item.is_monitored() {
+                    out.write_all(item.show(level - 1).as_bytes())?;
+                }
+            }
+        }
+        // Partial: the C lists the structures and enumerations of the
+        // server's type dictionaries here; this port reads no dictionaries.
+        if level >= 3 {
+            writeln!(out, "No custom data types")?;
+        }
+        Ok(())
+    }
 }
 
 /// Everything the worker owns.
@@ -460,7 +622,6 @@ pub struct SessionWorker {
     commands: mpsc::UnboundedReceiver<(Priority, Request)>,
     control: mpsc::UnboundedReceiver<Control>,
     connection: Option<Arc<dyn UaConnection>>,
-    server: ServerInfo,
     /// Read and write requests waiting for a service call, highest priority first.
     reads: [VecDeque<u32>; 3],
     writes: [VecDeque<u32>; 3],
@@ -480,6 +641,7 @@ pub fn create(
         subscriptions: Mutex::new(Vec::new()),
         revised_publishing_intervals: Mutex::new(HashMap::new()),
         status: Mutex::new(ConnectionStatus::Down),
+        client: Mutex::new(ClientState::default()),
         commands: commands_tx,
         control: control_tx,
     });
@@ -489,7 +651,6 @@ pub fn create(
         commands,
         control,
         connection: None,
-        server: ServerInfo::default(),
         reads: Default::default(),
         writes: Default::default(),
     };
@@ -518,6 +679,11 @@ impl SessionWorker {
                 let attempt = self.connect().await;
                 let was_manual = std::mem::take(&mut manual);
                 if let Err(e) = attempt {
+                    // A bad status leaves the C's session and channel states
+                    // as they were (`SessionOpen62541.cpp:2375-2382`).
+                    if let Some(status) = e.status {
+                        self.handle.client.lock().connect_status = status;
+                    }
                     if was_manual || self.debug() > 0 {
                         errlog_vprintf(format_args!("OPC UA session {}: {e}\n", self.handle.name));
                     }
@@ -594,19 +760,29 @@ impl SessionWorker {
     /// limits and namespaces, rebuild the node ids, register the nodes, create
     /// the subscriptions, read every item once, run the `bini=write` writes,
     /// then add the monitored items.
-    async fn connect(&mut self) -> Result<(), String> {
+    async fn connect(&mut self) -> Result<(), ConnectError> {
         let config = self.handle.config.lock().clone();
         let identity = config.setup_identity();
         let connection = self.connector.connect(&config, &identity).await?;
         if config.debug > 0 {
             eprintln!("Session {}: connect service succeeded", self.handle.name);
         }
-        if let Some(endpoint) = connection.endpoint() {
+        let endpoint = connection.endpoint();
+        {
+            let mut client = self.handle.client.lock();
+            client.connect_status = StatusCode::Good;
+            client.link = Link::Activated;
+            if let Some(endpoint) = &endpoint {
+                client.security_mode = endpoint.security_mode;
+                client.security_policy_uri = endpoint.security_policy_uri.to_string();
+            }
+        }
+        if let Some(endpoint) = endpoint {
             self.report_connected(&identity, &endpoint);
         }
         // C reads each capability on its own and keeps its default when the
         // read fails, with no print (`SessionOpen62541.cpp:2447-2484`).
-        self.server = connection.server_info().await.unwrap_or_default();
+        self.handle.client.lock().server = connection.server_info().await.unwrap_or_default();
         let type_tree = connection.type_tree().await.ok();
 
         self.rebuild_node_ids();
@@ -635,7 +811,7 @@ impl SessionWorker {
         // a write request queued for it by the item, which the record then pops
         // and answers by writing its own value back.
         let handles: Vec<u32> = (0..items.len() as u32).collect();
-        self.read_batch(&connection, &handles).await;
+        let _ = self.read_batch(&connection, &handles).await;
 
         for item in &items {
             item.lock().set_state(ConnectionStatus::Up);
@@ -663,7 +839,7 @@ impl SessionWorker {
 
                 control = self.control.recv() => match control {
                     Some(Control::Disconnect) => {
-                        self.disconnect(&connection, ProcessReason::ConnectionLoss).await;
+                        self.disconnect(&connection, End::Requested).await;
                         return ServeOutcome::DisconnectRequested;
                     }
                     Some(Control::Connect) => {
@@ -704,14 +880,14 @@ impl SessionWorker {
                             "OPC UA Session {}: server inactive\n",
                             self.handle.name
                         ));
-                        self.disconnect(&connection, ProcessReason::ConnectionLoss).await;
+                        self.disconnect(&connection, End::Lost(StatusCode::BadTimeout)).await;
                         return ServeOutcome::Disconnected;
                     }
                 }
 
                 _ = tokio::time::sleep_until(flush_at.into()), if self.has_pending() => {
-                    if !self.flush(&connection).await {
-                        self.disconnect(&connection, ProcessReason::ConnectionLoss).await;
+                    if let Err(status) = self.flush(&connection).await {
+                        self.disconnect(&connection, End::Lost(status)).await;
                         return ServeOutcome::Disconnected;
                     }
                 }
@@ -756,20 +932,18 @@ impl SessionWorker {
     /// `no_of_properties_read`). A server that states `MaxNodesPerRead = 100`
     /// therefore gets Reads of 200 nodes and answers `BadTooManyOperations`.
     fn read_limit(&self) -> usize {
-        (self.handle.config.lock().read_batch_size(&self.server) / NO_OF_PROPERTIES_READ).max(1)
+        let server = self.handle.client.lock().server.clone();
+        (self.handle.config.lock().read_batch_size(&server) / NO_OF_PROPERTIES_READ).max(1)
     }
 
     /// A write puts one node per item into the request.
     fn write_limit(&self) -> usize {
-        self.handle
-            .config
-            .lock()
-            .write_batch_size(&self.server)
-            .max(1)
+        let server = self.handle.client.lock().server.clone();
+        self.handle.config.lock().write_batch_size(&server).max(1)
     }
 
-    /// Send one batch, highest priority first. Returns false on a connection error.
-    async fn flush(&mut self, connection: &Arc<dyn UaConnection>) -> bool {
+    /// Send one batch, highest priority first. Fails with a connection error.
+    async fn flush(&mut self, connection: &Arc<dyn UaConnection>) -> Result<(), StatusCode> {
         let (read_limit, write_limit) = (self.read_limit(), self.write_limit());
         if let Some(handles) = take_batch(&mut self.writes, write_limit) {
             return self.write_batch(connection, &handles).await;
@@ -777,25 +951,31 @@ impl SessionWorker {
         if let Some(handles) = take_batch(&mut self.reads, read_limit) {
             return self.read_batch(connection, &handles).await;
         }
-        true
+        Ok(())
     }
 
     /// Read items, in as many service calls as the node limit needs. Every read
     /// goes through here, so no Read can exceed the limit.
-    async fn read_batch(&mut self, connection: &Arc<dyn UaConnection>, handles: &[u32]) -> bool {
+    async fn read_batch(
+        &mut self,
+        connection: &Arc<dyn UaConnection>,
+        handles: &[u32],
+    ) -> Result<(), StatusCode> {
         for chunk in handles.chunks(self.read_limit()) {
-            if !self.read_chunk(connection, chunk).await {
-                return false;
-            }
+            self.read_chunk(connection, chunk).await?;
         }
-        true
+        Ok(())
     }
 
     /// One Read. Each item takes two nodes in it: its DataType and its Value
     /// (`SessionOpen62541::processRequests(ReadRequest)`, `no_of_properties_read
     /// = 2`) — the data type is what tells an Int32 that is an enumeration from
     /// one that is not.
-    async fn read_chunk(&mut self, connection: &Arc<dyn UaConnection>, handles: &[u32]) -> bool {
+    async fn read_chunk(
+        &mut self,
+        connection: &Arc<dyn UaConnection>,
+        handles: &[u32],
+    ) -> Result<(), StatusCode> {
         let items = self.handle.items.lock().clone();
         let mut nodes = Vec::with_capacity(handles.len() * 2);
         for handle in handles {
@@ -815,7 +995,7 @@ impl SessionWorker {
             });
         }
         if nodes.is_empty() {
-            return true;
+            return Ok(());
         }
 
         let (id, result) = connection.read(&nodes).await;
@@ -868,7 +1048,7 @@ impl SessionWorker {
                     };
                     self.deliver_read(item, data_type, value.clone());
                 }
-                true
+                Ok(())
             }
             Err(status) => {
                 if is_connection_error(status) {
@@ -890,7 +1070,11 @@ impl SessionWorker {
                             .set_incoming_event(ProcessReason::ReadFailure, status);
                     }
                 }
-                !is_connection_error(status)
+                if is_connection_error(status) {
+                    Err(status)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -910,16 +1094,22 @@ impl SessionWorker {
     }
 
     /// Write items, in as many service calls as the node limit needs.
-    async fn write_batch(&mut self, connection: &Arc<dyn UaConnection>, handles: &[u32]) -> bool {
+    async fn write_batch(
+        &mut self,
+        connection: &Arc<dyn UaConnection>,
+        handles: &[u32],
+    ) -> Result<(), StatusCode> {
         for chunk in handles.chunks(self.write_limit()) {
-            if !self.write_chunk(connection, chunk).await {
-                return false;
-            }
+            self.write_chunk(connection, chunk).await?;
         }
-        true
+        Ok(())
     }
 
-    async fn write_chunk(&mut self, connection: &Arc<dyn UaConnection>, handles: &[u32]) -> bool {
+    async fn write_chunk(
+        &mut self,
+        connection: &Arc<dyn UaConnection>,
+        handles: &[u32],
+    ) -> Result<(), StatusCode> {
         let items = self.handle.items.lock().clone();
         let mut values = Vec::with_capacity(handles.len());
         let mut written = Vec::with_capacity(handles.len());
@@ -941,7 +1131,7 @@ impl SessionWorker {
             written.push(item.clone());
         }
         if values.is_empty() {
-            return true;
+            return Ok(());
         }
 
         let (id, result) = connection.write(&values).await;
@@ -978,7 +1168,7 @@ impl SessionWorker {
                     };
                     item.lock().set_incoming_event(reason, status);
                 }
-                true
+                Ok(())
             }
             Err(status) => {
                 if is_connection_error(status) {
@@ -998,7 +1188,11 @@ impl SessionWorker {
                     item.lock()
                         .set_incoming_event(ProcessReason::WriteFailure, status);
                 }
-                !is_connection_error(status)
+                if is_connection_error(status) {
+                    Err(status)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -1007,35 +1201,39 @@ impl SessionWorker {
     /// node id (`SessionOpen62541::updateNamespaceMap` / `rebuildNodeIds`).
     fn rebuild_node_ids(&self) {
         let map = self.handle.config.lock().namespace_map.clone();
-        let mut remap: HashMap<u16, u16> = HashMap::new();
+        let namespace_array = self.handle.client.lock().server.namespace_array.clone();
         // An unread namespace array is no mapping to report on, as in C.
-        let read = !self.server.namespace_array.is_empty();
+        let read = !namespace_array.is_empty();
         if read && self.debug() > 0 {
             println!(
                 "Session {}: (updateNamespaceMap) namespace array with {} elements read; \
                  updating index map with {} entries",
                 self.handle.name,
-                self.server.namespace_array.len(),
+                namespace_array.len(),
                 map.len()
             );
         }
-        for (uri, local) in map.iter().filter(|_| read) {
-            match self
-                .server
-                .namespace_array
-                .iter()
-                .position(|server_uri| server_uri == uri)
-            {
-                Some(index) => {
-                    remap.insert(*local, index as u16);
+        // Without a new array the last mapping stands, as C's `nsIndexMap` does.
+        if read && !map.is_empty() {
+            let mut remap = HashMap::new();
+            for (uri, local) in &map {
+                match namespace_array
+                    .iter()
+                    .position(|server_uri| server_uri == uri)
+                {
+                    Some(index) => {
+                        remap.insert(*local, index as u16);
+                    }
+                    None => errlog_vprintf(format_args!(
+                        "OPC UA session {}: locally mapped namespace '{uri}' not found on server\n",
+                        self.handle.name
+                    )),
                 }
-                None => errlog_vprintf(format_args!(
-                    "OPC UA session {}: locally mapped namespace '{uri}' not found on server\n",
-                    self.handle.name
-                )),
             }
+            self.handle.client.lock().namespace_indices = remap;
         }
 
+        let remap = self.handle.client.lock().namespace_indices.clone();
         for item in self.handle.items.lock().iter() {
             let mut item = item.lock();
             let configured = item.configured_node_id.clone();
@@ -1078,10 +1276,16 @@ impl SessionWorker {
                         registered.len()
                     );
                 }
+                let mut count = 0;
                 for ((i, _), id) in to_register.iter().zip(registered) {
                     items[*i].lock().registered_node_id = Some(id);
+                    count += 1;
                 }
+                self.handle.client.lock().registered = count;
             }
+            // Upstream C defect fixed at source: the C keeps the count it asked
+            // for as `registeredItemsNo` (`SessionOpen62541.cpp:822`), so
+            // `opcuaShow` reports registrations the server refused.
             Err(status) => errlog_vprintf(format_args!(
                 "OPC UA session {}: (registerNodes) registerNodes service failed with status {}\n",
                 self.handle.name,
@@ -1236,10 +1440,21 @@ impl SessionWorker {
         }
     }
 
-    async fn disconnect(&mut self, connection: &Arc<dyn UaConnection>, reason: ProcessReason) {
+    async fn disconnect(&mut self, connection: &Arc<dyn UaConnection>, end: End) {
         connection.disconnect().await;
         self.connection = None;
         *self.handle.status.lock() = ConnectionStatus::Down;
+        {
+            let mut client = self.handle.client.lock();
+            client.registered = 0;
+            match end {
+                End::Requested => client.link = Link::Closed,
+                End::Lost(status) => {
+                    client.link = Link::Lost;
+                    client.connect_status = status;
+                }
+            }
+        }
         // The ACTIVATED -> CREATED arm (`SessionOpen62541.cpp:2520-2523`), which
         // every way out of a session passes.
         errlog_vprintf(format_args!(
@@ -1255,10 +1470,20 @@ impl SessionWorker {
             queue.clear();
         }
         for item in self.handle.items.lock().iter() {
-            item.lock()
-                .set_incoming_event(reason, StatusCode::BadConnectionClosed);
+            item.lock().set_incoming_event(
+                ProcessReason::ConnectionLoss,
+                StatusCode::BadConnectionClosed,
+            );
         }
     }
+}
+
+/// How a connection ended.
+enum End {
+    /// `opcuaDisconnect`: open62541 closes the session and the channel.
+    Requested,
+    /// The server or the connection to it failed with this status.
+    Lost(StatusCode),
 }
 
 /// The items monitored on one connection, at their client handle less one:

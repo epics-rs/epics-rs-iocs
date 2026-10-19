@@ -14,7 +14,9 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
-use opcua::client::{CreatedSubscription, Notification, ServerInfo, UaConnection, UaConnector};
+use opcua::client::{
+    ConnectError, CreatedSubscription, Notification, ServerInfo, UaConnection, UaConnector,
+};
 use opcua::item::{Item, Leaf};
 use opcua::link::{InfoDefaults, LinkInfo, NodeIdentifier, RecordKind, parse_link};
 use opcua::queue::{ConnectionStatus, ProcessReason, Update};
@@ -86,12 +88,15 @@ impl UaConnector for MockConnector {
         &self,
         config: &SessionConfig,
         _identity: &opcua::client::Identity,
-    ) -> Result<Arc<dyn UaConnection>, String> {
+    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
         self.0.connects.lock().push(config.clone());
         let mut refuse = self.0.refuse_connects.lock();
         if *refuse > 0 {
             *refuse -= 1;
-            return Err("connect service failed with status BadNotConnected".into());
+            return Err(ConnectError {
+                status: Some(StatusCode::BadNotConnected),
+                message: "connect service failed with status BadNotConnected".into(),
+            });
         }
         Ok(self.0.clone())
     }
@@ -1204,6 +1209,62 @@ async fn a_requested_disconnect_prints_disconnected() {
             .filter(|l| *l == "OPC UA session sess: disconnected\n")
             .count(),
         1
+    );
+}
+
+/// The connection fields of the `opcuaShow` line, and `registered=`.
+fn shown_state(handle: &SessionHandle) -> String {
+    let mut out = Vec::new();
+    handle.show(0, &mut out, &mut Vec::new()).unwrap();
+    let line = String::from_utf8(out).unwrap();
+    let field = |key: &str| {
+        let start = line.find(key).expect(key) + key.len();
+        line[start..].split(' ').next().unwrap().to_string()
+    };
+    format!(
+        "{} {} {} registered={}",
+        field("connect status="),
+        field("sessionState="),
+        field("channelState="),
+        field("registered="),
+    )
+}
+
+/// The states the C oracle IOC shows (`SessionOpen62541::show`): unconnected,
+/// a refused connect, connected, disconnected on request, and lost.
+#[tokio::test]
+async fn the_shown_connection_state_follows_the_client() {
+    let mock = Mock::arc();
+    *mock.refuse_connects.lock() = 1;
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor register=y monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    assert_eq!(
+        shown_state(&handle),
+        "BadInvalidState Closed Closed registered=0"
+    );
+
+    handle.control(Control::Connect);
+    until(|| mock.connects.lock().len() == 1).await;
+    until(|| shown_state(&handle) == "BadNotConnected Closed Closed registered=0").await;
+
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    assert_eq!(shown_state(&handle), "Good Activated Open registered=1");
+
+    handle.control(Control::Disconnect);
+    until(|| !handle.is_connected()).await;
+    assert_eq!(shown_state(&handle), "Good Closed Closed registered=0");
+
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    mock.behave(|b| b.read_error = Some(StatusCode::BadConnectionClosed));
+    handle.request(Priority::Low, Request::Read { handle: 0 });
+    until(|| !handle.is_connected()).await;
+    assert_eq!(
+        shown_state(&handle),
+        "BadConnectionClosed Created Fresh registered=0"
     );
 }
 

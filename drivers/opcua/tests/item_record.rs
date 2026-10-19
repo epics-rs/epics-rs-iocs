@@ -26,7 +26,9 @@ use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::server::records::longout::LongoutRecord;
 use epics_rs::base::types::EpicsValue;
 
-use opcua::client::{CreatedSubscription, Notification, ServerInfo, UaConnection, UaConnector};
+use opcua::client::{
+    ConnectError, CreatedSubscription, Notification, ServerInfo, UaConnection, UaConnector,
+};
 use opcua::device_support::OpcuaDevice;
 use opcua::item::Leaf;
 use opcua::queue::{ConnectionStatus, ProcessReason, Update};
@@ -57,7 +59,7 @@ impl UaConnector for MockConnector {
         &self,
         _config: &SessionConfig,
         _identity: &opcua::client::Identity,
-    ) -> Result<Arc<dyn UaConnection>, String> {
+    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
         Ok(self.0.clone())
     }
 }
@@ -149,8 +151,8 @@ fn offline() -> Arc<Registry> {
             &self,
             _config: &SessionConfig,
             _identity: &opcua::client::Identity,
-        ) -> Result<Arc<dyn UaConnection>, String> {
-            Err("no server".to_string())
+        ) -> Result<Arc<dyn UaConnection>, ConnectError> {
+            Err(ConnectError::setup("no server"))
         }
     }
     let registry = Registry::new(Arc::new(Offline));

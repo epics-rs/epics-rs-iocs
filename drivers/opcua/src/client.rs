@@ -9,6 +9,7 @@
 //! (`devOpcuaSup/UaSdk/`, `devOpcuaSup/open62541/`) are replaced by one pure-Rust
 //! client. The open62541 backend is the behavioural reference.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,6 +103,38 @@ pub trait UaConnection: Send + Sync {
     }
 }
 
+/// A failed connect attempt: its console text, and the `connectStatus` the C's
+/// attempt leaves (`SessionOpen62541.cpp:577`, `:1049`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectError {
+    /// `None` when the attempt failed before any service call, which leaves
+    /// the status as it was.
+    pub status: Option<StatusCode>,
+    pub message: String,
+}
+
+impl ConnectError {
+    pub fn setup(message: impl Into<String>) -> Self {
+        Self {
+            status: None,
+            message: message.into(),
+        }
+    }
+
+    fn service(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status: Some(status),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Opens sessions. The driver holds one; a test holds a double.
 #[async_trait]
 pub trait UaConnector: Send + Sync {
@@ -109,7 +142,7 @@ pub trait UaConnector: Send + Sync {
         &self,
         config: &SessionConfig,
         identity: &Identity,
-    ) -> Result<Arc<dyn UaConnection>, String>;
+    ) -> Result<Arc<dyn UaConnection>, ConnectError>;
 }
 
 /// The `async-opcua` client.
@@ -182,7 +215,7 @@ impl UaConnector for AsyncOpcuaConnector {
         &self,
         config: &SessionConfig,
         identity: &Identity,
-    ) -> Result<Arc<dyn UaConnection>, String> {
+    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
         // The session's own options win over the client-wide ones; what neither
         // sets falls back to the `async-opcua` default PKI location.
         let client = self.security();
@@ -211,13 +244,13 @@ impl UaConnector for AsyncOpcuaConnector {
         }
 
         let mut client = builder.client().map_err(|errors| {
-            format!(
+            ConnectError::setup(format!(
                 "security discovery and setup failed with status {}",
                 errors.join(", ")
-            )
+            ))
         })?;
 
-        let identity = identity.token()?;
+        let identity = identity.token().map_err(ConnectError::setup)?;
         let token = match identity {
             IdentityToken::Anonymous => UserTokenType::Anonymous,
             IdentityToken::UserName(..) => UserTokenType::UserName,
@@ -232,23 +265,34 @@ impl UaConnector for AsyncOpcuaConnector {
                     "OPC UA session {}: fatal - only URLs of type 'opc.tcp' supported\n",
                     config.name
                 ));
-                return Err("security discovery and setup failed with status fatal".to_string());
+                return Err(ConnectError::setup(
+                    "security discovery and setup failed with status fatal",
+                ));
             }
             let endpoints = client
                 .get_server_endpoints_from_url(config.url.as_str())
                 .await
-                .map_err(|_| "security discovery and setup failed with status cantConnect")?;
-            Some(
-                config
-                    .select_endpoint(&endpoints)
-                    .ok_or("security discovery and setup failed with status noMatchingEndpoint")?,
-            )
+                .map_err(|e| {
+                    ConnectError::service(
+                        e.status(),
+                        "security discovery and setup failed with status cantConnect",
+                    )
+                })?;
+            Some(config.select_endpoint(&endpoints).ok_or_else(|| {
+                ConnectError::service(
+                    StatusCode::Good,
+                    "security discovery and setup failed with status noMatchingEndpoint",
+                )
+            })?)
         };
 
         // `UA_Client_connect` reads the endpoints again and picks the one to
         // connect to by itself, for `sec-mode=None` as for any other.
         let failed = |status: StatusCode| {
-            format!("connect service failed with status {}", status_name(status))
+            ConnectError::service(
+                status,
+                format!("connect service failed with status {}", status_name(status)),
+            )
         };
         let endpoints = client
             .get_server_endpoints_from_url(config.url.as_str())
@@ -270,10 +314,7 @@ impl UaConnector for AsyncOpcuaConnector {
             ended = &mut handle => Some(ended.unwrap_or(StatusCode::BadInternalError)),
         };
         if let Some(status) = ended {
-            return Err(format!(
-                "connect service failed with status {}",
-                status_name(status)
-            ));
+            return Err(failed(status));
         }
 
         Ok(Arc::new(AsyncOpcuaConnection {

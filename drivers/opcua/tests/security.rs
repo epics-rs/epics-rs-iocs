@@ -20,7 +20,7 @@ mod setup_security {
     use async_opcua::types::{
         EndpointDescription, MessageSecurityMode, StatusCode, UserTokenPolicy, UserTokenType,
     };
-    use opcua::client::{AsyncOpcuaConnector, Identity, UaConnector};
+    use opcua::client::{AsyncOpcuaConnector, ConnectError, Identity, UaConnector};
     use opcua::session::SessionConfig;
 
     const NONE: &str = "http://opcfoundation.org/UA/SecurityPolicy#None";
@@ -271,7 +271,7 @@ mod setup_security {
             .unwrap();
         let _ = std::fs::remove_dir_all(&pki);
         assert_eq!(
-            err,
+            err.message,
             "security discovery and setup failed with status cantConnect"
         );
     }
@@ -303,7 +303,10 @@ mod setup_security {
         errlog_flush();
         errlog_remove_listener(id);
         let _ = std::fs::remove_dir_all(&pki);
-        assert_eq!(err, "security discovery and setup failed with status fatal");
+        assert_eq!(
+            err,
+            ConnectError::setup("security discovery and setup failed with status fatal")
+        );
         assert_eq!(
             *lines.lock(),
             ["OPC UA session s: fatal - only URLs of type 'opc.tcp' supported\n"]
@@ -332,8 +335,10 @@ mod setup_security {
             .unwrap();
         let _ = std::fs::remove_dir_all(&pki);
         assert!(
-            err.starts_with("connect service failed with status Bad"),
+            err.message
+                .starts_with("connect service failed with status Bad"),
             "{err}"
         );
+        assert!(err.status.is_some_and(|s| s.is_bad()), "{err:?}");
     }
 }

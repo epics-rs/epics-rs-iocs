@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 
 use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
-use opcua::client::{Identity, UaConnection, UaConnector};
+use opcua::client::{ConnectError, Identity, UaConnection, UaConnector};
 use opcua::ioc;
 use opcua::link::{InfoDefaults, RecordKind, parse_link};
 use opcua::registry::Registry;
@@ -23,8 +23,8 @@ impl UaConnector for Offline {
         &self,
         _config: &SessionConfig,
         _identity: &Identity,
-    ) -> Result<Arc<dyn UaConnection>, String> {
-        Err("no server".to_string())
+    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
+        Err(ConnectError::setup("no server"))
     }
 }
 
@@ -426,14 +426,130 @@ fn a_subscription_shows_its_settings_and_its_monitored_items() {
 
     let line =
         "subscription=SUB1 session=S1 interval=250(250) prio=4 enable=?(Y) debug=0 items=1\n";
-    assert_eq!(ioc::show(&registry, "SUB1", 0), line);
+    assert_eq!(show(&registry, "SUB1", 0).0, line);
     assert_eq!(
-        ioc::show(&registry, "SUB1", 1),
+        show(&registry, "SUB1", 1).0,
         format!(
             "{line}item ns=0(2);s=Demo.Static.Scalar.Double record=R:AI state=down \
              status=BadServerNotConnected dataDirty=n context=SUB1@S1 sampling=0(-1) \
              deadband=0 qsize=0(1) cqsize=3 discard=old timestamp=server bini=read \
              output=n monitor=y registered=-(n)\n"
         )
+    );
+}
+
+/// `opcuaShow PATTERN LEVEL`'s stdout and stderr.
+fn show(registry: &Registry, pattern: &str, level: i32) -> (String, String) {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    ioc::show(registry, pattern, level, &mut out, &mut err).unwrap();
+    (
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+/// The C example of `opcuaShow` (opcua `exampleTop`, run unconnected): two
+/// sessions, a subscription, a namespace mapping and four records.
+fn show_example() -> Arc<Registry> {
+    let registry = registry();
+    ioc::session_command(
+        &registry,
+        Some("S1"),
+        Some("opc.tcp://localhost:4999"),
+        &["autoconnect=n"],
+    );
+    ioc::session_command(
+        &registry,
+        Some("S2"),
+        Some("opc.tcp://localhost:4998"),
+        &["autoconnect=n:nodes-max=7:read-nodes-max=3"],
+    );
+    ioc::subscription_command(&registry, Some("SUB1"), Some("S1"), 250.0, &["priority=4"]);
+    ioc::map_namespace_command(&registry, Some("S1"), 3, Some("urn:test:ns"));
+    // The C order: an `opcuaItem` record creates its item in init pass 0,
+    // before any device support's `add_record`.
+    bind(
+        &registry,
+        "R:ITEM",
+        "opcuaItem",
+        "SUB1 ns=2;s=Demo.Struct",
+        false,
+    );
+    bind(
+        &registry,
+        "R:AI",
+        "ai",
+        "SUB1 ns=2;s=Demo.Static.Scalar.Double",
+        false,
+    );
+    bind(&registry, "R:EL", "ai", "R:ITEM element=a", false);
+    bind(
+        &registry,
+        "R:LO",
+        "longout",
+        "S1 ns=3;i=1234 monitor=n",
+        true,
+    );
+    registry
+}
+
+const S1: &str = "session=S1 url=opc.tcp://localhost:4999 connect status=BadInvalidState \
+    sessionState=Closed channelState=Closed sec-mode=None(best) \
+    sec-policy=None(http://opcfoundation.org/UA/SecurityPolicy#None) debug=0 batch r/w=0/0(0/0) \
+    autoconnect=n items=3 registered=0 subscriptions=1 reader=0/0-0ms writer=0/0-0ms\n";
+const SUB1: &str =
+    "subscription=SUB1 session=S1 interval=250(250) prio=4 enable=?(Y) debug=0 items=2\n";
+const ITEM: &str = "item ns=0(2);s=Demo.Struct record=R:ITEM state=down \
+    status=BadServerNotConnected dataDirty=n context=SUB1@S1 sampling=0(-1) deadband=0 \
+    qsize=0(1) cqsize=3 discard=old timestamp=server bini=read output=n monitor=y \
+    registered=-(n) dataNodes=1 dataLeafs=1\n";
+const ITEM_TREE: &str = "  node=[ROOT] children=1 mapped=n\n    leaf=a record(ai)=R:EL type=Null \
+    timestamp=server bini=read monitor=y\n";
+const AI: &str = "item ns=0(2);s=Demo.Static.Scalar.Double record=R:AI state=down \
+    status=BadServerNotConnected dataDirty=n context=SUB1@S1 sampling=0(-1) deadband=0 \
+    qsize=0(1) cqsize=3 discard=old timestamp=server bini=read output=n monitor=y \
+    registered=-(n)\n";
+const AI_LEAF: &str =
+    "  leaf=[ROOT] record(ai)=R:AI type=Null timestamp=server bini=read monitor=y\n";
+const LO: &str = "item ns=0(3);i=1234 record=R:LO state=down status=BadServerNotConnected \
+    dataDirty=n context=@S1 sampling=0(-1) deadband=0 qsize=0(1) cqsize=3 discard=old \
+    timestamp=server bini=read output=y monitor=n registered=-(n)\n";
+const LO_LEAF: &str =
+    "  leaf=[ROOT] record(longout)=R:LO type=Null timestamp=server bini=read monitor=n\n";
+
+/// `SessionOpen62541::show` (`SessionOpen62541.cpp:1232-1292`): its line, the
+/// namespace mapping from level 3, the subscriptions from level 1, and from
+/// level 2 the unmonitored items under a `subscription=[none]` on stderr.
+#[test]
+fn a_session_shows_as_the_c_example_does() {
+    let registry = show_example();
+    assert_eq!(show(&registry, "S1", 0), (S1.to_string(), String::new()));
+    assert_eq!(
+        show(&registry, "S1", 1),
+        (format!("{S1}{SUB1}"), String::new())
+    );
+    let none = "subscription=[none]\n".to_string();
+    assert_eq!(
+        show(&registry, "S1", 2),
+        (format!("{S1}{SUB1}{ITEM}{AI}{LO}{LO_LEAF}"), none.clone())
+    );
+    assert_eq!(
+        show(&registry, "S1", 3),
+        (
+            format!(
+                "{S1}Configured Namespace Mapping (local -> Namespace URI -> server)\n \
+                 3 -> urn:test:ns -> 3\n{SUB1}{ITEM}{ITEM_TREE}{AI}{AI_LEAF}{LO}{LO_LEAF}\
+                 No custom data types\n"
+            ),
+            none
+        )
+    );
+    assert_eq!(
+        show(&registry, "S2", 0).0,
+        "session=S2 url=opc.tcp://localhost:4998 connect status=BadInvalidState \
+         sessionState=Closed channelState=Closed sec-mode=None(best) \
+         sec-policy=None(http://opcfoundation.org/UA/SecurityPolicy#None) debug=0 \
+         batch r/w=0/0(3/7) autoconnect=n items=0 registered=0 subscriptions=0 \
+         reader=3/0-0ms writer=7/0-0ms\n"
     );
 }
