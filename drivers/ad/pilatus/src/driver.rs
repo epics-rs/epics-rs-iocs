@@ -861,7 +861,7 @@ mod tests {
             self.sent.lock().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet_eom(
+        fn io_read_octet(
             &mut self,
             _user: &AsynUser,
             buf: &mut [u8],
