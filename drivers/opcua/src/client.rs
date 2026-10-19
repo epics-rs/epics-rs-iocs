@@ -88,7 +88,8 @@ pub trait UaConnection: Send + Sync {
         items: Vec<MonitoredItemCreateRequest>,
     ) -> Result<Vec<MonitoredItemCreateResult>, StatusCode>;
     async fn disconnect(&self);
-    /// The endpoint the session runs on, as the server described it.
+    /// The endpoint the session runs on, as [`SessionConfig::connect_endpoint`]
+    /// gave it.
     fn endpoint(&self) -> Option<EndpointDescription> {
         None
     }
@@ -216,8 +217,8 @@ impl UaConnector for AsyncOpcuaConnector {
             IdentityToken::X509(..) => UserTokenType::Certificate,
             IdentityToken::IssuedToken(..) => UserTokenType::IssuedToken,
         };
-        let (mode, policy) = if config.security_mode == SecurityMode::None {
-            (MessageSecurityMode::None, None)
+        let secured = if config.security_mode == SecurityMode::None {
+            None
         } else {
             if !config.url.starts_with("opc.tcp") {
                 errlog_vprintf(format_args!(
@@ -230,12 +231,10 @@ impl UaConnector for AsyncOpcuaConnector {
                 .get_server_endpoints_from_url(config.url.as_str())
                 .await
                 .map_err(|_| "security discovery and setup failed with status cantConnect")?;
-            let endpoint = config
-                .select_endpoint(&endpoints)
-                .ok_or("security discovery and setup failed with status noMatchingEndpoint")?;
-            (
-                endpoint.security_mode,
-                Some(endpoint.security_policy_uri.as_ref().to_string()),
+            Some(
+                config
+                    .select_endpoint(&endpoints)
+                    .ok_or("security discovery and setup failed with status noMatchingEndpoint")?,
             )
         };
 
@@ -249,7 +248,7 @@ impl UaConnector for AsyncOpcuaConnector {
             .await
             .map_err(|e| failed(e.status()))?;
         let endpoint = config
-            .connect_endpoint(&endpoints, mode, policy.as_deref(), token)
+            .connect_endpoint(&endpoints, secured.as_ref(), token)
             .map_err(failed)?;
         let (session, event_loop) = client
             .connect_to_endpoint_directly(endpoint, identity)

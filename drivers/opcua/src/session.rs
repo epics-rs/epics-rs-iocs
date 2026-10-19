@@ -291,17 +291,29 @@ impl SessionConfig {
 
     /// The endpoint `UA_Client_connect` settles on (`responseGetEndpoints`,
     /// open62541.c:45155-45330): the first binary-transport endpoint, in the
-    /// server's order, with `mode` and — when set — `policy`, that has a user
-    /// token policy for `token`. That token policy is the only one left on it,
-    /// so the client cannot pick another, and the session still connects to its
-    /// own URL. No such endpoint is BadInternalError, as in open62541.
+    /// server's order, with the mode and policy of `secured` — the
+    /// [`Self::select_endpoint`] pick — or, without security, mode None and any
+    /// policy, that has a user token policy for `token`. That token policy is
+    /// the only one left on it, so the client cannot pick another, and the
+    /// session still connects to its own URL. No such endpoint is
+    /// BadInternalError, as in open62541.
+    ///
+    /// Its security level is the one the session reports: the pick's, or 0
+    /// without security (`SessionOpen62541.cpp:1028`).
     pub fn connect_endpoint(
         &self,
         endpoints: &[EndpointDescription],
-        mode: MessageSecurityMode,
-        policy: Option<&str>,
+        secured: Option<&EndpointDescription>,
         token: UserTokenType,
     ) -> Result<EndpointDescription, StatusCode> {
+        let (mode, policy, security_level) = match secured {
+            Some(e) => (
+                e.security_mode,
+                Some(e.security_policy_uri.as_ref()),
+                e.security_level,
+            ),
+            None => (MessageSecurityMode::None, None, 0),
+        };
         const BINARY: &str = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary";
         let supported = |uri: &str| SecurityPolicy::from_uri(uri) != SecurityPolicy::Unknown;
         endpoints
@@ -323,6 +335,7 @@ impl SessionConfig {
                 Some(EndpointDescription {
                     endpoint_url: self.url.as_str().into(),
                     user_identity_tokens: Some(vec![chosen.clone()]),
+                    security_level,
                     ..e.clone()
                 })
             })

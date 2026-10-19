@@ -143,20 +143,29 @@ mod setup_security {
             binary,
             with_tokens(
                 endpoint("opc.tcp://srv:4840", MessageSecurityMode::None, NONE, 7),
-                vec![anonymous.clone()],
+                vec![token("later", UserTokenType::Anonymous, "")],
             ),
         ];
         let e = config
-            .connect_endpoint(
-                &offered,
-                MessageSecurityMode::None,
-                None,
-                UserTokenType::Anonymous,
-            )
+            .connect_endpoint(&offered, None, UserTokenType::Anonymous)
             .unwrap();
-        assert_eq!(e.security_level, 1);
         assert_eq!(e.endpoint_url.as_ref(), "opc.tcp://10.0.0.1:4840");
         assert_eq!(e.user_identity_tokens, Some(vec![anonymous]));
+    }
+
+    /// The level the session reports is `setupSecurity`'s: 0 without security
+    /// (`SessionOpen62541.cpp:1028`), whatever the server advertises.
+    #[test]
+    fn a_none_session_reports_security_level_zero() {
+        let config = SessionConfig::new("s", "opc.tcp://srv:4840");
+        let offered = [with_tokens(
+            endpoint("opc.tcp://srv:4840", MessageSecurityMode::None, NONE, 1),
+            vec![token("anon", UserTokenType::Anonymous, "")],
+        )];
+        let e = config
+            .connect_endpoint(&offered, None, UserTokenType::Anonymous)
+            .unwrap();
+        assert_eq!(e.security_level, 0);
     }
 
     /// A non-anonymous token policy whose own security policy the client lacks
@@ -182,8 +191,12 @@ mod setup_security {
         let e = config
             .connect_endpoint(
                 &offered,
-                MessageSecurityMode::SignAndEncrypt,
-                Some(SHA256),
+                Some(&endpoint(
+                    "opc.tcp://srv:4840",
+                    MessageSecurityMode::SignAndEncrypt,
+                    SHA256,
+                    6,
+                )),
                 UserTokenType::UserName,
             )
             .unwrap();
@@ -206,34 +219,38 @@ mod setup_security {
             ),
         ];
         assert_eq!(
-            config.connect_endpoint(
-                &offered,
-                MessageSecurityMode::None,
-                None,
-                UserTokenType::UserName
-            ),
+            config.connect_endpoint(&offered, None, UserTokenType::UserName),
             Err(StatusCode::BadInternalError)
         );
         assert_eq!(
             config.connect_endpoint(
                 &offered,
-                MessageSecurityMode::Sign,
-                Some(NONE),
+                Some(&endpoint(
+                    "opc.tcp://srv:4840",
+                    MessageSecurityMode::Sign,
+                    NONE,
+                    6
+                )),
                 UserTokenType::Anonymous
             ),
             Err(StatusCode::BadInternalError)
         );
+        // A secured session reports the level of `setupSecurity`'s pick.
         assert_eq!(
             config
                 .connect_endpoint(
                     &offered,
-                    MessageSecurityMode::Sign,
-                    Some(SHA256),
+                    Some(&endpoint(
+                        "opc.tcp://srv:4840",
+                        MessageSecurityMode::Sign,
+                        SHA256,
+                        6
+                    )),
                     UserTokenType::Anonymous
                 )
                 .unwrap()
                 .security_level,
-            3
+            6
         );
     }
 
