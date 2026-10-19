@@ -585,4 +585,42 @@ mod tests {
         assert_eq!(base.get_float64_param(p.threshold, 0).unwrap(), 10.0);
         assert_eq!(base.get_float64_param(p.energy, 0).unwrap(), 20.0);
     }
+
+    fn ok(_: &str) -> String {
+        "15 OK".into()
+    }
+
+    /// pilatusDetector.cpp:893-912: camserver before 7.9.0 has no
+    /// `ResetModulePower`; from 7.9.0 it gets `ResetModulePower <ResetPowerTime>`
+    /// and then setThreshold's commands.
+    #[test]
+    fn reset_module_power_needs_camserver_7_9() {
+        for (version, supported) in [
+            ((6, 10, 0), false),
+            ((7, 8, 9), false),
+            ((7, 9, 0), true),
+            ((8, 0, 0), true),
+        ] {
+            let name = format!("PILATUS_RMP_{}_{}_{}", version.0, version.1, version.2);
+            let (mut det, log) = rig(&name, ok);
+            det.version = version;
+            let reason = det.p.reset_power;
+            det.write_int32(&mut AsynUser::new(reason), 1).unwrap();
+            let cmds = commands(&log);
+            if supported {
+                assert_eq!(
+                    cmds.get(..2),
+                    Some(
+                        &[
+                            "ResetModulePower 1".to_string(),
+                            "SetThreshold energy 0 lowG 0".to_string()
+                        ][..]
+                    ),
+                    "{version:?}"
+                );
+            } else {
+                assert!(cmds.is_empty(), "{version:?}: {cmds:?}");
+            }
+        }
+    }
 }
