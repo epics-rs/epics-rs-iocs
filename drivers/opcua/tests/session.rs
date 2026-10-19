@@ -1166,6 +1166,37 @@ async fn a_lost_connection_prints_disconnected() {
     );
 }
 
+/// `opcuaDisconnect` takes the session from ACTIVATED to CREATED too, so C
+/// prints the same line (`SessionOpen62541.cpp:2520-2523`).
+#[tokio::test]
+async fn a_requested_disconnect_prints_disconnected() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+
+    handle.control(Control::Disconnect);
+    until(|| !handle.is_connected()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    assert_eq!(
+        lines
+            .lock()
+            .iter()
+            .filter(|l| *l == "OPC UA session sess: disconnected\n")
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn requests_queued_for_a_lost_connection_are_dropped() {
     let mock = Mock::arc();
