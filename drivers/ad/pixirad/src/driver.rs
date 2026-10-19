@@ -6,7 +6,7 @@
 //! reach the driver only through the actor.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -36,25 +36,11 @@ use crate::udp::Frame;
 
 /// State the port actor shares with the background threads.
 pub struct SharedState {
-    /// Frames the UDP listener has completed (C `PixiradUDPBuffersRead`).
-    pub udp_buffers_read: AtomicI32,
-    /// Frames handed to the data task and not yet taken.
+    /// Frames handed to the data task and not yet taken (C
+    /// `epicsMessageQueuePending`).
     pub queued_frames: AtomicI32,
     /// The size of the frame queue (C `maxDataPortBuffers`).
     pub max_buffers: i32,
-    /// The last measured data rate, in MB/s, as `f64::to_bits`.
-    pub udp_speed: AtomicU64,
-}
-
-impl SharedState {
-    pub fn set_speed(&self, mb_per_second: f64) {
-        self.udp_speed
-            .store(mb_per_second.to_bits(), Ordering::Relaxed);
-    }
-
-    pub fn speed(&self) -> f64 {
-        f64::from_bits(self.udp_speed.load(Ordering::Relaxed))
-    }
 }
 
 pub struct PixiradDetector {
@@ -260,6 +246,17 @@ impl PixiradDetector {
     /// then the dew point and cooling status when every input arrived, then on
     /// an error CoolingState off and `setCoolingAndHV` (its status ignored),
     /// and one `callParamCallbacks`, which posts in that order.
+    /// The UDP listener's pass after it queues a frame (C
+    /// `udpDataListenerTask`, pixirad.cpp:1234-1245).
+    pub(crate) fn post_udp_frame(&mut self, speed: f64) -> AsynResult<()> {
+        let read = self.get_i32(self.params.udp_buffers_read) + 1;
+        self.set_int32(self.params.udp_buffers_read, read)?;
+        let free = self.shared.max_buffers - self.shared.queued_frames.load(Ordering::Acquire);
+        self.set_int32(self.params.udp_buffers_free, free)?;
+        self.set_float64(self.params.udp_speed, speed)?;
+        self.ad.port_base.call_param_callbacks(0)
+    }
+
     pub(crate) fn post_status(
         &mut self,
         readings: &[(usize, f64)],
@@ -343,9 +340,7 @@ impl PixiradDetector {
     fn reset_frame_counters(&mut self) -> AsynResult<()> {
         self.set_int32(self.ad.params.num_images_counter, 0)?;
         self.set_int32(self.params.colors_collected, 0)?;
-        self.set_int32(self.params.udp_buffers_read, 0)?;
-        self.shared.udp_buffers_read.store(0, Ordering::Release);
-        Ok(())
+        self.set_int32(self.params.udp_buffers_read, 0)
     }
 
     /// `DAQ:! LOOP` (C `startAcquire`).
@@ -592,10 +587,8 @@ pub fn create_pixirad_detector(
     let port_name = claim.name();
     let max_buffers = max_data_port_buffers.max(1);
     let shared = Arc::new(SharedState {
-        udp_buffers_read: AtomicI32::new(0),
         queued_frames: AtomicI32::new(0),
         max_buffers: max_buffers as i32,
-        udp_speed: AtomicU64::new(0),
     });
 
     let det = PixiradDetector::new(
@@ -724,10 +717,8 @@ mod tests {
         let handle = runtime.port_handle().clone();
         std::mem::forget(runtime);
         let shared = Arc::new(SharedState {
-            udp_buffers_read: AtomicI32::new(0),
             queued_frames: AtomicI32::new(0),
             max_buffers: 1,
-            udp_speed: AtomicU64::new(0),
         });
         PixiradDetector::new(
             name,
@@ -748,10 +739,8 @@ mod tests {
             SyncIOHandle::connect_port("PIXI_NONE_IP", 0, Duration::ZERO, InterfaceType::Octet);
         assert!(status.is_err());
         let shared = Arc::new(SharedState {
-            udp_buffers_read: AtomicI32::new(0),
             queued_frames: AtomicI32::new(0),
             max_buffers: 1,
-            udp_speed: AtomicU64::new(0),
         });
         let mut det = PixiradDetector::new(
             "PIXI_NONE",
@@ -1005,6 +994,62 @@ mod tests {
                 st.ad.string_to_server,
             ]
         );
+    }
+
+    /// C udpDataListenerTask posts UDPBuffersRead, UDPBuffersFree and
+    /// UDPSpeed once it has queued a frame, whether or not dataTask has taken
+    /// it (pixirad.cpp:1234-1245).
+    #[test]
+    fn the_udp_listener_posts_each_queued_frame() {
+        let det = detector("PIXI_UDP", Some("NEVER"));
+        let (params, sensor, shared) = (det.params, det.sensor.unwrap(), det.shared.clone());
+        let (runtime, _) = create_port_runtime(
+            &claim_port("PIXI_UDP").unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // No dataTask: the frame stays queued.
+        let (frame_tx, _frame_rx) = std::sync::mpsc::sync_channel(1);
+        task::start_udp_listener(port, handle.clone(), sensor, frame_tx, shared);
+
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let read = || {
+            handle
+                .read_int32_blocking(params.udp_buffers_read, 0)
+                .unwrap()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // Until the listener is bound, a frame goes nowhere: send it again.
+        while read() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the listener posted no UDPBuffersRead"
+            );
+            for id in 0..sensor.num_udp_packets {
+                let mut packet = vec![0u8; MAX_UDP_PACKET_LEN];
+                packet[PACKET_ID_OFFSET..PACKET_ID_OFFSET + 2]
+                    .copy_from_slice(&((id % DAQ_PACKET_FRAGMENT) as u16).to_be_bytes());
+                sender.send_to(&packet, ("127.0.0.1", port)).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(read(), 1);
+        assert_eq!(
+            handle
+                .read_int32_blocking(params.udp_buffers_free, 0)
+                .unwrap(),
+            0
+        );
+        let speed = handle.read_float64_blocking(params.udp_speed, 0).unwrap();
+        assert!(speed > 0.0, "UDPSpeed {speed}");
     }
 
     #[test]

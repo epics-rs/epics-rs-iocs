@@ -24,7 +24,9 @@ use crate::decode::Decoder;
 use crate::driver::{PixiradDetector, SharedState};
 use crate::params::PixiradParams;
 use crate::protocol;
-use crate::types::{FrameType, MAX_UDP_DATA_BUFFER, MAX_UDP_PACKET_LEN, Sensor};
+use crate::types::{
+    FrameType, MAX_UDP_DATA_BUFFER, MAX_UDP_PACKET_LEN, PACKET_SENSOR_DATA_BYTES, Sensor,
+};
 use crate::udp::{self, Frame, FrameAssembler, strerror};
 
 /// The box sends the colours in the order thresh2, thresh1, thresh4, thresh3
@@ -81,25 +83,32 @@ pub(crate) fn start_udp_listener(
                         continue;
                     }
                 };
-                let started = *started_at.get_or_insert_with(Instant::now);
+                // C times a frame from its first full-length packet
+                // (pixirad.cpp:1174).
+                if n == MAX_UDP_PACKET_LEN {
+                    started_at.get_or_insert_with(Instant::now);
+                }
 
                 let Some(frame) = assembler.accept(&packet[..n]) else {
                     continue;
                 };
 
-                let seconds = started.elapsed().as_secs_f64();
-                if seconds > 0.0 {
-                    let bytes = frame.payload.len() as f64;
-                    shared.set_speed(bytes / (seconds * 1024.0 * 1024.0));
-                }
-                started_at = None;
+                let seconds = started_at
+                    .take()
+                    .expect("only a full-length packet completes a frame")
+                    .elapsed()
+                    .as_secs_f64();
+                // C counts whole packets (pixirad.cpp:1207).
+                let packets = frame.payload.len() / PACKET_SENSOR_DATA_BYTES;
+                let speed = (packets * MAX_UDP_PACKET_LEN) as f64 / (seconds * 1024.0 * 1024.0);
 
-                shared.udp_buffers_read.fetch_add(1, Ordering::AcqRel);
                 shared.queued_frames.fetch_add(1, Ordering::AcqRel);
                 if frames.send(frame).is_err() {
                     // The data task is gone; so is the point of reading.
                     return;
                 }
+                let _ = handle
+                    .with_driver_blocking(move |d: &mut PixiradDetector| d.post_udp_frame(speed));
             }
         })
         .expect("failed to spawn the Pixirad UDP thread")
@@ -225,23 +234,14 @@ async fn data_loop(ctx: DataContext) {
         }
         colors_collected += 1;
 
+        // dataTask's own UDP param is UDPBuffersFree (pixirad.cpp:1012-1013).
         let udp_updates = vec![
-            ParamSetValue::new(
-                ctx.params.udp_buffers_read,
-                0,
-                ParamValue::Int32(ctx.shared.udp_buffers_read.load(Ordering::Acquire)),
-            ),
             ParamSetValue::new(
                 ctx.params.udp_buffers_free,
                 0,
                 ParamValue::Int32(
                     ctx.shared.max_buffers - ctx.shared.queued_frames.load(Ordering::Acquire),
                 ),
-            ),
-            ParamSetValue::new(
-                ctx.params.udp_speed,
-                0,
-                ParamValue::Float64(ctx.shared.speed()),
             ),
             ParamSetValue::new(
                 ctx.params.colors_collected,
