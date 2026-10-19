@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -78,16 +78,26 @@ pub struct Exchange {
     pub result: ServerResult<()>,
 }
 
+struct Channel {
+    handle: SyncIOHandle,
+    /// C `fromServer_`: the buffer the reply is read into, shared by every
+    /// command.
+    from_server: String,
+}
+
 /// The Pixirad command socket.
 #[derive(Clone)]
 pub struct PixiradServer {
-    handle: Arc<Mutex<SyncIOHandle>>,
+    channel: Arc<Mutex<Channel>>,
 }
 
 impl PixiradServer {
     pub fn new(handle: SyncIOHandle) -> Self {
         Self {
-            handle: Arc::new(Mutex::new(handle)),
+            channel: Arc::new(Mutex::new(Channel {
+                handle,
+                from_server: String::new(),
+            })),
         }
     }
 
@@ -100,7 +110,11 @@ impl PixiradServer {
             buf_size: MAX_MESSAGE_SIZE,
             flush: true,
         };
-        let handle = self.handle.lock();
+        let mut channel = self.channel.lock();
+        let Channel {
+            handle,
+            from_server,
+        } = &mut *channel;
         let outcome = handle
             .port()
             .and_then(|port| port.submit_blocking(op, user));
@@ -125,14 +139,24 @@ impl PixiradServer {
                     SERVER_TIMEOUT.as_secs_f64(),
                     status as i32
                 ));
+                // asynOctetSyncIO writeRead leaves the buffer alone unless it
+                // got as far as the read, which (EOS interpose) stores what
+                // arrived and terminates it (asynInterposeEos.c:250).
+                if e.octet_step() == Some(OctetStep::Read) {
+                    let partial = e.partial_read().map(|p| p.data.as_slice());
+                    *from_server = String::from_utf8_lossy(partial.unwrap_or_default())
+                        .trim_end()
+                        .to_string();
+                }
                 Exchange {
-                    reply: String::new(),
+                    reply: from_server.clone(),
                     result: Err(e.into()),
                 }
             }
             Ok(result) => {
                 let bytes = result.data.unwrap_or_default();
                 let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                from_server.clone_from(&reply);
                 let result = if crate::protocol::reply_is_ok(command, &reply) {
                     Ok(())
                 } else {
@@ -152,14 +176,16 @@ impl PixiradServer {
     pub fn reconnect_after(&self, delay: Duration) {
         let user = || AsynUser::new(0).with_addr(0).with_timeout(SERVER_TIMEOUT);
         {
-            let handle = self.handle.lock();
-            let _ = handle
+            let channel = self.channel.lock();
+            let _ = channel
+                .handle
                 .port()
                 .and_then(|port| port.submit_blocking(RequestOp::Disconnect, user()));
         }
         std::thread::sleep(delay);
-        let handle = self.handle.lock();
-        let _ = handle
+        let channel = self.channel.lock();
+        let _ = channel
+            .handle
             .port()
             .and_then(|port| port.submit_blocking(RequestOp::Connect, user()));
     }
@@ -194,5 +220,94 @@ mod is_timeout_tests {
             message: "boom".into(),
         };
         assert!(matches!(ServerError::from(e), ServerError::Transport(_)));
+    }
+}
+
+#[cfg(test)]
+mod from_server_tests {
+    use super::*;
+    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+    use epics_rs::asyn::port::InterfaceMask;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::create_port_runtime;
+
+    /// Exchange 1 answers, 2 fails its write, 3 times out after part of a
+    /// reply, 4 times out with nothing.
+    struct Scripted {
+        base: PortDriverBase,
+        exchange: usize,
+    }
+
+    fn timeout() -> AsynError {
+        AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }
+    }
+
+    impl PortDriver for Scripted {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.exchange += 1;
+            if self.exchange == 2 {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "write failed".into(),
+                });
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, EomReason)> {
+            match self.exchange {
+                1 => {
+                    buf[..7].copy_from_slice(b"GOT: OK");
+                    Ok((7, EomReason::EOS))
+                }
+                3 => Err(timeout().with_partial_read(PartialOctetRead {
+                    data: b"GO".to_vec(),
+                    eom_reason: EomReason::empty(),
+                })),
+                _ => Err(timeout()),
+            }
+        }
+    }
+
+    /// C `writeReadServer` publishes `fromServer_` whatever the status, and
+    /// asynOctetSyncIO writes it only once the read starts.
+    #[test]
+    fn a_failed_exchange_replies_with_what_c_left_in_from_server() {
+        let name = "PIXI_FROM_SERVER";
+        let driver = Scripted {
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
+            exchange: 0,
+        };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let server = PixiradServer::new(SyncIOHandle::from_handle(
+            runtime.port_handle().clone(),
+            0,
+            Duration::ZERO,
+        ));
+        let replies: Vec<String> = (0..4).map(|_| server.command("DAQ:! X").reply).collect();
+        assert_eq!(replies, ["GOT: OK", "GOT: OK", "GO", ""]);
     }
 }
