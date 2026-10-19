@@ -988,9 +988,7 @@ mod tests {
     /// returns ADAcquire, SoftwareTrigger and NDArrayCounter after it.
     fn last_software_triggered_frame(name: &str, max_memory: usize) -> (i32, i32, i32) {
         let mut det = detector_sized(name, max_memory);
-        let (ad_params, params, init_param) = (det.ad.params, det.params, det.init_param);
-        let pool = det.ad.pool.clone();
-        let shared = det.shared.clone();
+        let (ad_params, params) = (det.ad.params, det.params);
         let base = &mut det.ad.port_base;
         base.set_int32_param(ad_params.acquire, 0, 1).unwrap();
         base.set_int32_param(
@@ -1000,17 +998,34 @@ mod tests {
         )
         .unwrap();
         base.set_int32_param(params.software_trigger, 0, 1).unwrap();
-        shared.images_remaining.store(1, Ordering::Release);
+        det.shared.images_remaining.store(1, Ordering::Release);
+        let handle = run_quad_frame(name, det, NDArrayOutput::new());
+        let acquire = handle.read_int32_blocking(ad_params.acquire, 0).unwrap();
+        let trigger = handle
+            .read_int32_blocking(params.software_trigger, 0)
+            .unwrap();
+        let counter = handle
+            .read_int32_blocking(ad_params.base.array_counter, 0)
+            .unwrap();
+        (acquire, trigger, counter)
+    }
+
+    /// One 256x256 quad data frame through handle_frame, on `det`'s port.
+    fn run_quad_frame(name: &str, det: MerlinDetector, output: NDArrayOutput) -> PortHandle {
+        let (ad_params, params, init_param) = (det.ad.params, det.params, det.init_param);
+        let pool = det.ad.pool.clone();
+        let shared = det.shared.clone();
         let (runtime, _) =
             create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
         let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
         let ctx = AcquisitionContext {
             data: MpxConnection::new(
                 SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO),
                 MPX_MAXLINE,
             ),
             handle: handle.clone(),
-            output: ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()))),
+            output: ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(output))),
             pool,
             ad_params,
             params,
@@ -1026,15 +1041,52 @@ mod tests {
         })
         .join()
         .unwrap();
-        let acquire = handle.read_int32_blocking(ad_params.acquire, 0).unwrap();
-        let trigger = handle
-            .read_int32_blocking(params.software_trigger, 0)
-            .unwrap();
-        let counter = handle
-            .read_int32_blocking(ad_params.base.array_counter, 0)
-            .unwrap();
-        std::mem::forget(runtime);
-        (acquire, trigger, counter)
+        handle
+    }
+
+    /// merlinTask stamps timeStamp and never calls updateTimeStamp
+    /// (merlinDetector.cpp:255-258): epicsTS is the zero NDArray starts with.
+    #[test]
+    fn a_frame_carries_no_epics_timestamp() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::ad_core::timestamp::EpicsTimestamp;
+        let (sender, mut receiver) = ndarray_channel("MERLIN_FRAME_TS_SINK", 4);
+        let mut output = NDArrayOutput::new();
+        output.add(sender);
+        // 1 MiB of the limit is the flat-field buffer.
+        let det = detector_sized("MERLIN_FRAME_TS", 2 << 20);
+        run_quad_frame("MERLIN_FRAME_TS", det, output);
+        let array = receiver.blocking_recv().expect("the frame's array");
+        assert!(array.time_stamp > 0.0);
+        assert_eq!(array.timestamp, EpicsTimestamp::default());
+    }
+
+    /// merlinDetector.cpp sets the array size and type params only in the
+    /// constructor (:1494-1497) and never the time-stamp ones: a frame
+    /// leaves them all as they were.
+    #[test]
+    fn a_frame_leaves_the_array_params_alone() {
+        // 1 MiB of the limit is the flat-field buffer.
+        let det = detector_sized("MERLIN_FRAME_PARAMS", 2 << 20);
+        let p = det.ad.params.base;
+        let handle = run_quad_frame("MERLIN_FRAME_PARAMS", det, NDArrayOutput::new());
+        let int = |reason| handle.read_int32_blocking(reason, 0).unwrap();
+        assert_eq!(
+            [
+                int(p.array_size_x),
+                int(p.array_size_y),
+                int(p.array_size),
+                int(p.n_dimensions),
+                int(p.data_type),
+                int(p.epics_ts_sec),
+                int(p.epics_ts_nsec),
+            ],
+            [512, 512, 0, 0, NDDataType::UInt32 as u8 as i32, 0, 0]
+        );
+        assert_eq!(
+            handle.read_float64_blocking(p.timestamp_rbv, 0).unwrap(),
+            0.0
+        );
     }
 
     /// merlinDetector.cpp:209/:242: a frame the pool refuses `continue`s past

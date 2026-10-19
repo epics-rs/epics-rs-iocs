@@ -15,8 +15,6 @@ use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
-use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::interrupt::InterruptValue;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -341,18 +339,14 @@ impl Ctx {
     }
 
     /// C `doCallbacksInt64Array` from the stream threads (serval_stream.cpp:975,
-    /// histogram_io.cpp:541/605): the array goes to the asynInt64Array
-    /// subscribers only, is not stored, and is not gated on interruptAccept
-    /// (asynPortDriver.cpp:1829-1866).
+    /// histogram_io.cpp:541/605), not gated on interruptAccept. A port job, as
+    /// the stamp is the port's, so it keeps its place after the worker's
+    /// `updateTimeStamp` and posts.
     fn post_int64_array(&self, reason: usize, addr: i32, data: Vec<i64>) {
-        self.handle.interrupts().notify(InterruptValue {
-            reason,
-            addr,
-            value: ParamValue::Int64Array(data.into()),
-            timestamp: SystemTime::now(),
-            iface: Some(InterfaceType::Int64Array),
-            ..Default::default()
-        });
+        self.shared
+            .port_jobs
+            .push(move |base| crate::driver::do_callbacks_int64_array(base, reason, addr, data));
+        self.flush_jobs();
     }
 }
 
@@ -1353,7 +1347,9 @@ fn layout_chips(detector: &Value, family: DetectorFamily) -> Option<&Vec<Value>>
 }
 
 /// C `publishChipLayout`: the entry whose integer `Chip` is `chip`, not the
-/// entry at that position.
+/// entry at that position. C compares `get<int>()`, which wraps a `Chip`
+/// past int onto a real chip number (serval_http.cpp:1541-1542); that is
+/// not copied.
 fn chip_layout_entry(chips: &[Value], chip: i32) -> Option<&Value> {
     chips.iter().find(|entry| {
         entry
@@ -2053,6 +2049,14 @@ fn prv_hst_accumulating(ctx: &Ctx) -> bool {
     ctx.mirrored(Mirrored::PrvHstAccumulationEnable) != 0
 }
 
+/// A latch the accumulator moved, posted from the stream worker as C's
+/// `update*RangeState` is.
+async fn post_accum_range(ctx: &Ctx, which: Accum, range: Option<RangeState>) {
+    let (saturated, status) = which.range_params(&ctx.p);
+    ctx.post_range(Locking::Unlocked, saturated, status, range)
+        .await;
+}
+
 /// The window half of C `processImgFrame` / `processPrvHstFrame`
 /// (serval_stream.cpp:1005-1043, :1132-1164; histogram_io.cpp:356-395,
 /// :607-632): a reconfiguration posts the effective frames and the retention
@@ -2331,11 +2335,9 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                         .img
                         .lock()
                         .add_shaped(&f.pixels, &[f.width, f.height], value_bytes);
+                post_accum_range(ctx, Accum::Img, update.range).await;
                 post_window(ctx, Accum::Img, &update).await;
-                let (counts, frames) = {
-                    let img = ctx.shared.img.lock();
-                    (img.total_counts(), img.frame_count())
-                };
+                let frames = ctx.shared.img.lock().frame_count();
                 post_metrics(ctx, Accum::Img, started).await;
                 ctx.post(
                     ADDR,
@@ -2351,10 +2353,9 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                         ),
                     )],
                 );
-                ctx.post_int64(
-                    p.img_total_counts,
-                    i64::try_from(counts).unwrap_or(i64::MAX),
-                );
+                let (total, range) = ctx.shared.img.lock().public_total();
+                post_accum_range(ctx, Accum::Img, range).await;
+                ctx.post_int64(p.img_total_counts, total);
 
                 publish_accumulation(
                     ctx,
@@ -2408,10 +2409,11 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                 .frame(h.frame_number, EpicsTimestamp::now().as_f64())
                 .rate;
             let update = ctx.shared.hst.lock().add(&h.counts);
-            let (frames, counts) = {
+            post_accum_range(ctx, Accum::PrvHst, update.range).await;
+            let frames = {
                 let mut hst = ctx.shared.hst.lock();
                 hst.grow_time_axis(h.counts.len() + 1);
-                (hst.frame_count(), hst.total_counts())
+                hst.frame_count()
             };
 
             ctx.post(
@@ -2464,10 +2466,9 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                     ParamValue::Float64Array(h.time_axis_ms().into()),
                 )],
             );
-            ctx.post_int64(
-                p.prv_hst_total_counts,
-                i64::try_from(counts).unwrap_or(i64::MAX),
-            );
+            let (total, range) = ctx.shared.hst.lock().public_total();
+            post_accum_range(ctx, Accum::PrvHst, range).await;
+            ctx.post_int64(p.prv_hst_total_counts, total);
             post_window(ctx, Accum::PrvHst, &update).await;
 
             publish_accumulation(
@@ -3299,6 +3300,7 @@ async fn publish_image(ctx: &Ctx, addr: usize, array: impl Into<PublishedArray>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     /// A read the test expects to succeed, as its bytes.
     trait BytesOk {
@@ -3530,6 +3532,49 @@ mod tests {
         };
         assert_eq!(&a[..], [3, 1, 4]);
         assert_eq!(v.iface, Some(InterfaceType::Int64Array));
+    }
+
+    /// C doCallbacksArray stamps getTimeStamp and the param's status and
+    /// alarm on the callback (asynPortDriver.cpp:1838-1858).
+    #[tokio::test]
+    async fn a_worker_int64_array_carries_the_port_stamp_and_param_status() {
+        use epics_rs::asyn::error::AsynStatus;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+
+        let ctx = idle_ctx("TPXT_STAMP");
+        let reason = ctx.p.prv_hst_histogram_data;
+        let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        ctx.handle
+            .with_driver(move |d: &mut TimePix3Driver| {
+                let base = &mut d.ad.port_base;
+                base.set_time_stamp(stamp);
+                base.set_param_status(reason, 0, AsynStatus::Error)?;
+                base.set_param_alarm_status(reason, 0, 3)?;
+                base.set_param_alarm_severity(reason, 0, 2)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let (_sub, mut rx) = ctx
+            .handle
+            .interrupts()
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(reason),
+                    ..Default::default()
+                },
+                1024,
+            )
+            .unwrap();
+        ctx.post_int64_array(reason, 0, vec![3, 1, 4]);
+        let v = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no callback")
+            .unwrap();
+        assert_eq!(
+            (v.timestamp, v.aux_status, v.alarm_status, v.alarm_severity),
+            (stamp, AsynStatus::Error, 3, 2)
+        );
     }
 
     #[tokio::test]
@@ -4180,6 +4225,45 @@ mod tests {
         assert_eq!(
             h.read_float64(p.prv_hst_memory_usage, 0).await.unwrap(),
             expected
+        );
+    }
+
+    /// The worker posts the latch the accumulator moves: a bin-count change
+    /// after a clamp reports OK again (histogram_io.cpp:485).
+    #[tokio::test]
+    async fn a_restarted_prv_hst_posts_the_range_reset() {
+        let ctx = Arc::new(idle_ctx("TPX_HST_RANGE"));
+        let p = ctx.p;
+        let frame = |counts: Vec<u32>| {
+            Frame::Histogram(crate::stream::HistogramFrame {
+                bin_width: 2,
+                bin_offset: 1,
+                frame_number: 1,
+                time_at_frame: 0.0,
+                counts,
+            })
+        };
+        handle_frame(&ctx, StreamKind::PrvHst, frame(vec![1, 2])).await;
+        let clamped = ctx
+            .shared
+            .hst
+            .lock()
+            .report_range(RangeState::OutputClamped);
+        ctx.post_range(
+            Locking::Unlocked,
+            p.prv_hst_range_saturated,
+            p.prv_hst_range_status,
+            clamped,
+        )
+        .await;
+        let h = &ctx.handle;
+        assert_eq!(h.read_int32(p.prv_hst_range_saturated, 0).await.unwrap(), 1);
+
+        handle_frame(&ctx, StreamKind::PrvHst, frame(vec![1, 2, 3])).await;
+        assert_eq!(h.read_int32(p.prv_hst_range_saturated, 0).await.unwrap(), 0);
+        assert_eq!(
+            h.read_octet(p.prv_hst_range_status, 0, 64).await.bytes_ok(),
+            b"OK\0"
         );
     }
 

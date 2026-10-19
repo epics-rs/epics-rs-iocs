@@ -24,7 +24,9 @@ use crate::decode::Decoder;
 use crate::driver::{PixiradDetector, SharedState};
 use crate::params::PixiradParams;
 use crate::protocol;
-use crate::types::{FrameType, MAX_UDP_DATA_BUFFER, MAX_UDP_PACKET_LEN, Sensor};
+use crate::types::{
+    FrameType, MAX_UDP_DATA_BUFFER, MAX_UDP_PACKET_LEN, PACKET_SENSOR_DATA_BYTES, Sensor,
+};
 use crate::udp::{self, Frame, FrameAssembler, strerror};
 
 /// The box sends the colours in the order thresh2, thresh1, thresh4, thresh3
@@ -81,25 +83,32 @@ pub(crate) fn start_udp_listener(
                         continue;
                     }
                 };
-                let started = *started_at.get_or_insert_with(Instant::now);
+                // C times a frame from its first full-length packet
+                // (pixirad.cpp:1174).
+                if n == MAX_UDP_PACKET_LEN {
+                    started_at.get_or_insert_with(Instant::now);
+                }
 
                 let Some(frame) = assembler.accept(&packet[..n]) else {
                     continue;
                 };
 
-                let seconds = started.elapsed().as_secs_f64();
-                if seconds > 0.0 {
-                    let bytes = frame.payload.len() as f64;
-                    shared.set_speed(bytes / (seconds * 1024.0 * 1024.0));
-                }
-                started_at = None;
+                let seconds = started_at
+                    .take()
+                    .expect("only a full-length packet completes a frame")
+                    .elapsed()
+                    .as_secs_f64();
+                // C counts whole packets (pixirad.cpp:1207).
+                let packets = frame.payload.len() / PACKET_SENSOR_DATA_BYTES;
+                let speed = (packets * MAX_UDP_PACKET_LEN) as f64 / (seconds * 1024.0 * 1024.0);
 
-                shared.udp_buffers_read.fetch_add(1, Ordering::AcqRel);
                 shared.queued_frames.fetch_add(1, Ordering::AcqRel);
                 if frames.send(frame).is_err() {
                     // The data task is gone; so is the point of reading.
                     return;
                 }
+                let _ = handle
+                    .with_driver_blocking(move |d: &mut PixiradDetector| d.post_udp_frame(speed));
             }
         })
         .expect("failed to spawn the Pixirad UDP thread")
@@ -193,6 +202,9 @@ async fn data_loop(ctx: DataContext) {
             Ok(pixels) => pixels,
             Err(_) => continue,
         };
+        // dataTask's own UDP param (pixirad.cpp:1012-1013).
+        let udp_buffers_free =
+            ctx.shared.max_buffers - ctx.shared.queued_frames.load(Ordering::Acquire);
 
         if image.as_ref().is_some_and(|i| i.colors != num_colors) {
             image = None;
@@ -225,96 +237,66 @@ async fn data_loop(ctx: DataContext) {
         }
         colors_collected += 1;
 
-        let udp_updates = vec![
-            ParamSetValue::new(
-                ctx.params.udp_buffers_read,
-                0,
-                ParamValue::Int32(ctx.shared.udp_buffers_read.load(Ordering::Acquire)),
-            ),
-            ParamSetValue::new(
-                ctx.params.udp_buffers_free,
-                0,
-                ParamValue::Int32(
-                    ctx.shared.max_buffers - ctx.shared.queued_frames.load(Ordering::Acquire),
-                ),
-            ),
-            ParamSetValue::new(
-                ctx.params.udp_speed,
-                0,
-                ParamValue::Float64(ctx.shared.speed()),
-            ),
-            ParamSetValue::new(
-                ctx.params.colors_collected,
-                0,
-                ParamValue::Int32((colors_collected % num_colors) as i32),
-            ),
-        ];
-        let _ = ctx.handle.set_params_and_notify(0, udp_updates).await;
-
-        if colors_collected < num_colors {
-            continue;
-        }
-        // Every colour is in, but the image they belonged to was refused.
-        let Some(Image { array, colors }) = image.take() else {
-            continue;
-        };
-
-        // Every colour is in: this is an image.
-        let unique_id = sync
-            .read_int32(ctx.ad_params.base.array_counter)
-            .unwrap_or(0)
-            + 1;
-        let images_taken = sync
-            .read_int32(ctx.ad_params.num_images_counter)
-            .unwrap_or(0)
-            + 1;
-        let num_images = sync.read_int32(ctx.ad_params.num_images).unwrap_or(1);
-        let array_callbacks = sync
-            .read_int32(ctx.ad_params.base.array_callbacks)
-            .unwrap_or(1)
-            != 0;
-
-        let mut updates = vec![
-            ParamSetValue::new(
+        // C posts one pass per frame and stores Acquire=0 only once the
+        // finished image is on the plugins (pixirad.cpp:1053-1083), so
+        // WaitForPlugins finds it queued.
+        let mut updates = vec![ParamSetValue::new(
+            ctx.params.udp_buffers_free,
+            0,
+            ParamValue::Int32(udp_buffers_free),
+        )];
+        // A finished image whose colour-0 alloc was refused counts nothing.
+        if let Some(Image { array, colors }) = image.take_if(|_| colors_collected >= num_colors) {
+            let unique_id = sync
+                .read_int32(ctx.ad_params.base.array_counter)
+                .unwrap_or(0)
+                + 1;
+            let images_taken = sync
+                .read_int32(ctx.ad_params.num_images_counter)
+                .unwrap_or(0)
+                + 1;
+            updates.push(ParamSetValue::new(
                 ctx.ad_params.base.array_counter,
                 0,
                 ParamValue::Int32(unique_id),
-            ),
-            ParamSetValue::new(
+            ));
+            updates.push(ParamSetValue::new(
                 ctx.ad_params.num_images_counter,
                 0,
                 ParamValue::Int32(images_taken),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size,
-                0,
-                ParamValue::Int32((array.data.len() * 2) as i32),
-            ),
-        ];
-        if images_taken >= num_images {
-            updates.push(ParamSetValue::new(
-                ctx.ad_params.acquire,
-                0,
-                ParamValue::Int32(0),
             ));
+            if sync
+                .read_int32(ctx.ad_params.base.array_callbacks)
+                .unwrap_or(1)
+                != 0
+            {
+                publish(&ctx, array, colors, unique_id).await;
+            }
+            if images_taken >= sync.read_int32(ctx.ad_params.num_images).unwrap_or(1) {
+                updates.push(ParamSetValue::new(
+                    ctx.ad_params.acquire,
+                    0,
+                    ParamValue::Int32(0),
+                ));
+            }
+            if auto_calibrate {
+                updates.push(ParamSetValue::new(
+                    ctx.params.auto_calibrate,
+                    0,
+                    ParamValue::Int32(0),
+                ));
+            }
         }
-        if auto_calibrate {
-            updates.push(ParamSetValue::new(
-                ctx.params.auto_calibrate,
-                0,
-                ParamValue::Int32(0),
-            ));
-        }
+        updates.push(ParamSetValue::new(
+            ctx.params.colors_collected,
+            0,
+            ParamValue::Int32((colors_collected % num_colors) as i32),
+        ));
         let _ = ctx.handle.set_params_and_notify(0, updates).await;
-
-        if array_callbacks {
-            publish(&ctx, array, colors, unique_id).await;
-        }
     }
 }
 
 async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, unique_id: i32) {
-    let n_dims = array.dims.len();
     let ts = array.timestamp;
 
     let mut attributes = NDAttributeList::new();
@@ -339,35 +321,8 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
     array.time_stamp = ts.as_f64();
     array.attributes = attributes;
 
-    let _ = ctx
-        .handle
-        .set_params_and_notify(
-            0,
-            vec![
-                ParamSetValue::new(
-                    ctx.ad_params.base.n_dimensions,
-                    0,
-                    ParamValue::Int32(n_dims as i32),
-                ),
-                ParamSetValue::new(
-                    ctx.ad_params.base.timestamp_rbv,
-                    0,
-                    ParamValue::Float64(ts.as_f64()),
-                ),
-                ParamSetValue::new(
-                    ctx.ad_params.base.epics_ts_sec,
-                    0,
-                    ParamValue::Int32(epics_ts.sec as i32),
-                ),
-                ParamSetValue::new(
-                    ctx.ad_params.base.epics_ts_nsec,
-                    0,
-                    ParamValue::Int32(epics_ts.nsec as i32),
-                ),
-            ],
-        )
-        .await;
-
+    // C stores no array size, dimension or time-stamp param per image; the
+    // constructor's values stand (pixirad.cpp:1051-1079).
     ctx.output.publish(array).await;
 }
 
