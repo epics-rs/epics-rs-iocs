@@ -739,7 +739,11 @@ impl PortDriver for MultiFunctionDriver {
                     ranges[ch] =
                         map_range(&trace, self.int(self.params.analog_out_range, ch as i32));
                 }
-                // C `writeAnalogOutSync` does not print its status.
+                // C `writeAnalogOutSync` does not print its status. Its
+                // AOUTARRAY_FF_SIMULTANEOUS (drvMultiFunction.cpp:2259) is a
+                // flag the 2408 refuses with ERR_BAD_FLAG (AoUsb24xx.cpp:18),
+                // so C's sync write never reaches the DACs. Not copied: the
+                // 2408 updates both DACs together without it.
                 status = trace::status_of(&dev.analog_out_array(
                     0,
                     (MAX_ANALOG_OUT - 1) as i32,
