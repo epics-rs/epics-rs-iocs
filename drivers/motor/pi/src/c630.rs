@@ -208,14 +208,13 @@ impl PIC630Controller {
         Ok(())
     }
 
-    /// Read one EOS-stripped reply, folding any transport failure or empty read
-    /// into `""` (C `recv_mess`'s `if (nread < 1) com[0] = '\0'`). The C-630
-    /// does *not* strip an extra trailing byte (unlike the C-862).
+    /// Read one EOS-stripped reply whatever the read's status: C `recv_mess`
+    /// clears the buffer only on `nread < 1` (drvPIC630.cc:357), so a reply
+    /// cut by a timeout is kept. The C-630 does *not* strip an extra trailing
+    /// byte (unlike the C-862).
     fn recv(&self) -> String {
-        match self.handle.read_octet(0, READ_BUF) {
-            Ok(raw) if !raw.is_empty() => String::from_utf8_lossy(&raw).into_owned(),
-            _ => String::new(),
-        }
+        let (raw, _) = self.handle.read_octet(0, READ_BUF).into_parts();
+        String::from_utf8_lossy(&raw).into_owned()
     }
 
     /// Send a query and read its data reply. `send` already consumed the echo,
@@ -536,6 +535,25 @@ mod tests {
             .into_iter()
             .filter(|l| l != "1TS" && l != "1TP")
             .collect()
+    }
+
+    /// drvPIC630.cc:357 clears the reply only on `nread < 1`, so a TS or TP
+    /// reply cut by a timeout is still polled.
+    #[test]
+    fn replies_cut_by_a_timeout_are_still_polled() {
+        let (_line, io) = LineRig::cut(
+            "pic630Cut",
+            |last| match last {
+                "1TS" => format!("1TS:{MOVING}"),
+                "1TP" => "1TP:250".into(),
+                c => c.into(),
+            },
+            |last| last == "1TS" || last == "1TP",
+        );
+        let ctrl = PIC630Controller::new(io, 1).unwrap();
+        let mut axis = PIC630Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0);
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert_eq!((status.position, status.done), (250.0, false));
     }
 
     /// devPIC630.cc:186-192: INIT as its own message.

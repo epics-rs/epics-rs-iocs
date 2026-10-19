@@ -47,7 +47,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::exception::{AsynException, ExceptionCallbackGuard};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::manager::PortManager;
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -620,24 +620,23 @@ impl OmsController {
     /// leaves the bytes it got there, and C callers that ignore the status
     /// read them.
     pub fn send_receive_buffer(&self, cmd: &str) -> (String, AsynResult<()>) {
-        let failed = |e: AsynError| {
-            let reply = e
-                .partial_read()
-                .map_or_else(String::new, |p| trim_reply(&p.data));
-            (reply, Err(e))
-        };
-        let mut raw = match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
-            Ok(raw) => raw,
-            Err(e) => return failed(e),
+        let failed = |raw: Vec<u8>, e: AsynError| (trim_reply(&raw), Err(e));
+        let mut raw = match self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts()
+        {
+            (raw, Ok(())) => raw,
+            (raw, Err(e)) => return failed(raw, e),
         };
         // A move notification may sit ahead of the real reply; skip it. Bound
         // the retries so a chatty controller cannot spin forever.
         for _ in 0..12 {
             let trimmed = trim_reply(&raw);
             if self.notification(&trimmed) {
-                raw = match self.handle.read_octet(0, READ_BUF) {
-                    Ok(raw) => raw,
-                    Err(e) => return failed(e),
+                raw = match self.handle.read_octet(0, READ_BUF).into_parts() {
+                    (raw, Ok(())) => raw,
+                    (raw, Err(e)) => return failed(raw, e),
                 };
                 continue;
             }
@@ -682,10 +681,11 @@ impl OmsController {
             return;
         };
         let user = AsynUser::new(0).with_addr(0).with_timeout(Duration::ZERO);
-        let read = port.submit_blocking(RequestOp::OctetRead { buf_size: READ_BUF }, user);
-        if let Some(data) = read.ok().and_then(|r| r.data)
-            && data.contains(&b'%')
-        {
+        // C drops the read's status and looks at whatever arrived.
+        let (data, _) = port
+            .submit_octet_read_blocking(OctetReadOp::Read { buf_size: READ_BUF }, user)
+            .into_parts();
+        if data.contains(&b'%') {
             self.poll_shared.wakeup();
             self.notification(&trim_reply(&data));
         }
@@ -1077,6 +1077,19 @@ mod tests {
     use super::*;
     use epics_rs::asyn::port_handle::PortHandle;
 
+    /// A read the test expects to succeed, as its bytes.
+    trait BytesOk {
+        fn bytes_ok(self) -> Vec<u8>;
+    }
+
+    impl BytesOk for epics_rs::asyn::request::OctetRead {
+        fn bytes_ok(self) -> Vec<u8> {
+            let (bytes, status) = self.into_parts();
+            status.unwrap();
+            bytes
+        }
+    }
+
     /// A controller port on the poller tests' one-axis MAXnet line.
     fn params_port(
         name: &str,
@@ -1119,12 +1132,12 @@ mod tests {
         io.write_octet(send, b"AX ST;").unwrap();
         io.write_octet(send_receive, b"AX RP").unwrap();
         assert_eq!(*rig.written.lock().unwrap(), ["AX ST;", "AX RP"]);
-        assert_eq!(io.read_octet(receive, 40).unwrap(), b"1234\0");
-        assert_eq!(io.read_octet(send, 40).unwrap(), b"\0");
-        assert_eq!(io.read_octet(send_receive, 40).unwrap(), b"\0");
+        assert_eq!(io.read_octet(receive, 40).bytes_ok(), b"1234\0");
+        assert_eq!(io.read_octet(send, 40).bytes_ok(), b"\0");
+        assert_eq!(io.read_octet(send_receive, 40).bytes_ok(), b"\0");
         let message = epics_rs::motor::controller_port::index::PROFILE_BUILD_MESSAGE;
         io.write_octet(message, b"dropped").unwrap();
-        assert!(io.read_octet(message, 40).is_err());
+        assert!(io.read_octet(message, 40).status().is_err());
         let past = SyncIOHandle::from_handle(port, 1, Duration::from_secs(1));
         assert!(past.write_octet(send, b"AX ST;").is_err());
         assert_eq!(rig.written.lock().unwrap().len(), 2);
@@ -1171,9 +1184,9 @@ mod tests {
         io.write_octet(reason(&port, "OMS_STRING_SENDRECV"), b"AX RP")
             .unwrap();
         assert_eq!(*rig.written.lock().unwrap(), ["AX ST;", "AX RP"]);
-        assert!(io.read_octet(receive, 40).is_err());
+        assert!(io.read_octet(receive, 40).status().is_err());
         let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
-        assert_eq!(io.read_octet(receive, 40).unwrap(), b"\0");
+        assert_eq!(io.read_octet(receive, 40).bytes_ok(), b"\0");
     }
 
     /// OMS_POLL's closing line: IO_DRIVER on success, ERROR with the
@@ -1291,10 +1304,17 @@ mod tests {
             self.written.lock().unwrap().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = std::mem::take(&mut self.reply);
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -1485,15 +1505,20 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
-            Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "timeout".into(),
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            buf[..self.partial.len()].copy_from_slice(self.partial);
+            OctetReadResult {
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "timeout".into(),
+                }),
+                ..OctetReadResult::ok(self.partial.len(), EomReason::empty())
             }
-            .with_partial_read(epics_rs::asyn::interpose::PartialOctetRead {
-                data: self.partial.to_vec(),
-                eom_reason: epics_rs::asyn::interpose::EomReason::empty(),
-            }))
         }
     }
 

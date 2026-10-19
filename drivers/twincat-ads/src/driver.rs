@@ -62,7 +62,7 @@ use parking_lot::Mutex;
 use asyn_rs::asyn_record::PortClaim;
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::InterfaceType;
-use asyn_rs::interpose::EomReason;
+use asyn_rs::interpose::{EomReason, OctetReadResult};
 use asyn_rs::interrupt::{InterruptManager, InterruptValue};
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::InterfaceMask;
@@ -1544,17 +1544,25 @@ impl PortDriver for AdsPortDriver {
 
     /// Reason 0 drains the ASCII command channel's reply buffer; a `STRING`
     /// parameter returns its last sample (C `readOctet`, :1919).
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         if user.reason != 0 {
             let params = self.shared.params.lock();
-            let p = param_ref(&params, user.reason).map_err(|e| asyn_err(e.to_string()))?;
+            let p = match param_ref(&params, user.reason) {
+                Ok(p) => p,
+                Err(e) => return OctetReadResult::failed(asyn_err(e.to_string())),
+            };
             let text = match &p.value {
                 ParamValue::Octet(s) => &s[..],
-                _ => return Err(asyn_err(format!("{}: no string sample yet", p.info.raw))),
+                _ => {
+                    return OctetReadResult::failed(asyn_err(format!(
+                        "{}: no string sample yet",
+                        p.info.raw
+                    )));
+                }
             };
             let n = text.len().min(buf.len());
             buf[..n].copy_from_slice(&text[..n]);
-            return Ok(n);
+            return OctetReadResult::ok(n, EomReason::END);
         }
 
         let mut reply = self.shared.octet_buffer.lock();
@@ -1563,7 +1571,13 @@ impl PortDriver for AdsPortDriver {
         buf[..n].copy_from_slice(&bytes[..n]);
         // C `octetCMDreadIt` (:1985) removes exactly what it handed out.
         *reply = String::from_utf8_lossy(&bytes[n..]).into_owned();
-        Ok(n)
+        // C reports CNT when the reply fills the buffer, EOS otherwise.
+        let eom = if n == buf.len() {
+            EomReason::CNT
+        } else {
+            EomReason::EOS
+        };
+        OctetReadResult::ok(n, eom)
     }
 
     /// Reason 0 is the ASCII command channel; a `STRING` parameter is written to
@@ -2385,14 +2399,19 @@ mod tests {
         let mut d = driver();
         d.shared.octet_buffer.lock().push_str("1.500000;OK");
 
+        let read = |d: &mut AdsPortDriver, buf: &mut [u8]| {
+            let r = d.read_octet(&user(0), buf);
+            r.status.unwrap();
+            (r.nbytes_transferred, r.eom_reason)
+        };
         let mut buf = [0u8; 4];
-        let n = d.read_octet(&user(0), &mut buf).unwrap();
-        assert_eq!(&buf[..n], b"1.50");
+        let (n, eom) = read(&mut d, &mut buf);
+        assert_eq!((&buf[..n], eom), (&b"1.50"[..], EomReason::CNT));
         // What was handed out is gone; the rest waits for the next read.
         let mut rest = [0u8; 32];
-        let n = d.read_octet(&user(0), &mut rest).unwrap();
-        assert_eq!(&rest[..n], b"0000;OK");
-        assert_eq!(d.read_octet(&user(0), &mut rest).unwrap(), 0);
+        let (n, eom) = read(&mut d, &mut rest);
+        assert_eq!((&rest[..n], eom), (&b"0000;OK"[..], EomReason::EOS));
+        assert_eq!(read(&mut d, &mut rest).0, 0);
     }
 
     #[test]

@@ -71,12 +71,13 @@
 //! - **Uninitialized-read on I/O failure in `mcaReadStatus`**
 //!   (`drvMcaRontec.c:307-317`): `sendMessage`'s `asynStatus` return is
 //!   discarded, and `response[4]`/`atoi(&response[4])` are read
-//!   unconditionally from a *local, stack-allocated* buffer -- on a timeout
-//!   or disconnected line, `response` was never written and its bytes are
-//!   indeterminate, so `acquiring`/`elive`/`ereal` are corrupted with
-//!   garbage rather than left at their last known value.
-//!   `RontecDriver::read_status` applies each parsed field only when its
-//!   `send_message` call actually succeeded.
+//!   unconditionally from a *local, stack-allocated* buffer -- when fewer
+//!   than four bytes came (a failed write, or a read that timed out early),
+//!   `response[4]` was never written and is indeterminate, so
+//!   `acquiring`/`elive`/`ereal` are corrupted with garbage rather than left
+//!   at their last known value. `RontecDriver::read_status` parses whatever
+//!   bytes the read delivered, as C does, and leaves a field alone only in
+//!   that indeterminate case.
 //! - **`int32ArrayRead` buffer overflow** (`drvMcaRontec.c:436-478`):
 //!   `nread = 4 + 4*maxChans` is written into the fixed
 //!   `pPvt->mcaBuffer[RONTEC_MAXCHANS*4+4]` with no check that the caller's
@@ -90,12 +91,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::error::OctetStep;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::claim_port;
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::asyn::trace::TraceMask;
@@ -340,27 +342,24 @@ impl RontecDriver {
 
     /// C `sendMessage` (`drvMcaRontec.c:581-604`): both lines are printed
     /// through the serial port's trace, as C prints them on `pPvt->pasynUser`.
-    fn send_message(&self, output: &str) -> AsynResult<Vec<u8>> {
-        let result = self
+    /// The bytes read come back with the status, as C's `input` does.
+    fn send_message(&self, output: &str) -> (Vec<u8>, AsynResult<()>) {
+        let (input, result) = self
             .serial
-            .submit_blocking(
-                RequestOp::OctetWriteRead {
+            .submit_octet_read_blocking(
+                OctetReadOp::WriteRead {
                     data: output.as_bytes().to_vec(),
                     buf_size: RONTEC_MESSAGE_SIZE,
-                    flush: true,
                 },
                 self.octet_user(RONTEC_TIMEOUT),
             )
-            .map(|r| r.data.unwrap_or_default());
+            .into_parts();
         // A failed read still wrote the whole command; a failed write read
         // nothing. A bare error carries neither count.
-        let (input, status, nbytes_out): (&[u8], AsynStatus, usize) = match &result {
-            Ok(data) => (data, AsynStatus::Success, output.len()),
-            Err(e) => match (e.partial_read(), e.partial_write()) {
-                (Some(p), _) => (&p.data, e.status(), output.len()),
-                (None, Some(n)) => (&[], e.status(), n),
-                (None, None) => (&[], e.status(), 0),
-            },
+        let (status, nbytes_out) = match &result {
+            Ok(()) => (AsynStatus::Success, output.len()),
+            Err(e) if e.octet_step() == Some(OctetStep::Read) => (e.status(), output.len()),
+            Err(e) => (e.status(), e.partial_write().unwrap_or(0)),
         };
         self.serial.user_trace().print(
             self.addr,
@@ -371,7 +370,7 @@ impl RontecDriver {
             format_args!(
                 "drvMcaRontec::sendMessage: output={output}, output_len={} number sent={nbytes_out}\n                           input={}, input_len={RONTEC_MESSAGE_SIZE}, number_received={}\n",
                 output.len(),
-                CStr(input),
+                CStr(&input),
                 input.len()
             ),
         );
@@ -384,13 +383,13 @@ impl RontecDriver {
                 line!(),
                 format_args!(
                     "drvMcaRontec::sendMessage: error {}, status={}, nbytesOut={nbytes_out}, nbytesIn={}\n",
-                    CStr(input),
+                    CStr(&input),
                     status as i32,
                     input.len()
                 ),
             );
         }
-        result
+        (input, result)
     }
 
     /// C `int32ArrayRead` (`drvMcaRontec.c:436-478`), with the request
@@ -431,24 +430,22 @@ impl RontecDriver {
             RequestOp::SetInputEos { eos: Vec::new() },
             self.eos_user(SPECTRUM_TIMEOUT),
         );
-        let read_result = self.serial.submit_blocking(
-            RequestOp::OctetWriteRead {
-                data: message.into_bytes(),
-                buf_size: nread,
-                flush: true,
-            },
-            self.octet_user(SPECTRUM_TIMEOUT),
-        );
+        let (raw, _) = self
+            .serial
+            .submit_octet_read_blocking(
+                OctetReadOp::WriteRead {
+                    data: message.into_bytes(),
+                    buf_size: nread,
+                },
+                self.octet_user(SPECTRUM_TIMEOUT),
+            )
+            .into_parts();
         let _ = self.serial.submit_blocking(
             RequestOp::SetInputEos {
                 eos: self.input_eos.clone(),
             },
             self.eos_user(SPECTRUM_TIMEOUT),
         );
-        let raw = match &read_result {
-            Ok(r) => r.data.as_deref().unwrap_or_default(),
-            Err(e) => e.partial_read().map_or(&[][..], |p| &p.data),
-        };
         let nbytes_in = raw.len().min(nread);
         self.mca_buffer[..nbytes_in].copy_from_slice(&raw[..nbytes_in]);
         if nbytes_in != nread {
@@ -477,14 +474,14 @@ impl RontecDriver {
     }
 
     /// C `mcaReadStatus`'s handler inside `RontecWrite`
-    /// (`drvMcaRontec.c:307-317`), with the uninitialized-read defect fixed
-    /// at source (module doc): a field is only updated when its query
-    /// actually succeeded.
+    /// (`drvMcaRontec.c:307-317`). C parses `response` whatever the status,
+    /// as the string of the bytes read: index 4 is a byte or, after exactly
+    /// four, the NUL. With fewer it is indeterminate (module doc) and the
+    /// field is left alone.
     fn read_status(&mut self, user: &AsynUser) {
-        if let Ok(resp) = self.send_message("$FP")
-            && let Some(&flag) = resp.get(4)
-        {
-            self.acquiring = flag == b'-';
+        let (resp, _) = self.send_message("$FP");
+        if resp.len() >= 4 {
+            self.acquiring = resp.get(4) == Some(&b'-');
         }
 
         // C: "Read 1 channel of the spectrum so we get the elapsed live and
@@ -495,9 +492,8 @@ impl RontecDriver {
 
         // Preserved quirk: `elive` mirrors `ereal` from the same `"$MS"`
         // reply (module doc's "unfixable-without-spec" entry).
-        if let Ok(resp) = self.send_message("$MS")
-            && resp.len() > 4
-        {
+        let (resp, _) = self.send_message("$MS");
+        if resp.len() >= 4 {
             let value = c_atoi(&resp[4..]);
             self.ereal = value;
             self.elive = value;
@@ -877,6 +873,9 @@ mod tests {
     struct FakeSerial {
         base: PortDriverBase,
         reply: fn(&[u8]) -> Vec<u8>,
+        /// Commands whose reply comes on a read that then times out.
+        cut: fn(&[u8]) -> bool,
+        cutting: bool,
         pending: Vec<u8>,
         writes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
         input_eos: Vec<u8>,
@@ -894,26 +893,39 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             self.writes.lock().unwrap().push(data.to_vec());
             self.pending = (self.reply)(data);
+            self.cutting = (self.cut)(data);
             Ok(data.len())
         }
 
-        /// No reply is a timeout, carried the way the EOS interpose carries
-        /// every failed read.
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        /// No reply is a timeout.
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             if self.pending.is_empty() {
-                return Err(AsynError::Status {
+                return epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "timeout".into(),
-                }
-                .with_partial_read(epics_rs::asyn::interpose::PartialOctetRead {
-                    data: Vec::new(),
-                    eom_reason: epics_rs::asyn::interpose::EomReason::empty(),
-                }));
+                });
             }
             let n = self.pending.len().min(buf.len());
             buf[..n].copy_from_slice(&self.pending[..n]);
             self.pending.drain(..n);
-            Ok(n)
+            let read = epics_rs::asyn::interpose::OctetReadResult::ok(
+                n,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            );
+            if std::mem::take(&mut self.cutting) {
+                return epics_rs::asyn::interpose::OctetReadResult {
+                    status: Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "reply cut by a timeout".into(),
+                    }),
+                    ..read
+                };
+            }
+            read
         }
 
         fn set_input_eos(&mut self, _user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
@@ -938,6 +950,12 @@ mod tests {
 
     impl Rig {
         fn new(tag: &str, reply: fn(&[u8]) -> Vec<u8>) -> Self {
+            Self::cutting(tag, reply, |_| false)
+        }
+
+        /// [`Self::new`], with the reply to each command `cut` picks
+        /// delivered by a read that then times out.
+        fn cutting(tag: &str, reply: fn(&[u8]) -> Vec<u8>, cut: fn(&[u8]) -> bool) -> Self {
             use epics_rs::asyn::services::PortServices;
             use epics_rs::asyn::trace::TraceFile;
             let services = PortServices::new();
@@ -957,6 +975,8 @@ mod tests {
                     InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 reply,
+                cut,
+                cutting: false,
                 pending: Vec::new(),
                 writes: writes.clone(),
                 input_eos: b"\r".to_vec(),
@@ -1166,6 +1186,40 @@ mod tests {
         );
     }
 
+    /// C `mcaReadStatus` (`drvMcaRontec.c:309-317`) parses replies a timeout
+    /// cut; after exactly four bytes index 4 is the NUL, and fewer leave the
+    /// fields alone.
+    #[test]
+    fn read_status_parses_replies_cut_by_a_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static KEEP: AtomicUsize = AtomicUsize::new(usize::MAX);
+        fn reply(cmd: &[u8]) -> Vec<u8> {
+            let full: &[u8] = match cmd {
+                b"$FP" => b"!FP -",
+                b"$MS" => b"!MS 2500",
+                _ => return b"!OK".to_vec(),
+            };
+            full[..full.len().min(KEEP.load(Ordering::SeqCst))].to_vec()
+        }
+        let rig = Rig::cutting("cutstatus", reply, |cmd| cmd == b"$FP" || cmd == b"$MS");
+        let status = |keep| {
+            KEEP.store(keep, Ordering::SeqCst);
+            rig.submit(RequestOp::Int32Write { value: 1 }, McaReason::ReadStatus)
+                .expect("RontecWrite always succeeds");
+            let acquiring = rig.submit(RequestOp::Int32Read, McaReason::Acquiring);
+            let real = rig.submit(RequestOp::Float64Read, McaReason::ElapsedRealTime);
+            let live = rig.submit(RequestOp::Float64Read, McaReason::ElapsedLiveTime);
+            (
+                acquiring.unwrap().int_val.unwrap(),
+                real.unwrap().float_val.unwrap(),
+                live.unwrap().float_val.unwrap(),
+            )
+        };
+        assert_eq!(status(usize::MAX), (1, 2.5, 2.5));
+        assert_eq!(status(3), (1, 2.5, 2.5));
+        assert_eq!(status(4), (0, 0.0, 0.0));
+    }
+
     /// `$SS` answered in full with 100.. the first time, then with only two
     /// channels of 200.. .
     fn spectrum_reply(cmd: &[u8]) -> Vec<u8> {
@@ -1369,6 +1423,8 @@ mod tests {
             FakeSerial {
                 base,
                 reply: rontec_reply,
+                cut: |_| false,
+                cutting: false,
                 pending: Vec::new(),
                 writes: Default::default(),
                 input_eos: b"\r".to_vec(),
@@ -1402,6 +1458,8 @@ mod tests {
                     InterfaceMask::UNMIGRATED_INTERRUPTS,
                 ),
                 reply: rontec_reply,
+                cut: |_| false,
+                cutting: false,
                 pending: Vec::new(),
                 writes: Default::default(),
                 input_eos: b"\r".to_vec(),

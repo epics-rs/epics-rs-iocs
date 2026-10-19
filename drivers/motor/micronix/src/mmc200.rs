@@ -82,9 +82,23 @@ impl Mmc200Controller {
     /// trailing line terminator. The leading `#` is left intact — callers skip
     /// it with `reply.get(1..)`, matching C's `&inString_[1]`.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let (reply, status) = self.exchange(cmd);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::query`]'s reply beside its status. The EOS layer NUL-terminates
+    /// `inString_` on every read, so a failed read leaves the bytes it
+    /// delivered, which the axis constructor parses.
+    fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
+        let (raw, status) = self
+            .handle
+            .write_read(0, &Self::framed(cmd), READ_BUF)
+            .into_parts();
         let reply = String::from_utf8_lossy(&raw);
-        Ok(reply.trim_end_matches(['\r', '\n', '\0']).to_string())
+        (
+            reply.trim_end_matches(['\r', '\n', '\0']).to_string(),
+            status,
+        )
     }
 }
 
@@ -228,14 +242,14 @@ impl Mmc200Axis {
         let axis_index = index as i32 + 1;
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
-        // C carries on past a failed query with `errorFlag` set and reports
-        // it as `motorStatusProblem_` (MMC200Driver.cpp:143-146, :263-266).
+        // C carries on past a failed query with `errorFlag` set, parses what
+        // arrived, and reports the flag as `motorStatusProblem_`
+        // (MMC200Driver.cpp:143-149, :263-266).
         let mut error = false;
         let mut query = |cmd: String| {
-            ctrl.query(&cmd).unwrap_or_else(|_| {
-                error = true;
-                String::new()
-            })
+            let (reply, status) = ctrl.exchange(&cmd);
+            error |= status.is_err();
+            reply
         };
 
         let version = query(format!("{axis_index}VER?"));
@@ -505,6 +519,30 @@ mod tests {
         assert_eq!(axis.model, -1);
         // C's status_ starts at 0; only a good STA? sets Done (:482).
         assert!(axis.last_status.problem && !axis.last_status.done);
+    }
+
+    /// MMC200Driver.cpp:143-257 sets errorFlag on a failed query and parses
+    /// `inString_` anyway, so replies cut by a timeout still find the model
+    /// and the jog speed, and the axis starts with a problem.
+    #[test]
+    fn constructor_replies_cut_by_a_timeout_are_still_parsed() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::cut(
+            "mmc200Cut",
+            |cmd| {
+                match cmd.trim_end() {
+                    "1VER?" => "#MMC-200 v4.1",
+                    "1VMX?" => "#2.5",
+                    _ => "#0",
+                }
+                .into()
+            },
+            |_| true,
+        );
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
+        let axis = Mmc200Axis::new(controller, 0, false);
+        assert_eq!((axis.model, axis.max_velocity), (200, 2.5));
+        assert!(axis.last_status.problem);
     }
 
     /// C's constructor returns early for an MMC-ETH module and its poll

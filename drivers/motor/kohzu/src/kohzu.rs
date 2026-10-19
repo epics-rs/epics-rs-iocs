@@ -156,7 +156,11 @@ impl KohzuController {
     /// [`command`](Self::command) for a record string's raw bytes.
     fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
         // C send_mess flushes the input before every write.
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let (raw, status) = self
+            .handle
+            .write_read(0, &Self::framed(cmd), READ_BUF)
+            .into_parts();
+        status?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text
             .trim_matches(|c: char| c == '\r' || c == '\n' || c == '\0' || c == '\u{2}')

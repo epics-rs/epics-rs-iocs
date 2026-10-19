@@ -7,10 +7,9 @@
 //! The AH501BE in external-gate trigger mode needs the partial bytes of a
 //! *timed-out* binary read: upstream recognises the meter's `ACK\r\n`
 //! preamble either there or at the front of a completed frame
-//! (`drvAHxxx.cpp:252-283`). `asyn-rs` 0.22.1 discarded a timed-out read's
-//! partial bytes, so the port used to refuse the mode outright;
-//! `AsynError::partial_read` (asyn-rs 0.24.0+) carries them, so `read_thread`'s
-//! binary branch now detects the preamble the same way upstream does.
+//! (`drvAHxxx.cpp:252-283`). An asyn-rs octet read returns its bytes beside
+//! its status, so `read_thread`'s binary branch detects the preamble the same
+//! way upstream does.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +30,7 @@ use crate::drv_quad_em::{
     self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QeReadFormat,
     QeTriggerMode, QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared, num_average_from,
 };
-use crate::octet::{OctetIo, connect_octet};
+use crate::octet::{OctetIo, connect_octet, outcome, reply_text};
 use crate::{asyn_print, trace};
 
 /// Poll interval of C++'s `epicsThreadSleep(0.01)` handshake loop.
@@ -39,25 +38,15 @@ const HANDSHAKE_POLL: Duration = Duration::from_millis(10);
 /// C++ `epicsThreadSleep(1.0)` after an unexpected read error.
 const READ_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 
-/// True for a timeout, including one `AsynError::PartialRead` wraps to carry
-/// the bytes transferred before it. A bare `AsynError::Status` variant match
-/// would miss that wrapper and misclassify every partial-transfer timeout —
-/// routine on this port, since it installs the EOS interpose — as an
-/// unexpected error.
 fn is_timeout(e: &AsynError) -> bool {
     e.status() == AsynStatus::Timeout
 }
 
 /// `read_thread`'s binary-read error arm (C++ `drvAHxxx.cpp:252-259`): trigger
-/// callbacks only when the failure was a genuine timeout. `status` must be
-/// checked first — `AsynError::PartialRead` also wraps non-timeout failures
-/// (an ECONNRESET, say) that could happen to carry the same 5 bytes, and C++
-/// reaches this trigger only inside `status != asynTimeout`'s `else`.
-fn is_ext_gate_ack_timeout(e: &AsynError, ext_gate: bool) -> bool {
-    ext_gate
-        && is_timeout(e)
-        && e.partial_read()
-            .is_some_and(|partial| proto::is_ack_preamble_only(&partial.data))
+/// callbacks only when a timeout, not any failure that happens to carry the
+/// same 5 bytes, ended the read on the ACK preamble.
+fn is_ext_gate_ack_timeout(data: &[u8], e: &AsynError, ext_gate: bool) -> bool {
+    ext_gate && is_timeout(e) && proto::is_ack_preamble_only(data)
 }
 
 fn error(message: impl Into<String>) -> AsynError {
@@ -154,7 +143,8 @@ impl AhxxxDriver {
     // --- I/O helpers (C++ writeReadMeter / sendCommand) ---
 
     fn write_read_meter(&self, out: &str) -> AsynResult<String> {
-        self.io.write_read(out, proto::MAX_COMMAND_LEN)
+        let (raw, status) = self.io.write_read(out, proto::MAX_COMMAND_LEN).into_parts();
+        status.map(|()| reply_text(&raw))
     }
 
     /// C++ `sendCommand`: stop acquisition around the command, require an
@@ -187,7 +177,8 @@ impl AhxxxDriver {
     /// As in `drvTetrAMM`, the `goto error` path skips the `setAcquire(1)`
     /// restore, so a status read that fails leaves the meter stopped.
     ///
-    /// A failed exchange returns its own status. C discards each
+    /// A failed exchange's reply is still parsed ([`trace::Reply::parse`]);
+    /// one that does not parse returns its own status. C discards each
     /// `writeReadMeter` status (drvAHxxx.cpp:697-772) and reports the empty
     /// reply as asynError (:801), which `drvQuadEM::writeFloat64` ORs with the
     /// setter's asynDisconnected into status=7: a disconnected meter alarms
@@ -196,36 +187,41 @@ impl AhxxxDriver {
         let p = self.params();
         let bad = |what: &str, resp: &str| error(format!("AHxxx: bad {what} response: {resp}"));
 
-        let resp = last.query(&self.io, "RNG ?", proto::MAX_COMMAND_LEN)?;
-        let range = proto::parse_range(&resp).ok_or_else(|| bad("RNG", &resp))?;
+        let range = last
+            .query(&self.io, "RNG ?", proto::MAX_COMMAND_LEN)
+            .parse(proto::parse_range, |r| bad("RNG", r))?;
         self.base.port_base.set_int32_param(p.range, 0, range)?;
 
         let read_format =
             QeReadFormat::from_i32(qe::int_param(&self.base.port_base, p.read_format, 0));
         let mut sample_time;
         if self.is_ah401() {
-            let resp = last.query(&self.io, "HLF ?", proto::MAX_COMMAND_LEN)?;
-            let ping_pong = proto::parse_hlf(&resp).ok_or_else(|| bad("HLF", &resp))?;
+            let ping_pong = last
+                .query(&self.io, "HLF ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_hlf, |r| bad("HLF", r))?;
             self.base
                 .port_base
                 .set_int32_param(p.ping_pong, 0, ping_pong)?;
 
-            let resp = last.query(&self.io, "ITM ?", proto::MAX_COMMAND_LEN)?;
-            let integration_time = proto::parse_itm(&resp).ok_or_else(|| bad("ITM", &resp))?;
+            let integration_time = last
+                .query(&self.io, "ITM ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_itm, |r| bad("ITM", r))?;
             self.base
                 .port_base
                 .set_float64_param(p.integration_time, 0, integration_time)?;
             sample_time = proto::sample_time_ah401(ping_pong, integration_time);
         } else {
-            let resp = last.query(&self.io, "CHN ?", proto::MAX_COMMAND_LEN)?;
-            let num_channels = proto::parse_chn(&resp).ok_or_else(|| bad("CHN", &resp))?;
+            let num_channels = last
+                .query(&self.io, "CHN ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_chn, |r| bad("CHN", r))?;
             self.base
                 .port_base
                 .set_int32_param(p.num_channels, 0, num_channels)?;
             self.shared.acq.lock().num_channels = num_channels;
 
-            let resp = last.query(&self.io, "RES ?", proto::MAX_COMMAND_LEN)?;
-            let resolution = proto::parse_res(&resp).ok_or_else(|| bad("RES", &resp))?;
+            let resolution = last
+                .query(&self.io, "RES ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_res, |r| bad("RES", r))?;
             self.base
                 .port_base
                 .set_int32_param(p.resolution, 0, resolution)?;
@@ -235,8 +231,10 @@ impl AhxxxDriver {
         }
 
         if proto::reads_bias_status(self.model) {
-            let resp = last.query(&self.io, "HVS ?", proto::MAX_COMMAND_LEN)?;
-            match proto::parse_hvs(&resp).ok_or_else(|| bad("HVS", &resp))? {
+            match last
+                .query(&self.io, "HVS ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_hvs, |r| bad("HVS", r))?
+            {
                 None => self.base.port_base.set_int32_param(p.bias_state, 0, 0)?,
                 Some(volts) => {
                     self.base.port_base.set_int32_param(p.bias_state, 0, 1)?;
@@ -326,8 +324,8 @@ impl QuadEmDevice for AhxxxDriver {
                 // Flush, then read with a short timeout to drain any responses;
                 // only a timeout that read nothing ends the loop.
                 let _ = self.io.flush();
-                let drained = self.io.read_line(proto::MAX_COMMAND_LEN);
-                if let (AsynStatus::Timeout, 0, _) = trace::read_result(&drained) {
+                let (drained, status) = outcome(self.io.read_line(proto::MAX_COMMAND_LEN));
+                if let (AsynStatus::Timeout, 0, _) = trace::read_result(&drained, &status) {
                     break;
                 }
             }
@@ -479,11 +477,16 @@ impl QuadEmDevice for AhxxxDriver {
     fn reset(&mut self) -> AsynResult<()> {
         let _ = self.set_acquire(0);
         self.firmware_version = "Unknown".into();
-        // C copies `inString_` over "Unknown" even when `VER ?` failed
-        // (drvAHxxx.cpp:408-411), publishing a stale or empty reply; drvTetrAMM
-        // guards the same copy on asynSuccess. C defect, not copied.
-        if let Ok(resp) = self.write_read_meter("VER ?") {
-            self.firmware_version = resp;
+        // C copies `inString_` whatever the `VER ?` status
+        // (drvAHxxx.cpp:408-411): a reply cut by a failed read is kept. One
+        // that delivered nothing would publish a stale or empty buffer; that
+        // C defect is not copied.
+        let (raw, status) = self
+            .io
+            .write_read("VER ?", proto::MAX_COMMAND_LEN)
+            .into_parts();
+        if status.is_ok() || !raw.is_empty() {
+            self.firmware_version = reply_text(&raw);
         }
         let p = self.params();
         self.base
@@ -618,25 +621,32 @@ fn read_thread(ctx: ReadContext) {
                     && QeTriggerMode::from_i32(ctx.shared.acq.lock().trigger_mode)
                         == QeTriggerMode::ExtGate;
 
-                let read = ctx.io.locked_read_binary(n_requested);
-                let mut outcome = match read {
-                    Ok(o) if o.data.len() == n_requested && o.eom.contains(EomReason::CNT) => o,
-                    Ok(_) => {
-                        trace::print_read_error(&ctx.handle, "drvAHxxx:readThread", &read);
+                let mut outcome = match outcome(ctx.io.locked_read_binary(n_requested)) {
+                    (o, Ok(()))
+                        if o.data.len() == n_requested && o.eom.contains(EomReason::CNT) =>
+                    {
+                        o
+                    }
+                    (o, status @ Ok(())) => {
+                        trace::print_read_error(&ctx.handle, "drvAHxxx:readThread", &o, &status);
                         thread::sleep(READ_ERROR_BACKOFF);
                         continue;
                     }
-                    Err(ref e) => {
+                    (o, Err(e)) => {
                         // C++ `readThread` (drvAHxxx.cpp:252-259): in Ext.
                         // Gate mode the AH501BE answers its `ACK\r\n`
                         // preamble and then goes quiet waiting for the
                         // external gate pulse, so the binary read times out
-                        // after exactly those 5 bytes. Only
-                        // `AsynError::partial_read` still carries them.
-                        if !is_timeout(e) {
-                            trace::print_read_error(&ctx.handle, "drvAHxxx:readThread", &read);
+                        // after exactly those 5 bytes.
+                        if !is_timeout(&e) {
+                            trace::print_read_error(
+                                &ctx.handle,
+                                "drvAHxxx:readThread",
+                                &o,
+                                &Err(e),
+                            );
                             thread::sleep(READ_ERROR_BACKOFF);
-                        } else if is_ext_gate_ack_timeout(e, ext_gate) {
+                        } else if is_ext_gate_ack_timeout(&o.data, &e, ext_gate) {
                             asyn_print!(
                                 ctx.handle,
                                 IO_DRIVER,
@@ -664,12 +674,14 @@ fn read_thread(ctx: ReadContext) {
                     let _ = ctx.shared.trigger_callbacks(&ctx.handle);
                     let preamble_len = proto::ACK_PREAMBLE.len();
                     outcome.data.drain(0..preamble_len);
-                    let extra = ctx.io.locked_read_binary(preamble_len);
-                    match &extra {
-                        Ok(o) if o.data.len() == preamble_len && o.eom.contains(EomReason::CNT) => {
-                        }
+                    let (extra, status) =
+                        crate::octet::outcome(ctx.io.locked_read_binary(preamble_len));
+                    match &status {
+                        Ok(())
+                            if extra.data.len() == preamble_len
+                                && extra.eom.contains(EomReason::CNT) => {}
                         _ => {
-                            let (status, n_read, eom) = trace::read_result(&extra);
+                            let (status, n_read, eom) = trace::read_result(&extra, &status);
                             asyn_print!(
                                 ctx.handle,
                                 ERROR,
@@ -678,9 +690,8 @@ fn read_thread(ctx: ReadContext) {
                             );
                         }
                     }
-                    if let Ok(o) = extra {
-                        outcome.data.extend_from_slice(&o.data);
-                    }
+                    // C reads the refill into the frame whatever its status.
+                    outcome.data.extend_from_slice(&extra.data);
                 }
                 trace::print_io(
                     &ctx.handle,
@@ -706,12 +717,16 @@ fn read_thread(ctx: ReadContext) {
             }
             QeReadFormat::Ascii => {
                 for _ in 0..values_per_read {
-                    let read = ctx.io.locked_read_line(proto::ASCII_BUFFER_SIZE);
-                    let outcome = match read {
-                        Ok(o) if o.eom.contains(EomReason::EOS) => o,
-                        _ => {
-                            if trace::read_result(&read).0 != AsynStatus::Timeout {
-                                trace::print_read_error(&ctx.handle, "drvAHxxx:readThread", &read);
+                    let outcome = match outcome(ctx.io.locked_read_line(proto::ASCII_BUFFER_SIZE)) {
+                        (o, Ok(())) if o.eom.contains(EomReason::EOS) => o,
+                        (o, status) => {
+                            if trace::read_result(&o, &status).0 != AsynStatus::Timeout {
+                                trace::print_read_error(
+                                    &ctx.handle,
+                                    "drvAHxxx:readThread",
+                                    &o,
+                                    &status,
+                                );
                                 thread::sleep(READ_ERROR_BACKOFF);
                             }
                             continue;
@@ -850,29 +865,8 @@ pub fn create_ahxxx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::asyn::interpose::PartialOctetRead;
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::base::runtime::interrupt_accept::InterruptGate;
-
-    /// `AsynError::PartialRead` is how `asyn-rs` 0.24+ carries a timed-out
-    /// read's transferred bytes (see the module docs); a bare
-    /// `AsynError::Status` match would miss it entirely.
-    #[test]
-    fn is_timeout_recognizes_a_partial_read_wrapped_timeout() {
-        let e = AsynError::Status {
-            status: AsynStatus::Timeout,
-            message: "read timeout".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: proto::ACK_PREAMBLE.to_vec(),
-            eom_reason: EomReason::empty(),
-        });
-        assert!(is_timeout(&e));
-        assert_eq!(
-            e.partial_read().map(|p| p.data.as_slice()),
-            Some(proto::ACK_PREAMBLE)
-        );
-    }
 
     /// C++ prints the connect failure and returns from its constructor: the
     /// port stays, with no read thread, and a meter command fails on the
@@ -1006,6 +1000,89 @@ mod tests {
         assert_eq!(fw, b"Unknown");
     }
 
+    /// A meter whose `VER ?` reply is cut by a timeout.
+    struct CutVersion {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reply: &'static [u8],
+        cut: bool,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for CutVersion {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut epics_rs::asyn::user::AsynUser,
+            data: &[u8],
+        ) -> AsynResult<usize> {
+            self.cut = data.starts_with(b"VER");
+            self.reply = if self.cut { b"AH501D 3.0" } else { b"ACK" };
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &epics_rs::asyn::user::AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            let n = self.reply.len();
+            buf[..n].copy_from_slice(self.reply);
+            if !self.cut {
+                return OctetReadResult::ok(n, EomReason::empty());
+            }
+            OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }),
+                ..OctetReadResult::ok(n, EomReason::empty())
+            }
+        }
+    }
+
+    /// drvAHxxx.cpp:408-411 copies `inString_` whatever the `VER ?` status,
+    /// so a reply cut by a timeout still names the firmware and the model.
+    #[test]
+    fn a_version_cut_by_a_timeout_is_still_read() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let (_io, _meter) = crate::octet::tests::published_port(
+            "QE_AH_CUTVER_IP",
+            CutVersion {
+                base: PortDriverBase::new(
+                    "QE_AH_CUTVER_IP",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                reply: b"",
+                cut: false,
+            },
+        );
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_CUTVER").unwrap(),
+            "QE_AH_CUTVER_IP",
+            4,
+            0,
+            "AH999",
+        )
+        .unwrap();
+        let fw = rt
+            .port_handle()
+            .get_string_param_blocking(rt.params.firmware, 0, 256)
+            .unwrap();
+        assert_eq!(fw, b"AH501D 3.0");
+        let model = rt
+            .port_handle()
+            .read_int32_blocking(rt.params.model, 0)
+            .unwrap();
+        assert_eq!(model, QeModel::Ah501d as i32);
+    }
+
     /// A down meter link fails a write with the link's asynDisconnected, not
     /// C's asynError from parsing an empty status reply.
     #[test]
@@ -1040,28 +1117,25 @@ mod tests {
         assert!(!is_timeout(&error("boom")));
     }
 
-    /// `AsynError::PartialRead` wraps non-timeout failures too (`error.rs`
-    /// cites a mid-transfer ECONNRESET). One that happens to carry exactly
-    /// the 5-byte ACK preamble must NOT trigger callbacks — only a genuine
-    /// timeout carrying it should.
+    /// A mid-transfer ECONNRESET that happens to leave exactly the 5-byte
+    /// ACK preamble must NOT trigger callbacks — only a genuine timeout
+    /// carrying it should.
     #[test]
     fn ext_gate_ack_trigger_requires_a_genuine_timeout() {
-        let ack_payload = PartialOctetRead {
-            data: proto::ACK_PREAMBLE.to_vec(),
-            eom_reason: EomReason::empty(),
-        };
         let non_timeout = AsynError::Status {
             status: AsynStatus::Error,
             message: "read error: ECONNRESET".into(),
-        }
-        .with_partial_read(ack_payload.clone());
-        assert!(!is_ext_gate_ack_timeout(&non_timeout, true));
+        };
+        assert!(!is_ext_gate_ack_timeout(
+            proto::ACK_PREAMBLE,
+            &non_timeout,
+            true
+        ));
 
         let timeout = AsynError::Status {
             status: AsynStatus::Timeout,
             message: "read timeout".into(),
-        }
-        .with_partial_read(ack_payload);
-        assert!(is_ext_gate_ack_timeout(&timeout, true));
+        };
+        assert!(is_ext_gate_ack_timeout(proto::ACK_PREAMBLE, &timeout, true));
     }
 }

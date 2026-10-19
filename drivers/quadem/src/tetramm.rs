@@ -20,7 +20,7 @@ use crate::drv_quad_em::{
     self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QeReadFormat,
     QeTriggerMode, QeTriggerPolarity, QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared,
 };
-use crate::octet::{OctetIo, ReadOutcome, connect_octet, reply_text};
+use crate::octet::{OctetIo, ReadOutcome, connect_octet, outcome, reply_text};
 use crate::tetramm_proto as proto;
 use crate::{asyn_print, trace};
 
@@ -115,7 +115,8 @@ impl TetrAmmDriver {
     // --- I/O helpers (C++ writeReadMeter / sendCommand) ---
 
     fn write_read_meter(&self, out: &str) -> AsynResult<String> {
-        self.io.write_read(out, MAX_COMMAND_LEN)
+        let (raw, status) = self.io.write_read(out, MAX_COMMAND_LEN).into_parts();
+        status.map(|()| reply_text(&raw))
     }
 
     /// C++ `sendCommand`: stop acquisition around the command, require `ACK`.
@@ -192,8 +193,8 @@ impl QuadEmDevice for TetrAmmDriver {
                 // Drain until a response ends on EOS with a trailing ACK, or the
                 // read times out.
                 loop {
-                    match self.io.read_line(MAX_COMMAND_LEN) {
-                        Ok(outcome) => {
+                    match outcome(self.io.read_line(MAX_COMMAND_LEN)) {
+                        (outcome, Ok(())) => {
                             let s = outcome.as_str();
                             if outcome.eom.contains(EomReason::EOS) && s.ends_with("ACK") {
                                 status = Ok(());
@@ -206,7 +207,7 @@ impl QuadEmDevice for TetrAmmDriver {
                                 outcome.data.len()
                             );
                         }
-                        Err(e) => {
+                        (_, Err(e)) => {
                             asyn_print!(
                                 self.base.port_base,
                                 ERROR,
@@ -421,7 +422,8 @@ impl TetrAmmDriver {
         Ok(())
     }
 
-    /// A failed exchange returns its own status. C discards each
+    /// A failed exchange's reply is still parsed ([`trace::Reply::parse`]);
+    /// one that does not parse returns its own status. C discards each
     /// `writeReadMeter` status (drvTetrAMM.cpp:793-842) and reports the empty
     /// reply as asynError (:865), so a disconnected meter alarms WRITE there
     /// and COMM here. C defect, not copied.
@@ -432,24 +434,27 @@ impl TetrAmmDriver {
             message: "TetrAMM: unparseable status response".into(),
         };
 
-        let resp = last.query(&self.io, "CHN:?", MAX_COMMAND_LEN)?;
-        let num_channels = proto::parse_chn(&resp).ok_or_else(err)?;
+        let num_channels = last
+            .query(&self.io, "CHN:?", MAX_COMMAND_LEN)
+            .parse(proto::parse_chn, |_| err())?;
         self.base
             .port_base
             .set_int32_param(p.num_channels, 0, num_channels)?;
         self.shared.acq.lock().num_channels = num_channels;
 
         for i in 0..QE_MAX_INPUTS as i32 {
-            let resp = last.query(&self.io, &proto::cmd_range_query(i + 1), MAX_COMMAND_LEN)?;
-            let range = proto::parse_range(&resp).ok_or_else(err)?;
+            let range = last
+                .query(&self.io, &proto::cmd_range_query(i + 1), MAX_COMMAND_LEN)
+                .parse(proto::parse_range, |_| err())?;
             self.base.port_base.set_int32_param(p.range, i + 1, range)?;
             if i == 0 {
                 self.base.port_base.set_int32_param(p.range, 0, range)?;
             }
         }
 
-        let resp = last.query(&self.io, "NRSAMP:?", MAX_COMMAND_LEN)?;
-        let values_per_read = proto::parse_nrsamp(&resp).ok_or_else(err)?;
+        let values_per_read = last
+            .query(&self.io, "NRSAMP:?", MAX_COMMAND_LEN)
+            .parse(proto::parse_nrsamp, |_| err())?;
         self.base
             .port_base
             .set_int32_param(p.values_per_read, 0, values_per_read)?;
@@ -460,8 +465,10 @@ impl TetrAmmDriver {
             .port_base
             .set_float64_param(p.sample_time, 0, sample_time)?;
 
-        let resp = last.query(&self.io, "HVS:?", MAX_COMMAND_LEN)?;
-        match proto::parse_hvs(&resp).ok_or_else(err)? {
+        match last
+            .query(&self.io, "HVS:?", MAX_COMMAND_LEN)
+            .parse(proto::parse_hvs, |_| err())?
+        {
             None => self.base.port_base.set_int32_param(p.hvs_readback, 0, 0)?,
             Some(volts) => {
                 self.base.port_base.set_int32_param(p.hvs_readback, 0, 1)?;
@@ -471,24 +478,28 @@ impl TetrAmmDriver {
             }
         }
 
-        let resp = last.query(&self.io, "HVV:?", MAX_COMMAND_LEN)?;
-        let v = proto::parse_hvv(&resp).ok_or_else(err)?;
+        let v = last
+            .query(&self.io, "HVV:?", MAX_COMMAND_LEN)
+            .parse(proto::parse_hvv, |_| err())?;
         self.base
             .port_base
             .set_float64_param(p.hvv_readback, 0, v)?;
 
-        let resp = last.query(&self.io, "HVI:?", MAX_COMMAND_LEN)?;
-        let v = proto::parse_hvi(&resp).ok_or_else(err)?;
+        let v = last
+            .query(&self.io, "HVI:?", MAX_COMMAND_LEN)
+            .parse(proto::parse_hvi, |_| err())?;
         self.base
             .port_base
             .set_float64_param(p.hvi_readback, 0, v)?;
 
-        let resp = last.query(&self.io, "TEMP:?", MAX_COMMAND_LEN)?;
-        let v = proto::parse_temp(&resp).ok_or_else(err)?;
+        let v = last
+            .query(&self.io, "TEMP:?", MAX_COMMAND_LEN)
+            .parse(proto::parse_temp, |_| err())?;
         self.base.port_base.set_float64_param(p.temperature, 0, v)?;
 
-        let resp = last.query(&self.io, "STATUS:?", MAX_COMMAND_LEN)?;
-        let unit_status = proto::parse_status(&resp).ok_or_else(err)?;
+        let unit_status = last
+            .query(&self.io, "STATUS:?", MAX_COMMAND_LEN)
+            .parse(proto::parse_status, |_| err())?;
         let interlock = proto::interlock_status(unit_status);
         self.base
             .port_base
@@ -535,7 +546,9 @@ impl PortDriver for TetrAmmDriver {
                 ("IFCONFIG:LINK", "IFCONFIG:LINK: response from meter:"),
                 ("IFCONFIG:ICMP", "IFCONFIG:ICMP: response from meter:"),
             ] {
-                let reply = reply_text(self.write_read_meter(command));
+                // C++ prints `inString_` whatever the read's status.
+                let (raw, _) = self.io.write_read(command, MAX_COMMAND_LEN).into_parts();
+                let reply = reply_text(&raw);
                 let _ = writeln!(out, "{label}\n{reply}");
             }
         }
@@ -595,11 +608,14 @@ fn read_thread(ctx: ReadContext) {
         match read_format {
             QeReadFormat::Binary => {
                 let n_requested = proto::binary_frame_len(num_channels);
-                let read = ctx.io.locked_read_binary(n_requested);
-                let outcome = match read {
-                    Ok(o) if o.data.len() == n_requested && o.eom.contains(EomReason::CNT) => o,
-                    _ => {
-                        report_read_failure(&ctx.handle, &read, true);
+                let outcome = match outcome(ctx.io.locked_read_binary(n_requested)) {
+                    (o, Ok(()))
+                        if o.data.len() == n_requested && o.eom.contains(EomReason::CNT) =>
+                    {
+                        o
+                    }
+                    (o, status) => {
+                        report_read_failure(&ctx.handle, &o, &status, true);
                         continue;
                     }
                 };
@@ -655,11 +671,10 @@ fn read_thread(ctx: ReadContext) {
                 }
             }
             QeReadFormat::Ascii => {
-                let read = ctx.io.locked_read_line(proto::ASCII_BUFFER_SIZE);
-                let outcome = match read {
-                    Ok(o) if o.eom.contains(EomReason::EOS) => o,
-                    _ => {
-                        report_read_failure(&ctx.handle, &read, false);
+                let outcome = match outcome(ctx.io.locked_read_line(proto::ASCII_BUFFER_SIZE)) {
+                    (o, Ok(())) if o.eom.contains(EomReason::EOS) => o,
+                    (o, status) => {
+                        report_read_failure(&ctx.handle, &o, &status, false);
                         continue;
                     }
                 };
@@ -704,8 +719,13 @@ fn read_thread(ctx: ReadContext) {
 /// C++ `readThread`'s rejected-read branch. A timeout is routine only on the
 /// binary path; C++ sleeps a second after anything else, the meter being
 /// probably offline.
-fn report_read_failure(handle: &PortHandle, read: &AsynResult<ReadOutcome>, binary: bool) {
-    if trace::read_result(read).0 == AsynStatus::Timeout {
+fn report_read_failure(
+    handle: &PortHandle,
+    read: &ReadOutcome,
+    status: &AsynResult<()>,
+    binary: bool,
+) {
+    if trace::read_result(read, status).0 == AsynStatus::Timeout {
         if binary {
             asyn_print!(
                 *handle,
@@ -715,7 +735,7 @@ fn report_read_failure(handle: &PortHandle, read: &AsynResult<ReadOutcome>, bina
         }
         return;
     }
-    trace::print_read_error(handle, "drvTetrAMM::readThread", read);
+    trace::print_read_error(handle, "drvTetrAMM::readThread", read, status);
     thread::sleep(Duration::from_secs(1));
 }
 
@@ -726,10 +746,7 @@ fn report_read_failure(handle: &PortHandle, read: &AsynResult<ReadOutcome>, bina
 fn resync(ctx: &ReadContext, num_channels: usize) {
     let doubled = proto::binary_frame_len(num_channels) * 2;
     let locked = ctx.io.locked(move |port| {
-        let data = match port.read_binary(doubled) {
-            Ok(outcome) => outcome.data,
-            Err(e) => e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
-        };
+        let (data, _) = port.read_binary(doubled).into_parts();
         let found = proto::find_resync_offset(&data).map(|offset| {
             let remainder = proto::resync_remainder(num_channels, offset);
             let _ = port.read_binary(remainder);
@@ -881,9 +898,9 @@ mod tests {
             TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
         );
 
-        let read = io.read_binary(proto::binary_frame_len(4));
-        assert!(read.is_err());
-        report_read_failure(handle, &read, true);
+        let (read, status) = outcome(io.read_binary(proto::binary_frame_len(4)));
+        assert!(status.is_err());
+        report_read_failure(handle, &read, &status, true);
 
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
