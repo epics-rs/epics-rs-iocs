@@ -84,6 +84,14 @@ const OP_JOG_MOVE: i32 = 3;
 /// ACSPL kinematic axis letters, indexed by 0-based axis (C `ACSPL_axis`).
 const AXIS_LETTERS: [&str; 8] = ["X", "Y", "Z", "T", "A", "B", "C", "D"];
 
+/// C `CommStatus`, kept per card.
+#[derive(Clone, Copy, PartialEq)]
+enum CommState {
+    Normal,
+    Retry,
+    CommErr,
+}
+
 /// Controller command-interface mode (C `enum CMND_MODES`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CommandMode {
@@ -128,6 +136,7 @@ pub struct SpiiPlusController {
     ident: String,
     mode: CommandMode,
     num_axes: usize,
+    comm_state: CommState,
 }
 
 impl SpiiPlusController {
@@ -140,6 +149,7 @@ impl SpiiPlusController {
             ident: String::new(),
             mode,
             num_axes: 0,
+            comm_state: CommState::Normal,
         };
 
         // C's send_recv_mess returns the bytes read, so any reply makes the
@@ -202,6 +212,22 @@ impl SpiiPlusController {
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
+
+    /// A `set_status` query: the reply, or `None` for C's command error
+    /// (drvSPiiPlus.cc:266-267), a failed or empty read or a `?` in the
+    /// reply's C string.
+    fn query(&self, cmd: &str) -> Option<String> {
+        let (raw, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        let c_str = raw.split(|&b| b == 0).next().unwrap_or_default();
+        if status.is_err() || raw.is_empty() || c_str.contains(&b'?') {
+            return None;
+        }
+        let text = String::from_utf8_lossy(c_str);
+        Some(text.trim_matches(['\r', '\n', ' ']).to_string())
+    }
 }
 
 /// Decoded motor status for one poll (mode-dependent done/limit logic).
@@ -258,6 +284,11 @@ pub struct SpiiPlusAxis {
     /// 0-based axis index (used directly on the wire).
     axis: usize,
     prev_position: i32,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// failed pass (RETRY, drvSPiiPlus.cc:276), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :278). Per axis, as the card's
+    /// state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
     /// What `motor_init`'s `set_status` read, until the motor task takes it.
@@ -273,6 +304,7 @@ impl SpiiPlusAxis {
             controller,
             axis: index,
             prev_position: 0,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
                 has_encoder: true,
                 gain_support: true,
@@ -328,16 +360,13 @@ impl SpiiPlusAxis {
 impl Model1Motor for SpiiPlusAxis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
 impl AsynMotor for SpiiPlusAxis {
-    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
-    /// `RA_PROBLEM` (drvSPiiPlus.cc). Its first failure's silent RETRY is not modelled:
-    /// a transport error raises both at once.
     fn poll_failure(&self) -> PollFailure {
-        PollFailure::PROBLEM_AND_COMMS_ERROR
+        self.failure
     }
 
     fn move_absolute(
@@ -491,26 +520,42 @@ impl AsynMotor for SpiiPlusAxis {
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
-        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let a = self.axis;
         let mode = ctrl.mode;
 
-        let mst = atoi(&ctrl.command(&format!("?D/MST({a})"))?);
-        let fault = atoi(&ctrl.command(&format!("?D/FAULT({a})"))?);
-        let apos = atof(&ctrl.command(&format!("?APOS({a})"))?);
-        let fpos_reply = match mode {
-            CommandMode::Connect => ctrl.command(&format!("?FPOS{}", AXIS_LETTERS[a]))?,
-            _ => ctrl.command(&format!("?FPOS({a})"))?,
-        };
-        let fpos = atof(&fpos_reply);
-        let velocity = atof(&ctrl.command(&format!("?FVEL({a})"))?);
-
-        // Done and the home request are only read back in Buffer mode.
-        let (done_val, opreq_val) = match mode {
-            CommandMode::Buffer => (
-                atoi(&ctrl.command(&format!("?Done({a})"))?),
-                atoi(&ctrl.command(&format!("?opReq({a})"))?),
-            ),
+        // C `queryCmnds[cmndMode]` in order, the pass ending at the first
+        // failed reply (drvSPiiPlus.cc:94-98, :252-269); Buffer mode alone
+        // reads opReq, then Done.
+        let mut queries = vec![
+            format!("?D/MST({a})"),
+            format!("?D/FAULT({a})"),
+            format!("?APOS({a})"),
+            match mode {
+                CommandMode::Connect => format!("?FPOS{}", AXIS_LETTERS[a]),
+                _ => format!("?FPOS({a})"),
+            },
+            format!("?FVEL({a})"),
+        ];
+        if mode == CommandMode::Buffer {
+            queries.extend([format!("?opReq({a})"), format!("?Done({a})")]);
+        }
+        let replies: Vec<String> = queries.iter().map_while(|q| ctrl.query(q)).collect();
+        if let Some(failed) = queries.get(replies.len()) {
+            (ctrl.comm_state, self.failure) = match ctrl.comm_state {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
+            };
+            return Err(spiiplus_err(format!("SPiiPlus axis {a}: {failed} failed")));
+        }
+        ctrl.comm_state = CommState::Normal;
+        let mst = atoi(&replies[0]);
+        let fault = atoi(&replies[1]);
+        let apos = atof(&replies[2]);
+        let fpos = atof(&replies[3]);
+        let velocity = atof(&replies[4]);
+        let (opreq_val, done_val) = match &replies[5..] {
+            [opreq, done] => (atoi(opreq), atoi(done)),
             _ => (0, 0),
         };
 
@@ -741,7 +786,7 @@ mod tests {
             "?VR" => "ACS SPiiPlus".into(),
             "?APOS(0)" => "0".into(),
             "?Done(0)" => u8::from(d.load(Ordering::SeqCst)).to_string(),
-            _ => String::new(),
+            _ => "0".into(),
         });
         let ctrl = SpiiPlusController::new(io, CommandMode::Buffer).unwrap();
         let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
@@ -771,6 +816,78 @@ mod tests {
         assert_eq!(polled(&line), ["P=0"]);
         axis.poll(&user).unwrap();
         assert!(polled(&line).is_empty());
+    }
+
+    /// drvSPiiPlus.cc:252-298: a reply holding `?` ends the pass, which is
+    /// RETRY (nothing raised, nothing posted) on a NORMAL card, COMM_ERR
+    /// after, and a full pass clears it.
+    #[test]
+    fn a_question_mark_reply_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let refuse = Arc::new(AtomicBool::new(false));
+        let r = refuse.clone();
+        let (line, io) = LineRig::new("spiiRetry", move |last| match last {
+            "?VR" => "ACS SPiiPlus".into(),
+            "?D/FAULT(0)" if r.load(Ordering::SeqCst) => "?1004".into(),
+            _ => "0".into(),
+        });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
+        let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        let user = AsynUser::default();
+        refuse.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(line.sent(), ["?D/MST(0)", "?D/FAULT(0)"]);
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        refuse.store(false, Ordering::SeqCst);
+        line.sent();
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        assert_eq!(
+            line.sent(),
+            [
+                "?D/MST(0)",
+                "?D/FAULT(0)",
+                "?APOS(0)",
+                "?FPOS(0)",
+                "?FVEL(0)"
+            ]
+        );
+        refuse.store(true, Ordering::SeqCst);
+        assert!(axis.poll(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvSPiiPlus.cc:282-295 exit stores what motor_init prepared
+    /// (:727-737, EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once
+    /// past RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("spiiInitFail", |last| match last {
+            "?VR" => "ACS SPiiPlus".into(),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(
+            SpiiPlusController::new(io, CommandMode::Buffer).unwrap(),
+        ));
+        let mut first = SpiiPlusAxis::new(ctrl.clone(), 0);
+        let mut second = SpiiPlusAxis::new(ctrl, 1);
+        let prepared = MotorStatus {
+            has_encoder: true,
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 
     /// devSPiiPlus.cc: Direct-mode HOME builds nothing, so the home is the
