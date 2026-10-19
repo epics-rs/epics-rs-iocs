@@ -490,6 +490,11 @@ impl QuadEmDevice for Pcr4Driver {
         }
         self.base_reset()
     }
+
+    /// C++ `drvPCR4::exitHandler`: the meter is stopped before the IOC goes.
+    fn exit_handler(&mut self) {
+        let _ = self.set_acquire(0);
+    }
 }
 
 // ===========================================================================
