@@ -1093,9 +1093,7 @@ impl SessionWorker {
         }
         let status = value.status.unwrap_or(StatusCode::Good);
         if status.is_bad() && value.value.is_none() {
-            // C's `setIncomingData` takes the value's status, as a value does.
-            item.last_status = status;
-            item.set_incoming_event(ProcessReason::ReadFailure);
+            item.set_incoming_failure(status);
         } else {
             item.set_incoming_data(value, ProcessReason::ReadComplete);
         }

@@ -258,7 +258,7 @@ impl Item {
         let status = value.status.unwrap_or(StatusCode::Good);
         let data = value.value.clone().unwrap_or(Variant::Empty);
         self.last_value = Some(data.clone());
-        self.last_status = status;
+        self.take_value_status(status);
         self.map_elements(&data);
         let data_time = self.data_timestamp(&data);
         self.last_timestamp = Some(timestamp_for(&self.link, &value, data_time));
@@ -312,6 +312,34 @@ impl Item {
                 leaf.state = ConnectionStatus::Up;
             }
         }
+    }
+
+    /// A read answered with a bad status and no value. C hands it to
+    /// `setIncomingData` like any value, so it is the item's status; the records
+    /// see a read failure.
+    pub fn set_incoming_failure(&mut self, status: StatusCode) {
+        self.take_value_status(status);
+        self.set_incoming_event(ProcessReason::ReadFailure);
+    }
+
+    /// The head of `ItemOpen62541::setIncomingData` (`ItemOpen62541.cpp:175-184`).
+    fn take_value_status(&mut self, status: StatusCode) {
+        if self.last_status == StatusCode::BadServerNotConnected
+            && status == StatusCode::BadNodeIdUnknown
+        {
+            // C prints the epicsUInt32 identifier with %d, negative from 2^31.
+            let identifier = match &self.link.identifier {
+                Some(NodeIdentifier::Numeric(n)) => format!("i={n}"),
+                Some(NodeIdentifier::String(s)) => format!("s={s}"),
+                None => "s=".to_string(),
+            };
+            errlog_vprintf(format_args!(
+                "OPC UA session {}: item ns={};{identifier} : BadNodeIdUnknown\n",
+                self.link.session().unwrap_or_default(),
+                self.link.namespace_index,
+            ));
+        }
+        self.last_status = status;
     }
 
     /// An event with no value — a read failure, a write result, a connection

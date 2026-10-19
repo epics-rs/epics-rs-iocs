@@ -1018,6 +1018,61 @@ async fn a_refused_value_reaches_the_record_and_the_item_status() {
     assert_eq!(item0.lock().last_status, StatusCode::BadNodeIdUnknown);
 }
 
+/// `ItemOpen62541::setIncomingData` reports a node the server does not know when
+/// it is the item's first answer since it was connected (`ItemOpen62541.cpp:175-182`).
+#[tokio::test]
+async fn an_unknown_node_is_reported_on_the_first_answer_after_a_connect() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    mock.behave(|b| b.value_status = Some(StatusCode::BadNodeIdUnknown));
+    let (item0, leaf0) = item("sess ns=2;s=Missing monitor=n", INPUT);
+    let (item1, _leaf1) = item("sess ns=3;i=1234 monitor=n", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone(), item1],
+    );
+    until(|| handle.is_connected()).await;
+    drain(&leaf0);
+
+    // Refused again: the item's status is no longer BadServerNotConnected.
+    handle.request(Priority::Low, Request::Read { handle: 0 });
+    until(|| !leaf0.lock().queue.is_empty()).await;
+
+    // A data change after a connection loss is the same first answer.
+    let mut item = item0.lock();
+    item.set_incoming_event(ProcessReason::ConnectionLoss);
+    let refused = DataValue {
+        value: Some(Variant::Int32(1)),
+        status: Some(StatusCode::BadNodeIdUnknown),
+        ..Default::default()
+    };
+    item.set_incoming_data(refused.clone(), ProcessReason::IncomingData);
+    item.set_incoming_data(refused, ProcessReason::IncomingData);
+    drop(item);
+
+    errlog_flush();
+    errlog_remove_listener(id);
+    let reported: Vec<String> = lines
+        .lock()
+        .iter()
+        .filter(|l| l.starts_with("OPC UA session sess: item "))
+        .cloned()
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            "OPC UA session sess: item ns=2;s=Missing : BadNodeIdUnknown\n",
+            "OPC UA session sess: item ns=3;i=1234 : BadNodeIdUnknown\n",
+            "OPC UA session sess: item ns=2;s=Missing : BadNodeIdUnknown\n",
+        ]
+    );
+}
+
 /// Upstream C defect fixed at source: `SessionOpen62541::readComplete` bounds-checks
 /// the DataType result and then reads the Value result at `i + 1` unchecked, so a
 /// server that returns fewer results than requested reads past the end of the array.
