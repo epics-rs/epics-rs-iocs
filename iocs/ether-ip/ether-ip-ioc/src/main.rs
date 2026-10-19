@@ -68,13 +68,14 @@ static DEVICES: &[(&str, &[DevSup])] = &[
     ),
 ];
 
-/// A devEtherIP row whose `init` is the shared `init(run)`.
+/// A devEtherIP row whose `init` is the shared `init(run)`, which calls
+/// `devExtend` at run 0 (`devEtherIP.c:1227-1230` and its twins).
 const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'static [u8]) -> DevSup {
     DevSup {
         name,
         choice,
         link_type: DbLinkType::InstIo,
-        dset: Dset::new(number, funcs, false).with_init(driver::dev_init),
+        dset: Dset::new(number, funcs, true).with_init(driver::dev_init),
     }
 }
 
@@ -304,6 +305,22 @@ mod tests {
                 assert_eq!(
                     row.dset.init.map(|f| f as usize),
                     (row.name != "devBoEtherIPReset").then_some(dev_init as usize),
+                    "{record_type} {}",
+                    row.name
+                );
+            }
+        }
+    }
+
+    /// Every devEtherIP dset but devBoEtherIPReset calls `devExtend` from its
+    /// `init(0)`, so a runtime INP/OUT put passes `dbPutFieldLink`'s gate.
+    #[test]
+    fn every_dset_but_reset_extends() {
+        for (record_type, rows) in DEVICES {
+            for row in *rows {
+                assert_eq!(
+                    row.has_dsxt(),
+                    row.name != "devBoEtherIPReset",
                     "{record_type} {}",
                     row.name
                 );

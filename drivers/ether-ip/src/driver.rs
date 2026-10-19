@@ -145,6 +145,11 @@ impl TagInfo {
         l
     }
 
+    /// C `drvEtherIP_remove_callback`.
+    pub fn remove_listener(&self, l: &Arc<Listener>) {
+        self.listeners.lock().retain(|x| !Arc::ptr_eq(x, l));
+    }
+
     /// Device support side of the write handshake: stage the value in the tag
     /// buffer, then flag it. The scan thread clears `do_write` and sets
     /// `is_writing` when it picks the write up.
