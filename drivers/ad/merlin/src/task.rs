@@ -15,10 +15,9 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
-use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -351,7 +350,9 @@ async fn publish_image(
     array.timestamp = start;
     array.time_stamp = start.as_f64();
     array.attributes = build_attributes(&header.attrs, acquisition_header);
-    publish(ctx, array).await;
+    // C stores no array size, type or time-stamp param per frame; the
+    // constructor's values stand (merlinDetector.cpp:1494-1497).
+    ctx.output.publish(array).await;
     true
 }
 
@@ -431,43 +432,8 @@ async fn publish_profiles(
     array.timestamp = start;
     array.time_stamp = start.as_f64();
     array.attributes = build_attributes(&header.attrs, acquisition_header);
-    publish(ctx, array).await;
-    true
-}
-
-/// Update the NDArray metadata parameters and hand the array to the plugins.
-async fn publish(ctx: &AcquisitionContext, array: DriverArray) {
-    let base = &ctx.ad_params.base;
-    let ts = array.timestamp;
-    let size_x = array.dims[0].size as i32;
-    let size_y = array.dims[1].size as i32;
-    let data_type = array.data.data_type();
-    let num_elements: i64 = array.dims.iter().map(|d| d.size as i64).product();
-    let array_size = num_elements
-        .saturating_mul(data_type.element_size() as i64)
-        .min(i32::MAX as i64) as i32;
-
-    let _ = ctx
-        .handle
-        .set_params_and_notify(
-            0,
-            vec![
-                ParamSetValue::new(base.timestamp_rbv, 0, ParamValue::Float64(ts.as_f64())),
-                ParamSetValue::new(base.epics_ts_sec, 0, ParamValue::Int32(ts.sec as i32)),
-                ParamSetValue::new(base.epics_ts_nsec, 0, ParamValue::Int32(ts.nsec as i32)),
-                ParamSetValue::new(base.array_size_x, 0, ParamValue::Int32(size_x)),
-                ParamSetValue::new(base.array_size_y, 0, ParamValue::Int32(size_y)),
-                ParamSetValue::new(base.array_size, 0, ParamValue::Int32(array_size)),
-                ParamSetValue::new(base.n_dimensions, 0, ParamValue::Int32(2)),
-                ParamSetValue::new(
-                    base.color_mode,
-                    0,
-                    ParamValue::Int32(NDColorMode::Mono as i32),
-                ),
-                ParamSetValue::new(base.data_type, 0, ParamValue::Int32(data_type as u8 as i32)),
-            ],
-        )
-        .await;
-
+    // C stores no array size, type or time-stamp param per frame; the
+    // constructor's values stand (merlinDetector.cpp:1494-1497).
     ctx.output.publish(array).await;
+    true
 }
