@@ -58,6 +58,8 @@ pub struct SpecsAnalyserDriver {
     /// C `lensModes_`/`scanRanges_`.
     lens_modes: Vec<String>,
     scan_ranges: Vec<String>,
+    /// C `runModes_`.
+    run_modes: Vec<String>,
     driver_port: Arc<SyncIOHandle>,
     driver_addr: i32,
     /// C `firstConnect_`.
@@ -110,6 +112,7 @@ impl SpecsAnalyserDriver {
             param_map: HashMap::new(),
             lens_modes: Vec::new(),
             scan_ranges: Vec::new(),
+            run_modes: Vec::new(),
             driver_port,
             driver_addr,
             first_connect: true,
@@ -229,22 +232,21 @@ impl SpecsAnalyserDriver {
         };
         let lens_mode_values = or_not_connected(&lens_modes);
         let scan_range_values = or_not_connected(&scan_ranges);
-        let _ = self.ad.port_base.set_enum_choices_param(
+        let _ = self.ad.port_base.do_callbacks_enum(
             self.p.lens_mode,
             0,
             enum_choices(&lens_mode_values),
         );
-        let _ = self.ad.port_base.set_enum_choices_param(
+        let _ = self.ad.port_base.do_callbacks_enum(
             self.p.scan_range,
             0,
             enum_choices(&scan_range_values),
         );
         self.lens_modes = lens_mode_values;
         self.scan_ranges = scan_range_values;
-        let _ =
-            self.ad
-                .port_base
-                .set_enum_choices_param(self.p.run_mode, 0, enum_choices(&run_modes));
+        // C's readRunModes appends to runModes_ on every connect; each
+        // connect here holds the fixed four once.
+        self.run_modes = run_modes;
 
         let failures = [
             connect.err(),
@@ -654,6 +656,22 @@ impl PortDriver for SpecsAnalyserDriver {
         let _ = self.ad.port_base.call_param_callbacks(0);
         result
     }
+
+    /// `SpecsAnalyser::readEnum` (`specsAnalyser.cpp:716-761`).
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        let table = match user.reason {
+            r if r == self.p.lens_mode => &self.lens_modes,
+            r if r == self.p.scan_range => &self.scan_ranges,
+            r if r == self.p.run_mode => &self.run_modes,
+            _ => {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: String::new(),
+                });
+            }
+        };
+        Ok((0, enum_choices(table)))
+    }
 }
 
 impl ADDriver for SpecsAnalyserDriver {
@@ -862,6 +880,33 @@ mod tests {
                 .interface_mask()
                 .contains(own | AD_DRIVER_INTERFACES | ND_ARRAY_DRIVER_INTERFACES)
         );
+    }
+
+    /// readEnum hands each mbbi/mbbo its table (specsAnalyser.cpp:716-761):
+    /// a failed spectrum read leaves the single "Not connected", the run
+    /// modes are the fixed four, and any other reason is asynError.
+    #[test]
+    fn read_enum_gives_the_c_tables() {
+        let mut d = offline("SPECS_ENUM");
+        let _ = d.reconnect();
+        let strings = |d: &mut SpecsAnalyserDriver, reason| {
+            let (_, entries) = d.read_enum(&AsynUser::new(reason)).unwrap();
+            entries
+                .iter()
+                .map(|e| (e.string.clone(), e.value))
+                .collect::<Vec<_>>()
+        };
+        let p = d.p;
+        let not_connected = vec![("Not connected".to_string(), 0)];
+        assert_eq!(strings(&mut d, p.lens_mode), not_connected);
+        assert_eq!(strings(&mut d, p.scan_range), not_connected);
+        let run_modes: Vec<_> = (0..)
+            .zip(wire::read_run_modes())
+            .map(|(i, s)| (s, i))
+            .collect();
+        assert_eq!(strings(&mut d, p.run_mode), run_modes);
+        let other = AsynUser::new(d.p.connected);
+        assert_eq!(d.read_enum(&other).unwrap_err().status(), AsynStatus::Error);
     }
 
     /// writeInt32/writeFloat64 set and post list 0 whatever the address
