@@ -27,6 +27,12 @@ use std::sync::Arc;
 /// Upstream DTYP shared by every GM10 record type (`gm10Support.dbd`).
 pub const DTYP: &str = "Yokogawa GM10";
 
+/// Every devGM10_* dset's `init(pass)` (devGM10_ai.c:73-79 and siblings):
+/// pass 0 `scanIoInit`s the dset's `dummy_ioscanpvt`. The port has no
+/// per-source I/O Intr list to create; the dummy is the per-record channel
+/// `io_intr_receiver` hands an invalid input record.
+pub fn dev_init(_after: bool) {}
+
 /// One variant per legal `(record type, link command)` pair validated by
 /// a `devGM10_*.c::init_record`.
 #[derive(Debug, Clone, Copy)]
