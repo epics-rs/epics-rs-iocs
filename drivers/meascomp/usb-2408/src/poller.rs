@@ -311,17 +311,7 @@ fn poller_loop(
             // and, under AUTO_RESTART, startWaveDig's parameters.
             updates.extend(snapshot.wave_dig_arrays.into_iter().flatten());
         } else {
-            for ch in 0..MAX_ANALOG_IN {
-                if let Some(raw) = snapshot.ai_raw[ch] {
-                    updates.push(int(params.analog_in_value, ch, raw));
-                }
-                if let Some(v) = snapshot.ai_volts[ch] {
-                    updates.push(float(params.voltage_in_value, ch, v));
-                }
-                if let Some(t) = snapshot.ai_temp[ch] {
-                    updates.push(float(params.temperature_in_value, ch, t));
-                }
-            }
+            push_analog_in(&mut updates, &params, &snapshot);
         }
         let _ = handle.with_driver_blocking::<MultiFunctionDriver, _>(move |driver| {
             let base = driver.base_mut();
@@ -341,6 +331,46 @@ fn poller_loop(
     }
 }
 
+/// C's analog-input sets of one poll (drvMultiFunction.cpp:2783-2785,
+/// 2830-2832). C sets each value off by one first to force a callback even
+/// when the value has not changed.
+fn push_analog_in(
+    updates: &mut Vec<ParamSetValue>,
+    params: &MultiFunctionParams,
+    snap: &PollSnapshot,
+) {
+    for ch in 0..MAX_ANALOG_IN {
+        let addr = ch as i32;
+        if let Some(raw) = snap.ai_raw[ch] {
+            for v in [raw.wrapping_add(1), raw] {
+                updates.push(ParamSetValue::new(
+                    params.analog_in_value,
+                    addr,
+                    ParamValue::Int32(v),
+                ));
+            }
+        }
+        if let Some(v) = snap.ai_volts[ch] {
+            updates.push(ParamSetValue::new(
+                params.voltage_in_value,
+                addr,
+                ParamValue::Float64(v),
+            ));
+        }
+    }
+    for ch in 0..MAX_ANALOG_IN {
+        if let Some(t) = snap.ai_temp[ch] {
+            for v in [t + 1.0, t] {
+                updates.push(ParamSetValue::new(
+                    params.temperature_in_value,
+                    ch as i32,
+                    ParamValue::Float64(v),
+                ));
+            }
+        }
+    }
+}
+
 /// The driver's `int` rule over the port handle: C's getIntegerParam with
 /// its status ignored, an unset value read as 0.
 fn get_int(handle: &PortHandle, reason: usize, addr: i32) -> i32 {
@@ -350,4 +380,47 @@ fn get_int(handle: &PortHandle, reason: usize, addr: i32) -> i32 {
 /// C `getDoubleParam`; see [`get_int`].
 fn get_float(handle: &PortHandle, reason: usize, addr: i32) -> f64 {
     handle.read_float64_blocking(reason, addr).unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+
+    use super::*;
+
+    #[test]
+    fn an_unchanged_analog_input_calls_back_every_poll() {
+        let mut base = PortDriverBase::new(
+            "MFPOLL",
+            MAX_SIGNALS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let mut snap = PollSnapshot::default();
+        snap.ai_raw[3] = Some(1234);
+        snap.ai_temp[3] = Some(21.5);
+        for poll in 0..2 {
+            let mut updates = Vec::new();
+            push_analog_in(&mut updates, &params, &snap);
+            for update in &updates {
+                base.set_param(update).unwrap();
+            }
+            assert_eq!(
+                base.params.take_changed(3).unwrap(),
+                [params.analog_in_value, params.temperature_in_value],
+                "poll {poll}"
+            );
+            assert_eq!(
+                base.get_int32_param(params.analog_in_value, 3).unwrap(),
+                1234
+            );
+            assert_eq!(
+                base.get_float64_param(params.temperature_in_value, 3)
+                    .unwrap(),
+                21.5
+            );
+        }
+    }
 }
