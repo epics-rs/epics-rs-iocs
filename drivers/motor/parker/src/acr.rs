@@ -441,6 +441,11 @@ impl AcrAxis {
 }
 
 impl AsynMotor for AcrAxis {
+    /// The C constructor ends in `callParamCallbacks` (ACRMotorDriver.cpp:307).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// C `ACRAxis::poll`'s `skip` label sets only `motorStatusProblem_`
     /// (ACRMotorDriver.cpp).
     fn poll_failure(&self) -> PollFailure {
@@ -596,6 +601,19 @@ mod tests {
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+    /// ACRMotorDriver.cpp:307.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        let (handle, _) = SyncIOHandle::connect_port(
+            "ACR_NONE",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let controller = Arc::new(Mutex::new(AcrController::new(handle)));
+        assert!(AcrAxis::new(controller, 0).constructor_calls_param_callbacks());
+    }
 
     /// A failed PPU query keeps the axis with no encoder or gain support and
     /// refuses motion rather than dividing by an unset PPU.

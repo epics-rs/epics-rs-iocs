@@ -238,6 +238,11 @@ impl C300Axis {
 }
 
 impl AsynMotor for C300Axis {
+    /// The C constructor ends in `callParamCallbacks` (C300MotorDriver.cpp:250).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// C `C300Axis::poll`'s `skip` label sets only `motorStatusProblem_`
     /// (C300MotorDriver.cpp).
     fn poll_failure(&self) -> PollFailure {
@@ -358,6 +363,19 @@ mod tests {
         let controller = Arc::new(Mutex::new(C300Controller::new(handle, 1)));
         let axis = C300Axis::new(controller, 0);
         assert!(!axis.has_encoder);
+    }
+
+    /// C300MotorDriver.cpp:250.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        let (handle, _) = SyncIOHandle::connect_port(
+            "C300_NONE",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let controller = Arc::new(Mutex::new(C300Controller::new(handle, 1)));
+        assert!(C300Axis::new(controller, 0).constructor_calls_param_callbacks());
     }
 
     #[test]

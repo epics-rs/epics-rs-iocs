@@ -540,6 +540,11 @@ impl Lc400Controller {
 }
 
 impl AsynMotor for Lc400Axis {
+    /// The C constructor ends in `callParamCallbacks` (LC400MotorDriver.cpp:666).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// C `LC400Axis::poll`'s `skip` label sets only `motorStatusProblem_`.
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM
@@ -916,6 +921,13 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         text.lines().map(str::to_owned).collect()
+    }
+
+    /// LC400MotorDriver.cpp:666.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(None, 1)));
+        assert!(Lc400Axis::new(controller, 0).constructor_calls_param_callbacks());
     }
 
     /// LC400MotorDriver.cpp poll / updateAuxParams: the digital position,

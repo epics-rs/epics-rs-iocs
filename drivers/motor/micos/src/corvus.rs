@@ -254,6 +254,11 @@ impl CorvusAxis {
 }
 
 impl AsynMotor for CorvusAxis {
+    /// The C constructor ends in `callParamCallbacks` (SMCcorvusDriver.cpp:185).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// C `SMCcorvusAxis::poll`'s `skip` label sets only `motorStatusProblem_`
     /// (SMCcorvusDriver.cpp).
     fn poll_failure(&self) -> PollFailure {
@@ -432,6 +437,21 @@ impl CorvusAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SMCcorvusDriver.cpp:185.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        use epics_rs::asyn::interfaces::InterfaceType;
+        let (handle, _) = SyncIOHandle::connect_port(
+            "CORVUS_DEAD",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let controller = Arc::new(Mutex::new(CorvusController::new(handle, 1)));
+        let axis = CorvusAxis::new(controller, 0, "").unwrap();
+        assert!(axis.constructor_calls_param_callbacks());
+    }
 
     /// C's status_ starts at 0 and the constructor sets no status bit; only
     /// a good poll sets Done (SMCcorvusDriver.cpp:431).

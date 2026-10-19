@@ -825,6 +825,12 @@ impl ImsMDrivePlusAxis {
 }
 
 impl AsynMotor for ImsMDrivePlusAxis {
+    /// The C constructor ends in `callParamCallbacks`, `configAxis` failed
+    /// or not (ImsMDrivePlusMotorAxis.cpp:56).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// C `ImsMDrivePlusMotorAxis::handleAxisError` sets only
     /// `motorStatusProblem_`.
     fn poll_failure(&self) -> PollFailure {
@@ -1020,6 +1026,22 @@ mod tests {
                 other => format!("{other:?}"),
             })
             .collect()
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:56.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        let (handle, _) = SyncIOHandle::connect_port(
+            "IMS_NONE",
+            0,
+            Duration::from_millis(10),
+            InterfaceType::Octet,
+        );
+        let axis = ImsMDrivePlusAxis::new(
+            ImsLine::new(handle, String::new(), "IMS_MOTOR"),
+            "IMS_MOTOR",
+        );
+        assert!(axis.constructor_calls_param_callbacks());
     }
 
     /// ImsMDrivePlusMotorController.cpp:69-99: a missing IO port still builds

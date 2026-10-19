@@ -287,6 +287,12 @@ impl PmacAxis {
 }
 
 impl AsynMotor for PmacAxis {
+    /// The C constructor calls `callParamCallbacks` whether or not
+    /// `getAxisInitialStatus` succeeded (pmacAxis.cpp:94-100).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// C `pmacAxis::getAxisStatus` sets no status bit on a failed read; the
     /// failure goes to the controller's `PMAC_C_COMMSERROR`.
     fn poll_failure(&self) -> PollFailure {
