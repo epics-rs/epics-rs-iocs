@@ -9,6 +9,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use meascomp::device::DaqDevice;
 
+use crate::board_enums::{AI_CHAN_TYPE_TC, AI_CHAN_TYPE_VOLTAGE, map_range, temp_scale};
 use crate::driver::MultiFunctionDriver;
 use crate::params::*;
 use crate::trace::{SelfTrace, status_of};
@@ -25,16 +26,19 @@ pub struct PollerState {
     pub ai_input_mode: i32,
 }
 
-/// Start the polling thread for USB-2408-2AO.
+/// Start the polling thread for USB-2408-2AO, reading the first `ai_chans`
+/// voltage and `tc_chans` thermocouple inputs.
 pub fn start_poller(
     handle: PortHandle,
     params: MultiFunctionParams,
     device: Arc<Mutex<DaqDevice>>,
     state: Arc<Mutex<PollerState>>,
+    ai_chans: usize,
+    tc_chans: usize,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("usb-2408-poller".into())
-        .spawn(move || poller_loop(handle, params, device, state))
+        .spawn(move || poller_loop(handle, params, device, state, ai_chans, tc_chans))
         .expect("failed to spawn USB-2408 poller thread")
 }
 
@@ -58,7 +62,6 @@ struct PollSnapshot {
     wave_dig_arrays: Option<Vec<ParamSetValue>>,
     // Analog inputs (only populated when wave_dig is not running)
     ai_raw: [Option<i32>; MAX_ANALOG_IN],
-    ai_volts: [Option<f64>; MAX_ANALOG_IN],
     ai_temp: [Option<f64>; MAX_ANALOG_IN],
 }
 
@@ -67,6 +70,8 @@ fn poller_loop(
     params: MultiFunctionParams,
     device: Arc<Mutex<DaqDevice>>,
     state: Arc<Mutex<PollerState>>,
+    ai_chans: usize,
+    tc_chans: usize,
 ) {
     const FUNCTION: &str = "pollerThread";
     let mut prev_digital_input: u64 = 0;
@@ -125,6 +130,10 @@ fn poller_loop(
             let mut snap = PollSnapshot::default();
             if let Ok(dev) = device.lock() {
                 'error: {
+                    // C reads every DIO_INFO_NUM_PORTS port (drvMultiFunction.cpp:
+                    // 2604-2631), but uldaq refuses the 2408's AUXPORT1/2 without
+                    // an expansion board (DioUsb24xx.cpp:41), so every C poll ends
+                    // there before any input is read. That C defect is not copied.
                     match dev.digital_in(uldaq_sys::AUXPORT) {
                         Ok(data) => snap.digital_input = Some(data),
                         Err(e) => {
@@ -198,42 +207,39 @@ fn poller_loop(
                         snap.wave_dig_current_point = st.wave_dig.current_point;
                         snap.wave_dig_running = true;
                     } else {
-                        for ch in 0..MAX_ANALOG_IN {
+                        // C reads an unset channel's type and range into
+                        // the previous channel's locals; here it is 0, so
+                        // neither loop reads it.
+                        for ch in 0..ai_chans {
                             let ch_i = ch as i32;
                             // One call per channel, chosen by its configured
                             // type: ulAIn rejects a thermocouple channel with
                             // ERR_BAD_RANGE and ulTIn rejects a voltage one.
                             // C drvMultiFunction skips each the same way.
-                            if in_types[ch] != 0 {
+                            if in_types[ch] != AI_CHAN_TYPE_VOLTAGE {
                                 continue;
                             }
-                            // C does not report a failed ulAIn; its status is
-                            // the raw read's (C has no scaled read).
+                            let range = map_range(&trace, in_ranges[ch]);
+                            // C does not report a failed ulAIn. It reads raw
+                            // counts only; VOLTAGE_IN_VALUE is USB-TEMP-AI's.
                             let raw = dev.analog_in(
                                 ch_i,
                                 input_mode,
-                                in_ranges[ch],
+                                range,
                                 uldaq_sys::AIN_FF_NOSCALEDATA,
                             );
                             status = status_of(&raw);
                             snap.ai_raw[ch] = raw.ok().map(|v| v as i32);
-                            let volts = dev.analog_in(
-                                ch_i,
-                                input_mode,
-                                in_ranges[ch],
-                                uldaq_sys::AIN_FF_DEFAULT,
-                            );
-                            snap.ai_volts[ch] = volts.ok();
                         }
-                        for ch in 0..MAX_ANALOG_IN {
-                            if in_types[ch] == 0 {
+                        for ch in 0..tc_chans {
+                            if in_types[ch] != AI_CHAN_TYPE_TC {
                                 continue;
                             }
                             // An open or broken thermocouple is expected,
                             // not an error: ulTIn reports it as -9999.
                             status = match dev.temperature_in(
                                 ch as i32,
-                                tc_scales[ch],
+                                temp_scale(&trace, tc_scales[ch]),
                                 uldaq_sys::TIN_FF_DEFAULT,
                             ) {
                                 Ok(temp) => {
@@ -311,17 +317,7 @@ fn poller_loop(
             // and, under AUTO_RESTART, startWaveDig's parameters.
             updates.extend(snapshot.wave_dig_arrays.into_iter().flatten());
         } else {
-            for ch in 0..MAX_ANALOG_IN {
-                if let Some(raw) = snapshot.ai_raw[ch] {
-                    updates.push(int(params.analog_in_value, ch, raw));
-                }
-                if let Some(v) = snapshot.ai_volts[ch] {
-                    updates.push(float(params.voltage_in_value, ch, v));
-                }
-                if let Some(t) = snapshot.ai_temp[ch] {
-                    updates.push(float(params.temperature_in_value, ch, t));
-                }
-            }
+            push_analog_in(&mut updates, &params, &snapshot);
         }
         let _ = handle.with_driver_blocking::<MultiFunctionDriver, _>(move |driver| {
             let base = driver.base_mut();
@@ -341,6 +337,38 @@ fn poller_loop(
     }
 }
 
+/// C's analog-input sets of one poll (drvMultiFunction.cpp:2783-2785,
+/// 2830-2832). C sets each value off by one first to force a callback even
+/// when the value has not changed.
+fn push_analog_in(
+    updates: &mut Vec<ParamSetValue>,
+    params: &MultiFunctionParams,
+    snap: &PollSnapshot,
+) {
+    for ch in 0..MAX_ANALOG_IN {
+        if let Some(raw) = snap.ai_raw[ch] {
+            for v in [raw.wrapping_add(1), raw] {
+                updates.push(ParamSetValue::new(
+                    params.analog_in_value,
+                    ch as i32,
+                    ParamValue::Int32(v),
+                ));
+            }
+        }
+    }
+    for ch in 0..MAX_ANALOG_IN {
+        if let Some(t) = snap.ai_temp[ch] {
+            for v in [t + 1.0, t] {
+                updates.push(ParamSetValue::new(
+                    params.temperature_in_value,
+                    ch as i32,
+                    ParamValue::Float64(v),
+                ));
+            }
+        }
+    }
+}
+
 /// The driver's `int` rule over the port handle: C's getIntegerParam with
 /// its status ignored, an unset value read as 0.
 fn get_int(handle: &PortHandle, reason: usize, addr: i32) -> i32 {
@@ -350,4 +378,47 @@ fn get_int(handle: &PortHandle, reason: usize, addr: i32) -> i32 {
 /// C `getDoubleParam`; see [`get_int`].
 fn get_float(handle: &PortHandle, reason: usize, addr: i32) -> f64 {
     handle.read_float64_blocking(reason, addr).unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+
+    use super::*;
+
+    #[test]
+    fn an_unchanged_analog_input_calls_back_every_poll() {
+        let mut base = PortDriverBase::new(
+            "MFPOLL",
+            MAX_SIGNALS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let mut snap = PollSnapshot::default();
+        snap.ai_raw[3] = Some(1234);
+        snap.ai_temp[3] = Some(21.5);
+        for poll in 0..2 {
+            let mut updates = Vec::new();
+            push_analog_in(&mut updates, &params, &snap);
+            for update in &updates {
+                base.set_param(update).unwrap();
+            }
+            assert_eq!(
+                base.params.take_changed(3).unwrap(),
+                [params.analog_in_value, params.temperature_in_value],
+                "poll {poll}"
+            );
+            assert_eq!(
+                base.get_int32_param(params.analog_in_value, 3).unwrap(),
+                1234
+            );
+            assert_eq!(
+                base.get_float64_param(params.temperature_in_value, 3)
+                    .unwrap(),
+                21.5
+            );
+        }
+    }
 }

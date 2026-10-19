@@ -2,7 +2,8 @@ use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 
-pub const MAX_ANALOG_IN: usize = 8;
+/// C `MAX_ANALOG_IN` (drvMultiFunction.cpp:212): the 2408 has 16 inputs.
+pub const MAX_ANALOG_IN: usize = 16;
 pub const MAX_ANALOG_OUT: usize = 2;
 pub const MAX_COUNTERS: usize = 2;
 pub const NUM_IO_BITS: usize = 8;
