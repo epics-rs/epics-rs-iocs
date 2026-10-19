@@ -178,10 +178,13 @@ pub struct DrvSoloistAxis {
     /// reading its reply, which every later status read then takes for its
     /// own; its reply is read away here.
     post: Option<PostMessage>,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl DrvSoloistAxis {
-    /// The axis [`motor_init`] set up, its status read as `motor_init` ends.
+    /// The axis [`motor_init`] set up, its status read as `motor_init` ends
+    /// (drvSoloist.cc:734).
     pub fn new(card: Arc<Mutex<SoloistCard>>, setup: AxisSetup) -> Self {
         let mut axis = Self {
             card,
@@ -194,8 +197,9 @@ impl DrvSoloistAxis {
             },
             strings: None,
             post: None,
+            init_status: None,
         };
-        let _ = axis.poll(&AsynUser::new(0));
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -426,6 +430,10 @@ impl AsynMotor for DrvSoloistAxis {
             self.send(post);
         }
         Ok(status)
+    }
+
+    fn take_init_status(&mut self) -> Option<AsynResult<MotorStatus>> {
+        self.init_status.take()
     }
 }
 
