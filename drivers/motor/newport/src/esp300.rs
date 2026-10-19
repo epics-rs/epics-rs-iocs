@@ -316,7 +316,7 @@ impl Esp300Axis {
 impl Model1Motor for Esp300Axis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -1056,5 +1056,39 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvESP300.cc:249-266 exit stores the status motor_init prepared
+    /// (:802-816, EA_PRESENT and GAIN_SUPPORT for an encoder), plus the
+    /// COMM_ERR bits on the second failure.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (ctrl, _sent) = esp300_line(
+            "esp300InitFail",
+            &[
+                ("TB?", "0, 0, NO ERROR DETECTED"),
+                ("01ZB?", "100"),
+                ("01SU?", "0.001"),
+                ("02ZB?", "100"),
+                ("02SU?", "0.001"),
+            ],
+        );
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let prepared = MotorStatus {
+            has_encoder: true,
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        let mut first = Esp300Axis::new(ctrl.clone(), 1);
+        let mut second = Esp300Axis::new(ctrl, 2);
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 }
