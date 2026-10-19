@@ -222,12 +222,20 @@ impl UaConnector for AsyncOpcuaConnector {
             )
         })?;
 
-        let handle = event_loop.spawn();
-        session
-            .wait_for_connection()
-            .await
-            .then_some(())
-            .ok_or_else(|| "connect service failed (session did not activate)".to_string())?;
+        // The event loop makes the one attempt `session_retry_limit(0)` allows
+        // and ends with its status; the session state stays `Connecting`, so
+        // its end is the only failure signal.
+        let mut handle = event_loop.spawn();
+        let ended = tokio::select! {
+            true = session.wait_for_connection() => None,
+            ended = &mut handle => Some(ended.unwrap_or(StatusCode::BadInternalError)),
+        };
+        if let Some(status) = ended {
+            return Err(format!(
+                "connect service failed with status {}",
+                status_name(status)
+            ));
+        }
 
         Ok(Arc::new(AsyncOpcuaConnection {
             session,

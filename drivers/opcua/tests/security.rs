@@ -111,4 +111,31 @@ mod setup_security {
             "security discovery and setup failed with status cantConnect"
         );
     }
+
+    /// C `SessionOpen62541::connect` prints `UA_Client_connect`'s status on
+    /// every failed connect (`SessionOpen62541.cpp:586-589`).
+    #[tokio::test]
+    async fn a_dead_session_url_is_a_connect_failure_with_its_status() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let pki = std::env::temp_dir().join(format!("opcua-deadsession-{}", std::process::id()));
+        let mut config = SessionConfig::new("s", format!("opc.tcp://127.0.0.1:{port}"));
+        config.pki_dir = Some(pki.to_string_lossy().into_owned());
+        config.set_option("sec-mode", "None").unwrap();
+        let connector = AsyncOpcuaConnector::new();
+        let connect = connector.connect(&config, &Identity::Anonymous);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(20), connect)
+            .await
+            .expect("a failed connect returns")
+            .err()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&pki);
+        assert!(
+            err.starts_with("connect service failed with status Bad"),
+            "{err}"
+        );
+    }
 }
