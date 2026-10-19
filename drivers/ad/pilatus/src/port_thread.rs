@@ -365,3 +365,177 @@ impl PilatusDriver {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use epics_rs::ad_core::runtime as rt;
+    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::interpose::EomReason;
+    use epics_rs::asyn::interrupt::InterruptFilter;
+    use epics_rs::asyn::manager::{PortManager, claim_port_driver};
+    use epics_rs::asyn::param::ParamValue;
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::open_owner;
+    use epics_rs::asyn::sync_io::SyncIOHandle;
+    use epics_rs::asyn::user::AsynUser;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+    use parking_lot::Mutex;
+
+    use super::*;
+    use crate::driver::DriverLinks;
+    use crate::task::{FlatFieldJob, Shared};
+    use crate::types::Event;
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// A camserver that logs `<flush>`, each command and `<read>`, and
+    /// answers a read with `reply(last command)`.
+    struct ScriptedCamserver {
+        base: PortDriverBase,
+        log: Log,
+        reply: fn(&str) -> String,
+        last: String,
+    }
+
+    impl PortDriver for ScriptedCamserver {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+            self.log.lock().push("<flush>".into());
+            Ok(())
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.last = String::from_utf8_lossy(data).into_owned();
+            self.log.lock().push(self.last.clone());
+            Ok(data.len())
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, EomReason)> {
+            self.log.lock().push("<read>".into());
+            let reply = (self.reply)(&self.last);
+            buf[..reply.len()].copy_from_slice(reply.as_bytes());
+            Ok((reply.len(), EomReason::EOS))
+        }
+    }
+
+    /// A detector on a fresh [`ScriptedCamserver`]; its ADStatus posts land
+    /// in the same log as `ADStatus=<v>`.
+    fn rig(name: &str, reply: fn(&str) -> String) -> (PilatusDriver, Log) {
+        let cam = format!("{name}_CAM");
+        let log = Log::default();
+        std::mem::forget(
+            PortManager::new()
+                .register_port(
+                    claim_port_driver(&cam).unwrap(),
+                    ScriptedCamserver {
+                        base: PortDriverBase::new(
+                            &cam,
+                            1,
+                            PortFlags::default(),
+                            InterfaceMask::UNMIGRATED_ALL,
+                            InterfaceMask::UNMIGRATED_INTERRUPTS,
+                        ),
+                        log: log.clone(),
+                        reply,
+                        last: String::new(),
+                    },
+                    &open_owner(),
+                )
+                .unwrap(),
+        );
+        let (flat_field_tx, flat_field_rx) = rt::command_channel::<FlatFieldJob>(1);
+        std::mem::forget(flat_field_rx);
+        let mut det = PilatusDriver::new(
+            name,
+            8,
+            8,
+            0,
+            DriverLinks {
+                flat_field_tx,
+                start: Arc::new(Event::new()),
+                stop: Arc::new(Event::new()),
+                shared: Arc::new(Mutex::new(Shared::default())),
+                cam: Arc::new(
+                    SyncIOHandle::connect_port(&cam, 0, Duration::ZERO, InterfaceType::Octet).0,
+                ),
+            },
+        )
+        .unwrap();
+        det.ad.port_base.own_interrupts(InterruptGate::opened());
+        let posts = log.clone();
+        let status = det.ad.params.status;
+        std::mem::forget(
+            det.ad
+                .port_base
+                .interrupts
+                .register_sync_callback(
+                    InterruptFilter {
+                        reason: Some(status),
+                        addr: Some(0),
+                        ..Default::default()
+                    },
+                    move |iv| {
+                        if let ParamValue::Int32(v) = &iv.value {
+                            posts.lock().push(format!("ADStatus={v}"));
+                        }
+                    },
+                )
+                .unwrap(),
+        );
+        (det, log)
+    }
+
+    /// The commands alone, in order.
+    fn commands(log: &Log) -> Vec<String> {
+        log.lock()
+            .iter()
+            .filter(|e| !e.starts_with('<') && !e.starts_with("ADStatus"))
+            .cloned()
+            .collect()
+    }
+
+    /// pilatusDetector.cpp:748-829 on a fresh detector: the acquisition
+    /// parameters with their defaults, then `Tau`, whose cutoff lands in
+    /// PixelCutOff.
+    #[test]
+    fn set_acquire_params_sends_the_c_commands_and_reads_back_the_cutoff() {
+        let (mut det, log) = rig("PILATUS_SAP", |cmd| match cmd {
+            "Tau" => {
+                "15 OK Rate correction is on; tau = 1.200000e-07 s, cutoff = 1221026 counts".into()
+            }
+            _ => "15 OK".into(),
+        });
+        let ad = det.ad.params;
+        det.write_float64(&mut AsynUser::new(ad.acquire_time), 1.0)
+            .unwrap();
+        assert_eq!(
+            commands(&log),
+            [
+                "nimages 1",
+                "nexpframe 1",
+                "exptime  1.00000000",
+                "expperiod  2.00000000",
+                "delay 0.000000",
+                "Tau"
+            ]
+        );
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(det.p.pixel_cutoff, 0)
+                .unwrap(),
+            1221026
+        );
+    }
+}
