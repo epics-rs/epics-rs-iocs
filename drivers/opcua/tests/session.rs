@@ -756,6 +756,50 @@ async fn namespaces_the_server_lacks_are_reported_in_uri_order() {
     assert_eq!(reported, expected);
 }
 
+/// `SessionOpen62541.cpp:879-883`.
+#[tokio::test]
+async fn a_read_namespace_array_is_reported_at_debug() {
+    let mut mock = Mock::default();
+    mock.server.namespace_array = vec![
+        "http://opcfoundation.org/UA/".to_string(),
+        "urn:server".to_string(),
+        "urn:sensors".to_string(),
+    ];
+    let mock = Arc::new(mock);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.set_option("debug", "1").unwrap();
+    config.add_namespace_mapping(4, "urn:sensors");
+
+    let sink = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs each test in its own process, so fd 1 is this
+    // test's alone.
+    let saved = unsafe {
+        let saved = libc::dup(1);
+        libc::dup2(std::os::fd::AsRawFd::as_raw_fd(sink.as_file()), 1);
+        saved
+    };
+    let handle = spawn(config, &mock, vec![]);
+    until(|| handle.is_connected()).await;
+    // SAFETY: restoring what this test replaced.
+    unsafe {
+        libc::dup2(saved, 1);
+        libc::close(saved);
+    }
+
+    let out = std::fs::read_to_string(sink.path()).unwrap();
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("(updateNamespaceMap)"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "Session sess: (updateNamespaceMap) namespace array with 3 elements read; \
+          updating index map with 1 entries"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn an_item_whose_namespace_the_server_does_not_have_keeps_its_index() {
     let mock = Mock::arc();

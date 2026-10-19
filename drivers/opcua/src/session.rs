@@ -966,6 +966,15 @@ impl SessionWorker {
         let mut remap: HashMap<u16, u16> = HashMap::new();
         // An unread namespace array is no mapping to report on, as in C.
         let read = !self.server.namespace_array.is_empty();
+        if read && self.debug() > 0 {
+            println!(
+                "Session {}: (updateNamespaceMap) namespace array with {} elements read; \
+                 updating index map with {} entries",
+                self.handle.name,
+                self.server.namespace_array.len(),
+                map.len()
+            );
+        }
         for (uri, local) in map.iter().filter(|_| read) {
             match self
                 .server
