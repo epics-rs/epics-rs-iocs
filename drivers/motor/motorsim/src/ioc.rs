@@ -138,13 +138,6 @@ impl<A: AsynMotor + 'static> SimDriver<A> {
     /// init_record. C's callback then scanOnce's before scanInit and
     /// segfaults (a C defect); here a post before the gate only sets
     /// needUpdate.
-    ///
-    /// C defect not copied: an axis has one callback slot and the record's
-    /// setCallback replaces whatever opened it before (motor_interface.h:
-    /// 472-475, paramLib.c:227-240), silently starving a
-    /// drvAsynMotorConfigure port or an earlier record on the axis. Here a
-    /// record's open leaves the slot alone, so every opener's records keep
-    /// getting every status.
     fn open(&self, card: i32, signal: i32) -> bool {
         let created = self.created.lock().unwrap_or_else(|e| e.into_inner());
         find(&created, card, signal).is_some()
@@ -598,11 +591,66 @@ mod one_poller {
         assert_eq!(pollers(), 1);
     }
 
-    /// A devMotorSim record's open does not take the drvAsynMotorConfigure
-    /// port's callback, as C's setCallback does (devMotorSim.c:173); see
-    /// [`SimDriver::open`].
+    /// A second drvAsynMotorConfigure on the card leaves the first port its
+    /// callback, which C's second setCallback replaces; see
+    /// [`motor_common::param_lib::Params::add_callback`].
     #[epics_rs::base::epics_test]
-    async fn a_record_s_open_leaves_the_port_its_callback() {
+    async fn a_second_configure_keeps_the_first_port_posted() {
+        use std::future::Future;
+
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::asyn::manager::PortManager;
+        use motor_common::drv_motor_asyn::function;
+        use motor_common::testing::run_command;
+
+        let args = [12, 0, -100, 100, 0, 1, 1, 0].map(ArgValue::Int).to_vec();
+        run_command(motor_sim_create_command(), args).await;
+        let mut gains = Vec::new();
+        for name in ["simFirst", "simSecond"] {
+            let args = vec![
+                ArgValue::String(name.into()),
+                ArgValue::String(DRIVER.into()),
+                ArgValue::Int(12),
+                ArgValue::Int(1),
+            ];
+            run_command(drv_asyn_motor_configure_command(vec![&MOTOR_SIM]), args).await;
+            let filter = InterruptFilter {
+                reason: Some(function::P_GAIN as usize),
+                addr: Some(0),
+                iface: Some(InterfaceType::Float64),
+                ..InterruptFilter::default()
+            };
+            let port = PortManager::global().find_port_handle(name).unwrap();
+            gains.push(
+                port.interrupts()
+                    .register_interrupt_user(filter, 0)
+                    .unwrap(),
+            );
+        }
+
+        let writer = PortManager::global().find_port_handle("simSecond").unwrap();
+        std::thread::spawn(move || {
+            writer.write_float64_blocking(function::P_GAIN as usize, 0, 0.75)
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        for (name, (_sub, gain)) in ["simFirst", "simSecond"].iter().zip(&mut gains) {
+            let called_back = std::pin::pin!(gain.recv()).poll(&mut cx);
+            assert!(
+                matches!(called_back, std::task::Poll::Ready(Some(_))),
+                "{name}"
+            );
+        }
+    }
+
+    /// A devMotorSim record on the axis does not take the
+    /// drvAsynMotorConfigure port's callback, as C's setCallback does
+    /// (devMotorSim.c:173): the record adds none.
+    #[epics_rs::base::epics_test]
+    async fn a_record_on_the_axis_leaves_the_port_its_callback() {
         use std::future::Future;
 
         use epics_rs::asyn::interfaces::InterfaceType;

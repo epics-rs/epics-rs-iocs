@@ -353,14 +353,14 @@ impl DrvMotorAsyn {
                 continue;
             };
             let interrupts = InterruptManager::from_shared_state(base.interrupts.shared_state());
-            // The store holds its callback, so the callback holds the getter
+            // The store holds its callbacks, so the callback holds the getter
             // weakly.
             let weak: Weak<dyn DrvGet> = Arc::downgrade(getter);
             let (status, poster) = (status.clone(), poster.clone());
             let addr = addr as i32;
             getter
                 .params()
-                .set_callback(Arc::new(move |changed: &[i32]| {
+                .add_callback(Arc::new(move |changed: &[i32]| {
                     if let Some(getter) = weak.upgrade() {
                         let record = (&*status, &poster);
                         int_callback(&interrupts, &*getter, addr, record, changed);
