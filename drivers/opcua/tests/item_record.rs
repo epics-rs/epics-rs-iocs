@@ -26,7 +26,10 @@ use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::server::records::longout::LongoutRecord;
 use epics_rs::base::types::EpicsValue;
 
-use opcua::client::{Notification, ServerInfo, UaConnection, UaConnector};
+use opcua::client::{
+    CreatedSubscription, Identity, Notification, ServerInfo, SetupError, UaClient, UaConnection,
+    UaConnector,
+};
 use opcua::device_support::OpcuaDevice;
 use opcua::item::Leaf;
 use opcua::queue::{ConnectionStatus, ProcessReason, Update};
@@ -53,21 +56,36 @@ struct MockConnector(Arc<Mock>);
 
 #[async_trait]
 impl UaConnector for MockConnector {
-    async fn connect(
-        &self,
-        _config: &SessionConfig,
-        _identity: &opcua::client::Identity,
-    ) -> Result<Arc<dyn UaConnection>, String> {
+    async fn setup(&self, config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+        Ok(Box::new(MockClient(
+            self.0.clone(),
+            config.setup_identity(),
+        )))
+    }
+}
+
+struct MockClient(Arc<Mock>, Identity);
+
+#[async_trait]
+impl UaClient for MockClient {
+    fn identity(&self) -> &Identity {
+        &self.1
+    }
+    async fn connect(&mut self) -> Result<Arc<dyn UaConnection>, StatusCode> {
         Ok(self.0.clone())
     }
 }
 
 #[async_trait]
 impl UaConnection for Mock {
-    async fn read(&self, nodes: &[ReadValueId]) -> Result<Vec<DataValue>, StatusCode> {
-        self.calls.lock().reads.push(nodes.to_vec());
+    async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>) {
+        let id = {
+            let mut calls = self.calls.lock();
+            calls.reads.push(nodes.to_vec());
+            calls.reads.len() as u32
+        };
         let values = self.values.lock();
-        Ok(nodes
+        let results = nodes
             .iter()
             .map(|node| {
                 if node.attribute_id == AttributeId::DataType as u32 {
@@ -86,12 +104,17 @@ impl UaConnection for Mock {
                     }
                 }
             })
-            .collect())
+            .collect();
+        (id, Ok(results))
     }
 
-    async fn write(&self, values: &[WriteValue]) -> Result<Vec<StatusCode>, StatusCode> {
-        self.calls.lock().writes.push(values.to_vec());
-        Ok(vec![StatusCode::Good; values.len()])
+    async fn write(&self, values: &[WriteValue]) -> (u32, Result<Vec<StatusCode>, StatusCode>) {
+        let mut calls = self.calls.lock();
+        calls.writes.push(values.to_vec());
+        (
+            calls.writes.len() as u32,
+            Ok(vec![StatusCode::Good; values.len()]),
+        )
     }
 
     async fn register_nodes(&self, nodes: &[NodeId]) -> Result<Vec<NodeId>, StatusCode> {
@@ -108,10 +131,13 @@ impl UaConnection for Mock {
 
     async fn create_subscription(
         &self,
-        _config: &SubscriptionConfig,
+        config: &SubscriptionConfig,
         _sink: mpsc::UnboundedSender<Notification>,
-    ) -> Result<u32, StatusCode> {
-        Ok(1)
+    ) -> Result<CreatedSubscription, StatusCode> {
+        Ok(CreatedSubscription {
+            id: 1,
+            revised_publishing_interval: config.publishing_interval,
+        })
     }
 
     async fn create_monitored_items(
@@ -133,12 +159,8 @@ fn offline() -> Arc<Registry> {
     struct Offline;
     #[async_trait]
     impl UaConnector for Offline {
-        async fn connect(
-            &self,
-            _config: &SessionConfig,
-            _identity: &opcua::client::Identity,
-        ) -> Result<Arc<dyn UaConnection>, String> {
-            Err("no server".to_string())
+        async fn setup(&self, _config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+            Err(SetupError::new("no server"))
         }
     }
     let registry = Registry::new(Arc::new(Offline));

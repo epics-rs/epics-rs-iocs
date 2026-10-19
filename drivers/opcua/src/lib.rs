@@ -12,6 +12,7 @@ pub mod device_support;
 pub mod ioc;
 pub mod item;
 pub mod link;
+pub mod print;
 pub mod queue;
 pub mod record;
 pub mod registry;

@@ -155,6 +155,13 @@ impl Record for OpcuaItemRecord {
         "opcuaItem"
     }
 
+    /// C creates the item in `init_record` pass 0 (`opcuaItemRecord.cpp:57-80`),
+    /// ahead of every other record's `add_record`; here that work is the
+    /// device's init. The C dset has no init of its own to run in pass 1.
+    fn dset_init_in_pass0(&self) -> bool {
+        true
+    }
+
     fn declared_fields(&self) -> &'static [FieldDesc] {
         FIELDS
     }

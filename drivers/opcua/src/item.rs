@@ -20,6 +20,7 @@ use async_opcua::types::{
     DataValue, DateTime, ExpandedMessageInfo, ExtensionObject, NodeId, StatusCode, StructureType,
     Variant,
 };
+use epics_rs::base::calc::cvt::fmt_g;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -34,6 +35,8 @@ use crate::value::{EnumChoices, type_name};
 #[derive(Debug)]
 pub struct Leaf {
     pub record: String,
+    /// `RecordConnector::getRecordType`.
+    pub record_type: String,
     pub link: LinkInfo,
     /// Incoming updates, one popped per record process cycle.
     pub queue: UpdateQueue,
@@ -53,10 +56,16 @@ pub struct Leaf {
 }
 
 impl Leaf {
-    pub fn new(record: String, link: LinkInfo, notify: mpsc::Sender<()>) -> Self {
+    pub fn new(
+        record: String,
+        record_type: &str,
+        link: LinkInfo,
+        notify: mpsc::Sender<()>,
+    ) -> Self {
         let queue = UpdateQueue::new(link.client_queue_size as usize, link.discard_oldest);
         Self {
             record,
+            record_type: record_type.to_string(),
             link,
             queue,
             outgoing: None,
@@ -108,8 +117,9 @@ pub struct Item {
     /// VALUE as a pair, `no_of_properties_read = 2`).
     pub data_type: Option<NodeId>,
     pub state: ConnectionStatus,
-    /// The client handle its monitored item was created with.
-    pub client_handle: u32,
+    /// Its place in `SessionHandle::items`, which is what the worker's requests
+    /// name it by. Not the monitored item's client handle.
+    pub index: u32,
     /// What the server granted when the monitored item was last created; 0
     /// until then (`ItemOpen62541::revisedSamplingInterval`/`revisedQueueSize`).
     pub revised_sampling_interval: f64,
@@ -135,8 +145,7 @@ pub struct Item {
     ///
     /// A record only ever reaches its session *through* its item, so this is the
     /// one place the two are tied together, and it is set exactly when the item
-    /// enters `SessionHandle::items` (which is what [`Self::client_handle`]
-    /// indexes).
+    /// enters `SessionHandle::items` (at [`Self::index`]).
     session: Option<Arc<SessionHandle>>,
 }
 
@@ -165,7 +174,7 @@ impl Item {
             registered_node_id: None,
             data_type: None,
             state: ConnectionStatus::Down,
-            client_handle: 0,
+            index: 0,
             revised_sampling_interval: 0.0,
             revised_queue_size: 0,
             leaves: Vec::new(),
@@ -179,18 +188,20 @@ impl Item {
     }
 
     /// The record that *addresses the node* has bound: the item is on this
-    /// session, at this node, under this client handle.
+    /// session, at this node, at this index of its items.
     pub fn adopt(
         &mut self,
         link: LinkInfo,
         node_id: NodeId,
-        client_handle: u32,
+        index: u32,
         session: Arc<SessionHandle>,
     ) {
         self.link = link;
-        self.configured_node_id = node_id.clone();
-        self.node_id = node_id;
-        self.client_handle = client_handle;
+        self.configured_node_id = node_id;
+        // Built at each connect (`ItemOpen62541::rebuildNodeId`); null until
+        // then, as `opcuaShow` prints it.
+        self.node_id = NodeId::null();
+        self.index = index;
         self.session = Some(session);
     }
 
@@ -213,7 +224,7 @@ impl Item {
             // to is not in the database. `Registry::start` reports that.
             return;
         };
-        let handle = self.client_handle;
+        let handle = self.index;
         session.request(
             priority,
             match action {
@@ -230,7 +241,13 @@ impl Item {
     }
 
     pub fn is_monitored(&self) -> bool {
-        self.link.monitor && self.link.subscription().is_some()
+        self.subscription().is_some()
+    }
+
+    /// The subscription the item is on: only a monitored item joins its link's
+    /// subscription (`ItemOpen62541.cpp:52-55`).
+    pub fn subscription(&self) -> Option<&str> {
+        self.link.subscription().filter(|_| self.link.monitor)
     }
 
     /// A value arrived from the server (`ItemOpen62541::setIncomingData`).
@@ -241,7 +258,7 @@ impl Item {
         let status = value.status.unwrap_or(StatusCode::Good);
         let data = value.value.clone().unwrap_or(Variant::Empty);
         self.last_value = Some(data.clone());
-        self.last_status = status;
+        self.take_value_status(status);
         self.map_elements(&data);
         let data_time = self.data_timestamp(&data);
         self.last_timestamp = Some(timestamp_for(&self.link, &value, data_time));
@@ -297,12 +314,41 @@ impl Item {
         }
     }
 
-    /// An event with no value — a read failure, a write result, a connection
-    /// loss (`ItemOpen62541::setIncomingEvent`).
-    pub fn set_incoming_event(&mut self, reason: ProcessReason, status: StatusCode) {
+    /// A read answered with a bad status and no value. C hands it to
+    /// `setIncomingData` like any value, so it is the item's status; the records
+    /// see a read failure.
+    pub fn set_incoming_failure(&mut self, status: StatusCode) {
+        self.take_value_status(status);
+        self.set_incoming_event(ProcessReason::ReadFailure);
+    }
+
+    /// The head of `ItemOpen62541::setIncomingData` (`ItemOpen62541.cpp:175-184`).
+    fn take_value_status(&mut self, status: StatusCode) {
+        if self.last_status == StatusCode::BadServerNotConnected
+            && status == StatusCode::BadNodeIdUnknown
+        {
+            // C prints the epicsUInt32 identifier with %d, negative from 2^31.
+            let identifier = match &self.link.identifier {
+                Some(NodeIdentifier::Numeric(n)) => format!("i={n}"),
+                Some(NodeIdentifier::String(s)) => format!("s={s}"),
+                None => "s=".to_string(),
+            };
+            errlog_vprintf(format_args!(
+                "OPC UA session {}: item ns={};{identifier} : BadNodeIdUnknown\n",
+                self.link.session().unwrap_or_default(),
+                self.link.namespace_index,
+            ));
+        }
         self.last_status = status;
+    }
+
+    /// An event with no value — a read failure, a write result, a connection
+    /// loss (`ItemOpen62541::setIncomingEvent`). Only a connection loss
+    /// changes the item's status (`ItemOpen62541.cpp:215-216`).
+    pub fn set_incoming_event(&mut self, reason: ProcessReason) {
         self.last_timestamp = Some(SystemTime::now());
         if reason == ProcessReason::ConnectionLoss {
+            self.last_status = StatusCode::BadServerNotConnected;
             self.state = ConnectionStatus::Down;
             self.last_value = None;
             self.mapped = false;
@@ -314,7 +360,12 @@ impl Item {
                 leaf.choices = None;
                 leaf.incoming = None;
             }
-            leaf.push(Update::new(reason, None, status, SystemTime::now()));
+            leaf.push(Update::new(
+                reason,
+                None,
+                StatusCode::Good,
+                SystemTime::now(),
+            ));
         }
     }
 
@@ -536,6 +587,65 @@ impl Item {
         name
     }
 
+    /// `ItemOpen62541::show`: the item's line, then from level 1 its data tree.
+    pub fn show(&self, level: i32) -> String {
+        let mut out = self.show_line() + "\n";
+        if level >= 1
+            && let Some(root) = self.data_tree()
+        {
+            root.show(self.mapped, 1, &mut out);
+        }
+        out
+    }
+
+    /// `ElementTree::addLeaf` over the element records, in the order they
+    /// bound: a record bound to the whole node is the root leaf, otherwise a
+    /// `[ROOT]` node holds a node per path step and the record's leaf last.
+    fn data_tree(&self) -> Option<Element> {
+        let mut root = None;
+        for leaf in &self.leaves {
+            let path = {
+                let locked = leaf.lock();
+                if locked.link.is_item_record {
+                    continue;
+                }
+                locked.link.element_path.clone()
+            };
+            let Some((name, nodes)) = path.split_last() else {
+                root.get_or_insert_with(|| Element::Leaf {
+                    name: "[ROOT]".to_string(),
+                    leaf: leaf.clone(),
+                });
+                continue;
+            };
+            let mut children = match root.get_or_insert_with(|| Element::node("[ROOT]")) {
+                Element::Node { children, .. } => children,
+                Element::Leaf { .. } => continue,
+            };
+            for step in nodes {
+                let at = match children
+                    .iter()
+                    .position(|c| matches!(c, Element::Node { name, .. } if name == step))
+                {
+                    Some(at) => at,
+                    None => {
+                        children.push(Element::node(step));
+                        children.len() - 1
+                    }
+                };
+                let Element::Node { children: next, .. } = &mut children[at] else {
+                    unreachable!("the position matched a node");
+                };
+                children = next;
+            }
+            children.push(Element::Leaf {
+                name: name.clone(),
+                leaf: leaf.clone(),
+            });
+        }
+        root
+    }
+
     /// `ItemOpen62541::show(0)`'s line.
     pub fn show_line(&self) -> String {
         let link = &self.link;
@@ -559,9 +669,9 @@ impl Item {
             yn(self.has_dirty_leaf()),
             link.subscription().unwrap_or(""),
             self.session.as_ref().map_or("", |s| s.name.as_str()),
-            self.revised_sampling_interval,
-            link.sampling_interval,
-            link.deadband,
+            stream_double(self.revised_sampling_interval),
+            stream_double(link.sampling_interval),
+            stream_double(link.deadband),
             self.revised_queue_size,
             link.queue_size,
             link.client_queue_size,
@@ -739,6 +849,60 @@ pub fn with_element(
 
 /// The structure nodes of C's element tree for these leaf paths: `[ROOT]` and
 /// one node per further step, in tree order.
+/// One element of an item's data tree, as `opcuaShow` walks it.
+enum Element {
+    Node {
+        name: String,
+        children: Vec<Element>,
+    },
+    Leaf {
+        name: String,
+        leaf: Arc<Mutex<Leaf>>,
+    },
+}
+
+impl Element {
+    fn node(name: &str) -> Self {
+        Element::Node {
+            name: name.to_string(),
+            children: Vec::new(),
+        }
+    }
+
+    /// `DataElementOpen62541Node::show` / `DataElementOpen62541Leaf::show`.
+    /// The port keeps one `mapped` flag per item, where the C keeps one per
+    /// node; every node of a tree maps on the same update.
+    fn show(&self, mapped: bool, indent: usize, out: &mut String) {
+        let ind = " ".repeat(indent * 2);
+        match self {
+            Element::Node { name, children } => {
+                *out += &format!(
+                    "{ind}node={name} children={} mapped={}\n",
+                    children.len(),
+                    yn(mapped)
+                );
+                for child in children {
+                    child.show(mapped, indent + 1, out);
+                }
+            }
+            Element::Leaf { name, leaf } => {
+                let leaf = leaf.lock();
+                *out += &format!(
+                    "{ind}leaf={name} record({})={} type={} timestamp={} bini={} monitor={}\n",
+                    leaf.record_type,
+                    leaf.record,
+                    leaf.incoming
+                        .as_ref()
+                        .map_or_else(|| "Null".to_string(), type_name),
+                    leaf.link.timestamp.as_str(),
+                    leaf.link.bini.as_str(),
+                    yn(leaf.link.monitor),
+                );
+            }
+        }
+    }
+}
+
 fn element_nodes(paths: &[Vec<String>]) -> Vec<&[String]> {
     let mut nodes: Vec<&[String]> = paths
         .iter()
@@ -752,4 +916,9 @@ fn element_nodes(paths: &[Vec<String>]) -> Vec<&[String]> {
 
 fn yn(flag: bool) -> &'static str {
     if flag { "y" } else { "n" }
+}
+
+/// A double as `std::cout << v` prints it: `%g` at the default precision 6.
+pub(crate) fn stream_double(v: f64) -> String {
+    fmt_g(v, 6, false, false)
 }
