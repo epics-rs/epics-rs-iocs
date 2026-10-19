@@ -293,6 +293,11 @@ impl AsynMotor for PmacAxis {
         PollFailure::NONE
     }
 
+    /// pmacAxis.cpp:100.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     fn take_port_sets(&mut self) -> PortSets {
         std::mem::take(&mut self.sets)
     }
@@ -629,6 +634,13 @@ fn decode_axis_status(status1: u32, status2: u32, deferred: bool) -> AxisFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_constructor_calls_back() {
+        let controller = PmacController::new("pmacCallback", "pmacCallbackLow", 0, None);
+        let axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
+        assert!(axis.constructor_calls_param_callbacks());
+    }
 
     #[test]
     fn speed_preamble_matches_c_format() {

@@ -240,6 +240,11 @@ impl AsynMotor for C300Axis {
         PollFailure::PROBLEM
     }
 
+    /// C300MotorDriver.cpp:250.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -342,6 +347,18 @@ impl AsynMotor for C300Axis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+
+    #[test]
+    fn the_constructor_calls_back() {
+        let (handle, _) = SyncIOHandle::connect_port(
+            "C300_CALLBACK",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let controller = Arc::new(Mutex::new(C300Controller::new(handle, 1)));
+        assert!(C300Axis::new(controller, 0).constructor_calls_param_callbacks());
+    }
 
     #[test]
     fn a_controller_of_a_missing_port_is_still_built() {

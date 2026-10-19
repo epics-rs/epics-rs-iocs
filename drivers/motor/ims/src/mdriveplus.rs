@@ -826,6 +826,11 @@ impl AsynMotor for ImsMDrivePlusAxis {
         PollFailure::PROBLEM
     }
 
+    /// ImsMDrivePlusMotorAxis.cpp:56.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// COMMS_ERROR is the controller's own param, set by
     /// writeController/writeReadController (ImsMDrivePlusMotorController.cpp:
     /// 371-373, :403-406) and cleared by a good poll.
@@ -997,6 +1002,17 @@ mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interfaces::motor::PortSet;
+
+    #[test]
+    fn the_constructor_calls_back() {
+        let (handle, _) =
+            SyncIOHandle::connect_port("IMS_CALLBACK", 0, Duration::ZERO, InterfaceType::Octet);
+        let axis = ImsMDrivePlusAxis::new(
+            ImsLine::new(handle, String::new(), "IMS_CALLBACK"),
+            "IMS_CALLBACK",
+        );
+        assert!(axis.constructor_calls_param_callbacks());
+    }
 
     /// The steps one call left on the controller port, in the order made.
     fn rendered(sets: PortSets) -> Vec<String> {

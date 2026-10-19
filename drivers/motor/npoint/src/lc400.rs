@@ -543,6 +543,11 @@ impl AsynMotor for Lc400Axis {
         PollFailure::PROBLEM
     }
 
+    /// LC400MotorDriver.cpp:666.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -876,6 +881,12 @@ mod tests {
     use epics_rs::motor::trace::TraceUser;
 
     use super::*;
+
+    #[test]
+    fn the_constructor_calls_back() {
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(None, 1)));
+        assert!(Lc400Axis::new(controller, 0).constructor_calls_param_callbacks());
+    }
 
     /// A four-axis LC400 port with no line: axis 3 has no controller
     /// address, and the controller's own registers fail to write.

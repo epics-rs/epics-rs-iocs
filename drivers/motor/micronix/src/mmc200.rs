@@ -348,6 +348,12 @@ impl AsynMotor for Mmc200Axis {
         PollFailure::PROBLEM
     }
 
+    /// An MMC-ETH module returns before the constructor's
+    /// `callParamCallbacks` (MMC200Driver.cpp:192-193, :271).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        self.model != MODEL_ETH
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -495,6 +501,22 @@ mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
     use std::time::Duration;
+
+    #[test]
+    fn only_a_motor_axis_constructor_calls_back() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("mmc200EthCallback", |_| "#MMC-ETH v1".into());
+        let eth = Mmc200Axis::new(Arc::new(Mutex::new(Mmc200Controller::new(io))), 0, false);
+        assert!(!eth.constructor_calls_param_callbacks());
+        let (handle, _) =
+            SyncIOHandle::connect_port("MMC200_CALLBACK", 0, Duration::ZERO, InterfaceType::Octet);
+        let dead = Mmc200Axis::new(
+            Arc::new(Mutex::new(Mmc200Controller::new(handle))),
+            0,
+            false,
+        );
+        assert!(dead.constructor_calls_param_callbacks());
+    }
 
     #[test]
     fn an_axis_of_an_unanswering_controller_is_built_with_a_problem() {
