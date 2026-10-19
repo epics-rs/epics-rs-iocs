@@ -275,7 +275,7 @@ impl Pm500Axis {
 impl Model1Motor for Pm500Axis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -600,6 +600,38 @@ mod tests {
     }
 
     type Line = (Pm500Axis, Arc<Mutex<Vec<String>>>, Arc<Mutex<&'static str>>);
+
+    /// drvPM500.cc:655-668: a failed `motor_init` read stores the
+    /// EA_PRESENT and GAIN_SUPPORT `motor_init` set, the first raising
+    /// nothing (RETRY) and the next CNTRL_COMM_ERR and RA_PROBLEM
+    /// (:242-262).
+    #[test]
+    fn a_failed_init_read_keeps_what_motor_init_set() {
+        let (_line, io) = motor_common::testing::LineRig::new("pm500InitFail", |last| match last {
+            "SVN?" => "XD PM500 1.0".into(),
+            "XSTAT?" => "X0".into(),
+            "YSTAT?" => "Y0".into(),
+            "XR" | "YR" => String::new(),
+            _ => "?E".into(),
+        });
+        let ctrl = Arc::new(Mutex::new(Pm500Controller::new(io).unwrap()));
+        let init = |index| Pm500Axis::new(ctrl.clone(), index).take_init_status();
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init(0), prepared);
+        assert_eq!(
+            init(1),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
+    }
 
     /// drvPM500.cc motor_init for one controller and its `X` axis: the
     /// axis, the wire log, and the `XR` reply.
