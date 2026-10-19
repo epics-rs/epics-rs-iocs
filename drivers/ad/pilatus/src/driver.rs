@@ -1,15 +1,12 @@
-//! The `PortDriver` half of the Pilatus port: parameter writes and the
-//! bookkeeping C does inline in `writeInt32` / `writeFloat64` / `writeOctet`.
-//!
-//! Camserver I/O is not done here — a `PortDriver` method runs inside the port
-//! actor, whose runtime cannot block on a second port — so each branch enqueues
-//! the corresponding [`Cmd`] for `PilatusCmdTask`.
+//! The `PortDriver` half of the Pilatus port: parameter writes and what C does
+//! inline in `writeInt32` / `writeFloat64` / `writeOctet`, camserver exchanges
+//! included (see [`crate::port_thread`]).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
@@ -30,13 +27,13 @@ use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArrayS
 use epics_rs::ad_core::runtime as rt;
 use parking_lot::Mutex;
 
-use crate::camserver::Ctx;
+use crate::camserver::{Camserver, Ctx};
 use crate::params::PilatusParams;
 use crate::protocol::{
     cmd_cbf_template_file, cmd_mx_f64, cmd_mx_i32, cmd_mx_pair, cmd_oscill_axis,
 };
-use crate::task::{Cmd, Shared, Worker, start_acq_task, start_cmd_task};
-use crate::types::{Event, TriggerMode};
+use crate::task::{FlatFieldJob, Shared, Worker, start_acq_task, start_flat_field_task};
+use crate::types::{CAMSERVER_DEFAULT_TIMEOUT, Event, TriggerMode};
 
 /// C `DRIVER_VERSION.DRIVER_REVISION.DRIVER_MODIFICATION`.
 const DRIVER_VERSION: &str = "2.9.0";
@@ -44,18 +41,26 @@ const DRIVER_VERSION: &str = "2.9.0";
 pub struct PilatusDriver {
     pub ad: ADDriverBase,
     pub p: PilatusParams,
-    cmd_tx: rt::CommandSender<Cmd>,
+    /// Hands `readFlatFieldFile`'s array to `PilatusFlatField` to publish.
+    pub(crate) flat_field_tx: rt::CommandSender<FlatFieldJob>,
     start: Arc<Event>,
-    stop: Arc<Event>,
-    shared: Arc<Mutex<Shared>>,
+    pub(crate) stop: Arc<Event>,
+    pub(crate) shared: Arc<Mutex<Shared>>,
+    /// C `pasynUserCamserver` with its buffers, for the port-thread exchanges.
+    pub(crate) cam: Camserver,
+    /// C `firstStatusCall`.
+    pub(crate) first_status_call: bool,
+    /// The camserver version `pilatusStatus` parsed, for `resetModulePower`.
+    pub(crate) version: (i32, i32, i32),
 }
 
 /// The handles the driver hands to (and shares with) its worker threads.
 pub(crate) struct DriverLinks {
-    pub(crate) cmd_tx: rt::CommandSender<Cmd>,
+    pub(crate) flat_field_tx: rt::CommandSender<FlatFieldJob>,
     pub(crate) start: Arc<Event>,
     pub(crate) stop: Arc<Event>,
     pub(crate) shared: Arc<Mutex<Shared>>,
+    pub(crate) cam: Arc<SyncIOHandle>,
 }
 
 impl PilatusDriver {
@@ -110,12 +115,15 @@ impl PilatusDriver {
         base.set_string_param(p.header_string, 0, String::new())?;
 
         Ok(Self {
+            cam: Camserver::new(links.cam, ad.params, links.stop.clone()),
             ad,
             p,
-            cmd_tx: links.cmd_tx,
+            flat_field_tx: links.flat_field_tx,
             start: links.start,
             stop: links.stop,
             shared: links.shared,
+            first_status_call: true,
+            version: (0, 0, 0),
         })
     }
 
@@ -124,10 +132,6 @@ impl PilatusDriver {
             .port_base
             .get_float64_param(reason, 0)
             .unwrap_or(0.0)
-    }
-
-    fn send(&self, cmd: Cmd) {
-        let _ = self.cmd_tx.try_send(cmd);
     }
 }
 
@@ -198,23 +202,33 @@ impl PortDriver for PilatusDriver {
                 }
                 if value == 0 && acquiring {
                     det.stop.signal();
-                    det.send(Cmd::AbortAcquire);
+                    det.abort_acquire();
                 }
             } else if function == params.trigger_mode
                 || function == params.num_images
                 || function == params.num_exposures
                 || function == p.gap_fill
             {
-                det.send(Cmd::SetAcquireParams);
+                det.set_acquire_params();
             } else if function == p.threshold_apply {
-                det.send(Cmd::SetThreshold);
+                det.set_threshold();
             } else if function == p.reset_power {
-                det.send(Cmd::ResetModulePower);
+                det.reset_module_power();
             } else if function == p.num_oscill {
-                det.send(Cmd::Raw(cmd_mx_i32("N_oscillations", value)));
+                det.cam_write_read(
+                    &cmd_mx_i32("N_oscillations", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == params.read_status {
                 if !acquiring {
-                    det.send(Cmd::ReadStatus);
+                    // C returns pilatusStatus()'s status (pilatusDetector.cpp:1429-1431).
+                    status = match det.pilatus_status() {
+                        AsynStatus::Success => Ok(()),
+                        s => Err(AsynError::Status {
+                            status: s,
+                            message: "pilatusStatus".into(),
+                        }),
+                    };
                 }
             } else if function < p.first() {
                 status = ADDriver::ad_write_int32(det, user, value);
@@ -264,7 +278,7 @@ impl PortDriver for PilatusDriver {
                     if let Some(v) = demanded {
                         status = det.ad.port_base.set_float64_param(function, 0, v);
                     }
-                    det.send(Cmd::SetThreshold);
+                    det.set_threshold();
                 } else {
                     // Put the old value back if we are deferring the threshold.
                     if function == p.threshold || function == p.energy {
@@ -275,51 +289,81 @@ impl PortDriver for PilatusDriver {
                 || function == params.acquire_period
                 || function == p.delay_time
             {
-                det.send(Cmd::SetAcquireParams);
+                det.set_acquire_params();
             } else if function == p.wavelength {
-                det.send(Cmd::Raw(cmd_mx_f64("Wavelength", value)));
+                det.cam_write_read(&cmd_mx_f64("Wavelength", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.energy_low || function == p.energy_high {
                 // C ignores both statuses and gets 0 (pilatusDetector.cpp:1511-1512).
                 let low = det.f64_or_zero(p.energy_low);
                 let high = det.f64_or_zero(p.energy_high);
-                det.send(Cmd::Raw(cmd_mx_pair("Energy_range", low, high)));
+                det.cam_write_read(
+                    &cmd_mx_pair("Energy_range", low, high),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.det_dist {
-                det.send(Cmd::Raw(cmd_mx_f64("Detector_distance", value / 1000.0)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Detector_distance", value / 1000.0),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.det_voffset {
-                det.send(Cmd::Raw(cmd_mx_f64("Detector_Voffset", value / 1000.0)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Detector_Voffset", value / 1000.0),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.beam_x || function == p.beam_y {
                 // As above (pilatusDetector.cpp:1523-1524).
                 let x = det.f64_or_zero(p.beam_x);
                 let y = det.f64_or_zero(p.beam_y);
-                det.send(Cmd::Raw(cmd_mx_pair("Beam_xy", x, y)));
+                det.cam_write_read(&cmd_mx_pair("Beam_xy", x, y), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.flux {
-                det.send(Cmd::Raw(cmd_mx_f64("Flux", value)));
+                det.cam_write_read(&cmd_mx_f64("Flux", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.filter_transm {
-                det.send(Cmd::Raw(cmd_mx_f64("Filter_transmission", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Filter_transmission", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.start_angle {
-                det.send(Cmd::Raw(cmd_mx_f64("Start_angle", value)));
+                det.cam_write_read(&cmd_mx_f64("Start_angle", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.angle_incr {
-                det.send(Cmd::Raw(cmd_mx_f64("Angle_increment", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Angle_increment", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.det_2theta {
-                det.send(Cmd::Raw(cmd_mx_f64("Detector_2theta", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Detector_2theta", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.polarization {
-                det.send(Cmd::Raw(cmd_mx_f64("Polarization", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Polarization", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.alpha {
-                det.send(Cmd::Raw(cmd_mx_f64("Alpha", value)));
+                det.cam_write_read(&cmd_mx_f64("Alpha", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.kappa {
-                det.send(Cmd::Raw(cmd_mx_f64("Kappa", value)));
+                det.cam_write_read(&cmd_mx_f64("Kappa", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.phi {
-                det.send(Cmd::Raw(cmd_mx_f64("Phi", value)));
+                det.cam_write_read(&cmd_mx_f64("Phi", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.phi_incr {
-                det.send(Cmd::Raw(cmd_mx_f64("Phi_increment", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Phi_increment", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.chi {
-                det.send(Cmd::Raw(cmd_mx_f64("Chi", value)));
+                det.cam_write_read(&cmd_mx_f64("Chi", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.chi_incr {
-                det.send(Cmd::Raw(cmd_mx_f64("Chi_increment", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Chi_increment", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.omega {
-                det.send(Cmd::Raw(cmd_mx_f64("Omega", value)));
+                det.cam_write_read(&cmd_mx_f64("Omega", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.omega_incr {
-                det.send(Cmd::Raw(cmd_mx_f64("Omega_increment", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Omega_increment", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function < p.delay_time {
                 // ADDriver::writeFloat64 is asynPortDriver's (pilatusDetector.cpp:1571).
                 status = det.ad.port_base.write_float64_param(user, value);
@@ -348,15 +392,15 @@ impl PortDriver for PilatusDriver {
             .port_base
             .set_string_param(function, 0, value.clone());
         if function == p.bad_pixel_file {
-            self.send(Cmd::ReadBadPixelFile(value.clone()));
+            self.read_bad_pixel_file(&value);
         } else if function == p.flat_field_file {
-            self.send(Cmd::ReadFlatFieldFile(value.clone()));
+            self.read_flat_field_file(&value);
         } else if function == params.base.file_path {
-            self.send(Cmd::ImgPath(value.clone()));
+            self.img_path(&value);
         } else if function == p.oscill_axis {
-            self.send(Cmd::Raw(cmd_oscill_axis(&value)));
+            self.cam_write_read(&cmd_oscill_axis(&value), CAMSERVER_DEFAULT_TIMEOUT);
         } else if function == p.cbf_template_file {
-            self.send(Cmd::Raw(cmd_cbf_template_file(&value)));
+            self.cam_write_read(&cmd_cbf_template_file(&value), CAMSERVER_DEFAULT_TIMEOUT);
         } else if function < p.first() {
             let _ = self.ad.write_octet(user, data);
         }
@@ -440,22 +484,24 @@ pub fn create_pilatus_detector(
         SyncIOHandle::connect_port(camserver_port, 0, Duration::ZERO, InterfaceType::Octet);
     let cam_handle = Arc::new(cam_handle);
 
-    let (cmd_tx, cmd_rx) = rt::command_channel::<Cmd>(64);
+    // The port thread waits for each ack, so one job is ever queued.
+    let (flat_field_tx, flat_field_rx) = rt::command_channel::<FlatFieldJob>(1);
     let start = Arc::new(Event::new());
     let stop = Arc::new(Event::new());
 
     let shared = Arc::new(Mutex::new(Shared::default()));
 
-    let driver = PilatusDriver::new(
+    let mut driver = PilatusDriver::new(
         port_name,
         max_size_x,
         max_size_y,
         max_memory,
         DriverLinks {
-            cmd_tx: cmd_tx.clone(),
+            flat_field_tx,
             start: start.clone(),
             stop: stop.clone(),
             shared: shared.clone(),
+            cam: cam_handle.clone(),
         },
     )
     .map_err(|e| format!("failed to create Pilatus driver: {e}"))?;
@@ -472,6 +518,9 @@ pub fn create_pilatus_detector(
         )
         .ok()
         .map(PersistentArray::new);
+    // C always calls pilatusStatus() once at the end of the constructor to get
+    // the TVX version.
+    let _ = driver.pilatus_status();
 
     let ad_params = driver.ad.params;
     let pilatus_params = driver.p;
@@ -482,18 +531,6 @@ pub fn create_pilatus_detector(
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(Mutex::new(NDArrayOutput::new()));
 
-    let cmd_worker = Worker {
-        ctx: Ctx::new(
-            handle.clone(),
-            cam_handle.clone(),
-            ad_params,
-            pilatus_params,
-            stop.clone(),
-        ),
-        shared: shared.clone(),
-        output: ArrayPublisher::new(array_output.clone()),
-        pool: pool.clone(),
-    };
     let acq_worker = Worker {
         ctx: Ctx::new(handle, cam_handle, ad_params, pilatus_params, stop),
         shared,
@@ -502,15 +539,9 @@ pub fn create_pilatus_detector(
     };
 
     let tasks = vec![
-        start_cmd_task(cmd_worker, cmd_rx),
+        start_flat_field_task(ArrayPublisher::new(array_output.clone()), flat_field_rx),
         start_acq_task(acq_worker, start),
     ];
-
-    // C always calls pilatusStatus() once at the end of the constructor to get
-    // the TVX version.
-    if cmd_tx.try_send(Cmd::ReadStatus).is_err() {
-        return Err("pilatus: command task did not start".to_string());
-    }
 
     Ok(PilatusRuntime {
         runtime_handle,
@@ -526,16 +557,25 @@ pub fn create_pilatus_detector(
 mod tests {
     use super::*;
 
+    /// A camserver user with no port, as C's when the startup script named
+    /// none (pilatusDetector.cpp:1731).
+    fn no_camserver() -> Arc<SyncIOHandle> {
+        Arc::new(
+            SyncIOHandle::connect_port("PILATUS_NO_CAM", 0, Duration::ZERO, InterfaceType::Octet).0,
+        )
+    }
+
     /// pilatusDetector.cpp:1796 seeds NDDataType NDInt32, the type of
     /// every array the driver reads.
     #[test]
     fn data_type_starts_at_int32() {
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
+            cam: no_camserver(),
         };
         let det = PilatusDriver::new("PILATUS_DATA_TYPE", 8, 8, 0, links).unwrap();
         let data_type = det.ad.params.base.data_type;
@@ -548,12 +588,13 @@ mod tests {
     #[test]
     fn a_base_class_write_reaches_addriver() {
         use epics_rs::ad_core::driver::ShutterMode;
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
+            cam: no_camserver(),
         };
         let mut det = PilatusDriver::new("PILATUS_BASE_WRITE", 8, 8, 0, links).unwrap();
         let ad = det.ad.params;
@@ -577,12 +618,13 @@ mod tests {
     /// whatever the address.
     #[test]
     fn a_write_at_another_address_sets_list_zero() {
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
+            cam: no_camserver(),
         };
         let mut det = PilatusDriver::new("PILATUS_LIST0", 8, 8, 0, links).unwrap();
         let p = det.p;
@@ -607,12 +649,13 @@ mod tests {
         use epics_rs::asyn::trace::TraceFile;
         use epics_rs::asyn::user::UserTrace;
         let port = "PILATUS_STATUS";
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
+            cam: no_camserver(),
         };
         let mut det = PilatusDriver::new(port, 8, 8, 0, links).unwrap();
         let manager = PortServices::global().trace().clone();
@@ -646,12 +689,14 @@ mod tests {
 
     #[test]
     fn a_pair_write_sends_zero_for_its_unset_partner() {
-        let (cmd_tx, mut cmd_rx) = rt::command_channel::<Cmd>(4);
+        let sent = recording_camserver("PILATUS_PAIR_CAM");
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
+            cam: camserver("PILATUS_PAIR_CAM"),
         };
         let mut det = PilatusDriver::new("PILATUS_PAIR", 8, 8, 0, links).unwrap();
         let p = det.p;
@@ -659,13 +704,52 @@ mod tests {
         for (reason, name) in [(p.energy_low, "Energy_range"), (p.beam_x, "Beam_xy")] {
             let mut user = AsynUser::new(reason);
             det.write_float64(&mut user, 2.5).unwrap();
-            match cmd_rx.try_recv() {
-                Ok(Cmd::Raw(cmd)) => {
-                    assert_eq!(cmd, format!("mxsettings {name} 2.500000,0.000000"))
-                }
-                other => panic!("{name}: {other:?}"),
-            }
+            assert_eq!(
+                sent.lock().last().map(String::as_str),
+                Some(format!("mxsettings {name} 2.500000,0.000000").as_str())
+            );
         }
+    }
+
+    /// A FilePath write runs C's `imgpath` then `asynNDArrayDriver::checkPath()`
+    /// (pilatusDetector.cpp:1612-1615, asynNDArrayDriver.cpp:98-111): an empty
+    /// path leaves FilePathExists undefined, any other is written back with its
+    /// separator.
+    #[test]
+    fn a_file_path_write_runs_ndarray_driver_check_path() {
+        let sent = recording_camserver("PILATUS_CHECK_PATH_CAM");
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
+        let links = DriverLinks {
+            flat_field_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+            cam: camserver("PILATUS_CHECK_PATH_CAM"),
+        };
+        let mut det = PilatusDriver::new("PILATUS_CHECK_PATH", 8, 8, 0, links).unwrap();
+        let (file_path, exists) = (
+            det.ad.params.base.file_path,
+            det.ad.params.base.file_path_exists,
+        );
+
+        det.write_octet(&mut AsynUser::new(file_path), b"").unwrap();
+        assert_eq!(sent.lock().last().map(String::as_str), Some("imgpath "));
+        assert!(
+            det.ad.port_base.get_int32_param(exists, 0).is_err(),
+            "an empty FilePath leaves FilePathExists undefined"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+        det.write_octet(&mut AsynUser::new(file_path), dir_path.as_bytes())
+            .unwrap();
+        assert_eq!(sent.lock().last(), Some(&format!("imgpath {dir_path}")));
+        assert_eq!(
+            det.ad.port_base.get_string_param(file_path, 0).unwrap(),
+            format!("{dir_path}/").as_bytes(),
+            "checkPath writes the path back with its separator"
+        );
+        assert_eq!(det.ad.port_base.get_int32_param(exists, 0).unwrap(), 1);
     }
 
     /// ADDriver::writeFloat64 is asynPortDriver's (pilatusDetector.cpp:1571),
@@ -675,12 +759,13 @@ mod tests {
         use epics_rs::asyn::trace::TraceFile;
         use epics_rs::asyn::user::UserTrace;
         let port = "PILATUS_BASE_F64";
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
+            cam: no_camserver(),
         };
         let mut det = PilatusDriver::new(port, 8, 8, 0, links).unwrap();
         let manager = epics_rs::asyn::services::PortServices::global()
@@ -749,5 +834,211 @@ mod tests {
         let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
         assert_eq!(sync.read_int32(rt.ad_params.max_size_x).unwrap(), 487);
         assert_eq!(sync.read_int32(rt.ad_params.max_size_y).unwrap(), 195);
+    }
+
+    /// A camserver that records every command and answers `15 OK`; the first
+    /// `nimages` waits for `gate`.
+    struct GatedCamserver {
+        base: epics_rs::asyn::port::PortDriverBase,
+        sent: Arc<Mutex<Vec<String>>>,
+        gate: Option<Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl PortDriver for GatedCamserver {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            if cmd.starts_with("nimages")
+                && let Some(gate) = self.gate.take()
+            {
+                let _ = gate.lock().recv();
+            }
+            self.sent.lock().push(cmd);
+            Ok(data.len())
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            let reply = b"15 OK";
+            buf[..reply.len()].copy_from_slice(reply);
+            OctetReadResult::ok(reply.len(), EomReason::EOS)
+        }
+    }
+
+    /// A camserver user on `port`.
+    fn camserver(port: &str) -> Arc<SyncIOHandle> {
+        Arc::new(SyncIOHandle::connect_port(port, 0, Duration::ZERO, InterfaceType::Octet).0)
+    }
+
+    /// Registers an ungated [`GatedCamserver`] as `port` and returns what it
+    /// is sent.
+    fn recording_camserver(port: &str) -> Arc<Mutex<Vec<String>>> {
+        use epics_rs::asyn::manager::{PortManager, claim_port_driver};
+        use epics_rs::asyn::port::PortFlags;
+        use epics_rs::asyn::registry::open_owner;
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let rt = PortManager::new()
+            .register_port(
+                claim_port_driver(port).unwrap(),
+                GatedCamserver {
+                    base: PortDriverBase::new(
+                        port,
+                        1,
+                        PortFlags::default(),
+                        InterfaceMask::UNMIGRATED_ALL,
+                        InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    ),
+                    sent: sent.clone(),
+                    gate: None,
+                },
+                &open_owner(),
+            )
+            .unwrap();
+        std::mem::forget(rt);
+        sent
+    }
+
+    /// C publishes the flat field before setting FlatFieldValid, both on the
+    /// port thread (pilatusDetector.cpp:315-316): when the write returns, a
+    /// plugin already holds the array.
+    #[test]
+    fn a_flat_field_write_returns_after_the_array_is_published() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::registry::claim_port;
+
+        let rt = create_pilatus_detector(
+            &claim_port("PILATUS_FF_ORDER").unwrap(),
+            "PILATUS_FF_ORDER_CAM",
+            2,
+            1,
+            0,
+        )
+        .expect("the detector port");
+        let (sender, mut receiver) = ndarray_channel("PILATUS_FF_SINK", 4);
+        rt.connect_downstream(sender);
+        let path = std::env::temp_dir().join(format!("pil-ff-order-{}.tif", std::process::id()));
+        let mut enc =
+            tiff::encoder::TiffEncoder::new(std::fs::File::create(&path).unwrap()).unwrap();
+        enc.write_image::<tiff::encoder::colortype::Gray32>(2, 1, &[7, 9])
+            .unwrap();
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let mut late = 0;
+        for _ in 0..200 {
+            sync.write_octet(
+                rt.pilatus_params.flat_field_file,
+                path.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                sync.read_int32(rt.pilatus_params.flat_field_valid).unwrap(),
+                1
+            );
+            if receiver.pending() == 0 {
+                late += 1;
+            }
+            receiver.blocking_recv().unwrap();
+        }
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            late, 0,
+            "FlatFieldValid read 1 before the plugin had the array"
+        );
+        std::mem::forget(rt);
+    }
+
+    /// C writeInt32 returns pilatusStatus()'s status for ReadStatus
+    /// (pilatusDetector.cpp:1429-1431), the `thread` exchange's.
+    #[test]
+    fn a_read_status_whose_thread_exchange_fails_fails_the_write() {
+        let (flat_field_tx, _rx) = rt::command_channel::<FlatFieldJob>(4);
+        let links = DriverLinks {
+            flat_field_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+            cam: no_camserver(),
+        };
+        let mut det = PilatusDriver::new("PILATUS_READ_STATUS", 8, 8, 0, links).unwrap();
+        let r = det.ad.params.read_status;
+        assert!(det.write_int32(&mut AsynUser::new(r), 1).is_err());
+    }
+
+    /// C runs setAcquireParams inside writeFloat64 on the port thread
+    /// (pilatusDetector.cpp:1502-1505), so a PINI AcquirePeriod write queued
+    /// behind AcquireTime's lands only after setAcquireParams has read the
+    /// still undefined period and sent its default 2 (:790-795).
+    #[test]
+    fn a_queued_acquire_period_lands_after_set_acquire_params_reads_it() {
+        use epics_rs::asyn::manager::{PortManager, claim_port_driver};
+        use epics_rs::asyn::port::PortFlags;
+        use epics_rs::asyn::registry::{claim_port, open_owner};
+        use epics_rs::asyn::request::RequestOp;
+
+        let cam = "PILATUS_PINI_CAM";
+        let (open, gate) = std::sync::mpsc::channel();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let cam_rt = PortManager::new()
+            .register_port(
+                claim_port_driver(cam).unwrap(),
+                GatedCamserver {
+                    base: PortDriverBase::new(
+                        cam,
+                        1,
+                        PortFlags::default(),
+                        InterfaceMask::UNMIGRATED_ALL,
+                        InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    ),
+                    sent: sent.clone(),
+                    gate: Some(Mutex::new(gate)),
+                },
+                &open_owner(),
+            )
+            .unwrap();
+        let rt = create_pilatus_detector(&claim_port("PILATUS_PINI").unwrap(), cam, 8, 8, 0)
+            .expect("the detector port");
+        let ad = rt.ad_params;
+        let port = rt.port_handle();
+        let time = port
+            .try_submit(
+                RequestOp::Float64Write { value: 1.0 },
+                AsynUser::new(ad.acquire_time),
+            )
+            .unwrap();
+        let period = port
+            .try_submit(
+                RequestOp::Float64Write { value: 0.0 },
+                AsynUser::new(ad.acquire_period),
+            )
+            .unwrap();
+        open.send(()).unwrap();
+        time.wait_blocking(Duration::from_secs(10)).unwrap();
+        period.wait_blocking(Duration::from_secs(10)).unwrap();
+
+        let periods = || -> Vec<String> {
+            sent.lock()
+                .iter()
+                .filter(|c| c.starts_with("expperiod"))
+                .cloned()
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while periods().len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            periods(),
+            ["expperiod  2.00000000", "expperiod  0.00000000"]
+        );
+        std::mem::forget(cam_rt);
+        std::mem::forget(rt);
     }
 }
