@@ -362,7 +362,7 @@ fn receive_packet(
         ReceivedPacket::ConfigReadback { .. } | ReceivedPacket::Ack { .. } => {}
         ReceivedPacket::Error { .. } => {
             // C spelling (`ConsoleHelper.cpp:725`).
-            eprintln!("Error recevied");
+            epics_rs::base::stderr_println!("Error recevied");
             return None;
         }
         ReceivedPacket::Unprocessed => return None,

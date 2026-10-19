@@ -138,7 +138,7 @@ impl DppLibUsb {
         match self.bus.devices() {
             Ok(list) => list.into_iter().filter(|&ids| is_amptek_dp5(ids)).count() as i32,
             Err(e) => {
-                eprintln!("failed to get device list: {}", e.strerror());
+                epics_rs::base::stderr_println!("failed to get device list: {}", e.strerror());
                 -1
             }
         }
@@ -150,7 +150,7 @@ impl DppLibUsb {
         let list = match self.bus.devices() {
             Ok(list) => list,
             Err(e) => {
-                eprintln!("failed to get device list: {}", e.strerror());
+                epics_rs::base::stderr_println!("failed to get device list: {}", e.strerror());
                 return None;
             }
         };
@@ -163,12 +163,12 @@ impl DppLibUsb {
         let mut handle = match self.bus.open(index) {
             Ok(handle) => handle,
             Err(e) => {
-                eprintln!("Cannot open USB device: {}", e.strerror());
+                epics_rs::base::stderr_println!("Cannot open USB device: {}", e.strerror());
                 return None;
             }
         };
         if let Err(e) = handle.claim_interface(INTERFACE_NUMBER) {
-            eprintln!("libusb_claim_interface error {}", e.strerror());
+            epics_rs::base::stderr_println!("libusb_claim_interface error {}", e.strerror());
             return None;
         }
         Some(handle)
@@ -180,7 +180,7 @@ impl DppLibUsb {
         if let Some(mut handle) = self.handle.take()
             && let Err(e) = handle.release_interface(INTERFACE_NUMBER)
         {
-            eprintln!("libusb_release_interface error {}", e.strerror());
+            epics_rs::base::stderr_println!("libusb_release_interface error {}", e.strerror());
         }
     }
 
@@ -264,13 +264,16 @@ impl DppLibUsb {
         let length = usize::from(byte(4)) * 256 + usize::from(byte(5)) + 8;
         let out = &packet[..length.min(packet.len())];
         if let Err(e) = handle.bulk_out(BULK_OUT_ENDPOINT, out, timeout) {
-            eprintln!("Error sending data via bulk transfer: {}", e.strerror());
+            epics_rs::base::stderr_println!(
+                "Error sending data via bulk transfer: {}",
+                e.strerror()
+            );
             return Vec::new();
         }
         let mut reply = vec![0u8; MAX_BULK_IN_TRANSFER_SIZE];
         match handle.bulk_in(BULK_IN_ENDPOINT, &mut reply, timeout) {
             Ok(0) => {
-                eprintln!("No data received in bulk transfer: Success");
+                epics_rs::base::stderr_println!("No data received in bulk transfer: Success");
                 Vec::new()
             }
             Ok(n) => {
@@ -278,7 +281,10 @@ impl DppLibUsb {
                 reply
             }
             Err(e) => {
-                eprintln!("Error receiving data via bulk transfer: {}", e.strerror());
+                epics_rs::base::stderr_println!(
+                    "Error receiving data via bulk transfer: {}",
+                    e.strerror()
+                );
                 Vec::new()
             }
         }
