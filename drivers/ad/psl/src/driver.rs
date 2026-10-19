@@ -22,6 +22,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
@@ -257,8 +258,14 @@ impl PslDetector {
             }
         }
 
-        // GetMode is always supported.
+        // GetMode is always supported. C sets Mono on every reply, before it
+        // looks at the mode (PSL.cpp:361-363).
         if let Some(reply) = self.checked("GetMode")? {
+            self.ad.port_base.set_int32_param(
+                self.ad.params.base.color_mode,
+                0,
+                NDColorMode::Mono as i32,
+            )?;
             match protocol::parse_mode(protocol::quoted_field(&reply, multi)) {
                 Ok((data_type, color_mode)) => {
                     let base = &mut self.ad.port_base;
@@ -795,6 +802,47 @@ mod tests {
         )
         .unwrap()
         .0
+    }
+
+    /// A server that answers every command with `reply`, on each of the
+    /// connections the exchanges reopen.
+    fn server_replying(name: &str, reply: &'static str) -> PslServer {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().map_while(Result::ok) {
+                let mut buf = [0u8; 512];
+                while matches!(stream.read(&mut buf), Ok(n) if n > 0) {
+                    if stream.write_all(reply.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let ip = format!("{name}_IP");
+        let driver = DrvAsynIPPort::new(&ip, &addr).unwrap();
+        let (runtime, _) =
+            create_port_runtime(&claim_port(&ip).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        PslServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO))
+    }
+
+    /// C getConfig sets NDColorModeMono on every successful GetMode, before
+    /// it looks at the mode (PSL.cpp:361-363).
+    #[test]
+    fn an_unknown_mode_still_sets_mono() {
+        let mut det = detector("PSL_MODE");
+        det.server = server_replying("PSL_MODE_SRV", "Q");
+        let color_mode = det.ad.params.base.color_mode;
+        det.ad
+            .port_base
+            .set_int32_param(color_mode, 0, NDColorMode::RGB1 as i32)
+            .unwrap();
+        det.get_config().unwrap();
+        assert_eq!(det.get_i32(color_mode), NDColorMode::Mono as i32);
     }
 
     /// ADDriver.cpp:180-181: ADMaxSizeX/Y start at 1, which a port whose
