@@ -81,3 +81,17 @@ fn heid_nd261_reads_through_dev_ai_heid_nd261() {
         )]
     );
 }
+
+/// devTPG261.c:12-13: the gauge address is 1 or 2; any other makes readBi
+/// index `vals[]` outside the array.
+#[test]
+fn st_cmd_tpg261_gauges_are_1_and_2() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("st.cmd");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let addrs: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("dbLoadRecords(") && l.contains("/TPG261.db"))
+        .map(|l| l.split("ADDR=").nth(1).unwrap().trim_end_matches("\")"))
+        .collect();
+    assert_eq!(addrs, ["1", "2"]);
+}
