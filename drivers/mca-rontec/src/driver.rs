@@ -122,6 +122,12 @@ const RONTEC_TIMEOUT: Duration = Duration::from_secs(2);
 /// -- distinct from [`RONTEC_TIMEOUT`], used only for the binary spectrum
 /// transfer.
 const SPECTRUM_TIMEOUT: Duration = Duration::from_secs(10);
+/// The interfaces `RontecConfig` registers (`drvMcaRontec.c:228-251`); it
+/// registers no interrupt source.
+const RONTEC_INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::DRV_USER);
 
 /// The `pasynUser->reason` used for octet transactions against the
 /// underlying serial port (mirrors `love::driver::OCTET_REASON`).
@@ -279,8 +285,8 @@ impl RontecDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            RONTEC_INTERFACES,
+            InterfaceMask::NONE,
         );
         let reasons = McaReason::create_params(&mut base)?;
 
@@ -1056,6 +1062,51 @@ mod tests {
     impl Drop for Rig {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.trace_path);
+        }
+    }
+
+    /// C registers asynCommon, asynInt32, asynFloat64, asynInt32Array and
+    /// asynDrvUser and no interrupt source (`drvMcaRontec.c:204-251`).
+    #[test]
+    fn the_port_has_cs_interfaces_and_no_interrupts() {
+        use epics_rs::asyn::interfaces::InterfaceType as I;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        let rig = Rig::new("ifaces", rontec_reply);
+        let handle = rig.rontec.port_handle();
+        let all = [
+            I::Common,
+            I::DrvUser,
+            I::Int32,
+            I::Int64,
+            I::Float64,
+            I::Octet,
+            I::Option,
+            I::UInt32Digital,
+            I::Enum,
+            I::GenericPointer,
+            I::Int32Array,
+            I::Float64Array,
+        ];
+        let present: Vec<_> = all
+            .into_iter()
+            .filter(|&i| handle.has_interface(i))
+            .collect();
+        assert_eq!(
+            present,
+            [I::Common, I::DrvUser, I::Int32, I::Float64, I::Int32Array]
+        );
+        for iface in [I::Int32, I::Float64, I::Int32Array] {
+            let filter = InterruptFilter {
+                iface: Some(iface),
+                ..InterruptFilter::default()
+            };
+            assert!(
+                handle
+                    .interrupts()
+                    .register_interrupt_user(filter, 0)
+                    .is_err(),
+                "{iface:?}"
+            );
         }
     }
 
