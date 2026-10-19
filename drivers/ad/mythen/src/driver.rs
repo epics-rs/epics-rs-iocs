@@ -185,13 +185,6 @@ impl MythenDriver {
             self.ad
                 .port_base
                 .set_int32_param(self.p.nmodules, 0, nmodules)?;
-            // One module is 1280 channels; the array the driver publishes is as
-            // wide as all the modules together.
-            self.ad.port_base.set_int32_param(
-                self.ad.params.base.array_size_x,
-                0,
-                nmodules * CHANNELS_PER_MODULE as i32,
-            )?;
         }
 
         self.ad.port_base.call_param_callbacks(0)

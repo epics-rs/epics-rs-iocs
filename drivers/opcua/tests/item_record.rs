@@ -182,7 +182,9 @@ fn process(device: &mut OpcuaDevice, record: &mut OpcuaItemRecord) {
 /// A put from a client: the field, then the `special()` the framework calls.
 fn put(record: &mut OpcuaItemRecord, field: &str, value: EpicsValue) {
     record.put_field(field, value).expect("the field takes it");
-    record.special(field, true).expect("special runs");
+    record
+        .special(field, true, &Default::default())
+        .expect("special runs");
 }
 
 fn up(leaf: &Arc<Mutex<Leaf>>) {

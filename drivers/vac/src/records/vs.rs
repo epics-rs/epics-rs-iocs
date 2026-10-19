@@ -382,7 +382,7 @@ impl Record for VsRecord {
     }
 
     /// C `vsRecord.c::special` — record which `SPC_MOD` field was written.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(&mut self, field: &str, after: bool, _common: &CommonFields) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -554,12 +554,12 @@ mod tests {
     #[test]
     fn special_records_the_changed_control_field() {
         let mut r = VsRecord::default();
-        r.special("IG1S", true).unwrap();
-        r.special("SP4S", true).unwrap();
+        r.special("IG1S", true, &CommonFields::default()).unwrap();
+        r.special("SP4S", true, &CommonFields::default()).unwrap();
         assert_eq!(r.chgc, IG1_FIELD | SP4_FIELD);
         // The "before" callback must not latch anything.
         let mut r = VsRecord::default();
-        r.special("IG1S", false).unwrap();
+        r.special("IG1S", false, &CommonFields::default()).unwrap();
         assert_eq!(r.chgc, 0);
     }
 
