@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 
 use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
-use opcua::client::{ConnectError, Identity, UaConnection, UaConnector};
+use opcua::client::{SetupError, UaClient, UaConnector};
 use opcua::ioc;
 use opcua::link::{InfoDefaults, RecordKind, parse_link};
 use opcua::registry::Registry;
@@ -19,12 +19,8 @@ struct Offline;
 
 #[async_trait]
 impl UaConnector for Offline {
-    async fn connect(
-        &self,
-        _config: &SessionConfig,
-        _identity: &Identity,
-    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
-        Err(ConnectError::setup("no server"))
+    async fn setup(&self, _config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+        Err(SetupError::new("no server"))
     }
 }
 

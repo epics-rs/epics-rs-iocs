@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use epics_rs::base::server::ioc_builder::IocBuilder;
 use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
-use opcua::client::{ConnectError, Identity, UaConnection, UaConnector};
+use opcua::client::{SetupError, UaClient, UaConnector};
 use opcua::device_support;
 use opcua::ioc;
 use opcua::registry::Registry;
@@ -19,12 +19,8 @@ struct Offline;
 
 #[async_trait]
 impl UaConnector for Offline {
-    async fn connect(
-        &self,
-        _config: &SessionConfig,
-        _identity: &Identity,
-    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
-        Err(ConnectError::setup("no server"))
+    async fn setup(&self, _config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+        Err(SetupError::new("no server"))
     }
 }
 

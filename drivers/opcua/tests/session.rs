@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 
 use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
 use opcua::client::{
-    ConnectError, CreatedSubscription, Notification, ServerInfo, UaConnection, UaConnector,
+    CreatedSubscription, Identity, Notification, ServerInfo, SetupError, UaClient, UaConnection,
+    UaConnector,
 };
 use opcua::item::{Item, Leaf};
 use opcua::link::{InfoDefaults, LinkInfo, NodeIdentifier, RecordKind, parse_link};
@@ -65,7 +66,10 @@ struct Mock {
     /// Value attribute per node, defaulting to Int32(42).
     values: Mutex<HashMap<NodeId, Variant>>,
     sink: Mutex<Option<mpsc::UnboundedSender<Notification>>>,
+    /// The configuration each `UA_Client_connect` ran with: the one its
+    /// client was set up with.
     connects: Mutex<Vec<SessionConfig>>,
+    setups: Mutex<usize>,
     /// Refuse this many connect attempts before accepting one.
     refuse_connects: Mutex<usize>,
     /// The server drops the connection.
@@ -88,21 +92,35 @@ struct MockConnector(Arc<Mock>);
 
 #[async_trait]
 impl UaConnector for MockConnector {
-    async fn connect(
-        &self,
-        config: &SessionConfig,
-        _identity: &opcua::client::Identity,
-    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
-        self.0.connects.lock().push(config.clone());
-        let mut refuse = self.0.refuse_connects.lock();
+    async fn setup(&self, config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+        *self.0.setups.lock() += 1;
+        Ok(Box::new(MockClient {
+            mock: self.0.clone(),
+            config: config.clone(),
+            identity: config.setup_identity(),
+        }))
+    }
+}
+
+struct MockClient {
+    mock: Arc<Mock>,
+    config: SessionConfig,
+    identity: Identity,
+}
+
+#[async_trait]
+impl UaClient for MockClient {
+    fn identity(&self) -> &Identity {
+        &self.identity
+    }
+    async fn connect(&mut self) -> Result<Arc<dyn UaConnection>, StatusCode> {
+        self.mock.connects.lock().push(self.config.clone());
+        let mut refuse = self.mock.refuse_connects.lock();
         if *refuse > 0 {
             *refuse -= 1;
-            return Err(ConnectError {
-                status: Some(StatusCode::BadNotConnected),
-                message: "connect service failed with status BadNotConnected".into(),
-            });
+            return Err(StatusCode::BadNotConnected);
         }
-        Ok(self.0.clone())
+        Ok(self.mock.clone())
     }
 }
 
@@ -1450,6 +1468,25 @@ async fn a_connection_the_server_drops_reconnects_at_once() {
     until(|| handle.is_connected()).await;
     assert_eq!(mock.calls.lock().disconnects, 1);
     assert_eq!(shown_state(&handle), "Good Activated Open registered=0");
+}
+
+/// open62541 reconnects a lost session on the client `connect` set up, with
+/// no security setup and no identity read again (`connectIterate`,
+/// open62541.c:45447-45560).
+#[tokio::test]
+async fn a_lost_session_reconnects_on_the_client_its_connect_set_up() {
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+
+    mock.lost.notify_one();
+    until(|| mock.connects.lock().len() == 2).await;
+    until(|| handle.is_connected()).await;
+    assert_eq!(*mock.setups.lock(), 1);
 }
 
 #[tokio::test]

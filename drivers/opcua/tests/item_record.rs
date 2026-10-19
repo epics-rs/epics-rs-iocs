@@ -27,7 +27,8 @@ use epics_rs::base::server::records::longout::LongoutRecord;
 use epics_rs::base::types::EpicsValue;
 
 use opcua::client::{
-    ConnectError, CreatedSubscription, Notification, ServerInfo, UaConnection, UaConnector,
+    CreatedSubscription, Identity, Notification, ServerInfo, SetupError, UaClient, UaConnection,
+    UaConnector,
 };
 use opcua::device_support::OpcuaDevice;
 use opcua::item::Leaf;
@@ -55,11 +56,22 @@ struct MockConnector(Arc<Mock>);
 
 #[async_trait]
 impl UaConnector for MockConnector {
-    async fn connect(
-        &self,
-        _config: &SessionConfig,
-        _identity: &opcua::client::Identity,
-    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
+    async fn setup(&self, config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+        Ok(Box::new(MockClient(
+            self.0.clone(),
+            config.setup_identity(),
+        )))
+    }
+}
+
+struct MockClient(Arc<Mock>, Identity);
+
+#[async_trait]
+impl UaClient for MockClient {
+    fn identity(&self) -> &Identity {
+        &self.1
+    }
+    async fn connect(&mut self) -> Result<Arc<dyn UaConnection>, StatusCode> {
         Ok(self.0.clone())
     }
 }
@@ -147,12 +159,8 @@ fn offline() -> Arc<Registry> {
     struct Offline;
     #[async_trait]
     impl UaConnector for Offline {
-        async fn connect(
-            &self,
-            _config: &SessionConfig,
-            _identity: &opcua::client::Identity,
-        ) -> Result<Arc<dyn UaConnection>, ConnectError> {
-            Err(ConnectError::setup("no server"))
+        async fn setup(&self, _config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+            Err(SetupError::new("no server"))
         }
     }
     let registry = Registry::new(Arc::new(Offline));

@@ -16,8 +16,8 @@ use std::time::Duration;
 use async_opcua::client::custom_types::DataTypeTreeBuilder;
 use async_opcua::client::services::{CreateSubscription, Read, Write};
 use async_opcua::client::{
-    ClientBuilder, IdentityToken, Session, SessionPollResult, Subscription, SubscriptionCallbacks,
-    UARequest,
+    Client, ClientBuilder, IdentityToken, Session, SessionPollResult, Subscription,
+    SubscriptionCallbacks, UARequest,
 };
 use async_opcua::core::ResponseMessage;
 use async_opcua::crypto::SecurityPolicy;
@@ -110,18 +110,18 @@ pub trait UaConnection: Send + Sync {
     }
 }
 
-/// A failed connect attempt: its console text, and the `connectStatus` the C's
-/// attempt leaves (`SessionOpen62541.cpp:577`, `:1049`).
+/// A failed security setup: its console text, and the `connectStatus` the C's
+/// attempt leaves (`SessionOpen62541.cpp:1049`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConnectError {
-    /// `None` when the attempt failed before any service call, which leaves
+pub struct SetupError {
+    /// `None` when the setup failed before any service call, which leaves
     /// the status as it was.
     pub status: Option<StatusCode>,
     pub message: String,
 }
 
-impl ConnectError {
-    pub fn setup(message: impl Into<String>) -> Self {
+impl SetupError {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             status: None,
             message: message.into(),
@@ -147,7 +147,7 @@ fn network_status(status: StatusCode) -> StatusCode {
     }
 }
 
-impl fmt::Display for ConnectError {
+impl fmt::Display for SetupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
     }
@@ -156,11 +156,21 @@ impl fmt::Display for ConnectError {
 /// Opens sessions. The driver holds one; a test holds a double.
 #[async_trait]
 pub trait UaConnector: Send + Sync {
-    async fn connect(
-        &self,
-        config: &SessionConfig,
-        identity: &Identity,
-    ) -> Result<Arc<dyn UaConnection>, ConnectError>;
+    /// `SessionOpen62541::connect` up to `UA_Client_connect`
+    /// (`SessionOpen62541.cpp:478-574`): a client with the security the
+    /// session asks for and the identity it presents.
+    async fn setup(&self, config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError>;
+}
+
+/// The open62541 client one `SessionOpen62541::connect` sets up.
+#[async_trait]
+pub trait UaClient: Send + Sync {
+    /// What [`SessionConfig::setup_identity`] gave the setup.
+    fn identity(&self) -> &Identity;
+    /// `UA_Client_connect`. Again after a lost connection, it is open62541's
+    /// reconnect on the same client (`connectIterate`, open62541.c:45447-45560):
+    /// no setup, and no GetEndpoints once the first connect picked the endpoint.
+    async fn connect(&mut self) -> Result<Arc<dyn UaConnection>, StatusCode>;
 }
 
 /// The `async-opcua` client.
@@ -229,11 +239,7 @@ impl Default for AsyncOpcuaConnector {
 
 #[async_trait]
 impl UaConnector for AsyncOpcuaConnector {
-    async fn connect(
-        &self,
-        config: &SessionConfig,
-        identity: &Identity,
-    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
+    async fn setup(&self, config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
         // The session's own options win over the client-wide ones; what neither
         // sets falls back to the `async-opcua` default PKI location.
         let client = self.security();
@@ -261,20 +267,15 @@ impl UaConnector for AsyncOpcuaConnector {
             builder = builder.private_key_path(key);
         }
 
-        let mut client = builder.client().map_err(|errors| {
-            ConnectError::setup(format!(
+        let client = builder.client().map_err(|errors| {
+            SetupError::new(format!(
                 "security discovery and setup failed with status {}",
                 errors.join(", ")
             ))
         })?;
 
-        let identity = identity.token().map_err(ConnectError::setup)?;
-        let token = match identity {
-            IdentityToken::Anonymous => UserTokenType::Anonymous,
-            IdentityToken::UserName(..) => UserTokenType::UserName,
-            IdentityToken::X509(..) => UserTokenType::Certificate,
-            IdentityToken::IssuedToken(..) => UserTokenType::IssuedToken,
-        };
+        let identity = config.setup_identity();
+        let token = identity.token().map_err(SetupError::new)?;
         let secured = if config.security_mode == SecurityMode::None {
             None
         } else {
@@ -283,7 +284,7 @@ impl UaConnector for AsyncOpcuaConnector {
                     "OPC UA session {}: fatal - only URLs of type 'opc.tcp' supported\n",
                     config.name
                 ));
-                return Err(ConnectError::setup(
+                return Err(SetupError::new(
                     "security discovery and setup failed with status fatal",
                 ));
             }
@@ -291,38 +292,75 @@ impl UaConnector for AsyncOpcuaConnector {
                 .get_server_endpoints_from_url(config.url.as_str())
                 .await
                 .map_err(|e| {
-                    ConnectError::service(
+                    SetupError::service(
                         network_status(e.status()),
                         "security discovery and setup failed with status cantConnect",
                     )
                 })?;
             Some(config.select_endpoint(&endpoints).ok_or_else(|| {
-                ConnectError::service(
+                SetupError::service(
                     StatusCode::Good,
                     "security discovery and setup failed with status noMatchingEndpoint",
                 )
             })?)
         };
+        Ok(Box::new(AsyncOpcuaClient {
+            client,
+            config: config.clone(),
+            identity,
+            token,
+            secured,
+            endpoint: None,
+        }))
+    }
+}
 
-        // `UA_Client_connect` reads the endpoints again and picks the one to
-        // connect to by itself, for `sec-mode=None` as for any other.
-        let failed = |status: StatusCode| {
-            let status = network_status(status);
-            ConnectError::service(
-                status,
-                format!("connect service failed with status {}", status_name(status)),
-            )
+struct AsyncOpcuaClient {
+    client: Client,
+    config: SessionConfig,
+    identity: Identity,
+    token: IdentityToken,
+    /// The endpoint security discovery picked, `None` without security.
+    secured: Option<EndpointDescription>,
+    /// The endpoint the first connect settled on, as open62541 keeps it in
+    /// `config.endpoint`.
+    endpoint: Option<EndpointDescription>,
+}
+
+#[async_trait]
+impl UaClient for AsyncOpcuaClient {
+    fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    async fn connect(&mut self) -> Result<Arc<dyn UaConnection>, StatusCode> {
+        let endpoint = match &self.endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => {
+                // `UA_Client_connect` reads the endpoints again and picks the one
+                // to connect to by itself, for `sec-mode=None` as for any other.
+                let endpoints = self
+                    .client
+                    .get_server_endpoints_from_url(self.config.url.as_str())
+                    .await
+                    .map_err(|e| network_status(e.status()))?;
+                let token = match self.token {
+                    IdentityToken::Anonymous => UserTokenType::Anonymous,
+                    IdentityToken::UserName(..) => UserTokenType::UserName,
+                    IdentityToken::X509(..) => UserTokenType::Certificate,
+                    IdentityToken::IssuedToken(..) => UserTokenType::IssuedToken,
+                };
+                let endpoint = self
+                    .config
+                    .connect_endpoint(&endpoints, self.secured.as_ref(), token)
+                    .map_err(network_status)?;
+                self.endpoint.insert(endpoint).clone()
+            }
         };
-        let endpoints = client
-            .get_server_endpoints_from_url(config.url.as_str())
-            .await
-            .map_err(|e| failed(e.status()))?;
-        let endpoint = config
-            .connect_endpoint(&endpoints, secured.as_ref(), token)
-            .map_err(failed)?;
-        let (session, event_loop) = client
-            .connect_to_endpoint_directly(endpoint, identity)
-            .map_err(|e| failed(e.status()))?;
+        let (session, event_loop) = self
+            .client
+            .connect_to_endpoint_directly(endpoint, self.token.clone())
+            .map_err(|e| network_status(e.status()))?;
 
         // The event loop makes the one attempt `session_retry_limit(0)` allows
         // and ends with its status; the session state stays `Connecting`, so
@@ -349,7 +387,7 @@ impl UaConnector for AsyncOpcuaConnector {
             ended = &mut handle => Some(ended.unwrap_or(StatusCode::BadInternalError)),
         };
         if let Some(status) = failed_with {
-            return Err(failed(status));
+            return Err(network_status(status));
         }
 
         Ok(Arc::new(AsyncOpcuaConnection { session, ended }))

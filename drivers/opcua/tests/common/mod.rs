@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use opcua::client::{
-    ConnectError, CreatedSubscription, Identity, Notification, ServerInfo, UaConnection,
+    CreatedSubscription, Identity, Notification, ServerInfo, SetupError, UaClient, UaConnection,
     UaConnector,
 };
 use opcua::ioc;
@@ -23,6 +23,7 @@ use opcua::subscription::SubscriptionConfig;
 
 #[derive(Default)]
 pub struct Server {
+    pub setups: AtomicUsize,
     pub connects: AtomicUsize,
     pub disconnects: AtomicUsize,
     /// Connect attempts never finish — a server that does not answer.
@@ -37,21 +38,27 @@ struct Connector(Arc<Server>);
 
 #[async_trait]
 impl UaConnector for Connector {
-    async fn connect(
-        &self,
-        _config: &SessionConfig,
-        _identity: &Identity,
-    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
+    async fn setup(&self, config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+        self.0.setups.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(Client(self.0.clone(), config.setup_identity())))
+    }
+}
+
+struct Client(Arc<Server>, Identity);
+
+#[async_trait]
+impl UaClient for Client {
+    fn identity(&self) -> &Identity {
+        &self.1
+    }
+    async fn connect(&mut self) -> Result<Arc<dyn UaConnection>, StatusCode> {
         self.0.connects.fetch_add(1, Ordering::SeqCst);
         if self.0.hang {
             std::future::pending::<()>().await;
         }
         tokio::time::sleep(self.0.latency).await;
         if self.0.refuse {
-            return Err(ConnectError {
-                status: Some(StatusCode::BadDisconnect),
-                message: "connect service failed with status BadDisconnect".into(),
-            });
+            return Err(StatusCode::BadDisconnect);
         }
         Ok(Arc::new(Connection(self.0.clone())))
     }

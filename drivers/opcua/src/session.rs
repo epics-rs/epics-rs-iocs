@@ -23,8 +23,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::client::{
-    ConnectError, CreatedSubscription, Identity, SecurityMode, ServerInfo, UaConnection,
-    UaConnector, security_policy_string,
+    CreatedSubscription, Identity, SecurityMode, ServerInfo, UaClient, UaConnection, UaConnector,
+    security_policy_string,
 };
 use crate::defaults;
 use crate::item::{Item, stream_double};
@@ -664,36 +664,30 @@ pub struct SessionWorker {
     commands: mpsc::UnboundedReceiver<(Priority, Request)>,
     control: mpsc::UnboundedReceiver<(Order, oneshot::Sender<()>)>,
     exit: watch::Receiver<bool>,
-    connection: Option<Arc<dyn UaConnection>>,
     /// Read and write requests waiting for a service call, highest priority first.
     reads: [VecDeque<u32>; 3],
     writes: [VecDeque<u32>; 3],
 }
 
 /// One connect attempt, and what asked for it.
-struct Attempt {
-    /// C `connect(manual)`: only a manual attempt reports its failure.
-    manual: bool,
-    /// Dropped once the attempt is through, which lets its caller return.
-    _done: Option<oneshot::Sender<()>>,
+enum Attempt {
+    /// C `connect(manual)`: `opcuaConnect`, the autoconnect at `iocInit`, or
+    /// the autoconnect timer.
+    Connect {
+        /// Only a manual attempt reports its failure.
+        manual: bool,
+        /// Dropped once the attempt is through, which lets its caller return.
+        done: Option<oneshot::Sender<()>>,
+    },
+    /// open62541 reconnecting a lost session on its client, whatever
+    /// autoconnect says (`connectIterate`, `SessionOpen62541.cpp:2374`).
+    Reconnect(Box<dyn UaClient>),
 }
 
-impl Attempt {
-    fn ordered(manual: bool, done: oneshot::Sender<()>) -> Self {
-        Self {
-            manual,
-            _done: Some(done),
-        }
-    }
-
-    /// open62541's own: the reconnect of a lost session, or the autoconnect
-    /// timer's `connect(false)`.
-    fn unordered() -> Self {
-        Self {
-            manual: false,
-            _done: None,
-        }
-    }
+/// The client a connect set up, and the session on it.
+struct Connected {
+    client: Box<dyn UaClient>,
+    connection: Arc<dyn UaConnection>,
 }
 
 /// Create a session and its worker. The worker must be spawned.
@@ -723,7 +717,6 @@ pub fn create(
         commands,
         control,
         exit,
-        connection: None,
         reads: Default::default(),
         writes: Default::default(),
     };
@@ -744,33 +737,23 @@ impl SessionWorker {
     async fn run(mut self) {
         let mut next: Option<Attempt> = None;
         loop {
-            if self.connection.is_none() {
-                let Some(attempt) = next.take() else {
-                    tokio::select! {
-                        order = self.control.recv() => match order {
-                            Some((Order::Connect { manual }, done)) => {
-                                next = Some(Attempt::ordered(manual, done));
-                            }
-                            Some((Order::Disconnect, _)) => {}
-                            None => return,
-                        },
-                        _ = exiting(&mut self.exit) => return,
-                    }
-                    continue;
-                };
-                let Some(result) = self.connect().await else {
-                    return;
-                };
-                if let Err(e) = result {
-                    // A bad status leaves the C's session and channel states
-                    // as they were (`SessionOpen62541.cpp:2375-2382`).
-                    if let Some(status) = e.status {
-                        self.handle.client.lock().connect_status = status;
-                    }
-                    if attempt.manual || self.debug() > 0 {
-                        errlog_vprintf(format_args!("OPC UA session {}: {e}\n", self.handle.name));
-                    }
-                    drop(attempt);
+            let Some(attempt) = next.take() else {
+                tokio::select! {
+                    order = self.control.recv() => match order {
+                        Some((Order::Connect { manual }, done)) => {
+                            next = Some(Attempt::Connect { manual, done: Some(done) });
+                        }
+                        Some((Order::Disconnect, _)) => {}
+                        None => return,
+                    },
+                    _ = exiting(&mut self.exit) => return,
+                }
+                continue;
+            };
+            let connected = match self.connect(attempt).await {
+                None => return,
+                Some(Ok(connected)) => connected,
+                Some(Err(())) => {
                     // `opcua_ConnectTimeout` is both the connect timeout and the
                     // interval between attempts (`iocshVariables.h:24`); an
                     // `opcuaConnect` meanwhile is C's immediate `connect(true)`.
@@ -780,13 +763,13 @@ impl SessionWorker {
                         tokio::select! {
                             _ = tokio::time::sleep_until(deadline) => {
                                 if self.autoconnect() {
-                                    next = Some(Attempt::unordered());
+                                    next = Some(Attempt::Connect { manual: false, done: None });
                                 }
                                 break;
                             }
                             order = self.control.recv() => match order {
                                 Some((Order::Connect { manual }, done)) => {
-                                    next = Some(Attempt::ordered(manual, done));
+                                    next = Some(Attempt::Connect { manual, done: Some(done) });
                                     break;
                                 }
                                 Some((Order::Disconnect, _)) => {}
@@ -797,16 +780,16 @@ impl SessionWorker {
                     }
                     continue;
                 }
-            }
+            };
 
-            match self.serve().await {
+            match self.serve(connected).await {
                 ServeOutcome::Shutdown => return,
                 // open62541 reconnects a lost session on its next
                 // `UA_Client_run_iterate`, whatever autoconnect says, and a
                 // failure is what leaves the connect status
                 // (`connectIterate`, `SessionOpen62541.cpp:2374`).
-                ServeOutcome::Lost => {
-                    next = Some(Attempt::unordered());
+                ServeOutcome::Lost(client) => {
+                    next = Some(Attempt::Reconnect(client));
                 }
                 ServeOutcome::DisconnectRequested => {}
             }
@@ -849,18 +832,56 @@ impl SessionWorker {
     /// the subscriptions, read every item once, run the `bini=write` writes,
     /// then add the monitored items.
     ///
-    /// `None` when the session exits first: C's `atExit` deletes the client,
-    /// which abandons a connect still in flight, while an activation already
-    /// under way holds the client lock and finishes.
-    async fn connect(&mut self) -> Option<Result<(), ConnectError>> {
+    /// `Err` once the failure is reported. `None` when the session exits
+    /// first: C's `atExit` deletes the client, which abandons a connect still
+    /// in flight, while an activation already under way holds the client lock
+    /// and finishes.
+    async fn connect(&mut self, attempt: Attempt) -> Option<Result<Connected, ()>> {
         let config = self.handle.config.lock().clone();
-        let identity = config.setup_identity();
+        // `done` lives until the attempt is through.
+        let (manual, _done, mut client) = match attempt {
+            Attempt::Connect { manual, done } => {
+                let setup = tokio::select! {
+                    setup = self.connector.setup(&config) => setup,
+                    _ = exiting(&mut self.exit) => return None,
+                };
+                match setup {
+                    Ok(client) => (manual, done, client),
+                    Err(e) => {
+                        // A bad status leaves the C's session and channel
+                        // states as they were (`SessionOpen62541.cpp:2375-2382`).
+                        if let Some(status) = e.status {
+                            self.handle.client.lock().connect_status = status;
+                        }
+                        if manual || config.debug > 0 {
+                            errlog_vprintf(format_args!(
+                                "OPC UA session {}: {e}\n",
+                                self.handle.name
+                            ));
+                        }
+                        return Some(Err(()));
+                    }
+                }
+            }
+            Attempt::Reconnect(client) => (false, None, client),
+        };
         let connection = tokio::select! {
-            connection = self.connector.connect(&config, &identity) => match connection {
-                Ok(connection) => connection,
-                Err(e) => return Some(Err(e)),
-            },
+            connection = client.connect() => connection,
             _ = exiting(&mut self.exit) => return None,
+        };
+        let connection = match connection {
+            Ok(connection) => connection,
+            Err(status) => {
+                self.handle.client.lock().connect_status = status;
+                if manual || config.debug > 0 {
+                    errlog_vprintf(format_args!(
+                        "OPC UA session {}: connect service failed with status {}\n",
+                        self.handle.name,
+                        status_name(status)
+                    ));
+                }
+                return Some(Err(()));
+            }
         };
         if config.debug > 0 {
             eprintln!("Session {}: connect service succeeded", self.handle.name);
@@ -876,7 +897,7 @@ impl SessionWorker {
             }
         }
         if let Some(endpoint) = endpoint {
-            self.report_connected(&identity, &endpoint);
+            self.report_connected(client.identity(), &endpoint);
         }
         // C reads each capability on its own and keeps its default when the
         // read fails, with no print (`SessionOpen62541.cpp:2447-2484`).
@@ -902,7 +923,6 @@ impl SessionWorker {
             item.set_state(ConnectionStatus::InitialRead);
         }
         *self.handle.status.lock() = ConnectionStatus::InitialRead;
-        self.connection = Some(connection.clone());
 
         // The initial read goes ahead of everything a record may already have
         // queued, and its result is what `bini` acts on: a `bini=write` leaf gets
@@ -918,14 +938,12 @@ impl SessionWorker {
 
         self.add_monitored_items(&connection, &subscriptions, &monitored)
             .await;
-        Some(Ok(()))
+        Some(Ok(Connected { client, connection }))
     }
 
     /// Serve requests until the connection drops or the IOC shuts down.
-    async fn serve(&mut self) -> ServeOutcome {
-        let Some(connection) = self.connection.clone() else {
-            return ServeOutcome::Lost;
-        };
+    async fn serve(&mut self, connected: Connected) -> ServeOutcome {
+        let Connected { client, connection } = connected;
         let mut closed = connection.closed();
         // open62541's background connectivity check: one Read of the server
         // state at a time, the next one an interval after the last answer.
@@ -957,7 +975,7 @@ impl SessionWorker {
 
                 _ = &mut closed => {
                     self.disconnect(&connection, End::Lost).await;
-                    return ServeOutcome::Lost;
+                    return ServeOutcome::Lost(client);
                 }
 
                 request = self.commands.recv() => match request {
@@ -993,14 +1011,14 @@ impl SessionWorker {
                             self.handle.name
                         ));
                         self.disconnect(&connection, End::Lost).await;
-                        return ServeOutcome::Lost;
+                        return ServeOutcome::Lost(client);
                     }
                 }
 
                 _ = tokio::time::sleep_until(flush_at.into()), if self.has_pending() => {
                     if self.flush(&connection).await.is_err() {
                         self.disconnect(&connection, End::Lost).await;
-                        return ServeOutcome::Lost;
+                        return ServeOutcome::Lost(client);
                     }
                 }
             }
@@ -1549,7 +1567,6 @@ impl SessionWorker {
 
     async fn disconnect(&mut self, connection: &Arc<dyn UaConnection>, end: End) {
         connection.disconnect().await;
-        self.connection = None;
         *self.handle.status.lock() = ConnectionStatus::Down;
         {
             let mut client = self.handle.client.lock();
@@ -1609,7 +1626,8 @@ type Monitored = Arc<Mutex<Vec<Arc<Mutex<Item>>>>>;
 
 enum ServeOutcome {
     Shutdown,
-    Lost,
+    /// With the client, for open62541's reconnect.
+    Lost(Box<dyn UaClient>),
     DisconnectRequested,
 }
 

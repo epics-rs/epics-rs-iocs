@@ -20,7 +20,7 @@ mod setup_security {
     use async_opcua::types::{
         EndpointDescription, MessageSecurityMode, StatusCode, UserTokenPolicy, UserTokenType,
     };
-    use opcua::client::{AsyncOpcuaConnector, ConnectError, Identity, UaConnector};
+    use opcua::client::{AsyncOpcuaConnector, SetupError, UaConnector};
     use opcua::session::SessionConfig;
 
     const NONE: &str = "http://opcfoundation.org/UA/SecurityPolicy#None";
@@ -265,14 +265,14 @@ mod setup_security {
         let mut config = SessionConfig::new("s", format!("opc.tcp://127.0.0.1:{port}"));
         config.pki_dir = Some(pki.to_string_lossy().into_owned());
         let err = AsyncOpcuaConnector::new()
-            .connect(&config, &Identity::Anonymous)
+            .setup(&config)
             .await
             .err()
             .unwrap();
         let _ = std::fs::remove_dir_all(&pki);
         assert_eq!(
             err,
-            ConnectError {
+            SetupError {
                 status: Some(StatusCode::BadDisconnect),
                 message: "security discovery and setup failed with status cantConnect".into(),
             }
@@ -299,7 +299,7 @@ mod setup_security {
             move |line: &str| lines.lock().push(line.to_string())
         });
         let err = AsyncOpcuaConnector::new()
-            .connect(&config, &Identity::Anonymous)
+            .setup(&config)
             .await
             .err()
             .unwrap();
@@ -308,7 +308,7 @@ mod setup_security {
         let _ = std::fs::remove_dir_all(&pki);
         assert_eq!(
             err,
-            ConnectError::setup("security discovery and setup failed with status fatal")
+            SetupError::new("security discovery and setup failed with status fatal")
         );
         assert_eq!(
             *lines.lock(),
@@ -316,13 +316,15 @@ mod setup_security {
         );
     }
 
-    async fn connect_without_security(url: &str, tag: &str) -> ConnectError {
+    async fn connect_without_security(url: &str, tag: &str) -> StatusCode {
         let pki = std::env::temp_dir().join(format!("opcua-{tag}-{}", std::process::id()));
         let mut config = SessionConfig::new("s", url);
         config.pki_dir = Some(pki.to_string_lossy().into_owned());
         config.set_option("sec-mode", "None").unwrap();
-        let connector = AsyncOpcuaConnector::new();
-        let connect = connector.connect(&config, &Identity::Anonymous);
+        let Ok(mut client) = AsyncOpcuaConnector::new().setup(&config).await else {
+            panic!("the setup without security reads nothing");
+        };
+        let connect = client.connect();
         let err = tokio::time::timeout(std::time::Duration::from_secs(20), connect)
             .await
             .expect("a failed connect returns")
@@ -344,13 +346,7 @@ mod setup_security {
             .port();
         let err =
             connect_without_security(&format!("opc.tcp://127.0.0.1:{port}"), "deadsession").await;
-        assert_eq!(
-            err,
-            ConnectError {
-                status: Some(StatusCode::BadDisconnect),
-                message: "connect service failed with status BadDisconnect".into(),
-            }
-        );
+        assert_eq!(err, StatusCode::BadDisconnect);
     }
 
     /// open62541's `initConnect` closes a connection whose host does not
@@ -358,12 +354,6 @@ mod setup_security {
     #[tokio::test]
     async fn a_session_url_that_does_not_resolve_is_connection_closed() {
         let err = connect_without_security("opc.tcp://no-such-host.invalid:4840", "nohost").await;
-        assert_eq!(
-            err,
-            ConnectError {
-                status: Some(StatusCode::BadConnectionClosed),
-                message: "connect service failed with status BadConnectionClosed".into(),
-            }
-        );
+        assert_eq!(err, StatusCode::BadConnectionClosed);
     }
 }
