@@ -11,7 +11,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_printf;
@@ -78,15 +80,15 @@ struct Inputs {
 }
 
 /// What `motor_init` learns of one drive.
-pub struct MDriveDrive {
+struct MDriveDrive {
     encoder: bool,
     inputs: Inputs,
 }
 
 /// `motor_init`'s probe: `PR VR` to each drive in turn, three tries each,
-/// until one does not answer; then each answering drive's encoder and
-/// switch inputs. With them, C's `ident`: the first drive's `PR VR`.
-pub fn mdrive_probe(ctrl: &MDriveController, card: i32) -> (String, Vec<MDriveDrive>) {
+/// until one does not answer. C's `ident`, the first drive's `PR VR`, and
+/// the number that answered.
+pub fn mdrive_probe(ctrl: &MDriveController) -> (String, usize) {
     let mut ident = String::new();
     let mut found = 0;
     for name in MDRIVE_AXIS {
@@ -99,29 +101,30 @@ pub fn mdrive_probe(ctrl: &MDriveController, card: i32) -> (String, Vec<MDriveDr
         }
         found += 1;
     }
-    let drives = (0..found)
-        .map(|index| {
-            let name = MDRIVE_AXIS[index];
-            let encoder = ident.ends_with('E') || {
-                let part = ctrl.ask(&format!("{name}PR PN"));
-                ["E", "EQ", "EE", "EJM", "EJM-N"]
-                    .iter()
-                    .any(|suffix| part.ends_with(suffix))
-            };
-            // C reads one more line here, waiting out its timeout when the
-            // drive sends none.
-            ctrl.read();
-            let inputs = read_inputs(ctrl, name);
-            if inputs.minus == 0 || inputs.plus == 0 {
-                let which = if inputs.minus == 0 { "Minus" } else { "Plus" };
-                errlog_printf(&format!(
-                    "MDrive chain #{card}, motor #{index} {which} LS not configured.\n"
-                ));
-            }
-            MDriveDrive { encoder, inputs }
-        })
-        .collect();
-    (ident, drives)
+    (ident, found)
+}
+
+/// Drive `index`'s encoder and switch inputs, as `motor_init` reads them
+/// ahead of its `set_status` (drvMDrive.cc:645-722).
+fn probe_drive(ctrl: &MDriveController, card: i32, index: usize, ident: &str) -> MDriveDrive {
+    let name = MDRIVE_AXIS[index];
+    let encoder = ident.ends_with('E') || {
+        let part = ctrl.ask(&format!("{name}PR PN"));
+        ["E", "EQ", "EE", "EJM", "EJM-N"]
+            .iter()
+            .any(|suffix| part.ends_with(suffix))
+    };
+    // C reads one more line here, waiting out its timeout when the drive
+    // sends none.
+    ctrl.read();
+    let inputs = read_inputs(ctrl, name);
+    if inputs.minus == 0 || inputs.plus == 0 {
+        let which = if inputs.minus == 0 { "Minus" } else { "Plus" };
+        errlog_printf(&format!(
+            "MDrive chain #{card}, motor #{index} {which} LS not configured.\n"
+        ));
+    }
+    MDriveDrive { encoder, inputs }
 }
 
 /// `PR S1` .. `PR S4`: which input is the home (1), plus (2) or minus (3)
@@ -164,10 +167,29 @@ pub struct DrvMDriveAxis {
     /// DVAL/ERES.
     encoder_ratio: f64,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl DrvMDriveAxis {
+    /// Drive `signal` of chain `card`, whose first drive answered `ident`:
+    /// its encoder and inputs, then its status read (drvMDrive.cc:725).
     pub fn new(
+        controller: Arc<Mutex<MDriveController>>,
+        card: i32,
+        signal: usize,
+        ident: &str,
+    ) -> Self {
+        let drive = {
+            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            probe_drive(&ctrl, card, signal, ident)
+        };
+        let mut axis = Self::with_drive(controller, signal, drive);
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
+    }
+
+    fn with_drive(
         controller: Arc<Mutex<MDriveController>>,
         signal: usize,
         drive: MDriveDrive,
@@ -185,6 +207,7 @@ impl DrvMDriveAxis {
             position: 0,
             encoder_ratio: 1.0,
             strings: MoveStrings::default(),
+            init_status: None,
         }
     }
 
@@ -253,6 +276,12 @@ impl DrvMDriveAxis {
         Self::accel(&mut commands, acceleration);
         commands.push(motion);
         self.send_move(&commands)
+    }
+}
+
+impl Model1Motor for DrvMDriveAxis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 
@@ -457,7 +486,7 @@ mod tests {
             };
             Self {
                 line,
-                axis: DrvMDriveAxis::new(controller, 0, drive),
+                axis: DrvMDriveAxis::with_drive(controller, 0, drive),
                 moving,
                 minus,
                 user: AsynUser::new(0),
@@ -565,7 +594,7 @@ mod tests {
                 home: 0,
             },
         };
-        let mut axis = DrvMDriveAxis::new(controller, 0, drive);
+        let mut axis = DrvMDriveAxis::with_drive(controller, 0, drive);
         let user = AsynUser::new(0);
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());

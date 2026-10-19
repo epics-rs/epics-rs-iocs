@@ -15,7 +15,9 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -164,12 +166,15 @@ pub struct DrvIm483Axis {
     /// `motor_info->position`.
     position: i32,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl DrvIm483Axis {
-    /// Axis `signal` of an IM483PL, which C takes to carry an encoder.
+    /// Axis `signal` of an IM483PL, which C takes to carry an encoder, and
+    /// its status read (drvIM483PL.cc:601).
     pub fn im483pl(controller: Arc<Mutex<Im483Controller>>, signal: usize) -> Self {
-        Self {
+        Self::with_status(Self {
             controller,
             name: IM483PL_AXIS[signal],
             sep: " ",
@@ -181,12 +186,14 @@ impl DrvIm483Axis {
             },
             position: 0,
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        })
     }
 
-    /// The one axis of an IM483SM, which C takes to have no encoder.
+    /// The one axis of an IM483SM, which C takes to have no encoder, and its
+    /// status read (drvIM483SM.cc:633).
     pub fn im483sm(controller: Arc<Mutex<Im483Controller>>) -> Self {
-        Self {
+        Self::with_status(Self {
             controller,
             name: "",
             sep: "",
@@ -195,7 +202,14 @@ impl DrvIm483Axis {
             status: MotorStatus::default(),
             position: 0,
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        })
+    }
+
+    /// `motor_init`'s `set_status` of a new axis.
+    fn with_status(mut axis: Self) -> Self {
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, Im483Controller> {
@@ -246,6 +260,12 @@ impl DrvIm483Axis {
             format!("V{:.2};", CFloat(velocity)),
             format!("I{:.2};", CFloat(min_velocity)),
         ]
+    }
+}
+
+impl Model1Motor for DrvIm483Axis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 
@@ -509,6 +529,7 @@ mod tests {
             } else {
                 DrvIm483Axis::im483sm(controller)
             };
+            sent.lock().unwrap().clear();
             Self {
                 axis,
                 sent,
