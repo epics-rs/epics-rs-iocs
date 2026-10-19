@@ -1205,8 +1205,9 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
     };
 
     let counter = ctx.shared.array_counter.fetch_add(1, Ordering::SeqCst) + 1;
-    let ts = EpicsTimestamp::now();
-    let time_stamp = ts.as_f64();
+    // Only the double timeStamp: C never sets an array's epicsTS, so it stays
+    // the constructor's zero (drvQuadEM.cpp:335-336, NDArray.cpp:31-32).
+    let time_stamp = EpicsTimestamp::now().as_f64();
 
     // Address 11: the whole [QE_MAX_DATA, numRead] array, sample-major on disk
     // exactly as the C++ ring layout.
@@ -1221,7 +1222,6 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
         NDDataBuffer::F64(flat),
     ) {
         all.unique_id = counter;
-        all.timestamp = ts;
         all.time_stamp = time_stamp;
         ArrayPublisher::new(ctx.outputs[QE_ADDR_ALL].clone())
             .publish(all)
@@ -1238,7 +1238,6 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
             continue;
         };
         single.unique_id = counter;
-        single.timestamp = ts;
         single.time_stamp = time_stamp;
         ArrayPublisher::new(ctx.outputs[item].clone())
             .publish(single)
