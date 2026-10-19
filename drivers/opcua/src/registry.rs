@@ -202,10 +202,7 @@ impl Registry {
         let sessions = inner.sessions.clone();
         drop(inner);
         errlog_vprintf(format_args!("OPC UA: Autoconnecting sessions\n"));
-        let workers = workers
-            .into_iter()
-            .map(|worker| tokio::spawn(worker.run()))
-            .collect();
+        let workers = workers.into_iter().map(SessionWorker::spawn).collect();
         // C registers it from `initHookAfterIocRunning` too
         // (`SessionOpen62541.cpp:2705`).
         let runtime = Handle::current();

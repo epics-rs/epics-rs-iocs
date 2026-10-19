@@ -5,110 +5,17 @@
 //! The exit callbacks are the process's, so each test here runs alone in its
 //! own process under nextest.
 
+mod common;
+
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use async_opcua::types::{
-    DataValue, MonitoredItemCreateRequest, MonitoredItemCreateResult, NodeId, ReadValueId,
-    StatusCode, WriteValue,
-};
-use async_trait::async_trait;
 use epics_rs::base::runtime::exit::call_at_exits;
 use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 
-use opcua::client::{
-    ConnectError, CreatedSubscription, Identity, Notification, ServerInfo, UaConnection,
-    UaConnector,
-};
-use opcua::ioc;
-use opcua::registry::Registry;
-use opcua::session::SessionConfig;
-use opcua::subscription::SubscriptionConfig;
-
-#[derive(Default)]
-struct Server {
-    connects: AtomicUsize,
-    disconnects: AtomicUsize,
-    /// Connect attempts never finish — a server that does not answer.
-    hang: bool,
-    /// Connect attempts fail.
-    refuse: bool,
-}
-
-struct Connector(Arc<Server>);
-
-#[async_trait]
-impl UaConnector for Connector {
-    async fn connect(
-        &self,
-        _config: &SessionConfig,
-        _identity: &Identity,
-    ) -> Result<Arc<dyn UaConnection>, ConnectError> {
-        self.0.connects.fetch_add(1, Ordering::SeqCst);
-        if self.0.hang {
-            std::future::pending::<()>().await;
-        }
-        if self.0.refuse {
-            return Err(ConnectError::setup("refused"));
-        }
-        Ok(Arc::new(Connection(self.0.clone())))
-    }
-}
-
-struct Connection(Arc<Server>);
-
-#[async_trait]
-impl UaConnection for Connection {
-    async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>) {
-        (0, Ok(vec![DataValue::default(); nodes.len()]))
-    }
-    async fn write(&self, values: &[WriteValue]) -> (u32, Result<Vec<StatusCode>, StatusCode>) {
-        (0, Ok(vec![StatusCode::Good; values.len()]))
-    }
-    async fn register_nodes(&self, nodes: &[NodeId]) -> Result<Vec<NodeId>, StatusCode> {
-        Ok(nodes.to_vec())
-    }
-    async fn server_info(&self) -> Result<ServerInfo, StatusCode> {
-        Ok(ServerInfo::default())
-    }
-    async fn type_tree(&self) -> Result<Arc<async_opcua::types::custom::DataTypeTree>, StatusCode> {
-        Err(StatusCode::BadNotSupported)
-    }
-    async fn create_subscription(
-        &self,
-        config: &SubscriptionConfig,
-        _sink: mpsc::UnboundedSender<Notification>,
-    ) -> Result<CreatedSubscription, StatusCode> {
-        Ok(CreatedSubscription {
-            id: 1,
-            revised_publishing_interval: config.publishing_interval,
-        })
-    }
-    async fn create_monitored_items(
-        &self,
-        _subscription_id: u32,
-        items: Vec<MonitoredItemCreateRequest>,
-    ) -> Result<Vec<MonitoredItemCreateResult>, StatusCode> {
-        Ok(vec![MonitoredItemCreateResult::default(); items.len()])
-    }
-    async fn disconnect(&self) {
-        self.0.disconnects.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-fn registry(server: &Arc<Server>, autoconnect: &str) -> Arc<Registry> {
-    let registry = Registry::new(Arc::new(Connector(server.clone())));
-    ioc::session_command(
-        &registry,
-        Some("S1"),
-        Some("opc.tcp://localhost:4999"),
-        &[autoconnect],
-    );
-    registry
-}
+use common::{Server, registry};
 
 async fn until(f: impl Fn() -> bool) {
     for _ in 0..2000 {

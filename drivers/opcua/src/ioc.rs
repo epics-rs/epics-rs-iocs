@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::runtime::task::block_on_sync;
 use epics_rs::base::server::RecordFactory;
 
 use crate::client::ClientSecurity;
@@ -314,7 +315,11 @@ pub fn control_command(registry: &Registry, pattern: Option<&str>, control: Cont
         return;
     };
     for session in registry.glob_sessions(pattern) {
-        session.control(control);
+        // C's `connect` returns with the session activated, its `disconnect`
+        // with it closed (`SessionOpen62541.cpp:577`, `:605-628`).
+        if let Some(done) = session.control(control) {
+            let _ = block_on_sync(done);
+        }
     }
 }
 

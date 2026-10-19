@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_opcua::crypto::SecurityPolicy;
@@ -19,7 +19,8 @@ use async_opcua::types::{
 };
 use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 
 use crate::client::{
     ConnectError, CreatedSubscription, Identity, SecurityMode, ServerInfo, UaConnection,
@@ -442,7 +443,9 @@ pub struct SessionHandle {
     /// The client underneath, as the worker last left it.
     pub client: Mutex<ClientState>,
     commands: mpsc::UnboundedSender<(Priority, Request)>,
-    control: mpsc::UnboundedSender<Control>,
+    control: mpsc::UnboundedSender<(Control, oneshot::Sender<()>)>,
+    /// The worker has been spawned to answer `control`.
+    running: AtomicBool,
     exit: watch::Sender<bool>,
 }
 
@@ -518,8 +521,12 @@ impl SessionHandle {
         let _ = self.commands.send((priority, request));
     }
 
-    pub fn control(&self, control: Control) {
-        let _ = self.control.send(control);
+    /// Hand `control` to the worker. The receiver resolves once the worker has
+    /// carried it out; `None` before the worker runs, when it waits its turn.
+    pub fn control(&self, control: Control) -> Option<oneshot::Receiver<()>> {
+        let (done, finished) = oneshot::channel();
+        let _ = self.control.send((control, done));
+        self.running.load(Ordering::Acquire).then_some(finished)
     }
 
     /// End the session for good (`SessionOpen62541::atExit`): a connected one
@@ -628,7 +635,7 @@ pub struct SessionWorker {
     handle: Arc<SessionHandle>,
     connector: Arc<dyn UaConnector>,
     commands: mpsc::UnboundedReceiver<(Priority, Request)>,
-    control: mpsc::UnboundedReceiver<Control>,
+    control: mpsc::UnboundedReceiver<(Control, oneshot::Sender<()>)>,
     exit: watch::Receiver<bool>,
     connection: Option<Arc<dyn UaConnection>>,
     /// Read and write requests waiting for a service call, highest priority first.
@@ -654,6 +661,7 @@ pub fn create(
         client: Mutex::new(ClientState::default()),
         commands: commands_tx,
         control: control_tx,
+        running: AtomicBool::new(false),
         exit: exit_tx,
     });
     let worker = SessionWorker {
@@ -670,21 +678,30 @@ pub fn create(
 }
 
 impl SessionWorker {
+    /// Spawn [`Self::run`]; from then on [`SessionHandle::control`] answers.
+    pub fn spawn(self) -> JoinHandle<()> {
+        let handle = self.handle.clone();
+        let worker = tokio::spawn(self.run());
+        handle.running.store(true, Ordering::Release);
+        worker
+    }
+
     /// The worker's whole life: connect, serve, reconnect.
     pub async fn run(mut self) {
         let mut connect_now = self.autoconnect();
-        // `opcuaConnect` asked for this attempt (C `connect(manual)`).
-        let mut manual = false;
+        // The `opcuaConnect` that asked for the next attempt (C
+        // `connect(manual)`), waiting for it to be through.
+        let mut requested = None;
         loop {
             if self.connection.is_none() {
                 if !connect_now {
                     tokio::select! {
                         control = self.control.recv() => match control {
-                            Some(Control::Connect) => {
+                            Some((Control::Connect, done)) => {
                                 connect_now = true;
-                                manual = true;
+                                requested = Some(done);
                             }
-                            Some(Control::Disconnect) => {}
+                            Some((Control::Disconnect, _)) => {}
                             None => return,
                         },
                         _ = exiting(&mut self.exit) => return,
@@ -694,16 +711,18 @@ impl SessionWorker {
                 let Some(attempt) = self.connect().await else {
                     return;
                 };
-                let was_manual = std::mem::take(&mut manual);
+                // Dropped, it lets that `opcuaConnect` return.
+                let asked = requested.take();
                 if let Err(e) = attempt {
                     // A bad status leaves the C's session and channel states
                     // as they were (`SessionOpen62541.cpp:2375-2382`).
                     if let Some(status) = e.status {
                         self.handle.client.lock().connect_status = status;
                     }
-                    if was_manual || self.debug() > 0 {
+                    if asked.is_some() || self.debug() > 0 {
                         errlog_vprintf(format_args!("OPC UA session {}: {e}\n", self.handle.name));
                     }
+                    drop(asked);
                     // `opcua_ConnectTimeout` is both the connect timeout and the
                     // interval between attempts (`iocshVariables.h:24`); an
                     // `opcuaConnect` meanwhile is C's immediate `connect(true)`.
@@ -716,12 +735,12 @@ impl SessionWorker {
                                 break;
                             }
                             control = self.control.recv() => match control {
-                                Some(Control::Connect) => {
+                                Some((Control::Connect, done)) => {
                                     connect_now = true;
-                                    manual = true;
+                                    requested = Some(done);
                                     break;
                                 }
-                                Some(Control::Disconnect) => {}
+                                Some((Control::Disconnect, _)) => {}
                                 None => return,
                             },
                             _ = exiting(&mut self.exit) => return,
@@ -876,11 +895,12 @@ impl SessionWorker {
                 }
 
                 control = self.control.recv() => match control {
-                    Some(Control::Disconnect) => {
+                    Some((Control::Disconnect, done)) => {
                         self.disconnect(&connection, End::Requested).await;
+                        drop(done);
                         return ServeOutcome::DisconnectRequested;
                     }
-                    Some(Control::Connect) => {
+                    Some((Control::Connect, _)) => {
                         eprintln!("Session {} already connected (Activated)", self.handle.name);
                     }
                     None => return ServeOutcome::Shutdown,
