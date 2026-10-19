@@ -106,6 +106,11 @@ impl PslServer {
         self.session().command(command)
     }
 
+    /// [`Self::command`] with the reply a failed read delivered.
+    pub fn exchange(&self, command: &str) -> (String, ServerResult<()>) {
+        self.session().exchange(command)
+    }
+
     /// C `asynPrint(pasynUserServer_, ASYN_TRACE_ERROR, ...)`.
     pub fn trace_error(&self, message: &str) {
         let io = self.io.lock();
@@ -123,11 +128,21 @@ impl Session<'_> {
     /// Send a command and read the reply as text (C `writeReadServer` with the
     /// default `PSL_SERVER_TIMEOUT`).
     pub fn command(&mut self, command: &str) -> ServerResult<String> {
-        let bytes = self
+        let (reply, status) = self.exchange(command);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::command`] with the bytes a failed read delivered, which C's
+    /// `fromServer_` holds; a failed write reads none.
+    pub fn exchange(&mut self, command: &str) -> (String, ServerResult<()>) {
+        let (bytes, status) = self
             .io
-            .write_read(command, MAX_MESSAGE_SIZE, SERVER_TIMEOUT)
-            .inspect_err(|e| self.io.write_read_failed(e, command))?;
-        Ok(String::from_utf8_lossy(&bytes).trim_end().to_string())
+            .write_read(command, MAX_MESSAGE_SIZE, SERVER_TIMEOUT);
+        if let Err(e) = &status {
+            self.io.write_read_failed(e, command);
+        }
+        let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();
+        (reply, status)
     }
 
     /// Ask for a frame and read the first block of the answer: the text header
@@ -190,11 +205,13 @@ impl ServerIo {
         command: &str,
         buf_size: usize,
         timeout: Duration,
-    ) -> ServerResult<Vec<u8>> {
+    ) -> (Vec<u8>, ServerResult<()>) {
         self.reconnect();
-        let (reply, status) = self
-            .handle
-            .port()?
+        let port = match self.handle.port() {
+            Ok(port) => port,
+            Err(e) => return (Vec::new(), Err(e.into())),
+        };
+        let (reply, status) = port
             .submit_octet_read_blocking(
                 OctetReadOp::WriteRead {
                     data: command.as_bytes().to_vec(),
@@ -203,8 +220,7 @@ impl ServerIo {
                 self.user(timeout),
             )
             .into_parts();
-        status?;
-        Ok(reply)
+        (reply, status.map_err(ServerError::from))
     }
 
     fn write(&mut self, command: &str, timeout: Duration) -> ServerResult<()> {

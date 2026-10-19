@@ -24,7 +24,7 @@ use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
-use crate::connection::{PslServer, ServerError};
+use crate::connection::{PslServer, ServerError, ServerResult};
 use crate::driver::{SharedState, TaskCommand};
 use crate::image;
 use crate::protocol::{self, ImageHeader};
@@ -179,13 +179,25 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
     }
 }
 
+/// One `HasNewData` poll. C compares `fromServer_` to "True" whatever the
+/// read's status (PSL.cpp:697-698), so a reply a timeout cut still counts.
+pub(crate) fn has_new_data(server: &PslServer) -> ServerResult<bool> {
+    let (reply, status) = server.exchange("HasNewData");
+    if reply.trim() == "True" {
+        return Ok(true);
+    }
+    match status {
+        Err(ServerError::Timeout) => Ok(false),
+        status => status.map(|()| false),
+    }
+}
+
 /// Poll `HasNewData` until the server has a frame (C's inner `while (1)` loop).
 async fn wait_for_new_data(ctx: &AcquisitionContext) -> Result<(), Abort> {
     loop {
-        match ctx.server.command("HasNewData") {
-            Ok(reply) if reply.trim() == "True" => return Ok(()),
-            Ok(_) => {}
-            Err(ServerError::Timeout) => {}
+        match has_new_data(&ctx.server) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
             Err(e) => return Err(Abort::Error(format!("HasNewData failed: {e}"))),
         }
         if ctx.shared.stop_requested.load(Ordering::Acquire) {
