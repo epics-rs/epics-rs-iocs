@@ -656,37 +656,29 @@ pub struct ConstLine {
 /// prefix (`drvGM10.c:1109,1137`: `p += 8`, unexamined by C either), then
 /// `<digits>,<float>\n`.
 pub fn parse_const_lines(payload: &[u8]) -> Vec<ConstLine> {
-    let text = String::from_utf8_lossy(payload);
     let mut out = Vec::new();
-    let mut rest: &str = text.as_ref();
-    while !rest.is_empty() && !rest.starts_with('E') {
+    let mut rest = payload;
+    while !rest.is_empty() && rest[0] != b'E' {
         let Some(after_prefix) = rest.get(8..) else {
             break;
         };
-        let digits_end = after_prefix
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(after_prefix.len());
-        let Ok(addr1): Result<i64, _> = after_prefix[..digits_end].parse() else {
+        let Some(index) = parse_1based_index(after_prefix, 0, scan_digits(after_prefix, 0)) else {
             break;
         };
-        if addr1 < 1 {
-            break;
-        }
-        let Some(comma) = after_prefix.find(',') else {
+        let Some(comma) = find_byte(after_prefix, 0, b',') else {
             break;
         };
         let after_comma = &after_prefix[comma + 1..];
-        let Some(nl) = after_comma.find('\n') else {
+        let Some(nl) = find_byte(after_comma, 0, b'\n') else {
             break;
         };
-        let value_str = after_comma[..nl].trim_end_matches('\r');
-        let Ok(value) = value_str.parse::<f64>() else {
+        let Some(value) = std::str::from_utf8(&after_comma[..nl])
+            .ok()
+            .and_then(|s| s.trim_end_matches('\r').parse::<f64>().ok())
+        else {
             break;
         };
-        out.push(ConstLine {
-            index: (addr1 - 1) as usize,
-            value,
-        });
+        out.push(ConstLine { index, value });
         rest = &after_comma[nl + 1..];
     }
     out
@@ -933,6 +925,18 @@ mod tests {
                 index: 1,
                 value: -3.25
             }
+        );
+    }
+
+    #[test]
+    fn const_lines_skip_the_prefix_by_bytes() {
+        let lines = parse_const_lines(b"aaaa\xffaaa001,12.5\nE");
+        assert_eq!(
+            lines,
+            [ConstLine {
+                index: 0,
+                value: 12.5
+            }]
         );
     }
 
