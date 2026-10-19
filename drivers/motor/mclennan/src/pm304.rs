@@ -116,7 +116,8 @@ impl Pm304Controller {
         };
         // C reads 1ID still assuming a PM304 (drvPM304.cc:583) and so keeps a
         // PM600's echo in the ident it reports (:663); a C defect not copied.
-        ctrl.ident = ctrl.strip_echo(&ident).trim().to_string();
+        // Its blanks stay, as strncpy keeps them.
+        ctrl.ident = ctrl.strip_echo(&ident).to_string();
         Ok(ctrl)
     }
 
@@ -550,6 +551,18 @@ mod tests {
         let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         let status = axis.poll(&AsynUser::default()).unwrap();
         assert_eq!((status.position, status.done), (123.0, true));
+    }
+
+    /// drvPM304.cc:662-663: the ident is the 1ID reply as it came.
+    #[test]
+    fn the_ident_keeps_its_blanks() {
+        let (_line, io) = LineRig::new("pm304_ident", |last| match last {
+            "1OA\r" => "AP=0".into(),
+            "1ID\r" => " Mclennan PM304 v1 ".into(),
+            _ => "OK".into(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        assert_eq!(ctrl.ident(), " Mclennan PM304 v1 ");
     }
 
     fn pm304_line(name: &str) -> (LineRig, Pm304Axis) {
