@@ -623,4 +623,33 @@ mod tests {
             }
         }
     }
+
+    /// pilatusDetector.cpp:1406-1416: an Acquire 0 while acquiring sends
+    /// `camcmd k` and reads, sends `K` without reading, then sleeps 2 s.
+    #[test]
+    fn an_abort_sends_camcmd_k_then_k_and_sleeps_two_seconds() {
+        let (mut det, log) = rig("PILATUS_ABORT", ok);
+        let ad = det.ad.params;
+        det.ad
+            .port_base
+            .set_i32(ad.status, ADStatus::Acquire as i32);
+        let start = std::time::Instant::now();
+        det.write_int32(&mut AsynUser::new(ad.acquire), 0).unwrap();
+        let elapsed = start.elapsed();
+        let io: Vec<String> = log
+            .lock()
+            .iter()
+            .filter(|e| !e.starts_with("ADStatus"))
+            .cloned()
+            .collect();
+        assert_eq!(io, ["<flush>", "camcmd k", "<read>", "<flush>", "K"]);
+        assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_string_param(ad.status_message, 0)
+                .unwrap(),
+            b"Acquisition aborted"
+        );
+    }
 }
