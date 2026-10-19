@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -202,18 +202,24 @@ pub struct Mdt695Axis {
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl Mdt695Axis {
-    /// Construct axis `index` (0-based; wire letter = `X`/`Y`/`Z`).
+    /// Construct axis `index` (0-based; wire letter = `X`/`Y`/`Z`) and read
+    /// its status, as `motor_init`'s `set_status` does (drvMDT695.cc:631).
     pub fn new(controller: Arc<Mutex<Mdt695Controller>>, index: usize) -> Self {
-        Self {
+        let mut me = Self {
             controller,
             letter: axis_letter(index),
             prev_position: 0.0,
             failure: PollFailure::NONE,
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        };
+        me.init_status = Some(me.poll(&AsynUser::new(0)));
+        me
     }
 
     fn lock(&self) -> MutexGuard<'_, Mdt695Controller> {
@@ -240,6 +246,12 @@ impl Mdt695Axis {
         }
         let line = self.addressed(&prem);
         self.lock().write_only(&line)
+    }
+}
+
+impl Model1Motor for Mdt695Axis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 
