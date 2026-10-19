@@ -250,6 +250,8 @@ impl OmsParams {
     }
 
     /// C `getAxis(pasynUser)`: the axis Init created at the address.
+    /// UPSTREAM DEFECT (omsBaseController.cpp:168): C indexes pAxes without a
+    /// check, and pAxes is unset until Init succeeds (:512).
     fn axis(&self, user: AxisUser<'_>) -> Option<i32> {
         let count = self.state.axes.get().map_or(0, |a| a.axis_count());
         Some(user.addr).filter(|&addr| (addr as usize) < count)
