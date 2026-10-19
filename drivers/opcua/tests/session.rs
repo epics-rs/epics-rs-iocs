@@ -302,7 +302,8 @@ fn spawn(
         item.adopt(info, node_id, index as u32, handle.clone());
     }
     *handle.items.lock() = items;
-    tokio::spawn(worker.run());
+    worker.spawn();
+    handle.autoconnect();
     handle
 }
 

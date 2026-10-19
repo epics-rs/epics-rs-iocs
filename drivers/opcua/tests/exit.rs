@@ -16,6 +16,7 @@ use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_rem
 use parking_lot::Mutex;
 
 use common::{Server, registry};
+use opcua::session::Control;
 
 async fn until(f: impl Fn() -> bool) {
     for _ in 0..2000 {
@@ -70,8 +71,10 @@ async fn a_connect_in_flight_is_abandoned_at_exit() {
         hang: true,
         ..Default::default()
     });
-    let registry = registry(&server, "autoconnect=y");
+    let registry = registry(&server, "autoconnect=n");
     registry.start();
+    // An `opcuaConnect` from another thread, still waiting.
+    let pending = registry.session("S1").unwrap().control(Control::Connect);
     until(|| server.connects.load(Ordering::SeqCst) == 1).await;
 
     let (lines, took) = exit();
@@ -81,6 +84,8 @@ async fn a_connect_in_flight_is_abandoned_at_exit() {
     );
     assert!(took < Duration::from_secs(1), "the exit waited {took:?}");
     assert_eq!(server.disconnects.load(Ordering::SeqCst), 0);
+    // And the command waiting for it returns.
+    assert!(pending.unwrap().await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

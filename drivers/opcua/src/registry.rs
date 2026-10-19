@@ -203,6 +203,15 @@ impl Registry {
         drop(inner);
         errlog_vprintf(format_args!("OPC UA: Autoconnecting sessions\n"));
         let workers = workers.into_iter().map(SessionWorker::spawn).collect();
+        // C connects them one after another, in name order, before `iocInit`
+        // goes on (`SessionOpen62541.cpp:2697-2703`).
+        let mut by_name = sessions.clone();
+        by_name.sort_by(|a, b| a.name.cmp(&b.name));
+        for session in &by_name {
+            if let Some(done) = session.autoconnect() {
+                let _ = block_on_sync(done);
+            }
+        }
         // C registers it from `initHookAfterIocRunning` too
         // (`SessionOpen62541.cpp:2705`).
         let runtime = Handle::current();
