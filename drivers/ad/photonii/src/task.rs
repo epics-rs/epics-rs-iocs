@@ -181,7 +181,9 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
     let start = SystemTime::now();
     let start_instant = Instant::now();
     let start_ts = EpicsTimestamp::now();
-    let expected = Duration::from_secs_f64((setup.count as f64 * setup.acquire_time).max(0.0));
+    // C's expectedTime is signed, so TimeRemaining goes below zero past it
+    // or on a negative AcquireTime (PhotonII.cpp:350, :363-364).
+    let expected = f64::from(setup.count) * setup.acquire_time;
 
     // set_shutter is a no-op unless ShutterMode is EPICS, so the mode test C
     // spelled out at both ends lives in one place.
@@ -250,9 +252,9 @@ async fn wait_for_frame(
     ctx: &AcquisitionContext,
     setup: &AcquireSetup,
     start: Instant,
-    expected: Duration,
+    expected: f64,
 ) -> Result<String, Abort> {
-    let deadline = Duration::from_secs_f64(setup.acquire_time.max(0.0)) + FILE_READ_TIMEOUT;
+    let deadline = setup.acquire_time + FILE_READ_TIMEOUT.as_secs_f64();
     let poll_start = Instant::now();
 
     loop {
@@ -260,7 +262,7 @@ async fn wait_for_frame(
             return Err(Abort::Stopped);
         }
 
-        let remaining = expected.saturating_sub(start.elapsed()).as_secs_f64();
+        let remaining = expected - start.elapsed().as_secs_f64();
         set_params(
             ctx,
             vec![ParamSetValue::new(
@@ -295,7 +297,7 @@ async fn wait_for_frame(
             }
         }
 
-        if poll_start.elapsed() > deadline {
+        if poll_start.elapsed().as_secs_f64() > deadline {
             trace_error(
                 ctx,
                 "PhotonII::PhotonIITask: timeout waiting for file written message\n",
@@ -336,8 +338,7 @@ async fn publish_frame(
 
     let path = Path::new(file_name);
     let expected = raw::frame_bytes();
-    let deadline = Duration::from_secs_f64(setup.acquire_time.max(0.0)) + FILE_READ_TIMEOUT;
-    let poll_start = Instant::now();
+    let timeout = setup.acquire_time + FILE_READ_TIMEOUT.as_secs_f64();
     // C's task prints this after every readRaw failure, a stop included.
     let read_raw_failed = |abort: Abort| {
         trace_error(
@@ -350,29 +351,38 @@ async fn publish_frame(
         abort
     };
     let mut file_exists = false;
+    let mut ready = false;
 
-    loop {
+    // C `while (deltaTime <= timeout)`: a negative timeout never looks for
+    // the file (PhotonII.cpp:165-198).
+    let poll_start = Instant::now();
+    let mut delta = 0.0;
+    while delta <= timeout {
         if ctx.shared.stop_requested.load(Ordering::Acquire) {
             return Err(read_raw_failed(Abort::Stopped));
         }
         match raw::check_raw_file(path, start, expected) {
-            FileState::Ready => break,
+            FileState::Ready => {
+                ready = true;
+                break;
+            }
             FileState::Missing => {}
             FileState::Stale | FileState::Incomplete { .. } => file_exists = true,
         }
-        if poll_start.elapsed() > deadline {
-            trace_error(
-                ctx,
-                &format!("PhotonII::readRaw timeout waiting for file to be created {file_name}\n"),
-            );
-            if file_exists {
-                trace_error(ctx, "  file exists but is either old or the wrong size\n");
-            }
-            return Err(read_raw_failed(Abort::Timeout(format!(
-                "timeout waiting for the frame file {file_name}"
-            ))));
-        }
         rt::sleep(FILE_READ_DELAY).await;
+        delta = poll_start.elapsed().as_secs_f64();
+    }
+    if !ready {
+        trace_error(
+            ctx,
+            &format!("PhotonII::readRaw timeout waiting for file to be created {file_name}\n"),
+        );
+        if file_exists {
+            trace_error(ctx, "  file exists but is either old or the wrong size\n");
+        }
+        return Err(read_raw_failed(Abort::Timeout(format!(
+            "timeout waiting for the frame file {file_name}"
+        ))));
     }
 
     let bytes = raw::read_raw_file(path)
@@ -509,5 +519,150 @@ fn read_string(ctx: &AcquisitionContext, reason: usize) -> String {
     {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(_) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::create_photonii_detector;
+    use epics_rs::ad_core::plugin::channel::NDArrayOutput;
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::create_port_runtime;
+    use std::sync::atomic::AtomicBool;
+
+    /// A task context whose p2util socket connects and never speaks.
+    fn silent_ctx(name: &str) -> (AcquisitionContext, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ip = format!("{name}_IP");
+        let addr = listener.local_addr().unwrap().to_string();
+        let (ip_rt, _) = create_port_runtime(
+            &claim_port(&ip).unwrap(),
+            DrvAsynIPPort::new(&ip, &addr).unwrap(),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let sync = || SyncIOHandle::from_handle(ip_rt.port_handle().clone(), 0, Duration::ZERO);
+        let det = create_photonii_detector(&claim_port(name).unwrap(), sync(), 0).unwrap();
+        let p2 = P2Util::new(sync());
+        // Until the socket is up a read fails rather than times out.
+        for _ in 0..100 {
+            if matches!(p2.read(FILE_READ_DELAY), Err(ChannelError::Timeout)) {
+                break;
+            }
+        }
+        let (_tx, commands) = rt::command_channel::<TaskCommand>(1);
+        let ctx = AcquisitionContext {
+            p2,
+            handle: det.port_handle().clone(),
+            output: ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()))),
+            pool: det.pool().clone(),
+            ad_params: det.ad_params,
+            params: det.params,
+            shared: Arc::new(SharedState {
+                stop_requested: AtomicBool::new(false),
+            }),
+            commands,
+        };
+        std::mem::forget(ip_rt);
+        std::mem::forget(det);
+        (ctx, listener)
+    }
+
+    fn setup(acquire_time: f64) -> AcquireSetup {
+        AcquireSetup {
+            frame_type: FrameType::Normal,
+            acquire_time,
+            count: 1,
+            file_path: String::new(),
+            file_name: String::new(),
+            file_number: 0,
+            array_callbacks: true,
+        }
+    }
+
+    /// wait_for_frame on its own thread; what it ended with, how long it took
+    /// and the last TimeRemaining it posted.
+    fn wait(
+        ctx: AcquisitionContext,
+        acquire_time: f64,
+        stop_after: Option<Duration>,
+    ) -> (bool, Duration, f64) {
+        if let Some(after) = stop_after {
+            let shared = ctx.shared.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                shared.stop_requested.store(true, Ordering::Release);
+            });
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = ctx.handle.clone();
+        let remaining = ctx.ad_params.time_remaining;
+        rt::run_thread(move || async move {
+            let setup = setup(acquire_time);
+            let start = Instant::now();
+            let timed_out = matches!(
+                wait_for_frame(
+                    &ctx,
+                    &setup,
+                    start,
+                    f64::from(setup.count) * setup.acquire_time
+                )
+                .await,
+                Err(Abort::Timeout(_))
+            );
+            let _ = tx.send((timed_out, start.elapsed()));
+        })
+        .join()
+        .unwrap();
+        let (timed_out, took) = rx.recv().unwrap();
+        (
+            timed_out,
+            took,
+            handle.read_float64_blocking(remaining, 0).unwrap(),
+        )
+    }
+
+    /// C TimeRemaining is expectedTime - elapsed, unclamped: past the
+    /// expected time it goes below zero (PhotonII.cpp:350, :363-364).
+    #[test]
+    fn time_remaining_goes_below_zero_past_the_expected_time() {
+        let (ctx, _listener) = silent_ctx("PII_REMAINING");
+        let (_, _, remaining) = wait(ctx, 0.05, Some(Duration::from_millis(300)));
+        assert!(remaining < -0.1, "{remaining}");
+    }
+
+    /// A negative AcquireTime gives C a negative expected time and a deadline
+    /// already past (PhotonII.cpp:350, :390).
+    #[test]
+    fn a_negative_acquire_time_times_out_at_once() {
+        let (ctx, _listener) = silent_ctx("PII_NEGATIVE");
+        let (timed_out, took, remaining) = wait(ctx, -10.0, Some(Duration::from_secs(5)));
+        assert!(timed_out);
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        assert!(remaining < -9.9, "{remaining}");
+    }
+
+    /// readRaw's loop never runs on a negative timeout, so even a ready file
+    /// times out (PhotonII.cpp:169, :417-421).
+    #[test]
+    fn read_raw_with_a_negative_timeout_never_looks_for_the_file() {
+        let (ctx, _listener) = silent_ctx("PII_RAW_NEGATIVE");
+        let path = std::env::temp_dir().join(format!("pii-neg-{}.raw", std::process::id()));
+        std::fs::write(&path, vec![0u8; raw::frame_bytes()]).unwrap();
+        let file = path.to_string_lossy().into_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt::run_thread(move || async move {
+            let start = SystemTime::now() - Duration::from_secs(5);
+            let outcome =
+                publish_frame(&ctx, &setup(-10.0), &file, start, EpicsTimestamp::now(), 1).await;
+            let _ = tx.send(matches!(outcome, Err(Abort::Timeout(_))));
+        })
+        .join()
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(rx.recv().unwrap());
     }
 }
