@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::InterfaceMask;
@@ -77,53 +78,92 @@ impl SpiiPlusComm {
     }
 
     fn print(&self, args: std::fmt::Arguments<'_>) {
-        PortManager::global().trace_manager().print(
-            Some(&self.port),
-            Some(0),
-            0,
-            TraceMask::ERROR,
-            args,
+        self.trace(TraceMask::ERROR, args);
+    }
+
+    fn trace(&self, mask: TraceMask, args: std::fmt::Arguments<'_>) {
+        PortManager::global()
+            .trace_manager()
+            .print(Some(&self.port), Some(0), 0, mask, args);
+    }
+
+    /// `writeReadController` between `func`'s `output`, `input` and `status`
+    /// lines: the reply whatever the status, as C's zero-filled `inString`
+    /// holds it.
+    fn exchange(&self, func: &str, cmd: &str) -> (String, AsynResult<()>) {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("SPiiPlusComm:{func}: output = {cmd}\n"),
         );
-    }
-
-    /// `writeReadController`: the reply, its EOS stripped.
-    fn write_read_controller(&self, cmd: &str) -> AsynResult<String> {
         let (raw, status) = self.io.write_read(0, cmd.as_bytes(), READ_BUF).into_parts();
-        status?;
-        Ok(String::from_utf8_lossy(&raw).into_owned())
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let reply = String::from_utf8_lossy(&raw[..end]).into_owned();
+        let code = status.as_ref().err().map_or(0, AsynError::c_status_code);
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("SPiiPlusComm:{func}:  input = {reply}\n"),
+        );
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("SPiiPlusComm:{func}: status = {code}\n"),
+        );
+        (reply, status)
     }
 
-    /// The exchange of `writeReadInt`/`Double`/`Str`/`Ack`: a `?` reply is
+    /// The exchange of `writeReadInt`/`Double`/`Str`: a `?` reply is
     /// printed as `func`'s failure, with the error's text, and refused.
     fn query(&self, func: &str, cmd: &str) -> AsynResult<String> {
-        let reply = self.write_read_controller(cmd)?;
+        let (reply, status) = self.exchange(func, cmd);
+        status?;
+        self.refuse_error(func, cmd, &reply)?;
+        Ok(reply)
+    }
+
+    fn refuse_error(&self, func: &str, cmd: &str, reply: &str) -> AsynResult<()> {
         if reply.starts_with('?') {
             self.print(format_args!("SPiiPlusComm:{func}: Command failed: {cmd}\n"));
-            self.error_message(&reply);
+            self.error_message(reply);
             return Err(comm_error(format!("{cmd}: {reply}")));
         }
-        Ok(reply)
+        Ok(())
+    }
+
+    fn print_val(&self, func: &str, val: impl std::fmt::Display) {
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("SPiiPlusComm:{func}:    val = {val}\n"),
+        );
     }
 
     /// `writeReadInt`.
     pub fn write_read_int(&self, cmd: &str) -> AsynResult<i32> {
-        Ok(atoi(&self.query("writeReadInt", cmd)?))
+        let val = atoi(&self.query("writeReadInt", cmd)?);
+        self.print_val("writeReadInt", val);
+        Ok(val)
     }
 
     /// `writeReadDouble`.
     pub fn write_read_double(&self, cmd: &str) -> AsynResult<f64> {
-        Ok(atof(&self.query("writeReadDouble", cmd)?))
+        let val = atof(&self.query("writeReadDouble", cmd)?);
+        self.print_val("writeReadDouble", CFloat(val));
+        Ok(val)
     }
 
     /// `writeReadStr`: the reply up to its first `\r`.
     pub fn write_read_str(&self, cmd: &str) -> AsynResult<String> {
         let reply = self.query("writeReadStr", cmd)?;
-        Ok(reply.split(['\r', '\0']).next().unwrap_or("").to_string())
+        let val = reply.split(['\r', '\0']).next().unwrap_or("");
+        self.print_val("writeReadStr", val);
+        Ok(val.to_string())
     }
 
-    /// `writeReadAck`.
+    /// `writeReadAck`: a `?` reply is an error whatever the status, so a
+    /// read cut short after one still asks for its text
+    /// (SPiiPlusCommDriver.cpp:241-249).
     pub fn write_read_ack(&self, cmd: &str) -> AsynResult<()> {
-        self.query("writeReadAck", cmd).map(drop)
+        let (reply, status) = self.exchange("writeReadAck", cmd);
+        self.refuse_error("writeReadAck", cmd, &reply)?;
+        status
     }
 
     /// `writeReadErrorMessage`: `?` + the `?<errno>` reply asks for the
@@ -141,20 +181,27 @@ impl SpiiPlusComm {
         self.print_error(errno, &format!("??{errno}"), "writeReadBinaryErrorMessage");
     }
 
+    /// C prints the text whatever the status: what a cut read delivered,
+    /// nothing after a failed write (SPiiPlusCommDriver.cpp:288-295).
     fn print_error(&self, errno: i32, cmd: &str, func: &str) {
-        match self.write_read_controller(cmd) {
-            Ok(text) if !text.starts_with('?') => self.print(format_args!(
+        let (text, _) = self.exchange(func, cmd);
+        if text.starts_with('?') {
+            self.print(format_args!("SPiiPlusComm:{func}: ERROR #{errno}\n"));
+        } else {
+            self.print(format_args!(
                 "SPiiPlusComm:{func}: ERROR #{errno}: {text}\n"
-            )),
-            _ => self.print(format_args!("SPiiPlusComm:{func}: ERROR #{errno}\n")),
+            ));
         }
     }
 
     /// `isVariableDefined`: whether `?var` is answered without an error.
+    /// C reads the reply whatever the status, so an exchange that failed
+    /// before a `?` arrived reads as defined (SPiiPlusCommDriver.cpp:541):
+    /// a C defect, not copied.
     pub fn is_variable_defined(&self, var: &str) -> AsynResult<bool> {
-        Ok(!self
-            .write_read_controller(&format!("?{var}"))?
-            .starts_with('?'))
+        let (reply, status) = self.exchange("isVariableDefined", &format!("?{var}"));
+        status?;
+        Ok(!reply.starts_with('?'))
     }
 
     /// `writeReadBinary`: send a query frame, read its `in_bytes` reply,
@@ -360,10 +407,15 @@ impl SpiiPlusComm {
         } else {
             (0, format!("?{var}(0)"))
         };
-        let reply = self.write_read_controller(&cmd)?;
+        let (reply, status) = self.exchange("globalVarCheck", &cmd);
+        status?;
         if !reply.starts_with('?') {
             return Ok((dimensions, false));
         }
+        self.trace(
+            TraceMask::IO_DRIVER,
+            format_args!("SPiiPlusComm:globalVarCheck: Command failed: {cmd}\n"),
+        );
         match atoi(&reply[1..]) {
             1064 => Ok((dimensions, true)),
             1035 => Err(comm_error(format!("{var} is too small"))),
@@ -468,6 +520,100 @@ pub fn register_comm_port(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+    use motor_common::testing::LineRig;
+    use std::sync::{Arc, Mutex};
+
+    /// A comm on `io` printing under `port`, and that port's IO_DRIVER and
+    /// ERROR lines without the prefix.
+    fn traced_comm(port: &str, io: SyncIOHandle) -> (SpiiPlusComm, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("acs-comm-{port}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        trace.set_trace_info_mask(Some(port), TraceInfoMask::empty());
+        trace.set_trace_file(Some(port), TraceFile::File(file));
+        let comm = SpiiPlusComm {
+            io,
+            port: port.into(),
+        };
+        (comm, path)
+    }
+
+    fn take(path: &std::path::Path) -> String {
+        let text = std::fs::read_to_string(path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        text
+    }
+
+    fn answer(cmd: &str) -> String {
+        match cmd.trim_end_matches(['\r', '\n']) {
+            "?X" => "12",
+            "?Y" => "2.5",
+            "ENABLE 9" => "?1021",
+            "??1021" => "Bad axis",
+            _ => "",
+        }
+        .into()
+    }
+
+    /// SPiiPlusCommDriver.cpp:82-100, 128-147, 231-249, 280-295: the output,
+    /// input and status of every exchange, the value read, and a `?` reply
+    /// a timeout cut short still refused with its text.
+    #[test]
+    fn exchanges_print_c_io_driver_lines() {
+        let (_rig, io) = LineRig::cut("acsIoCut", answer, |cmd| cmd.starts_with("ENABLE"));
+        let (comm, path) = traced_comm("acsIoCutComm", io);
+        assert_eq!(comm.write_read_int("?X").unwrap(), 12);
+        assert_eq!(comm.write_read_double("?Y").unwrap(), 2.5);
+        assert!(comm.write_read_ack("ENABLE 9").is_err());
+        assert_eq!(
+            take(&path),
+            "SPiiPlusComm:writeReadInt: output = ?X\n\
+             SPiiPlusComm:writeReadInt:  input = 12\n\
+             SPiiPlusComm:writeReadInt: status = 0\n\
+             SPiiPlusComm:writeReadInt:    val = 12\n\
+             SPiiPlusComm:writeReadDouble: output = ?Y\n\
+             SPiiPlusComm:writeReadDouble:  input = 2.5\n\
+             SPiiPlusComm:writeReadDouble: status = 0\n\
+             SPiiPlusComm:writeReadDouble:    val = 2.500000\n\
+             SPiiPlusComm:writeReadAck: output = ENABLE 9\n\
+             SPiiPlusComm:writeReadAck:  input = ?1021\n\
+             SPiiPlusComm:writeReadAck: status = 1\n\
+             SPiiPlusComm:writeReadAck: Command failed: ENABLE 9\n\
+             SPiiPlusComm:writeReadErrorMessage: output = ??1021\n\
+             SPiiPlusComm:writeReadErrorMessage:  input = Bad axis\n\
+             SPiiPlusComm:writeReadErrorMessage: status = 0\n\
+             SPiiPlusComm:writeReadErrorMessage: ERROR #1021: Bad axis\n"
+        );
+    }
+
+    /// SPiiPlusCommDriver.cpp:76-100, 288-291: a failed write reads as an
+    /// empty reply, and the error's text is printed even then.
+    #[test]
+    fn a_failed_write_prints_an_empty_input() {
+        let (_rig, io) = LineRig::failing("acsIoFail", answer, |cmd| {
+            cmd.starts_with("?Z") || cmd.starts_with("??")
+        });
+        let (comm, path) = traced_comm("acsIoFailComm", io);
+        assert!(comm.write_read_int("?Z").is_err());
+        assert!(comm.write_read_ack("ENABLE 9").is_err());
+        assert_eq!(
+            take(&path),
+            "SPiiPlusComm:writeReadInt: output = ?Z\n\
+             SPiiPlusComm:writeReadInt:  input = \n\
+             SPiiPlusComm:writeReadInt: status = 3\n\
+             SPiiPlusComm:writeReadAck: output = ENABLE 9\n\
+             SPiiPlusComm:writeReadAck:  input = ?1021\n\
+             SPiiPlusComm:writeReadAck: status = 0\n\
+             SPiiPlusComm:writeReadAck: Command failed: ENABLE 9\n\
+             SPiiPlusComm:writeReadErrorMessage: output = ??1021\n\
+             SPiiPlusComm:writeReadErrorMessage:  input = \n\
+             SPiiPlusComm:writeReadErrorMessage: status = 3\n\
+             SPiiPlusComm:writeReadErrorMessage: ERROR #1021: \n"
+        );
+    }
 
     #[test]
     fn error_reply_carries_its_number() {
