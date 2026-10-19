@@ -111,8 +111,9 @@ mod tests {
         writes
     }
 
-    /// `EIP_printf` is one `vfprintf`, which glibc stages whole for an
-    /// unbuffered stream; `EIP_printf_time` is that plus its stamp.
+    /// An `EIP_printf` line is one write, and an `EIP_printf_time` line with
+    /// its stamp. glibc writes an unbuffered `vfprintf` in 128-byte chunks:
+    /// one write at any length is a deliberate deviation from C.
     #[test]
     fn an_eip_line_is_one_write() {
         let name = "plc1";
