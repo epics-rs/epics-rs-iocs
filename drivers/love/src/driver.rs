@@ -1477,9 +1477,10 @@ mod tests {
         assert!(!port.contains("readInt32"), "{port:?}");
     }
 
-    /// A reply whose checksum fails.
+    /// A serial port answering every command with `reply`.
     struct BadReplySerial {
         base: PortDriverBase,
+        reply: &'static [u8],
     }
 
     impl PortDriver for BadReplySerial {
@@ -1500,9 +1501,8 @@ mod tests {
             _user: &AsynUser,
             buf: &mut [u8],
         ) -> AsynResult<(usize, EomReason)> {
-            let reply = b"\x02L01\xff000000";
-            buf[..reply.len()].copy_from_slice(reply);
-            Ok((reply.len(), EomReason::EOS))
+            buf[..self.reply.len()].copy_from_slice(self.reply);
+            Ok((self.reply.len(), EomReason::EOS))
         }
     }
 
@@ -1517,7 +1517,11 @@ mod tests {
             InterfaceMask::UNMIGRATED_ALL,
             InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        let (user, port_path, dev_path) = traced_love(BadReplySerial { base }, "LOVETESTRAW");
+        let serial = BadReplySerial {
+            base,
+            reply: b"\x02L01\xff000000",
+        };
+        let (user, port_path, dev_path) = traced_love(serial, "LOVETESTRAW");
         assert!(user.read_int32(0).is_err());
         let _ = read_trace(&port_path);
         let dev = read_trace(&dev_path);
@@ -1529,6 +1533,39 @@ mod tests {
         );
         let want: &[u8] = b"drvLove::evalMessage checksum failed\n";
         assert!(dev.windows(want.len()).any(|w| w == want));
+    }
+
+    /// evalMessage leaves a 7-byte error reply's 3 bytes after the header in
+    /// inpMsg, which recvReply and executeCommand then print
+    /// (drvLove.c:585-591, :617-619).
+    #[test]
+    fn a_device_error_reply_is_printed_as_evalmessage_leaves_it() {
+        let base = PortDriverBase::new(
+            "LOVETESTERRSER",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let serial = BadReplySerial {
+            base,
+            reply: b"\x02L01X02",
+        };
+        let (user, port_path, dev_path) = traced_love(serial, "LOVETESTERR");
+        assert!(user.read_int32(0).is_err());
+        let _ = read_trace(&port_path);
+        let dev = String::from_utf8(read_trace(&dev_path)).unwrap();
+        let mut at = 0;
+        for line in [
+            "drvLove::evalMessage error message received \"02 - Checksum error on received data from Host.\"\n",
+            "drvLove::recvReply 3 \"X02\"\n",
+            "drvLove::executeCommand read failure - Sent \"\u{2}L0100C1\" Rcvd \"X02\" \n",
+        ] {
+            let Some(i) = dev[at..].find(line) else {
+                panic!("missing {line:?} after {at} in {dev:?}");
+            };
+            at += i + line.len();
+        }
     }
 
     fn report_of(love: &mut LoveDriver) -> String {
