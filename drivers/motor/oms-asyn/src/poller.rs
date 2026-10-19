@@ -3,6 +3,7 @@
 //! writes the axes' status parameters and posts each axis, as its
 //! `callParamCallbacks` does, through the axis's motor poll loop.
 
+use std::ffi::c_long;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -564,8 +565,9 @@ fn parse_axes_array(reply: &str) -> ([i32; OMS_MAX_AXES], usize) {
     (values, count)
 }
 
-/// C `strtol(s, &end, 10)` cast to `int`: the value and where it ended,
-/// `None` when no digits were converted.
+/// C `strtol(s, &end, 10)` cast to `int`, saturating at `LONG_MIN` /
+/// `LONG_MAX`: the value and where it ended, `None` when no digits were
+/// converted.
 fn strtol(s: &[u8]) -> Option<(i32, usize)> {
     let mut at = s.iter().take_while(|c| c.is_ascii_whitespace()).count();
     let negative = s.get(at) == Some(&b'-');
@@ -576,10 +578,15 @@ fn strtol(s: &[u8]) -> Option<(i32, usize)> {
     if digits == 0 {
         return None;
     }
-    let magnitude = s[at..at + digits].iter().fold(0i64, |v, d| {
-        v.saturating_mul(10).saturating_add(i64::from(d - b'0'))
+    // Accumulated toward the sign, so LONG_MIN's magnitude fits.
+    let value = s[at..at + digits].iter().fold(0 as c_long, |v, d| {
+        let d = c_long::from(d - b'0');
+        if negative {
+            v.saturating_mul(10).saturating_sub(d)
+        } else {
+            v.saturating_mul(10).saturating_add(d)
+        }
     });
-    let value = if negative { -magnitude } else { magnitude };
     Some((value as i32, at + digits))
 }
 
@@ -983,5 +990,14 @@ pub(crate) mod tests {
         assert_eq!(parse_axes_array("5,").1, 1);
         assert_eq!(parse_axes_array("-7, 3").0[..2], [-7, 3]);
         assert_eq!(parse_axes_array("").1, 0);
+    }
+
+    /// omsBaseController.cpp:1051: `int intVal = strtol(..)` of an
+    /// overflow is `(int)LONG_MIN` 0 and `(int)LONG_MAX` -1.
+    #[test]
+    fn an_overflowing_axis_value_is_strtol_cast_to_int() {
+        let (values, count) = parse_axes_array("-99999999999999999999,99999999999999999999");
+        assert_eq!((values[..2].to_vec(), count), (vec![0, -1], 2));
+        assert_eq!(strtol(c_long::MIN.to_string().as_bytes()), Some((0, 20)));
     }
 }

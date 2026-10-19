@@ -104,6 +104,7 @@
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::ffi::c_long;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -221,8 +222,8 @@ fn get_value_f64(reply: &str) -> AsynResult<f64> {
 
 /// C `strtol(s, NULL, radix)`: leading blanks, a sign and, in base 16, a
 /// `0x` are read; base 0 reads a `0x` as 16 and a leading `0` as 8; no
-/// digit is 0 and an overflow saturates.
-fn strtol(s: &str, radix: u32) -> i64 {
+/// digit is 0 and an overflow saturates at `LONG_MIN` / `LONG_MAX`.
+fn strtol(s: &str, radix: u32) -> c_long {
     let t = s.trim_start();
     let (negative, t) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -242,8 +243,18 @@ fn strtol(s: &str, radix: u32) -> i64 {
     if n == 0 {
         return 0;
     }
-    let value = i64::from_str_radix(&t[..n], radix).unwrap_or(i64::MAX);
-    if negative { -value } else { value }
+    // Accumulated toward the sign, so LONG_MIN's magnitude fits.
+    t.chars()
+        .map_while(|c| c.to_digit(radix))
+        .fold(0, |v: c_long, d| {
+            let d = c_long::from(d);
+            let v = v.saturating_mul(c_long::from(radix));
+            if negative {
+                v.saturating_sub(d)
+            } else {
+                v.saturating_add(d)
+            }
+        })
 }
 
 fn get_value_bool(reply: &str) -> AsynResult<bool> {
@@ -5682,6 +5693,19 @@ mod tests {
         let ctrl = PIGCS2Controller::new(io, "gcs2Moving0x");
         assert!(ctrl.get_moving(2).unwrap());
         assert!(!ctrl.get_moving(1).unwrap());
+    }
+
+    /// PIGCSController.cpp:591-605: an overflowing `#5` word is
+    /// `strtol`'s `LONG_MIN`, which carries no axis bit.
+    #[test]
+    fn an_overflowing_moving_word_is_long_min() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2MovingMin", |_| {
+            "-FFFFFFFFFFFFFFFFFFFF".into()
+        });
+        let ctrl = PIGCS2Controller::new(io, "gcs2MovingMin");
+        assert!(!ctrl.get_moving(1).unwrap());
+        assert_eq!(strtol("-9223372036854775808", 10), c_long::MIN);
+        assert_eq!(strtol("99999999999999999999", 0), c_long::MAX);
     }
 
     #[test]
