@@ -113,16 +113,23 @@ static DEVICES: &[(&str, &[DevSup])] = &[
     ),
     (
         "opcuaItem",
-        &[row("devItemOpcua", device_support::DTYP, 6, &[3, 4])],
+        &[DevSup {
+            name: "devItemOpcua",
+            choice: device_support::DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[3, 4], false),
+        }],
     ),
 ];
 
+/// An opcua row whose `init` is `opcua_init`, which calls `devExtend` at
+/// pass 0 (`devOpcua.cpp:139`).
 const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'static [u8]) -> DevSup {
     DevSup {
         name,
         choice,
         link_type: DbLinkType::InstIo,
-        dset: Dset::new(number, funcs, false),
+        dset: Dset::new(number, funcs, true).with_init(device_support::opcua_init),
     }
 }
 
@@ -514,4 +521,65 @@ async fn main() -> CaResult<()> {
     });
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// `opcua_init` calls `devExtend(&opcua_dsxt)` at pass 0
+    /// (`devOpcua.cpp:139`); devItemOpcua has no init, so no `dsxt`.
+    #[test]
+    fn every_dset_but_item_extends() {
+        for (record_type, rows) in DEVICES {
+            for row in *rows {
+                assert_eq!(
+                    row.has_dsxt(),
+                    row.name != "devItemOpcua",
+                    "{record_type} {}",
+                    row.name
+                );
+            }
+        }
+    }
+
+    /// initDevSup's init(0) then finishDevSup's init(1) over every row: the
+    /// opcua_init banner prints once, and devItemOpcua (SUPI, devOpcua.cpp:1346)
+    /// has no init.
+    #[test]
+    fn the_banner_prints_once_across_the_dsets() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let id = errlog_add_listener({
+            let lines = lines.clone();
+            move |line: &str| lines.lock().unwrap().push(line.to_string())
+        });
+        let opcua_init: fn(bool) = device_support::opcua_init;
+        for after in [false, true] {
+            for (record_type, rows) in DEVICES {
+                for row in *rows {
+                    let init = row.dset.init;
+                    assert_eq!(
+                        init.map(|f| f as usize),
+                        (row.name != "devItemOpcua").then_some(opcua_init as usize),
+                        "{record_type} {}",
+                        row.name
+                    );
+                    if let Some(init) = init {
+                        init(after);
+                    }
+                }
+            }
+        }
+        errlog_flush();
+        errlog_remove_listener(id);
+        let lines = lines.lock().unwrap();
+        let banners: Vec<_> = lines
+            .iter()
+            .filter(|l| l.starts_with("OPC UA Client Device Support "))
+            .collect();
+        assert_eq!(banners, [device_support::BANNER], "{lines:#?}");
+    }
 }

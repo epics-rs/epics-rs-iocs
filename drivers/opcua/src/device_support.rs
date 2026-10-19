@@ -40,10 +40,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use async_opcua::types::Variant;
-use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::error::{CaError, CaResult, LinkRefusal};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::device_support::{
@@ -61,6 +62,27 @@ use crate::record::OpcuaItemRecord;
 use crate::registry::{Binding, Registry};
 use crate::session::Priority;
 use crate::value::{self, EnumChoices};
+
+/// opcua_init's banner (devOpcua.cpp:128-135), the rs crate and client
+/// library standing in for EPICS_OPCUA_* and Open62541.
+pub const BANNER: &str = concat!(
+    "OPC UA Client Device Support ",
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("OPCUA_GIT_COMMIT"),
+    "); using ",
+    env!("OPCUA_CLIENT_API"),
+    "\n"
+);
+
+/// `opcua_init(pass)` (devOpcua.cpp:123-141), every opcua dset's `init` but
+/// devItemOpcua's: the banner on the first call of any of them.
+pub fn opcua_init(_after: bool) {
+    static BLURP: AtomicBool = AtomicBool::new(false);
+    if !BLURP.swap(true, Ordering::SeqCst) {
+        errlog_vprintf(format_args!("{BANNER}"));
+    }
+}
 
 /// The DTYP every OPC UA record uses (`opcua.dbd`: `device(ai, INST_IO,
 /// devAiOpcua, "OPCUA")`).
@@ -858,6 +880,13 @@ impl OpcuaDevice {
 impl DeviceSupport for OpcuaDevice {
     fn dtyp(&self) -> &str {
         DTYP
+    }
+
+    /// `opcua_del_record` (`devOpcua.cpp:111-116`): changing an OPCUA link
+    /// is not supported, so every device-link put is refused with the link
+    /// as it was.
+    fn del_record(&mut self) -> Result<(), LinkRefusal> {
+        Err(LinkRefusal::del_record("devOpcua"))
     }
 
     // Every C++ init failure is a `CATCH()` that returns an `S_*` status

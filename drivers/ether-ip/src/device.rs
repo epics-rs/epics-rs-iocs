@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::error::{CaError, CaResult, LinkRefusal};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::database::DeviceDoneSource;
@@ -425,6 +425,64 @@ impl EtherIpDevice {
         self.alarm = Some((alarm_status::NO_ALARM, AlarmSeverity::NoAlarm as u16));
     }
 
+    /// C `init_record(rec, cbtype, link, count, bits)` (`devEtherIP.c:1183-1205`):
+    /// bind this object's link for `record`, after the errlog line C prints.
+    fn bind_link(&mut self, record: &dyn Record) -> Result<(), String> {
+        let (bits, count) = record_shape(record);
+        let name = self.name.clone();
+        let fail = |msg: String| {
+            errlog_vprintf(format_args!("devEtherIP ({name}): {msg}\n"));
+            Err(msg)
+        };
+        if !driver::initialized() {
+            return fail("Failed to all drvEtherIP_init()".to_string());
+        }
+        let (link, plc) = match analyze_link(
+            &self.link_text,
+            count,
+            bits,
+            // devEtherIP.c:1021-1035: a non-positive period at each step
+            // falls through to the next.
+            || {
+                get_period(&name, self.scan)
+                    .filter(|p| *p > 0.0)
+                    .or_else(|| Some(driver::default_rate()).filter(|p| *p > 0.0))
+                    .unwrap_or_else(|| {
+                        errlog_vprintf(format_args!(
+                            "devEtherIP ({name}): cannot decode SCAN field, no scan flag given\n"
+                        ));
+                        errlog_vprintf(format_args!(
+                            "Device support will use the default of 1 secs, "
+                        ));
+                        errlog_vprintf(format_args!("please complete the record configuration\n"));
+                        1.0
+                    })
+            },
+            driver::find_plc,
+        ) {
+            Ok(found) => found,
+            Err(msg) => return fail(msg),
+        };
+
+        let Some(tag) = plc.add_tag(link.period, &link.string_tag, link.elements) else {
+            return fail(format!(
+                "cannot register tag '{}' with driver",
+                link.string_tag
+            ));
+        };
+
+        // One I/O Intr pulse per new tag value. Depth 1: a pending pulse
+        // already says "re-read", and the record reads the current value.
+        let (tx, rx) = mpsc::channel(1);
+        self.listener = Some(tag.add_listener(tx));
+        self.io_intr_rx = Some(rx);
+
+        self.link = Some(link);
+        self.plc = Some(plc);
+        self.tag = Some(tag);
+        Ok(())
+    }
+
     /// C `lock_data`'s first half: do we have a tag at all? Returns owned
     /// handles so the caller can still take `&mut self` for the alarm.
     fn bound(&self) -> Option<(Arc<TagInfo>, Link)> {
@@ -529,64 +587,31 @@ impl DeviceSupport for EtherIpDevice {
         ) {
             record.put_field("SHFT", EpicsValue::UShort(0))?;
         }
-        let (bits, count) = record_shape(record);
-        let name = self.name.clone();
-        let fail = |msg: String| {
-            errlog_vprintf(format_args!("devEtherIP ({name}): {msg}\n"));
-            Err(CaError::InvalidValue(msg))
-        };
-        if !driver::initialized() {
-            return fail("Failed to all drvEtherIP_init()".to_string());
-        }
-        let (link, plc) = match analyze_link(
-            &self.link_text,
-            count,
-            bits,
-            // devEtherIP.c:1021-1035: a non-positive period at each step
-            // falls through to the next.
-            || {
-                get_period(&name, self.scan)
-                    .filter(|p| *p > 0.0)
-                    .or_else(|| Some(driver::default_rate()).filter(|p| *p > 0.0))
-                    .unwrap_or_else(|| {
-                        errlog_vprintf(format_args!(
-                            "devEtherIP ({name}): cannot decode SCAN field, no scan flag given\n"
-                        ));
-                        errlog_vprintf(format_args!(
-                            "Device support will use the default of 1 secs, "
-                        ));
-                        errlog_vprintf(format_args!("please complete the record configuration\n"));
-                        1.0
-                    })
-            },
-            driver::find_plc,
-        ) {
-            Ok(found) => found,
-            Err(msg) => return fail(msg),
-        };
-
-        let Some(tag) = plc.add_tag(link.period, &link.string_tag, link.elements) else {
-            return fail(format!(
-                "cannot register tag '{}' with driver",
-                link.string_tag
-            ));
-        };
-
-        // One I/O Intr pulse per new tag value. Depth 1: a pending pulse
-        // already says "re-read", and the record reads the current value.
-        let (tx, rx) = mpsc::channel(1);
-        self.listener = Some(tag.add_listener(tx));
-        self.io_intr_rx = Some(rx);
-
-        self.link = Some(link);
-        self.plc = Some(plc);
-        self.tag = Some(tag);
+        self.bind_link(record).map_err(CaError::InvalidValue)?;
         // devEtherIP.c ao/bo/mbbo/mbboDirect_init_record: "return 2; /* don't
         // convert, we have no value, yet */".
         if matches!(record.record_type(), "ao" | "bo" | "mbbo" | "mbboDirect") {
             return Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched));
         }
         Ok(DeviceInitOutcome::ok())
+    }
+
+    /// The `<type>_add_record` every dset but devBoEtherIPReset registers with
+    /// `devExtend` (`devEtherIP.c:1210-1230` and its twins): `init_record`
+    /// on the new link.
+    fn add_record(&mut self, record: &mut dyn Record) -> Result<(), LinkRefusal> {
+        self.bind_link(record)
+            .map_err(|_| LinkRefusal::add_record("devEtherIP"))
+    }
+
+    /// `del_scan_callback_record` / `<type>_del_record`
+    /// (`devEtherIP.c:1215-1223`, `:1409-1418`): the record leaves its tag.
+    fn del_record(&mut self) -> Result<(), LinkRefusal> {
+        println!("Updating link for {}", self.name);
+        if let (Some(tag), Some(listener)) = (&self.tag, self.listener.take()) {
+            tag.remove_listener(&listener);
+        }
+        Ok(())
     }
 
     fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {
@@ -1242,6 +1267,45 @@ mod tests {
             dev.write_begin(&mut record, &source).unwrap(),
             WriteStart::Completed
         ));
+    }
+
+    /// devEtherIP's dsxt: the new link's object binds its tag in
+    /// `add_record` (`ai_add_record` → `init_record`), and the old one's
+    /// `del_scan_callback_record` takes its callback off the old tag.
+    #[test]
+    fn add_record_binds_the_new_link_and_del_record_leaves_the_old_tag() {
+        use epics_rs::base::server::records::ai::AiRecord;
+
+        define_plc("dsxt", "127.0.0.1", 0);
+        let mut record = AiRecord::default();
+        let mut old = EtherIpDevice::new("@dsxt DSXT_A", false);
+        old.init(&mut record).unwrap();
+        let mut old_rx = old.io_intr_receiver().unwrap();
+        let a = old.tag.clone().unwrap();
+
+        let mut new = EtherIpDevice::new("@dsxt DSXT_B", false);
+        new.add_record(&mut record).unwrap();
+        let mut new_rx = new.io_intr_receiver().unwrap();
+        let b = new.tag.clone().unwrap();
+        assert_eq!(b.string_tag, "DSXT_B");
+
+        old.del_record().unwrap();
+        a.notify();
+        b.notify();
+        assert!(old_rx.try_recv().is_err(), "the old tag still calls back");
+        assert!(new_rx.try_recv().is_ok());
+    }
+
+    /// A link `analyze_link` refuses refuses the put through `add_record`.
+    #[test]
+    fn add_record_refuses_a_link_with_no_plc() {
+        use epics_rs::base::server::records::ai::AiRecord;
+
+        define_plc("dsxt2", "127.0.0.1", 0);
+        let mut record = AiRecord::default();
+        let mut new = EtherIpDevice::new("@nosuchplc DSXT_C", false);
+        assert!(new.add_record(&mut record).is_err());
+        assert!(new.tag.is_none());
     }
 
     /// A bo on bit 12 of the tag's UDINT 9, bound to `plc`, with its common
