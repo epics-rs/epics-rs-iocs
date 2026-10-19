@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::registry::{claim_port, open_owner};
@@ -19,6 +20,10 @@ type Reply = Box<dyn Fn(&str) -> String + Send + Sync>;
 type Lines = Box<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 type Fails = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
+fn no() -> Fails {
+    Box::new(|_| false)
+}
+
 struct Line {
     base: PortDriverBase,
     sent: Arc<Mutex<Vec<String>>>,
@@ -29,6 +34,8 @@ struct Line {
     command: String,
     answer: Answer,
     fails: Fails,
+    /// Commands whose reply read times out after delivering the reply.
+    cuts: Fails,
 }
 
 enum Answer {
@@ -81,17 +88,13 @@ impl PortDriver for Line {
     fn get_output_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
         Ok(self.base.output_eos(user.addr).to_vec())
     }
-    fn io_read_octet(
-        &mut self,
-        _user: &AsynUser,
-        buf: &mut [u8],
-    ) -> epics_rs::asyn::interpose::OctetReadResult {
+    fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         let reply = match &mut self.answer {
             Answer::Last(reply) => reply(&self.command),
             Answer::Queued(_, queue) => match queue.pop_front() {
                 Some(reply) => reply,
                 None => {
-                    return epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
+                    return OctetReadResult::failed(AsynError::Status {
                         status: AsynStatus::Timeout,
                         message: "LineRig: nothing to read".into(),
                     });
@@ -100,10 +103,17 @@ impl PortDriver for Line {
         };
         let n = reply.len().min(buf.len());
         buf[..n].copy_from_slice(&reply.as_bytes()[..n]);
-        epics_rs::asyn::interpose::OctetReadResult::ok(
-            n,
-            epics_rs::asyn::interpose::EomReason::empty(),
-        )
+        let read = OctetReadResult::ok(n, EomReason::empty());
+        if (self.cuts)(&self.command) {
+            return OctetReadResult {
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "LineRig: reply cut by a timeout".into(),
+                }),
+                ..read
+            };
+        }
+        read
     }
 }
 
@@ -131,7 +141,23 @@ impl LineRig {
         reply: impl Fn(&str) -> String + Send + Sync + 'static,
         fails: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> (Self, SyncIOHandle) {
-        Self::open(name, 1, Answer::Last(Box::new(reply)), Box::new(fails))
+        Self::open(
+            name,
+            1,
+            Answer::Last(Box::new(reply)),
+            Box::new(fails),
+            no(),
+        )
+    }
+
+    /// [`Self::new`], with the reply to each command `cuts` picks delivered
+    /// by a read that then times out.
+    pub fn cut(
+        name: &str,
+        reply: impl Fn(&str) -> String + Send + Sync + 'static,
+        cuts: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (Self, SyncIOHandle) {
+        Self::open(name, 1, Answer::Last(Box::new(reply)), no(), Box::new(cuts))
     }
 
     /// [`Self::new`] for a device that answers a command with `lines`, one
@@ -144,7 +170,8 @@ impl LineRig {
             name,
             1,
             Answer::Queued(Box::new(lines), VecDeque::new()),
-            Box::new(|_| false),
+            no(),
+            no(),
         )
     }
 
@@ -155,15 +182,16 @@ impl LineRig {
         max_addr: usize,
         reply: impl Fn(&str) -> String + Send + Sync + 'static,
     ) -> (Self, SyncIOHandle) {
-        Self::open(
-            name,
-            max_addr,
-            Answer::Last(Box::new(reply)),
-            Box::new(|_| false),
-        )
+        Self::open(name, max_addr, Answer::Last(Box::new(reply)), no(), no())
     }
 
-    fn open(name: &str, max_addr: usize, answer: Answer, fails: Fails) -> (Self, SyncIOHandle) {
+    fn open(
+        name: &str,
+        max_addr: usize,
+        answer: Answer,
+        fails: Fails,
+        cuts: Fails,
+    ) -> (Self, SyncIOHandle) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let addrs = Arc::new(Mutex::new(Vec::new()));
         let line = Line {
@@ -179,6 +207,7 @@ impl LineRig {
             command: String::new(),
             answer,
             fails,
+            cuts,
         };
         let claim = claim_port(name).unwrap();
         let (rt, _jh) = create_port_runtime(&claim, line, RuntimeConfig::default()).unwrap();

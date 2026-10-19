@@ -83,15 +83,22 @@ impl HydraController {
 
     /// Write a query and read one reply line.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        // C writeReadController: pasynOctetSyncIO->writeRead.
+        let (reply, status) = self.exchange(cmd);
+        status.map(|()| reply)
+    }
+
+    /// C `writeReadController`: `inString_` beside the status. The EOS layer
+    /// NUL-terminates the buffer on every read, so a failed read leaves the
+    /// bytes it delivered, which the callers that ignore the status parse.
+    fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
         let (raw, status) = self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
-        status?;
-        Ok(String::from_utf8_lossy(&raw)
+        let reply = String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
-            .to_string())
+            .to_string();
+        (reply, status)
     }
 }
 
@@ -127,8 +134,9 @@ impl HydraAxis {
     /// Construct axis `axis_no` (0-based) and read its motor form, pitch,
     /// pole pairs and closed-loop period for `axisRes`, then its travel
     /// limits, as C's constructor.
-    /// C ignores the queries' status (SMChydraAxis.cpp:15-17), so a controller
-    /// that does not answer leaves each at `atoi("")`/`atof("")`, 0.
+    /// C ignores the queries' status (SMChydraAxis.cpp:15-17) and parses what
+    /// arrived, so a controller that does not answer leaves each at
+    /// `atoi("")`/`atof("")`, 0, and a reply cut by a timeout still counts.
     pub fn new(
         controller: Arc<Mutex<HydraController>>,
         axis_no: usize,
@@ -138,7 +146,7 @@ impl HydraAxis {
         let addr = axis_no + 1;
         let (motor_form, members) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let read = |verb: &str| ctrl.query(&format!("{addr} {verb}")).unwrap_or_default();
+            let read = |verb: &str| ctrl.exchange(&format!("{addr} {verb}")).0;
             let motor_form = atoi(&read("getmotor"));
             let pitch = atof(&read("getpitch"));
             let pole_pairs = atoi(&read("getpolepairs"));
@@ -461,6 +469,29 @@ mod tests {
         assert!(status.problem);
         assert!(status.gain_support);
     }
+    /// SMChydraAxis.cpp:15-57 parses `inString_` whatever
+    /// `writeReadController` returned, so replies cut by a timeout still set
+    /// the motor form and travel limits.
+    #[test]
+    fn the_constructor_parses_replies_cut_by_a_timeout() {
+        use motor_common::testing::LineRig;
+        let (_line, handle) = LineRig::cut(
+            "hydraCutReplies",
+            |cmd| match cmd.trim_end() {
+                "1 getmotor" => "1".into(),
+                "1 getclperiod" => "0.5".into(),
+                "1 getnlimit" => "-10 20".into(),
+                _ => String::new(),
+            },
+            |_| true,
+        );
+        let controller = Arc::new(Mutex::new(HydraController::new(handle)));
+        let axis = HydraAxis::new(controller, 0, Arc::default(), "");
+        assert_eq!(axis.motor_form, 1);
+        assert_eq!(axis.axis_res(), 0.5);
+        assert_eq!(axis.members.state().travel_limits, (-10.0, 20.0));
+    }
+
     #[test]
     fn an_axis_of_an_unanswering_controller_is_still_built() {
         let (handle, _) =
