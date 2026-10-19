@@ -558,9 +558,10 @@ impl ImsMDrivePlusAxis {
             println!("Controller version {version}");
         }
         println!("Setup config:");
-        let vlow = version.to_lowercase();
-        if vlow.contains("lmm") || vlow.contains("lmd") {
-            if vlow.contains("lmm") {
+        // C's strstr, so a mixed-case name is an MForce (:182-188).
+        let model = |names: [&str; 2]| names.iter().any(|n| version.contains(n));
+        if model(["lmm", "LMM"]) || model(["lmd", "LMD"]) {
+            if model(["lmm", "LMM"]) {
                 println!("Lexium Motor Module detected");
                 println!("{RULE}");
             } else {
@@ -1232,6 +1233,23 @@ mod tests {
             (axis.pos_limit_switch, axis.neg_limit_switch),
             (Some(2), Some(3))
         );
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:182-188 match `lmm`/`LMM` and
+    /// `lmd`/`LMD` only, so `Lmm` probes the MForce S1-S4 setup.
+    #[test]
+    fn a_mixed_case_lexium_name_is_an_mforce() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("imsMixedLmm", |last| match last.trim_end() {
+            "PR VR" => "Lmm 3.0".into(),
+            _ => "0".into(),
+        });
+        ImsMDrivePlusAxis::new(
+            ImsLine::new(io, String::new(), "imsMixedLmm"),
+            "imsMixedLmm",
+        );
+        let sent = rig.sent();
+        assert!(sent.iter().any(|c| c.trim_end() == "PR S1"), "{sent:?}");
     }
 
     #[test]
