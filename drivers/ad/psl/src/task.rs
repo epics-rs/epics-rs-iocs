@@ -183,7 +183,7 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
 /// read's status (PSL.cpp:697-698), so a reply a timeout cut still counts.
 pub(crate) fn has_new_data(server: &PslServer) -> ServerResult<bool> {
     let (reply, status) = server.exchange("HasNewData");
-    if reply.trim() == "True" {
+    if reply.is_some_and(|reply| reply.trim() == "True") {
         return Ok(true);
     }
     match status {

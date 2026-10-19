@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
 use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -107,7 +107,7 @@ impl PslServer {
     }
 
     /// [`Self::command`] with the reply a failed read delivered.
-    pub fn exchange(&self, command: &str) -> (String, ServerResult<()>) {
+    pub fn exchange(&self, command: &str) -> (Option<String>, ServerResult<()>) {
         self.session().exchange(command)
     }
 
@@ -129,19 +129,20 @@ impl Session<'_> {
     /// default `PSL_SERVER_TIMEOUT`).
     pub fn command(&mut self, command: &str) -> ServerResult<String> {
         let (reply, status) = self.exchange(command);
-        status.map(|()| reply)
+        status.map(|()| reply.unwrap_or_default())
     }
 
     /// [`Self::command`] with the bytes a failed read delivered, which C's
-    /// `fromServer_` holds; a failed write reads none.
-    pub fn exchange(&mut self, command: &str) -> (String, ServerResult<()>) {
+    /// `fromServer_` holds; `None` when no read ran and the buffer kept the
+    /// last reply.
+    pub fn exchange(&mut self, command: &str) -> (Option<String>, ServerResult<()>) {
         let (bytes, status) = self
             .io
             .write_read(command, MAX_MESSAGE_SIZE, SERVER_TIMEOUT);
         if let Err(e) = &status {
             self.io.write_read_failed(e, command);
         }
-        let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();
+        let reply = bytes.map(|bytes| String::from_utf8_lossy(&bytes).trim_end().to_string());
         (reply, status)
     }
 
@@ -221,11 +222,11 @@ impl ServerIo {
         command: &str,
         buf_size: usize,
         timeout: Duration,
-    ) -> (Vec<u8>, ServerResult<()>) {
+    ) -> (Option<Vec<u8>>, ServerResult<()>) {
         self.reconnect();
         let port = match self.handle.port() {
             Ok(port) => port,
-            Err(e) => return (Vec::new(), Err(e.into())),
+            Err(e) => return (None, Err(e.into())),
         };
         let (reply, status) = port
             .submit_octet_read_blocking(
@@ -236,7 +237,11 @@ impl ServerIo {
                 self.user(timeout),
             )
             .into_parts();
-        (reply, status.map_err(ServerError::from))
+        let read = match &status {
+            Ok(()) => true,
+            Err(e) => e.octet_step() == Some(OctetStep::Read),
+        };
+        (read.then_some(reply), status.map_err(ServerError::from))
     }
 
     fn write(&mut self, command: &str, timeout: Duration) -> ServerResult<()> {
