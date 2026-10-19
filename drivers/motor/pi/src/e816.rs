@@ -59,7 +59,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -289,14 +291,16 @@ pub struct PIE816Axis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIE816Axis {
-    /// Construct one axis, seeding the initial status. `prev_position` starts
-    /// at 0.
+    /// Construct one axis and read its status, as C `motor_init`'s
+    /// `set_status` does (drvPIE816.cc:661). `prev_position` starts at 0.
     pub fn new(controller: Arc<Mutex<PIE816Controller>>, axis: usize) -> Self {
         let mut me = Self {
-            controller: controller.clone(),
+            controller,
             axis,
             prev_position: 0,
             failure: PollFailure::NONE,
@@ -307,12 +311,9 @@ impl PIE816Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            init_status: None,
         };
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(reading) = ctrl.poll_axis(axis) {
-            drop(ctrl);
-            me.last_status = fold_reading(&mut me.prev_position, false, &reading);
-        }
+        me.init_status = Some(me.poll(&AsynUser::new(0)));
         me
     }
 
@@ -346,6 +347,12 @@ impl PIE816Axis {
         }
         line.extend_from_slice(command.as_bytes());
         line
+    }
+}
+
+impl Model1Motor for PIE816Axis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 

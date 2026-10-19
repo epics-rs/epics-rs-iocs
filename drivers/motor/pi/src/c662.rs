@@ -77,7 +77,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -237,25 +239,23 @@ pub struct PIC662Axis {
     /// C `no_motion_count`: polls the position sat still while a move was
     /// held; a MOTION command restarts it (motordrvCom.cc:435).
     no_motion_count: u32,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIC662Axis {
-    /// Construct the controller's one axis, seeding the initial status (C
-    /// `motor_init`'s `set_status(card, 0)`). A failed initial poll is not an
-    /// error.
+    /// Construct the controller's one axis and read its status, as C
+    /// `motor_init`'s `set_status(card, 0)` does (drvPIC662.cc:576).
     pub fn new(controller: Arc<Mutex<PIC662Controller>>) -> Self {
         let mut axis = Self {
-            controller: controller.clone(),
+            controller,
             failure: PollFailure::NONE,
             last_status: MotorStatus::default(),
             strings: MoveStrings::default(),
             no_motion_count: 0,
+            init_status: None,
         };
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(polled) = ctrl.poll_status() {
-            drop(ctrl);
-            axis.apply(polled, false);
-        }
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -305,6 +305,12 @@ impl PIC662Axis {
             vbas_supported: false,
             ..MotorStatus::default()
         };
+    }
+}
+
+impl Model1Motor for PIC662Axis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -111,7 +111,7 @@ pub fn pic862_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
 
                 let axis = PIC862Axis::new(controller);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(axis));
                 init.axis(0, motor);
                 init.describe(line);
             })?;
@@ -176,7 +176,7 @@ pub fn pic663_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
 
                 let axis = PIC663Axis::new(controller);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(axis));
                 init.axis(0, motor);
                 init.describe(line);
             })?;
@@ -274,7 +274,7 @@ pub fn pic630_config_command() -> CommandDef {
 
                 for (signal, current) in (0..num_axes).zip(currents) {
                     let axis = PIC630Axis::new(controller.clone(), signal, current);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(axis));
                     init.axis(signal as i32, motor);
                 }
                 // C's ident is the constant motor_init copies (drvPIC630.cc:546).
@@ -335,7 +335,7 @@ pub fn pic662_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
 
                 let axis = PIC662Axis::new(controller);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(axis));
                 init.axis(0, motor);
                 init.describe(line);
             })?;
@@ -396,7 +396,7 @@ pub fn pic844_config_command() -> CommandDef {
 
                 for signal in 0..PIC844_NUM_AXES {
                     let axis = PIC844Axis::new(controller.clone(), signal);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(axis));
                     init.axis(signal as i32, motor);
                 }
                 init.describe(line);
@@ -462,7 +462,7 @@ pub fn pic848_config_command() -> CommandDef {
 
                 for signal in 0..num_axes {
                     let axis = PIC848Axis::new(controller.clone(), card, signal);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(axis));
                     init.axis(signal as i32, motor);
                 }
                 init.describe(line);
@@ -525,7 +525,7 @@ pub fn pie516_config_command() -> CommandDef {
 
                 for axis in 0..num_axes {
                     let axis_obj = PIE516Axis::new(controller.clone(), axis);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(axis_obj));
                     init.axis(axis as i32, motor);
                 }
                 init.describe(line);
@@ -589,7 +589,7 @@ pub fn pie517_config_command() -> CommandDef {
 
                 for axis in 0..num_axes {
                     let axis_obj = PIE517Axis::new(controller.clone(), axis);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(axis_obj));
                     init.axis(axis as i32, motor);
                 }
                 init.describe(line);
@@ -652,7 +652,7 @@ pub fn pie710_config_command() -> CommandDef {
 
                 for axis in 0..num_axes {
                     let axis_obj = PIE710Axis::new(controller.clone(), axis);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(axis_obj));
                     init.axis(axis as i32, motor);
                 }
                 init.describe(line);
@@ -715,7 +715,7 @@ pub fn pie816_config_command() -> CommandDef {
 
                 for axis in 0..num_axes {
                     let axis_obj = PIE816Axis::new(controller.clone(), axis);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(axis_obj));
                     init.axis(axis as i32, motor);
                 }
                 init.describe(line);
@@ -1060,5 +1060,367 @@ mod report {
             "    PIE816 controller 0 connection failed.\n    PIE816 controller #1, \
              port=e816RepLine, id: E-816 \n"
         );
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+    use std::sync::atomic::AtomicU8;
+
+    fn int(v: i64) -> ArgValue {
+        ArgValue::Int(v)
+    }
+
+    fn port(name: &str) -> ArgValue {
+        ArgValue::String(name.into())
+    }
+
+    /// Run `setup` and `config`, then `motor_init`: the wire it wrote.
+    async fn motor_init(
+        line: &LineRig,
+        setup: (CommandDef, Vec<ArgValue>),
+        config: (CommandDef, Vec<ArgValue>),
+    ) -> Vec<String> {
+        run_command(setup.0, setup.1).await;
+        run_command(config.0, config.1).await;
+        drvsup_init().await;
+        line.sent()
+    }
+
+    /// The RMPs of `dtyp`'s card 0 signals `0..n` once the records start.
+    async fn rmps(dtyp: &str, n: usize) -> Vec<EpicsValue> {
+        let db: String = (0..n)
+            .map(|s| {
+                format!(
+                    "record(motor, \"m{s}\") {{ field(DTYP, \"{dtyp}\") field(OUT, \"#C0 S{s} @\") }}\n"
+                )
+            })
+            .collect();
+        let db = record_init(&db).await;
+        (0..n)
+            .map(|s| db.get_pv(format!("m{s}.RMP")).unwrap())
+            .collect()
+    }
+
+    fn longs(v: &[i32]) -> Vec<EpicsValue> {
+        v.iter().map(|&v| EpicsValue::Long(v)).collect()
+    }
+
+    /// drvPIC862.cc:580: `motor_init` reads the axis's status once, and the
+    /// record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pic862_motor_init_reads_the_status_once() {
+        let (line, _io) = LineRig::new("c862InitLine", |last| match last {
+            "TS" => "S:04 00 00 02 00 00\r".into(),
+            "TP" => "P:14\r".into(),
+            _ => "C-862\r".into(),
+        });
+        let sent = motor_init(
+            &line,
+            (pic862_setup_command(), vec![int(1), int(10)]),
+            (
+                pic862_config_command(),
+                vec![int(0), port("c862InitLine"), int(1)],
+            ),
+        )
+        .await;
+        assert_eq!(sent, ["\u{1}1VE", "TS", "TP"]);
+        assert_eq!(rmps("PIC862", 1).await, longs(&[14]));
+    }
+
+    /// drvPIC663.cc:554: `motor_init` reads the axis's status once, and the
+    /// record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pic663_motor_init_reads_the_status_once() {
+        let (line, _io) = LineRig::new("c663InitLine", |last| match last {
+            "TS" => "S:04 00 00\r".into(),
+            "TP" => "P:14\r".into(),
+            _ => "C-663\r".into(),
+        });
+        let sent = motor_init(
+            &line,
+            (pic663_setup_command(), vec![int(1), int(10)]),
+            (
+                pic663_config_command(),
+                vec![int(0), port("c663InitLine"), int(1)],
+            ),
+        )
+        .await;
+        assert_eq!(sent, ["\u{1}1VE", "TS", "TP"]);
+        assert_eq!(rmps("PIC663", 1).await, longs(&[14]));
+    }
+
+    /// drvPIC630.cc:529-552: `motor_init` reads each axis's status once,
+    /// after its DC and AB, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pic630_motor_init_reads_each_status_after_its_dc_and_ab() {
+        let (line, _io) = LineRig::new("c630InitLine", |last| match last {
+            "1TS" => "1TS:0".into(),
+            "2TS" => "2TS:0".into(),
+            "1TP" => "1TP:14".into(),
+            "2TP" => "2TP:3".into(),
+            c => c.into(),
+        });
+        let mut config = vec![int(0), port("c630InitLine")];
+        config.extend((0..9).map(|_| int(1)));
+        let sent = motor_init(
+            &line,
+            (pic630_setup_command(), vec![int(1), int(2), int(10)]),
+            (pic630_config_command(), config),
+        )
+        .await;
+        assert_eq!(
+            sent,
+            [
+                "1TS", "2TS", "1DC1", "1AB", "1TS", "1TP", "2DC1", "2AB", "2TS", "2TP"
+            ]
+        );
+        assert_eq!(rmps("PI C630", 2).await, longs(&[14, 3]));
+    }
+
+    /// drvPIC662.cc:576: `motor_init` reads the axis's status once, after
+    /// REMOTE_MODE, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pic662_motor_init_reads_the_status_once() {
+        let (line, _io) = LineRig::new("c662InitLine", |last| match last {
+            "*IDN?" => "E-662".into(),
+            "*ESR?" => "1".into(),
+            "POS?" => "0.014".into(),
+            _ => "0.000".into(),
+        });
+        let sent = motor_init(
+            &line,
+            (pic662_setup_command(), vec![int(1), int(10)]),
+            (pic662_config_command(), vec![int(0), port("c662InitLine")]),
+        )
+        .await;
+        assert_eq!(sent, ["*IDN?", "DEV:CONT REM", "*ESR?", "POS?"]);
+        assert_eq!(rmps("PIC662", 1).await, longs(&[14]));
+    }
+
+    /// drvPIC844.cc:611-627: `motor_init` reads each axis's status once,
+    /// and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pic844_motor_init_reads_each_status_once() {
+        let selected = AtomicU8::new(0);
+        let (line, _io) = LineRig::new("c844InitLine", move |last| match last {
+            "*IDN?" => "C-844".into(),
+            c if c.ends_with("AXIS:STAT?") => {
+                selected.store(c.as_bytes()[5] - b'0', Ordering::SeqCst);
+                "ON".into()
+            }
+            "CURR:TPOS?" => match selected.load(Ordering::SeqCst) {
+                1 => "14".into(),
+                2 => "3".into(),
+                _ => "0".into(),
+            },
+            _ => "0".into(),
+        });
+        let sent = motor_init(
+            &line,
+            (pic844_setup_command(), vec![int(1), int(10)]),
+            (
+                pic844_config_command(),
+                vec![int(0), port("c844InitLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(
+            sent,
+            [
+                "*IDN?",
+                "AXIS 1;AXIS:STAT?",
+                "MOT:COND?",
+                "CURR:TPOS?",
+                "AXIS:POS?",
+                "AXIS 2;AXIS:STAT?",
+                "MOT:COND?",
+                "CURR:TPOS?",
+                "AXIS:POS?",
+                "AXIS 3;AXIS:STAT?",
+                "MOT:COND?",
+                "CURR:TPOS?",
+                "AXIS:POS?",
+                "AXIS 4;AXIS:STAT?",
+                "MOT:COND?",
+                "CURR:TPOS?",
+                "AXIS:POS?",
+            ]
+        );
+        assert_eq!(rmps("PIC844", 2).await, longs(&[14, 3]));
+    }
+
+    /// drvPIC848.cc:575-598: `motor_init` counts the stages, then per axis
+    /// asks `REF?` and reads the status once, and the record starts from
+    /// that read.
+    #[epics_rs::base::epics_test]
+    async fn pic848_motor_init_reads_each_status_after_its_ref() {
+        let (line, _io) = LineRig::new("c848InitLine", |last| match last {
+            "*IDN?" => "C-848".into(),
+            "CST? A" => "A=M-110".into(),
+            "CST? B" => "B=M-110".into(),
+            "CST? C" => "C=NOSTAGE".into(),
+            "STA? A" => "A=257".into(),
+            "STA? B" => "B=257".into(),
+            "POS? A" => "A=0.000014".into(),
+            "POS? B" => "B=0.000003".into(),
+            _ => "A=0".into(),
+        });
+        let sent = motor_init(
+            &line,
+            (pic848_setup_command(), vec![int(1), int(10)]),
+            (
+                pic848_config_command(),
+                vec![int(0), port("c848InitLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(
+            sent,
+            [
+                "*IDN?", "CST? A", "CST? B", "CST? C", "REF? A", "STA? A", "POS? A", "REF? B",
+                "STA? B", "POS? B"
+            ]
+        );
+        assert_eq!(rmps("PIC848", 2).await, longs(&[14, 3]));
+    }
+
+    /// drvPIE516.cc:619-648: `motor_init` reads each axis's status once,
+    /// past the position probe and VCO, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pie516_motor_init_reads_each_status_once() {
+        let (line, _io) = LineRig::new("e516InitLine", |last| match last {
+            "ONL?" | "SVO? A" | "SVO? B" => "1".into(),
+            "VER?" => "E-516".into(),
+            "ONT? A" | "ONT? B" | "OVF? A" | "OVF? B" => "0".into(),
+            "POS? A" => "0.014".into(),
+            "POS? B" => "0.003".into(),
+            _ => String::new(),
+        });
+        let sent = motor_init(
+            &line,
+            (pie516_setup_command(), vec![int(1), int(10)]),
+            (
+                pie516_config_command(),
+                vec![int(0), port("e516InitLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(
+            sent,
+            [
+                "ONL 1",
+                "ONL?",
+                "VER?",
+                "POS? A",
+                "POS? B",
+                "POS? C",
+                "VCO A1 B1 C1",
+                "ONL?",
+                "ONT? A",
+                "OVF? A",
+                "SVO? A",
+                "POS? A",
+                "ONL?",
+                "ONT? B",
+                "OVF? B",
+                "SVO? B",
+                "POS? B",
+            ]
+        );
+        assert_eq!(rmps("PIE516", 2).await, longs(&[14, 3]));
+    }
+
+    /// drvPIE517.cc:633-660: `motor_init` reads each axis's status once,
+    /// past the position probe, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pie517_motor_init_reads_each_status_once() {
+        let (line, _io) = LineRig::new("e517InitLine", |last| match last {
+            "SVO? 1" => "1=1".into(),
+            "SVO? 2" => "2=1".into(),
+            "ONT? 1" | "OVF? 1" => "1=0".into(),
+            "ONT? 2" | "OVF? 2" => "2=0".into(),
+            "POS? 1" => "1=0.014".into(),
+            "POS? 2" => "2=0.003".into(),
+            _ => String::new(),
+        });
+        let sent = motor_init(
+            &line,
+            (pie517_setup_command(), vec![int(1), int(10)]),
+            (
+                pie517_config_command(),
+                vec![int(0), port("e517InitLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(
+            sent,
+            [
+                "POS? 1", "POS? 2", "POS? 3", "ONT? 1", "OVF? 1", "SVO? 1", "POS? 1", "ONT? 2",
+                "OVF? 2", "SVO? 2", "POS? 2",
+            ]
+        );
+        assert_eq!(rmps("PIE517", 2).await, longs(&[14, 3]));
+    }
+
+    /// drvPIE710.cc:592-618: `motor_init` reads each axis's status once,
+    /// past the position probe, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pie710_motor_init_reads_each_status_once() {
+        let (line, _io) = LineRig::new("e710InitLine", |last| match last {
+            "GI" => "PI E-710 V5.000".into(),
+            "1GI8" | "2GI8" => "1 8 0".into(),
+            "1TP" => "0.0014".into(),
+            "2TP" => "0.0003".into(),
+            _ => String::new(),
+        });
+        let sent = motor_init(
+            &line,
+            (pie710_setup_command(), vec![int(1), int(10)]),
+            (
+                pie710_config_command(),
+                vec![int(0), port("e710InitLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(
+            sent,
+            ["GI", "1TP", "2TP", "3TP", "1GI8", "1TP", "2GI8", "2TP"]
+        );
+        assert_eq!(rmps("PIE710", 2).await, longs(&[14, 3]));
+    }
+
+    /// drvPIE816.cc:633-661: `motor_init` reads each axis's status once,
+    /// past the position probe, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pie816_motor_init_reads_each_status_once() {
+        let (line, _io) = LineRig::new("e816InitLine", |last| match last {
+            "*IDN?" => "E-816".into(),
+            "SVO? A" | "SVO? B" => "1".into(),
+            "ONT? A" | "ONT? B" | "OVF? A" | "OVF? B" => "0".into(),
+            "POS? A" => "0.0014".into(),
+            "POS? B" => "0.0003".into(),
+            _ => String::new(),
+        });
+        let sent = motor_init(
+            &line,
+            (pie816_setup_command(), vec![int(1), int(10)]),
+            (
+                pie816_config_command(),
+                vec![int(0), port("e816InitLine"), int(0)],
+            ),
+        )
+        .await;
+        assert_eq!(
+            sent,
+            [
+                "*IDN?", "POS? A", "POS? B", "POS? C", "ONT? A", "OVF? A", "SVO? A", "POS? A",
+                "ONT? B", "OVF? B", "SVO? B", "POS? B",
+            ]
+        );
+        assert_eq!(rmps("PIE816", 2).await, longs(&[14, 3]));
     }
 }

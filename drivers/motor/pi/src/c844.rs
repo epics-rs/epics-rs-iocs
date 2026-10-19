@@ -80,7 +80,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -243,15 +243,17 @@ pub struct PIC844Axis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIC844Axis {
-    /// Construct one axis, seeding the initial status (C `motor_init`'s
-    /// `set_status(card, motor_index)`). `signal` is 0-based; wire axis is
-    /// `signal + 1`. A failed initial poll is not an error.
+    /// Construct one axis and read its status, as C `motor_init`'s
+    /// `set_status(card, motor_index)` does (drvPIC844.cc:627). `signal` is
+    /// 0-based; wire axis is `signal + 1`.
     pub fn new(controller: Arc<Mutex<PIC844Controller>>, signal: u8) -> Self {
         let mut axis = Self {
-            controller: controller.clone(),
+            controller,
             n: signal + 1,
             failure: PollFailure::NONE,
             last_status: MotorStatus {
@@ -261,12 +263,9 @@ impl PIC844Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            init_status: None,
         };
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(polled) = ctrl.poll_status(signal) {
-            drop(ctrl);
-            axis.apply(polled);
-        }
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -328,6 +327,12 @@ impl PIC844Axis {
             vbas_supported: false,
             ..MotorStatus::default()
         };
+    }
+}
+
+impl Model1Motor for PIC844Axis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 

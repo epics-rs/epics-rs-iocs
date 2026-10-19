@@ -32,9 +32,10 @@
 //! ## Connect (`motor_init`)
 //! `*IDN?` (retry up to 3× until a non-empty reply → `brdptr->ident`). Then the
 //! axis count is discovered: `CST? {A..D}` until a reply whose body (`&buff[2]`)
-//! is `"NOSTAGE"`. For each present axis, `REF? {letter}` sets the
-//! `reference` flag (`&buff[2] == "0"` → `false`, else
-//! `true`), which governs `LOAD_POS`. Every axis has encoder + gain support.
+//! is `"NOSTAGE"`. Then for each present axis, ahead of its status,
+//! `REF? {letter}` sets the `reference` flag (`&buff[2] == "0"` → `false`,
+//! else `true`), which governs `LOAD_POS`. Every axis has encoder + gain
+//! support.
 //!
 //! ## Status
 //! Per axis, under one lock (C `set_status`):
@@ -93,7 +94,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -160,26 +161,25 @@ enum CommState {
 }
 
 /// Shared multi-axis controller endpoint: owns the octet handle, the probed
-/// axis count + per-axis reference flags, and the (controller-wide) comm
-/// debounce state.
+/// axis count, and the (controller-wide) comm debounce state.
 pub struct PIC848Controller {
     handle: SyncIOHandle,
     ident: String,
     comm_state: CommState,
-    /// Per-axis reference-switch flag (index = signal), from `REF?` at connect.
-    references: Vec<bool>,
+    /// Axes with a configured stage, from the `CST?` probe.
+    num_axes: u8,
 }
 
 impl PIC848Controller {
     /// Connect, identify, and probe a C-848 (C `motor_init`'s per-card block):
     /// `*IDN?` retried up to 3×, then `CST?` per axis to count stages
-    /// (stopping at `NOSTAGE`) and `REF?` per axis for the reference flag.
+    /// (stopping at `NOSTAGE`).
     pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
         let mut ctrl = Self {
             handle,
             ident: String::new(),
             comm_state: CommState::Normal,
-            references: Vec::new(),
+            num_axes: 0,
         };
 
         for _ in 0..3 {
@@ -200,9 +200,7 @@ impl PIC848Controller {
             if cst.get(2..) == Some("NOSTAGE") {
                 break;
             }
-            // REF? {letter} -> "{L}={0|1}"; body "0" => no reference switch.
-            let refr = ctrl.query(&format!("REF? {letter}"));
-            ctrl.references.push(refr.get(2..) != Some("0"));
+            ctrl.num_axes += 1;
         }
 
         Ok(ctrl)
@@ -215,13 +213,7 @@ impl PIC848Controller {
 
     /// Number of axes with a configured stage (probed via `CST?`).
     pub fn num_axes(&self) -> u8 {
-        self.references.len() as u8
-    }
-
-    /// Whether axis `signal` has a reference (home) switch (C
-    /// `cntrl->reference[signal]`).
-    fn reference(&self, signal: u8) -> bool {
-        self.references[signal as usize]
+        self.num_axes
     }
 
     /// Write a command, no reply expected (C `send_mess`). No terminator (port
@@ -321,22 +313,26 @@ pub struct PIC848Axis {
     /// C `no_motion_count`: polls the position sat still while a move was
     /// held; a MOTION command restarts it (motordrvCom.cc:435).
     no_motion_count: u32,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIC848Axis {
-    /// Construct axis `signal` (0-based; wire letter `A`+`signal`), seeding the
-    /// initial status (C `motor_init`'s `set_status`). A failed initial poll is
-    /// not an error.
+    /// Construct axis `signal` (0-based; wire letter `A`+`signal`): its `REF?`,
+    /// then its status, the per-axis order of C `motor_init`
+    /// (drvPIC848.cc:589-598).
     pub fn new(controller: Arc<Mutex<PIC848Controller>>, card: i32, signal: u8) -> Self {
+        let letter = axis_letter(signal);
+        // REF? {letter} -> "{L}={0|1}"; body "0" => no reference switch.
         let reference = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            ctrl.reference(signal)
+            ctrl.query(&format!("REF? {letter}")).get(2..) != Some("0")
         };
         let mut axis = Self {
-            controller: controller.clone(),
+            controller,
             card,
             signal,
-            letter: axis_letter(signal),
+            letter,
             reference,
             failure: PollFailure::NONE,
             last_status: MotorStatus {
@@ -347,12 +343,9 @@ impl PIC848Axis {
             },
             strings: MoveStrings::default(),
             no_motion_count: 0,
+            init_status: None,
         };
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(polled) = ctrl.poll_status(signal) {
-            drop(ctrl);
-            axis.apply(polled, false);
-        }
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -410,6 +403,12 @@ impl PIC848Axis {
             vbas_supported: false,
             ..MotorStatus::default()
         };
+    }
+}
+
+impl Model1Motor for PIC848Axis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 

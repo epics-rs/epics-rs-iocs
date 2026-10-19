@@ -95,7 +95,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -315,15 +315,16 @@ pub struct PIC663Axis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIC663Axis {
-    /// Construct the controller's one axis, seeding the initial status. A
-    /// failed initial poll is not an error — C leaves the zeroed defaults
-    /// in place either way.
+    /// Construct the controller's one axis and read its status, as C
+    /// `motor_init`'s `set_status` does (drvPIC663.cc:554).
     pub fn new(controller: Arc<Mutex<PIC663Controller>>) -> Self {
         let mut axis = Self {
-            controller: controller.clone(),
+            controller,
             high_limit: None,
             low_limit: None,
             failure: PollFailure::NONE,
@@ -334,11 +335,9 @@ impl PIC663Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            init_status: None,
         };
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(polled) = ctrl.poll_status() {
-            axis.last_status = status_from_polled(&polled);
-        }
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -358,6 +357,12 @@ impl PIC663Axis {
         }
         line.extend_from_slice(command.as_bytes());
         self.lock().send_bytes(&line)
+    }
+}
+
+impl Model1Motor for PIC663Axis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 
