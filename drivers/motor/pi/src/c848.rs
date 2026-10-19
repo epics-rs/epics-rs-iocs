@@ -430,8 +430,10 @@ impl AsynMotor for PIC848Axis {
         self.no_motion_count = 0;
         let line = self.move_line(&format!("MOV  {l}{:.5}", CFloat(position * POS_RES)));
         let ctrl = self.lock();
-        // SET_VELOCITY ("VEL  L {v}") then MOVE_ABS ("MOV  L{p}") — two writes.
-        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
+        // SET_VELOCITY ("VEL  L {v}") then MOVE_ABS ("MOV  L{p}") — two writes;
+        // motordrvCom sends each whatever the one before returned
+        // (motordrvCom.cc:397-484).
+        let _ = ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)));
         ctrl.send_bytes(&line)
     }
 
@@ -447,7 +449,7 @@ impl AsynMotor for PIC848Axis {
         self.no_motion_count = 0;
         let line = self.move_line(&format!("MVR  {l}{:+.5}", CFloat(distance * POS_RES)));
         let ctrl = self.lock();
-        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
+        let _ = ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)));
         ctrl.send_bytes(&line)
     }
 
@@ -477,7 +479,7 @@ impl AsynMotor for PIC848Axis {
         self.no_motion_count = 0;
         let line = self.move_line(&format!("REF  {l}"));
         let ctrl = self.lock();
-        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
+        let _ = ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)));
         ctrl.send_bytes(&line)
     }
 
@@ -509,7 +511,7 @@ impl AsynMotor for PIC848Axis {
         if enable {
             // Enabling while torque is disabled first clears the axis status.
             if !self.last_status.powered {
-                ctrl.send(&format!("CLR  {l}"))?;
+                let _ = ctrl.send(&format!("CLR  {l}"));
             }
             ctrl.send(&format!("SVO  {l}1"))
         } else {
@@ -651,20 +653,54 @@ mod tests {
     /// Axis A of a one-stage C-848 on a [`LineRig`] whose `STA? A` reply
     /// follows `sta`.
     fn strings_rig(name: &str) -> (LineRig, PIC848Axis, Arc<AtomicU32>) {
+        refusing_rig(name, |_| false)
+    }
+
+    /// [`strings_rig`] with each write `refused` picks recorded and refused.
+    fn refusing_rig(
+        name: &str,
+        refused: fn(&str) -> bool,
+    ) -> (LineRig, PIC848Axis, Arc<AtomicU32>) {
         let sta = Arc::new(AtomicU32::new(DONE));
         let st = sta.clone();
-        let (line, io) = LineRig::new(name, move |last| match last {
-            "*IDN?" => "C-848".into(),
-            "CST? A" => "A=M-110".into(),
-            "CST? B" => "B=NOSTAGE".into(),
-            "REF? A" => "A=0".into(),
-            "STA? A" => format!("A={}", st.load(Ordering::SeqCst)),
-            _ => "A=0".into(),
-        });
+        let (line, io) = LineRig::failing(
+            name,
+            move |last| match last {
+                "*IDN?" => "C-848".into(),
+                "CST? A" => "A=M-110".into(),
+                "CST? B" => "B=NOSTAGE".into(),
+                "REF? A" => "A=0".into(),
+                "STA? A" => format!("A={}", st.load(Ordering::SeqCst)),
+                _ => "A=0".into(),
+            },
+            refused,
+        );
         let ctrl = PIC848Controller::new(io).unwrap();
         let axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0);
         line.sent();
         (line, axis, sta)
+    }
+
+    /// devPIC848.cc:253-260, :326: the velocity, the CLR and the command are
+    /// each a message of their own, whose status C's motor task drops.
+    #[test]
+    fn a_refused_message_still_sends_the_ones_after_it() {
+        let (line, mut axis, _) = refusing_rig("c848Refused", |cmd| {
+            cmd.starts_with("VEL  A ") || cmd == "CLR  A" || cmd == "REF  A"
+        });
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 1.0, 0.0, 2.0, 0.0).unwrap();
+        axis.move_relative(&user, -1.0, 0.0, 2.0, 0.0).unwrap();
+        assert!(axis.home(&user, 0.0, 2.0, 0.0, true).is_err());
+        axis.last_status.powered = false;
+        axis.set_closed_loop(&user, true).unwrap();
+        let sent: Vec<String> = line.sent().iter().map(|c| c[..4].to_string()).collect();
+        assert_eq!(
+            sent,
+            [
+                "VEL ", "MOV ", "VEL ", "MVR ", "VEL ", "REF ", "CLR ", "SVO "
+            ]
+        );
     }
 
     fn post(text: &[u8]) -> PostMessage {

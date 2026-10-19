@@ -299,20 +299,16 @@ impl Mvp2001Axis {
     }
 
     /// Send the max-current, velocity and acceleration commands (C
-    /// `sendAccelAndVelocity`). Returns the computed speed parameter for reuse.
-    fn send_accel_and_velocity(
-        &self,
-        ctrl: &Mvp2001Controller,
-        accel: f64,
-        velocity: f64,
-    ) -> AsynResult<i32> {
+    /// `sendAccelAndVelocity`). Every caller overwrites the status C returns
+    /// with its own command's (MVP2001Driver.cpp:250-341), so none is
+    /// returned.
+    fn send_accel_and_velocity(&self, ctrl: &Mvp2001Controller, accel: f64, velocity: f64) {
         let n = self.axis_index;
-        ctrl.write_only(&format!("{n} ANO {}", ano_param(self.max_current_ma)))?;
+        let _ = ctrl.write_only(&format!("{n} ANO {}", ano_param(self.max_current_ma)));
         let sp = speed_param(self.sample_period, velocity);
-        ctrl.write_only(&format!("{n} SP {sp}"))?;
+        let _ = ctrl.write_only(&format!("{n} SP {sp}"));
         let ac = accel_param(self.sample_period, self.encoder_lines_per_rev, accel, sp);
-        ctrl.write_only(&format!("{n} AC {ac}"))?;
-        Ok(sp)
+        let _ = ctrl.write_only(&format!("{n} AC {ac}"));
     }
 }
 
@@ -333,8 +329,8 @@ impl AsynMotor for Mvp2001Axis {
     ) -> AsynResult<()> {
         let n = self.axis_index;
         let ctrl = self.lock();
-        self.send_accel_and_velocity(&ctrl, acceleration, velocity)?;
-        ctrl.write_only(&format!("{n} LA {}", nint(position)))?;
+        self.send_accel_and_velocity(&ctrl, acceleration, velocity);
+        let _ = ctrl.write_only(&format!("{n} LA {}", nint(position)));
         ctrl.write_only(&format!("{n} M"))
     }
 
@@ -348,8 +344,8 @@ impl AsynMotor for Mvp2001Axis {
     ) -> AsynResult<()> {
         let n = self.axis_index;
         let ctrl = self.lock();
-        self.send_accel_and_velocity(&ctrl, acceleration, velocity)?;
-        ctrl.write_only(&format!("{n} LR {}", nint(distance)))?;
+        self.send_accel_and_velocity(&ctrl, acceleration, velocity);
+        let _ = ctrl.write_only(&format!("{n} LR {}", nint(distance)));
         ctrl.write_only(&format!("{n} M"))
     }
 
@@ -372,7 +368,7 @@ impl AsynMotor for Mvp2001Axis {
         );
         let n = self.axis_index;
         let ctrl = self.lock();
-        self.send_accel_and_velocity(&ctrl, acceleration, velocity)?;
+        self.send_accel_and_velocity(&ctrl, acceleration, velocity);
         let sp = speed_param(self.sample_period, velocity);
         ctrl.write_only(&format!("{n} V {sp}"))
     }
@@ -405,8 +401,9 @@ impl AsynMotor for Mvp2001Axis {
         let n = self.axis_index;
         let ctrl = self.lock();
         if enable {
-            // An AB is needed before EN (EN fails if status ends in 8, not E).
-            ctrl.write_only(&format!("{n} AB"))?;
+            // An AB is needed before EN (EN fails if status ends in 8, not E);
+            // EN's status overwrites AB's (MVP2001Driver.cpp:408-429).
+            let _ = ctrl.write_only(&format!("{n} AB"));
             drop(ctrl);
             sleep(REPLY_DELAY);
             let ctrl = self.lock();
@@ -522,6 +519,43 @@ mod tests {
         assert!(left.gain_support && left.has_encoder, "{left:?}");
         // C's status_ starts at 0; only a good poll sets Done (:467).
         assert!(!left.done, "{left:?}");
+    }
+
+    /// C sets `status =` on each write and returns the last
+    /// (MVP2001Driver.cpp:250-341, :408-429): a refused setting still sends
+    /// the command after it.
+    #[test]
+    fn a_refused_setting_still_sends_the_command_after_it() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::failing(
+            "mvp2001Refused",
+            |_| String::new(),
+            |cmd| {
+                let cmd = cmd.trim_end();
+                cmd.contains(" ANO ") || cmd.contains(" LA ") || cmd == "1 AB" || cmd == "1 DI"
+            },
+        );
+        let controller = Arc::new(Mutex::new(Mvp2001Controller::new(io, 1)));
+        let mut axis = Mvp2001Axis::new(controller, "mvp2001Refused", 0, 512, 500, 1);
+        let user = AsynUser::default();
+        let sent = || -> Vec<String> {
+            rig.sent()
+                .iter()
+                .map(|c| c.trim_end().to_string())
+                .filter(|c| !c.contains(" ANO ") && !c.contains(" SP ") && !c.contains(" AC "))
+                .collect()
+        };
+        sent();
+        axis.move_absolute(&user, 10.0, 0.0, 100.0, 250.0).unwrap();
+        axis.move_relative(&user, 5.0, 0.0, 100.0, 250.0).unwrap();
+        axis.move_velocity(&user, 0.0, 100.0, 250.0).unwrap();
+        axis.set_closed_loop(&user, true).unwrap();
+        let v = format!("1 V {}", speed_param(DEFAULT_SAMPLE_PERIOD, 100.0));
+        assert_eq!(
+            sent(),
+            ["1 LA 10", "1 M", "1 LR 5", "1 M", &v, "1 AB", "1 EN"]
+        );
+        assert!(axis.set_closed_loop(&user, false).is_err());
     }
 
     #[test]

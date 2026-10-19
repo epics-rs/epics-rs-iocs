@@ -289,25 +289,26 @@ impl KohzuAxis {
     /// PREM ahead of `ASI` in one message that `write_parms` strcpy's `ASI`
     /// over, and the move's message replaces the motion node holding POST,
     /// so C sends neither (devSC800.cc:198-217, write_parms); not copied.
+    /// Each message goes out whatever the one before it returned, as
+    /// motordrvCom ignores `send_mess` (motordrvCom.cc:397-484).
     fn write_move(&mut self, command: &str) -> AsynResult<()> {
         let prem = self.strings.arm();
         let ctrl = self.lock();
         if !prem.is_empty() {
-            ctrl.command_bytes(&prem)?;
+            let _ = ctrl.command_bytes(&prem);
         }
-        self.program_speeds(&ctrl)?;
+        self.program_speeds(&ctrl);
         ctrl.command(command)?;
         Ok(())
     }
 
     /// Program the axis speeds (C `write_parms` → `ASI`).
-    fn program_speeds(&self, ctrl: &KohzuController) -> AsynResult<()> {
+    fn program_speeds(&self, ctrl: &KohzuController) {
         let s = self.speeds;
-        ctrl.command(&format!(
+        let _ = ctrl.command(&format!(
             "ASI{}/{}/{}/{}/{}/0/0/0/0/0/0/0/0/0",
             self.axis, s.base, s.slew, s.accel, s.accel
-        ))?;
-        Ok(())
+        ));
     }
 }
 
@@ -530,9 +531,19 @@ mod tests {
     /// An SC-200's axis 1 on a [`LineRig`] whose `STR` reply follows
     /// `state`.
     fn strings_rig(name: &str) -> (LineRig, KohzuAxis, Arc<AtomicU8>) {
+        refusing_rig(name, |_| false)
+    }
+
+    /// [`strings_rig`], with the commands `refused` picks, less their STX,
+    /// refused.
+    fn refusing_rig(
+        name: &str,
+        refused: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (LineRig, KohzuAxis, Arc<AtomicU8>) {
         let state = Arc::new(AtomicU8::new(0));
         let st = state.clone();
-        let (line, io) = LineRig::new(name, move |last| {
+        let refused = move |cmd: &str| refused(cmd.trim_start_matches('\u{2}').trim_end());
+        let reply = move |last: &str| {
             let bit = |b: u8| u8::from(st.load(Ordering::SeqCst) & b != 0);
             if bit(QUIET) == 1 {
                 return String::new();
@@ -549,7 +560,8 @@ mod tests {
                 "RSY1/21" => "C\tRSY1\t21\t0".into(),
                 c => format!("C\t{c}"),
             }
-        });
+        };
+        let (line, io) = LineRig::failing(name, reply, refused);
         let ctrl = KohzuController::new(io).unwrap();
         let axis = KohzuAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
@@ -613,6 +625,23 @@ mod tests {
         let (line, mut axis, _) = strings_rig("sc800Init");
         axis.primitive(&AsynUser::default(), b"COF1/0").unwrap();
         assert_eq!(sent(&line), ["COF1/0"]);
+    }
+
+    /// write_parms ends ASI's transaction and motordrvCom ignores what
+    /// send_mess returns (devSC800.cc:347-363, motordrvCom.cc:397-484): a
+    /// refused PREM or ASI still sends the move.
+    #[test]
+    fn a_refused_prem_or_asi_still_sends_the_move() {
+        let (line, mut axis, _) = refusing_rig("sc800Refused", |cmd| {
+            cmd == "COF1/0" || cmd.starts_with("ASI") || cmd == "ORG1/2/0/0/3/1"
+        });
+        let user = AsynUser::default();
+        let asi = "ASI1/10/100/9/9/0/0/0/0/0/0/0/0/0";
+        axis.set_move_strings(&user, b"COF1/0", None).unwrap();
+        axis.move_absolute(&user, 5.0, 10.0, 100.0, 1000.0).unwrap();
+        assert_eq!(sent(&line), ["COF1/0", asi, "APS1/2/0/0/5/0/0/1"]);
+        assert!(axis.home(&user, 10.0, 100.0, 1000.0, true).is_err());
+        assert_eq!(sent(&line), [asi, "ORG1/2/0/0/3/1"]);
     }
 
     /// devSC800.cc:198-217: PREM as its own command ahead of each move,

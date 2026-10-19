@@ -432,6 +432,9 @@ impl Lc400Axis {
 /// last, C ignoring the others.
 fn halt(ctrl: &Lc400Controller, ch: u32, wav: u32) -> AsynResult<()> {
     let _ = ctrl.write_single(ch + WAV_ACTIVE, 0);
+    // C writes its uninitialised `currentPos` when the read fails
+    // (LC400MotorDriver.cpp:679-680, :703-704); not copied, the write is
+    // skipped.
     if let Ok(current) = ctrl.read_single(ch + ST_DIGITAL_POS) {
         let _ = ctrl.write_single(wav, current);
     }
@@ -522,8 +525,9 @@ impl Lc400Controller {
         }
 
         self.write_single(ch + WAV_ACTIVE, 1)?;
-        // C spins until the table starts, forever when the read fails; a failed
-        // read ends the wait here.
+        // C spins until the table starts, forever when the start write or a
+        // read fails (LC400MotorDriver.cpp:797-805); either failure ends the
+        // wait here.
         while self.read_single(ch + WAV_INDEX)? == 0 {
             sleep(Duration::from_millis(10));
         }

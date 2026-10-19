@@ -502,6 +502,8 @@ impl Mcs2Axis {
     }
 
     /// Closed-loop move: set move mode, acceleration and velocity, then move.
+    /// C overwrites each write's status with the next one's
+    /// (smarActMCS2MotorDriver.cpp:363-374).
     fn move_closed_loop(
         &self,
         ctrl: &Mcs2Controller,
@@ -511,25 +513,26 @@ impl Mcs2Axis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let c = self.channel;
-        ctrl.write_only(&format!(":CHAN{c}:MMOD {}", if relative { 1 } else { 0 }))?;
-        ctrl.write_only(&format!(
+        let _ = ctrl.write_only(&format!(":CHAN{c}:MMOD {}", if relative { 1 } else { 0 }));
+        let _ = ctrl.write_only(&format!(
             ":CHAN{c}:ACC {:.6}",
             CFloat(acceleration * PULSES_PER_STEP)
-        ))?;
-        ctrl.write_only(&format!(
+        ));
+        let _ = ctrl.write_only(&format!(
             ":CHAN{c}:VEL {:.6}",
             CFloat(velocity * PULSES_PER_STEP)
-        ))?;
+        ));
         ctrl.write_only(&format!(":MOVE{c} {:.6}", CFloat(target * PULSES_PER_STEP)))
     }
 
     /// Open-loop step move: track the target in software and send the relative
-    /// delta unscaled (C `MMOD 4`). Locks the controller internally.
+    /// delta unscaled (C `MMOD 4`), `MOVE` sent whatever `MMOD` returned
+    /// (:390-394). Locks the controller internally.
     fn move_open_loop(&mut self, delta: f64) -> AsynResult<()> {
         let c = self.channel;
         self.tracked_position += delta;
         let ctrl = self.lock();
-        ctrl.write_only(&format!(":CHAN{c}:MMOD 4"))?;
+        let _ = ctrl.write_only(&format!(":CHAN{c}:MMOD 4"));
         ctrl.write_only(&format!(":MOVE{c} {:.6}", CFloat(delta)))
     }
 }
@@ -611,22 +614,24 @@ impl AsynMotor for Mcs2Axis {
         if !forward {
             ref_opt |= START_DIRECTION;
         }
+        // C overwrites each write's status with the next one's and returns
+        // REF's (smarActMCS2MotorDriver.cpp:411-427).
         let mut ctrl = self.lock();
-        ctrl.write_only(&format!(":CHAN{c}:REF:OPT {ref_opt}"))?;
+        let _ = ctrl.write_only(&format!(":CHAN{c}:REF:OPT {ref_opt}"));
         ctrl.clear_errors();
-        ctrl.write_only(&format!(
+        let _ = ctrl.write_only(&format!(
             ":CHAN{c}:ACC {:.6}",
             CFloat(acceleration * PULSES_PER_STEP)
-        ))?;
+        ));
         ctrl.clear_errors();
-        ctrl.write_only(&format!(
+        let _ = ctrl.write_only(&format!(
             ":CHAN{c}:VEL {:.6}",
             CFloat(velocity * PULSES_PER_STEP)
-        ))?;
+        ));
         ctrl.clear_errors();
-        ctrl.write_only(&format!(":REF{c}"))?;
+        let status = ctrl.write_only(&format!(":REF{c}"));
         ctrl.clear_errors();
-        Ok(())
+        status
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -747,6 +752,33 @@ mod tests {
                 "{want}: {sent:?}"
             );
         }
+    }
+
+    /// C overwrites each write's status with the next one's
+    /// (smarActMCS2MotorDriver.cpp:363-374, :390-394, :411-427), so a
+    /// refused setting still sends the command after it, and that command's
+    /// status is returned.
+    #[test]
+    fn a_refused_setting_still_sends_the_command_after_it() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::failing(
+            "mcs2Refused",
+            |_| String::new(),
+            |cmd| cmd.contains(":ACC") || cmd.contains(":MMOD 4") || cmd.contains(":REF0"),
+        );
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2Refused", 0));
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        let moved = |sent: Vec<String>| sent.iter().any(|c| c.starts_with(":MOVE0 "));
+        axis.has_encoder = true;
+        rig.sent();
+        axis.move_absolute(&user, 2.0, 0.0, 1.0, 1.0).unwrap();
+        assert!(moved(rig.sent()));
+        assert!(axis.home(&user, 0.0, 2.0, 3.0, true).is_err());
+        assert!(rig.sent().iter().any(|c| c.trim_end() == ":REF0"));
+        axis.has_encoder = false;
+        axis.move_relative(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        assert!(moved(rig.sent()));
     }
 
     /// smarActMCS2MotorDriver.cpp:303-328 ignores each report query's status

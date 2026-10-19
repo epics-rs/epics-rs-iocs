@@ -43,8 +43,8 @@ struct SpiiPlusAuxIo {
 
 impl SpiiPlusAuxIo {
     /// `writeBits`: all 32 bits with `OUT(chan)`, else each masked bit with
-    /// `OUT(chan).bit`. C keeps only the last bit's status; this reports
-    /// the first failure and still writes the other bits.
+    /// `OUT(chan).bit`, returning the last bit's status as C
+    /// (SPiiPlusAuxDriver.cpp:101-110).
     fn write_bits(&self, chan: i32, mask: u32, value: u32) -> AsynResult<()> {
         if mask == u32::MAX {
             return self.comm.write_read_ack(&format!("OUT({chan}) = {value}"));
@@ -52,10 +52,9 @@ impl SpiiPlusAuxIo {
         let mut result = Ok(());
         for bit in (0..MAX_BITS).filter(|bit| mask & 1 << bit != 0) {
             let on = u32::from(value & 1 << bit != 0);
-            let status = self
+            result = self
                 .comm
                 .write_read_ack(&format!("OUT({chan}).{bit} = {on}"));
-            result = result.and(status);
         }
         result
     }
@@ -332,5 +331,33 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(sent, ["AOUT(0) = 5", "OUT(0) = 1"]);
+    }
+
+    /// C `writeBits` returns the last bit's status (SPiiPlusAuxDriver.cpp:
+    /// 101-110), which `writeUInt32Digital` returns.
+    #[test]
+    fn a_masked_write_returns_the_last_bit_s_status() {
+        let line = crate::fake::line("spiiAuxBits");
+        config(&open_owner(), "spiiAuxBitsIo", "spiiAuxBits", 1, 1000.0).unwrap();
+        let port = PortManager::global()
+            .find_port_handle("spiiAuxBitsIo")
+            .unwrap();
+        let reason = port
+            .drv_user_create_blocking(&DrvUserRequest::new("DIGITAL_OUTPUT", 0))
+            .unwrap()
+            .reason;
+        let write = || {
+            let op = RequestOp::UInt32DigitalWrite {
+                value: 0b01,
+                mask: 0b11,
+            };
+            port.submit_blocking(op, AsynUser::new(reason))
+        };
+        line.lock().unwrap().refused.insert("OUT(0).0 = 1".into());
+        write().unwrap();
+        let sent = line.lock().unwrap().sent.clone();
+        assert!(sent.iter().any(|c| c == "OUT(0).1 = 0"), "{sent:?}");
+        line.lock().unwrap().refused.insert("OUT(0).1 = 0".into());
+        assert!(write().is_err());
     }
 }

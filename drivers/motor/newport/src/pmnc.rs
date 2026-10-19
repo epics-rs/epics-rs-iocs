@@ -460,7 +460,9 @@ impl PmncAxis {
     /// `[MIN_ACCEL, MAX_ACCEL]`; an 8753 additionally programs the minimum
     /// profile velocity (`MPV`) after parking `VEL` at max to dodge an
     /// out-of-range error. The record sends no SET_ACCEL for a zero rate
-    /// (motorRecord.cc:874, 940), so there is no `ACC` then.
+    /// (motorRecord.cc:874, 940), so there is no `ACC` then. Each message is
+    /// sent whatever the one before returned (motordrvCom.cc:397-484); the
+    /// last one's status is returned.
     fn send_speed(
         &self,
         ctrl: &PmncController,
@@ -473,36 +475,32 @@ impl PmncAxis {
         // The record writes SET_VELOCITY before SET_VEL_BASE, so on an 8753
         // C's VEL-at-max lands last and every move runs at 2000 steps/sec.
         // That C defect is not copied: the record's velocity goes last.
-        self.send_vel_base(ctrl, min_velocity)?;
-        ctrl.command(&format!("VEL A{d} {m}={vel}"))?;
+        self.send_vel_base(ctrl, min_velocity);
+        let status = ctrl.command(&format!("VEL A{d} {m}={vel}"));
         if acceleration > 0.0 {
             let accel = i64::from(nint(acceleration)).clamp(MIN_ACCEL, MAX_ACCEL);
-            ctrl.command(&format!("ACC A{d} {m}={accel}"))?;
+            return ctrl.command(&format!("ACC A{d} {m}={accel}")).map(drop);
         }
-        Ok(())
+        status.map(drop)
     }
 
     /// The record's SET_VEL_BASE: on an 8753, `VEL` parked at max then `MPV`;
     /// an 8751 sends nothing.
-    fn send_vel_base(&self, ctrl: &PmncController, min_velocity: f64) -> AsynResult<()> {
+    fn send_vel_base(&self, ctrl: &PmncController, min_velocity: f64) {
         if self.is_8753() {
             let (d, m) = (self.def.driver_num, self.def.motor_num);
             let mpv = nint(min_velocity)
                 .unsigned_abs()
                 .min((MAX_VELOCITY - 1) as u32) as i64;
-            ctrl.command(&format!("VEL A{d} {m}={MAX_VELOCITY}"))?;
-            ctrl.command(&format!("MPV A{d} {m}={mpv}"))?;
+            let _ = ctrl.command(&format!("VEL A{d} {m}={MAX_VELOCITY}"));
+            let _ = ctrl.command(&format!("MPV A{d} {m}={mpv}"));
         }
-        Ok(())
     }
 
     /// PREM as its own message ahead of the move's commands
-    /// (devPMNC87xx.cc:204-219).
-    fn send_prem(ctrl: &PmncController, prem: &[u8]) -> AsynResult<()> {
-        if !prem.is_empty() {
-            ctrl.command_bytes(prem)?;
-        }
-        Ok(())
+    /// (devPMNC87xx.cc:204-219); `None` when there is none to send.
+    fn send_prem(ctrl: &PmncController, prem: &[u8]) -> Option<AsynResult<()>> {
+        (!prem.is_empty()).then(|| ctrl.command_bytes(prem).map(drop))
     }
 }
 
@@ -536,18 +534,17 @@ impl AsynMotor for PmncAxis {
         let target = nint(position) as i64;
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        self.send_speed(&ctrl, min_velocity, velocity, acceleration)?;
-        Self::send_prem(&ctrl, &prem)?;
+        let _ = self.send_speed(&ctrl, min_velocity, velocity, acceleration);
+        let _ = Self::send_prem(&ctrl, &prem);
         if self.is_8753() {
             // Open loop: no absolute command — move relative to the
             // software-tracked position.
             let rel = target - self.position;
-            ctrl.command(&format!("REL A{d}={rel}"))?;
+            let _ = ctrl.command(&format!("REL A{d}={rel}"));
         } else {
-            ctrl.command(&format!("ABS A{d}={target}"))?;
+            let _ = ctrl.command(&format!("ABS A{d}={target}"));
         }
-        ctrl.command(&format!("GO A{d}"))?;
-        Ok(())
+        ctrl.command(&format!("GO A{d}")).map(drop)
     }
 
     fn move_relative(
@@ -562,11 +559,10 @@ impl AsynMotor for PmncAxis {
         let rel = nint(distance) as i64;
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        self.send_speed(&ctrl, min_velocity, velocity, acceleration)?;
-        Self::send_prem(&ctrl, &prem)?;
-        ctrl.command(&format!("REL A{d}={rel}"))?;
-        ctrl.command(&format!("GO A{d}"))?;
-        Ok(())
+        let _ = self.send_speed(&ctrl, min_velocity, velocity, acceleration);
+        let _ = Self::send_prem(&ctrl, &prem);
+        let _ = ctrl.command(&format!("REL A{d}={rel}"));
+        ctrl.command(&format!("GO A{d}")).map(drop)
     }
 
     fn move_velocity(
@@ -586,25 +582,24 @@ impl AsynMotor for PmncAxis {
         let ctrl = self.lock();
         // The record's SET_VEL_BASE and SET_ACCEL ahead of JOG
         // (motorRecord.cc:2140-2142).
-        self.send_vel_base(&ctrl, min_velocity)?;
-        ctrl.command(&format!("ACC A{d} {m}={accel}"))?;
-        Self::send_prem(&ctrl, &prem)?;
+        self.send_vel_base(&ctrl, min_velocity);
+        let _ = ctrl.command(&format!("ACC A{d} {m}={accel}"));
+        let _ = Self::send_prem(&ctrl, &prem);
         if self.is_8753() {
             // Native slew commands.
             if forward {
-                ctrl.command(&format!("FOR A{d}={velval}"))?;
+                let _ = ctrl.command(&format!("FOR A{d}={velval}"));
             } else {
-                ctrl.command(&format!("REV A{d}={velval}"))?;
+                let _ = ctrl.command(&format!("REV A{d}={velval}"));
             }
         } else {
             // 8751 slew does not report motion via FOR/REV, so C jogs with a
             // large relative move (kept bug-for-bug).
-            ctrl.command(&format!("VEL A{d} {m}={velval}"))?;
+            let _ = ctrl.command(&format!("VEL A{d} {m}={velval}"));
             let rel = if forward { 1_000_000 } else { -1_000_000 };
-            ctrl.command(&format!("REL A{d}={rel}"))?;
+            let _ = ctrl.command(&format!("REL A{d}={rel}"));
         }
-        ctrl.command(&format!("GO A{d}"))?;
-        Ok(())
+        ctrl.command(&format!("GO A{d}")).map(drop)
     }
 
     fn home(
@@ -622,8 +617,8 @@ impl AsynMotor for PmncAxis {
         // that sees the axis done.
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        self.send_speed(&ctrl, min_velocity, velocity, acceleration)?;
-        Self::send_prem(&ctrl, &prem)
+        let speed = self.send_speed(&ctrl, min_velocity, velocity, acceleration);
+        Self::send_prem(&ctrl, &prem).unwrap_or(speed)
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -641,15 +636,15 @@ impl AsynMotor for PmncAxis {
         if self.is_8753() {
             // Open loop: the controller position cannot be set, so C selects
             // the channel and redefines the software-tracked position.
-            ctrl.command(&format!("CHL A{d}={m}"))?;
+            let status = ctrl.command(&format!("CHL A{d}={m}"));
             drop(ctrl);
             self.position = value;
             self.encoder_position = value;
             self.last_reading = 0;
+            status.map(drop)
         } else {
-            ctrl.command(&format!("POS {d}={value}"))?;
+            ctrl.command(&format!("POS {d}={value}")).map(drop)
         }
-        Ok(())
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
@@ -825,8 +820,10 @@ impl AsynMotor for PmncAxis {
         // clear the controller's per-move position on the selected channel.
         if (done || ls_active) && self.is_8753() {
             self.last_reading = 0;
+            // C ignores the CHL's status and goes on to POST
+            // (drvPMNC87xx.cc:518-523).
             if select_motor == m {
-                ctrl.command(&format!("CHL A{d}={m}"))?;
+                let _ = ctrl.command(&format!("CHL A{d}={m}"));
             }
         }
         // drvPMNC87xx.cc:511-537; C ignores the exchange's status too.
@@ -982,6 +979,78 @@ mod tests {
                 "REV A0=100",
                 "GO A0"
             ]
+        );
+    }
+
+    /// motordrvCom sends each message of a transaction and ignores what
+    /// send_mess returns (motordrvCom.cc:397-484): a refused VEL or MPV
+    /// still sends the move, and LOAD_POS sets the 8753's position whatever
+    /// its CHL returned (devPMNC87xx.cc:255-261).
+    #[test]
+    fn a_refused_message_still_sends_the_ones_after_it() {
+        let (line, io) = LineRig::failing(
+            "pmncRefused",
+            |last| match last {
+                "VER" => "Version 1.6.0".into(),
+                "DRT" => "A0=1>".into(),
+                _ => ">".into(),
+            },
+            |last| ["VEL A0 1=2000", "MPV A0 1=50", "CHL A0=1"].contains(&last),
+        );
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(1);
+        line.sent();
+        let user = AsynUser::default();
+        axis.move_relative(&user, 5.0, 50.0, 100.0, 200.0).unwrap();
+        axis.move_velocity(&user, 50.0, -100.0, 200.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL A0 1=2000",
+                "MPV A0 1=50",
+                "VEL A0 1=100",
+                "ACC A0 1=200",
+                "REL A0=5",
+                "GO A0",
+                "VEL A0 1=2000",
+                "MPV A0 1=50",
+                "ACC A0 1=200",
+                "REV A0=100",
+                "GO A0"
+            ]
+        );
+        assert!(axis.set_position(&user, 7.0).is_err());
+        assert_eq!((axis.position, axis.encoder_position), (7, 7));
+    }
+
+    /// drvPMNC87xx.cc:518-534: a refused post-move CHL on the selected 8753
+    /// channel still sends POST.
+    #[test]
+    fn a_refused_post_move_chl_still_sends_post() {
+        let (line, io) = LineRig::failing(
+            "pmncChlPost",
+            |last| match last {
+                "VER" => "Version 1.6.0".into(),
+                "DRT" => "A0=1>".into(),
+                "CHL 0" => "1>".into(),
+                "STA 0" => format!("A0=0x{S8753_POWER_ON:02x}>"),
+                "POS 0" => "A0=0>".into(),
+                _ => ">".into(),
+            },
+            |last| last == "CHL A0=1",
+        );
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(1);
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"MOF A0")))
+            .unwrap();
+        axis.move_relative(&user, 5.0, 0.0, 100.0, 200.0).unwrap();
+        line.sent();
+        axis.poll(&user).unwrap();
+        let sent = line.sent();
+        assert!(
+            sent.ends_with(&["CHL A0=1".into(), "MOF A0".into()]),
+            "{sent:?}"
         );
     }
 

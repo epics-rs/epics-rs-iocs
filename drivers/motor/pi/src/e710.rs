@@ -518,7 +518,9 @@ impl AsynMotor for PIE710Axis {
         let label = self.label();
         let line = self.move_line(&ma_msg(label, position * POS_RES));
         let ctrl = self.lock();
-        ctrl.send(&sv_msg(label, velocity * POS_RES))?;
+        // motordrvCom sends each message whatever the one before returned
+        // (motordrvCom.cc:397-484).
+        let _ = ctrl.send(&sv_msg(label, velocity * POS_RES));
         ctrl.send_bytes(&line)
     }
 
@@ -533,7 +535,7 @@ impl AsynMotor for PIE710Axis {
         let label = self.label();
         let line = self.move_line(&mr_msg(label, distance * POS_RES));
         let ctrl = self.lock();
-        ctrl.send(&sv_msg(label, velocity * POS_RES))?;
+        let _ = ctrl.send(&sv_msg(label, velocity * POS_RES));
         ctrl.send_bytes(&line)
     }
 
@@ -561,7 +563,7 @@ impl AsynMotor for PIE710Axis {
         let label = self.label();
         let line = self.move_line(&substitute_axis("#GH,", label));
         let ctrl = self.lock();
-        ctrl.send(&sv_msg(label, velocity * POS_RES))?;
+        let _ = ctrl.send(&sv_msg(label, velocity * POS_RES));
         ctrl.send_bytes(&line)
     }
 
@@ -665,18 +667,44 @@ mod tests {
     /// Axis 1 of a one-axis E-710 on a [`LineRig`] whose `1GI8` reply
     /// follows `gi8`.
     fn rig(name: &str) -> (LineRig, PIE710Axis, Arc<AtomicU32>) {
+        refusing_rig(name, |_| false)
+    }
+
+    /// [`rig`] with each write `refused` picks recorded and refused.
+    fn refusing_rig(
+        name: &str,
+        refused: fn(&str) -> bool,
+    ) -> (LineRig, PIE710Axis, Arc<AtomicU32>) {
         let gi8 = Arc::new(AtomicU32::new(DONE));
         let g = gi8.clone();
-        let (line, io) = LineRig::new(name, move |last| match last {
-            "GI" => "PI E-710 V5.000".into(),
-            "1TP" => "0.0".into(),
-            "1GI8" => format!("A B {}", g.load(Ordering::SeqCst)),
-            _ => String::new(),
-        });
+        let (line, io) = LineRig::failing(
+            name,
+            move |last| match last {
+                "GI" => "PI E-710 V5.000".into(),
+                "1TP" => "0.0".into(),
+                "1GI8" => format!("A B {}", g.load(Ordering::SeqCst)),
+                _ => String::new(),
+            },
+            refused,
+        );
         let ctrl = PIE710Controller::new(io).unwrap();
         let axis = PIE710Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
         (line, axis, gi8)
+    }
+
+    /// The velocity and the command are each a message of their own, whose
+    /// status C's motor task drops.
+    #[test]
+    fn a_refused_velocity_still_sends_the_command() {
+        let (line, mut axis, _) =
+            refusing_rig("e710Refused", |cmd| cmd.starts_with("1SV") || cmd == "1GH,");
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 1.0, 0.0, 2.0, 0.0).unwrap();
+        axis.move_relative(&user, -1.0, 0.0, 2.0, 0.0).unwrap();
+        assert!(axis.home(&user, 0.0, 2.0, 0.0, true).is_err());
+        let sent: Vec<String> = line.sent().iter().map(|c| c[..3].to_string()).collect();
+        assert_eq!(sent, ["1SV", "1MA", "1SV", "1MR", "1SV", "1GH"]);
     }
 
     fn post(text: &[u8]) -> PostMessage {

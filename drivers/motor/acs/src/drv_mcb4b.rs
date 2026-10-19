@@ -64,37 +64,37 @@ impl DrvMcb4bAxis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `SET_VELOCITY`: `V` = 115200/velocity, 2..=255.
-    fn set_velocity(&self, ctrl: &Mcb4bController, velocity: f64) -> AsynResult<()> {
+    /// `SET_VELOCITY`: `V` = 115200/velocity, 2..=255. Like the messages
+    /// below, its status is dropped: motordrvCom sends each message of a
+    /// transaction whatever `send_mess` returned (motordrvCom.cc:397-484).
+    fn set_velocity(&self, ctrl: &Mcb4bController, velocity: f64) {
         let ival = nint((115200.0 / velocity).abs()).clamp(2, 255);
-        ctrl.command(&format!("#{:02}V={ival}", self.axis))?;
-        Ok(())
+        let _ = ctrl.command(&format!("#{:02}V={ival}", self.axis));
     }
 
     /// `SET_ACCEL`: ramp index `R` = 256 - 720000/accel, 1..=255.
-    fn set_accel(&self, ctrl: &Mcb4bController, acceleration: f64) -> AsynResult<()> {
+    fn set_accel(&self, ctrl: &Mcb4bController, acceleration: f64) {
         let ival = nint(256.0 - 720000.0 / acceleration).clamp(1, 255);
-        ctrl.command(&format!("#{:02}R={ival}", self.axis))?;
-        Ok(())
+        let _ = ctrl.command(&format!("#{:02}R={ival}", self.axis));
     }
 
     /// The PREM a MOVE_ABS, MOVE_REL, HOME or JOG sends as its own message
     /// ahead of the command, arming POST (devMCB4B.cc:200-216).
-    fn prem(&mut self, ctrl: &Mcb4bController) -> AsynResult<()> {
+    fn prem(&mut self, ctrl: &Mcb4bController) {
         let prem = self.strings.arm();
         if !prem.is_empty() {
-            ctrl.command_bytes(&prem)?;
+            let _ = ctrl.command_bytes(&prem);
         }
-        Ok(())
     }
 
-    /// The record's `SET_VELOCITY`, `SET_ACCEL`, then the motion command.
+    /// The record's `SET_VELOCITY`, `SET_ACCEL`, then the motion command,
+    /// whose status is returned.
     fn motion(&mut self, velocity: f64, acceleration: f64, cmd: String) -> AsynResult<()> {
         let controller = self.controller.clone();
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        self.set_velocity(&ctrl, velocity)?;
-        self.set_accel(&ctrl, acceleration)?;
-        self.prem(&ctrl)?;
+        self.set_velocity(&ctrl, velocity);
+        self.set_accel(&ctrl, acceleration);
+        self.prem(&ctrl);
         ctrl.command(&cmd)?;
         Ok(())
     }
@@ -153,10 +153,10 @@ impl AsynMotor for DrvMcb4bAxis {
         // C's second start_trans drops the POST armed on C=; it is kept here.
         let controller = self.controller.clone();
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        self.set_accel(&ctrl, acceleration)?;
-        self.prem(&ctrl)?;
+        self.set_accel(&ctrl, acceleration);
+        self.prem(&ctrl);
         let ival = nint((115200.0 / velocity).abs()).clamp(2, 65535);
-        ctrl.command(&format!("#{:02}C={ival}", self.axis))?;
+        let _ = ctrl.command(&format!("#{:02}C={ival}", self.axis));
         let sign = if velocity > 0.0 { '+' } else { '-' };
         ctrl.command(&format!("#{:02}M{sign}1000000", self.axis))?;
         Ok(())
@@ -271,14 +271,23 @@ mod tests {
 
     /// Axis 1 of a card on a [`LineRig`]; `X` reports moving while `moving`.
     fn rig(name: &str) -> (LineRig, DrvMcb4bAxis, Arc<AtomicBool>) {
+        refusing_rig(name, |_| false)
+    }
+
+    /// [`rig`], with the writes `refused` picks refused.
+    fn refusing_rig(
+        name: &str,
+        refused: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (LineRig, DrvMcb4bAxis, Arc<AtomicBool>) {
         let moving = Arc::new(AtomicBool::new(false));
         let m = moving.clone();
-        let (line, io) = LineRig::new(name, move |last| match last {
+        let reply = move |last: &str| match last {
             "#01X" => format!("#01X={}", u8::from(m.load(Ordering::SeqCst))),
             "#01E" => "#01E=00".into(),
             "#01P" => "#01P=+0".into(),
             _ => "OK".into(),
-        });
+        };
+        let (line, io) = LineRig::failing(name, reply, refused);
         let ctrl = Mcb4bController::new(io, MCB4B_NUM_AXES);
         let axis = DrvMcb4bAxis::new(Arc::new(Mutex::new(ctrl)), 1);
         line.sent();
@@ -316,6 +325,39 @@ mod tests {
         assert_eq!(line.sent(), ["#01X", "#01E", "#01P", "#01W=0"]);
         axis.poll(&user).unwrap();
         assert_eq!(line.sent(), ["#01X", "#01E", "#01P"]);
+    }
+
+    /// motordrvCom sends each message of a transaction and ignores what
+    /// send_mess returns (motordrvCom.cc:397-484): a refused V, R or PREM
+    /// still sends the command after it.
+    #[test]
+    fn a_refused_message_still_sends_the_ones_after_it() {
+        let (line, mut axis, _) = refusing_rig("mcb4bRefused", |cmd| {
+            cmd.starts_with("#01V=") || cmd.starts_with("#01R=") || cmd == "P" || cmd == "#01H-"
+        });
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"P", None).unwrap();
+        axis.move_absolute(&user, 100.0, 0.0, 1000.0, 1000.0)
+            .unwrap();
+        axis.set_move_strings(&user, b"P", None).unwrap();
+        axis.move_velocity(&user, 0.0, -1152.0, 1000.0).unwrap();
+        assert!(axis.home(&user, 0.0, 1000.0, 1000.0, false).is_err());
+        assert_eq!(
+            line.sent(),
+            [
+                "#01V=115",
+                "#01R=1",
+                "P",
+                "#01G+100",
+                "#01R=1",
+                "P",
+                "#01C=100",
+                "#01M-1000000",
+                "#01V=115",
+                "#01R=1",
+                "#01H-",
+            ]
+        );
     }
 
     #[test]

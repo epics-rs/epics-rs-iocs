@@ -374,7 +374,9 @@ impl AsynMotor for PmacAxis {
         let mut controller = lock(&self.controller);
         controller.clear_deferred(axis);
         if self.amp_enabled || self.fatal_following {
-            controller.abort_cs_motion(axis)?;
+            // C drops the CS abort's status and still sends the jog stop
+            // (pmacAxis.cpp:381-390).
+            let _ = controller.abort_cs_motion(axis);
             controller.command(&format!("#{axis} J/ M{axis}40=1"))
         } else {
             // Just set the in-position bit, so the record stops waiting.

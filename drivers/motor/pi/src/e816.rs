@@ -378,7 +378,9 @@ impl AsynMotor for PIE816Axis {
         let label = self.label();
         let line = self.move_line(&mov_cmd(label, position));
         let ctrl = self.lock();
-        ctrl.send(&vel_cmd(label, velocity * POS_RES))?;
+        // motordrvCom sends each message whatever the one before returned
+        // (motordrvCom.cc:397-484).
+        let _ = ctrl.send(&vel_cmd(label, velocity * POS_RES));
         ctrl.send_bytes(&line)
     }
 
@@ -393,7 +395,7 @@ impl AsynMotor for PIE816Axis {
         let label = self.label();
         let line = self.move_line(&mvr_cmd(label, distance));
         let ctrl = self.lock();
-        ctrl.send(&vel_cmd(label, velocity * POS_RES))?;
+        let _ = ctrl.send(&vel_cmd(label, velocity * POS_RES));
         ctrl.send_bytes(&line)
     }
 
@@ -511,20 +513,41 @@ mod tests {
     /// Axis A of a one-axis E-816 on a [`LineRig`] whose `ONT? A` reply
     /// follows `ont`.
     fn strings_rig(name: &str) -> (LineRig, PIE816Axis, Arc<AtomicU8>) {
+        refusing_rig(name, |_| false)
+    }
+
+    /// [`strings_rig`] with each write `refused` picks recorded and refused.
+    fn refusing_rig(name: &str, refused: fn(&str) -> bool) -> (LineRig, PIE816Axis, Arc<AtomicU8>) {
         let ont = Arc::new(AtomicU8::new(1));
         let o = ont.clone();
-        let (line, io) = LineRig::new(name, move |last| match last {
-            "*IDN?" => "E-816".into(),
-            "SVO? A" => "1".into(),
-            "POS? A" => "0.000".into(),
-            "ONT? A" => o.load(Ordering::SeqCst).to_string(),
-            "OVF? A" => "0".into(),
-            _ => String::new(),
-        });
+        let (line, io) = LineRig::failing(
+            name,
+            move |last| match last {
+                "*IDN?" => "E-816".into(),
+                "SVO? A" => "1".into(),
+                "POS? A" => "0.000".into(),
+                "ONT? A" => o.load(Ordering::SeqCst).to_string(),
+                "OVF? A" => "0".into(),
+                _ => String::new(),
+            },
+            refused,
+        );
         let ctrl = PIE816Controller::new(io).unwrap();
         let axis = PIE816Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
         (line, axis, ont)
+    }
+
+    /// The velocity and the move are each a message of their own, whose
+    /// status C's motor task drops.
+    #[test]
+    fn a_refused_velocity_still_sends_the_move() {
+        let (line, mut axis, _) = refusing_rig("e816Refused", |cmd| cmd.starts_with("VEL A"));
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 1.0, 0.0, 2.0, 0.0).unwrap();
+        axis.move_relative(&user, -1.0, 0.0, 2.0, 0.0).unwrap();
+        let sent: Vec<String> = line.sent().iter().map(|c| c[..3].to_string()).collect();
+        assert_eq!(sent, ["VEL", "MOV", "VEL", "MVR"]);
     }
 
     fn post(text: &[u8]) -> PostMessage {

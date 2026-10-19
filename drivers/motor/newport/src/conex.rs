@@ -577,15 +577,16 @@ impl ConexAxis {
     }
 
     /// C `AG_CONEXAxis::move` velocity/accel preamble (model-gated), in
-    /// steps times `stepSize_`.
+    /// steps times `stepSize_`, whose statuses the move overwrites
+    /// (AG_CONEX.cpp:322-342).
     fn send_accel_and_velocity(&self, acceleration: f64, velocity: f64) -> AsynResult<()> {
         let step = self.step()?;
         if self.model.supports_velocity() {
-            self.write(&cmd_set_acceleration(
+            let _ = self.write(&cmd_set_acceleration(
                 self.controller_id,
                 acceleration * step,
-            ))?;
-            self.write(&cmd_set_velocity(self.controller_id, velocity * step))?;
+            ));
+            let _ = self.write(&cmd_set_velocity(self.controller_id, velocity * step));
         }
         Ok(())
     }
@@ -653,20 +654,21 @@ impl AsynMotor for ConexAxis {
     ) -> AsynResult<()> {
         // C `home()`: reset to unreferenced state, then home. The blocking
         // sleeps mirror C `epicsThreadSleep` and run in the same blocking
-        // context as the driver's serial I/O.
-        self.write(&cmd_reset(self.controller_id))?;
+        // context as the driver's serial I/O. Each write's status is
+        // overwritten by the next one's (AG_CONEX.cpp:344-377).
+        let _ = self.write(&cmd_reset(self.controller_id));
         thread::sleep(Duration::from_secs(1));
 
         if self.model == ConexModel::Dl {
-            self.write(&cmd_dl_init(self.controller_id))?;
+            let _ = self.write(&cmd_dl_init(self.controller_id));
             thread::sleep(Duration::from_secs(5));
         }
 
         // CONEX-PP: set home velocity (unscaled, as C) and force minus-EOR
         // home type.
         if self.model == ConexModel::Pp {
-            self.write(&cmd_home_velocity(self.controller_id, velocity))?;
-            self.write(&cmd_home_type(self.controller_id, HOME_TYPE_MINUS_EOR))?;
+            let _ = self.write(&cmd_home_velocity(self.controller_id, velocity));
+            let _ = self.write(&cmd_home_type(self.controller_id, HOME_TYPE_MINUS_EOR));
         }
 
         self.write(&cmd_home(self.controller_id))
@@ -692,9 +694,10 @@ impl AsynMotor for ConexAxis {
             return Ok(());
         }
         let max = self.model.gain_max();
-        // C ignores getClosedLoop's status (AG_CONEX.cpp:442/459/476).
+        // C ignores getClosedLoop's and setClosedLoop's statuses and returns
+        // the gain write's (AG_CONEX.cpp:435-489).
         let was_closed = self.get_closed_loop().0.unwrap_or(false);
-        self.write(&cmd_set_closed_loop(self.controller_id, false))?;
+        let _ = self.write(&cmd_set_closed_loop(self.controller_id, false));
 
         let cmd = match kind {
             PidGainKind::Proportional => cmd_set_gain(self.controller_id, "KP", gain * max.kp),
@@ -709,12 +712,12 @@ impl AsynMotor for ConexAxis {
                 _ => return Ok(()),
             },
         };
-        self.write(&cmd)?;
+        let status = self.write(&cmd);
 
         if was_closed {
-            self.write(&cmd_set_closed_loop(self.controller_id, true))?;
+            let _ = self.write(&cmd_set_closed_loop(self.controller_id, true));
         }
-        Ok(())
+        status
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -837,6 +840,46 @@ mod tests {
             ]
         );
         assert_eq!(axis.poll(&user).unwrap().position, 25000.0);
+    }
+
+    /// C sets `status =` on each write and returns the last
+    /// (AG_CONEX.cpp:322-377); a gain write returns the gain's status, the
+    /// closed-loop writes around it unchecked (:435-450).
+    #[test]
+    fn a_refused_setting_still_sends_the_command_after_it() {
+        let (line, io) = LineRig::failing(
+            "conex_refused",
+            |last| {
+                match last {
+                    "1VE" => "1VE CONEX-CC 2.0",
+                    "1SU?" => "1SU0.0001",
+                    "1MM?" => "1MM33",
+                    _ => "",
+                }
+                .to_string()
+            },
+            |last| {
+                last.starts_with("1AC")
+                    || last.starts_with("1KP")
+                    || ["1RS", "1MM0"].contains(&last)
+            },
+        );
+        let mut axis = ConexAxis::new(io, 1, &MotorTrace::new("conex_refused", 0)).unwrap();
+        line.sent();
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 20000.0, 0.0, 5000.0, 10000.0)
+            .unwrap();
+        axis.home(&user, 0.0, 5000.0, 10000.0, true).unwrap();
+        assert_eq!(
+            line.sent(),
+            ["1AC1.000000", "1VA0.500000", "1PA2.000000", "1RS", "1OR"]
+        );
+        assert!(
+            axis.set_pid_gain(&user, PidGainKind::Proportional, 0.5)
+                .is_err()
+        );
+        let sent = line.sent();
+        assert_eq!(sent[1..], ["1MM0", sent[2].as_str(), "1MM1"], "{sent:?}");
     }
 
     /// AG_CONEX.cpp `writeCONEX`: the poll after a move waits out

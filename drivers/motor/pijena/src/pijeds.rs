@@ -267,28 +267,29 @@ impl PiJedsAxis {
 
     /// Send an absolute move to `position` (steps) after its slew velocity
     /// (C `SET_VELOCITY` + `MOVE_ABS`); the record sends SET_VELOCITY
-    /// whatever the rate.
+    /// whatever the rate. Each message goes out whatever the one before it
+    /// returned, as `send_mess` ignores the write (drvPIJEDS.cc:449-453).
     fn issue_move(&mut self, position: f64, velocity: f64) -> AsynResult<()> {
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        ctrl.write_cmd(&format!(
+        let _ = ctrl.write_cmd(&format!(
             "sr,{},{:.*}",
             self.axis,
             MAX_RES,
             velocity * DRIVE_RESOLUTION
-        ))?;
-        self.send_prem(&ctrl, &prem)?;
-        ctrl.write_cmd(&format!(
+        ));
+        let _ = self.send_prem(&ctrl, &prem);
+        let _ = ctrl.write_cmd(&format!(
             "set,{},{:.*}",
             self.axis,
             MAX_RES,
             position * DRIVE_RESOLUTION
-        ))?;
-        self.go(&ctrl)?;
+        ));
+        let status = self.go(&ctrl);
         drop(ctrl);
         self.moving = true;
         self.no_motion_count = 0;
-        Ok(())
+        status
     }
 }
 
@@ -346,7 +347,7 @@ impl AsynMotor for PiJedsAxis {
         // C JOG only sets the slew rate — the E-516 has no continuous jog.
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        self.send_prem(&ctrl, &prem)?;
+        let _ = self.send_prem(&ctrl, &prem);
         ctrl.write_cmd(&format!(
             "sr,{},{:.*}",
             self.axis,
@@ -369,13 +370,13 @@ impl AsynMotor for PiJedsAxis {
         // POST goes at the next poll that reports done.
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        ctrl.write_cmd(&format!(
+        let _ = ctrl.write_cmd(&format!(
             "sr,{},{:.*}",
             self.axis,
             MAX_RES,
             velocity * DRIVE_RESOLUTION
-        ))?;
-        self.send_prem(&ctrl, &prem)?;
+        ));
+        let _ = self.send_prem(&ctrl, &prem);
         self.go(&ctrl)
     }
 
@@ -630,6 +631,38 @@ mod tests {
         axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
         axis.home(&user, 0.0, 2000.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["sr,0,2.000", "cl,0,1", "stat,0"]);
+    }
+
+    /// drvPIJEDS.cc:449-453: `send_mess` ignores the write's status, so a
+    /// refused write leaves the ones after it going out; the last one's
+    /// status is returned.
+    #[test]
+    fn a_refused_write_still_sends_the_ones_after_it() {
+        let (line, io) = LineRig::failing(
+            "pijedsRefused",
+            |last| match last {
+                "" => "DSM V1.959".into(),
+                "mess,0" => "mess,0,0".into(),
+                "stat,0" => "stat,0,133".into(),
+                _ => "not present".into(),
+            },
+            |cmd| cmd.starts_with("sr,") || cmd.starts_with("cl,"),
+        );
+        let ctrl = PiJedsController::new(io).unwrap();
+        let mut axis = PiJedsAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
+        axis.move_absolute(&user, 1500.0, 0.0, 2000.0, 0.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            ["sr,0,2.000", "cl,0,1", "set,0,1.500", "stat,0"]
+        );
+        axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
+        axis.home(&user, 0.0, 2000.0, 0.0, true).unwrap();
+        assert_eq!(line.sent(), ["sr,0,2.000", "cl,0,1", "stat,0"]);
+        assert!(axis.set_closed_loop(&user, true).is_err());
+        assert_eq!(line.sent(), ["cl,0,1"]);
     }
 
     /// drvPIJEDS.cc:388-395: POST once the move settles, not while it runs,

@@ -349,11 +349,13 @@ impl SpiiPlusAxis {
             msg.push(b';');
         }
         msg.extend(body.as_bytes());
-        ctrl.command_bytes(&msg)?;
-        if buffer {
-            ctrl.command(start)?;
+        let sent = ctrl.command_bytes(&msg);
+        if !buffer {
+            return sent.map(drop);
         }
-        Ok(())
+        // GO's `start` is a message of its own, sent whatever the move's
+        // returned (devSPiiPlus.cc:256-266, motordrvCom.cc:397-484).
+        ctrl.command(start).map(drop)
     }
 }
 
@@ -677,11 +679,21 @@ mod tests {
 
     /// Axis 0 of a controller in `mode` on a [`LineRig`].
     fn rig(name: &str, mode: CommandMode) -> (LineRig, SpiiPlusAxis) {
-        let (line, io) = LineRig::new(name, |last| match last {
+        refusing_rig(name, mode, |_| false)
+    }
+
+    /// [`rig`], with the writes `refused` picks refused.
+    fn refusing_rig(
+        name: &str,
+        mode: CommandMode,
+        refused: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (LineRig, SpiiPlusAxis) {
+        let reply = |last: &str| match last {
             "?VR" => "ACS SPiiPlus".into(),
             "?APOS(0)" => "0".into(),
             _ => String::new(),
-        });
+        };
+        let (line, io) = LineRig::failing(name, reply, refused);
         let ctrl = SpiiPlusController::new(io, mode).unwrap();
         let axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
@@ -713,6 +725,30 @@ mod tests {
         assert_eq!(
             line.sent(),
             ["VEL0=100;ACC0=50;Done(0)=0;opReq(0)=4;", "start 0, 1"]
+        );
+    }
+
+    /// GO's `start` is a transaction of its own and motordrvCom ignores
+    /// what send_mess returns (devSPiiPlus.cc:256-266, motordrvCom.cc:
+    /// 397-484): a refused move message still sends the `start`.
+    #[test]
+    fn a_refused_move_message_still_sends_the_start() {
+        let (line, mut axis) = refusing_rig("spiiRefused", CommandMode::Buffer, |cmd| {
+            cmd.starts_with("VEL0=") || cmd == "start 0,1"
+        });
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 7.0, 0.0, 100.0, 0.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL0=100;Done(0)=0;target_pos(0)=7;opReq(0)=1;",
+                "start 0, 1"
+            ]
+        );
+        assert!(axis.move_velocity(&user, 0.0, 10.0, 0.0).is_err());
+        assert_eq!(
+            line.sent(),
+            ["ACC0=0;Done(0)=0;jog_vel(0)=10; opReq(0)=3;", "start 0,1"]
         );
     }
 

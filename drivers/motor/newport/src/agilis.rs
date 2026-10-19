@@ -261,15 +261,16 @@ impl AgUcController {
 
     /// C `setChannel`: unconditionally select `channel_id` via `CC` (the C
     /// driver issues even `CC0` when polling a UC2). Caller holds the lock.
-    fn set_channel(&self, channel_id: i32) -> AsynResult<()> {
-        self.write(&format!("CC{channel_id}"))
+    /// Both C callers drop its status (AG_UC.cpp:162, :350).
+    fn set_channel(&self, channel_id: i32) {
+        let _ = self.write(&format!("CC{channel_id}"));
     }
 
     /// C `writeAgilis(channelID, ..)`: select the channel first when non-zero,
     /// then write the channel-scoped command. Caller holds the lock.
     fn write_on_channel(&self, channel_id: i32, cmd: &str) -> AsynResult<()> {
         if channel_id != 0 {
-            self.set_channel(channel_id)?;
+            self.set_channel(channel_id);
         }
         self.write(cmd)
     }
@@ -470,7 +471,7 @@ impl AsynMotor for AgUcAxis {
 
         // Select this axis's channel (C issues CC unconditionally, incl. CC0
         // on a UC2).
-        ctrl.set_channel(self.channel_id)?;
+        ctrl.set_channel(self.channel_id);
 
         // Position (TP): accumulated step count at offset 3 ("1TP").
         let position = parse_int_at(&ctrl.write_read(&format!("{}TP", self.axis_id))?, 3)
@@ -594,6 +595,33 @@ mod tests {
         assert!(ph_limit(2, 3));
         assert!(!ph_limit(2, 1));
         assert!(!ph_limit(1, 0) && !ph_limit(2, 0));
+    }
+
+    /// writeAgilis and poll ignore what setChannel returns (AG_UC.cpp:162,
+    /// :350): a refused `CC` still sends the command and polls the axis.
+    #[test]
+    fn a_refused_channel_select_still_sends_the_command() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::failing(
+            "ag_uc_refused_cc",
+            |last| match last {
+                "VE" => "AG-UC8 v2.2.1".into(),
+                "1TP" => "1TP7".into(),
+                "1TS" => "1TS0".into(),
+                "PH" => "PH0".into(),
+                _ => String::new(),
+            },
+            |last| last == "CC1",
+        );
+        let controller = AgUcController::new(io, &MotorTrace::new("AG_UC_REFUSED_CC", 0));
+        let mut axis = AgUcAxis::new(Arc::new(Mutex::new(controller)), 0, true, 50, -50);
+        line.sent();
+        let user = AsynUser::new(0);
+        axis.move_relative(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["CC1", "1PR5"]);
+        let status = axis.poll(&user).unwrap();
+        assert_eq!(status.position, 7.0);
+        assert_eq!(line.sent(), ["CC1", "1TP", "1TS", "PH"]);
     }
 
     /// AG_UC.cpp:71-74 prints `inString_` before testing the `VE` status,

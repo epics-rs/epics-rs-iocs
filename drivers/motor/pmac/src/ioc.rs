@@ -1310,6 +1310,27 @@ mod tests {
         assert!(status.powered && !status.problem);
     }
 
+    /// pmacAxis.cpp:383-391: `stop` drops the CS abort's status and sends
+    /// the jog-stop.
+    #[test]
+    fn a_refused_cs_abort_still_stops_the_axis() {
+        let (_rt, rig) = publish_scripted("pmacStopAbort");
+        rig.answer("#1 ? F P", b"882000000001\r0\r100.0\r");
+        rig.answer("#1 J/ M140=1", b"\r");
+        rig.refuse("&2A");
+        let mut controller = controller_on("pmacStopAbort");
+        let groups = controller.cs_groups_mut();
+        groups.add_group(1, "test");
+        groups.add_axis(1, 1, "X", 2).unwrap();
+        groups.select(1);
+        let mut axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
+        let user = AsynUser::new(0).with_addr(1);
+        assert!(axis.poll(&user).unwrap().powered);
+        rig.written();
+        axis.stop(&user, 0.0).unwrap();
+        assert_eq!(rig.written(), ["#1 J/ M140=1"]);
+    }
+
     /// pmacAsynCoord.c:532-543: home and jog print their refusal on the
     /// coordinate system's trace.
     #[test]
