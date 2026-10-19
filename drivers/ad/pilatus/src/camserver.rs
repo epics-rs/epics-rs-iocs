@@ -477,6 +477,15 @@ mod tests {
                 start: Arc::new(Event::new()),
                 stop: stop.clone(),
                 shared: Arc::new(parking_lot::Mutex::new(Shared::default())),
+                cam: Arc::new(
+                    epics_rs::asyn::sync_io::SyncIOHandle::connect_port(
+                        "PILATUS_NO_CAM",
+                        0,
+                        std::time::Duration::ZERO,
+                        epics_rs::asyn::interfaces::InterfaceType::Octet,
+                    )
+                    .0,
+                ),
             },
         )
         .unwrap();
@@ -590,6 +599,15 @@ mod tests {
                 start: Arc::new(Event::new()),
                 stop: stop.clone(),
                 shared: Arc::new(parking_lot::Mutex::new(Shared::default())),
+                cam: Arc::new(
+                    epics_rs::asyn::sync_io::SyncIOHandle::connect_port(
+                        "PILATUS_NO_CAM",
+                        0,
+                        std::time::Duration::ZERO,
+                        epics_rs::asyn::interfaces::InterfaceType::Octet,
+                    )
+                    .0,
+                ),
             },
         )
         .unwrap();

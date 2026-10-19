@@ -1,9 +1,8 @@
 //! The two Pilatus worker threads.
 //!
-//! * `PilatusCmdTask` executes everything C does inline in `writeInt32` /
-//!   `writeFloat64` / `writeOctet` (`setAcquireParams`, `setThreshold`,
-//!   `resetModulePower`, `pilatusStatus`, the `mxsettings` writes, `imgpath`,
-//!   the bad-pixel / flat-field file reads and the abort sequence).
+//! * `PilatusCmdTask` executes the rest of what C does inline in `writeInt32`
+//!   / `writeFloat64` / `writeOctet` (the `mxsettings` writes, `imgpath`, the
+//!   bad-pixel / flat-field file reads and the abort sequence).
 //! * `PilatusDetTask` is C's `pilatusTask` acquisition state machine.
 //!
 //! Both talk to camserver directly, exactly as C's port thread and
@@ -31,18 +30,10 @@ use crate::image::{
     apply_flat_field, apply_flat_field_floor, correct_bad_pixels, decode_tiff, flat_field_average,
     parse_bad_pixel_file,
 };
-use crate::protocol::{
-    cmd_delay, cmd_expperiod, cmd_exptime, cmd_gapfill, cmd_nexpframe, cmd_nimages,
-    parse_tau_cutoff,
-};
-use crate::protocol::{
-    cmd_exposure, cmd_header_string, cmd_imgpath, cmd_mx_f64, cmd_reset_module_power,
-    cmd_set_threshold, gain_index, parse_energy_setting, parse_threshold_ev, parse_version,
-    thread_channel_values,
-};
+use crate::protocol::{cmd_exposure, cmd_header_string, cmd_imgpath, cmd_mx_f64};
 use crate::types::{
-    BadPixel, CAMSERVER_ACQUIRE_TIMEOUT, CAMSERVER_DEFAULT_TIMEOUT, CAMSERVER_RESET_POWER_TIMEOUT,
-    Event, FILE_READ_DELAY, MAX_FILENAME_LEN, MAX_HEADER_STRING_LEN, TriggerMode, secs,
+    BadPixel, CAMSERVER_ACQUIRE_TIMEOUT, CAMSERVER_DEFAULT_TIMEOUT, Event, FILE_READ_DELAY,
+    MAX_FILENAME_LEN, MAX_HEADER_STRING_LEN, TriggerMode, secs,
 };
 
 /// Work that C performs synchronously inside an asyn `write*` callback. A Rust
@@ -50,14 +41,6 @@ use crate::types::{
 /// port, so the actor enqueues these instead.
 #[derive(Debug)]
 pub enum Cmd {
-    /// C `setAcquireParams()`.
-    SetAcquireParams,
-    /// C `setThreshold()`.
-    SetThreshold,
-    /// C `resetModulePower()`.
-    ResetModulePower,
-    /// C `pilatusStatus()`.
-    ReadStatus,
     /// C's `ADAcquire == 0` branch: `camcmd k`, `K`, sleep 2 s.
     AbortAcquire,
     /// C's `NDFilePath` branch: `imgpath <path>` then `checkPath()`.
@@ -106,22 +89,8 @@ pub(crate) fn start_cmd_task(
 }
 
 async fn cmd_loop(mut w: Worker, mut rx: rt::CommandReceiver<Cmd>) {
-    // C keeps these as driver members but only `pilatusStatus` /
-    // `resetModulePower` — both on this thread — ever touch them.
-    let mut first_status_call = true;
-    let mut version = (0i32, 0i32, 0i32);
-
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            Cmd::SetAcquireParams => {
-                set_acquire_params(&mut w.ctx).await;
-                w.ctx.callbacks().await;
-            }
-            Cmd::SetThreshold => set_threshold(&mut w).await,
-            Cmd::ResetModulePower => reset_module_power(&mut w, version).await,
-            Cmd::ReadStatus => {
-                pilatus_status(&mut w.ctx, &mut first_status_call, &mut version).await
-            }
             Cmd::AbortAcquire => {
                 w.ctx.cam_write_read("camcmd k", CAMSERVER_DEFAULT_TIMEOUT);
                 w.ctx.cam_write("K", CAMSERVER_DEFAULT_TIMEOUT);
@@ -145,205 +114,6 @@ async fn cmd_loop(mut w: Worker, mut rx: rt::CommandReceiver<Cmd>) {
             }
         }
     }
-}
-
-/// C `setAcquireParams()`.
-async fn set_acquire_params(ctx: &mut Ctx) {
-    let trigger_mode = ctx
-        .get_i32(ctx.ad.trigger_mode)
-        .await
-        .unwrap_or(TriggerMode::Internal as i32);
-    // When we change modes download all exposure parameters, since some modes
-    // replace values with new parameters.
-    if trigger_mode == TriggerMode::Alignment as i32 {
-        ctx.set_i32(ctx.ad.num_images, 1);
-    }
-
-    let mut ival = ctx.get_i32(ctx.ad.num_images).await.unwrap_or(0);
-    if ival < 1 {
-        ival = 1;
-        ctx.set_i32(ctx.ad.num_images, ival);
-    }
-    ctx.cam_write_read(&cmd_nimages(ival), CAMSERVER_DEFAULT_TIMEOUT);
-
-    let mut ival = ctx.get_i32(ctx.ad.num_exposures).await.unwrap_or(0);
-    if ival < 1 {
-        ival = 1;
-        ctx.set_i32(ctx.ad.num_exposures, ival);
-    }
-    ctx.cam_write_read(&cmd_nexpframe(ival), CAMSERVER_DEFAULT_TIMEOUT);
-
-    let mut dval = ctx.get_f64(ctx.ad.acquire_time).await.unwrap_or(-1.0);
-    if dval < 0.0 {
-        dval = 1.0;
-        ctx.set_f64(ctx.ad.acquire_time, dval);
-    }
-    ctx.cam_write_read(&cmd_exptime(dval), CAMSERVER_DEFAULT_TIMEOUT);
-
-    let mut dval = ctx.get_f64(ctx.ad.acquire_period).await.unwrap_or(-1.0);
-    if dval < 0.0 {
-        dval = 2.0;
-        ctx.set_f64(ctx.ad.acquire_period, dval);
-    }
-    ctx.cam_write_read(&cmd_expperiod(dval), CAMSERVER_DEFAULT_TIMEOUT);
-
-    let mut dval = ctx.get_f64(ctx.p.delay_time).await.unwrap_or(-1.0);
-    if dval < 0.0 {
-        dval = 0.0;
-        ctx.set_f64(ctx.p.delay_time, dval);
-    }
-    ctx.cam_write_read(&cmd_delay(dval), CAMSERVER_DEFAULT_TIMEOUT);
-
-    let mut ival = ctx.get_i32(ctx.p.gap_fill).await.unwrap_or(-2);
-    if !(-2..=0).contains(&ival) {
-        ival = -2;
-        ctx.set_i32(ctx.p.gap_fill, ival);
-    }
-    // -2 means GapFill is not supported (single-element detector).
-    if ival != -2 {
-        ctx.cam_write_read(&cmd_gapfill(ival), CAMSERVER_DEFAULT_TIMEOUT);
-    }
-
-    // Read back the pixel count-rate cut-off.
-    let status = ctx.cam_write_read("Tau", 5.0);
-    if status == AsynStatus::Success
-        && let Some(cutoff) = parse_tau_cutoff(ctx.from())
-    {
-        ctx.set_i32(ctx.p.pixel_cutoff, cutoff);
-    }
-}
-
-/// C `setThreshold()`.
-async fn set_threshold(w: &mut Worker) {
-    let ctx = &mut w.ctx;
-    let dgain = ctx.get_f64(ctx.ad.gain).await.unwrap_or(0.0);
-    let igain = gain_index(dgain);
-    let (threshold, mut energy) = {
-        let s = w.shared.lock();
-        (s.demanded_threshold, s.demanded_energy)
-    };
-    if energy == 0.0 {
-        energy = threshold * 2.0;
-    }
-    let cmd = cmd_set_threshold(energy, igain, threshold);
-
-    // Set the status to waiting so we can be notified when it has finished.
-    ctx.set_i32(ctx.ad.status, ADStatus::Waiting as i32);
-    ctx.set_str(ctx.ad.status_message, "Setting threshold");
-    ctx.callbacks().await;
-
-    // This command can take 96 seconds on a 6M.
-    let status = ctx.cam_write_read(&cmd, 110.0);
-    let new_status = if status != AsynStatus::Success {
-        ADStatus::Error
-    } else {
-        ADStatus::Idle
-    };
-    ctx.set_i32(ctx.ad.status, new_status as i32);
-    ctx.set_i32(ctx.p.threshold_apply, 0);
-
-    // Read back the actual threshold setting, in case we are out of bounds.
-    let status = ctx.cam_write_read("SetThreshold", 5.0);
-    if status == AsynStatus::Success
-        && let Some(ev) = parse_threshold_ev(ctx.from())
-    {
-        ctx.set_f64(ctx.p.threshold, ev as f64 / 1000.0);
-    }
-
-    // Read back the actual energy setting.
-    let status = ctx.cam_write_read("SetEnergy", 5.0);
-    if status == AsynStatus::Success {
-        let ev = parse_energy_setting(ctx.from());
-        ctx.set_f64(ctx.p.energy, ev as f64 / 1000.0);
-    }
-
-    // SetThreshold resets nimages and gapfill, so re-send the acquisition
-    // parameters.
-    set_acquire_params(ctx).await;
-    ctx.callbacks().await;
-}
-
-/// C `resetModulePower()`.
-async fn reset_module_power(w: &mut Worker, version: (i32, i32, i32)) {
-    let (major, minor, patch) = version;
-    // This command only exists on camserver 7.9.0 and higher.
-    if major < 7 || (major == 7 && minor < 9) {
-        w.ctx.trace(
-            TraceMask::ERROR,
-            &format!(
-                "pilatusDetector::resetModulePower ResetModulePower not supported on \
-                 version {major}.{minor}.{patch} of camserver\n"
-            ),
-        );
-        return;
-    }
-    let reason = w.ctx.ad.status_message;
-    w.ctx.set_str(reason, "Resetting module power");
-    w.ctx.callbacks().await;
-    let reset_time = w.ctx.get_i32(w.ctx.p.reset_power_time).await.unwrap_or(0);
-    w.ctx.cam_write_read(
-        &cmd_reset_module_power(reset_time),
-        CAMSERVER_RESET_POWER_TIMEOUT + reset_time as f64,
-    );
-    // The threshold must be set after resetting module power.
-    set_threshold(w).await;
-}
-
-/// C `pilatusStatus()`.
-async fn pilatus_status(
-    ctx: &mut Ctx,
-    first_status_call: &mut bool,
-    version: &mut (i32, i32, i32),
-) {
-    if *first_status_call {
-        let status = ctx.cam_write_read("version", 1.0);
-        if status == AsynStatus::Success {
-            if let Some(v) = parse_version(ctx.from()) {
-                ctx.set_str(ctx.p.tvx_version, v.version_string.clone());
-                ctx.set_str(ctx.ad.base.sdk_version, v.version_string);
-                if let Some(x) = v.major {
-                    version.0 = x;
-                }
-                if let Some(x) = v.minor {
-                    version.1 = x;
-                }
-                if let Some(x) = v.patch {
-                    version.2 = x;
-                }
-            }
-            ctx.set_i32(ctx.ad.status, ADStatus::Idle as i32);
-        } else {
-            ctx.set_i32(ctx.ad.status, ADStatus::Error as i32);
-        }
-        *first_status_call = false;
-    }
-
-    let status = ctx.cam_write_read("thread", 1.0);
-    if status == AsynStatus::Success {
-        // Fixed (upstream-c-defects.md #12): resolve each channel independently
-        // so a partial reply for one channel never leaks another channel's
-        // value (C shared one `temp` / `humid` pair across all channels).
-        let reply = ctx.from().to_string();
-
-        if let Some((temp, humid)) = thread_channel_values(&reply, 0) {
-            ctx.set_f64(ctx.p.th_temp_0, temp);
-            ctx.set_f64(ctx.p.th_humid_0, humid);
-            ctx.set_f64(ctx.ad.temperature, temp);
-        }
-        if let Some((temp, humid)) = thread_channel_values(&reply, 1) {
-            ctx.set_f64(ctx.p.th_temp_1, temp);
-            ctx.set_f64(ctx.p.th_humid_1, humid);
-        }
-        if let Some((temp, humid)) = thread_channel_values(&reply, 2) {
-            ctx.set_f64(ctx.p.th_temp_2, temp);
-            ctx.set_f64(ctx.p.th_humid_2, humid);
-        }
-        // Channel 3 handling removed as fixed defect #10 — the `thread` reply
-        // defines only channels 0-2 and there is no channel-3 parameter.
-    } else {
-        ctx.set_i32(ctx.ad.status, ADStatus::Error as i32);
-    }
-    ctx.callbacks().await;
 }
 
 /// C `readBadPixelFile()`.
@@ -1081,6 +851,15 @@ mod tests {
                 start: Arc::new(Event::new()),
                 stop: stop.clone(),
                 shared: shared.clone(),
+                cam: Arc::new(
+                    epics_rs::asyn::sync_io::SyncIOHandle::connect_port(
+                        "PILATUS_NO_CAM",
+                        0,
+                        std::time::Duration::ZERO,
+                        epics_rs::asyn::interfaces::InterfaceType::Octet,
+                    )
+                    .0,
+                ),
             },
         )
         .unwrap();
@@ -1159,6 +938,15 @@ mod tests {
                 start: Arc::new(Event::new()),
                 stop: stop.clone(),
                 shared: shared.clone(),
+                cam: Arc::new(
+                    epics_rs::asyn::sync_io::SyncIOHandle::connect_port(
+                        "PILATUS_NO_CAM",
+                        0,
+                        std::time::Duration::ZERO,
+                        epics_rs::asyn::interfaces::InterfaceType::Octet,
+                    )
+                    .0,
+                ),
             },
         )
         .unwrap();

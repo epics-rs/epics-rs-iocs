@@ -57,6 +57,7 @@ pub mod driver;
 pub mod file_name;
 pub mod image;
 pub mod params;
+pub mod port_thread;
 pub mod protocol;
 pub mod task;
 pub mod types;
