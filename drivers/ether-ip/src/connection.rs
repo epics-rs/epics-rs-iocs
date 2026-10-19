@@ -9,7 +9,7 @@
 //! module is the only part that touches a socket.
 
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::cip::{self, CipClass, CipType, ParsedTag};
@@ -60,6 +60,8 @@ pub struct IdentityInfo {
 
 pub struct Connection {
     stream: TcpStream,
+    /// C's `millisec_timeout`: the connect's wait and each read's.
+    timeout: Duration,
     session: u32,
     slot: u8,
     buffer_limit: usize,
@@ -84,17 +86,23 @@ impl Connection {
             return Err(EipError::Resolve(host.to_string()));
         };
 
-        let stream = TcpStream::connect_timeout(&addr, timeout).inspect_err(|_| {
+        let stream = connect(&addr, timeout).inspect_err(|_| {
             crate::eip_printf!(3, "EIP cannot connect to {host}:{port}\n");
         })?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
+        // C's send has no timeout; each wait for reply bytes has, and a 0
+        // one is a poll (ether_ip.c:2176-2178).
+        if timeout.is_zero() {
+            stream.set_nonblocking(true)?;
+        } else {
+            stream.set_read_timeout(Some(timeout))?;
+        }
         stream.set_nodelay(true).inspect_err(|_| {
             crate::eip_printf!(2, "EIP cannot set socket option to TCP_NODELAY\n");
         })?;
 
         let mut c = Connection {
             stream,
+            timeout,
             session: 0,
             slot,
             buffer_limit,
@@ -142,11 +150,7 @@ impl Connection {
         #[cfg(not(unix))]
         let sock = 0;
         let (limit, ms) = c.map_or((buffer_limit, timeout_ms), |c| {
-            let ms = c.stream.read_timeout().ok().flatten();
-            (
-                c.buffer_limit,
-                ms.map_or(timeout_ms, |d| d.as_millis() as u32),
-            )
+            (c.buffer_limit, c.timeout.as_millis() as u32)
         });
         println!("EIPConnection:");
         println!("    SOCKET          : {sock}");
@@ -753,6 +757,30 @@ fn command_name(command: u16) -> &'static str {
     }
 }
 
+/// C's connectWithTimeout. A 0 timeout is its `poll(..., 0)`: the connect
+/// must be complete when checked, as a loopback one is.
+fn connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    if !timeout.is_zero() {
+        // C defect, not copied: connectWithTimeout polls `tv_sec*1000` ms
+        // (ether_ip.c:2010), so a sub-second EIP_timeout does not wait.
+        return TcpStream::connect_timeout(addr, timeout);
+    }
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(
+        Domain::for_address(*addr),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    socket.set_nonblocking(true)?;
+    // EINPROGRESS or not, it is connected exactly when it has a peer.
+    let _ = socket.connect(&(*addr).into());
+    if let Some(e) = socket.take_error()? {
+        return Err(e);
+    }
+    socket.peer_addr()?;
+    Ok(socket.into())
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
         if self.session != 0 {
@@ -764,5 +792,38 @@ impl Drop for Connection {
             let msg = encap::encode_unregister_session(self.session, TransactionId::generate());
             let _ = self.stream.write_all(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 0 EIP_timeout: C's loopback connect is complete at its zero poll,
+    /// its ListServices goes out, and the reply it does not wait for fails
+    /// the startup.
+    #[test]
+    fn a_zero_timeout_connects_and_polls_for_the_reply() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let plc = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut header = [0u8; encap::HEADER_SIZE];
+            s.read_exact(&mut header).unwrap();
+            // Open until joined, so the poll finds no data rather than EOF.
+            (u16::from_le_bytes([header[0], header[1]]), s)
+        });
+        let started = Connection::startup(
+            "127.0.0.1",
+            port,
+            0,
+            Duration::ZERO,
+            encap::DEFAULT_BUFFER_LIMIT,
+        );
+        let Err(EipError::Io(e)) = started else {
+            panic!("startup did not fail on its read");
+        };
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(plc.join().unwrap().0, encap::EC_LIST_SERVICES);
     }
 }
