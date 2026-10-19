@@ -319,10 +319,11 @@ async fn publish_frame(
     // buffer. The array is the size of the frame that was actually read.
     let data_size = image.data.len() * 4;
     // C dereferences a refused alloc unchecked (BISDetector.cpp:588); here the frame
-    // is dropped after the pool's limit line.
+    // is dropped after the pool's limit line. C allocates NDInt32 there, though
+    // DataType says UInt32, and readSFRM stores the unsigned pixels in it.
     let Ok(mut array) = ctx.pool.alloc_with(
         vec![NDDimension::new(image.cols), NDDimension::new(image.rows)],
-        NDDataBuffer::U32(image.data),
+        NDDataBuffer::I32(image.data.into_iter().map(|v| v as i32).collect()),
     ) else {
         return Ok(());
     };

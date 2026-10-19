@@ -19,7 +19,7 @@ use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer};
+use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType};
 use epics_rs::ad_core::plugin::channel::ndarray_channel;
 
 use bruker::{BrukerRuntime, create_bruker_detector};
@@ -279,10 +279,18 @@ fn one_scan_reaches_the_plugins() {
     assert_eq!(array.dims.len(), 2);
     assert_eq!(array.dims[0].size, 4, "columns are the fast axis");
     assert_eq!(array.dims[1].size, 2);
+    // C allocates NDInt32 (BISDetector.cpp:588) while DataType says UInt32.
     match &array.data {
-        NDDataBuffer::U32(data) => assert_eq!(data, &vec![1, 2, 3, 4, 5, 6, 7, 8]),
-        other => panic!("the frame is 32-bit unsigned, not {other:?}"),
+        NDDataBuffer::I32(data) => assert_eq!(data, &vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        other => panic!("the frame is NDInt32 as C allocates it, not {other:?}"),
     }
+    assert_eq!(
+        fixture
+            .sync
+            .read_int32(ad.base.data_type)
+            .expect("data type"),
+        NDDataType::UInt32 as u8 as i32
+    );
     assert_eq!(array.unique_id, 1);
 
     // The file name came from FileTemplate/FileNumber, and the number was
