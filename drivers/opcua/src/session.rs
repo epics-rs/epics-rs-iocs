@@ -349,7 +349,7 @@ impl Priority {
 pub struct SessionHandle {
     pub name: String,
     pub config: Mutex<SessionConfig>,
-    /// Items on this session, indexed by client handle.
+    /// Items on this session, at [`Item::index`].
     pub items: Mutex<Vec<Arc<Mutex<Item>>>>,
     pub subscriptions: Mutex<Vec<SubscriptionConfig>>,
     pub status: Mutex<ConnectionStatus>,
@@ -551,7 +551,8 @@ impl SessionWorker {
 
         self.rebuild_node_ids();
         self.register_nodes(&connection).await;
-        let subscriptions = self.create_subscriptions(&connection).await;
+        let monitored = Monitored::default();
+        let subscriptions = self.create_subscriptions(&connection, &monitored).await;
 
         let items = self.handle.items.lock().clone();
         if config.debug > 0 {
@@ -581,7 +582,8 @@ impl SessionWorker {
         }
         *self.handle.status.lock() = ConnectionStatus::Up;
 
-        self.add_monitored_items(&connection, &subscriptions).await;
+        self.add_monitored_items(&connection, &subscriptions, &monitored)
+            .await;
         Ok(())
     }
 
@@ -1030,10 +1032,10 @@ impl SessionWorker {
     async fn create_subscriptions(
         &mut self,
         connection: &Arc<dyn UaConnection>,
+        monitored: &Monitored,
     ) -> Vec<(SubscriptionConfig, Option<u32>)> {
         let mut subscriptions = self.handle.subscriptions.lock().clone();
         subscriptions.sort_by(|a, b| a.name.cmp(&b.name));
-        let items = self.handle.items.lock().clone();
 
         let mut created = Vec::with_capacity(subscriptions.len());
         for config in subscriptions {
@@ -1062,11 +1064,14 @@ impl SessionWorker {
             if id.is_some() {
                 // One dispatcher task per subscription: every value the server
                 // pushes goes to the item its client handle names.
-                let items = items.clone();
+                let monitored = monitored.clone();
                 tokio::spawn(async move {
                     let mut rx = rx;
                     while let Some(notification) = rx.recv().await {
-                        if let Some(item) = items.get(notification.client_handle as usize) {
+                        let item = (notification.client_handle as usize)
+                            .checked_sub(1)
+                            .and_then(|i| monitored.lock().get(i).cloned());
+                        if let Some(item) = item {
                             item.lock()
                                 .set_incoming_data(notification.value, ProcessReason::IncomingData);
                         }
@@ -1079,17 +1084,21 @@ impl SessionWorker {
     }
 
     /// `addAllMonitoredItems`: each subscription's monitored items, in the order
-    /// [`Self::create_subscriptions`] made them
-    /// (`SubscriptionOpen62541::addMonitoredItems`).
+    /// [`Self::create_subscriptions`] made them, one CreateMonitoredItems call
+    /// per item (`SubscriptionOpen62541::addMonitoredItems`).
     async fn add_monitored_items(
         &mut self,
         connection: &Arc<dyn UaConnection>,
         subscriptions: &[(SubscriptionConfig, Option<u32>)],
+        monitored: &Monitored,
     ) {
+        let refused = |status_code| MonitoredItemCreateResult {
+            status_code,
+            ..Default::default()
+        };
         let items = self.handle.items.lock().clone();
         for (config, id) in subscriptions {
-            let id = *id;
-            let monitored: Vec<Arc<Mutex<Item>>> = items
+            let mine: Vec<Arc<Mutex<Item>>> = items
                 .iter()
                 .filter(|item| {
                     let item = item.lock();
@@ -1097,70 +1106,66 @@ impl SessionWorker {
                 })
                 .cloned()
                 .collect();
-            let requests: Vec<MonitoredItemCreateRequest> = monitored
-                .iter()
-                .map(|item| monitored_item_request(&item.lock()))
-                .collect();
-            if !requests.is_empty() {
-                // C creates the items one call each, so a failed batch is every
-                // item failing with its status.
-                // C goes on to add the items of a subscription the server refused;
-                // open62541 then fails each on the unknown subscription id.
-                let refused = |status| {
-                    vec![
-                        MonitoredItemCreateResult {
-                            status_code: status,
-                            ..Default::default()
-                        };
-                        monitored.len()
-                    ]
-                };
-                let results = match id {
-                    Some(id) => connection
-                        .create_monitored_items(id, requests)
-                        .await
-                        .unwrap_or_else(refused),
+            let mut last = StatusCode::Good;
+            for item in &mine {
+                let result = match *id {
+                    // C goes on to add the items of a subscription the server
+                    // refused; open62541 fails each on the unknown subscription id
+                    // without a call, so the item takes no handle.
                     None => refused(StatusCode::BadSubscriptionIdInvalid),
-                };
-                for (item, result) in monitored.iter().zip(&results) {
-                    let mut item = item.lock();
-                    let status = result.status_code;
-                    if status.is_good() {
-                        item.revised_sampling_interval = result.revised_sampling_interval;
-                        item.revised_queue_size = result.revised_queue_size;
-                        if config.debug >= 5 {
-                            println!(
-                                "** OPC UA record {} monitored item {} succeeded with id {} \
-                                 revised sampling interval {} revised queue size {}",
-                                item.addressing_record(),
-                                item.wire_node_id(),
-                                result.monitored_item_id,
-                                stream_double(result.revised_sampling_interval),
-                                result.revised_queue_size
-                            );
+                    Some(id) => {
+                        let handle = {
+                            let mut monitored = monitored.lock();
+                            monitored.push(item.clone());
+                            monitored.len() as u32
+                        };
+                        let request = monitored_item_request(&item.lock(), handle);
+                        // `UA_Client_MonitoredItems_createDataChange`: a failed call
+                        // is the item's status, and an answer without exactly one
+                        // result is BadInternalError.
+                        match connection.create_monitored_items(id, vec![request]).await {
+                            Ok(results) => match <[_; 1]>::try_from(results) {
+                                Ok([result]) => result,
+                                Err(_) => refused(StatusCode::BadInternalError),
+                            },
+                            Err(status) => refused(status),
                         }
-                    } else {
-                        eprintln!(
-                            "OPC UA record {} monitored item {} failed with error {}",
+                    }
+                };
+                last = result.status_code;
+                let mut item = item.lock();
+                if last.is_good() {
+                    item.revised_sampling_interval = result.revised_sampling_interval;
+                    item.revised_queue_size = result.revised_queue_size;
+                    if config.debug >= 5 {
+                        println!(
+                            "** OPC UA record {} monitored item {} succeeded with id {} \
+                             revised sampling interval {} revised queue size {}",
                             item.addressing_record(),
                             item.wire_node_id(),
-                            status_name(status)
+                            result.monitored_item_id,
+                            stream_double(result.revised_sampling_interval),
+                            result.revised_queue_size
                         );
-                        item.set_incoming_event(ProcessReason::ConnectionLoss, status);
                     }
-                }
-                if config.debug > 0 {
-                    let last = results
-                        .last()
-                        .map_or(StatusCode::Good, |result| result.status_code);
-                    println!(
-                        "Subscription {}@{}: created {} monitored items ({})",
-                        config.name,
-                        self.handle.name,
-                        monitored.len(),
+                } else {
+                    eprintln!(
+                        "OPC UA record {} monitored item {} failed with error {}",
+                        item.addressing_record(),
+                        item.wire_node_id(),
                         status_name(last)
                     );
+                    item.set_incoming_event(ProcessReason::ConnectionLoss, last);
                 }
+            }
+            if config.debug > 0 && !mine.is_empty() {
+                println!(
+                    "Subscription {}@{}: created {} monitored items ({})",
+                    config.name,
+                    self.handle.name,
+                    mine.len(),
+                    status_name(last)
+                );
             }
         }
     }
@@ -1184,6 +1189,11 @@ impl SessionWorker {
     }
 }
 
+/// The items monitored on one connection, at their client handle less one:
+/// open62541 numbers a session's monitored items from 1 in the order they are
+/// created, whatever subscription they are on (`MonitoredItems_CreateData_prepare`).
+type Monitored = Arc<Mutex<Vec<Arc<Mutex<Item>>>>>;
+
 enum ServeOutcome {
     Shutdown,
     Disconnected,
@@ -1202,7 +1212,7 @@ fn take_batch(queues: &mut [VecDeque<u32>; 3], limit: usize) -> Option<Vec<u32>>
     None
 }
 
-fn monitored_item_request(item: &Item) -> MonitoredItemCreateRequest {
+fn monitored_item_request(item: &Item, client_handle: u32) -> MonitoredItemCreateRequest {
     use async_opcua::types::{
         DataChangeFilter, DataChangeTrigger, DeadbandType, ExtensionObject, MonitoringMode,
         MonitoringParameters,
@@ -1227,7 +1237,7 @@ fn monitored_item_request(item: &Item) -> MonitoredItemCreateRequest {
         },
         monitoring_mode: MonitoringMode::Reporting,
         requested_parameters: MonitoringParameters {
-            client_handle: item.client_handle,
+            client_handle,
             sampling_interval: link.sampling_interval,
             filter,
             queue_size: link.queue_size,

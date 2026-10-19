@@ -109,8 +109,9 @@ pub struct Item {
     /// VALUE as a pair, `no_of_properties_read = 2`).
     pub data_type: Option<NodeId>,
     pub state: ConnectionStatus,
-    /// The client handle its monitored item was created with.
-    pub client_handle: u32,
+    /// Its place in `SessionHandle::items`, which is what the worker's requests
+    /// name it by. Not the monitored item's client handle.
+    pub index: u32,
     /// What the server granted when the monitored item was last created; 0
     /// until then (`ItemOpen62541::revisedSamplingInterval`/`revisedQueueSize`).
     pub revised_sampling_interval: f64,
@@ -136,8 +137,7 @@ pub struct Item {
     ///
     /// A record only ever reaches its session *through* its item, so this is the
     /// one place the two are tied together, and it is set exactly when the item
-    /// enters `SessionHandle::items` (which is what [`Self::client_handle`]
-    /// indexes).
+    /// enters `SessionHandle::items` (at [`Self::index`]).
     session: Option<Arc<SessionHandle>>,
 }
 
@@ -166,7 +166,7 @@ impl Item {
             registered_node_id: None,
             data_type: None,
             state: ConnectionStatus::Down,
-            client_handle: 0,
+            index: 0,
             revised_sampling_interval: 0.0,
             revised_queue_size: 0,
             leaves: Vec::new(),
@@ -180,18 +180,18 @@ impl Item {
     }
 
     /// The record that *addresses the node* has bound: the item is on this
-    /// session, at this node, under this client handle.
+    /// session, at this node, at this index of its items.
     pub fn adopt(
         &mut self,
         link: LinkInfo,
         node_id: NodeId,
-        client_handle: u32,
+        index: u32,
         session: Arc<SessionHandle>,
     ) {
         self.link = link;
         self.configured_node_id = node_id.clone();
         self.node_id = node_id;
-        self.client_handle = client_handle;
+        self.index = index;
         self.session = Some(session);
     }
 
@@ -214,7 +214,7 @@ impl Item {
             // to is not in the database. `Registry::start` reports that.
             return;
         };
-        let handle = self.client_handle;
+        let handle = self.index;
         session.request(
             priority,
             match action {

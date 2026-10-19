@@ -247,7 +247,7 @@ fn node_id_of(link: &LinkInfo) -> NodeId {
 }
 
 /// One item with one record bound to the whole node. The item is adopted — given
-/// its node, its client handle and its session — when [`spawn`] puts it on a
+/// its node, its index and its session — when [`spawn`] puts it on a
 /// session, which is where a `Registry` adopts one too.
 fn item(text: &str, kind: RecordKind) -> (Arc<Mutex<Item>>, Arc<Mutex<Leaf>>) {
     let info = link(text, kind);
@@ -266,11 +266,11 @@ fn spawn(
     items: Vec<Arc<Mutex<Item>>>,
 ) -> Arc<SessionHandle> {
     let (handle, worker) = session::create(config, Arc::new(MockConnector(mock.clone())));
-    for (client_handle, item) in items.iter().enumerate() {
+    for (index, item) in items.iter().enumerate() {
         let mut item = item.lock();
         let info = item.leaves[0].lock().link.clone();
         let node_id = node_id_of(&info);
-        item.adopt(info, node_id, client_handle as u32, handle.clone());
+        item.adopt(info, node_id, index as u32, handle.clone());
     }
     *handle.items.lock() = items;
     tokio::spawn(worker.run());
@@ -1149,7 +1149,7 @@ async fn a_monitored_item_carries_the_links_monitoring_parameters() {
         request.item_to_monitor.attribute_id,
         AttributeId::Value as u32
     );
-    assert_eq!(request.requested_parameters.client_handle, 0);
+    assert_eq!(request.requested_parameters.client_handle, 1);
     assert_eq!(request.requested_parameters.sampling_interval, 250.0);
     assert_eq!(request.requested_parameters.queue_size, 8);
     assert!(!request.requested_parameters.discard_oldest);
@@ -1217,6 +1217,57 @@ async fn subscriptions_are_created_before_the_initial_read_and_monitor_after_it(
             "Session sess: triggering initial read for all 2 items",
             "Subscription early@sess: created 1 monitored items (Good)",
             "Subscription subs@sess: created 1 monitored items (Good)",
+        ]
+    );
+}
+
+/// `SubscriptionOpen62541::addMonitoredItems` makes one CreateMonitoredItems
+/// call per item, and open62541 numbers the session's monitored items from 1 in
+/// the order they are created (`++client->monitoredItemHandles`).
+#[tokio::test]
+async fn each_monitored_item_is_its_own_call_under_a_session_wide_handle() {
+    let mock = Mock::arc();
+    let (unmonitored, _l0) = item("sess ns=2;s=U monitor=n", INPUT);
+    let (item_a, _la) = item("subs ns=2;s=A", INPUT);
+    let (item_b, _lb) = item("early ns=2;s=B", INPUT);
+    let (item_c, _lc) = item("subs ns=2;s=C", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![unmonitored, item_a, item_b, item_c],
+    );
+    for name in ["subs", "early"] {
+        handle
+            .subscriptions
+            .lock()
+            .push(SubscriptionConfig::new(name, "sess"));
+    }
+    until(|| mock.calls.lock().monitored.len() == 3).await;
+
+    let calls = mock.calls.lock();
+    let monitors: Vec<&str> = calls
+        .events
+        .iter()
+        .filter(|e| e.starts_with("monitor"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(monitors, ["monitor 1", "monitor 2", "monitor 2"]);
+    let created: Vec<(NodeId, u32)> = calls
+        .monitored
+        .iter()
+        .map(|r| {
+            (
+                r.item_to_monitor.node_id.clone(),
+                r.requested_parameters.client_handle,
+            )
+        })
+        .collect();
+    assert_eq!(
+        created,
+        [
+            (NodeId::new(2, "B"), 1),
+            (NodeId::new(2, "A"), 2),
+            (NodeId::new(2, "C"), 3),
         ]
     );
 }
@@ -1307,7 +1358,7 @@ async fn a_value_the_server_pushes_reaches_the_item_its_handle_names() {
 
     let sink = mock.sink.lock().clone().expect("the subscription is up");
     sink.send(Notification {
-        client_handle: 1,
+        client_handle: 2,
         value: DataValue::value_only(Variant::Int32(64)),
     })
     .unwrap();

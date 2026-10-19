@@ -205,7 +205,7 @@ impl Registry {
     /// So both an element record and the item record itself reach the item
     /// through [`Self::item_of_record`], and whichever of the two binds first
     /// creates it. The item record's binding is the one that [`Item::adopt`]s it:
-    /// gives it its node, its session and its client handle.
+    /// gives it its node, its session and its index.
     /// A record with OPCUA device support attached (`set_record_info`).
     pub fn declare_record(&self, name: &str, record_type: &str) {
         self.inner
@@ -274,9 +274,9 @@ impl Registry {
         };
         {
             let mut items = session.items.lock();
-            let client_handle = items.len() as u32;
+            let index = items.len() as u32;
             let mut locked = item.lock();
-            locked.adopt(link, node_id, client_handle, session.clone());
+            locked.adopt(link, node_id, index, session.clone());
             locked.leaves.push(leaf.clone());
             drop(locked);
             items.push(item.clone());
