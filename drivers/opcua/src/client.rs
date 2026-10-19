@@ -136,6 +136,17 @@ impl ConnectError {
     }
 }
 
+/// A failed connection as open62541 1.2's client network layer reports it:
+/// any socket failure is BadDisconnect (`UA_ClientConnectionTCP_poll`), an
+/// address that does not resolve BadConnectionClosed (`initConnect`).
+fn network_status(status: StatusCode) -> StatusCode {
+    match status {
+        StatusCode::BadCommunicationError => StatusCode::BadDisconnect,
+        StatusCode::BadTcpEndpointUrlInvalid => StatusCode::BadConnectionClosed,
+        status => status,
+    }
+}
+
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
@@ -281,7 +292,7 @@ impl UaConnector for AsyncOpcuaConnector {
                 .await
                 .map_err(|e| {
                     ConnectError::service(
-                        e.status(),
+                        network_status(e.status()),
                         "security discovery and setup failed with status cantConnect",
                     )
                 })?;
@@ -296,6 +307,7 @@ impl UaConnector for AsyncOpcuaConnector {
         // `UA_Client_connect` reads the endpoints again and picks the one to
         // connect to by itself, for `sec-mode=None` as for any other.
         let failed = |status: StatusCode| {
+            let status = network_status(status);
             ConnectError::service(
                 status,
                 format!("connect service failed with status {}", status_name(status)),

@@ -271,8 +271,11 @@ mod setup_security {
             .unwrap();
         let _ = std::fs::remove_dir_all(&pki);
         assert_eq!(
-            err.message,
-            "security discovery and setup failed with status cantConnect"
+            err,
+            ConnectError {
+                status: Some(StatusCode::BadDisconnect),
+                message: "security discovery and setup failed with status cantConnect".into(),
+            }
         );
     }
 
@@ -313,17 +316,9 @@ mod setup_security {
         );
     }
 
-    /// C `SessionOpen62541::connect` prints `UA_Client_connect`'s status on
-    /// every failed connect (`SessionOpen62541.cpp:586-589`).
-    #[tokio::test]
-    async fn a_dead_session_url_is_a_connect_failure_with_its_status() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let pki = std::env::temp_dir().join(format!("opcua-deadsession-{}", std::process::id()));
-        let mut config = SessionConfig::new("s", format!("opc.tcp://127.0.0.1:{port}"));
+    async fn connect_without_security(url: &str, tag: &str) -> ConnectError {
+        let pki = std::env::temp_dir().join(format!("opcua-{tag}-{}", std::process::id()));
+        let mut config = SessionConfig::new("s", url);
         config.pki_dir = Some(pki.to_string_lossy().into_owned());
         config.set_option("sec-mode", "None").unwrap();
         let connector = AsyncOpcuaConnector::new();
@@ -334,11 +329,41 @@ mod setup_security {
             .err()
             .unwrap();
         let _ = std::fs::remove_dir_all(&pki);
-        assert!(
-            err.message
-                .starts_with("connect service failed with status Bad"),
-            "{err}"
+        err
+    }
+
+    /// C `SessionOpen62541::connect` prints `UA_Client_connect`'s status on
+    /// every failed connect (`SessionOpen62541.cpp:586-589`); a refused TCP
+    /// connect is BadDisconnect (`UA_ClientConnectionTCP_poll`).
+    #[tokio::test]
+    async fn a_dead_session_url_is_a_connect_failure_with_its_status() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let err =
+            connect_without_security(&format!("opc.tcp://127.0.0.1:{port}"), "deadsession").await;
+        assert_eq!(
+            err,
+            ConnectError {
+                status: Some(StatusCode::BadDisconnect),
+                message: "connect service failed with status BadDisconnect".into(),
+            }
         );
-        assert!(err.status.is_some_and(|s| s.is_bad()), "{err:?}");
+    }
+
+    /// open62541's `initConnect` closes a connection whose host does not
+    /// resolve before any socket exists.
+    #[tokio::test]
+    async fn a_session_url_that_does_not_resolve_is_connection_closed() {
+        let err = connect_without_security("opc.tcp://no-such-host.invalid:4840", "nohost").await;
+        assert_eq!(
+            err,
+            ConnectError {
+                status: Some(StatusCode::BadConnectionClosed),
+                message: "connect service failed with status BadConnectionClosed".into(),
+            }
+        );
     }
 }
