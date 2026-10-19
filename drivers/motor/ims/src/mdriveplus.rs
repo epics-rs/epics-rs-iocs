@@ -259,13 +259,14 @@ impl ImsLine {
         status.map(|()| reply)
     }
 
-    /// [`Self::write_read`]'s reply beside its status. The EOS layer
-    /// NUL-terminates `resp` on every read, so a failed read leaves the bytes
-    /// it delivered, which the callers that ignore the status parse.
+    /// [`Self::write_read`]'s reply beside its status, as C's `resp` string:
+    /// up to its first NUL and untrimmed, which the console lines print. The
+    /// EOS layer NUL-terminates `resp` on every read, so a failed read leaves
+    /// the bytes it delivered, which the callers that ignore the status parse.
     fn exchange_text(&self, cmd: &str) -> (String, AsynResult<()>) {
         let (raw, status) = self.exchange(cmd);
-        let s = String::from_utf8_lossy(&raw);
-        (s.trim_matches(['\r', '\n', '\0', ' ']).to_string(), status)
+        let resp = raw.split(|&b| b == 0).next().unwrap_or_default();
+        (String::from_utf8_lossy(resp).into_owned(), status)
     }
 
     /// C `writeReadController`'s writeRead and its trace line, which
@@ -1250,6 +1251,28 @@ mod tests {
         );
         let sent = rig.sent();
         assert!(sent.iter().any(|c| c.trim_end() == "PR S1"), "{sent:?}");
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:175-178 and :214 print the version
+    /// and S1-S4 replies as read, a CR included.
+    #[test]
+    fn config_replies_print_untrimmed() {
+        use motor_common::testing::{LineRig, child_stdout, in_child};
+        if !in_child() {
+            let out = child_stdout(module_path!(), "config_replies_print_untrimmed");
+            assert!(out.contains("Controller version 1.000\r\n"), "{out:?}");
+            assert!(out.contains("\n2,0,0\r\n"), "{out:?}");
+            return;
+        }
+        let (_rig, io) = LineRig::new("imsRawReply", |last| match last.trim_end() {
+            "PR VR" => "1.000\r".into(),
+            "PR S2" => "2,0,0\r".into(),
+            _ => "0".into(),
+        });
+        ImsMDrivePlusAxis::new(
+            ImsLine::new(io, String::new(), "imsRawReply"),
+            "imsRawReply",
+        );
     }
 
     #[test]
