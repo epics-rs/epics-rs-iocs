@@ -473,6 +473,9 @@ impl AsynMotor for AgUcAxis {
         // on a UC2).
         ctrl.set_channel(self.channel_id);
 
+        // C indexes `inString_`, which asyn ends with a NUL: a reply as long
+        // as its offset reads 0, or for TS the terminator. A shorter one
+        // reads an earlier reply's bytes there, a C defect refused here.
         // Position (TP): accumulated step count at offset 3 ("1TP").
         let position = parse_int_at(&ctrl.write_read(&format!("{}TP", self.axis_id))?, 3)
             .ok_or_else(|| parse_error("TP"))?;
@@ -484,8 +487,10 @@ impl AsynMotor for AgUcAxis {
 
         // Moving status (TS): state char at index 3; '0' means done.
         let ts = ctrl.write_read(&format!("{}TS", self.axis_id))?;
-        let state = *ts.as_bytes().get(3).ok_or_else(|| parse_error("TS"))?;
-        let moving = state != b'0';
+        if ts.len() < 3 {
+            return Err(parse_error("TS"));
+        }
+        let moving = ts.as_bytes().get(3) != Some(&b'0');
 
         // Limit status (PH, controller-wide): value at offset 2.
         let lim = parse_int_at(&ctrl.write_read("PH")?, 2).ok_or_else(|| parse_error("PH"))?;
@@ -622,6 +627,36 @@ mod tests {
         let status = axis.poll(&user).unwrap();
         assert_eq!(status.position, 7.0);
         assert_eq!(line.sent(), ["CC1", "1TP", "1TS", "PH"]);
+    }
+
+    /// AG_UC.cpp:359,370,381 index `inString_`, which asyn ends with a NUL
+    /// (asynInterposeEos.c:251): a reply as long as its offset reads 0, or
+    /// for TS the terminator, so not done. A shorter one is refused.
+    #[test]
+    fn a_reply_as_long_as_its_offset_reads_the_terminator() {
+        use motor_common::testing::LineRig;
+        use std::collections::HashMap;
+        let replies: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(
+            [("1TP", "1TP"), ("1TS", "1TS"), ("PH", "PH")]
+                .map(|(cmd, reply)| (cmd.to_string(), reply.to_string()))
+                .into(),
+        ));
+        let table = replies.clone();
+        let (_line, io) = LineRig::new("ag_uc_short", move |last| match last {
+            "VE" => "AG-UC8 v2.2.1".into(),
+            _ => table.lock().unwrap().get(last).cloned().unwrap_or_default(),
+        });
+        let controller = AgUcController::new(io, &MotorTrace::new("AG_UC_SHORT", 0));
+        let mut axis = AgUcAxis::new(Arc::new(Mutex::new(controller)), 0, true, 50, -50);
+        let user = AsynUser::new(0);
+        let status = axis.poll(&user).unwrap();
+        assert_eq!(status.position, 0.0);
+        assert!(status.moving && !status.done && !status.low_limit);
+        for (cmd, short) in [("1TP", "1T"), ("1TS", "1T"), ("PH", "P")] {
+            let full = replies.lock().unwrap().insert(cmd.into(), short.into());
+            assert!(axis.poll(&user).is_err(), "{cmd}");
+            replies.lock().unwrap().insert(cmd.into(), full.unwrap());
+        }
     }
 
     /// AG_UC.cpp:71-74 prints `inString_` before testing the `VE` status,
