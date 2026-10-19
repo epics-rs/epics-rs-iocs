@@ -44,6 +44,16 @@ pub struct CtrDriver {
     dio_configurable: bool,
 }
 
+/// drvUSBCTR.cpp:256-257.
+const USBCTR_INTERRUPTS: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::UINT32_DIGITAL)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::FLOAT32_ARRAY)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::OCTET);
+const USBCTR_INTERFACES: InterfaceMask = USBCTR_INTERRUPTS.or(InterfaceMask::DRV_USER);
+
 impl CtrDriver {
     pub fn new(port_name: &str, device: DaqDevice, max_time_points: usize) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
@@ -54,8 +64,8 @@ impl CtrDriver {
                 can_block: false,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            USBCTR_INTERFACES,
+            USBCTR_INTERRUPTS,
         );
         let params = CtrParams::create(&mut base)?;
 
@@ -691,4 +701,27 @@ pub fn create_usb_ctr(
         state,
         _poller_handle: poller_handle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_port_carries_cs_interface_and_interrupt_masks() {
+        use InterfaceMask as I;
+        let drv = CtrDriver::new("CTRMASKS", DaqDevice::unconnected(), 16).unwrap();
+        let interrupts = I::INT32
+            | I::UINT32_DIGITAL
+            | I::INT32_ARRAY
+            | I::FLOAT32_ARRAY
+            | I::FLOAT64
+            | I::FLOAT64_ARRAY
+            | I::OCTET;
+        assert_eq!(drv.base.interrupt_mask(), interrupts);
+        assert_eq!(
+            drv.base.interface_mask(),
+            interrupts | I::DRV_USER | I::COMMON
+        );
+    }
 }
