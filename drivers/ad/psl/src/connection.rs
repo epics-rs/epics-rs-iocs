@@ -152,18 +152,31 @@ impl Session<'_> {
     /// an input end-of-string; `OctetReadBinary` suppresses one if the IOC has
     /// configured it. C reconnects the socket before every command, so nothing
     /// can be left in the input buffer from the previous exchange.
-    pub fn request_image(&mut self) -> ServerResult<Vec<u8>> {
+    ///
+    /// The block is what the read delivered, with the read's status: C's
+    /// `getImage` parses `fromServer_` whatever `writeReadServer` returned
+    /// (PSL.cpp:523-557). `Err` when no read ran.
+    pub fn request_image(&mut self) -> ServerResult<(Vec<u8>, ServerResult<()>)> {
         self.io.reconnect();
-        self.io
+        let read = self
+            .io
             .write("GetImage", GET_IMAGE_TIMEOUT)
-            .and_then(|()| self.io.read_binary(MAX_MESSAGE_SIZE, GET_IMAGE_TIMEOUT))
-            .inspect_err(|e| self.io.write_read_failed(e, "GetImage"))
+            .and_then(|()| self.io.read_binary(MAX_MESSAGE_SIZE, GET_IMAGE_TIMEOUT));
+        let status = match &read {
+            Ok((_, status)) => status.as_ref(),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = status {
+            self.io.write_read_failed(e, "GetImage");
+        }
+        read
     }
 
     /// Read the next block of an image payload (C `pasynOctetSyncIO->read`
     /// inside the copy loop).
     pub fn read_image_block(&mut self, max_bytes: usize) -> ServerResult<Vec<u8>> {
-        self.io.read_binary(max_bytes, GET_IMAGE_TIMEOUT)
+        let (block, status) = self.io.read_binary(max_bytes, GET_IMAGE_TIMEOUT)?;
+        status.map(|()| block)
     }
 }
 
@@ -233,14 +246,21 @@ impl ServerIo {
         Ok(())
     }
 
-    fn read_binary(&mut self, buf_size: usize, timeout: Duration) -> ServerResult<Vec<u8>> {
+    /// What the read delivered and its status; `Err` when it never ran.
+    fn read_binary(
+        &mut self,
+        buf_size: usize,
+        timeout: Duration,
+    ) -> ServerResult<(Vec<u8>, ServerResult<()>)> {
         let (data, status) = self
             .handle
             .port()?
             .submit_octet_read_blocking(OctetReadOp::ReadBinary { buf_size }, self.user(timeout))
             .into_parts();
-        status?;
-        Ok(data)
+        match status {
+            Err(e) if e.never_ran() => Err(e.into()),
+            status => Ok((data, status.map_err(ServerError::from))),
+        }
     }
 }
 

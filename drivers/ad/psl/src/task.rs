@@ -45,7 +45,7 @@ pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::Jo
 }
 
 /// Why an acquisition ended before it had taken every frame.
-enum Abort {
+pub(crate) enum Abort {
     /// Acquire was set to 0.
     Stopped,
     /// The socket failed, or the server sent a frame that cannot be read.
@@ -132,7 +132,7 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
             let unique_id = sync
                 .read_int32(ctx.ad_params.base.array_counter)
                 .unwrap_or(0);
-            match read_frame(ctx) {
+            match read_frame(&ctx.server, &ctx.handle) {
                 Ok((header, data)) => publish_frame(ctx, &header, data, unique_id).await,
                 Err(abort) => {
                     finish(ctx, Some(abort)).await;
@@ -212,10 +212,15 @@ async fn wait_for_new_data(ctx: &AcquisitionContext) -> Result<(), Abort> {
 /// The session is held for the whole read — header and every payload block —
 /// so no other command can slip between them; it is dropped before the caller
 /// goes back to the parameter library.
-fn read_frame(ctx: &AcquisitionContext) -> Result<(ImageHeader, Vec<u8>), Abort> {
-    let mut session = ctx.server.session();
+pub(crate) fn read_frame(
+    server: &PslServer,
+    handle: &PortHandle,
+) -> Result<(ImageHeader, Vec<u8>), Abort> {
+    let mut session = server.session();
 
-    let first = session
+    // C parses a cut read's bytes too. A failed write leaves HasNewData's
+    // "True" in fromServer_, which C parses as a header: a C defect, not copied.
+    let (first, _) = session
         .request_image()
         .map_err(|e| Abort::Error(format!("GetImage failed: {e}")))?;
     let header = protocol::parse_image_header(&first)
@@ -227,8 +232,8 @@ fn read_frame(ctx: &AcquisitionContext) -> Result<(ImageHeader, Vec<u8>), Abort>
     while payload.len() < header.data_len {
         let want = (header.data_len - payload.len()).min(MAX_MESSAGE_SIZE);
         let block = session.read_image_block(want).map_err(|e| {
-            ctx.handle.trace().output_device(
-                ctx.handle.port_name(),
+            handle.trace().output_device(
+                handle.port_name(),
                 Some(0),
                 0,
                 TraceMask::ERROR,

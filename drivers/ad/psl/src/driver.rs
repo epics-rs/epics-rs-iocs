@@ -1107,6 +1107,82 @@ mod tests {
         assert!(!det.connect_to_server().unwrap());
     }
 
+    /// A PSLViewer that answers its reads from `reads` in turn, each with
+    /// whether a timeout cuts it, and times out once they run out.
+    struct Scripted {
+        base: PortDriverBase,
+        reads: std::collections::VecDeque<(&'static [u8], bool)>,
+    }
+
+    impl PortDriver for Scripted {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            let (reply, cut) = self.reads.pop_front().unwrap_or((b"", true));
+            buf[..reply.len()].copy_from_slice(reply);
+            let read = OctetReadResult::ok(reply.len(), EomReason::empty());
+            if !cut {
+                return read;
+            }
+            OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Timeout,
+                    message: "read cut by a timeout".into(),
+                }),
+                ..read
+            }
+        }
+    }
+
+    /// A [`Scripted`] server on port `name`.
+    fn scripted(name: &str, reads: &[(&'static [u8], bool)]) -> (PslServer, PortHandle) {
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            Default::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.init_connected(true);
+        let server = Scripted {
+            base,
+            reads: reads.iter().copied().collect(),
+        };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), server, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        let server = PslServer::new(SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO));
+        (server, handle)
+    }
+
+    /// getImage parses what the GetImage read delivered whatever its status
+    /// (PSL.cpp:523-582): a header a timeout cut after its first data bytes
+    /// still starts the frame.
+    #[test]
+    fn a_cut_get_image_read_starts_the_frame() {
+        let (server, handle) = scripted("PSL_CUT_IMAGE", &[(b"L;2;2;4;ab", true), (b"cd", false)]);
+        let (header, payload) = match crate::task::read_frame(&server, &handle) {
+            Ok(frame) => frame,
+            Err(_) => panic!("the cut GetImage read aborted the frame"),
+        };
+        assert_eq!((header.width, header.height), (2, 2));
+        assert_eq!(payload, b"abcd");
+    }
+
     /// getConfig stores GetRecordPath's answer as it came, without
     /// `checkPath` (PSL.cpp:453-459).
     #[test]
