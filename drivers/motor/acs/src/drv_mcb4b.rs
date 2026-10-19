@@ -14,7 +14,7 @@ use epics_rs::asyn::interfaces::motor::{
 };
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{atoi, nint};
 
 use crate::mcb4b::Mcb4bController;
@@ -106,8 +106,9 @@ fn byte_at(reply: &str, i: usize) -> u8 {
 }
 
 impl Model1Motor for DrvMcb4bAxis {
-    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
-        self.init_status.take().expect("taken once")
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 

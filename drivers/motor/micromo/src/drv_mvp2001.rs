@@ -20,6 +20,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::device_support::{BuildTrans, DialLimitReset, LimitBuild};
 
+use motor_common::model1::init_read;
 use motor_common::util::{atoi, nint};
 
 /// `MVP2001_NUM_CARDS`.
@@ -301,8 +302,9 @@ fn refused(message: &str) -> AsynError {
 }
 
 impl Model1Motor for DrvMvp2001Axis {
-    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
-        self.init_status.take().expect("taken once")
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 

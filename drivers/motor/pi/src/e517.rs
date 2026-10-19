@@ -72,7 +72,7 @@ use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{atof, nint};
 
 use crate::scan_int;
@@ -360,8 +360,9 @@ impl PIE517Axis {
 }
 
 impl Model1Motor for PIE517Axis {
-    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
-        self.init_status.take().expect("taken once")
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 

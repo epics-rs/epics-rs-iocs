@@ -101,7 +101,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{nint, parse_int_at, parse_value_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -407,8 +407,9 @@ impl PIC848Axis {
 }
 
 impl Model1Motor for PIC848Axis {
-    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
-        self.init_status.take().expect("taken once")
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 

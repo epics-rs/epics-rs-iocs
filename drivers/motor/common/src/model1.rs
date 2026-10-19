@@ -7,7 +7,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::interfaces::motor::{Model1Motor, PostMessage};
+use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -318,6 +319,21 @@ impl Model1 {
     }
 }
 
+/// C `set_status` as `motor_init` calls it: the status `read`, or after a
+/// failed read the status `motor_init` prepared, which the failure exit
+/// stores back, with the bits `failure` names.
+pub fn init_read(
+    read: AsynResult<MotorStatus>,
+    prepared: MotorStatus,
+    failure: PollFailure,
+) -> MotorStatus {
+    read.unwrap_or(MotorStatus {
+        problem: prepared.problem | failure.problem,
+        comms_error: prepared.comms_error | failure.comms_error,
+        ..prepared
+    })
+}
+
 /// The record's PREM and POST as a model-1 device holds them: `build_trans`
 /// reads PREM into the move it builds, and points `postmsgptr` at the POST
 /// field when POST is set, for `set_status` to send once that move ends
@@ -374,8 +390,8 @@ mod tests {
 
     /// At rest at 0 when its `motor_init` read it.
     impl Model1Motor for Card {
-        fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
-            Ok(MotorStatus::default())
+        fn take_init_status(&mut self) -> MotorStatus {
+            MotorStatus::default()
         }
     }
 

@@ -37,7 +37,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atof, atoi, is_unsolicited_limit_error, leading_hex};
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 
 /// C `BUFF_SIZE`: the most one read takes.
 const READ_BUF: usize = 100;
@@ -314,8 +314,9 @@ impl Esp300Axis {
 }
 
 impl Model1Motor for Esp300Axis {
-    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
-        self.init_status.take().expect("taken once")
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 

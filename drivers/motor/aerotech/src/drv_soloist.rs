@@ -18,6 +18,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
+use motor_common::model1::init_read;
 use motor_common::util::{atof, atoi, nint};
 
 /// `Soloist_NUM_CARDS`.
@@ -263,8 +264,9 @@ impl DrvSoloistAxis {
 }
 
 impl Model1Motor for DrvSoloistAxis {
-    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
-        self.init_status.take().expect("taken once")
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 

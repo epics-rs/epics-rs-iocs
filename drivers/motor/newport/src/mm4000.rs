@@ -55,7 +55,7 @@ use motor_common::model2::AxisLog;
 use motor_common::param_lib::Params;
 
 use crate::util::{atof, atoi, max_digits};
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 
 /// Response buffer size for a single controller reply (C `BUFFER_SIZE` 160).
 const READ_BUF: usize = 256;
@@ -888,8 +888,9 @@ impl Mm4000Axis {
 }
 
 impl Model1Motor for Mm4000Axis {
-    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
-        self.init_status.take().expect("taken once")
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 

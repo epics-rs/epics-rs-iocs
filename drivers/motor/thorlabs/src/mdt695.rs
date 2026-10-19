@@ -43,7 +43,7 @@ use epics_rs::motor::device_support::{BuildTrans, LimitBuild};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_libcom_rs::runtime::stdlib::strtod;
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::nint;
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -257,8 +257,9 @@ impl Mdt695Axis {
 }
 
 impl Model1Motor for Mdt695Axis {
-    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
-        self.init_status.take().expect("taken once")
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 

@@ -47,7 +47,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_message;
 
 use crate::util::{atof, max_digits, nint};
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
@@ -273,8 +273,9 @@ impl Pm500Axis {
 }
 
 impl Model1Motor for Pm500Axis {
-    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
-        self.init_status.take().expect("taken once")
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 
