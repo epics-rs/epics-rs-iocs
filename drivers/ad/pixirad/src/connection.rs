@@ -2,16 +2,11 @@
 //!
 //! # Ownership
 //!
-//! Two threads send commands: the port actor (every parameter write) and the
-//! status task (which switches the cooling off when the box gets too warm or
-//! too damp). The socket therefore sits behind its own mutex.
-//!
-//! **Invariant: no caller may touch the detector port's parameter library while
-//! holding the command lock.** The actor takes the lock inside `write_int32`,
-//! so a task that held the lock and then waited on the actor would deadlock.
-//! The status task reads every parameter it needs *before* it sends anything.
+//! The driver owns the one [`PixiradServer`] and [`PixiradServer::command`]
+//! takes it by `&mut`, so every command — the status task's cooling-off
+//! included — runs on the port actor through the driver's exchange, which
+//! publishes it as C does.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
@@ -19,7 +14,6 @@ use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use parking_lot::Mutex;
 
 use crate::types::{MAX_MESSAGE_SIZE, SERVER_TIMEOUT};
 
@@ -87,35 +81,33 @@ struct Channel {
 }
 
 /// The Pixirad command socket.
-#[derive(Clone)]
 pub struct PixiradServer {
-    channel: Arc<Mutex<Channel>>,
+    channel: Channel,
 }
 
 impl PixiradServer {
     pub fn new(handle: SyncIOHandle) -> Self {
         Self {
-            channel: Arc::new(Mutex::new(Channel {
+            channel: Channel {
                 handle,
                 from_server: String::new(),
-            })),
+            },
         }
     }
 
     /// Send a command and read the reply (C `writeReadServer`, including its
     /// `GOT:` check).
-    pub fn command(&self, command: &str) -> Exchange {
+    pub fn command(&mut self, command: &str) -> Exchange {
         let user = AsynUser::new(0).with_addr(0).with_timeout(SERVER_TIMEOUT);
         let op = RequestOp::OctetWriteRead {
             data: command.as_bytes().to_vec(),
             buf_size: MAX_MESSAGE_SIZE,
             flush: true,
         };
-        let mut channel = self.channel.lock();
         let Channel {
             handle,
             from_server,
-        } = &mut *channel;
+        } = &mut self.channel;
         let outcome = handle
             .port()
             .and_then(|port| port.submit_blocking(op, user));
@@ -176,16 +168,14 @@ impl PixiradServer {
     /// than waiting for the auto-reconnect).
     pub fn reconnect_after(&self, delay: Duration) {
         let user = || AsynUser::new(0).with_addr(0).with_timeout(SERVER_TIMEOUT);
-        {
-            let channel = self.channel.lock();
-            let _ = channel
-                .handle
-                .port()
-                .and_then(|port| port.submit_blocking(RequestOp::Disconnect, user()));
-        }
+        let _ = self
+            .channel
+            .handle
+            .port()
+            .and_then(|port| port.submit_blocking(RequestOp::Disconnect, user()));
         std::thread::sleep(delay);
-        let channel = self.channel.lock();
-        let _ = channel
+        let _ = self
+            .channel
             .handle
             .port()
             .and_then(|port| port.submit_blocking(RequestOp::Connect, user()));
@@ -303,7 +293,7 @@ mod from_server_tests {
         let (runtime, _) =
             create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
                 .unwrap();
-        let server = PixiradServer::new(SyncIOHandle::from_handle(
+        let mut server = PixiradServer::new(SyncIOHandle::from_handle(
             runtime.port_handle().clone(),
             0,
             Duration::ZERO,

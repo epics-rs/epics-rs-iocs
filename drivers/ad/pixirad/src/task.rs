@@ -20,9 +20,8 @@ use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
-use crate::connection::PixiradServer;
 use crate::decode::Decoder;
-use crate::driver::SharedState;
+use crate::driver::{PixiradDetector, SharedState};
 use crate::params::PixiradParams;
 use crate::protocol;
 use crate::types::{FrameType, MAX_UDP_DATA_BUFFER, MAX_UDP_PACKET_LEN, Sensor};
@@ -376,7 +375,6 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
 
 pub(crate) struct StatusContext {
     pub status_port: u16,
-    pub server: PixiradServer,
     pub handle: PortHandle,
     pub ad_params: ADBaseParams,
     pub params: PixiradParams,
@@ -410,7 +408,6 @@ async fn status_loop(ctx: StatusContext) {
             return;
         }
     };
-    let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, Duration::from_secs(30));
     // C blocked in `recvfrom` for ever; a timeout keeps the loop alive when the
     // box stops broadcasting.
     let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
@@ -492,26 +489,13 @@ async fn status_loop(ctx: StatusContext) {
             0,
             ParamValue::Int32(cooling_status as i32),
         ));
-        if cooling_status.is_error() {
-            updates.push(ParamSetValue::new(
-                ctx.params.cooling_state,
-                0,
-                ParamValue::Int32(0),
-            ));
-        }
         let _ = ctx.handle.set_params_and_notify(0, updates).await;
 
-        if !cooling_status.is_error() {
-            continue;
+        if cooling_status.is_error() {
+            let _ = ctx
+                .handle
+                .with_driver(PixiradDetector::switch_cooling_off)
+                .await;
         }
-
-        // Switch the cooling off at the box. Every parameter it needs is read
-        // before the command socket is taken — see the invariant in
-        // `crate::connection`.
-        let temperature = sync.read_float64(ctx.ad_params.temperature).unwrap_or(0.0);
-        let hv_value = sync.read_float64(ctx.params.hv_value).unwrap_or(0.0);
-        let hv_state = sync.read_int32(ctx.params.hv_state).unwrap_or(0);
-        let command = protocol::init(temperature, 0, hv_value, hv_state);
-        let _ = ctx.server.command(&command);
     }
 }

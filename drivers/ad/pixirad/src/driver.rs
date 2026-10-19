@@ -1,10 +1,9 @@
 //! The Pixirad areaDetector driver (C `pixirad.cpp`).
 //!
-//! Ownership: every command to the box goes through [`PixiradServer`]; the port
-//! actor owns the parameter library and is the only thing that reacts to a
-//! record write. The three background threads — UDP data listener, data task,
-//! status task — reach the parameter library through the actor and never call
-//! into the driver directly (see the invariant in [`crate::connection`]).
+//! Ownership: the driver owns the [`PixiradServer`], so every command to the
+//! box runs on the port actor and goes through [`PixiradDetector::exchange`].
+//! The three background threads — UDP data listener, data task, status task —
+//! reach the driver only through the actor.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -256,6 +255,14 @@ impl PixiradDetector {
             .unwrap_or(SyncOutFunction::Shutter);
         let command = protocol::set_sync(sync_in, sync_out, function);
         self.command(&command)
+    }
+
+    /// C statusTask's error branch, run under the port lock: CoolingState off,
+    /// `setCoolingAndHV` (its status ignored), `callParamCallbacks`.
+    pub(crate) fn switch_cooling_off(&mut self) -> AsynResult<()> {
+        self.set_int32(self.params.cooling_state, 0)?;
+        let _ = self.set_cooling_and_hv();
+        self.ad.port_base.call_param_callbacks(0)
     }
 
     fn frame_type(&self) -> FrameType {
@@ -577,10 +584,9 @@ pub fn create_pixirad_detector(
         udp_speed: AtomicU64::new(0),
     });
 
-    let server = PixiradServer::new(command_handle);
     let det = PixiradDetector::new(
         port_name,
-        server.clone(),
+        PixiradServer::new(command_handle),
         max_size_x,
         max_size_y,
         max_memory,
@@ -595,7 +601,6 @@ pub fn create_pixirad_detector(
 
     let mut threads = vec![task::start_status_task(StatusContext {
         status_port,
-        server,
         handle: runtime_handle.port_handle().clone(),
         ad_params,
         params,
@@ -829,6 +834,56 @@ mod tests {
         // A command the box takes is a success.
         det.write_int32(&mut AsynUser::new(q.sync_in_polarity), 1)
             .unwrap();
+    }
+
+    /// C statusTask switches the cooling off through `setCoolingAndHV`, whose
+    /// `writeReadServer` publishes the exchange (pixirad.cpp:1363-1369, :916-924).
+    #[test]
+    fn the_status_task_publishes_its_cooling_off_exchange() {
+        let name = "PIXI_STATUS_OFF";
+        let det = detector(name, Some("NEVER"));
+        let (ad, params) = (det.ad.params, det.params);
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        task::start_status_task(StatusContext {
+            status_port: port,
+            handle: handle.clone(),
+            ad_params: ad,
+            params,
+        });
+        let published = |reason: usize| {
+            handle
+                .with_driver_blocking(move |d: &mut PixiradDetector| {
+                    d.ad.port_base.get_string_param(reason, 0).unwrap().to_vec()
+                })
+                .unwrap()
+        };
+        // A cold side at 45 C is TColdError.
+        let message = "READ_TCOLD 45.0 READ_THOT 25.0 READ_BOX_TEMP 20.0 READ_BOX_HUM 10.0 \
+                       READ_PELTIER_PWR 1.0 READ_HV 350.0 READ_HV_CURRENT 0.1";
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !published(ad.string_to_server).starts_with(b"DAQ:! INIT") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cooling-off exchange never reached ADStringToServer"
+            );
+            sender
+                .send_to(message.as_bytes(), ("127.0.0.1", port))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let command = protocol::init(INITIAL_COOLING_VALUE, 0, INITIAL_HV_VALUE, 1);
+        assert_eq!(published(ad.string_to_server), command.as_bytes());
+        assert_eq!(published(ad.string_from_server), b"GOT: OK");
+        assert_eq!(published(ad.status_message), b"Server returned OK");
     }
 
     #[test]
