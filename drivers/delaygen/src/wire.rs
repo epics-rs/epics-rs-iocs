@@ -94,15 +94,24 @@ pub fn write_read(link: &OctetLink, cmd: &str) -> Result<String, OctetFailure> {
 
 /// [`write_read`]'s reply as the device sent it.
 pub fn write_read_bytes(link: &OctetLink, cmd: &str) -> Result<Vec<u8>, OctetFailure> {
-    let sent = write_all(link, cmd)?;
-    match link.sync.read_octet(OCTET_REASON, 4096).into_parts() {
-        (raw, Ok(())) => Ok(raw),
-        (raw, Err(error)) => Err(OctetFailure {
-            received: raw.len(),
-            error,
-            sent,
-        }),
-    }
+    let (raw, status) = exchange(link, cmd);
+    status.map(|()| raw)
+}
+
+/// [`write_read_bytes`] with the bytes a failed read delivered, which C's
+/// buffer holds; a failed write reads none.
+pub fn exchange(link: &OctetLink, cmd: &str) -> (Vec<u8>, Result<(), OctetFailure>) {
+    let sent = match write_all(link, cmd) {
+        Ok(sent) => sent,
+        Err(f) => return (Vec::new(), Err(f)),
+    };
+    let (raw, status) = link.sync.read_octet(OCTET_REASON, 4096).into_parts();
+    let status = status.map_err(|error| OctetFailure {
+        received: raw.len(),
+        error,
+        sent,
+    });
+    (raw, status)
 }
 
 /// Send `cmd` without reading a reply (C `pasynOctetSyncIO->write`).

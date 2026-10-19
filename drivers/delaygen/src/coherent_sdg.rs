@@ -34,7 +34,7 @@
 //! - **Unconditional 100 ms post-transaction delay** (`WRITEREADDELAY`) —
 //!   the shared C `writeRead()` helper sleeps 100 ms after *every*
 //!   transaction (read or write), regardless of success or failure, before
-//!   returning. [`device_write_read`] reproduces this exactly (including on
+//!   returning. [`device_exchange`] reproduces this exactly (including on
 //!   the error path).
 //! - **Interface/address cross-checking is stricter here than in C.** C's
 //!   `readFloat64`/`writeFloat64`/`readUInt32`/`writeUInt32`/`readOctet`/
@@ -67,7 +67,7 @@ use epics_rs::asyn::trace::TraceMask;
 use crate::connect::OctetLink;
 use epics_rs::asyn::user::AsynUser;
 
-use crate::wire::{self, atof, atoi, require_init, write_read_bytes};
+use crate::wire::{self, atof, atoi, require_init};
 
 /// C `WRITEREADDELAY` (`0.100` seconds).
 const WRITEREADDELAY: Duration = Duration::from_millis(100);
@@ -273,10 +273,11 @@ fn ok_or_device_error(reply: &str) -> AsynResult<()> {
 /// C `writeRead(pport,pasynUser,outBuf,inpBuf,inputSize,eomReason)` — used
 /// for both reads (`readParam`) and writes (`writeIntParam`/
 /// `writeFloatParam`/`writeCmdOnly`) alike. The 100 ms delay runs
-/// unconditionally, even when the I/O itself failed.
-fn device_write_read(port: &str, handle: &OctetLink, cmd: &str) -> AsynResult<String> {
+/// unconditionally, even when the I/O itself failed. The reply comes back
+/// with the status: C's `inpBuf` holds what a failed read delivered.
+fn device_exchange(port: &str, handle: &OctetLink, cmd: &str) -> (String, AsynResult<()>) {
     use std::fmt::Write as _;
-    let result = write_read_bytes(handle, cmd);
+    let (raw, result) = wire::exchange(handle, cmd);
     if let Err(f) = &result {
         handle.reset();
         handle.print(
@@ -284,17 +285,31 @@ fn device_write_read(port: &str, handle: &OctetLink, cmd: &str) -> AsynResult<St
             format_args!("{port} writeRead: error {} wrote \"{cmd}\"\n", f.status()),
         );
     }
-    // C's `%s` of inpBuf: the reply's bytes as sent, up to a NUL. C defect
-    // not copied: after a failed read inpBuf is unterminated stale bytes.
-    let read = result.as_deref().unwrap_or_default();
-    let read = &read[..read.iter().position(|&b| b == 0).unwrap_or(read.len())];
+    // C's `%s` of inpBuf: the bytes read, up to a NUL. C defect not copied:
+    // after a failed write inpBuf is uninitialised.
+    let read = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
     handle.write_trace(TraceMask::IO_FILTER, |out| {
         write!(out, "{port} writeRead: wrote \"{cmd}\" read \"")?;
         out.write_bytes(read)?;
         out.write_str("\"\n")
     });
     std::thread::sleep(WRITEREADDELAY);
-    Ok(String::from_utf8_lossy(&result?).into_owned())
+    (
+        String::from_utf8_lossy(&raw).into_owned(),
+        result.map_err(AsynError::from),
+    )
+}
+
+/// [`device_exchange`] for C's reads, which convert only a successful reply.
+fn device_write_read(port: &str, handle: &OctetLink, cmd: &str) -> AsynResult<String> {
+    let (reply, status) = device_exchange(port, handle, cmd);
+    status.map(|()| reply)
+}
+
+/// C `writeIntParam`/`writeFloatParam`/`writeCmdOnly`: success is the reply
+/// text alone, whatever the transfer's status.
+fn device_write(port: &str, handle: &OctetLink, cmd: &str) -> AsynResult<()> {
+    ok_or_device_error(&device_exchange(port, handle, cmd).0)
 }
 
 /// Coherent SDG port driver state (C `struct Port`).
@@ -425,8 +440,7 @@ impl CoherentSdgDriver {
         match spec.write {
             WriteKind::FloatFmt { prefix } => {
                 let cmd = format_float_write(prefix, value);
-                let reply = device_write_read(&self.base.port_name, &self.handle, &cmd)?;
-                ok_or_device_error(&reply)
+                device_write(&self.base.port_name, &self.handle, &cmd)
             }
             _ => Err(AsynError::AddressOutOfRange(user.addr)),
         }
@@ -461,13 +475,9 @@ impl CoherentSdgDriver {
         match spec.write {
             WriteKind::IntFmt { prefix, width } => {
                 let cmd = format_int_write(prefix, width, value);
-                let reply = device_write_read(&self.base.port_name, &self.handle, &cmd)?;
-                ok_or_device_error(&reply)
+                device_write(&self.base.port_name, &self.handle, &cmd)
             }
-            WriteKind::CmdOnly(cmd) => {
-                let reply = device_write_read(&self.base.port_name, &self.handle, cmd)?;
-                ok_or_device_error(&reply)
-            }
+            WriteKind::CmdOnly(cmd) => device_write(&self.base.port_name, &self.handle, cmd),
             WriteKind::Sink => Ok(()),
             WriteKind::FloatFmt { .. } => Err(AsynError::AddressOutOfRange(user.addr)),
         }
@@ -612,6 +622,47 @@ mod init_tests {
             "{}",
             String::from_utf8_lossy(&out)
         );
+    }
+
+    /// drvAsynCoherentSDG.cpp:476-503 tests the reply for "OK" whatever
+    /// `writeRead` returned, and :745 prints the bytes a failed read
+    /// delivered; reads still refuse a failed transfer (:620).
+    #[test]
+    fn an_ok_cut_by_a_timeout_is_a_successful_write() {
+        use crate::connect::cut_link;
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let mut sdg = CoherentSdgDriver::new("SDG_CUT", cut_link("SDG_CUT_IO", b"OK"));
+        sdg.init = true;
+        let path = std::env::temp_dir().join(format!("sdg-cut-{}.trace", std::process::id()));
+        let file =
+            std::sync::Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+        let services = PortServices::global();
+        let trace = services.trace();
+        trace.set_trace_mask(Some("SDG_CUT_IO"), TraceMask::IO_FILTER);
+        trace.set_trace_file(Some("SDG_CUT_IO"), TraceFile::File(file));
+
+        let addr_of =
+            |kind: fn(&WriteKind) -> bool| COMMANDS.iter().find(|c| kind(&c.write)).unwrap().addr;
+        let int = addr_of(|w| matches!(w, WriteKind::IntFmt { .. }));
+        let cmd = addr_of(|w| matches!(w, WriteKind::CmdOnly(_)));
+        let float = addr_of(|w| matches!(w, WriteKind::FloatFmt { .. }));
+        for addr in [int, cmd] {
+            sdg.write_uint32_digital(&mut AsynUser::default().with_addr(addr), 1, 1)
+                .unwrap();
+        }
+        sdg.write_float64(&mut AsynUser::default().with_addr(float), 1.0)
+            .unwrap();
+        assert!(sdg.read_float64(&AsynUser::default().with_addr(8)).is_err());
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let read = format!(
+            "SDG_CUT writeRead: wrote \"{}\" read \"OK\"\n",
+            find_spec(8).unwrap().read_cmd
+        );
+        assert!(out.contains(&read), "{out}");
+        assert_eq!(out.matches("read \"OK\"").count(), 4, "{out}");
     }
 
     /// C's writes are asynError unless the reply is "OK", and nothing writes
