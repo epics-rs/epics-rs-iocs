@@ -231,10 +231,9 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
         )
         .await;
 
-        // A dark or ADC0 frame is a calibration measurement kept inside the
-        // detector server; C published neither, and neither do we.
+        // A dark frame stays inside the detector server (PhotonII.cpp:412).
         if setup.array_callbacks
-            && setup.frame_type == FrameType::Normal
+            && setup.frame_type != FrameType::Dark
             && let Err(abort) =
                 publish_frame(ctx, &setup, &file_name, start, start_ts, array_counter).await
         {
