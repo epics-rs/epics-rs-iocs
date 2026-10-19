@@ -213,6 +213,9 @@ impl Mm3000Controller {
 
     /// Write a command and read the reply (C `send_mess` + `recv_mess`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
+        // write_read flushes first; C reads with no flush past motor_init
+        // (drvMM3000.cc:492), so one late reply shifts every later answer: a
+        // C defect, not copied.
         let (raw, status) = self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)

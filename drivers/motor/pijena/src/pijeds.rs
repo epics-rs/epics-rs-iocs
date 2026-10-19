@@ -170,6 +170,9 @@ impl PiJedsController {
     /// Send a query command and return its reply, stripped of framing control
     /// bytes (STX/ETX) and surrounding whitespace.
     fn query(&self, cmd: &str) -> AsynResult<String> {
+        // write_read flushes first; C flushes only at set_status
+        // (drvPIJEDS.cc:257), so a late reply shifts its answers until the
+        // next poll: a C defect, not copied.
         let (raw, status) = self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)

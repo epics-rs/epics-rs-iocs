@@ -63,6 +63,9 @@ impl Im483Controller {
 
     /// `send_mess` then `recv_mess`: the reply, empty when none came.
     fn ask(&self, msg: impl AsRef<[u8]>) -> String {
+        // write_read flushes first; C reads with no flush past motor_init
+        // (drvIM483PL.cc:440, drvIM483SM.cc:433), so one late reply shifts
+        // every later answer: a C defect, not copied.
         match self
             .handle
             .write_read(0, msg.as_ref(), BUFF_SIZE)

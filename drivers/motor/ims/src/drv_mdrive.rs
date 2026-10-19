@@ -52,6 +52,9 @@ impl MDriveController {
 
     /// `send_mess` then `recv_mess`: the reply, empty when none came.
     fn ask(&self, msg: &str) -> String {
+        // write_read flushes first; C flushes only at set_status
+        // (drvMDrive.cc:259), so a late reply shifts its answers until the
+        // next poll: a C defect, not copied.
         match self
             .handle
             .write_read(0, msg.as_bytes(), BUFF_SIZE)

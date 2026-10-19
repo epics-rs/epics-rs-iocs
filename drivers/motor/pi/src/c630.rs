@@ -204,7 +204,8 @@ impl PIC630Controller {
             return Ok(());
         }
         // Consume + discard the echo. The exchange flushes stale input first,
-        // so a stray line cannot be taken for the echo; C ignores the echo
+        // so a stray line cannot be taken for the echo; C reads with no flush
+        // (drvPIC630.cc:354), a C defect not copied. C ignores the echo
         // read's outcome, and so does this.
         let _ = self.handle.write_read(0, cmd, READ_BUF);
         Ok(())

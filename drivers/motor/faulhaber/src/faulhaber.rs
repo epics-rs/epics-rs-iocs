@@ -151,8 +151,9 @@ impl FaulhaberController {
 
     /// Send a query to `node` and return its reply, trimmed of framing.
     fn query(&self, node: usize, cmd: &str) -> AsynResult<String> {
-        // C send_mess/recv_mess write then read with no flush, so one stray
-        // line shifts every later reply; write_read flushes first.
+        // C send_mess/recv_mess write then read with no flush
+        // (drvMCDC2805.cc:442), so one stray line shifts every later reply;
+        // write_read flushes first: a C defect, not copied.
         let (raw, status) = self
             .reader
             .write_read(0, &Self::framed(node, cmd), READ_BUF)

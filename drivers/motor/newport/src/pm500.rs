@@ -135,9 +135,9 @@ impl Pm500Controller {
         self.num_axes
     }
 
-    /// Write one command message and read its one reply: C `send_mess`,
-    /// which flushes stale input first, + `recv_mess`, which logs a "system
-    /// error" on an `SE` reply but still returns it. C's motor task pairs
+    /// Write one command message and read its one reply: C `send_mess` +
+    /// `recv_mess`, which logs a "system error" on an `SE` reply but still
+    /// returns it. C's motor task pairs
     /// every `send_mess` with a `recv_mess` (`cmnd_response = true`), so even
     /// pure motion messages consume a response.
     fn command(&self, cmd: &str) -> AsynResult<String> {
@@ -145,6 +145,9 @@ impl Pm500Controller {
     }
 
     fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
+        // write_read flushes first; C reads with no flush past motor_init
+        // (drvPM500.cc:423), so one late reply shifts every later answer: a
+        // C defect, not copied.
         let (raw, status) = self.handle.write_read(0, cmd, READ_BUF).into_parts();
         status?;
         let reply = String::from_utf8_lossy(&raw).into_owned();

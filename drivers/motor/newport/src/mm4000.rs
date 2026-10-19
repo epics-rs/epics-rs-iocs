@@ -467,6 +467,9 @@ impl Mm4000Controller {
 
     /// C `sendAndReceive`: the bytes that arrived, and the status.
     fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
+        // write_read is drvMM4000Asyn.c:947's writeRead; the model-1
+        // recv_mess reads with no flush (drvMM4000.cc:582), so one late reply
+        // shifts every later answer there: a C defect, not copied.
         let (raw, e) = match self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)

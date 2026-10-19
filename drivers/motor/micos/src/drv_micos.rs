@@ -38,6 +38,9 @@ impl MicosController {
 
     /// `send_mess` then `recv_mess`: the reply, empty when none came.
     fn ask(&self, msg: &str) -> String {
+        // write_read flushes first; C reads with no flush past motor_init
+        // (drvMicos.cc:355), so one late reply shifts every later answer: a
+        // C defect, not copied.
         match self
             .handle
             .write_read(0, msg.as_bytes(), BUFF_SIZE)

@@ -149,8 +149,9 @@ impl Esp300Controller {
 
     /// Write a command and read the reply (C `send_mess` + `recv_mess`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        // C writes then reads with no flush, so one stray line shifts every
-        // later reply; write_read flushes first. The ESP300 firmware can
+        // C writes then reads with no flush (drvESP300.cc:534), so one stray
+        // line shifts every later reply; write_read flushes first, a C defect
+        // not copied. The ESP300 firmware can
         // still put an unsolicited hard-limit error (E35..E42) ahead of the
         // real reply, which C recv_mess re-reads past; it tests the read with
         // its CR (drvESP300.cc:536).

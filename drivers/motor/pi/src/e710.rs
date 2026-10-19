@@ -366,8 +366,8 @@ impl PIE710Controller {
     }
 
     /// Write a query and read its reply as one exchange that first flushes
-    /// stale input, so a stray line cannot shift every later reply by one
-    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    /// stale input. C flushes only at `set_status` (drvPIE710.cc:237), so a late reply
+    /// shifts its answers until the next poll: a C defect, not copied.
     fn exchange(&self, cmd: &str) -> String {
         Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
     }
