@@ -224,8 +224,8 @@ impl PilatusDriver {
         self.set_threshold();
     }
 
-    /// C `pilatusStatus()`.
-    pub(crate) fn pilatus_status(&mut self) {
+    /// C `pilatusStatus()`; the status is the `thread` exchange's.
+    pub(crate) fn pilatus_status(&mut self) -> AsynStatus {
         let (ad, p) = (self.ad.params, self.p);
         if self.first_status_call {
             let status = self.cam_write_read("version", 1.0);
@@ -276,6 +276,7 @@ impl PilatusDriver {
             self.set_i32(ad.status, ADStatus::Error as i32);
         }
         let _ = self.ad.port_base.call_param_callbacks(0);
+        status
     }
     /// C `readBadPixelFile()`.
     pub(crate) fn read_bad_pixel_file(&mut self, file: &str) {

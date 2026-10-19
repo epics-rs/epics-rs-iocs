@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
@@ -221,7 +221,14 @@ impl PortDriver for PilatusDriver {
                 );
             } else if function == params.read_status {
                 if !acquiring {
-                    det.pilatus_status();
+                    // C returns pilatusStatus()'s status (pilatusDetector.cpp:1429-1431).
+                    status = match det.pilatus_status() {
+                        AsynStatus::Success => Ok(()),
+                        s => Err(AsynError::Status {
+                            status: s,
+                            message: "pilatusStatus".into(),
+                        }),
+                    };
                 }
             } else if function < p.first() {
                 status = ADDriver::ad_write_int32(det, user, value);
@@ -512,7 +519,7 @@ pub fn create_pilatus_detector(
         .map(PersistentArray::new);
     // C always calls pilatusStatus() once at the end of the constructor to get
     // the TVX version.
-    driver.pilatus_status();
+    let _ = driver.pilatus_status();
 
     let ad_params = driver.ad.params;
     let pilatus_params = driver.p;
@@ -896,6 +903,23 @@ mod tests {
             .unwrap();
         std::mem::forget(rt);
         sent
+    }
+
+    /// C writeInt32 returns pilatusStatus()'s status for ReadStatus
+    /// (pilatusDetector.cpp:1429-1431), the `thread` exchange's.
+    #[test]
+    fn a_read_status_whose_thread_exchange_fails_fails_the_write() {
+        let (flat_field_tx, _rx) = rt::command_channel::<PublishedArray>(4);
+        let links = DriverLinks {
+            flat_field_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+            cam: no_camserver(),
+        };
+        let mut det = PilatusDriver::new("PILATUS_READ_STATUS", 8, 8, 0, links).unwrap();
+        let r = det.ad.params.read_status;
+        assert!(det.write_int32(&mut AsynUser::new(r), 1).is_err());
     }
 
     /// C runs setAcquireParams inside writeFloat64 on the port thread
