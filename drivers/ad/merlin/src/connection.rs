@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use epics_rs::ad_core::driver::ADDriverBase;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -224,8 +225,13 @@ impl MpxConnection {
     /// back (C `mpxWriteRead`). Anything else on the wire is reported and
     /// dropped, which is how the channel recovers from a desynchronised
     /// server.
+    ///
+    /// The command lands on `ADStringToServer` whatever the write did, and
+    /// every frame read lands on `ADStringFromServer`, stray ones included
+    /// (mpxConnection.cpp:571/:763); C posts neither.
     fn transact(
         &self,
+        ad: &mut ADDriverBase,
         kind: MpxKind,
         name: &str,
         value: Option<&str>,
@@ -246,10 +252,19 @@ impl MpxConnection {
                 ChannelError::from(e).code()
             ));
         }
+        let _ = ad
+            .port_base
+            .set_string_param(ad.params.string_to_server, 0, msg.clone());
 
         loop {
             let mut header = String::new();
             let read = self.read_frame_into(&mut header, timeout);
+            if let Ok(body) = &read {
+                let from = format!("{header}{}", String::from_utf8_lossy(body));
+                let _ = ad
+                    .port_base
+                    .set_string_param(ad.params.string_from_server, 0, from);
+            }
             let (code, body) = match &read {
                 Ok(body) if protocol::response_echoes(body, kind, name) => break read,
                 Ok(body) => (0, String::from_utf8_lossy(body).into_owned()),
@@ -263,36 +278,52 @@ impl MpxConnection {
     }
 
     /// `SET <name> <value>`.
-    pub fn set(&self, name: &str, value: &str, timeout: Duration) -> Result<(), ChannelError> {
-        let body = self.transact(MpxKind::Set, name, Some(value), timeout)?;
+    pub fn set(
+        &self,
+        ad: &mut ADDriverBase,
+        name: &str,
+        value: &str,
+        timeout: Duration,
+    ) -> Result<(), ChannelError> {
+        let body = self.transact(ad, MpxKind::Set, name, Some(value), timeout)?;
         protocol::decode_ack(&body)?;
         Ok(())
     }
 
     /// `GET <name>`, returning the device's value field.
-    pub fn get(&self, name: &str, timeout: Duration) -> Result<String, ChannelError> {
-        let body = self.transact(MpxKind::Get, name, None, timeout)?;
+    pub fn get(
+        &self,
+        ad: &mut ADDriverBase,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<String, ChannelError> {
+        let body = self.transact(ad, MpxKind::Get, name, None, timeout)?;
         Ok(protocol::decode_get(&body)?)
     }
 
     /// `CMD <name>`.
-    pub fn command(&self, name: &str, timeout: Duration) -> Result<(), ChannelError> {
-        let body = self.transact(MpxKind::Cmd, name, None, timeout)?;
+    pub fn command(
+        &self,
+        ad: &mut ADDriverBase,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<(), ChannelError> {
+        let body = self.transact(ad, MpxKind::Cmd, name, None, timeout)?;
         protocol::decode_ack(&body)?;
         Ok(())
     }
 
     /// `GET <name>` parsed as a float, or `None` if the device refused.
-    pub fn get_f64(&self, name: &str, timeout: Duration) -> Option<f64> {
-        match self.get(name, timeout) {
+    pub fn get_f64(&self, ad: &mut ADDriverBase, name: &str, timeout: Duration) -> Option<f64> {
+        match self.get(ad, name, timeout) {
             Ok(v) => v.trim().parse().ok(),
             Err(_) => None,
         }
     }
 
     /// `GET <name>` parsed as an integer, or `None` if the device refused.
-    pub fn get_i32(&self, name: &str, timeout: Duration) -> Option<i32> {
-        match self.get(name, timeout) {
+    pub fn get_i32(&self, ad: &mut ADDriverBase, name: &str, timeout: Duration) -> Option<i32> {
+        match self.get(ad, name, timeout) {
             Ok(v) => v.trim().parse().ok(),
             Err(_) => None,
         }
