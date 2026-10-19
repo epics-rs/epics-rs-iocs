@@ -62,8 +62,8 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
             .unwrap(),
         b""
     );
-    // C returns before setting SDNModules when `-get nmodules` fails
-    // (mythen.cpp:1362-1373), so it stays undefined.
+    // C sets SDNModules from a failed read's leftover inString_
+    // (mythen.cpp:1364-1373, a C bug); rs leaves it undefined.
     assert!(matches!(
         base.get_int32_param(driver.p.nmodules, 0),
         Err(AsynError::ParamUndefined(r)) if r == driver.p.nmodules
