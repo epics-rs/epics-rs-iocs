@@ -441,8 +441,8 @@ impl Ctx {
 mod tests {
     use super::*;
     use crate::driver::{DriverLinks, PilatusDriver};
+    use crate::task::FlatFieldJob;
     use crate::task::Shared;
-    use epics_rs::ad_core::ndarray_pool::PublishedArray;
     use epics_rs::ad_core::runtime as rt;
     use epics_rs::asyn::error::AsynError;
     use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
@@ -475,7 +475,7 @@ mod tests {
     /// connection prints `status=4`, not asynError's 3.
     #[test]
     fn a_camserver_write_keeps_the_octet_ports_status() {
-        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let stop = Arc::new(Event::new());
         let det = PilatusDriver::new(
             "PILATUS_WRITE_STATUS",
@@ -597,7 +597,7 @@ mod tests {
     /// `cam_read(timeout)` over a camserver port replaying `reads`: the
     /// status and the `fromCamserver` it ends with.
     fn cam_read_over(name: &str, reads: &[(&'static [u8], bool)], timeout: f64) -> (i32, String) {
-        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let stop = Arc::new(Event::new());
         let det = PilatusDriver::new(
             name,

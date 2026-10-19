@@ -357,7 +357,11 @@ impl PilatusDriver {
         else {
             return;
         };
-        let _ = self.flat_field_tx.try_send(array);
-        self.set_i32(valid, 1);
+        // C publishes before FlatFieldValid = 1 (pilatusDetector.cpp:315-316);
+        // a flat field that never reached the publisher is not valid.
+        let (done, published) = std::sync::mpsc::sync_channel(1);
+        if self.flat_field_tx.try_send((array, done)).is_ok() && published.recv().is_ok() {
+            self.set_i32(valid, 1);
+        }
     }
 }

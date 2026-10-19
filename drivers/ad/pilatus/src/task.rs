@@ -58,16 +58,21 @@ pub(crate) struct Worker {
 // Flat-field publisher
 // ---------------------------------------------------------------------------
 
+/// A flat field and the port thread waiting for its publish.
+pub(crate) type FlatFieldJob = (PublishedArray, std::sync::mpsc::SyncSender<()>);
+
 /// Fans out the flat field `readFlatFieldFile` reads on the port thread. C
 /// calls `doCallbacksGenericPointer` there (pilatusDetector.cpp:316); the
-/// port actor's current-thread runtime cannot await [`ArrayPublisher::publish`].
+/// port actor's current-thread runtime cannot await [`ArrayPublisher::publish`],
+/// so the port thread waits for the ack instead.
 pub(crate) fn start_flat_field_task(
     output: ArrayPublisher,
-    mut rx: rt::CommandReceiver<PublishedArray>,
+    mut rx: rt::CommandReceiver<FlatFieldJob>,
 ) -> std::thread::JoinHandle<()> {
     rt::run_thread_named("PilatusFlatField", move || async move {
-        while let Some(array) = rx.recv().await {
+        while let Some((array, done)) = rx.recv().await {
             output.publish(array).await;
+            let _ = done.send(());
         }
     })
 }
@@ -696,12 +701,52 @@ mod tests {
     /// (pilatusDetector.cpp:678, :685), whatever MaxSizeX reads now.
     #[test]
     fn a_flat_field_file_sized_to_max_size_not_pflatfield_is_rejected() {
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
+        let mut det = flat_field_driver("PILATUS_FLAT_DIMS", flat_field_tx);
+        let (ad, p) = (det.ad.params, det.p);
+        det.ad.port_base.set_i32(ad.max_size_x, 3);
+        let path = flat_field_tiff("dims", 3, &[7, 8, 9]);
+        det.read_flat_field_file(&path.to_string_lossy());
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(p.flat_field_valid, 0)
+                .unwrap(),
+            0
+        );
+    }
+
+    /// FlatFieldValid follows the publish (pilatusDetector.cpp:315-316): a
+    /// flat field the publisher never took leaves it 0.
+    #[test]
+    fn a_flat_field_the_publisher_never_took_is_not_valid() {
+        let (flat_field_tx, flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
+        drop(flat_field_rx);
+        let mut det = flat_field_driver("PILATUS_FLAT_UNPUBLISHED", flat_field_tx);
+        let p = det.p;
+        let path = flat_field_tiff("unpublished", 2, &[7, 9]);
+        det.read_flat_field_file(&path.to_string_lossy());
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(p.flat_field_valid, 0)
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A 2x1 detector with no camserver and a 2x1 `pFlatField`.
+    fn flat_field_driver(
+        port: &str,
+        flat_field_tx: rt::CommandSender<FlatFieldJob>,
+    ) -> crate::driver::PilatusDriver {
         use crate::driver::{DriverLinks, PilatusDriver};
 
-        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
         let shared = Arc::new(Mutex::new(Shared::default()));
-        let mut det = PilatusDriver::new(
-            "PILATUS_FLAT_DIMS",
+        let det = PilatusDriver::new(
+            port,
             2,
             1,
             0,
@@ -722,30 +767,26 @@ mod tests {
             },
         )
         .unwrap();
-        let (ad, p, pool) = (det.ad.params, det.p, det.ad.pool.clone());
         shared.lock().flat_field = Some(PersistentArray::new(
-            pool.alloc(
-                vec![NDDimension::new(2), NDDimension::new(1)],
-                epics_rs::ad_core::ndarray::NDDataType::Int32,
-            )
-            .unwrap(),
+            det.ad
+                .pool
+                .alloc(
+                    vec![NDDimension::new(2), NDDimension::new(1)],
+                    epics_rs::ad_core::ndarray::NDDataType::Int32,
+                )
+                .unwrap(),
         ));
-        det.ad.port_base.set_i32(ad.max_size_x, 3);
+        det
+    }
 
-        let path = std::env::temp_dir().join(format!("pil-flat-{}.tif", std::process::id()));
+    /// A one-row Gray32 TIFF of `width` pixels.
+    fn flat_field_tiff(tag: &str, width: u32, pixels: &[u32]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("pil-flat-{tag}-{}.tif", std::process::id()));
         let mut enc =
             tiff::encoder::TiffEncoder::new(std::fs::File::create(&path).unwrap()).unwrap();
-        enc.write_image::<tiff::encoder::colortype::Gray32>(3, 1, &[7, 8, 9])
+        enc.write_image::<tiff::encoder::colortype::Gray32>(width, 1, pixels)
             .unwrap();
-        det.read_flat_field_file(&path.to_string_lossy());
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(
-            det.ad
-                .port_base
-                .get_int32_param(p.flat_field_valid, 0)
-                .unwrap(),
-            0
-        );
+        path
     }
 
     #[test]

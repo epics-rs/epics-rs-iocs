@@ -21,7 +21,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::ad_core::driver::write_tail::{OwnList, WriteTail};
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverPool, PersistentArray, PublishedArray};
+use epics_rs::ad_core::ndarray_pool::{DriverPool, PersistentArray};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
@@ -32,7 +32,7 @@ use crate::params::PilatusParams;
 use crate::protocol::{
     cmd_cbf_template_file, cmd_mx_f64, cmd_mx_i32, cmd_mx_pair, cmd_oscill_axis,
 };
-use crate::task::{Shared, Worker, start_acq_task, start_flat_field_task};
+use crate::task::{FlatFieldJob, Shared, Worker, start_acq_task, start_flat_field_task};
 use crate::types::{CAMSERVER_DEFAULT_TIMEOUT, Event, TriggerMode};
 
 /// C `DRIVER_VERSION.DRIVER_REVISION.DRIVER_MODIFICATION`.
@@ -42,7 +42,7 @@ pub struct PilatusDriver {
     pub ad: ADDriverBase,
     pub p: PilatusParams,
     /// Hands `readFlatFieldFile`'s array to `PilatusFlatField` to publish.
-    pub(crate) flat_field_tx: rt::CommandSender<PublishedArray>,
+    pub(crate) flat_field_tx: rt::CommandSender<FlatFieldJob>,
     start: Arc<Event>,
     pub(crate) stop: Arc<Event>,
     pub(crate) shared: Arc<Mutex<Shared>>,
@@ -56,7 +56,7 @@ pub struct PilatusDriver {
 
 /// The handles the driver hands to (and shares with) its worker threads.
 pub(crate) struct DriverLinks {
-    pub(crate) flat_field_tx: rt::CommandSender<PublishedArray>,
+    pub(crate) flat_field_tx: rt::CommandSender<FlatFieldJob>,
     pub(crate) start: Arc<Event>,
     pub(crate) stop: Arc<Event>,
     pub(crate) shared: Arc<Mutex<Shared>>,
@@ -484,7 +484,8 @@ pub fn create_pilatus_detector(
         SyncIOHandle::connect_port(camserver_port, 0, Duration::ZERO, InterfaceType::Octet);
     let cam_handle = Arc::new(cam_handle);
 
-    let (flat_field_tx, flat_field_rx) = rt::command_channel::<PublishedArray>(64);
+    // The port thread waits for each ack, so one job is ever queued.
+    let (flat_field_tx, flat_field_rx) = rt::command_channel::<FlatFieldJob>(1);
     let start = Arc::new(Event::new());
     let stop = Arc::new(Event::new());
 
@@ -568,7 +569,7 @@ mod tests {
     /// every array the driver reads.
     #[test]
     fn data_type_starts_at_int32() {
-        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
             flat_field_tx,
             start: Arc::new(Event::new()),
@@ -587,7 +588,7 @@ mod tests {
     #[test]
     fn a_base_class_write_reaches_addriver() {
         use epics_rs::ad_core::driver::ShutterMode;
-        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
             flat_field_tx,
             start: Arc::new(Event::new()),
@@ -617,7 +618,7 @@ mod tests {
     /// whatever the address.
     #[test]
     fn a_write_at_another_address_sets_list_zero() {
-        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
             flat_field_tx,
             start: Arc::new(Event::new()),
@@ -648,7 +649,7 @@ mod tests {
         use epics_rs::asyn::trace::TraceFile;
         use epics_rs::asyn::user::UserTrace;
         let port = "PILATUS_STATUS";
-        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
             flat_field_tx,
             start: Arc::new(Event::new()),
@@ -689,7 +690,7 @@ mod tests {
     #[test]
     fn a_pair_write_sends_zero_for_its_unset_partner() {
         let sent = recording_camserver("PILATUS_PAIR_CAM");
-        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
             flat_field_tx,
             start: Arc::new(Event::new()),
@@ -717,7 +718,7 @@ mod tests {
     #[test]
     fn a_file_path_write_runs_ndarray_driver_check_path() {
         let sent = recording_camserver("PILATUS_CHECK_PATH_CAM");
-        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
             flat_field_tx,
             start: Arc::new(Event::new()),
@@ -758,7 +759,7 @@ mod tests {
         use epics_rs::asyn::trace::TraceFile;
         use epics_rs::asyn::user::UserTrace;
         let port = "PILATUS_BASE_F64";
-        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
             flat_field_tx,
             start: Arc::new(Event::new()),
@@ -905,11 +906,59 @@ mod tests {
         sent
     }
 
+    /// C publishes the flat field before setting FlatFieldValid, both on the
+    /// port thread (pilatusDetector.cpp:315-316): when the write returns, a
+    /// plugin already holds the array.
+    #[test]
+    fn a_flat_field_write_returns_after_the_array_is_published() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::registry::claim_port;
+
+        let rt = create_pilatus_detector(
+            &claim_port("PILATUS_FF_ORDER").unwrap(),
+            "PILATUS_FF_ORDER_CAM",
+            2,
+            1,
+            0,
+        )
+        .expect("the detector port");
+        let (sender, mut receiver) = ndarray_channel("PILATUS_FF_SINK", 4);
+        rt.connect_downstream(sender);
+        let path = std::env::temp_dir().join(format!("pil-ff-order-{}.tif", std::process::id()));
+        let mut enc =
+            tiff::encoder::TiffEncoder::new(std::fs::File::create(&path).unwrap()).unwrap();
+        enc.write_image::<tiff::encoder::colortype::Gray32>(2, 1, &[7, 9])
+            .unwrap();
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let mut late = 0;
+        for _ in 0..200 {
+            sync.write_octet(
+                rt.pilatus_params.flat_field_file,
+                path.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                sync.read_int32(rt.pilatus_params.flat_field_valid).unwrap(),
+                1
+            );
+            if receiver.pending() == 0 {
+                late += 1;
+            }
+            receiver.blocking_recv().unwrap();
+        }
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            late, 0,
+            "FlatFieldValid read 1 before the plugin had the array"
+        );
+        std::mem::forget(rt);
+    }
+
     /// C writeInt32 returns pilatusStatus()'s status for ReadStatus
     /// (pilatusDetector.cpp:1429-1431), the `thread` exchange's.
     #[test]
     fn a_read_status_whose_thread_exchange_fails_fails_the_write() {
-        let (flat_field_tx, _rx) = rt::command_channel::<PublishedArray>(4);
+        let (flat_field_tx, _rx) = rt::command_channel::<FlatFieldJob>(4);
         let links = DriverLinks {
             flat_field_tx,
             start: Arc::new(Event::new()),
