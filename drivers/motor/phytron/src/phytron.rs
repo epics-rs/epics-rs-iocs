@@ -48,11 +48,6 @@
 //! - The brake output + idle-motor-disable feature (`phytronBrakeOutput`): with
 //!   the default (no brake, keep motor enabled) a move only needs to enable the
 //!   module output once, which this driver sends as `MA` before the first move.
-//! - The `HOMING_PROCEDURE` aux record selects one of seven homing procedures;
-//!   its record default is `limit` (home onto a limit switch), which is the only
-//!   procedure this driver issues (`R+`/`R-`), together with the C limit-home
-//!   state machine that reports the reached limit as home-done. The other six
-//!   procedures require the unported aux record.
 //! - The fake-HOMED-bit feature (Phytron registers 1001..1020, enabled by the
 //!   `fakeHomedEnable` option): disabled by default, so HOMED is reported from
 //!   status bit 0x08.
@@ -418,6 +413,7 @@ struct Reasons {
     controller_reset: usize,
     axis_status_reset: usize,
     axis_reset: usize,
+    homing_procedure: usize,
 }
 
 impl PhytronParams {
@@ -547,6 +543,7 @@ impl ControllerParams for PhytronParams {
         r.axis_status_reset = base.create_param("AXIS_STATUS_RESET", ParamType::Int32)?;
         r.axis_reset = base.create_param("AXIS_RESET", ParamType::Int32)?;
         base.create_param("AXIS_STATUS", ParamType::Int32)?;
+        r.homing_procedure = base.create_param("HOMING_PROCEDURE", ParamType::Int32)?;
         for (name, p) in AXIS_P_PARAMS {
             self.p_regs
                 .insert(base.create_param(name, ParamType::Int32)?, p);
@@ -578,6 +575,14 @@ impl ControllerParams for PhytronParams {
             } else {
                 ParamWrite::Handled(status)
             };
+        }
+        if user.reason == r.homing_procedure {
+            let found = self.axis_controller(base, user, "phytronAxis::writeInt32");
+            return ParamWrite::PassToBase(found.map(|(mut ctrl, addr, _)| {
+                if let Some(a) = ctrl.axis_mut(addr) {
+                    a.homing_procedure = Some(value);
+                }
+            }));
         }
         let p = self.p_regs.get(&user.reason).copied();
         if p.is_none() && user.reason != r.axis_reset && user.reason != r.axis_status_reset {
@@ -819,6 +824,9 @@ struct AxisState {
     answers: Option<Vec<String>>,
     /// The axis has been polled, for [`PhytronController::did_initial_readout`].
     read_once: bool,
+    /// HOMING_PROCEDURE as written, which C's `home` reads back; unset
+    /// until a write, as C's param is.
+    homing_procedure: Option<i32>,
 }
 
 /// A Phytron controller endpoint owning the asyn octet handle. Shared by all of
@@ -1288,6 +1296,7 @@ impl PhytronAxis {
             last_status: 0,
             answers: None,
             read_once: false,
+            homing_procedure: None,
         });
         drop(ctrl);
         Ok(Self {
@@ -1574,8 +1583,7 @@ impl AsynMotor for PhytronAxis {
         moved
     }
 
-    /// C `home` (phytronAxisMotor.cpp:1637-1705) with the `limit` homing
-    /// procedure, which arms the limit-home state machine before the send.
+    /// C `home` (phytronAxisMotor.cpp:1637-1705).
     fn home(
         &mut self,
         _user: &AsynUser,
@@ -1674,7 +1682,11 @@ impl PhytronAxis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        let set = self.lock().set_char();
+        let (set, procedure) = {
+            let ctrl = self.lock();
+            let procedure = ctrl.axis(self.axis_no).and_then(|a| a.homing_procedure);
+            (ctrl.set_char(), procedure)
+        };
         let mut commands = Vec::new();
         self.clear_axis_error(&mut commands)?;
         self.profile(
@@ -1685,9 +1697,22 @@ impl PhytronAxis {
             true,
         );
         self.release(&mut commands);
-        self.home_state = if forward { 3 } else { 2 };
-        let dir = if forward { "R+" } else { "R-" };
-        commands.push(format!("{}{dir}", self.axis_module_no));
+        // C homingType; only `limit` arms the limit-home state machine.
+        let d = if forward { '+' } else { '-' };
+        let run = match procedure {
+            Some(0) => {
+                self.home_state = if forward { 3 } else { 2 };
+                format!("R{d}")
+            }
+            Some(1) => format!("R{d}C"),
+            Some(2) => format!("R{d}I"),
+            Some(3) => format!("R{d}^I"),
+            Some(4) => format!("R{d}C^I"),
+            Some(5) => format!("RC{d}"),
+            Some(6) => format!("RC{d}^I"),
+            _ => return Err(phytron_err("phytronAxis::home: no homing procedure")),
+        };
+        commands.push(format!("{}{run}", self.axis_module_no));
         self.run(commands, "home", "Start homing")
     }
 
@@ -2369,6 +2394,7 @@ mod tests {
         assert_eq!(secs(&written), 0, "disarmed");
         axis.poll(&user).unwrap();
         written.lock().unwrap().clear();
+        ctrl.lock().unwrap().axis_mut(11).unwrap().homing_procedure = Some(0);
         axis.home(&user, 10.0, 100.0, 5000.0, true).unwrap();
         assert_eq!(secs(&written), 1, "a limit-switch error re-arms it");
 
@@ -2390,6 +2416,33 @@ mod tests {
         assert_eq!(secs(&written), 1);
         axis.move_absolute(&user, 1.0, 10.0, 100.0, 5000.0).unwrap();
         assert_eq!(secs(&written), 0);
+    }
+
+    /// C `home`'s seven homing procedures (phytronAxisMotor.cpp:1679-1699),
+    /// of which only `limit` arms the limit-home state machine; an unset or
+    /// unknown one sends nothing and fails.
+    #[test]
+    fn a_home_sends_the_axis_s_homing_procedure() {
+        let (ctrl, [mut axis, _], written) = lines_with("phyHomingProc", |_| Some(String::new()));
+        let user = AsynUser::new(0);
+        let mut home = |procedure, forward| {
+            ctrl.lock().unwrap().axis_mut(11).unwrap().homing_procedure = procedure;
+            let homed = axis.home(&user, 10.0, 100.0, 5000.0, forward).is_ok();
+            let sent = std::mem::take(&mut *written.lock().unwrap());
+            (homed, sent.last().cloned(), axis.home_state)
+        };
+        let some = |c: &str| (true, Some(format!("M1.1{c}")), 0);
+        assert_eq!(home(None, true), (false, None, 0));
+        assert_eq!(home(Some(7), true), (false, None, 0));
+        assert_eq!(home(Some(1), true), some("R+C"));
+        assert_eq!(home(Some(1), false), some("R-C"));
+        assert_eq!(home(Some(2), true), some("R+I"));
+        assert_eq!(home(Some(3), false), some("R-^I"));
+        assert_eq!(home(Some(4), true), some("R+C^I"));
+        assert_eq!(home(Some(5), false), some("RC-"));
+        assert_eq!(home(Some(6), true), some("RC+^I"));
+        assert_eq!(home(Some(0), false), (true, Some("M1.1R-".into()), 2));
+        assert_eq!(home(Some(0), true), (true, Some("M1.1R+".into()), 3));
     }
 
     /// An MCC has no `SEC` (phytronAxisMotor.cpp:1394-1395).
