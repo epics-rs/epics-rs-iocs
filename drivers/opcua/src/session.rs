@@ -1490,12 +1490,19 @@ impl SessionWorker {
                 End::Lost => Link::Lost,
             };
         }
-        // The ACTIVATED -> CREATED arm (`SessionOpen62541.cpp:2520-2523`), which
-        // every way out of a session passes.
-        errlog_vprintf(format_args!(
-            "OPC UA session {}: disconnected\n",
-            self.handle.name
-        ));
+        // The ACTIVATED -> CREATED arm (`SessionOpen62541.cpp:2520-2523`). A
+        // requested disconnect ends C's session in CLOSED and skips it. The C
+        // oracle prints it anyway when the session has a subscription (5/5
+        // runs with one, 0/3 without): open62541 1.2 re-sends Publish while
+        // CLOSING (`UA_Client_Subscriptions_backgroundPublish`, open62541.c:48202
+        // in opcua's end2endTest/server) and aborts the channel. That library
+        // defect is not copied.
+        if matches!(end, End::Lost) {
+            errlog_vprintf(format_args!(
+                "OPC UA session {}: disconnected\n",
+                self.handle.name
+            ));
+        }
         // Requests queued for a connection that no longer exists would be
         // answered against the next one; the C leaves them in `outstandingOps`
         // and later logs them as unknown transactions
@@ -1518,7 +1525,8 @@ async fn exiting(exit: &mut watch::Receiver<bool>) {
 
 /// How a connection ended.
 enum End {
-    /// `opcuaDisconnect`: open62541 closes the session and the channel.
+    /// `opcuaDisconnect` or the IOC's exit: open62541 closes the session and
+    /// the channel.
     Requested,
     /// The server or the connection to it failed. The connect status stays
     /// `Good`, as open62541 reports it with the state change.

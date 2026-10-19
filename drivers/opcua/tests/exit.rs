@@ -147,10 +147,7 @@ async fn a_connected_session_is_closed_at_exit_and_stays_closed() {
     until(|| session.is_connected()).await;
 
     let (lines, _) = exit();
-    assert!(
-        lines.contains(&"OPC UA: Disconnecting sessions\n".to_string()),
-        "{lines:?}"
-    );
+    assert_eq!(lines, ["OPC UA: Disconnecting sessions\n"]);
     // The exit returns once the session has closed.
     assert_eq!(server.disconnects.load(Ordering::SeqCst), 1);
     assert!(!session.is_connected());

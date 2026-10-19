@@ -1309,10 +1309,10 @@ async fn a_lost_connection_prints_disconnected() {
     );
 }
 
-/// `opcuaDisconnect` takes the session from ACTIVATED to CREATED too, so C
-/// prints the same line (`SessionOpen62541.cpp:2520-2523`).
+/// `opcuaDisconnect` ends C's session in CLOSED, not CREATED, so the
+/// `disconnected` line of `SessionOpen62541.cpp:2520-2523` is not printed.
 #[tokio::test]
-async fn a_requested_disconnect_prints_disconnected() {
+async fn a_requested_disconnect_prints_nothing() {
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let id = errlog_add_listener({
         let lines = lines.clone();
@@ -1326,18 +1326,14 @@ async fn a_requested_disconnect_prints_disconnected() {
     handle.control(Control::Connect);
     until(|| handle.is_connected()).await;
 
+    errlog_flush();
+    lines.lock().clear();
     handle.control(Control::Disconnect);
     until(|| !handle.is_connected()).await;
     errlog_flush();
     errlog_remove_listener(id);
-    assert_eq!(
-        lines
-            .lock()
-            .iter()
-            .filter(|l| *l == "OPC UA session sess: disconnected\n")
-            .count(),
-        1
-    );
+    assert_eq!(mock.calls.lock().disconnects, 1);
+    assert_eq!(*lines.lock(), Vec::<String>::new());
 }
 
 /// The connection fields of the `opcuaShow` line, and `registered=`.
