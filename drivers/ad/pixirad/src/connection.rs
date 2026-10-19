@@ -53,19 +53,20 @@ impl From<AsynError> for ServerError {
     }
 }
 
+/// C `writeReadServer` returns a bare status: the message stays on
+/// `pasynUserCommand_` and never reaches the record's user, whose devAsyn
+/// error line is therefore empty.
 impl From<ServerError> for AsynError {
     fn from(e: ServerError) -> Self {
-        match e {
-            ServerError::Timeout => AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "timeout".into(),
-            },
-            ServerError::Transport(e) => e,
+        let status = match e {
+            ServerError::Timeout => AsynStatus::Timeout,
+            ServerError::Transport(e) => e.status(),
             // C's `status = asynError` on a reply without `GOT:`.
-            e @ ServerError::Rejected(_) => AsynError::Status {
-                status: AsynStatus::Error,
-                message: e.to_string(),
-            },
+            ServerError::Rejected(_) => AsynStatus::Error,
+        };
+        AsynError::Status {
+            status,
+            message: String::new(),
         }
     }
 }

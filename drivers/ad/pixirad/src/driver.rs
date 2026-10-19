@@ -796,6 +796,7 @@ mod tests {
             .write_int32(&mut AsynUser::new(q.hv_state), 0)
             .unwrap_err();
         assert_ne!(e.status(), AsynStatus::Success);
+        assert_eq!(e.message(), "", "C returns writeReadServer's bare status");
         assert!(
             det.write_float64(&mut AsynUser::new(q.hit_threshold), 1.0)
                 .is_err()
@@ -824,6 +825,7 @@ mod tests {
             .write_int32(&mut AsynUser::new(q.cooling_state), 1)
             .unwrap_err();
         assert_eq!(e.status(), AsynStatus::Error);
+        assert_eq!(e.message(), "");
         // A command the box takes is a success.
         det.write_int32(&mut AsynUser::new(q.sync_in_polarity), 1)
             .unwrap();
