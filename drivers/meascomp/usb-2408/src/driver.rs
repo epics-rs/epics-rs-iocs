@@ -50,6 +50,13 @@ struct IoPort {
     num_bits: i32,
 }
 
+impl IoPort {
+    /// C `digitalIOBitConfigurable_` (drvMultiFunction.cpp:1071).
+    fn bit_configurable(&self) -> bool {
+        self.io_type == uldaq_sys::DPIOT_BITIO as i32
+    }
+}
+
 impl BoardInfo {
     /// C ignores the status of every one of these queries; a query that
     /// fails reads 0 here (for a width, a degenerate getBounds range device
@@ -119,7 +126,7 @@ impl BoardInfo {
             let _ = writeln!(
                 out,
                 "    I/O bit configurable  = {}",
-                i32::from(port.io_type == uldaq_sys::DPIOT_BITIO as i32)
+                i32::from(port.bit_configurable())
             );
             let _ = writeln!(out, "    I/O port configurable = 0");
             let _ = writeln!(
@@ -183,9 +190,6 @@ pub struct MultiFunctionDriver {
     pub state: Arc<Mutex<PollerState>>,
     pub max_input_points: usize,
     pub max_output_points: usize,
-    /// C `digitalIOBitConfigurable_`: AUXPORT is `DPIOT_BITIO`. The
-    /// USB-2408 reports `DPIOT_NONCONFIG`.
-    dio_bit_configurable: bool,
     board: BoardInfo,
 }
 
@@ -253,11 +257,6 @@ impl MultiFunctionDriver {
             base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
         }
 
-        // drvMultiFunction.cpp:1069-1071. C configures no port on Linux
-        // (digitalIOPortConfigurable_ stays 0 for the 2408).
-        let dio_bit_configurable =
-            matches!(device.digital_port_io_type(0), Ok(uldaq_sys::DPIOT_BITIO));
-
         // Seed DIGITAL_INPUT so the bi records have a value to read at init.
         // The poller only pushes on a changed bit, and its one forced first
         // callback happens here -- before dbLoadRecords has run.
@@ -279,7 +278,6 @@ impl MultiFunctionDriver {
             state,
             max_input_points,
             max_output_points,
-            dio_bit_configurable,
             board,
         })
     }
@@ -1050,12 +1048,18 @@ impl PortDriver for MultiFunctionDriver {
                 }
             }
         } else if reason == self.params.digital_direction {
+            // C's digitalIOPortConfigurable_ is 0 on Linux: no ConfigPort path.
+            let bit_configurable = self
+                .board
+                .io_ports
+                .first()
+                .is_some_and(IoPort::bit_configurable);
             let dev = self.device.lock().unwrap();
             for bit in 0..NUM_IO_BITS {
                 if mask & (1 << bit) == 0 {
                     continue;
                 }
-                if self.dio_bit_configurable {
+                if bit_configurable {
                     let dir = if (value >> bit) & 1 != 0 {
                         uldaq_sys::DD_OUTPUT
                     } else {
@@ -1262,10 +1266,21 @@ mod tests {
     #[test]
     fn a_direction_write_on_a_fixed_port_zeroes_the_output_bit() {
         let mut drv = MultiFunctionDriver::new("MFDIR", DaqDevice::unconnected(), 16, 16).unwrap();
-        assert!(!drv.dio_bit_configurable);
+        assert!(drv.board.io_ports.is_empty());
         let mut user = AsynUser::new(drv.params.digital_direction);
         // Only a write that reaches ulDBitOut fails on the null handle.
         assert!(drv.write_uint32_digital(&mut user, 0, 0x01).is_err());
+    }
+
+    #[test]
+    fn only_a_bitio_port_is_bit_configurable() {
+        let port = |io_type: i64| IoPort {
+            port_type: 1,
+            io_type: io_type as i32,
+            num_bits: 8,
+        };
+        assert!(port(uldaq_sys::DPIOT_BITIO).bit_configurable());
+        assert!(!port(uldaq_sys::DPIOT_NONCONFIG).bit_configurable());
     }
 
     #[test]
