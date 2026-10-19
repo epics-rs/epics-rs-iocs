@@ -538,4 +538,51 @@ mod tests {
             1221026
         );
     }
+
+    /// The acquisition parameters setAcquireParams sends on a fresh
+    /// detector (pilatusDetector.cpp:748-829).
+    const FRESH_ACQUIRE_PARAMS: [&str; 6] = [
+        "nimages 1",
+        "nexpframe 1",
+        "exptime  1.00000000",
+        "expperiod  2.00000000",
+        "delay 0.000000",
+        "Tau",
+    ];
+
+    /// pilatusDetector.cpp:833-889: Waiting is posted before `SetThreshold
+    /// energy`, the two readbacks follow, then setAcquireParams re-sends.
+    #[test]
+    fn set_threshold_posts_waiting_then_sends_the_c_commands() {
+        let (mut det, log) = rig("PILATUS_THR", |cmd| match cmd {
+            "SetThreshold" => "15 OK  Settings: lowG gain; threshold: 10000 eV; vcmp: 0.6 V".into(),
+            "SetEnergy" => "15 OK Energy setting: 20000 eV".into(),
+            _ => "15 OK".into(),
+        });
+        det.shared.lock().demanded_threshold = 10.0;
+        let p = det.p;
+        det.write_int32(&mut AsynUser::new(p.threshold_apply), 1)
+            .unwrap();
+
+        let events = log.lock().clone();
+        let waiting = format!("ADStatus={}", ADStatus::Waiting as i32);
+        let posted = events.iter().position(|e| *e == waiting);
+        let sent = events
+            .iter()
+            .position(|e| e.starts_with("SetThreshold energy"));
+        assert!(
+            matches!((posted, sent), (Some(w), Some(c)) if w < c),
+            "{events:?}"
+        );
+        let mut expected = vec![
+            "SetThreshold energy 20000 lowG 10000",
+            "SetThreshold",
+            "SetEnergy",
+        ];
+        expected.extend(FRESH_ACQUIRE_PARAMS);
+        assert_eq!(commands(&log), expected);
+        let base = &det.ad.port_base;
+        assert_eq!(base.get_float64_param(p.threshold, 0).unwrap(), 10.0);
+        assert_eq!(base.get_float64_param(p.energy, 0).unwrap(), 20.0);
+    }
 }
