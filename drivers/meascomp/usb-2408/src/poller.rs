@@ -62,7 +62,6 @@ struct PollSnapshot {
     wave_dig_arrays: Option<Vec<ParamSetValue>>,
     // Analog inputs (only populated when wave_dig is not running)
     ai_raw: [Option<i32>; MAX_ANALOG_IN],
-    ai_volts: [Option<f64>; MAX_ANALOG_IN],
     ai_temp: [Option<f64>; MAX_ANALOG_IN],
 }
 
@@ -217,8 +216,8 @@ fn poller_loop(
                                 continue;
                             }
                             let range = map_range(&trace, in_ranges[ch]);
-                            // C does not report a failed ulAIn; its status is
-                            // the raw read's (C has no scaled read).
+                            // C does not report a failed ulAIn. It reads raw
+                            // counts only; VOLTAGE_IN_VALUE is USB-TEMP-AI's.
                             let raw = dev.analog_in(
                                 ch_i,
                                 input_mode,
@@ -227,9 +226,6 @@ fn poller_loop(
                             );
                             status = status_of(&raw);
                             snap.ai_raw[ch] = raw.ok().map(|v| v as i32);
-                            let volts =
-                                dev.analog_in(ch_i, input_mode, range, uldaq_sys::AIN_FF_DEFAULT);
-                            snap.ai_volts[ch] = volts.ok();
                         }
                         for ch in 0..tc_chans {
                             if in_types[ch] != AI_CHAN_TYPE_TC {
@@ -346,22 +342,14 @@ fn push_analog_in(
     snap: &PollSnapshot,
 ) {
     for ch in 0..MAX_ANALOG_IN {
-        let addr = ch as i32;
         if let Some(raw) = snap.ai_raw[ch] {
             for v in [raw.wrapping_add(1), raw] {
                 updates.push(ParamSetValue::new(
                     params.analog_in_value,
-                    addr,
+                    ch as i32,
                     ParamValue::Int32(v),
                 ));
             }
-        }
-        if let Some(v) = snap.ai_volts[ch] {
-            updates.push(ParamSetValue::new(
-                params.voltage_in_value,
-                addr,
-                ParamValue::Float64(v),
-            ));
         }
     }
     for ch in 0..MAX_ANALOG_IN {
