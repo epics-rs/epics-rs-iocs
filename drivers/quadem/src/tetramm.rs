@@ -356,6 +356,12 @@ impl QuadEmDevice for TetrAmmDriver {
         }
         self.base_reset()
     }
+
+    /// C++ `drvTetrAMM::exitHandler` (drvTetrAMM.cpp:869-874): the meter
+    /// stops streaming when the IOC goes.
+    fn exit_handler(&mut self) {
+        let _ = self.set_acquire(0);
+    }
 }
 
 impl TetrAmmDriver {

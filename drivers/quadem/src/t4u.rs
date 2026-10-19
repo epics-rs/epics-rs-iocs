@@ -539,6 +539,10 @@ impl QuadEmDevice for T4uDriver {
     fn reset(&mut self) -> AsynResult<()> {
         Ok(())
     }
+
+    /// C++ `drvT4U_EM::exitHandler` / `drvT4UDirect_EM::exitHandler` are
+    /// empty (drvT4U_EM.cpp:265-268, drvT4UDirect_EM.cpp:305-308).
+    fn exit_handler(&mut self) {}
 }
 
 // ===========================================================================
