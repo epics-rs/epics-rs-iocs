@@ -380,7 +380,7 @@ impl OpcuaDevice {
         let outgoing = match self.outgoing_value(record, &incoming, choices.as_deref()) {
             Ok(v) => v,
             Err(e) => {
-                errlog_vprintf(format_args!("{} : {e}\n", self.record_name));
+                e.log(&self.record_name);
                 self.alarm = Some((WRITE_ALARM, INVALID));
                 return Ok(());
             }
@@ -406,16 +406,8 @@ impl OpcuaDevice {
         record: &mut dyn Record,
         incoming: &Variant,
         choices: Option<&EnumChoices>,
-    ) -> Result<Variant, String> {
-        // C's outgoing wording (`DataElementOpen62541Leaf.h:1088-1135`).
-        let err = |e: value::ConvError| match e {
-            value::ConvError::Unsupported { from, to } => {
-                format!("unsupported conversion from {from} to {to} for outgoing data")
-            }
-            value::ConvError::OutOfRange { .. } => "value out of range".to_string(),
-            value::ConvError::NotAnArray => "OPC UA data type is not an array".to_string(),
-            other => other.to_string(),
-        };
+    ) -> Result<Variant, Failure> {
+        let err = Failure::from;
         match self.op {
             Op::Int32 => value::write_scalar(long(record, "VAL")?, incoming, choices).map_err(err),
             Op::Int64 => value::write_scalar(int64(record, "VAL")?, incoming, choices).map_err(err),
@@ -449,7 +441,7 @@ impl OpcuaDevice {
                 value::write_string(&long_string(record)?, incoming, choices).map_err(err)
             }
             Op::Array => outgoing_array(record, incoming).map_err(err),
-            Op::Item => Err("the item record has no value of its own".to_string()),
+            Op::Item => Err("the item record has no value of its own".to_string().into()),
         }
     }
 
@@ -540,7 +532,7 @@ impl OpcuaDevice {
         match self.store(&data, choices.as_deref(), record) {
             Ok(outcome) => Ok(outcome),
             Err(e) => {
-                errlog_vprintf(format_args!("{} : {e}\n", self.record_name));
+                e.log(&self.record_name);
                 self.alarm = Some((READ_ALARM, INVALID));
                 // The C clears UDF even on a failed conversion: the scalar
                 // template cleared it at the pop and the array overload clears
@@ -563,23 +555,22 @@ impl OpcuaDevice {
         data: &Variant,
         choices: Option<&EnumChoices>,
         record: &mut dyn Record,
-    ) -> Result<DeviceReadOutcome, String> {
-        let err = |e: value::ConvError| e.to_string();
+    ) -> Result<DeviceReadOutcome, Failure> {
         match self.op {
             Op::Int32 => {
-                let v: i32 = value::read_scalar(data, choices).map_err(err)?;
+                let v: i32 = value::read_scalar(data, choices)?;
                 put(record, "VAL", EpicsValue::Long(v))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Op::Int64 => {
-                let v: i64 = value::read_scalar(data, choices).map_err(err)?;
+                let v: i64 = value::read_scalar(data, choices)?;
                 put(record, "VAL", EpicsValue::Int64(v))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             // bi's ZSV/OSV and mbbiDirect's bits come out of the record's own
             // RVAL -> VAL conversion, which is what `ok()` asks it to run.
             Op::UInt32Rval => {
-                let v: u32 = value::read_scalar(data, choices).map_err(err)?;
+                let v: u32 = value::read_scalar(data, choices)?;
                 put(record, "RVAL", EpicsValue::ULong(v))?;
                 Ok(DeviceReadOutcome::ok())
             }
@@ -588,20 +579,20 @@ impl OpcuaDevice {
             // and `apply_raw_readback` is the framework's entry into them
             // (`record_trait.rs:533-549`; C `processBo`/`processMbbo`).
             Op::Bo | Op::MbboDirect => {
-                let v: u32 = value::read_scalar(data, choices).map_err(err)?;
+                let v: u32 = value::read_scalar(data, choices)?;
                 raw_readback(record, v)?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Op::Enum => self.store_enum(data, choices, record),
             Op::Analog => self.store_analog(data, choices, record),
             Op::String => {
-                let v = value::read_string(data, choices).map_err(err)?;
+                let v = value::read_string(data, choices)?;
                 put(record, "VAL", EpicsValue::String(truncate(&v, 39).into()))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             // lsi/lso clamp the string to SIZV themselves and set LEN from it.
             Op::LongString => {
-                let v = value::read_string(data, choices).map_err(err)?;
+                let v = value::read_string(data, choices)?;
                 put(record, "VAL", EpicsValue::CharArray(v.into_bytes().into()))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
@@ -620,8 +611,8 @@ impl OpcuaDevice {
         data: &Variant,
         choices: Option<&EnumChoices>,
         record: &mut dyn Record,
-    ) -> Result<DeviceReadOutcome, String> {
-        let raw: u32 = value::read_scalar(data, choices).map_err(|e| e.to_string())?;
+    ) -> Result<DeviceReadOutcome, Failure> {
+        let raw: u32 = value::read_scalar(data, choices)?;
         self.update_enum_infos(choices, record)?;
 
         if !self.enums.values_defined {
@@ -737,9 +728,8 @@ impl OpcuaDevice {
         data: &Variant,
         choices: Option<&EnumChoices>,
         record: &mut dyn Record,
-    ) -> Result<DeviceReadOutcome, String> {
+    ) -> Result<DeviceReadOutcome, Failure> {
         let converts = !no_conversion(record);
-        let err = |e: value::ConvError| e.to_string();
 
         if self.is_output {
             // ao inverts its forward conversion inside the record: ROFF,
@@ -748,12 +738,12 @@ impl OpcuaDevice {
             // conversion it is the plain ASLO/AOFF scaling
             // (`apply_float64_readback`).
             if converts {
-                let raw: i32 = value::read_scalar(data, choices).map_err(err)?;
+                let raw: i32 = value::read_scalar(data, choices)?;
                 raw_readback(record, raw as u32)?;
             } else {
-                let v: f64 = value::read_scalar(data, choices).map_err(err)?;
+                let v: f64 = value::read_scalar(data, choices)?;
                 if !record.apply_float64_readback(v) {
-                    return Err("the record has no float64 readback".to_string());
+                    return Err("the record has no float64 readback".to_string().into());
                 }
             }
             // `prec->udf = std::isnan(prec->val)` (`devOpcua.cpp:686`), over
@@ -768,7 +758,7 @@ impl OpcuaDevice {
 
         if converts {
             // RVAL, and the record's LINR conversion turns it into VAL.
-            let raw: i32 = value::read_scalar(data, choices).map_err(err)?;
+            let raw: i32 = value::read_scalar(data, choices)?;
             put(record, "RVAL", EpicsValue::Long(raw))?;
             return Ok(DeviceReadOutcome::ok());
         }
@@ -777,7 +767,7 @@ impl OpcuaDevice {
         // smoothing itself and hands the record a finished VAL
         // (`devOpcua.cpp:595-611`). The record's own no-conversion path would
         // route the value through RVAL, an `epicsInt32`, and lose its fraction.
-        let mut v: f64 = value::read_scalar(data, choices).map_err(err)?;
+        let mut v: f64 = value::read_scalar(data, choices)?;
         let aslo = double(record, "ASLO").unwrap_or(0.0);
         let aoff = double(record, "AOFF").unwrap_or(0.0);
         if aslo != 0.0 {
@@ -1136,10 +1126,9 @@ fn truncate(s: &str, max: usize) -> String {
 /// The record's VAL keeps its element type (its FTVL), so an incoming array is
 /// converted to exactly that type — the C picks the `readArray<T>` overload from
 /// FTVL (`devOpcua.cpp:1083-1134`).
-fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), String> {
+fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), Failure> {
     let nelm = usize::try_from(long(record, "NELM").unwrap_or(0)).unwrap_or(0);
     let current = field(record, "VAL")?;
-    let err = |e: value::ConvError| e.to_string();
 
     let value = match current {
         // FTVL = CHAR doubles as a long string (`devOpcua.cpp:1084-1087`), so a
@@ -1147,50 +1136,50 @@ fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), String> {
         EpicsValue::CharArray(_) | EpicsValue::UCharArray(_) => {
             let bytes = match data {
                 Variant::String(_) | Variant::ByteString(_) | Variant::LocalizedText(_) => {
-                    value::read_string(data, None).map_err(err)?.into_bytes()
+                    value::read_string(data, None)?.into_bytes()
                 }
-                _ => value::read_array_u8(data).map_err(err)?,
+                _ => value::read_array_u8(data)?,
             };
             EpicsValue::CharArray(clamp(bytes, nelm).into())
         }
         EpicsValue::ShortArray(_) => {
-            EpicsValue::ShortArray(clamp(value::read_array::<i16>(data).map_err(err)?, nelm).into())
+            EpicsValue::ShortArray(clamp(value::read_array::<i16>(data)?, nelm).into())
         }
-        EpicsValue::UShortArray(_) => EpicsValue::UShortArray(
-            clamp(value::read_array::<u16>(data).map_err(err)?, nelm).into(),
-        ),
+        EpicsValue::UShortArray(_) => {
+            EpicsValue::UShortArray(clamp(value::read_array::<u16>(data)?, nelm).into())
+        }
         EpicsValue::LongArray(_) => {
-            EpicsValue::LongArray(clamp(value::read_array::<i32>(data).map_err(err)?, nelm).into())
+            EpicsValue::LongArray(clamp(value::read_array::<i32>(data)?, nelm).into())
         }
         EpicsValue::ULongArray(_) => {
-            EpicsValue::ULongArray(clamp(value::read_array::<u32>(data).map_err(err)?, nelm).into())
+            EpicsValue::ULongArray(clamp(value::read_array::<u32>(data)?, nelm).into())
         }
         EpicsValue::Int64Array(_) => {
-            EpicsValue::Int64Array(clamp(value::read_array::<i64>(data).map_err(err)?, nelm).into())
+            EpicsValue::Int64Array(clamp(value::read_array::<i64>(data)?, nelm).into())
         }
-        EpicsValue::UInt64Array(_) => EpicsValue::UInt64Array(
-            clamp(value::read_array::<u64>(data).map_err(err)?, nelm).into(),
-        ),
+        EpicsValue::UInt64Array(_) => {
+            EpicsValue::UInt64Array(clamp(value::read_array::<u64>(data)?, nelm).into())
+        }
         EpicsValue::FloatArray(_) => {
-            EpicsValue::FloatArray(clamp(value::read_array::<f32>(data).map_err(err)?, nelm).into())
+            EpicsValue::FloatArray(clamp(value::read_array::<f32>(data)?, nelm).into())
         }
-        EpicsValue::DoubleArray(_) => EpicsValue::DoubleArray(
-            clamp(value::read_array::<f64>(data).map_err(err)?, nelm).into(),
-        ),
+        EpicsValue::DoubleArray(_) => {
+            EpicsValue::DoubleArray(clamp(value::read_array::<f64>(data)?, nelm).into())
+        }
         EpicsValue::StringArray(_) => EpicsValue::StringArray(
-            clamp(value::read_string_array(data).map_err(err)?, nelm)
+            clamp(value::read_string_array(data)?, nelm)
                 .into_iter()
                 .map(|s| truncate(&s, 39).into())
                 .collect(),
         ),
-        other => return Err(format!("VAL is not an array ({other:?})")),
+        other => return Err(format!("VAL is not an array ({other:?})").into()),
     };
-    put(record, "VAL", value)
+    Ok(put(record, "VAL", value)?)
 }
 
 /// VAL comes back NORD elements long, which is exactly what the C sends
 /// (`writeArray(prec->bptr, prec->nord)`).
-fn outgoing_array(record: &mut dyn Record, incoming: &Variant) -> value::Result<Variant> {
+fn outgoing_array(record: &mut dyn Record, incoming: &Variant) -> value::WriteResult {
     let current = record.get_field("VAL").unwrap_or(EpicsValue::Long(0));
     match current {
         EpicsValue::CharArray(v) | EpicsValue::UCharArray(v) => match incoming {
@@ -1212,10 +1201,42 @@ fn outgoing_array(record: &mut dyn Record, incoming: &Variant) -> value::Result<
             let strings: Vec<String> = v.iter().map(|s| s.to_string()).collect();
             value::write_string_array(&strings, incoming)
         }
-        other => Err(value::ConvError::Unsupported {
+        other => Err(value::WriteError::Unsupported {
             from: format!("{other:?}"),
             to: value::type_name(incoming),
+            text: None,
         }),
+    }
+}
+
+/// Why a record pass could not move its value: the C's conversion lines, or
+/// one line of the record's own.
+struct Failure(Vec<String>);
+
+impl Failure {
+    /// Each line behind the record name, as the C's `errlogPrintf("%s : ...")`.
+    fn log(&self, record: &str) {
+        for line in &self.0 {
+            errlog_vprintf(format_args!("{record} : {line}\n"));
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(line: String) -> Self {
+        Failure(vec![line])
+    }
+}
+
+impl From<value::ReadError> for Failure {
+    fn from(e: value::ReadError) -> Self {
+        Failure(e.lines())
+    }
+}
+
+impl From<value::WriteError> for Failure {
+    fn from(e: value::WriteError) -> Self {
+        Failure(e.lines())
     }
 }
 

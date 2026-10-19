@@ -1,12 +1,13 @@
 //! Boundary tests for the Variant ↔ EPICS conversions.
 
 use async_opcua::types::{
-    Array, ByteString, LocalizedText, QualifiedName, UAString, Variant, VariantScalarTypeId,
+    Array, ByteString, LocalizedText, QualifiedName, StatusCode, UAString, Variant,
+    VariantScalarTypeId,
 };
 use opcua::value::{
-    ConvError, EnumChoices, hex_decode, hex_encode, read_array, read_array_u8, read_scalar,
-    read_string, read_string_array, write_array, write_array_u8, write_scalar, write_string,
-    write_string_array,
+    EnumChoices, ReadError, WriteError, hex_decode, hex_encode, read_array, read_array_u8,
+    read_scalar, read_string, read_string_array, write_array, write_array_u8, write_scalar,
+    write_string, write_string_array,
 };
 
 fn choices() -> EnumChoices {
@@ -43,19 +44,19 @@ fn every_numeric_kind_reads_into_int32() {
 fn an_integer_that_does_not_fit_the_record_is_out_of_range() {
     assert!(matches!(
         read_scalar::<i32>(&Variant::Int64(i64::from(i32::MAX) + 1), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(ReadError::OutOfBounds { .. })
     ));
     assert!(matches!(
         read_scalar::<i32>(&Variant::UInt32(u32::MAX), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(ReadError::OutOfBounds { .. })
     ));
     assert!(matches!(
         read_scalar::<u32>(&Variant::Int32(-1), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(ReadError::OutOfBounds { .. })
     ));
     assert!(matches!(
         read_scalar::<i64>(&Variant::UInt64(u64::MAX), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(ReadError::OutOfBounds { .. })
     ));
     // The widest value each target *does* hold.
     assert_eq!(
@@ -80,7 +81,7 @@ fn a_float_at_the_integer_boundary() {
     );
     assert!(matches!(
         read_scalar::<i32>(&Variant::Double(2147483648.0), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(ReadError::OutOfBounds { .. })
     ));
     assert_eq!(
         read_scalar::<i32>(&Variant::Double(-2147483648.0), None),
@@ -88,13 +89,13 @@ fn a_float_at_the_integer_boundary() {
     );
     assert!(matches!(
         read_scalar::<i32>(&Variant::Double(-2147483649.0), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(ReadError::OutOfBounds { .. })
     ));
     // 2^63 is what `INT64_MAX` rounds to as a double, so the C's `value > max`
     // check lets it through and then casts it — undefined behaviour.
     assert!(matches!(
         read_scalar::<i64>(&Variant::Double(9223372036854775808.0), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(ReadError::OutOfBounds { .. })
     ));
     // The largest double below 2^63 does convert.
     assert_eq!(
@@ -111,17 +112,17 @@ fn a_non_finite_float_never_becomes_an_integer() {
         assert!(
             matches!(
                 read_scalar::<i32>(&Variant::Double(v), None),
-                Err(ConvError::OutOfRange { .. })
+                Err(ReadError::OutOfBounds { .. })
             ),
             "{v}"
         );
         assert!(matches!(
             read_scalar::<i64>(&Variant::Double(v), None),
-            Err(ConvError::OutOfRange { .. })
+            Err(ReadError::OutOfBounds { .. })
         ));
         assert!(matches!(
             read_scalar::<u32>(&Variant::Double(v), None),
-            Err(ConvError::OutOfRange { .. })
+            Err(ReadError::OutOfBounds { .. })
         ));
     }
     // ... but a float record takes them unchanged.
@@ -142,14 +143,14 @@ fn a_string_node_parses_into_a_numeric_record() {
     assert_eq!(read_scalar::<f64>(&s("1.5e3"), None), Ok(1500.0));
     assert!(matches!(
         read_scalar::<i32>(&s("nonsense"), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(ReadError::OutOfBounds { .. })
     ));
     // The C's `string_to(epicsInt32)` assigns a `long` to an `epicsInt32`
     // without a range check (`DataElementOpen62541Leaf.h:150-157`), silently
     // truncating; only its `epicsUInt32` overload checks.
     assert!(matches!(
         read_scalar::<i32>(&s("99999999999"), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(ReadError::OutOfBounds { .. })
     ));
 
     let lt = Variant::LocalizedText(Box::new(LocalizedText::new("en", "17")));
@@ -161,11 +162,11 @@ fn a_type_with_no_numeric_meaning_is_unsupported() {
     let qn = Variant::QualifiedName(Box::new(QualifiedName::new(2, "Name")));
     assert!(matches!(
         read_scalar::<i32>(&qn, None),
-        Err(ConvError::Unsupported { .. })
+        Err(ReadError::UnsupportedKind { .. })
     ));
     assert!(matches!(
         read_scalar::<i32>(&Variant::Empty, None),
-        Err(ConvError::Unsupported { .. })
+        Err(ReadError::UnsupportedKind { .. })
     ));
 }
 
@@ -175,7 +176,7 @@ fn an_enum_value_must_be_one_of_its_choices() {
     assert_eq!(read_scalar::<i32>(&Variant::Int32(7), Some(&c)), Ok(7));
     assert!(matches!(
         read_scalar::<i32>(&Variant::Int32(3), Some(&c)),
-        Err(ConvError::NotAnEnumChoice { .. })
+        Err(ReadError::OutOfBounds { .. })
     ));
     // Without the type's choices, any in-range value passes.
     assert_eq!(read_scalar::<i32>(&Variant::Int32(3), None), Ok(3));
@@ -266,15 +267,15 @@ fn a_numeric_array_must_match_the_records_ftvl_exactly() {
     assert_eq!(read_array::<i32>(&i32s), Ok(vec![1, 2]));
     assert!(matches!(
         read_array::<i16>(&i32s),
-        Err(ConvError::ArrayTypeMismatch { .. })
+        Err(ReadError::ArrayTypeMismatch { .. })
     ));
     assert!(matches!(
         read_array::<f64>(&i32s),
-        Err(ConvError::ArrayTypeMismatch { .. })
+        Err(ReadError::ArrayTypeMismatch { .. })
     ));
     assert!(matches!(
         read_array::<i32>(&Variant::Int32(1)),
-        Err(ConvError::NotAnArray)
+        Err(ReadError::NotAnArray)
     ));
 }
 
@@ -298,7 +299,7 @@ fn a_uint8_array_also_takes_booleans_and_a_byte_string() {
     let i16s = array(VariantScalarTypeId::Int16, vec![Variant::Int16(1)]);
     assert!(matches!(
         read_array_u8(&i16s),
-        Err(ConvError::ArrayTypeMismatch { .. })
+        Err(ReadError::ArrayTypeMismatch { .. })
     ));
 }
 
@@ -366,19 +367,19 @@ fn the_outgoing_value_takes_the_type_of_the_node() {
 fn an_outgoing_value_that_does_not_fit_the_node_is_out_of_range() {
     assert!(matches!(
         write_scalar(300i32, &Variant::Byte(0), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(WriteError::OutOfRange { .. })
     ));
     assert!(matches!(
         write_scalar(-1i32, &Variant::UInt32(0), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(WriteError::OutOfRange { .. })
     ));
     assert!(matches!(
         write_scalar(1e300f64, &Variant::Float(0.0), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(WriteError::OutOfRange { .. })
     ));
     assert!(matches!(
         write_scalar(1i32, &Variant::Empty, None),
-        Err(ConvError::Unsupported { .. })
+        Err(WriteError::Unsupported { .. })
     ));
 }
 
@@ -391,7 +392,7 @@ fn an_outgoing_enum_value_must_be_one_of_the_choices() {
     );
     assert!(matches!(
         write_scalar(3i32, &Variant::Int32(0), Some(&c)),
-        Err(ConvError::NotAnEnumChoice { .. })
+        Err(WriteError::OutOfRange { .. })
     ));
 }
 
@@ -407,7 +408,7 @@ fn a_string_record_writes_to_a_double_node() {
     );
     assert!(matches!(
         write_string("nonsense", &Variant::Double(0.0), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(WriteError::OutOfRange { .. })
     ));
 }
 
@@ -431,7 +432,7 @@ fn a_string_record_writes_every_scalar_node_type() {
     );
     assert!(matches!(
         write_string("300", &Variant::Byte(0), None),
-        Err(ConvError::OutOfRange { .. })
+        Err(WriteError::OutOfRange { .. })
     ));
 }
 
@@ -480,7 +481,7 @@ fn an_outgoing_enum_takes_a_choice_name_before_a_number() {
     );
     assert!(matches!(
         write_string("3", &Variant::Int32(0), Some(&c)),
-        Err(ConvError::NotAnEnumChoice { .. })
+        Err(WriteError::OutOfRange { .. })
     ));
 }
 
@@ -496,11 +497,11 @@ fn an_outgoing_array_must_match_the_nodes_element_type() {
     );
     assert!(matches!(
         write_array(&[1i16], &node),
-        Err(ConvError::ArrayTypeMismatch { .. })
+        Err(WriteError::ArrayTypeMismatch { .. })
     ));
     assert!(matches!(
         write_array(&[1i32], &Variant::Int32(0)),
-        Err(ConvError::NotAnArray)
+        Err(WriteError::NotAnArray)
     ));
 
     let node = array(VariantScalarTypeId::Boolean, vec![Variant::Boolean(false)]);
@@ -526,5 +527,96 @@ fn an_outgoing_array_must_match_the_nodes_element_type() {
             VariantScalarTypeId::String,
             vec![Variant::String(UAString::from("a"))]
         ))
+    );
+}
+
+// ---------------------------------------------------------- the C's lines
+
+/// What the C logs for a value it cannot read, line for line
+/// (`DataElementOpen62541Leaf.h:824-838`, `:911-919`).
+#[test]
+fn a_failed_read_logs_the_c_lines() {
+    fn lines<T: std::fmt::Debug>(r: Result<T, ReadError>) -> Vec<String> {
+        r.unwrap_err().lines()
+    }
+    assert_eq!(
+        lines(read_scalar::<i32>(&Variant::Int64(1 << 40), None)),
+        ["incoming data (Int64 1099511627776) out-of-bounds for epicsInt32"]
+    );
+    // A value that is no choice of the enumeration is out of bounds too.
+    assert_eq!(
+        lines(read_scalar::<i32>(&Variant::Int32(3), Some(&choices()))),
+        ["incoming data (Int32 3) out-of-bounds for epicsInt32"]
+    );
+    // An unsupported kind names itself, then falls into the out-of-bounds line.
+    assert_eq!(
+        lines(read_scalar::<i32>(&Variant::Empty, None)),
+        [
+            "unsupported type kind None for incoming data",
+            "incoming data (Null ) out-of-bounds for epicsInt32"
+        ]
+    );
+    let i32s = array(VariantScalarTypeId::Int32, vec![Variant::Int32(1)]);
+    assert_eq!(
+        lines(read_array::<i16>(&i32s)),
+        ["incoming data type (Int32) does not match EPICS array type (epicsInt16)"]
+    );
+    assert_eq!(
+        lines(read_array::<i32>(&Variant::Int32(1))),
+        ["incoming data is not an array"]
+    );
+}
+
+/// What the C logs for a value it cannot send, line for line
+/// (`DataElementOpen62541Leaf.h:1087-1096`, `:1128-1137`, `.cpp:1075-1100`).
+#[test]
+fn a_failed_write_logs_the_c_lines() {
+    fn lines(r: Result<Variant, WriteError>) -> Vec<String> {
+        r.unwrap_err().lines()
+    }
+    assert_eq!(
+        lines(write_scalar(300i32, &Variant::Byte(0), None)),
+        ["value out of range"]
+    );
+    assert_eq!(
+        lines(write_scalar(3i32, &Variant::Int32(0), Some(&choices()))),
+        ["value out of range"]
+    );
+    assert_eq!(
+        lines(write_scalar(1i32, &Variant::Empty, None)),
+        [
+            "unsupported conversion from epicsInt32 to Null for outgoing data",
+            "value out of range"
+        ]
+    );
+    assert_eq!(
+        lines(write_string("300", &Variant::Byte(0), None)),
+        ["value \"300\" out of range"]
+    );
+    assert_eq!(
+        lines(write_string("3", &Variant::Int32(0), Some(&choices()))),
+        ["value \"3\" out of range"]
+    );
+    assert_eq!(
+        lines(write_string(
+            "x",
+            &Variant::StatusCode(StatusCode::Good),
+            None
+        )),
+        [
+            "unsupported conversion from string to StatusCode for outgoing data",
+            "value \"x\" out of range"
+        ]
+    );
+    let i32s = array(VariantScalarTypeId::Int32, vec![Variant::Int32(0)]);
+    assert_eq!(
+        lines(write_array(&[1i16], &i32s)),
+        [
+            "OPC UA data type (Int32) does not match expected type (Int16) for EPICS array (epicsInt16)"
+        ]
+    );
+    assert_eq!(
+        lines(write_array(&[1i32], &Variant::Int32(0))),
+        ["OPC UA data type is not an array"]
     );
 }
