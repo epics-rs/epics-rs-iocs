@@ -326,32 +326,40 @@ pub struct StreamApi {
 
 impl StreamApi {
     pub async fn connect(hostname: &str) -> Result<Self> {
+        Self::connect_to(&format!("tcp://{hostname}:{ZMQ_PORT}")).await
+    }
+
+    pub(crate) async fn connect_to(addr: &str) -> Result<Self> {
         use zeromq::Socket;
         let mut socket = zeromq::PullSocket::new();
-        let addr = format!("tcp://{hostname}:{ZMQ_PORT}");
         socket
-            .connect(&addr)
+            .connect(addr)
             .await
             .map_err(|e| StreamError::Transport(format!("connect {addr}: {e}")))?;
         Ok(Self { socket })
     }
 
-    /// Receive and decode the next message, or `Ok(None)` on timeout
-    /// (C polls the socket with a timeout in seconds).
-    pub async fn recv(
-        &mut self,
-        timeout: std::time::Duration,
-        decompress: bool,
-    ) -> Result<Option<StreamMessage>> {
+    /// Receive the next message, or `Ok(None)` on timeout (C polls the socket
+    /// with a timeout in seconds). It is decoded apart, so the caller can read
+    /// StreamDecompress after the frame arrives, where C's getFrame does.
+    pub async fn recv(&mut self, timeout: std::time::Duration) -> Result<Option<Received>> {
         use zeromq::SocketRecv;
 
-        let msg = match tokio::time::timeout(timeout, self.socket.recv()).await {
-            Err(_) => return Ok(None),
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => return Err(StreamError::Transport(e.to_string())),
-        };
-        let parts: Vec<&[u8]> = msg.iter().map(|f| f.as_ref()).collect();
-        decode_message(&parts, decompress).map(Some)
+        match tokio::time::timeout(timeout, self.socket.recv()).await {
+            Err(_) => Ok(None),
+            Ok(Ok(m)) => Ok(Some(Received(m))),
+            Ok(Err(e)) => Err(StreamError::Transport(e.to_string())),
+        }
+    }
+}
+
+/// One multipart message off the stream socket, not yet decoded.
+pub struct Received(zeromq::ZmqMessage);
+
+impl Received {
+    pub fn decode(&self, decompress: bool) -> Result<StreamMessage> {
+        let parts: Vec<&[u8]> = self.0.iter().map(|f| f.as_ref()).collect();
+        decode_message(&parts, decompress)
     }
 }
 

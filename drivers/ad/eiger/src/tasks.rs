@@ -1161,12 +1161,15 @@ async fn stream_task(
 /// Receive one whole series. Returns whether it ended with a `dseries_end`
 /// (C `mStreamComplete`).
 async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
-    let decompress = s.get_int(s.p.stream_decompress).await != 0;
     let timeout = Duration::from_secs(1);
 
     // Wait out the series header.
     loop {
-        match stream.recv(timeout, decompress).await {
+        match stream
+            .recv(timeout)
+            .await
+            .and_then(|m| m.map(|m| m.decode(false)).transpose())
+        {
             Ok(Some(StreamMessage::Header(_))) => break,
             Ok(Some(StreamMessage::End)) => return true,
             Ok(Some(StreamMessage::Image(_))) => {
@@ -1187,13 +1190,21 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
         }
     }
 
-    let signed_data = s.get_int(s.p.signed_data).await != 0;
-    let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
-
     loop {
-        let msg = match stream.recv(timeout, decompress).await {
+        let received = match stream.recv(timeout).await {
             Ok(Some(m)) => m,
             Ok(None) => continue,
+            Err(_) => {
+                s.trace().err("streamTask", "failed to get frame packet");
+                return false;
+            }
+        };
+        // C reads these per frame, once waitFrame has it (eigerDetector.cpp:1497-1517).
+        let decompress = s.get_int(s.p.stream_decompress).await != 0;
+        let signed_data = s.get_int(s.p.signed_data).await != 0;
+        let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
+        let msg = match received.decode(decompress) {
+            Ok(m) => m,
             Err(crate::stream::StreamError::WrongHtype(_)) => continue,
             // UPSTREAM DEFECT (streamApi.cpp:1503-1507 in the caller): C assigns
             // `err = mStreamAPI->getFrame(&pArray, ...)` and then dereferences
@@ -1774,6 +1785,161 @@ mod tests {
         }
         assert_eq!(ids, [0, 1]);
         assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
+        std::mem::forget(runtime);
+    }
+
+    /// C streamTask reads StreamDecompress, SignedData and ArrayCallbacks for
+    /// every frame, once waitFrame has it (eigerDetector.cpp:1497-1517).
+    #[tokio::test]
+    async fn stream_v1_reads_its_frame_params_per_frame() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use zeromq::{Socket, SocketSend};
+
+        let name = "EIGER_STREAM_PER_FRAME";
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: name.to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let det = crate::driver::EigerDriver::new(cfg, rest, signals.clone()).expect("driver");
+        let (p, ad, ops) = (det.p, det.ad.params, det.ops.clone());
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
+                .expect("runtime");
+        let outputs = Outputs::new();
+        let (tx, mut rx) = ndarray_channel("STREAM_PER_FRAME_SINK", 8);
+        // Frame 3 passes through compressed.
+        rx.admission().set_compression_aware(true);
+        outputs.main.lock().add(tx);
+        let s = shared(
+            ops,
+            runtime.port_handle().clone(),
+            p,
+            ad,
+            Model::Eiger1,
+            ApiVersion::V1_6_0,
+            "127.0.0.1".to_string(),
+            outputs,
+            DriverPool::standalone(0),
+            &signals,
+        );
+
+        let mut push = zeromq::PushSocket::new();
+        let endpoint = push.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut stream = StreamApi::connect_to(&endpoint.to_string())
+            .await
+            .expect("connect");
+        let task = {
+            let s = Arc::clone(&s);
+            tokio::spawn(async move { stream_series(&s, &mut stream).await })
+        };
+        let message = |parts: Vec<Vec<u8>>| {
+            zeromq::ZmqMessage::try_from(
+                parts
+                    .into_iter()
+                    .map(bytes::Bytes::from)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let raw: Vec<u8> = [1u16, 0xffff]
+            .iter()
+            .flat_map(|p| p.to_le_bytes())
+            .collect();
+        let image = |frame: u64, compressed: bool| {
+            let (enc, blob) = if compressed {
+                ("lz4<", lz4_flex::block::compress(&raw))
+            } else {
+                ("<", raw.clone())
+            };
+            message(vec![
+                format!(r#"{{"htype":"dimage-1.0","series":1,"frame":{frame},"hash":"x"}}"#)
+                    .into_bytes(),
+                format!(
+                    r#"{{"htype":"dimage_d-1.0","shape":[2,1],"type":"uint16","encoding":"{enc}","size":{}}}"#,
+                    blob.len()
+                )
+                .into_bytes(),
+                blob,
+            ])
+        };
+        let frame_done = |n: i32| {
+            let s = Arc::clone(&s);
+            async move {
+                for _ in 0..500 {
+                    if s.get_int(s.ad.base.array_counter).await == n {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                panic!("frame {n} never published");
+            }
+        };
+        let set = |updates: Vec<ParamUpdate>| {
+            let s = Arc::clone(&s);
+            async move { s.apply(updates).await }
+        };
+
+        set(vec![
+            ParamUpdate::Int32(s.ad.base.array_callbacks, 1),
+            ParamUpdate::Int32(s.p.signed_data, 0),
+            ParamUpdate::Int32(s.p.stream_decompress, 1),
+        ])
+        .await;
+        // A PUSH socket refuses to send until the PULL side has connected.
+        let header = br#"{"htype":"dheader-1.0","series":1,"header_detail":"none"}"#;
+        while push.send(message(vec![header.to_vec()])).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        push.send(image(0, false)).await.unwrap();
+        frame_done(1).await;
+        let a = rx.recv().await.expect("frame 0");
+        assert!(matches!(a.data, NDDataBuffer::U16(_)));
+
+        set(vec![ParamUpdate::Int32(s.ad.base.array_callbacks, 0)]).await;
+        push.send(image(1, false)).await.unwrap();
+        frame_done(2).await;
+        assert_eq!(
+            rx.pending(),
+            0,
+            "ArrayCallbacks=0 on frame 1 still published it"
+        );
+
+        set(vec![
+            ParamUpdate::Int32(s.ad.base.array_callbacks, 1),
+            ParamUpdate::Int32(s.p.signed_data, 1),
+        ])
+        .await;
+        push.send(image(2, false)).await.unwrap();
+        frame_done(3).await;
+        let a = rx.recv().await.expect("frame 2");
+        assert!(
+            matches!(a.data, NDDataBuffer::I16(_)),
+            "SignedData=1 on frame 2"
+        );
+
+        set(vec![
+            ParamUpdate::Int32(s.p.signed_data, 0),
+            ParamUpdate::Int32(s.p.stream_decompress, 0),
+        ])
+        .await;
+        push.send(image(3, true)).await.unwrap();
+        frame_done(4).await;
+        let a = rx.recv().await.expect("frame 3");
+        assert!(a.codec.is_some(), "StreamDecompress=0 on frame 3");
+
+        push.send(message(vec![
+            br#"{"htype":"dseries_end-1.0","series":1}"#.to_vec(),
+        ]))
+        .await
+        .unwrap();
+        assert!(task.await.unwrap(), "dseries_end completes the series");
         std::mem::forget(runtime);
     }
 
