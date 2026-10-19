@@ -253,8 +253,10 @@ impl Ctx {
                 }
                 Err(e) => {
                     // C's asynOctetSyncIO null-terminates at `nbytesTransfered`,
-                    // which is 0 on a failed read.
-                    self.from.clear();
+                    // which counts what a timed-out read still delivered.
+                    self.from = e.partial_read().map_or_else(String::new, |p| {
+                        String::from_utf8_lossy(&p.data).into_owned()
+                    });
                     e.status()
                 }
             };
@@ -354,6 +356,7 @@ mod tests {
     use crate::task::{Cmd, Shared};
     use epics_rs::ad_core::runtime as rt;
     use epics_rs::asyn::error::AsynError;
+    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
     use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::create_port_runtime;
@@ -450,5 +453,137 @@ mod tests {
             std::mem::forget(cam);
         }
         std::mem::forget(runtime);
+    }
+
+    /// Replays one read per entry, `(bytes, timed_out)`, repeating the last.
+    struct ScriptedPort {
+        base: PortDriverBase,
+        reads: std::collections::VecDeque<(&'static [u8], bool)>,
+    }
+
+    impl PortDriver for ScriptedPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, EomReason)> {
+            let (data, timed_out) = if self.reads.len() > 1 {
+                self.reads.pop_front().unwrap()
+            } else {
+                self.reads[0]
+            };
+            buf[..data.len()].copy_from_slice(data);
+            if !timed_out {
+                return Ok((data.len(), EomReason::EOS));
+            }
+            let err = AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".into(),
+            };
+            if data.is_empty() {
+                return Err(err);
+            }
+            Err(err.with_partial_read(PartialOctetRead {
+                data: data.to_vec(),
+                eom_reason: EomReason::empty(),
+            }))
+        }
+    }
+
+    /// `cam_read(timeout)` over a camserver port replaying `reads`: the
+    /// status and the `fromCamserver` it ends with.
+    fn cam_read_over(name: &str, reads: &[(&'static [u8], bool)], timeout: f64) -> (i32, String) {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let stop = Arc::new(Event::new());
+        let det = PilatusDriver::new(
+            name,
+            2,
+            1,
+            0,
+            DriverLinks {
+                cmd_tx,
+                start: Arc::new(Event::new()),
+                stop: stop.clone(),
+                shared: Arc::new(parking_lot::Mutex::new(Shared::default())),
+            },
+        )
+        .unwrap();
+        let (ad, p) = (det.ad.params, det.p);
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let cam_name = format!("{name}_CAM");
+        let (cam, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(&cam_name).unwrap(),
+            ScriptedPort {
+                base: PortDriverBase::new(
+                    &cam_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                reads: reads.iter().copied().collect(),
+            },
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let mut ctx = Ctx::new(
+            runtime.port_handle().clone(),
+            Arc::new(SyncIOHandle::from_handle(
+                cam.port_handle().clone(),
+                0,
+                std::time::Duration::ZERO,
+            )),
+            ad,
+            p,
+            stop,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt::run_thread_named("PilatusCamReadTest", move || async move {
+            let status = ctx.cam_read(timeout).await as i32;
+            tx.send((status, ctx.from().to_string())).unwrap();
+        })
+        .join()
+        .unwrap();
+        std::mem::forget(cam);
+        std::mem::forget(runtime);
+        rx.recv().unwrap()
+    }
+
+    /// C `readCamserver` (pilatusDetector.cpp:953-976) breaks only on a
+    /// status other than asynTimeout, so a timeout after part of a reply
+    /// polls again and the next read completes it.
+    #[test]
+    fn a_timeout_after_part_of_a_reply_keeps_polling() {
+        let (status, from) = cam_read_over(
+            "PILATUS_PARTIAL_POLL",
+            &[(b"15 OK", true), (b"15 OK exptime 1.0", false)],
+            1.0,
+        );
+        assert_eq!(status, AsynStatus::Success as i32);
+        assert_eq!(from, "15 OK exptime 1.0");
+    }
+
+    /// When the polling runs out, C's `fromCamserver` holds what the last
+    /// read delivered, terminated at its `nbytesTransfered`.
+    #[test]
+    fn a_read_that_ends_on_a_partial_timeout_keeps_the_partial_reply() {
+        let (status, from) = cam_read_over(
+            "PILATUS_PARTIAL_END",
+            &[(b"15 OK", true), (b"15 OK exp", true)],
+            0.05,
+        );
+        assert_eq!(status, AsynStatus::Timeout as i32);
+        assert_eq!(from, "15 OK exp");
     }
 }
