@@ -77,8 +77,8 @@ record(seq, "$(P)$(M)-INIT-AXIS-2")
     field(DOL6, "$(CURRENT_DELAY)")
     field(LNK7, "$(P)$(M)-STEP-RES_SET PP")
     field(DOL7, "$(STEP_RES)")
-    field(LNK8, "$(P)$(M)-PS-MONITOR_SET PP")
-    field(DOL8, "$(PS_MON)")
+    # C's LNK8 names $(P)$(M)-PS-MONITOR_SET, which this db does not have:
+    # the put fails and leaves this record in LINK/INVALID.
     field(LNK9, "$(P)$(M)-ENC-DIR_SET PP")
     field(DOL9, "$(ENC_DIR)")
     field(SELM, "All")

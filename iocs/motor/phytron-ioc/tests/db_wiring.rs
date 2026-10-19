@@ -206,8 +206,7 @@ fn st_cmd_loads_the_phymotion_aux_records() {
 
 /// C's MCC example (`st.cmd.mcc`): an MCC axis, two analog inputs, the
 /// digital channel and the direct command; it loads no MCM01, so the
-/// axis REINIT_ link to the controller RESET_ dangles there too. C's
-/// Phytron_MCC.db has no PS-MONITOR_SET for INIT-AXIS-2's LNK8.
+/// axis REINIT_ link to the controller RESET_ dangles there too.
 #[test]
 fn st_mcc_cmd_loads_the_mcc_aux_records() {
     let script = run("st.mcc.cmd");
@@ -220,7 +219,7 @@ fn st_mcc_cmd_loads_the_mcc_aux_records() {
     ];
     assert_eq!(script.loaded, want.map(String::from).into());
     asyn_links_resolve(&script);
-    db_links_resolve(&script, &["phytron:-RESET_", "phytron:m1-PS-MONITOR_SET"]);
+    db_links_resolve(&script, &["phytron:-RESET_"]);
 }
 
 /// Every db the IOC ships is one a script loads, or Phytron_DIO_MCC1.db,

@@ -42,7 +42,7 @@ dbLoadRecords("$(PHYTRON_IOC)/db/phytron.template", "P=$(P),M=m1,PORT=$(CTRL),AD
 # C's MCC example this loads no Phytron_MCM01.db, so the axis link to
 # $(P)-RESET_ stays unresolved. STEP_RES is STEP-RES_SET's state index: C's
 # "1/16" makes INIT-AXIS-2's DOL7 a link to a PV of that name; 5 is 1/16.
-dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_MCC.db", "P=$(P),M=m1,PORT=$(CTRL),ADDR=1,SCAN=5 second,TIMEOUT=1,INIT=YES,HOMING=0,MODE=1,POS_OFFSET=0,NEG_OFFSET=0,INIT_TIME=20,POS_TIME=20,BOOST=0,SWITCH_TYP=0,PWR_STAGE=1,ENC_TYP=0,ENC_SFI=0,ENC_DIR=1,STOP_CURR=20,RUN_CURR=80,BOOST_CURR=100,CURRENT_DELAY=20,STEP_RES=5,PS_MON=1")
+dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_MCC.db", "P=$(P),M=m1,PORT=$(CTRL),ADDR=1,SCAN=5 second,TIMEOUT=1,INIT=YES,HOMING=0,MODE=1,POS_OFFSET=0,NEG_OFFSET=0,INIT_TIME=20,POS_TIME=20,BOOST=0,SWITCH_TYP=0,PWR_STAGE=1,ENC_TYP=0,ENC_SFI=0,ENC_DIR=1,STOP_CURR=20,RUN_CURR=80,BOOST_CURR=100,CURRENT_DELAY=20,STEP_RES=5")
 dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_AIO_MCC.db", "P=$(P)phyA1,PORT=phyA1")
 dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_AIO_MCC.db", "P=$(P)phyA2,PORT=phyA2")
 dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_DIO.db", "P=$(P)phyD1,PORT=phyD1")
