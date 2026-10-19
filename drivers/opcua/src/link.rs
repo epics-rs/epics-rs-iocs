@@ -295,24 +295,6 @@ impl InfoDefaults {
             element: get("opcua:ELEMENT"),
         }
     }
-
-    /// C `linkParser.cpp:104-190`: one deprecation line per info item set.
-    pub fn warn_deprecated(&self, record: &str) {
-        let set = [
-            &self.sampling,
-            &self.qsize,
-            &self.discard,
-            &self.timestamp,
-            &self.readback,
-            &self.element,
-        ];
-        for _ in set.iter().filter(|v| v.is_some()) {
-            eprintln!(
-                "{record} DEPRECATION WARNING: setting parameters through info items is deprecated; \
-                 use link parameters instead."
-            );
-        }
-    }
 }
 
 /// What the parser needs to know about the record the link belongs to.
@@ -329,6 +311,7 @@ pub struct RecordKind {
 /// `link` is the INST_IO text *without* the leading `@` (the framework hands it
 /// over with the `@` still attached; the caller strips it).
 pub fn parse_link(
+    record: &str,
     link: &str,
     kind: RecordKind,
     info: &InfoDefaults,
@@ -363,7 +346,7 @@ pub fn parse_link(
         monitor: defaults::DEFAULT_OUTPUT_READBACK.load(Ordering::Relaxed) != 0,
     };
 
-    apply_info_defaults(&mut pinfo, info)?;
+    apply_info_defaults(record, &mut pinfo, info)?;
 
     let link = link.trim_start();
     let (name, rest) = match link.find([' ', '\t', ';']) {
@@ -408,23 +391,37 @@ pub fn parse_link(
     Ok(pinfo)
 }
 
-fn apply_info_defaults(pinfo: &mut LinkInfo, info: &InfoDefaults) -> Result<(), LinkError> {
-    if let Some(s) = &info.sampling {
+/// C `linkParser.cpp:104-185`: each tag set prints its deprecation line just
+/// before it is parsed, so a bad tag stops the lines at its own.
+fn apply_info_defaults(
+    record: &str,
+    pinfo: &mut LinkInfo,
+    info: &InfoDefaults,
+) -> Result<(), LinkError> {
+    fn deprecated<'a>(record: &str, tag: &'a Option<String>) -> Option<&'a str> {
+        tag.as_deref().inspect(|_| {
+            eprintln!(
+                "{record} DEPRECATION WARNING: setting parameters through info items is deprecated; \
+                 use link parameters instead."
+            )
+        })
+    }
+    if let Some(s) = deprecated(record, &info.sampling) {
         pinfo.sampling_interval = parse_f64(s)?;
     }
-    if let Some(s) = &info.qsize {
+    if let Some(s) = deprecated(record, &info.qsize) {
         pinfo.queue_size = parse_u32(s)?;
     }
-    if let Some(s) = &info.discard {
+    if let Some(s) = deprecated(record, &info.discard) {
         pinfo.discard_oldest = parse_discard(s)?;
     }
-    if let Some(s) = &info.timestamp {
+    if let Some(s) = deprecated(record, &info.timestamp) {
         parse_timestamp(pinfo, s)?;
     }
-    if let Some(s) = &info.readback {
+    if let Some(s) = deprecated(record, &info.readback) {
         pinfo.monitor = yes_no(first_char(s, "readback")?)?;
     }
-    if let Some(s) = &info.element {
+    if let Some(s) = deprecated(record, &info.element) {
         set_element(pinfo, s);
     }
     Ok(())

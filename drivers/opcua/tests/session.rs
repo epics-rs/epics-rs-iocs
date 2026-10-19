@@ -225,7 +225,7 @@ const OUTPUT: RecordKind = RecordKind {
 };
 
 fn link(text: &str, kind: RecordKind) -> LinkInfo {
-    parse_link(text, kind, &InfoDefaults::default(), &Names)
+    parse_link("rec", text, kind, &InfoDefaults::default(), &Names)
         .unwrap_or_else(|e| panic!("parsing '{text}' failed: {e}"))
 }
 

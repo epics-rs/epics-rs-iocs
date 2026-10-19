@@ -814,9 +814,14 @@ impl OpcuaDevice {
             is_item_record: op == Op::Item,
         };
         let defaults = InfoDefaults::from_info(&self.info);
-        defaults.warn_deprecated(&self.record_name);
-        let link = parse_link(&self.link_text, kind, &defaults, &*self.registry)
-            .map_err(|e| CaError::LinkError(format!("{}: {e}", self.record_name)))?;
+        let link = parse_link(
+            &self.record_name,
+            &self.link_text,
+            kind,
+            &defaults,
+            &*self.registry,
+        )
+        .map_err(|e| CaError::LinkError(format!("{}: {e}", self.record_name)))?;
 
         let names = (
             link.session().unwrap_or_default().to_string(),
