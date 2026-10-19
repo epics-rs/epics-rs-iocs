@@ -348,8 +348,10 @@ impl Mm3000Axis {
 impl Model1Motor for Mm3000Axis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        let left = self.left.take().unwrap_or_default();
-        init_read(read, left, self.poll_failure())
+        // What the exit stored, a RETRY's MS bits included, which the
+        // first post now carries instead of `left`.
+        self.left = None;
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -1075,6 +1077,46 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvMM3000.cc:685-711: a failed `motor_init` read stores the
+    /// EA_PRESENT and GAIN_SUPPORT `motor_init` set: a missed MS raises
+    /// nothing (RETRY), a TP missed after a good MS keeps its bits, and the
+    /// next miss raises CNTRL_COMM_ERR and RA_PROBLEM (:250-334).
+    #[test]
+    fn a_failed_init_read_keeps_what_motor_init_set() {
+        let (_line, io) = LineRig::new("mm3000InitFail", |last| match last {
+            "VE" => "MM3000".into(),
+            "RC" => "1=dc 2=dc 3=dc".into(),
+            "2MS" => "%".into(),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(Mm3000Controller::new(io).unwrap()));
+        let init = |axis| Mm3000Axis::new(ctrl.clone(), axis).take_init_status();
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init(1), prepared);
+        assert_eq!(
+            init(2),
+            MotorStatus {
+                moving: true,
+                direction: true,
+                home: true,
+                powered: true,
+                ..prepared.clone()
+            }
+        );
+        assert_eq!(
+            init(3),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 
     /// drvMM3000.cc:311-334,380: a TP missed after a good MS is RETRY, and
