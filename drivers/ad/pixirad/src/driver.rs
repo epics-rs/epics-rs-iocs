@@ -183,7 +183,6 @@ impl PixiradDetector {
         // C added the length of the marker to a null `strstr` result and
         // published whatever was at that address.
         if let Some(info) = protocol::parse_additional_info(&reply) {
-            let info = info.trim().to_string();
             self.ad
                 .port_base
                 .set_string_param(self.params.system_info, 0, info)?;
@@ -660,9 +659,28 @@ mod tests {
         reject: Option<&'static str>,
         max_memory: usize,
     ) -> PixiradDetector {
-        let addr = match reject {
+        let answer = reject.map(|reject| {
+            move |command: &str| -> Vec<u8> {
+                if command.contains(reject) {
+                    b"NAK".to_vec()
+                } else {
+                    b"GOT: OK".to_vec()
+                }
+            }
+        });
+        detector_answering(name, answer, max_memory)
+    }
+
+    /// A box that sends `answer(command)` back for each command; `None` is a
+    /// box that never accepts the connection.
+    fn detector_answering(
+        name: &str,
+        answer: Option<impl Fn(&str) -> Vec<u8> + Send + 'static>,
+        max_memory: usize,
+    ) -> PixiradDetector {
+        let addr = match answer {
             None => "127.0.0.1:1".to_string(),
-            Some(reject) => {
+            Some(answer) => {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 let addr = listener.local_addr().unwrap().to_string();
                 std::thread::spawn(move || {
@@ -672,13 +690,8 @@ mod tests {
                         if n == 0 {
                             break;
                         }
-                        let command = String::from_utf8_lossy(&buf[..n]);
-                        let reply: &[u8] = if command.contains(reject) {
-                            b"NAK"
-                        } else {
-                            b"GOT: OK"
-                        };
-                        if stream.write_all(reply).is_err() {
+                        let reply = answer(&String::from_utf8_lossy(&buf[..n]));
+                        if stream.write_all(&reply).is_err() {
                             break;
                         }
                     }
@@ -770,6 +783,29 @@ mod tests {
         for reason in [p.serial_number, p.firmware_version] {
             assert_eq!(det.ad.port_base.get_string_param(reason, 0).unwrap(), b"");
         }
+    }
+
+    /// pixirad.cpp:569-570 publishes the bytes after the marker as they came.
+    #[test]
+    fn system_info_keeps_the_raw_reply() {
+        let det = detector_answering(
+            "PIXI_SYSINFO",
+            Some(|command: &str| -> Vec<u8> {
+                if command.contains("GET_ADDITIONAL_INFO") {
+                    b"ADDITIONAL INFO:  box 3 \t".to_vec()
+                } else {
+                    b"GOT: OK".to_vec()
+                }
+            }),
+            1 << 20,
+        );
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_string_param(det.params.system_info, 0)
+                .unwrap(),
+            b"  box 3 \t"
+        );
     }
 
     #[test]

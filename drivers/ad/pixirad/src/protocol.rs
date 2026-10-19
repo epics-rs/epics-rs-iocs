@@ -108,42 +108,54 @@ pub fn get_additional_info() -> String {
     "SYS:? GET_ADDITIONAL_INFO".into()
 }
 
+/// The C string in a reply buffer: its bytes up to the first NUL, as
+/// `setStringParam`, `strstr` and `sscanf` see `fromServer_`.
+pub fn c_string(bytes: &[u8]) -> &[u8] {
+    bytes.split(|&b| b == 0).next().unwrap_or_default()
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Did the box accept the command? (C `writeReadServer`: every reply to a
 /// non-`SYS:?` command has to contain `GOT:`.)
-pub fn reply_is_ok(command: &str, reply: &str) -> bool {
-    command.contains("SYS:?") || reply.contains("GOT:")
+pub fn reply_is_ok(command: &str, reply: &[u8]) -> bool {
+    command.contains("SYS:?") || find(reply, b"GOT:").is_some()
 }
 
 /// `DETECTOR <serial> FRMW_VER: <version>` → (serial, version), each present
 /// as far as C's `sscanf(fromServer_, "DETECTOR %s FRMW_VER: %s")` got
 /// before the reply stopped matching.
-pub fn parse_firmware_version(reply: &str) -> (Option<String>, Option<String>) {
+pub fn parse_firmware_version(reply: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     // C `isspace` in the "C" locale.
-    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
+    let is_space = |c: &u8| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+    let skip_space = |s: &[u8]| -> usize { s.iter().take_while(|c| is_space(c)).count() };
     // `%s ` : skip blanks, take the longest non-blank run (not empty), then the
     // format blank after it.
-    let word = |rest: &mut &str| {
-        let s = rest.trim_start_matches(is_space);
-        let end = s.find(is_space).unwrap_or(s.len());
-        *rest = s[end..].trim_start_matches(is_space);
-        (end > 0).then(|| s[..end].to_string())
+    let word = |rest: &mut &[u8]| {
+        let s = &rest[skip_space(rest)..];
+        let end = s.iter().position(is_space).unwrap_or(s.len());
+        *rest = &s[end..];
+        *rest = &rest[skip_space(rest)..];
+        (end > 0).then(|| s[..end].to_vec())
     };
     // A literal matches as written; a blank after it matches none or more.
-    let literal = |rest: &mut &str, text: &str| match rest.strip_prefix(text) {
+    let literal = |rest: &mut &[u8], text: &[u8]| match rest.strip_prefix(text) {
         Some(s) => {
-            *rest = s.trim_start_matches(is_space);
+            *rest = &s[skip_space(s)..];
             true
         }
         None => false,
     };
-    let mut rest = reply;
-    if !literal(&mut rest, "DETECTOR") {
+    let mut rest = c_string(reply);
+    if !literal(&mut rest, b"DETECTOR") {
         return (None, None);
     }
     let Some(serial) = word(&mut rest) else {
         return (None, None);
     };
-    let version = if literal(&mut rest, "FRMW_VER:") {
+    let version = if literal(&mut rest, b"FRMW_VER:") {
         word(&mut rest)
     } else {
         None
@@ -151,14 +163,15 @@ pub fn parse_firmware_version(reply: &str) -> (Option<String>, Option<String>) {
     (Some(serial), version)
 }
 
-/// Everything after `ADDITIONAL INFO:`.
+/// Everything after `ADDITIONAL INFO:`, byte for byte.
 ///
 /// C bug, pixirad.cpp:569-570: `strstr` returns NULL for a reply without the
 /// marker and C publishes the string at address 0x10; here the parameter is
 /// left unset.
-pub fn parse_additional_info(reply: &str) -> Option<&str> {
-    const MARKER: &str = "ADDITIONAL INFO:";
-    reply.find(MARKER).map(|i| &reply[i + MARKER.len()..])
+pub fn parse_additional_info(reply: &[u8]) -> Option<&[u8]> {
+    const MARKER: &[u8] = b"ADDITIONAL INFO:";
+    let reply = c_string(reply);
+    find(reply, MARKER).map(|i| &reply[i + MARKER.len()..])
 }
 
 /// The value the status broadcast carries for `key`, e.g. `READ_TCOLD -21.5`
@@ -208,6 +221,12 @@ pub fn cooling_status(cold_temp: f64, hot_temp: f64, dew_point: f64) -> CoolingS
 mod tests {
     use super::*;
 
+    fn fw(reply: &str) -> (Option<String>, Option<String>) {
+        let text = |v: Vec<u8>| String::from_utf8(v).unwrap();
+        let (serial, version) = parse_firmware_version(reply.as_bytes());
+        (serial.map(text), version.map(text))
+    }
+
     #[test]
     fn init_command_matches_c() {
         assert_eq!(init(15.0, 1, 350.0, 1), "DAQ:! INIT 15.0 1 350.0 1");
@@ -251,26 +270,23 @@ mod tests {
 
     #[test]
     fn reply_is_ok_only_when_the_box_said_got() {
-        assert!(reply_is_ok("DAQ:! SYSTEM_RESET", "GOT: SYSTEM_RESET"));
-        assert!(!reply_is_ok("DAQ:! SYSTEM_RESET", "ERR"));
+        assert!(reply_is_ok("DAQ:! SYSTEM_RESET", b"GOT: SYSTEM_RESET"));
+        assert!(!reply_is_ok("DAQ:! SYSTEM_RESET", b"ERR"));
         // SYS:? queries answer with data, not with an acknowledgement.
         assert!(reply_is_ok(
             "SYS:? GET_FIRMWARE_VERSION",
-            "DETECTOR 007 FRMW_VER: 2.1"
+            b"DETECTOR 007 FRMW_VER: 2.1"
         ));
     }
 
     #[test]
     fn firmware_version_is_split_into_serial_and_version() {
         assert_eq!(
-            parse_firmware_version("DETECTOR PX8-007 FRMW_VER: 3.14\r\n"),
+            fw("DETECTOR PX8-007 FRMW_VER: 3.14\r\n"),
             (Some("PX8-007".to_string()), Some("3.14".to_string()))
         );
-        assert_eq!(
-            parse_firmware_version("DETECTOR PX8-007"),
-            (Some("PX8-007".to_string()), None)
-        );
-        assert_eq!(parse_firmware_version("nonsense"), (None, None));
+        assert_eq!(fw("DETECTOR PX8-007"), (Some("PX8-007".to_string()), None));
+        assert_eq!(fw("nonsense"), (None, None));
     }
 
     /// The edges of C's `sscanf(fromServer_, "DETECTOR %s FRMW_VER: %s")`:
@@ -279,44 +295,30 @@ mod tests {
     #[test]
     fn firmware_version_follows_sscanf() {
         let both = |s: &str, v: &str| (Some(s.to_string()), Some(v.to_string()));
+        assert_eq!(fw(" DETECTOR PX8 FRMW_VER: 3"), (None, None));
+        assert_eq!(fw("DETECTORPX8 FRMW_VER: 3"), both("PX8", "3"));
+        assert_eq!(fw("DETECTOR PX8 FRMW_VER:3"), both("PX8", "3"));
         assert_eq!(
-            parse_firmware_version(" DETECTOR PX8 FRMW_VER: 3"),
-            (None, None)
-        );
-        assert_eq!(
-            parse_firmware_version("DETECTORPX8 FRMW_VER: 3"),
-            both("PX8", "3")
-        );
-        assert_eq!(
-            parse_firmware_version("DETECTOR PX8 FRMW_VER:3"),
-            both("PX8", "3")
-        );
-        assert_eq!(
-            parse_firmware_version("DETECTOR PX8FRMW_VER: 3"),
+            fw("DETECTOR PX8FRMW_VER: 3"),
             (Some("PX8FRMW_VER:".into()), None)
         );
+        assert_eq!(fw("DETECTOR\x0bPX8\x0bFRMW_VER:\x0b3"), both("PX8", "3"));
         assert_eq!(
-            parse_firmware_version("DETECTOR\x0bPX8\x0bFRMW_VER:\x0b3"),
-            both("PX8", "3")
-        );
-        assert_eq!(
-            parse_firmware_version("DETECTOR PX8\u{a0}1 FRMW_VER: 3"),
+            fw("DETECTOR PX8\u{a0}1 FRMW_VER: 3"),
             both("PX8\u{a0}1", "3")
         );
-        assert_eq!(
-            parse_firmware_version("DETECTOR PX8 FRMW_VERS 3"),
-            (Some("PX8".into()), None)
-        );
-        assert_eq!(parse_firmware_version("DETECTOR "), (None, None));
+        assert_eq!(fw("DETECTOR PX8 FRMW_VERS 3"), (Some("PX8".into()), None));
+        assert_eq!(fw("DETECTOR "), (None, None));
     }
 
     #[test]
     fn additional_info_is_the_tail_and_none_when_absent() {
         assert_eq!(
-            parse_additional_info("HEAD ADDITIONAL INFO: box 3"),
-            Some(" box 3")
+            parse_additional_info(b"HEAD ADDITIONAL INFO: box 3 \r\0junk"),
+            Some(&b" box 3 \r"[..])
         );
-        assert_eq!(parse_additional_info("HEAD"), None);
+        assert_eq!(parse_additional_info(b"HEAD"), None);
+        assert_eq!(parse_additional_info(b"HEAD\0ADDITIONAL INFO: x"), None);
     }
 
     #[test]

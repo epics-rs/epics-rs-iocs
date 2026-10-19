@@ -22,7 +22,7 @@ pub enum ServerError {
     Timeout,
     Transport(AsynError),
     /// The box answered, but not with `GOT:` (C's "Error from server").
-    Rejected(String),
+    Rejected(Vec<u8>),
 }
 
 impl std::fmt::Display for ServerError {
@@ -30,7 +30,9 @@ impl std::fmt::Display for ServerError {
         match self {
             Self::Timeout => write!(f, "timeout"),
             Self::Transport(e) => write!(f, "{e}"),
-            Self::Rejected(reply) => write!(f, "the box answered '{reply}'"),
+            Self::Rejected(reply) => {
+                write!(f, "the box answered '{}'", String::from_utf8_lossy(reply))
+            }
         }
     }
 }
@@ -69,15 +71,16 @@ pub type ServerResult<T> = Result<T, ServerError>;
 
 /// What one exchange with the box produced.
 pub struct Exchange {
-    pub reply: String,
+    /// `fromServer_` as a C string.
+    pub reply: Vec<u8>,
     pub result: ServerResult<()>,
 }
 
 struct Channel {
     handle: SyncIOHandle,
     /// C `fromServer_`: the buffer the reply is read into, shared by every
-    /// command.
-    from_server: String,
+    /// command, kept as the C string it holds.
+    from_server: Vec<u8>,
 }
 
 /// The Pixirad command socket.
@@ -90,7 +93,7 @@ impl PixiradServer {
         Self {
             channel: Channel {
                 handle,
-                from_server: String::new(),
+                from_server: Vec::new(),
             },
         }
     }
@@ -137,9 +140,7 @@ impl PixiradServer {
                 // arrived and terminates it (asynInterposeEos.c:250).
                 if e.octet_step() == Some(OctetStep::Read) {
                     let partial = e.partial_read().map(|p| p.data.as_slice());
-                    *from_server = String::from_utf8_lossy(partial.unwrap_or_default())
-                        .trim_end()
-                        .to_string();
+                    *from_server = crate::protocol::c_string(partial.unwrap_or_default()).to_vec();
                 }
                 Exchange {
                     reply: from_server.clone(),
@@ -148,13 +149,14 @@ impl PixiradServer {
             }
             Ok(result) => {
                 let bytes = result.data.unwrap_or_default();
-                let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                let reply = crate::protocol::c_string(&bytes).to_vec();
                 from_server.clone_from(&reply);
                 let result = if crate::protocol::reply_is_ok(command, &reply) {
                     Ok(())
                 } else {
                     trace_error(&format!(
-                        "pixirad:writeReadServer unexpected response from server = {reply}\n"
+                        "pixirad:writeReadServer unexpected response from server = {}\n",
+                        String::from_utf8_lossy(&reply)
                     ));
                     Err(ServerError::Rejected(reply.clone()))
                 };
@@ -226,7 +228,8 @@ mod from_server_tests {
     use epics_rs::asyn::runtime::port::create_port_runtime;
 
     /// Exchange 1 answers, 2 fails its write, 3 times out after part of a
-    /// reply, 4 times out with nothing.
+    /// reply, 4 times out with nothing. Each text ends in a blank and runs on
+    /// past a NUL.
     struct Scripted {
         base: PortDriverBase,
         exchange: usize,
@@ -263,11 +266,12 @@ mod from_server_tests {
         ) -> AsynResult<(usize, EomReason)> {
             match self.exchange {
                 1 => {
-                    buf[..7].copy_from_slice(b"GOT: OK");
-                    Ok((7, EomReason::EOS))
+                    let reply = b"GOT: OK \0x";
+                    buf[..reply.len()].copy_from_slice(reply);
+                    Ok((reply.len(), EomReason::EOS))
                 }
                 3 => Err(timeout().with_partial_read(PartialOctetRead {
-                    data: b"GO".to_vec(),
+                    data: b"GO \0x".to_vec(),
                     eom_reason: EomReason::empty(),
                 })),
                 _ => Err(timeout()),
@@ -275,8 +279,9 @@ mod from_server_tests {
         }
     }
 
-    /// C `writeReadServer` publishes `fromServer_` whatever the status, and
-    /// asynOctetSyncIO writes it only once the read starts.
+    /// C `writeReadServer` publishes `fromServer_` whatever the status, as the
+    /// C string it holds, and asynOctetSyncIO writes it only once the read
+    /// starts.
     #[test]
     fn a_failed_exchange_replies_with_what_c_left_in_from_server() {
         let name = "PIXI_FROM_SERVER";
@@ -298,7 +303,7 @@ mod from_server_tests {
             0,
             Duration::ZERO,
         ));
-        let replies: Vec<String> = (0..4).map(|_| server.command("DAQ:! X").reply).collect();
-        assert_eq!(replies, ["GOT: OK", "GOT: OK", "GO", ""]);
+        let replies: Vec<Vec<u8>> = (0..4).map(|_| server.command("DAQ:! X").reply).collect();
+        assert_eq!(replies, [&b"GOT: OK "[..], b"GOT: OK ", b"GO ", b""]);
     }
 }
