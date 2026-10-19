@@ -165,3 +165,55 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvMCDC2805.cc:584-623: `motor_init` sets up each node and reads its
+    /// status once, before the next node's set-up, and the record starts
+    /// from that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_after_its_own_setup() {
+        let int = ArgValue::Int;
+        run_command(mcdc2805_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("mcdcInitLine", |cmd| match cmd.trim_end() {
+            "0POS" => "14".into(),
+            "1POS" => "3".into(),
+            c if c.ends_with("VER") => "V1".into(),
+            c if c.ends_with("GST") => "0000000".into(),
+            c if c.ends_with("GAST") => "00".into(),
+            c if c.ends_with("GV") => "0".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), int(2), ArgValue::String("mcdcInitLine".into())];
+        run_command(mcdc2805_config_command(), config).await;
+        drvsup_init().await;
+        let mut want: Vec<String> = ["0VER", "1VER"].map(String::from).into();
+        for node in 0..2 {
+            for cmd in [
+                "SOR 0", "REFIN", "HP7", "HB6", "HD2", "HL1", "HA1", "CAHOSEQ", "GST", "POS",
+                "GAST", "GV",
+            ] {
+                want.push(format!("{node}{cmd}"));
+            }
+        }
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        assert_eq!(sent, want);
+        let db = record_init(
+            r##"
+record(motor, "mcdc:m1") { field(DTYP, "MCDC2805") field(OUT, "#C0 S0 @") }
+record(motor, "mcdc:m2") { field(DTYP, "MCDC2805") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("mcdc:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("mcdc:m2.RMP").unwrap(), EpicsValue::Long(3));
+    }
+}

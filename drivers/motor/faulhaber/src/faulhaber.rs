@@ -197,13 +197,16 @@ pub struct FaulhaberAxis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl FaulhaberAxis {
     /// Construct axis `node` (0-based) and run the C `motor_init` per-axis setup:
     /// RS-232 velocity source (`SOR 0`) and the limit-switch and homing
-    /// configuration. Performs blocking serial I/O; as C's bare `send_mess`
-    /// (drvMCDC2805.cc:600-623), a refused command keeps the axis.
+    /// configuration, then its status read. Performs blocking serial I/O; as
+    /// C's bare `send_mess` (drvMCDC2805.cc:600-623), a refused command keeps
+    /// the axis.
     pub fn new(controller: Arc<Mutex<FaulhaberController>>, node: usize) -> Self {
         {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -215,7 +218,7 @@ impl FaulhaberAxis {
                 let _ = ctrl.write_cmd(node, cmd);
             }
         }
-        Self {
+        let mut axis = Self {
             controller,
             node,
             // Read only by a move, which set_record_fields leads.
@@ -231,7 +234,10 @@ impl FaulhaberAxis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        };
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
     }
 
     fn counts_per_rev(&self) -> f64 {
@@ -498,6 +504,10 @@ impl AsynMotor for FaulhaberAxis {
             ..MotorStatus::default()
         };
         Ok(self.last_status.clone())
+    }
+
+    fn take_init_status(&mut self) -> Option<AsynResult<MotorStatus>> {
+        self.init_status.take()
     }
 }
 
