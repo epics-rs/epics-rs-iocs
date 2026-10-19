@@ -3,7 +3,7 @@
 //! The C driver has no StreamDevice and no `asynDrvUser` interface at all --
 //! every one of the 18 data-db records binds via `@asyn($(PORT) addr 0)` (no
 //! drvInfo string), so [`DataDriver::drv_user_create`] dispatches purely by
-//! `addr`, unlike [`crate::config_driver`]'s name-keyed reason table.
+//! `addr`, unlike the L0 config driver's name-keyed reason table.
 //!
 //! # Addressing (`capaNCDT6200Sup.c:34-51`)
 //!
@@ -93,7 +93,7 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::{OctetRead, RequestOp};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -483,6 +483,17 @@ fn long_wait() {
 
 /// `readerThread` (`capaNCDT6200Sup.c:254-462`). Returns once the IOC's
 /// atExit callbacks have asked it to.
+/// C advances `tread` only on asynSuccess (`capaNCDT6200Sup.c:321`), so a
+/// failed read's bytes are overwritten by the next one; the failure is a
+/// timeout or a read error by its status alone (:420).
+fn read_bytes(read: OctetRead) -> Result<Vec<u8>, (AsynError, ReadOutcome)> {
+    match read.into_parts() {
+        (bytes, Ok(())) => Ok(bytes),
+        (_, Err(e)) if e.status() == AsynStatus::Timeout => Err((e, ReadOutcome::Timeout)),
+        (_, Err(e)) => Err((e, ReadOutcome::ReadError)),
+    }
+}
+
 fn reader_thread(
     rbk_port_handle: PortHandle,
     shared: Arc<Mutex<SharedState>>,
@@ -556,7 +567,7 @@ fn reader_thread(
                 return;
             }
 
-            let outcome = match read_result {
+            let outcome = match read_bytes(read_result) {
                 Ok(bytes) => {
                     let n = bytes.len();
                     buf[tread..tread + n].copy_from_slice(&bytes);
@@ -579,9 +590,9 @@ fn reader_thread(
                         ReadOutcome::Partial
                     }
                 }
-                Err(e) => {
+                Err((e, failure)) => {
                     print_error(format_args!("{rbk}: port read failed: {}\n", e.message()));
-                    if e.status() == AsynStatus::Timeout {
+                    if failure == ReadOutcome::Timeout {
                         ReadOutcome::Timeout
                     } else {
                         // C waits before it counts the failure (`:428`).
@@ -719,6 +730,24 @@ pub fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A timeout counts as one, not as a read error, and a failed read's
+    /// bytes never reach the packet buffer (`capaNCDT6200Sup.c:321`, `:420`).
+    #[test]
+    fn a_timeout_is_classified_by_status_and_its_bytes_are_dropped() {
+        use epics_rs::asyn::interpose::EomReason;
+        let read = |data: &[u8], status| OctetRead::new(data.to_vec(), EomReason::empty(), status);
+        let fail = |status| AsynError::Status {
+            status,
+            message: "read failed".into(),
+        };
+
+        let (_, timeout) = read_bytes(read(b"abc", Err(fail(AsynStatus::Timeout)))).unwrap_err();
+        assert_eq!(timeout, ReadOutcome::Timeout);
+        let (_, error) = read_bytes(read(b"abc", Err(fail(AsynStatus::Error)))).unwrap_err();
+        assert_eq!(error, ReadOutcome::ReadError);
+        assert_eq!(read_bytes(read(b"abc", Ok(()))).unwrap(), b"abc");
+    }
 
     #[test]
     fn addresses_match_c_defines() {

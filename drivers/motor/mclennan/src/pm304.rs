@@ -97,19 +97,20 @@ impl Pm304Controller {
             use_encoder: Vec::with_capacity(n_axes),
         };
 
-        // drvPM304.cc:668-675: the card is there once `1OA` gets a reply,
-        // tried three times; every later reply's status is ignored.
-        if !(0..3).any(|_| ctrl.write_read_raw("1OA").is_ok_and(|r| !r.is_empty())) {
+        // drvPM304.cc:643-647: the card is there once `1OA` gets a reply,
+        // tried three times. send_recv_mess ignores every status, so a
+        // reply cut by a timeout counts.
+        if !(0..3).any(|_| !ctrl.exchange("1OA").0.is_empty()) {
             return Err(pm304_err("PM304: no response to 1OA position query"));
         }
 
         // Stop axis 1 for safety (C sends "1ST;" before identifying).
-        let _ = ctrl.write_read_raw("1ST");
+        let _ = ctrl.exchange("1ST");
 
         // Model detection is robust to the PM600 echo: the reply is
         // "1ID\r<ident>" on the PM600 and "<ident>" on the PM304, and both
         // contain "PM304" only for the PM304.
-        let ident = ctrl.write_read_raw("1ID").unwrap_or_default();
+        let ident = ctrl.exchange("1ID").0;
         ctrl.model = if ident.contains("PM304") {
             Model::Pm304
         } else {
@@ -120,9 +121,7 @@ impl Pm304Controller {
         ctrl.ident = ctrl.strip_echo(&ident).trim().to_string();
 
         for axis in 1..=n_axes {
-            let id = ctrl
-                .write_read_raw(&format!("{axis}ID"))
-                .unwrap_or_default();
+            let id = ctrl.exchange(&format!("{axis}ID")).0;
             // C: PM304 always uses the encoder; PM600 uses the command counter
             // only when the axis reports "Open loop stepper mode".
             let use_encoder = match ctrl.model {
@@ -175,25 +174,29 @@ impl Pm304Controller {
         }
     }
 
-    /// Write a command and return its raw reply (input EOS already stripped by
-    /// the port), without removing the PM600 echo — used during identification
-    /// before the model is known.
-    fn write_read_raw(&self, cmd: &str) -> AsynResult<String> {
-        // C send_mess/send_recv_mess: pasynOctetSyncIO->writeRead, which
-        // flushes first so a stray line cannot shift every later reply.
-        let raw = self
+    /// C `send_recv_mess`: write a command and return its raw reply (input
+    /// EOS already stripped by the port) beside the status, without removing
+    /// the PM600 echo — used during identification before the model is
+    /// known. The EOS layer NUL-terminates the buffer on every read, so a
+    /// failed read leaves the bytes it delivered, which every C caller parses.
+    fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
+        // pasynOctetSyncIO->writeRead flushes first so a stray line cannot
+        // shift every later reply.
+        let (raw, status) = self
             .handle
-            .write_read(0, &Self::framed(cmd.as_bytes()), READ_BUF)?;
+            .write_read(0, &Self::framed(cmd.as_bytes()), READ_BUF)
+            .into_parts();
         let text = String::from_utf8_lossy(&raw);
-        Ok(text.trim_end_matches(['\r', '\n', '\0']).to_string())
+        let text = text.trim_end_matches(['\r', '\n', '\0']).to_string();
+        (text, status)
     }
 
-    /// Write a command and return its reply with the PM600 echo removed. Every
-    /// command produces a reply, so this is used for both queries and set
-    /// commands (whose reply is discarded) to keep the stream synchronized.
-    fn command(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.write_read_raw(cmd)?;
-        Ok(self.strip_echo(&raw).trim().to_string())
+    /// Write a query and return its reply with the PM600 echo removed,
+    /// whatever the read's status: C `set_status` ignores
+    /// `send_recv_mess`'s (drvPM304.cc:231/:301).
+    fn command(&self, cmd: &str) -> String {
+        let (raw, _) = self.exchange(cmd);
+        self.strip_echo(&raw).trim().to_string()
     }
 
     /// C `send_mess`: each `;`-separated piece of `msg` is its own command,
@@ -435,7 +438,7 @@ impl AsynMotor for Pm304Axis {
         let use_encoder = ctrl.use_encoder(self.index);
         let model = ctrl.model;
 
-        let status_reply = ctrl.command(&format!("{}OS", self.axis))?;
+        let status_reply = ctrl.command(&format!("{}OS", self.axis));
         let bits = parse_status(model, &status_reply);
 
         let pos_cmd = if use_encoder {
@@ -443,7 +446,7 @@ impl AsynMotor for Pm304Axis {
         } else {
             format!("{}OC", self.axis)
         };
-        let pos_reply = ctrl.command(&pos_cmd)?;
+        let pos_reply = ctrl.command(&pos_cmd);
 
         // drvPM304.cc:330-338: POST and a CR once done or on a limit; only
         // the PM304 branch sets ls_active.
@@ -520,6 +523,29 @@ mod tests {
         assert!(!s.problem);
         assert!(s.plus_ls);
         assert!(!s.minus_ls);
+    }
+
+    /// drvPM304.cc:499-522 ignores writeRead's status and keeps what
+    /// arrived, so a card whose replies are cut by a timeout is still found
+    /// and identified, and set_status still parses its OS and OA replies.
+    #[test]
+    fn replies_cut_by_a_timeout_are_still_parsed() {
+        let (_line, io) = LineRig::cut(
+            "pm304_cut",
+            |last| match last {
+                "1OA\r" => "AP=123".into(),
+                "1ID\r" => "Mclennan PM304".into(),
+                "1OS\r" => "00010000".into(),
+                _ => "OK".into(),
+            },
+            |_| true,
+        );
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        assert!(ctrl.model == Model::Pm304);
+        assert_eq!(ctrl.ident, "Mclennan PM304");
+        let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert_eq!((status.position, status.done), (123.0, true));
     }
 
     fn pm304_line(name: &str) -> (LineRig, Pm304Axis) {

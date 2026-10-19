@@ -164,14 +164,19 @@ impl Mdt695Controller {
 
     /// Read one CR-terminated reply line (trimmed).
     fn read_line(&self) -> AsynResult<String> {
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let (raw, status) = self.handle.read_octet(0, READ_BUF).into_parts();
+        status?;
         Ok(trim_line(&raw))
     }
 
     /// Write a query and return its reply line. C send_mess flushes the input
     /// before every write (drvMDT695.cc:393), as `write_read` does.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let (raw, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        status?;
         Ok(trim_line(&raw))
     }
 }

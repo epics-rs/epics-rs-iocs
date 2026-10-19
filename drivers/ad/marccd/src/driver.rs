@@ -503,8 +503,12 @@ pub(crate) mod tests {
                 message: "refused".into(),
             })
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
-            Err(AsynError::Status {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            _buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
                 status: self.status,
                 message: "refused".into(),
             })
@@ -556,6 +560,62 @@ pub(crate) mod tests {
             );
             std::mem::forget(server);
         }
+    }
+
+    /// A server port whose every read times out after sending `abc`.
+    struct TimesOutAfterAbc(PortDriverBase);
+
+    impl PortDriver for TimesOutAfterAbc {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            buf[..3].copy_from_slice(b"abc");
+            OctetReadResult {
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "timeout".into(),
+                }),
+                ..OctetReadResult::ok(3, EomReason::empty())
+            }
+        }
+    }
+
+    /// C `readServer` publishes the buffer whatever the status, and a timed-out
+    /// read leaves in it what it transferred (marCCD.cpp:527-533).
+    #[test]
+    fn a_timed_out_read_publishes_its_bytes() {
+        let name = "MARCCD_PARTIAL";
+        let (server, _) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            TimesOutAfterAbc(PortDriverBase::new(
+                name,
+                1,
+                Default::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            )),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let links = DriverLinks {
+            server: SyncIOHandle::from_handle(server.port_handle().clone(), 0, Duration::ZERO),
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+        };
+        let mut det = MarccdDriver::new(&format!("{name}_DET"), 0, links).unwrap();
+        assert_eq!(det.read_server(0.1), AsynStatus::Timeout);
+        assert_eq!(det.from, "abc");
+        assert_eq!(det.get_str(det.ad.params.string_from_server, 256), "abc");
+        std::mem::forget(server);
     }
 
     /// marCCD.cpp:1467 adds asynEnumMask to ADDriver's interrupt mask, and

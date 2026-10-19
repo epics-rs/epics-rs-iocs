@@ -251,7 +251,7 @@ impl PmncController {
         // C strncpy's the raw reply (drvPMNC87xx.cc:914), up to MAX_IDENT_LEN.
         let mut ident = String::new();
         for _ in 0..3 {
-            if let Ok(raw) = ctrl.handle.write_read(0, b"VER", READ_BUF)
+            if let (raw, Ok(())) = ctrl.handle.write_read(0, b"VER", READ_BUF).into_parts()
                 && !raw.is_empty()
             {
                 let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -345,7 +345,9 @@ impl PmncController {
 
     /// [`command`](Self::command) for a record string's raw bytes.
     fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
-        Self::trimmed(self.handle.write_read(0, cmd, READ_BUF)?)
+        let (raw, status) = self.handle.write_read(0, cmd, READ_BUF).into_parts();
+        status?;
+        Self::trimmed(raw)
     }
 
     /// `STA` for one driver module (C `set_status`), read to `\n` instead of
@@ -358,11 +360,15 @@ impl PmncController {
         let _ = self
             .port
             .set_input_eos_blocking(eos_user(self.addr), NL_EOS);
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF);
+        let (raw, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
         let _ = self
             .port
             .set_input_eos_blocking(eos_user(self.addr), PROMPT_EOS);
-        Self::trimmed(raw?)
+        status?;
+        Self::trimmed(raw)
     }
 
     fn trimmed(raw: Vec<u8>) -> AsynResult<String> {
@@ -1118,10 +1124,17 @@ mod tests {
             };
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = std::mem::take(&mut self.reply);
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

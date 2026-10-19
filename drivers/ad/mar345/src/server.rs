@@ -7,7 +7,7 @@
 //! `task::Held`, and the worker reads with the hold released.
 
 use epics_rs::asyn::error::{AsynResult, AsynStatus};
-use epics_rs::asyn::request::{RequestOp, RequestResult};
+use epics_rs::asyn::request::{OctetRead, OctetReadOp, RequestOp, RequestResult};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -28,6 +28,14 @@ pub(crate) fn server_submit(
     user: AsynUser,
 ) -> AsynResult<RequestResult> {
     server.port()?.submit_blocking(op, user)
+}
+
+/// [`server_submit`] for a read, its bytes beside its status.
+pub(crate) fn server_read(server: &SyncIOHandle, op: OctetReadOp, user: AsynUser) -> OctetRead {
+    match server.port() {
+        Ok(port) => port.submit_octet_read_blocking(op, user),
+        Err(e) => OctetRead::failed(e),
+    }
 }
 
 impl Mar345Driver {

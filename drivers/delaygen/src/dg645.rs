@@ -39,6 +39,7 @@
 //!   check_errors state. See [`Dg645Driver::error`] usage in `read_int32`.
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
@@ -530,24 +531,25 @@ impl Dg645Driver {
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
         use std::fmt::Write as _;
         let port = &self.base.port_name;
-        let result = wire::write_read_bytes(&self.handle, cmd);
+        let (raw, result) = wire::exchange(&self.handle, cmd);
         if let Err(f) = &result {
             self.base.trace_print(
                 TraceMask::ERROR,
                 format_args!("{port} writeRead: error {} wrote \"{cmd}\"\n", f.status()),
             );
         }
-        // C's `%s` of inpBuf: the reply's bytes as sent, up to a NUL. C defect
-        // not copied: after a failed read inpBuf is unterminated stale bytes.
-        let read = result.as_deref().unwrap_or_default();
-        let read = &read[..read.iter().position(|&b| b == 0).unwrap_or(read.len())];
+        // C's `%s` of inpBuf: the bytes read, also by a failed read, up to a
+        // NUL. C defect not copied: after a failed write inpBuf is
+        // uninitialised.
+        let read = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
         self.base
             .trace_write_at(0, 0, TraceMask::IO_FILTER, file!(), line!(), |out| {
                 write!(out, "{port} writeRead: wrote \"{cmd}\" read \"")?;
                 out.write_bytes(read)?;
                 out.write_str("\"\n")
             });
-        Ok(String::from_utf8_lossy(&result?).into_owned())
+        result?;
+        Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 
     /// C `writeOnly`; see [`Self::write_read`].
@@ -700,9 +702,11 @@ impl PortDriver for Dg645Driver {
             .map_err(|e| wire::record_error(e.status()))
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        self.do_read_octet(user, buf)
-            .map_err(|e| wire::record_error(e.status()))
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        match self.do_read_octet(user, buf) {
+            Ok(n) => OctetReadResult::ok(n, EomReason::empty()),
+            Err(e) => OctetReadResult::failed(wire::record_error(e.status())),
+        }
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -1016,6 +1020,32 @@ mod init_tests {
             out.windows(want.len()).any(|w| w == want),
             "{}",
             String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// drvAsynDG645.cpp:1206-1208 prints inpBuf after a failed read too,
+    /// where it holds the bytes that read delivered.
+    #[test]
+    fn write_read_traces_a_reply_cut_by_a_timeout() {
+        use crate::connect::cut_link;
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let dg = Dg645Driver::new("DG645_CUT", cut_link("DG645_CUT_IO", b"7")).unwrap();
+        let path = std::env::temp_dir().join(format!("dg645-cut-{}.trace", std::process::id()));
+        let file =
+            std::sync::Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+        let services = PortServices::global();
+        let trace = services.trace();
+        trace.set_trace_mask(Some("DG645_CUT"), TraceMask::IO_FILTER);
+        trace.set_trace_file(Some("DG645_CUT"), TraceFile::File(file));
+
+        assert!(dg.write_read("LERR?").is_err());
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.contains("DG645_CUT writeRead: wrote \"LERR?\" read \"7\"\n"),
+            "{out}"
         );
     }
 

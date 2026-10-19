@@ -183,7 +183,8 @@ impl Lc400Controller {
         let handle = self.handle()?;
         let mut buf = Vec::with_capacity(len);
         while buf.len() < len {
-            let chunk = handle.read_octet(0, len - buf.len())?;
+            let (chunk, status) = handle.read_octet(0, len - buf.len()).into_parts();
+            status?;
             if chunk.is_empty() {
                 return Err(lc400_err("short LC400 reply"));
             }
@@ -235,7 +236,8 @@ impl Lc400Controller {
         out.extend_from_slice(&addr.to_le_bytes());
         out.extend_from_slice(&(count as u32).to_le_bytes());
         out.push(EOS);
-        let header = self.handle()?.write_read(0, &out, 5)?;
+        let (header, status) = self.handle()?.write_read(0, &out, 5).into_parts();
+        status?;
         if header.len() < 5 {
             self.read_exact(5 - header.len())?;
         }
@@ -1016,12 +1018,19 @@ mod tests {
             }
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let n = self.reply.len().min(buf.len());
             for (slot, byte) in buf.iter_mut().zip(self.reply.drain(..n)) {
                 *slot = byte;
             }
-            Ok(n)
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                n,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

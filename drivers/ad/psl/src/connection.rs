@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -48,8 +48,6 @@ impl std::fmt::Display for ServerError {
 
 impl From<AsynError> for ServerError {
     fn from(e: AsynError) -> Self {
-        // `status()` reads *through* a `PartialRead` carrier, so a timeout that
-        // returned partial bytes (EOS interpose installed) is still recognized.
         if e.status() == AsynStatus::Timeout {
             Self::Timeout
         } else {
@@ -108,6 +106,11 @@ impl PslServer {
         self.session().command(command)
     }
 
+    /// [`Self::command`] with the reply a failed read delivered.
+    pub fn exchange(&self, command: &str) -> (String, ServerResult<()>) {
+        self.session().exchange(command)
+    }
+
     /// C `asynPrint(pasynUserServer_, ASYN_TRACE_ERROR, ...)`.
     pub fn trace_error(&self, message: &str) {
         let io = self.io.lock();
@@ -125,11 +128,21 @@ impl Session<'_> {
     /// Send a command and read the reply as text (C `writeReadServer` with the
     /// default `PSL_SERVER_TIMEOUT`).
     pub fn command(&mut self, command: &str) -> ServerResult<String> {
-        let bytes = self
+        let (reply, status) = self.exchange(command);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::command`] with the bytes a failed read delivered, which C's
+    /// `fromServer_` holds; a failed write reads none.
+    pub fn exchange(&mut self, command: &str) -> (String, ServerResult<()>) {
+        let (bytes, status) = self
             .io
-            .write_read(command, MAX_MESSAGE_SIZE, SERVER_TIMEOUT)
-            .inspect_err(|e| self.io.write_read_failed(e, command))?;
-        Ok(String::from_utf8_lossy(&bytes).trim_end().to_string())
+            .write_read(command, MAX_MESSAGE_SIZE, SERVER_TIMEOUT);
+        if let Err(e) = &status {
+            self.io.write_read_failed(e, command);
+        }
+        let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();
+        (reply, status)
     }
 
     /// Ask for a frame and read the first block of the answer: the text header
@@ -192,17 +205,22 @@ impl ServerIo {
         command: &str,
         buf_size: usize,
         timeout: Duration,
-    ) -> ServerResult<Vec<u8>> {
+    ) -> (Vec<u8>, ServerResult<()>) {
         self.reconnect();
-        let result = self.handle.port()?.submit_blocking(
-            RequestOp::OctetWriteRead {
-                data: command.as_bytes().to_vec(),
-                buf_size,
-                flush: true,
-            },
-            self.user(timeout),
-        )?;
-        Ok(result.data.unwrap_or_default())
+        let port = match self.handle.port() {
+            Ok(port) => port,
+            Err(e) => return (Vec::new(), Err(e.into())),
+        };
+        let (reply, status) = port
+            .submit_octet_read_blocking(
+                OctetReadOp::WriteRead {
+                    data: command.as_bytes().to_vec(),
+                    buf_size,
+                },
+                self.user(timeout),
+            )
+            .into_parts();
+        (reply, status.map_err(ServerError::from))
     }
 
     fn write(&mut self, command: &str, timeout: Duration) -> ServerResult<()> {
@@ -216,11 +234,13 @@ impl ServerIo {
     }
 
     fn read_binary(&mut self, buf_size: usize, timeout: Duration) -> ServerResult<Vec<u8>> {
-        let result = self
+        let (data, status) = self
             .handle
             .port()?
-            .submit_blocking(RequestOp::OctetReadBinary { buf_size }, self.user(timeout))?;
-        Ok(result.data.unwrap_or_default())
+            .submit_octet_read_blocking(OctetReadOp::ReadBinary { buf_size }, self.user(timeout))
+            .into_parts();
+        status?;
+        Ok(data)
     }
 }
 
@@ -256,22 +276,13 @@ mod reconnect_tests {
 #[cfg(test)]
 mod is_timeout_tests {
     use super::*;
-    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
 
-    /// A read that times out *after* transferring bytes arrives as
-    /// `AsynError::PartialRead` when the EOS interpose is installed (this
-    /// port's st.cmd uses `noProcessEos=0`). A bare `AsynError::Status`
-    /// match missed it and misclassified the timeout as a transport fault.
     #[test]
-    fn a_partial_read_wrapped_timeout_maps_to_timeout() {
+    fn a_timeout_maps_to_timeout() {
         let e = AsynError::Status {
             status: AsynStatus::Timeout,
             message: "read timeout".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: b"partial".to_vec(),
-            eom_reason: EomReason::empty(),
-        });
+        };
         assert!(matches!(ServerError::from(e), ServerError::Timeout));
     }
 

@@ -182,10 +182,22 @@ impl Mcs2Controller {
 
     /// Write a query and return its reply (trimmed).
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-        Ok(String::from_utf8_lossy(&raw)
+        let (reply, status) = self.exchange(cmd);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::query`]'s reply beside its status. The EOS layer NUL-terminates
+    /// `inString_` on every read, so a failed read leaves the bytes it
+    /// delivered, which the axis report parses.
+    fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
+        let (raw, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        let reply = String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
-            .to_string())
+            .to_string();
+        (reply, status)
     }
 
     /// Drain the controller error queue (C `clearErrors`): read the error count
@@ -374,12 +386,13 @@ impl AxisReport for Mcs2AxisReport {
         }
         let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         let c = self.channel;
-        let query = |what: &str| ctrl.query(&format!(":CHAN{c}:{what}?"));
-        let int = |what: &str| atoi(&query(what).unwrap_or_default());
+        // C ignores every status but the last and parses what arrived.
+        let query = |what: &str| ctrl.exchange(&format!(":CHAN{c}:{what}?"));
+        let int = |what: &str| atoi(&query(what).0);
         let pcode = int("PTYP");
         // C copies its uninitialised `pname` over the reply
         // (`strcpy(pC_->inString_, pname)`), a bug; the reply is printed.
-        let pname = query("PTYP:NAME").unwrap_or_default();
+        let pname = query("PTYP:NAME").0;
         let (state, vel, acc, mclf, ferr, error) = (
             int("STAT"),
             int("VEL"),
@@ -389,11 +402,11 @@ impl AxisReport for Mcs2AxisReport {
             int("ERR"),
         );
         // C reports only the last query's status.
-        let temp = query("TEMP");
-        if let Err(e) = &temp {
+        let (temp, status) = query("TEMP");
+        if let Err(e) = &status {
             let _ = writeln!(out, "  axis {c} -> asyn status error {}", e.status() as i32);
         }
-        let temp = atoi(&temp.unwrap_or_default());
+        let temp = atoi(&temp);
         let _ = write!(
             out,
             "  axis {c}\n    positioner type {pcode}\n    positioner name {pname}\n    \
@@ -706,6 +719,41 @@ mod tests {
                 sent.iter().any(|c| c.trim_end() == want),
                 "{want}: {sent:?}"
             );
+        }
+    }
+
+    /// smarActMCS2MotorDriver.cpp:303-328 ignores each report query's status
+    /// and parses `inString_`, so replies cut by a timeout are still printed.
+    #[test]
+    fn report_replies_cut_by_a_timeout_are_still_printed() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::cut(
+            "mcs2Cut",
+            |cmd| {
+                match cmd.trim_end() {
+                    ":CHAN0:VEL?" => "7\r\n",
+                    ":CHAN0:PTYP:NAME?" => "SL...S1SS\r\n",
+                    ":CHAN0:TEMP?" => "31\r\n",
+                    _ => "0\r\n",
+                }
+                .to_string()
+            },
+            |_| true,
+        );
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2Cut", 0));
+        let report = Mcs2AxisReport {
+            controller: Arc::new(Mutex::new(ctrl)),
+            channel: 0,
+        };
+        let mut out = String::new();
+        report.report(&mut out, 1);
+        for want in [
+            "asyn status error",
+            "positioner name SL...S1SS\n",
+            "velocity 7\n",
+            "temp 31\n",
+        ] {
+            assert!(out.contains(want), "{want}: {out}");
         }
     }
 

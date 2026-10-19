@@ -18,7 +18,7 @@ use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::claim_port;
-use epics_rs::asyn::request::{PortCalls, RequestOp};
+use epics_rs::asyn::request::{OctetReadOp, PortCalls, RequestOp};
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -88,7 +88,8 @@ impl SpiiPlusComm {
 
     /// `writeReadController`: the reply, its EOS stripped.
     fn write_read_controller(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.io.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let (raw, status) = self.io.write_read(0, cmd.as_bytes(), READ_BUF).into_parts();
+        status?;
         Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 
@@ -411,13 +412,9 @@ fn user(timeout: Duration) -> AsynUser {
 
 /// An EOS-free read of `n` bytes: what arrived, and the read's status.
 fn read(calls: &mut dyn PortCalls, n: usize, timeout: Duration) -> (Vec<u8>, AsynResult<()>) {
-    match calls.call(&RequestOp::OctetReadBinary { buf_size: n }, user(timeout)) {
-        Ok(result) => (result.data.unwrap_or_default(), Ok(())),
-        Err(e) => (
-            e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
-            Err(e),
-        ),
-    }
+    calls
+        .octet_read(OctetReadOp::ReadBinary { buf_size: n }, user(timeout))
+        .into_parts()
 }
 
 fn comm_error(message: String) -> AsynError {

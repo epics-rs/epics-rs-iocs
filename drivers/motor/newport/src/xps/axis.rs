@@ -1361,19 +1361,24 @@ mod tests {
             };
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-            let reply = self
-                .reply
-                .take()
-                .or_else(|| {
-                    std::mem::take(&mut *self.answer.lock().unwrap()).then(|| "0,EndOfAPI".into())
-                })
-                .ok_or_else(|| AsynError::Status {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            let Some(reply) = self.reply.take().or_else(|| {
+                std::mem::take(&mut *self.answer.lock().unwrap()).then(|| "0,EndOfAPI".into())
+            }) else {
+                return epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "no reply".into(),
-                })?;
+                });
+            };
             buf[..reply.len()].copy_from_slice(reply.as_bytes());
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

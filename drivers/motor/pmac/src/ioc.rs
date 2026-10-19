@@ -935,10 +935,17 @@ mod tests {
             self.written.lock().unwrap().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = std::mem::take(&mut self.reply);
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -1037,6 +1044,8 @@ mod tests {
         base: PortDriverBase,
         rig: Rig,
         reply: Option<Vec<u8>>,
+        /// The pending reply ends in a timeout.
+        cut: bool,
     }
 
     #[derive(Clone, Default)]
@@ -1046,15 +1055,31 @@ mod tests {
         disconnects: Arc<AtomicUsize>,
         /// Commands the port takes this long to answer.
         slow: Arc<Mutex<HashMap<String, Duration>>>,
+        /// Commands whose reply a timeout cuts short.
+        cut: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        /// Commands whose write fails.
+        refused: Arc<Mutex<Vec<String>>>,
     }
 
     impl Rig {
         fn answer(&self, command: &str, reply: &[u8]) {
+            self.cut.lock().unwrap().remove(command);
             let mut replies = self.replies.lock().unwrap();
             replies.insert(command.into(), reply.into());
         }
         fn silence(&self, command: &str) {
             self.replies.lock().unwrap().remove(command);
+            self.cut.lock().unwrap().remove(command);
+        }
+        fn cut(&self, command: &str, partial: &[u8]) {
+            self.replies.lock().unwrap().remove(command);
+            self.cut
+                .lock()
+                .unwrap()
+                .insert(command.into(), partial.into());
+        }
+        fn refuse(&self, command: &str) {
+            self.refused.lock().unwrap().push(command.into());
         }
         fn written(&self) -> Vec<String> {
             std::mem::take(&mut *self.written.lock().unwrap())
@@ -1083,20 +1108,48 @@ mod tests {
         }
         fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data).into_owned();
-            self.reply = self.rig.replies.lock().unwrap().get(&cmd).cloned();
+            if self.rig.refused.lock().unwrap().contains(&cmd) {
+                self.reply = None;
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "write refused".into(),
+                });
+            }
+            let cut = self.rig.cut.lock().unwrap().get(&cmd).cloned();
+            self.cut = cut.is_some();
+            self.reply = cut.or_else(|| self.rig.replies.lock().unwrap().get(&cmd).cloned());
             if let Some(&delay) = self.rig.slow.lock().unwrap().get(&cmd) {
                 std::thread::sleep(delay);
             }
             self.rig.written.lock().unwrap().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-            let reply = self.reply.take().ok_or_else(|| AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "timeout".into(),
-            })?;
+        fn io_read_octet(
+            &mut self,
+            _: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            let Some(reply) = self.reply.take() else {
+                return epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "timeout".into(),
+                });
+            };
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            let read = epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            );
+            if !self.cut {
+                return read;
+            }
+            epics_rs::asyn::interpose::OctetReadResult {
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "timeout".into(),
+                }),
+                ..read
+            }
         }
     }
 
@@ -1112,6 +1165,7 @@ mod tests {
             ),
             rig: rig.clone(),
             reply: None,
+            cut: false,
         };
         let claim = claim_port(name).unwrap();
         let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
@@ -1583,6 +1637,51 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    /// pmacAsynCoord.c:584-595, 634-646: both reads parse what a failed
+    /// read delivered, nothing included; only a failed write fails the poll.
+    #[test]
+    fn cut_cs_reads_are_parsed_as_c() {
+        let (rt, rig) = publish_scripted("pmacCsCut");
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let trace = MotorTrace::new("pmacCsCut", 0);
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(
+            io,
+            trace,
+            9110,
+            2,
+            0,
+            Duration::ZERO,
+        )));
+        let mut axis = PmacCsAxis::new(system, 1).unwrap();
+        let own = TraceCapture::on("pmacCsCut");
+        let user = AsynUser::new(0);
+        let q8 = "&2Q81Q82Q83Q84Q85Q86Q87Q88Q89";
+        rig.answer(q8, b"0.25\r0.5\r");
+        rig.answer("&2??", b"000000\r020000\r000000\r");
+        assert!(axis.poll(&user).unwrap().done);
+
+        rig.cut("&2??", b"000001\r");
+        let status = axis.poll(&user).unwrap();
+        assert!(!status.done && !status.msta_moving);
+        let text = own.take();
+        assert!(
+            text.ends_with(
+                "drvPmacAxisGetStatus: not all status values returned. Status: -1\n\
+                 Command :&2??\nResponse:000001\r"
+            ),
+            "{text}"
+        );
+
+        rig.answer("&2??", b"000000\r020000\r000000\r");
+        rig.cut(q8, b"0.75\r");
+        let status = axis.poll(&user).unwrap();
+        assert_eq!((status.position, status.comms_error), (7500.0, true));
+        rig.silence(q8);
+        assert_eq!(axis.poll(&user).unwrap().position, 0.0);
+        rig.refuse(q8);
+        assert!(axis.poll(&user).is_err());
     }
 
     /// pmacAsynCoord.c:636-648: strtod reads 0 past the end of a short
@@ -2074,6 +2173,15 @@ mod tests {
             own.take(),
             "drvPmacAxisGetStatus: not all status values returned. Status: 1\n\
              Command :#1 ? F P\nResponse:"
+        );
+        // pmacAxis.cpp:493-498: a read a timeout cut short prints what it
+        // delivered.
+        rig.cut("#1 ? F P", b"882000");
+        axis.poll(&user).unwrap();
+        assert_eq!(
+            own.take(),
+            "drvPmacAxisGetStatus: not all status values returned. Status: 1\n\
+             Command :#1 ? F P\nResponse:882000"
         );
 
         let warning = "*** WARNING *** Limits are disabled on controller pmacAxErrCtl, axis 1\n";

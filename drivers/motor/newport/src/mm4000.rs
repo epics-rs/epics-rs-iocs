@@ -253,8 +253,8 @@ impl Mm4000Controller {
         };
         ctrl.model = model;
 
-        // C ignores the `TP;` status; a failed read leaves an empty buffer.
-        let tp = ctrl.write_read("TP;").unwrap_or_default();
+        // C ignores the `TP;` status and counts what arrived.
+        let tp = ctrl.unchecked_reply("TP;");
         let total_axes = strtok_count(&tp);
         if total_axes < num_axes {
             return Err(Mm4000Refusal::TooFewAxes {
@@ -288,7 +288,7 @@ impl Mm4000Controller {
             cache_ttl,
             driver: Mm4000Driver::Model1(Model1Poll::default()),
         };
-        let read = |ctrl: &Self, cmd: &str| ctrl.write_read(cmd).unwrap_or_default();
+        let read = |ctrl: &Self, cmd: &str| ctrl.unchecked_reply(cmd);
         if !(0..3).any(|_| !read(&ctrl, "TH;").is_empty()) {
             return Err(Mm4000Refusal::NoAnswer);
         }
@@ -313,7 +313,7 @@ impl Mm4000Controller {
             return;
         };
         let mut poll = last.clone();
-        let read = |cmd: &str| self.write_read(cmd).unwrap_or_default();
+        let read = |cmd: &str| self.unchecked_reply(cmd);
         poll.status = read("MS;");
         if !poll.status.is_empty() {
             poll.comm = CommStatus::Normal;
@@ -392,7 +392,7 @@ impl Mm4000Controller {
             false => 0.0,
         };
         s.velocity = 0.0;
-        s.problem = !te_ok(&self.write_read("TE;").unwrap_or_default());
+        s.problem = !te_ok(&self.unchecked_reply("TE;"));
         s
     }
 
@@ -447,9 +447,29 @@ impl Mm4000Controller {
 
     /// Write a command and read the reply (C `sendAndReceive`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        let e = match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
-            Ok(raw) => return Ok(String::from_utf8_lossy(&raw).into_owned()),
-            Err(e) => e,
+        let (reply, status) = self.exchange(cmd);
+        status.map(|()| reply)
+    }
+
+    /// A reply whose status C ignores: drvMM4000Asyn.c parses whatever
+    /// arrived, drvMM4000.cc's `recv_mess` empties the buffer on a failed
+    /// read.
+    fn unchecked_reply(&self, cmd: &str) -> String {
+        match self.exchange(cmd) {
+            (_, Err(_)) if self.is_model1() => String::new(),
+            (reply, _) => reply,
+        }
+    }
+
+    /// C `sendAndReceive`: the bytes that arrived, and the status.
+    fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
+        let (raw, e) = match self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts()
+        {
+            (raw, Ok(())) => return (String::from_utf8_lossy(&raw).into_owned(), Ok(())),
+            (raw, Err(e)) => (raw, e),
         };
         let written = match e.octet_step() {
             Some(OctetStep::Read) => cmd.len(),
@@ -465,7 +485,7 @@ impl Mm4000Controller {
                 e.message()
             ),
         );
-        Err(e)
+        (String::from_utf8_lossy(&raw).into_owned(), Err(e))
     }
 
     /// Controller-wide poll with a TTL cache: `MS;` + `TP;` + `TE;` at most
@@ -625,9 +645,9 @@ impl Mm4000Axis {
     /// `TC` (closed-loop state — drvMM4000.cc's encoder flag, which
     /// drvMM4000Asyn.c stores unused),
     /// `TU` (drive resolution → command precision), `XH` (home preset),
-    /// `TL`/`TR` (travel limits). C checks none of these replies, so a
-    /// failed one reads as an empty buffer (`atof` → 0). Performs blocking
-    /// serial I/O under the controller lock.
+    /// `TL`/`TR` (travel limits). C checks none of these replies: a failed
+    /// one parses what arrived, empty on model 1 (`atof` → 0). Performs
+    /// blocking serial I/O under the controller lock.
     pub fn new(
         controller: Arc<Mutex<Mm4000Controller>>,
         card: i32,
@@ -638,7 +658,7 @@ impl Mm4000Axis {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // C `&inputBuff[3]`: skip the echoed `nCC` prefix.
             let query = |cc: &str| {
-                let reply = ctrl.write_read(&format!("{axis}{cc}")).unwrap_or_default();
+                let reply = ctrl.unchecked_reply(&format!("{axis}{cc}"));
                 reply.get(3..).unwrap_or("").to_owned()
             };
             let encoder_present = atoi(&query("TC")) != 0;
@@ -1015,7 +1035,7 @@ impl AsynMotor for Mm4000Axis {
         // C busy-waits (unbounded) until the axis power bit reads ON after
         // MF; bounded here (see module Deviations).
         for _ in 0..TORQUE_OFF_MAX_TRIES {
-            let status_all = ctrl.write_read("MS;")?;
+            let status_all = ctrl.unchecked_reply("MS;");
             if let Some(byte) = parse_axis_status(&status_all, self.axis - 1)
                 && byte & MM4000_POWER_OFF == 0
             {
@@ -1331,13 +1351,22 @@ mod tests {
             };
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             if self.dead.load(Ordering::SeqCst) {
-                return Err(mm_err("timeout".into()));
+                return epics_rs::asyn::interpose::OctetReadResult::failed(mm_err(
+                    "timeout".into(),
+                ));
             }
             let n = self.reply.len();
             buf[..n].copy_from_slice(&self.reply);
-            Ok(n)
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                n,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -1376,13 +1405,22 @@ mod tests {
             };
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = std::mem::take(&mut self.reply);
             if reply.is_empty() {
-                return Err(mm_err("timeout".into()));
+                return epics_rs::asyn::interpose::OctetReadResult::failed(mm_err(
+                    "timeout".into(),
+                ));
             }
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -2195,5 +2233,43 @@ mod tests {
                 "MM4000Poller: axis 1 axisStatus=45, position=-1.250000\n"
             );
         }
+    }
+
+    /// drvMM4000Asyn.c:846-896 and :427 ignore the `sendAndReceive` status
+    /// and parse what arrived: a reply cut by a timeout still counts the
+    /// axes, sets the step size and limits, and ends the torque-off wait.
+    #[test]
+    fn replies_cut_by_a_timeout_are_still_parsed() {
+        use motor_common::testing::LineRig;
+
+        let (_line, io) = LineRig::cut(
+            "mm4000_cut",
+            |last| {
+                match last {
+                    "VE;" => "VEMM4005 Version 2.0",
+                    "TP;" => "1TP0.0,2TP-1.25",
+                    "MS;" => "1MS@,2MS@",
+                    "1TU" => "1TU0.001",
+                    "1TL" => "1TL-10.0",
+                    "1TR" => "1TR20.0",
+                    _ => "",
+                }
+                .to_string()
+            },
+            |last| last != "VE;",
+        );
+        let Ok(ctrl) =
+            Mm4000Controller::new(io, "mm4000_cut", "mm4000_cut_motor", 2, Duration::ZERO)
+        else {
+            panic!("a cut TP; still counts two axes");
+        };
+        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
+        let report = axis.report();
+        assert_eq!(
+            (report.step_size, report.low_limit, report.high_limit),
+            (0.001, -10.0, 20.0)
+        );
+        axis.set_closed_loop(&AsynUser::default(), false)
+            .expect("a cut MS; still reads the power bit");
     }
 }

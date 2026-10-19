@@ -166,10 +166,18 @@ fn write_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
 }
 
 fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
-    // C writeReadController: pasynOctetSyncIO->writeRead.
-    let reply = handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-    thread::sleep(WRITE_DELAY);
-    Ok(String::from_utf8_lossy(&reply).into_owned())
+    let (reply, status) = exchange_raw(handle, cmd);
+    status.map(|()| reply)
+}
+
+/// C `writeReadController` (pasynOctetSyncIO->writeRead): the bytes that
+/// arrived, and the status. The caller's sleep follows a success only.
+fn exchange_raw(handle: &SyncIOHandle, cmd: &str) -> (String, AsynResult<()>) {
+    let (reply, status) = handle.write_read(0, cmd.as_bytes(), READ_BUF).into_parts();
+    if status.is_ok() {
+        thread::sleep(WRITE_DELAY);
+    }
+    (String::from_utf8_lossy(&reply).into_owned(), status)
 }
 
 /// Shared Agilis controller endpoint. Held behind a mutex so an axis's
@@ -196,16 +204,14 @@ impl AgUcController {
         // Remote mode.
         let _ = write_raw(&handle, "MR");
         // Firmware version → model.
-        let version = write_read_raw(&handle, "VE");
-        // C sleeps after VE before testing its status (AG_UC.cpp:71-74);
-        // write_read_raw slept only on success.
-        if version.is_err() {
+        let (version, status) = exchange_raw(&handle, "VE");
+        // C sleeps after VE and prints `inString_` before testing its status
+        // (AG_UC.cpp:71-74); exchange_raw slept only on success.
+        if status.is_err() {
             thread::sleep(WRITE_DELAY);
         }
-        println!(
-            "Agilis controller firmware version = {}",
-            version.as_deref().unwrap_or("")
-        );
+        println!("Agilis controller firmware version = {version}");
+        let version = status.map(|()| version);
         let model = match &version {
             Err(_) => {
                 trace.print_self(
@@ -588,5 +594,32 @@ mod tests {
         assert!(ph_limit(2, 3));
         assert!(!ph_limit(2, 1));
         assert!(!ph_limit(1, 0) && !ph_limit(2, 0));
+    }
+
+    /// AG_UC.cpp:71-74 prints `inString_` before testing the `VE` status,
+    /// so a reply cut by a timeout is still printed.
+    #[test]
+    fn a_version_cut_by_a_timeout_is_still_printed() {
+        use motor_common::testing::{LineRig, child_stdout, in_child};
+        if !in_child() {
+            let out = child_stdout(
+                module_path!(),
+                "a_version_cut_by_a_timeout_is_still_printed",
+            );
+            let line = "Agilis controller firmware version = AG-UC8 v2.2.1\n";
+            assert_eq!(out.matches(line).count(), 1, "{out}");
+            return;
+        }
+        let (_line, io) = LineRig::cut(
+            "ag_uc_cut",
+            |last| match last {
+                "VE" => "AG-UC8 v2.2.1".to_string(),
+                _ => String::new(),
+            },
+            |last| last == "VE",
+        );
+        let controller = AgUcController::new(io, &MotorTrace::new("AG_UC_CUT", 0));
+        // C returns before storing the version or the model.
+        assert_eq!((controller.model(), controller.version()), (None, ""));
     }
 }
