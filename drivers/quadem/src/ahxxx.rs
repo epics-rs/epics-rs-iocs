@@ -840,7 +840,7 @@ pub fn create_ahxxx(
             .expect("failed to spawn drvAHxxxTask")
     });
 
-    let callback_thread = qe::start_callback_task(CallbackContext {
+    let callback_thread = qe::start_callback_task::<AhxxxDriver>(CallbackContext {
         trigger_rx,
         handle,
         params,

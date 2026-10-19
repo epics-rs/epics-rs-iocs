@@ -847,7 +847,7 @@ pub fn create_tetramm(
             .expect("failed to spawn drvTetrAMMTask")
     });
 
-    let callback_thread = qe::start_callback_task(CallbackContext {
+    let callback_thread = qe::start_callback_task::<TetrAmmDriver>(CallbackContext {
         trigger_rx,
         handle,
         params,

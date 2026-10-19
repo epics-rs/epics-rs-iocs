@@ -495,6 +495,11 @@ impl QuadEmDevice for Pcr4Driver {
         }
         self.base_reset()
     }
+
+    /// C++ `drvPCR4::exitHandler`: the meter is stopped before the IOC goes.
+    fn exit_handler(&mut self) {
+        let _ = self.set_acquire(0);
+    }
 }
 
 // ===========================================================================
@@ -713,7 +718,7 @@ pub fn create_pcr4(
             .expect("failed to spawn drvPCR4Task")
     });
 
-    let callback_thread = qe::start_callback_task(CallbackContext {
+    let callback_thread = qe::start_callback_task::<Pcr4Driver>(CallbackContext {
         trigger_rx,
         handle,
         params,

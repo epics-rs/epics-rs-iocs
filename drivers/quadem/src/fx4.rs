@@ -318,6 +318,12 @@ impl QuadEmDevice for Fx4Driver {
     fn reset(&mut self) -> AsynResult<()> {
         Ok(())
     }
+
+    /// C++ `drvFX4::exitHandler`: an acquisition still running is
+    /// unsubscribed before the IOC goes.
+    fn exit_handler(&mut self) {
+        let _ = self.set_acquire(0);
+    }
 }
 
 // ===========================================================================
@@ -673,7 +679,7 @@ pub fn create_fx4(
         .spawn(move || data_thread(data_ctx))
         .expect("failed to spawn drvFX4Task");
 
-    let callback_thread = qe::start_callback_task(CallbackContext {
+    let callback_thread = qe::start_callback_task::<Fx4Driver>(CallbackContext {
         trigger_rx,
         handle,
         params,
