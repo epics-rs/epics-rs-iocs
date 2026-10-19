@@ -348,3 +348,66 @@ mod missing_num_axes {
         assert!(port_after(mvp2001_create_controller_command(), args, "mvpNoAxes").await);
     }
 }
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvMVP2001.cc:711-720: once every controller's limits are read, each
+    /// is homed and its status read in turn, once, and the record starts
+    /// from that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_once_after_its_ho() {
+        let int = ArgValue::Int;
+        run_command(micromo_setup_command(), vec![int(1), int(10)]).await;
+        // Each command answers once, terminator then reply, so a flush ends.
+        let reads = Mutex::new((String::new(), 0));
+        let (line, _io) = LineRig::new("mvpInitLine", move |cmd| {
+            let mut reads = reads.lock().unwrap();
+            if reads.0 != cmd {
+                *reads = (cmd.to_string(), 0);
+            }
+            reads.1 += 1;
+            let reply = match cmd.trim_end() {
+                "1 ST" | "2 ST" => "0001 0000",
+                "1 POS" => "0001 0000000E",
+                "2 POS" => "0002 00000003",
+                _ => return String::new(),
+            };
+            match reads.1 {
+                1 => "\r".into(),
+                2 => reply.into(),
+                _ => String::new(),
+            }
+        });
+        let config = vec![int(0), ArgValue::String("mvpInitLine".into())];
+        run_command(micromo_config_command(), config).await;
+        drvsup_init().await;
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        let mut want: Vec<String> = ["1 ST", "2 ST", "3 ST", "3 ST", "3 ST"]
+            .map(String::from)
+            .into();
+        for addr in [1, 2] {
+            for cmd in ["V 0", "HO", "EN", "LL -", "LL"] {
+                want.push(format!("{addr} {cmd}"));
+            }
+        }
+        want.extend(["1 HO", "1 ST", "1 POS", "2 HO", "2 ST", "2 POS"].map(String::from));
+        assert_eq!(sent, want);
+        let db = record_init(
+            r##"
+record(motor, "mvp:m1") { field(DTYP, "MVP2001") field(OUT, "#C0 S0 @512,100") }
+record(motor, "mvp:m2") { field(DTYP, "MVP2001") field(OUT, "#C0 S1 @512,100") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("mvp:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("mvp:m2.RMP").unwrap(), EpicsValue::Long(3));
+    }
+}

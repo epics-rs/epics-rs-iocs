@@ -169,12 +169,14 @@ pub struct DrvMvp2001Axis {
     /// every `build_trans` restarts the transaction, which clears the
     /// pointer before the move is queued.
     post: Option<PostMessage>,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl DrvMvp2001Axis {
     /// Controller `signal + 1` of `chain`, with the travel limits
     /// [`motor_init`] read for it: zeroed once more and its status read, as
-    /// `motor_init` ends.
+    /// `motor_init` ends (drvMVP2001.cc:711-720).
     pub fn new(chain: Arc<Mutex<Mvp2001Chain>>, signal: usize, limits: (i32, i32)) -> Self {
         let mut axis = Self {
             chain,
@@ -190,11 +192,12 @@ impl DrvMvp2001Axis {
             position: 0,
             strings: None,
             post: None,
+            init_status: None,
         };
         // HO too soon after EN reads back within ten counts of zero.
         sleep(Duration::from_millis(200));
         axis.send("HO");
-        let _ = axis.poll(&AsynUser::new(0));
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -441,6 +444,10 @@ impl AsynMotor for DrvMvp2001Axis {
             self.lock().send(post);
         }
         Ok(status)
+    }
+
+    fn take_init_status(&mut self) -> Option<AsynResult<MotorStatus>> {
+        self.init_status.take()
     }
 }
 
