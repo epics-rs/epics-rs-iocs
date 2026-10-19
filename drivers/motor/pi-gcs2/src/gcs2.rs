@@ -2450,6 +2450,13 @@ impl PIGCS2Axis {
 }
 
 impl AsynMotor for PIGCS2Axis {
+    /// `PIasynAxis::Init`, run right after the constructor
+    /// (PIasynController.cpp:188-189), ends in `callParamCallbacks`
+    /// (PIasynAxis.cpp:101).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     fn take_port_sets(&mut self) -> PortSets {
         std::mem::take(&mut self.sets)
     }
@@ -2735,6 +2742,22 @@ mod tests {
     use epics_rs::asyn::interfaces::motor::PortSet;
     use epics_rs::asyn::port_handle::PortHandle;
     use epics_rs::asyn::request::ParamSetValue;
+
+    /// PIasynAxis.cpp:101, run from PIasynController.cpp:189.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2CtorCallback", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = PIGCS2Controller::new(io, "gcs2CtorCallback");
+        let axis = PIGCS2Axis::new(
+            Arc::new(Mutex::new(ctrl)),
+            "1".into(),
+            0,
+            "gcs2CtorCallback",
+        );
+        assert!(axis.constructor_calls_param_callbacks());
+    }
 
     /// The controller poll, its sets applied as the poller does.
     fn post_poll(ctrl: &Mutex<PIGCS2Controller>, port: &PortHandle) {

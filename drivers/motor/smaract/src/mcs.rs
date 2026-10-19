@@ -595,6 +595,12 @@ impl McsAxis {
 }
 
 impl AsynMotor for McsAxis {
+    /// The C constructor calls `callParamCallbacks` past `bail:`, before
+    /// any throw (smarActMCSMotorDriver.cpp:389).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// C `MCSAxis::poll`'s `bail` label sets `motorStatusProblem_` and
     /// `motorStatusCommsError_`.
     fn poll_failure(&self) -> PollFailure {
@@ -751,6 +757,18 @@ impl AsynMotor for McsAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// smarActMCSMotorDriver.cpp:385-389: past `bail:`, so a failed probe
+    /// calls back too.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        let (_rig, io) =
+            motor_common::testing::LineRig::failing("mcsCtorCallback", |_| String::new(), |_| true);
+        let controller = Arc::new(Mutex::new(McsController::new(io, false)));
+        let (axis, probed) = McsAxis::new(controller, 0, 0);
+        assert!(probed.is_err());
+        assert!(axis.constructor_calls_param_callbacks());
+    }
 
     #[test]
     fn parses_value_replies_and_errors() {

@@ -676,6 +676,11 @@ impl StatusFlags {
 }
 
 impl AsynMotor for XpsAxis {
+    /// The C constructor ends in `callParamCallbacks` (XPSAxis.cpp:163).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// C `XPSAxis::poll`'s `done` label sets only `motorStatusCommsError_`.
     fn poll_failure(&self) -> PollFailure {
         PollFailure::COMMS_ERROR
@@ -1252,6 +1257,13 @@ mod tests {
     fn fake_axis(port: &str, fail: &'static str) -> (XpsAxis, Fail, Log) {
         let (mut axes, fail, log) = fake_axes(port, fail, false, &["G1.P1"]);
         (axes.remove(0), fail, log)
+    }
+
+    /// XPSAxis.cpp:163.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        let (axis, _, _) = fake_axis("xps_ctor_callback", "");
+        assert!(axis.constructor_calls_param_callbacks());
     }
 
     /// One axis per positioner, numbered in order, on one controller.

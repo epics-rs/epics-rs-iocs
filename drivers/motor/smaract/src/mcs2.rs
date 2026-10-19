@@ -512,6 +512,12 @@ impl Mcs2Axis {
 }
 
 impl AsynMotor for Mcs2Axis {
+    /// The C constructor ends in `callParamCallbacks`
+    /// (smarActMCS2MotorDriver.cpp:277).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     fn take_port_sets(&mut self) -> PortSets {
         std::mem::take(&mut self.sets)
     }
@@ -677,6 +683,15 @@ impl AsynMotor for Mcs2Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// smarActMCS2MotorDriver.cpp:277.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        let (_rig, io) = motor_common::testing::LineRig::new("mcs2CtorCallback", |_| String::new());
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2CtorCallback", 0));
+        let axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        assert!(axis.constructor_calls_param_callbacks());
+    }
 
     /// C `sprintf(":CHAN%d:ACC %f")` and the like: six decimals, where
     /// Rust's `{}` writes the shortest form.
