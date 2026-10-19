@@ -279,7 +279,7 @@ impl DrvIm483Axis {
 impl Model1Motor for DrvIm483Axis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.status.clone(), self.poll_failure())
     }
 }
 
@@ -460,6 +460,36 @@ mod tests {
         );
         let endless = sign_on_ident(|| Some(b"ab".to_vec())).unwrap();
         assert_eq!(endless, vec!["ab"; 17].join(" "));
+    }
+
+    /// drvIM483PL.cc:584-601: a failed `motor_init` read stores the
+    /// EA_PRESENT `motor_init` sets on an IM483PL axis, and nothing on an
+    /// IM483SM's (drvIM483SM.cc:617-633), the first raising nothing (RETRY)
+    /// and the next CNTRL_COMM_ERR and RA_PROBLEM (drvIM483PL.cc:252-264).
+    #[test]
+    fn a_failed_init_read_keeps_what_motor_init_set() {
+        let silent = |name| {
+            let (line, io) = motor_common::testing::LineRig::new(name, |_| String::new());
+            (line, Arc::new(Mutex::new(Im483Controller::new(io))))
+        };
+        let (_pl_line, pl) = silent("im483plInitFail");
+        let prepared = MotorStatus {
+            has_encoder: true,
+            ..MotorStatus::default()
+        };
+        let init = |signal| DrvIm483Axis::im483pl(pl.clone(), signal).take_init_status();
+        assert_eq!(init(0), prepared);
+        assert_eq!(
+            init(1),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
+        let (_sm_line, sm) = silent("im483smInitFail");
+        let sm = DrvIm483Axis::im483sm(sm).take_init_status();
+        assert_eq!(sm, MotorStatus::default());
     }
 
     /// drvIM483SM.cc:551-555: the probe flushes ahead of the ETX, not after
