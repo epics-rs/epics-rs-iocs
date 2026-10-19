@@ -1845,6 +1845,28 @@ mod tests {
         );
     }
 
+    /// initParams sets NDDataType to NDUInt32 with NDArraySize and
+    /// ADImageMode (eigerDetector.cpp:1655-1657).
+    #[test]
+    fn the_constructor_sets_data_type_uint32() {
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: "EIGER_DATA_TYPE".to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let det = crate::driver::EigerDriver::new(cfg, rest, signals).expect("driver");
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(det.ad.params.base.data_type, 0)
+                .unwrap(),
+            NDDataType::UInt32 as u8 as i32
+        );
+    }
+
     /// eigerDetector.cpp:667-668 hands every float64 below mFirstParam to
     /// ADDriver::writeFloat64, which is asynPortDriver's: its IO_DRIVER line
     /// precedes the driver's.

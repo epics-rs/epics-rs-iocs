@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
+use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::InterfaceMask;
@@ -243,6 +244,11 @@ impl EigerDriver {
         base.set_string_param(self.ad.params.base.model, 0, model)?;
 
         base.set_int32_param(self.ad.params.base.array_size, 0, 0)?;
+        base.set_int32_param(
+            self.ad.params.base.data_type,
+            0,
+            NDDataType::UInt32 as u8 as i32,
+        )?;
         base.set_int32_param(self.ad.params.image_mode, 0, ImageMode::Multiple as i32)?;
         base.set_int32_param(self.ad.params.status, 0, ADStatus::Idle as i32)?;
 
