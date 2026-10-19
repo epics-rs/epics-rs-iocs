@@ -139,18 +139,20 @@ impl DrvMicosAxis {
         self.send(&[motion])
     }
 
-    /// `SET_ACCEL`, which the record sends only for a positive rate.
+    /// `SET_ACCEL`.
     fn accel(commands: &mut Vec<String>, acceleration: f64) {
-        if acceleration > 0.0 {
-            commands.push(format!("da{},ud", clamp(acceleration, 1_000_000)));
-        }
+        commands.push(format!("da{},ud", clamp(acceleration, 1_000_000)));
     }
 
     /// The record's `SET_VELOCITY`, `SET_ACCEL` (`SET_VEL_BASE` sends
     /// nothing), then `motion`.
     fn motion(&mut self, velocity: f64, acceleration: f64, motion: String) -> AsynResult<()> {
         let mut commands = vec![format!("dv{},ud", clamp(velocity, 1_000_000))];
-        Self::accel(&mut commands, acceleration);
+        // A move's or home's SET_ACCEL only at a positive rate
+        // (motorRecord.cc:874); a jog's at any (:2141).
+        if acceleration > 0.0 {
+            Self::accel(&mut commands, acceleration);
+        }
         self.send_move(commands, motion)
     }
 }
@@ -405,9 +407,22 @@ mod tests {
         axis.set_high_limit(&user, 900.0).unwrap();
         axis.set_move_strings(&user, b"P", None).unwrap();
         axis.move_velocity(&user, 0.0, 10.0, 0.0).unwrap();
-        assert_eq!(line.sent(), ["P", "\x010ma900"]);
+        assert_eq!(line.sent(), ["\x010da0,ud", "P", "\x010ma900"]);
         axis.set_move_strings(&user, b"P", None).unwrap();
         axis.home(&user, 0.0, 10.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["\x010dv10,ud", "P", "\x010gh"]);
+    }
+
+    /// motorRecord.cc:2141, :3068: a jog's SET_ACCEL goes out at any rate,
+    /// a move's only at a positive one (:874).
+    #[test]
+    fn a_jog_sends_set_accel_at_a_zero_rate() {
+        let (line, mut axis, _) = rig("micosJogAccel");
+        let user = AsynUser::default();
+        axis.set_high_limit(&user, 900.0).unwrap();
+        axis.move_velocity(&user, 0.0, 10.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["\x010da0,ud", "\x010ma900"]);
+        axis.move_absolute(&user, 100.0, 0.0, 500.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["\x010dv500,ud", "\x010ma100"]);
     }
 }

@@ -258,13 +258,10 @@ impl DrvMDriveAxis {
         Ok(())
     }
 
-    /// `SET_ACCEL`, which the record sends only for a positive rate, then
-    /// `D=A`.
+    /// `SET_ACCEL`, then `D=A`.
     fn accel(commands: &mut Vec<String>, acceleration: f64) {
-        if acceleration > 0.0 {
-            commands.push(format!("A={}", nint(acceleration)));
-            commands.push("D=A".to_string());
-        }
+        commands.push(format!("A={}", nint(acceleration)));
+        commands.push("D=A".to_string());
     }
 
     /// The record's `SET_VELOCITY`, `SET_VEL_BASE`, `SET_ACCEL`, then
@@ -280,7 +277,11 @@ impl DrvMDriveAxis {
             format!("VM={}", nint(velocity)),
             format!("VI={}", nint(min_velocity)),
         ];
-        Self::accel(&mut commands, acceleration);
+        // A move's or home's SET_ACCEL only at a positive rate
+        // (motorRecord.cc:874); a jog's at any (:2141).
+        if acceleration > 0.0 {
+            Self::accel(&mut commands, acceleration);
+        }
         commands.push(motion);
         self.send_move(&commands)
     }
@@ -546,7 +547,18 @@ mod tests {
         assert_eq!(r.line.sent(), ["1VM=2", "1VI=1", "1DE=1  F1000 0"]);
         r.axis.set_move_strings(&r.user, b"DE=1", None).unwrap();
         r.axis.move_velocity(&r.user, 1.0, 3.0, 0.0).unwrap();
-        assert_eq!(r.line.sent(), ["1VI=1", "1DE=1 SL=3"]);
+        assert_eq!(r.line.sent(), ["1VI=1", "1A=0", "1D=A", "1DE=1 SL=3"]);
+    }
+
+    /// motorRecord.cc:2141, :3068: a jog's SET_ACCEL goes out at any rate,
+    /// a move's only at a positive one (:874).
+    #[test]
+    fn a_jog_sends_set_accel_at_a_zero_rate() {
+        let mut r = Rig::new("mdrive_jog_accel");
+        r.axis.move_velocity(&r.user, 1.0, 3.0, 0.0).unwrap();
+        assert_eq!(r.line.sent(), ["1VI=1", "1A=0", "1D=A", "1SL=3"]);
+        r.move_to(100.0);
+        assert_eq!(r.line.sent(), ["1VM=2", "1VI=1", "1MA 100"]);
     }
 
     /// drvMDrive.cc:399-406: POST once the move is done, not while it runs.

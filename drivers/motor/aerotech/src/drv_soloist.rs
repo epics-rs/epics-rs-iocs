@@ -229,10 +229,16 @@ impl DrvSoloistAxis {
         self.send(format!("SETPARM 107, {v}"));
     }
 
-    /// `SET_ACCEL`, unless zero.
+    /// `SET_ACCEL`.
     fn accel(&self, acceleration: f64) {
+        self.send(format!("SETPARM 103, {}", self.units(acceleration)));
+    }
+
+    /// A move's or home's SET_ACCEL, which the record sends only at a
+    /// positive rate (motorRecord.cc:874); a jog's goes at any (:2141).
+    fn move_accel(&self, acceleration: f64) {
         if acceleration > 0.0 {
-            self.send(format!("SETPARM 103, {}", self.units(acceleration)));
+            self.accel(acceleration);
         }
     }
 
@@ -250,7 +256,7 @@ impl DrvSoloistAxis {
 
     fn move_to(&mut self, command: &str, target: f64, velocity: f64, acceleration: f64) {
         self.velocity(velocity);
-        self.accel(acceleration);
+        self.move_accel(acceleration);
         let motion = format!("{command} D{}", self.units(target));
         self.motion(&motion);
     }
@@ -317,7 +323,7 @@ impl AsynMotor for DrvSoloistAxis {
         forward: bool,
     ) -> AsynResult<()> {
         self.velocity(velocity);
-        self.accel(acceleration);
+        self.move_accel(acceleration);
         let hparam = if forward {
             self.setup.home_dparam | 1
         } else {
@@ -449,6 +455,32 @@ mod tests {
         assert_eq!(decimals(1.0), 2);
         assert_eq!(decimals(1.0 / 3.0), 2);
         assert_eq!(decimals(1000.0), 1);
+    }
+
+    /// motorRecord.cc:2141, :3068: a jog's SET_ACCEL goes out at any rate,
+    /// a move's only at a positive one (:874).
+    #[test]
+    fn a_jog_sends_set_accel_at_a_zero_rate() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::new("soloistJogAccel", |_| "%0".into());
+        let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+        let setup = AxisSetup {
+            encoder: false,
+            gain: false,
+            resolution: 1.0,
+            digits: 0,
+            home_dparam: 0,
+        };
+        let mut axis = DrvSoloistAxis::new(card, setup);
+        let user = AsynUser::new(0);
+        line.sent();
+        axis.move_velocity(&user, 0.0, 3.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["SETPARM 103, 0", "FREERUN F 3"]);
+        axis.move_absolute(&user, 5.0, 0.0, 3.0, 0.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            ["SETPARM 102, 3", "SETPARM 107, 3", "MOVEABS D5"]
+        );
     }
 
     /// drvSoloist.cc's `%.*f` of a non-finite step value.

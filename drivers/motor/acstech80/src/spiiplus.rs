@@ -108,6 +108,12 @@ impl CommandMode {
     }
 }
 
+/// The SET_ACCEL the record sends ahead of a move or home: none unless the
+/// rate is positive (motorRecord.cc:874); a jog's goes at any (:2141).
+fn move_accel(acceleration: f64) -> Option<f64> {
+    (acceleration > 0.0).then_some(acceleration)
+}
+
 fn spiiplus_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
@@ -285,13 +291,13 @@ impl SpiiPlusAxis {
 
     /// One record transaction as devSPiiPlus.cc builds it into one message:
     /// SET_VELOCITY's `VEL` when the record sends it, SET_ACCEL's `ACC` in
-    /// Buffer mode when the record sends it (`acc > 0`), PREM and `;`
+    /// Buffer mode when the record sends it, PREM and `;`
     /// (devSPiiPlus.cc:187-203), then `body`. In Buffer mode `start` follows
     /// alone, as GO or JOG end the message there.
     fn transaction(
         &mut self,
         velocity: Option<f64>,
-        acceleration: f64,
+        acceleration: Option<f64>,
         body: &str,
         start: &str,
     ) -> AsynResult<()> {
@@ -303,8 +309,8 @@ impl SpiiPlusAxis {
         if let Some(v) = velocity {
             msg.extend(format!("VEL{a}={};", nint(v)).into_bytes());
         }
-        if buffer && acceleration > 0.0 {
-            msg.extend(format!("ACC{a}={};", nint(acceleration)).into_bytes());
+        if let Some(acc) = acceleration.filter(|_| buffer) {
+            msg.extend(format!("ACC{a}={};", nint(acc)).into_bytes());
         }
         if !prem.is_empty() {
             msg.extend(prem);
@@ -351,7 +357,7 @@ impl AsynMotor for SpiiPlusAxis {
         };
         self.transaction(
             Some(velocity),
-            acceleration,
+            move_accel(acceleration),
             &body,
             &format!("start {a}, 1"),
         )
@@ -375,7 +381,7 @@ impl AsynMotor for SpiiPlusAxis {
         };
         self.transaction(
             Some(velocity),
-            acceleration,
+            move_accel(acceleration),
             &body,
             &format!("start {a}, 1"),
         )
@@ -397,7 +403,7 @@ impl AsynMotor for SpiiPlusAxis {
             }
             CommandMode::Connect | CommandMode::Direct => format!("jog/v ({a}), {v};"),
         };
-        self.transaction(None, acceleration, &body, &format!("start {a},1"))
+        self.transaction(None, Some(acceleration), &body, &format!("start {a},1"))
     }
 
     fn home(
@@ -421,7 +427,7 @@ impl AsynMotor for SpiiPlusAxis {
         };
         self.transaction(
             Some(velocity),
-            acceleration,
+            move_accel(acceleration),
             &body,
             &format!("start {a}, 1"),
         )
@@ -693,6 +699,19 @@ mod tests {
         axis.move_velocity(&AsynUser::default(), 0.0, -20.0, 5.0)
             .unwrap();
         assert_eq!(line.sent(), ["jog/v (0), -20;"]);
+    }
+
+    /// motorRecord.cc:2141, :3068: a jog's SET_ACCEL goes out at any rate,
+    /// a move's only at a positive one (:874).
+    #[test]
+    fn a_jog_sends_acc_at_a_zero_rate() {
+        let (line, mut axis) = rig("spiiJogZeroAcc", CommandMode::Buffer);
+        axis.move_velocity(&AsynUser::default(), 0.0, -20.0, 0.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            ["ACC0=0;Done(0)=0;jog_vel(0)=-20; opReq(0)=3;", "start 0,1"]
+        );
     }
 
     fn post(text: &[u8]) -> PostMessage {

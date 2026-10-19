@@ -348,7 +348,9 @@ impl AsynMotor for KohzuAxis {
         if self.speeds.base > self.speeds.slew {
             self.speeds.base = self.speeds.slew;
         }
-        // C `NINT((jvel - vbas) / jar * 100)`, with no VBAS guard.
+        // C `NINT((jvel - vbas) / jar * 100)`, with no VBAS guard. A JAR of
+        // 0 divides by zero into an undefined int conversion
+        // (devSC800.cc:301), a C defect not copied: the last rate is kept.
         if acceleration > 0.0 {
             self.speeds.accel = nint((velocity.abs() - min_velocity) / acceleration * 100.0);
         }
