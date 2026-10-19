@@ -12,6 +12,9 @@
 # so do the areaDetector IOCs, as C's iocBoot dirs do
 /iocs/ad/*/autosave/*
 !/iocs/ad/*/autosave/README
+# and the measComp IOCs, as C's iocBoot dirs do
+/iocs/meascomp/*/autosave/*
+!/iocs/meascomp/*/autosave/README.txt
 
 # procServ console log written at runtime by the systemd units
 /iocs/*/procServ-*.log
