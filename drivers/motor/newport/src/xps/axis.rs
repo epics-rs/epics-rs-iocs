@@ -791,14 +791,23 @@ impl AsynMotor for XpsAxis {
             ctrl.set_group_referencing(&self.group_name, false);
             let ctrl = &*ctrl;
             let sock = ctrl.poll_socket();
+            // C ignores both GroupStatusGet statuses. C defect, not copied: a
+            // failed first one leaves groupStatus uninitialized
+            // (XPSAxis.cpp:313, :327); here -1, so neither branch runs.
+            let mut status = -1;
+            let mut read_status = || {
+                if let Ok(s) = sock.group_status_get(&self.group_name) {
+                    status = s;
+                }
+                status
+            };
             // A Ready group (10..=18) will refuse home; kill it first.
-            let status = sock.group_status_get(&self.group_name)?;
-            if (10..=18).contains(&status) {
+            if (10..=18).contains(&read_status()) {
                 sock.group_kill(&self.group_name)
                     .inspect_err(|e| home_error(ctrl, "GroupKill", e))?;
             }
             // If not initialized, initialize it.
-            let status = sock.group_status_get(&self.group_name)?;
+            let status = read_status();
             if (0..=9).contains(&status) || status == 50 || status == 63 {
                 sock.group_initialize(&self.group_name)
                     .inspect_err(|e| home_error(ctrl, "GroupInitialize", e))?;
@@ -1620,6 +1629,25 @@ mod tests {
                 "{call}: status 12 is not referencing mode"
             );
         }
+    }
+
+    /// C home ignores both GroupStatusGet statuses (XPSAxis.cpp:327, :339):
+    /// with no status read it neither kills nor initializes, and still homes.
+    #[test]
+    fn home_goes_on_past_a_failed_group_status_get() {
+        let (mut axis, _, log) = fake_axis("xps_home_status", "GroupStatusGet");
+        log.lock().unwrap().clear();
+        axis.home(&AsynUser::new(0), 0.0, 1.0, 1.0, true).unwrap();
+        let log = log.lock().unwrap();
+        let sent: Vec<_> = log
+            .iter()
+            .map(|c| c.split(' ').next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            sent,
+            ["GroupStatusGet", "GroupStatusGet", "GroupHomeSearch"],
+            "{log:?}"
+        );
     }
 
     /// XPSAxis.cpp:566-575 fails the poll on GroupStatusStringGet; :628 ignores
