@@ -468,6 +468,70 @@ fn a_string_record_can_set_the_locale_and_the_namespace() {
     );
 }
 
+/// The namespace is C's `atoi` of the whole value, kept to 16 bits
+/// (`DataElementOpen62541Leaf.cpp:930-931`).
+#[test]
+fn a_namespace_is_read_as_atoi_reads_it() {
+    let node = Variant::QualifiedName(Box::new(QualifiedName::new(2, "old")));
+    let namespace = |value: &str| match write_string(value, &node, None) {
+        Ok(Variant::QualifiedName(qn)) => qn.namespace_index,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(namespace(" 3abc|n"), 3);
+    assert_eq!(namespace("+4|n"), 4);
+    assert_eq!(namespace("x|n"), 0);
+    assert_eq!(namespace("-1|n"), 65535);
+    assert_eq!(namespace("70000|n"), 4464);
+}
+
+/// Each element may name its locale or namespace; one that does not takes
+/// the node's element at its index, else the element before it
+/// (`DataElementOpen62541Leaf.cpp:1167-1203`).
+#[test]
+fn a_string_array_sets_each_elements_locale_and_namespace() {
+    let lt = |locale: &str, text: &str| {
+        Variant::LocalizedText(Box::new(LocalizedText::new(locale, text)))
+    };
+    let node = array(
+        VariantScalarTypeId::LocalizedText,
+        vec![lt("de", "a"), lt("fr", "b")],
+    );
+    let values = ["en|x", "y", "z"].map(String::from);
+    assert_eq!(
+        write_string_array(&values, &node),
+        Ok(array(
+            VariantScalarTypeId::LocalizedText,
+            vec![lt("en", "x"), lt("fr", "y"), lt("fr", "z")]
+        ))
+    );
+    let empty = array(VariantScalarTypeId::LocalizedText, vec![]);
+    assert_eq!(
+        write_string_array(&["x".to_string()], &empty),
+        Ok(array(
+            VariantScalarTypeId::LocalizedText,
+            vec![Variant::LocalizedText(Box::new(LocalizedText {
+                locale: UAString::null(),
+                text: "x".into(),
+            }))]
+        ))
+    );
+
+    let qn = |ns: u16, name: &str| Variant::QualifiedName(Box::new(QualifiedName::new(ns, name)));
+    let node = array(VariantScalarTypeId::QualifiedName, vec![qn(2, "a")]);
+    assert_eq!(
+        write_string_array(&["y".to_string()], &node),
+        Ok(array(VariantScalarTypeId::QualifiedName, vec![qn(2, "y")]))
+    );
+    let values = ["5|x", "y", "-1|z"].map(String::from);
+    assert_eq!(
+        write_string_array(&values, &node),
+        Ok(array(
+            VariantScalarTypeId::QualifiedName,
+            vec![qn(5, "x"), qn(5, "y"), qn(65535, "z")]
+        ))
+    );
+}
+
 #[test]
 fn an_outgoing_enum_takes_a_choice_name_before_a_number() {
     let c = choices();

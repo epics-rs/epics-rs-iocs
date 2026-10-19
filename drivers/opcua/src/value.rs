@@ -259,6 +259,27 @@ fn parse_int_base0(s: &str) -> Option<i128> {
     Some(if negative { -magnitude } else { magnitude })
 }
 
+/// `atoi`: glibc's `(int) strtol(s, NULL, 10)`.
+fn atoi(s: &str) -> i32 {
+    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let mut n: i128 = 0;
+    for b in digits.bytes().take_while(u8::is_ascii_digit) {
+        n = (n * 10 + i128::from(b - b'0')).min(1 << 64);
+    }
+    let n = if negative { -n } else { n };
+    n.clamp(i64::MIN.into(), i64::MAX.into()) as i64 as i32
+}
+
+/// The namespace of a "namespace|name" value: its `atoi`, kept to the 16 bits
+/// of `namespaceIndex` (`DataElementOpen62541Leaf.cpp:933`).
+fn namespace_index(text: &str) -> u16 {
+    atoi(text) as u16
+}
+
 /// The scalar payload of a variant, as a number — the common part of the C's
 /// per-type-kind switch in `readScalar`.
 fn scalar_number(v: &Variant) -> Option<Number> {
@@ -711,7 +732,7 @@ pub fn write_string(value: &str, incoming: &Variant, choices: Option<&EnumChoice
         // "namespace|name", likewise (`:907-923`).
         Variant::QualifiedName(qn) => {
             let (namespace_index, name) = match value.split_once('|') {
-                Some((ns, name)) => (ns.trim().parse().unwrap_or(0), name),
+                Some((ns, name)) => (namespace_index(ns), name),
                 None => (qn.namespace_index, value),
             };
             Variant::QualifiedName(Box::new(QualifiedName {
@@ -793,12 +814,16 @@ pub fn write_array_u8(values: &[u8], incoming: &Variant) -> WriteResult {
     }
 }
 
-/// String arrays on the way out (`writeArray(const char*, len, num, ...)`).
+/// String arrays on the way out (`writeArray(const char*, len, num, ...)`,
+/// `DataElementOpen62541Leaf.cpp:1137-1224`).
 pub fn write_string_array(values: &[String], incoming: &Variant) -> WriteResult {
     let array = match incoming {
         Variant::Array(a) => a,
         _ => return Err(WriteError::NotAnArray),
     };
+    // An element without "locale|" or "namespace|" keeps the node's element
+    // at its index, else the one built before it.
+    let kept = |built: &[Variant]| array.values.get(built.len()).or(built.last()).cloned();
     let elements: Vec<Variant> = match array.value_type {
         VariantScalarTypeId::String => values
             .iter()
@@ -808,15 +833,43 @@ pub fn write_string_array(values: &[String], incoming: &Variant) -> WriteResult 
             .iter()
             .map(|s| Variant::XmlElement(XmlElement::from(s.as_str())))
             .collect(),
-        VariantScalarTypeId::LocalizedText => values
-            .iter()
-            .map(|s| {
-                Variant::LocalizedText(Box::new(LocalizedText {
-                    locale: UAString::null(),
-                    text: UAString::from(s.as_str()),
-                }))
-            })
-            .collect(),
+        VariantScalarTypeId::LocalizedText => {
+            let mut built = Vec::with_capacity(values.len());
+            for value in values {
+                let (locale, text) = match value.split_once('|') {
+                    Some((locale, text)) => (UAString::from(locale), text),
+                    None => match kept(&built) {
+                        Some(Variant::LocalizedText(lt)) => (lt.locale, value.as_str()),
+                        _ => (UAString::null(), value.as_str()),
+                    },
+                };
+                built.push(Variant::LocalizedText(Box::new(LocalizedText {
+                    locale,
+                    text: UAString::from(text),
+                })));
+            }
+            built
+        }
+        VariantScalarTypeId::QualifiedName => {
+            let mut built = Vec::with_capacity(values.len());
+            for value in values {
+                let (namespace_index, name) = match value.split_once('|') {
+                    Some((ns, name)) => (namespace_index(ns), name),
+                    None => match kept(&built) {
+                        Some(Variant::QualifiedName(qn)) => (qn.namespace_index, value.as_str()),
+                        _ => (0, value.as_str()),
+                    },
+                };
+                built.push(Variant::QualifiedName(Box::new(QualifiedName {
+                    namespace_index,
+                    name: UAString::from(name),
+                })));
+            }
+            built
+        }
+        // C writes each element's text as the bytes, though it reads a
+        // ByteString array as hex (`:570-574` against `:1158-1163`), so a
+        // value does not survive the round trip; hex both ways here.
         VariantScalarTypeId::ByteString => values
             .iter()
             .map(|s| {
