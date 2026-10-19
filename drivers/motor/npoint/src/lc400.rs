@@ -148,7 +148,7 @@ impl Lc400Controller {
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 controller.firmware = bytes[..end].to_vec();
             }
-            Err(_) => eprintln!(
+            Err(_) => epics_rs::base::stderr_println!(
                 "LC400MotorDriver:LC400Controller: cannot read LC400 controller firmware version"
             ),
         }
@@ -369,7 +369,9 @@ fn gen_trapezoid(ipos: f64, fpos: f64, mut vel: f64, acc: f64, max_pts: usize) -
         }
     }
     if cycle_count == 0 {
-        eprintln!("Cycle Count was calculated to be 0, which shouldn't happen. Setting it to 1");
+        epics_rs::base::stderr_println!(
+            "Cycle Count was calculated to be 0, which shouldn't happen. Setting it to 1"
+        );
         cycle_count = 1;
     }
     data.truncate(npts);

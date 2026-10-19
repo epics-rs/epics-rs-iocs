@@ -56,7 +56,7 @@ fn lc400_create_controller_command(registry: &Registry) -> CommandDef {
 
             let handle = connect_serial(&lc400_port, 0, LC400_TIMEOUT)
                 .inspect_err(|_| {
-                    eprintln!(
+                    epics_rs::base::stderr_println!(
                         "LC400MotorDriver:LC400Controller: cannot connect to LC400 controller"
                     )
                 })
