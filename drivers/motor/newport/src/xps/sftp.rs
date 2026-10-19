@@ -93,7 +93,7 @@ pub fn xps_sftp_upload(
     let mut session = match Session::new() {
         Ok(session) => session,
         Err(e) => {
-            eprintln!("libssh2 initialization failed ({})", rc(&e));
+            epics_rs::base::stderr_println!("libssh2 initialization failed ({})", rc(&e));
             return -1;
         }
     };
@@ -103,14 +103,14 @@ pub fn xps_sftp_upload(
         .ok()
         .and_then(|ip| TcpStream::connect(SocketAddrV4::new(ip, 22)).ok());
     let Some(stream) = stream else {
-        eprintln!("failed to connect to {ip_address}");
+        epics_rs::base::stderr_println!("failed to connect to {ip_address}");
         return -1;
     };
     let _ = stream.set_nodelay(true);
     session.set_blocking(true);
     session.set_tcp_stream(stream);
     if let Err(e) = session.handshake() {
-        eprintln!("Failure establishing SSH session: {}", rc(&e));
+        epics_rs::base::stderr_println!("Failure establishing SSH session: {}", rc(&e));
         return -1;
     }
     let fingerprint = session.host_key_hash(HashType::Sha1).unwrap_or_default();
@@ -118,19 +118,19 @@ pub fn xps_sftp_upload(
     for byte in fingerprint.iter().take(20) {
         line.push_str(&format!("{byte:02X} "));
     }
-    eprintln!("{line}");
+    epics_rs::base::stderr_println!("{line}");
 
     let status = (|| {
         if session.userauth_password(user_name, password).is_err() {
-            eprintln!("Authentication by password failed.");
+            epics_rs::base::stderr_println!("Authentication by password failed.");
             return -1;
         }
         let Ok(contents) = std::fs::read(file_name) else {
-            eprintln!("Can't open local file {file_name}");
+            epics_rs::base::stderr_println!("Can't open local file {file_name}");
             return -1;
         };
         let Ok(sftp) = session.sftp() else {
-            eprintln!("Unable to init SFTP session");
+            epics_rs::base::stderr_println!("Unable to init SFTP session");
             return -1;
         };
         let Ok(mut remote) = sftp.open_mode(
@@ -139,7 +139,7 @@ pub fn xps_sftp_upload(
             0o644,
             OpenType::File,
         ) else {
-            eprintln!("Unable to open remote file {remote_file} with SFTP");
+            epics_rs::base::stderr_println!("Unable to open remote file {remote_file} with SFTP");
             return -1;
         };
         // C answers 0 after a failed write.
