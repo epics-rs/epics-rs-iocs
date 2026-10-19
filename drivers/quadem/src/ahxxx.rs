@@ -477,11 +477,16 @@ impl QuadEmDevice for AhxxxDriver {
     fn reset(&mut self) -> AsynResult<()> {
         let _ = self.set_acquire(0);
         self.firmware_version = "Unknown".into();
-        // C copies `inString_` over "Unknown" even when `VER ?` failed
-        // (drvAHxxx.cpp:408-411), publishing a stale or empty reply; drvTetrAMM
-        // guards the same copy on asynSuccess. C defect, not copied.
-        if let Ok(resp) = self.write_read_meter("VER ?") {
-            self.firmware_version = resp;
+        // C copies `inString_` whatever the `VER ?` status
+        // (drvAHxxx.cpp:408-411): a reply cut by a failed read is kept. One
+        // that delivered nothing would publish a stale or empty buffer; that
+        // C defect is not copied.
+        let (raw, status) = self
+            .io
+            .write_read("VER ?", proto::MAX_COMMAND_LEN)
+            .into_parts();
+        if status.is_ok() || !raw.is_empty() {
+            self.firmware_version = reply_text(&raw);
         }
         let p = self.params();
         self.base
@@ -993,6 +998,89 @@ mod tests {
             .get_string_param_blocking(rt.params.firmware, 0, 256)
             .unwrap();
         assert_eq!(fw, b"Unknown");
+    }
+
+    /// A meter whose `VER ?` reply is cut by a timeout.
+    struct CutVersion {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reply: &'static [u8],
+        cut: bool,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for CutVersion {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut epics_rs::asyn::user::AsynUser,
+            data: &[u8],
+        ) -> AsynResult<usize> {
+            self.cut = data.starts_with(b"VER");
+            self.reply = if self.cut { b"AH501D 3.0" } else { b"ACK" };
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &epics_rs::asyn::user::AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            let n = self.reply.len();
+            buf[..n].copy_from_slice(self.reply);
+            if !self.cut {
+                return OctetReadResult::ok(n, EomReason::empty());
+            }
+            OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }),
+                ..OctetReadResult::ok(n, EomReason::empty())
+            }
+        }
+    }
+
+    /// drvAHxxx.cpp:408-411 copies `inString_` whatever the `VER ?` status,
+    /// so a reply cut by a timeout still names the firmware and the model.
+    #[test]
+    fn a_version_cut_by_a_timeout_is_still_read() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let (_io, _meter) = crate::octet::tests::published_port(
+            "QE_AH_CUTVER_IP",
+            CutVersion {
+                base: PortDriverBase::new(
+                    "QE_AH_CUTVER_IP",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                reply: b"",
+                cut: false,
+            },
+        );
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_CUTVER").unwrap(),
+            "QE_AH_CUTVER_IP",
+            4,
+            0,
+            "AH999",
+        )
+        .unwrap();
+        let fw = rt
+            .port_handle()
+            .get_string_param_blocking(rt.params.firmware, 0, 256)
+            .unwrap();
+        assert_eq!(fw, b"AH501D 3.0");
+        let model = rt
+            .port_handle()
+            .read_int32_blocking(rt.params.model, 0)
+            .unwrap();
+        assert_eq!(model, QeModel::Ah501d as i32);
     }
 
     /// A down meter link fails a write with the link's asynDisconnected, not
