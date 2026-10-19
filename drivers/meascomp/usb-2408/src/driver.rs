@@ -85,6 +85,13 @@ impl BoardInfo {
         }
     }
 
+    /// C `numAnalogIn_` and `numTemperatureIn_`, the poller's channel
+    /// counts, held to the param arrays.
+    fn poll_channels(&self) -> (usize, usize) {
+        let n = |v: i32| (v.max(0) as usize).min(MAX_ANALOG_IN);
+        (n(self.num_analog_in), n(self.num_temperature_in))
+    }
+
     /// C `MultiFunction::report` after `asynPortDriver::report`
     /// (drvMultiFunction.cpp:2861-2892), for the USB-2408-2AO family: no
     /// timers, `MAX_COUNTERS` counters from 0, and no port C marks
@@ -214,10 +221,6 @@ impl MultiFunctionDriver {
         for ch in 0..MAX_ANALOG_OUT as i32 {
             base.set_int32_param(params.analog_out_range, ch, board_enums::OUTPUT_RANGE[0].1)?;
         }
-        for ch in 0..MAX_ANALOG_IN {
-            base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
-        }
-
         // Device info
         let product_name = device.product_name();
         let product_id = device.product_id();
@@ -233,6 +236,9 @@ impl MultiFunctionDriver {
         base.set_string_param(params.driver_version, 0, "4.4")?;
 
         let board = BoardInfo::read(&device);
+        for ch in 0..board.poll_channels().1 {
+            base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
+        }
 
         // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
         // ulDConfigPort and ulDConfigBit reject anything else outright, so ask
@@ -1084,6 +1090,7 @@ pub fn create_usb_2408(
     let params = driver.params;
     let device = driver.device.clone();
     let state = driver.state.clone();
+    let (ai_chans, tc_chans) = driver.board.poll_channels();
 
     let (runtime_handle, _actor_jh) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the USB-2408 port runtime: {e}"))?;
@@ -1098,6 +1105,8 @@ pub fn create_usb_2408(
         params,
         device.clone(),
         state,
+        ai_chans,
+        tc_chans,
     );
 
     Ok(MultiFunctionRuntime {

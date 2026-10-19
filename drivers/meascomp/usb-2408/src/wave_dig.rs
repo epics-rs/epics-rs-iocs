@@ -389,6 +389,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inputs_9_to_16_get_their_waveforms() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new(
+            "MFWAVEDIG",
+            MAX_SIGNALS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let mut state = WaveDigState::new(4);
+        state.first_chan = 14;
+        state.num_chans = 2;
+        state.current_point = 3;
+        let addrs: Vec<_> = waveform_updates(&params, &state, &SelfTrace::default())
+            .into_iter()
+            .filter_map(|u| match u {
+                ParamSetValue::Value { reason, addr, .. } if reason == params.wave_dig_volt_wf => {
+                    Some(addr)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addrs, [14, 15]);
+    }
+
+    #[test]
     fn a_completed_scan_counts_every_point() {
         // 2 channels x 50 points: the last sample written is index 98.
         assert_eq!(points_transferred(98, 2, 50), 50);

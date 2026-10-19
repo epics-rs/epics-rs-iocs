@@ -26,16 +26,19 @@ pub struct PollerState {
     pub ai_input_mode: i32,
 }
 
-/// Start the polling thread for USB-2408-2AO.
+/// Start the polling thread for USB-2408-2AO, reading the first `ai_chans`
+/// voltage and `tc_chans` thermocouple inputs.
 pub fn start_poller(
     handle: PortHandle,
     params: MultiFunctionParams,
     device: Arc<Mutex<DaqDevice>>,
     state: Arc<Mutex<PollerState>>,
+    ai_chans: usize,
+    tc_chans: usize,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("usb-2408-poller".into())
-        .spawn(move || poller_loop(handle, params, device, state))
+        .spawn(move || poller_loop(handle, params, device, state, ai_chans, tc_chans))
         .expect("failed to spawn USB-2408 poller thread")
 }
 
@@ -68,6 +71,8 @@ fn poller_loop(
     params: MultiFunctionParams,
     device: Arc<Mutex<DaqDevice>>,
     state: Arc<Mutex<PollerState>>,
+    ai_chans: usize,
+    tc_chans: usize,
 ) {
     const FUNCTION: &str = "pollerThread";
     let mut prev_digital_input: u64 = 0;
@@ -199,14 +204,15 @@ fn poller_loop(
                         snap.wave_dig_current_point = st.wave_dig.current_point;
                         snap.wave_dig_running = true;
                     } else {
-                        for ch in 0..MAX_ANALOG_IN {
+                        // C reads an unset channel's type and range into
+                        // the previous channel's locals; here it is 0, so
+                        // neither loop reads it.
+                        for ch in 0..ai_chans {
                             let ch_i = ch as i32;
                             // One call per channel, chosen by its configured
                             // type: ulAIn rejects a thermocouple channel with
                             // ERR_BAD_RANGE and ulTIn rejects a voltage one.
-                            // C drvMultiFunction skips each the same way, and
-                            // a channel of neither type (ANALOG_IN_TYPE unset)
-                            // in both loops.
+                            // C drvMultiFunction skips each the same way.
                             if in_types[ch] != AI_CHAN_TYPE_VOLTAGE {
                                 continue;
                             }
@@ -225,7 +231,7 @@ fn poller_loop(
                                 dev.analog_in(ch_i, input_mode, range, uldaq_sys::AIN_FF_DEFAULT);
                             snap.ai_volts[ch] = volts.ok();
                         }
-                        for ch in 0..MAX_ANALOG_IN {
+                        for ch in 0..tc_chans {
                             if in_types[ch] != AI_CHAN_TYPE_TC {
                                 continue;
                             }
