@@ -2341,9 +2341,7 @@ mod tests {
             },
             |last| last != "VE;",
         );
-        let Ok(ctrl) =
-            Mm4000Controller::new(io, "mm4000_cut", "mm4000_cut_motor", 2, Duration::ZERO)
-        else {
+        let Ok(ctrl) = Mm4000Controller::new(io, "mm4000_cut", 2, Duration::ZERO) else {
             panic!("a cut TP; still counts two axes");
         };
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
