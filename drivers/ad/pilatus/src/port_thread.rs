@@ -37,6 +37,30 @@ impl PilatusDriver {
         let _ = self.ad.port_base.set_float64_param(reason, 0, value);
     }
 
+    /// C's `if ((status != asynSuccess) || <invalid>) { ival = fallback;
+    /// setIntegerParam(...); }`: an undefined parameter is replaced and
+    /// stored exactly as an invalid one is.
+    fn i32_or_store(&mut self, reason: usize, invalid: impl Fn(i32) -> bool, fallback: i32) -> i32 {
+        match self.get_i32(reason) {
+            Some(v) if !invalid(v) => v,
+            _ => {
+                self.set_i32(reason, fallback);
+                fallback
+            }
+        }
+    }
+
+    /// [`Self::i32_or_store`] for a `getDoubleParam`.
+    fn f64_or_store(&mut self, reason: usize, invalid: impl Fn(f64) -> bool, fallback: f64) -> f64 {
+        match self.get_f64(reason) {
+            Some(v) if !invalid(v) => v,
+            _ => {
+                self.set_f64(reason, fallback);
+                fallback
+            }
+        }
+    }
+
     fn set_str(&mut self, reason: usize, value: impl Into<String>) {
         self.ad.port_base.set_str(reason, value.into());
     }
@@ -94,46 +118,22 @@ impl PilatusDriver {
             self.set_i32(ad.num_images, 1);
         }
 
-        let mut ival = self.get_i32(ad.num_images).unwrap_or(0);
-        if ival < 1 {
-            ival = 1;
-            self.set_i32(ad.num_images, ival);
-        }
+        let ival = self.i32_or_store(ad.num_images, |v| v < 1, 1);
         self.cam_write_read(&cmd_nimages(ival), CAMSERVER_DEFAULT_TIMEOUT);
 
-        let mut ival = self.get_i32(ad.num_exposures).unwrap_or(0);
-        if ival < 1 {
-            ival = 1;
-            self.set_i32(ad.num_exposures, ival);
-        }
+        let ival = self.i32_or_store(ad.num_exposures, |v| v < 1, 1);
         self.cam_write_read(&cmd_nexpframe(ival), CAMSERVER_DEFAULT_TIMEOUT);
 
-        let mut dval = self.get_f64(ad.acquire_time).unwrap_or(-1.0);
-        if dval < 0.0 {
-            dval = 1.0;
-            self.set_f64(ad.acquire_time, dval);
-        }
+        let dval = self.f64_or_store(ad.acquire_time, |v| v < 0.0, 1.0);
         self.cam_write_read(&cmd_exptime(dval), CAMSERVER_DEFAULT_TIMEOUT);
 
-        let mut dval = self.get_f64(ad.acquire_period).unwrap_or(-1.0);
-        if dval < 0.0 {
-            dval = 2.0;
-            self.set_f64(ad.acquire_period, dval);
-        }
+        let dval = self.f64_or_store(ad.acquire_period, |v| v < 0.0, 2.0);
         self.cam_write_read(&cmd_expperiod(dval), CAMSERVER_DEFAULT_TIMEOUT);
 
-        let mut dval = self.get_f64(p.delay_time).unwrap_or(-1.0);
-        if dval < 0.0 {
-            dval = 0.0;
-            self.set_f64(p.delay_time, dval);
-        }
+        let dval = self.f64_or_store(p.delay_time, |v| v < 0.0, 0.0);
         self.cam_write_read(&cmd_delay(dval), CAMSERVER_DEFAULT_TIMEOUT);
 
-        let mut ival = self.get_i32(p.gap_fill).unwrap_or(-2);
-        if !(-2..=0).contains(&ival) {
-            ival = -2;
-            self.set_i32(p.gap_fill, ival);
-        }
+        let ival = self.i32_or_store(p.gap_fill, |v| !(-2..=0).contains(&v), -2);
         // -2 means GapFill is not supported (single-element detector).
         if ival != -2 {
             self.cam_write_read(&cmd_gapfill(ival), CAMSERVER_DEFAULT_TIMEOUT);
@@ -539,6 +539,47 @@ mod tests {
                 .unwrap(),
             1221026
         );
+    }
+
+    /// pilatusDetector.cpp:766-810: a parameter no record has written yet
+    /// fails its get, and C stores the fallback as it does for an invalid
+    /// value. GapFill's fallback, -2, is also its one "not sent" value.
+    #[test]
+    fn set_acquire_params_stores_each_fallback_for_an_undefined_parameter() {
+        let (mut det, log) = rig("PILATUS_SAP_UNDEF", ok);
+        det.set_acquire_params();
+        assert_eq!(commands(&log), FRESH_ACQUIRE_PARAMS);
+        let (ad, p) = (det.ad.params, det.p);
+        let base = &det.ad.port_base;
+        assert_eq!(base.get_int32_param(ad.num_images, 0).unwrap(), 1);
+        assert_eq!(base.get_int32_param(ad.num_exposures, 0).unwrap(), 1);
+        assert_eq!(base.get_float64_param(ad.acquire_time, 0).unwrap(), 1.0);
+        assert_eq!(base.get_float64_param(ad.acquire_period, 0).unwrap(), 2.0);
+        assert_eq!(base.get_float64_param(p.delay_time, 0).unwrap(), 0.0);
+        assert_eq!(base.get_int32_param(p.gap_fill, 0).unwrap(), -2);
+    }
+
+    /// pilatusDetector.cpp:806-814 at each edge of `-2..=0`: inside it the
+    /// value is kept and only -2 is not sent; outside it -2 is stored.
+    #[test]
+    fn set_acquire_params_gap_fill_edges() {
+        for (set, kept, sent) in [
+            (-3, -2, None),
+            (-2, -2, None),
+            (-1, -1, Some("gapfill -1")),
+            (0, 0, Some("gapfill 0")),
+            (1, -2, None),
+        ] {
+            let (mut det, log) = rig(&format!("PILATUS_GAP_{}", set + 3), ok);
+            let p = det.p;
+            det.ad.port_base.set_i32(p.gap_fill, set);
+            det.set_acquire_params();
+            let cmds = commands(&log);
+            let gap = cmds.iter().find(|c| c.starts_with("gapfill"));
+            assert_eq!(gap.map(String::as_str), sent, "set {set}");
+            let stored = det.ad.port_base.get_int32_param(p.gap_fill, 0).unwrap();
+            assert_eq!(stored, kept, "set {set}");
+        }
     }
 
     /// The acquisition parameters setAcquireParams sends on a fresh
