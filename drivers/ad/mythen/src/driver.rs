@@ -70,35 +70,6 @@ impl MythenParams {
     }
 }
 
-/// The outcome of the constructor's detector queries.
-///
-/// The single gate that keeps a constructor-time detector query from failing
-/// port creation: it records that a query failed, and hands the caller a `None` to fall back from. C gets the same property from
-/// `status |= ...` over a C++ constructor, which cannot fail — an unreachable
-/// detector must never stop the IOC from reaching `iocInit`.
-#[derive(Default)]
-struct BootQueries {
-    failed: bool,
-}
-
-impl BootQueries {
-    /// Run one constructor-time query, recording a failure.
-    fn run<T>(&mut self, result: AsynResult<T>) -> Option<T> {
-        match result {
-            Ok(value) => Some(value),
-            Err(_) => {
-                self.fail();
-                None
-            }
-        }
-    }
-
-    /// Record a query that answered, but answered something unusable.
-    fn fail(&mut self) {
-        self.failed = true;
-    }
-}
-
 pub struct MythenDriver {
     pub ad: ADDriverBase,
     pub p: MythenParams,
@@ -153,15 +124,12 @@ impl MythenDriver {
 
     /// C's constructor body, mythen.cpp:1326-1377.
     ///
-    /// Every detector query on this path goes through [`BootQueries`]. C runs
-    /// the same queries with `status |= ...` and carries on when one fails, so
-    /// a detector that is powered off when the IOC boots leaves the parameters
-    /// at their defaults but still gets a port — and the IOC still reaches
-    /// `iocInit`. Nothing here may use `?` on the detector directly.
+    /// C runs every detector query here with `status |= ...` and carries on
+    /// when one fails, so a detector that is powered off when the IOC boots
+    /// leaves the parameters at their defaults but still gets a port — and the
+    /// IOC still reaches `iocInit`. Nothing here may use `?` on the detector directly.
     fn init_params(&mut self) -> AsynResult<()> {
-        let mut q = BootQueries::default();
-
-        let firmware = q.run(self.det.get_firmware());
+        let firmware = self.det.get_firmware().ok();
         // C ORs only these two into the constructor's `status`
         // (mythen.cpp:1329, :1364).
         let mut camera_params_failed = firmware.is_none();
@@ -178,21 +146,23 @@ impl MythenDriver {
         base.set_int32_param(self.ad.params.size_x, 0, SENSOR_SIZE_X)?;
         base.set_int32_param(self.ad.params.size_y, 0, SENSOR_SIZE_Y)?;
         base.set_int32_param(self.ad.params.base.array_size, 0, 0)?;
-        base.set_int32_param(self.ad.params.base.data_type, 0, NDDataType::UInt32 as i32)?;
+        // NDInt32 although dataCallback publishes NDUInt32 frames, as C does
+        // (mythen.cpp:1345, :979).
+        base.set_int32_param(self.ad.params.base.data_type, 0, NDDataType::Int32 as i32)?;
         base.set_int32_param(self.ad.params.image_mode, 0, ImageMode::Single as i32)?;
 
-        let status = q.run(self.det.get_status());
+        let status = self.det.get_status().ok();
         self.ad.port_base.set_int32_param(
             self.ad.params.status,
             0,
             status.unwrap_or(ADStatus::Disconnected) as i32,
         )?;
 
-        if let Some(settings) = q.run(self.det.get_settings()) {
+        if let Ok(settings) = self.det.get_settings() {
             self.apply_settings(&settings)?;
         }
 
-        let nmodules = match q.run(self.det.read_nmodules()) {
+        let nmodules = match self.det.read_nmodules().ok() {
             Some(n) if n >= 0 => Some(n),
             // C prints the same message and abandons the rest of the
             // constructor (mythen.cpp:1367-1372); the port survives either way.
@@ -200,7 +170,6 @@ impl MythenDriver {
                 self.det.trace_error(&format!(
                     "mythen:mythen: error, outString=-get nmodules, inString={n}\n"
                 ));
-                q.fail();
                 camera_params_failed = false;
                 None
             }
@@ -224,23 +193,6 @@ impl MythenDriver {
                 nmodules * CHANNELS_PER_MODULE as i32,
             )?;
         }
-
-        // The message is set and cleared here because this runs again on every
-        // reconnect: a detector that came back must not leave the operator
-        // reading "FAILED TO CONNECT" off a working port.
-        let message = if q.failed {
-            self.ad.port_base.set_int32_param(
-                self.ad.params.status,
-                0,
-                ADStatus::Disconnected as i32,
-            )?;
-            "Mythen FAILED TO CONNECT"
-        } else {
-            ""
-        };
-        self.ad
-            .port_base
-            .set_string_param(self.ad.params.status_message, 0, message)?;
 
         self.ad.port_base.call_param_callbacks(0)
     }

@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use epics_rs::ad_core::driver::ADStatus;
+use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::AsynError;
@@ -49,7 +50,8 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
         .expect("the port must be created even though every detector query failed");
 
     // Failed queries leave the parameters at their defaults and the detector
-    // reported as disconnected, which is what tells an operator why.
+    // reported as disconnected. C sets no status message on this path; it
+    // stays ADDriver's "" (ADDriver.cpp:189).
     let base = &driver.ad.port_base;
     assert_eq!(
         base.get_int32_param(driver.ad.params.status, 0).unwrap(),
@@ -58,10 +60,10 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
     assert_eq!(
         base.get_string_param(driver.ad.params.status_message, 0)
             .unwrap(),
-        b"Mythen FAILED TO CONNECT"
+        b""
     );
-    // C returns before setting SDNModules when `-get nmodules` fails
-    // (mythen.cpp:1362-1373), so it stays undefined.
+    // C sets SDNModules from a failed read's leftover inString_
+    // (mythen.cpp:1364-1373, a C bug); rs leaves it undefined.
     assert!(matches!(
         base.get_int32_param(driver.p.nmodules, 0),
         Err(AsynError::ParamUndefined(r)) if r == driver.p.nmodules
@@ -86,5 +88,12 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
         base.get_string_param(driver.ad.params.base.manufacturer, 0)
             .unwrap(),
         b"Dectris"
+    );
+    // C publishes UInt32 frames but sets NDDataType to NDInt32
+    // (mythen.cpp:1345, :979).
+    assert_eq!(
+        base.get_int32_param(driver.ad.params.base.data_type, 0)
+            .unwrap(),
+        NDDataType::Int32 as i32
     );
 }

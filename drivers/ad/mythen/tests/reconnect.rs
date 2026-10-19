@@ -179,7 +179,6 @@ fn no_command_is_sent_while_the_detector_is_disconnected_and_an_acquisition_brin
     assert_eq!(
         base.get_string_param(driver.ad.params.status_message, 0)
             .unwrap(),
-        b"",
-        "the FAILED TO CONNECT message must be gone once the detector answers"
+        b""
     );
 }
