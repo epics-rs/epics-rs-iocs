@@ -27,7 +27,7 @@ use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 
-use crate::connection::{Exchange, PixiradServer};
+use crate::connection::{Exchange, PixiradServer, ServerError};
 use crate::params::PixiradParams;
 use crate::protocol;
 use crate::task::{self, DataContext, StatusContext};
@@ -196,12 +196,16 @@ impl PixiradDetector {
     /// Send one command; publish both sides of it and whether the box took it.
     fn exchange(&mut self, command: &str) -> AsynResult<Exchange> {
         let exchange = self.server.command(command);
+        // C sets the message only on a reply (pixirad.cpp:910-920).
         let message = match &exchange.result {
-            Ok(()) => "Server returned OK",
-            Err(_) => "Error from server",
+            Ok(()) => Some("Server returned OK"),
+            Err(ServerError::Rejected(_)) => Some("Error from server"),
+            Err(_) => None,
         };
         let base = &mut self.ad.port_base;
-        base.set_string_param(self.ad.params.status_message, 0, message)?;
+        if let Some(message) = message {
+            base.set_string_param(self.ad.params.status_message, 0, message)?;
+        }
         base.set_string_param(self.ad.params.string_to_server, 0, command)?;
         base.set_string_param(self.ad.params.string_from_server, 0, exchange.reply.clone())?;
         Ok(exchange)
@@ -782,6 +786,20 @@ mod tests {
         assert!(
             det.write_float64(&mut AsynUser::new(q.hit_threshold), 1.0)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_failed_exchange_leaves_the_status_message() {
+        let mut det = detector("PIXI_DEAD_MSG", None);
+        let q = det.params;
+        let _ = det.write_int32(&mut AsynUser::new(q.hv_state), 0);
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_string_param(det.ad.params.status_message, 0)
+                .unwrap(),
+            b""
         );
     }
 
