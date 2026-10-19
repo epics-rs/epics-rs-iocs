@@ -122,26 +122,25 @@ impl PixiradServer {
 
         match outcome {
             Err(e) => {
-                let status = e.status();
-                // A timeout is the read side giving up after the write went out.
-                let wrote = if status == AsynStatus::Timeout {
-                    command.len()
+                // asynOctetSyncIO writeRead leaves the buffer alone unless it
+                // got as far as the read, which follows a whole write and
+                // (EOS interpose) stores what arrived, terminated
+                // (asynInterposeEos.c:250).
+                let (wrote, read) = if e.octet_step() == Some(OctetStep::Read) {
+                    let partial = e.partial_read().map(|p| p.data.as_slice());
+                    let partial = partial.unwrap_or_default();
+                    *from_server = crate::protocol::c_string(partial).to_vec();
+                    (command.len(), partial.len())
                 } else {
-                    0
+                    (0, 0)
                 };
                 trace_error(&format!(
                     "pixirad:writeReadServer, timeout={:.6}, status={} wrote {wrote} bytes, \
-                     received 0 bytes\n\n",
+                     received {read} bytes\n{}\n",
                     SERVER_TIMEOUT.as_secs_f64(),
-                    status as i32
+                    e.status() as i32,
+                    String::from_utf8_lossy(from_server)
                 ));
-                // asynOctetSyncIO writeRead leaves the buffer alone unless it
-                // got as far as the read, which (EOS interpose) stores what
-                // arrived and terminates it (asynInterposeEos.c:250).
-                if e.octet_step() == Some(OctetStep::Read) {
-                    let partial = e.partial_read().map(|p| p.data.as_slice());
-                    *from_server = crate::protocol::c_string(partial.unwrap_or_default()).to_vec();
-                }
                 Exchange {
                     reply: from_server.clone(),
                     result: Err(e.into()),
@@ -305,5 +304,53 @@ mod from_server_tests {
         ));
         let replies: Vec<Vec<u8>> = (0..4).map(|_| server.command("DAQ:! X").reply).collect();
         assert_eq!(replies, [&b"GOT: OK "[..], b"GOT: OK ", b"GO ", b""]);
+    }
+
+    /// C's failure line prints what each step moved and `fromServer_`
+    /// (pixirad.cpp:906-910).
+    #[test]
+    fn a_failed_exchange_traces_nread_and_from_server() {
+        use epics_rs::asyn::trace::TraceFile;
+        let name = "PIXI_TRACE_FAIL";
+        let driver = Scripted {
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
+            exchange: 0,
+        };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        handle.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        let mut server = PixiradServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO));
+        for _ in 0..4 {
+            server.command("DAQ:! X");
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let line = |status: AsynStatus, wrote: usize, read: usize, from: &str| {
+            format!(
+                "pixirad:writeReadServer, timeout=1.000000, status={} wrote {wrote} bytes, \
+                 received {read} bytes\n{from}\n",
+                status as i32
+            )
+        };
+        for expected in [
+            line(AsynStatus::Error, 0, 0, "GOT: OK "),
+            line(AsynStatus::Timeout, 7, 5, "GO "),
+            line(AsynStatus::Timeout, 7, 0, ""),
+        ] {
+            assert!(text.contains(&expected), "{expected:?} not in {text:?}");
+        }
     }
 }
