@@ -55,7 +55,8 @@ impl Nf874xController {
             closed_loop: false,
             params: None,
         };
-        let reply = controller.write_read("VE?").unwrap_or_default();
+        // C ignores writeReadController's status and parses what arrived.
+        let (reply, _) = controller.exchange("VE?");
         // C copies at most 9 characters and dereferences the space it
         // expects in them, crashing on a reply without one.
         let model: String = reply.chars().take(9).take_while(|&c| c != ' ').collect();
@@ -91,23 +92,34 @@ impl Nf874xController {
 
     /// `writeReadController`.
     fn write_read(&self, command: &str) -> AsynResult<String> {
-        let (reply, status) = self
-            .handle()?
+        let (reply, status) = self.exchange(command);
+        status.map(|()| reply)
+    }
+
+    /// `writeReadController`: `inString_` beside the status. The EOS layer
+    /// NUL-terminates the buffer on every read, so a failed read leaves the
+    /// bytes it delivered, which the callers that ignore the status parse.
+    fn exchange(&self, command: &str) -> (String, AsynResult<()>) {
+        let handle = match self.handle() {
+            Ok(handle) => handle,
+            Err(e) => return (String::new(), Err(e)),
+        };
+        let (reply, status) = handle
             .write_read(0, command.as_bytes(), MAX_REPLY)
             .into_parts();
-        status?;
-        Ok(String::from_utf8_lossy(&reply).into_owned())
+        (String::from_utf8_lossy(&reply).into_owned(), status)
     }
 
     /// `PH?` of the controller `axis` is on, and the shift of its three
     /// switch bits. C sends a bare `PH?` and shifts by the chain-wide axis
     /// number, so an axis past the master reads bits its controller does
     /// not have; this asks the axis's own controller for its local bits.
-    fn hardware_status(&self, axis: i32, name: &str) -> AsynResult<(i32, i32)> {
+    /// The reply is parsed whatever the exchange returned, beside its status.
+    fn hardware_status(&self, axis: i32, name: &str) -> ((i32, i32), AsynResult<()>) {
         let prefix = name.rfind('>').map_or("", |i| &name[..=i]);
-        let reply = self.write_read(&format!("{prefix}PH?"))?;
+        let (reply, status) = self.exchange(&format!("{prefix}PH?"));
         let local = (axis - 1) % self.axes_per_controller();
-        Ok((atoi(skip(&reply, name)), 3 * local))
+        ((atoi(skip(&reply, name)), 3 * local), status)
     }
 }
 
@@ -176,9 +188,8 @@ impl Nf874xAxis {
             status: MotorStatus::default(),
         };
         if closed_loop {
-            let (bits, shift) = lock(&this.controller)
-                .hardware_status(axis, &this.name)
-                .unwrap_or((0, 0));
+            // C ignores the PH? status (874xMotorDriver.cpp:246).
+            let ((bits, shift), _) = lock(&this.controller).hardware_status(axis, &this.name);
             this.limit_checking = (bits >> shift) & 0x3 != 0x3;
             this.status.gain_support = true;
             this.status.has_encoder = true;
@@ -255,7 +266,8 @@ impl Nf874xAxis {
             let value = ParamValue::Float64(atof(skip(&ask(query)?, &name)));
             self.sets.axis(reason, value);
         }
-        let (bits, shift) = ctrl.hardware_status(self.axis, &name)?;
+        let ((bits, shift), ph) = ctrl.hardware_status(self.axis, &name);
+        ph?;
         let bit = |i: i32| bits & (1 << (shift + i)) != 0;
         status.high_limit = self.limit_checking && bit(0);
         status.low_limit = self.limit_checking && bit(1);
@@ -628,6 +640,26 @@ mod tests {
         let task = axis.move_to_home_task(0).expect("C's doMoveToHome");
         task(&|_| ()).unwrap();
         assert_eq!(rig.sent(), ["1 PA 0"]);
+    }
+
+    /// 874xMotorDriver.cpp:67 and :246 ignore writeReadController's status
+    /// and parse `inString_`, so a `VE?` cut by a timeout still finds an
+    /// 8743-CL and a cut `PH?` still finds a stage without limit switches.
+    #[test]
+    fn replies_cut_by_a_timeout_are_still_parsed() {
+        let (_rig, io) = motor_common::testing::LineRig::cut(
+            "nf874xCut",
+            |sent| match sent {
+                "VE?" => "8743-CL v2.0".into(),
+                "PH?" => "3".into(),
+                _ => "0".into(),
+            },
+            |_| true,
+        );
+        let ctrl = Arc::new(Mutex::new(Nf874xController::new(Some(io))));
+        assert!(lock(&ctrl).closed_loop);
+        let axis = Nf874xAxis::new(ctrl, 1);
+        assert!(!axis.limit_checking);
     }
 
     #[test]
