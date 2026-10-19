@@ -1,8 +1,12 @@
-# A line printed with `eprint!` / `eprintln!` reaches stderr as one `write` per
-# format piece, so another thread's stdout line can land inside it. Non-test
-# code prints through `stderr_print!` / `stderr_println!` (`epics_rs::base`),
+# A line printed with `eprint!` / `eprintln!`, or `write!` to `stderr()`,
+# reaches stderr as one `write` per format piece, so another thread's stdout
+# line can land inside it. Non-test code prints through `stderr_print!` /
+# `stderr_println!` or writes `StagedStderr` (`epics_rs::base::runtime::log`),
 # which stage the line whole first, as glibc's `fprintf` does.
 disallowed-macros = [
     { path = "std::eprint", reason = "use stderr_print!: one write per line" },
     { path = "std::eprintln", reason = "use stderr_println!: one write per line" },
+]
+disallowed-methods = [
+    { path = "std::io::stderr", reason = "use StagedStderr or stderr_println!: one write per line" },
 ]
