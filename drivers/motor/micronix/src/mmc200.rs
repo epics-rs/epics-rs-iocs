@@ -28,7 +28,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, StatusWrite};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -223,8 +223,8 @@ pub struct Mmc200Axis {
     resolution: f64,
     /// Controller-wide `ignoreLimits` flag (C `ignoreLimits_`).
     ignore_limits: bool,
-    /// Last polled status, reused on the comm-failure early exit.
-    last_status: MotorStatus,
+    /// What the constructor set on the axis's status.
+    status_writes: Vec<StatusWrite>,
     /// What the constructor read, for [`Self::report`].
     probed: Arc<Mmc200AxisReport>,
 }
@@ -272,7 +272,7 @@ impl Mmc200Axis {
                 max_velocity: 0.0,
                 resolution: 1.0,
                 ignore_limits,
-                last_status: MotorStatus::default(),
+                status_writes: Vec::new(),
                 probed: Arc::new(probed),
             };
         }
@@ -313,13 +313,14 @@ impl Mmc200Axis {
             max_velocity,
             resolution,
             ignore_limits,
-            // MMC200Driver.cpp:259-268, once.
-            last_status: MotorStatus {
-                problem: error,
-                gain_support: true,
-                has_encoder: true,
-                ..MotorStatus::default()
-            },
+            // MMC200Driver.cpp:259-268.
+            status_writes: [
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true),
+            ]
+            .into_iter()
+            .chain(error.then_some(StatusWrite::Problem(true)))
+            .collect(),
             probed: Arc::new(probed),
         }
     }
@@ -458,16 +459,11 @@ impl AsynMotor for Mmc200Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
-        let polled = self.poll_params();
-        *status = self.last_status.clone();
-        polled
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
-}
 
-impl Mmc200Axis {
-    /// C `poll`'s sets into `last_status`, which a failure leaves as they were.
-    fn poll_params(&mut self) -> AsynResult<()> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         // C ignores the MMC-ETH module in poll (returns asynSuccess without
         // updating any parameter); keep the record inert.
         if !self.active {
@@ -483,20 +479,20 @@ impl Mmc200Axis {
         // `goto skip`: what was written stays, and `poll_failure` adds PROBLEM.
         let pos_reply = ctrl.query(&format!("{n}POS?"))?;
         let (position, encoder) = parse_position(&pos_reply);
-        self.last_status.position = position / self.resolution;
-        self.last_status.encoder_position = encoder / self.resolution;
+        status.position = position / self.resolution;
+        status.encoder_position = encoder / self.resolution;
 
         let sta_reply = ctrl.query(&format!("{n}STA?"))?;
-        let status = atoi(sta_reply.get(1..).unwrap_or(""));
-        let done = status & STA_DONE != 0;
-        self.last_status.done = done;
-        self.last_status.moving = !done;
-        (self.last_status.high_limit, self.last_status.low_limit) = if self.ignore_limits {
+        let sta = atoi(sta_reply.get(1..).unwrap_or(""));
+        let done = sta & STA_DONE != 0;
+        status.done = done;
+        status.moving = !done;
+        (status.high_limit, status.low_limit) = if self.ignore_limits {
             (false, false)
         } else {
-            (status & STA_HIGH_LIMIT != 0, status & STA_LOW_LIMIT != 0)
+            (sta & STA_HIGH_LIMIT != 0, sta & STA_LOW_LIMIT != 0)
         };
-        if status & STA_ERROR != 0 {
+        if sta & STA_ERROR != 0 {
             // C stores this return in `status`, which nothing reads after
             // done/limits were taken from it: a refused CER neither skips nor
             // raises PROBLEM.
@@ -505,8 +501,8 @@ impl Mmc200Axis {
 
         let mot_reply = ctrl.query(&format!("{n}MOT?"))?;
         let drive_on = atoi(mot_reply.get(1..).unwrap_or(""));
-        self.last_status.powered = drive_on != 0;
-        self.last_status.problem = false;
+        status.powered = drive_on != 0;
+        status.problem = false;
         Ok(())
     }
 }
@@ -539,10 +535,11 @@ mod tests {
         let (handle, _) =
             SyncIOHandle::connect_port("MMC200_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(Mmc200Controller::new(handle)));
-        let axis = Mmc200Axis::new(controller, 0, false);
+        let mut axis = Mmc200Axis::new(controller, 0, false);
         assert_eq!(axis.model, -1);
         // C's status_ starts at 0; only a good STA? sets Done (:482).
-        assert!(axis.last_status.problem && !axis.last_status.done);
+        let status = axis.constructed();
+        assert!(status.problem && !status.done, "{status:?}");
     }
 
     /// MMC200Driver.cpp:143-257 sets errorFlag on a failed query and parses
@@ -564,9 +561,9 @@ mod tests {
             |_| true,
         );
         let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
-        let axis = Mmc200Axis::new(controller, 0, false);
+        let mut axis = Mmc200Axis::new(controller, 0, false);
         assert_eq!((axis.model, axis.max_velocity), (200, 2.5));
-        assert!(axis.last_status.problem);
+        assert!(axis.constructed().problem);
     }
 
     /// C's constructor returns early for an MMC-ETH module and its poll
@@ -591,10 +588,51 @@ mod tests {
             SyncIOHandle::connect_port("MMC200_DEAD", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(Mmc200Controller::new(handle)));
         let mut axis = Mmc200Axis::new(controller, 0, false);
-        let mut left = MotorStatus::default();
+        let mut left = axis.constructed();
         assert!(axis.poll(&AsynUser::default(), &mut left).is_err());
         assert!(left.gain_support && left.has_encoder, "{left:?}");
         assert!(!left.comms_error, "{left:?}");
+    }
+
+    /// MMC200Driver.cpp:449-522 sets only what it read before a failed
+    /// read's `skip`, over the params as they stood, the Done=0 a move start
+    /// set included (asynMotorController.cpp:301).
+    #[test]
+    fn a_failed_read_leaves_the_done_a_move_start_set() {
+        use motor_common::testing::LineRig;
+        let refused = Arc::new(Mutex::new(String::new()));
+        let pick = refused.clone();
+        let (_rig, io) = LineRig::failing(
+            "mmc200MoveStartDone",
+            |cmd| {
+                match cmd.trim_end() {
+                    "1VER?" => "#MMC-200 v4.1",
+                    "1REZ?" => "#1000",
+                    "1UST?" => "#8",
+                    "1VMX?" => "#2.5",
+                    "1POS?" => "#1.000000,1.000000",
+                    "1STA?" => "#8",
+                    "1MOT?" => "#1",
+                    _ => "#0",
+                }
+                .into()
+            },
+            move |cmd| *pick.lock().unwrap() == cmd.trim_end(),
+        );
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
+        let mut axis = Mmc200Axis::new(controller, 0, false);
+        let user = AsynUser::default();
+        // The PROBLEM the poller raised over an earlier failure; `skip` clears it.
+        let mut status = MotorStatus {
+            problem: true,
+            ..MotorStatus::default()
+        };
+        axis.poll(&user, &mut status).unwrap();
+        assert!(status.done && !status.problem, "{status:?}");
+        status.done = false;
+        *refused.lock().unwrap() = "1STA?".into();
+        assert!(axis.poll(&user, &mut status).is_err());
+        assert!(!status.done, "{status:?}");
     }
 
     /// MMC200Driver.cpp:505 stores the `CER` write's return in `status`, not

@@ -21,6 +21,8 @@ use epics_rs::asyn::user::AsynUser;
 pub trait Polled {
     fn polled(&mut self, user: &AsynUser) -> AsynResult<MotorStatus>;
     fn polled_in_motion(&mut self, user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus>;
+    /// The status the constructor's sets leave, as the poller starts it.
+    fn constructed(&mut self) -> MotorStatus;
 }
 
 impl<M: AsynMotor + ?Sized> Polled for M {
@@ -33,6 +35,14 @@ impl<M: AsynMotor + ?Sized> Polled for M {
         let mut status = MotorStatus::default();
         self.poll_in_motion(user, cdir, &mut status)
             .map(|()| status)
+    }
+
+    fn constructed(&mut self) -> MotorStatus {
+        let mut status = MotorStatus::default();
+        for write in self.take_status_writes() {
+            write.apply(&mut status);
+        }
+        status
     }
 }
 
