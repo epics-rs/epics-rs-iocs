@@ -45,9 +45,6 @@
 //!   (the `AXIS_STATUS`/`CONTROLLER_STATUS` records, the resets, the
 //!   direct-command passthrough, ...).
 //! - The `phytronIO` digital/analog I/O subsystem (`phytronIOctrl.cpp`).
-//! - The brake output + idle-motor-disable feature (`phytronBrakeOutput`): with
-//!   the default (no brake, keep motor enabled) a move only needs to enable the
-//!   module output once, which this driver sends as `MA` before the first move.
 //! - The fake-HOMED-bit feature (Phytron registers 1001..1020, enabled by the
 //!   `fakeHomedEnable` option): disabled by default, so HOMED is reported from
 //!   status bit 0x08.
@@ -63,6 +60,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
 };
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -90,6 +88,9 @@ const MAX_VELOCITY: f64 = 500000.0;
 /// Controller acceleration clamp (steps/s²), phytronAxisMotor.h.
 const MIN_ACCELERATION: f64 = 4000.0;
 const MAX_ACCELERATION: f64 = 500000.0;
+
+/// C `MAXIMUM_BRAKE_TIME`, seconds (phytronAxisMotor.cpp:76).
+const MAX_BRAKE_TIME: f64 = 10.0;
 
 /// Controller family — selects framing, addressing and the parameter set-char.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,6 +415,10 @@ struct Reasons {
     axis_status_reset: usize,
     axis_reset: usize,
     homing_procedure: usize,
+    brake_output: usize,
+    disable_motor: usize,
+    brake_engage_time: usize,
+    brake_release_time: usize,
 }
 
 impl PhytronParams {
@@ -552,6 +557,11 @@ impl ControllerParams for PhytronParams {
             self.temps
                 .insert(base.create_param(name, ParamType::Float64)?, p);
         }
+        let r = &mut self.reasons;
+        r.brake_output = base.create_param("AXIS_BRAKE_OUTPUT", ParamType::Float64)?;
+        r.disable_motor = base.create_param("AXIS_DISABLE_MOTOR", ParamType::Int32)?;
+        r.brake_engage_time = base.create_param("AXIS_BRAKE_ENGAGE_TIME", ParamType::Float64)?;
+        r.brake_release_time = base.create_param("AXIS_BRAKE_RELEASE_TIME", ParamType::Float64)?;
         Ok(())
     }
 
@@ -582,6 +592,12 @@ impl ControllerParams for PhytronParams {
                 if let Some(a) = ctrl.axis_mut(addr) {
                     a.homing_procedure = Some(value);
                 }
+            }));
+        }
+        if user.reason == r.disable_motor {
+            let found = self.axis_controller(base, user, "phytronAxis::writeInt32");
+            return ParamWrite::PassToBase(found.map(|(mut ctrl, addr, _)| {
+                ctrl.reconfigure_brake(addr, |b| b.disable_idle = value != 0);
             }));
         }
         let p = self.p_regs.get(&user.reason).copied();
@@ -617,15 +633,59 @@ impl ControllerParams for PhytronParams {
     }
 
     /// C `phytronController::writeFloat64` (phytronAxisMotor.cpp:519-541)
-    /// looks the axis up first.
+    /// looks the axis up first, then sets the brake's members.
     fn write_float64(
         &mut self,
         base: &mut PortDriverBase,
         user: AxisUser<'_>,
-        _value: f64,
+        value: f64,
     ) -> ParamWrite {
-        Self::refuses(base, user, "phytronAxis::writeFloat64")
-            .unwrap_or(ParamWrite::PassToBase(Ok(())))
+        let r = &self.reasons;
+        let engage = user.reason == r.brake_engage_time;
+        if user.reason != r.brake_output && !engage && user.reason != r.brake_release_time {
+            return Self::refuses(base, user, "phytronAxis::writeFloat64")
+                .unwrap_or(ParamWrite::PassToBase(Ok(())));
+        }
+        let (mut ctrl, addr, _) =
+            match self.axis_controller(base, user, "phytronAxis::writeFloat64") {
+                Ok(found) => found,
+                Err(e) => return ParamWrite::PassToBase(Err(e)),
+            };
+        let Some(a) = ctrl.axis_mut(addr) else {
+            return ParamWrite::PassToBase(Ok(()));
+        };
+        if user.reason == r.brake_output {
+            a.brake.output = Brake::output_of(value);
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        // C hands the base the time clamped to MAXIMUM_BRAKE_TIME, which
+        // the records read back; the base here stores what was written, so
+        // its store, callbacks and trace line are done here.
+        let value = if value > MAX_BRAKE_TIME {
+            MAX_BRAKE_TIME
+        } else {
+            value
+        };
+        let time = if value > 0.0 { value as f32 } else { 0.0 };
+        if engage {
+            a.brake.engage_time = time;
+        } else {
+            a.brake.release_time = time;
+        }
+        drop(ctrl);
+        let _ = base.set_float64_param(user.reason, addr, value);
+        let _ = base.call_param_callbacks(addr);
+        PortManager::global().trace_manager().print(
+            Some(&base.port_name),
+            Some(addr),
+            user.reason as i32,
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "asynMotorController:writeFloat64:: axis={addr}, function={}, value={value:.6}\n",
+                user.reason
+            ),
+        );
+        ParamWrite::Handled(Ok(()))
     }
 
     /// C `phytronController::readInt32` (phytronAxisMotor.cpp:285-357): the
@@ -650,6 +710,11 @@ impl ControllerParams for PhytronParams {
         }
         let (mut ctrl, addr, m) =
             self.axis_controller(base, user, "phytronController::readInt32")?;
+        if user.reason == r.disable_motor {
+            return Ok(ctrl
+                .axis(addr)
+                .map_or(0, |a| i32::from(a.brake.disable_idle)));
+        }
         let Some(&p) = self.p_regs.get(&user.reason) else {
             return Ok(value);
         };
@@ -671,6 +736,18 @@ impl ControllerParams for PhytronParams {
         let (mut ctrl, addr, m) =
             self.axis_controller(base, user, "phytronController::readFloat64")?;
         let value = base.read_float64_param(user.asyn()).unwrap_or(0.0);
+        let r = &self.reasons;
+        if let Some(b) = ctrl.axis(addr).map(|a| a.brake) {
+            for (reason, v) in [
+                (r.brake_output, b.output),
+                (r.brake_engage_time, b.engage_time),
+                (r.brake_release_time, b.release_time),
+            ] {
+                if user.reason == reason {
+                    return Ok(f64::from(v));
+                }
+            }
+        }
         let Some(&p) = self.temps.get(&user.reason) else {
             return Ok(value);
         };
@@ -827,6 +904,51 @@ struct AxisState {
     /// HOMING_PROCEDURE as written, which C's `home` reads back; unset
     /// until a write, as C's param is.
     homing_procedure: Option<i32>,
+    brake: Brake,
+}
+
+/// C `phytronAxis`'s brake members (phytronAxisMotor.h:126-130), in C's
+/// `float`.
+#[derive(Clone, Copy, Default)]
+struct Brake {
+    /// C `brakeOutput_`: the digital output `<module>.<index>`, an MCC's
+    /// in its tenths, 0 for none, negative inverted.
+    output: f32,
+    /// C `disableMotor_` bit 0: the idle motor's output is disabled.
+    disable_idle: bool,
+    /// C `disableMotor_` bit 1: the motor output is enabled.
+    enabled: bool,
+    /// C `brakeEngageTime_` / `brakeReleaseTime_`, seconds.
+    engage_time: f32,
+    release_time: f32,
+    /// C `brakeReleased_`.
+    released: bool,
+}
+
+impl Brake {
+    /// C's output, tenths within ±100 (phytronAxisMotor.cpp:529, 1512).
+    fn output_of(v: f64) -> f32 {
+        let v = if v > -100.0 && v < 100.0 { v } else { 0.0 };
+        ((10.0 * v + 0.5).floor() / 10.0) as f32
+    }
+
+    /// The command that releases (`release`) or engages the brake
+    /// (phytronAxisMotor.cpp:1544-1568). C's MCC digit is
+    /// `fabs(10*out+0.5)`, which names output 2 for an inverted 3 (-0.3);
+    /// the digit here is that of `|out|`.
+    fn command(&self, phymotion: bool, release: bool) -> String {
+        let c = if (self.output > 0.0) == release {
+            'S'
+        } else {
+            'R'
+        };
+        let out = f64::from(self.output.abs());
+        if phymotion {
+            format!("A{:.1}{c}", CFloat(out))
+        } else {
+            format!("A{}{c}", (10.0 * out + 0.5) as i32 % 10)
+        }
+    }
 }
 
 /// A Phytron controller endpoint owning the asyn octet handle. Shared by all of
@@ -901,6 +1023,116 @@ impl PhytronController {
             }
         };
         self.type_name = print_escaped(name.as_bytes());
+    }
+
+    /// C `phytronBrakeOutput`'s axis lookup and `configureBrake`
+    /// (phytronAxisMotor.cpp:1287-1330, 1510-1524): axis `axis` is
+    /// `module.index`, the times are seconds. A missing axis is `Err` with
+    /// the name C looked for. C formats a phyMOTION's into 5 bytes, which
+    /// cuts `M10.1`; the whole name is looked for here.
+    pub fn configure_brake(
+        &mut self,
+        axis: f32,
+        output: f32,
+        disable_idle: bool,
+        engage: f64,
+        release: f64,
+    ) -> Result<(), String> {
+        let m = match self.ctrl_type {
+            CtrlType::Phymotion => format!("M{:.1}", CFloat(f64::from(axis))),
+            CtrlType::Mcc => {
+                let i = (10.0 * f64::from(axis) + 0.5).floor() as i32;
+                // C prints its unset name then.
+                if !(1..=8).contains(&i) {
+                    return Err(String::new());
+                }
+                i.to_string()
+            }
+        };
+        let Some(axis_no) = self
+            .axes
+            .iter()
+            .find(|a| a.module_no == m)
+            .map(|a| a.axis_no)
+        else {
+            return Err(m);
+        };
+        let time = |t: f64| {
+            let t = if t > MAX_BRAKE_TIME {
+                MAX_BRAKE_TIME
+            } else {
+                t
+            };
+            if t > 0.0 { t as f32 } else { 0.0 }
+        };
+        self.reconfigure_brake(axis_no, |b| {
+            b.output = Brake::output_of(f64::from(output));
+            b.disable_idle = disable_idle;
+            b.engage_time = time(engage);
+            b.release_time = time(release);
+        });
+        Ok(())
+    }
+
+    /// `change` on axis `axis_no`'s brake, then C `setBrakeOutput(NULL,
+    /// brakeReleased_)`, as configureBrake and the AXIS_DISABLE_MOTOR write
+    /// do.
+    fn reconfigure_brake(&mut self, axis_no: i32, change: impl FnOnce(&mut Brake)) {
+        let Some(a) = self.axis_mut(axis_no) else {
+            return;
+        };
+        change(&mut a.brake);
+        let released = a.brake.released;
+        self.set_brake_output(axis_no, None, released);
+    }
+
+    /// C `setBrakeOutput` (phytronAxisMotor.cpp:1531-1585) on axis
+    /// `axis_no`: onto `list`, or sent at once with none. A wait sends the
+    /// list first. The sends' statuses are dropped, as C's are.
+    fn set_brake_output(&mut self, axis_no: i32, list: Option<&mut Vec<String>>, want_move: bool) {
+        let phymotion = self.ctrl_type == CtrlType::Phymotion;
+        let Some(a) = self.axis_mut(axis_no) else {
+            return;
+        };
+        let b = a.brake;
+        a.brake.released = want_move;
+        if want_move {
+            a.brake.enabled = true;
+        } else if b.disable_idle {
+            a.brake.enabled = false;
+        }
+        let m = a.module_no.clone();
+        let mut own = Vec::new();
+        let direct = list.is_none();
+        let list = list.unwrap_or(&mut own);
+        if want_move {
+            if !b.enabled {
+                list.push(format!("{m}MA"));
+            }
+            if b.output != 0.0 {
+                list.push(b.command(phymotion, true));
+            }
+            self.flush_brake(list, direct || b.release_time > 0.0, b.release_time);
+            return;
+        }
+        if b.output != 0.0 {
+            list.push(b.command(phymotion, false));
+            self.flush_brake(list, direct || b.engage_time > 0.0, b.engage_time);
+        }
+        if b.disable_idle {
+            list.push(format!("{m}MD"));
+            self.flush_brake(list, direct, 0.0);
+        }
+    }
+
+    /// `list` on one line when `send`, then the brake's `wait`.
+    fn flush_brake(&self, list: &mut Vec<String>, send: bool, wait: f32) {
+        if send {
+            let _ = self.multi_command(std::mem::take(list), false, false);
+        }
+        if wait > 0.0 {
+            std::thread::sleep(Duration::from_secs_f32(wait));
+        }
     }
 
     /// What C `epicsInithookFunction` (phytronAxisMotor.cpp:1003-1024)
@@ -1254,10 +1486,6 @@ pub struct PhytronAxis {
     axis_no: i32,
     /// Command prefix: `M<mod>.<idx>` (phyMOTION) or a single digit (MCC).
     axis_module_no: String,
-    /// True once the module output has been enabled (`MA`) for a move; the C
-    /// default (no brake, motor kept enabled) enables it once and never
-    /// disables it.
-    motor_enabled: bool,
     /// Limit-home state machine (C `homeState_`): 0 = idle, else bit0 = homing
     /// direction (1 = forward/high), bits>>1 = phase.
     home_state: i32,
@@ -1297,6 +1525,7 @@ impl PhytronAxis {
             answers: None,
             read_once: false,
             homing_procedure: None,
+            brake: Brake::default(),
         });
         drop(ctrl);
         Ok(Self {
@@ -1304,7 +1533,6 @@ impl PhytronAxis {
             ctrl_type,
             axis_no,
             axis_module_no,
-            motor_enabled: false,
             home_state: 0,
             sets: PortSets::default(),
             // phytronAxisMotor.cpp:1352: the controller always has an encoder.
@@ -1343,13 +1571,10 @@ impl PhytronAxis {
         commands.push(format!("{m}{acc}{set}{}", fmt6(clamp_acceleration(a))));
     }
 
-    /// C `setBrakeOutput(list, 1)` with no brake configured: the module
-    /// output enabled (`MA`) the first time.
-    fn release(&mut self, commands: &mut Vec<String>) {
-        if !self.motor_enabled {
-            commands.push(format!("{}MA", self.axis_module_no));
-            self.motor_enabled = true;
-        }
+    /// C `setBrakeOutput(list, 1)` of a motion method.
+    fn release(&self, commands: &mut Vec<String>) {
+        self.lock()
+            .set_brake_output(self.axis_no, Some(commands), true);
     }
 
     /// C `clearAxisError` (phytronAxisMotor.cpp:1391-1415) under the
@@ -1444,6 +1669,11 @@ impl PhytronAxis {
                 (atof(pos), atof(enc), moving, status)
             }
         };
+        // C engages the brake once the axis stops (:2013-2024).
+        if !self.done && !moving {
+            self.lock().set_brake_output(self.axis_no, None, false);
+        }
+
         // The poll reports `P22R` times the ratio (:2005-2006).
         let (ratio, axis_status) = {
             let ctrl = self.lock();
@@ -2443,6 +2673,54 @@ mod tests {
         assert_eq!(home(Some(6), true), some("RC+^I"));
         assert_eq!(home(Some(0), false), (true, Some("M1.1R-".into()), 2));
         assert_eq!(home(Some(0), true), (true, Some("M1.1R+".into()), 3));
+    }
+
+    /// C `configureBrake`'s output and `setBrakeOutput`'s commands
+    /// (phytronAxisMotor.cpp:1512, 1544-1568).
+    #[test]
+    fn a_brake_command_names_its_output_as_c() {
+        assert_eq!(Brake::output_of(1.25), 1.3);
+        assert_eq!(Brake::output_of(-0.34), -0.3);
+        assert_eq!(Brake::output_of(150.0), 0.0);
+        assert_eq!(Brake::output_of(f64::NAN), 0.0);
+        let brake = |output| Brake {
+            output,
+            ..Brake::default()
+        };
+        assert_eq!(brake(1.2).command(true, true), "A1.2S");
+        assert_eq!(brake(1.2).command(true, false), "A1.2R");
+        assert_eq!(brake(-1.2).command(true, true), "A1.2R");
+        assert_eq!(brake(0.3).command(false, true), "A3S");
+        assert_eq!(brake(0.3).command(false, false), "A3R");
+        assert_eq!(brake(-0.3).command(false, true), "A3R");
+    }
+
+    /// A release wait sends the motion's list up to the release first; the
+    /// poll that reads the axis stopped engages the brake, then disables
+    /// the motor, each its own line (phytronAxisMotor.cpp:1531-1585, 2022).
+    #[test]
+    fn a_brake_is_released_ahead_of_a_move_and_engaged_once_it_stops() {
+        let idle = |c: &str| Some(if c.ends_with("==H") { "E" } else { "0" }.to_owned());
+        let (ctrl, [mut axis, _], written) = lines_with("phyBrakeLines", idle);
+        let take = || std::mem::take(&mut *written.lock().unwrap());
+        ctrl.lock()
+            .unwrap()
+            .configure_brake(1.1, 1.2, true, 0.0, 0.001)
+            .unwrap();
+        assert_eq!(take(), ["A1.2R", "M1.1MD"]);
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 1.0, 10.0, 100.0, 5000.0).unwrap();
+        let sent = take();
+        let [.., release, mv] = &sent[..] else {
+            panic!("{sent:?}");
+        };
+        assert!(release.ends_with(" M1.1MA A1.2S"), "{sent:?}");
+        assert_eq!(mv, "M1.1A1");
+        axis.poll(&user).unwrap();
+        let sent = take();
+        assert_eq!(sent[sent.len() - 2..], ["A1.2R", "M1.1MD"], "{sent:?}");
+        axis.poll(&user).unwrap();
+        assert!(!take().iter().any(|l| l.contains("A1.2")));
     }
 
     /// An MCC has no `SEC` (phytronAxisMotor.cpp:1394-1395).

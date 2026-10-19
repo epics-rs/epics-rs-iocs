@@ -19,8 +19,8 @@ use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
-    arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
-    req_int, req_string,
+    arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_int,
+    opt_string, poll_intervals, req_int, req_string,
 };
 use motor_common::{AxisReport, Controller, asyn_user, register_port_with};
 
@@ -46,13 +46,14 @@ fn registry_lock(reg: &Registry) -> std::sync::MutexGuard<'_, HashMap<String, Co
 /// `module*10 + index` address.
 const PHYTRON_PORT_AXES: i32 = 0xFF;
 
-/// Build all three Phytron iocsh commands, sharing one controller registry.
+/// Build the Phytron iocsh commands, sharing one controller registry.
 pub fn phytron_commands() -> Vec<CommandDef> {
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
     vec![
         phytron_create_phymotion_command(&registry),
         phytron_create_mcc_command(&registry),
         phytron_create_axis_command(&registry),
+        phytron_brake_output_command(&registry),
     ]
 }
 
@@ -274,6 +275,52 @@ fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
                 let report: Arc<dyn AxisReport> = Arc::new(PhytronAxisReport(axis_no));
                 Ok((Arc::new(Mutex::new(axis)), Some(report)))
             })?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `phytronBrakeOutput(controllerName, axis, output, disableMotor,
+/// engageTime, releaseTime)`: the axis and output as `module.index`, the
+/// times in ms.
+fn phytron_brake_output_command(registry: &Registry) -> CommandDef {
+    let registry = registry.clone();
+    CommandDef::new(
+        "phytronBrakeOutput",
+        vec![
+            arg_str_opt("Controller Name"),
+            arg_double_opt("Axis index"),
+            arg_double_opt("Output index"),
+            arg_int_opt("Motor disable flag"),
+            arg_double_opt("Brake engage wait time (ms)"),
+            arg_double_opt("Brake release wait time (ms)"),
+        ],
+        "phytronBrakeOutput(controllerName, axis, output, disableMotor, engageTime, releaseTime)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let name = opt_string(args, 0)?.unwrap_or_default();
+            let axis = opt_double(args, 1, 0.0, "Axis index")? as f32;
+            let output = opt_double(args, 2, 0.0, "Output index")? as f32;
+            let disable = opt_int(args, 3, 0, "Motor disable flag")? != 0;
+            let engage = opt_double(args, 4, 0.0, "Brake engage wait time (ms)")?;
+            let release = opt_double(args, 5, 0.0, "Brake release wait time (ms)")?;
+            let controller = registry_lock(&registry)
+                .get(&name)
+                .map(|reg| reg.controller.clone());
+            // C prints its unset axis name for a missing controller.
+            let configured = controller.map_or(Err(String::new()), |c| {
+                c.lock().unwrap_or_else(|e| e.into_inner()).configure_brake(
+                    axis,
+                    output,
+                    disable,
+                    engage / 1000.,
+                    release / 1000.,
+                )
+            });
+            if let Err(m) = configured {
+                println!(
+                    "ERROR: phytronBrakeOutput: Controller {name} is not registered or axis {m} not found"
+                );
+            }
             Ok(CommandOutcome::Continue)
         },
     )
