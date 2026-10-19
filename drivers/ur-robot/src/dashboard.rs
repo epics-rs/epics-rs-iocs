@@ -283,7 +283,7 @@ impl DashboardClient {
     /// boot still answers from the live version.
     pub fn is_in_remote_control(&mut self) -> UrResult<bool> {
         if !self.polyscope_version()?.supports_remote_control_query() {
-            eprintln!(
+            epics_rs::base::stderr_println!(
                 "Warning! isInRemoteControl() function is not supported on the dashboard \
                  server for PolyScope versions less than 5.6.0"
             );

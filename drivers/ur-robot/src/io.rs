@@ -151,7 +151,7 @@ impl IoInterface {
             Ok(()) => Ok(()),
             Err(first) => {
                 println!("RTDEIOInterface: Lost connection to robot...");
-                eprintln!("{first}");
+                epics_rs::base::stderr_println!("{first}");
                 self.session.disconnect(false);
                 println!("RTDEIOInterface: Robot is disconnected, reconnecting...");
                 self.reconnect()?;

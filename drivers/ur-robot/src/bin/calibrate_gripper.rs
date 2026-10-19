@@ -19,7 +19,9 @@ const GRIPPER_TIMEOUT: Duration = Duration::from_secs(2);
 fn run(ip: &str) -> UrResult<()> {
     let mut gripper = RobotiqGripper::new(ip, GRIPPER_TIMEOUT);
     if let Err(e) = gripper.connect() {
-        eprintln!("Error connecting to gripper, check that IP address is correct");
+        epics_rs::base::stderr_println!(
+            "Error connecting to gripper, check that IP address is correct"
+        );
         return Err(e);
     }
     if !gripper.is_active()? {
@@ -40,13 +42,13 @@ fn run(ip: &str) -> UrResult<()> {
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let (Some(ip), None) = (args.next(), args.next()) else {
-        eprintln!("Please provide robot IP");
+        epics_rs::base::stderr_println!("Please provide robot IP");
         return ExitCode::FAILURE;
     };
     match run(&ip) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{e}");
+            epics_rs::base::stderr_println!("{e}");
             ExitCode::FAILURE
         }
     }
