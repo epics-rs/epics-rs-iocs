@@ -838,6 +838,8 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
     // Nth frame of a 4-D dataset belongs to the Nth *active* threshold.
     let active = active_thresholds(s).await;
     let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
+    // Once per file, counted on locally (eigerDetector.cpp:1841-1842, :1903-1904).
+    let mut counters = Counters::read(s).await;
 
     // C `break`s out of the threshold loop on a refused alloc
     // (eigerDetector.cpp:1849), dropping the rest of that image's thresholds.
@@ -868,6 +870,7 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
                 timestamp: None,
             },
             array_callbacks,
+            &mut counters,
         )
         .await
         .is_err()
@@ -1203,6 +1206,7 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
         let decompress = s.get_int(s.p.stream_decompress).await != 0;
         let signed_data = s.get_int(s.p.signed_data).await != 0;
         let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
+        let mut counters = Counters::read(s).await;
         let msg = match received.decode(decompress) {
             Ok(m) => m,
             Err(crate::stream::StreamError::WrongHtype(_)) => continue,
@@ -1237,9 +1241,14 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                 };
                 // A refused alloc is getFrame's STREAM_ERROR (streamApi.cpp:370),
                 // which ends the series like any other failed frame above.
-                if publish(s, image.signed_if(signed_data), array_callbacks)
-                    .await
-                    .is_err()
+                if publish(
+                    s,
+                    image.signed_if(signed_data),
+                    array_callbacks,
+                    &mut counters,
+                )
+                .await
+                .is_err()
                 {
                     eprintln!("StreamApi::getFrame: failed to allocate NDArray for frame {number}");
                     s.trace().err("streamTask", "failed to get frame packet");
@@ -1308,6 +1317,7 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
             };
             let signed_data = s.get_int(s.p.signed_data).await != 0;
             let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
+            let mut counters = Counters::read(s).await;
             let mut attributes = NDAttributeList::new();
             if let Some((number, energy)) = frame.threshold {
                 attributes.add(threshold_number_attr(number));
@@ -1323,9 +1333,14 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
             };
             // A refused alloc is getFrame's STREAM_ERROR (stream2Api.cpp:290),
             // skipped like the other failed frames above.
-            if publish(s, image.signed_if(signed_data), array_callbacks)
-                .await
-                .is_err()
+            if publish(
+                s,
+                image.signed_if(signed_data),
+                array_callbacks,
+                &mut counters,
+            )
+            .await
+            .is_err()
             {
                 eprintln!("Stream2Api::getFrame: failed to allocate NDArray for frame");
             }
@@ -1421,9 +1436,30 @@ impl Image {
     }
 }
 
+/// C's `imageCounter` / `numImagesCounter` locals: each path reads them where
+/// C does and [`publish`] counts them on.
+struct Counters {
+    image: i32,
+    num_images: i32,
+}
+
+impl Counters {
+    async fn read(s: &Shared) -> Self {
+        Self {
+            image: s.get_int(s.ad.base.array_counter).await,
+            num_images: s.get_int(s.ad.num_images_counter).await,
+        }
+    }
+}
+
 /// `Err` when the pool refuses the frame (C's `alloc` returning NULL); the
-/// caller prints C's line for its path.
-async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) -> ADResult<()> {
+/// caller prints C's line for its path, and the counters stay as they were.
+async fn publish(
+    s: &Arc<Shared>,
+    image: Image,
+    array_callbacks: bool,
+    counters: &mut Counters,
+) -> ADResult<()> {
     let Image {
         dims,
         data,
@@ -1434,8 +1470,7 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) -> ADResu
     } = image;
     // C stamps the counter before its `++imageCounter` (eigerDetector.cpp:1537,
     // :1878), so the first array of an IOC's life is uniqueId 0.
-    let unique_id = s.get_int(s.ad.base.array_counter).await;
-    let counter = unique_id + 1;
+    let unique_id = counters.image;
     // C calls updateTimeStamps only when stream2 left the ts unset
     // (eigerDetector.cpp:1539-1541).
     let timestamp = match timestamp {
@@ -1470,10 +1505,11 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) -> ADResu
         .unwrap_or("")
         .to_string();
 
-    let num_images_counter = s.get_int(s.ad.num_images_counter).await + 1;
+    counters.image += 1;
+    counters.num_images += 1;
     s.apply(vec![
-        ParamUpdate::Int32(s.ad.base.array_counter, counter),
-        ParamUpdate::Int32(s.ad.num_images_counter, num_images_counter),
+        ParamUpdate::Int32(s.ad.base.array_counter, counters.image),
+        ParamUpdate::Int32(s.ad.num_images_counter, counters.num_images),
         ParamUpdate::Float64(s.ad.base.timestamp_rbv, array.time_stamp),
         ParamUpdate::Int32(s.ad.base.epics_ts_sec, array.timestamp.sec as i32),
         ParamUpdate::Int32(s.ad.base.epics_ts_nsec, array.timestamp.nsec as i32),
@@ -1775,9 +1811,15 @@ mod tests {
         );
 
         for _ in 0..2 {
-            publish(&s, image(NDDataBuffer::U16(vec![1, 2]), None), true)
-                .await
-                .unwrap();
+            let mut counters = Counters::read(&s).await;
+            publish(
+                &s,
+                image(NDDataBuffer::U16(vec![1, 2]), None),
+                true,
+                &mut counters,
+            )
+            .await
+            .unwrap();
         }
         let mut ids = Vec::new();
         for _ in 0..2 {
@@ -1940,6 +1982,126 @@ mod tests {
         .await
         .unwrap();
         assert!(task.await.unwrap(), "dseries_end completes the series");
+        std::mem::forget(runtime);
+    }
+
+    /// A FileWriter-shaped file: `/entry/data/data` of u16 images, `[n, h, w]`.
+    fn h5_file(shape: [usize; 3]) -> Vec<u8> {
+        let path = std::env::temp_dir().join(format!(
+            "eiger-h5-{}-{:?}.h5",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = rust_hdf5::H5File::create(&path).unwrap();
+        let data = file
+            .create_group("entry")
+            .unwrap()
+            .create_group("data")
+            .unwrap();
+        let n: usize = shape.iter().product();
+        data.new_dataset::<u16>()
+            .shape(shape)
+            .create("data")
+            .unwrap()
+            .write_raw(&(0..n as u16).collect::<Vec<_>>())
+            .unwrap();
+        file.close().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        bytes
+    }
+
+    /// C parseH5File reads NDArrayCounter and ADNumImagesCounter once per file
+    /// and counts on from there (eigerDetector.cpp:1841-1842, :1903-1904): a
+    /// client write between two frames is overwritten, not counted on from.
+    #[tokio::test]
+    async fn parse_h5_counts_on_from_the_counters_read_at_file_start() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::request::RequestOp;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::user::AsynUser;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let name = "EIGER_H5_COUNTERS";
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: name.to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let mut det = crate::driver::EigerDriver::new(cfg, rest, signals.clone()).expect("driver");
+        det.ad.port_base.own_interrupts(InterruptGate::opened());
+        let (p, ad, ops) = (det.p, det.ad.params, det.ops.clone());
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
+                .expect("runtime");
+        let outputs = Outputs::new();
+        let (tx, mut rx) = ndarray_channel("H5_COUNTERS_SINK", 4);
+        outputs.main.lock().add(tx);
+        let handle = runtime.port_handle().clone();
+        let s = shared(
+            ops,
+            handle.clone(),
+            p,
+            ad,
+            Model::Eiger1,
+            ApiVersion::V1_6_0,
+            "127.0.0.1".to_string(),
+            outputs,
+            DriverPool::standalone(0),
+            &signals,
+        );
+
+        // A client's store of both counters, sent from the port thread as frame
+        // 0 posts its counter: it reaches the port ahead of everything frame 1
+        // sends. A direct op, so the asyn queue cannot reorder it.
+        let (counter, images) = (ad.base.array_counter, ad.num_images_counter);
+        let written = AtomicBool::new(false);
+        let client = handle.clone();
+        let _sub = handle
+            .interrupts()
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(counter),
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                move |iv| {
+                    if matches!(iv.value, ParamValue::Int32(1))
+                        && !written.swap(true, Ordering::AcqRel)
+                    {
+                        let updates = [counter, images]
+                            .map(|r| ParamSetValue::new(r, 0, ParamValue::Int32(100)))
+                            .to_vec();
+                        client
+                            .try_submit(
+                                RequestOp::CallParamCallbacks {
+                                    addr: 0,
+                                    updates,
+                                    time_stamp: None,
+                                },
+                                AsynUser::new(0),
+                            )
+                            .expect("client write");
+                    }
+                },
+            )
+            .unwrap();
+
+        s.set_int(s.ad.base.array_callbacks, 1).await;
+        parse_h5(&s, &h5_file([2, 1, 2])).await.expect("parse");
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            ids.push(rx.recv().await.expect("array").unique_id);
+        }
+        assert_eq!(ids, [0, 1]);
+        assert_eq!(s.get_int(counter).await, 2);
+        assert_eq!(s.get_int(images).await, 2);
         std::mem::forget(runtime);
     }
 
