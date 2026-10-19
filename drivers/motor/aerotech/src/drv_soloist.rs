@@ -266,7 +266,7 @@ impl DrvSoloistAxis {
 impl Model1Motor for DrvSoloistAxis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.status.clone(), self.poll_failure())
     }
 }
 
@@ -457,6 +457,41 @@ mod tests {
         assert_eq!(decimals(1.0), 2);
         assert_eq!(decimals(1.0 / 3.0), 2);
         assert_eq!(decimals(1000.0), 1);
+    }
+
+    /// drvSoloist.cc:640-734: a failed `motor_init` read stores the
+    /// EA_PRESENT and GAIN_SUPPORT GETPARM(58) and GETPARM(33) gave, a
+    /// missed reply raising nothing (RETRY) and a refused one
+    /// CNTRL_COMM_ERR and RA_PROBLEM (:228-250).
+    #[test]
+    fn a_failed_init_read_keeps_what_motor_init_set() {
+        use motor_common::testing::LineRig;
+        let init = |name, reply: &'static str, encoder| {
+            let (_line, io) = LineRig::new(name, move |_| reply.into());
+            let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+            let setup = AxisSetup {
+                encoder,
+                gain: true,
+                resolution: 1.0,
+                digits: 0,
+                home_dparam: 0,
+            };
+            DrvSoloistAxis::new(card, setup).take_init_status()
+        };
+        let prepared = |encoder| MotorStatus {
+            gain_support: true,
+            has_encoder: encoder,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init("soloistInitMissed", "", true), prepared(true));
+        assert_eq!(
+            init("soloistInitRefused", "!", false),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared(false)
+            }
+        );
     }
 
     /// motorRecord.cc:2141, :3068: a jog's SET_ACCEL goes out at any rate,
