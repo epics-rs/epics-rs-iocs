@@ -1044,6 +1044,8 @@ mod tests {
         base: PortDriverBase,
         rig: Rig,
         reply: Option<Vec<u8>>,
+        /// The pending reply ends in a timeout.
+        cut: bool,
     }
 
     #[derive(Clone, Default)]
@@ -1053,15 +1055,26 @@ mod tests {
         disconnects: Arc<AtomicUsize>,
         /// Commands the port takes this long to answer.
         slow: Arc<Mutex<HashMap<String, Duration>>>,
+        /// Commands whose reply a timeout cuts short.
+        cut: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     }
 
     impl Rig {
         fn answer(&self, command: &str, reply: &[u8]) {
+            self.cut.lock().unwrap().remove(command);
             let mut replies = self.replies.lock().unwrap();
             replies.insert(command.into(), reply.into());
         }
         fn silence(&self, command: &str) {
             self.replies.lock().unwrap().remove(command);
+            self.cut.lock().unwrap().remove(command);
+        }
+        fn cut(&self, command: &str, partial: &[u8]) {
+            self.replies.lock().unwrap().remove(command);
+            self.cut
+                .lock()
+                .unwrap()
+                .insert(command.into(), partial.into());
         }
         fn written(&self) -> Vec<String> {
             std::mem::take(&mut *self.written.lock().unwrap())
@@ -1090,7 +1103,9 @@ mod tests {
         }
         fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data).into_owned();
-            self.reply = self.rig.replies.lock().unwrap().get(&cmd).cloned();
+            let cut = self.rig.cut.lock().unwrap().get(&cmd).cloned();
+            self.cut = cut.is_some();
+            self.reply = cut.or_else(|| self.rig.replies.lock().unwrap().get(&cmd).cloned());
             if let Some(&delay) = self.rig.slow.lock().unwrap().get(&cmd) {
                 std::thread::sleep(delay);
             }
@@ -1109,10 +1124,20 @@ mod tests {
                 });
             };
             buf[..reply.len()].copy_from_slice(&reply);
-            epics_rs::asyn::interpose::OctetReadResult::ok(
+            let read = epics_rs::asyn::interpose::OctetReadResult::ok(
                 reply.len(),
                 epics_rs::asyn::interpose::EomReason::empty(),
-            )
+            );
+            if !self.cut {
+                return read;
+            }
+            epics_rs::asyn::interpose::OctetReadResult {
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "timeout".into(),
+                }),
+                ..read
+            }
         }
     }
 
@@ -1128,6 +1153,7 @@ mod tests {
             ),
             rig: rig.clone(),
             reply: None,
+            cut: false,
         };
         let claim = claim_port(name).unwrap();
         let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
@@ -2090,6 +2116,15 @@ mod tests {
             own.take(),
             "drvPmacAxisGetStatus: not all status values returned. Status: 1\n\
              Command :#1 ? F P\nResponse:"
+        );
+        // pmacAxis.cpp:493-498: a read a timeout cut short prints what it
+        // delivered.
+        rig.cut("#1 ? F P", b"882000");
+        axis.poll(&user).unwrap();
+        assert_eq!(
+            own.take(),
+            "drvPmacAxisGetStatus: not all status values returned. Status: 1\n\
+             Command :#1 ? F P\nResponse:882000"
         );
 
         let warning = "*** WARNING *** Limits are disabled on controller pmacAxErrCtl, axis 1\n";
