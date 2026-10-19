@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use epics_rs::ad_core::driver::ADStatus;
+use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::AsynError;
@@ -86,5 +87,12 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
         base.get_string_param(driver.ad.params.base.manufacturer, 0)
             .unwrap(),
         b"Dectris"
+    );
+    // C publishes UInt32 frames but sets NDDataType to NDInt32
+    // (mythen.cpp:1345, :979).
+    assert_eq!(
+        base.get_int32_param(driver.ad.params.base.data_type, 0)
+            .unwrap(),
+        NDDataType::Int32 as i32
     );
 }

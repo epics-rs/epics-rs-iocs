@@ -178,7 +178,9 @@ impl MythenDriver {
         base.set_int32_param(self.ad.params.size_x, 0, SENSOR_SIZE_X)?;
         base.set_int32_param(self.ad.params.size_y, 0, SENSOR_SIZE_Y)?;
         base.set_int32_param(self.ad.params.base.array_size, 0, 0)?;
-        base.set_int32_param(self.ad.params.base.data_type, 0, NDDataType::UInt32 as i32)?;
+        // NDInt32 although dataCallback publishes NDUInt32 frames, as C does
+        // (mythen.cpp:1345, :979).
+        base.set_int32_param(self.ad.params.base.data_type, 0, NDDataType::Int32 as i32)?;
         base.set_int32_param(self.ad.params.image_mode, 0, ImageMode::Single as i32)?;
 
         let status = q.run(self.det.get_status());
