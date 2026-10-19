@@ -1,10 +1,9 @@
 //! The Pixirad areaDetector driver (C `pixirad.cpp`).
 //!
-//! Ownership: every command to the box goes through [`PixiradServer`]; the port
-//! actor owns the parameter library and is the only thing that reacts to a
-//! record write. The three background threads — UDP data listener, data task,
-//! status task — reach the parameter library through the actor and never call
-//! into the driver directly (see the invariant in [`crate::connection`]).
+//! Ownership: the driver owns the [`PixiradServer`], so every command to the
+//! box runs on the port actor and goes through [`PixiradDetector::exchange`].
+//! The three background threads — UDP data listener, data task, status task —
+//! reach the driver only through the actor.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -27,7 +26,7 @@ use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 
-use crate::connection::{Exchange, PixiradServer};
+use crate::connection::{Exchange, PixiradServer, ServerError};
 use crate::params::PixiradParams;
 use crate::protocol;
 use crate::task::{self, DataContext, StatusContext};
@@ -123,7 +122,6 @@ impl PixiradDetector {
         base.set_float64_param(params.threshold[1], 0, 15.0)?;
         base.set_float64_param(params.threshold[2], 0, 20.0)?;
         base.set_float64_param(params.threshold[3], 0, 25.0)?;
-        base.set_float64_param(params.hit_threshold, 0, 0.0)?;
         base.set_int32_param(params.sync_in_polarity, 0, SyncPolarity::Pos as i32)?;
         base.set_int32_param(params.sync_out_polarity, 0, SyncPolarity::Pos as i32)?;
         base.set_int32_param(params.sync_out_function, 0, SyncOutFunction::Shutter as i32)?;
@@ -171,17 +169,20 @@ impl PixiradDetector {
     /// Ask the box who it is (C's constructor).
     fn identify(&mut self) -> AsynResult<()> {
         let reply = self.exchange(&protocol::get_firmware_version())?.reply;
-        if let Some((serial, version)) = protocol::parse_firmware_version(&reply) {
-            let base = &mut self.ad.port_base;
-            base.set_string_param(self.ad.params.base.serial_number, 0, serial)?;
-            base.set_string_param(self.ad.params.base.firmware_version, 0, version)?;
-        }
+        // C bug, pixirad.cpp:448-449, :564-566: both are set whatever the
+        // reply, and a part `sscanf` did not match publishes the uninitialised
+        // `serialNumber` and a `tempString` still holding the driver version.
+        // Here such a part is empty.
+        let (serial, version) = protocol::parse_firmware_version(&reply);
+        let base = &mut self.ad.port_base;
+        let p = self.ad.params.base;
+        base.set_string_param(p.serial_number, 0, serial.unwrap_or_default())?;
+        base.set_string_param(p.firmware_version, 0, version.unwrap_or_default())?;
 
         let reply = self.exchange(&protocol::get_additional_info())?.reply;
         // C added the length of the marker to a null `strstr` result and
         // published whatever was at that address.
         if let Some(info) = protocol::parse_additional_info(&reply) {
-            let info = info.trim().to_string();
             self.ad
                 .port_base
                 .set_string_param(self.params.system_info, 0, info)?;
@@ -197,12 +198,16 @@ impl PixiradDetector {
     /// Send one command; publish both sides of it and whether the box took it.
     fn exchange(&mut self, command: &str) -> AsynResult<Exchange> {
         let exchange = self.server.command(command);
+        // C sets the message only on a reply (pixirad.cpp:910-920).
         let message = match &exchange.result {
-            Ok(()) => "Server returned OK",
-            Err(_) => "Error from server",
+            Ok(()) => Some("Server returned OK"),
+            Err(ServerError::Rejected(_)) => Some("Error from server"),
+            Err(_) => None,
         };
         let base = &mut self.ad.port_base;
-        base.set_string_param(self.ad.params.status_message, 0, message)?;
+        if let Some(message) = message {
+            base.set_string_param(self.ad.params.status_message, 0, message)?;
+        }
         base.set_string_param(self.ad.params.string_to_server, 0, command)?;
         base.set_string_param(self.ad.params.string_from_server, 0, exchange.reply.clone())?;
         Ok(exchange)
@@ -249,6 +254,29 @@ impl PixiradDetector {
             .unwrap_or(SyncOutFunction::Shutter);
         let command = protocol::set_sync(sync_in, sync_out, function);
         self.command(&command)
+    }
+
+    /// One pass of C statusTask under the port lock: the broadcast readings,
+    /// then the dew point and cooling status when every input arrived, then on
+    /// an error CoolingState off and `setCoolingAndHV` (its status ignored),
+    /// and one `callParamCallbacks`, which posts in that order.
+    pub(crate) fn post_status(
+        &mut self,
+        readings: &[(usize, f64)],
+        cooling: Option<(f64, CoolingStatus)>,
+    ) -> AsynResult<()> {
+        for &(reason, value) in readings {
+            self.set_float64(reason, value)?;
+        }
+        if let Some((dew_point, status)) = cooling {
+            self.set_float64(self.params.dew_point, dew_point)?;
+            self.set_int32(self.params.cooling_status, status as i32)?;
+            if status.is_error() {
+                self.set_int32(self.params.cooling_state, 0)?;
+                let _ = self.set_cooling_and_hv();
+            }
+        }
+        self.ad.port_base.call_param_callbacks(0)
     }
 
     fn frame_type(&self) -> FrameType {
@@ -570,10 +598,9 @@ pub fn create_pixirad_detector(
         udp_speed: AtomicU64::new(0),
     });
 
-    let server = PixiradServer::new(command_handle);
     let det = PixiradDetector::new(
         port_name,
-        server.clone(),
+        PixiradServer::new(command_handle),
         max_size_x,
         max_size_y,
         max_memory,
@@ -586,13 +613,14 @@ pub fn create_pixirad_detector(
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
 
-    let mut threads = vec![task::start_status_task(StatusContext {
+    let mut threads = vec![task::start_status_task(
         status_port,
-        server,
-        handle: runtime_handle.port_handle().clone(),
-        ad_params,
-        params,
-    })];
+        StatusContext {
+            handle: runtime_handle.port_handle().clone(),
+            ad_params,
+            params,
+        },
+    )];
     // C starts the data tasks on an uninitialised sensor; without one there is
     // no frame to read.
     if let Some(sensor) = sensor {
@@ -648,9 +676,28 @@ mod tests {
         reject: Option<&'static str>,
         max_memory: usize,
     ) -> PixiradDetector {
-        let addr = match reject {
+        let answer = reject.map(|reject| {
+            move |command: &str| -> Vec<u8> {
+                if command.contains(reject) {
+                    b"NAK".to_vec()
+                } else {
+                    b"GOT: OK".to_vec()
+                }
+            }
+        });
+        detector_answering(name, answer, max_memory)
+    }
+
+    /// A box that sends `answer(command)` back for each command; `None` is a
+    /// box that never accepts the connection.
+    fn detector_answering(
+        name: &str,
+        answer: Option<impl Fn(&str) -> Vec<u8> + Send + 'static>,
+        max_memory: usize,
+    ) -> PixiradDetector {
+        let addr = match answer {
             None => "127.0.0.1:1".to_string(),
-            Some(reject) => {
+            Some(answer) => {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 let addr = listener.local_addr().unwrap().to_string();
                 std::thread::spawn(move || {
@@ -660,13 +707,8 @@ mod tests {
                         if n == 0 {
                             break;
                         }
-                        let command = String::from_utf8_lossy(&buf[..n]);
-                        let reply: &[u8] = if command.contains(reject) {
-                            b"NAK"
-                        } else {
-                            b"GOT: OK"
-                        };
-                        if stream.write_all(reply).is_err() {
+                        let reply = answer(&String::from_utf8_lossy(&buf[..n]));
+                        if stream.write_all(&reply).is_err() {
                             break;
                         }
                     }
@@ -738,6 +780,51 @@ mod tests {
         );
     }
 
+    /// C never sets PixiradHitThresh (pixirad.cpp:510-544), so the PINI ao
+    /// keeps its database VAL instead of reading a driver default back.
+    #[test]
+    fn the_hit_threshold_starts_undefined() {
+        let det = detector("PIXI_HIT_UNSET", None);
+        assert!(
+            det.ad
+                .port_base
+                .get_float64_param(det.params.hit_threshold, 0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_dead_box_still_sets_serial_number_and_firmware_version() {
+        let det = detector("PIXI_DEAD_ID", None);
+        let p = det.ad.params.base;
+        for reason in [p.serial_number, p.firmware_version] {
+            assert_eq!(det.ad.port_base.get_string_param(reason, 0).unwrap(), b"");
+        }
+    }
+
+    /// pixirad.cpp:569-570 publishes the bytes after the marker as they came.
+    #[test]
+    fn system_info_keeps_the_raw_reply() {
+        let det = detector_answering(
+            "PIXI_SYSINFO",
+            Some(|command: &str| -> Vec<u8> {
+                if command.contains("GET_ADDITIONAL_INFO") {
+                    b"ADDITIONAL INFO:  box 3 \t".to_vec()
+                } else {
+                    b"GOT: OK".to_vec()
+                }
+            }),
+            1 << 20,
+        );
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_string_param(det.params.system_info, 0)
+                .unwrap(),
+            b"  box 3 \t"
+        );
+    }
+
     #[test]
     fn a_base_class_write_reaches_addriver() {
         use epics_rs::ad_core::driver::ShutterMode;
@@ -767,9 +854,24 @@ mod tests {
             .write_int32(&mut AsynUser::new(q.hv_state), 0)
             .unwrap_err();
         assert_ne!(e.status(), AsynStatus::Success);
+        assert_eq!(e.message(), "", "C returns writeReadServer's bare status");
         assert!(
             det.write_float64(&mut AsynUser::new(q.hit_threshold), 1.0)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_failed_exchange_leaves_the_status_message() {
+        let mut det = detector("PIXI_DEAD_MSG", None);
+        let q = det.params;
+        let _ = det.write_int32(&mut AsynUser::new(q.hv_state), 0);
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_string_param(det.ad.params.status_message, 0)
+                .unwrap(),
+            b""
         );
     }
 
@@ -781,9 +883,128 @@ mod tests {
             .write_int32(&mut AsynUser::new(q.cooling_state), 1)
             .unwrap_err();
         assert_eq!(e.status(), AsynStatus::Error);
+        assert_eq!(e.message(), "");
         // A command the box takes is a success.
         det.write_int32(&mut AsynUser::new(q.sync_in_polarity), 1)
             .unwrap();
+    }
+
+    /// A status task on a box that takes every command, fed broadcasts by the
+    /// test; its port is open, as after iocInit.
+    struct StatusTask {
+        handle: PortHandle,
+        ad: ADBaseParams,
+        params: PixiradParams,
+        port: u16,
+    }
+
+    impl StatusTask {
+        fn start(name: &str) -> Self {
+            let det = detector(name, Some("NEVER"));
+            let (ad, params) = (det.ad.params, det.params);
+            let claim = claim_port(name).unwrap();
+            let (runtime, _) = create_port_runtime(&claim, det, RuntimeConfig::default()).unwrap();
+            let handle = runtime.port_handle().clone();
+            claim
+                .publish(handle.clone(), &epics_rs::asyn::registry::open_owner())
+                .unwrap();
+            std::mem::forget(runtime);
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = socket.local_addr().unwrap().port();
+            task::start_status_task_on(
+                socket,
+                StatusContext {
+                    handle: handle.clone(),
+                    ad_params: ad,
+                    params,
+                },
+            );
+            Self {
+                handle,
+                ad,
+                params,
+                port,
+            }
+        }
+
+        fn published(&self, reason: usize) -> Vec<u8> {
+            self.handle
+                .with_driver_blocking(move |d: &mut PixiradDetector| {
+                    d.ad.port_base.get_string_param(reason, 0).unwrap().to_vec()
+                })
+                .unwrap()
+        }
+
+        /// Broadcast a cold side at 45 C (TColdError) until the cooling-off
+        /// exchange is published.
+        fn overheat(&self) {
+            let message = "READ_TCOLD 45.0 READ_THOT 25.0 READ_BOX_TEMP 20.0 READ_BOX_HUM 10.0 \
+                           READ_PELTIER_PWR 1.0 READ_HV 350.0 READ_HV_CURRENT 0.1";
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !self
+                .published(self.ad.string_to_server)
+                .starts_with(b"DAQ:! INIT")
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the cooling-off exchange never reached ADStringToServer"
+                );
+                sender
+                    .send_to(message.as_bytes(), ("127.0.0.1", self.port))
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+
+    /// C statusTask switches the cooling off through `setCoolingAndHV`, whose
+    /// `writeReadServer` publishes the exchange (pixirad.cpp:1363-1369, :916-924).
+    #[test]
+    fn the_status_task_publishes_its_cooling_off_exchange() {
+        let st = StatusTask::start("PIXI_STATUS_OFF");
+        st.overheat();
+        let command = protocol::init(INITIAL_COOLING_VALUE, 0, INITIAL_HV_VALUE, 1);
+        assert_eq!(st.published(st.ad.string_to_server), command.as_bytes());
+        assert_eq!(st.published(st.ad.string_from_server), b"GOT: OK");
+        assert_eq!(st.published(st.ad.status_message), b"Server returned OK");
+    }
+
+    /// C statusTask posts the readings, CoolingState and the exchange in one
+    /// `callParamCallbacks` (pixirad.cpp:1325-1370), which posts in the order
+    /// the parameters were set (asynPortDriver.cpp:841-843).
+    #[test]
+    fn the_status_task_posts_its_cooling_off_in_one_pass() {
+        let st = StatusTask::start("PIXI_STATUS_PASS");
+        let mut posts = st.handle.interrupts().subscribe_async(256, 0);
+        st.overheat();
+        let mut reasons = Vec::new();
+        while let Ok(v) = posts.try_recv() {
+            reasons.push(v.reason);
+        }
+        // The open flush can still be delivering when the subscription starts;
+        // the status pass is what follows its last reading.
+        let pass = reasons
+            .iter()
+            .rposition(|&r| r == st.ad.temperature_actual)
+            .map_or(&[][..], |at| &reasons[at..]);
+        let p = st.params;
+        assert_eq!(
+            pass,
+            [
+                st.ad.temperature_actual,
+                p.hot_temperature,
+                p.box_temperature,
+                p.box_humidity,
+                p.peltier_power,
+                p.hv_actual,
+                p.hv_current,
+                p.dew_point,
+                p.cooling_status,
+                p.cooling_state,
+                st.ad.string_to_server,
+            ]
+        );
     }
 
     #[test]

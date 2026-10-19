@@ -20,9 +20,8 @@ use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
-use crate::connection::PixiradServer;
 use crate::decode::Decoder;
-use crate::driver::SharedState;
+use crate::driver::{PixiradDetector, SharedState};
 use crate::params::PixiradParams;
 use crate::protocol;
 use crate::types::{FrameType, MAX_UDP_DATA_BUFFER, MAX_UDP_PACKET_LEN, Sensor};
@@ -375,8 +374,6 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
 // ────────────────────────────────── status ───────────────────────────────────
 
 pub(crate) struct StatusContext {
-    pub status_port: u16,
-    pub server: PixiradServer,
     pub handle: PortHandle,
     pub ad_params: ADBaseParams,
     pub params: PixiradParams,
@@ -394,23 +391,33 @@ impl StatusContext {
     }
 }
 
-pub(crate) fn start_status_task(ctx: StatusContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PixiradStatusTask", move || status_loop(ctx))
+pub(crate) fn start_status_task(
+    status_port: u16,
+    ctx: StatusContext,
+) -> std::thread::JoinHandle<()> {
+    rt::run_thread_named("PixiradStatusTask", move || async move {
+        match udp::bind_status_socket(status_port) {
+            Ok(socket) => status_loop(socket, ctx).await,
+            // C returns here still holding the port lock, which wedges the
+            // port; only the task stops.
+            Err(e) => ctx.trace_error(&format!("pixirad:statusTask: {e}\n")),
+        }
+    })
+}
+
+/// The status task on a socket the caller already holds, so no other socket
+/// can take the port between a bind and the task's own.
+#[cfg(test)]
+pub(crate) fn start_status_task_on(
+    socket: std::net::UdpSocket,
+    ctx: StatusContext,
+) -> std::thread::JoinHandle<()> {
+    rt::run_thread_named("PixiradStatusTask", move || status_loop(socket, ctx))
 }
 
 /// Read the environmental broadcast, work out the dew point, and switch the
 /// cooling off if the box is in trouble (C `statusTask`).
-async fn status_loop(ctx: StatusContext) {
-    let socket = match udp::bind_status_socket(ctx.status_port) {
-        Ok(socket) => socket,
-        Err(e) => {
-            // C returns here still holding the port lock, which wedges the
-            // port; only the task stops.
-            ctx.trace_error(&format!("pixirad:statusTask: {e}\n"));
-            return;
-        }
-    };
-    let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, Duration::from_secs(30));
+async fn status_loop(socket: std::net::UdpSocket, ctx: StatusContext) {
     // C blocked in `recvfrom` for ever; a timeout keeps the loop alive when the
     // box stops broadcasting.
     let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
@@ -431,7 +438,8 @@ async fn status_loop(ctx: StatusContext) {
                 continue;
             }
         };
-        let message = String::from_utf8_lossy(&buffer[..n]).to_string();
+        let datagram = &buffer[..n];
+        let message = String::from_utf8_lossy(protocol::c_string(datagram)).to_string();
 
         let readings = [
             ("READ_TCOLD", ctx.ad_params.temperature_actual),
@@ -443,13 +451,13 @@ async fn status_loop(ctx: StatusContext) {
             ("READ_HV_CURRENT", ctx.params.hv_current),
         ];
 
-        let mut updates = Vec::new();
+        let mut found = Vec::new();
         let mut cold_temp = None;
         let mut hot_temp = None;
         let mut box_temp = None;
         let mut humidity = None;
         for (key, reason) in readings {
-            let Some(value) = protocol::status_value(&message, key) else {
+            let Some(value) = protocol::status_value(datagram, key) else {
                 ctx.trace_error(&format!(
                     "pixirad:statusTask: {} {key} in status broadcast message={message}\n",
                     if message.contains(key) {
@@ -467,51 +475,25 @@ async fn status_loop(ctx: StatusContext) {
                 "READ_BOX_HUM" => humidity = Some(value),
                 _ => {}
             }
-            updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(value)));
+            found.push((reason, value));
         }
 
         // C computed the dew point from whatever was last in the parameter
         // library, so a broadcast that was missing the humidity produced a dew
         // point from a stale reading and could switch the cooling off on it.
-        let (Some(cold_temp), Some(hot_temp), Some(box_temp), Some(humidity)) =
-            (cold_temp, hot_temp, box_temp, humidity)
-        else {
-            let _ = ctx.handle.set_params_and_notify(0, updates).await;
-            continue;
+        let cooling = match (cold_temp, hot_temp, box_temp, humidity) {
+            (Some(cold_temp), Some(hot_temp), Some(box_temp), Some(humidity)) => {
+                let dew_point = protocol::dew_point(humidity, box_temp);
+                Some((
+                    dew_point,
+                    protocol::cooling_status(cold_temp, hot_temp, dew_point),
+                ))
+            }
+            _ => None,
         };
-
-        let dew_point = protocol::dew_point(humidity, box_temp);
-        let cooling_status = protocol::cooling_status(cold_temp, hot_temp, dew_point);
-        updates.push(ParamSetValue::new(
-            ctx.params.dew_point,
-            0,
-            ParamValue::Float64(dew_point),
-        ));
-        updates.push(ParamSetValue::new(
-            ctx.params.cooling_status,
-            0,
-            ParamValue::Int32(cooling_status as i32),
-        ));
-        if cooling_status.is_error() {
-            updates.push(ParamSetValue::new(
-                ctx.params.cooling_state,
-                0,
-                ParamValue::Int32(0),
-            ));
-        }
-        let _ = ctx.handle.set_params_and_notify(0, updates).await;
-
-        if !cooling_status.is_error() {
-            continue;
-        }
-
-        // Switch the cooling off at the box. Every parameter it needs is read
-        // before the command socket is taken — see the invariant in
-        // `crate::connection`.
-        let temperature = sync.read_float64(ctx.ad_params.temperature).unwrap_or(0.0);
-        let hv_value = sync.read_float64(ctx.params.hv_value).unwrap_or(0.0);
-        let hv_state = sync.read_int32(ctx.params.hv_state).unwrap_or(0);
-        let command = protocol::init(temperature, 0, hv_value, hv_state);
-        let _ = ctx.server.command(&command);
+        let _ = ctx
+            .handle
+            .with_driver(move |d: &mut PixiradDetector| d.post_status(&found, cooling))
+            .await;
     }
 }

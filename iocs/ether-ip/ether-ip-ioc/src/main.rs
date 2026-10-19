@@ -16,65 +16,66 @@ use ether_ip::driver;
 
 /// `ether_ipApp/src/ether_ip-{3-14,lint,lsio}.dbd`'s `device()` lines.
 static DEVICES: &[(&str, &[DevSup])] = &[
-    ("ai", &[row("devAiEtherIP", device::DTYP, 6, &[1, 2, 3, 4])]),
-    ("bi", &[row("devBiEtherIP", device::DTYP, 5, &[1, 2, 3, 4])]),
+    ("ai", &[row("devAiEtherIP", device::DTYP, 6, &[2, 3, 4])]),
+    ("bi", &[row("devBiEtherIP", device::DTYP, 5, &[2, 3, 4])]),
     (
         "int64in",
-        &[row("devInt64inEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
+        &[row("devInt64inEtherIP", device::DTYP, 5, &[2, 3, 4])],
     ),
-    (
-        "lsi",
-        &[row("devLsiEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
-    ),
+    ("lsi", &[row("devLsiEtherIP", device::DTYP, 5, &[2, 3, 4])]),
     (
         "mbbi",
-        &[row("devMbbiEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
+        &[row("devMbbiEtherIP", device::DTYP, 5, &[2, 3, 4])],
     ),
     (
         "mbbiDirect",
-        &[row("devMbbiDirectEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
+        &[row("devMbbiDirectEtherIP", device::DTYP, 5, &[2, 3, 4])],
     ),
     (
         "stringin",
-        &[row("devSiEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
+        &[row("devSiEtherIP", device::DTYP, 5, &[2, 3, 4])],
     ),
     (
         "waveform",
-        &[row("devWfEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
+        &[row("devWfEtherIP", device::DTYP, 5, &[2, 3, 4])],
     ),
-    ("ao", &[row("devAoEtherIP", device::DTYP, 6, &[1, 2, 4])]),
+    ("ao", &[row("devAoEtherIP", device::DTYP, 6, &[2, 4])]),
     (
         "bo",
         &[
-            row("devBoEtherIP", device::DTYP, 6, &[1, 2, 4]),
-            row("devBoEtherIPReset", device::DTYP_RESET, 6, &[4]),
+            row("devBoEtherIP", device::DTYP, 6, &[2, 4]),
+            DevSup {
+                name: "devBoEtherIPReset",
+                choice: device::DTYP_RESET,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[4], false),
+            },
         ],
     ),
     (
         "int64out",
-        &[row("devInt64outEtherIP", device::DTYP, 5, &[1, 2, 4])],
+        &[row("devInt64outEtherIP", device::DTYP, 5, &[2, 4])],
     ),
-    ("lso", &[row("devLsoEtherIP", device::DTYP, 5, &[1, 2, 4])]),
-    (
-        "mbbo",
-        &[row("devMbboEtherIP", device::DTYP, 5, &[1, 2, 4])],
-    ),
+    ("lso", &[row("devLsoEtherIP", device::DTYP, 5, &[2, 4])]),
+    ("mbbo", &[row("devMbboEtherIP", device::DTYP, 5, &[2, 4])]),
     (
         "mbboDirect",
-        &[row("devMbboDirectEtherIP", device::DTYP, 5, &[1, 2, 4])],
+        &[row("devMbboDirectEtherIP", device::DTYP, 5, &[2, 4])],
     ),
     (
         "stringout",
-        &[row("devSoEtherIP", device::DTYP, 5, &[1, 2, 4])],
+        &[row("devSoEtherIP", device::DTYP, 5, &[2, 4])],
     ),
 ];
 
+/// A devEtherIP row whose `init` is the shared `init(run)`, which calls
+/// `devExtend` at run 0 (`devEtherIP.c:1227-1230` and its twins).
 const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'static [u8]) -> DevSup {
     DevSup {
         name,
         choice,
         link_type: DbLinkType::InstIo,
-        dset: Dset::new(number, funcs, false),
+        dset: Dset::new(number, funcs, true).with_init(driver::dev_init),
     }
 }
 
@@ -288,4 +289,42 @@ async fn main() -> CaResult<()> {
     init_hook_register(std::sync::Arc::new(driver::init_hook));
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every devEtherIP dset but devBoEtherIPReset has `init` (devEtherIP.c),
+    /// so `finishDevSup` starts the driver through any of them.
+    #[test]
+    fn every_dset_but_reset_runs_dev_init() {
+        let dev_init: fn(bool) = driver::dev_init;
+        for (record_type, rows) in DEVICES {
+            for row in *rows {
+                assert_eq!(
+                    row.dset.init().map(|f| f as usize),
+                    (row.name != "devBoEtherIPReset").then_some(dev_init as usize),
+                    "{record_type} {}",
+                    row.name
+                );
+            }
+        }
+    }
+
+    /// Every devEtherIP dset but devBoEtherIPReset calls `devExtend` from its
+    /// `init(0)`, so a runtime INP/OUT put passes `dbPutFieldLink`'s gate.
+    #[test]
+    fn every_dset_but_reset_extends() {
+        for (record_type, rows) in DEVICES {
+            for row in *rows {
+                assert_eq!(
+                    row.has_dsxt(),
+                    row.name != "devBoEtherIPReset",
+                    "{record_type} {}",
+                    row.name
+                );
+            }
+        }
+    }
 }

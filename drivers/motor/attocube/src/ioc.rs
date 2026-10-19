@@ -95,6 +95,9 @@ pub fn anc150_config_command() -> CommandDef {
                 println!("ANC150AsynConfig: cannot connect to asyn port {port_name}");
                 return Ok(CommandOutcome::Continue);
             };
+            // UPSTREAM DEFECT (drvANC150Asyn.cc:260, :295): C returns here with
+            // pAxis never allocated, so motorAxisOpen's &pAxis[axis] segfaults
+            // in motorAxisSetCallback. No card is registered here instead.
             let Ok(controller) = Anc150Controller::new(handle, &port_name) else {
                 return Ok(CommandOutcome::Continue);
             };

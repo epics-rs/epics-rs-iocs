@@ -1110,8 +1110,6 @@ impl QuadEmBase {
         )?;
         let params = QuadEmParams::create(&mut port_base)?;
 
-        port_base.set_int32_param(nd_params.array_callbacks, 0, 1)?;
-
         // C++ drvQuadEM constructor defaults.
         port_base.set_int32_param(params.ring_overflows, 0, 0)?;
         port_base.set_int32_param(params.ping_pong, 0, 0)?;
@@ -1787,6 +1785,15 @@ mod tests {
         assert_eq!(pb.get_float64_param(nd.timestamp_rbv, 0).unwrap(), 0.0);
         assert_eq!(pb.get_int32_param(nd.n_dimensions, 0).unwrap(), 0);
         assert_eq!(pb.get_int32_param(nd.bayer_pattern, 0).unwrap(), 0);
+    }
+
+    /// Neither drvQuadEM.cpp nor asynNDArrayDriver sets NDArrayCallbacks, so it
+    /// stays undefined until its record writes it.
+    #[test]
+    fn construction_leaves_array_callbacks_undefined() {
+        let base = QuadEmBase::new("QE_ARRAY_CB", 0).unwrap();
+        let reason = base.nd_params.array_callbacks;
+        assert!(base.port_base.get_int32_param(reason, 0).is_err());
     }
 
     /// drvQuadEM.cpp sets no PoolMaxMemory, so it reads the 0 the base

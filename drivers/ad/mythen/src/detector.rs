@@ -230,6 +230,8 @@ impl Detector {
 
     /// C `-get nmodules` in the constructor, mythen.cpp:1363.
     pub fn read_nmodules(&self) -> AsynResult<i32> {
+        // UPSTREAM DEFECT (mythen.cpp:1364-1373): C tests `aux < 0` on the
+        // leftover inString_ of a failed read and sets SDNModules from it.
         let n = self.get_int("-get nmodules")?;
         if n > 0 {
             self.state.nmodules.store(n, Ordering::Release);
@@ -243,6 +245,8 @@ impl Detector {
     /// increasing amount of time — up to about a minute in total — and reports
     /// [`ADStatus::Error`] if the trigger never arrives.
     pub fn get_status(&self) -> AsynResult<ADStatus> {
+        // UPSTREAM DEFECT (mythen.cpp:515-516): C decodes a failed read's
+        // leftover inString_ as the status word; rs returns the error.
         let mut bits = protocol::status_bits(self.get_int("-get status")?);
 
         if protocol::is_idle(bits) {
@@ -396,11 +400,17 @@ impl Detector {
     /// A reply outside the range C checks for (`goto error`) fails the whole
     /// read, exactly as in C.
     pub fn get_settings(&self) -> AsynResult<Settings> {
+        // UPSTREAM DEFECT (mythen.cpp:696-712): C ignores writeReadMeter's
+        // status and decodes whatever a failed read left in inString_, so a
+        // silent detector publishes these as 0. rs fails the read instead.
         let use_flat_field = self.get_bool("-get flatfieldcorrection")?;
         let use_bad_chan_intrpl = self.get_bool("-get badchannelinterpolation")?;
         let use_count_rate = self.get_bool("-get ratecorrection")?;
 
         let nbits = self.get_int("-get nbits")?;
+        // UPSTREAM DEFECT (mythen.cpp:717-719): C accepts 0 here and then
+        // divides by it (`chanperline_ = 32/aux`, SIGFPE). 0 is kept as C
+        // keeps it; `protocol::channels_per_word` reads it as one channel.
         if nbits < 0 {
             return Err(self.settings_error("-get nbits", nbits.to_string()));
         }

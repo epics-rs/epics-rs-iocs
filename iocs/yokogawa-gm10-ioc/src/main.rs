@@ -25,45 +25,29 @@ use yokogawa_gm10::instrument::{Registry, gm10_init};
 static DEVICES: &[(&str, &[DevSup])] = &[
     (
         "ai",
-        &[row("devGM10_ai", device_support::DTYP, 6, &[1, 2, 3, 4])],
+        &[row("devGM10_ai", device_support::DTYP, 6, &[2, 3, 4])],
     ),
-    (
-        "ao",
-        &[row("devGM10_ao", device_support::DTYP, 6, &[1, 2, 4])],
-    ),
+    ("ao", &[row("devGM10_ao", device_support::DTYP, 6, &[2, 4])]),
     (
         "bi",
-        &[row("devGM10_bi", device_support::DTYP, 5, &[1, 2, 3, 4])],
+        &[row("devGM10_bi", device_support::DTYP, 5, &[2, 3, 4])],
     ),
-    (
-        "bo",
-        &[row("devGM10_bo", device_support::DTYP, 5, &[1, 2, 4])],
-    ),
+    ("bo", &[row("devGM10_bo", device_support::DTYP, 5, &[2, 4])]),
     (
         "mbbi",
-        &[row("devGM10_mbbi", device_support::DTYP, 5, &[1, 2, 3, 4])],
+        &[row("devGM10_mbbi", device_support::DTYP, 5, &[2, 3, 4])],
     ),
     (
         "mbbo",
-        &[row("devGM10_mbbo", device_support::DTYP, 5, &[1, 2, 4])],
+        &[row("devGM10_mbbo", device_support::DTYP, 5, &[2, 4])],
     ),
     (
         "longin",
-        &[row(
-            "devGM10_longin",
-            device_support::DTYP,
-            5,
-            &[1, 2, 3, 4],
-        )],
+        &[row("devGM10_longin", device_support::DTYP, 5, &[2, 3, 4])],
     ),
     (
         "stringin",
-        &[row(
-            "devGM10_stringin",
-            device_support::DTYP,
-            6,
-            &[1, 2, 3, 4],
-        )],
+        &[row("devGM10_stringin", device_support::DTYP, 6, &[2, 3, 4])],
     ),
 ];
 
@@ -72,7 +56,7 @@ const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'stat
         name,
         choice,
         link_type: DbLinkType::InstIo,
-        dset: Dset::new(number, funcs, false),
+        dset: Dset::new(number, funcs, false).with_init(device_support::dev_init),
     }
 }
 
@@ -119,4 +103,26 @@ async fn main() -> CaResult<()> {
     ));
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every devGM10_* dset has `init` (devGM10_*.c), so dbDumpDevice shows
+    /// slot 1 and the dset init passes reach it.
+    #[test]
+    fn every_dset_runs_dev_init() {
+        let dev_init: fn(bool) = device_support::dev_init;
+        for (record_type, rows) in DEVICES {
+            for row in *rows {
+                assert_eq!(
+                    row.dset.init().map(|f| f as usize),
+                    Some(dev_init as usize),
+                    "{record_type} {}",
+                    row.name
+                );
+            }
+        }
+    }
 }

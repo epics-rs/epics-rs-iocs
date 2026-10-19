@@ -1041,6 +1041,12 @@ impl Registry {
     /// C. A bad address registers nothing, where C leaves a freed
     /// `devqueue` in the list (`drvMW100.c:1525-1529`).
     pub fn init_mw100(&self, device: Option<&[u8]>, address: Option<&[u8]>) -> bool {
+        self.init_on_port(device, address, PORT)
+    }
+
+    /// [`Self::init_mw100`] connecting to `port`, C's `PORT` there; a test's
+    /// fake unit listens on a port of its own.
+    fn init_on_port(&self, device: Option<&[u8]>, address: Option<&[u8]>, port: u16) -> bool {
         let Some(name) = device.filter(|d| valid_device_name(d)) else {
             return false;
         };
@@ -1059,7 +1065,7 @@ impl Registry {
                 instrument: instrument.clone(),
             },
         );
-        TcpStream::connect(SocketAddrV4::new(address, PORT))
+        TcpStream::connect(SocketAddrV4::new(address, port))
             .and_then(|stream| instrument.start(stream))
             .is_ok()
     }
@@ -1473,9 +1479,8 @@ mod tests {
 
     #[test]
     fn failed_init_stays_listed_and_resolves_with_no_queue_thread() {
-        // 127.0.0.2 so the fixed MW100 port does not clash with a real
-        // listener on 127.0.0.1.
-        let listener = TcpListener::bind(("127.0.0.2", PORT)).unwrap();
+        let listener = TcpListener::bind(("127.0.0.2", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
         // E0 greeting, BO1, CF0, then EOF during the IS0 status load.
         let device = spawn_fake_device(
             listener,
@@ -1483,7 +1488,7 @@ mod tests {
         );
         let registry = Registry::new();
         registry.insert_connected("first", connect_default_fixture());
-        assert!(!registry.init_mw100(Some(b"dau2"), Some(b"127.0.0.2")));
+        assert!(!registry.init_on_port(Some(b"dau2"), Some(b"127.0.0.2"), port));
         device.join().unwrap();
 
         let dau2 = registry.get("dau2").unwrap();
