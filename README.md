@@ -1089,8 +1089,8 @@ protocol for the config port)
 `drivers/microepsilon` ports two independent asyn ports per physical unit:
 **L0**, a config port whose ~30-command ASCII protocol (sample rate,
 averaging, trigger mode, per-channel status/info/linearization, data-port
-number, analog filter) is translated from StreamDevice `.proto` into a
-native command table; and **L1**, a fully custom native driver with its
+number, analog filter) runs the upstream `capaNCDT6200.proto` on stream-rs;
+and **L1**, a fully custom native driver with its
 own background reader thread ingesting a raw binary TCP measurement
 stream (fixed-format packets, up to 4 channels), ported byte-for-byte
 including duplicate/missed-packet detection and averaging/throttle.

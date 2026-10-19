@@ -1,9 +1,7 @@
 # MicroEpsilon capaNCDT6200 capacitive displacement sensor, ported from
-# epics-modules/microEpsilon. Two independent asyn ports per physical unit:
-# the config port (`capaNCDT6200.proto` StreamDevice commands, translated to
-# a native asyn command table -- no StreamDevice engine in epics-rs 0.22.1)
-# and the data port (`capaNCDT6200Sup.c`, a native C asyn driver ingesting a
-# raw binary TCP measurement stream -- ported byte-for-byte).
+# epics-modules/microEpsilon: the data port (`capaNCDT6200Sup.c`, a native C
+# asyn driver ingesting a raw binary TCP measurement stream). The config
+# port's `capaNCDT6200.proto` runs on stream-rs in microepsilon-ioc.
 
 [package]
 name = "microepsilon"

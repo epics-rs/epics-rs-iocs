@@ -1422,11 +1422,9 @@ mod tests {
         let db = PvDatabase::new();
         db.add_record("TEST", record).await.unwrap();
         let rec = db.get_record("TEST").unwrap();
-        let mut inst = rec.write();
-        inst.common.dtyp = DTYP.into();
+        rec.write().common.dtyp = DTYP.into();
         // The framework's init, so the record's own status-0 arm runs.
-        wire_device_to_record(&mut inst, device);
-        drop(inst);
+        wire_device_to_record(&db, &rec, device);
         db
     }
 

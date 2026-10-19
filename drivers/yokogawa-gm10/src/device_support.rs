@@ -1305,10 +1305,10 @@ mod tests {
                 .await
                 .unwrap();
             let rec = db.get_record("TEST").unwrap();
-            let mut inst = rec.write();
-            inst.common.dtyp = DTYP.into();
+            rec.write().common.dtyp = DTYP.into();
             // The framework's init, so boRecord's status-0 RVAL->VAL arm runs.
-            wire_device_to_record(&mut inst, device);
+            wire_device_to_record(&db, &rec, device);
+            let inst = rec.read();
             assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Enum(1)));
             assert_eq!(inst.record.get_field("RVAL"), Some(EpicsValue::ULong(1)));
         });
