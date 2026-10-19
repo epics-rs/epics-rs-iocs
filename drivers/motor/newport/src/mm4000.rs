@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -640,6 +640,9 @@ pub struct Mm4000Axis {
     status: Arc<AtomicI32>,
     /// drvMM4000Asyn.c `pAxis->params`.
     params: Arc<Params>,
+    /// What model-1 `motor_init`'s `set_status` read, until the motor task
+    /// takes it; `None` on the asyn driver.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 /// C model-1 `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
@@ -687,7 +690,7 @@ impl Mm4000Axis {
                 encoder_present,
             )
         };
-        Self {
+        let mut ax = Self {
             controller,
             card,
             log,
@@ -720,7 +723,19 @@ impl Mm4000Axis {
                 let _ = params.set_integer(function::HAS_CLOSED_LOOP, 1);
                 Arc::new(params)
             },
+            init_status: None,
+        };
+        // drvMM4000.cc:811: model-1 motor_init ends each axis with
+        // set_status, on the strings its start_status left.
+        let controller = ax.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        if let Mm4000Driver::Model1(poll) = &ctrl.driver {
+            ax.init_status = Some(
+                ax.step_size()
+                    .and_then(|step| ax.model1_status(&ctrl, poll, step)),
+            );
         }
+        ax
     }
 
     /// The axis' drvMM4000Asyn.c parameters, which drvAsynMotorConfigure
@@ -748,19 +763,20 @@ impl Mm4000Axis {
         }
     }
 
-    /// The `set_status` that ends drvMM4000.cc's per-axis init, on the
-    /// strings init's `start_status` left. No-op on the asyn driver.
-    pub fn model1_set_status(&mut self) {
-        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Mm4000Driver::Model1(poll) = &ctrl.driver {
-            self.last = ctrl.set_status(
-                poll,
-                self.axis - 1,
-                self.encoder_present,
-                self.step_size,
-                &self.last,
-            );
+    /// drvMM4000.cc `set_status` on `poll`'s strings: RETRY fails raising
+    /// nothing, COMM_ERR raising `poll_failure`'s bits (:341-353).
+    fn model1_status(
+        &mut self,
+        ctrl: &Mm4000Controller,
+        poll: &Model1Poll,
+        step: f64,
+    ) -> AsynResult<MotorStatus> {
+        if poll.comm != CommStatus::Normal {
+            self.retry_failed = poll.comm == CommStatus::Retry;
+            return Err(mm_err(format!("MM4000 axis {}: no MS; reply", self.axis)));
         }
+        self.last = ctrl.set_status(poll, self.axis - 1, self.encoder_present, step, &self.last);
+        Ok(self.last.clone())
     }
 
     fn lock(&self) -> MutexGuard<'_, Mm4000Controller> {
@@ -865,6 +881,12 @@ impl Mm4000Axis {
             velocity = CFloat(velocity),
             value = CFloat(value)
         ))
+    }
+}
+
+impl Model1Motor for Mm4000Axis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 
@@ -1176,27 +1198,20 @@ impl AsynMotor for Mm4000Axis {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         self.retry_failed = false;
         let step = self.step_size()?;
-        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(poll) = ctrl.model1_poll() {
-            // drvMM4000.cc:341-353: RETRY fails the poll raising nothing,
-            // COMM_ERR raising `poll_failure`'s bits.
-            if poll.comm != CommStatus::Normal {
-                self.retry_failed = poll.comm == CommStatus::Retry;
-                return Err(mm_err(format!("MM4000 axis {}: no MS; reply", self.axis)));
-            }
-            let s = ctrl.set_status(&poll, self.axis - 1, self.encoder_present, step, &self.last);
+            let s = self.model1_status(&ctrl, &poll, step)?;
             // drvMM4000.cc:495-501: POST once the move is done or stopped by
             // the limit in its direction, past an answered MS; and TE;.
             let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
-            if poll.comm == CommStatus::Normal
-                && !s.problem
+            if !s.problem
                 && (s.done || ls_active)
                 && let Some(post) = self.strings.post_due()
             {
                 let _ = ctrl.write(&String::from_utf8_lossy(&post));
             }
-            self.last = s;
-            return Ok(self.last.clone());
+            return Ok(s);
         }
         let idx = self.axis - 1;
         let turn = ctrl.axis_turn(idx);
@@ -1480,11 +1495,7 @@ mod tests {
         let num_axes = ctrl.num_axes();
         let ctrl = Arc::new(Mutex::new(ctrl));
         let axes = (1..=num_axes)
-            .map(|axis| {
-                let mut ax = Mm4000Axis::new(ctrl.clone(), 0, axis, MODEL1_POLL_FAILURE);
-                ax.model1_set_status();
-                ax
-            })
+            .map(|axis| Mm4000Axis::new(ctrl.clone(), 0, axis, MODEL1_POLL_FAILURE))
             .collect();
         (Some(axes), sent, silent)
     }

@@ -1862,13 +1862,12 @@ pub fn mm4000_config_command() -> CommandDef {
         let line = format!("port={port}, address={addr}, id: {}", controller.firmware());
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let mut ax = Mm4000Axis::new(
+            let ax = Mm4000Axis::new(
                 controller.clone(),
                 init.card(),
                 axis,
                 mm4000::MODEL1_POLL_FAILURE,
             );
-            ax.model1_set_status();
             init.axis((axis - 1) as i32, Arc::new(Mutex::new(ax)));
         }
         init.describe(line);
@@ -3635,6 +3634,209 @@ mod report {
         assert!(
             text.contains(&format!("{head}  axis 1\n  axis 2\nPort: smcRep\n")),
             "{text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The RMPs of `dtyp`'s card 0 signals 0 and 1 once the records start.
+    async fn rmps(dtyp: &str) -> [EpicsValue; 2] {
+        let db = record_init(&format!(
+            r##"
+record(motor, "m1") {{ field(DTYP, "{dtyp}") field(OUT, "#C0 S0 @") }}
+record(motor, "m2") {{ field(DTYP, "{dtyp}") field(OUT, "#C0 S1 @") }}
+"##
+        ))
+        .await;
+        ["m1.RMP", "m2.RMP"].map(|pv| db.get_pv(pv).unwrap())
+    }
+
+    fn wire(cmds: &[&str]) -> Vec<String> {
+        cmds.iter().map(|c| c.to_string()).collect()
+    }
+
+    /// drvMM3000.cc:634-711: `motor_init` reads each axis's status once,
+    /// after its `TPE`, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn mm3000_motor_init_reads_each_status_after_its_tpe() {
+        let int = ArgValue::Int;
+        run_command(mm3000_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("mm3000InitLine", |last| match last {
+            "VE" => "MM3000 Version 2.4".into(),
+            "RC" => "1=dc 2=dc".into(),
+            "1MS" | "2MS" => "D".into(),
+            "1TP" => "14 ".into(),
+            "2TP" => "3 ".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("mm3000InitLine".into()), int(0)];
+        run_command(mm3000_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            line.sent(),
+            wire(&[
+                "VE", "ST", "VE", "RC", "1TPE", "1MS", "1TP", "2TPE", "2MS", "2TP"
+            ])
+        );
+        assert_eq!(
+            rmps("MM3000").await,
+            [EpicsValue::Long(14), EpicsValue::Long(3)]
+        );
+    }
+
+    /// drvMM4000.cc:757-811: `motor_init` reads each axis's status once,
+    /// after its TC/TU/XH/TL/TR, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn mm4000_motor_init_reads_each_status_after_its_queries() {
+        let int = ArgValue::Int;
+        run_command(mm4000_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("mm4000InitLine", |last| match last {
+            "TH;" => "1TH0.014,2TH0.003".into(),
+            "VE;" => "VEMM4005 Version 2.0".into(),
+            "MS;" => "1MSA,2MSA".into(),
+            "TP;" => "1TP0.014,2TP0.003".into(),
+            "TE;" => "TE@".into(),
+            c if c.ends_with("TU") => format!("{c}0.001"),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("mm4000InitLine".into()), int(0)];
+        run_command(mm4000_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            line.sent(),
+            wire(&[
+                "TH;", "ST;", "VE;", "TH;", "MS;", "TH;", "TP;", "1TC", "1TU", "1XH", "1TL", "1TR",
+                "TE;", "2TC", "2TU", "2XH", "2TL", "2TR", "TE;"
+            ])
+        );
+        assert_eq!(
+            rmps("MM4000").await,
+            [EpicsValue::Long(14), EpicsValue::Long(3)]
+        );
+    }
+
+    /// drvPM500.cc:611-668: `motor_init` reads each axis's status once,
+    /// after its `CONFIG?`, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pm500_motor_init_reads_each_status_after_its_config() {
+        let int = ArgValue::Int;
+        run_command(pm500_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("pm500InitLine", |last| match last.trim_end() {
+            "SVN?" => "XDPM500 v1".into(),
+            "XSTAT?" | "YSTAT?" => "XB".into(),
+            "XCONFIG?" => "XCONFIG 302".into(),
+            "YCONFIG?" => "YCONFIG 302".into(),
+            "XR" => "XD+0.14".into(),
+            "YR" => "YD+0.03".into(),
+            "XM?" | "YM?" => "XM1".into(),
+            _ => "ZE".into(),
+        });
+        let config = vec![int(0), ArgValue::String("pm500InitLine".into()), int(0)];
+        run_command(pm500_config_command(), config).await;
+        drvsup_init().await;
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|c| c.trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            sent,
+            wire(&[
+                "SCUM 1",
+                "SENAINT $AF",
+                "SVN?",
+                "SVN?",
+                "XSTAT?",
+                "YSTAT?",
+                "ZSTAT?",
+                "XCONFIG?",
+                "XR",
+                "XM?",
+                "YCONFIG?",
+                "YR",
+                "YM?"
+            ])
+        );
+        assert_eq!(
+            rmps("PM500").await,
+            [EpicsValue::Long(14), EpicsValue::Long(3)]
+        );
+    }
+
+    /// drvESP300.cc:757-816: `motor_init` reads each axis's status once,
+    /// after its SN?/ZB?/FR?, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn esp300_motor_init_reads_each_status_after_its_queries() {
+        let int = ArgValue::Int;
+        run_command(esp300_setup_command(), vec![int(1), int(10)]).await;
+        let tb = AtomicUsize::new(0);
+        let (line, _io) = LineRig::new("esp300InitLine", move |last| {
+            match last {
+                "VE?" => "ESP300 Version 3.08",
+                // The third axis is out of range.
+                "TB?" if tb.fetch_add(1, Ordering::SeqCst) == 2 => "9, 0, AXIS NUMBER OUT OF RANGE",
+                "TB?" | "TE?" | "01ZB?" | "02ZB?" => "0",
+                "01FR?" | "02FR?" => "0.001",
+                "01MD" | "02MD" | "01MO?" | "02MO?" => "1",
+                "01TP?" => "0.014",
+                "02TP?" => "0.003",
+                _ => "",
+            }
+            .to_string()
+                + "\r"
+        });
+        let config = vec![int(0), ArgValue::String("esp300InitLine".into()), int(0)];
+        run_command(esp300_config_command(), config).await;
+        drvsup_init().await;
+        let axis = |a: &str| {
+            ["SN?", "ZB?", "FR?", "TB?", "MD", "TP?", "ZH?", "MO?", "TE?"].map(|c| match c {
+                "TB?" | "TE?" => c.to_owned(),
+                c => format!("{a}{c}"),
+            })
+        };
+        let mut want = wire(&["VE?", "01ST", "TB?", "02ST", "TB?", "03ST", "TB?"]);
+        want.extend(axis("01"));
+        want.extend(axis("02"));
+        assert_eq!(line.sent(), want);
+        assert_eq!(
+            rmps("ESP300").await,
+            [EpicsValue::Long(14), EpicsValue::Long(3)]
+        );
+    }
+
+    /// drvPMNC87xx.cc:1010-1027: `motor_init` reads each axis's status
+    /// once, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pmnc87xx_motor_init_reads_each_status_once() {
+        let int = ArgValue::Int;
+        run_command(pmnc87xx_setup_command(), vec![int(1), int(2), int(10)]).await;
+        let (line, _io) = LineRig::new("pmncInitLine", |last| match last {
+            "VER" => "Version 1.6.0".into(),
+            "DRT" => "A0=2\nA1=2>".into(),
+            "STA 0" | "DIAG 0" => "A0=0x04>".into(),
+            "STA 1" | "DIAG 1" => "A1=0x04>".into(),
+            "POS 0" => "A0=14>".into(),
+            "POS 1" => "A1=3>".into(),
+            _ => ">".into(),
+        });
+        let config = vec![int(0), ArgValue::String("pmncInitLine".into()), int(0)];
+        run_command(pmnc87xx_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            line.sent(),
+            wire(&[
+                "VER", "DRT", "STA 0", "DIAG 0", "POS 0", "STA 1", "DIAG 1", "POS 1"
+            ])
+        );
+        assert_eq!(
+            rmps("PMNC87xx").await,
+            [EpicsValue::Long(14), EpicsValue::Long(3)]
         );
     }
 }

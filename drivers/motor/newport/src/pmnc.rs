@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -403,11 +403,13 @@ pub struct PmncAxis {
     left: Option<MotorStatus>,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PmncAxis {
-    /// One axis per discovered channel, in discovery order. No controller
-    /// I/O.
+    /// One axis per discovered channel, in discovery order, each read as
+    /// `motor_init`'s `set_status` reads it (drvPMNC87xx.cc:1027).
     pub fn all(controller: Arc<Mutex<PmncController>>) -> Vec<Self> {
         let defs = controller
             .lock()
@@ -420,7 +422,7 @@ impl PmncAxis {
     }
 
     fn new(controller: Arc<Mutex<PmncController>>, def: AxisDef) -> Self {
-        Self {
+        let mut axis = Self {
             controller,
             def,
             position: 0,
@@ -431,7 +433,10 @@ impl PmncAxis {
             left: None,
             last_status: MotorStatus::default(),
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        };
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, PmncController> {
@@ -491,6 +496,12 @@ impl PmncAxis {
             ctrl.command_bytes(prem)?;
         }
         Ok(())
+    }
+}
+
+impl Model1Motor for PmncAxis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 

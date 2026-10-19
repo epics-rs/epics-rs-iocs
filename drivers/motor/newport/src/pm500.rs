@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -172,6 +172,8 @@ pub struct Pm500Axis {
     /// encoder it keeps when the steps are unchanged.
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl Pm500Axis {
@@ -202,9 +204,9 @@ impl Pm500Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            init_status: None,
         };
-        // C motor_init ignores set_status's verdict.
-        let _ = ax.set_status();
+        ax.init_status = Some(ax.poll(&AsynUser::new(0)));
         ax
     }
 
@@ -264,6 +266,12 @@ impl Pm500Axis {
             msg += &format!("{c}ACCEL{:.d$};", CFloat(self.rate(acceleration)?));
         }
         Ok(msg)
+    }
+}
+
+impl Model1Motor for Pm500Axis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 
