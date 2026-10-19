@@ -202,6 +202,9 @@ async fn data_loop(ctx: DataContext) {
             Ok(pixels) => pixels,
             Err(_) => continue,
         };
+        // dataTask's own UDP param (pixirad.cpp:1012-1013).
+        let udp_buffers_free =
+            ctx.shared.max_buffers - ctx.shared.queued_frames.load(Ordering::Acquire);
 
         if image.as_ref().is_some_and(|i| i.colors != num_colors) {
             image = None;
@@ -234,77 +237,62 @@ async fn data_loop(ctx: DataContext) {
         }
         colors_collected += 1;
 
-        // dataTask's own UDP param is UDPBuffersFree (pixirad.cpp:1012-1013).
-        let udp_updates = vec![
-            ParamSetValue::new(
-                ctx.params.udp_buffers_free,
-                0,
-                ParamValue::Int32(
-                    ctx.shared.max_buffers - ctx.shared.queued_frames.load(Ordering::Acquire),
-                ),
-            ),
-            ParamSetValue::new(
-                ctx.params.colors_collected,
-                0,
-                ParamValue::Int32((colors_collected % num_colors) as i32),
-            ),
-        ];
-        let _ = ctx.handle.set_params_and_notify(0, udp_updates).await;
-
-        if colors_collected < num_colors {
-            continue;
-        }
-        // Every colour is in, but the image they belonged to was refused.
-        let Some(Image { array, colors }) = image.take() else {
-            continue;
-        };
-
-        // Every colour is in: this is an image.
-        let unique_id = sync
-            .read_int32(ctx.ad_params.base.array_counter)
-            .unwrap_or(0)
-            + 1;
-        let images_taken = sync
-            .read_int32(ctx.ad_params.num_images_counter)
-            .unwrap_or(0)
-            + 1;
-        let num_images = sync.read_int32(ctx.ad_params.num_images).unwrap_or(1);
-        let array_callbacks = sync
-            .read_int32(ctx.ad_params.base.array_callbacks)
-            .unwrap_or(1)
-            != 0;
-
-        let mut updates = vec![
-            ParamSetValue::new(
+        // C posts one pass per frame and stores Acquire=0 only once the
+        // finished image is on the plugins (pixirad.cpp:1053-1083), so
+        // WaitForPlugins finds it queued.
+        let mut updates = vec![ParamSetValue::new(
+            ctx.params.udp_buffers_free,
+            0,
+            ParamValue::Int32(udp_buffers_free),
+        )];
+        // A finished image whose colour-0 alloc was refused counts nothing.
+        if let Some(Image { array, colors }) = image.take_if(|_| colors_collected >= num_colors) {
+            let unique_id = sync
+                .read_int32(ctx.ad_params.base.array_counter)
+                .unwrap_or(0)
+                + 1;
+            let images_taken = sync
+                .read_int32(ctx.ad_params.num_images_counter)
+                .unwrap_or(0)
+                + 1;
+            updates.push(ParamSetValue::new(
                 ctx.ad_params.base.array_counter,
                 0,
                 ParamValue::Int32(unique_id),
-            ),
-            ParamSetValue::new(
+            ));
+            updates.push(ParamSetValue::new(
                 ctx.ad_params.num_images_counter,
                 0,
                 ParamValue::Int32(images_taken),
-            ),
-        ];
-        if images_taken >= num_images {
-            updates.push(ParamSetValue::new(
-                ctx.ad_params.acquire,
-                0,
-                ParamValue::Int32(0),
             ));
+            if sync
+                .read_int32(ctx.ad_params.base.array_callbacks)
+                .unwrap_or(1)
+                != 0
+            {
+                publish(&ctx, array, colors, unique_id).await;
+            }
+            if images_taken >= sync.read_int32(ctx.ad_params.num_images).unwrap_or(1) {
+                updates.push(ParamSetValue::new(
+                    ctx.ad_params.acquire,
+                    0,
+                    ParamValue::Int32(0),
+                ));
+            }
+            if auto_calibrate {
+                updates.push(ParamSetValue::new(
+                    ctx.params.auto_calibrate,
+                    0,
+                    ParamValue::Int32(0),
+                ));
+            }
         }
-        if auto_calibrate {
-            updates.push(ParamSetValue::new(
-                ctx.params.auto_calibrate,
-                0,
-                ParamValue::Int32(0),
-            ));
-        }
+        updates.push(ParamSetValue::new(
+            ctx.params.colors_collected,
+            0,
+            ParamValue::Int32((colors_collected % num_colors) as i32),
+        ));
         let _ = ctx.handle.set_params_and_notify(0, updates).await;
-
-        if array_callbacks {
-            publish(&ctx, array, colors, unique_id).await;
-        }
     }
 }
 

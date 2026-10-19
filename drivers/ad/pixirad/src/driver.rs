@@ -1175,6 +1175,36 @@ mod tests {
         );
     }
 
+    /// C queues the last image on the plugins before it stores Acquire=0
+    /// (pixirad.cpp:1066-1077), so under WaitForPlugins the queued image
+    /// holds AcquireBusy (asynNDArrayDriver.cpp:640-647).
+    #[test]
+    fn the_last_image_is_queued_before_acquire_drops() {
+        let t = DataTask::start("PIXI_BUSY", 1 << 20);
+        for (reason, value) in [
+            (t.ad.base.array_callbacks, 1),
+            (t.ad.wait_for_plugins, 1),
+            (t.ad.num_images, 1),
+            (t.ad.acquire, 1),
+        ] {
+            t.handle.write_int32_blocking(reason, 0, value).unwrap();
+        }
+        t.send_frame();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while t.counter() != 1 {
+            assert!(std::time::Instant::now() < deadline, "no image");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let int = |reason| t.handle.read_int32_blocking(reason, 0).unwrap();
+        assert_eq!(int(t.ad.acquire), 0);
+        assert_eq!(
+            int(t.ad.acquire_busy),
+            1,
+            "AcquireBusy cleared with the image unqueued"
+        );
+        assert_eq!(t.arrays.pending(), 1);
+    }
+
     /// C bumps NDArrayCounter only after the colour-0 alloc
     /// (pixirad.cpp:1033, :1055-1057).
     #[test]
