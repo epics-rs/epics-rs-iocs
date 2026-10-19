@@ -52,7 +52,7 @@ use epics_rs::motor::flags::MstaFlags;
 use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
-use motor_common::util::{atof, atoi};
+use motor_common::util::{atof, atoi, strtol};
 
 /// Reply read buffer size (C `MAX_BUFF_LEN`).
 const READ_BUF: usize = 80;
@@ -90,6 +90,20 @@ fn parse_input_setup(block: &[u8]) -> Vec<(i32, i32)> {
             }
         })
         .collect()
+}
+
+/// C `sscanf(resp, "%4d[^,]", &type)`'s `type`: at most four characters of
+/// an int after the blanks; `None` when none convert.
+fn scan_switch_type(resp: &str) -> Option<i32> {
+    let b = resp.as_bytes();
+    let at = b
+        .iter()
+        .take_while(|&&c| matches!(c, b' ' | b'\t'..=b'\r'))
+        .count();
+    match strtol(&b[at..b.len().min(at + 4)], 10) {
+        (_, 0) => None,
+        (value, _) => Some(value as i32),
+    }
 }
 
 fn ims_err(message: impl Into<String>) -> AsynError {
@@ -595,7 +609,12 @@ impl ImsMDrivePlusAxis {
                 // C prints and parses `resp` whatever the status (:213-216).
                 let resp = self.line.exchange_text(&format!("PR S{input_no}")).0;
                 println!("{resp}");
-                self.set_switch(atoi(&resp), input_no);
+                // C's unchecked sscanf leaves `type` as the last input's, or
+                // uninitialised at S1, and maps this input to it: a C defect,
+                // not copied.
+                if let Some(type_code) = scan_switch_type(&resp) {
+                    self.set_switch(type_code, input_no);
+                }
             }
         }
         println!(
@@ -1275,6 +1294,21 @@ mod tests {
         );
     }
 
+    /// ImsMDrivePlusMotorController.cpp:215 reads `type` with `%4d`, so
+    /// `00001` is type 0 and maps no switch.
+    #[test]
+    fn a_switch_type_reads_four_characters() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("imsWidth4", |last| match last.trim_end() {
+            "PR VR" => "1.000".into(),
+            "PR S1" => "00001,0,0".into(),
+            _ => "0".into(),
+        });
+        let axis =
+            ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), "imsWidth4"), "imsWidth4");
+        assert_eq!(axis.home_switch, None);
+    }
+
     #[test]
     fn a_stall_sets_following_error_and_slip() {
         use epics_rs::motor::flags::MstaFlags;
@@ -1590,5 +1624,14 @@ mod tests {
         let block = b"IS = 1, 1, 0\r\nIS = 2, 2, 1\r\nIS = 3, 0, 0\r\nIS = 4, 3";
         assert_eq!(parse_input_setup(block), vec![(1, 1), (2, 2), (3, 0)]);
         assert_eq!(parse_input_setup(b"junk\n"), vec![]);
+    }
+
+    #[test]
+    fn switch_type_scans_as_c_width_4() {
+        assert_eq!(scan_switch_type("3,0,0"), Some(3));
+        assert_eq!(scan_switch_type(" \t12345"), Some(1234));
+        assert_eq!(scan_switch_type("-12345"), Some(-123));
+        assert_eq!(scan_switch_type("+"), None);
+        assert_eq!(scan_switch_type(""), None);
     }
 }
