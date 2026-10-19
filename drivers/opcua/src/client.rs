@@ -343,9 +343,9 @@ impl UaConnection for AsyncOpcuaConnection {
         self.session
             .create_subscription(
                 Duration::from_secs_f64(config.publishing_interval / 1000.0),
-                config.lifetime_count,
-                config.max_keep_alive_count,
-                config.max_notifications_per_publish,
+                config.lifetime_count(),
+                SubscriptionConfig::MAX_KEEP_ALIVE_COUNT,
+                SubscriptionConfig::MAX_NOTIFICATIONS_PER_PUBLISH,
                 config.priority,
                 true,
                 SubscriptionCallbacks::new(

@@ -158,6 +158,8 @@ fn a_subscription_checks_its_name_session_and_interval() {
     let subscriptions = session.subscriptions.lock().clone();
     assert_eq!(subscriptions[0].publishing_interval, 100.0);
     assert_eq!(subscriptions[0].debug, 1);
+    // open62541's default timeout, 500 ms x 10000, kept at the configured interval.
+    assert_eq!(subscriptions[0].lifetime_count(), 50_000);
     assert_eq!(
         lines(|| ioc::subscription_command(&registry, Some("SUB1"), Some("S1"), 0.0, &[])),
         [
