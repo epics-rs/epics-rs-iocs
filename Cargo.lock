@@ -3182,7 +3182,9 @@ dependencies = [
  "async-trait",
  "chrono",
  "epics-rs",
+ "libc",
  "parking_lot",
+ "tempfile",
  "tokio",
 ]
 
