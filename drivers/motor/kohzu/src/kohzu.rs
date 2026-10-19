@@ -314,7 +314,9 @@ impl KohzuAxis {
 impl Model1Motor for KohzuAxis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        // The GAIN_SUPPORT motor_init set (drvSC800.cc:619), which a failed
+        // read stores back.
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -711,6 +713,34 @@ mod tests {
     /// drvSC800.cc:229-249: a first bad `STR` is RETRY (nothing raised,
     /// nothing posted, nothing more sent), the next COMM_ERR, and a reply
     /// clears it.
+    /// drvSC800.cc:609-621: a failed `motor_init` read stores the
+    /// GAIN_SUPPORT `motor_init` set, the first raising nothing (RETRY) and
+    /// the next CNTRL_COMM_ERR and RA_PROBLEM (:236-250).
+    #[test]
+    fn a_failed_init_read_keeps_gain_support() {
+        let (_line, io) = LineRig::new("sc800InitFail", |last| {
+            match last.trim_start_matches('\u{2}') {
+                "IDN" => "C\tIDN0\t200\t1".into(),
+                _ => String::new(),
+            }
+        });
+        let ctrl = Arc::new(Mutex::new(KohzuController::new(io).unwrap()));
+        let init = |index| KohzuAxis::new(ctrl.clone(), index).take_init_status();
+        let prepared = MotorStatus {
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init(0), prepared);
+        assert_eq!(
+            init(1),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
+    }
+
     #[test]
     fn a_missed_str_is_retry_then_comm_error() {
         let (line, mut axis, state) = strings_rig("sc800Retry");
