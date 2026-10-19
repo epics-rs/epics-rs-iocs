@@ -74,7 +74,7 @@ pub fn set_options(
         for (key, value) in options {
             // The C's catch: report, and apply nothing further.
             if let Err(e) = registry.set_option(name, key, value) {
-                eprintln!("ERROR : {e}");
+                epics_rs::base::stderr_println!("ERROR : {e}");
                 return Ok(names.len());
             }
         }
