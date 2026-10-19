@@ -106,8 +106,8 @@ impl TaurusController {
     /// `index`'s type from `getsw`.
     pub fn limit_switches(&self, addr: usize, index: usize) -> AsynResult<i32> {
         // C parses inString_ whatever writeReadController returned
-        // (SMCTaurusAxis.cpp:186-187); a failed query is an unparsed reply.
-        let reply = self.query(&format!("{addr} getsw")).unwrap_or_default();
+        // (SMCTaurusAxis.cpp:186-187).
+        let (reply, _) = self.exchange(&format!("{addr} getsw"));
         let types: Vec<i32> = reply
             .split_whitespace()
             .map_while(|tok| tok.parse::<i32>().ok())
@@ -125,15 +125,22 @@ impl TaurusController {
 
     /// Write a query and read one reply line.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        // C writeReadController: pasynOctetSyncIO->writeRead.
+        let (reply, status) = self.exchange(cmd);
+        status.map(|()| reply)
+    }
+
+    /// C `writeReadController`: `inString_` beside the status. The EOS layer
+    /// NUL-terminates the buffer on every read, so a failed read leaves the
+    /// bytes it delivered, which the callers that ignore the status parse.
+    fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
         let (raw, status) = self
             .handle
             .write_read(0, &Self::framed(cmd), READ_BUF)
             .into_parts();
-        status?;
-        Ok(String::from_utf8_lossy(&raw)
+        let reply = String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
-            .to_string())
+            .to_string();
+        (reply, status)
     }
 }
 
@@ -159,15 +166,8 @@ impl TaurusAxis {
         let addr = axis_no + 1;
         let (cl_period, reply) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let cl_period = atof(
-                &ctrl
-                    .query(&format!("{addr} getclperiod"))
-                    .unwrap_or_default(),
-            );
-            (
-                cl_period,
-                ctrl.query(&format!("{addr} getnlimit")).unwrap_or_default(),
-            )
+            let cl_period = atof(&ctrl.exchange(&format!("{addr} getclperiod")).0);
+            (cl_period, ctrl.exchange(&format!("{addr} getnlimit")).0)
         };
         let state = SmcState {
             axis_res: cl_period,
@@ -435,6 +435,30 @@ impl TaurusAxis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+
+    /// SMCTaurusAxis.cpp:14-28 and :186-188 parse `inString_` whatever
+    /// `writeReadController` returned, so replies cut by a timeout still set
+    /// `axisRes`, the travel limits and the limit-switch types.
+    #[test]
+    fn replies_cut_by_a_timeout_are_still_parsed() {
+        use motor_common::testing::LineRig;
+        let (_line, handle) = LineRig::cut(
+            "taurusCutReplies",
+            |cmd| match cmd.trim_end() {
+                "1 getclperiod" => "0.5".into(),
+                "1 getnlimit" => "-10 20".into(),
+                "1 getsw" => "2 3".into(),
+                _ => String::new(),
+            },
+            |_| true,
+        );
+        let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
+        let axis = TaurusAxis::new(controller.clone(), 0, "");
+        let state = axis.members.state();
+        assert_eq!((state.axis_res, state.travel_limits), (0.5, (-10.0, 20.0)));
+        let ctrl = controller.lock().unwrap();
+        assert_eq!(ctrl.limit_switches(1, 1).unwrap(), 3);
+    }
 
     /// C's poll prints the `nst` limit, e-stop and busy bits, and
     /// `moveVelocity` its FLOW line, on the axis's `pasynUser_`.
