@@ -441,7 +441,7 @@ fn a_subscription_shows_its_settings_and_its_monitored_items() {
 /// `opcuaShow PATTERN LEVEL`'s stdout and stderr.
 fn show(registry: &Registry, pattern: &str, level: i32) -> (String, String) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    ioc::show(registry, pattern, level, &mut out, &mut err).unwrap();
+    ioc::show(registry, Some(pattern), level, &mut out, &mut err).unwrap();
     (
         String::from_utf8(out).unwrap(),
         String::from_utf8(err).unwrap(),
@@ -497,6 +497,10 @@ const S1: &str = "session=S1 url=opc.tcp://localhost:4999 connect status=BadInva
     sessionState=Closed channelState=Closed sec-mode=None(best) \
     sec-policy=None(http://opcfoundation.org/UA/SecurityPolicy#None) debug=0 batch r/w=0/0(0/0) \
     autoconnect=n items=3 registered=0 subscriptions=1 reader=0/0-0ms writer=0/0-0ms\n";
+const S2: &str = "session=S2 url=opc.tcp://localhost:4998 connect status=BadInvalidState \
+    sessionState=Closed channelState=Closed sec-mode=None(best) \
+    sec-policy=None(http://opcfoundation.org/UA/SecurityPolicy#None) debug=0 batch r/w=0/0(3/7) \
+    autoconnect=n items=0 registered=0 subscriptions=0 reader=3/0-0ms writer=7/0-0ms\n";
 const SUB1: &str =
     "subscription=SUB1 session=S1 interval=250(250) prio=4 enable=?(Y) debug=0 items=2\n";
 const ITEM: &str = "item ns=0(2);s=Demo.Struct record=R:ITEM state=down \
@@ -544,12 +548,37 @@ fn a_session_shows_as_the_c_example_does() {
             none
         )
     );
+    assert_eq!(show(&registry, "S2", 0), (S2.to_string(), String::new()));
+}
+
+/// `opcuaShow`'s dispatch (`iocshIntegration.cpp:386-418`): the matching
+/// sessions, else the matching subscriptions, else the item of every record
+/// whose name or node identifier matches (`RecordConnector::glob`).
+#[test]
+fn opcua_show_falls_from_sessions_to_subscriptions_to_records() {
+    let registry = show_example();
+    assert_eq!(show(&registry, "S*", 0).0, format!("{S1}{S2}"));
+    assert_eq!(show(&registry, "SUB1", 1).0, format!("{SUB1}{ITEM}{AI}"));
+    assert_eq!(show(&registry, "R:AI", 0).0, AI);
+    assert_eq!(show(&registry, "R:AI", 1).0, format!("{AI}{AI_LEAF}"));
+    assert_eq!(show(&registry, "R:EL", 1).0, format!("{ITEM}{ITEM_TREE}"));
+    assert_eq!(show(&registry, "R:ITEM", 2).0, format!("{ITEM}{ITEM_TREE}"));
+    assert_eq!(show(&registry, "1234", 0).0, LO);
+    assert_eq!(show(&registry, "Demo*", 0).0, format!("{ITEM}{AI}"));
+
+    let mut shown = (String::new(), String::new());
     assert_eq!(
-        show(&registry, "S2", 0).0,
-        "session=S2 url=opc.tcp://localhost:4998 connect status=BadInvalidState \
-         sessionState=Closed channelState=Closed sec-mode=None(best) \
-         sec-policy=None(http://opcfoundation.org/UA/SecurityPolicy#None) debug=0 \
-         batch r/w=0/0(3/7) autoconnect=n items=0 registered=0 subscriptions=0 \
-         reader=3/0-0ms writer=7/0-0ms\n"
+        lines(|| shown = show(&registry, "nothing", 0)),
+        ["No matches for pattern 'nothing'\n"]
+    );
+    assert_eq!(shown, (String::new(), String::new()));
+    assert_eq!(
+        lines(|| shown = show(&registry, "", 0)),
+        ["missing argument #1 (pattern for name)\n"]
+    );
+    assert_eq!(shown, (String::new(), String::new()));
+    assert_eq!(
+        lines(|| ioc::show(&registry, None, 0, &mut Vec::new(), &mut Vec::new()).unwrap()),
+        ["missing argument #1 (pattern for name)\n"]
     );
 }

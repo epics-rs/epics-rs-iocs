@@ -44,6 +44,17 @@ struct Inner {
     records: HashMap<String, String>,
     /// `opcuaItem` records whose own init failed (C: `dpvt` left NULL).
     failed_item_records: HashSet<String>,
+    /// Every bound record, in bind order: what `RecordConnector::glob` walks.
+    connectors: Vec<Connector>,
+}
+
+/// A bound record's `RecordConnector`, as far as `opcuaShow` reads it.
+struct Connector {
+    record: String,
+    /// The link's node identifier as `RecordConnector::glob` matches it: a
+    /// numeric one in decimal, none as empty.
+    identifier: String,
+    item: Arc<Mutex<Item>>,
 }
 
 /// What a record's device support gets when it binds its link.
@@ -225,6 +236,39 @@ impl Registry {
     }
 
     pub fn bind(
+        &self,
+        record: &str,
+        record_type: &str,
+        link: LinkInfo,
+        notify: tokio::sync::mpsc::Sender<()>,
+    ) -> Result<Binding, String> {
+        let identifier = match &link.identifier {
+            Some(NodeIdentifier::Numeric(id)) => id.to_string(),
+            Some(NodeIdentifier::String(id)) => id.clone(),
+            None => String::new(),
+        };
+        let binding = self.bind_item(record, record_type, link, notify)?;
+        self.inner.lock().connectors.push(Connector {
+            record: record.to_string(),
+            identifier,
+            item: binding.item.clone(),
+        });
+        Ok(binding)
+    }
+
+    /// `RecordConnector::glob` (`RecordConnector.cpp:219-262`): the item of
+    /// every bound record whose name, or else whose node identifier, matches.
+    pub fn glob_records(&self, pattern: &str) -> Vec<Arc<Mutex<Item>>> {
+        self.inner
+            .lock()
+            .connectors
+            .iter()
+            .filter(|c| glob_match(pattern, &c.record) || glob_match(pattern, &c.identifier))
+            .map(|c| c.item.clone())
+            .collect()
+    }
+
+    fn bind_item(
         &self,
         record: &str,
         record_type: &str,

@@ -258,13 +258,14 @@ fn commands(
         {
             let registry = registry.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let pattern = sval(args, 0).unwrap_or_else(|| "*".to_string());
                 let _ = ioc::show(
                     &registry,
-                    &pattern,
+                    sval(args, 0).as_deref(),
                     ival(args, 1) as i32,
-                    &mut std::io::stdout().lock(),
-                    &mut std::io::stderr().lock(),
+                    // Unlocked: the errlog thread prints to stderr while this
+                    // waits for it.
+                    &mut std::io::stdout(),
+                    &mut std::io::stderr(),
                 );
                 Ok(CommandOutcome::Continue)
             }

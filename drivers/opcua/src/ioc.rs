@@ -442,31 +442,53 @@ pub fn options_command(registry: &Registry, pattern: Option<&str>, options: &[&s
     }
 }
 
-/// `opcuaShow(pattern, verbosity)` (`iocshIntegration.cpp:379-410`): every
-/// matching session, and every matching subscription of the others.
+/// `opcuaShow(pattern, verbosity)` (`iocshIntegration.cpp:386-418`): the
+/// matching sessions, else the matching subscriptions, else the item of every
+/// matching record.
 pub fn show(
     registry: &Registry,
-    pattern: &str,
+    pattern: Option<&str>,
     level: i32,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> io::Result<()> {
-    let pattern = if pattern.is_empty() { "*" } else { pattern };
+    let Some(pattern) = pattern.filter(|p| !p.is_empty()) else {
+        errlog_vprintf(format_args!("missing argument #1 (pattern for name)\n"));
+        return Ok(());
+    };
+
+    let mut sessions = registry.glob_sessions(pattern);
+    if !sessions.is_empty() {
+        sessions.sort_by(|a, b| a.name.cmp(&b.name));
+        for session in sessions {
+            session.show(level, out, err)?;
+        }
+        return Ok(());
+    }
+
     let mut sessions = registry.sessions();
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
-
+    let mut found = false;
     for session in sessions {
-        if glob_match(pattern, &session.name) {
-            session.show(level, out, err)?;
-            continue;
-        }
         let subscriptions = session.subscriptions.lock().clone();
         for subscription in subscriptions
             .iter()
             .filter(|s| glob_match(pattern, &s.name))
         {
+            found = true;
             out.write_all(subscription.show(&session, level).as_bytes())?;
         }
+    }
+    if found {
+        return Ok(());
+    }
+
+    let items = registry.glob_records(pattern);
+    if items.is_empty() {
+        errlog_vprintf(format_args!("No matches for pattern '{pattern}'\n"));
+    }
+    for item in items {
+        out.write_all(item.lock().show(level).as_bytes())?;
     }
     Ok(())
 }
