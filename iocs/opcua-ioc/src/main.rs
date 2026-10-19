@@ -39,27 +39,21 @@ use opcua::subscription::SubscriptionConfig;
 static DEVICES: &[(&str, &[DevSup])] = &[
     (
         "longin",
-        &[row("devLiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+        &[row("devLiOpcua", device_support::DTYP, 6, &[3, 4])],
     ),
     (
         "longout",
-        &[row("devLoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+        &[row("devLoOpcua", device_support::DTYP, 6, &[3, 4])],
     ),
-    (
-        "bi",
-        &[row("devBiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
-    ),
-    (
-        "bo",
-        &[row("devBoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
-    ),
+    ("bi", &[row("devBiOpcua", device_support::DTYP, 6, &[3, 4])]),
+    ("bo", &[row("devBoOpcua", device_support::DTYP, 6, &[3, 4])]),
     (
         "mbbi",
-        &[row("devMbbiOpcua", device_support::DTYP, 6, &[1, 2, 3, 4])],
+        &[row("devMbbiOpcua", device_support::DTYP, 6, &[2, 3, 4])],
     ),
     (
         "mbbo",
-        &[row("devMbboOpcua", device_support::DTYP, 6, &[1, 2, 3, 4])],
+        &[row("devMbboOpcua", device_support::DTYP, 6, &[2, 3, 4])],
     ),
     (
         "mbbiDirect",
@@ -67,7 +61,7 @@ static DEVICES: &[(&str, &[DevSup])] = &[
             "devMbbiDirectOpcua",
             device_support::DTYP,
             6,
-            &[1, 2, 3, 4],
+            &[2, 3, 4],
         )],
     ),
     (
@@ -76,52 +70,46 @@ static DEVICES: &[(&str, &[DevSup])] = &[
             "devMbboDirectOpcua",
             device_support::DTYP,
             6,
-            &[1, 2, 3, 4],
+            &[2, 3, 4],
         )],
     ),
-    (
-        "ai",
-        &[row("devAiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
-    ),
-    (
-        "ao",
-        &[row("devAoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
-    ),
+    ("ai", &[row("devAiOpcua", device_support::DTYP, 6, &[3, 4])]),
+    ("ao", &[row("devAoOpcua", device_support::DTYP, 6, &[3, 4])]),
     (
         "stringin",
-        &[row("devSiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+        &[row("devSiOpcua", device_support::DTYP, 6, &[3, 4])],
     ),
     (
         "stringout",
-        &[row("devSoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+        &[row("devSoOpcua", device_support::DTYP, 6, &[3, 4])],
     ),
     (
         "lsi",
-        &[row("devLsiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+        &[row("devLsiOpcua", device_support::DTYP, 6, &[3, 4])],
     ),
     (
         "lso",
-        &[row("devLsoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+        &[row("devLsoOpcua", device_support::DTYP, 6, &[3, 4])],
     ),
     (
         "waveform",
-        &[row("devWfOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+        &[row("devWfOpcua", device_support::DTYP, 6, &[3, 4])],
     ),
     (
         "aai",
-        &[row("devAaiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+        &[row("devAaiOpcua", device_support::DTYP, 6, &[3, 4])],
     ),
     (
         "aao",
-        &[row("devAaoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+        &[row("devAaoOpcua", device_support::DTYP, 6, &[3, 4])],
     ),
     (
         "int64in",
-        &[row("devInt64inOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+        &[row("devInt64inOpcua", device_support::DTYP, 6, &[3, 4])],
     ),
     (
         "int64out",
-        &[row("devInt64outOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+        &[row("devInt64outOpcua", device_support::DTYP, 6, &[3, 4])],
     ),
     (
         "opcuaItem",

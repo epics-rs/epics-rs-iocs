@@ -203,10 +203,16 @@ pub struct Plc {
     conn: Mutex<Option<Connection>>,
     stop: AtomicBool,
     started: AtomicBool,
+    /// C's `ETHERIP_PORT`; a test's fake PLC listens on a port of its own.
+    port: u16,
 }
 
 impl Plc {
     fn new(name: &str, ip_addr: &str, slot: u8) -> Plc {
+        Self::on_port(name, ip_addr, slot, ETHERIP_PORT)
+    }
+
+    fn on_port(name: &str, ip_addr: &str, slot: u8, port: u16) -> Plc {
         Plc {
             name: name.to_string(),
             addr: Mutex::new((ip_addr.to_string(), slot)),
@@ -217,6 +223,7 @@ impl Plc {
             conn: Mutex::new(None),
             stop: AtomicBool::new(false),
             started: AtomicBool::new(false),
+            port,
         }
     }
 
@@ -361,20 +368,24 @@ pub fn initialized() -> bool {
     INITIALIZED.load(Ordering::SeqCst)
 }
 
-/// The init hooks C's driver and device support act on: devEtherIP's
-/// `init(1)` (finishDevSup, before `initHookAfterFinishDevSup`) and
-/// `drvEtherIP_initHook` at `initHookAfterScanInit`. Both call
-/// `drvEtherIP_restart`; only the second finds the database ready.
+/// devEtherIP's `driver_started`.
+static DRIVER_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// devEtherIP's `init(run)` (devEtherIP.c:1171-1180), every devEtherIP
+/// dset's `init`: `finishDevSup`'s `init(1)` starts the driver once, before
+/// the database is ready.
+pub fn dev_init(after: bool) {
+    if after && !DRIVER_STARTED.swap(true, Ordering::SeqCst) {
+        restart();
+    }
+}
+
+/// `drvEtherIP_initHook`: at `initHookAfterScanInit` the database is ready
+/// and `drvEtherIP_restart` launches the scan tasks [`dev_init`] delayed.
 pub fn init_hook(state: InitHookState) {
-    match state {
-        InitHookState::AfterFinishDevSup => {
-            restart();
-        }
-        InitHookState::AfterScanInit if initialized() => {
-            DATABASE_READY.store(true, Ordering::SeqCst);
-            restart();
-        }
-        _ => {}
+    if state == InitHookState::AfterScanInit && initialized() {
+        DATABASE_READY.store(true, Ordering::SeqCst);
+        restart();
     }
 }
 
@@ -503,12 +514,13 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
         let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;
         crate::eip_printf_time!(4, "EIP connecting {}\n", plc.name);
         let (ip_addr, slot) = plc.addr.lock().clone();
-        match Connection::startup(&ip_addr, ETHERIP_PORT, slot, timeout(), limit) {
+        let port = plc.port;
+        match Connection::startup(&ip_addr, port, slot, timeout(), limit) {
             Ok(mut c) => {
                 *plc.identity.lock() = Some(c.identity.clone());
                 if !complete_tag_infos(plc, &mut c) {
                     errlog_vprintf(format_args!(
-                        "EIP error during scan list completion for {ip_addr}:{ETHERIP_PORT}\n"
+                        "EIP error during scan list completion for {ip_addr}:{port}\n"
                     ));
                     // C disconnect_PLC: the session is open, so the tags
                     // are invalidated.
@@ -521,9 +533,7 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
                 *conn = Some(c);
             }
             Err(_) => {
-                errlog_vprintf(format_args!(
-                    "EIP connection failed for {ip_addr}:{ETHERIP_PORT}\n"
-                ));
+                errlog_vprintf(format_args!("EIP connection failed for {ip_addr}:{port}\n"));
                 // C's EIP_startup leaves no socket, so disconnect_PLC
                 // never runs and the records keep their state.
                 crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
@@ -1229,6 +1239,16 @@ pub fn help() {
 mod registry_tests {
     use super::*;
 
+    /// devEtherIP `init(run)`: `init(0)` starts nothing, the first
+    /// `init(1)` starts the driver and a second does not again.
+    #[test]
+    fn dev_init_starts_the_driver_once_on_the_after_pass() {
+        dev_init(false);
+        assert!(!DRIVER_STARTED.load(Ordering::SeqCst));
+        dev_init(true);
+        assert!(DRIVER_STARTED.load(Ordering::SeqCst));
+    }
+
     /// drvEtherIP.c:494-501: a PLC that never connects leaves no socket, so
     /// disconnect_PLC does not run and no record is told its tag is invalid.
     #[test]
@@ -1243,13 +1263,14 @@ mod registry_tests {
         assert!(rx.try_recv().is_err(), "no record was processed");
     }
 
-    /// A PLC on `ip`:ETHERIP_PORT that registers a session and then fails
-    /// every request, so the scan-list completion reads no tag.
-    #[cfg(target_os = "linux")]
-    fn plc_that_reads_nothing(ip: &str) -> std::thread::JoinHandle<()> {
+    /// A PLC on a free 127.0.0.1 port, returned with it, that registers a
+    /// session and then fails every request, so the scan-list completion
+    /// reads no tag.
+    fn plc_that_reads_nothing() -> (u16, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind((ip, encap::ETHERIP_PORT)).unwrap();
-        std::thread::spawn(move || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
             let mut header = [0u8; encap::HEADER_SIZE];
             while s.read_exact(&mut header).is_ok() {
@@ -1278,18 +1299,17 @@ mod registry_tests {
                     break;
                 }
             }
-        })
+        });
+        (port, server)
     }
 
     /// drvEtherIP.c:503-510: a scan-list completion failure runs
     /// disconnect_PLC, which invalidates the tags, and counts no PLC error;
     /// only a transfer failure does (:887).
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_completion_failure_invalidates_the_tags_and_counts_nothing() {
-        let ip = format!("127.{}.{}.7", std::process::id() % 250 + 1, line!() % 250);
-        let server = plc_that_reads_nothing(&ip);
-        let plc = Arc::new(Plc::new("nocomplete", &ip, 0));
+        let (port, server) = plc_that_reads_nothing();
+        let plc = Arc::new(Plc::on_port("nocomplete", "127.0.0.1", 0, port));
         let tag = plc.add_tag(1.0, "T", 1).unwrap();
         tag.data.lock().is_writing = true;
         let mut conn = None;
