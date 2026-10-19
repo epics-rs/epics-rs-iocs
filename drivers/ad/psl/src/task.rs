@@ -231,7 +231,8 @@ pub(crate) fn read_frame(
 
     while payload.len() < header.data_len {
         let want = (header.data_len - payload.len()).min(MAX_MESSAGE_SIZE);
-        let block = session.read_image_block(want).map_err(|e| {
+        let (block, status) = session.read_image_block(want);
+        if let Err(e) = status {
             handle.trace().output_device(
                 handle.port_name(),
                 Some(0),
@@ -239,14 +240,15 @@ pub(crate) fn read_frame(
                 TraceMask::ERROR,
                 &format!(
                     "PSL:getImage: error reading image, status={}, dataLen={}, nCopied={}, \
-                     maxRead={want}, nRead=0\n",
+                     maxRead={want}, nRead={}\n",
                     e.status(),
                     header.data_len,
-                    payload.len()
+                    payload.len(),
+                    block.len()
                 ),
             );
-            Abort::Error(format!("error reading the image: {e}"))
-        })?;
+            return Err(Abort::Error(format!("error reading the image: {e}")));
+        }
         // C added `nRead_` to its copy counter without checking it: a read that
         // returned nothing left the loop spinning forever on a half-written
         // image.

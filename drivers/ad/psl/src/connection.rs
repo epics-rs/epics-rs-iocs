@@ -173,10 +173,13 @@ impl Session<'_> {
     }
 
     /// Read the next block of an image payload (C `pasynOctetSyncIO->read`
-    /// inside the copy loop).
-    pub fn read_image_block(&mut self, max_bytes: usize) -> ServerResult<Vec<u8>> {
-        let (block, status) = self.io.read_binary(max_bytes, GET_IMAGE_TIMEOUT)?;
-        status.map(|()| block)
+    /// inside the copy loop): what arrived, also when the read failed.
+    pub fn read_image_block(&mut self, max_bytes: usize) -> (Vec<u8>, ServerResult<()>) {
+        // A read that never ran leaves C's `nRead_` at the previous block's
+        // count, which its error line prints: not copied.
+        self.io
+            .read_binary(max_bytes, GET_IMAGE_TIMEOUT)
+            .unwrap_or_else(|e| (Vec::new(), Err(e)))
     }
 }
 

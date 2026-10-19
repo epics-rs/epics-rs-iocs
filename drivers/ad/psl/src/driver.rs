@@ -1183,6 +1183,32 @@ mod tests {
         assert_eq!(payload, b"abcd");
     }
 
+    /// getImage's error line counts the bytes the failed block read
+    /// delivered (PSL.cpp:588-591).
+    #[test]
+    fn a_failed_block_read_prints_its_byte_count() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+        let name = "PSL_BLOCK_CUT";
+        let (server, handle) = scripted(name, &[(b"L;2;2;4;ab", false), (b"c", true)]);
+        let path = std::env::temp_dir().join(format!("psl-{name}-{}", std::process::id()));
+        let file = Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_info_mask(Some(name), TraceInfoMask::empty());
+        trace.set_trace_file(Some(name), TraceFile::File(file.clone()));
+        trace.set_device_trace_info_mask(name, 0, TraceInfoMask::empty());
+        trace.set_device_trace_file(name, 0, TraceFile::File(file));
+        assert!(crate::task::read_frame(&server, &handle).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            text,
+            "PSL:getImage: error reading image, status=1, dataLen=4, nCopied=2, maxRead=2, \
+             nRead=1\n"
+        );
+    }
+
     /// getConfig stores GetRecordPath's answer as it came, without
     /// `checkPath` (PSL.cpp:453-459).
     #[test]
