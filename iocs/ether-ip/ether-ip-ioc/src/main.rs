@@ -302,7 +302,7 @@ mod tests {
         for (record_type, rows) in DEVICES {
             for row in *rows {
                 assert_eq!(
-                    row.dset.init.map(|f| f as usize),
+                    row.dset.init().map(|f| f as usize),
                     (row.name != "devBoEtherIPReset").then_some(dev_init as usize),
                     "{record_type} {}",
                     row.name
