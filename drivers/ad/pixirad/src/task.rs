@@ -428,7 +428,8 @@ async fn status_loop(ctx: StatusContext) {
                 continue;
             }
         };
-        let message = String::from_utf8_lossy(&buffer[..n]).to_string();
+        let datagram = &buffer[..n];
+        let message = String::from_utf8_lossy(protocol::c_string(datagram)).to_string();
 
         let readings = [
             ("READ_TCOLD", ctx.ad_params.temperature_actual),
@@ -446,7 +447,7 @@ async fn status_loop(ctx: StatusContext) {
         let mut box_temp = None;
         let mut humidity = None;
         for (key, reason) in readings {
-            let Some(value) = protocol::status_value(&message, key) else {
+            let Some(value) = protocol::status_value(datagram, key) else {
                 ctx.trace_error(&format!(
                     "pixirad:statusTask: {} {key} in status broadcast message={message}\n",
                     if message.contains(key) {

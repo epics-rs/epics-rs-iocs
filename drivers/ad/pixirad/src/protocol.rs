@@ -174,12 +174,46 @@ pub fn parse_additional_info(reply: &[u8]) -> Option<&[u8]> {
     find(reply, MARKER).map(|i| &reply[i + MARKER.len()..])
 }
 
-/// The value the status broadcast carries for `key`, e.g. `READ_TCOLD -21.5`
-/// (C's `sscanf(pString, "%s %f")`).
-pub fn status_value(message: &str, key: &str) -> Option<f64> {
-    let start = message.find(key)?;
-    let rest = &message[start + key.len()..];
-    rest.split_whitespace().next()?.parse().ok()
+/// The value the status broadcast carries for `key`, e.g. `READ_TCOLD -21.5`:
+/// C's `sscanf(strstr(buffer, key), "<key> %f", &value)` on the C string in
+/// the datagram, so `%f` takes the longest float prefix into a `float`.
+pub fn status_value(message: &[u8], key: &str) -> Option<f64> {
+    let message = c_string(message);
+    let start = find(message, key.as_bytes())?;
+    let rest = message[start + key.len()..].trim_ascii_start();
+    let number = std::str::from_utf8(&rest[..float_prefix(rest)]).ok()?;
+    number.parse::<f32>().ok().map(f64::from)
+}
+
+/// The length of the `strtof` subject sequence at the start of `s`: a sign,
+/// then `inf`/`infinity`/`nan` or digits with an optional point and exponent.
+fn float_prefix(s: &[u8]) -> usize {
+    let sign = usize::from(matches!(s.first(), Some(b'+' | b'-')));
+    let rest = &s[sign..];
+    for word in [&b"infinity"[..], b"inf", b"nan"] {
+        if rest.len() >= word.len() && rest[..word.len()].eq_ignore_ascii_case(word) {
+            return sign + word.len();
+        }
+    }
+    let digits = |s: &[u8]| s.iter().take_while(|b| b.is_ascii_digit()).count();
+    let int = digits(rest);
+    let mut len = int;
+    let mut frac = 0;
+    if rest.get(len) == Some(&b'.') {
+        frac = digits(&rest[len + 1..]);
+        len += 1 + frac;
+    }
+    if int + frac == 0 {
+        return 0;
+    }
+    if matches!(rest.get(len), Some(b'e' | b'E')) {
+        let exp_sign = usize::from(matches!(rest.get(len + 1), Some(b'+' | b'-')));
+        let exp = digits(&rest[len + 1 + exp_sign..]);
+        if exp > 0 {
+            len += 1 + exp_sign + exp;
+        }
+    }
+    sign + len
 }
 
 /// The dew point of the box (Magnus formula, C `statusTask`).
@@ -323,10 +357,26 @@ mod tests {
 
     #[test]
     fn status_broadcast_values_are_found_by_key() {
-        let msg = "READ_TCOLD -21.5 READ_THOT 33.0 READ_BOX_HUM 12.5";
+        let msg = b"READ_TCOLD -21.5 READ_THOT 33.0 READ_BOX_HUM 12.5";
         assert_eq!(status_value(msg, "READ_TCOLD"), Some(-21.5));
         assert_eq!(status_value(msg, "READ_THOT"), Some(33.0));
         assert_eq!(status_value(msg, "READ_HV"), None);
+    }
+
+    /// `%f` stops at the first byte that cannot continue the number, the
+    /// datagram's C string ends at its NUL, and the value is a `float`.
+    #[test]
+    fn status_values_scan_as_c_sscanf_float() {
+        let msg =
+            b"READ_HV_CURRENT 0.50\0READ_TCOLD 1 READ_THOT 2.5e1x READ_HV 3e READ_BOX_HUM 24.7";
+        assert_eq!(status_value(msg, "READ_HV_CURRENT"), Some(0.5));
+        assert_eq!(status_value(msg, "READ_TCOLD"), None);
+        let msg = b"READ_THOT 2.5e1x READ_HV 3e READ_BOX_HUM 24.7 READ_TCOLD -.5, READ_BOX_TEMP .";
+        assert_eq!(status_value(msg, "READ_THOT"), Some(25.0));
+        assert_eq!(status_value(msg, "READ_HV"), Some(3.0));
+        assert_eq!(status_value(msg, "READ_BOX_HUM"), Some(f64::from(24.7f32)));
+        assert_eq!(status_value(msg, "READ_TCOLD"), Some(-0.5));
+        assert_eq!(status_value(msg, "READ_BOX_TEMP"), None);
     }
 
     #[test]
