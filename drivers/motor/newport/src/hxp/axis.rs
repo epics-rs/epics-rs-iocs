@@ -222,10 +222,10 @@ impl AsynMotor for HxpAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         // C `HXPAxis::poll` reads what the controller poll before it read.
         let data = self.lock_controller().data().clone();
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position: data.setpoint[self.axis_no] / MRES,
             encoder_position: data.encoder[self.axis_no] / MRES,
             done: !data.moving,
@@ -240,7 +240,8 @@ impl AsynMotor for HxpAxis {
             // The hexapod plans its own trajectory; base velocity is ignored.
             vbas_supported: false,
             ..Default::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -249,6 +250,7 @@ mod tests {
     use super::*;
     use crate::xps::fake::FakeLine;
     use crate::xps::rpc::SocketMode;
+    use motor_common::testing::Polled;
 
     /// HXPAxis inherits asynMotorAxis::setPosition, which sends nothing and
     /// returns asynSuccess (asynMotorAxis.cpp:130).
@@ -316,7 +318,7 @@ mod tests {
         );
         // The fake reports 1.5 for the current position.
         axis.lock_controller().poll();
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert_eq!(
             (status.position, status.encoder_position),
             (150000.0, 150000.0)

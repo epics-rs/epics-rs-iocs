@@ -265,8 +265,6 @@ pub struct A3200Axis {
     /// `motorAxisProblem` latched by a faulted move and cleared by enable,
     /// `motorAxisDirection` set by the commands, never by the poller.
     params: Arc<Params>,
-    /// The status a failed poll left, for the next post.
-    failed: Option<MotorStatus>,
     /// The sets a command made, for its callback.
     status_writes: Vec<StatusWrite>,
     report: Arc<AxisMembers>,
@@ -340,7 +338,6 @@ impl A3200Axis {
             digits: max_digits(step_size),
             last_fault: 0,
             current_cmd_pos: 0.0,
-            failed: None,
             status_writes: Vec::new(),
             log: Arc::default(),
         }
@@ -792,16 +789,10 @@ impl AsynMotor for A3200Axis {
         ctrl.send("WAIT MODE AUTO")
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let polled = self.poll_status();
-        if polled.is_err() {
-            self.failed = Some(self.params.motor_status());
-        }
-        polled.map(|()| self.params.motor_status())
-    }
-
-    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
-        self.failed.take()
+        *status = self.params.motor_status();
+        polled
     }
 
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
@@ -851,6 +842,7 @@ impl DrvSet for A3200Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn max_digits_follows_the_step() {
@@ -1128,13 +1120,13 @@ mod tests {
         let set = |r: &str| *reply.lock().unwrap() = r.into();
         // A real axis with its CW input active-high and the drive enabled.
         set(&format!("%{} 3 0 5 6 0", AXISSTATUS_NOT_VIRTUAL));
-        let good = axis.poll(&user).unwrap();
+        let good = axis.polled(&user).unwrap();
         assert!(good.powered && good.low_limit && !good.comms_error);
         assert_eq!((good.position, good.encoder_position), (6.0, 5.0));
 
         *fail.lock().unwrap() = true;
-        assert!(axis.poll(&user).is_err());
-        let left = axis.take_failed_poll_status().unwrap();
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert_eq!(
             left,
             MotorStatus {
@@ -1144,12 +1136,13 @@ mod tests {
         );
         *fail.lock().unwrap() = false;
         set("!");
-        assert!(axis.poll(&user).is_err());
-        assert!(axis.take_failed_poll_status().unwrap().comms_error);
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
+        assert!(left.comms_error);
 
         // A virtual axis: the limits stay where the real reading left them.
         set("%0 0 0 7 8 0");
-        let virt = axis.poll(&user).unwrap();
+        let virt = axis.polled(&user).unwrap();
         assert!(!virt.comms_error && !virt.powered);
         assert_eq!(
             (virt.high_limit, virt.low_limit),
@@ -1313,10 +1306,10 @@ mod tests {
         let (_line, mut axis) = rig_axis("a32SettleLine", true, reply, |_| false);
         let user = AsynUser::new(0);
         axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
-        assert!(!axis.poll(&user).unwrap().done);
+        assert!(!axis.polled(&user).unwrap().done);
         *started.lock().unwrap() = None;
         axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
-        assert!(!axis.poll(&user).unwrap().done);
+        assert!(!axis.polled(&user).unwrap().done);
     }
 
     #[test]
@@ -1399,7 +1392,7 @@ mod tests {
         let trace = manager.trace_manager();
         trace.set_trace_mask(None, TraceMask::IO_DRIVER);
         trace.set_trace_file(None, TraceFile::File(file));
-        axis.poll(&AsynUser::new(0)).unwrap();
+        axis.polled(&AsynUser::new(0)).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let lines: Vec<_> = text
@@ -1441,7 +1434,7 @@ mod tests {
         let user = AsynUser::new(0);
         for f in [0, 26, 26, 0, 26, 4] {
             *fault.lock().unwrap() = f;
-            axis.poll(&user).unwrap();
+            axis.polled(&user).unwrap();
         }
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);

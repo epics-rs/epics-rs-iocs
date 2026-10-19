@@ -316,7 +316,7 @@ impl AsynMotor for C300Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let mut ctrl = self.lock();
         let data = ctrl.query(&format!("{}:DATA?", self.chan))?;
         // Encoder position from the monitor record (fixed-offset fields).
@@ -334,7 +334,7 @@ impl AsynMotor for C300Axis {
         // Simulated done: within tolerance of the encoder position.
         let done = (theory_position - encoder_position).abs() <= TOLERANCE;
 
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position: theory_position,
             encoder_position,
             velocity: 0.0,
@@ -343,7 +343,8 @@ impl AsynMotor for C300Axis {
             has_encoder: self.has_encoder,
             gain_support: self.has_encoder,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 

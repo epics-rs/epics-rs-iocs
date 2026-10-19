@@ -1933,7 +1933,7 @@ impl AsynMotor for PhytronAxis {
     /// C `phytronAxis::poll` (phytronAxisMotor.cpp:1842-1872): a serial or
     /// axis-parallel axis reads itself; a controller-parallel one parses
     /// what the controller poll read for it.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let (method, answers) = {
             let mut ctrl = self.lock();
             let method = ctrl.poll_method(self.axis_no);
@@ -1957,7 +1957,8 @@ impl AsynMotor for PhytronAxis {
             }
             (method, answers)
         };
-        self.parse_answer(&answers?, method)
+        *status = self.parse_answer(&answers?, method)?;
+        Ok(())
     }
 }
 
@@ -2138,6 +2139,7 @@ fn mcc_status_word(axis_digit: u8, perr: &str, sui: &str, moving: bool) -> AsynR
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::motor::PortSet;
+    use motor_common::testing::Polled;
 
     /// An MCC that ACKs every command, answering `P22R` with 1000 and the
     /// rest of a poll with an idle, fault-free axis; records each command
@@ -2287,7 +2289,7 @@ mod tests {
         let (mut axis, _) = mcc_axis("phytronFailedMoving");
         assert_eq!(axis.failed_poll_moving(), Some(true));
         axis.controller.lock().unwrap().poll();
-        assert!(!axis.poll(&AsynUser::new(0)).unwrap().moving);
+        assert!(!axis.polled(&AsynUser::new(0)).unwrap().moving);
         assert_eq!(axis.failed_poll_moving(), Some(false));
         let _ = axis.move_absolute(&AsynUser::new(0), 10.0, 1.0, 2.0, 1.0);
         assert_eq!(axis.failed_poll_moving(), Some(true));
@@ -2313,7 +2315,7 @@ mod tests {
         ];
         for (name, start) in starts {
             axis.controller.lock().unwrap().poll();
-            assert!(!axis.poll(&user).unwrap().moving, "{name}");
+            assert!(!axis.polled(&user).unwrap().moving, "{name}");
             assert_eq!(axis.failed_poll_moving(), Some(false), "{name}");
             start(&mut axis, &user);
             assert_eq!(axis.failed_poll_moving(), Some(true), "{name}");
@@ -2357,7 +2359,7 @@ mod tests {
         controller.lock().unwrap().set_axis_status_reason(99);
         let mut axis = PhytronAxis::new(controller.clone(), 0, 1).unwrap();
         let user = AsynUser::new(0);
-        assert_eq!(axis.poll(&user).unwrap().encoder_position, 1000.0);
+        assert_eq!(axis.polled(&user).unwrap().encoder_position, 1000.0);
         // AXIS_STATUS on the axis's own address, the poll's only step on
         // the port (:2084).
         let sets: Vec<_> = axis
@@ -2373,13 +2375,13 @@ mod tests {
             .collect();
         assert_eq!(sets, [99]);
         axis.set_encoder_ratio(&user, 0.5).unwrap();
-        assert_eq!(axis.poll(&user).unwrap().encoder_position, 500.0);
+        assert_eq!(axis.polled(&user).unwrap().encoder_position, 500.0);
         controller
             .lock()
             .unwrap()
             .reset("phytronEncoderPoll", 0)
             .unwrap();
-        assert_eq!(axis.poll(&user).unwrap().encoder_position, 1000.0);
+        assert_eq!(axis.polled(&user).unwrap().encoder_position, 1000.0);
     }
 
     /// phytronAxisMotor.cpp:2083: status bit 0x4000 is motorStatusSlip_,
@@ -2418,7 +2420,7 @@ mod tests {
             0,
         )));
         let mut axis = PhytronAxis::new(controller, 1, 1).unwrap();
-        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
         assert!(status.slip);
         assert!(!status.slip_stall);
     }
@@ -2595,7 +2597,7 @@ mod tests {
     fn an_axis_parallel_poll_reads_its_status_and_positions_on_one_line() {
         let (ctrl, [mut axis, _], written) = lines("phyAxisParallel");
         let user = AsynUser::new(0);
-        let serial = axis.poll(&user).unwrap();
+        let serial = axis.polled(&user).unwrap();
         assert_eq!(
             *written.lock().unwrap(),
             ["M1.1P20R", "M1.1P22R", "M1.1==H", "SE1.1"]
@@ -2603,7 +2605,7 @@ mod tests {
         assert!(serial.moving);
         written.lock().unwrap().clear();
         ctrl.lock().unwrap().axis_mut(11).unwrap().poll_method = PollMethod::AxisParallel;
-        let parallel = axis.poll(&user).unwrap();
+        let parallel = axis.polled(&user).unwrap();
         assert_eq!(*written.lock().unwrap(), ["SE1.1 M1.1P20R M1.1P22R"]);
         assert!(parallel.moving && parallel.high_limit);
         assert_eq!((parallel.position, parallel.encoder_position), (7.0, 9.0));
@@ -2616,23 +2618,23 @@ mod tests {
         let (ctrl, mut axes, written) = lines("phyCtrlParallel");
         ctrl.lock().unwrap().default_poll_method = PollMethod::ControllerParallel;
         let user = AsynUser::new(0);
-        assert!(axes[0].poll(&user).is_err(), "no controller poll yet");
+        assert!(axes[0].polled(&user).is_err(), "no controller poll yet");
         ctrl.lock().unwrap().poll();
         for axis in &mut axes {
-            let status = axis.poll(&user).unwrap();
+            let status = axis.polled(&user).unwrap();
             assert_eq!(status.position, 7.0);
         }
         assert_eq!(
             *written.lock().unwrap(),
             ["SE1.1 M1.1P20R M1.1P22R SE1.2 M1.2P20R M1.2P22R"]
         );
-        assert!(axes[1].poll(&user).is_err(), "each pass's answers once");
+        assert!(axes[1].polled(&user).is_err(), "each pass's answers once");
         // A pass that reads no axis in parallel leaves none of the last's.
         ctrl.lock().unwrap().poll();
         ctrl.lock().unwrap().default_poll_method = PollMethod::Serial;
         ctrl.lock().unwrap().poll();
         ctrl.lock().unwrap().default_poll_method = PollMethod::ControllerParallel;
-        assert!(axes[0].poll(&user).is_err());
+        assert!(axes[0].polled(&user).is_err());
     }
 
     /// A motion method is one line unless the axis polls serially.
@@ -2712,7 +2714,7 @@ mod tests {
         assert_eq!(secs(&written), 1);
         axis.move_velocity(&user, 10.0, 100.0, 5000.0).unwrap();
         assert_eq!(secs(&written), 0, "disarmed");
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         written.lock().unwrap().clear();
         ctrl.lock().unwrap().axis_mut(11).unwrap().homing_procedure = Some(0);
         axis.home(&user, 10.0, 100.0, 5000.0, true).unwrap();
@@ -2806,10 +2808,10 @@ mod tests {
         };
         assert!(release.ends_with(" M1.1MA A1.2S"), "{sent:?}");
         assert_eq!(mv, "M1.1A1");
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         let sent = take();
         assert_eq!(sent[sent.len() - 2..], ["A1.2R", "M1.1MD"], "{sent:?}");
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert!(!take().iter().any(|l| l.contains("A1.2")));
     }
 

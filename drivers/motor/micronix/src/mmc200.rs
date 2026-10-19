@@ -458,11 +458,20 @@ impl AsynMotor for Mmc200Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        let polled = self.poll_params();
+        *status = self.last_status.clone();
+        polled
+    }
+}
+
+impl Mmc200Axis {
+    /// C `poll`'s sets into `last_status`, which a failure leaves as they were.
+    fn poll_params(&mut self) -> AsynResult<()> {
         // C ignores the MMC-ETH module in poll (returns asynSuccess without
         // updating any parameter); keep the record inert.
         if !self.active {
-            return Ok(self.last_status.clone());
+            return Ok(());
         }
 
         let n = self.axis_index;
@@ -498,11 +507,7 @@ impl AsynMotor for Mmc200Axis {
         let drive_on = atoi(mot_reply.get(1..).unwrap_or(""));
         self.last_status.powered = drive_on != 0;
         self.last_status.problem = false;
-        Ok(self.last_status.clone())
-    }
-
-    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
-        Some(self.last_status.clone())
+        Ok(())
     }
 }
 
@@ -510,6 +515,7 @@ impl AsynMotor for Mmc200Axis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+    use motor_common::testing::Polled;
     use std::time::Duration;
 
     #[test]
@@ -572,7 +578,7 @@ mod tests {
         let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
         let mut axis = Mmc200Axis::new(controller, 0, false);
         assert_eq!(axis.model, MODEL_ETH);
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert_eq!(status, MotorStatus::default());
     }
 
@@ -585,8 +591,8 @@ mod tests {
             SyncIOHandle::connect_port("MMC200_DEAD", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(Mmc200Controller::new(handle)));
         let mut axis = Mmc200Axis::new(controller, 0, false);
-        assert!(axis.poll(&AsynUser::default()).is_err());
-        let left = axis.take_failed_poll_status().expect("the status C left");
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&AsynUser::default(), &mut left).is_err());
         assert!(left.gain_support && left.has_encoder, "{left:?}");
         assert!(!left.comms_error, "{left:?}");
     }
@@ -616,7 +622,7 @@ mod tests {
         let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
         let mut axis = Mmc200Axis::new(controller, 0, false);
         rig.sent();
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert!(
             status.done && status.powered && !status.problem,
             "{status:?}"

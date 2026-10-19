@@ -625,7 +625,7 @@ impl AsynMotor for Lc400Axis {
 
     /// `LC400Axis::poll`: the position, then WAV_ACTIVE for done; the limit
     /// bits latch at a hard limit once done and clear while moving away.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let Some(address) = base_address(self.axis) else {
             return Err(lc400_err(format!("LC400 has no axis {}", self.axis)));
         };
@@ -677,7 +677,8 @@ impl AsynMotor for Lc400Axis {
         for (reason, value) in updates {
             self.sets.axis(reason, value);
         }
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 
     fn take_port_sets(&mut self) -> PortSets {
@@ -879,6 +880,7 @@ mod tests {
     use epics_rs::motor::trace::TraceUser;
 
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn the_constructor_calls_back() {
@@ -950,9 +952,9 @@ mod tests {
                 .collect()
         };
         // The first poll finds the axis done; the aux params wait for it.
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(reasons(&mut axis), [p.digital_pos]);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(
             reasons(&mut axis),
             [
@@ -986,11 +988,11 @@ mod tests {
         let p = lock(&controller).params.unwrap();
         let mut axis = Lc400Axis::new(controller, 0);
         let user = AsynUser::new(0);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         axis.take_port_sets();
         // Position, WAV_ACTIVE, range, range type, then SERVO_STATE refused.
         left.store(5, Ordering::SeqCst);
-        assert!(axis.poll(&user).unwrap().problem);
+        assert!(axis.polled(&user).unwrap().problem);
         let reasons: Vec<usize> = axis
             .take_port_sets()
             .into_iter()

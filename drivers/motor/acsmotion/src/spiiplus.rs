@@ -890,7 +890,7 @@ impl AsynMotor for SpiiPlusAxis {
 
     /// C `SPiiPlusAxis::poll` (SPiiPlusDriver.cpp:751-866): what the
     /// controller's [`SpiiPlusController::poll`] read, with no I/O of its own.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let mut ctrl = self.lock();
         let a = self.axis;
         let polled = &ctrl.polled;
@@ -945,7 +945,7 @@ impl AsynMotor for SpiiPlusAxis {
             }
         }
 
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position: apos,
             encoder_position: encoder,
             // C sets no motorVelocity_, so RVEL stays 0.
@@ -960,7 +960,8 @@ impl AsynMotor for SpiiPlusAxis {
             has_encoder: true,
             gain_support: true,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 
     fn take_port_sets(&mut self) -> PortSets {
@@ -1537,6 +1538,7 @@ mod tests {
     use super::*;
     use crate::profile::tests::{SERVOS, rig};
     use epics_rs::asyn::interfaces::motor::PortSet;
+    use motor_common::testing::Polled;
 
     /// The poll's steps on the port, each on the axis's own address.
     fn axis_params(sets: PortSets) -> Vec<(usize, ParamValue)> {
@@ -1844,7 +1846,7 @@ mod tests {
     /// One poller pass over `axis`: the controller poll, then the axis's.
     fn pass(ctrl: &Arc<Mutex<SpiiPlusController>>, axis: &mut SpiiPlusAxis) -> MotorStatus {
         ctrl.lock().unwrap().poll().unwrap();
-        axis.poll(&AsynUser::default()).unwrap()
+        axis.polled(&AsynUser::default()).unwrap()
     }
 
     /// C's controller poll reads every axis in binary, in its order, and
@@ -1868,7 +1870,7 @@ mod tests {
         line.lock().unwrap().sent.clear();
         let positions = axes
             .each_mut()
-            .map(|axis| axis.poll(&AsynUser::default()).unwrap().position);
+            .map(|axis| axis.polled(&AsynUser::default()).unwrap().position);
         assert_eq!(positions, [3.0, 4.0]);
         assert!(line.lock().unwrap().sent.is_empty());
     }
@@ -2035,7 +2037,7 @@ mod tests {
         let mut axes = [0, 1].map(|i| SpiiPlusAxis::new(ctrl.clone(), i));
         ctrl.lock().unwrap().poll().unwrap();
         for axis in &mut axes {
-            axis.poll(&user).unwrap();
+            axis.polled(&user).unwrap();
         }
         assert_eq!(
             ctrl.lock().unwrap().motion,

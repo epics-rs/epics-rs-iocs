@@ -583,6 +583,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::oms::OmsAxis;
+    use motor_common::testing::Polled;
 
     type Replies = Arc<Mutex<HashMap<String, String>>>;
 
@@ -739,7 +740,7 @@ pub(crate) mod tests {
         );
 
         let user = AsynUser::default();
-        let x = rig.axes[0].poll(&user).unwrap();
+        let x = rig.axes[0].polled(&user).unwrap();
         assert_eq!(
             (x.done, x.moving, x.msta_moving, x.problem),
             (false, true, true, false)
@@ -749,7 +750,7 @@ pub(crate) mod tests {
         assert!(!x.gain_support, "C sets 0 for an `on` field");
         assert!(!x.low_limit && !x.high_limit);
 
-        let y = rig.axes[1].poll(&user).unwrap();
+        let y = rig.axes[1].polled(&user).unwrap();
         assert_eq!((y.done, y.moving, y.msta_moving), (true, false, false));
         assert_eq!((y.position, y.encoder_position), (-5.0, 0.0));
         assert!(!y.direction && y.home && y.gain_support);
@@ -758,9 +759,9 @@ pub(crate) mod tests {
         rig.axes[1]
             .move_absolute(&user, 10.0, 1.0, 100.0, 1000.0)
             .unwrap();
-        assert!(!rig.axes[1].poll(&user).unwrap().done);
+        assert!(!rig.axes[1].polled(&user).unwrap().done);
         assert!(
-            rig.axes[1].poll(&user).unwrap().home,
+            rig.axes[1].polled(&user).unwrap().home,
             "untouched until the next loop"
         );
     }
@@ -778,7 +779,7 @@ pub(crate) mod tests {
             let Ok(PollCommand::Post(status)) = rx.try_recv() else {
                 panic!("axis {i} not posted");
             };
-            assert_eq!(status, rig.axes[i].poll(&AsynUser::default()).unwrap());
+            assert_eq!(status, rig.axes[i].polled(&AsynUser::default()).unwrap());
             assert!(rx.try_recv().is_err());
         }
         assert!(poller.shared.wait(Duration::ZERO));
@@ -867,8 +868,8 @@ pub(crate) mod tests {
         init_positions(&rig.controller);
         assert_eq!(*rig.written.lock().unwrap(), ["AM PP;"]);
         let user = AsynUser::default();
-        assert_eq!(rig.axes[0].poll(&user).unwrap().position, 3000.0);
-        assert_eq!(rig.axes[1].poll(&user).unwrap().position, -5.0);
+        assert_eq!(rig.axes[0].polled(&user).unwrap().position, 3000.0);
+        assert_eq!(rig.axes[1].polled(&user).unwrap().position, -5.0);
     }
 
     /// C `homing`: set by home(), cleared by the loop that finds the axis
@@ -897,7 +898,7 @@ pub(crate) mod tests {
             .move_absolute(&user, 10.0, 1.0, 100.0, 1000.0)
             .unwrap();
         assert!(!shared.wait(Duration::ZERO));
-        rig.axes[0].poll(&user).unwrap();
+        rig.axes[0].polled(&user).unwrap();
         assert!(shared.wait(Duration::ZERO));
     }
 
@@ -947,7 +948,7 @@ pub(crate) mod tests {
         assert_eq!(poller.pass(), Some(Duration::from_secs(1)));
         assert!(!poller.enabled);
         assert_eq!(
-            rig.axes[0].poll(&AsynUser::default()).unwrap().position,
+            rig.axes[0].polled(&AsynUser::default()).unwrap().position,
             0.0
         );
         rig.written.lock().unwrap().clear();

@@ -18,7 +18,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
-use motor_common::model1::init_read;
+use motor_common::model1::{init_poll, init_read};
 use motor_common::util::{atof, atoi, nint};
 
 /// `Soloist_NUM_CARDS`.
@@ -200,7 +200,7 @@ impl DrvSoloistAxis {
             post: None,
             init_status: None,
         };
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -388,7 +388,7 @@ impl AsynMotor for DrvSoloistAxis {
     /// `set_status`: `AXISSTATUS()`, `AXISFAULT()` and `PFBKPROG()`. A first
     /// missed status fails the poll raising nothing; a second, or a reply
     /// other than `%`, raises the comms error.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let card = self.card.clone();
         let mut ctrl = card.lock().unwrap_or_else(|e| e.into_inner());
         let reply = ctrl.ask(b"AXISSTATUS()");
@@ -443,13 +443,15 @@ impl AsynMotor for DrvSoloistAxis {
         {
             self.send(post);
         }
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn digits_follow_the_resolution() {
@@ -561,9 +563,9 @@ mod tests {
         };
         let mut axis = DrvSoloistAxis::new(card, setup);
         let user = AsynUser::new(0);
-        assert!(axis.poll(&user).unwrap().msta_moving);
+        assert!(axis.polled(&user).unwrap().msta_moving);
         bits.store(IN_POSITION_BIT, Ordering::Relaxed);
-        assert!(!axis.poll(&user).unwrap().msta_moving);
+        assert!(!axis.polled(&user).unwrap().msta_moving);
     }
 
     /// drvSoloist.cc:222-251: a first missed `AXISSTATUS()` is RETRY
@@ -593,15 +595,15 @@ mod tests {
         let mut axis = DrvSoloistAxis::new(card, setup);
         let user = AsynUser::new(0);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
@@ -637,7 +639,7 @@ mod tests {
         let user = AsynUser::new(0);
         for (m, want) in [(0, 5.0), (1, 0.0), (0, 5.0), (2, 0.0)] {
             mode.store(m, Ordering::SeqCst);
-            let s = axis.poll(&user).unwrap();
+            let s = axis.polled(&user).unwrap();
             assert_eq!((s.position, s.encoder_position), (want, want), "mode {m}");
         }
     }

@@ -465,12 +465,21 @@ impl AsynMotor for AgUcAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        let polled = self.poll_params();
+        *status = self.last_status.clone();
+        polled
+    }
+}
+
+impl AgUcAxis {
+    /// C `poll`'s sets into `last_status`, which a failure leaves as they were.
+    fn poll_params(&mut self) -> AsynResult<()> {
         let controller = Arc::clone(&self.controller);
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // C never starts the poller: the axis reports its initial status only.
         if ctrl.model.is_none() {
-            return Ok(MotorStatus::default());
+            return Ok(());
         }
 
         // Select this axis's channel (C issues CC unconditionally, incl. CC0
@@ -505,11 +514,7 @@ impl AsynMotor for AgUcAxis {
         let limit = ph_limit(self.axis_id, lim);
         // C sets both low and high limit to the same flag.
         (self.last_status.low_limit, self.last_status.high_limit) = (limit, limit);
-        Ok(self.last_status.clone())
-    }
-
-    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
-        Some(self.last_status.clone())
+        Ok(())
     }
 }
 
@@ -517,6 +522,7 @@ impl AsynMotor for AgUcAxis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+    use motor_common::testing::Polled;
 
     #[test]
     fn model_detected_from_firmware_string() {
@@ -549,7 +555,7 @@ mod tests {
         assert!(start.elapsed() >= RESET_SETTLE + 3 * WRITE_DELAY);
         assert_eq!(controller.lock().unwrap().model(), None);
         let mut axis = AgUcAxis::new(controller, 0, true, 50, -50);
-        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
         assert!(!status.moving);
     }
 
@@ -629,7 +635,7 @@ mod tests {
         let user = AsynUser::new(0);
         axis.move_relative(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["CC1", "1PR5"]);
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert_eq!(status.position, 7.0);
         assert_eq!(line.sent(), ["CC1", "1TP", "1TS", "PH"]);
     }
@@ -657,22 +663,22 @@ mod tests {
         let user = AsynUser::new(0);
         line.sent();
         *refused.lock().unwrap() = "1TS".into();
-        assert!(axis.poll(&user).is_err());
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert_eq!(line.sent(), ["CC1", "1TP", "1TS"]);
-        let left = axis.take_failed_poll_status().unwrap();
         assert!(
             left.position == 7.0 && !left.moving && !left.problem,
             "{left:?}"
         );
         *refused.lock().unwrap() = "PH".into();
-        assert!(axis.poll(&user).is_err());
-        let left = axis.take_failed_poll_status().unwrap();
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert!(left.moving && !left.done && !left.low_limit, "{left:?}");
         refused.lock().unwrap().clear();
-        assert!(axis.poll(&user).unwrap().low_limit);
+        assert!(axis.polled(&user).unwrap().low_limit);
         *refused.lock().unwrap() = "1TP".into();
-        assert!(axis.poll(&user).is_err());
-        let left = axis.take_failed_poll_status().unwrap();
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert!(
             left.position == 7.0 && left.moving && left.low_limit,
             "{left:?}"
@@ -699,12 +705,12 @@ mod tests {
         let controller = AgUcController::new(io, &MotorTrace::new("AG_UC_SHORT", 0));
         let mut axis = AgUcAxis::new(Arc::new(Mutex::new(controller)), 0, true, 50, -50);
         let user = AsynUser::new(0);
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert_eq!(status.position, 0.0);
         assert!(status.moving && !status.done && !status.low_limit);
         for (cmd, short) in [("1TP", "1T"), ("1TS", "1T"), ("PH", "P")] {
             let full = replies.lock().unwrap().insert(cmd.into(), short.into());
-            assert!(axis.poll(&user).is_err(), "{cmd}");
+            assert!(axis.polled(&user).is_err(), "{cmd}");
             replies.lock().unwrap().insert(cmd.into(), full.unwrap());
         }
     }

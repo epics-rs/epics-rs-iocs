@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
 use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
@@ -15,6 +16,25 @@ use epics_rs::asyn::registry::{claim_port, open_owner};
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+
+/// One poll's status, polled into a fresh one.
+pub trait Polled {
+    fn polled(&mut self, user: &AsynUser) -> AsynResult<MotorStatus>;
+    fn polled_in_motion(&mut self, user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus>;
+}
+
+impl<M: AsynMotor + ?Sized> Polled for M {
+    fn polled(&mut self, user: &AsynUser) -> AsynResult<MotorStatus> {
+        let mut status = MotorStatus::default();
+        self.poll(user, &mut status).map(|()| status)
+    }
+
+    fn polled_in_motion(&mut self, user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
+        let mut status = MotorStatus::default();
+        self.poll_in_motion(user, cdir, &mut status)
+            .map(|()| status)
+    }
+}
 
 type Reply = Box<dyn Fn(&str) -> String + Send + Sync>;
 type Lines = Box<dyn Fn(&str) -> Vec<String> + Send + Sync>;

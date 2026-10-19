@@ -383,11 +383,12 @@ impl AsynMotor for CorvusAxis {
     /// only Problem; C's poller ignores the returned error, so no COMM_ERR.
     /// Problem is set from the comm status alone, overwriting the drive-off
     /// problem (SMCcorvusDriver.cpp:473-477).
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let mut status = self.last_status.clone();
         status.problem = self.poll_into(&mut status).is_err();
         self.last_status = status.clone();
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
@@ -441,6 +442,7 @@ impl CorvusAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn the_constructor_calls_back() {
@@ -469,7 +471,7 @@ mod tests {
         );
         let controller = Arc::new(Mutex::new(CorvusController::new(handle, 1)));
         let mut axis = CorvusAxis::new(controller, 0, "").unwrap();
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert!(status.problem && !status.done, "{status:?}");
     }
 

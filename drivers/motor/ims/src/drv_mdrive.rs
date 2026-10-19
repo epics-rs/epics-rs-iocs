@@ -18,7 +18,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_printf;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atof, atoi, nint};
 
 /// `MDrive_NUM_CARDS`.
@@ -192,7 +192,7 @@ impl DrvMDriveAxis {
             probe_drive(&ctrl, card, signal, ident)
         };
         let mut axis = Self::with_drive(controller, signal, drive);
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -398,7 +398,7 @@ impl AsynMotor for DrvMDriveAxis {
     /// for each wired switch, `PR C2` for the encoder and `PR V` for the
     /// velocity. A first unanswered `PR MV` fails the poll raising nothing; a
     /// second raises the comms error.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let name = self.name;
@@ -450,7 +450,8 @@ impl AsynMotor for DrvMDriveAxis {
             line.extend_from_slice(&post);
             self.lock().send(line);
         }
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
@@ -458,6 +459,7 @@ impl AsynMotor for DrvMDriveAxis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct Rig {
@@ -510,7 +512,7 @@ mod tests {
 
         /// What one poll sent besides its queries.
         fn poll_extra(&mut self) -> Vec<String> {
-            self.axis.poll(&self.user).unwrap();
+            self.axis.polled(&self.user).unwrap();
             self.line
                 .sent()
                 .into_iter()
@@ -652,15 +654,15 @@ mod tests {
         let mut axis = DrvMDriveAxis::with_drive(controller, 0, drive);
         let user = AsynUser::new(0);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

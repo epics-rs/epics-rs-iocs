@@ -46,7 +46,7 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{nint, strtol};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -271,7 +271,7 @@ impl KohzuAxis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -425,13 +425,20 @@ impl AsynMotor for KohzuAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        self.poll_status(None)
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = self.poll_status(None)?;
+        Ok(())
     }
 
     /// drvSC800.cc:278-282: a moving axis reports the record's CDIR.
-    fn poll_in_motion(&mut self, _user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
-        self.poll_status(Some(*cdir))
+    fn poll_in_motion(
+        &mut self,
+        _user: &AsynUser,
+        cdir: &mut bool,
+        status: &mut MotorStatus,
+    ) -> AsynResult<()> {
+        *status = self.poll_status(Some(*cdir))?;
+        Ok(())
     }
 }
 
@@ -519,6 +526,7 @@ impl KohzuAxis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// `STR` fields of the rig: moving, cw limit, ccw limit.
@@ -612,7 +620,7 @@ mod tests {
 
     /// What a poll sent besides its queries.
     fn poll_extra(line: &LineRig, axis: &mut KohzuAxis) -> Vec<String> {
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         sent(line)
             .into_iter()
             .filter(|l| !["STR1/1", "RDP1/0", "RSY1/21"].contains(&l.as_str()))
@@ -707,12 +715,12 @@ mod tests {
         let user = AsynUser::default();
         state.store(MOVING | CCW, Ordering::SeqCst);
         let mut cdir = false;
-        let s = axis.poll_in_motion(&user, &mut cdir).unwrap();
+        let s = axis.polled_in_motion(&user, &mut cdir).unwrap();
         assert!(!s.direction && !cdir);
         let mut cdir = true;
-        assert!(axis.poll_in_motion(&user, &mut cdir).unwrap().direction);
+        assert!(axis.polled_in_motion(&user, &mut cdir).unwrap().direction);
         state.store(0, Ordering::SeqCst);
-        assert!(axis.poll(&user).unwrap().direction, "kept at rest");
+        assert!(axis.polled(&user).unwrap().direction, "kept at rest");
     }
 
     #[test]
@@ -775,16 +783,16 @@ mod tests {
         let (line, mut axis, state) = strings_rig("sc800Retry");
         let user = AsynUser::default();
         state.store(QUIET, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(sent(&line), ["STR1/1"]);
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         state.store(0, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         state.store(QUIET, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 

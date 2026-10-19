@@ -720,7 +720,7 @@ impl AsynMotor for ConexAxis {
         status
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         // Position (TP): controller units to record steps.
         let step = self.step()?;
         let position = parse_value_at(&self.write_read(&query(self.controller_id, "TP"))?, 3)
@@ -744,7 +744,7 @@ impl AsynMotor for ConexAxis {
         mm?;
         let powered = powered.ok_or_else(|| parse_error("MM?"))?;
 
-        Ok(MotorStatus {
+        *out = MotorStatus {
             position,
             encoder_position: position,
             done: status.done,
@@ -754,7 +754,8 @@ impl AsynMotor for ConexAxis {
             powered,
             gain_support: self.model.is_cc_or_agp(),
             ..Default::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -762,6 +763,7 @@ impl AsynMotor for ConexAxis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
 
     /// AG_CONEX.cpp:217-268 and :442 ignore writeReadController's status
     /// past VE and parse `inString_`, so replies cut by a timeout still set
@@ -839,7 +841,7 @@ mod tests {
                 "1PA12.499900"
             ]
         );
-        assert_eq!(axis.poll(&user).unwrap().position, 25000.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 25000.0);
     }
 
     /// C sets `status =` on each write and returns the last

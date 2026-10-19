@@ -39,7 +39,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atof, is_unsolicited_limit_error, nint};
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
@@ -279,8 +279,8 @@ pub struct Mm3000Axis {
     /// What the last failed poll raises: nothing on C's first missed reply
     /// (RETRY), `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next (COMM_ERR).
     failure: PollFailure,
-    /// The status a RETRY exit stored after a good `MS`, which the poller
-    /// carries to its next post.
+    /// The status a RETRY exit stored after a good `MS`, which the poll
+    /// leaves.
     left: Option<MotorStatus>,
     strings: MoveStrings,
     /// What `motor_init`'s `set_status` read, until the motor task takes it.
@@ -318,7 +318,7 @@ impl Mm3000Axis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        ax.init_status = Some(ax.poll(&AsynUser::new(0)));
+        ax.init_status = Some(init_poll(&mut ax, &AsynUser::new(0)));
         ax
     }
 
@@ -358,10 +358,6 @@ impl Model1Motor for Mm3000Axis {
 impl AsynMotor for Mm3000Axis {
     fn poll_failure(&self) -> PollFailure {
         self.failure
-    }
-
-    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
-        self.left.take()
     }
 
     fn move_absolute(
@@ -509,8 +505,17 @@ impl AsynMotor for Mm3000Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        self.set_status()
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        match self.set_status() {
+            Ok(polled) => *status = polled,
+            Err(e) => {
+                if let Some(left) = self.left.take() {
+                    *status = left;
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -614,6 +619,7 @@ fn retry(axis: impl std::fmt::Display) -> AsynError {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// Answers `VE` and the commands in `replies`, fails every other read,
@@ -838,7 +844,7 @@ mod tests {
 
     /// What a poll sent besides its queries.
     fn poll_extra(line: &LineRig, axis: &mut Mm3000Axis) -> Vec<String> {
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         line.sent()
             .into_iter()
             .filter(|l| l != "1MS" && l != "1TP")
@@ -1067,15 +1073,15 @@ mod tests {
         let mut axis = Mm3000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
@@ -1142,18 +1148,23 @@ mod tests {
         let ctrl = Mm3000Controller::new(io).unwrap();
         let mut axis = Mm3000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
         let user = AsynUser::default();
-        assert!(axis.poll(&user).is_err());
-        assert_eq!(axis.take_failed_poll_status(), None);
-        assert!(axis.poll(&user).is_err());
+        // An exit before any reply leaves the axis's status as it was.
+        let before = MotorStatus {
+            position: 99.0,
+            ..MotorStatus::default()
+        };
+        let mut left = before.clone();
+        assert!(axis.poll(&user, &mut left).is_err());
+        assert_eq!(left, before);
+        assert!(axis.poll(&user, &mut left).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
-        assert_eq!(axis.take_failed_poll_status(), None);
+        assert_eq!(left, before);
         quiet.store(false, Ordering::SeqCst);
         quiet_tp.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        let left = axis.take_failed_poll_status().unwrap();
         assert!(left.moving && !left.done && left.direction && left.home);
         assert!(!left.comms_error && left.problem && !left.msta_moving);
-        assert_eq!(axis.take_failed_poll_status(), None);
     }
 }

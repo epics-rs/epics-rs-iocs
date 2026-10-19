@@ -501,7 +501,8 @@ impl AsynMotor for PmacCsAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let status = self.poll(user)?;
+        let mut status = MotorStatus::default();
+        self.poll(user, &mut status)?;
         self.move_absolute(
             user,
             status.position + distance,
@@ -641,7 +642,7 @@ impl AsynMotor for PmacCsAxis {
     }
 
     /// C `drvPmacGetAxesStatus`, for this axis's share of the system poll.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let axis = self.axis;
         let mut system = lock(&self.system);
         let poll = system.poll_system()?;
@@ -678,7 +679,7 @@ impl AsynMotor for PmacCsAxis {
             let _ = params.set_integer(f, i32::from(v));
         }
         params.call_callback();
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position,
             encoder_position: position,
             done: flags.done,
@@ -693,7 +694,8 @@ impl AsynMotor for PmacCsAxis {
             problem: flags.problem,
             comms_error: system.params(axis).get_integer(function::COMM_ERROR) == Ok(Some(1)),
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -765,6 +767,7 @@ fn decode_cs_status(status: (u32, u32, u32), deferred: bool) -> CsFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     /// A coordinate system in position with no program running.
     struct Idle {
@@ -868,14 +871,14 @@ mod tests {
     fn record_steps_scale_by_step_size() {
         let (mut axis, system, sent, _) = idle_axis("pmac_cs_steps", Duration::ZERO);
         let user = AsynUser::default();
-        assert_eq!(axis.poll(&user).unwrap().position, 15000.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 15000.0);
         sent.lock().unwrap().clear();
         axis.move_absolute(&user, 20000.0, 0.0, 5000.0, 10000.0)
             .unwrap();
         axis.set_position(&user, 1234.6).unwrap();
         lock(&system).set_steps_per_unit(0, 100.0);
         axis.move_absolute(&user, 250.0, 0.0, 0.0, 0.0).unwrap();
-        assert_eq!(axis.poll(&user).unwrap().position, 150.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 150.0);
         let wire = sent.lock().unwrap().clone();
         assert_eq!(
             wire[..3],
@@ -902,14 +905,14 @@ mod tests {
         assert_eq!(get.get_integer(function::DEFER_MOVES), Some(1));
         assert_eq!(get.get_integer(function::SLIP), None);
         axis.set_integer(&user, function::DEFER_MOVES, 0).unwrap();
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(get.get_double(function::POSITION), Some(15000.0));
         assert_eq!(get.get_integer(function::DONE), Some(1));
         assert_eq!(get.get_integer(function::COMM_ERROR), Some(0));
         axis.move_absolute(&user, 1.0, 0.0, 0.0, 0.0).unwrap();
         assert_eq!(get.get_integer(function::DONE), Some(0));
         // pmacAsynCoord.c:660-665: done is the system's status alone.
-        assert!(axis.poll(&user).unwrap().done);
+        assert!(axis.polled(&user).unwrap().done);
         assert_eq!(get.get_integer(function::DONE), Some(1));
     }
 
@@ -933,19 +936,19 @@ mod tests {
     fn the_poll_after_a_move_is_fresh() {
         let (mut axis, _, sent, _) = idle_axis("pmac_cs_moved", Duration::from_secs(3600));
         let user = AsynUser::default();
-        assert!(axis.poll(&user).unwrap().done);
+        assert!(axis.polled(&user).unwrap().done);
         sent.lock().unwrap().clear();
-        assert!(axis.poll(&user).unwrap().done);
+        assert!(axis.polled(&user).unwrap().done);
         assert!(sent.lock().unwrap().is_empty(), "inside the TTL");
 
         axis.move_absolute(&user, 2.0, 0.0, 0.0, 0.0).unwrap();
-        let after = axis.poll(&user).unwrap();
+        let after = axis.polled(&user).unwrap();
         let wire = sent.lock().unwrap().clone();
         assert_eq!(wire.len(), 3, "{wire:?}");
         assert!(after.done && !after.moving && !after.msta_moving);
 
         sent.lock().unwrap().clear();
-        assert!(axis.poll(&user).unwrap().done);
+        assert!(axis.polled(&user).unwrap().done);
         assert!(sent.lock().unwrap().is_empty());
     }
 
@@ -963,25 +966,25 @@ mod tests {
 
         set_fail(&["&1A Q72"]);
         assert!(b.stop(&user, 0.0).is_err());
-        assert!(!a.poll(&user).unwrap().comms_error);
-        assert!(b.poll(&user).unwrap().comms_error);
+        assert!(!a.polled(&user).unwrap().comms_error);
+        assert!(b.polled(&user).unwrap().comms_error);
         set_fail(&[]);
         assert!(
-            b.poll(&user).unwrap().comms_error,
+            b.polled(&user).unwrap().comms_error,
             "a poll is not B's transfer"
         );
         b.stop(&user, 0.0).unwrap();
-        assert!(!b.poll(&user).unwrap().comms_error);
+        assert!(!b.polled(&user).unwrap().comms_error);
 
         set_fail(&["&1Q81"]);
-        assert!(a.poll(&user).is_err());
+        assert!(a.polled(&user).is_err());
         assert_eq!(a.poll_failure(), PollFailure::COMMS_ERROR);
-        assert!(b.poll(&user).is_err());
+        assert!(b.polled(&user).is_err());
         assert_eq!(b.poll_failure(), PollFailure::NONE);
         // The status read failing first does not outlast the position read.
         set_fail(&["&1??"]);
-        assert!(!a.poll(&user).unwrap().comms_error);
-        assert!(!b.poll(&user).unwrap().comms_error);
+        assert!(!a.polled(&user).unwrap().comms_error);
+        assert!(!b.polled(&user).unwrap().comms_error);
     }
 
     #[test]

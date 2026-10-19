@@ -425,7 +425,16 @@ impl AsynMotor for Mvp2001Axis {
         ctrl.write_only(&cmd)
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        let polled = self.poll_params();
+        *status = self.status.clone();
+        polled
+    }
+}
+
+impl Mvp2001Axis {
+    /// C `poll`'s sets into `status`, which a failure leaves as they were.
+    fn poll_params(&mut self) -> AsynResult<()> {
         let n = self.axis_index;
         let controller = Arc::clone(&self.controller);
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -456,11 +465,7 @@ impl AsynMotor for Mvp2001Axis {
         self.status.low_limit = (status & 0x8000) != 0;
         self.status.powered = (status & 0x100) == 0;
         self.status.problem = false;
-        Ok(self.status.clone())
-    }
-
-    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
-        Some(self.status.clone())
+        Ok(())
     }
 }
 
@@ -514,8 +519,8 @@ mod tests {
             SyncIOHandle::connect_port("MVP2001_DEAD", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(Mvp2001Controller::new(handle, 1)));
         let mut axis = Mvp2001Axis::new(controller, "MVP2001_DEAD", 0, 512, 500, 1);
-        assert!(axis.poll(&AsynUser::default()).is_err());
-        let left = axis.take_failed_poll_status().expect("the status C left");
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&AsynUser::default(), &mut left).is_err());
         assert!(left.gain_support && left.has_encoder, "{left:?}");
         // C's status_ starts at 0; only a good poll sets Done (:467).
         assert!(!left.done, "{left:?}");

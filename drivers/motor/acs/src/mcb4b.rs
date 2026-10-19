@@ -252,7 +252,7 @@ impl AsynMotor for Mcb4bAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
 
         // Position — reply "#01P=+1000"; C parses atof(&inString_[5]).
@@ -274,7 +274,7 @@ impl AsynMotor for Mcb4bAxis {
         let powered = byte_at(&reply, 5) == b'1';
         drop(ctrl);
 
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position,
             done,
             moving: !done,
@@ -287,7 +287,8 @@ impl AsynMotor for Mcb4bAxis {
             // flips it to 1 when a read fails (which is the `?` early return).
             problem: false,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 

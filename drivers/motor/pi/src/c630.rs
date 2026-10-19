@@ -129,7 +129,7 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{nint, parse_int_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -272,7 +272,7 @@ impl PIC630Axis {
         let _ = ctrl.send(&format!("{addr}DC{current}"));
         let _ = ctrl.send(&format!("{addr}AB"));
         drop(ctrl);
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -482,7 +482,7 @@ impl AsynMotor for PIC630Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let polled = self.poll_locked(&ctrl);
@@ -498,7 +498,8 @@ impl AsynMotor for PIC630Axis {
             ctrl.recv();
         }
         drop(ctrl);
-        Ok(self.last_status.clone())
+        *status = self.last_status.clone();
+        Ok(())
     }
 }
 
@@ -506,6 +507,7 @@ impl AsynMotor for PIC630Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// `TS` status bytes: done with no limit, moving, and moving into the
@@ -541,7 +543,7 @@ mod tests {
 
     /// What a poll sent besides its queries.
     fn poll_extra(line: &LineRig, axis: &mut PIC630Axis) -> Vec<String> {
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         line.sent()
             .into_iter()
             .filter(|l| l != "1TS" && l != "1TP")
@@ -563,7 +565,7 @@ mod tests {
         );
         let ctrl = PIC630Controller::new(io, 1).unwrap();
         let mut axis = PIC630Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0);
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert_eq!((status.position, status.done), (250.0, false));
     }
 

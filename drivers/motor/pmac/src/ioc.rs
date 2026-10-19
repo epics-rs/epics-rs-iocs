@@ -760,6 +760,7 @@ mod tests {
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
     use epics_rs::asyn::trace::TraceFile;
+    use motor_common::testing::Polled;
 
     /// A port with no EOS support of its own: both sets are refused.
     struct Bare(PortDriverBase);
@@ -981,7 +982,7 @@ mod tests {
         assert!(!axis.has_encoder);
         controller.lock().unwrap().poll();
         assert_eq!(std::mem::take(&mut *written.lock().unwrap()), ["???"]);
-        assert!(axis.poll(&AsynUser::new(0).with_addr(1)).is_ok());
+        assert!(axis.polled(&AsynUser::new(0).with_addr(1)).is_ok());
         assert_eq!(*written.lock().unwrap(), ["#1 ? F P"]);
         drop(rt);
     }
@@ -1283,12 +1284,12 @@ mod tests {
         let controller = Arc::new(Mutex::new(controller_on("pmacAxisSilent")));
         let mut axis = PmacAxis::new(controller, 1);
         let user = AsynUser::new(0).with_addr(1);
-        let read = axis.poll(&user).unwrap();
+        let read = axis.polled(&user).unwrap();
         assert!(read.powered);
         assert_eq!(read.position, 100.0);
 
         rig.silence("#1 ? F P");
-        let failed = axis.poll(&user).unwrap();
+        let failed = axis.polled(&user).unwrap();
         assert_eq!(
             failed,
             MotorStatus {
@@ -1306,7 +1307,7 @@ mod tests {
         rig.answer("#1 ? F P", b"882000000001\r0\r100.0\r");
         let controller = Arc::new(Mutex::new(controller_on("pmacIx24Silent")));
         let mut axis = PmacAxis::new(controller, 1);
-        let status = axis.poll(&AsynUser::new(0).with_addr(1)).unwrap();
+        let status = axis.polled(&AsynUser::new(0).with_addr(1)).unwrap();
         assert!(status.powered && !status.problem);
     }
 
@@ -1325,7 +1326,7 @@ mod tests {
         groups.select(1);
         let mut axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
         let user = AsynUser::new(0).with_addr(1);
-        assert!(axis.poll(&user).unwrap().powered);
+        assert!(axis.polled(&user).unwrap().powered);
         rig.written();
         axis.stop(&user, 0.0).unwrap();
         assert_eq!(rig.written(), ["#1 J/ M140=1"]);
@@ -1504,7 +1505,7 @@ mod tests {
         );
         rig.answer("&3??", b"000000\r020000\r000000\r");
         rig.answer("&3Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"0 0 0 0 0 0 0 0 0\r");
-        axis.lock().unwrap().poll(&user).unwrap();
+        axis.lock().unwrap().polled(&user).unwrap();
         assert_eq!(own.take(), "");
     }
 
@@ -1632,12 +1633,12 @@ mod tests {
         let q8 = "&2Q81Q82Q83Q84Q85Q86Q87Q88Q89";
         rig.answer(q8, b"0.25\r0.5\r");
         rig.answer("&2??", b"000000\r020000\r000000\r");
-        assert!(axis.poll(&user).unwrap().done);
+        assert!(axis.polled(&user).unwrap().done);
         rig.written();
 
         // One word read: it runs a program; the in-position word is stale.
         rig.answer("&2??", b"000001\rzz\r");
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert!(!status.done && !status.msta_moving);
         assert_eq!(status.position, 2500.0);
         assert_eq!(rig.written(), ["&2??", q8]);
@@ -1648,7 +1649,7 @@ mod tests {
         );
 
         rig.silence("&2??");
-        assert!(axis.poll(&user).is_ok());
+        assert!(axis.polled(&user).is_ok());
         assert_eq!(rig.written(), ["&2??", q8]);
         let text = own.take();
         assert!(
@@ -1681,10 +1682,10 @@ mod tests {
         let q8 = "&2Q81Q82Q83Q84Q85Q86Q87Q88Q89";
         rig.answer(q8, b"0.25\r0.5\r");
         rig.answer("&2??", b"000000\r020000\r000000\r");
-        assert!(axis.poll(&user).unwrap().done);
+        assert!(axis.polled(&user).unwrap().done);
 
         rig.cut("&2??", b"000001\r");
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert!(!status.done && !status.msta_moving);
         let text = own.take();
         assert!(
@@ -1697,12 +1698,12 @@ mod tests {
 
         rig.answer("&2??", b"000000\r020000\r000000\r");
         rig.cut(q8, b"0.75\r");
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert_eq!((status.position, status.comms_error), (7500.0, true));
         rig.silence(q8);
-        assert_eq!(axis.poll(&user).unwrap().position, 0.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 0.0);
         rig.refuse(q8);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
     }
 
     /// pmacAsynCoord.c:636-648: strtod reads 0 past the end of a short
@@ -1723,7 +1724,7 @@ mod tests {
         let mut axis = PmacCsAxis::new(system, 3).unwrap();
         rig.answer("&2??", b"000000\r020000\r000000\r");
         rig.answer("&2Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"0.25\r0.5\r");
-        assert_eq!(axis.poll(&AsynUser::new(0)).unwrap().position, 0.0);
+        assert_eq!(axis.polled(&AsynUser::new(0)).unwrap().position, 0.0);
     }
 
     /// pmacAsynCoord.c:636-643: each position is one strtod from where the
@@ -1748,14 +1749,14 @@ mod tests {
         let user = AsynUser::new(0);
         rig.answer("&2??", b"000000\r020000\r000000\r");
         rig.answer("&2Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"1e-400\r0.5abc 7\r");
-        assert_eq!(a.poll(&user).unwrap().position, 0.0);
+        assert_eq!(a.polled(&user).unwrap().position, 0.0);
         assert_eq!(
             own.take(),
             "drvPmacAxisGetStatus: not all status values returned. Status: 0\n\
              Command :&2Q81Q82Q83Q84Q85Q86Q87Q88Q89\nResponse1:1e-400\r0.5abc 7\r\n"
         );
-        assert_eq!(b.poll(&user).unwrap().position, 5000.0);
-        assert_eq!(c.poll(&user).unwrap().position, 0.0);
+        assert_eq!(b.polled(&user).unwrap().position, 5000.0);
+        assert_eq!(c.polled(&user).unwrap().position, 0.0);
     }
 
     /// pmacAxis.cpp:131-145: the initial status read sets the axis's soft
@@ -1830,7 +1831,7 @@ mod tests {
         axis.set_high_limit(&user, 100.0).unwrap();
         axis.set_low_limit(&user, -100.0).unwrap();
         axis.set_position(&user, 10.0).unwrap();
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert_eq!((status.position, status.encoder_position), (1000.0, 1000.0));
         assert_eq!(
             rig.written()[1..],
@@ -2182,14 +2183,14 @@ mod tests {
 
         let user = AsynUser::new(0).with_addr(1);
         rig.answer("#1 ? F P", b"zz\r");
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(
             own.take(),
             "drvPmacAxisGetStatus: not all status values returned. Status: 0\n\
              Command :#1 ? F P\nResponse:zz\r"
         );
         rig.silence("#1 ? F P");
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(
             own.take(),
             "drvPmacAxisGetStatus: not all status values returned. Status: 1\n\
@@ -2198,7 +2199,7 @@ mod tests {
         // pmacAxis.cpp:493-498: a read a timeout cut short prints what it
         // delivered.
         rig.cut("#1 ? F P", b"882000");
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(
             own.take(),
             "drvPmacAxisGetStatus: not all status values returned. Status: 1\n\
@@ -2209,13 +2210,13 @@ mod tests {
         rig.answer("#1 ? F P", b"882000000001\r0\r100.0\r");
         // The failed polls took this period's print.
         rig.answer("i124", b"$20000\r");
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(own.take(), "");
         rig.answer("i124", b"$0\r");
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         rig.answer("i124", b"$20000\r");
-        axis.poll(&user).unwrap();
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(own.take(), warning);
 
         let home = |axis: &mut PmacAxis| axis.home(&user, 0.0, 2.0, 0.0, false);

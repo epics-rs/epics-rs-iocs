@@ -551,7 +551,7 @@ impl AsynMotor for AcrAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
 
         let encoder_position = atof(&ctrl.read_reg(self.encoder_pos_reg)?);
@@ -573,7 +573,7 @@ impl AsynMotor for AcrAxis {
         let powered = drive.contains("ON");
         drop(ctrl);
 
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position: theory_position,
             encoder_position,
             velocity: 0.0,
@@ -587,7 +587,8 @@ impl AsynMotor for AcrAxis {
             home: at_home,
             powered,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -599,6 +600,7 @@ mod tests {
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use motor_common::testing::Polled;
 
     #[test]
     fn the_constructor_calls_back() {
@@ -629,7 +631,7 @@ mod tests {
             .move_absolute(&AsynUser::new(0), 1.0, 0.0, 1.0, 1.0)
             .unwrap_err();
         assert_eq!(e.message(), "AXIS0: PPU was never read");
-        assert!(axis.poll(&AsynUser::new(0)).is_err());
+        assert!(axis.polled(&AsynUser::new(0)).is_err());
     }
 
     /// C overwrites the JOG ACC/VEL and RES statuses with the command's

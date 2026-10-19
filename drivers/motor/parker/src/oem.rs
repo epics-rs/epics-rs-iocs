@@ -134,9 +134,6 @@ pub struct OemAxis {
     switches: SwitchFlags,
     /// The poll's `OEM_SWITCH_DETEC`, for [`AsynMotor::take_port_sets`].
     sets: PortSets,
-    /// What a poll whose last step failed had set, for
-    /// [`AsynMotor::take_failed_poll_status`].
-    left: Option<MotorStatus>,
 }
 
 /// The poll's switch-driven status bits. C sets each only where the switch
@@ -164,7 +161,6 @@ impl OemAxis {
             direction: false,
             switches: SwitchFlags::default(),
             sets: PortSets::default(),
-            left: None,
         };
         // C ignores configureController's status (OEMMotorDriver.cpp:208).
         let _ = axis.lock().configure(axis.axis_no);
@@ -430,7 +426,7 @@ impl AsynMotor for OemAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let addr = self.address;
         // The field, not `self`: the poll pushes its params with it held.
         let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -517,15 +513,8 @@ impl AsynMotor for OemAxis {
             ..MotorStatus::default()
         };
         // C sets every parameter before its skip label.
-        if let Err(e) = status {
-            self.left = Some(polled);
-            return Err(e);
-        }
-        Ok(polled)
-    }
-
-    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
-        self.left.take()
+        *out = polled;
+        status
     }
 }
 
@@ -558,6 +547,7 @@ mod tests {
     use epics_rs::motor::controller_port::index;
     use epics_rs::motor::devices::{register_axis, register_controller_port};
     use epics_rs::motor::trace::TraceUser;
+    use motor_common::testing::Polled as _;
 
     /// C overwrites each command's status with the next one's and sets
     /// `homed` whatever they returned (OEMMotorDriver.cpp:230-280).
@@ -788,7 +778,7 @@ mod tests {
             addr: 0,
         };
         register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
-        let poll = || axis.lock().unwrap().poll(&AsynUser::new(0)).unwrap();
+        let poll = || axis.lock().unwrap().polled(&AsynUser::new(0)).unwrap();
 
         // UPDATE_STATUS: the port's poll sets it, as C's poll does.
         port.write_int32_blocking(index::UPDATE_STATUS, 0, 1)
@@ -882,10 +872,10 @@ mod tests {
         let ctrl = Arc::new(Mutex::new(OemController::new(handle, 1)));
         let mut axis = OemAxis::new(ctrl, 0);
         let user = AsynUser::new(0);
-        assert_eq!(axis.poll(&user).unwrap().position, 40.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 40.0);
 
         cut.lock().unwrap().insert("R", "*B");
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert!(!status.done);
         assert_eq!(status.position, 56.0);
 
@@ -895,18 +885,18 @@ mod tests {
             cut.insert(query, partial);
         };
         cut_only("PR", "*+7");
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert!(status.done);
         assert_eq!(status.position, 56.0);
 
         cut_only("IS", "*ABCD01");
-        assert!(axis.poll(&user).is_err());
-        let left = axis.take_failed_poll_status().unwrap();
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert!(left.low_limit && left.home && !left.homed);
         assert_eq!(left.position, 40.0);
 
         axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
-        assert!(axis.poll(&user).unwrap().homed);
+        assert!(axis.polled(&user).unwrap().homed);
     }
 
     #[test]

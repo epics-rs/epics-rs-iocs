@@ -434,7 +434,7 @@ impl AsynMotor for Ang1Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         // C presses on through every read and always publishes: each read's
         // status is discarded (the base poller ignores poll()'s return) and
         // callParamCallbacks fires unconditionally. Mirror that — attempt each
@@ -486,7 +486,8 @@ impl AsynMotor for Ang1Axis {
             ..MotorStatus::default()
         };
         self.last = status.clone();
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 

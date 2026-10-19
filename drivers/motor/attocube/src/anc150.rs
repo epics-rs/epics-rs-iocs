@@ -484,7 +484,7 @@ impl AsynMotor for Anc150Axis {
         self.params.force_callback();
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         // C's axisDone: a move in flight at the poll's start, even one whose
         // timer has run out (drvANC150Asyn.cc:599-603).
         let axis_done = !self.moving;
@@ -566,7 +566,8 @@ impl AsynMotor for Anc150Axis {
         let _ = params.set_integer(function::POWER_ON, i32::from(powered));
         params.call_callback();
 
-        Ok(params.motor_status())
+        *status = params.motor_status();
+        Ok(())
     }
 }
 
@@ -637,6 +638,7 @@ impl Anc150Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn plan_move_absolute_direction_and_target() {
@@ -914,9 +916,9 @@ mod tests {
         // drvANC150Asyn.cc:601-605: the poll that finds the timer run out
         // still reports the axis moving.
         axis.move_deadline = Some(Instant::now());
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(params.get_integer(function::DONE), Ok(Some(0)));
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(params.get_integer(function::DONE), Ok(Some(1)));
         assert_eq!(params.get_double(function::POSITION), Ok(Some(2.0)));
         assert_eq!(params.get_double(function::ENCODER_POSN), Ok(Some(2.0)));
@@ -945,7 +947,7 @@ mod tests {
         let user = AsynUser::default();
         axis.move_absolute(&user, 2.0, 0.0, 1.0, 1.0).unwrap();
         axis.move_deadline = Some(Instant::now());
-        let polled = axis.poll(&user).unwrap();
+        let polled = axis.polled(&user).unwrap();
         assert_eq!(polled, axis.params().motor_status());
         assert!(!polled.done && polled.comms_error && !polled.problem);
     }
@@ -955,7 +957,11 @@ mod tests {
     #[epics_rs::base::epics_test]
     async fn the_poll_prints_the_c_iodriver_line() {
         let (axes, path) = traced_axes("ancPoll", TraceMask::IO_DRIVER).await;
-        axes[1].lock().unwrap().poll(&AsynUser::default()).unwrap();
+        axes[1]
+            .lock()
+            .unwrap()
+            .polled(&AsynUser::default())
+            .unwrap();
         // The poller's own startup poll may land in the file too.
         let text = take_trace(&path);
         assert!(!text.is_empty());

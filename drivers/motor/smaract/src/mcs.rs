@@ -708,7 +708,7 @@ impl AsynMotor for McsAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         let McsChannel {
             channel: ch,
@@ -734,7 +734,7 @@ impl AsynMotor for McsAxis {
         ctrl.get_val("GST", ch)?;
         drop(ctrl);
 
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position: pos as f64,
             encoder_position: pos as f64,
             velocity: 0.0,
@@ -744,7 +744,8 @@ impl AsynMotor for McsAxis {
             gain_support: self.has_encoder,
             homed,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 
     fn take_port_sets(&mut self) -> PortSets {
@@ -815,6 +816,7 @@ mod tests {
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use motor_common::testing::Polled;
 
     /// A link that holds `pending` bytes and logs each read and EOS set.
     struct Link {
@@ -939,7 +941,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(sets(&mut axis), [(12, 1), (13, 0)]);
-        axis.poll(&AsynUser::new(0)).unwrap();
+        axis.polled(&AsynUser::new(0)).unwrap();
         assert_eq!(sets(&mut axis), [(11, 300)]);
     }
 
@@ -963,6 +965,6 @@ mod tests {
             axis.take_status_writes(),
             [StatusWrite::Problem(true), StatusWrite::CommsError(true)]
         );
-        assert!(axis.poll(&AsynUser::new(0)).is_err());
+        assert!(axis.polled(&AsynUser::new(0)).is_err());
     }
 }

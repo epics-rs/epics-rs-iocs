@@ -53,7 +53,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atoi, nint};
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
@@ -398,9 +398,6 @@ pub struct PmncAxis {
     /// What the last failed poll raises: nothing on C's first missed reply
     /// (RETRY), `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next (COMM_ERR).
     failure: PollFailure,
-    /// The status a RETRY exit stored after an answered exchange, which the
-    /// poller carries to its next post.
-    left: Option<MotorStatus>,
     last_status: MotorStatus,
     strings: MoveStrings,
     /// What `motor_init`'s `set_status` read, until the motor task takes it.
@@ -431,7 +428,6 @@ impl PmncAxis {
             last_reading: 0,
             no_motion_count: 0,
             failure: PollFailure::NONE,
-            left: None,
             // drvPMNC87xx.cc:1014-1025: what motor_init prepares.
             last_status: MotorStatus {
                 gain_support: true,
@@ -442,7 +438,7 @@ impl PmncAxis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -507,8 +503,6 @@ impl PmncAxis {
 impl Model1Motor for PmncAxis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        // A RETRY exit's `left` is `last_status` as it stood.
-        self.left = None;
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
@@ -516,10 +510,6 @@ impl Model1Motor for PmncAxis {
 impl AsynMotor for PmncAxis {
     fn poll_failure(&self) -> PollFailure {
         self.failure
-    }
-
-    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
-        self.left.take()
     }
 
     fn move_absolute(
@@ -692,7 +682,7 @@ impl AsynMotor for PmncAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         // Port of C `set_status`: channel-select probe (8753), STA status
         // byte, DIAG aux byte (8751), then POS if this motor is the selected
         // channel — all under the controller lock, applying the
@@ -718,7 +708,7 @@ impl AsynMotor for PmncAxis {
                             ctrl.comm_state = CommState::Retry;
                             self.failure = PollFailure::NONE;
                             if $answered {
-                                self.left = Some(self.last_status.clone());
+                                *out = self.last_status.clone();
                             }
                         } else {
                             ctrl.comm_state = CommState::CommErr;
@@ -853,7 +843,8 @@ impl AsynMotor for PmncAxis {
             vbas_supported,
             ..MotorStatus::default()
         };
-        Ok(self.last_status.clone())
+        *out = self.last_status.clone();
+        Ok(())
     }
 }
 
@@ -861,6 +852,7 @@ impl AsynMotor for PmncAxis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// An 8752 with one 8751 module on a [`LineRig`] whose `STA` byte is
@@ -902,7 +894,7 @@ mod tests {
 
     /// What a poll sent besides its queries.
     fn poll_extra(line: &LineRig, axis: &mut PmncAxis) -> Vec<String> {
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         line.sent()
             .into_iter()
             .filter(|l| !["STA 0", "DIAG 0", "POS 0"].contains(&l.as_str()))
@@ -1046,7 +1038,7 @@ mod tests {
             .unwrap();
         axis.move_relative(&user, 5.0, 0.0, 100.0, 200.0).unwrap();
         line.sent();
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         let sent = line.sent();
         assert!(
             sent.ends_with(&["CHL A0=1".into(), "MOF A0".into()]),
@@ -1279,15 +1271,15 @@ mod tests {
         let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
@@ -1316,18 +1308,23 @@ mod tests {
         let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
-        assert_eq!(axis.take_failed_poll_status(), None);
-        assert!(axis.poll(&user).is_err());
+        // An exit before any reply leaves the axis's status as it was.
+        let before = MotorStatus {
+            position: 99.0,
+            ..MotorStatus::default()
+        };
+        let mut left = before.clone();
+        assert!(axis.poll(&user, &mut left).is_err());
+        assert_eq!(left, before);
+        assert!(axis.poll(&user, &mut left).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
-        assert_eq!(axis.take_failed_poll_status(), None);
+        assert_eq!(left, before);
         quiet.store(false, Ordering::SeqCst);
         quiet_diag.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        let left = axis.take_failed_poll_status().unwrap();
         assert!(!left.comms_error && left.problem);
-        assert_eq!(axis.take_failed_poll_status(), None);
     }
 
     /// drvPMNC87xx.cc:283-292,541: a failed init read stores what

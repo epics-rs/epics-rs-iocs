@@ -14,7 +14,7 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atoi, nint};
 
 /// `MICOS_NUM_CARDS`.
@@ -110,7 +110,7 @@ impl DrvMicosAxis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -299,7 +299,7 @@ impl AsynMotor for DrvMicosAxis {
     }
 
     /// `set_status`: `ts` for seven status bytes, `tp` for the position.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
         let state = ctrl.ask(&format!("{CTLA}{}ts", self.axis));
         let position = ctrl.ask(&format!("{CTLA}{}tp", self.axis));
@@ -333,7 +333,8 @@ impl AsynMotor for DrvMicosAxis {
             let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
             ctrl.send_bytes(&post);
         }
-        Ok(status.clone())
+        *out = status.clone();
+        Ok(())
     }
 }
 
@@ -350,6 +351,7 @@ mod tests {
     }
 
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// MoCo address 0 on a [`LineRig`]; `ts` reports done unless `moving`.
@@ -391,12 +393,12 @@ mod tests {
         axis.move_absolute(&user, 100.0, 0.0, 500.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["\x010dv500,ud", "\x010mn", "\x010ma100"]);
         moving.store(true, Ordering::SeqCst);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(line.sent(), ["\x010ts", "\x010tp"]);
         moving.store(false, Ordering::SeqCst);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(line.sent(), ["\x010ts", "\x010tp", "\x010mf"]);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(line.sent(), ["\x010ts", "\x010tp"]);
     }
 

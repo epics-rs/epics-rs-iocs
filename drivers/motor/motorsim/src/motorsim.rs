@@ -375,9 +375,10 @@ impl AsynMotor for MotorSimAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         self.advance(Instant::now());
-        Ok(self.last_status.clone())
+        *status = self.last_status.clone();
+        Ok(())
     }
 }
 
@@ -763,9 +764,10 @@ impl AsynMotor for DrvMotorSimAxis {
 
     /// motorProcTask's pass over the axis: motorSimProcess's parameters
     /// (drvMotorSim.c:646-653), then the callback (:677).
-    fn poll(&mut self, user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         self.sync();
-        let status = self.axis.poll(user)?;
+        let mut status = MotorStatus::default();
+        self.axis.poll(user, &mut status)?;
         let params = self.params();
         for (f, v) in [
             (function::POSITION, status.position),
@@ -784,7 +786,8 @@ impl AsynMotor for DrvMotorSimAxis {
             let _ = params.set_integer(f, i32::from(v));
         }
         params.call_callback();
-        Ok(params.motor_status())
+        *out = params.motor_status();
+        Ok(())
     }
 
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
@@ -873,6 +876,7 @@ impl DrvMotorSimAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     fn user() -> AsynUser {
         AsynUser::default()
@@ -979,7 +983,7 @@ mod tests {
             Arc::default(),
         );
         axis.axis.process(0.05);
-        let status = axis.poll(&user()).unwrap();
+        let status = axis.polled(&user()).unwrap();
         assert!(status.home, "RA_HOME not set at the home position");
         assert!(!status.encoder_home && !status.homed);
     }
@@ -994,7 +998,7 @@ mod tests {
         assert_eq!(get.get_double(function::POSITION), Some(0.0));
         assert_eq!(get.get_integer(function::DONE), None);
         axis.axis.process(0.05);
-        axis.poll(&user()).unwrap();
+        axis.polled(&user()).unwrap();
         assert!(axis.take_status_writes().is_empty());
         for (f, v) in [(function::POSITION, 0.0), (function::ENCODER_POSN, 0.0)] {
             assert_eq!(get.get_double(f), Some(v), "{f}");
@@ -1016,11 +1020,11 @@ mod tests {
     fn drv_motor_sim_reports_its_parameters() {
         let mut axis = DrvMotorSimAxis::new(0, 0, -10.0, 10.0, 0.0, Arc::default());
         axis.axis.process(0.05);
-        let polled = axis.poll(&user()).unwrap();
+        let polled = axis.polled(&user()).unwrap();
         assert_eq!(polled, axis.params().motor_status());
         axis.move_absolute(&user(), 5.0, 0.0, 1.0, 1.0).unwrap();
         axis.axis.process(0.5);
-        let polled = axis.poll(&user()).unwrap();
+        let polled = axis.polled(&user()).unwrap();
         assert!(!polled.done);
         assert_eq!(polled, axis.params().motor_status());
     }
@@ -1065,7 +1069,7 @@ mod tests {
         }
         assert!(b.axis.last_status.position.abs() < 1e-6);
         a.set_double(&user(), function::DEFER_MOVES, 0.0).unwrap();
-        b.poll(&user()).unwrap();
+        b.polled(&user()).unwrap();
         assert_eq!(
             b.take_status_writes(),
             [StatusWrite::Done(false), StatusWrite::Done(false)]
@@ -1099,10 +1103,10 @@ mod tests {
         axis.set_integer(&user(), function::DEFER_MOVES, 1).unwrap();
         assert_eq!(get.get_double(function::P_GAIN), Some(0.5));
         assert_eq!(get.get_integer(function::DEFER_MOVES), Some(1));
-        axis.poll(&user()).unwrap();
-        axis.poll(&user()).unwrap();
+        axis.polled(&user()).unwrap();
+        axis.polled(&user()).unwrap();
         axis.force_callback(&user());
-        axis.poll(&user()).unwrap();
+        axis.polled(&user()).unwrap();
         assert_eq!(
             *calls.lock().unwrap(),
             [

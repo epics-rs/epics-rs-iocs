@@ -690,7 +690,7 @@ impl AsynMotor for Mcs2Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
         let mut set = Vec::new();
         let polled = self.poll_channel(&ctrl, &mut set);
@@ -715,7 +715,7 @@ impl AsynMotor for Mcs2Axis {
             self.tracked_position = theory_position;
         }
 
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position: theory_position,
             encoder_position,
             velocity: 0.0,
@@ -736,13 +736,15 @@ impl AsynMotor for Mcs2Axis {
             slip_stall: (state & FOLLOWING_LIMIT_REACHED) != 0,
             powered,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     /// No port: what the constructors and the report post goes nowhere.
     fn no_port() -> ProblemPost {
@@ -993,7 +995,7 @@ mod tests {
         });
         let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2FollowLimit", 0), no_port());
         let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
-        assert!(axis.poll(&AsynUser::default()).unwrap().slip_stall);
+        assert!(axis.polled(&AsynUser::default()).unwrap().slip_stall);
     }
 
     /// smarActMCS2MotorDriver.cpp:479-555: an idle poll sets PSTAT,
@@ -1016,7 +1018,7 @@ mod tests {
         ctrl.set_reasons(Mcs2Reasons::from_slice([10, 11, 12, 13, 14, 15]));
         let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         // The constructors posted their clearErrors themselves.
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         let sets: Vec<(usize, i32)> = axis
             .take_port_sets()
             .into_iter()

@@ -458,7 +458,7 @@ impl AsynMotor for PmacAxis {
     }
 
     /// C `pmacAxis::getAxisStatus`.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let axis = self.axis;
         let mut controller = lock(&self.controller);
         let config = controller.axis_config(axis);
@@ -496,7 +496,8 @@ impl AsynMotor for PmacAxis {
             self.amp_enabled = false;
             self.last.powered = false;
             self.last.moving = false;
-            return Ok(self.last.clone());
+            *out = self.last.clone();
+            return Ok(());
         };
 
         // Closed-loop axis: the third field is the following error and the
@@ -589,7 +590,8 @@ impl AsynMotor for PmacAxis {
             has_encoder: self.has_encoder,
             ..MotorStatus::default()
         };
-        Ok(self.last.clone())
+        *out = self.last.clone();
+        Ok(())
     }
 }
 

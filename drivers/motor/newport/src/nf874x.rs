@@ -417,9 +417,10 @@ impl AsynMotor for Nf874xAxis {
         }))
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         self.status.problem = self.read_status().is_err();
-        Ok(self.status.clone())
+        *status = self.status.clone();
+        Ok(())
     }
 
     /// C's `setDoubleParam` of the soft limits, posted with the poll.
@@ -579,6 +580,7 @@ mod tests {
     use epics_rs::motor::trace::TraceUser;
 
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn only_an_8743_cl_axis_constructor_calls_back() {
@@ -688,9 +690,9 @@ mod tests {
         let ctrl = Arc::new(Mutex::new(Nf874xController::new(Some(io))));
         let mut axis = Nf874xAxis::new(ctrl, 1);
         let user = AsynUser::default();
-        assert!(axis.poll(&user).unwrap().msta_moving);
+        assert!(axis.polled(&user).unwrap().msta_moving);
         done.store(true, Ordering::Relaxed);
-        assert!(!axis.poll(&user).unwrap().msta_moving);
+        assert!(!axis.polled(&user).unwrap().msta_moving);
     }
 
     /// 874xMotorDriver.cpp:513-519: an 8743-CL poll sets the soft limits it
@@ -708,7 +710,7 @@ mod tests {
         });
         let ctrl = Arc::new(Mutex::new(Nf874xController::new(Some(io))));
         let mut axis = Nf874xAxis::new(ctrl, 1);
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         // On the axis's own address, in the order C sets them.
         let taken: Vec<_> = axis
             .take_port_sets()

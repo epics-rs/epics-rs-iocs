@@ -37,7 +37,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atof, atoi, is_unsolicited_limit_error, leading_hex};
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 
 /// C `BUFF_SIZE`: the most one read takes.
 const READ_BUF: usize = 100;
@@ -262,7 +262,7 @@ impl Esp300Axis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        ax.init_status = Some(ax.poll(&AsynUser::new(0)));
+        ax.init_status = Some(init_poll(&mut ax, &AsynUser::new(0)));
         ax
     }
 
@@ -483,8 +483,9 @@ impl AsynMotor for Esp300Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        self.set_status()
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = self.set_status()?;
+        Ok(())
     }
 }
 
@@ -581,6 +582,7 @@ impl Esp300Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Answers `VE?` and the commands in `replies`; fails every other read.
@@ -783,7 +785,7 @@ mod tests {
                 .is_err()
         );
         assert!(axis.move_absolute(&user, 10.0, 0.0, 1.0, 1.0).is_err());
-        assert!(axis.poll(&user).unwrap().problem);
+        assert!(axis.polled(&user).unwrap().problem);
     }
 
     /// drvESP300.cc:534-547: C tests the first read's bytes before its
@@ -952,12 +954,12 @@ mod tests {
                 .collect()
         };
         moving.store(true, Ordering::SeqCst);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert!(extra(&line).is_empty());
         moving.store(false, Ordering::SeqCst);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(extra(&line), ["01MF"]);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert!(extra(&line).is_empty(), "sent once");
     }
 
@@ -995,7 +997,7 @@ mod tests {
         let (ctrl, sent) = esp300_line("esp300SilentTb", &[]);
         let mut axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
         sent.lock().unwrap().clear();
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["TB?"]);
         assert!(status.problem);
     }
@@ -1046,15 +1048,15 @@ mod tests {
         let ctrl = Esp300Controller::new(io).unwrap();
         let mut axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 

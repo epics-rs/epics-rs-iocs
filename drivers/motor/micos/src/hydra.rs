@@ -343,13 +343,14 @@ impl AsynMotor for HydraAxis {
     /// C `SMChydraAxis::poll`: a failed exchange skips the rest and sets
     /// Problem, and the parameters set before it are still posted
     /// (SMChydraAxis.cpp:247-362).
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let mut status = self.last_status.clone();
         if self.poll_into(&mut status).is_err() {
             status.problem = true;
         }
         self.last_status = status.clone();
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
@@ -411,6 +412,7 @@ impl HydraAxis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+    use motor_common::testing::Polled;
 
     /// C's poll prints the `nst` limit, e-stop and busy bits, and
     /// `moveVelocity` its FLOW line, on the axis's `pasynUser_`.
@@ -429,7 +431,7 @@ mod tests {
         let mask = TraceMask::ERROR | TraceMask::IO_DRIVER | TraceMask::FLOW;
         let lines = crate::smc::trace_lines("hydraTrace", mask, || {
             let user = AsynUser::default();
-            axis.poll(&user).unwrap();
+            axis.polled(&user).unwrap();
             axis.move_velocity(&user, 1.0, 2.0, 4.0).unwrap();
         });
         assert_eq!(
@@ -463,7 +465,7 @@ mod tests {
         let controller = Arc::new(Mutex::new(HydraController::new(handle)));
         let mut axis = HydraAxis::new(controller, 0, Arc::default(), "");
         let res = axis.axis_res();
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert_eq!(status.position, 2.5 / res);
         assert_eq!(status.encoder_position, 2.5 / res);
         assert!(status.problem);
@@ -511,7 +513,7 @@ mod tests {
             SyncIOHandle::connect_port("HYDRA_DEAD", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(HydraController::new(handle)));
         let mut axis = HydraAxis::new(controller, 0, Arc::default(), "");
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert!(
             status.problem && status.gain_support && !status.done,
             "{status:?}"

@@ -506,7 +506,7 @@ impl AsynMotor for ScuAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let ch = self.channel;
         let ctrl = lock(&self.controller);
         let io = &mut self.io;
@@ -532,7 +532,7 @@ impl AsynMotor for ScuAxis {
         let homed = ctrl.query_int(io, "GPPK", ch)? != 0;
         drop(ctrl);
 
-        Ok(MotorStatus {
+        *out = MotorStatus {
             position,
             encoder_position: position,
             velocity: 0.0,
@@ -542,7 +542,8 @@ impl AsynMotor for ScuAxis {
             gain_support: self.has_encoder,
             homed,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
@@ -554,6 +555,7 @@ impl AsynMotor for ScuAxis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+    use motor_common::testing::Polled;
 
     /// smarActSCUMotorDriver.cpp:184-188: past `bail:`, so a failed probe
     /// calls back too.
@@ -592,7 +594,7 @@ mod tests {
             axis.take_status_writes(),
             [StatusWrite::Problem(true), StatusWrite::CommsError(true)]
         );
-        assert!(axis.poll(&AsynUser::new(0)).is_err());
+        assert!(axis.polled(&AsynUser::new(0)).is_err());
     }
 
     /// A failed move, home or stop raises Problem and CommsError

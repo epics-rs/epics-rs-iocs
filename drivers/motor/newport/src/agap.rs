@@ -428,7 +428,7 @@ impl AsynMotor for AgapAxis {
         }
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
         let id = ctrl.controller_id;
 
@@ -450,7 +450,7 @@ impl AsynMotor for AgapAxis {
         mm?;
         let powered = powered.ok_or_else(|| parse_error("MM?"))?;
 
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position,
             done: !moving,
             moving,
@@ -458,13 +458,15 @@ impl AsynMotor for AgapAxis {
             // C AGAP always reports both limits clear and does not advertise
             // gain support (leaves motorStatusGainSupport unset).
             ..Default::default()
-        })
+        };
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     /// AGAP_CONEX.cpp:207-247 and :343 ignore writeReadController's status
     /// and parse `inString_`, so replies cut by a timeout still set the stage
@@ -576,7 +578,7 @@ mod tests {
             line.sent(),
             ["1PAV1.500000", "1PRV-0.010000", "1JAV5000.000000"]
         );
-        assert_eq!(axis.poll(&user).unwrap().position, 2500.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 2500.0);
     }
 
     /// AGAP_CONEX.cpp `writeCONEX`: the next command waits out

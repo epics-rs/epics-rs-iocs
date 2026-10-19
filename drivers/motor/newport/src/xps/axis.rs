@@ -1099,7 +1099,7 @@ impl AsynMotor for XpsAxis {
         }))
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         // C's parameter library: every field this poll does not reach keeps
         // its last value, and a failed call ends the poll with only
         // `motorStatusCommsError_` raised (XPSAxis.cpp:755-758).
@@ -1107,7 +1107,8 @@ impl AsynMotor for XpsAxis {
         let failed = self.poll_into(&mut status).is_err();
         status.comms_error = failed;
         self.last_status = status.clone();
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
@@ -1253,6 +1254,7 @@ mod tests {
 
     use crate::xps::fake::{Fail, FakeLine, Log};
     use crate::xps::rpc::SocketMode;
+    use motor_common::testing::Polled;
 
     fn fake_axis(port: &str, fail: &'static str) -> (XpsAxis, Fail, Log) {
         let (mut axes, fail, log) = fake_axes(port, fail, false, &["G1.P1"]);
@@ -1365,7 +1367,7 @@ mod tests {
             log.iter().any(|c| c == "GroupMoveRelative (G1.P1,-1.5)"),
             "{log:?}"
         );
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert_eq!((status.position, status.encoder_position), (2.5, 3.0));
     }
 
@@ -1472,11 +1474,11 @@ mod tests {
     fn moving_mode_waits_for_the_move_socket_not_the_group() {
         let (mut mover, mut other, answer) = late_move_axes("xps_moving_mode", true);
         let user = AsynUser::new(0);
-        assert!(!mover.poll(&user).unwrap().done);
-        assert!(other.poll(&user).unwrap().done);
+        assert!(!mover.polled(&user).unwrap().done);
+        assert!(other.polled(&user).unwrap().done);
         *answer.lock().unwrap() = true;
-        assert!(mover.poll(&user).unwrap().done);
-        assert!(mover.poll(&user).unwrap().done);
+        assert!(mover.polled(&user).unwrap().done);
+        assert!(mover.polled(&user).unwrap().done);
     }
 
     /// XPSAxis.cpp:613: the move socket's answer, on FLOW.
@@ -1486,7 +1488,7 @@ mod tests {
         let path = trace_flow("xps_moving_trace", 1);
         let user = AsynUser::new(0);
         *answer.lock().unwrap() = true;
-        mover.poll(&user).unwrap();
+        mover.polled(&user).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(
@@ -1504,8 +1506,8 @@ mod tests {
         let (mut mover, mut other, answer) = late_move_axes("xps_group_mode", false);
         let user = AsynUser::new(0);
         *answer.lock().unwrap() = true;
-        assert!(!mover.poll(&user).unwrap().done);
-        assert!(!other.poll(&user).unwrap().done);
+        assert!(!mover.polled(&user).unwrap().done);
+        assert!(!other.polled(&user).unwrap().done);
         assert!(*answer.lock().unwrap());
     }
 
@@ -1517,11 +1519,11 @@ mod tests {
     fn the_group_state_paces_and_the_velocity_sets_msta_moving() {
         let (_, mut other, _) = late_move_axes("xps_pace_bit", false);
         let user = AsynUser::new(0);
-        let s = other.poll(&user).unwrap();
+        let s = other.polled(&user).unwrap();
         assert!(s.moving && !s.msta_moving);
 
         let (mut axes, _, _) = fake_axes("xps_drift", "", false, &["G1.P1", "G1.P2"]);
-        let s = axes[1].poll(&user).unwrap();
+        let s = axes[1].polled(&user).unwrap();
         assert!(!s.moving && s.msta_moving);
     }
 
@@ -1533,17 +1535,17 @@ mod tests {
         let user = AsynUser::new(0);
 
         *fail.lock().unwrap() = "PositionerErrorGet";
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(s.comms_error);
         assert!(!s.problem, "status 12 is Ready");
         assert!(s.homed);
         assert_eq!((s.encoder_position, s.position), (1.5, 1.25));
 
         *fail.lock().unwrap() = "";
-        assert!(!axis.poll(&user).unwrap().comms_error);
+        assert!(!axis.polled(&user).unwrap().comms_error);
 
         *fail.lock().unwrap() = "GroupStatusGet";
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(s.comms_error && s.homed && !s.problem);
         assert_eq!(s.position, 1.25);
     }
@@ -1685,7 +1687,7 @@ mod tests {
         let mut axis = axes.remove(0);
         let user = AsynUser::new(0);
         *line.group_status.lock().unwrap() = 0;
-        assert!(axis.poll(&user).unwrap().problem, "status 0 is NOTINIT");
+        assert!(axis.polled(&user).unwrap().problem, "status 0 is NOTINIT");
         *line.fail.lock().unwrap() = "GroupHomeSearch";
         assert!(axis.home(&user, 0.0, 1.0, 1.0, true).is_err());
         assert_eq!(axis.take_status_writes(), []);
@@ -1693,7 +1695,10 @@ mod tests {
         axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
         assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(false)]);
         *line.fail.lock().unwrap() = "GroupStatusGet";
-        assert!(!axis.poll(&user).unwrap().problem, "a failed poll keeps it");
+        assert!(
+            !axis.polled(&user).unwrap().problem,
+            "a failed poll keeps it"
+        );
     }
 
     /// XPSAxis.cpp:566-575 fails the poll on GroupStatusStringGet; :628 ignores
@@ -1704,10 +1709,10 @@ mod tests {
         let user = AsynUser::new(0);
 
         *fail.lock().unwrap() = "GroupStatusStringGet";
-        assert!(axis.poll(&user).unwrap().comms_error);
+        assert!(axis.polled(&user).unwrap().comms_error);
 
         *fail.lock().unwrap() = "PositionerUserTravelLimitsGet";
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error);
         assert_eq!(s.position, 1.25);
     }
@@ -1854,7 +1859,7 @@ mod tests {
         );
         let user = AsynUser::default();
         for axis in axes.iter_mut() {
-            axis.poll(&user).unwrap();
+            axis.polled(&user).unwrap();
         }
         let group_moves = |log: &Log| {
             log.lock()
@@ -1875,8 +1880,8 @@ mod tests {
         axes[0].move_absolute(&user, 3.0, 0.0, 1.0, 1.0).unwrap();
         axes[2].move_relative(&user, 0.5, 0.0, 1.0, 1.0).unwrap();
         assert!(group_moves(&log).is_empty());
-        assert!(!axes[0].poll(&user).unwrap().done);
-        assert!(axes[1].poll(&user).unwrap().done);
+        assert!(!axes[0].polled(&user).unwrap().done);
+        assert!(axes[1].polled(&user).unwrap().done);
 
         axes[3].set_deferred_moves(&user, false).unwrap();
         // A relative deferred move goes out as its absolute target, and a
@@ -1888,7 +1893,7 @@ mod tests {
                 "GroupMoveAbsolute (G2,1.25)"
             ]
         );
-        assert!(axes[2].poll(&user).unwrap().done);
+        assert!(axes[2].polled(&user).unwrap().done);
 
         log.lock().unwrap().clear();
         axes[0].move_absolute(&user, 2.0, 0.0, 1.0, 1.0).unwrap();
@@ -1901,12 +1906,12 @@ mod tests {
         let (mut axes, _fail, log) = fake_axes("xps_defer_stop", "", false, &["G1.P1", "G1.P2"]);
         let user = AsynUser::default();
         for axis in axes.iter_mut() {
-            axis.poll(&user).unwrap();
+            axis.polled(&user).unwrap();
         }
         axes[0].set_deferred_moves(&user, true).unwrap();
         axes[0].move_absolute(&user, 3.0, 0.0, 1.0, 1.0).unwrap();
         axes[0].stop(&user, 1.0).unwrap();
-        assert!(axes[0].poll(&user).unwrap().done);
+        assert!(axes[0].polled(&user).unwrap().done);
         log.lock().unwrap().clear();
         axes[0].set_deferred_moves(&user, false).unwrap();
         assert!(
@@ -1985,14 +1990,14 @@ mod tests {
              XPSAxis:setClosedLoop: motorAxisSetInteger set XPS xps_flow, axis 0 closed loop disable\n"
         );
 
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(
             take_trace(&path, &mut seen),
             "XPSAxis:poll: [xps_flow,0]: G1.P1 axisStatus=12, statusString=0\n"
         );
         // 22 is a following error and a disabled state.
         *line.group_status.lock().unwrap() = 22;
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(
             take_trace(&path, &mut seen),
             "XPSAxis:poll: [xps_flow,0]: G1.P1 axisStatus=22, statusString=0\n\

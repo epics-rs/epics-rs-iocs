@@ -367,13 +367,14 @@ impl AsynMotor for TaurusAxis {
     /// C `SMCTaurusAxis::poll`: a failed exchange skips the rest and sets
     /// Problem, and the parameters set before it are still posted
     /// (SMCTaurusAxis.cpp:215-343).
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let mut status = self.last_status.clone();
         if self.poll_into(&mut status).is_err() {
             status.problem = true;
         }
         self.last_status = status.clone();
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
@@ -435,6 +436,7 @@ impl TaurusAxis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+    use motor_common::testing::Polled;
 
     /// SMCTaurusAxis.cpp:14-28 and :186-188 parse `inString_` whatever
     /// `writeReadController` returned, so replies cut by a timeout still set
@@ -477,7 +479,7 @@ mod tests {
         let mask = TraceMask::ERROR | TraceMask::IO_DRIVER | TraceMask::FLOW;
         let lines = crate::smc::trace_lines("taurusTrace", mask, || {
             let user = AsynUser::default();
-            axis.poll(&user).unwrap();
+            axis.polled(&user).unwrap();
             axis.move_velocity(&user, 1.0, 2.0, 4.0).unwrap();
         });
         assert_eq!(
@@ -510,7 +512,7 @@ mod tests {
         let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
         let mut axis = TaurusAxis::new(controller, 0, "");
         let res = axis.axis_res();
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert_eq!(status.position, 2.5 / res);
         assert_eq!(status.encoder_position, 2.5 / res);
         assert!(status.problem);
@@ -533,7 +535,7 @@ mod tests {
             SyncIOHandle::connect_port("TAURUS_DEAD", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
         let mut axis = TaurusAxis::new(controller, 0, "");
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert!(
             status.problem && status.gain_support && !status.done,
             "{status:?}"

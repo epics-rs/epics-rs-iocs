@@ -50,7 +50,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
-use motor_common::model1::init_read;
+use motor_common::model1::{init_poll, init_read};
 use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -267,7 +267,7 @@ impl SmartMotorAxis {
             },
             init_status: None,
         };
-        me.init_status = Some(me.poll(&AsynUser::new(0)));
+        me.init_status = Some(init_poll(&mut me, &AsynUser::new(0)));
         me
     }
 
@@ -394,15 +394,22 @@ impl AsynMotor for SmartMotorAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        self.poll_status(None)
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = self.poll_status(None)?;
+        Ok(())
     }
 
     /// drvSmartMotor.cc:287-291: a moving motor reports the record's CDIR.
     /// The :384 write back to `mr->cdir` is dead, as the direction is already
     /// CDIR here.
-    fn poll_in_motion(&mut self, _user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
-        self.poll_status(Some(*cdir))
+    fn poll_in_motion(
+        &mut self,
+        _user: &AsynUser,
+        cdir: &mut bool,
+        status: &mut MotorStatus,
+    ) -> AsynResult<()> {
+        *status = self.poll_status(Some(*cdir))?;
+        Ok(())
     }
 }
 
@@ -492,6 +499,7 @@ impl SmartMotorAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn accel_clamps_to_minimum() {
@@ -658,15 +666,15 @@ mod tests {
         let user = AsynUser::new(0);
 
         silent.store(true, Ordering::Relaxed);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         silent.store(false, Ordering::Relaxed);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         silent.store(true, Ordering::Relaxed);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
@@ -848,7 +856,7 @@ mod tests {
             .lock()
             .unwrap()
             .extend([("RP", "!"), ("RBp", "!"), ("RBo", "!"), ("RV", "!")]);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert_eq!(s.position, 0.0);
         assert!(!s.high_limit && s.powered && !s.comms_error && !s.problem);
     }
@@ -865,19 +873,19 @@ mod tests {
             r.insert("RP", rp);
         };
         set("0", "-50");
-        assert!(!axis.poll(&user).unwrap().direction);
+        assert!(!axis.polled(&user).unwrap().direction);
         set("0", "-50");
-        assert!(!axis.poll(&user).unwrap().direction, "kept at rest");
+        assert!(!axis.polled(&user).unwrap().direction, "kept at rest");
         set("1", "-60");
         let mut cdir = true;
-        let s = axis.poll_in_motion(&user, &mut cdir).unwrap();
+        let s = axis.polled_in_motion(&user, &mut cdir).unwrap();
         assert!(s.direction && cdir, "the record's CDIR, left unchanged");
         set("0", "100");
         let mut cdir = false;
-        assert!(!axis.poll_in_motion(&user, &mut cdir).unwrap().direction);
+        assert!(!axis.polled_in_motion(&user, &mut cdir).unwrap().direction);
         set("0", "90");
         assert!(
-            !axis.poll(&user).unwrap().direction,
+            !axis.polled(&user).unwrap().direction,
             "position delta at rest"
         );
     }
@@ -888,7 +896,7 @@ mod tests {
     fn encoder_is_a_second_rp_truncated() {
         let (mut axis, replies, _, _rt) = single("smartEnc");
         replies.lock().unwrap().insert("RP", "-7.6");
-        let s = axis.poll(&AsynUser::new(0)).unwrap();
+        let s = axis.polled(&AsynUser::new(0)).unwrap();
         assert_eq!((s.position, s.encoder_position), (-8.0, -7.0));
     }
 }

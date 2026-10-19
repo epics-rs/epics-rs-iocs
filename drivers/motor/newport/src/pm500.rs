@@ -48,7 +48,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_message;
 
 use crate::util::{atof, max_digits, nint};
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
@@ -212,7 +212,7 @@ impl Pm500Axis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        ax.init_status = Some(ax.poll(&AsynUser::new(0)));
+        ax.init_status = Some(init_poll(&mut ax, &AsynUser::new(0)));
         ax
     }
 
@@ -411,8 +411,9 @@ impl AsynMotor for Pm500Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        self.set_status()
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = self.set_status()?;
+        Ok(())
     }
 }
 
@@ -505,6 +506,7 @@ impl Pm500Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     /// A line that never answers.
     struct Silent(epics_rs::asyn::port::PortDriverBase);
@@ -661,10 +663,10 @@ mod tests {
         let (mut axis, _, xr) = pm500_axis("pm500_r2");
         let user = AsynUser::default();
         *xr.lock().unwrap() = "XB";
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(s.position == 0.0 && !s.done && !s.direction, "{s:?}");
         *xr.lock().unwrap() = "X";
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
     }
 
     /// drvPM500.cc motor_init for one controller and its `X` axis: the
@@ -766,7 +768,7 @@ mod tests {
         let user = AsynUser::default();
         let mut poll = |reply: &'static str| {
             *xr.lock().unwrap() = reply;
-            let s = axis.poll(&user).unwrap();
+            let s = axis.polled(&user).unwrap();
             (s.position, s.encoder_position)
         };
         assert_eq!(poll("XD+4.997"), (500.0, 499.0));
@@ -782,7 +784,7 @@ mod tests {
         let user = AsynUser::default();
         let mut poll = |reply: &'static str| {
             *xr.lock().unwrap() = reply;
-            let s = axis.poll(&user).unwrap();
+            let s = axis.polled(&user).unwrap();
             (s.high_limit, s.low_limit)
         };
         assert_eq!(poll("XL+5.012"), (true, false));
@@ -820,10 +822,10 @@ mod tests {
         axis.set_move_strings(&user, b"XSOFF", Some(post)).unwrap();
         axis.move_relative(&user, 200.0, 0.0, 200000.0, 100000.0)
             .unwrap();
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         *xr.lock().unwrap() = "XD+7.012";
-        axis.poll(&user).unwrap();
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(
             *sent.lock().unwrap(),
             [
@@ -847,16 +849,16 @@ mod tests {
         let (mut axis, _, xr) = pm500_axis("pm500_retry");
         let user = AsynUser::default();
         *xr.lock().unwrap() = "";
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         *xr.lock().unwrap() = "XD+5.000";
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
-        assert!(axis.poll(&user).is_ok());
+        assert!(axis.polled(&user).is_ok());
         *xr.lock().unwrap() = "";
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 

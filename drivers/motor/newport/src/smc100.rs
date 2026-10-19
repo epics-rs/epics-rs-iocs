@@ -215,7 +215,7 @@ impl AsynMotor for Smc100Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         // Position (TP): controller units to record steps.
         let position_units =
             protocol::parse_value(&self.write_read(&protocol::cmd_query_position(self.axis))?)
@@ -227,7 +227,7 @@ impl AsynMotor for Smc100Axis {
             protocol::parse_status(&self.write_read(&protocol::cmd_query_status(self.axis))?)
                 .ok_or_else(|| parse_error("TS"))?;
 
-        Ok(MotorStatus {
+        *out = MotorStatus {
             position,
             encoder_position: position,
             done: !status.moving,
@@ -240,7 +240,8 @@ impl AsynMotor for Smc100Axis {
             has_encoder: false,
             vbas_supported: false,
             ..Default::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -248,6 +249,7 @@ impl AsynMotor for Smc100Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
 
     /// SMC100Driver.cpp: values go out as steps * stepSize_, TP comes back
     /// / stepSize_, and the jog targets SR?/SL? are sent unscaled.
@@ -286,7 +288,7 @@ mod tests {
                 "1PA25.000000"
             ]
         );
-        assert_eq!(axis.poll(&user).unwrap().position, 50000.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 50000.0);
     }
 
     /// C sets `status =` on each write and returns the last

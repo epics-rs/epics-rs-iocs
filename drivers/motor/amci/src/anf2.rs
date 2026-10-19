@@ -600,17 +600,18 @@ impl AsynMotor for Anf2Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
 
         // Don't poll until every axis on this controller has been created —
         // avoids interpreting still-being-written config values as command
         // values (C `axesCreated_ != numAxes_`).
         if ctrl.axes_created != ctrl.num_axes {
-            return Ok(MotorStatus {
+            *out = MotorStatus {
                 moving: false,
                 ..MotorStatus::default()
-            });
+            };
+            return Ok(());
         }
 
         // C presses on through every read and always publishes: each read's
@@ -691,13 +692,15 @@ impl AsynMotor for Anf2Axis {
             ..MotorStatus::default()
         };
         self.last = status.clone();
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn axes_of_missing_ports_are_built_and_counted() {
@@ -780,7 +783,7 @@ mod tests {
         crate::regs::fake::publish("anf2ForceReadOut");
         let ctrl = Anf2Controller::new("anf2ForceReadIn", "anf2ForceReadOut", 1).0;
         let mut ax = Anf2Axis::new(Arc::new(Mutex::new(ctrl)), 2, 0, 1, 0);
-        ax.poll(&AsynUser::new(0)).unwrap();
+        ax.polled(&AsynUser::new(0)).unwrap();
         assert_eq!(*taken.lock().unwrap(), [(reason, 2 * AXIS_REG_OFFSET)]);
     }
 }
