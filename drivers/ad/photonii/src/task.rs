@@ -515,7 +515,7 @@ mod tests {
         let p2 = P2Util::new(sync());
         // Until the socket is up a read fails rather than times out.
         for _ in 0..100 {
-            if matches!(p2.read(FILE_READ_DELAY), Err(ChannelError::Timeout)) {
+            if matches!(p2.read(FILE_READ_DELAY).1, Err(ChannelError::Timeout)) {
                 break;
             }
         }
