@@ -1040,10 +1040,7 @@ impl SessionWorker {
                     let (Some(data_type), Some(value)) =
                         (results.get(i * 2), results.get(i * 2 + 1))
                     else {
-                        item.lock().set_incoming_event(
-                            ProcessReason::ReadFailure,
-                            StatusCode::BadUnexpectedError,
-                        );
+                        item.lock().set_incoming_event(ProcessReason::ReadFailure);
                         continue;
                     };
                     self.deliver_read(item, data_type, value.clone());
@@ -1066,8 +1063,7 @@ impl SessionWorker {
                 }
                 for handle in handles {
                     if let Some(item) = items.get(*handle as usize) {
-                        item.lock()
-                            .set_incoming_event(ProcessReason::ReadFailure, status);
+                        item.lock().set_incoming_event(ProcessReason::ReadFailure);
                     }
                 }
                 if is_connection_error(status) {
@@ -1087,7 +1083,9 @@ impl SessionWorker {
         }
         let status = value.status.unwrap_or(StatusCode::Good);
         if status.is_bad() && value.value.is_none() {
-            item.set_incoming_event(ProcessReason::ReadFailure, status);
+            // C's `setIncomingData` takes the value's status, as a value does.
+            item.last_status = status;
+            item.set_incoming_event(ProcessReason::ReadFailure);
         } else {
             item.set_incoming_data(value, ProcessReason::ReadComplete);
         }
@@ -1166,7 +1164,7 @@ impl SessionWorker {
                     } else {
                         ProcessReason::WriteFailure
                     };
-                    item.lock().set_incoming_event(reason, status);
+                    item.lock().set_incoming_event(reason);
                 }
                 Ok(())
             }
@@ -1185,8 +1183,7 @@ impl SessionWorker {
                     );
                 }
                 for item in &written {
-                    item.lock()
-                        .set_incoming_event(ProcessReason::WriteFailure, status);
+                    item.lock().set_incoming_event(ProcessReason::WriteFailure);
                 }
                 if is_connection_error(status) {
                     Err(status)
@@ -1425,7 +1422,7 @@ impl SessionWorker {
                         item.wire_node_id(),
                         status_name(last)
                     );
-                    item.set_incoming_event(ProcessReason::ConnectionLoss, last);
+                    item.set_incoming_event(ProcessReason::ConnectionLoss);
                 }
             }
             if config.debug > 0 && !mine.is_empty() {
@@ -1470,10 +1467,8 @@ impl SessionWorker {
             queue.clear();
         }
         for item in self.handle.items.lock().iter() {
-            item.lock().set_incoming_event(
-                ProcessReason::ConnectionLoss,
-                StatusCode::BadConnectionClosed,
-            );
+            item.lock()
+                .set_incoming_event(ProcessReason::ConnectionLoss);
         }
     }
 }

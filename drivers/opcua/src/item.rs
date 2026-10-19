@@ -315,11 +315,12 @@ impl Item {
     }
 
     /// An event with no value — a read failure, a write result, a connection
-    /// loss (`ItemOpen62541::setIncomingEvent`).
-    pub fn set_incoming_event(&mut self, reason: ProcessReason, status: StatusCode) {
-        self.last_status = status;
+    /// loss (`ItemOpen62541::setIncomingEvent`). Only a connection loss
+    /// changes the item's status (`ItemOpen62541.cpp:215-216`).
+    pub fn set_incoming_event(&mut self, reason: ProcessReason) {
         self.last_timestamp = Some(SystemTime::now());
         if reason == ProcessReason::ConnectionLoss {
+            self.last_status = StatusCode::BadServerNotConnected;
             self.state = ConnectionStatus::Down;
             self.last_value = None;
             self.mapped = false;
@@ -331,7 +332,12 @@ impl Item {
                 leaf.choices = None;
                 leaf.incoming = None;
             }
-            leaf.push(Update::new(reason, None, status, SystemTime::now()));
+            leaf.push(Update::new(
+                reason,
+                None,
+                StatusCode::Good,
+                SystemTime::now(),
+            ));
         }
     }
 

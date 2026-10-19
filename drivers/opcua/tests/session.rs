@@ -32,6 +32,8 @@ struct Behaviour {
     write_error: Option<StatusCode>,
     /// The per-value status the write results carry.
     write_status: Option<StatusCode>,
+    /// Every Value read answers with this status and no value.
+    value_status: Option<StatusCode>,
     /// Return one result short of what was asked for — a server that under-answers.
     truncate_read: bool,
     /// The per-item status `CreateMonitoredItems` answers with.
@@ -115,12 +117,18 @@ impl UaConnection for Mock {
             return (id, Err(status));
         }
         let values = self.values.lock();
+        let value_status = self.behaviour.lock().value_status;
         let mut results: Vec<DataValue> = nodes
             .iter()
             .map(|node| {
                 if node.attribute_id == AttributeId::DataType as u32 {
                     // Int32 — i=6.
                     DataValue::value_only(Variant::NodeId(Box::new(NodeId::new(0, 6u32))))
+                } else if let Some(status) = value_status {
+                    DataValue {
+                        status: Some(status),
+                        ..Default::default()
+                    }
                 } else {
                     let value = values
                         .get(&node.node_id)
@@ -903,7 +911,7 @@ async fn a_failed_write_reaches_the_record_as_a_write_failure() {
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
         &mock,
-        vec![item0],
+        vec![item0.clone()],
     );
     until(|| handle.is_connected()).await;
     drain(&leaf0);
@@ -918,7 +926,9 @@ async fn a_failed_write_reaches_the_record_as_a_write_failure() {
 
     let update = pop(&leaf0);
     assert_eq!(update.reason, ProcessReason::WriteFailure);
-    assert_eq!(update.status, StatusCode::BadTypeMismatch);
+    // A write result is an event: the item keeps the status of its last read
+    // (`ItemOpen62541::setIncomingEvent`).
+    assert_eq!(item0.lock().last_status, StatusCode::Good);
     // The session stays up: a bad value is not a bad connection.
     assert!(handle.is_connected());
 }
@@ -931,7 +941,7 @@ async fn a_failed_read_reaches_the_record_as_a_read_failure() {
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
         &mock,
-        vec![item0],
+        vec![item0.clone()],
     );
     until(|| handle.is_connected()).await;
     drain(&leaf0);
@@ -942,8 +952,32 @@ async fn a_failed_read_reaches_the_record_as_a_read_failure() {
 
     let update = pop(&leaf0);
     assert_eq!(update.reason, ProcessReason::ReadFailure);
-    assert_eq!(update.status, StatusCode::BadNodeIdUnknown);
+    // A failed service is an event; only a value carries a status onto the item.
+    assert_eq!(item0.lock().last_status, StatusCode::Good);
     assert!(handle.is_connected());
+}
+
+/// A value the server refuses is still `setIncomingData`: its status lands on
+/// the item (`ItemOpen62541.cpp:184`).
+#[tokio::test]
+async fn a_refused_value_reaches_the_record_and_the_item_status() {
+    let mock = Mock::arc();
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone()],
+    );
+    until(|| handle.is_connected()).await;
+    drain(&leaf0);
+
+    mock.behave(|b| b.value_status = Some(StatusCode::BadNodeIdUnknown));
+    handle.request(Priority::Low, Request::Read { handle: 0 });
+    until(|| !leaf0.lock().queue.is_empty()).await;
+
+    assert_eq!(pop(&leaf0).reason, ProcessReason::ReadFailure);
+    assert_eq!(item0.lock().last_status, StatusCode::BadNodeIdUnknown);
 }
 
 /// Upstream C defect fixed at source: `SessionOpen62541::readComplete` bounds-checks
@@ -963,9 +997,7 @@ async fn a_server_that_returns_too_few_results_does_not_read_past_the_end() {
     until(|| handle.is_connected()).await;
     until(|| !leaf0.lock().queue.is_empty()).await;
 
-    let update = pop(&leaf0);
-    assert_eq!(update.reason, ProcessReason::ReadFailure);
-    assert_eq!(update.status, StatusCode::BadUnexpectedError);
+    assert_eq!(pop(&leaf0).reason, ProcessReason::ReadFailure);
 }
 
 /// C's `readComplete` reports a short answer before handling it
@@ -1147,7 +1179,8 @@ async fn a_connection_error_takes_the_session_down_and_tells_every_record() {
     let updates = drain(&leaf0);
     assert_eq!(updates[0].reason, ProcessReason::ReadFailure);
     assert_eq!(updates[1].reason, ProcessReason::ConnectionLoss);
-    assert_eq!(updates[1].status, StatusCode::BadConnectionClosed);
+    // `ItemOpen62541::setIncomingEvent` (`ItemOpen62541.cpp:215-216`).
+    assert_eq!(item0.lock().last_status, StatusCode::BadServerNotConnected);
     assert_eq!(item0.lock().state, ConnectionStatus::Down);
     assert_eq!(mock.calls.lock().disconnects, 1);
 }
@@ -1488,7 +1521,7 @@ async fn a_refused_subscription_still_fails_its_items() {
     assert!(mock.calls.lock().monitored.is_empty());
     let last = drain(&leaf0).pop().expect("the leaf has an update");
     assert_eq!(last.reason, ProcessReason::ConnectionLoss);
-    assert_eq!(last.status, StatusCode::BadSubscriptionIdInvalid);
+    assert_eq!(item0.lock().last_status, StatusCode::BadServerNotConnected);
 }
 
 /// `SubscriptionOpen62541::show` prints the server's revised interval beside
@@ -1546,7 +1579,7 @@ async fn a_refused_monitored_item_is_told_the_connection_is_lost() {
 
     let last = drain(&leaf0).pop().expect("the leaf has an update");
     assert_eq!(last.reason, ProcessReason::ConnectionLoss);
-    assert_eq!(last.status, StatusCode::BadNodeIdUnknown);
+    assert_eq!(item0.lock().last_status, StatusCode::BadServerNotConnected);
 }
 
 #[tokio::test]
