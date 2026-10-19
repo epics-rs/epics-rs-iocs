@@ -363,7 +363,7 @@ impl PIC663Axis {
 impl Model1Motor for PIC663Axis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -744,5 +744,34 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPIC663.cc:229-242 exit stores what motor_init prepared (:542-551,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once past
+    /// RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("c663InitFail", |last| match last {
+            "TS" | "TP" => String::new(),
+            _ => "C-663\r".into(),
+        });
+        let ctrl = Arc::new(Mutex::new(PIC663Controller::new(io, 1).unwrap()));
+        let mut first = PIC663Axis::new(ctrl.clone());
+        let mut again = PIC663Axis::new(ctrl);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            again.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 }
