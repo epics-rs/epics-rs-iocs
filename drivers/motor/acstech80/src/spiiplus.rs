@@ -82,6 +82,9 @@ const OP_ABS_MOVE: i32 = 1;
 const OP_REL_MOVE: i32 = 2;
 const OP_JOG_MOVE: i32 = 3;
 
+/// C `MAX_AXIS` (motor.h:129): the axes a model-1 card holds.
+const MAX_AXIS: usize = 32;
+
 /// ACSPL kinematic axis letters, indexed by 0-based axis (C `ACSPL_axis`).
 const AXIS_LETTERS: [&str; 8] = ["X", "Y", "Z", "T", "A", "B", "C", "D"];
 
@@ -169,16 +172,23 @@ impl SpiiPlusController {
         ctrl.ident = ctrl.command("?VR").unwrap_or_default();
 
         // Auto-detect the axis count: ?APOS(n) succeeds until n is out of
-        // range. A failed one only ends the count (drvSPiiPlus.cc:711-717),
+        // range. A failed one only ends the count (drvSPiiPlus.cc:711-721),
         // so a card that answered ?VR stays, with no axes at worst.
-        // C counts on past its 8 ACSPL_axis[] letters and reads beyond them;
-        // a C defect not copied: the count stops at the last letter.
-        ctrl.num_axes = (0..AXIS_LETTERS.len())
+        // C defects not copied: C keeps every axis that answers, past its
+        // MAX_AXIS motor_info slots and, in CONNECT mode, past the 8
+        // ACSPL_axis[] letters ?FPOS reads (:260). The probes are C's up
+        // to ?APOS(MAX_AXIS); the count stops at the mode's bound.
+        let bound = match mode {
+            CommandMode::Connect => AXIS_LETTERS.len(),
+            _ => MAX_AXIS,
+        };
+        ctrl.num_axes = (0..=MAX_AXIS)
             .take_while(|n| {
                 let reply = ctrl.command(&format!("?APOS({n})")).unwrap_or_default();
                 !reply.is_empty() && !reply.contains('?')
             })
-            .count();
+            .count()
+            .min(bound);
         Ok(ctrl)
     }
 
@@ -648,6 +658,39 @@ mod tests {
         let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         let status = axis.poll(&AsynUser::default()).unwrap();
         assert_eq!((status.position, status.encoder_position), (12.0, -12.0));
+    }
+
+    /// `motor_init` probes `?APOS(n)` until one fails and keeps that many
+    /// axes (drvSPiiPlus.cc:712-721), past 8 outside CONNECT mode. The count
+    /// stops at C's `MAX_AXIS` motor_info slots, and at the 8 `?FPOS`
+    /// letters in CONNECT mode, which C overruns; the probes are C's up to
+    /// `?APOS(32)`.
+    #[test]
+    fn axis_count_follows_the_probe_up_to_the_mode_s_bound() {
+        let count = |name: &str, axes: usize, mode| {
+            let (rig, io) = motor_common::testing::LineRig::new(name, move |sent| {
+                let n = sent
+                    .strip_prefix("?APOS(")
+                    .and_then(|s| s.strip_suffix(')'))
+                    .and_then(|s| s.parse::<usize>().ok());
+                match (sent, n) {
+                    ("?VR", _) => "v1".into(),
+                    (_, Some(n)) if n >= axes => "?".into(),
+                    _ => "0".into(),
+                }
+            });
+            let num_axes = SpiiPlusController::new(io, mode).unwrap().num_axes();
+            let probes = rig
+                .sent()
+                .iter()
+                .filter(|s| s.starts_with("?APOS("))
+                .count();
+            (num_axes, probes)
+        };
+        assert_eq!(count("acsT80Ax12B", 12, CommandMode::Buffer), (12, 13));
+        assert_eq!(count("acsT80Ax12C", 12, CommandMode::Connect), (8, 13));
+        assert_eq!(count("acsT80Ax8C", 8, CommandMode::Connect), (8, 9));
+        assert_eq!(count("acsT80Ax40D", 40, CommandMode::Direct), (32, 33));
     }
 
     /// C keeps `?FVEL` as `(int)vel` (drvSPiiPlus.cc:397), which the record
