@@ -138,6 +138,13 @@ impl<A: AsynMotor + 'static> SimDriver<A> {
     /// init_record. C's callback then scanOnce's before scanInit and
     /// segfaults (a C defect); here a post before the gate only sets
     /// needUpdate.
+    ///
+    /// C defect not copied: an axis has one callback slot and the record's
+    /// setCallback replaces whatever opened it before (motor_interface.h:
+    /// 472-475, paramLib.c:227-240), silently starving a
+    /// drvAsynMotorConfigure port or an earlier record on the axis. Here a
+    /// record's open leaves the slot alone, so every opener's records keep
+    /// getting every status.
     fn open(&self, card: i32, signal: i32) -> bool {
         let created = self.created.lock().unwrap_or_else(|e| e.into_inner());
         find(&created, card, signal).is_some()
@@ -589,6 +596,65 @@ mod one_poller {
             assert!(init.join().unwrap(), "{out}");
         }
         assert_eq!(pollers(), 1);
+    }
+
+    /// A devMotorSim record's open does not take the drvAsynMotorConfigure
+    /// port's callback, as C's setCallback does (devMotorSim.c:173); see
+    /// [`SimDriver::open`].
+    #[epics_rs::base::epics_test]
+    async fn a_record_s_open_leaves_the_port_its_callback() {
+        use std::future::Future;
+
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::asyn::manager::PortManager;
+        use motor_common::drv_motor_asyn::function;
+        use motor_common::testing::run_command;
+
+        let args = [11, 0, -100, 100, 0, 1, 1, 0].map(ArgValue::Int).to_vec();
+        run_command(motor_sim_create_command(), args).await;
+        let args = vec![
+            ArgValue::String("simOpened".into()),
+            ArgValue::String(DRIVER.into()),
+            ArgValue::Int(11),
+            ArgValue::Int(1),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&MOTOR_SIM]), args).await;
+        let port = PortManager::global().find_port_handle("simOpened").unwrap();
+        let filter = InterruptFilter {
+            reason: Some(function::P_GAIN as usize),
+            addr: Some(0),
+            iface: Some(InterfaceType::Float64),
+            ..InterruptFilter::default()
+        };
+        let (_sub, mut gain) = port
+            .interrupts()
+            .register_interrupt_user(filter, 0)
+            .unwrap();
+        let init = std::thread::spawn(|| {
+            let ctx = DeviceSupportContext {
+                record_type: "motor",
+                dtyp: DEV_MOTOR_SIM.choice,
+                inp: "",
+                out: "#C11 S0 @motorSim",
+            };
+            device_support_factory()(&ctx).is_some()
+        });
+        while !init.is_finished() {
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(init.join().unwrap());
+
+        let writer = port.clone();
+        std::thread::spawn(move || {
+            writer.write_float64_blocking(function::P_GAIN as usize, 0, 0.75)
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let called_back = std::pin::pin!(gain.recv()).poll(&mut cx);
+        assert!(matches!(called_back, std::task::Poll::Ready(Some(_))));
     }
 
     /// C `motorAxisReport` (drvMotorSim.c:132-166), the drvet `dbior`
