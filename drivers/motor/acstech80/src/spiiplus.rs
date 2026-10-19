@@ -647,17 +647,25 @@ mod tests {
     /// toward zero (drvSPiiPlus.cc:369, :386).
     #[test]
     fn positions_truncate_as_c_casts() {
-        let (_rig, io) = motor_common::testing::LineRig::new("acsT80Trunc", |sent| match sent {
-            "?VR" => "v1".into(),
-            "?APOS(0)" => "12.7".into(),
-            s if s.starts_with("?APOS(") => "?".into(),
-            "?FPOS(0)" => "-12.7".into(),
-            _ => "0".into(),
+        let sign = Arc::new(Mutex::new(1.0));
+        let at = sign.clone();
+        let (_rig, io) = motor_common::testing::LineRig::new("acsT80Trunc", move |sent| {
+            let sign = *at.lock().unwrap();
+            match sent {
+                "?VR" => "v1".into(),
+                "?APOS(0)" => format!("{}", 12.7 * sign),
+                s if s.starts_with("?APOS(") => "?".into(),
+                "?FPOS(0)" => format!("{}", -12.7 * sign),
+                _ => "0".into(),
+            }
         });
         let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
         let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         let status = axis.poll(&AsynUser::default()).unwrap();
         assert_eq!((status.position, status.encoder_position), (12.0, -12.0));
+        *sign.lock().unwrap() = -1.0;
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert_eq!((status.position, status.encoder_position), (-12.0, 12.0));
     }
 
     /// `motor_init` probes `?APOS(n)` until one fails and keeps that many
