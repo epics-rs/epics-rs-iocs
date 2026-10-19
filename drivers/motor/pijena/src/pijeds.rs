@@ -44,7 +44,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -204,13 +206,15 @@ pub struct PiJedsAxis {
     strings: MoveStrings,
     /// The last failed poll's verdict, per axis as each axis polls alone.
     failure: PollFailure,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PiJedsAxis {
-    /// Construct axis `axis` (0-based). No hardware setup is needed beyond the
-    /// controller identification already done in [`PiJedsController::new`].
+    /// Construct axis `axis` (0-based) and read its status, as `motor_init`'s
+    /// `set_status` does (drvPIJEDS.cc:673).
     pub fn new(controller: Arc<Mutex<PiJedsController>>, axis: usize) -> Self {
-        Self {
+        let mut me = Self {
             controller,
             axis,
             prev_position: 0.0,
@@ -224,7 +228,10 @@ impl PiJedsAxis {
             },
             strings: MoveStrings::default(),
             failure: PollFailure::NONE,
-        }
+            init_status: None,
+        };
+        me.init_status = Some(me.poll(&AsynUser::new(0)));
+        me
     }
 
     fn lock(&self) -> MutexGuard<'_, PiJedsController> {
@@ -279,6 +286,12 @@ impl PiJedsAxis {
         self.moving = true;
         self.no_motion_count = 0;
         Ok(())
+    }
+}
+
+impl Model1Motor for PiJedsAxis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 
