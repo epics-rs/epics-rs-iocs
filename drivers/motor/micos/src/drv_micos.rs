@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -54,22 +54,14 @@ impl MicosController {
     }
 }
 
-/// `motor_init`: `ts` to each of the `num_axis` addresses, three tries
-/// each; then echo off (`ef`) and stop (`ab1`) on every one. False when an
-/// address never answered, which leaves the whole card unconfigured.
+/// `motor_init`'s probe: `ts` to each of the `num_axis` addresses, three
+/// tries each. False when an address never answered, which leaves the whole
+/// card unconfigured.
 ///
 /// C counts the tries across all addresses, so after the first three only
 /// one try is left per address; each gets three here.
 pub fn micos_probe(ctrl: &MicosController, num_axis: i32) -> bool {
-    let answered =
-        (0..num_axis).all(|n| (0..3).any(|_| !ctrl.ask(&format!("{CTLA}{n}ts")).is_empty()));
-    if answered {
-        for n in 0..num_axis {
-            ctrl.send(&format!("{CTLA}{n}ef"));
-            ctrl.send(&format!("{CTLA}{n}ab1"));
-        }
-    }
-    answered
+    (0..num_axis).all(|n| (0..3).any(|_| !ctrl.ask(&format!("{CTLA}{n}ts")).is_empty()))
 }
 
 /// One MoCo driver: one motor.
@@ -84,11 +76,20 @@ pub struct DrvMicosAxis {
     high_limit: f64,
     low_limit: f64,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl DrvMicosAxis {
+    /// MoCo address `axis` as `motor_init` takes it up: echo off (`ef`),
+    /// stop (`ab1`), then its status (drvMicos.cc:527-553).
     pub fn new(controller: Arc<Mutex<MicosController>>, axis: i32) -> Self {
-        Self {
+        {
+            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            ctrl.send(&format!("{CTLA}{axis}ef"));
+            ctrl.send(&format!("{CTLA}{axis}ab1"));
+        }
+        let mut axis = Self {
             controller,
             axis,
             status: MotorStatus {
@@ -100,7 +101,10 @@ impl DrvMicosAxis {
             high_limit: 0.0,
             low_limit: 0.0,
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        };
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, MicosController> {
@@ -157,6 +161,12 @@ fn hex_byte(reply: &[u8], j: usize) -> i64 {
         (Some(hi), Some(lo)) => i64::from(hi * 16 + lo),
         (Some(hi), None) => i64::from(hi),
         _ => 0,
+    }
+}
+
+impl Model1Motor for DrvMicosAxis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 
@@ -343,11 +353,9 @@ mod tests {
             _ => String::new(),
         });
         let ctrl = MicosController::new(io);
-        (
-            line,
-            DrvMicosAxis::new(Arc::new(Mutex::new(ctrl)), 0),
-            moving,
-        )
+        let axis = DrvMicosAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        (line, axis, moving)
     }
 
     fn post(text: &[u8]) -> PostMessage {
