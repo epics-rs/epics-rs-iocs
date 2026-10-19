@@ -422,8 +422,7 @@ impl TetrAmmDriver {
         Ok(())
     }
 
-    /// A failed exchange's reply is still parsed ([`trace::Reply::parse`]);
-    /// one that does not parse returns its own status. C discards each
+    /// A failed exchange returns its own status. C discards each
     /// `writeReadMeter` status (drvTetrAMM.cpp:793-842) and reports the empty
     /// reply as asynError (:865), so a disconnected meter alarms WRITE there
     /// and COMM here. C defect, not copied.
@@ -434,27 +433,24 @@ impl TetrAmmDriver {
             message: "TetrAMM: unparseable status response".into(),
         };
 
-        let num_channels = last
-            .query(&self.io, "CHN:?", MAX_COMMAND_LEN)
-            .parse(proto::parse_chn, |_| err())?;
+        let resp = last.query(&self.io, "CHN:?", MAX_COMMAND_LEN)?;
+        let num_channels = proto::parse_chn(&resp).ok_or_else(err)?;
         self.base
             .port_base
             .set_int32_param(p.num_channels, 0, num_channels)?;
         self.shared.acq.lock().num_channels = num_channels;
 
         for i in 0..QE_MAX_INPUTS as i32 {
-            let range = last
-                .query(&self.io, &proto::cmd_range_query(i + 1), MAX_COMMAND_LEN)
-                .parse(proto::parse_range, |_| err())?;
+            let resp = last.query(&self.io, &proto::cmd_range_query(i + 1), MAX_COMMAND_LEN)?;
+            let range = proto::parse_range(&resp).ok_or_else(err)?;
             self.base.port_base.set_int32_param(p.range, i + 1, range)?;
             if i == 0 {
                 self.base.port_base.set_int32_param(p.range, 0, range)?;
             }
         }
 
-        let values_per_read = last
-            .query(&self.io, "NRSAMP:?", MAX_COMMAND_LEN)
-            .parse(proto::parse_nrsamp, |_| err())?;
+        let resp = last.query(&self.io, "NRSAMP:?", MAX_COMMAND_LEN)?;
+        let values_per_read = proto::parse_nrsamp(&resp).ok_or_else(err)?;
         self.base
             .port_base
             .set_int32_param(p.values_per_read, 0, values_per_read)?;
@@ -465,10 +461,8 @@ impl TetrAmmDriver {
             .port_base
             .set_float64_param(p.sample_time, 0, sample_time)?;
 
-        match last
-            .query(&self.io, "HVS:?", MAX_COMMAND_LEN)
-            .parse(proto::parse_hvs, |_| err())?
-        {
+        let resp = last.query(&self.io, "HVS:?", MAX_COMMAND_LEN)?;
+        match proto::parse_hvs(&resp).ok_or_else(err)? {
             None => self.base.port_base.set_int32_param(p.hvs_readback, 0, 0)?,
             Some(volts) => {
                 self.base.port_base.set_int32_param(p.hvs_readback, 0, 1)?;
@@ -478,28 +472,24 @@ impl TetrAmmDriver {
             }
         }
 
-        let v = last
-            .query(&self.io, "HVV:?", MAX_COMMAND_LEN)
-            .parse(proto::parse_hvv, |_| err())?;
+        let resp = last.query(&self.io, "HVV:?", MAX_COMMAND_LEN)?;
+        let v = proto::parse_hvv(&resp).ok_or_else(err)?;
         self.base
             .port_base
             .set_float64_param(p.hvv_readback, 0, v)?;
 
-        let v = last
-            .query(&self.io, "HVI:?", MAX_COMMAND_LEN)
-            .parse(proto::parse_hvi, |_| err())?;
+        let resp = last.query(&self.io, "HVI:?", MAX_COMMAND_LEN)?;
+        let v = proto::parse_hvi(&resp).ok_or_else(err)?;
         self.base
             .port_base
             .set_float64_param(p.hvi_readback, 0, v)?;
 
-        let v = last
-            .query(&self.io, "TEMP:?", MAX_COMMAND_LEN)
-            .parse(proto::parse_temp, |_| err())?;
+        let resp = last.query(&self.io, "TEMP:?", MAX_COMMAND_LEN)?;
+        let v = proto::parse_temp(&resp).ok_or_else(err)?;
         self.base.port_base.set_float64_param(p.temperature, 0, v)?;
 
-        let unit_status = last
-            .query(&self.io, "STATUS:?", MAX_COMMAND_LEN)
-            .parse(proto::parse_status, |_| err())?;
+        let resp = last.query(&self.io, "STATUS:?", MAX_COMMAND_LEN)?;
+        let unit_status = proto::parse_status(&resp).ok_or_else(err)?;
         let interlock = proto::interlock_status(unit_status);
         self.base
             .port_base
