@@ -9,7 +9,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use meascomp::device::DaqDevice;
 
-use crate::board_enums::{AI_CHAN_TYPE_TC, AI_CHAN_TYPE_VOLTAGE, map_range};
+use crate::board_enums::{AI_CHAN_TYPE_TC, AI_CHAN_TYPE_VOLTAGE, map_range, temp_scale};
 use crate::driver::MultiFunctionDriver;
 use crate::params::*;
 use crate::trace::{SelfTrace, status_of};
@@ -233,7 +233,7 @@ fn poller_loop(
                             // not an error: ulTIn reports it as -9999.
                             status = match dev.temperature_in(
                                 ch as i32,
-                                tc_scales[ch],
+                                temp_scale(&trace, tc_scales[ch]),
                                 uldaq_sys::TIN_FF_DEFAULT,
                             ) {
                                 Ok(temp) => {

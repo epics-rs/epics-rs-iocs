@@ -23,9 +23,9 @@ record(mbbo, "$(P)$(R)TCType") {
 record(mbbo, "$(P)$(R)Scale") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)TEMPERATURE_SCALE")
-    field(ZRST, "Celsius")    field(ZRVL, "1")
-    field(ONST, "Fahrenheit") field(ONVL, "2")
-    field(TWST, "Kelvin")     field(TWVL, "3")
+    field(ZRST, "Celsius")    field(ZRVL, "0")
+    field(ONST, "Fahrenheit") field(ONVL, "1")
+    field(TWST, "Kelvin")     field(TWVL, "2")
     field(THST, "Volts")      field(THVL, "4")
     field(FRST, "NoScale")    field(FRVL, "5")
     field(PINI, "YES")

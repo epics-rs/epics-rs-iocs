@@ -1,6 +1,6 @@
 //! C `MultiFunction`'s USB-2408-2AO enum tables (drvMultiFunction.cpp:
-//! 349-367) and `mapRange` (:1328-1376). The range parameters hold UL for
-//! Windows gain codes (`CBW_*`), which every uldaq call maps to a `Range`.
+//! 349-367), `mapRange` (:1328-1376) and temperature scales. The range and
+//! scale parameters hold UL for Windows codes, which every uldaq call maps.
 
 use epics_rs::asyn::param::EnumEntry;
 use epics_rs::asyn::trace::TraceMask;
@@ -50,6 +50,13 @@ pub const CBW_MA0TO20: i32 = 204;
 /// Linux (:222-223), the ANALOG_IN_TYPE values.
 pub const AI_CHAN_TYPE_VOLTAGE: i32 = uldaq_sys::AI_VOLTAGE as i32;
 pub const AI_CHAN_TYPE_TC: i32 = uldaq_sys::AI_TC as i32;
+
+// C's temperature scales (:228-232), the TEMPERATURE_SCALE values.
+pub const CELSIUS: i32 = 0;
+pub const FAHRENHEIT: i32 = 1;
+pub const KELVIN: i32 = 2;
+pub const VOLTS: i32 = 4;
+pub const NOSCALE: i32 = 5;
 
 /// `inputRangeUSB_2408`.
 pub const INPUT_RANGE: &[(&str, i32)] = &[
@@ -142,6 +149,25 @@ pub fn map_range(trace: &SelfTrace, gain: i32) -> i32 {
     })
 }
 
+/// C `pollerThread`'s switch (:2809-2819) from a TEMPERATURE_SCALE to the
+/// `TempScale` ulTIn takes.
+pub fn temp_scale(trace: &SelfTrace, scale: i32) -> i32 {
+    match scale {
+        CELSIUS => uldaq_sys::TS_CELSIUS,
+        FAHRENHEIT => uldaq_sys::TS_FAHRENHEIT,
+        KELVIN => uldaq_sys::TS_KELVIN,
+        VOLTS => uldaq_sys::TS_VOLTS,
+        NOSCALE => uldaq_sys::TS_NOSCALE,
+        _ => {
+            trace.print(
+                TraceMask::ERROR,
+                format_args!("{DRIVER_NAME}::pollerThread unsupported Scale={scale}\n"),
+            );
+            uldaq_sys::TS_CELSIUS
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +194,23 @@ mod tests {
         // C's commented-out CBW_BIP1PT67VOLTS and an unknown code.
         assert_eq!(ul_range(11), None);
         assert_eq!(ul_range(99), None);
+    }
+
+    #[test]
+    fn a_temperature_scale_is_cs_code_and_3_falls_back_to_celsius() {
+        use uldaq_sys::*;
+        let trace = SelfTrace::default();
+        let mapped = [0, 1, 2, 3, 4, 5].map(|s| temp_scale(&trace, s));
+        assert_eq!(
+            mapped,
+            [
+                TS_CELSIUS,
+                TS_FAHRENHEIT,
+                TS_KELVIN,
+                TS_CELSIUS,
+                TS_VOLTS,
+                TS_NOSCALE
+            ]
+        );
     }
 }
