@@ -157,8 +157,6 @@ pub(crate) fn health_transition(
     };
     targets
         .iter()
-        .map(|&(reason, addr)| {
-            epics_rs::asyn::request::ParamSetValue::status(reason, addr, status, 0, 0)
-        })
+        .map(|&(reason, addr)| epics_rs::asyn::request::ParamSetValue::status(reason, addr, status))
         .collect()
 }

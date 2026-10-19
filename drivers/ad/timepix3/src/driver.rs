@@ -2000,7 +2000,7 @@ impl TimePix3Driver {
                 self.set_text(p.write_msg, &msg)?;
                 self.ad
                     .port_base
-                    .set_param_status(p.mask_bp_c, 0, AsynStatus::Error, 0, 0)?;
+                    .set_param_status(p.mask_bp_c, 0, AsynStatus::Error)?;
                 self.ad.port_base.call_param_callbacks(0)?;
                 adlog::print(
                     &self.ad.port_base,
@@ -2035,9 +2035,7 @@ impl TimePix3Driver {
                 AsynStatus::Error
             }
         };
-        self.ad
-            .port_base
-            .set_param_status(p.mask_bp_c, 0, status, 0, 0)?;
+        self.ad.port_base.set_param_status(p.mask_bp_c, 0, status)?;
         self.ad.port_base.call_param_callbacks(0)?;
         match status {
             AsynStatus::Success => Ok(()),
@@ -2447,7 +2445,7 @@ impl TimePix3Driver {
         }
         self.ad
             .port_base
-            .set_param_status(p.pixel_config_diff, 0, AsynStatus::Success, 0, 0)?;
+            .set_param_status(p.pixel_config_diff, 0, AsynStatus::Success)?;
         self.ad
             .port_base
             .params

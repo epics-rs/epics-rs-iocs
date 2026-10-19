@@ -955,9 +955,12 @@ pub trait QuadEmDevice {
             ));
         }
 
-        // C's callParamCallbacks() posts address 0 only; the other addresses
-        // post from computePositions while data flows.
+        // drvQuadEM.cpp:517 posts address 0 only, leaving a channel write's
+        // readback to the next data post (:280): a C defect, not copied.
         status.add(self.qe_base().port_base.call_param_callbacks(0));
+        if channel != 0 {
+            status.add(self.qe_base().port_base.call_param_callbacks(channel));
+        }
         qe_write_result(
             &self.qe_base().port_base,
             status,
@@ -993,7 +996,11 @@ pub trait QuadEmDevice {
             status.add(self.read_status());
         }
 
+        // Address 0 only at drvQuadEM.cpp:572 too, the same C defect.
         status.add(self.qe_base().port_base.call_param_callbacks(0));
+        if channel != 0 {
+            status.add(self.qe_base().port_base.call_param_callbacks(channel));
+        }
         qe_write_result(
             &self.qe_base().port_base,
             status,
@@ -1891,5 +1898,39 @@ mod tests {
                 "read_status"
             ]
         );
+    }
+
+    #[test]
+    fn a_channel_write_posts_its_own_address_with_no_data_running() {
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let mut m = FakeMeter::new(&[]);
+        let (range, offset) = (m.base.params.range, m.base.params.current_offset);
+        m.base.port_base.own_interrupts(InterruptGate::opened());
+        // The boot sweep's post of what the constructor set.
+        m.base.port_base.call_param_callbacks(2).unwrap();
+        let filter = InterruptFilter {
+            addr: Some(2),
+            ..Default::default()
+        };
+        let mut rx = m
+            .base
+            .port_base
+            .interrupts
+            .subscribe_async_filtered(filter, 16, 0)
+            .unwrap();
+        m.qe_write_int32(&AsynUser::new(range).with_addr(2), 3)
+            .unwrap();
+        m.qe_write_float64(&AsynUser::new(offset).with_addr(2), 1.5)
+            .unwrap();
+        let posted: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|v| match v.value {
+                ParamValue::Int32(n) => format!("{} {n}", v.reason),
+                ParamValue::Float64(x) => format!("{} {x}", v.reason),
+                _ => format!("{} other", v.reason),
+            })
+            .collect();
+        assert_eq!(posted, [format!("{range} 3"), format!("{offset} 1.5")]);
     }
 }
