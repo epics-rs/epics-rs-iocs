@@ -4327,7 +4327,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stream-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3b8cc7585dd7d48f905ca5298609c434884578e6#3b8cc7585dd7d48f905ca5298609c434884578e6"
+source = "git+file:///home/stevek/work/epics-rs?rev=db3306ebddbf7ca51229d583c9931b03341d2c30#db3306ebddbf7ca51229d583c9931b03341d2c30"
 dependencies = [
  "asyn-rs",
  "chrono",

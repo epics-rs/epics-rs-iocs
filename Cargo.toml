@@ -261,9 +261,9 @@ modbus-rs = { version = "0.32.0", package = "epics-modbus-rs" }
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
 mca-rs = "0.32.0"
-# StreamDevice port (syringepump-ioc's Teledyne D/H); not a crates.io crate,
-# so taken from the rt/iocs-base rev directly.
-stream-rs = { git = "file:///home/stevek/work/epics-rs", rev = "3b8cc7585dd7d48f905ca5298609c434884578e6" }
+# StreamDevice port (syringepump-ioc's Teledyne D/H). Not on crates.io; the
+# patch below supplies it at the same rev as every other epics-rs crate.
+stream-rs = "0.32.0"
 # float_roundtrip makes the parser correctly rounded, as C's strtod is;
 # without it some doubles parse 1 ULP off.
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -287,3 +287,4 @@ epics-rtems-boot = { git = "file:///home/stevek/work/epics-rs", rev = "db3306ebd
 mca-rs = { git = "file:///home/stevek/work/epics-rs", rev = "db3306ebddbf7ca51229d583c9931b03341d2c30" }
 motor-rs = { git = "file:///home/stevek/work/epics-rs", rev = "db3306ebddbf7ca51229d583c9931b03341d2c30" }
 scaler-rs = { git = "file:///home/stevek/work/epics-rs", rev = "db3306ebddbf7ca51229d583c9931b03341d2c30" }
+stream-rs = { git = "file:///home/stevek/work/epics-rs", rev = "db3306ebddbf7ca51229d583c9931b03341d2c30" }
