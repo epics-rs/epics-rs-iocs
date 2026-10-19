@@ -296,6 +296,10 @@ impl Plc {
             for info in tags {
                 {
                     let mut d = info.data.lock();
+                    // C defect, not copied: "Reset all write flags ... skip
+                    // all writes" resets is_writing alone
+                    // (drvEtherIP.c:463-466), so a write still in do_write
+                    // goes out after the reconnect.
                     d.is_writing = false;
                     d.do_write = false;
                     d.valid_data_size = 0;
