@@ -40,7 +40,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -227,12 +229,15 @@ pub struct KohzuAxis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl KohzuAxis {
-    /// Construct axis `index` (0-based; wire axis = `index + 1`).
+    /// Construct axis `index` (0-based; wire axis = `index + 1`) and read
+    /// its status (drvSC800.cc:621).
     pub fn new(controller: Arc<Mutex<KohzuController>>, index: usize) -> Self {
-        Self {
+        let mut axis = Self {
             controller,
             axis: index as u32 + 1,
             speeds: Speeds {
@@ -247,7 +252,10 @@ impl KohzuAxis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        };
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, KohzuController> {
@@ -283,6 +291,12 @@ impl KohzuAxis {
             self.axis, s.base, s.slew, s.accel, s.accel
         ))?;
         Ok(())
+    }
+}
+
+impl Model1Motor for KohzuAxis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 
