@@ -178,16 +178,6 @@ fn readbacks_not_available() -> AsynError {
     }
 }
 
-fn is_asyn_timeout(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        }
-    )
-}
-
 /// `addr` resolution for [`DataDriver::drv_user_create`], factored out for
 /// unit testing without a live port. `capaNCDT6200Sup.c` has no
 /// `asynDrvUser` interface at all, so every addr resolves to *some* reason;
@@ -591,7 +581,7 @@ fn reader_thread(
                 }
                 Err(e) => {
                     print_error(format_args!("{rbk}: port read failed: {}\n", e.message()));
-                    if is_asyn_timeout(&e) {
+                    if e.status() == AsynStatus::Timeout {
                         ReadOutcome::Timeout
                     } else {
                         // C waits before it counts the failure (`:428`).
