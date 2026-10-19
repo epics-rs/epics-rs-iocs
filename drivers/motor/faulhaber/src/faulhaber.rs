@@ -296,7 +296,7 @@ impl FaulhaberAxis {
 impl Model1Motor for FaulhaberAxis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -701,6 +701,36 @@ mod tests {
         // 3000 counts/s² at 1000 counts/rev = 3 rev/s².
         assert_eq!(accel_to_rev(3000.0, 1000.0), 3);
         assert_eq!(accel_to_rev(3000.0, 0.0), 0);
+    }
+
+    /// drvMCDC2805.cc:589-623: a failed `motor_init` read stores the
+    /// GAIN_SUPPORT and EA_PRESENT `motor_init` set, the first raising
+    /// nothing (RETRY) and the next CNTRL_COMM_ERR and RA_PROBLEM
+    /// (:238-250).
+    #[test]
+    fn a_failed_init_read_keeps_what_motor_init_set() {
+        let (_line, io) = LineRig::new("faulhaberInitFail", |last| {
+            match last.get(1..).unwrap_or_default() {
+                "VER" => "MCDC2805".into(),
+                _ => String::new(),
+            }
+        });
+        let controller = Arc::new(Mutex::new(FaulhaberController::new(io, 2).unwrap()));
+        let init = |node| FaulhaberAxis::new(controller.clone(), node).take_init_status();
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init(0), prepared);
+        assert_eq!(
+            init(1),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 
     /// drvMCDC2805.cc:229-251: a first missed `GST` is RETRY (nothing
