@@ -16,12 +16,10 @@
 //!
 //! * **CBF is not supported.** C links CBFlib and calls `readCbf` for `.cbf`
 //!   file names; this port logs an error and fails the read.
-//! * **Camserver I/O runs on worker threads.** A Rust `PortDriver` method
-//!   executes inside its port actor's current-thread runtime and cannot block
-//!   on a second port, so the work C does inline in `writeInt32` /
-//!   `writeFloat64` / `writeOctet` is queued to a `PilatusCmdTask` thread. The
-//!   command order and the camserver byte stream are unchanged; only the moment
-//!   the record's write callback returns differs.
+//! * **The flat field is published from a thread.** C's `readFlatFieldFile`
+//!   calls `doCallbacksGenericPointer` on the port thread; the port actor's
+//!   current-thread runtime cannot await the publish, so `PilatusFlatField`
+//!   does it, and FlatFieldValid can read 1 before a plugin has the array.
 //! * **`createFileName` / `checkPath` are reimplemented** in [`file_name`],
 //!   because `ad-core-rs` 0.22.1 does not expose them.
 //! * **Multi-strip TIFFs decode correctly.** C's `readTiff` passes strip index

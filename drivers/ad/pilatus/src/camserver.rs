@@ -228,7 +228,7 @@ impl Camserver {
 
 /// Pending parameter writes, flushed by [`Ctx::callbacks`] at exactly the
 /// points where C calls `callParamCallbacks()`.
-struct Side {
+pub(crate) struct Side {
     /// This driver's own port (parameter library).
     handle: PortHandle,
     updates: Vec<ParamSetValue>,
@@ -298,6 +298,15 @@ impl Ctx {
     /// C `setIntegerParam`.
     pub fn set_i32(&mut self, reason: usize, value: i32) {
         self.side.set_i32(reason, value);
+    }
+
+    /// The image-file readers, posting through this context's batch.
+    pub(crate) fn image_reader(&mut self) -> crate::task::ImageReader<'_, Side> {
+        crate::task::ImageReader {
+            cx: &mut self.side,
+            ad: self.ad,
+            stop: &self.stop,
+        }
     }
 
     /// C `setDoubleParam`.
@@ -432,7 +441,8 @@ impl Ctx {
 mod tests {
     use super::*;
     use crate::driver::{DriverLinks, PilatusDriver};
-    use crate::task::{Cmd, Shared};
+    use crate::task::Shared;
+    use epics_rs::ad_core::ndarray_pool::PublishedArray;
     use epics_rs::ad_core::runtime as rt;
     use epics_rs::asyn::error::AsynError;
     use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
@@ -465,7 +475,7 @@ mod tests {
     /// connection prints `status=4`, not asynError's 3.
     #[test]
     fn a_camserver_write_keeps_the_octet_ports_status() {
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
         let stop = Arc::new(Event::new());
         let det = PilatusDriver::new(
             "PILATUS_WRITE_STATUS",
@@ -473,7 +483,7 @@ mod tests {
             1,
             0,
             DriverLinks {
-                cmd_tx,
+                flat_field_tx,
                 start: Arc::new(Event::new()),
                 stop: stop.clone(),
                 shared: Arc::new(parking_lot::Mutex::new(Shared::default())),
@@ -587,7 +597,7 @@ mod tests {
     /// `cam_read(timeout)` over a camserver port replaying `reads`: the
     /// status and the `fromCamserver` it ends with.
     fn cam_read_over(name: &str, reads: &[(&'static [u8], bool)], timeout: f64) -> (i32, String) {
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
         let stop = Arc::new(Event::new());
         let det = PilatusDriver::new(
             name,
@@ -595,7 +605,7 @@ mod tests {
             1,
             0,
             DriverLinks {
-                cmd_tx,
+                flat_field_tx,
                 start: Arc::new(Event::new()),
                 stop: stop.clone(),
                 shared: Arc::new(parking_lot::Mutex::new(Shared::default())),

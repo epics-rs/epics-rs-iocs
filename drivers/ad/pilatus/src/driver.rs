@@ -1,9 +1,6 @@
-//! The `PortDriver` half of the Pilatus port: parameter writes and the
-//! bookkeeping C does inline in `writeInt32` / `writeFloat64` / `writeOctet`.
-//!
-//! Camserver I/O is not done here — a `PortDriver` method runs inside the port
-//! actor, whose runtime cannot block on a second port — so each branch enqueues
-//! the corresponding [`Cmd`] for `PilatusCmdTask`.
+//! The `PortDriver` half of the Pilatus port: parameter writes and what C does
+//! inline in `writeInt32` / `writeFloat64` / `writeOctet`, camserver exchanges
+//! included (see [`crate::port_thread`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +21,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::ad_core::driver::write_tail::{OwnList, WriteTail};
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverPool, PersistentArray};
+use epics_rs::ad_core::ndarray_pool::{DriverPool, PersistentArray, PublishedArray};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
@@ -35,7 +32,7 @@ use crate::params::PilatusParams;
 use crate::protocol::{
     cmd_cbf_template_file, cmd_mx_f64, cmd_mx_i32, cmd_mx_pair, cmd_oscill_axis,
 };
-use crate::task::{Cmd, Shared, Worker, start_acq_task, start_cmd_task};
+use crate::task::{Shared, Worker, start_acq_task, start_flat_field_task};
 use crate::types::{CAMSERVER_DEFAULT_TIMEOUT, Event, TriggerMode};
 
 /// C `DRIVER_VERSION.DRIVER_REVISION.DRIVER_MODIFICATION`.
@@ -44,9 +41,10 @@ const DRIVER_VERSION: &str = "2.9.0";
 pub struct PilatusDriver {
     pub ad: ADDriverBase,
     pub p: PilatusParams,
-    cmd_tx: rt::CommandSender<Cmd>,
+    /// Hands `readFlatFieldFile`'s array to `PilatusFlatField` to publish.
+    pub(crate) flat_field_tx: rt::CommandSender<PublishedArray>,
     start: Arc<Event>,
-    stop: Arc<Event>,
+    pub(crate) stop: Arc<Event>,
     pub(crate) shared: Arc<Mutex<Shared>>,
     /// C `pasynUserCamserver` with its buffers, for the port-thread exchanges.
     pub(crate) cam: Camserver,
@@ -58,7 +56,7 @@ pub struct PilatusDriver {
 
 /// The handles the driver hands to (and shares with) its worker threads.
 pub(crate) struct DriverLinks {
-    pub(crate) cmd_tx: rt::CommandSender<Cmd>,
+    pub(crate) flat_field_tx: rt::CommandSender<PublishedArray>,
     pub(crate) start: Arc<Event>,
     pub(crate) stop: Arc<Event>,
     pub(crate) shared: Arc<Mutex<Shared>>,
@@ -120,7 +118,7 @@ impl PilatusDriver {
             cam: Camserver::new(links.cam, ad.params, links.stop.clone()),
             ad,
             p,
-            cmd_tx: links.cmd_tx,
+            flat_field_tx: links.flat_field_tx,
             start: links.start,
             stop: links.stop,
             shared: links.shared,
@@ -134,10 +132,6 @@ impl PilatusDriver {
             .port_base
             .get_float64_param(reason, 0)
             .unwrap_or(0.0)
-    }
-
-    fn send(&self, cmd: Cmd) {
-        let _ = self.cmd_tx.try_send(cmd);
     }
 }
 
@@ -391,9 +385,9 @@ impl PortDriver for PilatusDriver {
             .port_base
             .set_string_param(function, 0, value.clone());
         if function == p.bad_pixel_file {
-            self.send(Cmd::ReadBadPixelFile(value.clone()));
+            self.read_bad_pixel_file(&value);
         } else if function == p.flat_field_file {
-            self.send(Cmd::ReadFlatFieldFile(value.clone()));
+            self.read_flat_field_file(&value);
         } else if function == params.base.file_path {
             self.img_path(&value);
         } else if function == p.oscill_axis {
@@ -483,7 +477,7 @@ pub fn create_pilatus_detector(
         SyncIOHandle::connect_port(camserver_port, 0, Duration::ZERO, InterfaceType::Octet);
     let cam_handle = Arc::new(cam_handle);
 
-    let (cmd_tx, cmd_rx) = rt::command_channel::<Cmd>(64);
+    let (flat_field_tx, flat_field_rx) = rt::command_channel::<PublishedArray>(64);
     let start = Arc::new(Event::new());
     let stop = Arc::new(Event::new());
 
@@ -495,7 +489,7 @@ pub fn create_pilatus_detector(
         max_size_y,
         max_memory,
         DriverLinks {
-            cmd_tx: cmd_tx.clone(),
+            flat_field_tx,
             start: start.clone(),
             stop: stop.clone(),
             shared: shared.clone(),
@@ -529,18 +523,6 @@ pub fn create_pilatus_detector(
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(Mutex::new(NDArrayOutput::new()));
 
-    let cmd_worker = Worker {
-        ctx: Ctx::new(
-            handle.clone(),
-            cam_handle.clone(),
-            ad_params,
-            pilatus_params,
-            stop.clone(),
-        ),
-        shared: shared.clone(),
-        output: ArrayPublisher::new(array_output.clone()),
-        pool: pool.clone(),
-    };
     let acq_worker = Worker {
         ctx: Ctx::new(handle, cam_handle, ad_params, pilatus_params, stop),
         shared,
@@ -549,7 +531,7 @@ pub fn create_pilatus_detector(
     };
 
     let tasks = vec![
-        start_cmd_task(cmd_worker, cmd_rx),
+        start_flat_field_task(ArrayPublisher::new(array_output.clone()), flat_field_rx),
         start_acq_task(acq_worker, start),
     ];
 
@@ -579,9 +561,9 @@ mod tests {
     /// every array the driver reads.
     #[test]
     fn data_type_starts_at_int32() {
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
@@ -598,9 +580,9 @@ mod tests {
     #[test]
     fn a_base_class_write_reaches_addriver() {
         use epics_rs::ad_core::driver::ShutterMode;
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
@@ -628,9 +610,9 @@ mod tests {
     /// whatever the address.
     #[test]
     fn a_write_at_another_address_sets_list_zero() {
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
@@ -659,9 +641,9 @@ mod tests {
         use epics_rs::asyn::trace::TraceFile;
         use epics_rs::asyn::user::UserTrace;
         let port = "PILATUS_STATUS";
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
@@ -700,9 +682,9 @@ mod tests {
     #[test]
     fn a_pair_write_sends_zero_for_its_unset_partner() {
         let sent = recording_camserver("PILATUS_PAIR_CAM");
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
@@ -728,9 +710,9 @@ mod tests {
     #[test]
     fn a_file_path_write_runs_ndarray_driver_check_path() {
         let sent = recording_camserver("PILATUS_CHECK_PATH_CAM");
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
@@ -769,9 +751,9 @@ mod tests {
         use epics_rs::asyn::trace::TraceFile;
         use epics_rs::asyn::user::UserTrace;
         let port = "PILATUS_BASE_F64";
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<PublishedArray>(4);
         let links = DriverLinks {
-            cmd_tx,
+            flat_field_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),

@@ -9,11 +9,13 @@ use epics_rs::asyn::trace::TraceMask;
 
 use crate::camserver::CamParams;
 use crate::driver::PilatusDriver;
+use crate::image::{apply_flat_field_floor, flat_field_average, parse_bad_pixel_file};
 use crate::protocol::{
     cmd_delay, cmd_expperiod, cmd_exptime, cmd_gapfill, cmd_imgpath, cmd_nexpframe, cmd_nimages,
     cmd_reset_module_power, cmd_set_threshold, gain_index, parse_energy_setting, parse_tau_cutoff,
     parse_threshold_ev, parse_version, thread_channel_values,
 };
+use crate::task::{ImageReader, refill_flat_field};
 use crate::types::{CAMSERVER_DEFAULT_TIMEOUT, CAMSERVER_RESET_POWER_TIMEOUT, TriggerMode, secs};
 
 impl PilatusDriver {
@@ -274,5 +276,87 @@ impl PilatusDriver {
             self.set_i32(ad.status, ADStatus::Error as i32);
         }
         let _ = self.ad.port_base.call_param_callbacks(0);
+    }
+    /// C `readBadPixelFile()`.
+    pub(crate) fn read_bad_pixel_file(&mut self, file: &str) {
+        let nx = self.get_i32(self.ad.params.base.array_size_x).unwrap_or(0);
+        let reason = self.p.num_bad_pixels;
+        self.set_i32(reason, 0);
+        self.shared.lock().bad_pixels.clear();
+        if file.is_empty() {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(file) else {
+            self.ad.port_base.trace(
+                TraceMask::ERROR,
+                &format!("pilatusDetector::readBadPixelFile, cannot open file {file}\n"),
+            );
+            return;
+        };
+        match parse_bad_pixel_file(&text, nx) {
+            Ok(map) => {
+                let n = map.len() as i32;
+                self.shared.lock().bad_pixels = map;
+                self.set_i32(reason, n);
+            }
+            // C returns without updating NUM_BAD_PIXELS, which it zeroed above.
+            Err(n) => self.ad.port_base.trace(
+                TraceMask::ERROR,
+                &format!("pilatusDetector::readBadPixelFile, too few items ={n}, should be 4\n"),
+            ),
+        }
+    }
+
+    /// C `readFlatFieldFile()`.
+    pub(crate) fn read_flat_field_file(&mut self, file: &str) {
+        let valid = self.p.flat_field_valid;
+        self.set_i32(valid, 0);
+        let min_flat_field = self.get_i32(self.p.min_flat_field).unwrap_or(0);
+        if file.is_empty() {
+            return;
+        }
+
+        // readTiff checks the file against pFlatField's own dims (:678, :685).
+        let (dims, bad_pixels) = {
+            let s = self.shared.lock();
+            let dims = s
+                .flat_field
+                .as_ref()
+                .map(|f| (f.dims[0].size, f.dims[1].size));
+            (dims, s.bad_pixels.clone())
+        };
+        let Some((nx, ny)) = dims else {
+            return;
+        };
+        let read = ImageReader {
+            ad: self.ad.params,
+            cx: &mut self.ad.port_base,
+            stop: &self.stop,
+        }
+        .read_image_file(file, None, 0.0, nx, ny, &bad_pixels);
+        let Ok((mut data, description)) = read else {
+            self.ad.port_base.trace(
+                TraceMask::ERROR,
+                &format!(
+                    "pilatusDetector::readFlatFieldFile, error reading flat field file {file}\n"
+                ),
+            );
+            return;
+        };
+
+        let Some(average) = flat_field_average(&data, min_flat_field) else {
+            // Fixed (upstream-c-defects.md #11): no pixel reached MinFlatField, so
+            // the average would be 0/0 = NaN and would poison every corrected
+            // pixel. Skip normalization: leave FlatFieldValid = 0 (set above) and
+            // do not publish a NaN-based flat field.
+            return;
+        };
+        apply_flat_field_floor(&mut data, min_flat_field, average);
+        let Some(array) = refill_flat_field(&mut self.shared.lock(), &data, description, average)
+        else {
+            return;
+        };
+        let _ = self.flat_field_tx.try_send(array);
+        self.set_i32(valid, 1);
     }
 }
