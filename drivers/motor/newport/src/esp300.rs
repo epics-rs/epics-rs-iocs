@@ -149,12 +149,13 @@ impl Esp300Controller {
         // C writes then reads with no flush, so one stray line shifts every
         // later reply; write_read flushes first. The ESP300 firmware can
         // still put an unsolicited hard-limit error (E35..E42) ahead of the
-        // real reply, which C recv_mess re-reads past.
-        let reply = trim_reply(&self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?);
-        if is_unsolicited_limit_error(&reply) {
+        // real reply, which C recv_mess re-reads past; it tests the read with
+        // its CR (drvESP300.cc:536).
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        if is_unsolicited_limit_error(&String::from_utf8_lossy(&raw)) {
             return self.read_once();
         }
-        Ok(reply)
+        Ok(trim_reply(&raw))
     }
 
     fn read_once(&self) -> AsynResult<String> {
@@ -599,6 +600,24 @@ mod tests {
             buf[..reply.len()].copy_from_slice(&reply);
             Ok(reply.len())
         }
+    }
+
+    /// drvESP300.cc:536 counts the CR in `nread`: an `E35` read ahead of
+    /// the reply is the unsolicited limit error C reads past.
+    #[test]
+    fn an_e35_with_its_cr_is_read_past() {
+        let (_line, io) = LineRig::queued("esp300E35", |cmd| {
+            match cmd {
+                "VE?" => vec!["ESP300 Version 3.08\r"],
+                "TB?" => vec!["9, 0, AXIS NUMBER OUT OF RANGE\r"],
+                _ => vec!["E35\r", "1.5\r"],
+            }
+            .into_iter()
+            .map(String::from)
+            .collect()
+        });
+        let ctrl = Esp300Controller::new(io).unwrap();
+        assert_eq!(ctrl.write_read("01TP?").unwrap(), "1.5");
     }
 
     /// C reads a failed `TB?` as an empty buffer, which `atoi` takes as no
