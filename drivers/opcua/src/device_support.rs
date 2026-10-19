@@ -688,18 +688,12 @@ impl OpcuaDevice {
 
         for (field, value) in &posts {
             put(record, field, value.clone())?;
-            // The record derives "this state table is defined" (`sdef`, which is
-            // what makes its RVAL -> VAL conversion a state lookup) from the
-            // table's contents, and re-derives it only at init and from
-            // `special()` — the hook a database put goes through
-            // (`mbbi.rs:828-843`; C `mbbiRecord.c::special` -> `init_common`).
-            // A device write is neither, so the re-derive is asked for here.
-            // A device hook gets no common half; mbbi/mbbo's special reads
-            // none of it.
-            record
-                .special(field, true, &Default::default())
-                .map_err(|e| format!("cannot re-derive the state table: {e}"))?;
         }
+        // The record derives "this state table is defined" (`sdef`, which is
+        // what makes its RVAL -> VAL conversion a state lookup) only at init
+        // and from a put's `special()`; C sets `sdef` here itself
+        // (`devOpcua.cpp:714-716`).
+        record.state_table_written();
         self.enums.from_server = true;
         self.enums.values_defined = true;
         if let Some(tx) = &self.property_tx {
