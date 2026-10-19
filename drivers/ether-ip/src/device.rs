@@ -1029,6 +1029,9 @@ impl EtherIpDevice {
                 // (devEtherIP.c:641), which mbbo_write (:2136) writes back to
                 // the PLC against :316's "should NOT cause the record to
                 // write". Here RVAL takes the PLC's value.
+                // C defect, not copied: an mbboDirect's VAL is cut to 16 bits
+                // (:710) and only B0..B15 follow (:720), so with NOBT > 16 its
+                // process writes the cut value back. Here all NOBT bits follow.
                 let bits = if rtype == "bo" { 1 } else { nobt(record) };
                 let rval = i32_field(record, "RVAL") as u32;
                 follow!(
