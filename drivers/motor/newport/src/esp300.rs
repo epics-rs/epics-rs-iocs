@@ -154,11 +154,14 @@ impl Esp300Controller {
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
-        status?;
+        // C tests the first read's bytes before its status
+        // (drvESP300.cc:534-547), so a limit error cut by a timeout is still
+        // re-read past, and the re-read's status is the one kept.
         let reply = trim_reply(&raw);
         if is_unsolicited_limit_error(&reply) {
             return self.read_once();
         }
+        status?;
         Ok(reply)
     }
 
@@ -568,10 +571,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Answers `VE?` and the commands in `replies`; fails every other read.
+    /// A reply of two `\n`-separated lines is read in two reads.
     struct IdentOnly {
         base: epics_rs::asyn::port::PortDriverBase,
         replies: &'static [(&'static str, &'static str)],
+        /// Commands whose first reply line comes on a read that times out.
+        cuts: &'static [&'static str],
         reply: Vec<u8>,
+        next: Vec<u8>,
+        cut: bool,
         sent: Arc<Mutex<Vec<String>>>,
     }
 
@@ -585,14 +593,18 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data);
             self.sent.lock().unwrap().push(cmd.to_string());
-            self.reply = match cmd.as_ref() {
-                "VE?" => b"ESP300 Version 3.08 09/09/02".to_vec(),
+            let reply = match cmd.as_ref() {
+                "VE?" => "ESP300 Version 3.08 09/09/02",
                 c => self
                     .replies
                     .iter()
                     .find(|(k, _)| *k == c)
-                    .map_or_else(Vec::new, |(_, v)| v.as_bytes().to_vec()),
+                    .map_or("", |(_, v)| v),
             };
+            let (first, next) = reply.split_once('\n').unwrap_or((reply, ""));
+            self.reply = first.as_bytes().to_vec();
+            self.next = next.as_bytes().to_vec();
+            self.cut = self.cuts.contains(&cmd.as_ref());
             Ok(data.len())
         }
         fn io_read_octet(
@@ -600,7 +612,7 @@ mod tests {
             _user: &AsynUser,
             buf: &mut [u8],
         ) -> epics_rs::asyn::interpose::OctetReadResult {
-            let reply = std::mem::take(&mut self.reply);
+            let reply = std::mem::replace(&mut self.reply, std::mem::take(&mut self.next));
             if reply.is_empty() {
                 return epics_rs::asyn::interpose::OctetReadResult::failed(
                     epics_rs::asyn::error::AsynError::Status {
@@ -610,10 +622,20 @@ mod tests {
                 );
             }
             buf[..reply.len()].copy_from_slice(&reply);
-            epics_rs::asyn::interpose::OctetReadResult::ok(
+            let read = epics_rs::asyn::interpose::OctetReadResult::ok(
                 reply.len(),
                 epics_rs::asyn::interpose::EomReason::empty(),
-            )
+            );
+            if std::mem::take(&mut self.cut) {
+                return epics_rs::asyn::interpose::OctetReadResult {
+                    status: Err(epics_rs::asyn::error::AsynError::Status {
+                        status: epics_rs::asyn::error::AsynStatus::Timeout,
+                        message: "reply cut by a timeout".into(),
+                    }),
+                    ..read
+                };
+            }
+            read
         }
     }
 
@@ -635,7 +657,10 @@ mod tests {
                 InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             replies: &[],
+            cuts: &[],
             reply: Vec::new(),
+            next: Vec::new(),
+            cut: false,
             sent: Arc::default(),
         };
         let (rt, _actor) = create_port_runtime(
@@ -678,7 +703,10 @@ mod tests {
                 ("01FR?", "0.001"),
                 ("01QS?", "0"),
             ],
+            cuts: &[],
             reply: Vec::new(),
+            next: Vec::new(),
+            cut: false,
             sent: Arc::default(),
         };
         let (rt, _actor) = create_port_runtime(
@@ -704,6 +732,54 @@ mod tests {
         assert!(axis.poll(&user).unwrap().problem);
     }
 
+    /// drvESP300.cc:534-547: C tests the first read's bytes before its
+    /// status, so a limit error cut by a timeout is re-read past and the
+    /// re-read decides the reply; any other cut reply is still a failure.
+    #[test]
+    fn a_limit_error_cut_by_a_timeout_is_read_past() {
+        use epics_rs::asyn::port::InterfaceMask;
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = IdentOnly {
+            base: PortDriverBase::new(
+                "esp300CutLimit",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
+            replies: &[
+                ("TB?", "9, 0, AXIS NUMBER OUT OF RANGE"),
+                ("01TP?", "E38, 0, POSITIVE HARDWARE LIMIT DETECTED\n12.5"),
+                ("02TP?", "E38, 0, POSITIVE HARDWARE LIMIT DETECTED"),
+                ("03TP?", "7.25"),
+            ],
+            cuts: &["01TP?", "02TP?", "03TP?"],
+            reply: Vec::new(),
+            next: Vec::new(),
+            cut: false,
+            sent: Arc::default(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("esp300CutLimit").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_millis(100),
+        );
+        let ctrl = Esp300Controller::new(io).unwrap();
+        assert_eq!(ctrl.write_read("01TP?").unwrap(), "12.5");
+        // The re-read's status is kept: nothing follows the limit error.
+        assert!(ctrl.write_read("02TP?").is_err());
+        assert!(ctrl.write_read("03TP?").is_err());
+    }
+
     /// An ESP300 line answering `replies`: the controller and the wire log
     /// from after its construction.
     fn esp300_line(
@@ -725,7 +801,10 @@ mod tests {
                 InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             replies,
+            cuts: &[],
             reply: Vec::new(),
+            next: Vec::new(),
+            cut: false,
             sent: sent.clone(),
         };
         let (rt, _actor) =
