@@ -116,8 +116,8 @@ impl PslDetector {
     /// server version is wrong: C returns there (PSL.cpp:168-173), leaving
     /// the defaults unset and PSLTask not started, and the port stays up.
     fn connect_to_server(&mut self) -> AsynResult<bool> {
-        let reply = self.command("GetVersion")?;
-        if protocol::parse_version(&reply).is_err() {
+        let (reply, status) = self.command_status("GetVersion")?;
+        if status.is_err() || protocol::parse_version(&reply).is_err() {
             self.server.trace_error(&format!(
                 "PSL:getVersion, ERROR, unexpected version string = {reply}.\n"
             ));
@@ -144,9 +144,18 @@ impl PslDetector {
     }
 
     /// Send one command and publish both sides of the exchange to the
-    /// StringToServer / StringFromServer records (C `writeReadServer`).
+    /// StringToServer / StringFromServer records (C `writeReadServer`). The
+    /// reply is C's `fromServer_`, which also holds what a failed read
+    /// delivered.
     fn command(&mut self, command: &str) -> AsynResult<String> {
         Ok(self.command_status(command)?.0)
+    }
+
+    /// [`Self::command`] for C's `if (status == asynSuccess)` parses: the
+    /// reply only when the exchange succeeded.
+    fn checked(&mut self, command: &str) -> AsynResult<Option<String>> {
+        let (reply, status) = self.command_status(command)?;
+        Ok(status.is_ok().then_some(reply))
     }
 
     /// [`Self::command`] for a caller that returns C's `writeReadServer` status.
@@ -156,10 +165,7 @@ impl PslDetector {
 
     /// [`Self::command`] with the outcome C's `writeReadServer` returned.
     fn command_status(&mut self, command: &str) -> AsynResult<(String, ServerResult<()>)> {
-        let (reply, status) = match self.server.command(command) {
-            Ok(reply) => (reply, Ok(())),
-            Err(e) => (String::new(), Err(e)),
-        };
+        let (reply, status) = self.server.exchange(command);
         let base = &mut self.ad.port_base;
         base.set_string_param(self.ad.params.string_to_server, 0, command)?;
         base.set_string_param(self.ad.params.string_from_server, 0, reply.clone())?;
@@ -241,30 +247,33 @@ impl PslDetector {
     fn get_config(&mut self) -> AsynResult<()> {
         let multi = self.state.multi_camera();
 
-        let reply = self.command("GetSize")?;
-        let size = protocol::parse_ints(protocol::numeric_field(&reply, multi));
-        if size.len() >= 2 {
-            let base = &mut self.ad.port_base;
-            base.set_int32_param(self.ad.params.base.array_size_x, 0, size[0])?;
-            base.set_int32_param(self.ad.params.base.array_size_y, 0, size[1])?;
+        // Every exchange here parses only a successful reply, as C does.
+        if let Some(reply) = self.checked("GetSize")? {
+            let size = protocol::parse_ints(protocol::numeric_field(&reply, multi));
+            if size.len() >= 2 {
+                let base = &mut self.ad.port_base;
+                base.set_int32_param(self.ad.params.base.array_size_x, 0, size[0])?;
+                base.set_int32_param(self.ad.params.base.array_size_y, 0, size[1])?;
+            }
         }
 
         // GetMode is always supported.
-        let (reply, status) = self.command_status("GetMode")?;
-        match protocol::parse_mode(protocol::quoted_field(&reply, multi)) {
-            Ok((data_type, color_mode)) => {
-                let base = &mut self.ad.port_base;
-                base.set_int32_param(self.ad.params.base.data_type, 0, data_type as u8 as i32)?;
-                base.set_int32_param(self.ad.params.base.color_mode, 0, color_mode as i32)?;
+        if let Some(reply) = self.checked("GetMode")? {
+            match protocol::parse_mode(protocol::quoted_field(&reply, multi)) {
+                Ok((data_type, color_mode)) => {
+                    let base = &mut self.ad.port_base;
+                    base.set_int32_param(self.ad.params.base.data_type, 0, data_type as u8 as i32)?;
+                    base.set_int32_param(self.ad.params.base.color_mode, 0, color_mode as i32)?;
+                }
+                Err(_) => {
+                    self.trace_error(&format!("PSL:getConfig: unknown mode={reply}\n"));
+                }
             }
-            Err(_) if status.is_ok() => {
-                self.trace_error(&format!("PSL:getConfig: unknown mode={reply}\n"));
-            }
-            Err(_) => {}
         }
 
-        if self.supports("TriggerMode") {
-            let (reply, status) = self.command_status("GetTriggerMode")?;
+        if self.supports("TriggerMode")
+            && let Some(reply) = self.checked("GetTriggerMode")?
+        {
             let mode = protocol::quoted_field(&reply, multi).to_string();
             match protocol::index_of_choice(&self.state.trigger_modes, &mode) {
                 Some(index) => {
@@ -272,37 +281,36 @@ impl PslDetector {
                         .port_base
                         .set_int32_param(self.ad.params.trigger_mode, 0, index)?;
                 }
-                None if status.is_ok() => {
+                None => {
                     self.trace_error(&format!("PSL:getConfig: unknown trigger mode={mode}\n"));
                 }
-                None => {}
             }
         }
 
-        if self.supports("Exposure") {
-            let reply = self.command("GetExposure")?;
-            if let Some(seconds) = protocol::parse_exposure(protocol::numeric_field(&reply, multi))
-            {
-                self.ad
-                    .port_base
-                    .set_float64_param(self.ad.params.acquire_time, 0, seconds)?;
-            }
+        if self.supports("Exposure")
+            && let Some(reply) = self.checked("GetExposure")?
+            && let Some(seconds) = protocol::parse_exposure(protocol::numeric_field(&reply, multi))
+        {
+            self.ad
+                .port_base
+                .set_float64_param(self.ad.params.acquire_time, 0, seconds)?;
         }
 
-        if self.supports("ChipGain") {
-            let reply = self.command("GetChipGain")?;
-            if let Some(gain) = protocol::parse_first_f64(protocol::numeric_field(&reply, multi)) {
-                self.ad
-                    .port_base
-                    .set_float64_param(self.ad.params.gain, 0, gain)?;
-            }
+        if self.supports("ChipGain")
+            && let Some(reply) = self.checked("GetChipGain")?
+            && let Some(gain) = protocol::parse_first_f64(protocol::numeric_field(&reply, multi))
+        {
+            self.ad
+                .port_base
+                .set_float64_param(self.ad.params.gain, 0, gain)?;
         }
 
         let base = &mut self.ad.port_base;
         base.set_int32_param(self.ad.params.bin_x, 0, 1)?;
         base.set_int32_param(self.ad.params.bin_y, 0, 1)?;
-        if self.supports("Binning") {
-            let reply = self.command("GetBinning")?;
+        if self.supports("Binning")
+            && let Some(reply) = self.checked("GetBinning")?
+        {
             let bin = protocol::parse_ints(protocol::numeric_field(&reply, multi));
             if bin.len() >= 2 {
                 let base = &mut self.ad.port_base;
@@ -311,8 +319,9 @@ impl PslDetector {
             }
         }
 
-        if self.supports("SubArea") {
-            let reply = self.command("GetSubArea")?;
+        if self.supports("SubArea")
+            && let Some(reply) = self.checked("GetSubArea")?
+        {
             let area = protocol::parse_ints(protocol::numeric_field(&reply, multi));
             if area.len() >= 4 {
                 let (min_x, min_y, right, bottom) = (area[0], area[1], area[2], area[3]);
@@ -324,51 +333,54 @@ impl PslDetector {
             }
         }
 
-        if self.supports("Fliplr") {
-            let reply = self.command("GetFliplr")?;
-            if let Some(v) = protocol::parse_ints(protocol::numeric_field(&reply, multi)).first() {
-                self.ad
-                    .port_base
-                    .set_int32_param(self.ad.params.reverse_x, 0, *v)?;
-            }
+        if self.supports("Fliplr")
+            && let Some(reply) = self.checked("GetFliplr")?
+            && let Some(v) = protocol::parse_ints(protocol::numeric_field(&reply, multi)).first()
+        {
+            self.ad
+                .port_base
+                .set_int32_param(self.ad.params.reverse_x, 0, *v)?;
         }
 
-        if self.supports("Flipud") {
-            let reply = self.command("GetFlipud")?;
-            if let Some(v) = protocol::parse_ints(protocol::numeric_field(&reply, multi)).first() {
-                self.ad
-                    .port_base
-                    .set_int32_param(self.ad.params.reverse_y, 0, *v)?;
-            }
+        if self.supports("Flipud")
+            && let Some(reply) = self.checked("GetFlipud")?
+            && let Some(v) = protocol::parse_ints(protocol::numeric_field(&reply, multi)).first()
+        {
+            self.ad
+                .port_base
+                .set_int32_param(self.ad.params.reverse_y, 0, *v)?;
         }
 
-        if self.supports("RecordPath") {
-            let reply = self.command("GetRecordPath")?;
+        if self.supports("RecordPath")
+            && let Some(reply) = self.checked("GetRecordPath")?
+        {
             let path = protocol::quoted_field(&reply, multi).to_string();
             self.ad
                 .port_base
                 .set_string_param(self.ad.params.base.file_path, 0, path)?;
         }
 
-        if self.supports("RecordName") {
-            let reply = self.command("GetRecordName")?;
+        if self.supports("RecordName")
+            && let Some(reply) = self.checked("GetRecordName")?
+        {
             let name = protocol::quoted_field(&reply, multi).to_string();
             self.ad
                 .port_base
                 .set_string_param(self.ad.params.base.file_name, 0, name)?;
         }
 
-        if self.supports("RecordNumber") {
-            let reply = self.command("GetRecordNumber")?;
-            if let Some(n) = protocol::parse_ints(protocol::numeric_field(&reply, multi)).first() {
-                self.ad
-                    .port_base
-                    .set_int32_param(self.ad.params.base.file_number, 0, *n)?;
-            }
+        if self.supports("RecordNumber")
+            && let Some(reply) = self.checked("GetRecordNumber")?
+            && let Some(n) = protocol::parse_ints(protocol::numeric_field(&reply, multi)).first()
+        {
+            self.ad
+                .port_base
+                .set_int32_param(self.ad.params.base.file_number, 0, *n)?;
         }
 
-        if self.supports("RecordFormat") {
-            let (reply, status) = self.command_status("GetRecordFormat")?;
+        if self.supports("RecordFormat")
+            && let Some(reply) = self.checked("GetRecordFormat")?
+        {
             let format = protocol::quoted_field(&reply, multi).to_string();
             match protocol::index_of_choice(&self.state.record_formats, &format) {
                 Some(index) => {
@@ -376,17 +388,17 @@ impl PslDetector {
                         .port_base
                         .set_int32_param(self.ad.params.base.file_format, 0, index)?;
                 }
-                None if status.is_ok() => {
+                None => {
                     self.trace_error(&format!(
                         "PSL:getConfig: error, unknown file format string = {format}\n"
                     ));
                 }
-                None => {}
             }
         }
 
-        if self.supports("RecordTag") {
-            let reply = self.command("GetRecordTag")?;
+        if self.supports("RecordTag")
+            && let Some(reply) = self.checked("GetRecordTag")?
+        {
             let tag = protocol::quoted_field(&reply, multi).to_string();
             self.ad
                 .port_base
@@ -747,6 +759,19 @@ mod tests {
     use epics_rs::asyn::registry::claim_port;
     use std::time::Duration;
 
+    /// A read the test expects to succeed, as its bytes.
+    trait BytesOk {
+        fn bytes_ok(self) -> Vec<u8>;
+    }
+
+    impl BytesOk for epics_rs::asyn::request::OctetRead {
+        fn bytes_ok(self) -> Vec<u8> {
+            let (bytes, status) = self.into_parts();
+            status.unwrap();
+            bytes
+        }
+    }
+
     /// A detector whose PSLViewer socket never connects: the writes under
     /// test must not need the server.
     fn detector(name: &str) -> PslDetector {
@@ -815,12 +840,16 @@ mod tests {
             ADStatus::Idle as i32
         );
         let octet = |reason| {
-            let mut v = sync.read_octet(reason, 64).unwrap();
+            let mut v = sync.read_octet(reason, 64).bytes_ok();
             v.retain(|&b| b != 0);
             String::from_utf8(v).unwrap()
         };
         assert_eq!(octet(rt.ad_params.status_message), "");
-        assert!(sync.read_octet(rt.ad_params.base.model, 64).is_err());
+        assert!(
+            sync.read_octet(rt.ad_params.base.model, 64)
+                .status()
+                .is_err()
+        );
         assert_eq!(
             octet(rt.ad_params.base.driver_version),
             octet(rt.ad_params.base.ad_core_version)
@@ -967,10 +996,12 @@ mod tests {
         assert_eq!(det.get_i32(p.file_path_exists), 1);
     }
 
-    /// A PSLViewer that answers every command with `reply`.
+    /// A PSLViewer that answers every command with `reply`, on a read that
+    /// then times out when `cut` is set.
     struct FakeServer {
         base: PortDriverBase,
         reply: Vec<u8>,
+        cut: bool,
     }
 
     impl PortDriver for FakeServer {
@@ -983,20 +1014,32 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let n = self.reply.len().min(buf.len());
             buf[..n].copy_from_slice(&self.reply[..n]);
-            Ok(n)
+            let read = epics_rs::asyn::interpose::OctetReadResult::ok(
+                n,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            );
+            if self.cut {
+                return epics_rs::asyn::interpose::OctetReadResult {
+                    status: Err(epics_rs::asyn::error::AsynError::Status {
+                        status: epics_rs::asyn::error::AsynStatus::Timeout,
+                        message: "reply cut by a timeout".into(),
+                    }),
+                    ..read
+                };
+            }
+            read
         }
     }
 
-    /// getConfig stores GetRecordPath's answer as it came, without
-    /// `checkPath` (PSL.cpp:453-459).
-    #[test]
-    fn get_config_stores_the_record_path_unchecked() {
-        let name = "PSL_RECORD_PATH";
-        let dir = std::env::temp_dir().display().to_string();
-        let dir = dir.trim_end_matches('/').to_string();
+    /// A detector on a [`FakeServer`] answering `reply`.
+    fn served_detector(name: &str, reply: &[u8], cut: bool) -> PslDetector {
         let ip = format!("{name}_IP");
         let mut base = PortDriverBase::new(
             &ip,
@@ -1008,7 +1051,8 @@ mod tests {
         base.init_connected(true);
         let server = FakeServer {
             base,
-            reply: dir.clone().into_bytes(),
+            reply: reply.to_vec(),
+            cut,
         };
         let (runtime, _) =
             create_port_runtime(&claim_port(&ip).unwrap(), server, RuntimeConfig::default())
@@ -1019,7 +1063,7 @@ mod tests {
             stop_requested: AtomicBool::new(false),
         });
         let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
-        let mut det = PslDetector::new(
+        PslDetector::new(
             name,
             PslServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO)),
             1 << 20,
@@ -1027,7 +1071,50 @@ mod tests {
             tx,
         )
         .unwrap()
-        .0;
+        .0
+    }
+
+    fn string_param(det: &PslDetector, reason: usize) -> String {
+        String::from_utf8_lossy(det.ad.port_base.get_string_param(reason, 0).unwrap()).into_owned()
+    }
+
+    /// C's writeReadServer posts what a failed read delivered, openCamera
+    /// and PSLTask's HasNewData poll use it, and getVersion and getConfig
+    /// parse only a successful reply (PSL.cpp:213-233, 313-314, 328-329,
+    /// 354-509, 697-698).
+    #[test]
+    fn a_reply_cut_by_a_timeout_is_used_where_c_uses_it() {
+        let mut det = served_detector("PSL_CUT", b"(640,480)", true);
+        let p = det.ad.params;
+        det.ad
+            .port_base
+            .set_string_param(p.base.file_path, 0, "kept")
+            .unwrap();
+        det.state.valid_options = ["RecordPath".to_string()].into();
+        det.get_config().unwrap();
+        assert_eq!(string_param(&det, p.base.file_path), "kept");
+        assert_eq!(string_param(&det, p.string_from_server), "(640,480)");
+        det.state.camera_names = ["cam".to_string()].into();
+        assert!(det.open_camera(0).is_err());
+        assert_eq!(
+            (det.get_i32(p.max_size_x), det.get_i32(p.max_size_y)),
+            (640, 480)
+        );
+
+        let det = served_detector("PSL_CUT_TRUE", b"True", true);
+        assert!(crate::task::has_new_data(&det.server).unwrap());
+        let mut det = served_detector("PSL_CUT_VERSION", b"PSLViewer-5.0", true);
+        assert!(!det.connect_to_server().unwrap());
+    }
+
+    /// getConfig stores GetRecordPath's answer as it came, without
+    /// `checkPath` (PSL.cpp:453-459).
+    #[test]
+    fn get_config_stores_the_record_path_unchecked() {
+        let name = "PSL_RECORD_PATH";
+        let dir = std::env::temp_dir().display().to_string();
+        let dir = dir.trim_end_matches('/').to_string();
+        let mut det = served_detector(name, dir.as_bytes(), false);
         det.state.valid_options = ["RecordPath".to_string()].into();
         let p = det.ad.params.base;
         det.get_config().unwrap();

@@ -62,10 +62,14 @@ impl Im483Controller {
 
     /// `send_mess` then `recv_mess`: the reply, empty when none came.
     fn ask(&self, msg: impl AsRef<[u8]>) -> String {
-        self.handle
+        match self
+            .handle
             .write_read(0, msg.as_ref(), BUFF_SIZE)
-            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
-            .unwrap_or_default()
+            .into_parts()
+        {
+            (raw, Ok(())) => String::from_utf8_lossy(&raw).into_owned(),
+            (_, Err(_)) => String::new(),
+        }
     }
 }
 
@@ -89,7 +93,10 @@ pub fn im483sm_probe(ctrl: &Im483Controller) -> Option<String> {
         sign_on_ident(|| {
             let line = match first.take() {
                 Some(line) => line.into_bytes(),
-                None => ctrl.handle.read_octet(0, BUFF_SIZE).unwrap_or_default(),
+                None => match ctrl.handle.read_octet(0, BUFF_SIZE).into_parts() {
+                    (line, Ok(())) => line,
+                    (_, Err(_)) => Vec::new(),
+                },
             };
             Some(line).filter(|l| !l.is_empty())
         })
@@ -474,7 +481,11 @@ mod tests {
             self.sent.lock().unwrap().push(line);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let last = self
                 .sent
                 .lock()
@@ -490,7 +501,10 @@ mod tests {
                 "A Z 00".to_string()
             };
             buf[..reply.len()].copy_from_slice(reply.as_bytes());
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

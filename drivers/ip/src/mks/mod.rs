@@ -21,7 +21,7 @@ use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
+use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -72,8 +72,8 @@ fn print(handle: &PortHandle, mask: TraceMask, args: std::fmt::Arguments<'_>) {
 }
 
 /// `pasynOctetSyncIO->writeReadOnce(port, 0, data, ..., TIMEOUT, ...)`,
-/// with its own failure line.
-fn write_read_once(port: &str, data: &[u8]) -> Result<Vec<u8>, ()> {
+/// with its own failure line: the bytes read beside whether it succeeded.
+fn write_read_once(port: &str, data: &[u8]) -> (Vec<u8>, bool) {
     let (io, connected) = SyncIOHandle::connect_port(port, ADDR, TIMEOUT, InterfaceType::Octet);
     if let Err(e) = connected {
         io.print(
@@ -81,15 +81,17 @@ fn write_read_once(port: &str, data: &[u8]) -> Result<Vec<u8>, ()> {
             TraceMask::ERROR,
             format_args!("asynOctetSyncIO connect failed {}\n", e.message()),
         );
-        return Err(());
+        return (Vec::new(), false);
     }
-    io.write_read(0, data, MAX_RESPONSE_LEN).map_err(|e| {
+    let (reply, status) = io.write_read(0, data, MAX_RESPONSE_LEN).into_parts();
+    if let Err(e) = &status {
         io.print(
             0,
             TraceMask::ERROR,
             format_args!("asynOctetSyncIO writeReadOnce failed {}\n", e.message()),
         );
-    })
+    }
+    (reply, status.is_ok())
 }
 
 /// The pass a queued request's callback re-enters — C's `dbScanLock(pai);
@@ -135,19 +137,15 @@ impl CellBody for Job {
             },
             user(),
         );
-        let read = port.call(
-            &RequestOp::OctetRead {
-                buf_size: MAX_RESPONSE_LEN,
-            },
-            user(),
-        );
-        let (data, ok) = match read {
-            Ok(r) => (r.data.unwrap_or_default(), true),
-            Err(e) => (
-                e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
-                false,
-            ),
-        };
+        let (data, status) = port
+            .octet_read(
+                OctetReadOp::Read {
+                    buf_size: MAX_RESPONSE_LEN,
+                },
+                user(),
+            )
+            .into_parts();
+        let ok = status.is_ok();
         print(
             &self.handle,
             TraceMask::IO_DEVICE,
@@ -219,12 +217,13 @@ impl DevAiMks {
         }
     }
 
-    /// One of `initAi`'s `writeReadOnce` queries, refused unless it returns
-    /// the 7 characters C requires.
+    /// One of `initAi`'s `writeReadOnce` queries, refused unless it succeeds
+    /// with the 7 characters C requires. The refusal prints what a failed
+    /// read delivered (devAiMKS.c:172-175).
     fn query(&self, handle: &PortHandle, port: &str, command: &str) -> Option<String> {
-        let reply = write_read_once(port, command.as_bytes()).unwrap_or_default();
+        let (reply, ok) = write_read_once(port, command.as_bytes());
         let text = String::from_utf8_lossy(&reply).into_owned();
-        if reply.len() != REPLY_LEN {
+        if !ok || reply.len() != REPLY_LEN {
             print(
                 handle,
                 TraceMask::ERROR,
@@ -554,6 +553,78 @@ mod tests {
                 "{log}"
             );
         }
+    }
+
+    /// devAiMKS.c:172-175 prints `nread` and the response of a failed
+    /// `SU` read, so a reply cut by a timeout shows what arrived.
+    #[test]
+    fn a_cut_units_read_prints_what_arrived() {
+        use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+        use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::user::AsynUser;
+
+        /// Every read delivers `TORR` and then times out.
+        struct Cut(PortDriverBase);
+        impl PortDriver for Cut {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+                buf[..4].copy_from_slice(b"TORR");
+                OctetReadResult {
+                    status: Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "read timeout".into(),
+                    }),
+                    ..OctetReadResult::ok(4, EomReason::empty())
+                }
+            }
+        }
+
+        let port = "MKS_CUT";
+        let claim = claim_port(port).unwrap();
+        let (runtime, _actor) = create_port_runtime(
+            &claim,
+            Cut(PortDriverBase::new(
+                port,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            )),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &open_owner())
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("{port}-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        runtime
+            .port_handle()
+            .trace()
+            .set_trace_file(Some(port), TraceFile::File(Arc::new(Mutex::new(file))));
+        let (_, outcome) = init(port, "ipExample:cut", 1);
+        assert_eq!(
+            outcome,
+            DeviceInitOutcome::dead_with_alarm(READ_ALARM, AlarmSeverity::Major)
+        );
+        let log = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            log.contains("devAiMKS ERROR, record=ipExample:cut, nread=4, response=\nTORR\n"),
+            "{log}"
+        );
     }
 
     /// `initAi`'s refusals before any I/O: no port, no gauge, no link.

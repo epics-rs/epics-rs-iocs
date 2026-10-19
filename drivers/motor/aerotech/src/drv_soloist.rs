@@ -74,8 +74,8 @@ impl SoloistCard {
         }
         let mut reply = Vec::new();
         for _ in 0..count {
-            match self.handle.read_octet(0, BUFF_SIZE) {
-                Ok(part) if !part.is_empty() => reply.extend_from_slice(&part),
+            match self.handle.read_octet(0, BUFF_SIZE).into_parts() {
+                (part, Ok(())) if !part.is_empty() => reply.extend_from_slice(&part),
                 _ => return Vec::new(),
             }
         }

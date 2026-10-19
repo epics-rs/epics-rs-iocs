@@ -299,10 +299,10 @@ impl XpsSocket {
         };
         let mut buf = Vec::new();
         while !buf.ends_with(XPS_TERMINATOR.as_bytes()) && buf.len() < MAX_REPLY {
-            match link.pending.read_octet(OCTET_REASON, READ_BUF) {
+            match link.pending.read_octet(OCTET_REASON, READ_BUF).into_parts() {
                 // A zero-byte success is the peer closing; C's next read
                 // fails on the closed socket.
-                Ok(chunk) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
+                (chunk, Ok(())) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
                 _ => break,
             }
         }
@@ -324,21 +324,26 @@ impl XpsSocket {
     /// (`asynOctetSocket.cpp` uses `noProcessEos` and loops the same way), and
     /// return it with the terminator stripped. Self-contained: it does not rely
     /// on any port-level input EOS.
+    ///
+    /// The first read that fails ends the reply: C leaves what was read for
+    /// the caller's `sscanf` whatever the status (asynOctetSocket.cpp:162-184).
     fn query(&self, link: &Link, cmd: &str) -> XpsResult<XpsReply> {
         // C writeRead (asynOctetSocket.cpp:153) flushes stale input before the
         // write; only the continuation chunks are plain reads.
         let handle = &link.handle;
-        let mut buf = handle
+        let (mut buf, mut status) = handle
             .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
-            .inspect_err(|e| {
-                self.trace_error(format_args!(
-                    "SendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
-                    e.status() as i32,
-                    e.message()
-                ))
-            })?;
-        while !buf.ends_with(XPS_TERMINATOR.as_bytes()) {
-            let chunk = handle.read_octet(OCTET_REASON, READ_BUF)?;
+            .into_parts();
+        if let Err(e) = &status {
+            self.trace_error(format_args!(
+                "SendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
+                e.status() as i32,
+                e.message()
+            ));
+        }
+        while status.is_ok() && !buf.ends_with(XPS_TERMINATOR.as_bytes()) {
+            let (chunk, read) = handle.read_octet(OCTET_REASON, READ_BUF).into_parts();
+            status = read;
             buf.extend_from_slice(&chunk);
             if buf.len() > MAX_REPLY {
                 return Err(XpsError::Transport(AsynError::Status {
@@ -371,11 +376,12 @@ impl XpsSocket {
             match link
                 .handle
                 .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
+                .into_parts()
             {
                 // write_read wraps its failure in the step that failed, so
                 // the timeout is read through `status()`.
-                Err(e) if e.status() == AsynStatus::Timeout => return Ok(synthesized()),
-                Err(e) => {
+                (_, Err(e)) if e.status() == AsynStatus::Timeout => return Ok(synthesized()),
+                (_, Err(e)) => {
                     // C prints only for asynError (asynOctetSocket.cpp:197).
                     if e.status() == AsynStatus::Error {
                         self.trace_error(format_args!(
@@ -386,7 +392,7 @@ impl XpsSocket {
                     }
                     return Err(XpsError::Transport(e));
                 }
-                Ok(raw) => {
+                (raw, Ok(())) => {
                     // A reply in time is the caller's to parse, as C's
                     // `ErrorStringGet` on HXP's move socket does.
                     let text = String::from_utf8_lossy(&raw);
@@ -548,12 +554,100 @@ mod tests {
             &mut self,
             _user: &epics_rs::asyn::user::AsynUser,
             _buf: &mut [u8],
-        ) -> epics_rs::asyn::error::AsynResult<usize> {
-            Err(AsynError::Status {
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
                 status: AsynStatus::Timeout,
                 message: "no reply".into(),
             })
         }
+    }
+
+    /// An XPS whose reads hand out `reads` in turn, each `(bytes, cut)`; a
+    /// cut read delivers its bytes and then times out, as does every read
+    /// after the last.
+    struct Chunks {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reads: std::collections::VecDeque<(&'static [u8], bool)>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Chunks {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut epics_rs::asyn::user::AsynUser,
+            data: &[u8],
+        ) -> epics_rs::asyn::error::AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &epics_rs::asyn::user::AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            let (bytes, cut) = self.reads.pop_front().unwrap_or((b"", true));
+            buf[..bytes.len()].copy_from_slice(bytes);
+            let read = epics_rs::asyn::interpose::OctetReadResult::ok(
+                bytes.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            );
+            if !cut {
+                return read;
+            }
+            epics_rs::asyn::interpose::OctetReadResult {
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "reply cut by a timeout".into(),
+                }),
+                ..read
+            }
+        }
+    }
+
+    fn chunked_socket(port: &str, reads: &[(&'static [u8], bool)]) -> XpsSocket {
+        use epics_rs::asyn::port::InterfaceMask;
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let mut base = PortDriverBase::new(
+            port,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.init_connected(true);
+        let driver = Chunks {
+            base,
+            reads: reads.iter().copied().collect(),
+        };
+        let (rt, _jh) =
+            create_port_runtime(&claim_port(port).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = rt.port_handle().clone();
+        std::mem::forget(rt);
+        XpsSocket::new(
+            handle,
+            0,
+            port,
+            SocketMode::Query,
+            Duration::from_millis(100),
+        )
+    }
+
+    /// asynOctetSocket.cpp:162-184: the reply stops at the first read that
+    /// fails, and the caller parses what was read.
+    #[test]
+    fn a_reply_cut_by_a_timeout_is_parsed() {
+        let sock = chunked_socket("xps_query_cut", &[(b"0,1.", false), (b"5", true)]);
+        assert_eq!(sock.group_position_current_get("G1.P1").unwrap(), 1.5);
+        let sock = chunked_socket("xps_query_none", &[(b"", true)]);
+        assert_eq!(sock.group_status_get("G1").unwrap_err().code(), -1);
     }
 
     /// C `SendAndReceive` with a negative timeout: a move whose reply has

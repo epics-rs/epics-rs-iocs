@@ -1339,15 +1339,6 @@ impl PortDriver for AmptekDriver {
         status
     }
 
-    /// `asynPortDriver::readOctet`.
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let addr = self.base.get_address(user.addr, user.reason)?;
-        let bytes = self.base.get_string_param(user.reason, addr)?;
-        let n = bytes.len().min(buf.len());
-        buf[..n].copy_from_slice(&bytes[..n]);
-        Ok(n)
-    }
-
     /// `asynPortDriver::writeOctet`.
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let addr = self.base.get_address(user.addr, user.reason)?;

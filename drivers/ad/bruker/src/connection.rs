@@ -28,7 +28,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::OctetReadOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -116,25 +116,21 @@ fn exchange(io: &SyncIOHandle, command: &str, timeout: Duration) -> Exchange {
         Err(e) => return Exchange::NotSent(e),
     };
     let user = AsynUser::new(0).with_addr(0).with_timeout(timeout);
-    let op = RequestOp::OctetWriteRead {
+    let op = OctetReadOp::WriteRead {
         data: command.as_bytes().to_vec(),
         buf_size: MAX_MESSAGE_SIZE,
-        flush: true,
     };
 
-    match handle.submit_blocking(op, user) {
-        Ok(result) => Exchange::Read {
-            reply: reply_text(&result.data.unwrap_or_default()),
+    match handle.submit_octet_read_blocking(op, user).into_parts() {
+        (reply, Ok(())) => Exchange::Read {
+            reply: reply_text(&reply),
             status: Ok(()),
         },
-        Err(e) if e.octet_step() == Some(OctetStep::Read) => Exchange::Read {
-            reply: e
-                .partial_read()
-                .map(|p| reply_text(&p.data))
-                .unwrap_or_default(),
+        (reply, Err(e)) if e.octet_step() == Some(OctetStep::Read) => Exchange::Read {
+            reply: reply_text(&reply),
             status: Err(e),
         },
-        Err(e) => Exchange::NotSent(e),
+        (_, Err(e)) => Exchange::NotSent(e),
     }
 }
 

@@ -84,9 +84,14 @@ impl Pc6kCard {
 
     /// `send_recv_mess`: the reply, empty when none came.
     fn ask(&self, msg: &str) -> Vec<u8> {
-        self.handle
+        match self
+            .handle
             .write_read(0, msg.as_bytes(), MSG_SIZE)
-            .unwrap_or_default()
+            .into_parts()
+        {
+            (reply, Ok(())) => reply,
+            (_, Err(_)) => Vec::new(),
+        }
     }
 
     /// The value of `query`'s reply: what follows `*` and the echoed query,

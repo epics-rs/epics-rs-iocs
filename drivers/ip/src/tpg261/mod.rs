@@ -16,7 +16,7 @@ use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
+use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::error::CaResult;
@@ -173,13 +173,15 @@ impl Job {
                 "devTPG261::devTPG261Callback {tag} {name} nwrite={nwrite}, output=[{output}]\n"
             ),
         );
-        let read = port.call(
-            &RequestOp::OctetRead {
-                buf_size: BUFFER_SIZE,
-            },
-            user(),
-        );
-        let input = read.ok().and_then(|r| r.data).unwrap_or_default();
+        // C reads `nread` whatever the status.
+        let (input, _) = port
+            .octet_read(
+                OctetReadOp::Read {
+                    buf_size: BUFFER_SIZE,
+                },
+                user(),
+            )
+            .into_parts();
         let nread = input.len();
         self.trace(
             TraceMask::IO_DEVICE,
@@ -637,7 +639,8 @@ impl DeviceSupport for DevTpg261 {
 #[cfg(test)]
 mod tests {
     use epics_rs::asyn::error::AsynResult;
-    use epics_rs::asyn::request::RequestResult;
+    use epics_rs::asyn::interpose::EomReason;
+    use epics_rs::asyn::request::{OctetRead, RequestResult};
     use epics_rs::base::server::records::ai::AiRecord;
     use epics_rs::base::server::records::ao::AoRecord;
     use epics_rs::base::server::records::bi::BiRecord;
@@ -812,7 +815,8 @@ mod tests {
                 RequestOp::OctetRead { .. } => {
                     self.0.push("read".into());
                     let reply = if reads == 0 { "\x06" } else { "0,1.0E-06" };
-                    RequestResult::octet_read(reply.into(), reply.len())
+                    let read = OctetRead::new(reply.into(), EomReason::empty(), Ok(()));
+                    RequestResult::octet_read(read, reply.len())
                 }
                 _ => {
                     self.0.push(format!("{op:?}"));

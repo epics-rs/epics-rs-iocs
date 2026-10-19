@@ -153,9 +153,11 @@ impl FaulhaberController {
     fn query(&self, node: usize, cmd: &str) -> AsynResult<String> {
         // C send_mess/recv_mess write then read with no flush, so one stray
         // line shifts every later reply; write_read flushes first.
-        let raw = self
+        let (raw, status) = self
             .reader
-            .write_read(0, &Self::framed(node, cmd), READ_BUF)?;
+            .write_read(0, &Self::framed(node, cmd), READ_BUF)
+            .into_parts();
+        status?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text
             .trim_matches(|c: char| c.is_control() || c.is_whitespace())

@@ -218,7 +218,8 @@ impl SmartMotorController {
     /// Send a query to `axis` and return its `\r`-terminated reply (trimmed).
     fn query(&self, axis: usize, cmd: &str) -> AsynResult<String> {
         self.send(axis, cmd);
-        let raw = self.reader.read_octet(0, READ_BUF)?;
+        let (raw, status) = self.reader.read_octet(0, READ_BUF).into_parts();
+        status?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
@@ -537,12 +538,19 @@ mod tests {
             }
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             self.reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let reply = self.replies.pop_front().unwrap_or_default();
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -709,7 +717,11 @@ mod tests {
             self.last = String::from_utf8_lossy(data).into_owned();
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = if self.quiet.load(std::sync::atomic::Ordering::SeqCst) {
                 ""
             } else {
@@ -717,10 +729,15 @@ mod tests {
                 replies.get(self.last.as_str()).copied().unwrap_or("0")
             };
             if reply == "!" {
-                return Err(smartmotor_err("read failed"));
+                return epics_rs::asyn::interpose::OctetReadResult::failed(smartmotor_err(
+                    "read failed",
+                ));
             }
             buf[..reply.len()].copy_from_slice(reply.as_bytes());
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

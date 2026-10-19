@@ -139,10 +139,15 @@ impl Mvp2001Controller {
     /// prepended terminator first (C `writeRead2xController`).
     fn query(&self, cmd: &str) -> AsynResult<String> {
         // First read: the prepended terminator (discarded).
-        let _ = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let (_, status) = self
+            .handle
+            .write_read(0, &Self::framed(cmd), READ_BUF)
+            .into_parts();
+        status?;
         sleep(REPLY_DELAY);
         // Second read: the real reply.
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let (raw, status) = self.handle.read_octet(0, READ_BUF).into_parts();
+        status?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0'])
             .to_string())

@@ -116,8 +116,9 @@ fn max_digits(step_size: f64) -> usize {
 /// `sendReceiveMutex`).
 pub struct EnsembleController {
     io: Exchange,
-    /// C `inputBuff`: the last reply. A failed exchange leaves it, and C's
-    /// callers that ignore the status read it anyway.
+    /// C `inputBuff`: the last reply, or what a failed read delivered. A
+    /// failed write leaves it, and C's callers that ignore the status read
+    /// it anyway.
     input: String,
 }
 
@@ -142,8 +143,11 @@ impl EnsembleController {
     /// caller's to check. Its ACK-then-EOS re-read (drvEnsembleAsyn.cc:1083)
     /// never matches a reply the input EOS already stripped.
     pub fn send(&mut self, cmd: &str) -> AsynResult<()> {
-        self.input = self.io.write_read(cmd)?;
-        Ok(())
+        let (reply, status) = self.io.exchange(cmd);
+        if let Some(reply) = reply {
+            self.input = reply;
+        }
+        status
     }
 
     /// Whether the last reply is an ACK.
@@ -1321,6 +1325,30 @@ mod tests {
         set_reply(&line, "AXISSTATUS(@0)", "%1");
         fail_write(&line, Some("PLANESTATUS(0)"));
         assert!(!axis.poll(&user).unwrap().done);
+    }
+
+    /// drvEnsembleAsyn.cc:740-741, :787-789: a PLANESTATUS or PCMDPROG
+    /// reply cut by a timeout is read from what the failed read delivered.
+    #[test]
+    fn unchecked_poll_exchanges_read_a_cut_reply() {
+        let reply = |cmd: &str| {
+            match cmd.trim_end() {
+                c if c == format!("GETPARM(@0, {PARAM_COUNTS_PER_UNIT})") => "%1",
+                "PFBKPROG(@0)" => "%5",
+                "PCMDPROG(@0)" => "%6",
+                "PLANESTATUS(0)" => "%1",
+                _ => "%0",
+            }
+            .into()
+        };
+        let cut = |cmd: &str| matches!(cmd.trim_end(), "PCMDPROG(@0)" | "PLANESTATUS(0)");
+        let (line, io) = motor_common::testing::LineRig::cut("ensPollCut", reply, cut);
+        let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensPollCut", "0")));
+        let mut axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
+        line.sent();
+        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        assert_eq!(status.position, 6.0);
+        assert!(!status.done);
     }
 
     #[test]

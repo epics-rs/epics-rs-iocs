@@ -97,6 +97,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
+use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -253,9 +254,9 @@ impl PIC663Controller {
     /// Read one reply, unconditionally dropping the last byte (C
     /// `recv_mess`'s "Strip trailing CR"). Returns `(reply, raw_len)`;
     /// `raw_len` is the pre-strip byte count (C's `charcnt`).
-    fn reply(read: AsynResult<Vec<u8>>) -> (String, usize) {
-        match read {
-            Ok(raw) if !raw.is_empty() => {
+    fn reply(read: OctetRead) -> (String, usize) {
+        match read.into_parts() {
+            (raw, Ok(())) if !raw.is_empty() => {
                 let stripped = &raw[..raw.len() - 1];
                 (String::from_utf8_lossy(stripped).into_owned(), raw.len())
             }

@@ -24,7 +24,7 @@ use motor_common::iocsh::{
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::{AxisReport, Controller, asyn_user, model1_device, register_port_with};
 
-use crate::drv_mvp2001::{self, DrvMvp2001Axis, MVP2001_NUM_CARDS, Mvp2001Chain};
+use crate::drv_mvp2001::{self, DrvMvp2001Axis, MVP2001_NUM_CARDS, Mvp2001Build, Mvp2001Chain};
 use crate::mvp2001::{Mvp2001Axis, Mvp2001Controller, Mvp2001Params};
 
 /// Command timeout (C `DEFAULT_CONTROLLER_TIMEOUT`).
@@ -208,10 +208,13 @@ pub fn micromo_config_command() -> CommandDef {
                 }
                 let chain = Arc::new(Mutex::new(chain));
                 for (signal, limits) in limits.into_iter().enumerate() {
-                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(
-                        DrvMvp2001Axis::new(chain.clone(), signal, limits),
-                    ));
-                    init.axis(signal as i32, motor);
+                    let motor: Arc<Mutex<dyn Model1Motor>> =
+                        Arc::new(Mutex::new(DrvMvp2001Axis::new(chain.clone(), signal)));
+                    init.axis_with_build_trans(
+                        signal as i32,
+                        motor,
+                        Arc::new(Mvp2001Build::new(limits)),
+                    );
                 }
                 // C's `motor_init` clears `ident` and never fills it.
                 init.describe(format!("port={asyn_port}, id: "));
@@ -409,5 +412,62 @@ record(motor, "mvp:m2") { field(DTYP, "MVP2001") field(OUT, "#C0 S1 @512,100") }
         .await;
         assert_eq!(db.get_pv("mvp:m1.RMP").unwrap(), EpicsValue::Long(14));
         assert_eq!(db.get_pv("mvp:m2.RMP").unwrap(), EpicsValue::Long(3));
+    }
+}
+
+#[cfg(test)]
+mod limits {
+    use epics_rs::base::server::ioc_builder::IocBuilder;
+    use epics_rs::base::types::EpicsValue;
+    use epics_rs::motor::devices::{device_support_factory, devices};
+    use motor_common::testing::{LineRig, drvsup_init, run_command};
+
+    use super::*;
+
+    /// devMVP2001.cc:430-448: init_record's SET_HIGH_LIMIT and SET_LOW_LIMIT
+    /// past what `motor_init` read with `LL` are refused, and each resets its
+    /// dial limit to the controller's, which HLM and LLM then follow.
+    #[epics_rs::base::epics_test]
+    async fn init_resets_dial_limits_past_the_controllers() {
+        let int = ArgValue::Int;
+        run_command(micromo_setup_command(), vec![int(1), int(10)]).await;
+        let (_line, _io) = LineRig::queued("mvpLimLine", |cmd| {
+            let reply = match cmd.trim_end() {
+                "1 ST" => "0001 0000",
+                "1 POS" => "0001 00000000",
+                "1 LL -" => "0001 FFFE7960",
+                "1 LL" => "0001 000186A0",
+                _ => return Vec::new(),
+            };
+            vec!["\r".into(), reply.into()]
+        });
+        let config = vec![int(0), ArgValue::String("mvpLimLine".into())];
+        run_command(micromo_config_command(), config).await;
+        drvsup_init().await;
+        let db = r##"record(motor, "mvpLim:m1") {
+            field(DTYP, "MVP2001")
+            field(OUT, "#C0 S0 @512,1000")
+            field(MRES, "1")
+            field(DHLM, "1000000")
+            field(DLLM, "-1000000")
+        }"##;
+        let (name, factory) = epics_rs::motor::motor_record_factory();
+        let (db, _) = IocBuilder::new()
+            .register_record_type(name, factory)
+            .register_dynamic_device_support(&devices(), device_support_factory())
+            .db_string(db, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        for (field, value) in [
+            ("DHLM", 100000.0),
+            ("HLM", 100000.0),
+            ("DLLM", -100000.0),
+            ("LLM", -100000.0),
+        ] {
+            let got = db.get_pv(format!("mvpLim:m1.{field}")).unwrap();
+            assert_eq!(got, EpicsValue::Double(value), "{field}");
+        }
     }
 }

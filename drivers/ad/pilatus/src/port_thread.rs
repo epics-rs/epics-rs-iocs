@@ -374,7 +374,7 @@ mod tests {
     use epics_rs::ad_core::runtime as rt;
     use epics_rs::asyn::error::AsynResult;
     use epics_rs::asyn::interfaces::InterfaceType;
-    use epics_rs::asyn::interpose::EomReason;
+    use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
     use epics_rs::asyn::interrupt::InterruptFilter;
     use epics_rs::asyn::manager::{PortManager, claim_port_driver};
     use epics_rs::asyn::param::ParamValue;
@@ -417,15 +417,11 @@ mod tests {
             self.log.lock().push(self.last.clone());
             Ok(data.len())
         }
-        fn io_read_octet_eom(
-            &mut self,
-            _user: &AsynUser,
-            buf: &mut [u8],
-        ) -> AsynResult<(usize, EomReason)> {
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             self.log.lock().push("<read>".into());
             let reply = (self.reply)(&self.last);
             buf[..reply.len()].copy_from_slice(reply.as_bytes());
-            Ok((reply.len(), EomReason::EOS))
+            OctetReadResult::ok(reply.len(), EomReason::EOS)
         }
     }
 

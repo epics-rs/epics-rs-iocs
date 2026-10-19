@@ -108,12 +108,23 @@ pub(crate) fn mute_link(io: &str) -> OctetLink {
 /// answers every read with `reply`.
 #[cfg(test)]
 pub(crate) fn replying_link(io: &str, reply: &'static [u8]) -> OctetLink {
-    use epics_rs::asyn::error::AsynResult;
+    reply_link(io, reply, false)
+}
+
+/// [`replying_link`] whose every read times out after delivering `reply`.
+#[cfg(test)]
+pub(crate) fn cut_link(io: &str, reply: &'static [u8]) -> OctetLink {
+    reply_link(io, reply, true)
+}
+
+#[cfg(test)]
+fn reply_link(io: &str, reply: &'static [u8], cut: bool) -> OctetLink {
+    use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
     use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::user::AsynUser;
 
-    struct Replying(PortDriverBase, &'static [u8]);
+    struct Replying(PortDriverBase, &'static [u8], bool);
 
     impl PortDriver for Replying {
         fn base(&self) -> &PortDriverBase {
@@ -125,10 +136,27 @@ pub(crate) fn replying_link(io: &str, reply: &'static [u8]) -> OctetLink {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let n = self.1.len().min(buf.len());
             buf[..n].copy_from_slice(&self.1[..n]);
-            Ok(n)
+            let read = epics_rs::asyn::interpose::OctetReadResult::ok(
+                n,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            );
+            if self.2 {
+                return epics_rs::asyn::interpose::OctetReadResult {
+                    status: Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "reply cut by a timeout".into(),
+                    }),
+                    ..read
+                };
+            }
+            read
         }
     }
 
@@ -143,6 +171,7 @@ pub(crate) fn replying_link(io: &str, reply: &'static [u8]) -> OctetLink {
                 InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             reply,
+            cut,
         ),
     )
 }

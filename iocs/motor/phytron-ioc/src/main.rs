@@ -2,8 +2,9 @@
 //!
 //! Assembles: an asyn octet port (`drvAsynIPPortConfigure` or
 //! `drvAsynSerialPortConfigure`), the Phytron iocsh commands
-//! (`phytronCreateController`, `phytronCreateMCC`, `phytronCreateAxis`), the
-//! motor record type, and the CA + PVA (QSRV) server.
+//! (`phytronCreateController`, `phytronCreateMCC`, `phytronCreateAxis`,
+//! `phytronCreateAnalog`, `phytronCreateDigital`), the motor record type,
+//! asyn's devEpics for the module's aux dbs, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p phytron-ioc -- st.cmd          # phyMOTION MCM
@@ -37,6 +38,9 @@ async fn main() -> CaResult<()> {
     for cmd in epics_rs::motor::ioc::asyn_motor_controller_commands() {
         app = app.register_startup_command(cmd);
     }
+
+    // asyn's devEpics, for the Phytron_*.db aux records.
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides the drvAsyn*PortConfigure family.
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());

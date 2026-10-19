@@ -47,30 +47,40 @@ impl Exchange {
         }
     }
 
-    /// Write a command and read one reply line.
-    pub(crate) fn write_read(&self, cmd: &str) -> AsynResult<String> {
+    /// Write a command and read one reply line. The line is C's `inputBuff`
+    /// after the exchange: what a failed read delivered, `None` when a
+    /// failed write left it untouched.
+    pub(crate) fn exchange(&self, cmd: &str) -> (Option<String>, AsynResult<()>) {
         let driver = self.driver;
-        let mut result = self.handle.write_read(0, cmd.as_bytes(), self.read_buf);
-        match &result {
+        let (mut raw, mut status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), self.read_buf)
+            .into_parts();
+        // A failed write skips the read, so `inputBuff` keeps its contents.
+        let read = match &status {
+            Err(e) => e.octet_step() == Some(OctetStep::Read),
+            Ok(()) => true,
+        };
+        match &status {
             Err(e) => {
                 let written = match e.octet_step() {
                     Some(OctetStep::Read) => cmd.len(),
                     _ => e.partial_write().unwrap_or(0),
                 };
                 if written != cmd.len() {
-                    result = Err(AsynError::Status {
+                    status = Err(AsynError::Status {
                         status: AsynStatus::Error,
                         message: e.message(),
                     });
                 } else if e.status() == AsynStatus::Timeout {
                     let mut retry = 1;
                     while retry <= 3
-                        && matches!(&result, Err(e) if e.status() == AsynStatus::Timeout)
+                        && matches!(&status, Err(e) if e.status() == AsynStatus::Timeout)
                     {
                         self.print_axis0(format_args!(
                             "{driver}:sendAndReceive: Retrying read, retry# = {retry}.\n"
                         ));
-                        result = self.handle.read_octet(0, self.read_buf);
+                        (raw, status) = self.handle.read_octet(0, self.read_buf).into_parts();
                         retry += 1;
                     }
                     // C counts a success on the third retry as exhausted.
@@ -79,24 +89,25 @@ impl Exchange {
                             "{driver}:sendAndReceive: Retries exhausted on response to command = {cmd}.\n"
                         ));
                     } else {
-                        let reply = result.as_deref().map(trim_line).unwrap_or_default();
+                        let reply = trim_line(&raw);
                         self.print_axis0(format_args!(
                             "{driver}:sendAndReceive: Retry succeeded for command = {cmd} with response = {reply}\n"
                         ));
                     }
                 }
             }
-            Ok(raw) => {
+            Ok(()) => {
                 if self.fault.is_some() && raw.first() == self.fault.as_ref() {
                     self.print_axis0(format_args!(
                         "{driver}:sendAndReceive: Error returned for command = {cmd} with response = {}\n",
-                        trim_line(raw)
+                        trim_line(&raw)
                     ));
                 }
             }
         }
-        match result {
-            Ok(raw) => Ok(trim_line(&raw)),
+        let reply = read.then(|| trim_line(&raw));
+        match status {
+            Ok(()) => (reply, Ok(())),
             Err(e) => {
                 PortManager::global().trace_manager().print(
                     Some(&self.serial_port),
@@ -109,7 +120,7 @@ impl Exchange {
                         e.message()
                     ),
                 );
-                Err(e)
+                (reply, Err(e))
             }
         }
     }
@@ -155,15 +166,22 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             if self.reads.fetch_add(1, Ordering::SeqCst) < self.timeouts {
-                return Err(AsynError::Status {
+                return epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "timeout".into(),
                 });
             }
             buf[..2].copy_from_slice(b"%1");
-            Ok(2)
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                2,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -192,12 +210,13 @@ mod tests {
     #[test]
     fn a_timed_out_reply_is_read_again_three_times() {
         let (io, reads) = exchange("aerotech_retry", 2);
-        assert_eq!(io.write_read("CMD").unwrap(), "%1");
+        let (reply, status) = io.exchange("CMD");
+        assert_eq!((reply.as_deref(), status.is_ok()), (Some("%1"), true));
         assert_eq!(reads.load(Ordering::SeqCst), 3);
 
         let (io, reads) = exchange("aerotech_dead", usize::MAX);
         assert_eq!(
-            io.write_read("CMD").unwrap_err().status(),
+            io.exchange("CMD").1.unwrap_err().status(),
             AsynStatus::Timeout
         );
         assert_eq!(reads.load(Ordering::SeqCst), 4);

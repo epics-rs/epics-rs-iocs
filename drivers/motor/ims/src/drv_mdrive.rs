@@ -52,18 +52,22 @@ impl MDriveController {
 
     /// `send_mess` then `recv_mess`: the reply, empty when none came.
     fn ask(&self, msg: &str) -> String {
-        self.handle
+        match self
+            .handle
             .write_read(0, msg.as_bytes(), BUFF_SIZE)
-            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
-            .unwrap_or_default()
+            .into_parts()
+        {
+            (raw, Ok(())) => String::from_utf8_lossy(&raw).into_owned(),
+            (_, Err(_)) => String::new(),
+        }
     }
 
     /// `recv_mess` alone: the next line, empty when none came.
     fn read(&self) -> String {
-        self.handle
-            .read_octet(0, BUFF_SIZE)
-            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
-            .unwrap_or_default()
+        match self.handle.read_octet(0, BUFF_SIZE).into_parts() {
+            (raw, Ok(())) => String::from_utf8_lossy(&raw).into_owned(),
+            (_, Err(_)) => String::new(),
+        }
     }
 
     fn send(&self, msg: impl AsRef<[u8]>) {

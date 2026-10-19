@@ -198,14 +198,18 @@ impl ScuController {
     /// Send a command and read back its reply (C `sendCmd`; every SCU
     /// command replies).
     fn transact(&self, io: &mut AxisIo, cmd: &str) -> AsynResult<String> {
-        match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
-            Ok(raw) => {
+        match self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts()
+        {
+            (raw, Ok(())) => {
                 io.from_controller = String::from_utf8_lossy(&raw)
                     .trim_matches(['\r', '\n', '\0', ' '])
                     .to_string();
                 Ok(io.from_controller.clone())
             }
-            Err(e) => {
+            (_, Err(e)) => {
                 // A failed writeRead leaves fromController_ holding the last reply.
                 io.print(format_args!(
                     "ERROR: sendCmd: status={}, sent: {cmd}, received: {}\n",
