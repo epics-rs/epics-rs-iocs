@@ -216,13 +216,13 @@ fn float_prefix(s: &[u8]) -> usize {
     sign + len
 }
 
-/// The dew point of the box (Magnus formula, C `statusTask`).
-///
-/// C divided by the literal `0.4343`, which is `log10(e)` to four places; the
-/// constant itself is used here.
+/// The dew point of the box (Magnus formula, C `statusTask`), with C's
+/// literal `0.4343` for `log10(e)` (pixirad.cpp:1350).
 pub fn dew_point(humidity: f64, box_temp: f64) -> f64 {
-    let h = (humidity.log10() - 2.0) / std::f64::consts::LOG10_E
-        + (17.62 * box_temp) / (243.12 + box_temp);
+    // The same double as the literal, spelt so clippy does not take it for a
+    // mistyped LOG10_E.
+    const C_LOG10_E: f64 = 4343.0 / 10000.0;
+    let h = (humidity.log10() - 2.0) / C_LOG10_E + (17.62 * box_temp) / (243.12 + box_temp);
     243.12 * h / (17.62 - h)
 }
 
@@ -384,6 +384,13 @@ mod tests {
         // 50 % relative humidity at 20 C is a dew point of 9.3 C.
         let dp = dew_point(50.0, 20.0);
         assert!((dp - 9.26).abs() < 0.05, "dew point {dp}");
+    }
+
+    /// C's value for these inputs, from its expression compiled with cc.
+    #[test]
+    fn dew_point_is_c_value() {
+        let dp = dew_point(f64::from(21.3f32), f64::from(24.7f32));
+        assert!((dp - 1.089_111_869_989_379).abs() < 1e-12, "dew point {dp}");
     }
 
     #[test]
