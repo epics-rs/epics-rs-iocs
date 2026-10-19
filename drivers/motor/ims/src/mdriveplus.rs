@@ -73,7 +73,10 @@ const RULE: &str = "-------------------------------------------";
 
 /// `(input, function)` per line of a `PR IS` block: C turns every non-digit
 /// into a separator and scans `%d %d %d` (input, function, active level) from
-/// each LF-terminated line; text after the last LF is not scanned.
+/// each LF-terminated line; text after the last LF is not scanned. The
+/// active level is never read, and C's unchecked sscanf hands
+/// set_switch_vars an uninitialised `fn` from a line of one number: a C
+/// defect, not copied.
 fn parse_input_setup(block: &[u8]) -> Vec<(i32, i32)> {
     let mut lines: Vec<&[u8]> = block.split(|&b| b == b'\n').collect();
     lines.pop();
@@ -83,11 +86,8 @@ fn parse_input_setup(block: &[u8]) -> Vec<(i32, i32)> {
             let mut nums = line
                 .split(|b| !b.is_ascii_digit())
                 .filter(|f| !f.is_empty())
-                .map(|f| std::str::from_utf8(f).ok()?.parse::<i32>().ok());
-            match (nums.next(), nums.next(), nums.next()) {
-                (Some(Some(input)), Some(Some(function)), Some(Some(_))) => Some((input, function)),
-                _ => None,
-            }
+                .map(|f| strtol(f, 10).0 as i32);
+            Some((nums.next()?, nums.next()?))
         })
         .collect()
 }
@@ -1624,6 +1624,20 @@ mod tests {
         let block = b"IS = 1, 1, 0\r\nIS = 2, 2, 1\r\nIS = 3, 0, 0\r\nIS = 4, 3";
         assert_eq!(parse_input_setup(block), vec![(1, 1), (2, 2), (3, 0)]);
         assert_eq!(parse_input_setup(b"junk\n"), vec![]);
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:251-253 read only `inputno` and
+    /// `fn`, each glibc's `(int) strtol`.
+    #[test]
+    fn input_setup_maps_two_numbers_wrapped_as_c() {
+        assert_eq!(parse_input_setup(b"IS = 5, 1\n"), vec![(5, 1)]);
+        let wrapped = if std::os::raw::c_long::BITS == 64 {
+            2
+        } else {
+            i32::MAX
+        };
+        assert_eq!(parse_input_setup(b"3 4294967298 1\n"), vec![(3, wrapped)]);
+        assert_eq!(parse_input_setup(b"7\n"), vec![]);
     }
 
     #[test]
