@@ -214,7 +214,31 @@ fn a_namespace_mapping_checks_each_argument() {
     );
     // The C goes on to map namespace 0; that is not copied.
     let session = registry.session("S1").unwrap();
-    assert!(session.config.lock().namespace_map.is_empty());
+    assert!(session.config.lock().namespace_map().is_empty());
+}
+
+/// `SessionOpen62541::addNamespaceMapping` prints every mapping, outside any
+/// debug guard (`SessionOpen62541.cpp:861`).
+#[test]
+fn a_namespace_mapping_is_printed_and_replaces_by_index_and_by_uri() {
+    let registry = registry();
+    ioc::session_command(&registry, Some("S1"), Some("opc.tcp://h:4840"), &[]);
+    assert_eq!(
+        lines(|| ioc::map_namespace_command(&registry, Some("S1"), 3, Some("urn:a"))),
+        ["SessionOpen62541::addNamespaceMappingindex 3 = urn:a\n"]
+    );
+    ioc::map_namespace_command(&registry, Some("S1"), 3, Some("urn:b"));
+    ioc::map_namespace_command(&registry, Some("S1"), 5, Some("urn:c"));
+    ioc::map_namespace_command(&registry, Some("S1"), 4, Some("urn:c"));
+    let session = registry.session("S1").unwrap();
+    let map: Vec<(String, u16)> = session
+        .config
+        .lock()
+        .namespace_map()
+        .iter()
+        .map(|(uri, index)| (uri.clone(), *index))
+        .collect();
+    assert_eq!(map, [("urn:b".to_string(), 3), ("urn:c".to_string(), 4)]);
 }
 
 #[test]

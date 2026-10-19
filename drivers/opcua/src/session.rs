@@ -6,7 +6,7 @@
 //! into service calls, and dispatches everything the server sends back into the
 //! items. Records never touch the connection.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -69,8 +69,8 @@ pub struct SessionConfig {
     pub certificate_path: Option<String>,
     pub private_key_path: Option<String>,
     pub trust_server_certs: bool,
-    /// Namespace index → URI, from `opcuaMapNamespace`.
-    pub namespace_map: HashMap<u16, String>,
+    /// Namespace URI → local index, from `opcuaMapNamespace`.
+    namespace_map: BTreeMap<String, u16>,
 }
 
 impl SessionConfig {
@@ -93,8 +93,22 @@ impl SessionConfig {
             certificate_path: None,
             private_key_path: None,
             trust_server_certs: false,
-            namespace_map: HashMap::new(),
+            namespace_map: BTreeMap::new(),
         }
+    }
+
+    /// `SessionOpen62541::addNamespaceMapping`: a mapping replaces any other
+    /// with its index or its URI, so the map stays one-to-one.
+    pub fn add_namespace_mapping(&mut self, index: u16, uri: &str) {
+        errlog_vprintf(format_args!(
+            "SessionOpen62541::addNamespaceMappingindex {index} = {uri}\n"
+        ));
+        self.namespace_map.retain(|_, mapped| *mapped != index);
+        self.namespace_map.insert(uri.to_string(), index);
+    }
+
+    pub fn namespace_map(&self) -> &BTreeMap<String, u16> {
+        &self.namespace_map
     }
 
     /// The identity token the next connect presents
@@ -387,10 +401,7 @@ impl SessionHandle {
 
     /// `opcuaMapNamespace`.
     pub fn add_namespace_mapping(&self, index: u16, uri: &str) {
-        self.config
-            .lock()
-            .namespace_map
-            .insert(index, uri.to_string());
+        self.config.lock().add_namespace_mapping(index, uri);
     }
 }
 
@@ -955,7 +966,7 @@ impl SessionWorker {
         let mut remap: HashMap<u16, u16> = HashMap::new();
         // An unread namespace array is no mapping to report on, as in C.
         let read = !self.server.namespace_array.is_empty();
-        for (local, uri) in map.iter().filter(|_| read) {
+        for (uri, local) in map.iter().filter(|_| read) {
             match self
                 .server
                 .namespace_array

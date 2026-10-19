@@ -712,7 +712,7 @@ async fn the_namespace_map_moves_an_item_onto_the_servers_index() {
 
     let (item0, _leaf0) = item("sess ns=4;s=Sensor monitor=n", INPUT);
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    config.namespace_map.insert(4, "urn:sensors".to_string());
+    config.add_namespace_mapping(4, "urn:sensors");
 
     let handle = spawn(config, &mock, vec![item0.clone()]);
     until(|| handle.is_connected()).await;
@@ -721,12 +721,47 @@ async fn the_namespace_map_moves_an_item_onto_the_servers_index() {
     assert_eq!(item0.lock().configured_node_id, NodeId::new(4, "Sensor"));
 }
 
+/// The C's map is keyed by URI (`std::map<std::string, unsigned short>`), so
+/// the mappings the server lacks are reported in URI order
+/// (`SessionOpen62541::updateNamespaceMap`).
+#[tokio::test]
+async fn namespaces_the_server_lacks_are_reported_in_uri_order() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mut mock = Mock::default();
+    mock.server.namespace_array = vec!["http://opcfoundation.org/UA/".to_string()];
+    let mock = Arc::new(mock);
+    let handle = spawn(SessionConfig::new("sess", "opc.tcp://host"), &mock, vec![]);
+    for (index, uri) in (10..).zip(["urn:f", "urn:e", "urn:d", "urn:c", "urn:b", "urn:a"]) {
+        handle.add_namespace_mapping(index, uri);
+    }
+    until(|| handle.is_connected()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    let reported: Vec<String> = lines
+        .lock()
+        .iter()
+        .filter(|l| l.contains("not found on server"))
+        .cloned()
+        .collect();
+    let expected: Vec<String> = ["urn:a", "urn:b", "urn:c", "urn:d", "urn:e", "urn:f"]
+        .iter()
+        .map(|uri| {
+            format!("OPC UA session sess: locally mapped namespace '{uri}' not found on server\n")
+        })
+        .collect();
+    assert_eq!(reported, expected);
+}
+
 #[tokio::test]
 async fn an_item_whose_namespace_the_server_does_not_have_keeps_its_index() {
     let mock = Mock::arc();
     let (item0, _leaf0) = item("sess ns=4;s=Sensor monitor=n", INPUT);
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    config.namespace_map.insert(4, "urn:absent".to_string());
+    config.add_namespace_mapping(4, "urn:absent");
 
     let handle = spawn(config, &mock, vec![item0.clone()]);
     until(|| handle.is_connected()).await;
