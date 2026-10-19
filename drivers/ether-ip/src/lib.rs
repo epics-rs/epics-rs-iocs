@@ -74,7 +74,7 @@ mod tests {
 
     /// What `f` writes to fd 2, one entry per `write`: fd 2 is a datagram
     /// socket for the call, so each `write` is one datagram.
-    fn stderr_writes(f: impl FnOnce()) -> Vec<String> {
+    pub(crate) fn stderr_writes(f: impl FnOnce()) -> Vec<String> {
         let mut fds = [0; 2];
         // SAFETY: `fds` has room for the pair, and each fd is owned once.
         let (rx, tx) = unsafe {
