@@ -142,8 +142,9 @@ pub struct A3200Controller {
     io: Exchange,
     task_number: u32,
     linear: bool,
-    /// C `inputBuff`: the last reply. A failed exchange leaves it, and C's
-    /// callers that ignore the status read it anyway.
+    /// C `inputBuff`: the last reply, or what a failed read delivered. A
+    /// failed write leaves it, and C's callers that ignore the status read
+    /// it anyway.
     input: String,
 }
 
@@ -175,8 +176,11 @@ impl A3200Controller {
     /// caller's to check. Its ACK-then-EOS re-read (drvA3200Asyn.cc:1049)
     /// never matches a reply the input EOS already stripped.
     pub fn send(&mut self, cmd: &str) -> AsynResult<()> {
-        self.input = self.io.write_read(cmd)?;
-        Ok(())
+        let (reply, status) = self.io.exchange(cmd);
+        if let Some(reply) = reply {
+            self.input = reply;
+        }
+        status
     }
 
     /// Whether the last reply is an ACK.
@@ -1037,6 +1041,26 @@ mod tests {
             };
             assert!(result.is_err(), "{fails}");
         }
+    }
+
+    /// drvA3200Asyn.cc:539-540 reads TaskErrorCode from `inputBuff`
+    /// whatever the `~STATUS` status, so a reply cut by a timeout still
+    /// latches its code.
+    #[test]
+    fn a_task_error_code_cut_by_a_timeout_is_still_latched() {
+        let user = AsynUser::new(0);
+        let reply = |cmd: &str| match cmd {
+            c if c.starts_with("LINEAR") => "#".into(),
+            c if c.starts_with("~STATUS(1, TaskErrorCode)") => "%17".into(),
+            _ => "%0 0".into(),
+        };
+        let cut = |cmd: &str| cmd.starts_with("~STATUS(1, TaskErrorCode)");
+        let (line, io) = motor_common::testing::LineRig::cut("a32CutLine", reply, cut);
+        let controller = A3200Controller::new(io, "a32CutLine", "0", 1, true);
+        let mut axis = A3200Axis::new(Arc::new(Mutex::new(controller)), 0, 0, "X".into());
+        line.sent();
+        assert!(axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).is_err());
+        assert_eq!(axis.last_fault, 17);
     }
 
     /// drvA3200Asyn.cc:531-543: a `#` reply to the move latches problem and

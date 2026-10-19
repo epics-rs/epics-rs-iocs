@@ -47,13 +47,20 @@ impl Exchange {
         }
     }
 
-    /// Write a command and read one reply line.
-    pub(crate) fn write_read(&self, cmd: &str) -> AsynResult<String> {
+    /// Write a command and read one reply line. The line is C's `inputBuff`
+    /// after the exchange: what a failed read delivered, `None` when a
+    /// failed write left it untouched.
+    pub(crate) fn exchange(&self, cmd: &str) -> (Option<String>, AsynResult<()>) {
         let driver = self.driver;
         let (mut raw, mut status) = self
             .handle
             .write_read(0, cmd.as_bytes(), self.read_buf)
             .into_parts();
+        // A failed write skips the read, so `inputBuff` keeps its contents.
+        let read = match &status {
+            Err(e) => e.octet_step() == Some(OctetStep::Read),
+            Ok(()) => true,
+        };
         match &status {
             Err(e) => {
                 let written = match e.octet_step() {
@@ -98,8 +105,9 @@ impl Exchange {
                 }
             }
         }
+        let reply = read.then(|| trim_line(&raw));
         match status {
-            Ok(()) => Ok(trim_line(&raw)),
+            Ok(()) => (reply, Ok(())),
             Err(e) => {
                 PortManager::global().trace_manager().print(
                     Some(&self.serial_port),
@@ -112,7 +120,7 @@ impl Exchange {
                         e.message()
                     ),
                 );
-                Err(e)
+                (reply, Err(e))
             }
         }
     }
@@ -202,12 +210,13 @@ mod tests {
     #[test]
     fn a_timed_out_reply_is_read_again_three_times() {
         let (io, reads) = exchange("aerotech_retry", 2);
-        assert_eq!(io.write_read("CMD").unwrap(), "%1");
+        let (reply, status) = io.exchange("CMD");
+        assert_eq!((reply.as_deref(), status.is_ok()), (Some("%1"), true));
         assert_eq!(reads.load(Ordering::SeqCst), 3);
 
         let (io, reads) = exchange("aerotech_dead", usize::MAX);
         assert_eq!(
-            io.write_read("CMD").unwrap_err().status(),
+            io.exchange("CMD").1.unwrap_err().status(),
             AsynStatus::Timeout
         );
         assert_eq!(reads.load(Ordering::SeqCst), 4);
