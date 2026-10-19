@@ -253,17 +253,27 @@ impl NslsEmDriver {
     /// The connection is opened and closed around every transaction, as C++
     /// does with `pasynCommonSyncIO`.
     fn write_read_meter(&self, out: &str) -> AsynResult<String> {
+        let (reply, status) = self.exchange(out);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::write_read_meter`], returning C++'s `inString_` whatever the
+    /// status.
+    fn exchange(&self, out: &str) -> (String, AsynResult<()>) {
         // C++ calls connectDevice on pasynUserTCPCommandConnect_, which no
         // module found leaves unset, and crashes (drvNSLS_EM.cpp:271).
         let Some(command) = &self.command else {
-            return Err(error("drvNSLS_EM: no module on the network"));
+            return (
+                String::new(),
+                Err(error("drvNSLS_EM: no module on the network")),
+            );
         };
         // C++ discards the connect and first-write statuses; the writeRead
         // that follows reports the failure.
         if let Some(port) = command.handle() {
             let _ = port.connect_blocking();
         }
-        let result = (|| -> AsynResult<String> {
+        let result = (|| -> (String, AsynResult<()>) {
             if out.len() > 1 {
                 let _ = command.write(out);
             }
@@ -279,7 +289,7 @@ impl NslsEmDriver {
                         "drvNSLS_EM:writeReadMeter: error calling writeRead, outString={out} status={}, nread={n_read}, eomReason={eom}, inString={in_string}\n",
                         e.c_status_code()
                     );
-                    return Err(e);
+                    return (read.as_str(), Err(e));
                 }
             };
             if !proto::is_ok(&reply) {
@@ -288,9 +298,10 @@ impl NslsEmDriver {
                     ERROR,
                     "drvNSLS_EM:writeReadMeter: error, outString={out} expected OK>, received {reply}\n"
                 );
-                return Err(error(format!("NSLS_EM: {out} -> {reply}, expected OK>")));
+                let e = error(format!("NSLS_EM: {out} -> {reply}, expected OK>"));
+                return (reply, Err(e));
             }
-            Ok(reply)
+            (reply, Ok(()))
         })();
         if let Some(port) = command.handle() {
             let _ = port.disconnect_blocking();
@@ -330,7 +341,9 @@ impl NslsEmDriver {
 
     /// C++ `readStatus`.
     fn read_status_inner(&mut self) -> AsynResult<()> {
-        let reply = self.write_read_meter(proto::CMD_STATUS)?;
+        // C++ discards the `s` status and parses `inString_`, which holds
+        // what a failed read delivered (drvNSLS_EM.cpp:520-522).
+        let (reply, read) = self.exchange(proto::CMD_STATUS);
         let (items, s) = proto::scan_status(&reply);
         // C++'s sscanf stores each item it assigns, on failure too.
         if items >= 1 {
@@ -357,7 +370,9 @@ impl NslsEmDriver {
                     s.range,
                     s.period_us
                 );
-                return Err(error(format!("NSLS_EM: bad status reply: {reply}")));
+                return Err(read
+                    .err()
+                    .unwrap_or_else(|| error(format!("NSLS_EM: bad status reply: {reply}"))));
             }
         };
 
@@ -749,6 +764,79 @@ mod tests {
             )),
             "{out}"
         );
+    }
+
+    /// A module whose `s` reply is cut by a timeout.
+    struct CutStatus(epics_rs::asyn::port::PortDriverBase);
+
+    impl epics_rs::asyn::port::PortDriver for CutStatus {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut epics_rs::asyn::user::AsynUser,
+            data: &[u8],
+        ) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &epics_rs::asyn::user::AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            let reply = b"OK> \"ip: 10.0.0.5, id: 3, ver: 1.2.3 \
+                          { m = 1, n = 5, r = 2, p = 400.000000 }\"";
+            buf[..reply.len()].copy_from_slice(reply);
+            OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }),
+                ..OctetReadResult::ok(reply.len(), EomReason::empty())
+            }
+        }
+    }
+
+    /// drvNSLS_EM.cpp:520-522 discards the `s` status and parses
+    /// `inString_`, which holds what the timed-out read delivered.
+    #[test]
+    fn a_status_cut_by_a_timeout_is_still_parsed() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let (command, _module) = crate::octet::tests::published_port(
+            "QE_NSLS_CUT_IP",
+            CutStatus(PortDriverBase::new(
+                "QE_NSLS_CUT_IP",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            )),
+        );
+        let mut drv = NslsEmDriver {
+            base: QuadEmBase::new("QE_NSLS_CUT", 0).unwrap(),
+            command: Some(command),
+            shared: QuadEmShared::new(16).0,
+            state: Arc::new(parking_lot::Mutex::new(NslsState {
+                scale_factor: 0.0,
+                ping_pong: PingPong::Both,
+            })),
+            ip_address: String::new(),
+            module_id: 0,
+            firmware_version: String::new(),
+            modules: Vec::new(),
+        };
+        drv.read_status_inner().unwrap();
+        assert_eq!(
+            (drv.ip_address.as_str(), drv.firmware_version.as_str()),
+            ("10.0.0.5", "1.2.3")
+        );
+        let p = drv.params();
+        assert_eq!(qe::int_param(&drv.base.port_base, p.range, 0), 2);
     }
 
     /// C++ keeps the port when no module answers: no link, no read thread,
