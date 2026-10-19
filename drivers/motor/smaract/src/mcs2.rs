@@ -211,9 +211,9 @@ impl Mcs2Controller {
         let count = self
             .query(":SYST:ERR:COUN?")
             .ok()
-            .map(|r| atof(&r) as i64)
+            .map(|r| atoi(&r))
             .unwrap_or(0);
-        for _ in 0..count.clamp(0, MAX_ERROR_DRAIN as i64) {
+        for _ in 0..count.clamp(0, MAX_ERROR_DRAIN as i32) {
             let Ok(reply) = self.query(":SYST:ERR?") else {
                 break;
             };
@@ -803,6 +803,24 @@ mod tests {
             .count();
         // Two errors drained before and two after the serial number query.
         assert_eq!(traced, 4, "{text}");
+    }
+
+    /// smarActMCS2MotorDriver.cpp:125 reads the error count with `atoi`.
+    #[test]
+    fn the_error_count_is_read_with_atoi() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("mcs2CountAtoi", |cmd| {
+            match cmd.trim_end() {
+                ":SYST:ERR:COUN?" => "1e1\r\n",
+                _ => "0\r\n",
+            }
+            .to_string()
+        });
+        Mcs2Controller::new(io, MotorTrace::new("mcs2CountAtoi", 0));
+        let sent = rig.sent();
+        let drained = sent.iter().filter(|c| c.trim_end() == ":SYST:ERR?");
+        // One entry in each of the constructor's two drains.
+        assert_eq!(drained.count(), 2, "{sent:?}");
     }
 
     /// C sets `motorStatusFollowingError_` from FOLLOWING_LIMIT_REACHED
