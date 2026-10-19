@@ -25,45 +25,29 @@ use yokogawa_gm10::instrument::{Registry, gm10_init};
 static DEVICES: &[(&str, &[DevSup])] = &[
     (
         "ai",
-        &[row("devGM10_ai", device_support::DTYP, 6, &[1, 2, 3, 4])],
+        &[row("devGM10_ai", device_support::DTYP, 6, &[2, 3, 4])],
     ),
-    (
-        "ao",
-        &[row("devGM10_ao", device_support::DTYP, 6, &[1, 2, 4])],
-    ),
+    ("ao", &[row("devGM10_ao", device_support::DTYP, 6, &[2, 4])]),
     (
         "bi",
-        &[row("devGM10_bi", device_support::DTYP, 5, &[1, 2, 3, 4])],
+        &[row("devGM10_bi", device_support::DTYP, 5, &[2, 3, 4])],
     ),
-    (
-        "bo",
-        &[row("devGM10_bo", device_support::DTYP, 5, &[1, 2, 4])],
-    ),
+    ("bo", &[row("devGM10_bo", device_support::DTYP, 5, &[2, 4])]),
     (
         "mbbi",
-        &[row("devGM10_mbbi", device_support::DTYP, 5, &[1, 2, 3, 4])],
+        &[row("devGM10_mbbi", device_support::DTYP, 5, &[2, 3, 4])],
     ),
     (
         "mbbo",
-        &[row("devGM10_mbbo", device_support::DTYP, 5, &[1, 2, 4])],
+        &[row("devGM10_mbbo", device_support::DTYP, 5, &[2, 4])],
     ),
     (
         "longin",
-        &[row(
-            "devGM10_longin",
-            device_support::DTYP,
-            5,
-            &[1, 2, 3, 4],
-        )],
+        &[row("devGM10_longin", device_support::DTYP, 5, &[2, 3, 4])],
     ),
     (
         "stringin",
-        &[row(
-            "devGM10_stringin",
-            device_support::DTYP,
-            6,
-            &[1, 2, 3, 4],
-        )],
+        &[row("devGM10_stringin", device_support::DTYP, 6, &[2, 3, 4])],
     ),
 ];
 

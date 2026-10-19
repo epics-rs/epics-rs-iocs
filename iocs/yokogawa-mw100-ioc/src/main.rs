@@ -27,36 +27,31 @@ use yokogawa_mw100::instrument::Registry;
 static DEVICES: &[(&str, &[DevSup])] = &[
     (
         "ai",
-        &[row("devMW100_ai", device_support::DTYP, 6, &[1, 2, 3, 4])],
+        &[row("devMW100_ai", device_support::DTYP, 6, &[2, 3, 4])],
     ),
     (
         "ao",
-        &[row("devMW100_ao", device_support::DTYP, 6, &[1, 2, 4])],
+        &[row("devMW100_ao", device_support::DTYP, 6, &[2, 4])],
     ),
     (
         "bi",
-        &[row("devMW100_bi", device_support::DTYP, 5, &[1, 2, 3, 4])],
+        &[row("devMW100_bi", device_support::DTYP, 5, &[2, 3, 4])],
     ),
     (
         "bo",
-        &[row("devMW100_bo", device_support::DTYP, 5, &[1, 2, 4])],
+        &[row("devMW100_bo", device_support::DTYP, 5, &[2, 4])],
     ),
     (
         "mbbi",
-        &[row("devMW100_mbbi", device_support::DTYP, 5, &[1, 2, 3, 4])],
+        &[row("devMW100_mbbi", device_support::DTYP, 5, &[2, 3, 4])],
     ),
     (
         "mbbo",
-        &[row("devMW100_mbbo", device_support::DTYP, 5, &[1, 2, 4])],
+        &[row("devMW100_mbbo", device_support::DTYP, 5, &[2, 4])],
     ),
     (
         "longin",
-        &[row(
-            "devMW100_longin",
-            device_support::DTYP,
-            5,
-            &[1, 2, 3, 4],
-        )],
+        &[row("devMW100_longin", device_support::DTYP, 5, &[2, 3, 4])],
     ),
     (
         "stringin",
@@ -64,7 +59,7 @@ static DEVICES: &[(&str, &[DevSup])] = &[
             "devMW100_stringin",
             device_support::DTYP,
             6,
-            &[1, 2, 3, 4],
+            &[2, 3, 4],
         )],
     ),
 ];
