@@ -41,9 +41,10 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::device_support::{BuildTrans, LimitBuild};
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::stdlib::strtod;
 
 use motor_common::model1::MoveStrings;
-use motor_common::util::{atof, nint};
+use motor_common::util::nint;
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
@@ -402,14 +403,11 @@ impl AsynMotor for Mdt695Axis {
     }
 }
 
-/// C parses the voltage from reply offset 2 (skips the 2-char prefix).
+/// The voltage `strtod` reads from reply offset 2; a reply it converts
+/// nothing of is a failed read (drvMDT695.cc:240-241).
 fn parse_reading(reply: &str) -> Option<f64> {
-    let trimmed = reply.get(2..)?.trim_start();
-    trimmed
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_digit() || c == '+' || c == '-' || c == '.')
-        .then(|| atof(trimmed))
+    let parsed = strtod(reply.as_bytes().get(2..)?);
+    (parsed.len != 0).then_some(parsed.value)
 }
 
 #[cfg(test)]
@@ -430,6 +428,15 @@ mod tests {
         assert_eq!(parse_reading("X 12.5"), Some(12.5));
         assert_eq!(parse_reading("XR?"), None);
         assert_eq!(parse_reading("X"), None);
+    }
+
+    /// drvMDT695.cc:240-241: `strtod` converts no bare sign or point.
+    #[test]
+    fn a_reading_strtod_converts_nothing_of_is_none() {
+        for reply in ["X +", "X -", "X .", "X -.e1"] {
+            assert_eq!(parse_reading(reply), None, "{reply:?}");
+        }
+        assert_eq!(parse_reading("X  -.5e1"), Some(-5.0));
     }
 
     use motor_common::testing::LineRig;
