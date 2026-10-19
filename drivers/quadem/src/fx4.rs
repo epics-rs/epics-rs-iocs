@@ -151,7 +151,7 @@ impl Fx4Link {
             return;
         }
         if self.out_tx.send(message).is_err() {
-            eprintln!("drvFX4: send failed: ");
+            epics_rs::base::stderr_println!("drvFX4: send failed: ");
         }
     }
 
@@ -382,7 +382,7 @@ fn socket_thread(ctx: SocketContext) {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("drvFX4: connection setup error: {e}");
+            epics_rs::base::stderr_println!("drvFX4: connection setup error: {e}");
             return;
         }
     };
@@ -431,7 +431,7 @@ async fn reconnect(uri: &str, link: &Fx4Link, shared: &QuadEmShared) -> Option<F
     let stream = attempt(uri, link, shared).await;
     if stream.is_none() {
         tokio::time::sleep_until(started + CONNECT_TIMEOUT).await;
-        eprintln!("drvFX4: reconnect timeout to {uri}");
+        epics_rs::base::stderr_println!("drvFX4: reconnect timeout to {uri}");
     }
     // A write that asked during this attempt is answered by it; its stored
     // permit must not start another.
@@ -456,7 +456,7 @@ async fn attempt(uri: &str, link: &Fx4Link, shared: &QuadEmShared) -> Option<Fx4
             Some(stream)
         }
         Ok(Err(reason)) => {
-            eprintln!("drvFX4: WebSocket error: {reason}");
+            epics_rs::base::stderr_println!("drvFX4: WebSocket error: {reason}");
             None
         }
         Err(_) => None,
@@ -498,31 +498,31 @@ where
                 // status, 1006 for a stream that ended without one.
                 Some(Ok(Message::Close(frame))) => {
                     match frame {
-                        Some(f) => eprintln!(
+                        Some(f) => epics_rs::base::stderr_println!(
                             "drvFX4: WebSocket closed code={} reason={}",
                             u16::from(f.code),
                             f.reason
                         ),
-                        None => eprintln!("drvFX4: WebSocket closed code=1005 reason=No status code"),
+                        None => epics_rs::base::stderr_println!("drvFX4: WebSocket closed code=1005 reason=No status code"),
                     }
                     return pass;
                 }
                 None => {
-                    eprintln!("drvFX4: WebSocket closed code=1006 reason=Abnormal closure");
+                    epics_rs::base::stderr_println!("drvFX4: WebSocket closed code=1006 reason=Abnormal closure");
                     return pass;
                 }
                 // Ping/Pong are answered by tungstenite; the FX4 sends no
                 // binary frames.
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {
-                    eprintln!("drvFX4: WebSocket error: {e}");
+                    epics_rs::base::stderr_println!("drvFX4: WebSocket error: {e}");
                     return pass;
                 }
             },
             outgoing = out_rx.recv() => match outgoing {
                 Some(message) => {
                     if sink.send(Message::Text(message.into())).await.is_err() {
-                        eprintln!("drvFX4: send failed: ");
+                        epics_rs::base::stderr_println!("drvFX4: send failed: ");
                         return pass;
                     }
                 }
@@ -561,7 +561,7 @@ fn data_thread(ctx: DataContext) {
             Ok(Some(message)) => message,
             Ok(None) => continue,
             Err(e) => {
-                eprintln!("drvFX4: JSON parse error: {e}");
+                epics_rs::base::stderr_println!("drvFX4: JSON parse error: {e}");
                 continue;
             }
         };
@@ -691,7 +691,7 @@ pub fn create_fx4(
         thread::sleep(CONNECT_POLL);
     }
     if !link.is_connected() {
-        eprintln!("drvFX4::drvFX4: timeout connecting to FX4 at {uri}");
+        epics_rs::base::stderr_println!("drvFX4::drvFX4: timeout connecting to FX4 at {uri}");
     }
 
     Ok(Fx4Runtime {
