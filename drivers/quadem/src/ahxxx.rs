@@ -177,8 +177,7 @@ impl AhxxxDriver {
     /// As in `drvTetrAMM`, the `goto error` path skips the `setAcquire(1)`
     /// restore, so a status read that fails leaves the meter stopped.
     ///
-    /// A failed exchange's reply is still parsed ([`trace::Reply::parse`]);
-    /// one that does not parse returns its own status. C discards each
+    /// A failed exchange returns its own status. C discards each
     /// `writeReadMeter` status (drvAHxxx.cpp:697-772) and reports the empty
     /// reply as asynError (:801), which `drvQuadEM::writeFloat64` ORs with the
     /// setter's asynDisconnected into status=7: a disconnected meter alarms
@@ -187,41 +186,36 @@ impl AhxxxDriver {
         let p = self.params();
         let bad = |what: &str, resp: &str| error(format!("AHxxx: bad {what} response: {resp}"));
 
-        let range = last
-            .query(&self.io, "RNG ?", proto::MAX_COMMAND_LEN)
-            .parse(proto::parse_range, |r| bad("RNG", r))?;
+        let resp = last.query(&self.io, "RNG ?", proto::MAX_COMMAND_LEN)?;
+        let range = proto::parse_range(&resp).ok_or_else(|| bad("RNG", &resp))?;
         self.base.port_base.set_int32_param(p.range, 0, range)?;
 
         let read_format =
             QeReadFormat::from_i32(qe::int_param(&self.base.port_base, p.read_format, 0));
         let mut sample_time;
         if self.is_ah401() {
-            let ping_pong = last
-                .query(&self.io, "HLF ?", proto::MAX_COMMAND_LEN)
-                .parse(proto::parse_hlf, |r| bad("HLF", r))?;
+            let resp = last.query(&self.io, "HLF ?", proto::MAX_COMMAND_LEN)?;
+            let ping_pong = proto::parse_hlf(&resp).ok_or_else(|| bad("HLF", &resp))?;
             self.base
                 .port_base
                 .set_int32_param(p.ping_pong, 0, ping_pong)?;
 
-            let integration_time = last
-                .query(&self.io, "ITM ?", proto::MAX_COMMAND_LEN)
-                .parse(proto::parse_itm, |r| bad("ITM", r))?;
+            let resp = last.query(&self.io, "ITM ?", proto::MAX_COMMAND_LEN)?;
+            let integration_time = proto::parse_itm(&resp).ok_or_else(|| bad("ITM", &resp))?;
             self.base
                 .port_base
                 .set_float64_param(p.integration_time, 0, integration_time)?;
             sample_time = proto::sample_time_ah401(ping_pong, integration_time);
         } else {
-            let num_channels = last
-                .query(&self.io, "CHN ?", proto::MAX_COMMAND_LEN)
-                .parse(proto::parse_chn, |r| bad("CHN", r))?;
+            let resp = last.query(&self.io, "CHN ?", proto::MAX_COMMAND_LEN)?;
+            let num_channels = proto::parse_chn(&resp).ok_or_else(|| bad("CHN", &resp))?;
             self.base
                 .port_base
                 .set_int32_param(p.num_channels, 0, num_channels)?;
             self.shared.acq.lock().num_channels = num_channels;
 
-            let resolution = last
-                .query(&self.io, "RES ?", proto::MAX_COMMAND_LEN)
-                .parse(proto::parse_res, |r| bad("RES", r))?;
+            let resp = last.query(&self.io, "RES ?", proto::MAX_COMMAND_LEN)?;
+            let resolution = proto::parse_res(&resp).ok_or_else(|| bad("RES", &resp))?;
             self.base
                 .port_base
                 .set_int32_param(p.resolution, 0, resolution)?;
@@ -231,10 +225,8 @@ impl AhxxxDriver {
         }
 
         if proto::reads_bias_status(self.model) {
-            match last
-                .query(&self.io, "HVS ?", proto::MAX_COMMAND_LEN)
-                .parse(proto::parse_hvs, |r| bad("HVS", r))?
-            {
+            let resp = last.query(&self.io, "HVS ?", proto::MAX_COMMAND_LEN)?;
+            match proto::parse_hvs(&resp).ok_or_else(|| bad("HVS", &resp))? {
                 None => self.base.port_base.set_int32_param(p.bias_state, 0, 0)?,
                 Some(volts) => {
                     self.base.port_base.set_int32_param(p.bias_state, 0, 1)?;

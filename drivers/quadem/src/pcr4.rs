@@ -226,8 +226,7 @@ impl Pcr4Driver {
     /// `setAcquire(1)` restore, so a status read that fails leaves the meter
     /// stopped.
     ///
-    /// A failed exchange's reply is still parsed ([`trace::Reply::parse`]);
-    /// one that does not parse returns its own status. C discards each
+    /// A failed exchange returns its own status. C discards each
     /// `writeReadMeter` status (drvPCR4.cpp:641-663) and reports the empty
     /// reply as asynError (:689), so a disconnected meter alarms WRITE there
     /// and COMM here. C defect, not copied.
@@ -235,22 +234,21 @@ impl Pcr4Driver {
         let p = self.params();
         let bad = |what: &str, resp: &str| error(format!("PCR4: bad {what} response: {resp}"));
 
-        let range = last
-            .query(&self.io, proto::CMD_RANGE_QUERY, proto::MAX_COMMAND_LEN)
-            .parse(proto::parse_range, |r| bad("RANGE:?", r))?;
+        let resp = last.query(&self.io, proto::CMD_RANGE_QUERY, proto::MAX_COMMAND_LEN)?;
+        let range = proto::parse_range(&resp).ok_or_else(|| bad("RANGE:?", &resp))?;
         self.base.port_base.set_int32_param(p.range, 0, range)?;
 
-        let num_channels = last
-            .query(&self.io, proto::CMD_CHANNELS_QUERY, proto::MAX_COMMAND_LEN)
-            .parse(proto::parse_num_channels, |r| bad("CHANNELS:?", r))?;
+        let resp = last.query(&self.io, proto::CMD_CHANNELS_QUERY, proto::MAX_COMMAND_LEN)?;
+        let num_channels =
+            proto::parse_num_channels(&resp).ok_or_else(|| bad("CHANNELS:?", &resp))?;
         self.base
             .port_base
             .set_int32_param(p.num_channels, 0, num_channels)?;
         self.shared.acq.lock().num_channels = num_channels;
 
-        let values_per_read = last
-            .query(&self.io, proto::CMD_SPR_QUERY, proto::MAX_COMMAND_LEN)
-            .parse(proto::parse_values_per_read, |r| bad("SPR:?", r))?;
+        let resp = last.query(&self.io, proto::CMD_SPR_QUERY, proto::MAX_COMMAND_LEN)?;
+        let values_per_read =
+            proto::parse_values_per_read(&resp).ok_or_else(|| bad("SPR:?", &resp))?;
         self.base
             .port_base
             .set_int32_param(p.values_per_read, 0, values_per_read)?;
@@ -261,10 +259,8 @@ impl Pcr4Driver {
             .port_base
             .set_float64_param(p.sample_time, 0, sample_time)?;
 
-        match last
-            .query(&self.io, proto::CMD_BIAS_QUERY, proto::MAX_COMMAND_LEN)
-            .parse(proto::parse_bias_status, |r| bad("BIASSTATUS:?", r))?
-        {
+        let resp = last.query(&self.io, proto::CMD_BIAS_QUERY, proto::MAX_COMMAND_LEN)?;
+        match proto::parse_bias_status(&resp).ok_or_else(|| bad("BIASSTATUS:?", &resp))? {
             None => self.base.port_base.set_int32_param(p.hvs_readback, 0, 0)?,
             Some(volts) => {
                 self.base.port_base.set_int32_param(p.hvs_readback, 0, 1)?;

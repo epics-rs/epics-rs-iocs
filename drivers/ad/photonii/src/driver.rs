@@ -455,84 +455,6 @@ mod tests {
         assert_eq!(sync.read_int32(p.num_images).unwrap(), 3);
     }
 
-    /// A p2util that answers every command with `reply`, on a read that then
-    /// times out.
-    struct CutReply {
-        base: PortDriverBase,
-        reply: &'static [u8],
-    }
-
-    impl PortDriver for CutReply {
-        fn base(&self) -> &PortDriverBase {
-            &self.base
-        }
-        fn base_mut(&mut self) -> &mut PortDriverBase {
-            &mut self.base
-        }
-        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-            Ok(data.len())
-        }
-        fn io_read_octet(
-            &mut self,
-            _user: &AsynUser,
-            buf: &mut [u8],
-        ) -> epics_rs::asyn::interpose::OctetReadResult {
-            let n = self.reply.len().min(buf.len());
-            buf[..n].copy_from_slice(&self.reply[..n]);
-            epics_rs::asyn::interpose::OctetReadResult {
-                status: Err(epics_rs::asyn::error::AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "reply cut by a timeout".into(),
-                }),
-                ..epics_rs::asyn::interpose::OctetReadResult::ok(
-                    n,
-                    epics_rs::asyn::interpose::EomReason::empty(),
-                )
-            }
-        }
-    }
-
-    /// writePhotonII posts `fromPhotonII_` whatever the read's status
-    /// (PhotonII.cpp:226-237), so a reply a timeout cut still reaches
-    /// StringFromServer.
-    #[test]
-    fn a_reply_cut_by_a_timeout_reaches_string_from_server() {
-        let ip = "PII_CUT_IP";
-        let mut base = PortDriverBase::new(
-            ip,
-            1,
-            Default::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
-        base.init_connected(true);
-        let fake = CutReply {
-            base,
-            reply: b"set ok",
-        };
-        let (runtime, _) =
-            create_port_runtime(&claim_port(ip).unwrap(), fake, RuntimeConfig::default()).unwrap();
-        let p2 = P2Util::new(SyncIOHandle::from_handle(
-            runtime.port_handle().clone(),
-            0,
-            Duration::ZERO,
-        ));
-        std::mem::forget(runtime);
-        let shared = Arc::new(SharedState {
-            stop_requested: AtomicBool::new(false),
-        });
-        let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
-        let mut det = PhotonIIDetector::new("PII_CUT", p2, 0, shared, tx).unwrap();
-        det.command("set --subframes-per-frame 2").unwrap();
-        assert_eq!(
-            det.ad
-                .port_base
-                .get_string_param(det.ad.params.string_from_server, 0)
-                .unwrap(),
-            b"set ok"
-        );
-    }
-
     /// PhotonII.cpp:412 publishes every frame type but Dark, so an ADC0 frame
     /// reaches the plugins.
     #[test]
@@ -613,6 +535,84 @@ mod tests {
             "no ADC0 frame reached the plugins"
         );
         std::mem::forget((ip_rt, rt));
+    }
+
+    /// A p2util that answers every command with `reply`, on a read that then
+    /// times out.
+    struct CutReply {
+        base: PortDriverBase,
+        reply: &'static [u8],
+    }
+
+    impl PortDriver for CutReply {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            let n = self.reply.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.reply[..n]);
+            epics_rs::asyn::interpose::OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "reply cut by a timeout".into(),
+                }),
+                ..epics_rs::asyn::interpose::OctetReadResult::ok(
+                    n,
+                    epics_rs::asyn::interpose::EomReason::empty(),
+                )
+            }
+        }
+    }
+
+    /// writePhotonII posts `fromPhotonII_` whatever the read's status
+    /// (PhotonII.cpp:226-237), so a reply a timeout cut still reaches
+    /// StringFromServer.
+    #[test]
+    fn a_reply_cut_by_a_timeout_reaches_string_from_server() {
+        let ip = "PII_CUT_IP";
+        let mut base = PortDriverBase::new(
+            ip,
+            1,
+            Default::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.init_connected(true);
+        let fake = CutReply {
+            base,
+            reply: b"set ok",
+        };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(ip).unwrap(), fake, RuntimeConfig::default()).unwrap();
+        let p2 = P2Util::new(SyncIOHandle::from_handle(
+            runtime.port_handle().clone(),
+            0,
+            Duration::ZERO,
+        ));
+        std::mem::forget(runtime);
+        let shared = Arc::new(SharedState {
+            stop_requested: AtomicBool::new(false),
+        });
+        let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
+        let mut det = PhotonIIDetector::new("PII_CUT", p2, 0, shared, tx).unwrap();
+        det.command("set --subframes-per-frame 2").unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_string_param(det.ad.params.string_from_server, 0)
+                .unwrap(),
+            b"set ok"
+        );
     }
 
     /// PhotonII.cpp:117: MaxSize is the sensor, 768 x 1024.

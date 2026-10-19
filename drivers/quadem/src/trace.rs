@@ -113,42 +113,16 @@ pub struct StatusExchange {
 }
 
 impl StatusExchange {
-    /// One query. The command is recorded, and the reply as C's `inString_`
-    /// holds it: the bytes the read delivered whatever its status, since the
-    /// EOS layer NUL-terminates the buffer on every read
-    /// (asynInterposeEos.c:251), failed ones included.
-    pub fn query(&mut self, io: &OctetIo, out: &str, buf_size: usize) -> Reply {
+    /// One query: the command is recorded, and the reply when there is one;
+    /// a failed read leaves C's buffer, and this, holding the previous reply.
+    pub fn query(&mut self, io: &OctetIo, out: &str, buf_size: usize) -> AsynResult<String> {
         self.out.clear();
         self.out.push_str(out);
         let (raw, status) = io.write_read(out, buf_size).into_parts();
-        self.inp = reply_text(&raw);
-        Reply {
-            text: self.inp.clone(),
-            status,
-        }
-    }
-}
-
-/// A [`StatusExchange::query`] reply beside the exchange's status.
-pub struct Reply {
-    text: String,
-    status: AsynResult<()>,
-}
-
-impl Reply {
-    /// C parses `inString_` whatever `writeReadMeter` returned. A reply that
-    /// does not parse fails with the exchange's own status when it failed,
-    /// else with `bad`.
-    pub fn parse<T>(
-        self,
-        parse: impl FnOnce(&str) -> Option<T>,
-        bad: impl FnOnce(&str) -> AsynError,
-    ) -> AsynResult<T> {
-        match (parse(&self.text), self.status) {
-            (Some(value), _) => Ok(value),
-            (None, Err(e)) => Err(e),
-            (None, Ok(())) => Err(bad(&self.text)),
-        }
+        status?;
+        let resp = reply_text(&raw);
+        self.inp.clone_from(&resp);
+        Ok(resp)
     }
 }
 
@@ -156,72 +130,16 @@ impl Reply {
 mod tests {
     use std::sync::Arc;
 
-    use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
     use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortFlags};
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::create_port_runtime;
     use epics_rs::asyn::trace::TraceFile;
-    use epics_rs::asyn::user::AsynUser;
     use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
     use super::*;
-    use crate::octet::tests::published_port;
 
     struct Meter(PortDriverBase);
-
-    /// A meter whose every reply is cut by a timeout after `RNG 3`.
-    struct CutReply(PortDriverBase);
-
-    impl PortDriver for CutReply {
-        fn base(&self) -> &PortDriverBase {
-            &self.0
-        }
-        fn base_mut(&mut self) -> &mut PortDriverBase {
-            &mut self.0
-        }
-        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-            Ok(data.len())
-        }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
-            buf[..5].copy_from_slice(b"RNG 3");
-            OctetReadResult {
-                status: Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "read timeout".into(),
-                }),
-                ..OctetReadResult::ok(5, EomReason::empty())
-            }
-        }
-    }
-
-    /// drvAHxxx.cpp:697-700 discards `writeReadMeter`'s status and parses
-    /// `inString_`, which holds the bytes the timed-out read delivered.
-    #[test]
-    fn a_reply_cut_by_a_timeout_is_still_parsed() {
-        let (io, _runtime) = published_port(
-            "QE_CUT_REPLY",
-            CutReply(PortDriverBase::new(
-                "QE_CUT_REPLY",
-                1,
-                PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
-            )),
-        );
-        let mut last = StatusExchange::default();
-        let range = |r: &str| r.strip_prefix("RNG ")?.parse::<i32>().ok();
-        let bad = |_: &str| unreachable!("the timeout is the failure");
-
-        assert_eq!(last.query(&io, "RNG ?", 64).parse(range, bad).unwrap(), 3);
-        assert_eq!((last.out.as_str(), last.inp.as_str()), ("RNG ?", "RNG 3"));
-
-        // Unparseable, the exchange fails with its own status.
-        let err = last
-            .query(&io, "CHN ?", 64)
-            .parse(|r| r.strip_prefix("CHN ").map(drop), bad);
-        assert_eq!(err.unwrap_err().status(), AsynStatus::Timeout);
-    }
 
     impl PortDriver for Meter {
         fn base(&self) -> &PortDriverBase {
