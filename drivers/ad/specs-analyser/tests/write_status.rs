@@ -8,7 +8,8 @@ use std::sync::mpsc;
 
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::AsynStatus;
-use epics_rs::asyn::interrupt::InterruptFilter;
+use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::interrupt::{ENUM_ENTRY_BYTES, InterruptFilter};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::asyn::registry::{claim_port, open_owner};
@@ -258,6 +259,41 @@ fn connect_returns_the_or_of_the_step_statuses() {
     ]);
     let connect = fake.runtime.specs_params.connect;
     assert_eq!(fake.write_int32(connect, 1), Err(AsynStatus::Error));
+}
+
+/// readSpectrumParameter publishes each table on asynEnum
+/// (specsAnalyser.cpp:1724-1735), so the mbbo states follow a reconnect.
+#[test]
+fn a_connect_posts_the_spectrum_tables_on_asyn_enum() {
+    let fake = Fake::start_refusing("SPECS_WS_ENUMPOST", 3, &["Connect"]);
+    let p = &fake.runtime.specs_params;
+    let subscribe = |reason| {
+        fake.runtime
+            .port_handle()
+            .interrupts()
+            .subscribe_async_filtered(
+                InterruptFilter {
+                    reason: Some(reason),
+                    iface: Some(InterfaceType::Enum),
+                    ..Default::default()
+                },
+                16,
+                16 * ENUM_ENTRY_BYTES,
+            )
+            .unwrap()
+    };
+    let (mut lens, mut range) = (subscribe(p.lens_mode), subscribe(p.scan_range));
+    fake.answer(&[]);
+    fake.write_int32(p.connect, 1).unwrap();
+    for posts in [&mut lens, &mut range] {
+        let mut tables = Vec::new();
+        while let Ok(v) = posts.try_recv() {
+            if let ParamValue::Enum { choices, .. } = v.value {
+                tables.push(choices.iter().map(|e| e.string.clone()).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(tables, [["a", "b"]]);
+    }
 }
 
 /// connect() records the connection and asynPortConnect the server's
