@@ -199,9 +199,10 @@ impl MultiFunctionDriver {
         let mut base = PortDriverBase::new(
             port_name,
             MAX_SIGNALS,
+            // ASYN_MULTIDEVICE | ASYN_CANBLOCK (drvMultiFunction.cpp:821).
             PortFlags {
                 multi_device: true,
-                can_block: false,
+                can_block: true,
                 destructible: true,
             },
             InterfaceMask::UNMIGRATED_ALL,
@@ -1199,6 +1200,13 @@ mod tests {
         // uldaq refuses every call on the null handle, so only a write that
         // reaches ulAISetConfigDbl fails.
         assert!(drv.write_int32(&mut user, 60).is_err());
+    }
+
+    #[test]
+    fn the_port_can_block_as_cs_does() {
+        let drv = MultiFunctionDriver::new("MFFLAGS", DaqDevice::unconnected(), 16, 16).unwrap();
+        assert!(drv.base.flags.multi_device);
+        assert!(drv.base.flags.can_block);
     }
 
     #[test]
