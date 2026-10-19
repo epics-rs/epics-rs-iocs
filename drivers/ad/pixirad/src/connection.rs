@@ -2,24 +2,18 @@
 //!
 //! # Ownership
 //!
-//! Two threads send commands: the port actor (every parameter write) and the
-//! status task (which switches the cooling off when the box gets too warm or
-//! too damp). The socket therefore sits behind its own mutex.
-//!
-//! **Invariant: no caller may touch the detector port's parameter library while
-//! holding the command lock.** The actor takes the lock inside `write_int32`,
-//! so a task that held the lock and then waited on the actor would deadlock.
-//! The status task reads every parameter it needs *before* it sends anything.
+//! The driver owns the one [`PixiradServer`] and [`PixiradServer::command`]
+//! takes it by `&mut`, so every command — the status task's cooling-off
+//! included — runs on the port actor through the driver's exchange, which
+//! publishes it as C does.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use parking_lot::Mutex;
 
 use crate::types::{MAX_MESSAGE_SIZE, SERVER_TIMEOUT};
 
@@ -28,7 +22,7 @@ pub enum ServerError {
     Timeout,
     Transport(AsynError),
     /// The box answered, but not with `GOT:` (C's "Error from server").
-    Rejected(String),
+    Rejected(Vec<u8>),
 }
 
 impl std::fmt::Display for ServerError {
@@ -36,7 +30,9 @@ impl std::fmt::Display for ServerError {
         match self {
             Self::Timeout => write!(f, "timeout"),
             Self::Transport(e) => write!(f, "{e}"),
-            Self::Rejected(reply) => write!(f, "the box answered '{reply}'"),
+            Self::Rejected(reply) => {
+                write!(f, "the box answered '{}'", String::from_utf8_lossy(reply))
+            }
         }
     }
 }
@@ -53,19 +49,20 @@ impl From<AsynError> for ServerError {
     }
 }
 
+/// C `writeReadServer` returns a bare status: the message stays on
+/// `pasynUserCommand_` and never reaches the record's user, whose devAsyn
+/// error line is therefore empty.
 impl From<ServerError> for AsynError {
     fn from(e: ServerError) -> Self {
-        match e {
-            ServerError::Timeout => AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "timeout".into(),
-            },
-            ServerError::Transport(e) => e,
+        let status = match e {
+            ServerError::Timeout => AsynStatus::Timeout,
+            ServerError::Transport(e) => e.status(),
             // C's `status = asynError` on a reply without `GOT:`.
-            e @ ServerError::Rejected(_) => AsynError::Status {
-                status: AsynStatus::Error,
-                message: e.to_string(),
-            },
+            ServerError::Rejected(_) => AsynStatus::Error,
+        };
+        AsynError::Status {
+            status,
+            message: String::new(),
         }
     }
 }
@@ -74,33 +71,46 @@ pub type ServerResult<T> = Result<T, ServerError>;
 
 /// What one exchange with the box produced.
 pub struct Exchange {
-    pub reply: String,
+    /// `fromServer_` as a C string.
+    pub reply: Vec<u8>,
     pub result: ServerResult<()>,
 }
 
+struct Channel {
+    handle: SyncIOHandle,
+    /// C `fromServer_`: the buffer the reply is read into, shared by every
+    /// command, kept as the C string it holds.
+    from_server: Vec<u8>,
+}
+
 /// The Pixirad command socket.
-#[derive(Clone)]
 pub struct PixiradServer {
-    handle: Arc<Mutex<SyncIOHandle>>,
+    channel: Channel,
 }
 
 impl PixiradServer {
     pub fn new(handle: SyncIOHandle) -> Self {
         Self {
-            handle: Arc::new(Mutex::new(handle)),
+            channel: Channel {
+                handle,
+                from_server: Vec::new(),
+            },
         }
     }
 
     /// Send a command and read the reply (C `writeReadServer`, including its
     /// `GOT:` check).
-    pub fn command(&self, command: &str) -> Exchange {
+    pub fn command(&mut self, command: &str) -> Exchange {
         let user = AsynUser::new(0).with_addr(0).with_timeout(SERVER_TIMEOUT);
         let op = RequestOp::OctetWriteRead {
             data: command.as_bytes().to_vec(),
             buf_size: MAX_MESSAGE_SIZE,
             flush: true,
         };
-        let handle = self.handle.lock();
+        let Channel {
+            handle,
+            from_server,
+        } = &mut self.channel;
         let outcome = handle
             .port()
             .and_then(|port| port.submit_blocking(op, user));
@@ -112,32 +122,40 @@ impl PixiradServer {
 
         match outcome {
             Err(e) => {
-                let status = e.status();
-                // A timeout is the read side giving up after the write went out.
-                let wrote = if status == AsynStatus::Timeout {
-                    command.len()
+                // asynOctetSyncIO writeRead leaves the buffer alone unless it
+                // got as far as the read, which follows a whole write and
+                // (EOS interpose) stores what arrived, terminated
+                // (asynInterposeEos.c:250).
+                let (wrote, read) = if e.octet_step() == Some(OctetStep::Read) {
+                    let partial = e.partial_read().map(|p| p.data.as_slice());
+                    let partial = partial.unwrap_or_default();
+                    *from_server = crate::protocol::c_string(partial).to_vec();
+                    (command.len(), partial.len())
                 } else {
-                    0
+                    (0, 0)
                 };
                 trace_error(&format!(
                     "pixirad:writeReadServer, timeout={:.6}, status={} wrote {wrote} bytes, \
-                     received 0 bytes\n\n",
+                     received {read} bytes\n{}\n",
                     SERVER_TIMEOUT.as_secs_f64(),
-                    status as i32
+                    e.status() as i32,
+                    String::from_utf8_lossy(from_server)
                 ));
                 Exchange {
-                    reply: String::new(),
+                    reply: from_server.clone(),
                     result: Err(e.into()),
                 }
             }
             Ok(result) => {
                 let bytes = result.data.unwrap_or_default();
-                let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                let reply = crate::protocol::c_string(&bytes).to_vec();
+                from_server.clone_from(&reply);
                 let result = if crate::protocol::reply_is_ok(command, &reply) {
                     Ok(())
                 } else {
                     trace_error(&format!(
-                        "pixirad:writeReadServer unexpected response from server = {reply}\n"
+                        "pixirad:writeReadServer unexpected response from server = {}\n",
+                        String::from_utf8_lossy(&reply)
                     ));
                     Err(ServerError::Rejected(reply.clone()))
                 };
@@ -151,15 +169,15 @@ impl PixiradServer {
     /// than waiting for the auto-reconnect).
     pub fn reconnect_after(&self, delay: Duration) {
         let user = || AsynUser::new(0).with_addr(0).with_timeout(SERVER_TIMEOUT);
-        {
-            let handle = self.handle.lock();
-            let _ = handle
-                .port()
-                .and_then(|port| port.submit_blocking(RequestOp::Disconnect, user()));
-        }
+        let _ = self
+            .channel
+            .handle
+            .port()
+            .and_then(|port| port.submit_blocking(RequestOp::Disconnect, user()));
         std::thread::sleep(delay);
-        let handle = self.handle.lock();
-        let _ = handle
+        let _ = self
+            .channel
+            .handle
             .port()
             .and_then(|port| port.submit_blocking(RequestOp::Connect, user()));
     }
@@ -194,5 +212,145 @@ mod is_timeout_tests {
             message: "boom".into(),
         };
         assert!(matches!(ServerError::from(e), ServerError::Transport(_)));
+    }
+}
+
+#[cfg(test)]
+mod from_server_tests {
+    use super::*;
+    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+    use epics_rs::asyn::port::InterfaceMask;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::create_port_runtime;
+
+    /// Exchange 1 answers, 2 fails its write, 3 times out after part of a
+    /// reply, 4 times out with nothing. Each text ends in a blank and runs on
+    /// past a NUL.
+    struct Scripted {
+        base: PortDriverBase,
+        exchange: usize,
+    }
+
+    fn timeout() -> AsynError {
+        AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }
+    }
+
+    impl PortDriver for Scripted {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.exchange += 1;
+            if self.exchange == 2 {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "write failed".into(),
+                });
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, EomReason)> {
+            match self.exchange {
+                1 => {
+                    let reply = b"GOT: OK \0x";
+                    buf[..reply.len()].copy_from_slice(reply);
+                    Ok((reply.len(), EomReason::EOS))
+                }
+                3 => Err(timeout().with_partial_read(PartialOctetRead {
+                    data: b"GO \0x".to_vec(),
+                    eom_reason: EomReason::empty(),
+                })),
+                _ => Err(timeout()),
+            }
+        }
+    }
+
+    /// C `writeReadServer` publishes `fromServer_` whatever the status, as the
+    /// C string it holds, and asynOctetSyncIO writes it only once the read
+    /// starts.
+    #[test]
+    fn a_failed_exchange_replies_with_what_c_left_in_from_server() {
+        let name = "PIXI_FROM_SERVER";
+        let driver = Scripted {
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
+            exchange: 0,
+        };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let mut server = PixiradServer::new(SyncIOHandle::from_handle(
+            runtime.port_handle().clone(),
+            0,
+            Duration::ZERO,
+        ));
+        let replies: Vec<Vec<u8>> = (0..4).map(|_| server.command("DAQ:! X").reply).collect();
+        assert_eq!(replies, [&b"GOT: OK "[..], b"GOT: OK ", b"GO ", b""]);
+    }
+
+    /// C's failure line prints what each step moved and `fromServer_`
+    /// (pixirad.cpp:906-910).
+    #[test]
+    fn a_failed_exchange_traces_nread_and_from_server() {
+        use epics_rs::asyn::trace::TraceFile;
+        let name = "PIXI_TRACE_FAIL";
+        let driver = Scripted {
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
+            exchange: 0,
+        };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        handle.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        let mut server = PixiradServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO));
+        for _ in 0..4 {
+            server.command("DAQ:! X");
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let line = |status: AsynStatus, wrote: usize, read: usize, from: &str| {
+            format!(
+                "pixirad:writeReadServer, timeout=1.000000, status={} wrote {wrote} bytes, \
+                 received {read} bytes\n{from}\n",
+                status as i32
+            )
+        };
+        for expected in [
+            line(AsynStatus::Error, 0, 0, "GOT: OK "),
+            line(AsynStatus::Timeout, 7, 5, "GO "),
+            line(AsynStatus::Timeout, 7, 0, ""),
+        ] {
+            assert!(text.contains(&expected), "{expected:?} not in {text:?}");
+        }
     }
 }
