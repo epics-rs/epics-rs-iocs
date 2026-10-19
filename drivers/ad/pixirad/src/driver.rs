@@ -123,7 +123,6 @@ impl PixiradDetector {
         base.set_float64_param(params.threshold[1], 0, 15.0)?;
         base.set_float64_param(params.threshold[2], 0, 20.0)?;
         base.set_float64_param(params.threshold[3], 0, 25.0)?;
-        base.set_float64_param(params.hit_threshold, 0, 0.0)?;
         base.set_int32_param(params.sync_in_polarity, 0, SyncPolarity::Pos as i32)?;
         base.set_int32_param(params.sync_out_polarity, 0, SyncPolarity::Pos as i32)?;
         base.set_int32_param(params.sync_out_function, 0, SyncOutFunction::Shutter as i32)?;
@@ -735,6 +734,19 @@ mod tests {
                 .get_string_param(det.ad.params.base.driver_version, 0)
                 .unwrap(),
             b"2.2.0"
+        );
+    }
+
+    /// C never sets PixiradHitThresh (pixirad.cpp:510-544), so the PINI ao
+    /// keeps its database VAL instead of reading a driver default back.
+    #[test]
+    fn the_hit_threshold_starts_undefined() {
+        let det = detector("PIXI_HIT_UNSET", None);
+        assert!(
+            det.ad
+                .port_base
+                .get_float64_param(det.params.hit_threshold, 0)
+                .is_err()
         );
     }
 
