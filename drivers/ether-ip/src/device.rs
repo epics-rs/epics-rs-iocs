@@ -15,7 +15,7 @@ use std::sync::Arc;
 use epics_rs::base::error::{CaError, CaResult, LinkRefusal};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
-use epics_rs::base::server::database::{AsyncDbHandle, DeviceDoneSource};
+use epics_rs::base::server::database::{AsyncDbHandle, DeviceDoneSource, ProcessCallback};
 use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, IoIntrAction,
     WriteStart,
@@ -396,6 +396,8 @@ pub struct EtherIpDevice {
     alarm: Option<(u16, u16)>,
     /// For the `scanOnce` an output's PLC callback ends with.
     db: Option<AsyncDbHandle>,
+    /// C's `rset->process` from an output's PLC callback that finds no data.
+    process: Option<ProcessCallback>,
 }
 
 impl EtherIpDevice {
@@ -412,6 +414,7 @@ impl EtherIpDevice {
             io_intr_rx: None,
             alarm: None,
             db: None,
+            process: None,
         }
     }
 
@@ -576,6 +579,7 @@ impl DeviceSupport for EtherIpDevice {
     }
 
     fn bind_database(&mut self, db: AsyncDbHandle) {
+        self.process = Some(db.process_callback(&self.name));
         self.db = Some(db);
     }
 
@@ -643,8 +647,23 @@ impl DeviceSupport for EtherIpDevice {
         if !self.is_output {
             return IoIntrAction::Process;
         }
-        if let (true, Some(db)) = (self.check_callback(record, common), &self.db) {
-            db.scan_once(&self.name);
+        match self.check_callback(record, common) {
+            Callback::ScanOnce => {
+                if let Some(db) = &self.db {
+                    db.scan_once(&self.name);
+                }
+            }
+            // C calls `rset->process` under the record's lock, past every
+            // dbProcess gate (devEtherIP.c:347-354). This pulse holds the
+            // lock, so the record's ProcessCallback runs it on the record's
+            // band as an async completion re-enters: past the PACT and TPRO
+            // gates, not the DISA one.
+            Callback::Process => {
+                if let Some(process) = &self.process {
+                    let _ = process.request(common.callback_priority());
+                }
+            }
+            Callback::Leave => {}
         }
         IoIntrAction::Skip
     }
@@ -885,10 +904,20 @@ enum Follow {
     Kept,
 }
 
+/// What an output's PLC callback does with its record.
+#[derive(Debug, PartialEq, Eq)]
+enum Callback {
+    Leave,
+    /// `scanOnce`: the record takes the PLC's value, or FORCE writes its own.
+    ScanOnce,
+    /// `rset->process`: no data, for the write's WRITE_ALARM.
+    Process,
+}
+
 impl EtherIpDevice {
     /// An output's `check_*_callback` up to its `scanOnce`: follow the PLC,
-    /// and say whether the record processes.
-    fn check_callback(&self, record: &mut dyn Record, common: &mut CommonFields) -> bool {
+    /// and say how the record processes.
+    fn check_callback(&self, record: &mut dyn Record, common: &mut CommonFields) -> Callback {
         // C's `if (rec->pact)` pass: a write in flight ends on the driver's
         // transfer callback.
         if self
@@ -896,20 +925,23 @@ impl EtherIpDevice {
             .as_ref()
             .is_some_and(|l| l.write_done.lock().is_some())
         {
-            return false;
+            return Callback::Leave;
         }
         let refresh = common.udf != 0 || common.sevr == AlarmSeverity::Invalid;
-        let periodic = common.scan.to_u16() >= SCAN_1ST_PERIODIC;
+        let once = if common.scan.to_u16() >= SCAN_1ST_PERIODIC {
+            Callback::Leave
+        } else {
+            Callback::ScanOnce
+        };
         match self.follow_plc(record, refresh, common.udf == 0) {
-            // C calls `rset->process` whatever the SCAN, for the write's
-            // WRITE_ALARM.
-            Ok(Follow::NoData) => true,
+            // Whatever the SCAN.
+            Ok(Follow::NoData) => Callback::Process,
             Ok(Follow::Copied) => {
                 common.udf = 0;
-                !periodic
+                once
             }
-            Ok(Follow::Kept) => !periodic,
-            Ok(Follow::GetFailed | Follow::Same) | Err(_) => false,
+            Ok(Follow::Kept) => once,
+            Ok(Follow::GetFailed | Follow::Same) | Err(_) => Callback::Leave,
         }
     }
 
@@ -1368,11 +1400,17 @@ mod tests {
     #[test]
     fn an_output_processes_only_on_a_new_plc_value() {
         let (dev, mut record, mut common, tag) = bo_on_bit_300("cbsame");
-        assert!(!dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::Leave
+        );
         let mut words = [0; 10];
         words[9] = 1 << 12;
         set_words(&tag, &words);
-        assert!(dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::ScanOnce
+        );
         assert_eq!(rval(&record), 1);
     }
 
@@ -1381,10 +1419,16 @@ mod tests {
     fn an_undefined_or_invalid_output_takes_an_unchanged_value() {
         let (dev, mut record, mut common, _tag) = bo_on_bit_300("cbudf");
         common.udf = 1;
-        assert!(dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::ScanOnce
+        );
         assert_eq!(common.udf, 0);
         common.sevr = AlarmSeverity::Invalid;
-        assert!(dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::ScanOnce
+        );
     }
 
     /// C copies the value but leaves a periodic record to its own scan.
@@ -1395,7 +1439,10 @@ mod tests {
         let mut words = [0; 10];
         words[9] = 1 << 12;
         set_words(&tag, &words);
-        assert!(!dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::Leave
+        );
         assert_eq!(rval(&record), 1);
     }
 
@@ -1406,10 +1453,16 @@ mod tests {
         let (dev, mut record, mut common, tag) = bo_on_bit_300("cbnodata");
         common.scan = ScanType::from_u16(SCAN_1ST_PERIODIC);
         tag.data.lock().valid_data_size = 0;
-        assert!(dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::Process
+        );
         // The BOOL typecode with no word behind it.
         set_words(&tag, &[]);
-        assert!(!dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::Leave
+        );
     }
 
     /// A database whose records bind EtherIP at creation, as iocInit binds
@@ -1556,7 +1609,10 @@ mod tests {
             let mut dev = EtherIpDevice::new(&format!("@aopval {tag} S 1"), true);
             dev.init(&mut record).unwrap();
             set_tag(dev.tag.as_ref().unwrap(), ty, &bytes);
-            assert!(dev.check_callback(&mut record, &mut CommonFields::default()));
+            assert_eq!(
+                dev.check_callback(&mut record, &mut CommonFields::default()),
+                Callback::ScanOnce
+            );
             let want = if tag == "R" { 3.25 } else { 42.0 };
             assert_eq!(f64_field(&record, "VAL"), want, "{tag}");
             assert_eq!(f64_field(&record, "PVAL"), want, "{tag}");
@@ -1579,7 +1635,10 @@ mod tests {
         set_tag(&tag, CipType::Dint, &7i32.to_le_bytes());
 
         let mut common = CommonFields::default();
-        assert!(dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::ScanOnce
+        );
         assert_eq!(common.udf, 1);
         assert_eq!(record.get_field("RVAL"), Some(EpicsValue::Long(0)));
         assert_eq!(record.get_field("VAL"), Some(EpicsValue::Double(0.0)));
@@ -1660,14 +1719,20 @@ mod tests {
         set_string_tag(&tag, &long);
 
         let mut common = CommonFields::default();
-        assert!(dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::ScanOnce
+        );
         assert_eq!(
             record.get_field("VAL"),
             Some(EpicsValue::String(long[..MAX_STRING_SIZE - 1].into()))
         );
         dev.write(&mut record).unwrap();
         assert!(!tag.data.lock().do_write);
-        assert!(!dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::Leave
+        );
     }
 
     /// check_lso_callback copies the PLC's string whole up to SIZV, and
@@ -1685,11 +1750,17 @@ mod tests {
         set_string_tag(&tag, &long);
 
         let mut common = CommonFields::default();
-        assert!(dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::ScanOnce
+        );
         assert_eq!(string_val(&record), long);
         dev.write(&mut record).unwrap();
         assert!(!tag.data.lock().do_write, "lso wrote back");
-        assert!(!dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut common),
+            Callback::Leave
+        );
     }
 
     /// A tag holding one `ty` value of `bytes`.
@@ -1795,7 +1866,11 @@ mod tests {
             }
             let mut common = CommonFields::default();
             common.udf = udf;
-            assert!(dev.check_callback(&mut record, &mut common), "udf={udf}");
+            assert_eq!(
+                dev.check_callback(&mut record, &mut common),
+                Callback::ScanOnce,
+                "udf={udf}"
+            );
             assert_eq!(f64_field(&record, "VAL"), want_val, "udf={udf}");
             // ao_write, in the process that follows.
             dev.write(&mut record).unwrap();
@@ -1841,6 +1916,58 @@ mod tests {
         assert!(device_factory(&ctx("ao", DTYP_RESET)).is_none());
     }
 
+    /// check_ao_callback's no-data branch calls `rset->process` itself
+    /// (devEtherIP.c:347-354): a TPRO record prints no dbProcess line for
+    /// it, and still ends in WRITE_ALARM. Run in a child, whose stdout the
+    /// trace goes to.
+    #[test]
+    fn a_no_data_pulse_processes_past_dbprocess() {
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "EIP_NO_DATA_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "device::tests::a_no_data_pulse_processes_past_dbprocess",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}{stderr}");
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            assert!(!stdout.contains("dbProcess of 'AONODATA'"), "{stdout}");
+            return;
+        }
+        epics_rs::base::runtime::task::background_arm();
+        let rt = current_thread();
+        let db = eip_db("nodatapulse");
+        load_output(
+            &rt,
+            &db,
+            "AONODATA",
+            Box::new(AoRecord::default()),
+            "nodatapulse",
+            "R",
+        );
+        db.get_record("AONODATA")
+            .unwrap()
+            .write()
+            .put_common_field("TPRO", EpicsValue::Char(1))
+            .unwrap();
+        let stat = || db.get_record("AONODATA").unwrap().read().common.stat;
+        assert_ne!(stat(), alarm_status::WRITE_ALARM);
+        pulse(&rt, &db, "AONODATA");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stat() != alarm_status::WRITE_ALARM {
+            assert!(Instant::now() < deadline, "no WRITE_ALARM");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// A disconnected tag leaves an output in WRITE_ALARM, as C's ao_write.
     #[test]
     fn an_output_without_data_raises_write_alarm() {
@@ -1849,7 +1976,10 @@ mod tests {
         let mut record = AoRecord::default();
         let mut dev = EtherIpDevice::new("@nodata REAL S 1", true);
         dev.init(&mut record).unwrap();
-        assert!(dev.check_callback(&mut record, &mut CommonFields::default()));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut CommonFields::default()),
+            Callback::Process
+        );
         dev.write(&mut record).unwrap();
         let alarm = dev.last_alarm().unwrap();
         assert_eq!(alarm.stat, alarm_status::WRITE_ALARM);
@@ -1871,7 +2001,10 @@ mod tests {
             d.buf = CipType::Dint.code().to_le_bytes().to_vec();
             d.valid_data_size = d.buf.len();
         }
-        assert!(!dev.check_callback(&mut record, &mut CommonFields::default()));
+        assert_eq!(
+            dev.check_callback(&mut record, &mut CommonFields::default()),
+            Callback::Leave
+        );
     }
 
     /// devEtherIP.c:1642: statistics are read under lock_data, so a tag
