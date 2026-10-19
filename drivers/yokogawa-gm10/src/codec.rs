@@ -137,15 +137,14 @@ pub fn chop_string_40(src: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
         return (src.to_vec(), None);
     }
     let mut i = 39usize;
-    loop {
-        if src[i] == b' ' {
-            return (src[..i].to_vec(), Some(src[i + 1..].to_vec()));
-        }
+    while src[i] != b' ' {
+        i -= 1;
+        // C cuts here without testing `src[0]`.
         if i == 0 {
             return (src[..39].to_vec(), Some(src[39..].to_vec()));
         }
-        i -= 1;
     }
+    (src[..i].to_vec(), Some(src[i + 1..].to_vec()))
 }
 
 /// The `_ERR,<code>` reply's single-quoted message, chopped into up to 3
@@ -760,6 +759,14 @@ mod tests {
     #[test]
     fn chop_string_40_no_space_cuts_at_byte_39() {
         let msg = format!("{}\u{b0}{}", "x".repeat(38), "y".repeat(10));
+        let (chunk, rest) = chop_string_40(msg.as_bytes());
+        assert_eq!(chunk, &msg.as_bytes()[..39]);
+        assert_eq!(rest.unwrap(), &msg.as_bytes()[39..]);
+    }
+
+    #[test]
+    fn chop_string_40_never_breaks_at_byte_0() {
+        let msg = format!(" {}", "x".repeat(45));
         let (chunk, rest) = chop_string_40(msg.as_bytes());
         assert_eq!(chunk, &msg.as_bytes()[..39]);
         assert_eq!(rest.unwrap(), &msg.as_bytes()[39..]);
