@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -293,6 +293,12 @@ fn refused(message: &str) -> AsynError {
     }
 }
 
+impl Model1Motor for DrvPc6kAxis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
+    }
+}
+
 impl AsynMotor for DrvPc6kAxis {
     fn poll_failure(&self) -> PollFailure {
         self.failure
@@ -479,10 +485,6 @@ impl AsynMotor for DrvPc6kAxis {
             self.lock().send(post);
         }
         Ok(status)
-    }
-
-    fn take_init_status(&mut self) -> Option<AsynResult<MotorStatus>> {
-        self.init_status.take()
     }
 }
 

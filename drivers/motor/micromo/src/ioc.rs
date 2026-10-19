@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -208,7 +208,7 @@ pub fn micromo_config_command() -> CommandDef {
                 }
                 let chain = Arc::new(Mutex::new(chain));
                 for (signal, limits) in limits.into_iter().enumerate() {
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(
                         DrvMvp2001Axis::new(chain.clone(), signal, limits),
                     ));
                     init.axis(signal as i32, motor);

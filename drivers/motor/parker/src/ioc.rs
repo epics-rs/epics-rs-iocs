@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::error::AsynStatus;
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::{AsynMotor, Model1Motor};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -193,7 +193,7 @@ pub fn pc6k_config_command() -> CommandDef {
                 };
                 let controller = Arc::new(Mutex::new(controller));
                 for signal in 0..total {
-                    let motor: Arc<Mutex<dyn AsynMotor>> =
+                    let motor: Arc<Mutex<dyn Model1Motor>> =
                         Arc::new(Mutex::new(DrvPc6kAxis::new(controller.clone(), signal)));
                     init.axis(signal as i32, motor);
                 }

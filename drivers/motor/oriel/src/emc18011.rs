@@ -52,7 +52,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -420,6 +420,12 @@ fn send_prem(ctrl: &Emc18011Controller, prem: &[u8]) {
     }
 }
 
+impl Model1Motor for Emc18011Axis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
+    }
+}
+
 impl AsynMotor for Emc18011Axis {
     // devEMC18011.cc:129 forces NTM to NO.
     fn disables_ntm(&self) -> bool {
@@ -619,10 +625,6 @@ impl AsynMotor for Emc18011Axis {
 
         self.prev_position = position;
         Ok(self.status(&z))
-    }
-
-    fn take_init_status(&mut self) -> Option<AsynResult<MotorStatus>> {
-        self.init_status.take()
     }
 }
 

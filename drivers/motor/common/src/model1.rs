@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::interfaces::motor::{AsynMotor, PostMessage};
+use epics_rs::asyn::interfaces::motor::{Model1Motor, PostMessage};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -87,7 +87,11 @@ impl Model1Cards<'_> {
 
 /// One axis a card's `motor_init` found: signal, motor, and the device's own
 /// `build_trans` when it has one.
-type FoundAxis = (i32, Arc<Mutex<dyn AsynMotor>>, Option<Arc<dyn BuildTrans>>);
+type FoundAxis = (
+    i32,
+    Arc<Mutex<dyn Model1Motor>>,
+    Option<Arc<dyn BuildTrans>>,
+);
 
 /// What one card's `motor_init` pass found on its controller: the axes it
 /// gives the records, and its report line. A card left with neither is the
@@ -107,7 +111,7 @@ impl CardInit {
     }
 
     /// Make `motor` signal `signal` of the card.
-    pub fn axis(&mut self, signal: i32, motor: Arc<Mutex<dyn AsynMotor>>) {
+    pub fn axis(&mut self, signal: i32, motor: Arc<Mutex<dyn Model1Motor>>) {
         self.axes.push((signal, motor, None));
     }
 
@@ -116,7 +120,7 @@ impl CardInit {
     pub fn axis_with_build_trans(
         &mut self,
         signal: i32,
-        motor: Arc<Mutex<dyn AsynMotor>>,
+        motor: Arc<Mutex<dyn Model1Motor>>,
         build_trans: Arc<dyn BuildTrans>,
     ) {
         self.axes.push((signal, motor, Some(build_trans)));
@@ -351,7 +355,7 @@ impl MoveStrings {
 #[cfg(test)]
 mod tests {
     use epics_rs::asyn::error::AsynResult;
-    use epics_rs::asyn::interfaces::motor::{MotorStatus, PollFailure};
+    use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
     use epics_rs::asyn::user::AsynUser;
     use epics_rs::base::server::ioc_app::{InitHookState, init_hook_announce};
 
@@ -366,6 +370,13 @@ mod tests {
     struct Card {
         card: i32,
         log: Log,
+    }
+
+    /// At rest at 0 when its `motor_init` read it.
+    impl Model1Motor for Card {
+        fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+            Ok(MotorStatus::default())
+        }
     }
 
     impl AsynMotor for Card {

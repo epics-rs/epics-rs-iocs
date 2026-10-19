@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
@@ -387,7 +387,7 @@ pub fn soloist_config_command() -> CommandDef {
                     return;
                 };
                 let controller = Arc::new(Mutex::new(controller));
-                let motor: Arc<Mutex<dyn AsynMotor>> =
+                let motor: Arc<Mutex<dyn Model1Motor>> =
                     Arc::new(Mutex::new(DrvSoloistAxis::new(controller, setup)));
                 init.axis(0, motor);
             })?;

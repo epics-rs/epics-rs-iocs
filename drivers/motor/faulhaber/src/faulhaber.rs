@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -290,6 +290,12 @@ impl FaulhaberAxis {
     }
 }
 
+impl Model1Motor for FaulhaberAxis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
+    }
+}
+
 impl AsynMotor for FaulhaberAxis {
     fn poll_failure(&self) -> PollFailure {
         self.failure
@@ -504,10 +510,6 @@ impl AsynMotor for FaulhaberAxis {
             ..MotorStatus::default()
         };
         Ok(self.last_status.clone())
-    }
-
-    fn take_init_status(&mut self) -> Option<AsynResult<MotorStatus>> {
-        self.init_status.take()
     }
 }
 

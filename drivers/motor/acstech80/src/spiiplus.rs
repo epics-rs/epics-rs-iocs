@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -317,6 +317,12 @@ impl SpiiPlusAxis {
     }
 }
 
+impl Model1Motor for SpiiPlusAxis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
+    }
+}
+
 impl AsynMotor for SpiiPlusAxis {
     /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
     /// `RA_PROBLEM` (drvSPiiPlus.cc). Its first failure's silent RETRY is not modelled:
@@ -529,10 +535,6 @@ impl AsynMotor for SpiiPlusAxis {
         };
         self.last_status = status.clone();
         Ok(status)
-    }
-
-    fn take_init_status(&mut self) -> Option<AsynResult<MotorStatus>> {
-        self.init_status.take()
     }
 }
 

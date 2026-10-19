@@ -9,7 +9,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::model1::MoveStrings;
@@ -101,6 +103,12 @@ impl DrvMcb4bAxis {
 /// The reply byte at `i`, `0` past its end.
 fn byte_at(reply: &str, i: usize) -> u8 {
     reply.as_bytes().get(i).copied().unwrap_or(0)
+}
+
+impl Model1Motor for DrvMcb4bAxis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
+    }
 }
 
 impl AsynMotor for DrvMcb4bAxis {
@@ -244,10 +252,6 @@ impl AsynMotor for DrvMcb4bAxis {
             direction: self.direction,
             ..MotorStatus::default()
         })
-    }
-
-    fn take_init_status(&mut self) -> Option<AsynResult<MotorStatus>> {
-        self.init_status.take()
     }
 }
 

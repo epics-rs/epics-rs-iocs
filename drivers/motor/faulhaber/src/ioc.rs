@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -69,7 +69,7 @@ pub fn mcdc2805_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
                 for node in 0..num_axes {
                     let ax = FaulhaberAxis::new(controller.clone(), node);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(ax));
                     init.axis(node as i32, motor);
                 }
                 if num_axes > 0 {

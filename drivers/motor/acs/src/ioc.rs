@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::{AsynMotor, Model1Motor};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -136,7 +136,7 @@ pub fn mcb4b_config_command() -> CommandDef {
                 }
                 let controller = Arc::new(Mutex::new(controller));
                 for index in 0..MCB4B_NUM_AXES {
-                    let motor: Arc<Mutex<dyn AsynMotor>> =
+                    let motor: Arc<Mutex<dyn Model1Motor>> =
                         Arc::new(Mutex::new(DrvMcb4bAxis::new(controller.clone(), index)));
                     init.axis(index as i32, motor);
                 }
