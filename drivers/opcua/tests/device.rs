@@ -932,3 +932,13 @@ fn a_record_type_with_no_opc_ua_device_support_is_refused() {
         .expect_err("calc has no OPC UA dset");
     assert!(err.to_string().contains("calc"), "{err}");
 }
+
+/// `opcua_del_record` returns -1 (`devOpcua.cpp:111-116`): a bound record
+/// keeps its link through every device-link put.
+#[test]
+fn del_record_refuses_to_let_the_link_go() {
+    let registry = registry();
+    let mut record = AiRecord::default();
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    assert!(device.del_record().is_err());
+}

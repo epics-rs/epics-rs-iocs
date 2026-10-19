@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use async_opcua::types::Variant;
-use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::error::{CaError, CaResult, LinkRefusal};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::device_support::{
@@ -880,6 +880,13 @@ impl OpcuaDevice {
 impl DeviceSupport for OpcuaDevice {
     fn dtyp(&self) -> &str {
         DTYP
+    }
+
+    /// `opcua_del_record` (`devOpcua.cpp:111-116`): changing an OPCUA link
+    /// is not supported, so every device-link put is refused with the link
+    /// as it was.
+    fn del_record(&mut self) -> Result<(), LinkRefusal> {
+        Err(LinkRefusal::del_record("devOpcua"))
     }
 
     // Every C++ init failure is a `CATCH()` that returns an `S_*` status

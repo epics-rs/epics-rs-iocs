@@ -122,13 +122,14 @@ static DEVICES: &[(&str, &[DevSup])] = &[
     ),
 ];
 
-/// An opcua row whose `init` is `opcua_init`.
+/// An opcua row whose `init` is `opcua_init`, which calls `devExtend` at
+/// pass 0 (`devOpcua.cpp:139`).
 const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'static [u8]) -> DevSup {
     DevSup {
         name,
         choice,
         link_type: DbLinkType::InstIo,
-        dset: Dset::new(number, funcs, false).with_init(device_support::opcua_init),
+        dset: Dset::new(number, funcs, true).with_init(device_support::opcua_init),
     }
 }
 
@@ -528,6 +529,22 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    /// `opcua_init` calls `devExtend(&opcua_dsxt)` at pass 0
+    /// (`devOpcua.cpp:139`); devItemOpcua has no init, so no `dsxt`.
+    #[test]
+    fn every_dset_but_item_extends() {
+        for (record_type, rows) in DEVICES {
+            for row in *rows {
+                assert_eq!(
+                    row.has_dsxt(),
+                    row.name != "devItemOpcua",
+                    "{record_type} {}",
+                    row.name
+                );
+            }
+        }
+    }
 
     /// initDevSup's init(0) then finishDevSup's init(1) over every row: the
     /// opcua_init banner prints once, and devItemOpcua (SUPI, devOpcua.cpp:1346)
