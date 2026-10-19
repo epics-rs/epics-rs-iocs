@@ -779,6 +779,13 @@ impl PortDriver for MultiFunctionDriver {
                 let detect = self.int(self.params.thermocouple_open_detect, addr);
                 self.set_open_tc_detect(&dev, addr, detect);
             }
+        } else if reason == self.params.analog_in_rate {
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.ai_set_config_dbl(uldaq_sys::AI_CFG_CHAN_DATA_RATE, addr as u32, value as f64),
+                FUNCTION,
+                "Setting data rate",
+            );
         } else if reason == self.params.thermocouple_type && self.is_thermocouple(addr) {
             let dev = self.device.lock().unwrap();
             status = trace.report(
@@ -1179,6 +1186,15 @@ mod tests {
         assert!(drv.read_enum(&AsynUser::new(p.analog_in_mode)).is_err());
         // C's ctor writes the first output range's gain code.
         assert_eq!(drv.base.get_int32_param(p.analog_out_range, 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn analog_in_rate_is_written_to_the_device() {
+        let mut drv = MultiFunctionDriver::new("MFRATE", DaqDevice::unconnected(), 16, 16).unwrap();
+        let mut user = AsynUser::new(drv.params.analog_in_rate).with_addr(2);
+        // uldaq refuses every call on the null handle, so only a write that
+        // reaches ulAISetConfigDbl fails.
+        assert!(drv.write_int32(&mut user, 60).is_err());
     }
 
     #[test]

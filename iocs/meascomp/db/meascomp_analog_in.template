@@ -18,3 +18,10 @@ record(mbbo, "$(P)$(R)Type") {
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_IN_TYPE")
     field(PINI, "YES")
 }
+
+record(ao, "$(P)$(R)Rate") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_IN_RATE")
+    field(VAL,  "60")
+    field(PINI, "YES")
+}
