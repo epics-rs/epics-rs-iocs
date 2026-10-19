@@ -422,6 +422,7 @@ impl PmncAxis {
     }
 
     fn new(controller: Arc<Mutex<PmncController>>, def: AxisDef) -> Self {
+        let vbas_supported = def.driver_type == PmdModel::Pmd8753;
         let mut axis = Self {
             controller,
             def,
@@ -431,7 +432,13 @@ impl PmncAxis {
             no_motion_count: 0,
             failure: PollFailure::NONE,
             left: None,
-            last_status: MotorStatus::default(),
+            // drvPMNC87xx.cc:1014-1025: what motor_init prepares.
+            last_status: MotorStatus {
+                gain_support: true,
+                has_encoder: true,
+                vbas_supported,
+                ..MotorStatus::default()
+            },
             strings: MoveStrings::default(),
             init_status: None,
         };
@@ -502,8 +509,9 @@ impl PmncAxis {
 impl Model1Motor for PmncAxis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        let left = self.left.take().unwrap_or_default();
-        init_read(read, left, self.poll_failure())
+        // A RETRY exit's `left` is `last_status` as it stood.
+        self.left = None;
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -1251,5 +1259,32 @@ mod tests {
         let left = axis.take_failed_poll_status().unwrap();
         assert!(!left.comms_error && left.problem);
         assert_eq!(axis.take_failed_poll_status(), None);
+    }
+
+    /// drvPMNC87xx.cc:283-292,541: a failed init read stores what
+    /// motor_init prepared (:1014-1025, EA_PRESENT and GAIN_SUPPORT), with
+    /// both COMM_ERR bits once the card is past RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("pmncInitFail", move |last| match last {
+            "VER" => "Version 1.6.0".into(),
+            "DRT" => "A0=1>".into(),
+            "CHL 0" => String::new(),
+            _ => ">".into(),
+        });
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axes = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap())));
+        let prepared = MotorStatus {
+            has_encoder: true,
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        let lost = MotorStatus {
+            problem: true,
+            comms_error: true,
+            ..prepared.clone()
+        };
+        let init: Vec<_> = axes.iter_mut().map(|a| a.take_init_status()).collect();
+        assert_eq!(init, [prepared, lost.clone(), lost]);
     }
 }
