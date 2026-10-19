@@ -15,8 +15,6 @@ use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
-use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::interrupt::InterruptValue;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -361,18 +359,14 @@ impl Ctx {
     }
 
     /// C `doCallbacksInt64Array` from the stream threads (serval_stream.cpp:975,
-    /// histogram_io.cpp:541/605): the array goes to the asynInt64Array
-    /// subscribers only, is not stored, and is not gated on interruptAccept
-    /// (asynPortDriver.cpp:1829-1866).
+    /// histogram_io.cpp:541/605), not gated on interruptAccept. A port job, as
+    /// the stamp is the port's, so it keeps its place after the worker's
+    /// `updateTimeStamp` and posts.
     fn post_int64_array(&self, reason: usize, addr: i32, data: Vec<i64>) {
-        self.handle.interrupts().notify(InterruptValue {
-            reason,
-            addr,
-            value: ParamValue::Int64Array(data.into()),
-            timestamp: SystemTime::now(),
-            iface: Some(InterfaceType::Int64Array),
-            ..Default::default()
-        });
+        self.shared
+            .port_jobs
+            .push(move |base| crate::driver::do_callbacks_int64_array(base, reason, addr, data));
+        self.flush_jobs();
     }
 }
 
@@ -3315,6 +3309,7 @@ async fn publish_image(ctx: &Ctx, addr: usize, array: impl Into<PublishedArray>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     /// A read the test expects to succeed, as its bytes.
     trait BytesOk {
@@ -3546,6 +3541,47 @@ mod tests {
         };
         assert_eq!(&a[..], [3, 1, 4]);
         assert_eq!(v.iface, Some(InterfaceType::Int64Array));
+    }
+
+    /// C doCallbacksArray stamps getTimeStamp and the param's status and
+    /// alarm on the callback (asynPortDriver.cpp:1838-1858).
+    #[tokio::test]
+    async fn a_worker_int64_array_carries_the_port_stamp_and_param_status() {
+        use epics_rs::asyn::error::AsynStatus;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+
+        let ctx = idle_ctx("TPXT_STAMP");
+        let reason = ctx.p.prv_hst_histogram_data;
+        let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        ctx.handle
+            .with_driver(move |d: &mut TimePix3Driver| {
+                let base = &mut d.ad.port_base;
+                base.set_time_stamp(stamp);
+                base.set_param_status(reason, 0, AsynStatus::Error, 3, 2)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let (_sub, mut rx) = ctx
+            .handle
+            .interrupts()
+            .register_interrupt_user(
+                InterruptFilter {
+                    reason: Some(reason),
+                    ..Default::default()
+                },
+                1024,
+            )
+            .unwrap();
+        ctx.post_int64_array(reason, 0, vec![3, 1, 4]);
+        let v = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no callback")
+            .unwrap();
+        assert_eq!(
+            (v.timestamp, v.aux_status, v.alarm_status, v.alarm_severity),
+            (stamp, AsynStatus::Error, 3, 2)
+        );
     }
 
     #[tokio::test]
