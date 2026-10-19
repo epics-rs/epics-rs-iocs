@@ -22,16 +22,11 @@ pub const MCB4B_NUM_CARDS: i32 = 4;
 /// `motor_init` assumes four axes on every card.
 pub const MCB4B_NUM_AXES: usize = 4;
 
-/// `motor_init`'s probe: `#00X`, tried three times, then `#%02dQ` to every
-/// axis. False when the card never answered, which C leaves unconfigured.
+/// `motor_init`'s probe: `#00X`, tried three times. False when the card
+/// never answered, which C leaves unconfigured. Each axis is then set up by
+/// [`DrvMcb4bAxis::new`].
 pub fn motor_init(ctrl: &Mcb4bController) -> bool {
-    let answered = (0..3).any(|_| ctrl.command("#00X").is_ok_and(|r| !r.is_empty()));
-    if answered {
-        for axis in 0..MCB4B_NUM_AXES {
-            let _ = ctrl.command(&format!("#{axis:02}Q"));
-        }
-    }
-    answered
+    (0..3).any(|_| ctrl.command("#00X").is_ok_and(|r| !r.is_empty()))
 }
 
 /// One axis of a model-1 MCB-4B card.
@@ -42,17 +37,25 @@ pub struct DrvMcb4bAxis {
     position: i32,
     direction: bool,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl DrvMcb4bAxis {
+    /// Axis `axis` as `motor_init` sets it up: stopped with `#%02dQ`, then
+    /// its status read, before the next axis's (drvMCB4B.cc:489-506).
     pub fn new(controller: Arc<Mutex<Mcb4bController>>, axis: usize) -> Self {
-        Self {
+        let mut this = Self {
             controller,
             axis,
             position: 0,
             direction: false,
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        };
+        let _ = this.lock().command(&format!("#{axis:02}Q"));
+        this.init_status = Some(this.poll(&AsynUser::new(0)));
+        this
     }
 
     fn lock(&self) -> MutexGuard<'_, Mcb4bController> {
@@ -242,6 +245,10 @@ impl AsynMotor for DrvMcb4bAxis {
             ..MotorStatus::default()
         })
     }
+
+    fn take_init_status(&mut self) -> Option<AsynResult<MotorStatus>> {
+        self.init_status.take()
+    }
 }
 
 #[cfg(test)]
@@ -268,11 +275,9 @@ mod tests {
             _ => "OK".into(),
         });
         let ctrl = Mcb4bController::new(io, MCB4B_NUM_AXES);
-        (
-            line,
-            DrvMcb4bAxis::new(Arc::new(Mutex::new(ctrl)), 1),
-            moving,
-        )
+        let axis = DrvMcb4bAxis::new(Arc::new(Mutex::new(ctrl)), 1);
+        line.sent();
+        (line, axis, moving)
     }
 
     fn post(text: &[u8]) -> PostMessage {

@@ -262,3 +262,51 @@ mod missing_num_axes {
         assert!(port_after(mcb4b_create_controller_command(), args, "mcb4bNoAxes").await);
     }
 }
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvMCB4B.cc:489-506: `motor_init` stops each axis and reads its
+    /// status once, before the next axis's stop, and the record starts from
+    /// that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_after_its_own_stop() {
+        let int = ArgValue::Int;
+        run_command(mcb4b_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("mcb4bInitLine", |cmd| match cmd.trim_end() {
+            "#00P" => "#00P=+14".into(),
+            "#01P" => "#01P=+3".into(),
+            c if c.ends_with('P') => format!("{c}=+0"),
+            c if c.ends_with('E') => format!("{c}=00"),
+            c if c.ends_with('X') => format!("{c}=0"),
+            _ => "OK".into(),
+        });
+        let config = vec![int(0), ArgValue::String("mcb4bInitLine".into())];
+        run_command(mcb4b_config_command(), config).await;
+        drvsup_init().await;
+        let mut want = vec!["#00X".to_owned()];
+        for axis in 0..4 {
+            for cmd in ['Q', 'X', 'E', 'P'] {
+                want.push(format!("#{axis:02}{cmd}"));
+            }
+        }
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        assert_eq!(sent, want);
+        let db = record_init(
+            r##"
+record(motor, "mcb4b:m1") { field(DTYP, "ACS MCB-4B") field(OUT, "#C0 S0 @") }
+record(motor, "mcb4b:m2") { field(DTYP, "ACS MCB-4B") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("mcb4b:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("mcb4b:m2.RMP").unwrap(), EpicsValue::Long(3));
+    }
+}
