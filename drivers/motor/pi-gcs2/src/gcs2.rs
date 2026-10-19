@@ -134,19 +134,9 @@ const IO_ERROR: TraceMask = TraceMask::ERROR.union(TraceMask::IO_DRIVER);
 
 /// Appends a read's line to `reply`, or the bytes a failed read had
 /// transferred, which is what C's buffer holds after the call.
-fn append_read(reply: &mut Vec<u8>, read: AsynResult<Vec<u8>>) -> AsynResult<()> {
-    match read {
-        Ok(line) => {
-            reply.extend(line);
-            Ok(())
-        }
-        Err(e) => {
-            if let Some(partial) = e.partial_read() {
-                reply.extend(&partial.data);
-            }
-            Err(e)
-        }
-    }
+fn append_read(reply: &mut Vec<u8>, (line, status): (Vec<u8>, AsynResult<()>)) -> AsynResult<()> {
+    reply.extend(line);
+    status
 }
 
 /// Output command terminator (C sets input EOS `"\n"` and appends a bare
@@ -664,10 +654,11 @@ impl PIGCS2Controller {
         }
     }
 
-    /// The constructor's `*IDN?` into an emptied buffer: empty when the
-    /// exchange fails, whose status C ignores.
+    /// The constructor's `*IDN?` into an emptied buffer, whose status C
+    /// ignores: what arrived, a reply cut by a timeout included
+    /// (PIasynController.cpp:151-161).
     pub fn read_idn(&mut self) -> &str {
-        self.ident = self.query("*IDN?").unwrap_or_default();
+        self.ident = self.query_buffer("*IDN?").0;
         &self.ident
     }
 
@@ -879,7 +870,7 @@ impl PIGCS2Controller {
             }
         }
         let read = self.handle.write_read(0, TERMINATOR, READ_BUF);
-        if let Err(e) = &read {
+        if let Err(e) = read.status() {
             if e.octet_step() != Some(OctetStep::Read) {
                 return (
                     Vec::new(),
@@ -893,10 +884,10 @@ impl PIGCS2Controller {
             ));
         }
         let mut reply = Vec::new();
-        let mut status = append_read(&mut reply, read);
+        let mut status = append_read(&mut reply, read.into_parts());
         while reply.last() == Some(&b' ') {
             reply.push(b'\n');
-            status = append_read(&mut reply, self.handle.read_octet(0, READ_BUF));
+            status = append_read(&mut reply, self.handle.read_octet(0, READ_BUF).into_parts());
         }
         self.trace_received(&reply);
         (reply, status)
@@ -1305,9 +1296,7 @@ impl PIGCS2Controller {
         }
         match self.query(&format!("HAR? {axis}")) {
             Ok(reply) => get_value_bool(&reply),
-            // `status()` reads *through* a `PartialRead` carrier, so a timeout
-            // that returned partial bytes (EOS interpose installed) is still
-            // recognized as "no limit switches" rather than a hard fault.
+            // A timeout is "no limit switches", not a hard fault.
             Err(e) if e.status() == AsynStatus::Timeout => {
                 let err = self.get_gcs_error();
                 if err == PI_CNTR_UNKNOWN_COMMAND {
@@ -1423,20 +1412,21 @@ impl PIGCS2Controller {
             format_args!("PIInterface::sendAndReceive() sending \"#{c}\"\n"),
         );
         let write_read = || {
-            self.handle
-                .write_read(0, &[c], READ_BUF)
-                .map_err(|e| match e.octet_step() {
-                    Some(OctetStep::Read) => e,
-                    _ => pigcs2_err(e.message()),
-                })
+            let (line, status) = self.handle.write_read(0, &[c], READ_BUF).into_parts();
+            let status = status.map_err(|e| match e.octet_step() {
+                Some(OctetStep::Read) => e,
+                _ => pigcs2_err(e.message()),
+            });
+            (line, status)
         };
-        let read = write_read().inspect_err(|e| {
+        let (line, status) = write_read();
+        let read = (line, status.inspect_err(|e| {
             self.trace(IO_ERROR, format_args!(
                 "PIInterface::sendAndReceive error calling writeRead, output={c} status={}, error={}\n",
                 e.status() as i32,
                 e.message()
             ));
-        });
+        }));
         let mut reply = Vec::new();
         let mut status = append_read(&mut reply, read);
         while reply.last() == Some(&b' ') {
@@ -2967,10 +2957,17 @@ mod tests {
             }
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = std::mem::take(&mut self.reply);
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -3079,6 +3076,26 @@ mod tests {
     /// C `PIasynAxis::Init` (PIasynAxis.cpp:89-93): `getResolution`, then
     /// `getAxisVelocity`'s `VEL?` on a controller that knows it, then the
     /// position.
+    /// PIasynController.cpp:151-161 ignores `*IDN?`'s status and picks the
+    /// controller from `inputBuff`, so a reply cut by a timeout still names
+    /// it.
+    #[test]
+    fn an_idn_cut_by_a_timeout_is_still_read() {
+        let (_line, io) = motor_common::testing::LineRig::cut(
+            "gcs2IdnCut",
+            |last| {
+                if last == "*IDN?" {
+                    "PI E-517 Interface and Display Module".into()
+                } else {
+                    "0".into()
+                }
+            },
+            |last| last == "*IDN?",
+        );
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2IdnCut");
+        assert_eq!(ctrl.read_idn(), "PI E-517 Interface and Display Module");
+    }
+
     #[test]
     fn axis_init_reads_the_velocity_before_the_position() {
         let (line, io) = motor_common::testing::LineRig::new("gcs2InitVel", |last| {
@@ -4533,21 +4550,20 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet_eom(
+        fn io_read_octet(
             &mut self,
             _user: &AsynUser,
             buf: &mut [u8],
-        ) -> AsynResult<(usize, epics_rs::asyn::interpose::EomReason)> {
-            use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
             buf[..3].copy_from_slice(b"1=0");
-            Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "read timeout".into(),
+            OctetReadResult {
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }),
+                ..OctetReadResult::ok(3, EomReason::empty())
             }
-            .with_partial_read(PartialOctetRead {
-                data: b"1=0".to_vec(),
-                eom_reason: EomReason::empty(),
-            }))
         }
     }
 
@@ -5719,8 +5735,12 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
-            Err(pigcs2_err("timeout"))
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            _buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            epics_rs::asyn::interpose::OctetReadResult::failed(pigcs2_err("timeout"))
         }
     }
 

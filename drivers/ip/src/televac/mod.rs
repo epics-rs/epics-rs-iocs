@@ -15,7 +15,7 @@ use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
+use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::error::CaResult;
@@ -112,15 +112,15 @@ impl CellBody for Job {
                 ex.send
             ),
         );
-        let input = match port.call(
-            &RequestOp::OctetRead {
-                buf_size: BUFFER_SIZE,
-            },
-            user(),
-        ) {
-            Ok(r) => r.data.unwrap_or_default(),
-            Err(e) => e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
-        };
+        // C reads `input` whatever the status.
+        let (input, _) = port
+            .octet_read(
+                OctetReadOp::Read {
+                    buf_size: BUFFER_SIZE,
+                },
+                user(),
+            )
+            .into_parts();
         let nread = input.len();
         // C prints nwrite here.
         self.trace(
@@ -406,7 +406,8 @@ impl DeviceSupport for DevTelevac {
 #[cfg(test)]
 mod tests {
     use epics_rs::asyn::error::{AsynResult, AsynStatus};
-    use epics_rs::asyn::request::RequestResult;
+    use epics_rs::asyn::interpose::EomReason;
+    use epics_rs::asyn::request::{OctetRead, RequestResult};
     use epics_rs::base::server::records::ai::AiRecord;
     use epics_rs::base::server::records::bi::BiRecord;
 
@@ -453,13 +454,14 @@ mod tests {
                 RequestOp::OctetWrite { data } => {
                     format!("write {}", String::from_utf8_lossy(data))
                 }
-                RequestOp::OctetRead { buf_size } => format!("read {buf_size}"),
+                RequestOp::OctetRead { buf_size, .. } => format!("read {buf_size}"),
                 other => format!("{other:?}"),
             });
             match (op, self.reply) {
-                (RequestOp::OctetRead { .. }, Some(reply)) => {
-                    Ok(RequestResult::octet_read(reply.to_vec(), reply.len()))
-                }
+                (RequestOp::OctetRead { .. }, Some(reply)) => Ok(RequestResult::octet_read(
+                    OctetRead::new(reply.to_vec(), EomReason::empty(), Ok(())),
+                    reply.len(),
+                )),
                 (RequestOp::OctetRead { .. }, None) => Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "timeout".into(),

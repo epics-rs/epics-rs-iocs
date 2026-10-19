@@ -246,6 +246,18 @@ fn transaction_id_is_eight_ascii_digits() {
 }
 
 #[test]
+fn transaction_id_is_uppercase_hex() {
+    // generateTransactionId writes the counter in hex, most significant
+    // digit first; the fixtures above all sit below 10.
+    assert_eq!(TransactionId::from_counter(10).to_string(), "0000000A");
+    assert_eq!(TransactionId::from_counter(0x432).to_string(), "00000432");
+    assert_eq!(
+        TransactionId::from_counter(0x7FFF_FFFE).to_string(),
+        "7FFFFFFE"
+    );
+}
+
+#[test]
 fn register_session_request() {
     let out = encap::encode_register_session(TransactionId::from_counter(2));
     assert_eq!(

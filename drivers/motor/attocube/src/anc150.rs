@@ -106,9 +106,13 @@ impl Anc150Controller {
     /// to keep the stream synchronized). `writeRead` flushes a stray reply
     /// first.
     fn send_only(&self, cmd: &str) -> AsynResult<()> {
-        let (sent, e) = match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
-            Ok(_) => return Ok(()),
-            Err(e) => (
+        let (sent, e) = match self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts()
+        {
+            (_, Ok(())) => return Ok(()),
+            (_, Err(e)) => (
                 match e.octet_step() {
                     Some(OctetStep::Read) => cmd.len(),
                     _ => e.partial_write().unwrap_or(0),
@@ -133,8 +137,12 @@ impl Anc150Controller {
     /// response must open with the echoed command and hold the echo, the
     /// reply and the ack, each `\r\n`-terminated, or it is asynError.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let e = match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
-            Ok(raw) => {
+        let e = match self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts()
+        {
+            (raw, Ok(())) => {
                 if let Some(reply) = parse_reply(cmd, &String::from_utf8_lossy(&raw)) {
                     return Ok(reply.to_string());
                 }
@@ -142,7 +150,7 @@ impl Anc150Controller {
                 anc_err("")
             }
             // A failed writeRead keeps its own status in C.
-            Err(e) => e,
+            (_, Err(e)) => e,
         };
         self.print_error(format_args!(
             "drvANC150Asyn:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",

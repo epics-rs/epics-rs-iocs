@@ -664,7 +664,14 @@ mod tests {
     impl PortCalls for Silent {
         fn call(&mut self, op: &RequestOp, _user: AsynUser) -> AsynResult<RequestResult> {
             Ok(match op {
-                RequestOp::OctetRead { .. } => RequestResult::octet_read(Vec::new(), 0),
+                RequestOp::OctetRead { .. } => RequestResult::octet_read(
+                    epics_rs::asyn::request::OctetRead::new(
+                        Vec::new(),
+                        epics_rs::asyn::interpose::EomReason::empty(),
+                        Ok(()),
+                    ),
+                    0,
+                ),
                 _ => RequestResult::write_ok(),
             })
         }

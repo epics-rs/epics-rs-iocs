@@ -464,15 +464,14 @@ impl AsynMotor for PmacAxis {
         } else {
             format!("#{axis} ? F P")
         };
-        let read = controller.reply(&query);
-        let parsed = read.as_deref().ok().and_then(parse_axis_status);
+        // C parses `response` whatever the status and prints it on failure:
+        // a failed read leaves what it delivered there (pmacAxis.cpp:493-499).
+        let (response, read) = controller.exchange(&query);
+        let parsed = read.is_ok().then(|| parse_axis_status(&response)).flatten();
         let Some((status1, status2, first, second)) = parsed else {
             // C's poll returns before the read with no low-level user.
             if controller.connected() {
-                let (status, response) = match &read {
-                    Ok(reply) => (0, reply.as_str()),
-                    Err(e) => (e.c_status_code(), ""),
-                };
+                let status = read.as_ref().map_or_else(|e| e.c_status_code(), |()| 0);
                 controller.trace().print_self(
                     TraceMask::ERROR,
                     format_args!(

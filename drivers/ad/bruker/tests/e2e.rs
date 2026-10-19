@@ -24,6 +24,19 @@ use epics_rs::ad_core::plugin::channel::ndarray_channel;
 
 use bruker::{BrukerRuntime, create_bruker_detector};
 
+/// A read the test expects to succeed, as its bytes.
+trait BytesOk {
+    fn bytes_ok(self) -> Vec<u8>;
+}
+
+impl BytesOk for epics_rs::asyn::request::OctetRead {
+    fn bytes_ok(self) -> Vec<u8> {
+        let (bytes, status) = self.into_parts();
+        status.unwrap();
+        bytes
+    }
+}
+
 /// Privileged port 1: no test can bind it, so a connect is always refused.
 /// A freed ephemeral port can be taken by a concurrent test's listener.
 const DEAD_ADDR: &str = "127.0.0.1:1";
@@ -593,10 +606,10 @@ fn an_exchange_that_never_reads_keeps_the_last_reply() {
     sync.write_octet(ad.string_from_server, b"old").unwrap();
     sync.write_int32(ad.bin_x, 2).unwrap();
     assert_eq!(
-        sync.read_octet(ad.string_from_server, 64).unwrap(),
+        sync.read_octet(ad.string_from_server, 64).bytes_ok(),
         b"old\0"
     );
-    assert!(sync.read_octet(ad.string_to_server, 64).unwrap().len() > 1);
+    assert!(sync.read_octet(ad.string_to_server, 64).bytes_ok().len() > 1);
 }
 
 /// A read that times out leaves in `fromBIS` what it received: nothing.
@@ -619,7 +632,7 @@ fn an_exchange_whose_read_times_out_publishes_what_it_read() {
     let ad = detector.ad_params;
     sync.write_octet(ad.string_from_server, b"old").unwrap();
     sync.write_int32(ad.bin_x, 2).unwrap();
-    assert_eq!(sync.read_octet(ad.string_from_server, 64).unwrap(), b"\0");
+    assert_eq!(sync.read_octet(ad.string_from_server, 64).bytes_ok(), b"\0");
 }
 
 /// BISDetector.cpp:404-434: statusTask posts every successful read as read,
@@ -647,10 +660,10 @@ fn every_status_read_is_posted_as_read() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     // BIS_STATUS is undefined until statusTask's first post, as in C.
     let read = || {
-        (
-            sync.read_int32(size_x).unwrap(),
-            sync.read_octet(reason, 128).ok(),
-        )
+        (sync.read_int32(size_x).unwrap(), {
+            let (bytes, status) = sync.read_octet(reason, 128).into_parts();
+            status.ok().map(|()| bytes)
+        })
     };
     let mut got = read();
     while got != (1024, Some(b"\0".to_vec())) && std::time::Instant::now() < deadline {
@@ -677,7 +690,7 @@ fn the_driver_version_is_left_to_adcore() {
     let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
     let ad = detector.ad_params;
     assert_eq!(
-        sync.read_octet(ad.base.driver_version, 64).unwrap(),
-        sync.read_octet(ad.base.ad_core_version, 64).unwrap()
+        sync.read_octet(ad.base.driver_version, 64).bytes_ok(),
+        sync.read_octet(ad.base.ad_core_version, 64).bytes_ok()
     );
 }

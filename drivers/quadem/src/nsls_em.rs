@@ -35,7 +35,7 @@ use crate::drv_quad_em::{
     QuadEmShared, num_average_from,
 };
 use crate::nsls_em_proto::{self as proto, PingPong};
-use crate::octet::{OctetIo, create_ip_port};
+use crate::octet::{OctetIo, create_ip_port, outcome};
 use crate::{asyn_print, trace};
 use epics_rs::base::calc::engine::cvt::fmt_e;
 
@@ -46,11 +46,6 @@ const READ_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// C++ `setIntegerParam(P_ValuesPerRead, 5)` in the constructor.
 const DEFAULT_VALUES_PER_READ: i32 = 5;
 
-/// True for a timeout, including one `AsynError::PartialRead` wraps to carry
-/// the bytes transferred before it. A bare `AsynError::Status` variant match
-/// would miss that wrapper and misclassify every partial-transfer timeout —
-/// routine on this port, since it installs the EOS interpose — as an
-/// unexpected error.
 fn is_timeout(e: &AsynError) -> bool {
     e.status() == AsynStatus::Timeout
 }
@@ -175,14 +170,17 @@ fn discover(
     let deadline = Instant::now() + proto::BROADCAST_TIMEOUT;
     let udp_reader = udp.with_timeout(proto::BROADCAST_READ_TIMEOUT);
     while Instant::now() < deadline {
-        match udp_reader.read_binary(proto::DISCOVERY_BUFFER_SIZE) {
-            Ok(outcome) if !outcome.data.is_empty() => {
-                let text = String::from_utf8_lossy(&outcome.data);
+        match udp_reader
+            .read_binary(proto::DISCOVERY_BUFFER_SIZE)
+            .into_parts()
+        {
+            (data, Ok(())) if !data.is_empty() => {
+                let text = String::from_utf8_lossy(&data);
                 transport.modules.extend(proto::parse_discovery(&text));
             }
-            Ok(_) => {}
-            Err(e) if is_timeout(&e) => {}
-            Err(_) => return Err(()),
+            (_, Ok(())) => {}
+            (_, Err(e)) if is_timeout(&e) => {}
+            (_, Err(_)) => return Err(()),
         }
     }
 
@@ -255,36 +253,43 @@ impl NslsEmDriver {
     /// The connection is opened and closed around every transaction, as C++
     /// does with `pasynCommonSyncIO`.
     fn write_read_meter(&self, out: &str) -> AsynResult<String> {
+        let (reply, status) = self.exchange(out);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::write_read_meter`], returning C++'s `inString_` whatever the
+    /// status.
+    fn exchange(&self, out: &str) -> (String, AsynResult<()>) {
         // C++ calls connectDevice on pasynUserTCPCommandConnect_, which no
         // module found leaves unset, and crashes (drvNSLS_EM.cpp:271).
         let Some(command) = &self.command else {
-            return Err(error("drvNSLS_EM: no module on the network"));
+            return (
+                String::new(),
+                Err(error("drvNSLS_EM: no module on the network")),
+            );
         };
         // C++ discards the connect and first-write statuses; the writeRead
         // that follows reports the failure.
         if let Some(port) = command.handle() {
             let _ = port.connect_blocking();
         }
-        let result = (|| -> AsynResult<String> {
+        let result = (|| -> (String, AsynResult<()>) {
             if out.len() > 1 {
                 let _ = command.write(out);
             }
-            let reply = match command.write_read(out, proto::MAX_COMMAND_LEN) {
-                Ok(reply) => reply,
-                Err(e) => {
-                    let partial = e.partial_read();
-                    let n_read = partial.map_or(0, |p| p.data.len());
-                    let eom = partial.map_or(0, |p| p.eom_reason.bits());
-                    let in_string = partial
-                        .map(|p| String::from_utf8_lossy(&p.data).into_owned())
-                        .unwrap_or_default();
+            let reply = match outcome(command.write_read(out, proto::MAX_COMMAND_LEN)) {
+                (reply, Ok(())) => reply.as_str(),
+                (read, Err(e)) => {
+                    let n_read = read.data.len();
+                    let eom = read.eom.bits();
+                    let in_string = String::from_utf8_lossy(&read.data);
                     asyn_print!(
                         self.base.port_base,
                         ERROR,
                         "drvNSLS_EM:writeReadMeter: error calling writeRead, outString={out} status={}, nread={n_read}, eomReason={eom}, inString={in_string}\n",
                         e.c_status_code()
                     );
-                    return Err(e);
+                    return (read.as_str(), Err(e));
                 }
             };
             if !proto::is_ok(&reply) {
@@ -293,9 +298,10 @@ impl NslsEmDriver {
                     ERROR,
                     "drvNSLS_EM:writeReadMeter: error, outString={out} expected OK>, received {reply}\n"
                 );
-                return Err(error(format!("NSLS_EM: {out} -> {reply}, expected OK>")));
+                let e = error(format!("NSLS_EM: {out} -> {reply}, expected OK>"));
+                return (reply, Err(e));
             }
-            Ok(reply)
+            (reply, Ok(()))
         })();
         if let Some(port) = command.handle() {
             let _ = port.disconnect_blocking();
@@ -335,7 +341,9 @@ impl NslsEmDriver {
 
     /// C++ `readStatus`.
     fn read_status_inner(&mut self) -> AsynResult<()> {
-        let reply = self.write_read_meter(proto::CMD_STATUS)?;
+        // C++ discards the `s` status and parses `inString_`, which holds
+        // what a failed read delivered (drvNSLS_EM.cpp:520-522).
+        let (reply, read) = self.exchange(proto::CMD_STATUS);
         let (items, s) = proto::scan_status(&reply);
         // C++'s sscanf stores each item it assigns, on failure too.
         if items >= 1 {
@@ -362,7 +370,9 @@ impl NslsEmDriver {
                     s.range,
                     s.period_us
                 );
-                return Err(error(format!("NSLS_EM: bad status reply: {reply}")));
+                return Err(read
+                    .err()
+                    .unwrap_or_else(|| error(format!("NSLS_EM: bad status reply: {reply}"))));
             }
         };
 
@@ -543,12 +553,11 @@ fn read_thread(ctx: ReadContext) {
             ping_pong = ctx.state.lock().ping_pong;
         }
 
-        let read = ctx.data.locked_read_line(proto::DATA_BUFFER_SIZE);
-        let outcome = match read {
-            Ok(o) if o.eom.contains(EomReason::EOS) => o,
-            _ => {
-                if trace::read_result(&read).0 != AsynStatus::Timeout {
-                    trace::print_read_error(&ctx.handle, "drvNSLS_EM:readThread", &read);
+        let outcome = match outcome(ctx.data.locked_read_line(proto::DATA_BUFFER_SIZE)) {
+            (o, Ok(())) if o.eom.contains(EomReason::EOS) => o,
+            (o, status) => {
+                if trace::read_result(&o, &status).0 != AsynStatus::Timeout {
+                    trace::print_read_error(&ctx.handle, "drvNSLS_EM:readThread", &o, &status);
                     thread::sleep(READ_ERROR_BACKOFF);
                 }
                 continue;
@@ -708,28 +717,6 @@ pub fn create_nsls_em(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::asyn::interpose::PartialOctetRead;
-
-    /// `AsynError::PartialRead` is how `asyn-rs` 0.24+ carries a timed-out
-    /// read's transferred bytes (see the fix note on `is_timeout`); a bare
-    /// `AsynError::Status` match would miss it entirely. Routine on this
-    /// port's TCP command/data sub-ports, which install the EOS interpose.
-    #[test]
-    fn is_timeout_recognizes_a_partial_read_wrapped_timeout() {
-        let e = AsynError::Status {
-            status: AsynStatus::Timeout,
-            message: "read timeout".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: b"12.3".to_vec(),
-            eom_reason: EomReason::empty(),
-        });
-        assert!(is_timeout(&e));
-        assert_eq!(
-            e.partial_read().map(|p| p.data.as_slice()),
-            Some(&b"12.3"[..])
-        );
-    }
 
     #[test]
     fn report_prints_cs_block_then_the_base_report() {
@@ -777,6 +764,79 @@ mod tests {
             )),
             "{out}"
         );
+    }
+
+    /// A module whose `s` reply is cut by a timeout.
+    struct CutStatus(epics_rs::asyn::port::PortDriverBase);
+
+    impl epics_rs::asyn::port::PortDriver for CutStatus {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut epics_rs::asyn::user::AsynUser,
+            data: &[u8],
+        ) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &epics_rs::asyn::user::AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            let reply = b"OK> \"ip: 10.0.0.5, id: 3, ver: 1.2.3 \
+                          { m = 1, n = 5, r = 2, p = 400.000000 }\"";
+            buf[..reply.len()].copy_from_slice(reply);
+            OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }),
+                ..OctetReadResult::ok(reply.len(), EomReason::empty())
+            }
+        }
+    }
+
+    /// drvNSLS_EM.cpp:520-522 discards the `s` status and parses
+    /// `inString_`, which holds what the timed-out read delivered.
+    #[test]
+    fn a_status_cut_by_a_timeout_is_still_parsed() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let (command, _module) = crate::octet::tests::published_port(
+            "QE_NSLS_CUT_IP",
+            CutStatus(PortDriverBase::new(
+                "QE_NSLS_CUT_IP",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            )),
+        );
+        let mut drv = NslsEmDriver {
+            base: QuadEmBase::new("QE_NSLS_CUT", 0).unwrap(),
+            command: Some(command),
+            shared: QuadEmShared::new(16).0,
+            state: Arc::new(parking_lot::Mutex::new(NslsState {
+                scale_factor: 0.0,
+                ping_pong: PingPong::Both,
+            })),
+            ip_address: String::new(),
+            module_id: 0,
+            firmware_version: String::new(),
+            modules: Vec::new(),
+        };
+        drv.read_status_inner().unwrap();
+        assert_eq!(
+            (drv.ip_address.as_str(), drv.firmware_version.as_str()),
+            ("10.0.0.5", "1.2.3")
+        );
+        let p = drv.params();
+        assert_eq!(qe::int_param(&drv.base.port_base, p.range, 0), 2);
     }
 
     /// C++ keeps the port when no module answers: no link, no read thread,

@@ -14,7 +14,7 @@ use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
+use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::{AsynUser, timeout_from_secs};
 use epics_rs::base::error::CaResult;
@@ -81,15 +81,12 @@ impl CellBody for Job {
         let _ = port.call(&RequestOp::OctetWrite { data }, user());
         let eos = TERM.to_vec();
         let _ = port.call(&RequestOp::SetInputEos { eos }, user());
-        let read = port.call(&RequestOp::OctetRead { buf_size: NCHAR }, user());
+        let (read, status) = port
+            .octet_read(OctetReadOp::Read { buf_size: NCHAR }, user())
+            .into_parts();
         let mut ex = self.exchange.lock().unwrap();
-        (ex.status, ex.read) = match read {
-            Ok(r) => (0, r.data.unwrap_or_default()),
-            Err(e) => (
-                e.c_status_code(),
-                e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
-            ),
-        };
+        ex.read = read;
+        ex.status = status.map_or_else(|e| e.c_status_code(), |()| 0);
     }
 
     /// No `timeoutUser`, so only a port shutting down with the request queued
@@ -274,7 +271,8 @@ impl DeviceSupport for DevHeidNd261 {
 #[cfg(test)]
 mod tests {
     use epics_rs::asyn::error::AsynResult;
-    use epics_rs::asyn::request::RequestResult;
+    use epics_rs::asyn::interpose::EomReason;
+    use epics_rs::asyn::request::{OctetRead, RequestResult};
     use epics_rs::base::server::records::ai::AiRecord;
 
     use super::*;
@@ -316,13 +314,14 @@ mod tests {
             self.log.push(match op {
                 RequestOp::SetInputEos { eos } => format!("ieos {eos:?}"),
                 RequestOp::OctetWrite { data } => format!("write {data:?}"),
-                RequestOp::OctetRead { buf_size } => format!("read {buf_size}"),
+                RequestOp::OctetRead { buf_size, .. } => format!("read {buf_size}"),
                 other => format!("{other:?}"),
             });
             match (op, &self.reply) {
-                (RequestOp::OctetRead { .. }, Some(reply)) => {
-                    Ok(RequestResult::octet_read(reply.clone(), reply.len()))
-                }
+                (RequestOp::OctetRead { .. }, Some(reply)) => Ok(RequestResult::octet_read(
+                    OctetRead::new(reply.clone(), EomReason::empty(), Ok(())),
+                    reply.len(),
+                )),
                 (RequestOp::OctetRead { .. }, None) => Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "timeout".into(),

@@ -23,7 +23,7 @@ use crate::drv_quad_em::{
     self as qe, CallbackContext, QE_MAX_INPUTS, QeModel, QeTriggerMode, QeTriggerPolarity,
     QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared, num_average_from,
 };
-use crate::octet::{OctetIo, connect_octet, reply_text};
+use crate::octet::{OctetIo, connect_octet, outcome, reply_text};
 use crate::pcr4_proto::{self as proto, DataLine};
 use crate::{asyn_print, trace};
 
@@ -117,7 +117,8 @@ impl Pcr4Driver {
     // --- I/O helpers (C++ writeReadMeter / sendCommand) ---
 
     fn write_read_meter(&self, out: &str) -> AsynResult<String> {
-        self.io.write_read(out, proto::MAX_COMMAND_LEN)
+        let (raw, status) = self.io.write_read(out, proto::MAX_COMMAND_LEN).into_parts();
+        status.map(|()| reply_text(&raw))
     }
 
     /// C++ `sendCommand`: stop acquisition around the command, require `ACK`,
@@ -326,8 +327,8 @@ impl QuadEmDevice for Pcr4Driver {
                 // flight: read until a line ends in it, or until the meter
                 // stops answering.
                 loop {
-                    match self.io.read_line(proto::MAX_COMMAND_LEN) {
-                        Ok(outcome) => {
+                    match outcome(self.io.read_line(proto::MAX_COMMAND_LEN)) {
+                        (outcome, Ok(())) => {
                             if outcome.eom.contains(EomReason::EOS)
                                 && proto::ends_with_ack(&outcome.data)
                             {
@@ -341,7 +342,7 @@ impl QuadEmDevice for Pcr4Driver {
                                 outcome.data.len()
                             );
                         }
-                        Err(e) => {
+                        (_, Err(e)) => {
                             asyn_print!(
                                 self.base.port_base,
                                 ERROR,
@@ -519,7 +520,12 @@ impl PortDriver for Pcr4Driver {
         if level > 0 {
             prev_acquiring = self.shared.is_acquiring();
             let _ = self.set_acquire(0);
-            let reply = reply_text(self.write_read_meter(proto::CMD_NETCONFIG));
+            // C++ prints `inString_` whatever the read's status.
+            let (raw, _) = self
+                .io
+                .write_read(proto::CMD_NETCONFIG, proto::MAX_COMMAND_LEN)
+                .into_parts();
+            let reply = reply_text(&raw);
             let _ = writeln!(out, "NETCONFIG response from meter:\n{reply}");
         }
         self.asyn_port_driver_report(out, level);
@@ -592,12 +598,11 @@ fn read_thread(ctx: ReadContext) {
             ctx.shared.set_reading_active(true);
         }
 
-        let read = ctx.io.locked_read_line(proto::ASCII_BUFFER_SIZE);
-        let outcome = match read {
-            Ok(o) if o.eom.contains(EomReason::EOS) => o,
-            _ => {
-                if trace::read_result(&read).0 != AsynStatus::Timeout {
-                    trace::print_read_error(&ctx.handle, "drvPCR4::readThread", &read);
+        let outcome = match outcome(ctx.io.locked_read_line(proto::ASCII_BUFFER_SIZE)) {
+            (o, Ok(())) if o.eom.contains(EomReason::EOS) => o,
+            (o, status) => {
+                if trace::read_result(&o, &status).0 != AsynStatus::Timeout {
+                    trace::print_read_error(&ctx.handle, "drvPCR4::readThread", &o, &status);
                     thread::sleep(READ_ERROR_BACKOFF);
                 }
                 continue;
