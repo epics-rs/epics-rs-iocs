@@ -1961,10 +1961,7 @@ mod tests {
             "nodatapulse",
             "R",
         );
-        db.get_record("AONODATA")
-            .unwrap()
-            .write()
-            .put_common_field("TPRO", EpicsValue::Char(1))
+        rt.block_on(db.put_pv_no_process("AONODATA.TPRO", EpicsValue::Char(1)))
             .unwrap();
         let stat = || db.get_record("AONODATA").unwrap().read().common.stat;
         assert_ne!(stat(), alarm_status::WRITE_ALARM);
