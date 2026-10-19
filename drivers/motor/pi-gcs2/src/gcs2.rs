@@ -654,10 +654,11 @@ impl PIGCS2Controller {
         }
     }
 
-    /// The constructor's `*IDN?` into an emptied buffer: empty when the
-    /// exchange fails, whose status C ignores.
+    /// The constructor's `*IDN?` into an emptied buffer, whose status C
+    /// ignores: what arrived, a reply cut by a timeout included
+    /// (PIasynController.cpp:151-161).
     pub fn read_idn(&mut self) -> &str {
-        self.ident = self.query("*IDN?").unwrap_or_default();
+        self.ident = self.query_buffer("*IDN?").0;
         &self.ident
     }
 
@@ -3075,6 +3076,26 @@ mod tests {
     /// C `PIasynAxis::Init` (PIasynAxis.cpp:89-93): `getResolution`, then
     /// `getAxisVelocity`'s `VEL?` on a controller that knows it, then the
     /// position.
+    /// PIasynController.cpp:151-161 ignores `*IDN?`'s status and picks the
+    /// controller from `inputBuff`, so a reply cut by a timeout still names
+    /// it.
+    #[test]
+    fn an_idn_cut_by_a_timeout_is_still_read() {
+        let (_line, io) = motor_common::testing::LineRig::cut(
+            "gcs2IdnCut",
+            |last| {
+                if last == "*IDN?" {
+                    "PI E-517 Interface and Display Module".into()
+                } else {
+                    "0".into()
+                }
+            },
+            |last| last == "*IDN?",
+        );
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2IdnCut");
+        assert_eq!(ctrl.read_idn(), "PI E-517 Interface and Display Module");
+    }
+
     #[test]
     fn axis_init_reads_the_velocity_before_the_position() {
         let (line, io) = motor_common::testing::LineRig::new("gcs2InitVel", |last| {
