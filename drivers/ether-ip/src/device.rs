@@ -1024,6 +1024,11 @@ impl EtherIpDevice {
                 )
             }
             "bo" | "mbbo" | "mbboDirect" => {
+                // C defect, not copied: an mbbo whose PLC value matches no
+                // state gets VAL 65535 and keeps its stale RVAL
+                // (devEtherIP.c:641), which mbbo_write (:2136) writes back to
+                // the PLC against :316's "should NOT cause the record to
+                // write". Here RVAL takes the PLC's value.
                 let bits = if rtype == "bo" { 1 } else { nobt(record) };
                 let rval = i32_field(record, "RVAL") as u32;
                 follow!(
