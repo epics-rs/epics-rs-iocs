@@ -32,8 +32,7 @@ use opcua::defaults;
 use opcua::device_support;
 use opcua::ioc::{self, SharedRegistry};
 use opcua::registry::Registry;
-use opcua::session::{Control, SessionConfig};
-use opcua::subscription::SubscriptionConfig;
+use opcua::session::Control;
 
 /// `devOpcuaSup/10_devOpcuaInt64.dbd` and `20_devOpcuaAll.dbd`'s `device()` lines.
 static DEVICES: &[(&str, &[DevSup])] = &[
@@ -133,44 +132,47 @@ const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'stat
     }
 }
 
-/// How many `key=value` option slots each option-taking command declares.
-///
-/// Framework gap: `epics_rs`'s iocsh has no variadic argument type (`ArgType` is
-/// String, Int or Double), where the C's option argument is an `iocshArgArgv`
-/// tail of any length (`iocshIntegration.cpp:82`). A fixed number of optional
-/// String slots is the closest shape; six covers every option `SessionConfig`
-/// and `SubscriptionConfig` accept.
-const OPTION_SLOTS: usize = 6;
-
-fn string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
+/// C's `sval`: `None` when the line ended before the argument, `""` for an
+/// empty token.
+fn sval(args: &[ArgValue], i: usize) -> Option<String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Ok(Some(s.to_str()?.to_owned())),
-        _ => Ok(None),
+        Some(ArgValue::String(s)) => Some(s.to_str_lossy().into_owned()),
+        _ => None,
     }
 }
 
-fn required(args: &[ArgValue], i: usize, name: &str) -> Result<String, String> {
-    string(args, i)?.ok_or_else(|| format!("argument '{name}' is required"))
+/// C's `ival` / `dval`: 0 when the argument is absent or empty.
+fn ival(args: &[ArgValue], i: usize) -> i64 {
+    match args.get(i) {
+        Some(ArgValue::Int(v)) => *v,
+        _ => 0,
+    }
 }
 
-/// The `key=value` tail of a command, from argument `from` on.
-fn options(args: &[ArgValue], from: usize) -> Result<Vec<(String, String)>, String> {
-    let mut tokens = Vec::new();
-    for i in from..args.len() {
-        tokens.extend(string(args, i)?);
+fn dval(args: &[ArgValue], i: usize) -> f64 {
+    match args.get(i) {
+        Some(ArgValue::Double(v)) => *v,
+        _ => 0.0,
     }
-    Ok(ioc::parse_options(tokens.iter().map(String::as_str)))
+}
+
+/// An `iocshArgArgv` option tail, without the C's leading `av[0]`.
+fn argv(args: &[ArgValue], i: usize) -> Vec<String> {
+    match args.get(i) {
+        Some(ArgValue::Argv(tokens)) => tokens
+            .iter()
+            .map(|t| t.to_str_lossy().into_owned())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn strs(tokens: &[String]) -> Vec<&str> {
+    tokens.iter().map(String::as_str).collect()
 }
 
 fn arg(name: &'static str, arg_type: ArgType) -> ArgDesc {
     ArgDesc { name, arg_type }
-}
-
-/// `[options]`, as `OPTION_SLOTS` optional String arguments.
-fn option_args() -> Vec<ArgDesc> {
-    (0..OPTION_SLOTS)
-        .map(|_| arg("[key=value]", ArgType::String))
-        .collect()
 }
 
 fn commands(
@@ -178,115 +180,89 @@ fn commands(
     registry: &SharedRegistry,
     connector: &Arc<AsyncOpcuaConnector>,
 ) -> IocApplication {
-    // opcuaSession(name, URL, [options]) — iocshIntegration.cpp:88-140.
-    let mut args = vec![arg("name", ArgType::String), arg("URL", ArgType::String)];
-    args.extend(option_args());
+    // None of the C's command functions sets an error status: each prints its
+    // own lines and the script goes on.
     app = app.register_startup_command(CommandDef::new(
         "opcuaSession",
-        args,
-        "opcuaSession name URL [key=value ...]",
+        vec![
+            arg("name", ArgType::String),
+            arg("URL", ArgType::String),
+            arg("[options]", ArgType::Argv),
+        ],
+        ioc::SESSION_USAGE,
         {
             let registry = registry.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let name = required(args, 0, "name")?;
-                let url = required(args, 1, "URL")?;
-                if name.contains(char::is_whitespace) {
-                    return Err(format!("session name '{name}' must not contain spaces"));
-                }
-                let mut config = SessionConfig::new(&name, &url);
-                for (key, value) in options(args, 2)? {
-                    // The C's catch: report, and apply no further option.
-                    if let Err(e) = config.set_option(&key, &value) {
-                        eprintln!("ERROR : {e}");
-                        break;
-                    }
-                }
-                registry
-                    .add_session(config)
-                    .map_err(|e| format!("opcuaSession: {e}"))?;
+                let options = argv(args, 2);
+                ioc::session_command(
+                    &registry,
+                    sval(args, 0).as_deref(),
+                    sval(args, 1).as_deref(),
+                    &strs(&options),
+                );
                 Ok(CommandOutcome::Continue)
             }
         },
     ));
 
-    // opcuaSubscription(name, session, interval, [options]) —
-    // iocshIntegration.cpp:159-201.
-    let mut args = vec![
-        arg("name", ArgType::String),
-        arg("session", ArgType::String),
-        arg("publishing interval [ms]", ArgType::Double),
-    ];
-    args.extend(option_args());
     app = app.register_startup_command(CommandDef::new(
         "opcuaSubscription",
-        args,
-        "opcuaSubscription name session [interval_ms] [key=value ...]",
+        vec![
+            arg("name", ArgType::String),
+            arg("session", ArgType::String),
+            arg("publishing interval [ms]", ArgType::Double),
+            arg("[options]", ArgType::Argv),
+        ],
+        ioc::SUBSCRIPTION_USAGE,
         {
             let registry = registry.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let name = required(args, 0, "name")?;
-                let session = required(args, 1, "session")?;
-                if name.contains(char::is_whitespace) {
-                    return Err(format!(
-                        "subscription name '{name}' must not contain spaces"
-                    ));
-                }
-                let mut config = SubscriptionConfig::new(&name, &session);
-                // A missing or non-positive interval keeps the default, as in the
-                // C (`iocshIntegration.cpp:176-181`).
-                if let Some(ArgValue::Double(interval)) = args.get(2)
-                    && *interval > 0.0
-                {
-                    config.publishing_interval = *interval;
-                }
-                for (key, value) in options(args, 3)? {
-                    config.set_option(&key, &value);
-                }
-                registry
-                    .add_subscription(config)
-                    .map_err(|e| format!("opcuaSubscription: {e}"))?;
+                let options = argv(args, 3);
+                ioc::subscription_command(
+                    &registry,
+                    sval(args, 0).as_deref(),
+                    sval(args, 1).as_deref(),
+                    dval(args, 2),
+                    &strs(&options),
+                );
                 Ok(CommandOutcome::Continue)
             }
         },
     ));
 
-    // opcuaOptions(pattern, [options]) — iocshIntegration.cpp:212-260.
-    let mut args = vec![arg("session/subscription", ArgType::String)];
-    args.extend(option_args());
     app = app.register_startup_command(CommandDef::new(
         "opcuaOptions",
-        args,
-        "opcuaOptions pattern [key=value ...]",
+        vec![
+            arg("pattern", ArgType::String),
+            arg("[options]", ArgType::Argv),
+        ],
+        ioc::OPTIONS_USAGE,
         {
             let registry = registry.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let pattern = required(args, 0, "session/subscription")?;
-                let options = options(args, 1)?;
-                ioc::set_options(&registry, &pattern, &options)
-                    .map_err(|e| format!("opcuaOptions: {e}"))?;
+                let pattern = sval(args, 0).unwrap_or_default();
+                let options = ioc::parse_options(&strs(&argv(args, 1)));
+                if let Err(e) = ioc::set_options(&registry, &pattern, &options) {
+                    eprintln!("opcuaOptions: {e}");
+                }
                 Ok(CommandOutcome::Continue)
             }
         },
     ));
 
-    // opcuaShow(pattern, verbosity) — iocshIntegration.cpp:379-410. A runtime
-    // command as well as a startup one, as it is in the C.
+    // A runtime command as well as a startup one, as it is in the C.
     let show = CommandDef::new(
         "opcuaShow",
         vec![
             arg("pattern", ArgType::String),
             arg("verbosity", ArgType::Int),
         ],
-        "opcuaShow [pattern] [verbosity]",
+        ioc::SHOW_USAGE,
         {
             let registry = registry.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let pattern = string(args, 0)?.unwrap_or_else(|| "*".to_string());
-                let level = match args.get(1) {
-                    Some(ArgValue::Int(v)) => *v as i32,
-                    _ => 0,
-                };
-                print!("{}", ioc::show(&registry, &pattern, level));
+                let pattern = sval(args, 0).unwrap_or_else(|| "*".to_string());
+                print!("{}", ioc::show(&registry, &pattern, ival(args, 1) as i32));
                 Ok(CommandOutcome::Continue)
             }
         },
@@ -295,22 +271,24 @@ fn commands(
         .register_startup_command(show.clone())
         .register_shell_command(show);
 
-    // opcuaConnect / opcuaDisconnect — iocshIntegration.cpp:419-490.
-    for (name, control, usage) in [
-        ("opcuaConnect", Control::Connect, "opcuaConnect session"),
+    for (name, arg_name, control, usage) in [
+        (
+            "opcuaConnect",
+            "session",
+            Control::Connect,
+            ioc::CONNECT_USAGE,
+        ),
         (
             "opcuaDisconnect",
+            "session name",
             Control::Disconnect,
-            "opcuaDisconnect session",
+            ioc::DISCONNECT_USAGE,
         ),
     ] {
-        let command = CommandDef::new(name, vec![arg("session", ArgType::String)], usage, {
+        let command = CommandDef::new(name, vec![arg(arg_name, ArgType::String)], usage, {
             let registry = registry.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let session = required(args, 0, "session")?;
-                registry
-                    .control(&session, control)
-                    .map_err(|e| format!("{name}: {e}"))?;
+                ioc::control_command(&registry, sval(args, 0).as_deref(), control);
                 Ok(CommandOutcome::Continue)
             }
         });
@@ -319,7 +297,6 @@ fn commands(
             .register_shell_command(command);
     }
 
-    // opcuaMapNamespace(session, index, URI) — iocshIntegration.cpp:452-490.
     app = app.register_startup_command(CommandDef::new(
         "opcuaMapNamespace",
         vec![
@@ -327,37 +304,32 @@ fn commands(
             arg("namespace index", ArgType::Int),
             arg("namespace URI", ArgType::String),
         ],
-        "opcuaMapNamespace session index URI",
+        ioc::MAP_NAMESPACE_USAGE,
         {
             let registry = registry.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let session = required(args, 0, "session")?;
-                let index = match args.get(1) {
-                    Some(ArgValue::Int(v)) if (0..=i64::from(u16::MAX)).contains(v) => *v as u16,
-                    _ => return Err("namespace index must be 0..65535".into()),
-                };
-                let uri = required(args, 2, "namespace URI")?;
-                registry
-                    .map_namespace(&session, index, &uri)
-                    .map_err(|e| format!("opcuaMapNamespace: {e}"))?;
+                ioc::map_namespace_command(
+                    &registry,
+                    sval(args, 0).as_deref(),
+                    ival(args, 1),
+                    sval(args, 2).as_deref(),
+                );
                 Ok(CommandOutcome::Continue)
             }
         },
     ));
 
-    // opcuaShowSecurity(session) — iocshIntegration.cpp:573-590.
     let show_security = CommandDef::new(
         "opcuaShowSecurity",
-        vec![arg("session", ArgType::String)],
-        "opcuaShowSecurity [session]",
+        vec![arg("session name [\"\"=client]", ArgType::String)],
+        ioc::SHOW_SECURITY_USAGE,
         {
             let registry = registry.clone();
             let connector = connector.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let session = string(args, 0)?.unwrap_or_else(|| "*".to_string());
                 print!(
                     "{}",
-                    ioc::show_security(&registry, &connector.security(), &session)
+                    ioc::show_security(&registry, &connector.security(), sval(args, 0).as_deref())
                 );
                 Ok(CommandOutcome::Continue)
             }
@@ -367,27 +339,27 @@ fn commands(
         .register_startup_command(show_security.clone())
         .register_shell_command(show_security);
 
-    // opcuaClientCertificate(cert, key) — iocshIntegration.cpp:603-620.
     app = app.register_startup_command(CommandDef::new(
         "opcuaClientCertificate",
         vec![
-            arg("client public cert file", ArgType::String),
-            arg("client private key file", ArgType::String),
+            arg("certificate (public key) file", ArgType::String),
+            arg("private key file", ArgType::String),
         ],
-        "opcuaClientCertificate certfile keyfile",
+        ioc::CLIENT_CERTIFICATE_USAGE,
         {
             let connector = connector.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let certificate = required(args, 0, "client public cert file")?;
-                let key = required(args, 1, "client private key file")?;
-                connector.set_client_certificate(&certificate, &key);
+                let (certificate, key) = (sval(args, 0), sval(args, 1));
+                if let Some((certificate, key)) =
+                    ioc::client_certificate_args(certificate.as_deref(), key.as_deref())
+                {
+                    connector.set_client_certificate(certificate, key);
+                }
                 Ok(CommandOutcome::Continue)
             }
         },
     ));
 
-    // opcuaSetupPKI(location, ...) — iocshIntegration.cpp:638-690.
-    //
     // Accepted-and-documented: only the C's one-argument form ("a standard
     // directory structure under the specified location") has an equivalent.
     // `async-opcua` lays the four PKI locations out beneath one root itself, so
@@ -396,41 +368,38 @@ fn commands(
     // rather than silently reduced to its first argument.
     app = app.register_startup_command(CommandDef::new(
         "opcuaSetupPKI",
-        vec![
-            arg("PKI / server certs location", ArgType::String),
-            arg("server revocation lists location", ArgType::String),
-            arg("issuer certs location", ArgType::String),
-            arg("issuer revocation lists location", ArgType::String),
-        ],
-        "opcuaSetupPKI pki_root",
+        ioc::SETUP_PKI_ARGS
+            .iter()
+            .map(|name| arg(name, ArgType::String))
+            .collect(),
+        ioc::SETUP_PKI_USAGE,
         {
             let connector = connector.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let root = required(args, 0, "PKI / server certs location")?;
-                if (1..4).any(|i| matches!(args.get(i), Some(ArgValue::String(s)) if !s.is_empty()))
-                {
-                    return Err("opcuaSetupPKI: this port's client (async-opcua) derives \
-                         trusted/, rejected/ and issuers/ from one PKI root; the four-argument \
-                         form, which names each location separately, has no equivalent. Use \
+                let args: [Option<String>; 4] = std::array::from_fn(|i| sval(args, i));
+                match ioc::setup_pki_args(args.each_ref().map(|a| a.as_deref())) {
+                    Some([root, "", "", ""]) => connector.set_pki_root(root),
+                    Some(_) => eprintln!(
+                        "opcuaSetupPKI: this port's client (async-opcua) derives trusted/, \
+                         rejected/ and issuers/ from one PKI root; the four-argument form, which \
+                         names each location separately, has no equivalent. Use \
                          'opcuaSetupPKI <root>'."
-                        .into());
+                    ),
+                    None => {}
                 }
-                connector.set_pki_root(&root);
                 Ok(CommandOutcome::Continue)
             }
         },
     ));
 
-    // opcuaSaveRejected(location) — iocshIntegration.cpp:701-740.
-    //
     // Accepted-and-documented: rejected server certificates are saved, but the
     // location is `<PKI root>/rejected`, which `async-opcua` fixes. A script that
     // asks for a different one is warned, not failed — the certificates it wants
     // kept are being kept, just elsewhere.
     app = app.register_startup_command(CommandDef::new(
         "opcuaSaveRejected",
-        vec![arg("location", ArgType::String)],
-        "opcuaSaveRejected [location]",
+        vec![arg("location for saving rejected certs", ArgType::String)],
+        ioc::SAVE_REJECTED_USAGE,
         {
             let connector = connector.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
@@ -438,7 +407,7 @@ fn commands(
                     .security()
                     .pki_root
                     .unwrap_or_else(|| opcua::client::DEFAULT_PKI_DIR.to_string());
-                match string(args, 0)? {
+                match sval(args, 0).filter(|s| !s.is_empty()) {
                     Some(location) => eprintln!(
                         "opcuaSaveRejected: '{location}' ignored — this port's client saves \
                          rejected server certificates under '{pki}/rejected', which it fixes."
@@ -469,8 +438,13 @@ fn commands(
         ],
         "var opcua_<Variable> value",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let name = required(args, 0, "variable")?;
-            let value = required(args, 1, "value")?;
+            let required = |i, name| {
+                sval(args, i)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| format!("argument '{name}' is required"))
+            };
+            let name = required(0, "variable")?;
+            let value = required(1, "value")?;
             if !defaults::set_variable(&name, &value) {
                 return Err(format!(
                     "var: '{name}' is not one of this IOC's variables, or '{value}' is not a \

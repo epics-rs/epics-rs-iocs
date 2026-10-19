@@ -394,6 +394,14 @@ impl SessionHandle {
     pub fn set_option(&self, name: &str, value: &str) -> Result<(), String> {
         self.config.lock().set_option(name, value)
     }
+
+    /// `opcuaMapNamespace`.
+    pub fn add_namespace_mapping(&self, index: u16, uri: &str) {
+        self.config
+            .lock()
+            .namespace_map
+            .insert(index, uri.to_string());
+    }
 }
 
 /// Everything the worker owns.

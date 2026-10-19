@@ -14,9 +14,10 @@ use async_opcua::types::NodeId;
 use parking_lot::Mutex;
 
 use crate::client::UaConnector;
+use crate::ioc::glob_match;
 use crate::item::{Item, Leaf};
 use crate::link::{LinkInfo, LinkTarget, NameResolver, NodeIdentifier};
-use crate::session::{self, Control, SessionConfig, SessionHandle, SessionWorker};
+use crate::session::{self, SessionConfig, SessionHandle, SessionWorker};
 use crate::subscription::SubscriptionConfig;
 
 pub struct Registry {
@@ -26,11 +27,13 @@ pub struct Registry {
 
 #[derive(Default)]
 struct Inner {
-    sessions: HashMap<String, Arc<SessionHandle>>,
+    /// In creation order, which is the order a glob reports them in; the C's
+    /// glob yields a `std::set` of pointers, an order it does not define.
+    sessions: Vec<Arc<SessionHandle>>,
     /// Workers wait here until [`Registry::start`] spawns them.
     workers: Vec<SessionWorker>,
-    /// Subscription name → the session it runs on.
-    subscriptions: HashMap<String, String>,
+    /// (subscription, the session it runs on), in creation order.
+    subscriptions: Vec<(String, String)>,
     /// The item of each `opcuaItem` record, by record name — what an element
     /// record's link resolves to.
     item_records: HashMap<String, Arc<Mutex<Item>>>,
@@ -65,98 +68,93 @@ impl Registry {
         })
     }
 
-    /// `opcuaSession` (`iocshIntegration.cpp:88-140`).
-    pub fn add_session(&self, config: SessionConfig) -> Result<(), String> {
+    /// `Session::createSession` (`Session.cpp:66-73`): `None` when the name is
+    /// taken by a session or a subscription.
+    pub fn add_session(&self, config: SessionConfig) -> Option<Arc<SessionHandle>> {
         let mut inner = self.inner.lock();
-        if inner.sessions.contains_key(&config.name) {
-            return Err(format!("session '{}' already exists", config.name));
+        if inner.name_in_use(&config.name) {
+            return None;
         }
-        let name = config.name.clone();
         let (handle, worker) = session::create(config, self.connector.clone());
-        inner.sessions.insert(name, handle);
+        inner.sessions.push(handle.clone());
         inner.workers.push(worker);
-        Ok(())
+        Some(handle)
     }
 
-    /// `opcuaSubscription` (`iocshIntegration.cpp:159-201`).
-    pub fn add_subscription(&self, config: SubscriptionConfig) -> Result<(), String> {
+    /// `Subscription::createSubscription` (`Subscription.cpp:28-36`): false when
+    /// the name is taken by a session or a subscription, or there is no such
+    /// session.
+    pub fn add_subscription(&self, config: SubscriptionConfig) -> bool {
         let mut inner = self.inner.lock();
-        if inner.subscriptions.contains_key(&config.name) {
-            return Err(format!("subscription '{}' already exists", config.name));
+        let Some(session) = inner.session(&config.session).cloned() else {
+            return false;
+        };
+        if inner.name_in_use(&config.name) {
+            return false;
         }
-        let session = inner
-            .sessions
-            .get(&config.session)
-            .ok_or_else(|| format!("unknown session '{}'", config.session))?
-            .clone();
         inner
             .subscriptions
-            .insert(config.name.clone(), config.session.clone());
+            .push((config.name.clone(), config.session.clone()));
         session.subscriptions.lock().push(config);
-        Ok(())
+        true
     }
 
-    /// `opcuaOptions` — the name is a session's or a subscription's
-    /// (`iocshIntegration.cpp:212-260`).
-    pub fn set_option(&self, name: &str, key: &str, value: &str) -> Result<(), String> {
-        let inner = self.inner.lock();
-        if let Some(session) = inner.sessions.get(name) {
-            return session.set_option(key, value);
-        }
-        let Some(session_name) = inner.subscriptions.get(name) else {
-            return Err(format!("unknown session or subscription '{name}'"));
+    /// `RegistryKeyNamespace::global.contains`: sessions and subscriptions
+    /// share one namespace.
+    pub fn name_in_use(&self, name: &str) -> bool {
+        self.inner.lock().name_in_use(name)
+    }
+
+    /// `Subscription::find`.
+    pub fn has_subscription(&self, name: &str) -> bool {
+        self.inner.lock().subscription_session(name).is_some()
+    }
+
+    /// `SubscriptionOpen62541::setOption` on the named subscription.
+    pub fn set_subscription_option(&self, name: &str, key: &str, value: &str) {
+        let Some(session) = self
+            .subscription_session(name)
+            .and_then(|s| self.session(&s).ok())
+        else {
+            return;
         };
-        let session = inner.sessions[session_name].clone();
-        drop(inner);
         let mut subscriptions = session.subscriptions.lock();
-        let subscription = subscriptions
-            .iter_mut()
-            .find(|s| s.name == name)
-            .expect("the subscription is on the session it was added to");
-        subscription.set_option(key, value);
-        Ok(())
-    }
-
-    /// `opcuaMapNamespace` (`iocshIntegration.cpp:452-490`).
-    pub fn map_namespace(&self, session: &str, index: u16, uri: &str) -> Result<(), String> {
-        let session = self.session(session)?;
-        session
-            .config
-            .lock()
-            .namespace_map
-            .insert(index, uri.to_string());
-        Ok(())
-    }
-
-    /// `opcuaConnect` / `opcuaDisconnect`.
-    pub fn control(&self, session: &str, control: Control) -> Result<(), String> {
-        self.session(session)?.control(control);
-        Ok(())
+        if let Some(subscription) = subscriptions.iter_mut().find(|s| s.name == name) {
+            subscription.set_option(key, value);
+        }
     }
 
     pub fn session(&self, name: &str) -> Result<Arc<SessionHandle>, String> {
         self.inner
             .lock()
-            .sessions
-            .get(name)
+            .session(name)
             .cloned()
             .ok_or_else(|| format!("unknown session '{name}'"))
     }
 
     pub fn sessions(&self) -> Vec<Arc<SessionHandle>> {
-        self.inner.lock().sessions.values().cloned().collect()
+        self.inner.lock().sessions.clone()
     }
 
-    /// Every name `opcuaOptions` and `opcuaShow` can match: the sessions and the
-    /// subscriptions (`RegistryKeyNamespace::global`, which the C keeps them
-    /// both in).
-    pub fn names(&self) -> Vec<String> {
+    /// `Session::glob`.
+    pub fn glob_sessions(&self, pattern: &str) -> Vec<Arc<SessionHandle>> {
         let inner = self.inner.lock();
         inner
             .sessions
-            .keys()
-            .chain(inner.subscriptions.keys())
+            .iter()
+            .filter(|s| glob_match(pattern, &s.name))
             .cloned()
+            .collect()
+    }
+
+    /// `Subscription::glob`, by name.
+    pub fn glob_subscriptions(&self, pattern: &str) -> Vec<String> {
+        let inner = self.inner.lock();
+        inner
+            .subscriptions
+            .iter()
+            .filter(|(name, _)| glob_match(pattern, name))
+            .map(|(name, _)| name.clone())
             .collect()
     }
 
@@ -310,12 +308,32 @@ fn node_id_of(link: &LinkInfo) -> Result<NodeId, String> {
     }
 }
 
+impl Inner {
+    fn session(&self, name: &str) -> Option<&Arc<SessionHandle>> {
+        self.sessions.iter().find(|s| s.name == name)
+    }
+
+    fn subscription_session(&self, name: &str) -> Option<&str> {
+        self.subscriptions
+            .iter()
+            .find(|(subscription, _)| subscription == name)
+            .map(|(_, session)| session.as_str())
+    }
+
+    fn name_in_use(&self, name: &str) -> bool {
+        self.session(name).is_some() || self.subscription_session(name).is_some()
+    }
+}
+
 impl NameResolver for Registry {
     fn subscription_session(&self, name: &str) -> Option<String> {
-        self.inner.lock().subscriptions.get(name).cloned()
+        self.inner
+            .lock()
+            .subscription_session(name)
+            .map(str::to_string)
     }
 
     fn is_session(&self, name: &str) -> bool {
-        self.inner.lock().sessions.contains_key(name)
+        self.inner.lock().session(name).is_some()
     }
 }
