@@ -6,6 +6,8 @@
 //! "parse the leading numeric prefix, `0` on junk" behaviour of `atof`/`atoi`,
 //! which controller reply parsing relies on.
 
+use std::os::raw::c_long;
+
 /// Mimic C `atof`: parse the leading numeric prefix as `f64`, returning `0.0`
 /// on junk (as C `atof` does).
 pub fn atof(s: &str) -> f64 {
@@ -42,34 +44,60 @@ pub fn atof(s: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Mimic C `atoi`: parse the leading integer prefix, `0` on junk.
-pub fn atoi(s: &str) -> i32 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
+/// C `strtol(s, &end, radix)` on this platform's `long`, pre-C23 (no `0b`):
+/// `isspace` blanks, a sign and, in base 0 or 16, a `0x` are read, and base
+/// 0 takes a leading `0` as octal. An overflow saturates at `LONG_MIN` /
+/// `LONG_MAX`. The value and the offset `end` stopped at, `0` when no digit
+/// was converted.
+pub fn strtol(s: &[u8], radix: u32) -> (c_long, usize) {
+    let mut at = s
+        .iter()
+        .take_while(|&&c| matches!(c, b' ' | b'\t'..=b'\r'))
+        .count();
+    let negative = s.get(at) == Some(&b'-');
+    if matches!(s.get(at), Some(b'+' | b'-')) {
+        at += 1;
     }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
+    let hex = s.get(at) == Some(&b'0')
+        && matches!(s.get(at + 1), Some(b'x' | b'X'))
+        && s.get(at + 2).is_some_and(u8::is_ascii_hexdigit);
+    let radix = match radix {
+        0 | 16 if hex => {
+            at += 2;
+            16
+        }
+        0 if s.get(at) == Some(&b'0') => 8,
+        0 => 10,
+        radix => radix,
+    };
+    // Accumulated toward the sign, so LONG_MIN's magnitude fits.
+    let (value, digits) = s[at..]
+        .iter()
+        .map_while(|&c| char::from(c).to_digit(radix))
+        .fold((0 as c_long, 0), |(v, n), d| {
+            let v = v.saturating_mul(radix as c_long);
+            let v = if negative {
+                v.saturating_sub(d as c_long)
+            } else {
+                v.saturating_add(d as c_long)
+            };
+            (v, n + 1)
+        });
+    if digits == 0 {
+        return (0, 0);
     }
-    t.get(..i).and_then(|p| p.parse::<i32>().ok()).unwrap_or(0)
+    (value, at + digits)
 }
 
-/// Mimic C `atol`/`strtol` into `i64`: parse the leading integer prefix, `0`
-/// on junk. Used by controllers whose positions overflow `i32` (picomotor
-/// step counts, encoder counts).
-pub fn atol(s: &str) -> i64 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    t.get(..i).and_then(|p| p.parse::<i64>().ok()).unwrap_or(0)
+/// C `atoi`, `(int) strtol(s, NULL, 10)`: an out-of-`int` value wraps, after
+/// an overflow saturates.
+pub fn atoi(s: &str) -> i32 {
+    strtol(s.as_bytes(), 10).0 as i32
+}
+
+/// C `atol`, `strtol(s, NULL, 10)`.
+pub fn atol(s: &str) -> c_long {
+    strtol(s.as_bytes(), 10).0
 }
 
 /// Parse leading hex digits as `u32` (C `sscanf` `%x`); `None` if there is no
@@ -133,6 +161,40 @@ mod tests {
         assert_eq!(atol("10000000000x"), 10_000_000_000);
         assert_eq!(atol("-2"), -2);
         assert_eq!(atol("junk"), 0);
+    }
+
+    /// glibc on LP64 gives -1294967296, -1 and 0 here; a 32-bit `long`
+    /// saturates the first at `INT_MAX`.
+    #[test]
+    fn atoi_wraps_after_strtol_saturates() {
+        let wrapped = if c_long::BITS == 64 {
+            -1_294_967_296
+        } else {
+            i32::MAX
+        };
+        assert_eq!(atoi("3000000000"), wrapped);
+        assert_eq!(atoi("99999999999999999999"), c_long::MAX as i32);
+        assert_eq!(atoi("-99999999999999999999"), c_long::MIN as i32);
+        assert_eq!(atoi("\x0b\x0c 12"), 12);
+    }
+
+    #[test]
+    fn atol_saturates_as_strtol() {
+        assert_eq!(atol("99999999999999999999"), c_long::MAX);
+        assert_eq!(atol("-99999999999999999999"), c_long::MIN);
+    }
+
+    /// Offsets as glibc's `end`: `0x` without a hex digit stops at the `x`.
+    #[test]
+    fn strtol_reads_c_prefixes() {
+        assert_eq!(strtol(b" \x0b-0x1Fz", 16), (-31, 7));
+        assert_eq!(strtol(b"0X1f", 0), (31, 4));
+        assert_eq!(strtol(b"017", 0), (15, 3));
+        assert_eq!(strtol(b"09", 0), (0, 1));
+        assert_eq!(strtol(b" -0xg", 16), (0, 3));
+        assert_eq!(strtol(b"0b101", 0), (0, 1));
+        assert_eq!(strtol(b"  +", 10), (0, 0));
+        assert_eq!(strtol(b"", 10), (0, 0));
     }
 
     #[test]

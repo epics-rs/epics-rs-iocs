@@ -41,19 +41,7 @@ pub(crate) fn atof(s: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Mimic C `atoi`: parse the leading integer prefix, `0` on junk.
-pub(crate) fn atoi(s: &str) -> i32 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    t.get(..i).and_then(|p| p.parse::<i32>().ok()).unwrap_or(0)
-}
+pub(crate) use motor_common::util::atoi;
 
 /// Parse leading hex digits as `u32` (C `sscanf` `%x`); `None` if there is no
 /// hex digit (C `sscanf` count `!= 1`).
@@ -147,13 +135,6 @@ mod tests {
         // No valid number → 0.0, like C atof.
         assert_eq!(atof("abc"), 0.0);
         assert_eq!(atof("+"), 0.0);
-    }
-
-    #[test]
-    fn atoi_parses_leading_integer_prefix() {
-        assert_eq!(atoi("400rpm"), 400);
-        assert_eq!(atoi("-7"), -7);
-        assert_eq!(atoi("junk"), 0);
     }
 
     #[test]
