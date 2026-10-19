@@ -1367,7 +1367,9 @@ fn layout_chips(detector: &Value, family: DetectorFamily) -> Option<&Vec<Value>>
 }
 
 /// C `publishChipLayout`: the entry whose integer `Chip` is `chip`, not the
-/// entry at that position.
+/// entry at that position. C compares `get<int>()`, which wraps a `Chip`
+/// past int onto a real chip number (serval_http.cpp:1541-1542); that is
+/// not copied.
 fn chip_layout_entry(chips: &[Value], chip: i32) -> Option<&Value> {
     chips.iter().find(|entry| {
         entry
