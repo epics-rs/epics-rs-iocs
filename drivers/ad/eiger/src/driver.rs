@@ -232,9 +232,11 @@ impl EigerDriver {
             Ok(bytes) => (String::from_utf8_lossy(bytes).into_owned(), Ok(())),
             Err(e) => (String::new(), Err(e)),
         };
+        // With no space C's `space + 1` wraps npos to 0: the model is the whole
+        // description too (eigerDetector.cpp:1648-1650).
         let (manufacturer, model) = match description.split_once(' ') {
             Some((m, rest)) => (m.to_string(), rest.to_string()),
-            None => (description.clone(), String::new()),
+            None => (description.clone(), description.clone()),
         };
         base.set_string_param(self.ad.params.base.manufacturer, 0, manufacturer)?;
         base.set_string_param(self.ad.params.base.model, 0, model)?;
