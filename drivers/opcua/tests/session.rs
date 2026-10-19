@@ -301,7 +301,7 @@ fn drain(leaf: &Arc<Mutex<Leaf>>) -> Vec<Update> {
 #[test]
 fn a_batch_is_bounded_by_the_smaller_of_the_two_limits() {
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    config.nodes_max = 10;
+    config.set_option("nodes-max", "10").unwrap();
     let server = ServerInfo {
         max_nodes_per_read: 4,
         max_nodes_per_write: 20,
@@ -324,13 +324,32 @@ fn a_limit_only_one_side_sets_is_the_one_that_holds() {
     assert_eq!(config.write_batch_size(&server), 3);
 }
 
+/// `nodes-max` sets both limits when it is applied, so of it and a
+/// service-specific limit the later option wins (`SessionOpen62541.cpp:418-429`).
 #[test]
-fn the_service_specific_limit_beats_the_general_one() {
-    let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    config.nodes_max = 8;
-    config.read_nodes_max = 2;
-    assert_eq!(config.read_batch_size(&ServerInfo::default()), 2);
-    assert_eq!(config.write_batch_size(&ServerInfo::default()), 8);
+fn the_later_of_nodes_max_and_a_service_limit_wins() {
+    let sizes = |options: &[(&str, &str)]| {
+        let mut config = SessionConfig::new("sess", "opc.tcp://host");
+        for (key, value) in options {
+            config.set_option(key, value).unwrap();
+        }
+        (
+            config.read_batch_size(&ServerInfo::default()),
+            config.write_batch_size(&ServerInfo::default()),
+        )
+    };
+    assert_eq!(
+        sizes(&[("nodes-max", "8"), ("read-nodes-max", "2")]),
+        (2, 8)
+    );
+    assert_eq!(
+        sizes(&[("read-nodes-max", "2"), ("nodes-max", "8")]),
+        (8, 8)
+    );
+    assert_eq!(
+        sizes(&[("write-nodes-max", "3"), ("batch-nodes", "5")]),
+        (5, 5)
+    );
 }
 
 #[test]
@@ -354,7 +373,7 @@ fn session_options_are_parsed() {
 
     assert_eq!(config.debug, 2);
     assert!(!config.autoconnect);
-    assert_eq!(config.nodes_max, 100);
+    assert_eq!((config.read_nodes_max, config.write_nodes_max), (100, 100));
     assert_eq!(config.read_timeout_min, 5.0);
     assert_eq!(
         config.security_mode,
@@ -372,9 +391,9 @@ fn a_bad_session_option_is_passed_over() {
     config.set_option("nonsense", "1").unwrap();
     config.set_option("sec-mode", "Bogus").unwrap();
     config.set_option("nodes-max", "0x10").unwrap();
-    assert_eq!(config.nodes_max, 16);
+    assert_eq!(config.read_nodes_max, 16);
     config.set_option("nodes-max", "x").unwrap();
-    assert_eq!(config.nodes_max, 0);
+    assert_eq!(config.read_nodes_max, 0);
     assert_eq!(config.security_mode, opcua::client::SecurityMode::Best);
 }
 

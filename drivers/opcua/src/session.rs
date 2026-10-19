@@ -49,8 +49,8 @@ pub struct SessionConfig {
     pub debug: u32,
     /// Reconnect on connection loss and connect at `iocInit`.
     pub autoconnect: bool,
-    /// Per-service-call node limits (0 = no client-side limit).
-    pub nodes_max: u32,
+    /// Per-service-call node limits (0 = no client-side limit). `nodes-max`
+    /// sets both.
     pub read_nodes_max: u32,
     pub write_nodes_max: u32,
     /// Batch hold-off bounds [ms] (`read-timeout-min`/`read-timeout-max` and
@@ -80,7 +80,6 @@ impl SessionConfig {
             url: url.into(),
             debug: 0,
             autoconnect: true,
-            nodes_max: 0,
             read_nodes_max: 0,
             write_nodes_max: 0,
             read_timeout_min: 0.0,
@@ -222,7 +221,8 @@ impl SessionConfig {
                         "DEPRECATED: option 'batch-nodes'; use 'nodes-max' instead\n"
                     ));
                 }
-                self.nodes_max = count();
+                self.read_nodes_max = count();
+                self.write_nodes_max = self.read_nodes_max;
             }
             "read-nodes-max" => self.read_nodes_max = count(),
             "read-timeout-min" => self.read_timeout_min = count() as f64,
@@ -289,22 +289,12 @@ impl SessionConfig {
     /// the smaller of the server's limit and the session's, or whichever of the
     /// two is set. Zero means no limit.
     pub fn read_batch_size(&self, server: &ServerInfo) -> usize {
-        batch_size(
-            server.max_nodes_per_read,
-            effective(self.read_nodes_max, self.nodes_max),
-        )
+        batch_size(server.max_nodes_per_read, self.read_nodes_max)
     }
 
     pub fn write_batch_size(&self, server: &ServerInfo) -> usize {
-        batch_size(
-            server.max_nodes_per_write,
-            effective(self.write_nodes_max, self.nodes_max),
-        )
+        batch_size(server.max_nodes_per_write, self.write_nodes_max)
     }
-}
-
-fn effective(specific: u32, general: u32) -> u32 {
-    if specific > 0 { specific } else { general }
 }
 
 fn batch_size(server_limit: u32, session_limit: u32) -> usize {

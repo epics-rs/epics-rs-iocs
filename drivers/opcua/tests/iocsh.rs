@@ -322,7 +322,7 @@ fn an_option_reaches_every_session_before_the_next_one() {
     );
     for name in ["S1", "S2"] {
         assert_eq!(
-            registry.session(name).unwrap().config.lock().nodes_max,
+            registry.session(name).unwrap().config.lock().read_nodes_max,
             3,
             "{name}"
         );
