@@ -89,8 +89,8 @@ impl MarccdDriver {
             1,
             max_memory,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::ENUM,
+            InterfaceMask::ENUM,
         )?;
         let p = MarccdParams::create(&mut ad.port_base)?;
 
@@ -711,6 +711,74 @@ pub(crate) mod tests {
         assert_eq!(names(table(&mut det, p.readout_mode)).len(), 6);
 
         assert!(det.read_enum(&AsynUser::new(p.frame_shift)).is_err());
+    }
+
+    /// marCCD.cpp:1466 declares asynEnum, so devAsynInt32's initCommon
+    /// (devAsynInt32.c:298-324) loads `readEnum`'s tables into the mbbo
+    /// state strings at iocInit.
+    #[epics_rs::base::epics_test]
+    async fn iocinit_loads_read_enums_tables_into_the_mbbo() {
+        use std::collections::HashMap;
+
+        use epics_rs::asyn::adapter::register_asyn_device_support_for_builder;
+        use epics_rs::base::server::database::PvDatabase;
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::types::EpicsValue;
+
+        let name = "MARCCD_ENUMINIT";
+        fake_server(name, |c| match c {
+            c if c.starts_with("get_mode") => "2",
+            c if c.starts_with("get_size") => "64,32",
+            c if c.starts_with("get_bin") => "1,1",
+            c if c.starts_with("get_") => "0",
+            _ => "",
+        });
+        let claim = claim_port(name).unwrap();
+        let det = create_marccd_detector(&claim, &format!("{name}_IP"), 0).unwrap();
+        let owner = Arc::new(PvDatabase::new());
+        claim
+            .publish(
+                det.port_handle().clone(),
+                owner.scan_control().interrupt_gate(),
+            )
+            .unwrap();
+        let db_text = format!(
+            r#"record(mbbo, "MAR:TriggerMode") {{
+                field(DTYP, "asynInt32")
+                field(OUT,  "@asyn({name},0)TRIGGER_MODE")
+            }}
+            record(mbbo, "MAR:GateMode") {{
+                field(DTYP, "asynInt32")
+                field(OUT,  "@asyn({name},0)MAR_GATE_MODE")
+            }}"#
+        );
+        let (db, _) = register_asyn_device_support_for_builder(IocBuilder::new())
+            .with_database(owner)
+            .db_string(&db_text, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let strings = |rec: &str, fields: &[&str]| {
+            let rec = db.get_record(rec).unwrap();
+            let inst = rec.read();
+            fields
+                .iter()
+                .map(|f| match inst.record.get_field(f) {
+                    Some(EpicsValue::String(s)) => s.to_string(),
+                    other => panic!("{f}: {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            strings("MAR:TriggerMode", &["ZRST", "ONST", "TWST", "THST", "FRST"]),
+            ["Internal", "Frame", "Bulb", "Timed", ""]
+        );
+        assert_eq!(
+            strings("MAR:GateMode", &["ZRST", "ONST", "TWST"]),
+            ["None", "Gated", ""]
+        );
+        std::mem::forget(det);
     }
 
     /// ADDriver.cpp:180-181: C's ADDriver constructor sets ADMaxSizeX/Y to 1,

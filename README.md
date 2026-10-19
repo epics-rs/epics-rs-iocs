@@ -77,7 +77,6 @@ epics-rs-iocs/
 │   ├── ur-robot/               # Universal Robots arm (RTDE/script/dashboard/gripper)
 │   ├── love/                   # Love Controls PID controller (RS-485)
 │   ├── delaygen/               # SRS DG645 / Colby PDL-100A / Coherent SDG
-│   ├── syringepump/            # Teledyne ISCO / ISCO Modbus / Vindum pumps
 │   ├── microepsilon/           # capaNCDT6200 displacement sensor
 │   ├── yokogawa-gm10/          # Yokogawa GM10 data acquisition
 │   └── yokogawa-mw100/         # Yokogawa MW100 data acquisition
@@ -234,7 +233,7 @@ Records (`iocs/ad/bruker-ioc/db/BIS.template`, includes `ADBase.template` + `NDF
 - `ReadSFRMTimeout` (ao) — timeout waiting for the SFRM file beyond the exposure time
 - `BISStatus` (waveform, I/O Intr) — last status line BIS broadcast
 - `NumDarks` / `NumDarks_RBV` — number of dark frames
-- `FileFormat` redefined to just `SFRM`/`Invalid`
+- `FileFormat` redefined to just `SRFM` (upstream's spelling)/`Invalid`
 - `FrameType` redefined: `Normal`/`Dark`/`Raw`/`DblCorrelation`
 - `BISAsyn` (asyn record) — interactive access to the BIS command port
 
@@ -1049,30 +1048,27 @@ other two device blocks are commented out.
 ### syringepump — Teledyne ISCO, ISCO (Modbus), Vindum syringe pumps
 
 **Ports from:** [epics-modules/SyringePump](https://github.com/epics-modules/SyringePump)
-(`teled_d.proto`/`teled_h.proto` for the native driver; ISCO/Vindum are
-Modbus-only upstream)
+(ISCO/Vindum are Modbus-only upstream)
 
-`drivers/syringepump` is a native asyn port driver for the Teledyne ISCO
-D/H-series pumps, translating their StreamDevice `.proto` command tables
-(no StreamDevice engine exists in this framework) into a native command
-table, transcribed byte-for-byte including the shared `%0<nsum>` frame
-checksum. The module's other two families, ISCO and Vindum, are
-Modbus-only upstream (`drvModbusAsynConfigure` + generic templates, no
-StreamDevice) and are wired directly in `iocs/syringepump-ioc` against
-`epics-modbus-rs` — no driver code of their own in this crate.
+The Teledyne ISCO D/H-series pumps run on StreamDevice as in C: SPApp/Db's
+`teled_d.proto`/`teled_h.proto` and templates through `stream-rs`, with
+only the approved `PressSeq`/`MaxFlowSeq` link repoint in
+`teledynePumpD.template`. The module's other two families, ISCO and
+Vindum, are Modbus-only upstream (`drvModbusAsynConfigure` + generic
+templates) and are wired directly in `iocs/syringepump-ioc` against
+`epics-modbus-rs`.
 
 **Build/run:** `cargo run -p syringepump-ioc --release -- iocs/syringepump-ioc/st.cmd`
 
-Native-driver templates (`drivers/syringepump`-backed):
+StreamDevice templates:
 
 | db template | Records |
 |---|---|
-| `teledynePumpD.template` | `PressureTweak(+Down/Up)`, `Run`, `Stop`, `Remote`, `Local`, `PressureSP`, `PressSeq`, `PressSend`, `MaxFlow`, `MaxFlowSeq`, `MaxFlowSend`, `Scanner`, `Vol`, `Pressure`, `PressSet_RBV`, `Flow`, `MaxFlow_RBV`, `Status`, `Command`, `CmdReply`, `AlarmI` (22 records) |
-| `teledynePumpH.template` | Same core set as D-series plus `VolPARSE/Format`, `PressurePARSE/Format`, `PressSetPARSE/Format`, `FlowPARSE/Format`, `MaxFlow_RBVPARSE/Format` (`aSub` parsers, since the H-series reply is line text, not binary), `Units`, `Mode`, `ID`, `Refill`, `GetRefillLimit`, `SetRefillRate(+Calc)`, `SetDigitalOut`, `SetDigitalCalc1`, `AutoFillSeq1/2`, `ControlVentSeq/2` (44 records) |
+| `teledynePumpD.template` | `PressureTweak`, `FlowRateTweak`, `RefillRateTweak` (each +Down/Up), `Run`, `Stop`, `Remote`, `Local`, `PressureSP`, `PressSeq`, `PressSend`, `MaxFlow`, `MaxFlowSeq`, `MaxFlowSend`, `Scanner`, `Vol`, `Pressure`, `PressSet_RBV`, `Flow`, `MaxFlow_RBV`, `Status`, `Command`, `CmdProc`, `CmdReply`, `AlarmI` (30 records) |
+| `teledynePumpH.template` | `Run`, `PistonUp`, `Stop`, `Remote`, `Local`, `PressSet`, `PressSeq`, `PressSend`, `MaxFlow`, `MaxFlowSeq`, `MaxFlowSend`, `Scanner`, `Vol`, `Pressure`, `PressSet_RBV`, `Flow`, `MaxFlow_RBV` (the last five each with `PARSE`/`Format` aSubs), `Status`, `Units`, `Mode`, `ID`, `Command`, `CmdProc`, `CmdReply`, `AlarmI`, `Refill`, `GetRefillLimit`, `SetRefillRate(+Calc)`, `SetDigitalOut`, `SetDigitalCalc1`, `AutoFillSeq1/2`, `ControlVentSeq/2` (44 records) |
 
 Modbus-wired templates (loaded directly by `iocs/syringepump-ioc`'s
-st.cmd against `drvModbusAsynConfigure` ports, not the `syringepump`
-driver crate):
+st.cmd against `drvModbusAsynConfigure` ports):
 
 | db template | Records |
 |---|---|

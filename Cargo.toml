@@ -65,7 +65,6 @@ members = [
     "drivers/delaygen",
     "drivers/love",
     "drivers/scaler974",
-    "drivers/syringepump",
     "drivers/microepsilon",
     "iocs/ad/eiger-ioc",
     "iocs/ad/mythen-ioc",
@@ -262,7 +261,8 @@ modbus-rs = { version = "0.32.0", package = "epics-modbus-rs" }
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
 mca-rs = "0.32.0"
-# StreamDevice (psi StreamDevice port); microepsilon-ioc's L0 config port.
+# StreamDevice (psi StreamDevice port): syringepump-ioc's Teledyne D/H and
+# microepsilon-ioc's L0 config port.
 stream-rs = "0.32.0"
 # float_roundtrip makes the parser correctly rounded, as C's strtod is;
 # without it some doubles parse 1 ULP off.

@@ -4,6 +4,7 @@
 //! **MCC-1/MCC-2** stepper controllers over an asyn octet port with STX/ETX
 //! framing. Both are ported here onto the asyn-rs `AsynMotor` boundary.
 
+pub mod io;
 pub mod ioc;
 pub mod phytron;
 
