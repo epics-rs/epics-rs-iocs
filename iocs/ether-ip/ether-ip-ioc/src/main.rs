@@ -44,7 +44,12 @@ static DEVICES: &[(&str, &[DevSup])] = &[
         "bo",
         &[
             row("devBoEtherIP", device::DTYP, 6, &[2, 4]),
-            row("devBoEtherIPReset", device::DTYP_RESET, 6, &[4]),
+            DevSup {
+                name: "devBoEtherIPReset",
+                choice: device::DTYP_RESET,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[4], false),
+            },
         ],
     ),
     (
@@ -63,12 +68,13 @@ static DEVICES: &[(&str, &[DevSup])] = &[
     ),
 ];
 
+/// A devEtherIP row whose `init` is the shared `init(run)`.
 const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'static [u8]) -> DevSup {
     DevSup {
         name,
         choice,
         link_type: DbLinkType::InstIo,
-        dset: Dset::new(number, funcs, false),
+        dset: Dset::new(number, funcs, false).with_init(driver::dev_init),
     }
 }
 
@@ -282,4 +288,26 @@ async fn main() -> CaResult<()> {
     init_hook_register(std::sync::Arc::new(driver::init_hook));
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every devEtherIP dset but devBoEtherIPReset has `init` (devEtherIP.c),
+    /// so `finishDevSup` starts the driver through any of them.
+    #[test]
+    fn every_dset_but_reset_runs_dev_init() {
+        let dev_init: fn(bool) = driver::dev_init;
+        for (record_type, rows) in DEVICES {
+            for row in *rows {
+                assert_eq!(
+                    row.dset.init.map(|f| f as usize),
+                    (row.name != "devBoEtherIPReset").then_some(dev_init as usize),
+                    "{record_type} {}",
+                    row.name
+                );
+            }
+        }
+    }
 }

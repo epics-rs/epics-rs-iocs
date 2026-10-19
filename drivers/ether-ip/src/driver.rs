@@ -361,20 +361,24 @@ pub fn initialized() -> bool {
     INITIALIZED.load(Ordering::SeqCst)
 }
 
-/// The init hooks C's driver and device support act on: devEtherIP's
-/// `init(1)` (finishDevSup, before `initHookAfterFinishDevSup`) and
-/// `drvEtherIP_initHook` at `initHookAfterScanInit`. Both call
-/// `drvEtherIP_restart`; only the second finds the database ready.
+/// devEtherIP's `driver_started`.
+static DRIVER_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// devEtherIP's `init(run)` (devEtherIP.c:1171-1180), every devEtherIP
+/// dset's `init`: `finishDevSup`'s `init(1)` starts the driver once, before
+/// the database is ready.
+pub fn dev_init(after: bool) {
+    if after && !DRIVER_STARTED.swap(true, Ordering::SeqCst) {
+        restart();
+    }
+}
+
+/// `drvEtherIP_initHook`: at `initHookAfterScanInit` the database is ready
+/// and `drvEtherIP_restart` launches the scan tasks [`dev_init`] delayed.
 pub fn init_hook(state: InitHookState) {
-    match state {
-        InitHookState::AfterFinishDevSup => {
-            restart();
-        }
-        InitHookState::AfterScanInit if initialized() => {
-            DATABASE_READY.store(true, Ordering::SeqCst);
-            restart();
-        }
-        _ => {}
+    if state == InitHookState::AfterScanInit && initialized() {
+        DATABASE_READY.store(true, Ordering::SeqCst);
+        restart();
     }
 }
 
@@ -1228,6 +1232,16 @@ pub fn help() {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    /// devEtherIP `init(run)`: `init(0)` starts nothing, the first
+    /// `init(1)` starts the driver and a second does not again.
+    #[test]
+    fn dev_init_starts_the_driver_once_on_the_after_pass() {
+        dev_init(false);
+        assert!(!DRIVER_STARTED.load(Ordering::SeqCst));
+        dev_init(true);
+        assert!(DRIVER_STARTED.load(Ordering::SeqCst));
+    }
 
     /// drvEtherIP.c:494-501: a PLC that never connects leaves no socket, so
     /// disconnect_PLC does not run and no record is told its tag is invalid.
