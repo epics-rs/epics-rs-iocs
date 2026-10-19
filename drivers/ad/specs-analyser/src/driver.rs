@@ -45,6 +45,9 @@ fn enum_choices(values: &[String]) -> Arc<[EnumEntry]> {
         .collect()
 }
 
+/// specsAnalyser.cpp:50-51, both the interface and the interrupt mask.
+const SPECS_INTERFACES: InterfaceMask = InterfaceMask::ENUM.or(InterfaceMask::FLOAT64_ARRAY);
+
 pub struct SpecsAnalyserDriver {
     pub ad: ADDriverBase,
     pub p: SpecsParams,
@@ -78,8 +81,8 @@ impl SpecsAnalyserDriver {
             1,
             max_memory,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            SPECS_INTERFACES,
+            SPECS_INTERFACES,
         )?;
         let _ = max_buffers;
         let p = SpecsParams::create(&mut ad.port_base)?;
@@ -838,6 +841,27 @@ mod tests {
         d.create_discovered(found(2.5));
         let reason = d.ad.port_base.find_param("LENS_VOLTAGE").unwrap();
         assert_eq!(d.ad.port_base.get_float64_param(reason, 0).unwrap(), 2.5);
+    }
+
+    /// The port carries the interfaces C's constructor names
+    /// (specsAnalyser.cpp:50-51) on top of ADDriver's and asynNDArrayDriver's.
+    #[test]
+    fn the_port_has_the_c_interfaces() {
+        use epics_rs::ad_core::driver::ad_driver::{AD_DRIVER_INTERFACES, AD_DRIVER_INTERRUPTS};
+        use epics_rs::ad_core::driver::ndarray_driver::{
+            ND_ARRAY_DRIVER_INTERFACES, ND_ARRAY_DRIVER_INTERRUPTS,
+        };
+        let d = offline("SPECS_MASK");
+        let own = InterfaceMask::ENUM | InterfaceMask::FLOAT64_ARRAY;
+        assert_eq!(
+            d.ad.port_base.interrupt_mask(),
+            own | AD_DRIVER_INTERRUPTS | ND_ARRAY_DRIVER_INTERRUPTS
+        );
+        assert!(
+            d.ad.port_base
+                .interface_mask()
+                .contains(own | AD_DRIVER_INTERFACES | ND_ARRAY_DRIVER_INTERFACES)
+        );
     }
 
     /// writeInt32/writeFloat64 set and post list 0 whatever the address
