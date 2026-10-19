@@ -136,6 +136,7 @@ impl Camserver {
         let t_start = Instant::now();
         let mut delta_time = 0.0f64;
         let mut status = AsynStatus::Success;
+        let mut nread = 0;
 
         while delta_time <= timeout {
             let user = AsynUser::default()
@@ -151,6 +152,7 @@ impl Camserver {
             // C's fromCamserver ends at `nbytesTransfered`, which counts what a
             // timed-out read still delivered.
             let (data, result) = read.into_parts();
+            nread = data.len();
             self.from = String::from_utf8_lossy(&data).into_owned();
             status = result.map_or_else(|e| e.status(), |()| AsynStatus::Success);
 
@@ -184,9 +186,7 @@ impl Camserver {
         if status != AsynStatus::Success {
             cam_trace(&format!(
                 "pilatusDetector:readCamserver, timeout={timeout:.6}, status={} received {} bytes\n{}\n",
-                status as i32,
-                self.from.len(),
-                self.from
+                status as i32, nread, self.from
             ));
         } else if !reply_is_ok(&self.from) {
             cam_trace(&format!(
@@ -677,5 +677,26 @@ mod tests {
         );
         assert_eq!(status, AsynStatus::Timeout as i32);
         assert_eq!(from, "15 OK exp");
+    }
+
+    /// C prints the last read's nread (pilatusDetector.cpp:985-987): the bytes
+    /// the camserver sent, not the length of their lossy text.
+    #[test]
+    fn a_failed_read_prints_the_bytes_the_last_read_delivered() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let name = "PILATUS_NREAD";
+        let log = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        PortServices::global().trace().set_trace_file(
+            Some(&format!("{name}_CAM")),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let (status, _) = cam_read_over(name, &[(b"15 \xff", true)], 0.05);
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert_eq!(status, AsynStatus::Timeout as i32);
+        assert!(text.contains(" received 4 bytes\n"), "{text}");
     }
 }
