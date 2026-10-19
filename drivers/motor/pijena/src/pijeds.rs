@@ -295,7 +295,7 @@ impl PiJedsAxis {
 impl Model1Motor for PiJedsAxis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -557,6 +557,34 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPIJEDS.cc:292-306 exit stores what motor_init prepared (:660-669,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once the
+    /// controller is past RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("pijedsInitFail", |last| match last {
+            "" => "DSM V1.959".into(),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(PiJedsController::new(io).unwrap()));
+        let mut first = PiJedsAxis::new(ctrl.clone(), 0);
+        let mut second = PiJedsAxis::new(ctrl, 1);
+        let prepared = MotorStatus {
+            has_encoder: true,
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 
     /// devPIJEDS.cc:190-191: INIT as its own message, named like any queued
