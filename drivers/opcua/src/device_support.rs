@@ -822,7 +822,7 @@ impl OpcuaDevice {
         let (notify_tx, notify_rx) = mpsc::channel(1);
         let binding = self
             .registry
-            .bind(&self.record_name, link, notify_tx)
+            .bind(&self.record_name, record_type, link, notify_tx)
             .map_err(|e| CaError::LinkError(format!("{}: {e}", self.record_name)))?;
         self.bound = Some(binding.clone());
         self.notify = Some(notify_rx);

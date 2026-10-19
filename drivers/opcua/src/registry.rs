@@ -226,11 +226,13 @@ impl Registry {
     pub fn bind(
         &self,
         record: &str,
+        record_type: &str,
         link: LinkInfo,
         notify: tokio::sync::mpsc::Sender<()>,
     ) -> Result<Binding, String> {
         let leaf = Arc::new(Mutex::new(Leaf::new(
             record.to_string(),
+            record_type,
             link.clone(),
             notify,
         )));

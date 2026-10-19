@@ -255,7 +255,7 @@ fn item(text: &str, kind: RecordKind) -> (Arc<Mutex<Item>>, Arc<Mutex<Leaf>>) {
     // A capacity of one is all a test needs; the record end of the channel is
     // dropped, so a pulse that finds no room is simply dropped.
     let (notify, _rx) = mpsc::channel(1);
-    let leaf = Arc::new(Mutex::new(Leaf::new("rec".to_string(), info, notify)));
+    let leaf = Arc::new(Mutex::new(Leaf::new("rec".to_string(), "ai", info, notify)));
     item.leaves.push(leaf.clone());
     (Arc::new(Mutex::new(item)), leaf)
 }
@@ -1548,12 +1548,66 @@ fn an_item_shows_the_size_of_its_element_tree() {
         ("A_C", "ITEM element=a.c", INPUT),
         ("D", "ITEM element=d", INPUT),
     ] {
-        let leaf = Leaf::new(record.to_string(), link(text, kind), notify.clone());
+        let leaf = Leaf::new(record.to_string(), "ai", link(text, kind), notify.clone());
         item.leaves.push(Arc::new(Mutex::new(leaf)));
     }
 
     let line = item.show_line();
     assert!(line.ends_with(" dataNodes=2 dataLeafs=3"), "{line}");
+}
+
+/// From level 1 an item shows its data tree below its line: nodes named by
+/// the element paths, in the order the records added them, and a leaf per
+/// element record (`DataElementOpen62541Node::show`,
+/// `DataElementOpen62541Leaf::show`).
+#[test]
+fn an_item_shows_its_element_tree_from_level_one() {
+    const ITEM: RecordKind = RecordKind {
+        is_output: false,
+        is_item_record: true,
+    };
+    let mut item = Item::pending();
+    let (notify, _rx) = mpsc::channel(1);
+    for (record, rtyp, text, kind) in [
+        ("ITEM", "opcuaItem", "subs ns=2;s=Struct", ITEM),
+        ("A_B", "ai", "ITEM element=a.b", INPUT),
+        ("D", "stringin", "ITEM element=d monitor=n", INPUT),
+        ("A_C", "longout", "ITEM element=a.c", OUTPUT),
+    ] {
+        let leaf = Leaf::new(record.to_string(), rtyp, link(text, kind), notify.clone());
+        item.leaves.push(Arc::new(Mutex::new(leaf)));
+    }
+    item.leaves[2].lock().incoming = Some(Variant::from("text"));
+
+    let line = item.show_line();
+    assert_eq!(item.show(0), format!("{line}\n"));
+    assert_eq!(
+        item.show(1),
+        format!(
+            "{line}\n\
+             \x20 node=[ROOT] children=2 mapped=n\n\
+             \x20   node=a children=2 mapped=n\n\
+             \x20     leaf=b record(ai)=A_B type=Null timestamp=server bini=read monitor=y\n\
+             \x20     leaf=c record(longout)=A_C type=Null timestamp=server bini=read monitor=y\n\
+             \x20   leaf=d record(stringin)=D type=String timestamp=server bini=read monitor=n\n"
+        )
+    );
+}
+
+/// An item with one record bound to the whole node has that record's leaf
+/// as its root.
+#[test]
+fn a_single_record_is_the_root_leaf() {
+    let (item0, leaf0) = item("subs ns=2;s=Sensor", INPUT);
+    leaf0.lock().incoming = Some(Variant::Double(1.5));
+    let item = item0.lock();
+    assert_eq!(
+        item.show(1),
+        format!(
+            "{}\n  leaf=[ROOT] record(ai)=rec type=Double timestamp=server bini=read monitor=y\n",
+            item.show_line()
+        )
+    );
 }
 
 #[test]
@@ -1609,7 +1663,7 @@ fn the_element_map_reports_what_the_structure_cannot_supply() {
         ("Z", "PT element=z"),
         ("XQ", "PT element=x.q"),
     ] {
-        let leaf = Leaf::new(record.to_string(), link(text, INPUT), notify.clone());
+        let leaf = Leaf::new(record.to_string(), "ai", link(text, INPUT), notify.clone());
         item.leaves.push(Arc::new(Mutex::new(leaf)));
     }
 

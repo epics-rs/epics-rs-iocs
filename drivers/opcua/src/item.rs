@@ -35,6 +35,8 @@ use crate::value::{EnumChoices, type_name};
 #[derive(Debug)]
 pub struct Leaf {
     pub record: String,
+    /// `RecordConnector::getRecordType`.
+    pub record_type: String,
     pub link: LinkInfo,
     /// Incoming updates, one popped per record process cycle.
     pub queue: UpdateQueue,
@@ -54,10 +56,16 @@ pub struct Leaf {
 }
 
 impl Leaf {
-    pub fn new(record: String, link: LinkInfo, notify: mpsc::Sender<()>) -> Self {
+    pub fn new(
+        record: String,
+        record_type: &str,
+        link: LinkInfo,
+        notify: mpsc::Sender<()>,
+    ) -> Self {
         let queue = UpdateQueue::new(link.client_queue_size as usize, link.discard_oldest);
         Self {
             record,
+            record_type: record_type.to_string(),
             link,
             queue,
             outgoing: None,
@@ -539,6 +547,65 @@ impl Item {
         name
     }
 
+    /// `ItemOpen62541::show`: the item's line, then from level 1 its data tree.
+    pub fn show(&self, level: i32) -> String {
+        let mut out = self.show_line() + "\n";
+        if level >= 1
+            && let Some(root) = self.data_tree()
+        {
+            root.show(self.mapped, 1, &mut out);
+        }
+        out
+    }
+
+    /// `ElementTree::addLeaf` over the element records, in the order they
+    /// bound: a record bound to the whole node is the root leaf, otherwise a
+    /// `[ROOT]` node holds a node per path step and the record's leaf last.
+    fn data_tree(&self) -> Option<Element> {
+        let mut root = None;
+        for leaf in &self.leaves {
+            let path = {
+                let locked = leaf.lock();
+                if locked.link.is_item_record {
+                    continue;
+                }
+                locked.link.element_path.clone()
+            };
+            let Some((name, nodes)) = path.split_last() else {
+                root.get_or_insert_with(|| Element::Leaf {
+                    name: "[ROOT]".to_string(),
+                    leaf: leaf.clone(),
+                });
+                continue;
+            };
+            let mut children = match root.get_or_insert_with(|| Element::node("[ROOT]")) {
+                Element::Node { children, .. } => children,
+                Element::Leaf { .. } => continue,
+            };
+            for step in nodes {
+                let at = match children
+                    .iter()
+                    .position(|c| matches!(c, Element::Node { name, .. } if name == step))
+                {
+                    Some(at) => at,
+                    None => {
+                        children.push(Element::node(step));
+                        children.len() - 1
+                    }
+                };
+                let Element::Node { children: next, .. } = &mut children[at] else {
+                    unreachable!("the position matched a node");
+                };
+                children = next;
+            }
+            children.push(Element::Leaf {
+                name: name.clone(),
+                leaf: leaf.clone(),
+            });
+        }
+        root
+    }
+
     /// `ItemOpen62541::show(0)`'s line.
     pub fn show_line(&self) -> String {
         let link = &self.link;
@@ -742,6 +809,60 @@ pub fn with_element(
 
 /// The structure nodes of C's element tree for these leaf paths: `[ROOT]` and
 /// one node per further step, in tree order.
+/// One element of an item's data tree, as `opcuaShow` walks it.
+enum Element {
+    Node {
+        name: String,
+        children: Vec<Element>,
+    },
+    Leaf {
+        name: String,
+        leaf: Arc<Mutex<Leaf>>,
+    },
+}
+
+impl Element {
+    fn node(name: &str) -> Self {
+        Element::Node {
+            name: name.to_string(),
+            children: Vec::new(),
+        }
+    }
+
+    /// `DataElementOpen62541Node::show` / `DataElementOpen62541Leaf::show`.
+    /// The port keeps one `mapped` flag per item, where the C keeps one per
+    /// node; every node of a tree maps on the same update.
+    fn show(&self, mapped: bool, indent: usize, out: &mut String) {
+        let ind = " ".repeat(indent * 2);
+        match self {
+            Element::Node { name, children } => {
+                *out += &format!(
+                    "{ind}node={name} children={} mapped={}\n",
+                    children.len(),
+                    yn(mapped)
+                );
+                for child in children {
+                    child.show(mapped, indent + 1, out);
+                }
+            }
+            Element::Leaf { name, leaf } => {
+                let leaf = leaf.lock();
+                *out += &format!(
+                    "{ind}leaf={name} record({})={} type={} timestamp={} bini={} monitor={}\n",
+                    leaf.record_type,
+                    leaf.record,
+                    leaf.incoming
+                        .as_ref()
+                        .map_or_else(|| "Null".to_string(), type_name),
+                    leaf.link.timestamp.as_str(),
+                    leaf.link.bini.as_str(),
+                    yn(leaf.link.monitor),
+                );
+            }
+        }
+    }
+}
+
 fn element_nodes(paths: &[Vec<String>]) -> Vec<&[String]> {
     let mut nodes: Vec<&[String]> = paths
         .iter()
