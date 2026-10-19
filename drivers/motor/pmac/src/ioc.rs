@@ -1057,6 +1057,8 @@ mod tests {
         slow: Arc<Mutex<HashMap<String, Duration>>>,
         /// Commands whose reply a timeout cuts short.
         cut: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        /// Commands whose write fails.
+        refused: Arc<Mutex<Vec<String>>>,
     }
 
     impl Rig {
@@ -1075,6 +1077,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(command.into(), partial.into());
+        }
+        fn refuse(&self, command: &str) {
+            self.refused.lock().unwrap().push(command.into());
         }
         fn written(&self) -> Vec<String> {
             std::mem::take(&mut *self.written.lock().unwrap())
@@ -1103,6 +1108,13 @@ mod tests {
         }
         fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data).into_owned();
+            if self.rig.refused.lock().unwrap().contains(&cmd) {
+                self.reply = None;
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "write refused".into(),
+                });
+            }
             let cut = self.rig.cut.lock().unwrap().get(&cmd).cloned();
             self.cut = cut.is_some();
             self.reply = cut.or_else(|| self.rig.replies.lock().unwrap().get(&cmd).cloned());
@@ -1625,6 +1637,51 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    /// pmacAsynCoord.c:584-595, 634-646: both reads parse what a failed
+    /// read delivered, nothing included; only a failed write fails the poll.
+    #[test]
+    fn cut_cs_reads_are_parsed_as_c() {
+        let (rt, rig) = publish_scripted("pmacCsCut");
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let trace = MotorTrace::new("pmacCsCut", 0);
+        let system = Arc::new(Mutex::new(PmacCoordSystem::new(
+            io,
+            trace,
+            9110,
+            2,
+            0,
+            Duration::ZERO,
+        )));
+        let mut axis = PmacCsAxis::new(system, 1).unwrap();
+        let own = TraceCapture::on("pmacCsCut");
+        let user = AsynUser::new(0);
+        let q8 = "&2Q81Q82Q83Q84Q85Q86Q87Q88Q89";
+        rig.answer(q8, b"0.25\r0.5\r");
+        rig.answer("&2??", b"000000\r020000\r000000\r");
+        assert!(axis.poll(&user).unwrap().done);
+
+        rig.cut("&2??", b"000001\r");
+        let status = axis.poll(&user).unwrap();
+        assert!(!status.done && !status.msta_moving);
+        let text = own.take();
+        assert!(
+            text.ends_with(
+                "drvPmacAxisGetStatus: not all status values returned. Status: -1\n\
+                 Command :&2??\nResponse:000001\r"
+            ),
+            "{text}"
+        );
+
+        rig.answer("&2??", b"000000\r020000\r000000\r");
+        rig.cut(q8, b"0.75\r");
+        let status = axis.poll(&user).unwrap();
+        assert_eq!((status.position, status.comms_error), (7500.0, true));
+        rig.silence(q8);
+        assert_eq!(axis.poll(&user).unwrap().position, 0.0);
+        rig.refuse(q8);
+        assert!(axis.poll(&user).is_err());
     }
 
     /// pmacAsynCoord.c:636-648: strtod reads 0 past the end of a short
