@@ -42,8 +42,8 @@ pub fn mmc200_create_controller_command() -> CommandDef {
             let motor_port = req_string(args, 0, "Port name")?;
             let serial_port = req_string(args, 1, "MMC-200 port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
-            if num_axes <= 0 {
-                return Err("MMC200CreateController: numAxes must be positive".into());
+            if num_axes < 0 {
+                return Err("MMC200CreateController: numAxes must not be negative".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
             let ignore_limits = opt_int(args, 5, 0, "Ignore limit flag")? != 0;
@@ -161,5 +161,23 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("  axis index"), "{text}");
+    }
+}
+
+/// C iocsh passes a missing numAxes as 0 (iocsh.cpp:839-840), and C's
+/// controller then has no axes.
+#[cfg(test)]
+mod missing_num_axes {
+    use super::*;
+    use motor_common::testing::port_after;
+
+    #[epics_rs::base::epics_test]
+    async fn an_mmc200_with_no_axes() {
+        let args = vec![
+            ArgValue::String("mmcNoAxes".into()),
+            ArgValue::String("mmcNoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(mmc200_create_controller_command(), args, "mmcNoAxes").await);
     }
 }

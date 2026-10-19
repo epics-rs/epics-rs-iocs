@@ -92,10 +92,12 @@ pub fn opt_double(args: &[ArgValue], i: usize, default: f64, name: &str) -> Resu
     }
 }
 
-/// Read a required integer arg.
+/// Read an integer arg; a missing one is 0, as C iocsh passes it
+/// (iocsh.cpp:839-840).
 pub fn req_int(args: &[ArgValue], i: usize, name: &str) -> Result<i64, String> {
     match args.get(i) {
         Some(ArgValue::Int(v)) => Ok(*v),
+        None | Some(ArgValue::Missing) => Ok(0),
         _ => Err(format!("{name} must be an integer")),
     }
 }
@@ -128,5 +130,21 @@ fn poll_ms(arg: Option<&ArgValue>, default: u64, name: &str) -> Result<u64, Stri
         Some(ArgValue::Int(_)) => Err(format!("{name} must not be negative")),
         None | Some(ArgValue::Missing) => Ok(default),
         _ => Err(format!("{name} must be an integer")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_int_arg_is_c_s_0() {
+        assert_eq!(req_int(&[ArgValue::Missing], 0, "n"), Ok(0));
+        assert_eq!(req_int(&[], 0, "n"), Ok(0));
+    }
+
+    #[test]
+    fn a_given_int_arg_is_its_value() {
+        assert_eq!(req_int(&[ArgValue::Int(-3)], 0, "n"), Ok(-3));
     }
 }

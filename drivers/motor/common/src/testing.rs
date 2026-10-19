@@ -348,6 +348,18 @@ pub async fn pollers_after(
     pollers()
 }
 
+/// [`run_command`], then whether it left asyn port `port` registered.
+pub async fn port_after(
+    cmd: epics_rs::base::server::iocsh::registry::CommandDef,
+    args: Vec<epics_rs::base::server::iocsh::registry::ArgValue>,
+    port: &str,
+) -> bool {
+    run_command(cmd, args).await;
+    epics_rs::asyn::manager::PortManager::global()
+        .find_port_handle(port)
+        .is_ok()
+}
+
 /// C `asynReport(level, port)`'s text for asyn port `port`.
 pub fn port_report(port: &str, level: i32) -> String {
     epics_rs::asyn::manager::PortManager::global()

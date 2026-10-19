@@ -52,8 +52,8 @@ pub fn mcdc2805_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let num_motors = c_int(args, 1);
-            if !(1..=8).contains(&num_motors) {
-                return Err("MCDC2805Config: numMotors must be 1..=8".into());
+            if !(0..=8).contains(&num_motors) {
+                return Err("MCDC2805Config: numMotors must be 0..=8".into());
             }
             let asyn_port = req_string(args, 2, "asyn port name")?;
 
@@ -120,6 +120,27 @@ mod report {
 mod tests {
     use super::*;
     use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
+
+    /// C iocsh passes a missing module count as 0 (iocsh.cpp:839-840); C
+    /// stores it (drvMCDC2805.cc:511) and motor_init probes no module.
+    #[epics_rs::base::epics_test]
+    async fn a_missing_module_count_probes_no_module() {
+        let int = ArgValue::Int;
+        run_command(mcdc2805_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("mcdcNoModules", |_| "MCDC 2805".into());
+        let config = vec![
+            int(0),
+            ArgValue::Missing,
+            ArgValue::String("mcdcNoModules".into()),
+        ];
+        run_command(mcdc2805_config_command(), config).await;
+        drvsup_init().await;
+        assert!(line.sent().is_empty());
+        assert_eq!(
+            driver_report("drvMCDC2805", 0),
+            "    MCDC2805 controller 0 connection failed.\n"
+        );
+    }
 
     /// drvMCDC2805.cc:584-626: after the VER probe every setup command is a
     /// bare send_mess, so a refused `SOR 0` keeps the card and its axes.

@@ -213,14 +213,8 @@ pub fn ang1_create_controller_command() -> CommandDef {
             let in_port = req_string(args, 1, "In port name")?;
             let out_port = req_string(args, 2, "Out port name")?;
             let num_axes = req_int(args, 3, "Number of axes")?;
-            // Stricter than C by design: C's axis loop (ANG1Driver.cpp:94)
-            // simply doesn't execute for numAxes<=0, silently creating a
-            // zero-axis controller with no error. A zero-axis controller is a
-            // no-op in practice, so rejecting numAxes < 1 here only surfaces a
-            // likely startup-script mistake earlier rather than diverging in
-            // any runtime behavior.
-            if num_axes < 1 {
-                return Err("ANG1CreateController: numAxes must be > 0".into());
+            if num_axes < 0 {
+                return Err("ANG1CreateController: numAxes must not be negative".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
 
@@ -539,5 +533,24 @@ mod tests {
         assert_eq!(strtoul_hex(" 86zz"), Some(0x86));
         assert_eq!(strtoul_hex("zz"), Some(0));
         assert_eq!(strtoul_hex("0x1ffffffffffffffff"), None);
+    }
+}
+
+/// C iocsh passes a missing numAxes as 0 (iocsh.cpp:839-840), and C's
+/// controller then has no axes.
+#[cfg(test)]
+mod missing_num_axes {
+    use super::*;
+    use motor_common::testing::port_after;
+
+    #[epics_rs::base::epics_test]
+    async fn an_ang1_with_no_axes() {
+        let args = vec![
+            ArgValue::String("ang1NoAxes".into()),
+            ArgValue::String("ang1NoAxesIn".into()),
+            ArgValue::String("ang1NoAxesOut".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(ang1_create_controller_command(), args, "ang1NoAxes").await);
     }
 }

@@ -61,8 +61,8 @@ pub fn mvp2001_create_controller_command() -> CommandDef {
             let port_name = req_string(args, 0, "Port name")?;
             let asyn_port = req_string(args, 1, "MVP 2001 port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
-            if num_axes < 1 {
-                return Err("MVP2001CreateController: numAxes must be > 0".into());
+            if num_axes < 0 {
+                return Err("MVP2001CreateController: numAxes must not be negative".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
@@ -328,5 +328,23 @@ mod report {
             text.contains(&format!("{head}{axis}Port: mvpRep\n")),
             "{text}"
         );
+    }
+}
+
+/// C iocsh passes a missing numAxes as 0 (iocsh.cpp:839-840), and C's
+/// controller then has no axes.
+#[cfg(test)]
+mod missing_num_axes {
+    use super::*;
+    use motor_common::testing::port_after;
+
+    #[epics_rs::base::epics_test]
+    async fn an_mvp2001_with_no_axes() {
+        let args = vec![
+            ArgValue::String("mvpNoAxes".into()),
+            ArgValue::String("mvpNoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(mvp2001_create_controller_command(), args, "mvpNoAxes").await);
     }
 }

@@ -47,8 +47,8 @@ pub fn mcb4b_create_controller_command() -> CommandDef {
             let port_name = req_string(args, 0, "Port name")?;
             let asyn_port = req_string(args, 1, "MCB-4B port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
-            if num_axes < 1 {
-                return Err("MCB4BCreateController: numAxes must be > 0".into());
+            if num_axes < 0 {
+                return Err("MCB4BCreateController: numAxes must not be negative".into());
             }
             let num_axes = num_axes as usize;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
@@ -242,5 +242,23 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("  axis "), "{text}");
+    }
+}
+
+/// C iocsh passes a missing numAxes as 0 (iocsh.cpp:839-840), and C's
+/// controller then has no axes.
+#[cfg(test)]
+mod missing_num_axes {
+    use super::*;
+    use motor_common::testing::port_after;
+
+    #[epics_rs::base::epics_test]
+    async fn an_mcb4b_with_no_axes() {
+        let args = vec![
+            ArgValue::String("mcb4bNoAxes".into()),
+            ArgValue::String("mcb4bNoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(mcb4b_create_controller_command(), args, "mcb4bNoAxes").await);
     }
 }
