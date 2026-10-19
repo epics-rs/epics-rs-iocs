@@ -741,6 +741,19 @@ impl PortDriver for MultiFunctionDriver {
                     "calling AOut",
                 );
             }
+        } else if reason == self.params.analog_out_sync_master {
+            // The record's 0 is Master, 1 Slave.
+            let mode = if value != 0 {
+                uldaq_sys::AOSM_SLAVE
+            } else {
+                uldaq_sys::AOSM_MASTER
+            };
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.ao_set_config(uldaq_sys::AO_CFG_SYNC_MODE, addr as u32, mode),
+                FUNCTION,
+                "Setting analog out master",
+            );
         } else if reason == self.params.analog_out_sync_write {
             // Simultaneous write of all analog outputs
             if value != 0 {
@@ -1212,6 +1225,16 @@ mod tests {
         // uldaq refuses every call on the null handle, so only a write that
         // reaches ulAISetConfigDbl fails.
         assert!(drv.write_int32(&mut user, 60).is_err());
+    }
+
+    #[test]
+    fn analog_out_sync_master_is_written_to_the_device() {
+        let mut drv =
+            MultiFunctionDriver::new("MFSYNCM", DaqDevice::unconnected(), 16, 16).unwrap();
+        let mut user = AsynUser::new(drv.params.analog_out_sync_master).with_addr(1);
+        // A 2408 refuses AO_CFG_SYNC_MODE as the null handle does
+        // (uldaq AoDevice::setCfg_SyncMode), so the record takes WRITE/INVALID.
+        assert!(drv.write_int32(&mut user, 0).is_err());
     }
 
     #[test]
