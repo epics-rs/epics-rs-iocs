@@ -16,7 +16,7 @@ use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -521,7 +521,13 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
     }
 
     s.set_str(s.ad.status_message, "Arming").await;
-    let sequence_id = match s.rest().arm() {
+    let arm_start = std::time::Instant::now();
+    let armed = s.rest().arm();
+    s.trace().flow(
+        "controlTask",
+        format_args!("arming time {:.6}", arm_start.elapsed().as_secs_f64()),
+    );
+    let sequence_id = match armed {
         Ok(id) => id,
         Err(_) => {
             s.trace().err("controlTask", "Failed to arm the detector");
@@ -605,6 +611,13 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
             }
 
             if do_trigger {
+                s.trace().flow(
+                    "controlTask",
+                    format_args!(
+                        "sending trigger {}/{num_triggers}. timeout={trigger_timeout:.6}, exposure={acquire_time:.6}",
+                        triggers + 1
+                    ),
+                );
                 let exposure = (trigger_mode == TRIGGER_MODE_INTE).then_some(acquire_time);
                 let timeout = Duration::from_secs_f64(trigger_timeout.max(0.0));
                 let _ = s.rest().trigger(timeout, exposure);
@@ -615,6 +628,10 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
 
     // Wait for the detector to leave the acquisition states, for the expected
     // image count to arrive, or for a stop.
+    s.trace().flow(
+        "controlTask",
+        format_args!("waiting for detector state or numImages = expectedImages"),
+    );
     let expected_images = num_images.saturating_mul(num_triggers.max(1));
     loop {
         let state = s.fetch_str(p.state).await;
@@ -637,6 +654,8 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
 
     if wait_poll {
         // Let the FileWriter finish writing before telling the poll task to stop.
+        s.trace()
+            .flow("controlTask", format_args!("waiting for FileWriter"));
         loop {
             if s.fetch_str(p.fw_state).await != "acquire" {
                 break;
@@ -646,11 +665,25 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
         rt::sleep(Duration::from_millis(500)).await;
 
         s.poll_stop.store(true, Ordering::Release);
+        s.trace()
+            .flow("controlTask", format_args!("waiting for pollTask"));
         let _ = ch.poll_done_rx.recv().await;
+        let complete = s.poll_complete.load(Ordering::Acquire);
+        s.trace().flow(
+            "controlTask",
+            format_args!("pollTask complete = {}", i32::from(complete)),
+        );
     }
 
     if wait_stream {
+        s.trace()
+            .flow("controlTask", format_args!("waiting for streamTask"));
         let _ = ch.stream_done_rx.recv().await;
+        let complete = s.stream_complete.load(Ordering::Acquire);
+        s.trace().flow(
+            "controlTask",
+            format_args!("streamTask complete = {}", i32::from(complete)),
+        );
     }
 
     if saved_num_images != num_images {
@@ -736,8 +769,12 @@ async fn poll_task(
         let mut retries = 0;
         while i < total_files && retries <= MAX_RETRIES {
             let file = &files[i];
+            s.trace()
+                .flow("pollTask", format_args!("file={}", file.name));
             match s.rest().wait_file(&file.name, Duration::from_secs(1)) {
                 Ok(true) => {
+                    s.trace()
+                        .flow("pollTask", format_args!("file={} exists", file.name));
                     if file.save || file.parse {
                         s.add_pending(1).await;
                         if download_tx.send(file.clone()).await.is_err() {
@@ -753,11 +790,13 @@ async fn poll_task(
                 // means the acquisition was aborted and the file will never come.
                 Ok(false) => {
                     if s.poll_stop.load(Ordering::Acquire) {
+                        not_found_on_stop(&s, &file.name);
                         retries += 1;
                     }
                 }
                 Err(_) => {
                     if s.poll_stop.load(Ordering::Acquire) {
+                        not_found_on_stop(&s, &file.name);
                         retries += 1;
                     } else {
                         rt::sleep(Duration::from_millis(100)).await;
@@ -767,13 +806,25 @@ async fn poll_task(
         }
 
         // Every file we did claim must be reaped before the acquisition is over.
+        s.trace()
+            .flow("pollTask", format_args!("waiting for pending files"));
         while s.pending_files.load(Ordering::Acquire) > 0 {
             rt::sleep(Duration::from_millis(100)).await;
         }
+        s.trace()
+            .flow("pollTask", format_args!("done waiting for pending files"));
 
         s.poll_complete.store(i == total_files, Ordering::Release);
         let _ = done_tx.send(i == total_files).await;
     }
+}
+
+/// C's `waitFile` fails alike for a missing file and a failed request.
+fn not_found_on_stop(s: &Shared, name: &str) {
+    s.trace().flow(
+        "pollTask",
+        format_args!("file={name} not found and pollTask asked to stop"),
+    );
 }
 
 async fn download_task(
@@ -784,6 +835,8 @@ async fn download_task(
     reap_tx: rt::CommandSender<Arc<FileJob>>,
 ) {
     while let Some(file) = rx.recv().await {
+        s.trace()
+            .flow("downloadTask", format_args!("file={}", file.name));
         match s.rest().get_file(&file.name) {
             Err(_) => {
                 s.trace().err(
@@ -815,6 +868,8 @@ async fn parse_task(
     reap_tx: rt::CommandSender<Arc<FileJob>>,
 ) {
     while let Some(file) = rx.recv().await {
+        s.trace()
+            .flow("parseTask", format_args!("file={}", file.name));
         let data = file.data.lock().clone();
         if let Some(data) = data
             && parse_h5(&s, &data).await.is_err()
@@ -861,25 +916,23 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
         // Per frame, after its updateTimeStamps (eigerDetector.cpp:1880, :1892).
         let timestamp = port_stamp(&s.handle).await;
         let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
-        if publish(
-            s,
-            Image {
-                dims: frame.dims,
-                data: frame.data,
-                codec: None,
-                attributes: attrs,
-                threshold_index: frame.threshold,
-                timestamp: Some(timestamp),
-            },
-            array_callbacks,
-            &mut counters,
-        )
-        .await
-        .is_err()
-        {
+        let image = Image {
+            dims: frame.dims,
+            data: frame.data,
+            codec: None,
+            attributes: attrs,
+            threshold_index: frame.threshold,
+            timestamp: Some(timestamp),
+        };
+        let Ok(array) = prepare(s, image, &counters).await else {
             trace.err("parseH5File", "couldn't allocate NDArray");
             skip_image = true;
+            continue;
+        };
+        if array_callbacks {
+            trace.flow_single_colon("parseH5File", "calling NDArray callback");
         }
+        deliver(s, array, frame.threshold, array_callbacks, &mut counters).await;
     }
     Ok(())
 }
@@ -924,6 +977,7 @@ async fn save_task(
     reap_tx: rt::CommandSender<Arc<FileJob>>,
 ) {
     while let Some(file) = rx.recv().await {
+        save_flow(&s, &file.name);
         let data = file.data.lock().clone();
         let Some(data) = data else {
             let _ = reap_tx.send(file).await;
@@ -951,6 +1005,20 @@ async fn save_task(
     }
 }
 
+/// saveTask's first line. Without `FILE_OWNER` (see [`write_file`]) the owner
+/// is always the IOC's own uid and gid, C's `mFsUid`/`mFsGid` defaults.
+fn save_flow(s: &Shared, name: &str) {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid and getgid cannot fail and touch no memory.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        s.trace()
+            .flow("saveTask", format_args!("file={name} uid={uid} gid={gid}"));
+    }
+    #[cfg(not(unix))]
+    s.trace().flow("saveTask", format_args!("file={name}"));
+}
+
 /// Write one downloaded file to `FilePath` with `FILE_PERMISSIONS`.
 ///
 /// SCOPED GAP: C additionally honours `FILE_OWNER` / `FILE_OWNER_GROUP` by
@@ -958,7 +1026,7 @@ async fn save_task(
 /// `setfsuid`/`setfsgid` (eigerDetector.cpp:719, 1266-1267). That is a Linux-only,
 /// libc-dependent path with no portable Rust equivalent; it is not ported. The
 /// two PVs still exist and hold their strings, but they do not change the owner
-/// of the written file.
+/// of the written file, and C's "setting FS UID/GID" FLOW lines never print.
 ///
 /// Returns whether the whole file was written. Failures print C's
 /// `saveTask` lines and the `perror` that follows each; a failed `fchmod`
@@ -1037,14 +1105,22 @@ fn strerror(e: &std::io::Error) -> String {
 /// Drop one reference to a file; the last one deletes it from the detector
 /// (C `reapTask`, eigerDetector.cpp:1331).
 async fn reap(s: &Arc<Shared>, file: Arc<FileJob>) {
-    if file.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
+    let refs = file.refs.fetch_sub(1, Ordering::AcqRel);
+    s.trace().flow(
+        "reapTask",
+        format_args!("file={} refCount={refs}", file.name),
+    );
+    if refs != 1 {
         return;
     }
     if file.remove.load(Ordering::Acquire) {
         let _ = s.rest().delete_file(&file.name);
     }
     s.fetch(s.p.fw_free).await;
-    *file.data.lock() = None;
+    if file.data.lock().take().is_some() {
+        s.trace()
+            .flow("reapTask", format_args!("file={} reaped", file.name));
+    }
     s.add_pending(-1).await;
 }
 
@@ -1163,6 +1239,15 @@ async fn stream_task(
     }
 }
 
+fn stream_timeout(s: &Shared) {
+    s.trace()
+        .flow("streamTask", format_args!("got stream timeout"));
+}
+
+fn end_frame(s: &Shared) {
+    s.trace().flow("streamTask", format_args!("got end frame"));
+}
+
 /// Receive one whole series. Returns whether it ended with a `dseries_end`
 /// (C `mStreamComplete`).
 async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
@@ -1180,7 +1265,7 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
             Ok(Some(StreamMessage::Image(_))) => {
                 s.trace().err("streamTask", "got stray packet, ignoring");
             }
-            Ok(None) => {}
+            Ok(None) => stream_timeout(s),
             Err(crate::stream::StreamError::WrongHtype(h)) => {
                 eprintln!("StreamApi::getHeader: wrong header type, htype={h}");
                 s.trace().err("streamTask", "got stray packet, ignoring");
@@ -1198,7 +1283,10 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
     loop {
         let received = match stream.recv(timeout).await {
             Ok(Some(m)) => m,
-            Ok(None) => continue,
+            Ok(None) => {
+                stream_timeout(s);
+                continue;
+            }
             Err(_) => {
                 s.trace().err("streamTask", "failed to get frame packet");
                 return false;
@@ -1223,7 +1311,10 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
         };
 
         match msg {
-            StreamMessage::End => return true,
+            StreamMessage::End => {
+                end_frame(s);
+                return true;
+            }
             StreamMessage::Header(_) => {}
             StreamMessage::Image(frame) => {
                 // Stream v1 carries one image per message and no threshold axis
@@ -1273,7 +1364,7 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
         match stream.get_header(timeout).await {
             Ok(()) => break,
             Err(e) => match e.code() {
-                1 => {}
+                1 => stream_timeout(s),
                 2 => s.trace().err("streamTask", "got stray packet, ignoring"),
                 3 => {
                     s.trace().err("streamTask", "failed to get header packet");
@@ -1293,10 +1384,16 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
 
     loop {
         let num_thresholds = match stream.wait_frame(timeout).await {
-            Ok(Frame::End) => return true,
+            Ok(Frame::End) => {
+                end_frame(s);
+                return true;
+            }
             Ok(Frame::Image(n)) => n,
             Err(e) => match e.code() {
-                1 => continue,
+                1 => {
+                    stream_timeout(s);
+                    continue;
+                }
                 3 => {
                     s.trace().err("streamTask", "failed to get frame packet");
                     return false;
@@ -1387,9 +1484,6 @@ fn build_array(
     Ok(array)
 }
 
-/// Publish one image on the main output and on its threshold's output
-/// (C `doCallbacksGenericPointer(pArray, NDArrayData, 0)` plus the
-/// `thresh + 1` address).
 /// One image on its way out: what [`publish`] needs to build the NDArray and to
 /// pick the threshold output it also goes to.
 struct Image {
@@ -1463,12 +1557,20 @@ async fn publish(
     array_callbacks: bool,
     counters: &mut Counters,
 ) -> ADResult<()> {
+    let threshold_index = image.threshold_index;
+    let array = prepare(s, image, counters).await?;
+    deliver(s, array, threshold_index, array_callbacks, counters).await;
+    Ok(())
+}
+
+/// Stamp and allocate one image; [`publish`]'s first half.
+async fn prepare(s: &Arc<Shared>, image: Image, counters: &Counters) -> ADResult<PublishedArray> {
     let Image {
         dims,
         data,
         codec,
         attributes,
-        threshold_index,
+        threshold_index: _,
         timestamp,
     } = image;
     // C stamps the counter before its `++imageCounter` (eigerDetector.cpp:1537,
@@ -1480,8 +1582,19 @@ async fn publish(
         Some(ts) => ts,
         None => port_stamp(&s.handle).await,
     };
-    let array = build_array(&s.pool, dims, data, codec, attributes, unique_id, timestamp)?.share();
+    Ok(build_array(&s.pool, dims, data, codec, attributes, unique_id, timestamp)?.share())
+}
 
+/// Publish one image on the main output and on its threshold's output
+/// (C `doCallbacksGenericPointer(pArray, NDArrayData, 0)` plus the
+/// `thresh + 1` address), then count it.
+async fn deliver(
+    s: &Arc<Shared>,
+    array: PublishedArray,
+    threshold_index: usize,
+    array_callbacks: bool,
+    counters: &mut Counters,
+) {
     if array_callbacks {
         ArrayPublisher::new(s.outputs.main.clone())
             .publish(array.clone())
@@ -1530,7 +1643,6 @@ async fn publish(
         ),
     ])
     .await;
-    Ok(())
 }
 
 /// Build the shared state the tasks run on, plus the driver's signal handles.
@@ -2143,6 +2255,72 @@ mod tests {
         assert_eq!(rx.recv().await.expect("frame 0").unique_id, 0);
         assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
         assert_eq!(rx.pending(), 0, "ArrayCallbacks=0 before frame 1");
+    }
+
+    /// eigerDetector.cpp's and eigerParam.cpp's ASYN_TRACE_FLOW lines, in the
+    /// order C prints them.
+    #[tokio::test]
+    async fn flow_lines_print_under_the_ports_flow_mask() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use zeromq::Socket;
+
+        let port = "EIGER_FLOW";
+        let (s, mut rx) = h5_rig(port);
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::FLOW);
+
+        s.ops.fetch(s.p.fw_enable).unwrap();
+        s.ops.fetch(s.p.file_owner).unwrap();
+        s.ops.put_int(s.p.fw_enable, 1).unwrap();
+        s.set_int(s.ad.base.array_callbacks, 1).await;
+        parse_h5(&s, &h5_file([1, 1, 2])).await.expect("parse");
+        rx.recv().await.expect("array");
+        let job = Arc::new(FileJob {
+            name: "f.h5".into(),
+            save: false,
+            parse: true,
+            remove: AtomicBool::new(false),
+            perms: 0o644,
+            refs: AtomicUsize::new(1),
+            data: parking_lot::Mutex::new(Some(Vec::new())),
+        });
+        reap(&s, job).await;
+        // A silent stream times out once; the stop then ends the header wait.
+        let mut push = zeromq::PushSocket::new();
+        let endpoint = push.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut stream = StreamApi::connect_to(&endpoint.to_string())
+            .await
+            .expect("connect");
+        s.flags.stop.store(true, Ordering::Release);
+        assert!(!stream_series(&s, &mut stream).await);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut from = 0;
+        for line in [
+            "Param[FW_ENABLE]::baseFetch: disabled\n",
+            "Param[FW_ENABLE]::fetch<int>: 0\n",
+            "Param[FILE_OWNER]::fetch<string>: \n",
+            "Param[FW_ENABLE]::put<int>: 1\n",
+            "Param[FW_ENABLE]::basePut: '",
+            "eigerDetector:parseH5File: calling NDArray callback\n",
+            "eigerDetector::reapTask: file=f.h5 refCount=1\n",
+            "eigerDetector::reapTask: file=f.h5 reaped\n",
+            "eigerDetector::streamTask: got stream timeout\n",
+        ] {
+            let at = text[from..]
+                .find(line)
+                .unwrap_or_else(|| panic!("{line:?} after byte {from}: {text:?}"));
+            from += at + line.len();
+        }
     }
 
     /// Arming with SaveFiles runs `checkPath()` and then reads NDFilePathExists

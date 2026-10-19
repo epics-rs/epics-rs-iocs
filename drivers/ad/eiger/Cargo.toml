@@ -29,6 +29,10 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 # .h5 files in memory, as the C driver does with H5LTopen_file_image.
 hdf5-reader = { version = "0.8", default-features = false, features = ["lz4"] }
 
+[target.'cfg(unix)'.dependencies]
+# getuid/getgid for saveTask's FLOW line.
+libc = "0.2"
+
 [dev-dependencies]
 # Writes the FileWriter-shaped .h5 fixtures parse_h5 is tested on.
 rust-hdf5 = { version = "0.7.5", default-features = false }

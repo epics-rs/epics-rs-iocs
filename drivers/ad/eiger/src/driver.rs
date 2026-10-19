@@ -160,6 +160,7 @@ impl EigerDriver {
         } else {
             let _ = self.ops.rest.disarm();
         }
+        trace.flow("eigerDetector", format_args!("Eiger initialized"));
         Ok(true)
     }
 

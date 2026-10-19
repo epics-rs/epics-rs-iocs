@@ -12,6 +12,7 @@
 //! `PortHandle`). One codec, two sinks — no duplicated encode/decode logic.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -530,7 +531,16 @@ impl ParamOps {
     /// the param library, and so does this.
     pub fn fetch(&self, index: usize) -> RestResult<Vec<ParamUpdate>> {
         let def = self.def(index)?;
-        if !def.is_remote() || def.meta.kind == Kind::Command || def.meta.access == Access::Wo {
+        let local = !def.is_remote() || def.meta.kind == Kind::Command;
+        if local || def.meta.access == Access::Wo {
+            // A local or command param skips to the typed fetch's line, which
+            // prints fetch(void)'s local: an empty string, or an uninitialized
+            // int or double, a C defect not copied (eigerParam.cpp:617, :662,
+            // :695).
+            if local && matches!(def.asyn_type, AsynType::Octet) {
+                self.trace
+                    .param_flow(&def.asyn_name, "fetch<string>", format_args!(""));
+            }
             return Ok(Vec::new());
         }
 
@@ -593,6 +603,8 @@ impl ParamOps {
             base_failed("unable to parse raw value", &body);
             return Err(RestError::Parse(format!("[{name}] no 'value' in reply")));
         };
+        self.trace
+            .param_flow(name, "baseFetch", format_args!("{raw}"));
 
         self.decode_into_updates(&def, &meta, &raw)
     }
@@ -649,6 +661,18 @@ impl ParamOps {
             }
             AsynType::Octet => ParamUpdate::Octet(def.index, raw.to_string()),
         };
+        // fetch<string> returns before its line (eigerParam.cpp:687-693).
+        match update {
+            ParamUpdate::Int32(_, v) => {
+                self.trace
+                    .param_flow(name, "fetch<int>", format_args!("{v}"))
+            }
+            ParamUpdate::Float64(_, v) => {
+                self.trace
+                    .param_flow(name, "fetch<double>", format_args!("{v:.6}"))
+            }
+            ParamUpdate::Octet(..) => {}
+        }
         Ok(vec![update])
     }
 
@@ -673,6 +697,8 @@ impl ParamOps {
         timeout: Duration,
     ) -> RestResult<Vec<ParamUpdate>> {
         let name = &def.asyn_name;
+        self.trace
+            .param_flow(name, "basePut", format_args!("'{raw}'"));
         if def.meta.access == Access::Ro {
             let msg = format!("[param={name}] can't write to read-only parameter");
             self.trace.param_err(name, "basePut", &msg);
@@ -737,8 +763,18 @@ impl ParamOps {
         Ok(def)
     }
 
+    /// The line each C `put<T>` opens with, before anything can fail
+    /// (eigerParam.cpp:762, :804, :860, :906).
+    fn put_flow(&self, index: usize, function: &str, value: fmt::Arguments) {
+        let name = self.reg.lock().get(index).map(|d| d.asyn_name.clone());
+        if let Some(name) = name {
+            self.trace.param_flow(&name, function, value);
+        }
+    }
+
     /// Write an i32 (C `EigerParam::put(int)`).
     pub fn put_int(&self, index: usize, value: i32) -> RestResult<Vec<ParamUpdate>> {
+        self.put_flow(index, "put<int>", format_args!("{value}"));
         let def = self.ensure_meta(index)?;
         let mut updates = Vec::new();
         let mut value = value;
@@ -792,6 +828,7 @@ impl ParamOps {
 
     /// Write a bool (C `EigerParam::put(bool)`).
     pub fn put_bool(&self, index: usize, value: bool) -> RestResult<Vec<ParamUpdate>> {
+        self.put_flow(index, "put<bool>", format_args!("{}", i32::from(value)));
         let def = self.ensure_meta(index)?;
         if !def.is_remote() {
             return Ok(vec![ParamUpdate::Int32(index, i32::from(value))]);
@@ -814,6 +851,7 @@ impl ParamOps {
     /// `current` is the parameter's present value, used for the epsilon check
     /// that suppresses no-op writes to the detector.
     pub fn put_f64(&self, index: usize, value: f64, current: f64) -> RestResult<Vec<ParamUpdate>> {
+        self.put_flow(index, "put<double>", format_args!("{value:.6}"));
         let def = self.ensure_meta(index)?;
         if def.epsilon != 0.0 && (current - value).abs() < def.epsilon {
             return Ok(Vec::new());
@@ -846,6 +884,7 @@ impl ParamOps {
 
     /// Write a string (C `EigerParam::put(std::string)`).
     pub fn put_str(&self, index: usize, value: &str) -> RestResult<Vec<ParamUpdate>> {
+        self.put_flow(index, "put<string>", format_args!("{value}"));
         let def = self.ensure_meta(index)?;
         if !def.is_remote() {
             return Ok(vec![ParamUpdate::Octet(index, value.to_string())]);
