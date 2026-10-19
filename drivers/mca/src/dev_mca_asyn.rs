@@ -918,7 +918,7 @@ mod tests {
     fn a_rejected_driver_write_does_not_cut_the_cycle_short() {
         let mut f = fixture("MCATESTREJECT");
         f.rec.put_field("NUSE", EpicsValue::Long(4)).unwrap();
-        f.rec.special("NUSE", true).unwrap();
+        f.rec.special("NUSE", true, &Default::default()).unwrap();
         f.cycle();
         assert_eq!(
             *f.writes.lock().unwrap(),
@@ -946,7 +946,7 @@ mod tests {
             .set_enable(-1, false)
             .unwrap();
         f.rec.put_field("NUSE", EpicsValue::Long(4)).unwrap();
-        f.rec.special("NUSE", true).unwrap();
+        f.rec.special("NUSE", true, &Default::default()).unwrap();
         f.rec.acqg = 1;
         f.cycle();
         assert!(f.writes.lock().unwrap().is_empty());

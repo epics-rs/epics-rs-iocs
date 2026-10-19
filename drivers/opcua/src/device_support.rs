@@ -694,8 +694,10 @@ impl OpcuaDevice {
             // `special()` — the hook a database put goes through
             // (`mbbi.rs:828-843`; C `mbbiRecord.c::special` -> `init_common`).
             // A device write is neither, so the re-derive is asked for here.
+            // A device hook gets no common half; mbbi/mbbo's special reads
+            // none of it.
             record
-                .special(field, true)
+                .special(field, true, &Default::default())
                 .map_err(|e| format!("cannot re-derive the state table: {e}"))?;
         }
         self.enums.from_server = true;

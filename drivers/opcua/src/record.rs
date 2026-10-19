@@ -217,7 +217,12 @@ impl Record for OpcuaItemRecord {
     /// carries out (both are `pp(TRUE)`, so the put itself is what processes the
     /// record). WOC is not: switching it to `immediate` sends whatever its
     /// elements have already written, there and then.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(
+        &mut self,
+        field: &str,
+        after: bool,
+        _common: &epics_rs::base::server::record::CommonFields,
+    ) -> CaResult<()> {
         if !after {
             return Ok(());
         }
