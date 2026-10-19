@@ -189,8 +189,10 @@ impl Item {
         session: Arc<SessionHandle>,
     ) {
         self.link = link;
-        self.configured_node_id = node_id.clone();
-        self.node_id = node_id;
+        self.configured_node_id = node_id;
+        // Built at each connect (`ItemOpen62541::rebuildNodeId`); null until
+        // then, as `opcuaShow` prints it.
+        self.node_id = NodeId::null();
         self.index = index;
         self.session = Some(session);
     }
