@@ -48,7 +48,7 @@
 //! the C would put the control character in the wrong byte.
 
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::{AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::eos::EosInterpose;
 use epics_rs::asyn::interpose::{EomReason, OctetInterpose, OctetNext, OctetReadResult};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -119,16 +119,6 @@ fn frame_command(data: &[u8]) -> (Vec<u8>, usize) {
 /// with the character in `wValue`.
 fn frame_ctrl(c: u8) -> Vec<u8> {
     header(VR_UPLOAD, VR_CTRL_RESPONSE, c as u16, 0, 0).to_vec()
-}
-
-fn is_timeout(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        }
-    )
 }
 
 /// A fresh [`AsynUser`] for this layer's own probe I/O, carrying the caller's
@@ -204,6 +194,18 @@ impl PmacIpInterpose {
         Ok(())
     }
 
+    /// C `thisRead`: what a read put in [`Self::in_buf`], which a failed read
+    /// carries in its error.
+    fn transferred(&mut self, result: &AsynResult<OctetReadResult>) -> usize {
+        match result {
+            Ok(r) => r.nbytes_transferred,
+            Err(e) => e.partial_read().map_or(0, |p| {
+                self.in_buf[..p.data.len()].copy_from_slice(&p.data);
+                p.data.len()
+            }),
+        }
+    }
+
     /// Refill [`Self::in_buf`] from the socket (C `readResponse`). If the first
     /// read times out with nothing, poll `READREADY` and, if the PMAC says it
     /// has data, issue a `GETBUFFER` and read once more.
@@ -219,23 +221,20 @@ impl PmacIpInterpose {
         }
 
         let mut result = next.read(user, &mut self.in_buf[..maxchars]);
-        let mut n = match &result {
-            Ok(r) => r.nbytes_transferred,
-            Err(_) => 0,
-        };
+        let mut n = self.transferred(&result);
 
         // C: `status == asynTimeout && thisRead == 0 && pasynUser->timeout > 0`.
         if n == 0
-            && result.as_ref().err().is_some_and(is_timeout)
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.status() == AsynStatus::Timeout)
             && user.timeout.is_some_and(|t| !t.is_zero())
             && self.read_ready(user, next)
         {
             self.get_buffer(user, next, maxchars)?;
             result = next.read(user, &mut self.in_buf[..maxchars]);
-            n = match &result {
-                Ok(r) => r.nbytes_transferred,
-                Err(_) => 0,
-            };
+            n = self.transferred(&result);
         }
 
         if n > 0 {
@@ -462,11 +461,15 @@ pub fn pmac_asyn_ip_configure_command() -> CommandDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::error::AsynError;
+    use epics_rs::asyn::interpose::PartialOctetRead;
 
     /// A base layer that replays a canned byte stream and records writes.
     struct MockBase {
         to_read: Vec<Vec<u8>>,
         written: Vec<Vec<u8>>,
+        /// Bytes the timeout after `to_read` runs dry still delivered.
+        partial: Vec<u8>,
     }
 
     impl MockBase {
@@ -474,6 +477,7 @@ mod tests {
             Self {
                 to_read: reads.iter().map(|r| r.to_vec()).collect(),
                 written: Vec::new(),
+                partial: Vec::new(),
             }
         }
     }
@@ -481,10 +485,19 @@ mod tests {
     impl OctetNext for MockBase {
         fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
             if self.to_read.is_empty() {
-                return Err(AsynError::Status {
+                let partial = std::mem::take(&mut self.partial);
+                let err = AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "read timeout".into(),
-                });
+                };
+                if partial.is_empty() {
+                    return Err(err);
+                }
+                buf[..partial.len()].copy_from_slice(&partial);
+                return Err(err.with_partial_read(PartialOctetRead {
+                    data: partial,
+                    eom_reason: EomReason::empty(),
+                }));
             }
             let chunk = self.to_read.remove(0);
             let n = chunk.len().min(buf.len());
@@ -642,6 +655,21 @@ mod tests {
         // The probes went out as headers: READREADY then GETBUFFER.
         assert_eq!(base.written[0][1], 0xC2);
         assert_eq!(base.written[1][1], 0xC5);
+    }
+
+    #[test]
+    fn a_timeout_that_delivered_bytes_returns_them_without_polling() {
+        // C pmacAsynIPPort.c:371 polls READREADY only when `thisRead == 0`.
+        let mut layer = PmacIpInterpose::new();
+        let mut base = MockBase::new(&[]);
+        base.partial = b"100\r\x06".to_vec();
+        let user =
+            AsynUser::default().with_timeout_opt(Some(std::time::Duration::from_millis(100)));
+        let mut buf = [0u8; 64];
+
+        let r = layer.read(&user, &mut buf, &mut base).unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"100\r\x06");
+        assert!(base.written.is_empty());
     }
 
     #[test]

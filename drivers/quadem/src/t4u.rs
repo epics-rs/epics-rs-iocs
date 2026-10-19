@@ -85,16 +85,6 @@ const TEMPERATURE: f64 = 1234.5;
 /// C++ `setIntegerParam(P_Geometry, 1)` (square).
 const GEOMETRY: i32 = 1;
 
-fn is_timeout(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        }
-    )
-}
-
 fn error(message: impl Into<String>) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
@@ -867,7 +857,13 @@ impl StreamReader {
                 self.buf.extend(outcome.data);
                 Ok(got)
             }
-            Err(e) if is_timeout(&e) => Ok(false),
+            // C++ counts `nRead` whatever the status: a timeout that still
+            // delivered bytes delivered them.
+            Err(e) if e.status() == AsynStatus::Timeout => {
+                let partial = e.partial_read().map_or(&[][..], |p| &p.data[..]);
+                self.buf.extend(partial);
+                Ok(!partial.is_empty())
+            }
             Err(e) => Err(e),
         }
     }
@@ -1120,7 +1116,7 @@ fn direct_data_thread(ctx: DataContext) {
         let datagram = match ctx.io.read_binary(proto::MAX_PACKET_SIZE) {
             Ok(outcome) if outcome.data.is_empty() => continue,
             Ok(outcome) => outcome.data,
-            Err(e) if is_timeout(&e) => continue,
+            Err(e) if e.status() == AsynStatus::Timeout => continue,
             Err(_) => {
                 thread::sleep(ERROR_BACKOFF);
                 continue;
@@ -1490,11 +1486,59 @@ fn build(spec: Build, cmd: CmdSink, claim: &PortClaim) -> AsynResult<T4uRuntime>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::asyn::port::DrvUserRequest;
+    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+    use epics_rs::asyn::port::{DrvUserRequest, InterfaceMask, PortFlags};
     use epics_rs::asyn::registry::claim_port;
     use std::io::{BufRead, BufReader};
     use std::net::{TcpListener, TcpStream};
     use std::time::Instant;
+
+    /// An octet port whose every read times out after delivering `abc`.
+    struct PartialThenTimeout(PortDriverBase);
+
+    impl PortDriver for PartialThenTimeout {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, EomReason)> {
+            buf[..3].copy_from_slice(b"abc");
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".into(),
+            }
+            .with_partial_read(PartialOctetRead {
+                data: b"abc".to_vec(),
+                eom_reason: EomReason::empty(),
+            }))
+        }
+    }
+
+    fn partial_then_timeout_port(name: &str) -> PortRuntimeHandle {
+        let claim = claim_port(name).unwrap();
+        let (runtime, _actor) = create_port_runtime(
+            &claim,
+            PartialThenTimeout(PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            )),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        runtime
+    }
 
     /// C++ compares a read-back calibration register with the selected table
     /// at `currRange_`; the middle driver has no table and never complains.
@@ -1710,5 +1754,16 @@ mod tests {
             .unwrap();
         h.write_float64_blocking(reason("QE_BIAS_N_VOLTAGE"), bad_list, 1.0)
             .unwrap();
+    }
+
+    /// C++ `readResponse` appends `nRead` whatever the status, so a socket
+    /// read that timed out after some bytes still advances the frame.
+    #[test]
+    fn a_read_that_times_out_after_bytes_keeps_them() {
+        let runtime = partial_then_timeout_port("QE_PARTIAL_TIMEOUT");
+        let io = OctetIo::new(runtime.port_handle().clone(), Duration::from_millis(100));
+        let mut reader = StreamReader::new(io);
+        assert!(reader.fill().unwrap());
+        assert_eq!(reader.buf.iter().copied().collect::<Vec<_>>(), b"abc");
     }
 }

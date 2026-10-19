@@ -14,13 +14,11 @@ epicsEnvSet("HOST",   "192.168.1.21:22222")
 epicsEnvSet("ADDR",   "0")
 
 # ---- asyn octet port (serial is typical for the MCC; TCP also works) ----
-drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
-#drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 0)
+# noProcessEos=1 as in C's iocBoot: the driver frames STX..ETX both ways and
+# needs the ETX in the reply, which an input EOS of "\x03" would strip.
+drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 1)
+#drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 1)
 #asynSetOption("$(IPPORT)", -1, "baud", "57600")
-
-# The MCC replies end with ETX (0x03); the driver owns the STX..ETX output
-# framing (no CRC on the MCC), so only the input EOS is set here.
-asynOctetSetInputEos("$(IPPORT)", 0, "\x03")
 
 # ---- MCC controller ----
 # phytronCreateMCC(controllerName, asynPort, address, movingPollPeriod,
