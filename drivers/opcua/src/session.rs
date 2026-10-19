@@ -21,7 +21,8 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::client::{
-    Identity, SecurityMode, ServerInfo, UaConnection, UaConnector, security_policy_string,
+    CreatedSubscription, Identity, SecurityMode, ServerInfo, UaConnection, UaConnector,
+    security_policy_string,
 };
 use crate::defaults;
 use crate::item::{Item, stream_double};
@@ -409,6 +410,10 @@ pub struct SessionHandle {
     /// Items on this session, at [`Item::index`].
     pub items: Mutex<Vec<Arc<Mutex<Item>>>>,
     pub subscriptions: Mutex<Vec<SubscriptionConfig>>,
+    /// The publishing interval each subscription's last create left, by name:
+    /// the server's revision, or 0 when the create failed. Absent until then,
+    /// when the C shows the requested interval (`SubscriptionOpen62541.cpp:48`).
+    pub revised_publishing_intervals: Mutex<HashMap<String, f64>>,
     pub status: Mutex<ConnectionStatus>,
     commands: mpsc::UnboundedSender<(Priority, Request)>,
     control: mpsc::UnboundedSender<Control>,
@@ -473,6 +478,7 @@ pub fn create(
         config: Mutex::new(config),
         items: Mutex::new(Vec::new()),
         subscriptions: Mutex::new(Vec::new()),
+        revised_publishing_intervals: Mutex::new(HashMap::new()),
         status: Mutex::new(ConnectionStatus::Down),
         commands: commands_tx,
         control: control_tx,
@@ -1098,8 +1104,13 @@ impl SessionWorker {
         let mut created = Vec::with_capacity(subscriptions.len());
         for config in subscriptions {
             let (tx, rx) = mpsc::unbounded_channel();
-            let id = match connection.create_subscription(&config, tx).await {
-                Ok(id) => {
+            let answer = connection.create_subscription(&config, tx).await;
+            self.handle.revised_publishing_intervals.lock().insert(
+                config.name.clone(),
+                answer.map_or(0.0, |c| c.revised_publishing_interval),
+            );
+            let id = match answer {
+                Ok(CreatedSubscription { id, .. }) => {
                     if config.debug > 0 {
                         errlog_vprintf(format_args!(
                             "OPC UA subscription {} on session {} created (Good)\n",
@@ -1158,10 +1169,7 @@ impl SessionWorker {
         for (config, id) in subscriptions {
             let mine: Vec<Arc<Mutex<Item>>> = items
                 .iter()
-                .filter(|item| {
-                    let item = item.lock();
-                    item.is_monitored() && item.link.subscription() == Some(config.name.as_str())
-                })
+                .filter(|item| item.lock().subscription() == Some(config.name.as_str()))
                 .cloned()
                 .collect();
             let mut last = StatusCode::Good;

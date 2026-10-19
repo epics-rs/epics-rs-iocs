@@ -480,13 +480,7 @@ pub fn show(registry: &Registry, pattern: &str, level: i32) -> String {
             ));
         }
         for subscription in matched_subscriptions {
-            out.push_str(&format!(
-                "subscription {} on session {} interval={}ms priority={}\n",
-                subscription.name,
-                session.name,
-                subscription.publishing_interval,
-                subscription.priority,
-            ));
+            out += &subscription.show(&session, level);
         }
         if level < 1 || !matched {
             continue;

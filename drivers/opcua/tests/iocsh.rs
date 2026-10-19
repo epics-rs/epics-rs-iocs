@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
 use opcua::client::{Identity, UaConnection, UaConnector};
 use opcua::ioc;
+use opcua::link::{InfoDefaults, RecordKind, parse_link};
 use opcua::registry::Registry;
 use opcua::session::{Control, SessionConfig};
 
@@ -371,5 +372,68 @@ async fn starting_the_sessions_announces_the_autoconnect() {
             registry.start();
         }),
         ["OPC UA: Autoconnecting sessions\n"]
+    );
+}
+
+/// Bind a record of `record_type` with `link` as its INP/OUT text.
+fn bind(registry: &Arc<Registry>, record: &str, record_type: &str, link: &str, is_output: bool) {
+    let kind = RecordKind {
+        is_output,
+        is_item_record: record_type == "opcuaItem",
+    };
+    registry.declare_record(record, record_type);
+    let link = parse_link(
+        record,
+        link,
+        kind,
+        &InfoDefaults::default(),
+        registry.as_ref(),
+    )
+    .unwrap_or_else(|e| panic!("parsing '{link}' failed: {e}"));
+    let (notify, _rx) = tokio::sync::mpsc::channel(1);
+    registry
+        .bind(record, record_type, link, notify)
+        .unwrap_or_else(|e| panic!("binding {record} failed: {e}"));
+}
+
+/// `SubscriptionOpen62541::show` (`SubscriptionOpen62541.cpp:78-96`): only a
+/// monitored item is on the subscription, and from level 1 each shows at one
+/// level less.
+#[test]
+fn a_subscription_shows_its_settings_and_its_monitored_items() {
+    let registry = registry();
+    ioc::session_command(
+        &registry,
+        Some("S1"),
+        Some("opc.tcp://localhost:4999"),
+        &["autoconnect=n"],
+    );
+    ioc::subscription_command(&registry, Some("SUB1"), Some("S1"), 250.0, &["priority=4"]);
+    bind(
+        &registry,
+        "R:AI",
+        "ai",
+        "SUB1 ns=2;s=Demo.Static.Scalar.Double",
+        false,
+    );
+    bind(
+        &registry,
+        "R:LO",
+        "longout",
+        "SUB1 ns=3;i=1234 monitor=n",
+        true,
+    );
+
+    let line =
+        "subscription=SUB1 session=S1 interval=250(250) prio=4 enable=?(Y) debug=0 items=1\n";
+    assert_eq!(ioc::show(&registry, "SUB1", 0), line);
+    assert_eq!(
+        ioc::show(&registry, "SUB1", 1),
+        format!(
+            "{line}item ns=0(2);s=Demo.Static.Scalar.Double record=R:AI state=down \
+             status=BadServerNotConnected dataDirty=n context=SUB1@S1 sampling=0(-1) \
+             deadband=0 qsize=0(1) cqsize=3 discard=old timestamp=server bini=read \
+             output=n monitor=y registered=-(n)\n"
+        )
     );
 }

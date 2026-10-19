@@ -61,6 +61,13 @@ pub struct Notification {
     pub value: DataValue,
 }
 
+/// The server's answer to `CreateSubscription`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreatedSubscription {
+    pub id: u32,
+    pub revised_publishing_interval: f64,
+}
+
 /// A live session with a server.
 #[async_trait]
 pub trait UaConnection: Send + Sync {
@@ -80,7 +87,7 @@ pub trait UaConnection: Send + Sync {
         &self,
         config: &SubscriptionConfig,
         sink: mpsc::UnboundedSender<Notification>,
-    ) -> Result<u32, StatusCode>;
+    ) -> Result<CreatedSubscription, StatusCode>;
     /// Returns one status per requested item, in order.
     async fn create_monitored_items(
         &self,
@@ -357,7 +364,7 @@ impl UaConnection for AsyncOpcuaConnection {
         &self,
         config: &SubscriptionConfig,
         sink: mpsc::UnboundedSender<Notification>,
-    ) -> Result<u32, StatusCode> {
+    ) -> Result<CreatedSubscription, StatusCode> {
         // `Session::create_subscription` sends the interval in whole
         // milliseconds; this is its body with the C's request.
         let header = CreateSubscription::new(&self.session).header().clone();
@@ -411,7 +418,10 @@ impl UaConnection for AsyncOpcuaConnection {
             .lock()
             .add_subscription(subscription);
         self.session.trigger_publish_now();
-        Ok(response.subscription_id)
+        Ok(CreatedSubscription {
+            id: response.subscription_id,
+            revised_publishing_interval: response.revised_publishing_interval,
+        })
     }
 
     async fn create_monitored_items(

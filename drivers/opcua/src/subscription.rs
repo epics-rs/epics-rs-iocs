@@ -4,7 +4,8 @@ use async_opcua::types::{CreateSubscriptionRequest, RequestHeader};
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::defaults;
-use crate::session::strtoul;
+use crate::item::stream_double;
+use crate::session::{SessionHandle, strtoul};
 
 /// `opcuaSubscription(NAME, SESSION, INTERVAL, [options])`
 /// (`iocshIntegration.cpp:159-201`).
@@ -52,6 +53,40 @@ impl SubscriptionConfig {
             publishing_enabled: true,
             priority: self.priority,
         }
+    }
+
+    /// `SubscriptionOpen62541::show` (`SubscriptionOpen62541.cpp:78-96`) for this
+    /// subscription on `session`; the enable state is "?" there too.
+    pub fn show(&self, session: &SessionHandle, level: i32) -> String {
+        let items: Vec<_> = session
+            .items
+            .lock()
+            .iter()
+            .filter(|item| item.lock().subscription() == Some(self.name.as_str()))
+            .cloned()
+            .collect();
+        let revised = session
+            .revised_publishing_intervals
+            .lock()
+            .get(&self.name)
+            .copied()
+            .unwrap_or(self.publishing_interval);
+        let mut out = format!(
+            "subscription={} session={} interval={}({}) prio={} enable=?(Y) debug={} items={}\n",
+            self.name,
+            session.name,
+            stream_double(revised),
+            stream_double(self.publishing_interval),
+            self.priority,
+            self.debug,
+            items.len(),
+        );
+        if level >= 1 {
+            for item in &items {
+                out += &item.lock().show(level - 1);
+            }
+        }
+        out
     }
 
     /// One `key=value` subscription option (`SubscriptionOpen62541::setOption`);

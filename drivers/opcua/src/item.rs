@@ -241,7 +241,13 @@ impl Item {
     }
 
     pub fn is_monitored(&self) -> bool {
-        self.link.monitor && self.link.subscription().is_some()
+        self.subscription().is_some()
+    }
+
+    /// The subscription the item is on: only a monitored item joins its link's
+    /// subscription (`ItemOpen62541.cpp:52-55`).
+    pub fn subscription(&self) -> Option<&str> {
+        self.link.subscription().filter(|_| self.link.monitor)
     }
 
     /// A value arrived from the server (`ItemOpen62541::setIncomingData`).

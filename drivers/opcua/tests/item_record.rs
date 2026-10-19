@@ -26,7 +26,7 @@ use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::server::records::longout::LongoutRecord;
 use epics_rs::base::types::EpicsValue;
 
-use opcua::client::{Notification, ServerInfo, UaConnection, UaConnector};
+use opcua::client::{CreatedSubscription, Notification, ServerInfo, UaConnection, UaConnector};
 use opcua::device_support::OpcuaDevice;
 use opcua::item::Leaf;
 use opcua::queue::{ConnectionStatus, ProcessReason, Update};
@@ -117,10 +117,13 @@ impl UaConnection for Mock {
 
     async fn create_subscription(
         &self,
-        _config: &SubscriptionConfig,
+        config: &SubscriptionConfig,
         _sink: mpsc::UnboundedSender<Notification>,
-    ) -> Result<u32, StatusCode> {
-        Ok(1)
+    ) -> Result<CreatedSubscription, StatusCode> {
+        Ok(CreatedSubscription {
+            id: 1,
+            revised_publishing_interval: config.publishing_interval,
+        })
     }
 
     async fn create_monitored_items(

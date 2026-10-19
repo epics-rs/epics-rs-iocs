@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
-use opcua::client::{Notification, ServerInfo, UaConnection, UaConnector};
+use opcua::client::{CreatedSubscription, Notification, ServerInfo, UaConnection, UaConnector};
 use opcua::item::{Item, Leaf};
 use opcua::link::{InfoDefaults, LinkInfo, NodeIdentifier, RecordKind, parse_link};
 use opcua::queue::{ConnectionStatus, ProcessReason, Update};
@@ -36,6 +36,9 @@ struct Behaviour {
     monitor_status: Option<StatusCode>,
     /// `CreateSubscription` fails with this.
     subscription_error: Option<StatusCode>,
+    /// The publishing interval `CreateSubscription` revises to; the requested
+    /// one when unset.
+    revised_interval: Option<f64>,
 }
 
 #[derive(Default)]
@@ -169,7 +172,7 @@ impl UaConnection for Mock {
         &self,
         config: &SubscriptionConfig,
         sink: mpsc::UnboundedSender<Notification>,
-    ) -> Result<u32, StatusCode> {
+    ) -> Result<CreatedSubscription, StatusCode> {
         let id = {
             let mut calls = self.calls.lock();
             calls.subscriptions.push(config.clone());
@@ -180,7 +183,14 @@ impl UaConnection for Mock {
             return Err(status);
         }
         *self.sink.lock() = Some(sink);
-        Ok(id)
+        Ok(CreatedSubscription {
+            id,
+            revised_publishing_interval: self
+                .behaviour
+                .lock()
+                .revised_interval
+                .unwrap_or(config.publishing_interval),
+        })
     }
 
     async fn create_monitored_items(
@@ -1418,6 +1428,40 @@ async fn a_refused_subscription_still_fails_its_items() {
     let last = drain(&leaf0).pop().expect("the leaf has an update");
     assert_eq!(last.reason, ProcessReason::ConnectionLoss);
     assert_eq!(last.status, StatusCode::BadSubscriptionIdInvalid);
+}
+
+/// `SubscriptionOpen62541::show` prints the server's revised interval beside
+/// the requested one: the requested one until a create answers, and 0 once one
+/// fails, as the reinitialised response leaves it (`SubscriptionOpen62541.cpp:48`,
+/// `:127`).
+#[tokio::test]
+async fn a_subscription_shows_the_interval_the_server_revised() {
+    for (error, shown) in [
+        (None, "300(250)"),
+        (Some(StatusCode::BadTooManySubscriptions), "0(250)"),
+    ] {
+        let mock = Mock::arc();
+        mock.behave(|b| {
+            b.subscription_error = error;
+            b.revised_interval = Some(300.0);
+        });
+        let mut config = SessionConfig::new("sess", "opc.tcp://host");
+        config.autoconnect = false;
+        let handle = spawn(config, &mock, vec![]);
+        let mut subscription = SubscriptionConfig::new("subs", "sess");
+        subscription.publishing_interval = 250.0;
+        handle.subscriptions.lock().push(subscription.clone());
+        let line = |interval: &str| {
+            format!(
+                "subscription=subs session=sess interval={interval} prio=0 enable=?(Y) \
+                 debug=0 items=0\n"
+            )
+        };
+        assert_eq!(subscription.show(&handle, 0), line("250(250)"));
+
+        handle.control(Control::Connect);
+        until(|| subscription.show(&handle, 0) == line(shown)).await;
+    }
 }
 
 /// `SubscriptionOpen62541::addMonitoredItems` files a connection loss for an
