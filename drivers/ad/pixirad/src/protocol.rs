@@ -129,9 +129,9 @@ pub fn parse_firmware_version(reply: &str) -> Option<(String, String)> {
 
 /// Everything after `ADDITIONAL INFO:`.
 ///
-/// C added `strlen("ADDITIONAL INFO:")` to the result of `strstr` without
-/// checking it, so a reply that did not carry the marker made it publish the
-/// string at address 0x10.
+/// C bug, pixirad.cpp:569-570: `strstr` returns NULL for a reply without the
+/// marker and C publishes the string at address 0x10; here the parameter is
+/// left unset.
 pub fn parse_additional_info(reply: &str) -> Option<&str> {
     const MARKER: &str = "ADDITIONAL INFO:";
     reply.find(MARKER).map(|i| &reply[i + MARKER.len()..])
