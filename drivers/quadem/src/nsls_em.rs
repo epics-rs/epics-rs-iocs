@@ -682,7 +682,7 @@ pub fn create_nsls_em(
             .expect("failed to spawn drvNSLS_EMTask")
     });
 
-    let callback_thread = qe::start_callback_task(CallbackContext {
+    let callback_thread = qe::start_callback_task::<NslsEmDriver>(CallbackContext {
         trigger_rx,
         handle,
         params,

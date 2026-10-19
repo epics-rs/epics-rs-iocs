@@ -1435,7 +1435,7 @@ fn build(spec: Build, cmd: CmdSink, claim: &PortClaim) -> AsynResult<T4uRuntime>
         [cmd_thread_handle, data_thread_handle]
     });
 
-    let callback_thread = qe::start_callback_task(CallbackContext {
+    let callback_thread = qe::start_callback_task::<T4uDriver>(CallbackContext {
         trigger_rx,
         handle,
         params,
