@@ -353,7 +353,7 @@ impl PIE816Axis {
 impl Model1Motor for PIE816Axis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -702,5 +702,34 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPIE816.cc:286-306 exit stores what motor_init prepared (:648-657,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once past
+    /// RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("e816InitFail", |last| match last {
+            "*IDN?" => "E-816".into(),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(PIE816Controller::new(io).unwrap()));
+        let mut first = PIE816Axis::new(ctrl.clone(), 0);
+        let mut second = PIE816Axis::new(ctrl, 1);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 }
