@@ -2002,7 +2002,6 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
             let controller = match Mm4000Controller::new(
                 handle,
                 &port_name,
-                &port_name,
                 num_axes as usize,
                 cache_ttl,
             ) {
@@ -3290,6 +3289,7 @@ mod report {
                 _ => "",
             }
             .to_string()
+                + "\r"
         });
         let config = vec![int(1), ArgValue::String("esp300RepLine".into()), int(3)];
         run_command(esp300_config_command(), config).await;

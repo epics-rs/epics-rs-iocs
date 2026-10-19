@@ -373,7 +373,9 @@ impl AxisReport for ConexAxisReport {
         if level <= 0 {
             return;
         }
-        // C ignores each read's status and parses what arrived.
+        // C ignores each read's status and parses what arrived. C defect,
+        // not copied: a refused write leaves inString_ the previous reply,
+        // which AG_CONEX.cpp:287-301 then parse.
         let read = |code: &str| {
             let (reply, _) = exchange(&self.handle, &query(self.controller_id, code));
             parse_value_at(&reply, 3).unwrap_or(0.0)
@@ -430,7 +432,9 @@ impl ConexAxis {
     pub fn new(handle: SyncIOHandle, controller_id: i32, trace: &MotorTrace) -> Option<Self> {
         let handle = Arc::new(handle);
         // C writeReadController status is ignored past VE: a failed read is
-        // parsed for what it delivered, and atof reads nothing as 0.
+        // parsed for what it delivered, and atof reads nothing as 0. C
+        // defect, not copied: a refused write leaves inString_ the previous
+        // reply, which AG_CONEX.cpp:216-267 then parse; here it is empty.
         let reply = |cmd: &str| exchange(&handle, &query(controller_id, cmd)).0;
         let value_at = |cmd: &str, at: usize| parse_value_at(&reply(cmd), at).unwrap_or(0.0);
 

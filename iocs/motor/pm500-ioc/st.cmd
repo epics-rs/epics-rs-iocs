@@ -17,11 +17,14 @@ epicsEnvSet("TTY",    "/dev/ttyUSB0")
 # ---- serial octet port ----
 drvAsynSerialPortConfigure("$(SERIAL)", "$(TTY)")
 
-# PM500 serial line: match the controller's configured settings.
-asynSetOption("$(SERIAL)", 0, "baud",   "9600")
-asynSetOption("$(SERIAL)", 0, "bits",   "8")
-asynSetOption("$(SERIAL)", 0, "parity", "none")
-asynSetOption("$(SERIAL)", 0, "stop",   "1")
+# PM500 serial line as Newport_PM500.iocsh sets it: 9600 7E2, hardware
+# handshake (setSerialParams.iocsh's clocal N, crtscts N).
+asynSetOption("$(SERIAL)", 0, "baud",    "9600")
+asynSetOption("$(SERIAL)", 0, "bits",    "7")
+asynSetOption("$(SERIAL)", 0, "stop",    "2")
+asynSetOption("$(SERIAL)", 0, "parity",  "even")
+asynSetOption("$(SERIAL)", 0, "clocal",  "N")
+asynSetOption("$(SERIAL)", 0, "crtscts", "N")
 
 # Port EOS as the C example sets it (Newport_PM500.iocsh:22-23);
 # the driver sends bare commands.

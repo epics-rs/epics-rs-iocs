@@ -4,8 +4,8 @@
 //! (a model-1 dev/drv pair). Commands are `{axis:02}CC[value]` with a 1-based
 //! zero-padded axis prefix; several record transactions join commands with
 //! `;` into one write (a move is `VB;VA;AC;AG;PA`). Replies end in CR/LF
-//! (the port EOS is set at connect as C does, input `\n` / output `\r`; the
-//! leftover `\r` is trimmed).
+//! (the port EOS is set at connect as C does, input `\n` / output `\r`; a
+//! reply is the line before its `\r`).
 //!
 //! ## Shared-serial concurrency
 //!
@@ -39,13 +39,16 @@ use epics_rs::base::runtime::log::errlog_vprintf;
 use crate::util::{atof, atoi, is_unsolicited_limit_error, leading_hex};
 use motor_common::model1::MoveStrings;
 
-/// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
-const READ_BUF: usize = 256;
+/// C `BUFF_SIZE`: the most one read takes.
+const READ_BUF: usize = 100;
 
-/// Replies end in CR/LF (C strips the LF via input EOS, the CR itself).
-fn trim_reply(raw: &[u8]) -> String {
-    let s = String::from_utf8_lossy(raw);
-    s.trim_end_matches(['\r', '\n']).to_string()
+/// C `recv_mess`'s reply: replies end in CR/LF, the LF is the input EOS, and
+/// a read whose last byte is not the CR (one cut at `BUFF_SIZE`) is empty
+/// (drvESP300.cc:550-561).
+fn reply_line(raw: &[u8]) -> String {
+    raw.strip_suffix(b"\r").map_or_else(String::new, |line| {
+        String::from_utf8_lossy(line).into_owned()
+    })
 }
 
 /// Port EOS set at connect (C `input_terminator`/`output_terminator`, drvESP300.cc:649-650, :679-684).
@@ -149,7 +152,8 @@ impl Esp300Controller {
         // C writes then reads with no flush, so one stray line shifts every
         // later reply; write_read flushes first. The ESP300 firmware can
         // still put an unsolicited hard-limit error (E35..E42) ahead of the
-        // real reply, which C recv_mess re-reads past.
+        // real reply, which C recv_mess re-reads past; it tests the read with
+        // its CR (drvESP300.cc:536).
         let (raw, status) = self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
@@ -157,18 +161,17 @@ impl Esp300Controller {
         // C tests the first read's bytes before its status
         // (drvESP300.cc:534-547), so a limit error cut by a timeout is still
         // re-read past, and the re-read's status is the one kept.
-        let reply = trim_reply(&raw);
-        if is_unsolicited_limit_error(&reply) {
+        if is_unsolicited_limit_error(&String::from_utf8_lossy(&raw)) {
             return self.read_once();
         }
         status?;
-        Ok(reply)
+        Ok(reply_line(&raw))
     }
 
     fn read_once(&self) -> AsynResult<String> {
         let (raw, status) = self.handle.read_octet(0, READ_BUF).into_parts();
         status?;
-        Ok(trim_reply(&raw))
+        Ok(reply_line(&raw))
     }
 }
 
@@ -601,9 +604,14 @@ mod tests {
                     .find(|(k, _)| *k == c)
                     .map_or("", |(_, v)| v),
             };
+            // Each line read ends in its CR, as an ESP300 reply does.
+            let line = |s: &str| match s {
+                "" => Vec::new(),
+                s => format!("{s}\r").into_bytes(),
+            };
             let (first, next) = reply.split_once('\n').unwrap_or((reply, ""));
-            self.reply = first.as_bytes().to_vec();
-            self.next = next.as_bytes().to_vec();
+            self.reply = line(first);
+            self.next = line(next);
             self.cut = self.cuts.contains(&cmd.as_ref());
             Ok(data.len())
         }
@@ -637,6 +645,42 @@ mod tests {
             }
             read
         }
+    }
+
+    /// drvESP300.cc:536 counts the CR in `nread`: an `E35` read ahead of
+    /// the reply is the unsolicited limit error C reads past.
+    #[test]
+    fn an_e35_with_its_cr_is_read_past() {
+        let (_line, io) = LineRig::queued("esp300E35", |cmd| {
+            match cmd {
+                "VE?" => vec!["ESP300 Version 3.08\r"],
+                "TB?" => vec!["9, 0, AXIS NUMBER OUT OF RANGE\r"],
+                _ => vec!["E35\r", "1.5\r"],
+            }
+            .into_iter()
+            .map(String::from)
+            .collect()
+        });
+        let ctrl = Esp300Controller::new(io).unwrap();
+        assert_eq!(ctrl.write_read("01TP?").unwrap(), "1.5");
+    }
+
+    /// drvESP300.cc:550: a read whose last byte is not the CR, one cut at
+    /// `BUFF_SIZE` (100) among them, is an empty reply.
+    #[test]
+    fn a_read_not_ending_in_cr_is_empty() {
+        let long = format!("{}\r", "1".repeat(READ_BUF));
+        let (_line, io) = LineRig::new("esp300NoCr", move |last| match last {
+            "VE?" => "ESP300 Version 3.08\r".to_string(),
+            "TB?" => "9, 0, AXIS NUMBER OUT OF RANGE\r".to_string(),
+            "01TP?" => "1.5".to_string(),
+            "02TP?" => long.clone(),
+            _ => "2.5\r".to_string(),
+        });
+        let ctrl = Esp300Controller::new(io).unwrap();
+        assert_eq!(ctrl.write_read("01TP?").unwrap(), "");
+        assert_eq!(ctrl.write_read("02TP?").unwrap(), "");
+        assert_eq!(ctrl.write_read("03TP?").unwrap(), "2.5");
     }
 
     /// C reads a failed `TB?` as an empty buffer, which `atoi` takes as no
@@ -837,6 +881,7 @@ mod tests {
                 _ => "",
             }
             .to_string()
+                + "\r"
         });
         let ctrl = Esp300Controller::new(io).unwrap();
         let axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
@@ -986,6 +1031,7 @@ mod tests {
                 _ => "",
             }
             .to_string()
+                + "\r"
         });
         let ctrl = Esp300Controller::new(io).unwrap();
         let mut axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
