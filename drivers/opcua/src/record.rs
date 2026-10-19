@@ -46,11 +46,8 @@ const MAX_STRING_SIZE: usize = 40;
 
 // `INP` mirrors `field(INP,DBF_INLINK)` in `opcuaItemRecord.dbd` — INP is
 // not a dbCommon field, so the loader refuses it unless the record declares
-// it. The menu fields declare `DBF_MENU` and carry their choices, as the
-// `.dbd` does: the loader's refusal gate resolves menu names by identity
-// against base's generated tables, so an external menu never resolves there —
-// but its numeric arms do not decide `DBF_MENU` either, so the label reaches
-// the apply path, which reads `menu_field_choices`.
+// it. The menu fields declare `DBF_MENU` and carry their choices and menu
+// name, as the `.dbd` does; the name is what a refused label prints.
 static FIELDS: &[FieldDesc] = &[
     FieldDesc::new("VAL", DbFieldType::ULong, false),
     FieldDesc {
@@ -62,11 +59,13 @@ static FIELDS: &[FieldDesc] = &[
     FieldDesc {
         declared_dbf: DbfCode::Menu,
         menu: Some(DEF_ACTION),
+        menu_name: Some("menuDefAction"),
         ..FieldDesc::new("DEFACTN", DbFieldType::Enum, false)
     },
     FieldDesc {
         declared_dbf: DbfCode::Menu,
         menu: Some(BINI),
+        menu_name: Some("menuBini"),
         ..FieldDesc::new("BINI", DbFieldType::Enum, false)
     },
     FieldDesc::new("READ", DbFieldType::Char, false),
@@ -77,6 +76,7 @@ static FIELDS: &[FieldDesc] = &[
     FieldDesc {
         declared_dbf: DbfCode::Menu,
         menu: Some(WOC),
+        menu_name: Some("menuWoc"),
         ..FieldDesc::new("WOC", DbFieldType::Enum, false)
     },
 ];
