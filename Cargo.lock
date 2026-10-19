@@ -5011,6 +5011,7 @@ dependencies = [
  "epics-rs",
  "meascomp",
  "parking_lot",
+ "tokio",
  "uldaq-sys",
 ]
 
