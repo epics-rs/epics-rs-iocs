@@ -1407,6 +1407,8 @@ mod tests {
             out: link,
         };
         let device = f(&ctx).unwrap();
+        // C `callbackInit`: no build arms the bands for a bare database.
+        epics_rs::base::runtime::task::background_arm();
         let db = PvDatabase::new();
         db.add_record("TEST", record).await.unwrap();
         let rec = db.get_record("TEST").unwrap();
