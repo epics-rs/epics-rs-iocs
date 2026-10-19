@@ -1,13 +1,12 @@
-//! The worker-thread execution context: batched parameter access plus the
-//! camserver `writeCamserver` / `readCamserver` / `writeReadCamserver` trio.
+//! The camserver `writeCamserver` / `readCamserver` / `writeReadCamserver`
+//! trio, and the acquisition thread's batched parameter context.
 //!
-//! `pilatusDetector.cpp` runs camserver I/O from two contexts — the asyn port
-//! thread (`writeInt32` / `writeFloat64` / `writeOctet`) and `pilatusTask` —
-//! serialised by the driver lock, which is released around every socket poll so
-//! an abort can preempt a long read. A Rust `PortDriver` method runs *inside*
-//! the port actor and cannot block on another port, so both contexts here are
-//! worker threads that reach the driver's own parameters through a
-//! [`PortHandle`]. Everything else about the sequence is unchanged.
+//! `pilatusDetector.cpp` runs camserver I/O from two contexts: the asyn port
+//! thread (`writeInt32` / `writeFloat64` / `writeOctet`) and `pilatusTask`. The
+//! first is the driver here, inline on the port's own thread; the second is
+//! `PilatusDetTask`, which reaches the driver's parameters through a
+//! [`PortHandle`]. Both run the one [`Camserver`] trio, blocking on the
+//! camserver octet port, which is a different port.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,6 +16,7 @@ use epics_rs::ad_core::driver::{ADStatus, ShutterMode};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::asyn::error::{AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{ParamSetValue, RequestOp, RequestResult};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -34,30 +34,233 @@ const CAM_ADDR: i32 = 0;
 /// after the socket read.
 const ABORT_POLL_TIME: f64 = 0.001;
 
+/// The parameter sets and `pasynUserSelf` prints a camserver exchange makes:
+/// on the driver's own library inline, batched on a worker thread.
+pub(crate) trait CamParams {
+    fn set_i32(&mut self, reason: usize, value: i32);
+    fn set_str(&mut self, reason: usize, value: String);
+    fn trace(&self, mask: TraceMask, msg: &str);
+}
+
+impl CamParams for PortDriverBase {
+    fn set_i32(&mut self, reason: usize, value: i32) {
+        let _ = self.set_int32_param(reason, 0, value);
+    }
+    fn set_str(&mut self, reason: usize, value: String) {
+        let _ = self.set_string_param(reason, 0, value);
+    }
+    fn trace(&self, mask: TraceMask, msg: &str) {
+        self.trace_print(mask, format_args!("{msg}"));
+    }
+}
+
+/// C `pasynUserCamserver` and the `toCamserver` / `fromCamserver` buffers.
+pub(crate) struct Camserver {
+    /// No port when the startup script named one that does not exist.
+    port: Arc<SyncIOHandle>,
+    ad: ADBaseParams,
+    stop: Arc<Event>,
+    from: String,
+    /// Kept because `pilatusTask`'s trigger-mode `switch` has no `default`:
+    /// an out-of-range `ADTriggerMode` re-sends whatever command the buffer
+    /// still holds.
+    to: String,
+}
+
+impl Camserver {
+    pub(crate) fn new(port: Arc<SyncIOHandle>, ad: ADBaseParams, stop: Arc<Event>) -> Self {
+        Self {
+            port,
+            ad,
+            stop,
+            from: String::new(),
+            to: String::new(),
+        }
+    }
+
+    /// C `fromCamserver`.
+    pub(crate) fn from(&self) -> &str {
+        &self.from
+    }
+
+    /// C `toCamserver`.
+    pub(crate) fn to_camserver(&self) -> &str {
+        &self.to
+    }
+
+    fn submit(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
+        self.port.port()?.submit_blocking(op, user)
+    }
+
+    /// C `writeCamserver`: flush stale input, write, then publish the command
+    /// on `ADStringToServer` regardless of the write status.
+    pub(crate) fn write(
+        &mut self,
+        side: &mut impl CamParams,
+        cmd: &str,
+        timeout: f64,
+    ) -> AsynStatus {
+        self.to = cmd.to_string();
+        let _ = self.submit(RequestOp::Flush, AsynUser::default().with_addr(CAM_ADDR));
+
+        let user = AsynUser::default()
+            .with_addr(CAM_ADDR)
+            .with_timeout(secs(timeout));
+        let status = match self.submit(
+            RequestOp::OctetWrite {
+                data: cmd.as_bytes().to_vec(),
+            },
+            user,
+        ) {
+            Ok(_) => AsynStatus::Success,
+            Err(e) => {
+                let status = e.status();
+                side.trace(
+                    TraceMask::ERROR,
+                    &format!(
+                        "pilatusDetector:writeCamserver, status={}, sent\n{cmd}\n",
+                        status as i32
+                    ),
+                );
+                status
+            }
+        };
+
+        side.set_str(self.ad.string_to_server, cmd.to_string());
+        status
+    }
+
+    /// C `readCamserver`: poll the socket in `ASYN_POLL_TIME` slices so an
+    /// abort can interrupt a long exposure.
+    pub(crate) fn read(&mut self, side: &mut impl CamParams, timeout: f64) -> AsynStatus {
+        let t_start = Instant::now();
+        let mut delta_time = 0.0f64;
+        let mut status = AsynStatus::Success;
+
+        while delta_time <= timeout {
+            let user = AsynUser::default()
+                .with_addr(CAM_ADDR)
+                .with_timeout(secs(ASYN_POLL_TIME));
+            status = match self.submit(
+                RequestOp::OctetRead {
+                    buf_size: MAX_MESSAGE_SIZE,
+                },
+                user,
+            ) {
+                Ok(result) => {
+                    let data = result.data.unwrap_or_default();
+                    self.from = String::from_utf8_lossy(&data).into_owned();
+                    AsynStatus::Success
+                }
+                Err(e) => {
+                    // C's asynOctetSyncIO null-terminates at `nbytesTransfered`,
+                    // which counts what a timed-out read still delivered.
+                    self.from = e.partial_read().map_or_else(String::new, |p| {
+                        String::from_utf8_lossy(&p.data).into_owned()
+                    });
+                    e.status()
+                }
+            };
+
+            // C checks for an abort delivered during the read, so the next
+            // acquisition does not inherit it.
+            if self.stop.wait_timeout(secs(ABORT_POLL_TIME)) {
+                side.set_str(self.ad.status_message, "Acquisition aborted".into());
+                side.set_i32(self.ad.status, ADStatus::Aborted as i32);
+                return AsynStatus::Error;
+            }
+            if status != AsynStatus::Timeout {
+                break;
+            }
+
+            if self.stop.wait_timeout(secs(ASYN_POLL_TIME)) {
+                side.set_str(self.ad.status_message, "Acquisition aborted".into());
+                side.set_i32(self.ad.status, ADStatus::Aborted as i32);
+                return AsynStatus::Error;
+            }
+            delta_time = t_start.elapsed().as_secs_f64();
+        }
+
+        // A poll with timeout == 0 is only checking for a possible reply.
+        if status == AsynStatus::Timeout && timeout == 0.0 {
+            return AsynStatus::Success;
+        }
+        // C prints these on pasynUserCamserver.
+        let cam_trace = |msg: &str| {
+            self.port.print(0, TraceMask::ERROR, format_args!("{msg}"));
+        };
+        if status != AsynStatus::Success {
+            cam_trace(&format!(
+                "pilatusDetector:readCamserver, timeout={timeout:.6}, status={} received {} bytes\n{}\n",
+                status as i32,
+                self.from.len(),
+                self.from
+            ));
+        } else if !reply_is_ok(&self.from) {
+            cam_trace(&format!(
+                "pilatusDetector:readCamserver unexpected response from camserver, no OK, response={}\n",
+                self.from
+            ));
+            side.set_str(self.ad.status_message, "Error from camserver".into());
+            status = AsynStatus::Error;
+        } else {
+            side.set_str(self.ad.status_message, "Camserver returned OK".into());
+        }
+
+        side.set_str(self.ad.string_from_server, self.from.clone());
+        status
+    }
+
+    /// C `writeReadCamserver`.
+    pub(crate) fn write_read(
+        &mut self,
+        side: &mut impl CamParams,
+        cmd: &str,
+        timeout: f64,
+    ) -> AsynStatus {
+        let status = self.write(side, cmd, timeout);
+        if status != AsynStatus::Success {
+            return status;
+        }
+        self.read(side, timeout)
+    }
+}
+
 /// Pending parameter writes, flushed by [`Ctx::callbacks`] at exactly the
 /// points where C calls `callParamCallbacks()`.
-#[derive(Default)]
-struct Batch {
+pub(crate) struct Side {
+    /// This driver's own port (parameter library).
+    handle: PortHandle,
     updates: Vec<ParamSetValue>,
 }
 
-/// Worker-thread context.
+impl CamParams for Side {
+    fn set_i32(&mut self, reason: usize, value: i32) {
+        self.updates
+            .push(ParamSetValue::new(reason, 0, ParamValue::Int32(value)));
+    }
+    fn set_str(&mut self, reason: usize, value: String) {
+        self.updates.push(ParamSetValue::new(
+            reason,
+            0,
+            ParamValue::Octet(Into::<Vec<u8>>::into(value).into()),
+        ));
+    }
+    /// An `asynPrint` on `pasynUserSelf`.
+    fn trace(&self, mask: TraceMask, msg: &str) {
+        self.handle
+            .trace()
+            .output_device(self.handle.port_name(), Some(0), 0, mask, msg);
+    }
+}
+
+/// `pilatusTask`'s context.
 pub struct Ctx {
-    /// This driver's own port (parameter library).
-    handle: PortHandle,
-    /// C `pasynUserCamserver`: the user of the camserver octet port, which has
-    /// no port when the startup script named one that does not exist.
-    cam_port: Arc<SyncIOHandle>,
+    side: Side,
+    cam: Camserver,
     pub ad: ADBaseParams,
     pub p: PilatusParams,
     pub stop: Arc<Event>,
-    /// C `fromCamserver`.
-    from: String,
-    /// C `toCamserver`. Kept because `pilatusTask`'s trigger-mode `switch` has
-    /// no `default`: an out-of-range `ADTriggerMode` re-sends whatever command
-    /// the buffer still holds.
-    to: String,
-    batch: Batch,
 }
 
 impl Ctx {
@@ -69,63 +272,67 @@ impl Ctx {
         stop: Arc<Event>,
     ) -> Self {
         Self {
-            handle,
-            cam_port,
+            side: Side {
+                handle,
+                updates: Vec::new(),
+            },
+            cam: Camserver::new(cam_port, ad, stop.clone()),
             ad,
             p,
             stop,
-            from: String::new(),
-            to: String::new(),
-            batch: Batch::default(),
         }
     }
 
     /// The last camserver reply (C `fromCamserver`).
     pub fn from(&self) -> &str {
-        &self.from
+        self.cam.from()
     }
 
     /// The last camserver command (C `toCamserver`).
     pub fn to_camserver(&self) -> &str {
-        &self.to
+        self.cam.to_camserver()
     }
 
     // --- parameter library -------------------------------------------------
 
     /// C `setIntegerParam`.
     pub fn set_i32(&mut self, reason: usize, value: i32) {
-        self.batch
-            .updates
-            .push(ParamSetValue::new(reason, 0, ParamValue::Int32(value)));
+        self.side.set_i32(reason, value);
+    }
+
+    /// The image-file readers, posting through this context's batch.
+    pub(crate) fn image_reader(&mut self) -> crate::task::ImageReader<'_, Side> {
+        crate::task::ImageReader {
+            cx: &mut self.side,
+            ad: self.ad,
+            stop: &self.stop,
+        }
     }
 
     /// C `setDoubleParam`.
     pub fn set_f64(&mut self, reason: usize, value: f64) {
-        self.batch
+        self.side
             .updates
             .push(ParamSetValue::new(reason, 0, ParamValue::Float64(value)));
     }
 
     /// C `setStringParam`.
-    pub fn set_str(&mut self, reason: usize, value: impl Into<Vec<u8>>) {
-        self.batch.updates.push(ParamSetValue::new(
-            reason,
-            0,
-            ParamValue::Octet(Into::<Vec<u8>>::into(value).into()),
-        ));
+    pub fn set_str(&mut self, reason: usize, value: impl Into<String>) {
+        self.side.set_str(reason, value.into());
     }
 
     /// C `callParamCallbacks()` — applies the pending writes and posts monitors
     /// in one actor message.
     pub async fn callbacks(&mut self) {
-        let updates = std::mem::take(&mut self.batch.updates);
-        let _ = self.handle.set_params_and_notify(0, updates).await;
+        let updates = std::mem::take(&mut self.side.updates);
+        let _ = self.side.handle.set_params_and_notify(0, updates).await;
     }
 
     /// C `updateTimeStamps`' stamp: the port's, moved now
     /// (asynNDArrayDriver.cpp:832-836).
     pub async fn update_time_stamp(&self) -> epics_rs::ad_core::timestamp::EpicsTimestamp {
-        self.handle
+        self.side
+            .handle
             .update_time_stamp()
             .await
             .unwrap_or_else(|_| std::time::SystemTime::now())
@@ -134,15 +341,13 @@ impl Ctx {
 
     /// An `asynPrint` on `pasynUserSelf`.
     pub fn trace(&self, mask: TraceMask, msg: &str) {
-        self.handle
-            .trace()
-            .output_device(self.handle.port_name(), Some(0), 0, mask, msg);
+        self.side.trace(mask, msg);
     }
 
     /// Flush pending writes so a following read observes them. The actor
     /// processes its inbox in FIFO order, so enqueueing is enough.
     async fn flush(&mut self) {
-        if !self.batch.updates.is_empty() {
+        if !self.side.updates.is_empty() {
             self.callbacks().await;
         }
     }
@@ -150,20 +355,25 @@ impl Ctx {
     /// C `getIntegerParam`.
     pub async fn get_i32(&mut self, reason: usize) -> Option<i32> {
         self.flush().await;
-        self.handle.read_int32(reason, 0).await.ok()
+        self.side.handle.read_int32(reason, 0).await.ok()
     }
 
     /// C `getDoubleParam`.
     pub async fn get_f64(&mut self, reason: usize) -> Option<f64> {
         self.flush().await;
-        self.handle.read_float64(reason, 0).await.ok()
+        self.side.handle.read_float64(reason, 0).await.ok()
     }
 
     /// C `getStringParam` with a `max_chars` capacity (the C call truncates to
     /// the caller's buffer).
     pub async fn get_str(&mut self, reason: usize, max_chars: usize) -> String {
         self.flush().await;
-        match self.handle.get_string_param(reason, 0, max_chars).await {
+        match self
+            .side
+            .handle
+            .get_string_param(reason, 0, max_chars)
+            .await
+        {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(_) => String::new(),
         }
@@ -184,139 +394,19 @@ impl Ctx {
 
     // --- camserver ---------------------------------------------------------
 
-    async fn cam_submit(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
-        self.cam_port.port()?.submit_async(op, user).await
+    /// C `writeCamserver`.
+    pub fn cam_write(&mut self, cmd: &str, timeout: f64) -> AsynStatus {
+        self.cam.write(&mut self.side, cmd, timeout)
     }
 
-    /// C `writeCamserver`: flush stale input, write, then publish the command
-    /// on `ADStringToServer` regardless of the write status.
-    pub async fn cam_write(&mut self, cmd: &str, timeout: f64) -> AsynStatus {
-        self.to = cmd.to_string();
-        let _ = self
-            .cam_submit(RequestOp::Flush, AsynUser::default().with_addr(CAM_ADDR))
-            .await;
-
-        let user = AsynUser::default()
-            .with_addr(CAM_ADDR)
-            .with_timeout(secs(timeout));
-        let status = match self
-            .cam_submit(
-                RequestOp::OctetWrite {
-                    data: cmd.as_bytes().to_vec(),
-                },
-                user,
-            )
-            .await
-        {
-            Ok(_) => AsynStatus::Success,
-            Err(e) => {
-                let status = e.status();
-                self.trace(
-                    TraceMask::ERROR,
-                    &format!(
-                        "pilatusDetector:writeCamserver, status={}, sent\n{cmd}\n",
-                        status as i32
-                    ),
-                );
-                status
-            }
-        };
-
-        self.set_str(self.ad.string_to_server, cmd);
-        status
-    }
-
-    /// C `readCamserver`: poll the socket in `ASYN_POLL_TIME` slices so an
-    /// abort can interrupt a long exposure.
-    pub async fn cam_read(&mut self, timeout: f64) -> AsynStatus {
-        let t_start = Instant::now();
-        let mut delta_time = 0.0f64;
-        let mut status = AsynStatus::Success;
-
-        while delta_time <= timeout {
-            let user = AsynUser::default()
-                .with_addr(CAM_ADDR)
-                .with_timeout(secs(ASYN_POLL_TIME));
-            status = match self
-                .cam_submit(
-                    RequestOp::OctetRead {
-                        buf_size: MAX_MESSAGE_SIZE,
-                    },
-                    user,
-                )
-                .await
-            {
-                Ok(result) => {
-                    let data = result.data.unwrap_or_default();
-                    self.from = String::from_utf8_lossy(&data).into_owned();
-                    AsynStatus::Success
-                }
-                Err(e) => {
-                    // C's asynOctetSyncIO null-terminates at `nbytesTransfered`,
-                    // which is 0 on a failed read.
-                    self.from.clear();
-                    e.status()
-                }
-            };
-
-            // C checks for an abort delivered during the read, so the next
-            // acquisition does not inherit it.
-            if self.stop.wait_timeout(secs(ABORT_POLL_TIME)) {
-                self.set_str(self.ad.status_message, "Acquisition aborted");
-                self.set_i32(self.ad.status, ADStatus::Aborted as i32);
-                return AsynStatus::Error;
-            }
-            if status != AsynStatus::Timeout {
-                break;
-            }
-
-            if self.stop.wait_timeout(secs(ASYN_POLL_TIME)) {
-                self.set_str(self.ad.status_message, "Acquisition aborted");
-                self.set_i32(self.ad.status, ADStatus::Aborted as i32);
-                return AsynStatus::Error;
-            }
-            delta_time = t_start.elapsed().as_secs_f64();
-        }
-
-        // A poll with timeout == 0 is only checking for a possible reply.
-        if status == AsynStatus::Timeout && timeout == 0.0 {
-            return AsynStatus::Success;
-        }
-        // C prints these on pasynUserCamserver.
-        let cam_trace = |msg: &str| {
-            self.cam_port
-                .print(0, TraceMask::ERROR, format_args!("{msg}"));
-        };
-        if status != AsynStatus::Success {
-            cam_trace(&format!(
-                "pilatusDetector:readCamserver, timeout={timeout:.6}, status={} received {} bytes\n{}\n",
-                status as i32,
-                self.from.len(),
-                self.from
-            ));
-        } else if !reply_is_ok(&self.from) {
-            cam_trace(&format!(
-                "pilatusDetector:readCamserver unexpected response from camserver, no OK, response={}\n",
-                self.from
-            ));
-            self.set_str(self.ad.status_message, "Error from camserver");
-            status = AsynStatus::Error;
-        } else {
-            self.set_str(self.ad.status_message, "Camserver returned OK");
-        }
-
-        let from = self.from.clone();
-        self.set_str(self.ad.string_from_server, from);
-        status
+    /// C `readCamserver`.
+    pub fn cam_read(&mut self, timeout: f64) -> AsynStatus {
+        self.cam.read(&mut self.side, timeout)
     }
 
     /// C `writeReadCamserver`.
-    pub async fn cam_write_read(&mut self, cmd: &str, timeout: f64) -> AsynStatus {
-        let status = self.cam_write(cmd, timeout).await;
-        if status != AsynStatus::Success {
-            return status;
-        }
-        self.cam_read(timeout).await
+    pub fn cam_write_read(&mut self, cmd: &str, timeout: f64) -> AsynStatus {
+        self.cam.write_read(&mut self.side, cmd, timeout)
     }
 
     // --- shutter -----------------------------------------------------------
@@ -351,9 +441,11 @@ impl Ctx {
 mod tests {
     use super::*;
     use crate::driver::{DriverLinks, PilatusDriver};
-    use crate::task::{Cmd, Shared};
+    use crate::task::FlatFieldJob;
+    use crate::task::Shared;
     use epics_rs::ad_core::runtime as rt;
     use epics_rs::asyn::error::AsynError;
+    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
     use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::create_port_runtime;
@@ -383,7 +475,7 @@ mod tests {
     /// connection prints `status=4`, not asynError's 3.
     #[test]
     fn a_camserver_write_keeps_the_octet_ports_status() {
-        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let stop = Arc::new(Event::new());
         let det = PilatusDriver::new(
             "PILATUS_WRITE_STATUS",
@@ -391,10 +483,19 @@ mod tests {
             1,
             0,
             DriverLinks {
-                cmd_tx,
+                flat_field_tx,
                 start: Arc::new(Event::new()),
                 stop: stop.clone(),
                 shared: Arc::new(parking_lot::Mutex::new(Shared::default())),
+                cam: Arc::new(
+                    epics_rs::asyn::sync_io::SyncIOHandle::connect_port(
+                        "PILATUS_NO_CAM",
+                        0,
+                        std::time::Duration::ZERO,
+                        epics_rs::asyn::interfaces::InterfaceType::Octet,
+                    )
+                    .0,
+                ),
             },
         )
         .unwrap();
@@ -442,7 +543,7 @@ mod tests {
             );
             let (tx, rx) = std::sync::mpsc::channel();
             rt::run_thread_named("PilatusWriteStatusTest", move || async move {
-                tx.send(ctx.cam_write("version", 1.0).await as i32).unwrap();
+                tx.send(ctx.cam_write("version", 1.0) as i32).unwrap();
             })
             .join()
             .unwrap();
@@ -450,5 +551,146 @@ mod tests {
             std::mem::forget(cam);
         }
         std::mem::forget(runtime);
+    }
+
+    /// Replays one read per entry, `(bytes, timed_out)`, repeating the last.
+    struct ScriptedPort {
+        base: PortDriverBase,
+        reads: std::collections::VecDeque<(&'static [u8], bool)>,
+    }
+
+    impl PortDriver for ScriptedPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, EomReason)> {
+            let (data, timed_out) = if self.reads.len() > 1 {
+                self.reads.pop_front().unwrap()
+            } else {
+                self.reads[0]
+            };
+            buf[..data.len()].copy_from_slice(data);
+            if !timed_out {
+                return Ok((data.len(), EomReason::EOS));
+            }
+            let err = AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "read timeout".into(),
+            };
+            if data.is_empty() {
+                return Err(err);
+            }
+            Err(err.with_partial_read(PartialOctetRead {
+                data: data.to_vec(),
+                eom_reason: EomReason::empty(),
+            }))
+        }
+    }
+
+    /// `cam_read(timeout)` over a camserver port replaying `reads`: the
+    /// status and the `fromCamserver` it ends with.
+    fn cam_read_over(name: &str, reads: &[(&'static [u8], bool)], timeout: f64) -> (i32, String) {
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
+        let stop = Arc::new(Event::new());
+        let det = PilatusDriver::new(
+            name,
+            2,
+            1,
+            0,
+            DriverLinks {
+                flat_field_tx,
+                start: Arc::new(Event::new()),
+                stop: stop.clone(),
+                shared: Arc::new(parking_lot::Mutex::new(Shared::default())),
+                cam: Arc::new(
+                    epics_rs::asyn::sync_io::SyncIOHandle::connect_port(
+                        "PILATUS_NO_CAM",
+                        0,
+                        std::time::Duration::ZERO,
+                        epics_rs::asyn::interfaces::InterfaceType::Octet,
+                    )
+                    .0,
+                ),
+            },
+        )
+        .unwrap();
+        let (ad, p) = (det.ad.params, det.p);
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let cam_name = format!("{name}_CAM");
+        let (cam, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(&cam_name).unwrap(),
+            ScriptedPort {
+                base: PortDriverBase::new(
+                    &cam_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                reads: reads.iter().copied().collect(),
+            },
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let mut ctx = Ctx::new(
+            runtime.port_handle().clone(),
+            Arc::new(SyncIOHandle::from_handle(
+                cam.port_handle().clone(),
+                0,
+                std::time::Duration::ZERO,
+            )),
+            ad,
+            p,
+            stop,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt::run_thread_named("PilatusCamReadTest", move || async move {
+            let status = ctx.cam_read(timeout) as i32;
+            tx.send((status, ctx.from().to_string())).unwrap();
+        })
+        .join()
+        .unwrap();
+        std::mem::forget(cam);
+        std::mem::forget(runtime);
+        rx.recv().unwrap()
+    }
+
+    /// C `readCamserver` (pilatusDetector.cpp:953-976) breaks only on a
+    /// status other than asynTimeout, so a timeout after part of a reply
+    /// polls again and the next read completes it.
+    #[test]
+    fn a_timeout_after_part_of_a_reply_keeps_polling() {
+        let (status, from) = cam_read_over(
+            "PILATUS_PARTIAL_POLL",
+            &[(b"15 OK", true), (b"15 OK exptime 1.0", false)],
+            1.0,
+        );
+        assert_eq!(status, AsynStatus::Success as i32);
+        assert_eq!(from, "15 OK exptime 1.0");
+    }
+
+    /// When the polling runs out, C's `fromCamserver` holds what the last
+    /// read delivered, terminated at its `nbytesTransfered`.
+    #[test]
+    fn a_read_that_ends_on_a_partial_timeout_keeps_the_partial_reply() {
+        let (status, from) = cam_read_over(
+            "PILATUS_PARTIAL_END",
+            &[(b"15 OK", true), (b"15 OK exp", true)],
+            0.05,
+        );
+        assert_eq!(status, AsynStatus::Timeout as i32);
+        assert_eq!(from, "15 OK exp");
     }
 }

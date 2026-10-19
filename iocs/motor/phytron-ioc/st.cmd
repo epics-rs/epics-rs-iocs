@@ -14,13 +14,11 @@ epicsEnvSet("IPPORT", "phyAsyn")
 epicsEnvSet("HOST",   "192.168.1.20:22222")
 
 # ---- asyn octet port (Ethernet; use the serial line for USB/RS-232) ----
-drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
-#drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 0)
+# noProcessEos=1 as in C's iocBoot: the driver frames STX..ETX both ways and
+# needs the ETX in the reply, which an input EOS of "\x03" would strip.
+drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 1)
+#drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 1)
 #asynSetOption("$(IPPORT)", -1, "baud", "115200")
-
-# Phytron framing: replies end with ETX (0x03); the driver owns the STX..ETX
-# output framing, so only the input EOS is set here. Do NOT set an output EOS.
-asynOctetSetInputEos("$(IPPORT)", 0, "\x03")
 
 # ---- phyMOTION controller ----
 # phytronCreateController(controllerName, asynPort, movingPollPeriod,
