@@ -94,10 +94,14 @@ impl UaConnector for MockConnector {
 
 #[async_trait]
 impl UaConnection for Mock {
-    async fn read(&self, nodes: &[ReadValueId]) -> Result<Vec<DataValue>, StatusCode> {
-        self.calls.lock().reads.push(nodes.to_vec());
+    async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>) {
+        let id = {
+            let mut calls = self.calls.lock();
+            calls.reads.push(nodes.to_vec());
+            calls.reads.len() as u32
+        };
         if let Some(status) = self.behaviour.lock().read_error {
-            return Err(status);
+            return (id, Err(status));
         }
         let values = self.values.lock();
         let mut results: Vec<DataValue> = nodes
@@ -122,17 +126,21 @@ impl UaConnection for Mock {
         if self.behaviour.lock().truncate_read {
             results.pop();
         }
-        Ok(results)
+        (id, Ok(results))
     }
 
-    async fn write(&self, values: &[WriteValue]) -> Result<Vec<StatusCode>, StatusCode> {
-        self.calls.lock().writes.push(values.to_vec());
+    async fn write(&self, values: &[WriteValue]) -> (u32, Result<Vec<StatusCode>, StatusCode>) {
+        let id = {
+            let mut calls = self.calls.lock();
+            calls.writes.push(values.to_vec());
+            calls.writes.len() as u32
+        };
         let behaviour = self.behaviour.lock().clone();
         if let Some(status) = behaviour.write_error {
-            return Err(status);
+            return (id, Err(status));
         }
         let status = behaviour.write_status.unwrap_or(StatusCode::Good);
-        Ok(vec![status; values.len()])
+        (id, Ok(vec![status; values.len()]))
     }
 
     async fn register_nodes(&self, nodes: &[NodeId]) -> Result<Vec<NodeId>, StatusCode> {
@@ -821,6 +829,109 @@ async fn a_server_that_returns_too_few_results_does_not_read_past_the_end() {
     let update = pop(&leaf0);
     assert_eq!(update.reason, ProcessReason::ReadFailure);
     assert_eq!(update.status, StatusCode::BadUnexpectedError);
+}
+
+/// C's `readComplete` reports a short answer before handling it
+/// (`SessionOpen62541.cpp:2549-2554`).
+#[tokio::test]
+async fn a_short_read_answer_is_reported() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    mock.behave(|b| b.truncate_read = true);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0],
+    );
+    until(|| handle.is_connected()).await;
+    until(|| !leaf0.lock().queue.is_empty()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    let reported: Vec<String> = lines
+        .lock()
+        .iter()
+        .filter(|l| l.contains("(readComplete)"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            "OPC UA session sess: (readComplete) received a callback with 1 values for a request containing 1 items\n"
+        ]
+    );
+}
+
+/// The request and completion debug lines carry the service call's
+/// transaction id (`SessionOpen62541.cpp:696-701`, `:774-779`, `:2543-2547`,
+/// `:2587-2592`, `:2618-2622`, `:2641-2646`).
+#[tokio::test]
+async fn read_and_write_debug_lines_name_the_transaction() {
+    let mock = Mock::arc();
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", OUTPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.set_option("debug", "5").unwrap();
+
+    let sink = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs each test in its own process, so fd 1 is this
+    // test's alone.
+    let saved = unsafe {
+        let saved = libc::dup(1);
+        libc::dup2(std::os::fd::AsRawFd::as_raw_fd(sink.as_file()), 1);
+        saved
+    };
+    let handle = spawn(config, &mock, vec![item0]);
+    until(|| handle.is_connected()).await;
+    until(|| !leaf0.lock().queue.is_empty()).await;
+    drain(&leaf0);
+    let write = || {
+        let mut leaf = leaf0.lock();
+        leaf.outgoing = Some(Variant::Int32(7));
+        leaf.dirty = true;
+    };
+    write();
+    handle.request(Priority::Low, Request::Write { handle: 0 });
+    until(|| !leaf0.lock().queue.is_empty()).await;
+    drain(&leaf0);
+
+    mock.behave(|b| {
+        b.read_error = Some(StatusCode::BadNodeIdUnknown);
+        b.write_error = Some(StatusCode::BadNodeIdUnknown);
+    });
+    handle.request(Priority::Low, Request::Read { handle: 0 });
+    until(|| !leaf0.lock().queue.is_empty()).await;
+    drain(&leaf0);
+    write();
+    handle.request(Priority::Low, Request::Write { handle: 0 });
+    until(|| !leaf0.lock().queue.is_empty()).await;
+    // SAFETY: restoring what this test replaced.
+    unsafe {
+        libc::dup2(saved, 1);
+        libc::close(saved);
+    }
+
+    let out = std::fs::read_to_string(sink.path()).unwrap();
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("Read)") || l.contains("Write)") || l.contains("Complete)"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "Session sess: (requestRead) beginRead service ok (transaction id 1; retrieving 1 nodes)",
+            "Session sess: (readComplete) getting data for read service (transaction id 1; data for 2 items)",
+            "Session sess: (requestWrite) beginWrite service ok (transaction id 1; writing 1 nodes)",
+            "Session sess: (writeComplete) getting results for write service (transaction id 1; results for 1 items)",
+            "Session sess: (requestRead) beginRead service ok (transaction id 2; retrieving 1 nodes)",
+            "Session sess: (readComplete) for read service (transaction id 2) failed with status BadNodeIdUnknown",
+            "Session sess: (requestWrite) beginWrite service ok (transaction id 2; writing 1 nodes)",
+            "Session sess: (writeComplete) for write service (transaction id 2) failed with status BadNodeIdUnknown",
+        ]
+    );
 }
 
 #[tokio::test]

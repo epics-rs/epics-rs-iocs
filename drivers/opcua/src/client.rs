@@ -13,7 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_opcua::client::custom_types::DataTypeTreeBuilder;
-use async_opcua::client::{ClientBuilder, IdentityToken, Session, SubscriptionCallbacks};
+use async_opcua::client::services::{Read, Write};
+use async_opcua::client::{
+    ClientBuilder, IdentityToken, Session, SubscriptionCallbacks, UARequest,
+};
 use async_opcua::crypto::SecurityPolicy;
 use async_opcua::types::{
     DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
@@ -60,8 +63,11 @@ pub struct Notification {
 /// A live session with a server.
 #[async_trait]
 pub trait UaConnection: Send + Sync {
-    async fn read(&self, nodes: &[ReadValueId]) -> Result<Vec<DataValue>, StatusCode>;
-    async fn write(&self, values: &[WriteValue]) -> Result<Vec<StatusCode>, StatusCode>;
+    /// The result comes with the request's transaction id, which C's debug
+    /// lines print (`requestId`, `SessionOpen62541.cpp:686-701`).
+    async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>);
+    /// As [`Self::read`].
+    async fn write(&self, values: &[WriteValue]) -> (u32, Result<Vec<StatusCode>, StatusCode>);
     /// `RegisterNodes` — the server may return a faster handle for each node.
     async fn register_nodes(&self, nodes: &[NodeId]) -> Result<Vec<NodeId>, StatusCode>;
     async fn server_info(&self) -> Result<ServerInfo, StatusCode>;
@@ -253,14 +259,27 @@ struct AsyncOpcuaConnection {
 
 #[async_trait]
 impl UaConnection for AsyncOpcuaConnection {
-    async fn read(&self, nodes: &[ReadValueId]) -> Result<Vec<DataValue>, StatusCode> {
-        self.session
-            .read(nodes, TimestampsToReturn::Both, 0.0)
-            .await
+    async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>) {
+        let read = Read::new(&self.session)
+            .nodes_to_read(nodes.to_vec())
+            .timestamps_to_return(TimestampsToReturn::Both)
+            .max_age(0.0);
+        let id = read.header().request_handle;
+        let result = read.send(self.session.channel()).await;
+        (
+            id,
+            result.map(|response| response.results.unwrap_or_default()),
+        )
     }
 
-    async fn write(&self, values: &[WriteValue]) -> Result<Vec<StatusCode>, StatusCode> {
-        self.session.write(values).await
+    async fn write(&self, values: &[WriteValue]) -> (u32, Result<Vec<StatusCode>, StatusCode>) {
+        let write = Write::new(&self.session).nodes_to_write(values.to_vec());
+        let id = write.header().request_handle;
+        let result = write.send(self.session.channel()).await;
+        (
+            id,
+            result.map(|response| response.results.unwrap_or_default()),
+        )
     }
 
     async fn register_nodes(&self, nodes: &[NodeId]) -> Result<Vec<NodeId>, StatusCode> {

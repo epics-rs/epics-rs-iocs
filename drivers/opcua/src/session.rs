@@ -622,7 +622,7 @@ impl SessionWorker {
                             attribute_id: AttributeId::Value as u32,
                             ..Default::default()
                         };
-                        connection.read(&[node]).await
+                        connection.read(&[node]).await.1
                     }));
                 }
 
@@ -755,8 +755,36 @@ impl SessionWorker {
             return true;
         }
 
-        match connection.read(&nodes).await {
+        let (id, result) = connection.read(&nodes).await;
+        let debug = self.debug();
+        if debug >= 5
+            && !result
+                .as_ref()
+                .is_err_and(|status| is_connection_error(*status))
+        {
+            println!(
+                "Session {}: (requestRead) beginRead service ok (transaction id {id}; retrieving {} nodes)",
+                self.handle.name,
+                nodes.len() / 2
+            );
+        }
+        match result {
             Ok(results) => {
+                if debug >= 2 {
+                    println!(
+                        "Session {}: (readComplete) getting data for read service (transaction id {id}; data for {} items)",
+                        self.handle.name,
+                        results.len()
+                    );
+                }
+                if results.len() != nodes.len() {
+                    errlog_vprintf(format_args!(
+                        "OPC UA session {}: (readComplete) received a callback with {} values for a request containing {} items\n",
+                        self.handle.name,
+                        results.len(),
+                        nodes.len() / 2
+                    ));
+                }
                 for (i, handle) in handles.iter().enumerate() {
                     let Some(item) = items.get(*handle as usize) else {
                         continue;
@@ -786,9 +814,9 @@ impl SessionWorker {
                         self.handle.name,
                         status_name(status)
                     ));
-                } else if self.debug() > 0 {
+                } else if debug > 0 {
                     println!(
-                        "Session {}: (readComplete) for read service failed with status {}",
+                        "Session {}: (readComplete) for read service (transaction id {id}) failed with status {}",
                         self.handle.name,
                         status_name(status)
                     );
@@ -853,8 +881,28 @@ impl SessionWorker {
             return true;
         }
 
-        match connection.write(&values).await {
+        let (id, result) = connection.write(&values).await;
+        let debug = self.debug();
+        if debug >= 5
+            && !result
+                .as_ref()
+                .is_err_and(|status| is_connection_error(*status))
+        {
+            println!(
+                "Session {}: (requestWrite) beginWrite service ok (transaction id {id}; writing {} nodes)",
+                self.handle.name,
+                values.len()
+            );
+        }
+        match result {
             Ok(results) => {
+                if debug >= 2 {
+                    println!(
+                        "Session {}: (writeComplete) getting results for write service (transaction id {id}; results for {} items)",
+                        self.handle.name,
+                        results.len()
+                    );
+                }
                 for (i, item) in written.iter().enumerate() {
                     let status = results
                         .get(i)
@@ -876,9 +924,9 @@ impl SessionWorker {
                         self.handle.name,
                         status_name(status)
                     ));
-                } else if self.debug() > 0 {
+                } else if debug > 0 {
                     println!(
-                        "Session {}: (writeComplete) for write service failed with status {}",
+                        "Session {}: (writeComplete) for write service (transaction id {id}) failed with status {}",
                         self.handle.name,
                         status_name(status)
                     );
