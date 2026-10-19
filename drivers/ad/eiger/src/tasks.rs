@@ -963,6 +963,8 @@ fn write_file(s: &Shared, name: &str, path: &str, data: &[u8], perms: u32) -> bo
 
     let perror = |call: &str, e: &std::io::Error| eprintln!("{call}: {}", strerror(e));
     let mut opts = std::fs::OpenOptions::new();
+    // C DEFECT, not copied: C opens without O_TRUNC (eigerDetector.cpp:1293),
+    // so a shorter file written over an existing one keeps the old tail.
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
