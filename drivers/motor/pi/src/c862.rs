@@ -436,7 +436,7 @@ impl PIC862Axis {
 impl Model1Motor for PIC862Axis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -818,5 +818,34 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPIC862.cc:239-254 exit stores what motor_init prepared (:568-577,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once past
+    /// RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("c862InitFail", |last| match last {
+            "TS" | "TP" => String::new(),
+            _ => "C-862\r".into(),
+        });
+        let ctrl = Arc::new(Mutex::new(PIC862Controller::new(io, 1).unwrap()));
+        let mut first = PIC862Axis::new(ctrl.clone());
+        let mut again = PIC862Axis::new(ctrl);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            again.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 }
