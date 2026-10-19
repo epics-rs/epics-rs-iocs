@@ -41,7 +41,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure,
+};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -243,12 +245,16 @@ pub struct SmartMotorAxis {
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
     last_status: MotorStatus,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl SmartMotorAxis {
-    /// Construct axis `axis` (0-based chain position) of a controller.
+    /// Construct axis `axis` (0-based chain position) of a controller and
+    /// read its status, as `motor_init`'s `set_status` does
+    /// (drvSmartMotor.cc:660).
     pub fn new(controller: Arc<Mutex<SmartMotorController>>, axis: usize) -> Self {
-        Self {
+        let mut me = Self {
             controller,
             axis,
             prev_position: 0,
@@ -258,7 +264,10 @@ impl SmartMotorAxis {
                 has_encoder: true,
                 ..MotorStatus::default()
             },
-        }
+            init_status: None,
+        };
+        me.init_status = Some(me.poll(&AsynUser::new(0)));
+        me
     }
 
     fn lock(&self) -> MutexGuard<'_, SmartMotorController> {
@@ -273,6 +282,12 @@ impl SmartMotorAxis {
         if acceleration > 0.0 {
             ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)));
         }
+    }
+}
+
+impl Model1Motor for SmartMotorAxis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 
