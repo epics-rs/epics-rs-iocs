@@ -1,19 +1,6 @@
-//! SyringePump IOC — Teledyne ISCO D/H-series (native asyn port driver) plus
-//! ISCO and Vindum (Modbus-only upstream, wired directly against
-//! `epics-modbus-rs`).
-//!
-//! # Scope split (per task decision)
-//! `epics-modules/SyringePump` ships three pump families. Only Teledyne
-//! D/H's `teled_d.proto`/`teled_h.proto` are StreamDevice protocol files
-//! needing genuine protocol translation -- that logic lives in
-//! `drivers/syringepump` (see its module doc). ISCO and Vindum have no
-//! `.proto`/StreamDevice anywhere in their db: both are Modbus register maps
-//! wired entirely through `drvModbusAsynConfigure` + generic db templates
-//! (`epics-modules/SyringePump/SPApp/Db/ISCO*.template`,
-//! `VindumController.template`, `VindumPumpN.template`, and their
-//! `.substitutions` register-map files). They need no driver code of their
-//! own and are wired here directly against `epics-modbus-rs`'s existing
-//! `drvModbusAsynConfigure`/`modbusInterposeConfig` iocsh commands.
+//! SyringePump IOC — Teledyne ISCO D/H-series on StreamDevice (SPApp/Db's
+//! teled_d.proto/teled_h.proto through stream-rs, as C) plus ISCO and
+//! Vindum (Modbus-only upstream, wired directly against `epics-modbus-rs`).
 //!
 //! # dbLoadTemplate (epics-base-rs 0.24.3)
 //! `ISCO*.substitutions`/`Vindum*.substitutions` load via the `dbLoadTemplate`
@@ -39,23 +26,9 @@
 //!   cargo run -p syringepump-ioc -- st.cmd
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use epics_rs::asyn::registry::claim_port;
-use epics_rs::asyn::runtime::config::RuntimeConfig;
-use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::base::error::CaResult;
-use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
-
-use syringepump::connect::connect_octet;
-use syringepump::driver::{Family, TeledyneDriver};
-
-/// Fixed command timeout for every Teledyne transaction (no upstream
-/// `st.cmd`/`iocBoot` ships for either Teledyne family to source a real
-/// value from; chosen to match `drivers/love`'s established convention for
-/// this class of RS-485 ASCII device).
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -79,7 +52,9 @@ async fn main() -> CaResult<()> {
     app = app.register_record_type("sseq", || {
         Box::new(epics_rs::base::server::records::sseq::SseqRecord::default())
     });
-    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+    // streamApp.dbd: asyn device support, DTYP "stream" and the stream
+    // iocsh commands; Teledyne D/H run on SPApp/Db's teled_d/teled_h.proto.
+    app = stream_rs::dev::register_app(app);
 
     // Standard asyn iocsh commands -- provides drvAsynSerialPortConfigure /
     // drvAsynIPPortConfigure / asynOctetSetInputEos / asynOctetSetOutputEos /
@@ -93,134 +68,6 @@ async fn main() -> CaResult<()> {
     // module doc for the scope-split rationale).
     let runtime_handle = epics_rs::base::runtime::task::runtime_handle();
     app = modbus_rs::ioc::register_modbus_commands(app, runtime_handle);
-
-    // TeledyneDInit(port, serPort, serAddr, unit) -- creates a D-series
-    // TeledyneDriver on a pre-configured octet port. No separate *Config
-    // command: unlike drivers/love's per-address Model (a genuinely
-    // runtime-configurable fact), a D/H pump's letter is fixed by which
-    // template instantiation created the record (see driver.rs's module
-    // doc), and `unit` is a per-driver-instance constant set once here.
-    {
-        app = app.register_startup_command(CommandDef::new(
-            "TeledyneDInit",
-            vec![
-                ArgDesc {
-                    name: "port",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "serPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "serAddr",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "unit",
-                    arg_type: ArgType::Int,
-                },
-            ],
-            "TeledyneDInit port serPort serAddr unit",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = match &args[0] {
-                    ArgValue::String(s) => s.to_str()?.to_owned(),
-                    _ => return Err("port required".into()),
-                };
-                let ser_port = match &args[1] {
-                    ArgValue::String(s) => s.to_str()?.to_owned(),
-                    _ => return Err("serPort required".into()),
-                };
-                let ser_addr = match &args[2] {
-                    ArgValue::Int(n) => *n as i32,
-                    _ => return Err("serAddr required".into()),
-                };
-                let unit = match &args[3] {
-                    ArgValue::Int(n) => *n as u8,
-                    _ => return Err("unit required".into()),
-                };
-
-                let handle = connect_octet(&ser_port, ser_addr, COMMAND_TIMEOUT)
-                    .map_err(|e| format!("TeledyneDInit: {e}"))?;
-                let claim = claim_port(&port).map_err(|e| format!("TeledyneDInit: {e}"))?;
-                let driver = TeledyneDriver::new(&port, handle, Family::D, unit);
-
-                let (runtime_handle, _actor_jh) =
-                    create_port_runtime(&claim, driver, RuntimeConfig::default())
-                        .map_err(|e| format!("TeledyneDInit: {e}"))?;
-                claim
-                    .publish(
-                        runtime_handle.port_handle().clone(),
-                        ctx.db().scan_control().interrupt_gate(),
-                    )
-                    .map_err(|e| e.to_string())?;
-
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
-
-    // TeledyneHInit(port, serPort, serAddr, unit) -- same as TeledyneDInit,
-    // H-series.
-    {
-        app = app.register_startup_command(CommandDef::new(
-            "TeledyneHInit",
-            vec![
-                ArgDesc {
-                    name: "port",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "serPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "serAddr",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "unit",
-                    arg_type: ArgType::Int,
-                },
-            ],
-            "TeledyneHInit port serPort serAddr unit",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = match &args[0] {
-                    ArgValue::String(s) => s.to_str()?.to_owned(),
-                    _ => return Err("port required".into()),
-                };
-                let ser_port = match &args[1] {
-                    ArgValue::String(s) => s.to_str()?.to_owned(),
-                    _ => return Err("serPort required".into()),
-                };
-                let ser_addr = match &args[2] {
-                    ArgValue::Int(n) => *n as i32,
-                    _ => return Err("serAddr required".into()),
-                };
-                let unit = match &args[3] {
-                    ArgValue::Int(n) => *n as u8,
-                    _ => return Err("unit required".into()),
-                };
-
-                let handle = connect_octet(&ser_port, ser_addr, COMMAND_TIMEOUT)
-                    .map_err(|e| format!("TeledyneHInit: {e}"))?;
-                let claim = claim_port(&port).map_err(|e| format!("TeledyneHInit: {e}"))?;
-                let driver = TeledyneDriver::new(&port, handle, Family::H, unit);
-
-                let (runtime_handle, _actor_jh) =
-                    create_port_runtime(&claim, driver, RuntimeConfig::default())
-                        .map_err(|e| format!("TeledyneHInit: {e}"))?;
-                claim
-                    .publish(
-                        runtime_handle.port_handle().clone(),
-                        ctx.db().scan_control().interrupt_gate(),
-                    )
-                    .map_err(|e| e.to_string())?;
-
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
