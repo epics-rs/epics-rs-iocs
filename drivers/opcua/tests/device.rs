@@ -64,13 +64,15 @@ fn registry() -> Arc<Registry> {
 
 /// Bind one record to `ns=2;s=Node` on session `S`.
 ///
-/// `init_record(0)`, the dset's init, then `after_dset_init` is the order
-/// `iocInit` runs once the database has set the record's fields; the last is
-/// where mbbi/mbbo set `sdef` from their state table (`mbbiRecord.c:135`) — a
-/// record configured here field by field would otherwise process with a state
-/// table it does not know it has.
+/// `init_record(0)`, `init_record(1)`, the dset's init, then `after_dset_init`
+/// is the order `iocInit` runs once the database has set the record's fields;
+/// pass 1 derives mbbi/mbbo MASK (`mbboRecord.c:136-138`) and the last sets
+/// `sdef` from their state table (`mbbiRecord.c:135`) — a record configured
+/// here field by field would otherwise process with a state table it does not
+/// know it has.
 fn bind(registry: &Arc<Registry>, record: &mut dyn Record, link: &str) -> OpcuaDevice {
     record.init_record(0).expect("the record initialises");
+    record.init_record(1).expect("the record initialises");
     let mut device = OpcuaDevice::new(registry.clone(), link.to_string(), record.record_type());
     device.set_record_info("REC", ScanType::IoIntr);
     device.init(record).expect("the link binds");
