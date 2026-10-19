@@ -43,7 +43,6 @@
 //!
 //! - The auxiliary controller/axis parameters other than the P registers
 //!   (the `AXIS_STATUS`/`CONTROLLER_STATUS` records, the resets, ...).
-//! - The `phytronIO` digital/analog I/O subsystem (`phytronIOctrl.cpp`).
 //! - The fake-HOMED-bit feature (Phytron registers 1001..1020, enabled by the
 //!   `fakeHomedEnable` option): disabled by default, so HOMED is reported from
 //!   status bit 0x08.
@@ -72,6 +71,8 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_libcom_rs::runtime::epics_string::print_escaped;
 use motor_common::util::{atof, atoi, nint};
 use motor_common::{AxisReport, ControllerParams, ControllerReport};
+
+use crate::io::IoChannel;
 
 /// Reply read buffer size (C expects up to ~2010 bytes: 2000 data + framing).
 const READ_BUF: usize = 2048;
@@ -256,13 +257,13 @@ fn reply_bytes(raw: &[u8], ack_only: bool) -> Result<Vec<u8>, i32> {
 }
 
 /// C `isspace`, which `epicsParseInt64` and writeOption's trim skip.
-fn c_isspace(c: char) -> bool {
+pub(crate) fn c_isspace(c: char) -> bool {
     c == ' ' || ('\t'..='\r').contains(&c)
 }
 
 /// C `epicsParseInt64(value, &v, 0, NULL)`: a base-0 integer with only
 /// white space around it.
-fn parse_int64(value: &str) -> Option<i64> {
+pub(crate) fn parse_int64(value: &str) -> Option<i64> {
     let t = value.trim_matches(c_isspace);
     let (neg, body) = match t.as_bytes().first() {
         Some(b'-') => (true, &t[1..]),
@@ -1026,6 +1027,8 @@ pub struct PhytronController {
     do_initial_readout: bool,
     /// C `sCtrlType_`, escaped.
     type_name: String,
+    /// C `IOs_`, the phytronIO channels the poll reads.
+    ios: Vec<IoChannel>,
 }
 
 impl PhytronController {
@@ -1046,7 +1049,17 @@ impl PhytronController {
             axis_status: None,
             do_initial_readout: true,
             type_name: String::new(),
+            ios: Vec::new(),
         }
+    }
+
+    pub(crate) fn ctrl_type(&self) -> CtrlType {
+        self.ctrl_type
+    }
+
+    /// C `phytronIO`'s constructor's `IOs_.push_back` (phytronIOctrl.cpp:95-97).
+    pub(crate) fn add_io(&mut self, io: IoChannel) {
+        self.ios.push(io);
     }
 
     /// C `sCtrlType_`, which phytronIO reads.
@@ -1213,6 +1226,7 @@ impl PhytronController {
     /// C `phytronController::poll` (phytronAxisMotor.cpp:886-1001): an MCC
     /// reads the `SUI` limit-switch word once for every axis's poll to
     /// parse; a phyMOTION reads every controller-parallel axis on one line.
+    /// Every phytronIO channel is read on the same line.
     pub fn poll(&mut self) {
         self.do_initial_readout = false;
         let mut commands = Vec::new();
@@ -1236,6 +1250,17 @@ impl PhytronController {
                 commands.push("SUI".to_owned());
             }
         }
+        let mcc = self.ctrl_type == CtrlType::Mcc;
+        let io_counts: Vec<usize> = self
+            .ios
+            .iter()
+            .map(|io| {
+                let requests = io.requests(mcc);
+                let n = requests.len();
+                commands.extend(requests);
+                n
+            })
+            .collect();
         if commands.is_empty() {
             return;
         }
@@ -1243,12 +1268,12 @@ impl PhytronController {
         {
             Ok(mut answers) => {
                 let mut ok = true;
-                if self.ctrl_type == CtrlType::Mcc {
-                    match answers.first().and_then(|sui| sui.strip_prefix('\x06')) {
+                if mcc {
+                    // multi_command answers every command, SUI first.
+                    match answers.remove(0).strip_prefix('\x06') {
                         Some(sui) => self.last_sui = sui.to_owned(),
                         None => ok = false,
                     }
-                    answers.clear();
                 }
                 for axis_no in todo {
                     // C erases the axis's three whatever they hold.
@@ -1257,6 +1282,14 @@ impl PhytronController {
                     if let Some(a) = self.axis_mut(axis_no) {
                         a.answers = Some(mine);
                     }
+                }
+                // A channel whose replies fail to parse leaves them to the
+                // next in C (phytronIOctrl.cpp:408-483 return ahead of the
+                // erase at :484), which posts its neighbour's values; each
+                // channel takes its own here.
+                for (io, n) in self.ios.iter().zip(io_counts) {
+                    let mine: Vec<String> = answers.drain(..n.min(answers.len())).collect();
+                    ok &= io.parse(mcc, &mine);
                 }
                 if ok && answers.is_empty() {
                     0
@@ -1290,7 +1323,7 @@ impl PhytronController {
 
     /// Send one command line and return its reply payload (ACK/CRC/framing
     /// removed). A NAK or malformed reply is an error (C `bACKonly = true`).
-    fn command(&self, cmd: &str) -> AsynResult<String> {
+    pub(crate) fn command(&self, cmd: &str) -> AsynResult<String> {
         self.send(cmd, true).map_err(phy_to_asyn)
     }
 
@@ -1298,7 +1331,7 @@ impl PhytronController {
     /// failed transfer, `phytronInvalidReturn` (6) for a reply that is not
     /// an ACK (or a NAK when `ack_only` is false, when the reply keeps it),
     /// `phytronInvalidCommand` (7) past 994 bytes.
-    fn send(&self, cmd: &str, ack_only: bool) -> Result<String, i32> {
+    pub(crate) fn send(&self, cmd: &str, ack_only: bool) -> Result<String, i32> {
         let reply = self.send_bytes(cmd.as_bytes(), ack_only)?;
         Ok(String::from_utf8_lossy(&reply).into_owned())
     }
@@ -1320,7 +1353,7 @@ impl PhytronController {
     /// `commands` joined by spaces, up to 42 (one when `single`) and 994
     /// bytes a line, and the replies split at each ACK or NAK. Without
     /// `allow_nak` every reply must be an ACK, which is stripped.
-    fn multi_command(
+    pub(crate) fn multi_command(
         &self,
         mut commands: Vec<String>,
         allow_nak: bool,
