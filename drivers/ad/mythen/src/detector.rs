@@ -401,6 +401,9 @@ impl Detector {
         let use_count_rate = self.get_bool("-get ratecorrection")?;
 
         let nbits = self.get_int("-get nbits")?;
+        // UPSTREAM DEFECT (mythen.cpp:717-719): C accepts 0 here and then
+        // divides by it (`chanperline_ = 32/aux`, SIGFPE). 0 is kept as C
+        // keeps it; `protocol::channels_per_word` reads it as one channel.
         if nbits < 0 {
             return Err(self.settings_error("-get nbits", nbits.to_string()));
         }
