@@ -962,9 +962,11 @@ impl EtherIpDevice {
                     follow!(
                         cip::get_double(&data.buf, element),
                         |plc: &f64| *plc != val,
-                        |plc: f64| record
-                            .set_val(EpicsValue::Double(plc))
-                            .map(|()| Follow::Copied)
+                        |plc: f64| {
+                            record.set_val(EpicsValue::Double(plc))?;
+                            seed_pval(record, plc);
+                            Ok(Follow::Copied)
+                        }
                     )
                 }
                 _ => {
@@ -1091,11 +1093,21 @@ fn back_convert_ao(record: &mut dyn Record, raw: i32) -> CaResult<Follow> {
     if let Some(rval) = rval {
         record.put_field("RVAL", rval)?;
     }
-    Ok(if converted {
-        Follow::Copied
-    } else {
-        Follow::Kept
-    })
+    if !converted {
+        return Ok(Follow::Kept);
+    }
+    let val = f64_field(record, "VAL");
+    seed_pval(record, val);
+    Ok(Follow::Copied)
+}
+
+/// The `rec->pval` of check_ao_callback's `rec->val = rec->pval = dbl`: a
+/// closed-loop ao's fetch_value starts from PVAL. PVAL is SPC_NOMOD, so no
+/// put reaches it; it is stored through its slot, as C stores the member.
+fn seed_pval(record: &mut dyn Record, value: f64) {
+    if let Some(slot) = record.field_slot("PVAL") {
+        record.put_slot_f64(slot, value);
+    }
 }
 
 fn nobt(record: &dyn Record) -> usize {
@@ -1528,6 +1540,27 @@ mod tests {
         }
         assert!(!real.data.lock().do_write);
         assert!(!dint.data.lock().do_write);
+    }
+
+    /// check_ao_callback's `rec->val = rec->pval = dbl` (devEtherIP.c:371,
+    /// :404-413): PVAL follows the PLC before the record processes.
+    #[test]
+    fn an_ao_follow_seeds_pval() {
+        use epics_rs::base::server::records::ao::AoRecord;
+        define_plc("aopval", "127.0.0.1", 0);
+        for (tag, ty, bytes) in [
+            ("R", CipType::Real, 3.25f32.to_le_bytes()),
+            ("D", CipType::Dint, 42i32.to_le_bytes()),
+        ] {
+            let mut record = AoRecord::default();
+            let mut dev = EtherIpDevice::new(&format!("@aopval {tag} S 1"), true);
+            dev.init(&mut record).unwrap();
+            set_tag(dev.tag.as_ref().unwrap(), ty, &bytes);
+            assert!(dev.check_callback(&mut record, &mut CommonFields::default()));
+            let want = if tag == "R" { 3.25 } else { 42.0 };
+            assert_eq!(f64_field(&record, "VAL"), want, "{tag}");
+            assert_eq!(f64_field(&record, "PVAL"), want, "{tag}");
+        }
     }
 
     /// check_ao_callback's DINT back-convert breaks on a breakpoint table
