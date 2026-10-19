@@ -1928,7 +1928,8 @@ mod tests {
     fn each_start_clears_what_a_failed_poll_reads_as_done() {
         let (mut axis, _) = mcc_axis("phytronStartsClearDone");
         let user = AsynUser::new(0);
-        let starts: [(&str, fn(&mut PhytronAxis, &AsynUser)); 3] = [
+        type Start = fn(&mut PhytronAxis, &AsynUser);
+        let starts: [(&str, Start); 3] = [
             ("move_relative", |a, u| {
                 let _ = a.move_relative(u, 10.0, 1.0, 2.0, 1.0);
             }),
