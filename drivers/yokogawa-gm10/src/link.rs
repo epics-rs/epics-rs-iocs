@@ -39,18 +39,24 @@ pub struct ParsedLink<'a> {
     pub arg: Option<&'a str>,
 }
 
+/// C `isblank`, the only separator `gm10_parse_link` splits on.
+fn is_blank(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
 pub fn parse_link(text: &str) -> Option<ParsedLink<'_>> {
-    let text = text.trim_start();
-    let sep = text.find(char::is_whitespace)?;
-    let device = &text[..sep];
-    if device.is_empty() {
+    // C returns 1 on a leading blank, and reads past the NUL when there is
+    // no blank at all.
+    if text.starts_with(is_blank) {
         return None;
     }
-    let rest = text[sep..].trim_start();
+    let sep = text.find(is_blank)?;
+    let device = &text[..sep];
+    let rest = text[sep..].trim_start_matches(is_blank);
     if rest.is_empty() {
         return None;
     }
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let end = rest.find(is_blank).unwrap_or(rest.len());
     let cmd_and_arg = &rest[..end];
     let (command, arg) = match cmd_and_arg.split_once(':') {
         Some((c, a)) => (c, Some(a)),
@@ -160,6 +166,17 @@ mod tests {
         assert!(parse_link("hdl").is_none());
         assert!(parse_link("").is_none());
         assert!(parse_link("   ").is_none());
+    }
+
+    #[test]
+    fn splits_on_c_isblank_only_and_refuses_a_leading_blank() {
+        assert!(parse_link(" hdl VAL:1").is_none());
+        assert!(parse_link("\thdl VAL:1").is_none());
+        assert!(parse_link("hdl\u{a0}VAL:1").is_none());
+        let l = parse_link("h\x0cdl\tVAL:1\x0bx").unwrap();
+        assert_eq!(l.device, "h\x0cdl");
+        assert_eq!(l.command, "VAL");
+        assert_eq!(l.arg, Some("1\x0bx"));
     }
 
     #[test]
