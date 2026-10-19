@@ -3,7 +3,7 @@
 //! The C driver has no StreamDevice and no `asynDrvUser` interface at all --
 //! every one of the 18 data-db records binds via `@asyn($(PORT) addr 0)` (no
 //! drvInfo string), so [`DataDriver::drv_user_create`] dispatches purely by
-//! `addr`, unlike [`crate::config_driver`]'s name-keyed reason table.
+//! `addr`, unlike the L0 config driver's name-keyed reason table.
 //!
 //! # Addressing (`capaNCDT6200Sup.c:34-51`)
 //!
