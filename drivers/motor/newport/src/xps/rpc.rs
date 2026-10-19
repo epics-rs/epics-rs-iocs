@@ -299,10 +299,10 @@ impl XpsSocket {
         };
         let mut buf = Vec::new();
         while !buf.ends_with(XPS_TERMINATOR.as_bytes()) && buf.len() < MAX_REPLY {
-            match link.pending.read_octet(OCTET_REASON, READ_BUF) {
+            match link.pending.read_octet(OCTET_REASON, READ_BUF).into_parts() {
                 // A zero-byte success is the peer closing; C's next read
                 // fails on the closed socket.
-                Ok(chunk) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
+                (chunk, Ok(())) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
                 _ => break,
             }
         }
@@ -328,17 +328,19 @@ impl XpsSocket {
         // C writeRead (asynOctetSocket.cpp:153) flushes stale input before the
         // write; only the continuation chunks are plain reads.
         let handle = &link.handle;
-        let mut buf = handle
+        let (mut buf, status) = handle
             .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
-            .inspect_err(|e| {
-                self.trace_error(format_args!(
-                    "SendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
-                    e.status() as i32,
-                    e.message()
-                ))
-            })?;
+            .into_parts();
+        status.inspect_err(|e| {
+            self.trace_error(format_args!(
+                "SendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
+                e.status() as i32,
+                e.message()
+            ))
+        })?;
         while !buf.ends_with(XPS_TERMINATOR.as_bytes()) {
-            let chunk = handle.read_octet(OCTET_REASON, READ_BUF)?;
+            let (chunk, status) = handle.read_octet(OCTET_REASON, READ_BUF).into_parts();
+            status?;
             buf.extend_from_slice(&chunk);
             if buf.len() > MAX_REPLY {
                 return Err(XpsError::Transport(AsynError::Status {
@@ -371,11 +373,12 @@ impl XpsSocket {
             match link
                 .handle
                 .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
+                .into_parts()
             {
                 // write_read wraps its failure in the step that failed, so
                 // the timeout is read through `status()`.
-                Err(e) if e.status() == AsynStatus::Timeout => return Ok(synthesized()),
-                Err(e) => {
+                (_, Err(e)) if e.status() == AsynStatus::Timeout => return Ok(synthesized()),
+                (_, Err(e)) => {
                     // C prints only for asynError (asynOctetSocket.cpp:197).
                     if e.status() == AsynStatus::Error {
                         self.trace_error(format_args!(
@@ -386,7 +389,7 @@ impl XpsSocket {
                     }
                     return Err(XpsError::Transport(e));
                 }
-                Ok(raw) => {
+                (raw, Ok(())) => {
                     // A reply in time is the caller's to parse, as C's
                     // `ErrorStringGet` on HXP's move socket does.
                     let text = String::from_utf8_lossy(&raw);

@@ -150,7 +150,12 @@ impl Esp300Controller {
         // later reply; write_read flushes first. The ESP300 firmware can
         // still put an unsolicited hard-limit error (E35..E42) ahead of the
         // real reply, which C recv_mess re-reads past.
-        let reply = trim_reply(&self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?);
+        let (raw, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        status?;
+        let reply = trim_reply(&raw);
         if is_unsolicited_limit_error(&reply) {
             return self.read_once();
         }
@@ -158,7 +163,9 @@ impl Esp300Controller {
     }
 
     fn read_once(&self) -> AsynResult<String> {
-        Ok(trim_reply(&self.handle.read_octet(0, READ_BUF)?))
+        let (raw, status) = self.handle.read_octet(0, READ_BUF).into_parts();
+        status?;
+        Ok(trim_reply(&raw))
     }
 }
 

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{ParamSetValue, RequestOp};
+use epics_rs::asyn::request::{OctetReadOp, ParamSetValue};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -501,11 +501,16 @@ async fn read_status_message(ctx: &StatusContext) -> AsynResult<String> {
     let user = AsynUser::new(0)
         .with_addr(0)
         .with_timeout(STATUS_READ_TIMEOUT);
-    let op = RequestOp::OctetRead {
+    let op = OctetReadOp::Read {
         buf_size: MAX_MESSAGE_SIZE,
     };
-    let result = ctx.status.port()?.submit_async(op, user).await?;
-    let bytes = result.data.unwrap_or_default();
+    let (bytes, status) = ctx
+        .status
+        .port()?
+        .submit_octet_read(op, user)
+        .await
+        .into_parts();
+    status?;
     Ok(crate::connection::reply_text(&bytes))
 }
 

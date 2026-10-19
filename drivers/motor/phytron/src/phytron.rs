@@ -1001,10 +1001,8 @@ impl PhytronController {
             return Err(7);
         }
         let frame = build_frame(self.ctrl_type, self.address, cmd);
-        let raw = self
-            .handle
-            .write_read(0, &frame, READ_BUF)
-            .map_err(|e| e.status() as i32)?;
+        let (raw, status) = self.handle.write_read(0, &frame, READ_BUF).into_parts();
+        status.map_err(|e| e.status() as i32)?;
         reply_payload(&raw, ack_only)
     }
 

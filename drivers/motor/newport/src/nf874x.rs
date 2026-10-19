@@ -91,9 +91,11 @@ impl Nf874xController {
 
     /// `writeReadController`.
     fn write_read(&self, command: &str) -> AsynResult<String> {
-        let reply = self
+        let (reply, status) = self
             .handle()?
-            .write_read(0, command.as_bytes(), MAX_REPLY)?;
+            .write_read(0, command.as_bytes(), MAX_REPLY)
+            .into_parts();
+        status?;
         Ok(String::from_utf8_lossy(&reply).into_owned())
     }
 

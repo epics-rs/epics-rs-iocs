@@ -61,8 +61,8 @@ impl Mvp2001Chain {
     /// empty when none came.
     fn recv(&self) -> String {
         let _ = self.handle.read_octet(0, BUFF_SIZE);
-        match self.handle.read_octet(0, BUFF_SIZE) {
-            Ok(raw) if !raw.is_empty() => {
+        match self.handle.read_octet(0, BUFF_SIZE).into_parts() {
+            (raw, Ok(())) if !raw.is_empty() => {
                 sleep(Duration::from_millis(100));
                 String::from_utf8_lossy(&raw).into_owned()
             }
@@ -83,10 +83,10 @@ impl Mvp2001Chain {
             return;
         };
         let quick = SyncIOHandle::from_handle(port.clone(), 0, Duration::ZERO);
-        while quick
-            .read_octet(0, BUFF_SIZE)
-            .is_ok_and(|raw| !raw.is_empty())
-        {}
+        while matches!(
+            quick.read_octet(0, BUFF_SIZE).into_parts(),
+            (raw, Ok(())) if !raw.is_empty()
+        ) {}
     }
 }
 

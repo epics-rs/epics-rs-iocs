@@ -447,9 +447,13 @@ impl Mm4000Controller {
 
     /// Write a command and read the reply (C `sendAndReceive`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        let e = match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
-            Ok(raw) => return Ok(String::from_utf8_lossy(&raw).into_owned()),
-            Err(e) => e,
+        let e = match self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts()
+        {
+            (raw, Ok(())) => return Ok(String::from_utf8_lossy(&raw).into_owned()),
+            (_, Err(e)) => e,
         };
         let written = match e.octet_step() {
             Some(OctetStep::Read) => cmd.len(),

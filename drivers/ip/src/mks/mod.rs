@@ -21,7 +21,7 @@ use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
+use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -83,7 +83,8 @@ fn write_read_once(port: &str, data: &[u8]) -> Result<Vec<u8>, ()> {
         );
         return Err(());
     }
-    io.write_read(0, data, MAX_RESPONSE_LEN).map_err(|e| {
+    let (reply, status) = io.write_read(0, data, MAX_RESPONSE_LEN).into_parts();
+    status.map(|()| reply).map_err(|e| {
         io.print(
             0,
             TraceMask::ERROR,
@@ -135,19 +136,15 @@ impl CellBody for Job {
             },
             user(),
         );
-        let read = port.call(
-            &RequestOp::OctetRead {
-                buf_size: MAX_RESPONSE_LEN,
-            },
-            user(),
-        );
-        let (data, ok) = match read {
-            Ok(r) => (r.data.unwrap_or_default(), true),
-            Err(e) => (
-                e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
-                false,
-            ),
-        };
+        let (data, status) = port
+            .octet_read(
+                OctetReadOp::Read {
+                    buf_size: MAX_RESPONSE_LEN,
+                },
+                user(),
+            )
+            .into_parts();
+        let ok = status.is_ok();
         print(
             &self.handle,
             TraceMask::IO_DEVICE,

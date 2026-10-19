@@ -82,6 +82,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
+use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -168,9 +169,9 @@ impl PIC844Controller {
 
     /// Read one EOS-stripped reply, folding a transport failure / empty read
     /// into `""` (C `recv_mess`).
-    fn reply(read: AsynResult<Vec<u8>>) -> String {
-        match read {
-            Ok(raw) if !raw.is_empty() => String::from_utf8_lossy(&raw).into_owned(),
+    fn reply(read: OctetRead) -> String {
+        match read.into_parts() {
+            (raw, Ok(())) if !raw.is_empty() => String::from_utf8_lossy(&raw).into_owned(),
             _ => String::new(),
         }
     }

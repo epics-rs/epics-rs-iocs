@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::OctetReadOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -162,32 +162,33 @@ impl WireLink<'_> {
         }
         let request = codec::format_request(counter, command);
 
-        let result = port
-            .submit_blocking(
-                RequestOp::OctetWriteRead {
+        let (reply, status) = port
+            .submit_octet_read_blocking(
+                OctetReadOp::WriteRead {
                     data: request.into_bytes(),
                     buf_size: MAX_MESSAGE_SIZE,
-                    flush: true,
                 },
                 self.user(),
             )
-            .map_err(WireError::Io)?;
-        let raw = String::from_utf8_lossy(&result.data.unwrap_or_default()).into_owned();
+            .into_parts();
+        status.map_err(WireError::Io)?;
+        let raw = String::from_utf8_lossy(&reply).into_owned();
         let payload = codec::strip_response_frame(&raw, counter).map_err(WireError::Frame)?;
 
         let mut assembler = ResponseAssembler::new();
         match assembler.begin(payload) {
             BeginOutcome::Ok => {}
             BeginOutcome::NeedsMore => loop {
-                let more = port
-                    .submit_blocking(
-                        RequestOp::OctetRead {
+                let (more, status) = port
+                    .submit_octet_read_blocking(
+                        OctetReadOp::Read {
                             buf_size: MAX_MESSAGE_SIZE,
                         },
                         self.user(),
                     )
-                    .map_err(WireError::Io)?;
-                let chunk = String::from_utf8_lossy(&more.data.unwrap_or_default()).into_owned();
+                    .into_parts();
+                status.map_err(WireError::Io)?;
+                let chunk = String::from_utf8_lossy(&more).into_owned();
                 if !assembler.continue_with(&chunk) {
                     break;
                 }

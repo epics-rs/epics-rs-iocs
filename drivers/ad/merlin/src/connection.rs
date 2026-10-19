@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -75,8 +75,6 @@ impl From<MpxError> for ChannelError {
 
 impl From<AsynError> for ChannelError {
     fn from(e: AsynError) -> Self {
-        // `status()` reads *through* a `PartialRead` carrier, so a timeout that
-        // returned partial bytes (EOS interpose installed) is still recognized.
         if e.status() == AsynStatus::Timeout {
             Self::Timeout
         } else {
@@ -118,19 +116,17 @@ impl MpxConnection {
             // OctetReadBinary brackets the read with the input EOS cleared, so
             // a 0x0A byte inside a pixel payload cannot terminate it early —
             // MPX frames are length-delimited, never EOS-delimited.
-            let result = self
-                .io
-                .port()
-                .and_then(|handle| {
-                    handle.submit_blocking(
-                        RequestOp::OctetReadBinary {
-                            buf_size: want - out.len(),
-                        },
-                        self.user(timeout),
-                    )
-                })
-                .map_err(|e| Some(e.into()))?;
-            let chunk = result.data.unwrap_or_default();
+            let handle = self.io.port().map_err(|e| Some(e.into()))?;
+            // C adds `nread` only on asynSuccess (mpxConnection.cpp:647-648).
+            let (chunk, status) = handle
+                .submit_octet_read_blocking(
+                    OctetReadOp::ReadBinary {
+                        buf_size: want - out.len(),
+                    },
+                    self.user(timeout),
+                )
+                .into_parts();
+            status.map_err(|e| Some(e.into()))?;
             if chunk.is_empty() {
                 return Err(None);
             }
@@ -312,22 +308,13 @@ pub fn default_timeout() -> Duration {
 #[cfg(test)]
 mod is_timeout_tests {
     use super::*;
-    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
 
-    /// A read that times out *after* transferring bytes arrives as
-    /// `AsynError::PartialRead` when the EOS interpose is installed (this
-    /// port's st.cmd uses `noProcessEos=0`). A bare `AsynError::Status`
-    /// match missed it and misclassified the timeout as a transport fault.
     #[test]
-    fn a_partial_read_wrapped_timeout_maps_to_timeout() {
+    fn a_timeout_maps_to_timeout() {
         let e = AsynError::Status {
             status: AsynStatus::Timeout,
             message: "read timeout".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: b"partial".to_vec(),
-            eom_reason: EomReason::empty(),
-        });
+        };
         assert!(matches!(ChannelError::from(e), ChannelError::Timeout));
     }
 

@@ -60,10 +60,14 @@ impl Im483Controller {
 
     /// `send_mess` then `recv_mess`: the reply, empty when none came.
     fn ask(&self, msg: impl AsRef<[u8]>) -> String {
-        self.handle
+        match self
+            .handle
             .write_read(0, msg.as_ref(), BUFF_SIZE)
-            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
-            .unwrap_or_default()
+            .into_parts()
+        {
+            (raw, Ok(())) => String::from_utf8_lossy(&raw).into_owned(),
+            (_, Err(_)) => String::new(),
+        }
     }
 }
 
@@ -87,7 +91,10 @@ pub fn im483sm_probe(ctrl: &Im483Controller) -> Option<String> {
         sign_on_ident(|| {
             let line = match first.take() {
                 Some(line) => line.into_bytes(),
-                None => ctrl.handle.read_octet(0, BUFF_SIZE).unwrap_or_default(),
+                None => match ctrl.handle.read_octet(0, BUFF_SIZE).into_parts() {
+                    (line, Ok(())) => line,
+                    (_, Err(_)) => Vec::new(),
+                },
             };
             Some(line).filter(|l| !l.is_empty())
         })

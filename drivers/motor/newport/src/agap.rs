@@ -143,7 +143,11 @@ impl AgapController {
 
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
         // C writeReadController: pasynOctetSyncIO->writeRead.
-        let reply = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let (reply, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        status?;
         Ok(String::from_utf8_lossy(&reply).into_owned())
     }
 

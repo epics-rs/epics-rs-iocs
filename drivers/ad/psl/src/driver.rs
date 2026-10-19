@@ -747,6 +747,19 @@ mod tests {
     use epics_rs::asyn::registry::claim_port;
     use std::time::Duration;
 
+    /// A read the test expects to succeed, as its bytes.
+    trait BytesOk {
+        fn bytes_ok(self) -> Vec<u8>;
+    }
+
+    impl BytesOk for epics_rs::asyn::request::OctetRead {
+        fn bytes_ok(self) -> Vec<u8> {
+            let (bytes, status) = self.into_parts();
+            status.unwrap();
+            bytes
+        }
+    }
+
     /// A detector whose PSLViewer socket never connects: the writes under
     /// test must not need the server.
     fn detector(name: &str) -> PslDetector {
@@ -815,12 +828,16 @@ mod tests {
             ADStatus::Idle as i32
         );
         let octet = |reason| {
-            let mut v = sync.read_octet(reason, 64).unwrap();
+            let mut v = sync.read_octet(reason, 64).bytes_ok();
             v.retain(|&b| b != 0);
             String::from_utf8(v).unwrap()
         };
         assert_eq!(octet(rt.ad_params.status_message), "");
-        assert!(sync.read_octet(rt.ad_params.base.model, 64).is_err());
+        assert!(
+            sync.read_octet(rt.ad_params.base.model, 64)
+                .status()
+                .is_err()
+        );
         assert_eq!(
             octet(rt.ad_params.base.driver_version),
             octet(rt.ad_params.base.ad_core_version)

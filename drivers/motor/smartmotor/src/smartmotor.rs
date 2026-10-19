@@ -218,7 +218,8 @@ impl SmartMotorController {
     /// Send a query to `axis` and return its `\r`-terminated reply (trimmed).
     fn query(&self, axis: usize, cmd: &str) -> AsynResult<String> {
         self.send(axis, cmd);
-        let raw = self.reader.read_octet(0, READ_BUF)?;
+        let (raw, status) = self.reader.read_octet(0, READ_BUF).into_parts();
+        status?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }

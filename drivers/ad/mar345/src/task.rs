@@ -22,7 +22,7 @@ use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::{DriverHold, PortHandle};
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::OctetReadOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -34,7 +34,7 @@ use crate::protocol::{
     CMD_ERASE, DONE_MODE_CHANGE, DONE_SCAN_DATA, cmd_change, cmd_scan, full_file_name,
     response_done,
 };
-use crate::server::{SERVER_ADDR, server_submit};
+use crate::server::{SERVER_ADDR, server_read};
 use crate::types::{
     EraseMode, Event, IMAGE_SIZES, MAR345_COMMAND_TIMEOUT, MAR345_POLL_DELAY, MAX_FILENAME_LEN,
     MAX_MESSAGE_SIZE, Mode, Status, secs,
@@ -129,43 +129,47 @@ impl Worker {
     // -----------------------------------------------------------------------
 
     /// C `readServer`: a single read with the given timeout, the lock
-    /// released around it. Only a non-empty read publishes
-    /// `ADStringFromServer` (C returns before `setStringParam` when
-    /// `nread == 0`).
+    /// released around it. Any non-empty read publishes
+    /// `ADStringFromServer`, a failed one too (C returns before
+    /// `setStringParam` only when `nread == 0`).
     fn read_server(&mut self, l: &mut Held, timeout: f64) -> AsynStatus {
         let user = AsynUser::default()
             .with_addr(SERVER_ADDR)
             .with_timeout(secs(timeout));
         let read = l.unlocked(|| {
-            server_submit(
+            server_read(
                 &self.server_port,
-                RequestOp::OctetRead {
+                OctetReadOp::Read {
                     buf_size: MAX_MESSAGE_SIZE,
                 },
                 user,
             )
         });
-        match read {
-            Ok(result) => {
-                let data = result.data.unwrap_or_default();
-                if data.is_empty() {
-                    // C: `if (nread == 0) return status` without publishing.
-                    self.from.clear();
-                    return AsynStatus::Success;
-                }
-                self.from = String::from_utf8_lossy(&data).into_owned();
-                let (reason, from) = (self.ad.string_from_server, self.from.clone());
-                l.step(move |d| {
-                    d.set_str(reason, &from);
-                    d.callbacks();
-                });
-                AsynStatus::Success
-            }
-            Err(e) => {
-                self.from.clear();
-                e.status()
-            }
+        let (data, status) = read.into_parts();
+        let status = status.map_or_else(|e| e.status(), |()| AsynStatus::Success);
+        if data.is_empty() {
+            self.from.clear();
+            return status;
         }
+        self.from = String::from_utf8_lossy(&data).into_owned();
+        if status != AsynStatus::Success {
+            self.server_port.print(
+                0,
+                TraceMask::ERROR,
+                format_args!(
+                    "mar345:readServer, timeout={timeout:.6}, status={} received {} bytes\n{}\n",
+                    status as i32,
+                    data.len(),
+                    self.from
+                ),
+            );
+        }
+        let (reason, from) = (self.ad.string_from_server, self.from.clone());
+        l.step(move |d| {
+            d.set_str(reason, &from);
+            d.callbacks();
+        });
+        status
     }
 
     /// C `waitForCompletion`: poll `readServer` at `MAR345_POLL_DELAY` until the
@@ -631,6 +635,93 @@ mod tests {
         assert!(
             text.contains("mar345:mar345Task: no driver lock"),
             "{text:?}"
+        );
+        std::mem::forget(det);
+    }
+
+    /// A marServer port whose every read times out after sending `abc`.
+    struct TimesOutAfterAbc(epics_rs::asyn::port::PortDriverBase);
+
+    impl epics_rs::asyn::port::PortDriver for TimesOutAfterAbc {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.0
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            buf[..3].copy_from_slice(b"abc");
+            OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "timeout".into(),
+                }),
+                ..OctetReadResult::ok(3, EomReason::empty())
+            }
+        }
+    }
+
+    /// C `readServer` (mar345.cpp:264-269) publishes whatever a timed-out
+    /// read transferred, and returns the timeout.
+    #[test]
+    fn a_timed_out_read_publishes_its_bytes() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let name = "MAR345_PARTIAL";
+        let ip = format!("{name}_IP");
+        let claim = claim_port(&ip).unwrap();
+        let (runtime, _) = create_port_runtime(
+            &claim,
+            TimesOutAfterAbc(PortDriverBase::new(
+                &ip,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            )),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        std::mem::forget(runtime);
+        let det = create_mar345_detector(&claim_port(name).unwrap(), &ip, 0).unwrap();
+        let (h, ad) = (det.port_handle().clone(), det.ad_params);
+        let mut worker = Worker {
+            port: h.clone(),
+            server_port: Arc::new(crate::driver::tests::server_user(name)),
+            ad,
+            p: det.mar345_params,
+            from: String::new(),
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            abort: Arc::new(Event::new()),
+            mode: Arc::new(AtomicI32::new(0)),
+            acq_start: Arc::new(AtomicU64::new(0)),
+            output: ArrayPublisher::new(det.array_output().clone()),
+            pool: det.pool().clone(),
+            owner: h
+                .with_driver_blocking::<Mar345Driver, _>(|d| d.ad.owner.clone())
+                .unwrap(),
+        };
+        let status = {
+            let mut l = worker.port.clone().hold_driver_blocking().unwrap();
+            worker.read_server(&mut l, 0.1)
+        };
+        assert_eq!(status, AsynStatus::Timeout);
+        assert_eq!(worker.from, "abc");
+        assert_eq!(
+            h.get_string_param_blocking(ad.string_from_server, 0, 256)
+                .unwrap(),
+            b"abc"
         );
         std::mem::forget(det);
     }

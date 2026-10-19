@@ -259,8 +259,13 @@ impl PmacCoordSystem {
                 format_args!("Sending to PMAC C.S. ref {reference} command : {command}\n"),
             );
         }
-        let reply = self.handle.write_read(0, command.as_bytes(), PMAC_MAXBUF);
-        if let (Some(log), Ok(raw)) = (log, &reply)
+        let (raw, status) = self
+            .handle
+            .write_read(0, command.as_bytes(), PMAC_MAXBUF)
+            .into_parts();
+        // C logs whatever arrived, before it looks at the status
+        // (pmacAsynCoord.c:331-335).
+        if let Some(log) = log
             && !raw.is_empty()
         {
             let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -275,8 +280,8 @@ impl PmacCoordSystem {
         // C `motorAxisWriteRead`'s comm error (pmacAsynCoord.c:336, 345).
         let _ = self
             .params(axis)
-            .set_integer(function::COMM_ERROR, i32::from(reply.is_err()));
-        reply.inspect_err(|e| {
+            .set_integer(function::COMM_ERROR, i32::from(status.is_err()));
+        status.inspect_err(|e| {
             self.trace.print(
                 TraceMask::ERROR,
                 0,
@@ -289,7 +294,8 @@ impl PmacCoordSystem {
                     e.message_display()
                 ),
             );
-        })
+        })?;
+        Ok(raw)
     }
 
     /// C `drvPmacGetAxesStatus`: `&{cs}??` for the status words, then one

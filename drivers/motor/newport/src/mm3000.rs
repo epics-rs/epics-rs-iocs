@@ -213,7 +213,11 @@ impl Mm3000Controller {
 
     /// Write a command and read the reply (C `send_mess` + `recv_mess`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let (raw, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        status?;
         self.read_reply(String::from_utf8_lossy(&raw).into_owned())
     }
 
@@ -242,7 +246,8 @@ impl Mm3000Controller {
     /// One raw read. No trimming: the `MS` status reply is a binary byte and
     /// the port's input EOS (`\r`) already framed the message.
     fn read_once(&self) -> AsynResult<String> {
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let (raw, status) = self.handle.read_octet(0, READ_BUF).into_parts();
+        status?;
         Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 }

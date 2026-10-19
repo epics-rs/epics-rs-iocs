@@ -41,7 +41,7 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -255,20 +255,18 @@ impl ImsLine {
     /// Write a query and read one reply line (C `writeReadController`:
     /// `pasynOctetSyncIO->writeRead`, which flushes a stray line first).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.exchange(cmd)?;
+        let (raw, status) = self.exchange(cmd);
+        status?;
         let s = String::from_utf8_lossy(&raw);
         Ok(s.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
 
     /// C `writeReadController`'s writeRead and its trace line, which
     /// prints whatever reply there is even when the exchange failed.
-    fn exchange(&self, cmd: &str) -> AsynResult<Vec<u8>> {
+    fn exchange(&self, cmd: &str) -> (Vec<u8>, AsynResult<()>) {
         let out = self.framed(cmd);
-        let status = self.failed(self.handle.write_read(0, &out, READ_BUF));
-        let reply = match &status {
-            Ok(raw) => raw.as_slice(),
-            Err(e) => e.partial_read().map_or(&[][..], |p| p.data.as_slice()),
-        };
+        let (reply, status) = self.handle.write_read(0, &out, READ_BUF).into_parts();
+        let status = self.failed(status);
         let device_name = &self.device_name;
         self.print(
             TraceMask::IO_DRIVER,
@@ -278,7 +276,7 @@ impl ImsLine {
                 String::from_utf8_lossy(reply.split(|&b| b == 0).next().unwrap_or_default())
             ),
         );
-        status
+        (reply, status)
     }
 }
 
@@ -505,15 +503,14 @@ impl ImsMDrivePlusAxis {
                 format_args!("{DRIVER_NAME}:configAxis(): Version retry.\n"),
             );
             let resp = match resp {
-                Err(e) if e.status() == AsynStatus::Error => {
+                (_, Err(e)) if e.status() == AsynStatus::Error => {
                     self.line.print(
                         TraceMask::ERROR,
                         format_args!("{DRIVER_NAME}:configAxis(): Version inquiry FAILED.\n"),
                     );
                     continue;
                 }
-                Err(e) => e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
-                Ok(raw) => raw,
+                (raw, _) => raw,
             };
             let resp = resp.split(|&b| b == 0).next().unwrap_or_default();
             if resp.len() < 2 {
@@ -621,7 +618,7 @@ impl ImsMDrivePlusAxis {
             u
         };
         port.submit_blocking(RequestOp::BlockProcess { all_devices: true }, user())?;
-        let read = (|| {
+        let read = (|| -> AsynResult<Vec<u8>> {
             port.set_input_eos_blocking(user(), b"\0")?;
             port.submit_blocking(
                 RequestOp::OctetWrite {
@@ -629,15 +626,16 @@ impl ImsMDrivePlusAxis {
                 },
                 user(),
             )?;
-            match port.submit_blocking(
-                RequestOp::OctetRead {
-                    buf_size: IS_READ_BUF,
-                },
-                user(),
-            ) {
-                Ok(r) => Ok(r.data.unwrap_or_default()),
-                Err(e) => e.partial_read().map(|p| p.data.clone()).ok_or(e),
-            }
+            // C parses `resp[..nread]` whatever the read's status (:237-244).
+            let (resp, _) = port
+                .submit_octet_read_blocking(
+                    OctetReadOp::Read {
+                        buf_size: IS_READ_BUF,
+                    },
+                    user(),
+                )
+                .into_parts();
+            Ok(resp)
         })();
         let restored = port.set_input_eos_blocking(user(), INPUT_EOS);
         let unblocked =
