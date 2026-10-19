@@ -18,7 +18,7 @@ use epics_rs::motor::trace::MotorTrace;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port_with};
+use motor_common::{AxisReport, Controller, asyn_user, register_port_with};
 
 use crate::anf2::{Anf2Axis, Anf2AxisReport, Anf2Controller, Anf2Params, MAX_AXES};
 use crate::ang1::{Ang1Axis, Ang1AxisReport, Ang1Controller, Ang1Params};
@@ -142,13 +142,15 @@ pub fn anf2_create_axis_command() -> CommandDef {
             let base_speed = req_int(args, 3, "Base speed")?.clamp(1, 1_000_000) as i32;
             let homing_timeout = req_int(args, 4, "Homing timeout")?.clamp(0, 300) as i32;
 
-            let report = Arc::new(Anf2AxisReport {
-                controller: controller.clone(),
-                axis: axis as i32,
-            });
-            let ax = Anf2Axis::new(controller, axis as i32, config, base_speed, homing_timeout);
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            poller.install_with_report(asyn_user(&port_name, axis as i32), motor, report)?;
+            // C constructs the axis under pC->lock() (ANF2Driver.cpp:464-466).
+            poller.install_built(asyn_user(&port_name, axis as i32), || {
+                let report: Arc<dyn AxisReport> = Arc::new(Anf2AxisReport {
+                    controller: controller.clone(),
+                    axis: axis as i32,
+                });
+                let ax = Anf2Axis::new(controller, axis as i32, config, base_speed, homing_timeout);
+                Ok((Arc::new(Mutex::new(ax)), Some(report)))
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -165,7 +167,7 @@ pub fn anf2_start_poller_command() -> CommandDef {
             arg_int_req("Idle poll period (ms)"),
         ],
         "ANF2StartPoller(ANF2Name, movingPollPeriod, idlePollPeriod)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Port name")?;
             let Some(Anf2Port { controller, poller }) = anf2_registry()
                 .lock()
@@ -183,7 +185,7 @@ pub fn anf2_start_poller_command() -> CommandDef {
                 .unwrap_or_else(|e| e.into_inner())
                 .set_poll_periods(moving_poll_ms as f64 / 1000.0, idle_poll_ms as f64 / 1000.0);
             // C startPoller, ANF2Driver.cpp:129
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -251,7 +253,7 @@ pub fn ang1_create_controller_command() -> CommandDef {
                 poller.install_with_report(asyn_user(&port_name, axis as i32), motor, report)?;
             }
             // C startPoller, ANG1Driver.cpp:98
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
 
             Ok(CommandOutcome::Continue)
         },
@@ -280,13 +282,13 @@ mod tests {
             for (cmd, args) in cmds {
                 cmd.handler.call(&args, &ctx).unwrap();
             }
+            motor_common::testing::await_first_polls(&port);
             PortManager::global()
                 .find_port_handle(&port)
                 .unwrap()
                 .report_blocking(level)
                 .unwrap()
         });
-        // An axis joining the poller waits on a task this runtime runs.
         while !shell.is_finished() {
             sleep(std::time::Duration::from_millis(5)).await;
         }
@@ -522,9 +524,13 @@ mod tests {
         crate::regs::fake::publish("ang1NoAxisOut");
         let cmd = (ang1_create_controller_command(), ang1_args(port));
         report_after(vec![cmd], port, 0).await;
-        crate::regs::fake::written("ang1NoAxisOut");
         assert!(!put_int32_status(port, "ANG1_JERK", 5, 1234).await);
-        assert_eq!(crate::regs::fake::written("ang1NoAxisOut"), []);
+        // The poller thread's startup pass wrote CMD_MSW.
+        let written = crate::regs::fake::written("ang1NoAxisOut");
+        assert!(
+            !written.iter().any(|(reg, _)| *reg == crate::ang1::JERK),
+            "{written:?}"
+        );
     }
 
     #[test]

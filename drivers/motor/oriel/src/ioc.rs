@@ -47,14 +47,14 @@ pub fn emc18011_config_command() -> CommandDef {
             arg_str_req("asyn port name"),
         ],
         "EMC18011Config(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !EMC18011.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            EMC18011.config(ctx, card, move |init| {
+            EMC18011.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     // C connects at an asyn_address EMC18011Config never sets (drvEMC18011.cc:661).

@@ -27,14 +27,17 @@ async fn four_mcs2_axes_poll_on_one_poller() {
     assert_eq!(pollers_after(cmd, args).await, 1);
 }
 
-/// Run each `(cmd, args)` as the shell does, on a thread of its own.
-fn run(lines: Vec<(CommandDef, Vec<ArgValue>)>) {
+/// Run each `(cmd, args)` as the shell does, on a thread of its own, then
+/// wait for controller port `port`'s first polls.
+fn run(port: &str, lines: Vec<(CommandDef, Vec<ArgValue>)>) {
     let bridge = BlockingBridge::capture();
+    let port = port.to_owned();
     std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         for (cmd, args) in lines {
             cmd.handler.call(&args, &ctx).unwrap();
         }
+        motor_common::testing::await_first_polls(&port);
     })
     .join()
     .unwrap();
@@ -47,13 +50,20 @@ async fn four_axes_after(
     create_axis: CommandDef,
 ) -> usize {
     let port = controller_args[0].clone();
+    let ArgValue::String(name) = &port else {
+        unreachable!()
+    };
+    let name = name.to_string();
     assert_eq!(pollers_after(controller, controller_args).await, 1);
-    run((0..4)
-        .map(|axis| {
-            let args = vec![port.clone(), ArgValue::Int(axis), ArgValue::Int(axis)];
-            (create_axis.clone(), args)
-        })
-        .collect());
+    run(
+        &name,
+        (0..4)
+            .map(|axis| {
+                let args = vec![port.clone(), ArgValue::Int(axis), ArgValue::Int(axis)];
+                (create_axis.clone(), args)
+            })
+            .collect(),
+    );
     sleep(Duration::from_millis(200)).await;
     pollers()
 }

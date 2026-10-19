@@ -358,14 +358,14 @@ pub fn soloist_config_command() -> CommandDef {
             arg_int_opt("asyn address (GPIB)"),
         ],
         "SoloistConfig(card, name, addr)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !SOLOIST.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let addr = c_int(args, 2);
-            SOLOIST.config(ctx, card, move |init| {
+            SOLOIST.config(card, move |init| {
                 let (handle, connected) = SyncIOHandle::connect_port(
                     &asyn_port,
                     addr,

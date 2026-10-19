@@ -11,20 +11,20 @@ use epics_rs::base::server::iocsh::registry::{ArgValue, CommandContext, CommandD
 use motor_common::testing::LineRig;
 
 /// `cmd` with `args` on a thread of its own, then the asynReport of
-/// `port` at `level`.
+/// `port` at `level` once the poller thread's startup poll has run.
 async fn report_after(cmd: CommandDef, args: Vec<ArgValue>, port: &str, level: i32) -> String {
     let bridge = BlockingBridge::capture();
     let port = port.to_string();
     let shell = std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         cmd.handler.call(&args, &ctx).unwrap();
+        motor_common::testing::await_first_polls(&port);
         PortManager::global()
             .find_port_handle(&port)
             .unwrap()
             .report_blocking(level)
             .unwrap()
     });
-    // An axis joining the poller waits on a task this runtime runs.
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;
     }

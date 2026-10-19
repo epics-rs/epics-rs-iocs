@@ -46,7 +46,7 @@ pub fn mcdc2805_config_command() -> CommandDef {
             arg_str_req("asyn port name"),
         ],
         "MCDC2805Config(card, modules, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !MCDC2805.has_card(card) {
                 return Ok(CommandOutcome::Continue);
@@ -57,7 +57,7 @@ pub fn mcdc2805_config_command() -> CommandDef {
             }
             let asyn_port = req_string(args, 2, "asyn port name")?;
 
-            MCDC2805.config(ctx, card, move |init| {
+            MCDC2805.config(card, move |init| {
                 let Ok(handle) = connect_serial(&asyn_port, 0, MCDC2805_TIMEOUT) else {
                     return;
                 };

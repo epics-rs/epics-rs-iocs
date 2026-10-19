@@ -66,9 +66,11 @@ async fn maxnet(port: &str) {
         ArgValue::String("".into()),
     ];
     let bridge = BlockingBridge::capture();
+    let port = port.to_owned();
     let shell = std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         config.handler.call(&args, &ctx).unwrap();
+        motor_common::testing::await_first_polls(&port);
     });
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;
@@ -76,25 +78,12 @@ async fn maxnet(port: &str) {
     shell.join().unwrap();
 }
 
-/// The report once the poller's first pass has reached the parameters.
-async fn settled_report(port: &str, level: i32, want: &str) -> String {
-    let mut text = String::new();
-    for _ in 0..200 {
-        text = report(port, level).await;
-        if text.contains(want) {
-            break;
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
-    text
-}
-
 #[epics_rs::base::epics_test]
 async fn the_oms_report_prints_the_firmware_and_each_axis_as_c() {
     maxnet("omsReport1").await;
     let axis = "  axis 0\n    Current position = 100.000000, velocity = 0.000000\n    \
                 Encoder position 7.000000\n";
-    let text = settled_report("omsReport1", 1, axis).await;
+    let text = report("omsReport1", 1).await;
     assert!(
         text.contains("Oms MAXnet motor driver omsReport1, numAxes=1; Firmware: 1.33.4\n"),
         "{text}"
@@ -135,7 +124,7 @@ async fn a_homing_axis_is_reported_as_c() {
         sleep(Duration::from_millis(5)).await;
     }
     shell.join().unwrap();
-    let text = settled_report("omsReportHoming", 1, "    Currently homing axis\n").await;
+    let text = report("omsReportHoming", 1).await;
     assert!(
         text.contains("Encoder position 7.000000\n    Currently homing axis\n"),
         "{text}"

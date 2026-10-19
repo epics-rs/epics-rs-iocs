@@ -88,16 +88,6 @@ pub fn register_driver_report(
     register_driver_support(name, Arc::new(Drvet(report)));
 }
 
-/// C `asynMotorAxis::status_` before any poll: every bit 0 (asynMotorAxis.cpp
-/// :46), where `MotorStatus::default` has `done` set. A driver's own copy
-/// of the status params starts here.
-pub fn status_before_poll() -> epics_rs::asyn::interfaces::motor::MotorStatus {
-    epics_rs::asyn::interfaces::motor::MotorStatus {
-        done: false,
-        ..Default::default()
-    }
-}
-
 /// The trace user of an axis a C asyn driver serves: its port and address.
 pub fn asyn_user(port: &str, addr: i32) -> TraceUser {
     TraceUser::Asyn {
@@ -105,6 +95,10 @@ pub fn asyn_user(port: &str, addr: i32) -> TraceUser {
         addr,
     }
 }
+
+/// What a [`Controller::install_built`] build returns: C's constructed
+/// axis, and its `asynMotorAxis::report` override if it has one.
+pub type AxisBuilt = Result<(Arc<Mutex<dyn AsynMotor>>, Option<Arc<dyn AxisReport>>), String>;
 
 /// A C `asynMotorController`'s axes and its one poller thread
 /// (asynMotorController.cpp:567-575, :615-695): each pass runs the
@@ -166,6 +160,40 @@ impl Controller {
         self.add(user, motor, Some(report))
     }
 
+    /// [`Self::install`] for a driver whose C constructs the axis under
+    /// `pC->lock()` (MVP2001Driver.cpp:222-224): `build` runs under the
+    /// controller lock, so a pass due meanwhile waits for it and then polls
+    /// the axis, before iocInit as in C.
+    pub fn install_built(
+        &self,
+        user: TraceUser,
+        build: impl FnOnce() -> AxisBuilt,
+    ) -> Result<mpsc::Sender<PollCommand>, String> {
+        let (ControllerAxis { axis, poll_cmd_tx }, report) = self.axes.add_built(user, build)?;
+        epics_rs::motor::devices::register_axis(with_report(axis, report))?;
+        Ok(poll_cmd_tx)
+    }
+
+    /// [`Self::install_built`] for every `(user, build)` under one hold of
+    /// the controller lock, as pmacCreateAxes constructs its axes
+    /// (pmacController.cpp:974-979). A build's error ends the batch; the
+    /// axes built before it stay installed.
+    pub fn install_built_all<F>(
+        &self,
+        builds: impl IntoIterator<Item = (TraceUser, F)>,
+    ) -> Result<Vec<mpsc::Sender<PollCommand>>, String>
+    where
+        F: FnOnce() -> AxisBuilt,
+    {
+        let (added, done) = self.axes.add_built_all(builds);
+        let mut senders = Vec::new();
+        for (ControllerAxis { axis, poll_cmd_tx }, report) in added {
+            epics_rs::motor::devices::register_axis(with_report(axis, report))?;
+            senders.push(poll_cmd_tx);
+        }
+        done.map(|()| senders)
+    }
+
     fn add(
         &self,
         user: TraceUser,
@@ -193,6 +221,12 @@ impl Controller {
         self.axes.start_move_to_home_thread()
     }
 
+    /// Count a first poll pending on this controller until the guard drops,
+    /// for a driver whose own thread polls (omsBaseController's omsPoller).
+    pub fn first_poll_pending(&self) -> epics_rs::motor::poll_loop::FirstPollPending {
+        self.axes.first_poll_pending()
+    }
+
     /// C `startPoller(movingPollPeriod, idlePollPeriod, forcedFastPolls)`
     /// on controller port `port`: the startup pass over the axes so far,
     /// then the poller thread, which setMovingPollPeriod and
@@ -202,19 +236,12 @@ impl Controller {
     /// leaves its axes unpolled, as C's does. The poller starts once.
     pub fn start(
         &self,
-        ctx: &CommandContext,
         port: &str,
         moving_poll_ms: u64,
         idle_poll_ms: u64,
         forced_fast_polls: u32,
     ) {
-        self.spawn(
-            ctx,
-            Some(port),
-            moving_poll_ms,
-            idle_poll_ms,
-            forced_fast_polls,
-        );
+        self.spawn(Some(port), moving_poll_ms, idle_poll_ms, forced_fast_polls);
     }
 
     /// A model-2 driver's own thread, which no port names until
@@ -222,17 +249,15 @@ impl Controller {
     /// drvMotorSim.c:788-800).
     pub fn start_driver_thread(
         &self,
-        ctx: &CommandContext,
         moving_poll_ms: u64,
         idle_poll_ms: u64,
         forced_fast_polls: u32,
     ) {
-        self.spawn(ctx, None, moving_poll_ms, idle_poll_ms, forced_fast_polls);
+        self.spawn(None, moving_poll_ms, idle_poll_ms, forced_fast_polls);
     }
 
     fn spawn(
         &self,
-        ctx: &CommandContext,
         port: Option<&str>,
         moving_poll_ms: u64,
         idle_poll_ms: u64,
@@ -254,7 +279,7 @@ impl Controller {
             Duration::from_millis(idle_poll_ms),
             forced_fast_polls,
         );
-        ctx.bridge().spawn(poller.run());
+        poller.start();
     }
 }
 
@@ -265,7 +290,6 @@ impl Controller {
 /// `forced_fast_polls` is the driver's own: C's `startPoller` has no default
 /// (asynMotorController.cpp:567).
 pub fn install(
-    ctx: &CommandContext,
     user: TraceUser,
     motor: Arc<Mutex<dyn AsynMotor>>,
     moving_poll_ms: u64,
@@ -273,7 +297,6 @@ pub fn install(
     forced_fast_polls: u32,
 ) -> Result<(), String> {
     install_axis(
-        ctx,
         user,
         motor,
         None,
@@ -285,7 +308,6 @@ pub fn install(
 
 /// [`install`] for an axis with C's `asynMotorAxis::report` override.
 pub fn install_with_report(
-    ctx: &CommandContext,
     user: TraceUser,
     motor: Arc<Mutex<dyn AsynMotor>>,
     report: Arc<dyn AxisReport>,
@@ -294,7 +316,6 @@ pub fn install_with_report(
     forced_fast_polls: u32,
 ) -> Result<(), String> {
     install_axis(
-        ctx,
         user,
         motor,
         Some(report),
@@ -305,7 +326,6 @@ pub fn install_with_report(
 }
 
 fn install_axis(
-    ctx: &CommandContext,
     user: TraceUser,
     motor: Arc<Mutex<dyn AsynMotor>>,
     report: Option<Arc<dyn AxisReport>>,
@@ -324,7 +344,7 @@ fn install_axis(
         .forced_fast_polls(forced_fast_polls)
         .build_axis();
     epics_rs::motor::devices::register_axis(with_report(axis, report))?;
-    ctx.bridge().spawn(poll_loop.run());
+    poll_loop.start();
     Ok(())
 }
 
@@ -400,21 +420,38 @@ mod tests {
             }))
         };
         register_port(&ctx, "joinAfterStart", 2).unwrap();
-        let controller = Controller::new();
+        // -1 marks each pass: its controller poll comes first.
+        let pass = log.clone();
+        let controller = Controller::new().controller_poll(move || pass.lock().unwrap().push(-1));
         let _a1 = controller
             .install(asyn_user("joinAfterStart", 1), motor(1))
             .unwrap();
-        controller.start(&ctx, "joinAfterStart", 5, 5, 0);
+        controller.start("joinAfterStart", 5, 5, 0);
         let _a0 = controller
             .install(asyn_user("joinAfterStart", 0), motor(0))
             .unwrap();
-        let joined = log.lock().unwrap().len();
+        // The startup pass polls A0 or not by when the add lands, as C's
+        // may; every pass that starts after A0's first poll polls both.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while log.lock().unwrap()[joined..].len() < 4 && Instant::now() < deadline {
+        while epics_rs::motor::devices::first_polls_pending("joinAfterStart") != Some(0) {
+            assert!(Instant::now() < deadline, "a first poll never ran");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let joined = log.lock().unwrap().len();
+        let passes_after = || {
+            let log = log.lock().unwrap();
+            let start = log[joined..]
+                .iter()
+                .position(|&a| a == -1)
+                .map(|p| joined + p);
+            start.map_or_else(Vec::new, |start| log[start..].to_vec())
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while passes_after().len() < 6 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let passes = log.lock().unwrap()[joined..].to_vec();
-        assert_eq!(passes[..4], [0, 1, 0, 1], "{passes:?}");
+        let passes = passes_after();
+        assert_eq!(passes[..6], [-1, 0, 1, -1, 0, 1], "{passes:?}");
     }
 
     /// C setIdlePollPeriod finds the controller by its port, so a poller
@@ -431,7 +468,7 @@ mod tests {
             counted.fetch_add(1, Ordering::Relaxed);
             PortSets::default()
         });
-        controller.start(&ctx, "periodNoAxes", 3_600_000, 3_600_000, 0);
+        controller.start("periodNoAxes", 3_600_000, 3_600_000, 0);
         std::thread::sleep(Duration::from_millis(100));
         for set in [
             epics_rs::motor::ioc::set_moving_poll_period_command(),
@@ -551,7 +588,7 @@ mod poller_count {
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Idle));
                     controller.install(asyn_user("countPollers", addr), motor)?;
                 }
-                controller.start(ctx, "countPollers", 10, 10, 0);
+                controller.start("countPollers", 10, 10, 0);
                 Ok(CommandOutcome::Continue)
             },
         );

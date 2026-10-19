@@ -47,14 +47,14 @@ pub fn pijeds_config_command() -> CommandDef {
             arg_int_req("asyn address (GPIB)"),
         ],
         "PIJEDSConfig(card, name, address)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !PIJEDS.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            PIJEDS.config(ctx, card, move |init| {
+            PIJEDS.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,

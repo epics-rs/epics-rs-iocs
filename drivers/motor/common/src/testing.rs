@@ -280,20 +280,46 @@ pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
     lines.lock().unwrap().clone()
 }
 
-/// Run `f` on a thread of its own. Awaited, not joined: an axis joining a
-/// started poller waits on it, and the poller's thread is spawned by a task
-/// this runtime has to run.
+/// Block until controller port `port`'s poller has ended its startup pass,
+/// and every axis added to it running has had its first poll. Both run on
+/// the poller's own thread as C's do (asynMotorController.cpp:630), so what
+/// they set or trace is there to read once this returns. Call it off the
+/// test's runtime.
+pub fn await_first_polls(port: &str) {
+    use epics_rs::motor::devices::first_polls_pending;
+    await_zero(|| first_polls_pending(port).unwrap_or_else(|| panic!("no controller port {port}")));
+}
+
+/// [`await_first_polls`] for every controller in the process: what a shell
+/// command started or added to, which the command does not name.
+fn await_every_first_poll() {
+    await_zero(epics_rs::motor::poll_loop::first_polls_pending_in_process);
+}
+
+fn await_zero(pending: impl Fn() -> usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while pending() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a first poll never ran"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Run `f` on a thread of its own, awaited so this runtime keeps running
+/// while it does.
 async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    use epics_rs::base::runtime::task::{sleep, yield_now};
-    let shell = std::thread::spawn(f);
+    use epics_rs::base::runtime::task::sleep;
+    let shell = std::thread::spawn(move || {
+        let out = f();
+        await_every_first_poll();
+        out
+    });
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;
     }
-    let out = shell.join().unwrap();
-    // A shell that finished before the first check never yielded: run what
-    // it spawned before the caller can block this runtime with a sync wait.
-    yield_now().await;
-    out
+    shell.join().unwrap()
 }
 
 /// Run `cmd` with `args` as [`run_command`], and return the `motorPoller`
@@ -358,7 +384,7 @@ mod tests {
             move |_: &[ArgValue], ctx: &CommandContext| {
                 crate::register_port(ctx, "joinStarted", 1)?;
                 let controller = crate::Controller::new();
-                controller.start(ctx, "joinStarted", 10, 100, 0);
+                controller.start("joinStarted", 10, 100, 0);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::default()));
                 let tx = controller.install(crate::asyn_user("joinStarted", 0), motor)?;
                 kept.lock().unwrap().push(tx);

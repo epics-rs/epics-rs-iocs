@@ -56,7 +56,6 @@ pub fn nf874x_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> =
                     Arc::new(Mutex::new(Nf874xAxis::new(controller.clone(), axis)));
                 install_with_report(
-                    ctx,
                     asyn_user(&port_name, axis),
                     motor,
                     Arc::new(Nf874xAxisReport(axis)),

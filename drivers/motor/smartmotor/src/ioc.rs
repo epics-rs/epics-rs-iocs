@@ -50,14 +50,14 @@ pub fn smartmotor_config_command() -> CommandDef {
             arg_str_req("asyn port name"),
         ],
         "SmartMotorConfig(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !SMART_MOTOR.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            SMART_MOTOR.config(ctx, card, move |init| {
+            SMART_MOTOR.config(card, move |init| {
                 let Some(port) = get_port(&asyn_port) else {
                     return;
                 };

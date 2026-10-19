@@ -47,7 +47,7 @@ use motor_common::model1::{CardInit, Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 use motor_common::model2::{Model2, Model2Axis};
 use motor_common::{
-    Controller, ControllerParams, ControllerReport, asyn_user, install_with_report,
+    AxisReport, Controller, ControllerParams, ControllerReport, asyn_user, install_with_report,
     register_controller_port, register_port_with,
 };
 
@@ -265,7 +265,7 @@ pub fn smc100_create_controller_command() -> CommandDef {
                 }));
                 poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
             }
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2); // SMC100Driver.cpp:67
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2); // SMC100Driver.cpp:67
             Ok(CommandOutcome::Continue)
         },
     )
@@ -345,7 +345,6 @@ pub fn ag_conex_create_controller_command() -> CommandDef {
             let report = Arc::new(axis.report());
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             install_with_report(
-                ctx,
                 asyn_user(&port_name, 0),
                 motor,
                 report,
@@ -402,7 +401,7 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 poller.install_with_report(asyn_user(&port_name, axis as i32), motor, report)?;
             }
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2); // AGAP_CONEX.cpp:79
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2); // AGAP_CONEX.cpp:79
             Ok(CommandOutcome::Continue)
         },
     )
@@ -476,7 +475,7 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
             // (AG_UC.cpp:79, :96, :99); the axes created later stay unpolled.
             let poller = Arc::new(Controller::new());
             if controller.model().is_some() {
-                poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+                poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
             }
             AG_UC_CONTROLLERS
                 .lock()
@@ -516,16 +515,18 @@ pub fn ag_uc_create_axis_command() -> CommandDef {
                 };
                 (reg.controller.clone(), reg.poller.clone())
             };
-            let ax = AgUcAxis::new(
-                controller,
-                axis,
-                c_int(args, 2) != 0,
-                c_int(args, 3),
-                c_int(args, 4),
-            );
-            let report = Arc::new(ax.report());
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
+            // C constructs the axis under pC->lock() (AG_UC.cpp:135-137).
+            poller.install_built(asyn_user(&port_name, axis), || {
+                let ax = AgUcAxis::new(
+                    controller,
+                    axis,
+                    c_int(args, 2) != 0,
+                    c_int(args, 3),
+                    c_int(args, 4),
+                );
+                let report: Arc<dyn AxisReport> = Arc::new(ax.report());
+                Ok((Arc::new(Mutex::new(ax)), Some(report)))
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -693,7 +694,7 @@ pub fn xps_create_controller_command() -> CommandDef {
             ));
             // C starts the poller before any axis exists (XPSController.cpp:197).
             let poller = Arc::new(Controller::new());
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 10);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 10);
             // XPSController.cpp:200, the only C driver that starts it.
             poller
                 .start_move_to_home_thread()
@@ -748,36 +749,41 @@ pub fn xps_create_axis_command() -> CommandDef {
                 println!("XPSController:XPSCreateAxis: Error invalid steps per unit={text}");
                 return Ok(CommandOutcome::Continue);
             };
-            // C goes on with socket -1, whose TCP_SetTimeout prints
-            // (XPSAxis.cpp:146-152).
-            let move_sock = match connect_to_server(ctx, &ip, ip_port) {
-                Some((index, handle)) => XpsSocket::new(
-                    handle,
-                    index,
+            // C constructs the axis, its move socket included, under
+            // pC->lock() (XPSController.cpp:1379-1381).
+            poller.install_built(asyn_user(&port_name, axis), || {
+                // C goes on with socket -1, whose TCP_SetTimeout prints
+                // (XPSAxis.cpp:146-152).
+                let move_sock = match connect_to_server(ctx, &ip, ip_port) {
+                    Some((index, handle)) => XpsSocket::new(
+                        handle,
+                        index,
+                        &port_name,
+                        SocketMode::Fire,
+                        XPS_MOVE_TIMEOUT,
+                    ),
+                    None => {
+                        println!(
+                            "XPSAxis:XPSAxis: error calling TCP_ConnectToServer for move socket"
+                        );
+                        println!(
+                            "SetTCPTimeout, SocketIndex=-1, must be >=0 and < {}",
+                            NEXT_SOCKET.load(Ordering::Relaxed)
+                        );
+                        XpsSocket::invalid(&port_name, SocketMode::Fire)
+                    }
+                };
+                let ax = XpsAxis::new(
+                    controller,
+                    move_sock,
                     &port_name,
-                    SocketMode::Fire,
-                    XPS_MOVE_TIMEOUT,
-                ),
-                None => {
-                    println!("XPSAxis:XPSAxis: error calling TCP_ConnectToServer for move socket");
-                    println!(
-                        "SetTCPTimeout, SocketIndex=-1, must be >=0 and < {}",
-                        NEXT_SOCKET.load(Ordering::Relaxed)
-                    );
-                    XpsSocket::invalid(&port_name, SocketMode::Fire)
-                }
-            };
-            let ax = XpsAxis::new(
-                controller,
-                move_sock,
-                &port_name,
-                axis,
-                &positioner_name,
-                1.0 / steps_per_unit,
-            );
-            let report = Arc::new(ax.report());
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
+                    axis,
+                    &positioner_name,
+                    1.0 / steps_per_unit,
+                );
+                let report: Arc<dyn AxisReport> = Arc::new(ax.report());
+                Ok((Arc::new(Mutex::new(ax)), Some(report)))
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1715,7 +1721,7 @@ pub fn hxp_create_controller_command() -> CommandDef {
                 }));
                 poller.install_with_report(asyn_user(&port_name, axis_no as i32), motor, report)?;
             }
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1743,14 +1749,14 @@ fn model1_config_command(
         name,
         model1_config_args(),
         format!("{name}(card, name, addr)"),
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !driver.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let port = req_string(args, 1, "asyn port name")?;
             let addr = c_int(args, 2);
-            driver.config(ctx, card, move |init| build(init, &port, addr))?;
+            driver.config(card, move |init| build(init, &port, addr))?;
             Ok(CommandOutcome::Continue)
         },
     )

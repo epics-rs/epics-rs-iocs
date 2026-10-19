@@ -458,7 +458,7 @@ impl ImsMDrivePlusAxis {
             status: MotorStatus {
                 // IMS honours a base velocity (VI).
                 vbas_supported: true,
-                ..motor_common::status_before_poll()
+                ..MotorStatus::default()
             },
             failed: None,
             status_writes: Vec::new(),

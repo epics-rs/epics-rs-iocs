@@ -199,7 +199,7 @@ pub fn motor_sim_create_command() -> CommandDef {
             arg_int_req("Start posn"),
         ],
         "motorSimCreate(card, signal, lowLimit, hiLimit, home, nCards, nSignals, startPosn)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             let signal = c_int(args, 1);
             let low = c_int(args, 2);
@@ -216,7 +216,7 @@ pub fn motor_sim_create_command() -> CommandDef {
             // The first motorSimCreate starts drvMotorSim's one
             // motorSimThread, whose motorProcTask runs every axis each DELTA,
             // moving or idle (drvMotorSim.c:657-690, 788-800).
-            driver.poller.start_driver_thread(ctx, POLL_MS, POLL_MS, 0);
+            driver.poller.start_driver_thread(POLL_MS, POLL_MS, 0);
             for c in card..card.saturating_add(num_cards) {
                 for s in signal..signal.saturating_add(num_signals) {
                     let exists = {
@@ -355,7 +355,7 @@ impl MotorSimHolder {
                 }
                 // motorSimController's one motorSimTask polls every axis
                 // each DELTA (motorSimDriver.cpp:244), forcing none.
-                poller.start(ctx, &port_name, POLL_MS, POLL_MS, 0);
+                poller.start(&port_name, POLL_MS, POLL_MS, 0);
                 Ok(CommandOutcome::Continue)
             },
         )
@@ -411,8 +411,7 @@ mod one_poller {
     use epics_rs::asyn::error::AsynResult;
     use epics_rs::asyn::interfaces::motor::{MotorStatus, PollFailure};
     use epics_rs::asyn::user::AsynUser;
-    use epics_rs::base::runtime::task::{BlockingBridge, sleep};
-    use epics_rs::base::server::database::PvDatabase;
+    use epics_rs::base::runtime::task::sleep;
     use epics_rs::base::server::ioc_app::DeviceSupportContext;
     use epics_rs::motor::devices::device_support_factory;
     use motor_common::testing::{pollers, pollers_after};
@@ -787,8 +786,7 @@ mod one_poller {
             setter: Arc::new(Mutex::new(unused)),
             log: Arc::default(),
         };
-        let ctx = CommandContext::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
-        driver.poller.start_driver_thread(&ctx, POLL_MS, POLL_MS, 0);
+        driver.poller.start_driver_thread(POLL_MS, POLL_MS, 0);
         let model2 = axis.model2();
         let creator = driver.clone();
         let create = std::thread::spawn(move || creator.create(axis));

@@ -26,8 +26,8 @@ dbLoadRecords("$(ADCORE)/db/NDROIStat.template", "P=$(PREFIX),R=depthROIStat1:,P
 # ===== Stats (global min/max/mean; TS port also required by NDStats.template) =====
 NDStatsConfigure("STATS1_D", $(QSIZE), 0, "$(DEPTH_PORT)", 0, 0, 0, 0, 0)
 dbLoadRecords("$(ADCORE)/db/NDStats.template", "P=$(PREFIX),R=depthStats1:,PORT=STATS1_D,NDARRAY_PORT=$(DEPTH_PORT),NCHANS=$(NCHANS),XSIZE=$(XSIZE),YSIZE=$(YSIZE),HIST_SIZE=$(HIST_SIZE)")
-NDTimeSeriesConfigure("STATS1_D_TS", $(QSIZE), 0, "STATS1_D", 0)
-dbLoadRecords("$(ADCORE)/db/NDTimeSeries.template", "P=$(PREFIX),R=depthStats1:TS:,PORT=STATS1_D_TS,ADDR=0,TIMEOUT=1,NDARRAY_PORT=STATS1_D,NDARRAY_ADDR=0,NCHANS=$(NCHANS),ENABLED=1")
+NDTimeSeriesConfigure("STATS1_D_TS", $(QSIZE), 0, "STATS1_D", 1, 23)
+dbLoadRecords("$(ADCORE)/db/NDTimeSeries.template", "P=$(PREFIX),R=depthStats1:TS:,PORT=STATS1_D_TS,ADDR=0,TIMEOUT=1,NDARRAY_PORT=STATS1_D,NDARRAY_ADDR=1,NCHANS=$(NCHANS),ENABLED=1")
 
 # ===== File savers: TIFF (16-bit) and HDF5 =====
 NDFileTIFFConfigure("FileTIFF1_D", $(QSIZE), 0, "$(DEPTH_PORT)", 0)

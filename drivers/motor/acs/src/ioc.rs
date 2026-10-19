@@ -77,7 +77,7 @@ pub fn mcb4b_create_controller_command() -> CommandDef {
                 let report = Arc::new(Mcb4bAxisReport(index));
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -120,13 +120,13 @@ pub fn mcb4b_config_command() -> CommandDef {
             arg_str_req("asyn port name"),
         ],
         "MCB4BConfig(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !MCB4B.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            MCB4B.config(ctx, card, move |init| {
+            MCB4B.config(card, move |init| {
                 let Ok(handle) = connect_serial(&asyn_port, 0, DRV_MCB4B_TIMEOUT) else {
                     return;
                 };
@@ -198,13 +198,13 @@ mod tests {
         let shell = std::thread::spawn(move || {
             let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
             cmd.handler.call(&args, &ctx).unwrap();
+            motor_common::testing::await_first_polls(&port);
             PortManager::global()
                 .find_port_handle(&port)
                 .unwrap()
                 .report_blocking(level)
                 .unwrap()
         });
-        // An axis joining the poller waits on a task this runtime runs.
         while !shell.is_finished() {
             sleep(Duration::from_millis(5)).await;
         }

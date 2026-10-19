@@ -5,7 +5,7 @@
 #![cfg(target_os = "linux")]
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::manager::PortManager;
@@ -82,6 +82,7 @@ async fn a_poll_s_digital_position_lands_in_the_parameter_library() {
     let shell = std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         cmd.handler.call(&args, &ctx).unwrap();
+        motor_common::testing::await_first_polls("lc400Readback");
         let port = PortManager::global()
             .find_port_handle("lc400Readback")
             .unwrap();
@@ -89,14 +90,7 @@ async fn a_poll_s_digital_position_lands_in_the_parameter_library() {
             .drv_user_create_blocking(&DrvUserRequest::new("LC400_DIGITAL_POS", 0))
             .unwrap()
             .reason;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let read = port.read_float64_blocking(reason, 0).ok();
-            if read.is_some() || Instant::now() > deadline {
-                return read;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        port.read_float64_blocking(reason, 0).ok()
     });
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;

@@ -103,6 +103,7 @@ async fn on_line<T: Send + 'static>(
     let shell = std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         config.handler.call(&args, &ctx).unwrap();
+        motor_common::testing::await_first_polls(&port);
         let rig = Mutex::new(rig);
         body(PortManager::global().find_port_handle(&port).unwrap(), &rig)
     });
@@ -347,14 +348,7 @@ async fn an_unknown_axis_type_or_limit_state_keeps_the_axis() {
 #[epics_rs::base::epics_test]
 async fn int32_position_reads_ask_the_controller() {
     let (position, encoder) = on_maxnet("omsReadInt32", |port, _| {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let encoder = loop {
-            let read = port.read_int32_blocking(index::ENCODER_POSITION, 0);
-            if read.is_ok() || Instant::now() > deadline {
-                break read;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let encoder = port.read_int32_blocking(index::ENCODER_POSITION, 0);
         (port.read_int32_blocking(index::POSITION, 0), encoder)
     })
     .await;

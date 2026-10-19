@@ -104,7 +104,7 @@ pub fn mcs2_create_controller_command() -> CommandDef {
                 poller.install_with_report(asyn_user(&port_name, axis), motor, report)?;
             }
             // C startPoller, smarActMCS2MotorDriver.cpp:95
-            poller.start(ctx, &port_name, moving_poll_ms, idle_poll_ms, 2);
+            poller.start(&port_name, moving_poll_ms, idle_poll_ms, 2);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -160,7 +160,7 @@ fn register<C>(
     let controller = Arc::new(Mutex::new(connect(&port_name)));
     let poller = Controller::new();
     // C startPoller, smarActSCUMotorDriver.cpp:114, smarActMCSMotorDriver.cpp:215
-    poller.start(ctx, &port_name, period_ms(args, 3), period_ms(args, 4), 0);
+    poller.start(&port_name, period_ms(args, 3), period_ms(args, 4), 0);
     registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -195,9 +195,12 @@ fn create_axis<C>(
         return Ok(());
     }
     let controller = reg.controller.clone();
-    let motor = build(controller, axis, channel);
+    // C constructs the axis under pC->lock() (smarActMCSMotorDriver.cpp:
+    // 816-818, smarActSCUMotorDriver.cpp:617-619).
     reg.poller
-        .install(asyn_user(&controller_port, axis), motor)
+        .install_built(asyn_user(&controller_port, axis), || {
+            Ok((build(controller, axis, channel), None))
+        })
         .map(drop)
 }
 

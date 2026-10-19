@@ -46,14 +46,14 @@ pub fn mdt695_config_command() -> CommandDef {
             arg_str_req("asyn port name"),
         ],
         "MDT695Config(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !MDT695.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
 
-            MDT695.config(ctx, card, move |init| {
+            MDT695.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     // C connects at an asyn_address MDT695Config never sets (drvMDT695.cc:548).

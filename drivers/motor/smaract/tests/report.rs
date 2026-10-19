@@ -44,13 +44,13 @@ async fn mcs2_report(port: &str, level: i32) -> String {
     let shell = std::thread::spawn(move || {
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         cmd.handler.call(&args, &ctx).unwrap();
+        motor_common::testing::await_first_polls(&port);
         PortManager::global()
             .find_port_handle(&port)
             .unwrap()
             .report_blocking(level)
             .unwrap()
     });
-    // An axis joining the poller waits on a task this runtime runs.
     while !shell.is_finished() {
         sleep(Duration::from_millis(5)).await;
     }

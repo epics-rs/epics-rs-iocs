@@ -134,7 +134,7 @@ impl Ang1Controller {
 }
 
 /// C `JERK`, the output register `ANG1_JERK` writes.
-const JERK: i32 = 9;
+pub(crate) const JERK: i32 = 9;
 
 /// The ANG1 controller's `ANG1_JERK` and its poll periods, in seconds, for
 /// its report.

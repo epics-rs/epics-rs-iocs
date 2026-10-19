@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::DrvUserRequest;
+use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::connect::connect_controller;
@@ -22,7 +22,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port_with};
+use motor_common::{AxisReport, Controller, asyn_user, register_port_with};
 
 use crate::phytron::{CtrlType, PhytronAxis, PhytronAxisReport, PhytronController, PhytronParams};
 
@@ -195,8 +195,18 @@ fn register_controller(
         move || controller.lock().unwrap_or_else(|e| e.into_inner()).poll()
     });
     // C startPoller, phytronAxisMotor.cpp:240
-    poller.start(ctx, &name, moving_poll_ms, idle_poll_ms, 5);
-    registry_lock(registry).insert(
+    poller.start(&name, moving_poll_ms, idle_poll_ms, 5);
+    let mut controllers = registry_lock(registry);
+    // C registers its hook with the first controller (:186-187).
+    if controllers.is_empty() {
+        let registry = registry.clone();
+        init_hook_register(Arc::new(move |state| {
+            if state == InitHookState::AfterInitDevSup {
+                wait_for_initial_readout(&registry);
+            }
+        }));
+    }
+    controllers.insert(
         name.clone(),
         ControllerReg {
             controller,
@@ -204,6 +214,25 @@ fn register_controller(
         },
     );
     Ok(CommandOutcome::Continue)
+}
+
+/// C `phytronController::epicsInithookFunction` (phytronAxisMotor.cpp:
+/// 1003-1024): before motorRecord init_record pass 1, wait until every
+/// controller has been read once. The shell thread waits; the pollers run.
+fn wait_for_initial_readout(registry: &Registry) {
+    let controllers: Vec<_> = registry_lock(registry)
+        .values()
+        .map(|reg| reg.controller.clone())
+        .collect();
+    for controller in controllers {
+        while !controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .did_initial_readout()
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 /// `phytronCreateAxis(controllerName, module, index)`, printing C's error lines.
@@ -235,15 +264,15 @@ fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
             let poller = entry.poller.clone();
             drop(reg);
 
-            let axis = PhytronAxis::new(controller.clone(), module as i32, index as i32)
-                .map_err(|e| format!("phytronCreateAxis: {e}"))?;
             let axis_no = (module * 10 + index) as i32;
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            poller.install_with_report(
-                asyn_user(&name, axis_no),
-                motor,
-                Arc::new(PhytronAxisReport(axis_no)),
-            )?;
+            // C constructs the axis under pC->lock() (phytronAxisMotor.cpp:
+            // 1262-1265).
+            poller.install_built(asyn_user(&name, axis_no), || {
+                let axis = PhytronAxis::new(controller.clone(), module as i32, index as i32)
+                    .map_err(|e| format!("phytronCreateAxis: {e}"))?;
+                let report: Arc<dyn AxisReport> = Arc::new(PhytronAxisReport(axis_no));
+                Ok((Arc::new(Mutex::new(axis)), Some(report)))
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )

@@ -339,7 +339,6 @@ impl PIC848Axis {
             reference,
             failure: PollFailure::NONE,
             last_status: MotorStatus {
-                done: true,
                 gain_support: true,
                 has_encoder: true,
                 vbas_supported: false,

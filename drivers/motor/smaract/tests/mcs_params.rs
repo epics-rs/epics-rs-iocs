@@ -74,6 +74,7 @@ async fn on_line<T: Send + 'static>(
         let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
         create.handler.call(&controller_args, &ctx).unwrap();
         axis.handler.call(&axis_args, &ctx).unwrap();
+        motor_common::testing::await_first_polls(&port);
         let line = Mutex::new(line);
         line.lock().unwrap().sent();
         body(
@@ -192,17 +193,10 @@ async fn the_axis_posts_its_defaults_and_the_poll_its_sensor_type() {
             .iter()
             .map(|n| reason(&port, n))
             .collect();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let values: Vec<i32> = reasons
-                .iter()
-                .map(|&r| port.read_int32_blocking(r, 1).unwrap_or(-1))
-                .collect();
-            if values == [300, 1, 0] || Instant::now() > deadline {
-                return values;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        reasons
+            .iter()
+            .map(|&r| port.read_int32_blocking(r, 1).unwrap())
+            .collect::<Vec<i32>>()
     })
     .await;
     assert_eq!(values, [300, 1, 0]);

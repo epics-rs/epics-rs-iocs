@@ -246,10 +246,7 @@ impl PIC662Axis {
         let mut axis = Self {
             controller: controller.clone(),
             failure: PollFailure::NONE,
-            last_status: MotorStatus {
-                done: true,
-                ..MotorStatus::default()
-            },
+            last_status: MotorStatus::default(),
             strings: MoveStrings::default(),
             no_motion_count: 0,
         };

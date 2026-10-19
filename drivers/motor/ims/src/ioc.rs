@@ -84,13 +84,7 @@ pub fn ims_create_controller_command() -> CommandDef {
             // C startPoller, ImsMDrivePlusMotorController.cpp:101
             let poller = Controller::new();
             poller.install(asyn_user(&motor_port, 0), motor)?;
-            poller.start(
-                ctx,
-                &motor_port,
-                moving_poll_ms as u64,
-                idle_poll_ms as u64,
-                2,
-            );
+            poller.start(&motor_port, moving_poll_ms as u64, idle_poll_ms as u64, 2);
 
             Ok(CommandOutcome::Continue)
         },
@@ -131,13 +125,13 @@ pub fn im483pl_config_command() -> CommandDef {
         "IM483PLConfig",
         config_args(),
         "IM483PLConfig(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !IM483PL.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            IM483PL.config(ctx, card, move |init| {
+            IM483PL.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -188,13 +182,13 @@ pub fn im483sm_config_command() -> CommandDef {
         "IM483SMConfig",
         config_args(),
         "IM483SMConfig(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !IM483SM.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            IM483SM.config(ctx, card, move |init| {
+            IM483SM.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -242,13 +236,13 @@ pub fn mdrive_config_command() -> CommandDef {
         "MDriveConfig",
         config_args(),
         "MDriveConfig(card, name)",
-        move |args: &[ArgValue], ctx: &CommandContext| {
+        move |args: &[ArgValue], _ctx: &CommandContext| {
             let card = c_int(args, 0);
             if !MDRIVE.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            MDRIVE.config(ctx, card, move |init| {
+            MDRIVE.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     0,
@@ -580,11 +574,7 @@ mod extra_params {
         let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
         let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
         let locked = io.drv_user_create("IMS_LOCKEDROTOR").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while io.read_int32(locked).unwrap_or(0) != 1 {
-            assert!(std::time::Instant::now() < deadline);
-            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
-        }
+        assert_eq!(io.read_int32(locked).unwrap(), 1);
         assert_eq!(io.read_int32(problem).unwrap(), 0);
         assert!(io.write_int32(clear, 1).is_err());
         assert_eq!(io.read_int32(problem).unwrap(), 1);
@@ -624,7 +614,6 @@ mod extra_params {
         let (_line, io) = failing_controller("imsComms", "imsCommsLine", 1000.0, fails).await;
         let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
         let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
-        // Awaited: a thread sleep here starves the runtime the poller needs.
         let until = async |want: i32| {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while io.read_int32(comms).unwrap_or(-1) != want {
@@ -632,7 +621,7 @@ mod extra_params {
                 epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
             }
         };
-        until(0).await;
+        assert_eq!(io.read_int32(comms).unwrap(), 0);
         dead.store(true, Ordering::Relaxed);
         until(1).await;
         assert_eq!(io.read_int32(msta).unwrap() & 1 << 12, 0);
@@ -649,11 +638,7 @@ mod extra_params {
             failing_controller("imsComms1", "imsComms1Line", 3.6e6, |l| l == "APR P").await;
         let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
         let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while io.read_int32(problem).unwrap_or(0) != 1 {
-            assert!(std::time::Instant::now() < deadline, "problem never 1");
-            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
-        }
+        assert_eq!(io.read_int32(problem).unwrap(), 1);
         assert_eq!(io.read_int32(comms).unwrap(), 1);
     }
 
@@ -677,11 +662,7 @@ mod extra_params {
     async fn the_poll_reads_the_locked_rotor_flag() {
         let (line, io) = controller("imsLr", "imsLrLine").await;
         let locked = io.drv_user_create("IMS_LOCKEDROTOR").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while io.read_int32(locked).unwrap_or(0) != 1 {
-            assert!(std::time::Instant::now() < deadline);
-            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
-        }
+        assert_eq!(io.read_int32(locked).unwrap(), 1);
         let sent = line.sent();
         let c2 = sent.iter().position(|s| s == "APR C2").unwrap();
         assert_eq!(sent[c2 + 1], "APR LR", "{sent:?}");

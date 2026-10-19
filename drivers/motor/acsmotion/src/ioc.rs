@@ -109,7 +109,6 @@ pub fn acsmotion_config_command() -> CommandDef {
                 poller.install_with_report(asyn_user(&port_name, index as i32), motor, report)?;
             }
             poller.start(
-                ctx,
                 &port_name,
                 (moving_poll * 1000.0) as u64,
                 (idle_poll * 1000.0) as u64,
@@ -229,14 +228,13 @@ mod tests {
                 .handler
                 .call(&args, &ctx)
                 .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            motor_common::testing::await_first_polls(&name);
             PortManager::global()
                 .find_port_handle(&name)
                 .unwrap()
                 .report_blocking(level)
                 .unwrap()
         });
-        // The poller's thread is spawned by a task this runtime runs.
         while !shell.is_finished() {
             sleep(std::time::Duration::from_millis(5)).await;
         }

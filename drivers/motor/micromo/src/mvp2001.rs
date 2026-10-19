@@ -273,7 +273,7 @@ impl Mvp2001Axis {
             status: MotorStatus {
                 gain_support: true,
                 has_encoder: true,
-                ..motor_common::status_before_poll()
+                ..MotorStatus::default()
             },
         }
     }

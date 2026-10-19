@@ -55,7 +55,7 @@ pub fn spiiplus_config_command() -> CommandDef {
             let mode = CommandMode::parse(&opt_string(args, 2)?.unwrap_or_default());
             ctx.println(&format!("SPiiPlus config mode = {}", mode as i32));
 
-            SPIIPLUS.config(ctx, card, move |init| {
+            SPIIPLUS.config(card, move |init| {
                 let Ok(handle) = connect_with_eos(
                     &asyn_port,
                     // C connects at an asyn_address SPiiPlusConfig never sets (drvSPiiPlus.cc:682).

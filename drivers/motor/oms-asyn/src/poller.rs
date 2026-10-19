@@ -13,7 +13,7 @@ use epics_rs::base::runtime::exit::at_exit;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
-use epics_rs::motor::poll_loop::PollCommand;
+use epics_rs::motor::poll_loop::{FirstPollPending, PollCommand};
 
 use motor_common::util::leading_hex;
 
@@ -131,16 +131,19 @@ impl PollShared {
 }
 
 /// C `startPoller` and the constructor's `epicsAtExit(callShutdown)`.
-/// `posters` are the axes' poll loops, in axis order.
+/// `posters` are the axes' poll loops, in axis order; `first_pass` counts
+/// the poller's first pass on the axes' controller.
 pub fn start(
     controller: &Arc<Mutex<OmsController>>,
     posters: Vec<mpsc::Sender<PollCommand>>,
+    first_pass: FirstPollPending,
     moving_poll: Duration,
     idle_poll: Duration,
     fw_minor: i32,
 ) {
     let mut poller = OmsPoller::new(controller.clone(), moving_poll, idle_poll, fw_minor);
     poller.posters = posters;
+    poller.first_pass = Some(first_pass);
     // C creates the event with the controller; the axes' startup polls
     // signalled this one before the poller existed.
     poller.shared.wait(Duration::ZERO);
@@ -180,6 +183,8 @@ struct OmsPoller {
     closed_loop: [bool; OMS_MAX_AXES],
     /// Each axis's poll loop, which posts its status on change.
     posters: Vec<mpsc::Sender<PollCommand>>,
+    /// Held until the first pass ends, for readers after the create command.
+    first_pass: Option<FirstPollPending>,
 }
 
 impl OmsPoller {
@@ -213,6 +218,7 @@ impl OmsPoller {
             enabled: true,
             closed_loop: [false; OMS_MAX_AXES],
             posters: Vec::new(),
+            first_pass: None,
         }
     }
 
@@ -237,7 +243,9 @@ impl OmsPoller {
                 break;
             }
             let loop_start = Instant::now();
-            let Some(timeout) = self.pass() else {
+            let pass = self.pass();
+            self.first_pass = None;
+            let Some(timeout) = pass else {
                 continue;
             };
             if self.shared.shutting_down() {
