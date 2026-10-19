@@ -865,10 +865,11 @@ mod tests {
             &mut self,
             _user: &AsynUser,
             buf: &mut [u8],
-        ) -> AsynResult<(usize, epics_rs::asyn::interpose::EomReason)> {
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
             let reply = b"15 OK";
             buf[..reply.len()].copy_from_slice(reply);
-            Ok((reply.len(), epics_rs::asyn::interpose::EomReason::EOS))
+            OctetReadResult::ok(reply.len(), EomReason::EOS)
         }
     }
 
