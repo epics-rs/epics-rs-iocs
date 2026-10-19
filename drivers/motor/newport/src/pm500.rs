@@ -33,7 +33,8 @@
 //!   polls a problem.
 //! - C's axis-discovery and status parsing index fixed reply offsets into a
 //!   buffer that may hold stale bytes after a read failure; this port treats
-//!   a too-short reply like an empty one (comm-retry machine).
+//!   a reply short enough to leave C reading those bytes (an empty `STAT?`,
+//!   a one-byte `R`) like an empty one (comm-retry machine).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -112,14 +113,16 @@ impl Pm500Controller {
         ctrl.ident = ident.get(2..).unwrap_or("").chars().take(50).collect();
 
         // Axis discovery: STAT? each channel letter in order; an 'E' at
-        // reply byte 1 ends the scan (C checks buff[1]).
+        // reply byte 1 ends the scan (C checks buff[1], a one-byte reply's
+        // NUL). An empty reply leaves the command's 'S' there, which C
+        // counts: a C defect, not copied.
         let mut num_axes = 0;
         for name in PM500_AXIS_NAMES {
             let reply = ctrl.command(&format!("{name}STAT?")).unwrap_or_default();
-            match reply.as_bytes().get(1) {
-                Some(b'E') | None => break,
-                Some(_) => num_axes += 1,
+            if reply.is_empty() || reply.as_bytes().get(1) == Some(&b'E') {
+                break;
             }
+            num_axes += 1;
         }
         ctrl.num_axes = num_axes;
         Some(ctrl)
@@ -426,7 +429,7 @@ impl Pm500Axis {
         // machine on it; a too-short reply is treated the same (module
         // Deviations).
         let reply = ctrl.command(&format!("{c}R")).unwrap_or_default();
-        if reply.len() < 3 {
+        if reply.len() < 2 {
             (ctrl.comm_state, self.failure) = match ctrl.comm_state {
                 CommState::Normal => (CommState::Retry, PollFailure::NONE),
                 _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
@@ -439,9 +442,12 @@ impl Pm500Axis {
         ctrl.comm_state = CommState::Normal;
 
         let status_char = reply.as_bytes()[1];
-        let dir_char = reply.as_bytes()[2];
+        // A two-byte reply's byte 2 is the NUL C reads.
+        let dir_char = reply.as_bytes().get(2).copied().unwrap_or(0);
         // Position parses from the direction sign onward, in steps.
-        let steps = self.resolution().map(|res| atof(&reply[2..]) / res);
+        let steps = self
+            .resolution()
+            .map(|res| atof(reply.get(2..).unwrap_or("")) / res);
 
         let moving = status_char == b'B';
         let direction = dir_char == b'+';
@@ -631,6 +637,34 @@ mod tests {
                 ..prepared
             }
         );
+    }
+
+    /// drvPM500.cc:595 reads `buff[1]`, the NUL of a one-byte `STAT?`
+    /// reply, and counts the axis. An empty reply leaves the command's byte
+    /// there, which C also counts; that is not copied.
+    #[test]
+    fn a_one_byte_stat_reply_counts_the_axis() {
+        let (_line, io) = motor_common::testing::LineRig::new("pm500Stat1", |last| match last {
+            "SVN?" => "XD PM500 1.0".into(),
+            "XSTAT?" => "X".into(),
+            "YSTAT?" => String::new(),
+            _ => "?E".into(),
+        });
+        assert_eq!(Pm500Controller::new(io).unwrap().num_axes(), 1);
+    }
+
+    /// drvPM500.cc:265-267 reads `response[2]`, the NUL of a two-byte `R`
+    /// reply: no direction and a 0 position. A one-byte reply leaves stack
+    /// bytes there and is refused.
+    #[test]
+    fn a_two_byte_r_reply_reads_the_terminator() {
+        let (mut axis, _, xr) = pm500_axis("pm500_r2");
+        let user = AsynUser::default();
+        *xr.lock().unwrap() = "XB";
+        let s = axis.poll(&user).unwrap();
+        assert!(s.position == 0.0 && !s.done && !s.direction, "{s:?}");
+        *xr.lock().unwrap() = "X";
+        assert!(axis.poll(&user).is_err());
     }
 
     /// drvPM500.cc motor_init for one controller and its `X` axis: the
