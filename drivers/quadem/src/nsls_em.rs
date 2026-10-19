@@ -255,7 +255,8 @@ impl NslsEmDriver {
     /// The connection is opened and closed around every transaction, as C++
     /// does with `pasynCommonSyncIO`.
     fn write_read_meter(&self, out: &str) -> AsynResult<String> {
-        // C++ dereferences a NULL asynUser here and crashes.
+        // C++ calls connectDevice on pasynUserTCPCommandConnect_, which no
+        // module found leaves unset, and crashes (drvNSLS_EM.cpp:271).
         let Some(command) = &self.command else {
             return Err(error("drvNSLS_EM: no module on the network"));
         };
