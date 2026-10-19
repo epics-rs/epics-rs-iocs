@@ -217,20 +217,26 @@ impl Mm3000Controller {
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
-        status?;
-        self.read_reply(String::from_utf8_lossy(&raw).into_owned())
+        self.recv_mess(String::from_utf8_lossy(&raw).into_owned(), status)
     }
 
-    /// Apply C `recv_mess`'s two retry rules to the first reply: an unsolicited
-    /// hard-travel-limit error (`E35`..`E42`, an unconfirmed MM3000 firmware
-    /// bug) is flushed with one extra read, and any other reply starting with
-    /// `E` is reported through C's `errPrintf` and re-read (C recurses; the
-    /// retry normally times out, which surfaces here as the read error).
-    fn read_reply(&self, mut reply: String) -> AsynResult<String> {
-        if is_unsolicited_limit_error(&reply) {
-            reply = self.read_once()?;
-        }
-        while reply.starts_with('E') {
+    /// C `recv_mess` from its first read. Each pass is one C call, which
+    /// tests the bytes before the status (drvMM3000.cc:492-510): an
+    /// unsolicited hard-travel-limit error (`E35`..`E42`, an unconfirmed
+    /// MM3000 firmware bug), even one a timeout cut, is flushed with one
+    /// extra read whose status is kept, and any other reply starting with
+    /// `E` is reported through C's `errPrintf` and read again, where C
+    /// recurses. The retry normally times out, which surfaces here as the
+    /// read error.
+    fn recv_mess(&self, mut reply: String, mut status: AsynResult<()>) -> AsynResult<String> {
+        loop {
+            if is_unsolicited_limit_error(&reply) {
+                (reply, status) = self.read_once();
+            }
+            status?;
+            if !reply.starts_with('E') {
+                return Ok(reply);
+            }
             // errPrintf(-1, ...): no errSym name, then a space for the nonzero
             // status. The file and line are ours.
             errlog_vprintf(format_args!(
@@ -238,17 +244,15 @@ impl Mm3000Controller {
                 file!(),
                 line!()
             ));
-            reply = self.read_once()?;
+            (reply, status) = self.read_once();
         }
-        Ok(reply)
     }
 
     /// One raw read. No trimming: the `MS` status reply is a binary byte and
     /// the port's input EOS (`\r`) already framed the message.
-    fn read_once(&self) -> AsynResult<String> {
+    fn read_once(&self) -> (String, AsynResult<()>) {
         let (raw, status) = self.handle.read_octet(0, READ_BUF).into_parts();
-        status?;
-        Ok(String::from_utf8_lossy(&raw).into_owned())
+        (String::from_utf8_lossy(&raw).into_owned(), status)
     }
 }
 
@@ -598,11 +602,14 @@ mod tests {
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// Answers `VE` and the commands in `replies`, fails every other read,
-    /// and records every command.
+    /// and records every command. A reply of `\n`-separated lines is read
+    /// one line per read.
     struct IdentOnly {
         base: epics_rs::asyn::port::PortDriverBase,
         replies: &'static [(&'static str, &'static str)],
-        reply: Vec<u8>,
+        /// Reply lines delivered by a read that then times out.
+        cuts: &'static [&'static str],
+        reply: std::collections::VecDeque<String>,
         sent: Arc<Mutex<Vec<String>>>,
     }
 
@@ -615,14 +622,15 @@ mod tests {
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data).into_owned();
-            self.reply = match cmd.as_str() {
-                "VE" => b"MM3000 Version 2.4".to_vec(),
+            let reply = match cmd.as_str() {
+                "VE" => "MM3000 Version 2.4",
                 c => self
                     .replies
                     .iter()
                     .find(|(k, _)| *k == c)
-                    .map_or_else(Vec::new, |(_, v)| v.as_bytes().to_vec()),
+                    .map_or("", |(_, v)| v),
             };
+            self.reply = reply.split('\n').map(str::to_owned).collect();
             self.sent.lock().unwrap().push(cmd);
             Ok(data.len())
         }
@@ -631,17 +639,24 @@ mod tests {
             _user: &AsynUser,
             buf: &mut [u8],
         ) -> epics_rs::asyn::interpose::OctetReadResult {
-            let reply = std::mem::take(&mut self.reply);
+            let reply = self.reply.pop_front().unwrap_or_default();
             if reply.is_empty() {
                 return epics_rs::asyn::interpose::OctetReadResult::failed(mm_err(
                     "timeout".into(),
                 ));
             }
-            buf[..reply.len()].copy_from_slice(&reply);
-            epics_rs::asyn::interpose::OctetReadResult::ok(
+            buf[..reply.len()].copy_from_slice(reply.as_bytes());
+            let read = epics_rs::asyn::interpose::OctetReadResult::ok(
                 reply.len(),
                 epics_rs::asyn::interpose::EomReason::empty(),
-            )
+            );
+            if self.cuts.contains(&reply.as_str()) {
+                return epics_rs::asyn::interpose::OctetReadResult {
+                    status: Err(mm_err("reply cut by a timeout".into())),
+                    ..read
+                };
+            }
+            read
         }
     }
 
@@ -663,7 +678,8 @@ mod tests {
                 InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             replies: &[],
-            reply: Vec::new(),
+            cuts: &[],
+            reply: Default::default(),
             sent: Arc::default(),
         };
         let (rt, _actor) = create_port_runtime(
@@ -679,6 +695,65 @@ mod tests {
         );
         let ctrl = Mm3000Controller::new(io).unwrap();
         assert!(ctrl.axis_types().is_empty());
+    }
+
+    /// drvMM3000.cc:492-510: each `recv_mess` tests the bytes before the
+    /// status, so a limit error cut by a timeout is read past silently, also
+    /// on the read C's recursion makes after an `E` reply; any other cut
+    /// reply is still a failure.
+    #[test]
+    fn a_limit_error_cut_by_a_timeout_is_read_past() {
+        use epics_rs::asyn::port::InterfaceMask;
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+        use epics_rs::base::runtime::log::{
+            errlog_add_listener, errlog_flush, errlog_remove_listener,
+        };
+
+        let port = IdentOnly {
+            base: PortDriverBase::new(
+                "mm3000CutLimit",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
+            replies: &[
+                ("1TP", "E38 LIMIT\n12.5"),
+                ("2TP", "E12 SYNTAX\nE39 LIMIT\n7.25"),
+                ("3TP", "E38 LIMIT"),
+                ("4TP", "4.5"),
+            ],
+            cuts: &["E38 LIMIT", "E39 LIMIT", "4.5"],
+            reply: Default::default(),
+            sent: Arc::default(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("mm3000CutLimit").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_millis(100),
+        );
+        let ctrl = Mm3000Controller::new(io).unwrap();
+        let printed = Arc::new(Mutex::new(Vec::new()));
+        let sink = printed.clone();
+        let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
+        assert_eq!(ctrl.write_read("1TP").unwrap(), "12.5");
+        assert_eq!(ctrl.write_read("2TP").unwrap(), "7.25");
+        // The re-read's status is kept: nothing follows the limit error.
+        assert!(ctrl.write_read("3TP").is_err());
+        assert!(ctrl.write_read("4TP").is_err());
+        errlog_flush();
+        errlog_remove_listener(id);
+        let printed = printed.lock().unwrap();
+        assert_eq!(printed.len(), 1, "{printed:?}");
+        assert!(printed[0].ends_with(" E12 SYNTAX"), "{printed:?}");
     }
 
     /// An MM3000 line answering `replies`: its controller, and the wire log
@@ -702,7 +777,8 @@ mod tests {
                 InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             replies,
-            reply: Vec::new(),
+            cuts: &[],
+            reply: Default::default(),
             sent: sent.clone(),
         };
         let (rt, _actor) =
