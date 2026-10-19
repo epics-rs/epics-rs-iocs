@@ -188,7 +188,10 @@ impl SessionConfig {
     /// the C's exception (an illegal `autoconnect`), which ends the option list.
     pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), String> {
         if self.debug > 0 || name == "debug" {
-            eprintln!("Session {}: setting option {name} to {value}", self.name);
+            epics_rs::base::stderr_println!(
+                "Session {}: setting option {name} to {value}",
+                self.name
+            );
         }
         // C reads every count with strtoul and stores it narrowed.
         let count = || strtoul(value) as u32;
@@ -541,7 +544,10 @@ impl SessionWorker {
         let identity = config.setup_identity();
         let connection = self.connector.connect(&config, &identity).await?;
         if config.debug > 0 {
-            eprintln!("Session {}: connect service succeeded", self.handle.name);
+            epics_rs::base::stderr_println!(
+                "Session {}: connect service succeeded",
+                self.handle.name
+            );
         }
         if let Some(endpoint) = connection.endpoint() {
             self.report_connected(&identity, &endpoint);
@@ -599,7 +605,7 @@ impl SessionWorker {
                         return ServeOutcome::DisconnectRequested;
                     }
                     Some(Control::Connect) => {
-                        eprintln!("Session {} already connected (Activated)", self.handle.name);
+                        epics_rs::base::stderr_println!("Session {} already connected (Activated)", self.handle.name);
                     }
                     None => return ServeOutcome::Shutdown,
                 },
@@ -1050,7 +1056,7 @@ impl SessionWorker {
                             );
                         }
                     } else {
-                        eprintln!(
+                        epics_rs::base::stderr_println!(
                             "OPC UA record {} monitored item {} failed with error {}",
                             item.addressing_record(),
                             item.wire_node_id(),

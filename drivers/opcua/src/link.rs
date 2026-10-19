@@ -307,7 +307,7 @@ impl InfoDefaults {
             &self.element,
         ];
         for _ in set.iter().filter(|v| v.is_some()) {
-            eprintln!(
+            epics_rs::base::stderr_println!(
                 "{record} DEPRECATION WARNING: setting parameters through info items is deprecated; \
                  use link parameters instead."
             );

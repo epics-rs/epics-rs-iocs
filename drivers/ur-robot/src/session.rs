@@ -70,7 +70,7 @@ impl Session {
         self.buffer.clear(); // rtde.cpp:63 — reconnect must not reuse stale bytes.
         // rtde.cpp:85 prints the asio error to cerr before throwing its own.
         let sock = crate::net::connect_tcp(&self.hostname, self.port, None).map_err(|e| {
-            eprintln!("{}", crate::net::asio_connect_what(&e));
+            epics_rs::base::stderr_println!("{}", crate::net::asio_connect_what(&e));
             UrError::Connect(format!(
                 "Error: Could not connect to: {} at {}, verify the IP",
                 self.hostname, self.port
@@ -168,14 +168,14 @@ impl Session {
                 if rtde::decode_success(body) {
                     self.state = ConnState::Started;
                 } else {
-                    eprintln!("Unable to start synchronization");
+                    epics_rs::base::stderr_println!("Unable to start synchronization");
                 }
             }
             rtde::cmd::CONTROL_PACKAGE_PAUSE => {
                 if rtde::decode_success(body) {
                     self.state = ConnState::Paused;
                 } else {
-                    eprintln!("Unable to pause synchronization");
+                    epics_rs::base::stderr_println!("Unable to pause synchronization");
                 }
             }
             _ => {}

@@ -1027,7 +1027,7 @@ pub fn xps_aux_config_command() -> CommandDef {
                     }
                 });
             let Some(port) = registered else {
-                eprintln!("XPSAuxConfig ERROR: Can't register port");
+                epics_rs::base::stderr_println!("XPSAuxConfig ERROR: Can't register port");
                 return Ok(CommandOutcome::Continue);
             };
             if spawn_dedicated_thread(
@@ -1038,7 +1038,7 @@ pub fn xps_aux_config_command() -> CommandDef {
             )
             .is_err()
             {
-                eprintln!("XPSAuxConfig, epicsThreadCreate failed");
+                epics_rs::base::stderr_println!("XPSAuxConfig, epicsThreadCreate failed");
             }
             Ok(CommandOutcome::Continue)
         },

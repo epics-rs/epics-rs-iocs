@@ -1950,7 +1950,9 @@ async fn stream_run(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation) {
                         Some([connect, ..]) => {
                             ctx.trace(TraceMask::ERROR, &adlog::err(connect, &msg))
                         }
-                        None => eprintln!("ERROR | ADTimePix::prvHstConnect: {msg}"),
+                        None => epics_rs::base::stderr_println!(
+                            "ERROR | ADTimePix::prvHstConnect: {msg}"
+                        ),
                     }
                 }
                 disconnected(ctx, kind);
@@ -2015,7 +2017,9 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stre
                         Some([_, worker, _]) => {
                             ctx.trace(TraceMask::ERROR, &adlog::err(worker, &msg))
                         }
-                        None => eprintln!("ERROR | ADTimePix::prvHstWorkerThread: {msg}"),
+                        None => epics_rs::base::stderr_println!(
+                            "ERROR | ADTimePix::prvHstWorkerThread: {msg}"
+                        ),
                     }
                 }
                 println!("{} TCP connection closed by peer", kind.name());
@@ -2036,7 +2040,7 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stre
                         Some([_, worker, _]) => {
                             ctx.trace(TraceMask::IO_DRIVER, &adlog::log(worker, &msg))
                         }
-                        None => eprintln!("{msg}"),
+                        None => epics_rs::base::stderr_println!("{msg}"),
                     }
                 }
                 return;
@@ -2230,7 +2234,7 @@ fn framing_failed(ctx: &Ctx, kind: StreamKind, e: &FrameError) {
     let msg = format!("{} rejected TCP stream: {e}", kind.name());
     match kind.c_functions() {
         Some([_, worker, _]) => ctx.trace(TraceMask::ERROR, &adlog::err(worker, &msg)),
-        None => eprintln!("ERROR | ADTimePix::prvHstWorkerThread: {msg}"),
+        None => epics_rs::base::stderr_println!("ERROR | ADTimePix::prvHstWorkerThread: {msg}"),
     }
 }
 

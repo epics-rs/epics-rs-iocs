@@ -542,7 +542,9 @@ impl ControlInterface {
             // A script error (e.g. an unsolvable inverse kinematics) kills the
             // script, and then DONE never arrives.
             if !self.is_program_running()? {
-                eprintln!("RTDEControlInterface: RTDE control script is not running!");
+                epics_rs::base::stderr_println!(
+                    "RTDEControlInterface: RTDE control script is not running!"
+                );
                 return self.refused(RefusalReason::NotRunning);
             }
             if self.is_stopped_by_safety()? {
@@ -564,7 +566,9 @@ impl ControlInterface {
             return self.refused(RefusalReason::NotRunning);
         }
         if !self.is_program_running()? {
-            eprintln!("RTDEControlInterface: RTDE control script is not running!");
+            epics_rs::base::stderr_println!(
+                "RTDEControlInterface: RTDE control script is not running!"
+            );
             return self.refused(RefusalReason::NotRunning);
         }
         if let Some(reason) = self.wait_for_state(CONTROLLER_RDY_FOR_CMD, GET_READY_TIMEOUT)? {

@@ -1021,11 +1021,20 @@ fn dump_tag_info(info: &TagInfo, list: &ScanList, level: i32) {
             if d.do_write { "yes" } else { "no" },
             if d.is_writing { "yes" } else { "no" }
         );
-        crate::eip_printf!(0, "  data                : ");
     }
-    if d.valid_data_size > 0 {
-        crate::eip_printf!(0, "{}", cip::dump_raw_cip_data(&d.buf, elements));
+    // C writes the label and the value in two `EIP_printf`s
+    // (drvEtherIP.c:119-124); one write is a deliberate deviation. With no
+    // data the label stays on stderr and `-no data-` on stdout, as C.
+    let label = if level > 3 {
+        "  data                : "
     } else {
+        ""
+    };
+    if d.valid_data_size > 0 {
+        let value = cip::dump_raw_cip_data(&d.buf, elements);
+        crate::eip_printf!(0, "{label}{value}");
+    } else {
+        crate::eip_printf!(0, "{label}");
         println!("-no data-");
     }
     if level > 3 {
@@ -1146,15 +1155,14 @@ pub fn dump() {
         println!("PLC {}", plc.name);
         for list in plc.scanlists.lock().iter() {
             for info in list.tags.lock().iter() {
-                crate::eip_printf!(0, "{} ", info.string_tag);
+                // C writes the tag and its value in two calls
+                // (drvEtherIP.c:1163-1168); one write is a deliberate deviation.
                 let d = info.data.lock();
                 if d.valid_data_size > 0 {
-                    crate::eip_printf!(
-                        0,
-                        "{}",
-                        cip::dump_raw_cip_data(&d.buf, *info.elements.lock())
-                    );
+                    let value = cip::dump_raw_cip_data(&d.buf, *info.elements.lock());
+                    crate::eip_printf!(0, "{} {value}", info.string_tag);
                 } else {
+                    crate::eip_printf!(0, "{} ", info.string_tag);
                     println!(" - no data -");
                 }
             }
@@ -1405,6 +1413,31 @@ mod registry_tests {
             .filter(|n| n.starts_with("regorder_"))
             .collect();
         assert_eq!(names, ["regorder_b", "regorder_a"]);
+    }
+
+    /// drvEtherIP.c:119-124 and :1163-1168 write a label and the value in
+    /// two `EIP_printf`s; each is one line here.
+    #[cfg(unix)]
+    #[test]
+    fn a_tag_label_and_its_value_are_one_write() {
+        use crate::tests::stderr_writes;
+        let plc = define_plc("oneline_plc", "10.0.0.8", 0);
+        let tag = plc.add_tag(1.0, "ONELINE", 1).unwrap();
+        {
+            let mut d = tag.data.lock();
+            d.buf = vec![0xC4, 0, 7, 0, 0, 0];
+            d.valid_data_size = 6;
+        }
+        let list = plc.scanlists.lock()[0].clone();
+        let writes = stderr_writes(|| dump_tag_info(&tag, &list, 4));
+        let line = "  data                : DINT 7\n".to_string();
+        assert!(writes.contains(&line), "{writes:?}");
+
+        let writes = stderr_writes(dump);
+        assert!(
+            writes.contains(&"ONELINE DINT 7\n".to_string()),
+            "{writes:?}"
+        );
     }
 
     /// drvEtherIP.c:1278: a tag registered again at a shorter period moves

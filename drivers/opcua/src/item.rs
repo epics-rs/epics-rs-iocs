@@ -365,7 +365,7 @@ impl Item {
                 Ok(updated) => result = Some(updated),
                 Err(e) => {
                     if let ElementError::Encode(e) = e {
-                        eprintln!("Item {}: {e}", self.node_id);
+                        epics_rs::base::stderr_println!("Item {}: {e}", self.node_id);
                     }
                     result = Some(base);
                 }
@@ -428,7 +428,7 @@ impl Item {
         self.mapped = true;
         self.report_timestamp_element(data);
         for line in self.element_report(data) {
-            eprintln!("{line}");
+            epics_rs::base::stderr_println!("{line}");
         }
     }
 

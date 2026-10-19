@@ -197,7 +197,7 @@ fn commands(
                 for (key, value) in options(args, 2)? {
                     // The C's catch: report, and apply no further option.
                     if let Err(e) = config.set_option(&key, &value) {
-                        eprintln!("ERROR : {e}");
+                        epics_rs::base::stderr_println!("ERROR : {e}");
                         break;
                     }
                 }
@@ -439,11 +439,11 @@ fn commands(
                     .pki_root
                     .unwrap_or_else(|| opcua::client::DEFAULT_PKI_DIR.to_string());
                 match string(args, 0)? {
-                    Some(location) => eprintln!(
+                    Some(location) => epics_rs::base::stderr_println!(
                         "opcuaSaveRejected: '{location}' ignored — this port's client saves \
                          rejected server certificates under '{pki}/rejected', which it fixes."
                     ),
-                    None => eprintln!(
+                    None => epics_rs::base::stderr_println!(
                         "opcuaSaveRejected: rejected server certificates are saved under \
                          '{pki}/rejected'."
                     ),
@@ -490,7 +490,7 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: opcua-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: opcua-ioc <st.cmd>");
         std::process::exit(1);
     };
 
@@ -516,7 +516,7 @@ async fn main() -> CaResult<()> {
         let registry = registry.clone();
         move || {
             let started = registry.start();
-            eprintln!("opcua: {started} session(s) started");
+            epics_rs::base::stderr_println!("opcua: {started} session(s) started");
         }
     });
 

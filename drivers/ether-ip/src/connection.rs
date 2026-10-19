@@ -304,13 +304,24 @@ impl Connection {
             crate::eip_printf!(10, "    UINT type     = 0x{:04X}\n", i.item_type);
             crate::eip_printf!(10, "    UINT length   = {}\n", i.length);
             crate::eip_printf!(10, "    UINT version  = 0x{:04X}\n", i.version);
-            crate::eip_printf!(10, "    UINT flags    = 0x{:04X} ", i.flags);
+            // C writes the flags and their verdict in two `EIP_printf`s
+            // (ether_ip.c:2443-2449); one write is a deliberate deviation.
             if i.supports_cip() {
-                crate::eip_printf!(10, "(CIP PDU encap.)\n");
+                crate::eip_printf!(
+                    10,
+                    "    UINT flags    = 0x{:04X} (CIP PDU encap.)\n",
+                    i.flags
+                );
             } else {
+                let flags = if crate::EIP_VERBOSITY.load(std::sync::atomic::Ordering::Relaxed) >= 10
+                {
+                    format!("    UINT flags    = 0x{:04X} ", i.flags)
+                } else {
+                    String::new()
+                };
                 crate::eip_printf!(
                     2,
-                    "\nEIP list_services: NO SUPPORT for CIP PDU encapsulation.!\n"
+                    "{flags}\nEIP list_services: NO SUPPORT for CIP PDU encapsulation.!\n"
                 );
             }
             crate::eip_printf!(10, "    USINT name[16]= '{}'\n", i.name);
@@ -673,8 +684,10 @@ impl Connection {
         match cip::check_read_data_response(&response, n) {
             Some(d) => {
                 if crate::EIP_VERBOSITY.load(std::sync::atomic::Ordering::Relaxed) >= 10 {
-                    crate::eip_printf!(10, "    Data =  ");
-                    crate::eip_printf!(0, "{}", cip::dump_raw_cip_data(d, usize::from(elements)));
+                    // C writes the label and the value in two calls
+                    // (ether_ip.c:3565-3566); one write is a deliberate deviation.
+                    let value = cip::dump_raw_cip_data(d, usize::from(elements));
+                    crate::eip_printf!(10, "    Data =  {value}");
                 }
                 Ok(d.to_vec())
             }
@@ -825,5 +838,113 @@ mod tests {
         };
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(plc.join().unwrap().0, encap::EC_LIST_SERVICES);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stderr_tests {
+    use super::*;
+    use crate::tests::stderr_writes;
+    use std::sync::atomic::Ordering;
+
+    /// A PLC on a free 127.0.0.1 port, returned with it, whose ListServices
+    /// item carries `flags`, that answers every routed request with DINT 7
+    /// and refuses the identity read.
+    fn plc_with_flags(flags: u16) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut header = [0u8; encap::HEADER_SIZE];
+            while s.read_exact(&mut header).is_ok() {
+                let length = u16::from_le_bytes([header[2], header[3]]) as usize;
+                let mut body = vec![0u8; length];
+                if s.read_exact(&mut body).is_err() {
+                    break;
+                }
+                let command = u16::from_le_bytes([header[0], header[1]]);
+                let tid = TransactionId(header[12..20].try_into().unwrap());
+                let reply = match command {
+                    encap::EC_LIST_SERVICES => {
+                        let mut d = vec![1, 0, 0x00, 0x01, 20, 0, 1, 0];
+                        d.extend_from_slice(&flags.to_le_bytes());
+                        d.extend_from_slice(b"Communications\0\0");
+                        let mut r = Vec::new();
+                        encap::encode_header(&mut r, command, d.len() as u16, 0, tid, 0);
+                        r.extend_from_slice(&d);
+                        r
+                    }
+                    encap::EC_REGISTER_SESSION => {
+                        let mut r = Vec::new();
+                        encap::encode_header(&mut r, command, 4, 1, tid, 0);
+                        r.extend_from_slice(&[1, 0, 0, 0]);
+                        r
+                    }
+                    encap::EC_SEND_RR_DATA => {
+                        let service = body[encap::RRDATA_PREAMBLE_SIZE];
+                        let mr = if service == cip::service::CM_UNCONNECTED_SEND {
+                            vec![0xCC, 0, 0, 0, 0xC4, 0, 7, 0, 0, 0]
+                        } else {
+                            vec![service | 0x80, 0, 0x08, 0]
+                        };
+                        encap::encode_send_rr_data(1, tid, &mr)
+                    }
+                    _ => break,
+                };
+                if s.write_all(&reply).is_err() {
+                    break;
+                }
+            }
+        });
+        (port, server)
+    }
+
+    fn connect(port: u16) -> Result<Connection> {
+        Connection::startup("127.0.0.1", port, 0, Duration::from_secs(2), 500)
+    }
+
+    /// ether_ip.c:2443-2449 writes the flags and their verdict in two
+    /// `EIP_printf`s; each is one line here.
+    #[test]
+    fn list_services_writes_the_flags_and_their_verdict_once() {
+        crate::EIP_VERBOSITY.store(10, Ordering::Relaxed);
+        let (port, server) = plc_with_flags(0x0020);
+        let writes = stderr_writes(|| drop(connect(port)));
+        server.join().unwrap();
+        let line = "    UINT flags    = 0x0020 (CIP PDU encap.)\n".to_string();
+        assert!(writes.contains(&line), "{writes:?}");
+
+        let (port, server) = plc_with_flags(0);
+        let writes = stderr_writes(|| assert!(connect(port).is_err()));
+        server.join().unwrap();
+        let line = "    UINT flags    = 0x0000 \n\
+                    EIP list_services: NO SUPPORT for CIP PDU encapsulation.!\n"
+            .to_string();
+        assert!(writes.contains(&line), "{writes:?}");
+
+        // Below 10 only the verdict prints.
+        crate::EIP_VERBOSITY.store(2, Ordering::Relaxed);
+        let (port, server) = plc_with_flags(0);
+        let writes = stderr_writes(|| assert!(connect(port).is_err()));
+        server.join().unwrap();
+        let line = "\nEIP list_services: NO SUPPORT for CIP PDU encapsulation.!\n".to_string();
+        assert!(writes.contains(&line), "{writes:?}");
+    }
+
+    /// ether_ip.c:3565-3566 writes `Data =` and the value in two calls.
+    #[test]
+    fn read_tag_writes_data_and_its_value_once() {
+        crate::EIP_VERBOSITY.store(10, Ordering::Relaxed);
+        let (port, server) = plc_with_flags(0x0020);
+        let tag = ParsedTag::parse("T").unwrap();
+        let writes = stderr_writes(|| {
+            let mut c = connect(port).unwrap();
+            assert_eq!(c.read_tag(&tag, 1).unwrap(), [0xC4, 0, 7, 0, 0, 0]);
+        });
+        server.join().unwrap();
+        assert!(
+            writes.contains(&"    Data =  DINT 7\n".to_string()),
+            "{writes:?}"
+        );
     }
 }

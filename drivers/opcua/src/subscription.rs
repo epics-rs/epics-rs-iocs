@@ -42,7 +42,7 @@ impl SubscriptionConfig {
     /// a bad name or value is reported and passed over, as in the C.
     pub fn set_option(&mut self, name: &str, value: &str) {
         if self.debug > 0 || name == "debug" {
-            eprintln!(
+            epics_rs::base::stderr_println!(
                 "Subscription {}: setting option {name} to {value}",
                 self.name
             );
