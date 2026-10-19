@@ -39,9 +39,6 @@ pub struct CtrDriver {
     pub max_time_points: usize,
     /// C `pulseGenRunning_`.
     pulse_running: [bool; NUM_TIMERS],
-    /// Whether AUXPORT accepts a direction change at all (`DPIOT_IO` /
-    /// `DPIOT_BITIO`). The USB-CTR08 reports `DPIOT_BITIO`.
-    dio_configurable: bool,
 }
 
 /// drvUSBCTR.cpp:256-257.
@@ -89,17 +86,6 @@ impl CtrDriver {
         base.set_string_param(params.ul_version, 0, ul_ver)?;
         base.set_string_param(params.driver_version, 0, "4.3")?;
 
-        // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
-        // ulDConfigPort and ulDConfigBit reject anything else outright, so ask
-        // the device instead of assuming.
-        let dio_configurable = matches!(
-            device.digital_port_io_type(0),
-            Ok(uldaq_sys::DPIOT_IO) | Ok(uldaq_sys::DPIOT_BITIO)
-        );
-        if dio_configurable {
-            let _ = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT);
-        }
-
         // Seed DIGITAL_INPUT so the bi records have a value to read at init.
         // The poller only pushes on a changed bit, and its one forced first
         // callback happens here -- before dbLoadRecords has run.
@@ -136,7 +122,6 @@ impl CtrDriver {
             state,
             max_time_points,
             pulse_running: [false; NUM_TIMERS],
-            dio_configurable,
         };
         // C's constructor ends its MCS setup with eraseMCS (drvUSBCTR.cpp:425).
         driver.erase_mcs()?;
@@ -592,7 +577,7 @@ impl PortDriver for CtrDriver {
                     ));
                 }
             }
-        } else if reason == self.params.digital_direction && self.dio_configurable {
+        } else if reason == self.params.digital_direction {
             let dev = self.device.lock().unwrap();
             for bit in 0..NUM_IO_BITS {
                 if mask & (1 << bit) != 0 {
@@ -723,5 +708,13 @@ mod tests {
             drv.base.interface_mask(),
             interrupts | I::DRV_USER | I::COMMON
         );
+    }
+
+    #[test]
+    fn a_direction_write_calls_config_bit_unprobed() {
+        let mut drv = CtrDriver::new("CTRDIR", DaqDevice::unconnected(), 16).unwrap();
+        let mut user = AsynUser::new(drv.params.digital_direction);
+        // ulDConfigBit fails on the null handle.
+        assert!(drv.write_uint32_digital(&mut user, 1, 0x01).is_err());
     }
 }
