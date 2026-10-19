@@ -732,7 +732,7 @@ impl DeviceSupport for DevMpc {
     }
 
     /// `writeX` with `pact == 1`: a reply longer than `OK` alarms.
-    fn async_write_completed(&mut self) {
+    fn async_write_completed(&mut self, _record: &mut dyn Record) {
         let (ok, buf) = self.outcome();
         if ok && buf.len() > 2 {
             raise(&mut self.alarm, READ_ALARM, AlarmSeverity::Invalid);
