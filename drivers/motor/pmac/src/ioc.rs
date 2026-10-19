@@ -2152,6 +2152,50 @@ mod tests {
         );
     }
 
+    /// pmacController.cpp:944-947: pmacCreateAxis constructs its axis under
+    /// `pC->lock()`, so the pass due during the constructor's status read
+    /// waits and then polls the axis.
+    #[cfg(target_os = "linux")]
+    #[epics_rs::base::epics_test]
+    async fn pmac_create_axis_polls_the_axis_from_the_pass_that_waited() {
+        use motor_common::testing::run_command;
+
+        let (_rt, rig) = publish_scripted("pmacSingleLow");
+        rig.slow
+            .lock()
+            .unwrap()
+            .insert("I113 I114 I130 I131 I133".into(), Duration::from_millis(20));
+        let commands = pmac_commands();
+        let command = |name: &str| commands.iter().find(|c| c.name == name).unwrap().clone();
+        let args = vec![
+            ArgValue::String("pmacSingle".into()),
+            ArgValue::String("pmacSingleLow".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(1),
+            ArgValue::Int(1),
+            ArgValue::Int(1),
+        ];
+        run_command(command("pmacCreateController"), args).await;
+        let args = vec![ArgValue::String("pmacSingle".into()), ArgValue::Int(1)];
+        run_command(command("pmacCreateAxis"), args).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut written = rig.written();
+        while !written.iter().any(|w| w == "#1 ? F P") {
+            assert!(std::time::Instant::now() < deadline, "axis 1 never polled");
+            std::thread::sleep(Duration::from_millis(1));
+            written.extend(rig.written());
+        }
+        let read = written
+            .iter()
+            .position(|w| w == "I113 I114 I130 I131 I133")
+            .unwrap();
+        assert_eq!(
+            written[read + 1..read + 3],
+            ["???", "#1 ? F P"],
+            "{written:?}"
+        );
+    }
+
     /// pmacController.cpp:201: one poller from pmacCreateController, which
     /// pmacCreateAxes joins.
     #[cfg(target_os = "linux")]
