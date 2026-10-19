@@ -731,4 +731,19 @@ mod tests {
         assert_eq!(det.get_i32(reason).unwrap(), 0);
         assert!(commands(&log).is_empty());
     }
+
+    /// pilatusDetector.cpp:1426-1428: NumOscill is one mxsettings exchange.
+    #[test]
+    fn num_oscill_sends_mxsettings_n_oscillations() {
+        let (mut det, log) = rig("PILATUS_NUM_OSCILL", ok);
+        det.write_int32(&mut AsynUser::new(det.p.num_oscill), 3)
+            .unwrap();
+        let io: Vec<String> = log
+            .lock()
+            .iter()
+            .filter(|e| !e.starts_with("ADStatus"))
+            .cloned()
+            .collect();
+        assert_eq!(io, ["<flush>", "mxsettings N_oscillations 3", "<read>"]);
+    }
 }
