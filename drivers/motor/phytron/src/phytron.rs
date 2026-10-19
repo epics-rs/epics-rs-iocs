@@ -41,14 +41,9 @@
 //! boundary and are intentionally not ported; the driver runs with their C
 //! defaults:
 //!
-//! - The auxiliary controller/axis parameters other than the P registers
-//!   (the `AXIS_STATUS`/`CONTROLLER_STATUS` records, the resets, ...).
 //! - The fake-HOMED-bit feature (Phytron registers 1001..1020, enabled by the
 //!   `fakeHomedEnable` option): disabled by default, so HOMED is reported from
 //!   status bit 0x08.
-//! - The `pollMethod` batching options (axis-parallel / controller-parallel):
-//!   this driver always polls serially (one command + reply each), the C
-//!   default `pollMethodSerial`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
