@@ -4,8 +4,8 @@
 //! (a model-1 dev/drv pair). Commands are `{axis:02}CC[value]` with a 1-based
 //! zero-padded axis prefix; several record transactions join commands with
 //! `;` into one write (a move is `VB;VA;AC;AG;PA`). Replies end in CR/LF
-//! (the port EOS is set at connect as C does, input `\n` / output `\r`; the
-//! leftover `\r` is trimmed).
+//! (the port EOS is set at connect as C does, input `\n` / output `\r`; a
+//! reply is the line before its `\r`).
 //!
 //! ## Shared-serial concurrency
 //!
@@ -39,13 +39,16 @@ use epics_rs::base::runtime::log::errlog_vprintf;
 use crate::util::{atof, atoi, is_unsolicited_limit_error, leading_hex};
 use motor_common::model1::MoveStrings;
 
-/// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
-const READ_BUF: usize = 256;
+/// C `BUFF_SIZE`: the most one read takes.
+const READ_BUF: usize = 100;
 
-/// Replies end in CR/LF (C strips the LF via input EOS, the CR itself).
-fn trim_reply(raw: &[u8]) -> String {
-    let s = String::from_utf8_lossy(raw);
-    s.trim_end_matches(['\r', '\n']).to_string()
+/// C `recv_mess`'s reply: replies end in CR/LF, the LF is the input EOS, and
+/// a read whose last byte is not the CR (one cut at `BUFF_SIZE`) is empty
+/// (drvESP300.cc:550-561).
+fn reply_line(raw: &[u8]) -> String {
+    raw.strip_suffix(b"\r").map_or_else(String::new, |line| {
+        String::from_utf8_lossy(line).into_owned()
+    })
 }
 
 /// Port EOS set at connect (C `input_terminator`/`output_terminator`, drvESP300.cc:649-650, :679-684).
@@ -155,11 +158,11 @@ impl Esp300Controller {
         if is_unsolicited_limit_error(&String::from_utf8_lossy(&raw)) {
             return self.read_once();
         }
-        Ok(trim_reply(&raw))
+        Ok(reply_line(&raw))
     }
 
     fn read_once(&self) -> AsynResult<String> {
-        Ok(trim_reply(&self.handle.read_octet(0, READ_BUF)?))
+        Ok(reply_line(&self.handle.read_octet(0, READ_BUF)?))
     }
 }
 
@@ -580,12 +583,12 @@ mod tests {
             let cmd = String::from_utf8_lossy(data);
             self.sent.lock().unwrap().push(cmd.to_string());
             self.reply = match cmd.as_ref() {
-                "VE?" => b"ESP300 Version 3.08 09/09/02".to_vec(),
+                "VE?" => b"ESP300 Version 3.08 09/09/02\r".to_vec(),
                 c => self
                     .replies
                     .iter()
                     .find(|(k, _)| *k == c)
-                    .map_or_else(Vec::new, |(_, v)| v.as_bytes().to_vec()),
+                    .map_or_else(Vec::new, |(_, v)| format!("{v}\r").into_bytes()),
             };
             Ok(data.len())
         }
@@ -618,6 +621,24 @@ mod tests {
         });
         let ctrl = Esp300Controller::new(io).unwrap();
         assert_eq!(ctrl.write_read("01TP?").unwrap(), "1.5");
+    }
+
+    /// drvESP300.cc:550: a read whose last byte is not the CR, one cut at
+    /// `BUFF_SIZE` (100) among them, is an empty reply.
+    #[test]
+    fn a_read_not_ending_in_cr_is_empty() {
+        let long = format!("{}\r", "1".repeat(READ_BUF));
+        let (_line, io) = LineRig::new("esp300NoCr", move |last| match last {
+            "VE?" => "ESP300 Version 3.08\r".to_string(),
+            "TB?" => "9, 0, AXIS NUMBER OUT OF RANGE\r".to_string(),
+            "01TP?" => "1.5".to_string(),
+            "02TP?" => long.clone(),
+            _ => "2.5\r".to_string(),
+        });
+        let ctrl = Esp300Controller::new(io).unwrap();
+        assert_eq!(ctrl.write_read("01TP?").unwrap(), "");
+        assert_eq!(ctrl.write_read("02TP?").unwrap(), "");
+        assert_eq!(ctrl.write_read("03TP?").unwrap(), "2.5");
     }
 
     /// C reads a failed `TB?` as an empty buffer, which `atoi` takes as no
@@ -761,6 +782,7 @@ mod tests {
                 _ => "",
             }
             .to_string()
+                + "\r"
         });
         let ctrl = Esp300Controller::new(io).unwrap();
         let axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
@@ -910,6 +932,7 @@ mod tests {
                 _ => "",
             }
             .to_string()
+                + "\r"
         });
         let ctrl = Esp300Controller::new(io).unwrap();
         let mut axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);

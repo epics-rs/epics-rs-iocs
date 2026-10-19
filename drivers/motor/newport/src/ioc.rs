@@ -3283,6 +3283,7 @@ mod report {
                 _ => "",
             }
             .to_string()
+                + "\r"
         });
         let config = vec![int(1), ArgValue::String("esp300RepLine".into()), int(3)];
         run_command(esp300_config_command(), config).await;
