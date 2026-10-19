@@ -61,6 +61,8 @@ const ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// Bytes pulled from a TCP socket per read. C++ reads one byte per `read()`;
 /// the framing is identical either way.
 const READ_CHUNK: usize = 4096;
+/// C++ `cmdReadThread`'s sleep between commands.
+const CMD_YIELD: Duration = Duration::from_millis(1);
 /// C++ `cmd_tick_count >= 12`: idle polls of the command socket before the
 /// direct driver sends one queued command.
 const CMD_IDLE_TICKS: i32 = 12;
@@ -939,6 +941,11 @@ fn cmd_thread(ctx: CmdContext) {
     let mut reader = StreamReader::new(ctx.io.clone());
     let mut tick = 0i32;
     loop {
+        // C++ `unlock(); epicsThreadSleep(0.001);` before each command
+        // (drvT4U_EM.cpp:597-598, drvT4UDirect_EM.cpp:824-825): a port write
+        // queued behind the last read-back takes the socket before the next
+        // read does.
+        thread::sleep(CMD_YIELD);
         if cmd_iteration(&ctx, &mut reader, &mut tick).is_err() {
             reader.flush();
             thread::sleep(ERROR_BACKOFF);
@@ -1485,6 +1492,9 @@ mod tests {
     use super::*;
     use epics_rs::asyn::port::DrvUserRequest;
     use epics_rs::asyn::registry::claim_port;
+    use std::io::{BufRead, BufReader};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Instant;
 
     /// C++ compares a read-back calibration register with the selected table
     /// at `currRange_`; the middle driver has no table and never complains.
@@ -1561,18 +1571,12 @@ mod tests {
             .unwrap();
     }
 
-    /// drvT4U_EM's command thread applies a `tr` read-back under the driver
-    /// lock (drvT4U_EM.cpp:724), so one that arrives while a port request
-    /// holds the driver waits for it, and the reader is off the socket
-    /// meanwhile.
-    #[test]
-    fn a_register_read_back_waits_for_the_driver_lock() {
-        use std::io::Write as _;
-        use std::net::TcpListener;
-        use std::time::Instant;
-
+    /// A middle-layer port on a local meter: the port, the meter's end of
+    /// the command socket, and the data listener, which must outlive the
+    /// port.
+    fn middle_meter(port: &str) -> (T4uRuntime, TcpStream, TcpListener) {
         // The data socket is the command port + 1 (drvT4U_EM.cpp:186-196).
-        let (cmd, _data) = loop {
+        let (cmd, data) = loop {
             let cmd = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = cmd.local_addr().unwrap().port();
             if let Ok(data) = TcpListener::bind(("127.0.0.1", port + 1)) {
@@ -1581,7 +1585,7 @@ mod tests {
         };
         let base = cmd.local_addr().unwrap().port();
         let rt = create_t4u_em(
-            &claim_port("QE_T4U_REG_HOLD").unwrap(),
+            &claim_port(port).unwrap(),
             "127.0.0.1",
             16,
             base,
@@ -1589,18 +1593,34 @@ mod tests {
             &InterruptGate::opened(),
         )
         .unwrap();
-        let (mut meter, _) = cmd.accept().unwrap();
+        let (meter, _) = cmd.accept().unwrap();
+        (rt, meter, data)
+    }
+
+    /// `tr`, a big-endian length, then one little-endian register record.
+    fn tr_frame(reg_num: u16, reg_val: u32) -> Vec<u8> {
+        let mut frame = b"tr\x00\x06".to_vec();
+        frame.extend(reg_num.to_le_bytes());
+        frame.extend(reg_val.to_le_bytes());
+        frame
+    }
+
+    /// drvT4U_EM's command thread applies a `tr` read-back under the driver
+    /// lock (drvT4U_EM.cpp:724), so one that arrives while a port request
+    /// holds the driver waits for it, and the reader is off the socket
+    /// meanwhile.
+    #[test]
+    fn a_register_read_back_waits_for_the_driver_lock() {
+        let (rt, mut meter, _data) = middle_meter("QE_T4U_REG_HOLD");
         let sample_time = |d: &mut T4uDriver| d.state.lock().sample_time;
 
         let mut hold = rt
             .port_handle()
             .hold_driver_blocking::<T4uDriver>()
             .unwrap();
-        // tr, a big-endian length, then register 1 (the sample frequency).
-        let mut frame = b"tr\x00\x06".to_vec();
-        frame.extend((proto::REG_T4U_FREQ as u16).to_le_bytes());
-        frame.extend(10_000u32.to_le_bytes());
-        meter.write_all(&frame).unwrap();
+        meter
+            .write_all(&tr_frame(proto::REG_T4U_FREQ as u16, 10_000))
+            .unwrap();
         thread::sleep(Duration::from_millis(300));
         assert_eq!(hold.run(sample_time).unwrap(), MIDDLE_SAMPLE_TIME);
         drop(hold);
@@ -1615,6 +1635,54 @@ mod tests {
             assert!(Instant::now() < deadline, "the read-back was never applied");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// drvT4U_EM's command thread sleeps 1 ms before each command read
+    /// (drvT4U_EM.cpp:597-598), so a write issued as the last one's read-back
+    /// is applied reaches the meter before the reader's next 0.2 s read.
+    #[test]
+    fn a_write_after_a_read_back_does_not_wait_out_the_read_timeout() {
+        let (rt, meter, _data) = middle_meter("QE_T4U_CMD_YIELD");
+        // The meter answers each `wr <reg> <value>` with that register.
+        let mut out = meter.try_clone().unwrap();
+        thread::spawn(move || {
+            for line in BufReader::new(meter).lines() {
+                let line = line.unwrap();
+                let mut f = line.split_whitespace().skip(1);
+                let reg = f.next().unwrap().parse().unwrap();
+                let val = f.next().unwrap().parse().unwrap();
+                if out.write_all(&tr_frame(reg, val)).is_err() {
+                    return;
+                }
+            }
+        });
+        let h = rt.port_handle();
+        let freq = h
+            .drv_user_create_blocking(&DrvUserRequest::new("QE_SAMPLE_FREQ", 0))
+            .unwrap()
+            .reason;
+        let set_freq = |hz: i32| {
+            h.write_int32_blocking(freq, 0, hz).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while h
+                .with_driver_blocking::<T4uDriver, _>(|d| d.state.lock().sample_time)
+                .unwrap()
+                != 1.0 / hz as f64
+            {
+                assert!(Instant::now() < deadline, "no read-back for {hz} Hz");
+            }
+        };
+        // The first write may wait out a read already in progress.
+        set_freq(1000);
+        let start = Instant::now();
+        for hz in 1001..1011 {
+            set_freq(hz);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "10 writes took {:?}",
+            start.elapsed()
+        );
     }
 
     /// drvT4U_EM's own functions return asynSuccess whatever
