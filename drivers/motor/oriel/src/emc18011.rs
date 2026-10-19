@@ -344,6 +344,8 @@ pub struct Emc18011Axis {
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl Emc18011Axis {
@@ -358,6 +360,7 @@ impl Emc18011Axis {
             prev_position: 0.0,
             failure: PollFailure::NONE,
             strings: MoveStrings::default(),
+            init_status: None,
         };
         {
             // C sets motorSelect outright (drvEMC18011.cc:728).
@@ -366,7 +369,7 @@ impl Emc18011Axis {
             ctrl.wired = None;
             let _ = ctrl.select(index);
         }
-        let _ = axis.poll(&AsynUser::default());
+        axis.init_status = Some(axis.poll(&AsynUser::default()));
         axis
     }
 
@@ -616,6 +619,10 @@ impl AsynMotor for Emc18011Axis {
 
         self.prev_position = position;
         Ok(self.status(&z))
+    }
+
+    fn take_init_status(&mut self) -> Option<AsynResult<MotorStatus>> {
+        self.init_status.take()
     }
 }
 

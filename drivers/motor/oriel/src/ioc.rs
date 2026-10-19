@@ -118,3 +118,64 @@ mod report {
         );
     }
 }
+
+#[cfg(test)]
+mod init_status {
+    use std::time::Instant;
+
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvEMC18011.cc:725-730: `motor_init` selects each motor and reads
+    /// its status once, and the record starts from that read. No motor is
+    /// read unselected, which would sleep 0.1 s for it (:291).
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_motor_once_selected() {
+        let int = ArgValue::Int;
+        run_command(emc18011_setup_command(), vec![int(1), int(10)]).await;
+        let selected = Mutex::new(0);
+        let (line, _io) = LineRig::new("emcInitLine", move |cmd| {
+            let mut selected = selected.lock().unwrap();
+            match cmd.trim_end() {
+                "R" => "ON LINE".into(),
+                "Z" => "a".into(),
+                "A" => ["0.14", "0.03", "0.00"][*selected].into(),
+                m if m.starts_with('M') => {
+                    *selected = m[1..].parse::<usize>().unwrap() - 1;
+                    "OK".into()
+                }
+                _ => "OK".into(),
+            }
+        });
+        let config = vec![int(0), ArgValue::String("emcInitLine".into())];
+        run_command(emc18011_config_command(), config).await;
+        let started = Instant::now();
+        drvsup_init().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "L", "R", "S", "M1", "Z", "A", "M2", "Z", "A", "M3", "Z", "A"
+            ]
+        );
+        let db = record_init(
+            r##"
+record(motor, "emc:m1") { field(DTYP, "EMC18011") field(OUT, "#C0 S0 @") }
+record(motor, "emc:m2") { field(DTYP, "EMC18011") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("emc:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("emc:m2.RMP").unwrap(), EpicsValue::Long(3));
+    }
+}
