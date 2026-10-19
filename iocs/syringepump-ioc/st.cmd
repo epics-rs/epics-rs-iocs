@@ -5,7 +5,7 @@
 #   cargo run -p syringepump-ioc -- st.cmd
 #
 # Wires all three pump families from epics-modules/SyringePump:
-#   - Teledyne ISCO D/H-series (native asyn port driver -- drivers/syringepump)
+#   - Teledyne ISCO D/H-series (StreamDevice, teled_d.proto/teled_h.proto)
 #   - ISCO (Modbus/TCP, drvModbusAsynConfigure)
 #   - Vindum (Modbus RTU-over-TCP, drvModbusAsynConfigure)
 # No upstream st.cmd/iocBoot ships for either Teledyne family (confirmed
@@ -35,30 +35,22 @@ epicsEnvSet("P", "SP:")
 # Teledyne D-series (demo instance -- no upstream st.cmd/iocBoot exists
 # for either Teledyne family; see header comment).
 # ------------------------------------------------------------------
-# The driver port records bind to ($(TELD_PORT)) must differ from the serial
-# transport it rides on ($(TELD_TTY)): TeledyneDInit registers its own port,
-# so reusing the serial port's name collides ("port already registered").
-epicsEnvSet("TELD_PORT", "TelD1")
+# The records talk StreamDevice (teled_d.proto, $(u=6) unit) on the tty port.
+epicsEnvSet("STREAM_PROTOCOL_PATH", "$(SYRINGEPUMP)/db")
 epicsEnvSet("TELD_TTY", "TelD1_tty")
 drvAsynSerialPortConfigure("$(TELD_TTY)", "/dev/ttyS0", 0, 0, 0)
 asynSetTraceIOMask("$(TELD_TTY)", 0, HEX)
-# TeledyneDInit(port, serPort, serAddr, unit) -- unit 6 matches
-# teled_d.proto/teled_h.proto's shipped default ($(u=6), never overridden
-# anywhere upstream).
-TeledyneDInit("$(TELD_PORT)", "$(TELD_TTY)", 0, 6)
 
-dbLoadRecords("$(SYRINGEPUMP)/db/teledynePumpD.template", "P=$(P),PUMP=D1:,s=SP,ta=Teledyne,ss=D1,PORT=$(TELD_PORT),ADDR=0")
+dbLoadRecords("$(SYRINGEPUMP)/db/teledynePumpD.template", "P=$(P),PUMP=D1:,s=SP,ta=Teledyne,ss=D1,PORT=$(TELD_TTY),ADDR=0")
 
 # ------------------------------------------------------------------
 # Teledyne H-series (demo instance -- see header comment).
 # ------------------------------------------------------------------
-epicsEnvSet("TELH_PORT", "TelH1")
 epicsEnvSet("TELH_TTY", "TelH1_tty")
 drvAsynSerialPortConfigure("$(TELH_TTY)", "/dev/ttyS1", 0, 0, 0)
 asynSetTraceIOMask("$(TELH_TTY)", 0, HEX)
-TeledyneHInit("$(TELH_PORT)", "$(TELH_TTY)", 0, 6)
 
-dbLoadRecords("$(SYRINGEPUMP)/db/teledynePumpH.template", "s=SP,ta=Teledyne,ss=H1,PORT=$(TELH_PORT)")
+dbLoadRecords("$(SYRINGEPUMP)/db/teledynePumpH.template", "s=SP,ta=Teledyne,ss=H1,PORT=$(TELH_TTY)")
 
 # ------------------------------------------------------------------
 # ISCO -- wiring and drvModbusAsynConfigure arguments taken verbatim from
