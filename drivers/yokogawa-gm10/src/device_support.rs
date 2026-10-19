@@ -700,6 +700,23 @@ impl DeviceSupport for GmDevice {
         );
         Ok(WriteStart::Pending)
     }
+
+    // devGM10_bo.c:192-197: the completing pass drops a REC_TRIG or
+    // REC_ERROR bo's VAL back to 0.
+    fn async_write_completed(&mut self, record: &mut dyn Record) {
+        if let Some(Resolved {
+            op:
+                Operation::ChanTrig
+                | Operation::MiscTrig
+                | Operation::InfoTrig
+                | Operation::StatTrig
+                | Operation::ErrorClearSet,
+            ..
+        }) = self.resolved
+        {
+            let _ = record.put_field("VAL", EpicsValue::Enum(0));
+        }
+    }
 }
 
 impl GmDevice {
@@ -708,18 +725,6 @@ impl GmDevice {
         let Some(Resolved { op, .. }) = &self.resolved else {
             return Ok(None);
         };
-        // devGM10_bo.c:194-197 zeroes VAL of a trigger or ERROR_CLEAR bo on
-        // the completing pass.
-        if matches!(
-            op,
-            Operation::ChanTrig
-                | Operation::MiscTrig
-                | Operation::InfoTrig
-                | Operation::StatTrig
-                | Operation::ErrorClearSet
-        ) {
-            record.put_field("VAL", EpicsValue::Enum(0))?;
-        }
         Ok(Some(match *op {
             Operation::AnalogSet(addr) => {
                 let val = match record.get_field("VAL") {
@@ -1365,6 +1370,9 @@ mod tests {
             .write_begin(&mut record, &DeviceDoneSource::new(&done))
             .unwrap();
         assert!(matches!(start, WriteStart::Pending));
+        // VAL drops to 0 on the completing pass, not while PACT holds.
+        assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(1)));
+        device.async_write_completed(&mut record);
         assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(0)));
         let received = device_thread.join().unwrap();
         assert_eq!(received.last().unwrap(), "FData,1\r\n");

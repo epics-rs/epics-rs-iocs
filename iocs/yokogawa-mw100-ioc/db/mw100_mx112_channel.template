@@ -3,7 +3,7 @@
 # are identical; kept as separate files here to mirror the 1:1 per-model
 # split of yokogawaDasApp/Db/ rather than merging site-editable per-model
 # files that a future MX112 firmware revision could diverge.
-# Macros: P, DAU, HANDLE, ADDRESS (Signal channel address, e.g. 1).
+# Macros: P, DAU, HANDLE, ADDRESS (Signal channel address, e.g. 001).
 # Port of yokogawaDasApp/Db/MW100_MX112_channel.db.
 
 record(ai, "$(P)$(DAU):$(ADDRESS):ADC")

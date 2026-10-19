@@ -117,9 +117,9 @@ pub fn format_g(value: f64) -> String {
 /// `sscanf(inbuffer, "E1 %d %*s\r\n", &error_code) == 1`: the format's
 /// space and `%d` both skip any whitespace (including none) and `%d`
 /// takes a sign, so only the literal `E1` and one digit are required.
-pub fn parse_error_code(payload: &str) -> Option<i32> {
-    let rest = payload.strip_prefix("E1")?;
-    match c_strtol(rest.as_bytes()) {
+pub fn parse_error_code(payload: &[u8]) -> Option<i32> {
+    let rest = payload.strip_prefix(b"E1")?;
+    match c_strtol(rest) {
         (_, 0) => None,
         (code, _) => Some(code as i32),
     }
@@ -947,7 +947,7 @@ pub struct ModuleLine {
     /// The fixed 13 wire bytes C copies (`drvMW100.c:587-601`).
     pub set_message: [u8; 13],
     pub status_message: [u8; 13],
-    pub error_message: String,
+    pub error_message: Vec<u8>,
 }
 
 /// The all-dashes sentinel for "no module configured" (`drvMW100.c:616`) —
@@ -987,7 +987,7 @@ pub fn parse_cf0(payload: &[u8]) -> Option<Vec<ModuleLine>> {
         if p >= payload.len() {
             return None;
         }
-        let error_message = String::from_utf8_lossy(&payload[start..p]).into_owned();
+        let error_message = payload[start..p].to_vec();
         p += 2;
 
         modules.push(ModuleLine {
@@ -1015,13 +1015,13 @@ pub fn module_line_ok(line: &ModuleLine) -> bool {
 /// sub-field falls back to a default (`atoi` on garbage returns 0, an
 /// unrecognized speed char yields -1), matching the C source's own
 /// tolerant parse.
-pub fn classify_module_string(module_string: &[u8]) -> (i32, String, i32, i32) {
+pub fn classify_module_string(module_string: &[u8]) -> (i32, Vec<u8>, i32, i32) {
     // Byte offsets, as C walks `ptr` (`drvMW100.c:623-649`); the dash after
     // the model number halts `atoi`.
     let tail = |at: usize| module_string.get(at..).unwrap_or(&[]);
     let model = c_atoi(tail(2));
     let code_bytes = tail(6);
-    let code = String::from_utf8_lossy(&code_bytes[..code_bytes.len().min(3)]).into_owned();
+    let code = code_bytes[..code_bytes.len().min(3)].to_vec();
     let speed = match module_string.get(10) {
         Some(b'L') => 0,
         Some(b'M') => 1,
@@ -1061,7 +1061,7 @@ pub struct ChannelInfoLine {
     /// 0-based array index (`address = atoi(channel) - 1`).
     pub index: usize,
     pub status: u8, // CH_STATUS_{SKIP=0,NORMAL=1,DIFF=2,UNKNOWN=3}
-    pub unit: String,
+    pub unit: Vec<u8>,
     pub scale: u8,
 }
 
@@ -1213,7 +1213,7 @@ pub fn parse_fe1(payload: &[u8]) -> Option<Vec<ChannelInfoLine>> {
                     family,
                     index,
                     status,
-                    unit: "----".to_string(),
+                    unit: b"----".to_vec(),
                     scale: 0,
                 });
             }
@@ -1226,7 +1226,7 @@ pub fn parse_fe1(payload: &[u8]) -> Option<Vec<ChannelInfoLine>> {
         while i < 6 && unit_start + i < payload.len() && payload[unit_start + i] != b' ' {
             i += 1;
         }
-        let unit = String::from_utf8_lossy(&payload[unit_start..unit_start + i]).into_owned();
+        let unit = payload[unit_start..unit_start + i].to_vec();
         p = unit_start + i;
         let comma = find_byte(payload, p, b',')?;
         let scale_start = comma + 1;
@@ -1390,7 +1390,7 @@ pub type ChStatusWire = u8;
 pub struct ExprLine {
     pub index: usize,
     pub on_flag: bool,
-    pub expr: String,
+    pub expr: Vec<u8>,
 }
 
 /// `SO?` calc-expression decode. Unlike GM10's `SRangeMath`, the
@@ -1408,7 +1408,7 @@ pub fn parse_so(payload: &[u8]) -> Option<Vec<ExprLine>> {
                 out.push(ExprLine {
                     index,
                     on_flag: false,
-                    expr: String::new(),
+                    expr: Vec::new(),
                 });
             }
             let nl = find_byte(payload, p, b'\n')?;
@@ -1417,7 +1417,7 @@ pub fn parse_so(payload: &[u8]) -> Option<Vec<ExprLine>> {
         }
         p += 2;
         let comma = find_byte(payload, p, b',')?;
-        let expr = String::from_utf8_lossy(&payload[p..comma]).into_owned();
+        let expr = payload[p..comma].to_vec();
         p = comma + 1;
         if let Some(index) = index {
             out.push(ExprLine {
@@ -1657,15 +1657,15 @@ mod tests {
 
     #[test]
     fn error_code_parses_space_separated_format() {
-        assert_eq!(parse_error_code("E1 205 blah\r\n"), Some(205));
-        assert_eq!(parse_error_code("E1 205\r\n"), Some(205));
-        assert_eq!(parse_error_code("E0\r\n"), None);
+        assert_eq!(parse_error_code(b"E1 205 blah\r\n"), Some(205));
+        assert_eq!(parse_error_code(b"E1 205\r\n"), Some(205));
+        assert_eq!(parse_error_code(b"E0\r\n"), None);
         // sscanf whitespace/sign leniency.
-        assert_eq!(parse_error_code("E1205\r\n"), Some(205));
-        assert_eq!(parse_error_code("E1   \t42 x\r\n"), Some(42));
-        assert_eq!(parse_error_code("E1 -7\r\n"), Some(-7));
-        assert_eq!(parse_error_code("E1 +7x\r\n"), Some(7));
-        assert_eq!(parse_error_code("E1 x\r\n"), None);
+        assert_eq!(parse_error_code(b"E1205\r\n"), Some(205));
+        assert_eq!(parse_error_code(b"E1   \t42 x\r\n"), Some(42));
+        assert_eq!(parse_error_code(b"E1 -7\r\n"), Some(-7));
+        assert_eq!(parse_error_code(b"E1 +7x\r\n"), Some(7));
+        assert_eq!(parse_error_code(b"E1 x\r\n"), None);
     }
 
     #[test]
@@ -1685,19 +1685,19 @@ mod tests {
     fn classify_module_string_matches_doc_examples() {
         assert_eq!(
             classify_module_string(b"MX110-UNV-M10"),
-            (110, "UNV".to_string(), 1, 10)
+            (110, b"UNV".to_vec(), 1, 10)
         );
         assert_eq!(
             classify_module_string(b"MX115-D05-H10"),
-            (115, "D05".to_string(), 2, 10)
+            (115, b"D05".to_vec(), 2, 10)
         );
         assert_eq!(
             classify_module_string(b"MX120-VAO-M08"),
-            (120, "VAO".to_string(), 1, 8)
+            (120, b"VAO".to_vec(), 1, 8)
         );
         assert_eq!(
             classify_module_string(b"MX125-MKC-M10"),
-            (125, "MKC".to_string(), 1, 10)
+            (125, b"MKC".to_vec(), 1, 10)
         );
     }
 
@@ -1705,11 +1705,11 @@ mod tests {
     fn classify_module_string_reads_non_utf8_bytes_at_c_offsets() {
         assert_eq!(
             classify_module_string(b"MX110\xff-2-4-M-1"),
-            (110, "-2-".to_string(), -1, 0)
+            (110, b"-2-".to_vec(), -1, 0)
         );
         assert_eq!(
             classify_module_string(b"MX110-\xffNV-M10"),
-            (110, "\u{fffd}NV".to_string(), 1, 10)
+            (110, b"\xffNV".to_vec(), 1, 10)
         );
     }
 
@@ -1750,7 +1750,7 @@ mod tests {
         assert_eq!(lines[0].family, InfoFamily::Signal);
         assert_eq!(lines[0].index, 0);
         assert_eq!(lines[0].status, CH_STATUS_NORMAL);
-        assert_eq!(lines[0].unit, "DEGC");
+        assert_eq!(lines[0].unit, b"DEGC");
         assert_eq!(lines[0].scale, 3);
     }
 
@@ -1767,7 +1767,7 @@ mod tests {
         let payload = b"xxxxS 0001\nE";
         let lines = parse_fe1(payload).unwrap();
         assert_eq!(lines[0].status, CH_STATUS_SKIP);
-        assert_eq!(lines[0].unit, "----");
+        assert_eq!(lines[0].unit, b"----");
         assert_eq!(lines[0].scale, 0);
     }
 
@@ -1855,7 +1855,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].index, 0);
         assert!(!lines[0].on_flag);
-        assert_eq!(lines[0].expr, "");
+        assert!(lines[0].expr.is_empty());
     }
 
     #[test]
@@ -1864,7 +1864,7 @@ mod tests {
         let lines = parse_so(payload).unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].on_flag);
-        assert_eq!(lines[0].expr, "A001+A002");
+        assert_eq!(lines[0].expr, b"A001+A002");
     }
 
     #[test]
