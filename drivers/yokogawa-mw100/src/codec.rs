@@ -5,6 +5,8 @@
 //! consumer's own `ptr += 4`), or on a full raw binary frame (`FD1`/`FO1`,
 //! which indexes from the frame start).
 
+use std::ffi::c_long;
+
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::runtime::stdlib::strtod;
 
@@ -1069,9 +1071,10 @@ pub const CH_STATUS_DIFF: u8 = 2;
 pub const CH_STATUS_UNKNOWN: u8 = 3;
 
 /// C `strtol(s, &end, 10)`: leading `isspace`, an optional sign, then
-/// decimal digits up to the first non-digit. Returns the value and the
-/// bytes consumed, `(0, 0)` when no digit follows.
-pub fn c_strtol(s: &[u8]) -> (i64, usize) {
+/// decimal digits up to the first non-digit, saturating at `LONG_MIN` /
+/// `LONG_MAX`. Returns the value and the bytes consumed, `(0, 0)` when no
+/// digit follows.
+pub fn c_strtol(s: &[u8]) -> (c_long, usize) {
     let mut i = 0;
     while i < s.len() && epics_rs::base::runtime::stdlib::c_isspace(s[i] as char) {
         i += 1;
@@ -1088,15 +1091,21 @@ pub fn c_strtol(s: &[u8]) -> (i64, usize) {
         _ => false,
     };
     let digits = i;
-    let mut value: i64 = 0;
+    // Accumulated toward the sign, so LONG_MIN's magnitude fits.
+    let mut value: c_long = 0;
     while let Some(d) = s.get(i).filter(|c| c.is_ascii_digit()) {
-        value = value.saturating_mul(10).saturating_add(i64::from(d - b'0'));
+        let d = c_long::from(d - b'0');
+        value = if negative {
+            value.saturating_mul(10).saturating_sub(d)
+        } else {
+            value.saturating_mul(10).saturating_add(d)
+        };
         i += 1;
     }
     if i == digits {
         return (0, 0);
     }
-    (if negative { -value } else { value }, i)
+    (value, i)
 }
 
 /// glibc `inet_aton`: one to four `.`-separated `strtoul(.., 0)` numbers
@@ -1770,6 +1779,16 @@ mod tests {
         assert_eq!(c_strtol(b"x1"), (0, 0));
         assert_eq!(c_strtol(b"-"), (0, 0));
         assert_eq!(c_atoi(b" 12 "), 12);
+    }
+
+    #[test]
+    fn c_strtol_saturates_at_long_min_and_max() {
+        use std::ffi::c_long;
+        assert_eq!(c_strtol(b"-99999999999999999999").0, c_long::MIN);
+        assert_eq!(c_strtol(b"99999999999999999999").0, c_long::MAX);
+        assert_eq!(c_strtol(c_long::MIN.to_string().as_bytes()).0, c_long::MIN);
+        assert_eq!(c_atoi(b"-99999999999999999999"), c_long::MIN as i32);
+        assert_eq!(c_atoi(b"99999999999999999999"), c_long::MAX as i32);
     }
 
     #[test]
