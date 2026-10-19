@@ -46,6 +46,8 @@ struct Calls {
     subscriptions: Vec<SubscriptionConfig>,
     monitored: Vec<async_opcua::types::MonitoredItemCreateRequest>,
     disconnects: usize,
+    /// The read and subscription service calls, in the order they were made.
+    events: Vec<String>,
 }
 
 #[derive(Default)]
@@ -98,6 +100,7 @@ impl UaConnection for Mock {
         let id = {
             let mut calls = self.calls.lock();
             calls.reads.push(nodes.to_vec());
+            calls.events.push("read".to_string());
             calls.reads.len() as u32
         };
         if let Some(status) = self.behaviour.lock().read_error {
@@ -167,17 +170,22 @@ impl UaConnection for Mock {
         config: &SubscriptionConfig,
         sink: mpsc::UnboundedSender<Notification>,
     ) -> Result<u32, StatusCode> {
-        self.calls.lock().subscriptions.push(config.clone());
+        let id = {
+            let mut calls = self.calls.lock();
+            calls.subscriptions.push(config.clone());
+            calls.events.push(format!("create {}", config.name));
+            calls.subscriptions.len() as u32
+        };
         if let Some(status) = self.behaviour.lock().subscription_error {
             return Err(status);
         }
         *self.sink.lock() = Some(sink);
-        Ok(7)
+        Ok(id)
     }
 
     async fn create_monitored_items(
         &self,
-        _subscription_id: u32,
+        subscription_id: u32,
         items: Vec<async_opcua::types::MonitoredItemCreateRequest>,
     ) -> Result<Vec<async_opcua::types::MonitoredItemCreateResult>, StatusCode> {
         let results = items
@@ -193,7 +201,9 @@ impl UaConnection for Mock {
                 ..Default::default()
             })
             .collect();
-        self.calls.lock().monitored.extend(items);
+        let mut calls = self.calls.lock();
+        calls.events.push(format!("monitor {subscription_id}"));
+        calls.monitored.extend(items);
         Ok(results)
     }
 
@@ -208,7 +218,7 @@ struct Names;
 
 impl opcua::link::NameResolver for Names {
     fn subscription_session(&self, name: &str) -> Option<String> {
-        (name == "subs").then(|| "sess".to_string())
+        matches!(name, "subs" | "early").then(|| "sess".to_string())
     }
     fn is_session(&self, name: &str) -> bool {
         name == "sess"
@@ -1152,6 +1162,63 @@ async fn a_monitored_item_carries_the_links_monitoring_parameters() {
         .clone();
     assert_eq!(filter.deadband_type, DeadbandType::Absolute as u32);
     assert_eq!(filter.deadband_value, 0.5);
+}
+
+/// The `ACTIVATED` arm creates every subscription, in name order, before the
+/// initial read, and adds their monitored items only after it
+/// (`SessionOpen62541.cpp:2493-2516`).
+#[tokio::test]
+async fn subscriptions_are_created_before_the_initial_read_and_monitor_after_it() {
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("subs ns=2;s=A", INPUT);
+    let (item1, _leaf1) = item("early ns=2;s=B", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.set_option("debug", "1").unwrap();
+
+    let sink = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs each test in its own process, so fd 1 is this
+    // test's alone.
+    let saved = unsafe {
+        let saved = libc::dup(1);
+        libc::dup2(std::os::fd::AsRawFd::as_raw_fd(sink.as_file()), 1);
+        saved
+    };
+    let handle = spawn(config, &mock, vec![item0, item1]);
+    for name in ["subs", "early"] {
+        let mut subscription = SubscriptionConfig::new(name, "sess");
+        subscription.debug = 1;
+        handle.subscriptions.lock().push(subscription);
+    }
+    until(|| mock.calls.lock().monitored.len() == 2).await;
+    // SAFETY: restoring what this test replaced.
+    unsafe {
+        libc::dup2(saved, 1);
+        libc::close(saved);
+    }
+
+    assert_eq!(
+        mock.calls.lock().events[..5],
+        [
+            "create early",
+            "create subs",
+            "read",
+            "monitor 1",
+            "monitor 2"
+        ]
+    );
+    let out = std::fs::read_to_string(sink.path()).unwrap();
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("triggering") || l.starts_with("Subscription "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "Session sess: triggering initial read for all 2 items",
+            "Subscription early@sess: created 1 monitored items (Good)",
+            "Subscription subs@sess: created 1 monitored items (Good)",
+        ]
+    );
 }
 
 /// C still runs `addMonitoredItems` for a subscription whose create failed, so

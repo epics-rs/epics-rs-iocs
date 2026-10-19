@@ -499,11 +499,6 @@ impl SessionWorker {
         }
     }
 
-    /// Bring the session up (`SessionOpen62541::connectionStatusChanged`, the
-    /// `ACTIVATED` arm at `SessionOpen62541.cpp:2440-2530`): learn the server's
-    /// limits and namespaces, rebuild the node ids, register the nodes, read
-    /// every item once, run the `bini=write` writes, then start the
-    /// subscriptions.
     fn autoconnect(&self) -> bool {
         self.handle.config.lock().autoconnect
     }
@@ -534,6 +529,11 @@ impl SessionWorker {
         self.handle.config.lock().debug
     }
 
+    /// Bring the session up (`SessionOpen62541::connectionStatusChanged`, the
+    /// `ACTIVATED` arm at `SessionOpen62541.cpp:2424-2517`): learn the server's
+    /// limits and namespaces, rebuild the node ids, register the nodes, create
+    /// the subscriptions, read every item once, run the `bini=write` writes,
+    /// then add the monitored items.
     async fn connect(&mut self) -> Result<(), String> {
         let config = self.handle.config.lock().clone();
         let identity = config.setup_identity();
@@ -551,8 +551,16 @@ impl SessionWorker {
 
         self.rebuild_node_ids();
         self.register_nodes(&connection).await;
+        let subscriptions = self.create_subscriptions(&connection).await;
 
         let items = self.handle.items.lock().clone();
+        if config.debug > 0 {
+            println!(
+                "Session {}: triggering initial read for all {} items",
+                self.handle.name,
+                items.len()
+            );
+        }
         for item in &items {
             let mut item = item.lock();
             item.type_tree = type_tree.clone();
@@ -573,7 +581,7 @@ impl SessionWorker {
         }
         *self.handle.status.lock() = ConnectionStatus::Up;
 
-        self.start_subscriptions(&connection).await;
+        self.add_monitored_items(&connection, &subscriptions).await;
         Ok(())
     }
 
@@ -1016,15 +1024,21 @@ impl SessionWorker {
         }
     }
 
-    /// Create every subscription and its monitored items
-    /// (`SubscriptionOpen62541::create` / `addMonitoredItems`).
-    async fn start_subscriptions(&mut self, connection: &Arc<dyn UaConnection>) {
-        let subscriptions = self.handle.subscriptions.lock().clone();
+    /// `createAllSubscriptions`: every subscription, in name order (the C keeps
+    /// them in a `std::map`), each with the server's id or `None` when refused
+    /// (`SubscriptionOpen62541::create`).
+    async fn create_subscriptions(
+        &mut self,
+        connection: &Arc<dyn UaConnection>,
+    ) -> Vec<(SubscriptionConfig, Option<u32>)> {
+        let mut subscriptions = self.handle.subscriptions.lock().clone();
+        subscriptions.sort_by(|a, b| a.name.cmp(&b.name));
         let items = self.handle.items.lock().clone();
 
-        for config in &subscriptions {
+        let mut created = Vec::with_capacity(subscriptions.len());
+        for config in subscriptions {
             let (tx, rx) = mpsc::unbounded_channel();
-            let id = match connection.create_subscription(config, tx).await {
+            let id = match connection.create_subscription(&config, tx).await {
                 Ok(id) => {
                     if config.debug > 0 {
                         errlog_vprintf(format_args!(
@@ -1045,6 +1059,36 @@ impl SessionWorker {
                 }
             };
 
+            if id.is_some() {
+                // One dispatcher task per subscription: every value the server
+                // pushes goes to the item its client handle names.
+                let items = items.clone();
+                tokio::spawn(async move {
+                    let mut rx = rx;
+                    while let Some(notification) = rx.recv().await {
+                        if let Some(item) = items.get(notification.client_handle as usize) {
+                            item.lock()
+                                .set_incoming_data(notification.value, ProcessReason::IncomingData);
+                        }
+                    }
+                });
+            }
+            created.push((config, id));
+        }
+        created
+    }
+
+    /// `addAllMonitoredItems`: each subscription's monitored items, in the order
+    /// [`Self::create_subscriptions`] made them
+    /// (`SubscriptionOpen62541::addMonitoredItems`).
+    async fn add_monitored_items(
+        &mut self,
+        connection: &Arc<dyn UaConnection>,
+        subscriptions: &[(SubscriptionConfig, Option<u32>)],
+    ) {
+        let items = self.handle.items.lock().clone();
+        for (config, id) in subscriptions {
+            let id = *id;
             let monitored: Vec<Arc<Mutex<Item>>> = items
                 .iter()
                 .filter(|item| {
@@ -1118,22 +1162,6 @@ impl SessionWorker {
                     );
                 }
             }
-
-            if id.is_none() {
-                continue;
-            }
-            // One dispatcher task per subscription: every value the server pushes
-            // goes to the item its client handle names.
-            let items = items.clone();
-            tokio::spawn(async move {
-                let mut rx = rx;
-                while let Some(notification) = rx.recv().await {
-                    if let Some(item) = items.get(notification.client_handle as usize) {
-                        item.lock()
-                            .set_incoming_data(notification.value, ProcessReason::IncomingData);
-                    }
-                }
-            });
         }
     }
 
