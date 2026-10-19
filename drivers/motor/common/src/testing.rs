@@ -260,20 +260,14 @@ pub async fn drvsup_init() {
     off_runtime(|| init_hook_announce(InitHookState::AfterInitDrvSup)).await;
 }
 
-/// The errlog lines of iocInit from drvSup init through record init, with
-/// the motor records of `db` loaded: what C's console shows for the cards
-/// and their records.
-pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
-    use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+/// iocInit's record init over the motor records of `db`, past
+/// [`drvsup_init`]: the database, for what init took from the cards.
+pub async fn record_init(db: &str) -> Arc<epics_rs::base::server::database::PvDatabase> {
     use epics_rs::base::server::ioc_builder::IocBuilder;
     use epics_rs::motor::devices::{device_support_factory, devices};
 
-    let lines = Arc::new(Mutex::new(Vec::new()));
-    let sink = lines.clone();
-    let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
-    drvsup_init().await;
     let (name, factory) = epics_rs::motor::motor_record_factory();
-    let _db = IocBuilder::new()
+    let (db, _) = IocBuilder::new()
         .register_record_type(name, factory)
         .register_dynamic_device_support(&devices(), device_support_factory())
         .db_string(db, &std::collections::HashMap::new())
@@ -281,6 +275,19 @@ pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
         .build()
         .await
         .unwrap();
+    db
+}
+
+/// The errlog lines of iocInit from drvSup init through record init over
+/// `db`: what C's console shows for the cards and their records.
+pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
+    use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
+    drvsup_init().await;
+    let _db = record_init(db).await;
     errlog_flush();
     errlog_remove_listener(id);
     lines.lock().unwrap().clone()

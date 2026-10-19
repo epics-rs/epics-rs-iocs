@@ -421,10 +421,9 @@ mod tests {
         assert!(inits.lock().unwrap().is_empty(), "Config talks to no card");
         init_hook_announce(InitHookState::AfterInitDrvSup);
         assert_eq!(*inits.lock().unwrap(), [0, 1], "motor_init, in card order");
-        assert_eq!(
-            *log.lock().unwrap(),
-            [0, 1],
-            "drvSup init's startup pass over the axes motor_init found"
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "motor_task has no startup pass; each driver's motor_init reads"
         );
         assert!(TASK.config(2, |_| {}).is_err());
     }
