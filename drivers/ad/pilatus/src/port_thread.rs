@@ -429,18 +429,16 @@ mod tests {
         }
     }
 
-    /// A detector on a fresh [`ScriptedCamserver`]; its ADStatus posts land
-    /// in the same log as `ADStatus=<v>`.
-    fn rig(name: &str, reply: fn(&str) -> String) -> (PilatusDriver, Log) {
-        let cam = format!("{name}_CAM");
+    /// Registers a [`ScriptedCamserver`] as `cam` and returns its log.
+    fn scripted_camserver(cam: &str, reply: fn(&str) -> String) -> Log {
         let log = Log::default();
         std::mem::forget(
             PortManager::new()
                 .register_port(
-                    claim_port_driver(&cam).unwrap(),
+                    claim_port_driver(cam).unwrap(),
                     ScriptedCamserver {
                         base: PortDriverBase::new(
-                            &cam,
+                            cam,
                             1,
                             PortFlags::default(),
                             InterfaceMask::UNMIGRATED_ALL,
@@ -454,6 +452,14 @@ mod tests {
                 )
                 .unwrap(),
         );
+        log
+    }
+
+    /// A detector on a fresh [`ScriptedCamserver`]; its ADStatus posts land
+    /// in the same log as `ADStatus=<v>`.
+    fn rig(name: &str, reply: fn(&str) -> String) -> (PilatusDriver, Log) {
+        let cam = format!("{name}_CAM");
+        let log = scripted_camserver(&cam, reply);
         let (flat_field_tx, flat_field_rx) = rt::command_channel::<FlatFieldJob>(1);
         std::mem::forget(flat_field_rx);
         let mut det = PilatusDriver::new(
@@ -651,5 +657,58 @@ mod tests {
                 .unwrap(),
             b"Acquisition aborted"
         );
+    }
+
+    /// pilatusDetector.cpp:1304-1330: only the first pilatusStatus reads
+    /// `version`; every one reads `thread`.
+    #[test]
+    fn pilatus_status_reads_the_version_once() {
+        let (mut det, log) = rig("PILATUS_STATUS_VERSION", |cmd| match cmd {
+            "version" => "15 OK Code release: 7.9.0".into(),
+            _ => "15 OK".into(),
+        });
+        let reason = det.ad.params.read_status;
+        det.write_int32(&mut AsynUser::new(reason), 1).unwrap();
+        det.write_int32(&mut AsynUser::new(reason), 1).unwrap();
+        assert_eq!(commands(&log), ["version", "thread", "thread"]);
+        assert_eq!(det.version, (7, 9, 0));
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_string_param(det.p.tvx_version, 0)
+                .unwrap(),
+            b"7.9.0"
+        );
+    }
+
+    /// pilatusDetector.cpp:1429-1431: ReadStatus is ignored while acquiring.
+    #[test]
+    fn read_status_while_acquiring_sends_nothing() {
+        let (mut det, log) = rig("PILATUS_STATUS_ACQUIRING", ok);
+        let ad = det.ad.params;
+        det.ad
+            .port_base
+            .set_i32(ad.status, ADStatus::Acquire as i32);
+        det.write_int32(&mut AsynUser::new(ad.read_status), 1)
+            .unwrap();
+        assert!(commands(&log).is_empty(), "{:?}", log.lock());
+    }
+
+    /// pilatusDetector.cpp:1834-1837: the constructor calls pilatusStatus once.
+    #[test]
+    fn the_constructor_reads_the_status_once() {
+        use epics_rs::asyn::registry::claim_port;
+
+        let log = scripted_camserver("PILATUS_BOOT_CAM", ok);
+        let rt = crate::driver::create_pilatus_detector(
+            &claim_port("PILATUS_BOOT").unwrap(),
+            "PILATUS_BOOT_CAM",
+            8,
+            8,
+            0,
+        )
+        .expect("the detector port");
+        assert_eq!(commands(&log), ["version", "thread"]);
+        std::mem::forget(rt);
     }
 }
