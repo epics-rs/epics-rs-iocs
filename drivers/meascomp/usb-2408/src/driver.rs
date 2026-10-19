@@ -189,6 +189,18 @@ pub struct MultiFunctionDriver {
     board: BoardInfo,
 }
 
+/// drvMultiFunction.cpp:817-820.
+const MULTIFUNCTION_INTERRUPTS: InterfaceMask = InterfaceMask::UINT32_DIGITAL
+    .or(InterfaceMask::INT32)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::FLOAT32_ARRAY)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::ENUM);
+const MULTIFUNCTION_INTERFACES: InterfaceMask =
+    MULTIFUNCTION_INTERRUPTS.or(InterfaceMask::DRV_USER);
+
 impl MultiFunctionDriver {
     pub fn new(
         port_name: &str,
@@ -205,8 +217,8 @@ impl MultiFunctionDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            MULTIFUNCTION_INTERFACES,
+            MULTIFUNCTION_INTERRUPTS,
         );
         let params = MultiFunctionParams::create(&mut base)?;
 
@@ -1207,6 +1219,25 @@ mod tests {
         let drv = MultiFunctionDriver::new("MFFLAGS", DaqDevice::unconnected(), 16, 16).unwrap();
         assert!(drv.base.flags.multi_device);
         assert!(drv.base.flags.can_block);
+    }
+
+    #[test]
+    fn the_port_carries_cs_interface_and_interrupt_masks() {
+        use InterfaceMask as I;
+        let drv = MultiFunctionDriver::new("MFMASKS", DaqDevice::unconnected(), 16, 16).unwrap();
+        let interrupts = I::UINT32_DIGITAL
+            | I::INT32
+            | I::INT32_ARRAY
+            | I::FLOAT32_ARRAY
+            | I::FLOAT64
+            | I::FLOAT64_ARRAY
+            | I::OCTET
+            | I::ENUM;
+        assert_eq!(drv.base.interrupt_mask(), interrupts);
+        assert_eq!(
+            drv.base.interface_mask(),
+            interrupts | I::DRV_USER | I::COMMON
+        );
     }
 
     #[test]
