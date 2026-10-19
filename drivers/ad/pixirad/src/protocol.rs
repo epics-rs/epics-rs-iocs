@@ -115,16 +115,38 @@ pub fn reply_is_ok(command: &str, reply: &str) -> bool {
 }
 
 /// `DETECTOR <serial> FRMW_VER: <version>` → (serial, version), each present
-/// as far as C's `sscanf` got before the reply stopped matching.
+/// as far as C's `sscanf(fromServer_, "DETECTOR %s FRMW_VER: %s")` got
+/// before the reply stopped matching.
 pub fn parse_firmware_version(reply: &str) -> (Option<String>, Option<String>) {
-    let mut tokens = reply.split_whitespace();
-    let serial = match (tokens.next(), tokens.next()) {
-        (Some("DETECTOR"), Some(serial)) => serial.to_string(),
-        _ => return (None, None),
+    // C `isspace` in the "C" locale.
+    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
+    // `%s ` : skip blanks, take the longest non-blank run (not empty), then the
+    // format blank after it.
+    let word = |rest: &mut &str| {
+        let s = rest.trim_start_matches(is_space);
+        let end = s.find(is_space).unwrap_or(s.len());
+        *rest = s[end..].trim_start_matches(is_space);
+        (end > 0).then(|| s[..end].to_string())
     };
-    let version = match (tokens.next(), tokens.next()) {
-        (Some("FRMW_VER:"), Some(version)) => Some(version.to_string()),
-        _ => None,
+    // A literal matches as written; a blank after it matches none or more.
+    let literal = |rest: &mut &str, text: &str| match rest.strip_prefix(text) {
+        Some(s) => {
+            *rest = s.trim_start_matches(is_space);
+            true
+        }
+        None => false,
+    };
+    let mut rest = reply;
+    if !literal(&mut rest, "DETECTOR") {
+        return (None, None);
+    }
+    let Some(serial) = word(&mut rest) else {
+        return (None, None);
+    };
+    let version = if literal(&mut rest, "FRMW_VER:") {
+        word(&mut rest)
+    } else {
+        None
     };
     (Some(serial), version)
 }
@@ -249,6 +271,43 @@ mod tests {
             (Some("PX8-007".to_string()), None)
         );
         assert_eq!(parse_firmware_version("nonsense"), (None, None));
+    }
+
+    /// The edges of C's `sscanf(fromServer_, "DETECTOR %s FRMW_VER: %s")`:
+    /// a literal does not skip leading space, a format blank matches none or
+    /// more, and only `isspace` separates.
+    #[test]
+    fn firmware_version_follows_sscanf() {
+        let both = |s: &str, v: &str| (Some(s.to_string()), Some(v.to_string()));
+        assert_eq!(
+            parse_firmware_version(" DETECTOR PX8 FRMW_VER: 3"),
+            (None, None)
+        );
+        assert_eq!(
+            parse_firmware_version("DETECTORPX8 FRMW_VER: 3"),
+            both("PX8", "3")
+        );
+        assert_eq!(
+            parse_firmware_version("DETECTOR PX8 FRMW_VER:3"),
+            both("PX8", "3")
+        );
+        assert_eq!(
+            parse_firmware_version("DETECTOR PX8FRMW_VER: 3"),
+            (Some("PX8FRMW_VER:".into()), None)
+        );
+        assert_eq!(
+            parse_firmware_version("DETECTOR\x0bPX8\x0bFRMW_VER:\x0b3"),
+            both("PX8", "3")
+        );
+        assert_eq!(
+            parse_firmware_version("DETECTOR PX8\u{a0}1 FRMW_VER: 3"),
+            both("PX8\u{a0}1", "3")
+        );
+        assert_eq!(
+            parse_firmware_version("DETECTOR PX8 FRMW_VERS 3"),
+            (Some("PX8".into()), None)
+        );
+        assert_eq!(parse_firmware_version("DETECTOR "), (None, None));
     }
 
     #[test]
