@@ -16,9 +16,9 @@ epicsEnvSet("NCHANS", "1280")
 epicsEnvSet("MYTHENIP", "192.168.0.90:1030 UDP")
 epicsEnvSet("EPICS_CA_MAX_ARRAY_BYTES", "64008")
 
-# The socket to the detector. noProcessEos=1 and an output EOS of CR: the
-# detector's replies are binary (no input EOS to look for), and every command
-# is terminated with a CR.
+# The socket to the detector. The replies are binary, so noProcessEos=1; with
+# no EOS layer the output EOS below fails ("setOutputEos not implemented"), as
+# in C's iocMythen st.cmd, and commands go out with no terminator.
 drvAsynIPPortConfigure("IP_M1K", "$(MYTHENIP)", 0, 0, 1)
 asynOctetSetOutputEos("IP_M1K", 0, "\r")
 
