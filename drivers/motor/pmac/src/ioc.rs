@@ -1012,13 +1012,6 @@ mod tests {
         drop(rt);
     }
 
-    /// pmacAxis.cpp:94-100: a failed initial status read still calls back.
-    #[test]
-    fn the_axis_constructor_calls_param_callbacks() {
-        let controller = Arc::new(Mutex::new(controller_on("pmacNoSuchPort")));
-        assert!(PmacAxis::new(controller, 1).constructor_calls_param_callbacks());
-    }
-
     #[test]
     fn a_missing_low_level_port_leaves_a_controller_whose_commands_fail() {
         // C keeps the unconnected user; only a refused EOS set clears it.

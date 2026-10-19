@@ -164,8 +164,6 @@ pub struct Nf874xAxis {
     /// `limitChecking_`: off when both limit inputs read active, which is a
     /// stage with no limit switches (8410 rotary).
     limit_checking: bool,
-    /// The controller's `hasClosedLoopSupport_` when the axis was built.
-    has_closed_loop_support: bool,
     status: MotorStatus,
     /// The soft limits the last poll read, for [`AsynMotor::take_port_sets`].
     sets: PortSets,
@@ -186,7 +184,6 @@ impl Nf874xAxis {
             last_direction: false,
             encoder_position: 0.0,
             limit_checking: false,
-            has_closed_loop_support: closed_loop,
             sets: PortSets::default(),
             status: MotorStatus::default(),
         };
@@ -280,15 +277,14 @@ impl Nf874xAxis {
 }
 
 impl AsynMotor for Nf874xAxis {
-    /// The C constructor calls `callParamCallbacks` only on a controller
-    /// with closed-loop support (874xMotorDriver.cpp:240-254).
-    fn constructor_calls_param_callbacks(&self) -> bool {
-        self.has_closed_loop_support
-    }
-
     /// C `poll`'s `skip` label sets only `motorStatusProblem_`.
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM
+    }
+
+    /// Only the 8743-CL branch calls back (874xMotorDriver.cpp:241-253).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        lock(&self.controller).closed_loop
     }
 
     fn move_absolute(
@@ -584,6 +580,14 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn only_an_8743_cl_axis_constructor_calls_back() {
+        for closed_loop in [false, true] {
+            let axis = Nf874xAxis::new(Arc::new(Mutex::new(controller(closed_loop))), 1);
+            assert_eq!(axis.constructor_calls_param_callbacks(), closed_loop);
+        }
+    }
+
     fn controller(closed_loop: bool) -> Nf874xController {
         Nf874xController {
             handle: None,
@@ -601,14 +605,6 @@ mod tests {
         assert_eq!(closed.axis_name(2), "2");
         assert_eq!(closed.axis_name(3), "2>1");
         assert_eq!(closed.axis_name(6), "3>2");
-    }
-
-    /// 874xMotorDriver.cpp:240-254.
-    #[test]
-    fn only_a_closed_loop_constructor_calls_param_callbacks() {
-        let built = |closed_loop| Nf874xAxis::new(Arc::new(Mutex::new(controller(closed_loop))), 1);
-        assert!(built(true).constructor_calls_param_callbacks());
-        assert!(!built(false).constructor_calls_param_callbacks());
     }
 
     #[test]

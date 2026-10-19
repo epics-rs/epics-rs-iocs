@@ -287,16 +287,15 @@ impl PmacAxis {
 }
 
 impl AsynMotor for PmacAxis {
-    /// The C constructor calls `callParamCallbacks` whether or not
-    /// `getAxisInitialStatus` succeeded (pmacAxis.cpp:94-100).
-    fn constructor_calls_param_callbacks(&self) -> bool {
-        true
-    }
-
     /// C `pmacAxis::getAxisStatus` sets no status bit on a failed read; the
     /// failure goes to the controller's `PMAC_C_COMMSERROR`.
     fn poll_failure(&self) -> PollFailure {
         PollFailure::NONE
+    }
+
+    /// pmacAxis.cpp:100.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
     }
 
     fn take_port_sets(&mut self) -> PortSets {
@@ -634,6 +633,13 @@ fn decode_axis_status(status1: u32, status2: u32, deferred: bool) -> AxisFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_constructor_calls_back() {
+        let controller = PmacController::new("pmacCallback", "pmacCallbackLow", 0, None);
+        let axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
+        assert!(axis.constructor_calls_param_callbacks());
+    }
 
     #[test]
     fn speed_preamble_matches_c_format() {

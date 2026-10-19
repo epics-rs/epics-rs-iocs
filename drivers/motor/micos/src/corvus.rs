@@ -258,15 +258,15 @@ impl CorvusAxis {
 }
 
 impl AsynMotor for CorvusAxis {
-    /// The C constructor ends in `callParamCallbacks` (SMCcorvusDriver.cpp:185).
-    fn constructor_calls_param_callbacks(&self) -> bool {
-        true
-    }
-
     /// C `SMCcorvusAxis::poll`'s `skip` label sets only `motorStatusProblem_`
     /// (SMCcorvusDriver.cpp).
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM
+    }
+
+    /// SMCcorvusDriver.cpp:185.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
     }
 
     fn move_absolute(
@@ -442,12 +442,11 @@ impl CorvusAxis {
 mod tests {
     use super::*;
 
-    /// SMCcorvusDriver.cpp:185.
     #[test]
-    fn the_constructor_calls_param_callbacks() {
+    fn the_constructor_calls_back() {
         use epics_rs::asyn::interfaces::InterfaceType;
         let (handle, _) = SyncIOHandle::connect_port(
-            "CORVUS_DEAD",
+            "CORVUS_CALLBACK",
             0,
             std::time::Duration::ZERO,
             InterfaceType::Octet,

@@ -441,15 +441,15 @@ impl AcrAxis {
 }
 
 impl AsynMotor for AcrAxis {
-    /// The C constructor ends in `callParamCallbacks` (ACRMotorDriver.cpp:307).
-    fn constructor_calls_param_callbacks(&self) -> bool {
-        true
-    }
-
     /// C `ACRAxis::poll`'s `skip` label sets only `motorStatusProblem_`
     /// (ACRMotorDriver.cpp).
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM
+    }
+
+    /// ACRMotorDriver.cpp:307.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
     }
 
     fn move_absolute(
@@ -602,11 +602,10 @@ mod tests {
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
-    /// ACRMotorDriver.cpp:307.
     #[test]
-    fn the_constructor_calls_param_callbacks() {
+    fn the_constructor_calls_back() {
         let (handle, _) = SyncIOHandle::connect_port(
-            "ACR_NONE",
+            "ACR_CALLBACK",
             0,
             std::time::Duration::ZERO,
             InterfaceType::Octet,
