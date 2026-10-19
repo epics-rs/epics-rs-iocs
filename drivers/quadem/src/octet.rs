@@ -340,6 +340,14 @@ pub(crate) mod tests {
             InterfaceMask::UNMIGRATED_ALL,
             InterfaceMask::UNMIGRATED_INTERRUPTS,
         ));
+        published_port(name, driver)
+    }
+
+    /// `driver` registered as port `name`, and a 100 ms user on it.
+    pub(crate) fn published_port(
+        name: &str,
+        driver: impl PortDriver + 'static,
+    ) -> (OctetIo, PortRuntimeHandle) {
         let claim = claim_port(name).unwrap();
         let (runtime, _actor) =
             create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
