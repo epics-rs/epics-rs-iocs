@@ -280,7 +280,11 @@ impl ConfigDriver {
 
     fn execute(&self, out: &str) -> AsynResult<Vec<u8>> {
         self.write_frame(out)?;
-        self.handle.read_octet(TRANSPORT_REASON, REPLY_BUF_SIZE)
+        let (reply, status) = self
+            .handle
+            .read_octet(TRANSPORT_REASON, REPLY_BUF_SIZE)
+            .into_parts();
+        status.map(|()| reply)
     }
 
     fn wire_err(e: wire::ParseError) -> AsynError {
@@ -515,7 +519,11 @@ impl PortDriver for ConfigDriver {
                 Command::GrabWelcomeText => {
                     // No `out` clause upstream -- a pure "read whatever line
                     // is waiting" primitive, no write first.
-                    let reply = self.handle.read_octet(TRANSPORT_REASON, REPLY_BUF_SIZE)?;
+                    let (reply, status) = self
+                        .handle
+                        .read_octet(TRANSPORT_REASON, REPLY_BUF_SIZE)
+                        .into_parts();
+                    status?;
                     wire::parse_welcome_text(&reply).map_err(Self::wire_err)?
                 }
                 Command::QueryVer => {

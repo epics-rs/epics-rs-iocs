@@ -145,7 +145,8 @@ impl Pm500Controller {
     }
 
     fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd, READ_BUF)?;
+        let (raw, status) = self.handle.write_read(0, cmd, READ_BUF).into_parts();
+        status?;
         let reply = String::from_utf8_lossy(&raw).into_owned();
         if reply.starts_with("SE") {
             errlog_message("recv_mess(): PM500 system error.\n");

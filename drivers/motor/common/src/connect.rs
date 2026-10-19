@@ -240,7 +240,7 @@ mod tests {
             format_args!("cannot connect"),
         );
         assert!(status.is_err());
-        let e = handle.write_read(0, b"?", 16).unwrap_err();
+        let e = handle.write_read(0, b"?", 16).into_parts().1.unwrap_err();
         assert_eq!(e.message(), "asynManager::queueLockPort not connected");
     }
 

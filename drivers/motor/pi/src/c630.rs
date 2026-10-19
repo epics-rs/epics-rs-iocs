@@ -212,8 +212,8 @@ impl PIC630Controller {
     /// into `""` (C `recv_mess`'s `if (nread < 1) com[0] = '\0'`). The C-630
     /// does *not* strip an extra trailing byte (unlike the C-862).
     fn recv(&self) -> String {
-        match self.handle.read_octet(0, READ_BUF) {
-            Ok(raw) if !raw.is_empty() => String::from_utf8_lossy(&raw).into_owned(),
+        match self.handle.read_octet(0, READ_BUF).into_parts() {
+            (raw, Ok(())) if !raw.is_empty() => String::from_utf8_lossy(&raw).into_owned(),
             _ => String::new(),
         }
     }

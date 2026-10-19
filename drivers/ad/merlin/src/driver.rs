@@ -93,6 +93,9 @@ impl MerlinDetector {
             InterfaceMask::UNMIGRATED_SUBCLASS,
             InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
         )?;
+        // C sends this once ADDriver exists but before its own parameters
+        // do, so a restarted IOC never inherits a running acquisition.
+        let _ = cmd.command(&mut ad, MPXCMD_STOPACQUISITION, default_timeout());
         // A refusal leaves C's pointer NULL; the pool has printed its line.
         let _flat_field = ad
             .pool
@@ -162,7 +165,10 @@ impl MerlinDetector {
         self.get_threshold()?;
 
         // C read SOFTWAREVERSION into a local and threw it away.
-        if let Ok(version) = self.cmd.get(MPXVAR_GETSOFTWAREVERSION, default_timeout()) {
+        if let Ok(version) =
+            self.cmd
+                .get(&mut self.ad, MPXVAR_GETSOFTWAREVERSION, default_timeout())
+        {
             let base = &mut self.ad.port_base;
             base.set_string_param(self.ad.params.base.sdk_version, 0, version)?;
         }
@@ -268,7 +274,10 @@ impl MerlinDetector {
 
         // The server may lengthen the period to fit the readout time; take its
         // value back. C tested a stale `status` here instead of this GET's.
-        if let Some(period) = self.cmd.get_f64(MPXVAR_ACQUISITIONPERIOD, timeout) {
+        if let Some(period) = self
+            .cmd
+            .get_f64(&mut self.ad, MPXVAR_ACQUISITIONPERIOD, timeout)
+        {
             self.ad.port_base.set_float64_param(
                 self.ad.params.acquire_period,
                 0,
@@ -327,13 +336,16 @@ impl MerlinDetector {
         }
         let timeout = default_timeout();
         for (i, name) in MPXVAR_THRESHOLD.iter().enumerate() {
-            if let Some(v) = self.cmd.get_f64(name, timeout) {
+            if let Some(v) = self.cmd.get_f64(&mut self.ad, name, timeout) {
                 self.ad
                     .port_base
                     .set_float64_param(self.params.thresholds[i], 0, v)?;
             }
         }
-        if let Some(v) = self.cmd.get_f64(MPXVAR_OPERATINGENERGY, timeout) {
+        if let Some(v) = self
+            .cmd
+            .get_f64(&mut self.ad, MPXVAR_OPERATINGENERGY, timeout)
+        {
             self.ad
                 .port_base
                 .set_float64_param(self.params.operating_energy, 0, v)?;
@@ -364,11 +376,11 @@ impl MerlinDetector {
             (MPXVAR_THSTEP, self.params.step_threshold_scan),
             (MPXVAR_THSTOP, self.params.stop_threshold_scan),
         ] {
-            if let Some(v) = self.cmd.get_f64(name, timeout) {
+            if let Some(v) = self.cmd.get_f64(&mut self.ad, name, timeout) {
                 self.ad.port_base.set_float64_param(reason, 0, v)?;
             }
         }
-        if let Some(v) = self.cmd.get_i32(MPXVAR_THSSCAN, timeout) {
+        if let Some(v) = self.cmd.get_i32(&mut self.ad, MPXVAR_THSSCAN, timeout) {
             self.ad
                 .port_base
                 .set_int32_param(self.params.threshold_scan, 0, v)?;
@@ -401,12 +413,15 @@ impl MerlinDetector {
             self.try_set(MPXVAR_CONTINUOUSRW, &v.to_string());
         }
 
-        if let Some(v) = self.cmd.get_i32(MPXVAR_ENABLECOUNTER1, timeout) {
+        if let Some(v) = self
+            .cmd
+            .get_i32(&mut self.ad, MPXVAR_ENABLECOUNTER1, timeout)
+        {
             self.ad
                 .port_base
                 .set_int32_param(self.params.enable_counter1, 0, v)?;
         }
-        if let Some(v) = self.cmd.get_i32(MPXVAR_CONTINUOUSRW, timeout) {
+        if let Some(v) = self.cmd.get_i32(&mut self.ad, MPXVAR_CONTINUOUSRW, timeout) {
             self.ad
                 .port_base
                 .set_int32_param(self.params.continuous_rw, 0, v)?;
@@ -489,11 +504,12 @@ impl MerlinDetector {
             // C keeps the status of these two commands only.
             match image_mode {
                 MerlinImageMode::ThresholdScan => {
-                    self.cmd.command(MPXCMD_THSCAN, timeout)?;
+                    self.cmd.command(&mut self.ad, MPXCMD_THSCAN, timeout)?;
                 }
                 MerlinImageMode::BackgroundCalibrate => {
                     self.try_set(MPXVAR_BACKGROUNDCOUNT, &images_to_acquire.to_string());
-                    self.cmd.command(MPXCMD_BACKGROUNDACQUIRE, timeout)?;
+                    self.cmd
+                        .command(&mut self.ad, MPXCMD_BACKGROUNDACQUIRE, timeout)?;
                 }
                 _ => {
                     self.try_set(MPXVAR_NUMFRAMESTOACQUIRE, &images_to_acquire.to_string());
@@ -502,20 +518,22 @@ impl MerlinDetector {
                     } else {
                         MPXCMD_PROFILES
                     };
-                    let _ = self.cmd.command(cmd, timeout);
+                    let _ = self.cmd.command(&mut self.ad, cmd, timeout);
                 }
             }
         } else if value == 0 && status == ADStatus::Acquire as i32 {
             self.ad
                 .port_base
                 .set_int32_param(self.ad.params.status, 0, ADStatus::Idle as i32)?;
-            let _ = self.cmd.command(MPXCMD_STOPACQUISITION, timeout);
+            let _ = self
+                .cmd
+                .command(&mut self.ad, MPXCMD_STOPACQUISITION, timeout);
         }
         Ok(())
     }
 
-    fn try_set(&self, name: &str, value: &str) {
-        let _ = self.cmd.set(name, value, default_timeout());
+    fn try_set(&mut self, name: &str, value: &str) {
+        let _ = self.cmd.set(&mut self.ad, name, value, default_timeout());
     }
 }
 
@@ -542,7 +560,9 @@ impl PortDriver for MerlinDetector {
         let status = if reason == self.init_param {
             self.initialise()
         } else if reason == self.params.reset {
-            let _ = self.cmd.command(MPXCMD_RESET, default_timeout());
+            let _ = self
+                .cmd
+                .command(&mut self.ad, MPXCMD_RESET, default_timeout());
             // The Labview server cannot be reconnected to after a reset, so C
             // exits the IOC and relies on a supervisor to restart it. Keeping
             // the IOC up would leave every channel dead with no way back.
@@ -551,7 +571,9 @@ impl PortDriver for MerlinDetector {
         } else if reason == self.params.quad_merlin_mode {
             self.set_quad_mode(value)
         } else if reason == self.params.software_trigger {
-            let _ = self.cmd.command(MPXCMD_SOFTWARETRIGGER, default_timeout());
+            let _ = self
+                .cmd
+                .command(&mut self.ad, MPXCMD_SOFTWARETRIGGER, default_timeout());
             Ok(())
         } else if reason == self.ad.params.acquire {
             self.set_acquire(value)
@@ -627,7 +649,12 @@ impl PortDriver for MerlinDetector {
         let status = if let Some(name) = name {
             let set = self
                 .cmd
-                .set(name, &format!("{value:.6}"), default_timeout())
+                .set(
+                    &mut self.ad,
+                    name,
+                    &format!("{value:.6}"),
+                    default_timeout(),
+                )
                 .map_err(AsynError::from);
             let _ = self.get_threshold();
             set
@@ -736,10 +763,6 @@ pub fn create_merlin_detector(
     let cmd = MpxConnection::new(cmd_handle, MPX_MAXLINE);
     let data = MpxConnection::new(data_handle, det_type.max_frame_bytes());
 
-    // C sends this from the constructor, before the parameters exist, so a
-    // restarted IOC never inherits a running acquisition.
-    let _ = cmd.command(MPXCMD_STOPACQUISITION, default_timeout());
-
     let det = MerlinDetector::new(
         port_name,
         cmd,
@@ -785,6 +808,8 @@ mod tests {
     use epics_rs::ad_core::driver::ShutterMode;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+    use epics_rs::asyn::port::PortFlags;
     use epics_rs::asyn::registry::claim_port;
     use std::time::Duration;
 
@@ -1087,5 +1112,99 @@ mod tests {
         let (p, base) = (det.ad.params, &det.ad.port_base);
         assert_eq!(base.get_int32_param(p.max_size_x, 0).unwrap(), 512);
         assert_eq!(base.get_int32_param(p.max_size_y, 0).unwrap(), 512);
+    }
+
+    /// An MPX server that answers each command with a stray frame and then
+    /// the frame that echoes it.
+    struct MpxServer {
+        base: PortDriverBase,
+        pending: std::collections::VecDeque<u8>,
+    }
+
+    impl PortDriver for MpxServer {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let request = String::from_utf8_lossy(data);
+            let mut fields = request.splitn(4, ',').skip(2);
+            let (kind, name) = (fields.next().unwrap(), fields.next().unwrap());
+            let echo = match kind {
+                "GET" => format!("GET,{name},2.2,0"),
+                _ => format!("{kind},{name},0"),
+            };
+            for body in ["GET,STRAY,1,0".to_string(), echo] {
+                let frame = format!("MPX,{:010},{body}", body.len() + 1);
+                self.pending.extend(frame.bytes());
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            let n = buf.len().min(self.pending.len());
+            for (dst, src) in buf.iter_mut().zip(self.pending.drain(..n)) {
+                *dst = src;
+            }
+            OctetReadResult::ok(n, EomReason::CNT)
+        }
+    }
+
+    /// C `mpxWrite`/`mpxReadCmd` publish every command and every frame read
+    /// back, the constructor's STOPACQUISITION included.
+    #[test]
+    fn a_command_exchange_lands_on_string_to_and_from_server() {
+        let ip = "MERLIN_WIRE_CMD";
+        let server = MpxServer {
+            base: PortDriverBase::new(
+                ip,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
+            pending: Default::default(),
+        };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(ip).unwrap(), server, RuntimeConfig::default())
+                .unwrap();
+        let cmd = MpxConnection::new(
+            SyncIOHandle::from_handle(runtime.port_handle().clone(), 0, Duration::ZERO),
+            MPX_MAXLINE,
+        );
+        let mut det = MerlinDetector::new(
+            "MERLIN_WIRE",
+            cmd,
+            512,
+            512,
+            DetectorType::MerlinQuad,
+            1 << 20,
+            Arc::new(SharedState::new()),
+        )
+        .unwrap();
+        let wire = |det: &MerlinDetector| {
+            let base = &det.ad.port_base;
+            let to = base.get_string_param(det.ad.params.string_to_server, 0);
+            let from = base.get_string_param(det.ad.params.string_from_server, 0);
+            (to.unwrap().to_vec(), from.unwrap().to_vec())
+        };
+        let frame = |body: &str| format!("MPX,{:010},{body}", body.len() + 1).into_bytes();
+        let stop = crate::protocol::encode(MpxKind::Cmd, MPXCMD_STOPACQUISITION, None).unwrap();
+        let stop_ack = frame(&format!("CMD,{MPXCMD_STOPACQUISITION},0"));
+        assert_eq!(wire(&det), (stop.into_bytes(), stop_ack));
+
+        let version = det
+            .cmd
+            .get(
+                &mut det.ad,
+                MPXVAR_GETSOFTWAREVERSION,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(version, "2.2");
+        let get = crate::protocol::encode(MpxKind::Get, MPXVAR_GETSOFTWAREVERSION, None).unwrap();
+        let reply = frame(&format!("GET,{MPXVAR_GETSOFTWAREVERSION},2.2,0"));
+        assert_eq!(wire(&det), (get.into_bytes(), reply));
     }
 }

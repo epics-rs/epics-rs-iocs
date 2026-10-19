@@ -419,7 +419,9 @@ mod tests {
         });
         io.write_octet(0, b"POS? 1").unwrap();
         io.write_octet(0, b"\n").unwrap();
-        assert_eq!(io.read_octet(0, 64).unwrap(), b"1=0.5");
+        let (reply, status) = io.read_octet(0, 64).into_parts();
+        status.unwrap();
+        assert_eq!(reply, b"1=0.5");
         assert_eq!(rig.sent(), ["POS? 1", "\n"]);
     }
 

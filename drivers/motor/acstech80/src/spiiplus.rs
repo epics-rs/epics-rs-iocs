@@ -142,7 +142,8 @@ impl SpiiPlusController {
         let answered = (0..3).any(|_| {
             ctrl.handle
                 .write_read(0, b"?VR", READ_BUF)
-                .is_ok_and(|reply| !reply.is_empty())
+                .nbytes_transferred()
+                > 0
         });
         if !answered {
             return Err(spiiplus_err("SPiiPlus: no response to ?VR probe"));
@@ -190,7 +191,8 @@ impl SpiiPlusController {
     fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
         // C send_mess/send_recv_mess flush the input before every write;
         // write_read is that flush, write and read as one exchange.
-        let raw = self.handle.write_read(0, cmd, READ_BUF)?;
+        let (raw, status) = self.handle.write_read(0, cmd, READ_BUF).into_parts();
+        status?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }

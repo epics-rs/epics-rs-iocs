@@ -90,12 +90,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::error::OctetStep;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::claim_port;
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::asyn::trace::TraceMask;
@@ -341,26 +342,22 @@ impl RontecDriver {
     /// C `sendMessage` (`drvMcaRontec.c:581-604`): both lines are printed
     /// through the serial port's trace, as C prints them on `pPvt->pasynUser`.
     fn send_message(&self, output: &str) -> AsynResult<Vec<u8>> {
-        let result = self
+        let (input, result) = self
             .serial
-            .submit_blocking(
-                RequestOp::OctetWriteRead {
+            .submit_octet_read_blocking(
+                OctetReadOp::WriteRead {
                     data: output.as_bytes().to_vec(),
                     buf_size: RONTEC_MESSAGE_SIZE,
-                    flush: true,
                 },
                 self.octet_user(RONTEC_TIMEOUT),
             )
-            .map(|r| r.data.unwrap_or_default());
+            .into_parts();
         // A failed read still wrote the whole command; a failed write read
         // nothing. A bare error carries neither count.
-        let (input, status, nbytes_out): (&[u8], AsynStatus, usize) = match &result {
-            Ok(data) => (data, AsynStatus::Success, output.len()),
-            Err(e) => match (e.partial_read(), e.partial_write()) {
-                (Some(p), _) => (&p.data, e.status(), output.len()),
-                (None, Some(n)) => (&[], e.status(), n),
-                (None, None) => (&[], e.status(), 0),
-            },
+        let (status, nbytes_out) = match &result {
+            Ok(()) => (AsynStatus::Success, output.len()),
+            Err(e) if e.octet_step() == Some(OctetStep::Read) => (e.status(), output.len()),
+            Err(e) => (e.status(), e.partial_write().unwrap_or(0)),
         };
         self.serial.user_trace().print(
             self.addr,
@@ -371,7 +368,7 @@ impl RontecDriver {
             format_args!(
                 "drvMcaRontec::sendMessage: output={output}, output_len={} number sent={nbytes_out}\n                           input={}, input_len={RONTEC_MESSAGE_SIZE}, number_received={}\n",
                 output.len(),
-                CStr(input),
+                CStr(&input),
                 input.len()
             ),
         );
@@ -384,13 +381,13 @@ impl RontecDriver {
                 line!(),
                 format_args!(
                     "drvMcaRontec::sendMessage: error {}, status={}, nbytesOut={nbytes_out}, nbytesIn={}\n",
-                    CStr(input),
+                    CStr(&input),
                     status as i32,
                     input.len()
                 ),
             );
         }
-        result
+        result.map(|()| input)
     }
 
     /// C `int32ArrayRead` (`drvMcaRontec.c:436-478`), with the request
@@ -431,24 +428,22 @@ impl RontecDriver {
             RequestOp::SetInputEos { eos: Vec::new() },
             self.eos_user(SPECTRUM_TIMEOUT),
         );
-        let read_result = self.serial.submit_blocking(
-            RequestOp::OctetWriteRead {
-                data: message.into_bytes(),
-                buf_size: nread,
-                flush: true,
-            },
-            self.octet_user(SPECTRUM_TIMEOUT),
-        );
+        let (raw, _) = self
+            .serial
+            .submit_octet_read_blocking(
+                OctetReadOp::WriteRead {
+                    data: message.into_bytes(),
+                    buf_size: nread,
+                },
+                self.octet_user(SPECTRUM_TIMEOUT),
+            )
+            .into_parts();
         let _ = self.serial.submit_blocking(
             RequestOp::SetInputEos {
                 eos: self.input_eos.clone(),
             },
             self.eos_user(SPECTRUM_TIMEOUT),
         );
-        let raw = match &read_result {
-            Ok(r) => r.data.as_deref().unwrap_or_default(),
-            Err(e) => e.partial_read().map_or(&[][..], |p| &p.data),
-        };
         let nbytes_in = raw.len().min(nread);
         self.mca_buffer[..nbytes_in].copy_from_slice(&raw[..nbytes_in]);
         if nbytes_in != nread {
@@ -897,18 +892,13 @@ mod tests {
             Ok(data.len())
         }
 
-        /// No reply is a timeout, carried the way the EOS interpose carries
-        /// every failed read.
+        /// No reply is a timeout.
         fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
             if self.pending.is_empty() {
                 return Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "timeout".into(),
-                }
-                .with_partial_read(epics_rs::asyn::interpose::PartialOctetRead {
-                    data: Vec::new(),
-                    eom_reason: epics_rs::asyn::interpose::EomReason::empty(),
-                }));
+                });
             }
             let n = self.pending.len().min(buf.len());
             buf[..n].copy_from_slice(&self.pending[..n]);

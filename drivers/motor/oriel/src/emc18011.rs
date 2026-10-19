@@ -266,7 +266,8 @@ impl Emc18011Controller {
 
     /// [`command`](Self::command) for a record string's raw bytes.
     fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd, READ_BUF)?;
+        let (raw, status) = self.handle.write_read(0, cmd, READ_BUF).into_parts();
+        status?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }

@@ -89,10 +89,8 @@ pub fn connect_link(port_name: &str, io_port: &str, timeout: Duration) -> SyncIO
     }
     let (junk, _) =
         SyncIOHandle::connect_port(io_port, 0, Duration::from_secs(2), InterfaceType::Octet);
-    let got_junk = match junk.read_octet(0, 100) {
-        Ok(bytes) => bytes.len(),
-        Err(e) => e.partial_read().map_or(0, |p| p.data.len()),
-    };
+    // C counts what the read delivered whatever its status.
+    let got_junk = junk.read_octet(0, 100).nbytes_transferred();
     if got_junk > 0 {
         errlog_vprintf(format_args!(
             "SmarActMCSController({port_name}): WARNING - detected unexpected characters on \
@@ -259,7 +257,11 @@ impl McsController {
 
     /// Send a command and read back its reply (every MCS command replies).
     fn transact(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let (raw, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        status?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())
@@ -922,7 +924,7 @@ mod tests {
     #[test]
     fn a_missing_link_keeps_the_controller_and_its_axes() {
         let link = connect_link("MCS1", "mcsMissingLink", Duration::from_millis(10));
-        let e = link.write_read(0, b":GS0", 16).unwrap_err();
+        let e = link.write_read(0, b":GS0", 16).into_parts().1.unwrap_err();
         assert_eq!(e.message(), "asynManager::queueLockPort not connected");
         let controller = Arc::new(Mutex::new(McsController::new(link, false)));
         let (mut axis, probed) = McsAxis::new(controller.clone(), 1, 2);

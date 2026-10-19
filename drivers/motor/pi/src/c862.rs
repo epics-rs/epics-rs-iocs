@@ -146,6 +146,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
+use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -315,9 +316,9 @@ impl PIC862Controller {
     /// pre-strip byte count (C's `charcnt`), needed by callers that gate on
     /// it directly. Any transport failure or empty read folds into `("", 0)`,
     /// matching `recv_mess`'s swallow of a bad read into an empty string.
-    fn reply(read: AsynResult<Vec<u8>>) -> (String, usize) {
-        match read {
-            Ok(raw) if !raw.is_empty() => {
+    fn reply(read: OctetRead) -> (String, usize) {
+        match read.into_parts() {
+            (raw, Ok(())) if !raw.is_empty() => {
                 let stripped = &raw[..raw.len() - 1];
                 (String::from_utf8_lossy(stripped).into_owned(), raw.len())
             }

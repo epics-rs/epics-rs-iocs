@@ -15,7 +15,7 @@ use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
+use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::error::CaResult;
@@ -191,14 +191,15 @@ impl Job {
                 ex.send
             ),
         );
-        let read = port.call(
-            &RequestOp::OctetRead {
+        let read = port.octet_read(
+            OctetReadOp::Read {
                 buf_size: BUFFER_SIZE,
             },
             user(),
         );
-        let (data, eom) = match read {
-            Err(e) => {
+        let eom = read.eom().bits();
+        let data = match read.into_parts() {
+            (_, Err(e)) => {
                 ex.ok = false;
                 let status = e.c_status_code();
                 if status != ex.prev_read_status {
@@ -214,7 +215,7 @@ impl Job {
                 raise(&mut ex.alarm, READ_ALARM, AlarmSeverity::Invalid);
                 return;
             }
-            Ok(r) => {
+            (data, Ok(())) => {
                 ex.ok = true;
                 if ex.prev_read_status != 0 {
                     self.trace(
@@ -223,7 +224,7 @@ impl Job {
                     );
                     ex.prev_read_status = 0;
                 }
-                (r.data.unwrap_or_default(), r.eom_reason)
+                data
             }
         };
         if eom != EOM_EOS {

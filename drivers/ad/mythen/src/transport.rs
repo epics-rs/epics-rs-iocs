@@ -61,22 +61,20 @@ impl Transport {
         let mut reply = Vec::with_capacity(expect);
         while reply.len() < expect {
             let remaining = expect - reply.len();
-            match io.read_octet(0, remaining) {
-                Ok(bytes) if bytes.is_empty() => break,
-                Ok(bytes) => reply.extend_from_slice(&bytes),
+            match io.read_octet(0, remaining).into_parts() {
+                (bytes, Ok(())) if bytes.is_empty() => break,
+                (bytes, Ok(())) => reply.extend_from_slice(&bytes),
                 // A timeout with something already in hand is a short reply,
                 // which the caller has to see; with nothing in hand it is the
                 // detector not answering at all.
-                Err(e) if e.status() == AsynStatus::Timeout => {
-                    if let Some(p) = e.partial_read() {
-                        reply.extend_from_slice(&p.data);
-                    }
+                (bytes, Err(e)) if e.status() == AsynStatus::Timeout => {
+                    reply.extend_from_slice(&bytes);
                     if reply.is_empty() {
                         return Err(e);
                     }
                     break;
                 }
-                Err(e) => return Err(e),
+                (_, Err(e)) => return Err(e),
             }
             if Instant::now() >= deadline {
                 break;
@@ -140,7 +138,7 @@ fn short_reply(command: &str, got: usize) -> AsynError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+    use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
     use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -160,20 +158,15 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet_eom(
-            &mut self,
-            _user: &AsynUser,
-            buf: &mut [u8],
-        ) -> AsynResult<(usize, EomReason)> {
+        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             buf[..3].copy_from_slice(b"abc");
-            Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "read timeout".into(),
+            OctetReadResult {
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }),
+                ..OctetReadResult::ok(3, EomReason::empty())
             }
-            .with_partial_read(PartialOctetRead {
-                data: b"abc".to_vec(),
-                eom_reason: EomReason::empty(),
-            }))
         }
     }
 

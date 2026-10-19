@@ -42,7 +42,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
-use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::request::{OctetRead, ParamSetValue};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -817,21 +817,17 @@ impl StreamReader {
 
     /// One socket read. `false` when it timed out with nothing to show.
     fn fill(&mut self) -> AsynResult<bool> {
-        match self.io.read_binary(READ_CHUNK) {
-            Ok(outcome) => {
-                let got = !outcome.data.is_empty();
-                self.buf.extend(outcome.data);
-                Ok(got)
-            }
+        let (data, status) = self.io.read_binary(READ_CHUNK).into_parts();
+        match status {
             // C++ counts `nRead` whatever the status: a timeout that still
             // delivered bytes delivered them.
-            Err(e) if e.status() == AsynStatus::Timeout => {
-                let partial = e.partial_read().map_or(&[][..], |p| &p.data[..]);
-                self.buf.extend(partial);
-                Ok(!partial.is_empty())
-            }
-            Err(e) => Err(e),
+            Ok(()) => {}
+            Err(e) if e.status() == AsynStatus::Timeout => {}
+            Err(e) => return Err(e),
         }
+        let got = !data.is_empty();
+        self.buf.extend(data);
+        Ok(got)
     }
 
     /// The next byte, or `None` if the socket was idle for one timeout.
@@ -1081,14 +1077,40 @@ fn middle_data_iteration(ctx: &DataContext, reader: &mut StreamReader) -> AsynRe
     Ok(())
 }
 
+/// What one datagram read leaves [`direct_data_thread`] to do.
+#[derive(Debug, PartialEq)]
+enum Datagram {
+    Frame(Vec<u8>),
+    /// Nothing arrived within the read timeout: read again at once.
+    Idle,
+    /// The socket failed: back off before reading again.
+    Failed,
+}
+
+/// C++ reads its header `while (nRead != 2)` whatever the status, so bytes
+/// beside a timeout are a frame; a timeout with none is an idle line.
+fn datagram(read: OctetRead) -> Datagram {
+    match read.into_parts() {
+        (data, Ok(())) if data.is_empty() => Datagram::Idle,
+        (data, Ok(())) => Datagram::Frame(data),
+        (data, Err(e)) if e.status() == AsynStatus::Timeout => {
+            if data.is_empty() {
+                Datagram::Idle
+            } else {
+                Datagram::Frame(data)
+            }
+        }
+        (_, Err(_)) => Datagram::Failed,
+    }
+}
+
 /// C++ `drvT4UDirect_EM::dataReadThread`: one UDP datagram per frame.
 fn direct_data_thread(ctx: DataContext) {
     loop {
-        let datagram = match ctx.io.read_binary(proto::MAX_PACKET_SIZE) {
-            Ok(outcome) if outcome.data.is_empty() => continue,
-            Ok(outcome) => outcome.data,
-            Err(e) if e.status() == AsynStatus::Timeout => continue,
-            Err(_) => {
+        let datagram = match datagram(ctx.io.read_binary(proto::MAX_PACKET_SIZE)) {
+            Datagram::Frame(data) => data,
+            Datagram::Idle => continue,
+            Datagram::Failed => {
                 thread::sleep(ERROR_BACKOFF);
                 continue;
             }
@@ -1457,7 +1479,7 @@ fn build(spec: Build, cmd: CmdSink, claim: &PortClaim) -> AsynResult<T4uRuntime>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+    use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
     use epics_rs::asyn::port::{DrvUserRequest, InterfaceMask, PortFlags};
     use epics_rs::asyn::registry::claim_port;
 
@@ -1474,20 +1496,19 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet_eom(
-            &mut self,
-            _user: &AsynUser,
-            buf: &mut [u8],
-        ) -> AsynResult<(usize, EomReason)> {
+        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             buf[..3].copy_from_slice(b"abc");
-            Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "read timeout".into(),
+            OctetReadResult {
+                status: Err(timeout()),
+                ..OctetReadResult::ok(3, EomReason::empty())
             }
-            .with_partial_read(PartialOctetRead {
-                data: b"abc".to_vec(),
-                eom_reason: EomReason::empty(),
-            }))
+        }
+    }
+
+    fn timeout() -> AsynError {
+        AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
         }
     }
 
@@ -1619,5 +1640,23 @@ mod tests {
         let mut reader = StreamReader::new(io);
         assert!(reader.fill().unwrap());
         assert_eq!(reader.buf.iter().copied().collect::<Vec<_>>(), b"abc");
+    }
+
+    /// The direct meter's datagram read: an empty timeout is an idle line read
+    /// again at once, not the one-second backoff a socket failure takes.
+    #[test]
+    fn a_datagram_timeout_is_idle_and_any_other_failure_backs_off() {
+        let read = |data: &[u8], status| OctetRead::new(data.to_vec(), EomReason::empty(), status);
+        assert_eq!(datagram(read(b"", Err(timeout()))), Datagram::Idle);
+        assert_eq!(datagram(read(b"", Ok(()))), Datagram::Idle);
+        assert_eq!(
+            datagram(read(b"B\x01", Err(timeout()))),
+            Datagram::Frame(b"B\x01".to_vec())
+        );
+        let reset = AsynError::Status {
+            status: AsynStatus::Error,
+            message: "ECONNRESET".into(),
+        };
+        assert_eq!(datagram(read(b"", Err(reset))), Datagram::Failed);
     }
 }

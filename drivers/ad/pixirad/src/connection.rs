@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::{OctetRead, OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -39,8 +39,6 @@ impl std::fmt::Display for ServerError {
 
 impl From<AsynError> for ServerError {
     fn from(e: AsynError) -> Self {
-        // `status()` reads *through* a `PartialRead` carrier, so a timeout that
-        // returned partial bytes (EOS interpose installed) is still recognized.
         if e.status() == AsynStatus::Timeout {
             Self::Timeout
         } else {
@@ -102,35 +100,34 @@ impl PixiradServer {
     /// `GOT:` check).
     pub fn command(&mut self, command: &str) -> Exchange {
         let user = AsynUser::new(0).with_addr(0).with_timeout(SERVER_TIMEOUT);
-        let op = RequestOp::OctetWriteRead {
+        let op = OctetReadOp::WriteRead {
             data: command.as_bytes().to_vec(),
             buf_size: MAX_MESSAGE_SIZE,
-            flush: true,
         };
         let Channel {
             handle,
             from_server,
         } = &mut self.channel;
-        let outcome = handle
-            .port()
-            .and_then(|port| port.submit_blocking(op, user));
+        let (bytes, status) = match handle.port() {
+            Ok(port) => port.submit_octet_read_blocking(op, user),
+            Err(e) => OctetRead::failed(e),
+        }
+        .into_parts();
         // C prints both lines on `pasynUserCommand_`: the command port's trace
         // mask gates them.
         let trace_error = |message: &str| {
             handle.print(0, TraceMask::ERROR, format_args!("{message}"));
         };
 
-        match outcome {
+        match status {
             Err(e) => {
                 // asynOctetSyncIO writeRead leaves the buffer alone unless it
                 // got as far as the read, which follows a whole write and
                 // (EOS interpose) stores what arrived, terminated
                 // (asynInterposeEos.c:250).
                 let (wrote, read) = if e.octet_step() == Some(OctetStep::Read) {
-                    let partial = e.partial_read().map(|p| p.data.as_slice());
-                    let partial = partial.unwrap_or_default();
-                    *from_server = crate::protocol::c_string(partial).to_vec();
-                    (command.len(), partial.len())
+                    *from_server = crate::protocol::c_string(&bytes).to_vec();
+                    (command.len(), bytes.len())
                 } else {
                     (0, 0)
                 };
@@ -146,8 +143,7 @@ impl PixiradServer {
                     result: Err(e.into()),
                 }
             }
-            Ok(result) => {
-                let bytes = result.data.unwrap_or_default();
+            Ok(()) => {
                 let reply = crate::protocol::c_string(&bytes).to_vec();
                 from_server.clone_from(&reply);
                 let result = if crate::protocol::reply_is_ok(command, &reply) {
@@ -186,22 +182,13 @@ impl PixiradServer {
 #[cfg(test)]
 mod is_timeout_tests {
     use super::*;
-    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
 
-    /// A read that times out *after* transferring bytes arrives as
-    /// `AsynError::PartialRead` when the EOS interpose is installed (this
-    /// port's st.cmd uses `noProcessEos=0`). A bare `AsynError::Status`
-    /// match missed it and misclassified the timeout as a transport fault.
     #[test]
-    fn a_partial_read_wrapped_timeout_maps_to_timeout() {
+    fn a_timeout_maps_to_timeout() {
         let e = AsynError::Status {
             status: AsynStatus::Timeout,
             message: "read timeout".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: b"partial".to_vec(),
-            eom_reason: EomReason::empty(),
-        });
+        };
         assert!(matches!(ServerError::from(e), ServerError::Timeout));
     }
 
@@ -219,7 +206,7 @@ mod is_timeout_tests {
 mod from_server_tests {
     use super::*;
     use epics_rs::asyn::error::AsynResult;
-    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+    use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
     use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::claim_port;
@@ -258,22 +245,22 @@ mod from_server_tests {
             }
             Ok(data.len())
         }
-        fn io_read_octet_eom(
-            &mut self,
-            _user: &AsynUser,
-            buf: &mut [u8],
-        ) -> AsynResult<(usize, EomReason)> {
+        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             match self.exchange {
                 1 => {
                     let reply = b"GOT: OK \0x";
                     buf[..reply.len()].copy_from_slice(reply);
-                    Ok((reply.len(), EomReason::EOS))
+                    OctetReadResult::ok(reply.len(), EomReason::EOS)
                 }
-                3 => Err(timeout().with_partial_read(PartialOctetRead {
-                    data: b"GO \0x".to_vec(),
-                    eom_reason: EomReason::empty(),
-                })),
-                _ => Err(timeout()),
+                3 => {
+                    let partial = b"GO \0x";
+                    buf[..partial.len()].copy_from_slice(partial);
+                    OctetReadResult {
+                        status: Err(timeout()),
+                        ..OctetReadResult::ok(partial.len(), EomReason::empty())
+                    }
+                }
+                _ => OctetReadResult::failed(timeout()),
             }
         }
     }

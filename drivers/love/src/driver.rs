@@ -86,7 +86,7 @@ use epics_rs::asyn::port::{
     DpCells, DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags,
 };
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{PortCalls, RequestOp};
+use epics_rs::asyn::request::{OctetReadOp, PortCalls, RequestOp};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::{AsynUser, UserTrace};
 
@@ -242,28 +242,30 @@ impl Command {
             caller_print!(t, IO_FILTER, "drvLove::executeCommand write \"{frame}\"\n");
 
             caller_print!(t, FLOW, "drvLove::recvReplay\n");
-            let read = RequestOp::OctetRead {
-                buf_size: REPLY_BUF_SIZE,
-            };
-            let raw = match calls.call(&read, self.serial_user()) {
-                Ok(result) => {
-                    let raw = result.data.unwrap_or_default();
-                    if EomReason::from_bits_truncate(result.eom_reason) != EomReason::EOS {
+            let read = calls.octet_read(
+                OctetReadOp::Read {
+                    buf_size: REPLY_BUF_SIZE,
+                },
+                self.serial_user(),
+            );
+            let eom = read.eom();
+            let raw = match read.into_parts() {
+                (raw, Ok(())) => {
+                    if eom != EomReason::EOS {
                         caller_print!(t, ERROR, "drvLove::recvReply eos failure\n");
                         self.trace_read_failure(&raw);
                         return Err(protocol_error("recvReply eos failure"));
                     }
                     raw
                 }
-                Err(e) => {
+                (rcvd, Err(e)) => {
                     caller_print!(t, ERROR, "drvLove::recvReply {}\n", status_text(e.status()));
                     if is_timeout(&e) {
                         caller_print!(t, ERROR, "drvLove::executeCommand read timeout, retrying\n");
                         continue;
                     }
                     // C prints whatever the failed read left in inpMsg.
-                    let rcvd = e.partial_read().map(|p| p.data.as_slice()).unwrap_or(&[]);
-                    self.trace_read_failure(rcvd);
+                    self.trace_read_failure(&rcvd);
                     return Err(e);
                 }
             };
@@ -464,11 +466,6 @@ fn protocol_error(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// True for a timeout, including one `AsynError::PartialRead` wraps to carry
-/// the bytes transferred before it. A bare `AsynError::Status` variant match
-/// would miss that wrapper and misclassify every partial-transfer timeout —
-/// routine on this port, since it installs the EOS interpose — as an
-/// unexpected error.
 fn is_timeout(e: &AsynError) -> bool {
     e.status() == AsynStatus::Timeout
 }
@@ -926,6 +923,7 @@ impl PortDriver for LoveDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interpose::OctetReadResult;
     use epics_rs::asyn::sync_io::SyncIOHandle;
 
     #[test]
@@ -1008,28 +1006,6 @@ mod tests {
     fn process_write_response_fails_on_nonzero_code() {
         assert!(process_write_response(b"00").is_ok());
         assert!(process_write_response(b"01xyz").is_err());
-    }
-
-    /// `AsynError::PartialRead` is how `asyn-rs` 0.24+ carries a timed-out
-    /// read's transferred bytes (see the fix note on `is_timeout`); a bare
-    /// `AsynError::Status` match would miss it entirely.
-    #[test]
-    fn is_timeout_recognizes_a_partial_read_wrapped_timeout() {
-        use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
-
-        let e = AsynError::Status {
-            status: AsynStatus::Timeout,
-            message: "read timeout".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: b"\x02L01".to_vec(),
-            eom_reason: EomReason::empty(),
-        });
-        assert!(is_timeout(&e));
-        assert_eq!(
-            e.partial_read().map(|p| p.data.as_slice()),
-            Some(&b"\x02L01"[..])
-        );
     }
 
     #[test]
@@ -1344,15 +1320,11 @@ mod tests {
             Ok(data.len())
         }
 
-        fn io_read_octet_eom(
-            &mut self,
-            _user: &AsynUser,
-            buf: &mut [u8],
-        ) -> AsynResult<(usize, EomReason)> {
+        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let body = b"L010000";
             let reply = format!("\u{2}L010000{:02X}", calc_checksum(body));
             buf[..reply.len()].copy_from_slice(reply.as_bytes());
-            Ok((reply.len(), self.eom))
+            OctetReadResult::ok(reply.len(), self.eom)
         }
     }
 
@@ -1486,14 +1458,10 @@ mod tests {
             Ok(data.len())
         }
 
-        fn io_read_octet_eom(
-            &mut self,
-            _user: &AsynUser,
-            buf: &mut [u8],
-        ) -> AsynResult<(usize, EomReason)> {
+        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let reply = b"\x02L01\xff000000";
             buf[..reply.len()].copy_from_slice(reply);
-            Ok((reply.len(), EomReason::EOS))
+            OctetReadResult::ok(reply.len(), EomReason::EOS)
         }
     }
 
@@ -1604,16 +1572,12 @@ mod tests {
             Ok(data.len())
         }
 
-        fn io_read_octet_eom(
-            &mut self,
-            _user: &AsynUser,
-            buf: &mut [u8],
-        ) -> AsynResult<(usize, EomReason)> {
+        fn io_read_octet_eom(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             self.log.lock().unwrap().push("read".into());
             let body = b"L010000";
             let reply = format!("\u{2}L010000{:02X}", calc_checksum(body));
             buf[..reply.len()].copy_from_slice(reply.as_bytes());
-            Ok((reply.len(), EomReason::EOS))
+            OctetReadResult::ok(reply.len(), EomReason::EOS)
         }
     }
 

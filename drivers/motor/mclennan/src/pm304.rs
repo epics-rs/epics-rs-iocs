@@ -181,9 +181,11 @@ impl Pm304Controller {
     fn write_read_raw(&self, cmd: &str) -> AsynResult<String> {
         // C send_mess/send_recv_mess: pasynOctetSyncIO->writeRead, which
         // flushes first so a stray line cannot shift every later reply.
-        let raw = self
+        let (raw, status) = self
             .handle
-            .write_read(0, &Self::framed(cmd.as_bytes()), READ_BUF)?;
+            .write_read(0, &Self::framed(cmd.as_bytes()), READ_BUF)
+            .into_parts();
+        status?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_end_matches(['\r', '\n', '\0']).to_string())
     }

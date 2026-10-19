@@ -220,7 +220,11 @@ impl TeledyneDriver {
 
     fn execute(&self, out: &str) -> AsynResult<Vec<u8>> {
         self.write_frame(out)?;
-        self.handle.read_octet(OCTET_REASON, REPLY_BUF_SIZE)
+        let (reply, status) = self
+            .handle
+            .read_octet(OCTET_REASON, REPLY_BUF_SIZE)
+            .into_parts();
+        status.map(|()| reply)
     }
 
     fn parse_ack(&self, reply: &[u8]) -> AsynResult<()> {

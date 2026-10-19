@@ -35,7 +35,7 @@ use crate::drv_quad_em::{
     QuadEmShared, num_average_from,
 };
 use crate::nsls_em_proto::{self as proto, PingPong};
-use crate::octet::{OctetIo, create_ip_port};
+use crate::octet::{OctetIo, create_ip_port, outcome};
 use crate::{asyn_print, trace};
 use epics_rs::base::calc::engine::cvt::fmt_e;
 
@@ -46,11 +46,6 @@ const READ_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// C++ `setIntegerParam(P_ValuesPerRead, 5)` in the constructor.
 const DEFAULT_VALUES_PER_READ: i32 = 5;
 
-/// True for a timeout, including one `AsynError::PartialRead` wraps to carry
-/// the bytes transferred before it. A bare `AsynError::Status` variant match
-/// would miss that wrapper and misclassify every partial-transfer timeout —
-/// routine on this port, since it installs the EOS interpose — as an
-/// unexpected error.
 fn is_timeout(e: &AsynError) -> bool {
     e.status() == AsynStatus::Timeout
 }
@@ -175,14 +170,17 @@ fn discover(
     let deadline = Instant::now() + proto::BROADCAST_TIMEOUT;
     let udp_reader = udp.with_timeout(proto::BROADCAST_READ_TIMEOUT);
     while Instant::now() < deadline {
-        match udp_reader.read_binary(proto::DISCOVERY_BUFFER_SIZE) {
-            Ok(outcome) if !outcome.data.is_empty() => {
-                let text = String::from_utf8_lossy(&outcome.data);
+        match udp_reader
+            .read_binary(proto::DISCOVERY_BUFFER_SIZE)
+            .into_parts()
+        {
+            (data, Ok(())) if !data.is_empty() => {
+                let text = String::from_utf8_lossy(&data);
                 transport.modules.extend(proto::parse_discovery(&text));
             }
-            Ok(_) => {}
-            Err(e) if is_timeout(&e) => {}
-            Err(_) => return Err(()),
+            (_, Ok(())) => {}
+            (_, Err(e)) if is_timeout(&e) => {}
+            (_, Err(_)) => return Err(()),
         }
     }
 
@@ -269,15 +267,12 @@ impl NslsEmDriver {
             if out.len() > 1 {
                 let _ = command.write(out);
             }
-            let reply = match command.write_read(out, proto::MAX_COMMAND_LEN) {
-                Ok(reply) => reply,
-                Err(e) => {
-                    let partial = e.partial_read();
-                    let n_read = partial.map_or(0, |p| p.data.len());
-                    let eom = partial.map_or(0, |p| p.eom_reason.bits());
-                    let in_string = partial
-                        .map(|p| String::from_utf8_lossy(&p.data).into_owned())
-                        .unwrap_or_default();
+            let reply = match outcome(command.write_read(out, proto::MAX_COMMAND_LEN)) {
+                (reply, Ok(())) => reply.as_str(),
+                (read, Err(e)) => {
+                    let n_read = read.data.len();
+                    let eom = read.eom.bits();
+                    let in_string = String::from_utf8_lossy(&read.data);
                     asyn_print!(
                         self.base.port_base,
                         ERROR,
@@ -543,12 +538,11 @@ fn read_thread(ctx: ReadContext) {
             ping_pong = ctx.state.lock().ping_pong;
         }
 
-        let read = ctx.data.locked_read_line(proto::DATA_BUFFER_SIZE);
-        let outcome = match read {
-            Ok(o) if o.eom.contains(EomReason::EOS) => o,
-            _ => {
-                if trace::read_result(&read).0 != AsynStatus::Timeout {
-                    trace::print_read_error(&ctx.handle, "drvNSLS_EM:readThread", &read);
+        let outcome = match outcome(ctx.data.locked_read_line(proto::DATA_BUFFER_SIZE)) {
+            (o, Ok(())) if o.eom.contains(EomReason::EOS) => o,
+            (o, status) => {
+                if trace::read_result(&o, &status).0 != AsynStatus::Timeout {
+                    trace::print_read_error(&ctx.handle, "drvNSLS_EM:readThread", &o, &status);
                     thread::sleep(READ_ERROR_BACKOFF);
                 }
                 continue;
@@ -708,28 +702,6 @@ pub fn create_nsls_em(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::asyn::interpose::PartialOctetRead;
-
-    /// `AsynError::PartialRead` is how `asyn-rs` 0.24+ carries a timed-out
-    /// read's transferred bytes (see the fix note on `is_timeout`); a bare
-    /// `AsynError::Status` match would miss it entirely. Routine on this
-    /// port's TCP command/data sub-ports, which install the EOS interpose.
-    #[test]
-    fn is_timeout_recognizes_a_partial_read_wrapped_timeout() {
-        let e = AsynError::Status {
-            status: AsynStatus::Timeout,
-            message: "read timeout".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: b"12.3".to_vec(),
-            eom_reason: EomReason::empty(),
-        });
-        assert!(is_timeout(&e));
-        assert_eq!(
-            e.partial_read().map(|p| p.data.as_slice()),
-            Some(&b"12.3"[..])
-        );
-    }
 
     #[test]
     fn report_prints_cs_block_then_the_base_report() {

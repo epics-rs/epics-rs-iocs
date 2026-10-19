@@ -93,14 +93,23 @@ impl OemController {
 
     /// Send a command and read its single acknowledgement line.
     fn command(&self, cmd: &str) -> AsynResult<()> {
-        let _ack = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let (_ack, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        status?;
         Ok(())
     }
 
     /// Send a query and read the echo line then the data line (returned).
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let _echo = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let (_echo, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        status?;
+        let (raw, status) = self.handle.read_octet(0, READ_BUF).into_parts();
+        status?;
         Ok(Self::trimmed(&raw))
     }
 }

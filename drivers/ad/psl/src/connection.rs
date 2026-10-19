@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -48,8 +48,6 @@ impl std::fmt::Display for ServerError {
 
 impl From<AsynError> for ServerError {
     fn from(e: AsynError) -> Self {
-        // `status()` reads *through* a `PartialRead` carrier, so a timeout that
-        // returned partial bytes (EOS interpose installed) is still recognized.
         if e.status() == AsynStatus::Timeout {
             Self::Timeout
         } else {
@@ -194,15 +192,19 @@ impl ServerIo {
         timeout: Duration,
     ) -> ServerResult<Vec<u8>> {
         self.reconnect();
-        let result = self.handle.port()?.submit_blocking(
-            RequestOp::OctetWriteRead {
-                data: command.as_bytes().to_vec(),
-                buf_size,
-                flush: true,
-            },
-            self.user(timeout),
-        )?;
-        Ok(result.data.unwrap_or_default())
+        let (reply, status) = self
+            .handle
+            .port()?
+            .submit_octet_read_blocking(
+                OctetReadOp::WriteRead {
+                    data: command.as_bytes().to_vec(),
+                    buf_size,
+                },
+                self.user(timeout),
+            )
+            .into_parts();
+        status?;
+        Ok(reply)
     }
 
     fn write(&mut self, command: &str, timeout: Duration) -> ServerResult<()> {
@@ -216,11 +218,13 @@ impl ServerIo {
     }
 
     fn read_binary(&mut self, buf_size: usize, timeout: Duration) -> ServerResult<Vec<u8>> {
-        let result = self
+        let (data, status) = self
             .handle
             .port()?
-            .submit_blocking(RequestOp::OctetReadBinary { buf_size }, self.user(timeout))?;
-        Ok(result.data.unwrap_or_default())
+            .submit_octet_read_blocking(OctetReadOp::ReadBinary { buf_size }, self.user(timeout))
+            .into_parts();
+        status?;
+        Ok(data)
     }
 }
 
@@ -256,22 +260,13 @@ mod reconnect_tests {
 #[cfg(test)]
 mod is_timeout_tests {
     use super::*;
-    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
 
-    /// A read that times out *after* transferring bytes arrives as
-    /// `AsynError::PartialRead` when the EOS interpose is installed (this
-    /// port's st.cmd uses `noProcessEos=0`). A bare `AsynError::Status`
-    /// match missed it and misclassified the timeout as a transport fault.
     #[test]
-    fn a_partial_read_wrapped_timeout_maps_to_timeout() {
+    fn a_timeout_maps_to_timeout() {
         let e = AsynError::Status {
             status: AsynStatus::Timeout,
             message: "read timeout".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: b"partial".to_vec(),
-            eom_reason: EomReason::empty(),
-        });
+        };
         assert!(matches!(ServerError::from(e), ServerError::Timeout));
     }
 
