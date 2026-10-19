@@ -43,7 +43,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -72,21 +74,18 @@ fn pm304_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Shared controller endpoint: owns the serial handle, the model, and per-axis
-/// encoder flags.
+/// Shared controller endpoint: owns the serial handle and the model.
 pub struct Pm304Controller {
     handle: SyncIOHandle,
     ident: String,
     model: Model,
     n_axes: usize,
-    use_encoder: Vec<bool>,
 }
 
 impl Pm304Controller {
     /// Connect and identify a Mclennan controller (C `motor_init`): find it
-    /// by a `1OA` reply, stop axis 1, read `1ID` to select the model, then read each axis `ID` to decide
-    /// whether it reports position from the encoder (`OA`) or the command
-    /// counter (`OC`). Performs blocking serial I/O.
+    /// by a `1OA` reply, stop axis 1 and read `1ID` to select the model.
+    /// Performs blocking serial I/O.
     pub fn new(handle: SyncIOHandle, n_axes: usize) -> AsynResult<Self> {
         let n_axes = n_axes.max(1);
         let mut ctrl = Self {
@@ -94,7 +93,6 @@ impl Pm304Controller {
             ident: String::new(),
             model: Model::Pm304,
             n_axes,
-            use_encoder: Vec::with_capacity(n_axes),
         };
 
         // drvPM304.cc:668-675: the card is there once `1OA` gets a reply,
@@ -118,20 +116,6 @@ impl Pm304Controller {
         // C reads 1ID still assuming a PM304 (drvPM304.cc:583) and so keeps a
         // PM600's echo in the ident it reports (:663); a C defect not copied.
         ctrl.ident = ctrl.strip_echo(&ident).trim().to_string();
-
-        for axis in 1..=n_axes {
-            let id = ctrl
-                .write_read_raw(&format!("{axis}ID"))
-                .unwrap_or_default();
-            // C: PM304 always uses the encoder; PM600 uses the command counter
-            // only when the axis reports "Open loop stepper mode".
-            let use_encoder = match ctrl.model {
-                Model::Pm304 => true,
-                Model::Pm600 => !id.contains("Open loop stepper mode"),
-            };
-            ctrl.use_encoder.push(use_encoder);
-        }
-
         Ok(ctrl)
     }
 
@@ -148,11 +132,6 @@ impl Pm304Controller {
     /// Number of axes (as configured; C `n_axes`).
     pub fn num_axes(&self) -> usize {
         self.n_axes
-    }
-
-    /// Whether axis `index` (0-based) reports position from its encoder.
-    fn use_encoder(&self, index: usize) -> bool {
-        self.use_encoder.get(index).copied().unwrap_or(true)
     }
 
     fn framed(cmd: &[u8]) -> Vec<u8> {
@@ -256,25 +235,45 @@ pub struct Pm304Axis {
     controller: Arc<Mutex<Pm304Controller>>,
     /// 1-based wire axis number.
     axis: u32,
-    /// 0-based index into the controller's `use_encoder` table.
-    index: usize,
+    /// Whether the axis reports position from its encoder (`OA`) or the
+    /// command counter (`OC`).
+    use_encoder: bool,
     prev_position: i32,
     /// C's RA_DIRECTION, carried from poll to poll in `motor_info->status`.
     direction: bool,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl Pm304Axis {
-    /// Construct axis `index` (0-based; wire axis = `index + 1`).
+    /// Axis `index` (0-based; wire axis = `index + 1`) as `motor_init` takes
+    /// it up: its `ID`, then its status (drvPM304.cc:684-700).
     pub fn new(controller: Arc<Mutex<Pm304Controller>>, index: usize) -> Self {
-        Self {
+        let axis = index as u32 + 1;
+        let use_encoder = {
+            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            let id = ctrl
+                .write_read_raw(&format!("{axis}ID"))
+                .unwrap_or_default();
+            // C: PM304 always uses the encoder; PM600 uses the command
+            // counter only when the axis reports "Open loop stepper mode".
+            match ctrl.model {
+                Model::Pm304 => true,
+                Model::Pm600 => !id.contains("Open loop stepper mode"),
+            }
+        };
+        let mut axis = Self {
             controller,
-            axis: index as u32 + 1,
-            index,
+            axis,
+            use_encoder,
             prev_position: 0,
             direction: false,
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        };
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, Pm304Controller> {
@@ -299,6 +298,12 @@ impl Pm304Axis {
             ctrl.send_mess(format!("{axis}SA{accel}").as_bytes());
             ctrl.send_mess(format!("{axis}SD{accel}").as_bytes());
         }
+    }
+}
+
+impl Model1Motor for Pm304Axis {
+    fn take_init_status(&mut self) -> AsynResult<MotorStatus> {
+        self.init_status.take().expect("taken once")
     }
 }
 
@@ -402,7 +407,7 @@ impl AsynMotor for Pm304Axis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        let cmd = if ctrl.use_encoder(self.index) {
+        let cmd = if self.use_encoder {
             format!("{}AP{}", self.axis, nint(position))
         } else {
             format!("{}CP{}", self.axis, nint(position))
@@ -432,13 +437,12 @@ impl AsynMotor for Pm304Axis {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let controller = self.controller.clone();
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        let use_encoder = ctrl.use_encoder(self.index);
         let model = ctrl.model;
 
         let status_reply = ctrl.command(&format!("{}OS", self.axis))?;
         let bits = parse_status(model, &status_reply);
 
-        let pos_cmd = if use_encoder {
+        let pos_cmd = if self.use_encoder {
             format!("{}OA", self.axis)
         } else {
             format!("{}OC", self.axis)
@@ -528,8 +532,9 @@ mod tests {
             _ => "OK".into(),
         });
         let ctrl = Pm304Controller::new(io, 1).unwrap();
+        let axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
-        (line, Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0))
+        (line, axis)
     }
 
     /// devPM304.cc builds the record's SET_VELOCITY and SET_ACCEL parts of
@@ -604,10 +609,7 @@ mod tests {
         });
         let ctrl = Pm304Controller::new(io, 1).unwrap();
         assert_eq!(ctrl.ident(), "");
-        assert_eq!(
-            line.sent(),
-            ["1OA\r", "1OA\r", "1OA\r", "1ST\r", "1ID\r", "1ID\r"]
-        );
+        assert_eq!(line.sent(), ["1OA\r", "1OA\r", "1OA\r", "1ST\r", "1ID\r"]);
 
         let (_line, io) = LineRig::new("pm304Absent", |_| String::new());
         assert!(Pm304Controller::new(io, 1).is_err());
