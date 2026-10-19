@@ -3,7 +3,6 @@
 //! writes the axes' status parameters and posts each axis, as its
 //! `callParamCallbacks` does, through the axis's motor poll loop.
 
-use std::ffi::c_long;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -16,7 +15,7 @@ use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
 use epics_rs::motor::poll_loop::{FirstPollPending, PollCommand};
 
-use motor_common::util::leading_hex;
+use motor_common::util::{leading_hex, strtol};
 
 use crate::oms::{AXIS_CHARS, OmsController};
 
@@ -551,10 +550,11 @@ fn parse_axes_array(reply: &str) -> ([i32; OMS_MAX_AXES], usize) {
             }
             continue;
         }
-        let Some((parsed, end)) = strtol(&b[start..]) else {
+        let (parsed, end) = strtol(&b[start..], 10);
+        if end == 0 {
             break;
-        };
-        *value = parsed;
+        }
+        *value = parsed as i32;
         count += 1;
         let end = start + end;
         if end >= b.len() {
@@ -563,31 +563,6 @@ fn parse_axes_array(reply: &str) -> ([i32; OMS_MAX_AXES], usize) {
         start = end + 1;
     }
     (values, count)
-}
-
-/// C `strtol(s, &end, 10)` cast to `int`, saturating at `LONG_MIN` /
-/// `LONG_MAX`: the value and where it ended, `None` when no digits were
-/// converted.
-fn strtol(s: &[u8]) -> Option<(i32, usize)> {
-    let mut at = s.iter().take_while(|c| c.is_ascii_whitespace()).count();
-    let negative = s.get(at) == Some(&b'-');
-    if matches!(s.get(at), Some(b'+' | b'-')) {
-        at += 1;
-    }
-    let digits = s[at..].iter().take_while(|c| c.is_ascii_digit()).count();
-    if digits == 0 {
-        return None;
-    }
-    // Accumulated toward the sign, so LONG_MIN's magnitude fits.
-    let value = s[at..at + digits].iter().fold(0 as c_long, |v, d| {
-        let d = c_long::from(d - b'0');
-        if negative {
-            v.saturating_mul(10).saturating_sub(d)
-        } else {
-            v.saturating_mul(10).saturating_add(d)
-        }
-    });
-    Some((value as i32, at + digits))
 }
 
 #[cfg(test)]
@@ -998,6 +973,11 @@ pub(crate) mod tests {
     fn an_overflowing_axis_value_is_strtol_cast_to_int() {
         let (values, count) = parse_axes_array("-99999999999999999999,99999999999999999999");
         assert_eq!((values[..2].to_vec(), count), (vec![0, -1], 2));
-        assert_eq!(strtol(c_long::MIN.to_string().as_bytes()), Some((0, 20)));
+        assert_eq!(
+            parse_axes_array(&std::ffi::c_long::MIN.to_string()),
+            ([0; OMS_MAX_AXES], 1)
+        );
+        // strtol skips a `\v` as isspace.
+        assert_eq!(parse_axes_array("\x0b5").0[0], 5);
     }
 }

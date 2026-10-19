@@ -195,6 +195,8 @@ mod tests {
         assert_eq!(strtol(b"0b101", 0), (0, 1));
         assert_eq!(strtol(b"  +", 10), (0, 0));
         assert_eq!(strtol(b"", 10), (0, 0));
+        let min = c_long::MIN.to_string();
+        assert_eq!(strtol(min.as_bytes(), 10), (c_long::MIN, min.len()));
     }
 
     #[test]

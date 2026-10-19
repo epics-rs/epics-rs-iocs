@@ -104,7 +104,6 @@
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::ffi::c_long;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -124,7 +123,7 @@ use epics_rs::motor::controller_port::{
     AxisUser, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, index,
 };
 use epics_rs::motor::flags::{DriverCall, MotorCommand};
-use motor_common::util::{atof, atoi, nint};
+use motor_common::util::{atof, atoi, nint, strtol};
 use motor_common::{ControllerParams, ControllerReport};
 
 /// Response buffer size for a single reply line.
@@ -220,43 +219,6 @@ fn get_value_f64(reply: &str) -> AsynResult<f64> {
         .ok_or_else(|| pigcs2_err(format!("no '=' in reply {reply:?}")))
 }
 
-/// C `strtol(s, NULL, radix)`: leading blanks, a sign and, in base 16, a
-/// `0x` are read; base 0 reads a `0x` as 16 and a leading `0` as 8; no
-/// digit is 0 and an overflow saturates at `LONG_MIN` / `LONG_MAX`.
-fn strtol(s: &str, radix: u32) -> c_long {
-    let t = s.trim_start();
-    let (negative, t) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    let (t, radix) = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        Some(rest)
-            if matches!(radix, 0 | 16) && rest.starts_with(|c: char| c.is_ascii_hexdigit()) =>
-        {
-            (rest, 16)
-        }
-        _ if radix == 0 && t.starts_with('0') => (t, 8),
-        _ if radix == 0 => (t, 10),
-        _ => (t, radix),
-    };
-    let n = t.chars().take_while(|c| c.is_digit(radix)).count();
-    if n == 0 {
-        return 0;
-    }
-    // Accumulated toward the sign, so LONG_MIN's magnitude fits.
-    t.chars()
-        .map_while(|c| c.to_digit(radix))
-        .fold(0, |v: c_long, d| {
-            let d = c_long::from(d);
-            let v = v.saturating_mul(c_long::from(radix));
-            if negative {
-                v.saturating_sub(d)
-            } else {
-                v.saturating_add(d)
-            }
-        })
-}
-
 fn get_value_bool(reply: &str) -> AsynResult<bool> {
     value_str(reply)
         .map(|v| atoi(v) != 0)
@@ -339,7 +301,7 @@ fn status_from_bitmask(mask: u32) -> (bool, bool, bool, bool, bool) {
 fn status_mask_at(reply: &str, axis_no: usize) -> Option<u32> {
     let idx = 2 + axis_no * 4;
     let mask_str = reply.get(idx..)?;
-    Some(strtol(mask_str.get(..4).unwrap_or(mask_str), 16) as u32)
+    Some(strtol(mask_str.get(..4).unwrap_or(mask_str).as_bytes(), 16).0 as u32)
 }
 
 /// The C controller class `PIGCSController::CreateGCSController`
@@ -643,7 +605,7 @@ impl PIGCS2Controller {
                 e.status() as i32
             )
         })?;
-        let moving = strtol(&reply, 16) != 0;
+        let moving = strtol(reply.as_bytes(), 16).0 != 0;
         let hexapod = &mut self.hexapod;
         hexapod.any_moving = moving;
         hexapod.moving = moving;
@@ -1335,7 +1297,7 @@ impl PIGCS2Controller {
             if !self.hexapod.reads_status {
                 return Ok(true);
             }
-            return Ok(strtol(&self.query_char(4)?, 10) & 0x10000 != 0);
+            return Ok(strtol(self.query_char(4)?.as_bytes(), 10).0 & 0x10000 != 0);
         }
         if self.model == Model::C702 {
             return Ok(self.get_gcs_parameter(axis, PARA_C702_REFERENCED)? > 0.1);
@@ -1464,7 +1426,7 @@ impl PIGCS2Controller {
     /// C `getMoving`: `#5`'s hex word masked by the axis's
     /// `m_movingStateMask`.
     fn get_moving(&self, mask: i64) -> AsynResult<bool> {
-        Ok(strtol(&self.query_char(5)?, 16) & mask != 0)
+        Ok(strtol(self.query_char(5)?.as_bytes(), 16).0 & mask != 0)
     }
 
     /// `PIGCSPiezoController::getStatus`: `SRG? {axis} 1`'s mask, no limits;
@@ -1486,7 +1448,8 @@ impl PIGCS2Controller {
             self.piezo.srg.set(false);
             return Err(pigcs2_err(format!("no '=' in reply {reply:?}")));
         };
-        let (homing, moving, _, _, servo) = status_from_bitmask(strtol(value, 0) as u32);
+        let (homing, moving, _, _, servo) =
+            status_from_bitmask(strtol(value.as_bytes(), 0).0 as u32);
         self.trace(
             TraceMask::FLOW,
             format_args!(
@@ -5704,8 +5667,6 @@ mod tests {
         });
         let ctrl = PIGCS2Controller::new(io, "gcs2MovingMin");
         assert!(!ctrl.get_moving(1).unwrap());
-        assert_eq!(strtol("-9223372036854775808", 10), c_long::MIN);
-        assert_eq!(strtol("99999999999999999999", 0), c_long::MAX);
     }
 
     #[test]
