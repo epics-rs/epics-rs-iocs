@@ -678,14 +678,6 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
                         d.r_request,
                         d.r_response
                     );
-
-                    if data.len() < encap::BUFFER_SIZE {
-                        d.buf = data;
-                        d.valid_data_size = d.buf.len();
-                    } else {
-                        print_rejected(&info.string_tag, data.len());
-                        d.valid_data_size = 0;
-                    }
                 }
                 Err(_) => {
                     crate::eip_printf!(3, "tag '{}': Cannot read!\n", info.string_tag);
@@ -694,10 +686,8 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
                     d.r_response = 0;
                     d.w_request = 0;
                     d.w_response = 0;
-                    d.valid_data_size = 0;
                 }
             }
-            info.notify();
         }
     }
 
@@ -1272,6 +1262,12 @@ mod registry_tests {
     /// session and then fails every request, so the scan-list completion
     /// reads no tag.
     fn plc_that_reads_nothing() -> (u16, std::thread::JoinHandle<()>) {
+        plc_answering(None)
+    }
+
+    /// As [`plc_that_reads_nothing`], but every SendRRData gets `read`, the
+    /// CIP response, when there is one.
+    fn plc_answering(read: Option<Vec<u8>>) -> (u16, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1294,6 +1290,13 @@ mod registry_tests {
                     }
                     encap::EC_REGISTER_SESSION => (0, vec![1, 0, 0, 0]),
                     encap::EC_UNREGISTER_SESSION => break,
+                    encap::EC_SEND_RR_DATA if read.is_some() => {
+                        let reply = encap::encode_send_rr_data(1, tid, read.as_ref().unwrap());
+                        if s.write_all(&reply).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     _ => (1, Vec::new()),
                 };
                 let mut reply = Vec::new();
@@ -1306,6 +1309,38 @@ mod registry_tests {
             }
         });
         (port, server)
+    }
+
+    /// drvEtherIP.c:396-436: the completion's probe read takes the tag's
+    /// sizes and nothing else; the data and the records' callbacks wait for
+    /// the first scan.
+    #[test]
+    fn a_completion_probe_stores_no_data_and_calls_no_record() {
+        // A DINT 7: CIP_ReadData reply, status 0, no extended status.
+        let read = vec![0xCC, 0, 0, 0, 0xC4, 0, 7, 0, 0, 0];
+        let (port, server) = plc_answering(Some(read));
+        let plc = Arc::new(Plc::on_port("probe", "127.0.0.1", 0, port));
+        let tag = plc.add_tag(1.0, "T", 1).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tag.add_listener(tx);
+        let mut c = Connection::startup(
+            "127.0.0.1",
+            port,
+            0,
+            Duration::from_secs(5),
+            encap::DEFAULT_BUFFER_LIMIT,
+        )
+        .unwrap();
+        assert!(complete_tag_infos(&plc, &mut c));
+        {
+            let d = tag.data.lock();
+            assert_eq!(d.r_response, 10);
+            assert_eq!(d.valid_data_size, 0);
+            assert!(d.buf.is_empty());
+        }
+        assert!(rx.try_recv().is_err(), "no record was processed");
+        drop(c);
+        server.join().unwrap();
     }
 
     /// drvEtherIP.c:503-510: a scan-list completion failure runs
