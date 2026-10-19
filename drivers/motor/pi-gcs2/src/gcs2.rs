@@ -916,6 +916,9 @@ impl PIGCS2Controller {
             // PIC702Controller::findConnectedAxes: one word of one-char
             // axes, last first.
             let word = self.query("SAI?")?;
+            // C returns with m_nrFoundAxes the word's length and no axis IDs
+            // (PIC702Controller.cpp:82-86), so its constructor names axes
+            // from NULL: a C defect, not copied; no axes are kept.
             if word.len() >= MAX_NR_AXES {
                 return Err(pigcs2_err(format!("{} axes in SAI? reply", word.len())));
             }
