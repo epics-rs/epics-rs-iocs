@@ -717,10 +717,7 @@ impl DeviceSupport for EtherIpDevice {
                     "mbbi" | "mbbiDirect" => get_bits(raw, element, mask, nobt(record))
                         .map(|v| (EpicsValue::Long(v as i32), false))
                         .ok_or(()),
-                    "stringin" => cip::get_string(raw, element, MAX_STRING_SIZE)
-                        .map(|s| (EpicsValue::String(s.into()), true))
-                        .ok_or(()),
-                    "lsi" => cip::get_string(raw, element, count_field(record, "SIZV"))
+                    "stringin" | "lsi" => cip::get_string(raw, element, string_size(record))
                         .map(|s| (EpicsValue::String(s.into()), true))
                         .ok_or(()),
                     "waveform" => match read_waveform(raw, elements, record, &self.name) {
@@ -851,8 +848,7 @@ impl EtherIpDevice {
                     Some(EpicsValue::String(s)) => s.to_string(),
                     _ => String::new(),
                 };
-                let max = data.buf.len();
-                match cip::get_string(&data.buf, element, max) {
+                match cip::get_string(&data.buf, element, string_size(record)) {
                     Some(cur) if cur == val => false,
                     Some(_) => cip::put_string(&mut data.buf, &val),
                     None => false,
@@ -1010,13 +1006,13 @@ impl EtherIpDevice {
                 )
             }
             "stringout" | "lso" => {
-                let max = data.buf.len();
+                let size = string_size(record);
                 let val = match record.get_field("VAL") {
                     Some(EpicsValue::String(s)) => s.to_string(),
                     _ => String::new(),
                 };
                 follow!(
-                    cip::get_string(&data.buf, element, max),
+                    cip::get_string(&data.buf, element, size),
                     |plc: &String| *plc != val,
                     |plc: String| record.set_val(EpicsValue::String(plc.into()))
                 )
@@ -1107,6 +1103,16 @@ fn i32_field(record: &dyn Record, name: &str) -> i32 {
 /// NELM / NOBT / SIZV, used as C uses them: unclamped.
 fn count_field(record: &dyn Record, name: &str) -> usize {
     f64_field(record, name) as usize
+}
+
+/// The buffer, terminator included, C reads a PLC string into for VAL:
+/// `MAX_STRING_SIZE`, or SIZV on the long-string records. The PLC's string
+/// is compared cut to it, or a longer one never matches VAL.
+fn string_size(record: &dyn Record) -> usize {
+    match record.record_type() {
+        "lsi" | "lso" => count_field(record, "SIZV"),
+        _ => MAX_STRING_SIZE,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1540,6 +1546,41 @@ mod tests {
             (common.stat, common.sevr),
             (alarm_status::SOFT_ALARM, AlarmSeverity::Invalid)
         );
+    }
+
+    /// A tag holding one Logix STRING, `text`.
+    fn set_string_tag(tag: &TagInfo, text: &str) {
+        let mut chars = [0u8; cip::STRUCT_STRING_BUF];
+        chars[..text.len()].copy_from_slice(text.as_bytes());
+        let mut bytes = cip::STRUCT_STRING_HANDLE.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&chars);
+        set_tag(tag, CipType::Struct, &bytes);
+    }
+
+    /// check_so_callback and so_write compare the PLC's string cut to
+    /// MAX_STRING_SIZE, so a longer one is taken once, cut to fit, and not
+    /// written back.
+    #[test]
+    fn a_long_plc_string_is_taken_cut_and_not_written_back() {
+        use epics_rs::base::server::records::stringout::StringoutRecord;
+        define_plc("strlong", "127.0.0.1", 0);
+        let mut record = StringoutRecord::default();
+        let mut dev = EtherIpDevice::new("@strlong S S 1", true);
+        dev.init(&mut record).unwrap();
+        let tag = dev.tag.clone().unwrap();
+        let long = "x".repeat(60);
+        set_string_tag(&tag, &long);
+
+        let mut common = CommonFields::default();
+        assert!(dev.check_callback(&mut record, &mut common));
+        assert_eq!(
+            record.get_field("VAL"),
+            Some(EpicsValue::String(long[..MAX_STRING_SIZE - 1].into()))
+        );
+        dev.write(&mut record).unwrap();
+        assert!(!tag.data.lock().do_write);
+        assert!(!dev.check_callback(&mut record, &mut common));
     }
 
     /// A tag holding one `ty` value of `bytes`.
