@@ -34,8 +34,9 @@
 //!
 //! Positions are read with `?APOS`/`?FPOS` and commanded with `ptp`/`target_pos`
 //! in controller counts, with no resolution scaling, so the asyn-rs motor
-//! boundary is counts: positions pass through with `NINT` rounding, the record's
-//! `MRES` is 1, and its `EGU` is counts.
+//! boundary is counts: a commanded position is rounded with `NINT`, a read one
+//! truncated by C's `(long)` cast, the record's `MRES` is 1, and its `EGU` is
+//! counts.
 //!
 //! ## Deviations from C (documented)
 //!
@@ -571,12 +572,13 @@ impl AsynMotor for SpiiPlusAxis {
         }
         drop(ctrl);
 
-        let position = nint(apos);
-        self.prev_position = position;
+        // C reads both through `(long)atof` (drvSPiiPlus.cc:369, :386).
+        let position = apos.trunc();
+        self.prev_position = position as i32;
 
         let status = MotorStatus {
-            position: position as f64,
-            encoder_position: nint(fpos) as f64,
+            position,
+            encoder_position: fpos.trunc(),
             velocity,
             done: d.done,
             moving: d.moving,
@@ -628,6 +630,23 @@ mod tests {
         assert!(axis.poll(&user).unwrap().msta_moving);
         mst.store(MST_INPOSITION, Ordering::Relaxed);
         assert!(!axis.poll(&user).unwrap().msta_moving);
+    }
+
+    /// C reads `?APOS` and `?FPOS` through `(long)atof`, which truncates
+    /// toward zero (drvSPiiPlus.cc:369, :386).
+    #[test]
+    fn positions_truncate_as_c_casts() {
+        let (_rig, io) = motor_common::testing::LineRig::new("acsT80Trunc", |sent| match sent {
+            "?VR" => "v1".into(),
+            "?APOS(0)" => "12.7".into(),
+            s if s.starts_with("?APOS(") => "?".into(),
+            "?FPOS(0)" => "-12.7".into(),
+            _ => "0".into(),
+        });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
+        let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let status = axis.poll(&AsynUser::default()).unwrap();
+        assert_eq!((status.position, status.encoder_position), (12.0, -12.0));
     }
 
     #[test]
