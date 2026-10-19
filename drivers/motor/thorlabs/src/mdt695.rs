@@ -236,17 +236,23 @@ impl Mdt695Axis {
         out
     }
 
-    /// devMDT695.cc:203-210: PREM goes ahead of every MOVE_ABS, MOVE_REL,
-    /// HOME and JOG, and POST is armed. C sends PREM and the command as one
-    /// message whose only '#' substitution lands in PREM when PREM has one,
-    /// leaving the voltage command unaddressed; here each is addressed.
-    fn send_prem(&mut self) -> AsynResult<()> {
-        let prem = self.strings.arm();
-        if prem.is_empty() {
+    /// devMDT695.cc:190-210: INIT, or the PREM of a MOVE_ABS, MOVE_REL,
+    /// HOME or JOG, closed by `MDT695_OUT_EOS` ahead of `command` in one
+    /// message, so INIT and a PREM with no command leave an empty line on
+    /// the wire. C's send_mess substitutes only the message's first '#',
+    /// which leaves the voltage command after an addressed PREM unaddressed;
+    /// here each part is addressed.
+    fn send_message(&self, lead: &[u8], command: &[u8]) -> AsynResult<()> {
+        let mut message = Vec::new();
+        if !lead.is_empty() {
+            message = self.addressed(lead);
+            message.extend_from_slice(OUTPUT_EOS);
+        }
+        message.extend_from_slice(command);
+        if message.is_empty() {
             return Ok(());
         }
-        let line = self.addressed(&prem);
-        self.lock().write_only(&line)
+        self.lock().write_only(&message)
     }
 }
 
@@ -274,12 +280,10 @@ impl AsynMotor for Mdt695Axis {
         _velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        self.send_prem()?;
+        let prem = self.strings.arm();
         // Set the channel output voltage: "<axis>V<volts>" (C "#V%.1f").
-        let ctrl = self.lock();
-        ctrl.write_only(
-            format!("{}V{:.1}", self.letter, CFloat(position * DRIVE_RESOLUTION)).as_bytes(),
-        )
+        let command = format!("{}V{:.1}", self.letter, CFloat(position * DRIVE_RESOLUTION));
+        self.send_message(&prem, command.as_bytes())
     }
 
     fn move_relative(
@@ -291,7 +295,8 @@ impl AsynMotor for Mdt695Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         // C: MOVE_REL emits only PREM (no relative move on this controller).
-        self.send_prem()
+        let prem = self.strings.arm();
+        self.send_message(&prem, b"")
     }
 
     fn move_velocity(
@@ -302,7 +307,8 @@ impl AsynMotor for Mdt695Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         // C: JOG emits only PREM.
-        self.send_prem()
+        let prem = self.strings.arm();
+        self.send_message(&prem, b"")
     }
 
     fn home(
@@ -314,7 +320,8 @@ impl AsynMotor for Mdt695Axis {
         _forward: bool,
     ) -> AsynResult<()> {
         // C: HOME_FOR/HOME_REV emit only PREM.
-        self.send_prem()
+        let prem = self.strings.arm();
+        self.send_message(&prem, b"")
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -337,12 +344,9 @@ impl AsynMotor for Mdt695Axis {
         Ok(())
     }
 
-    /// `PRIMITIVE`: INIT, addressed (devMDT695.cc:190-194). C ends it with
-    /// `MDT695_OUT_EOS` ahead of the port's own, so an empty line follows
-    /// INIT on the C wire; that separator has nothing to separate here.
+    /// `PRIMITIVE`: INIT (devMDT695.cc:190-194).
     fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
-        let line = self.addressed(init);
-        self.lock().write_only(&line)
+        self.send_message(init, b"")
     }
 
     fn set_move_strings(
@@ -527,16 +531,18 @@ mod tests {
         assert_eq!(line.sent().last().map(String::as_str), Some("YVnan"));
     }
 
-    /// devMDT695.cc:190-194: INIT's first '#' carries the axis letter.
+    /// devMDT695.cc:190-194: INIT's first '#' carries the axis letter and
+    /// `MDT695_OUT_EOS` closes it ahead of the port's own.
     #[test]
     fn init_goes_out_addressed() {
         let (line, mut axis) = rig("mdt695Init");
         axis.primitive(&AsynUser::default(), b"#V0.0").unwrap();
-        assert_eq!(line.sent(), ["YV0.0"]);
+        assert_eq!(line.sent(), ["YV0.0\r"]);
     }
 
-    /// devMDT695.cc:203-210 with drvMDT695.cc:333-339: PREM ahead of the
-    /// move, both addressed, and POST once at the next poll, unaddressed.
+    /// devMDT695.cc:203-210 with drvMDT695.cc:333-339: PREM and the move in
+    /// one message, both addressed, and POST once at the next poll,
+    /// unaddressed.
     #[test]
     fn prem_leads_the_move_and_post_follows_it() {
         let (line, mut axis) = rig("mdt695Prem");
@@ -544,7 +550,7 @@ mod tests {
         axis.set_move_strings(&user, b"#L", Some(post(b"#H")))
             .unwrap();
         axis.move_absolute(&user, 10.0, 0.0, 0.0, 0.0).unwrap();
-        assert_eq!(line.sent(), ["YL", "YV1.0"]);
+        assert_eq!(line.sent(), ["YL\rYV1.0"]);
         axis.poll(&user).unwrap();
         assert_eq!(line.sent(), ["YR?", "#H"]);
         axis.poll(&user).unwrap();
@@ -587,14 +593,20 @@ mod tests {
         );
     }
 
-    /// MOVE_REL builds no command but still carries PREM.
+    /// MOVE_REL, HOME and JOG build no command but still carry PREM and its
+    /// `MDT695_OUT_EOS` (devMDT695.cc:203-210).
     #[test]
     fn a_relative_move_sends_only_prem() {
         let (line, mut axis) = rig("mdt695Rel");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"P", None).unwrap();
         axis.move_relative(&user, 1.0, 0.0, 0.0, 0.0).unwrap();
-        assert_eq!(line.sent(), ["P"]);
+        assert_eq!(line.sent(), ["P\r"]);
+        axis.set_move_strings(&user, b"Q", None).unwrap();
+        axis.home(&user, 0.0, 0.0, 0.0, true).unwrap();
+        axis.set_move_strings(&user, b"R", None).unwrap();
+        axis.move_velocity(&user, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["Q\r", "R\r"]);
         axis.move_relative(&user, 1.0, 0.0, 0.0, 0.0).unwrap();
         assert!(line.sent().is_empty());
     }

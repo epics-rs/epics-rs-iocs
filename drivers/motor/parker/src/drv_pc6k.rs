@@ -408,9 +408,12 @@ impl AsynMotor for DrvPc6kAxis {
         Ok(())
     }
 
-    /// `PRIMITIVE`: INIT as it is.
+    /// `PRIMITIVE`: INIT and `PC6K_OUT_EOS` ahead of the port's own, so an
+    /// empty line follows it on the wire (devPC6K.cc:194-198).
     fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
-        self.lock().command(init);
+        let mut msg = init.to_vec();
+        msg.push(b'\n');
+        self.lock().command(msg);
         Ok(())
     }
 
@@ -539,5 +542,17 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// devPC6K.cc:194-198.
+    #[test]
+    fn init_goes_out_with_its_eos() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::new("pc6kInit", |_| String::new());
+        let card = Arc::new(Mutex::new(Pc6kCard::new(io)));
+        let mut axis = DrvPc6kAxis::new(card, 0);
+        line.sent();
+        axis.primitive(&AsynUser::new(0), b"1DRIVE1").unwrap();
+        assert_eq!(line.sent(), ["1DRIVE1\n"]);
     }
 }

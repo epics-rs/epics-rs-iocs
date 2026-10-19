@@ -443,7 +443,7 @@ impl PIE516Axis {
     fn move_line(&mut self, command: &str) -> Vec<u8> {
         let prem = self.strings.arm();
         let mut line = self.addressed(&prem);
-        if !line.is_empty() && !command.is_empty() {
+        if !line.is_empty() {
             line.push(b'\n');
         }
         line.extend_from_slice(command.as_bytes());
@@ -666,8 +666,9 @@ mod tests {
         axis.move_velocity(&user, 0.0, -2.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["SVO A1\nVEL A-2.000"]);
         axis.set_move_strings(&user, b"SVO #1", None).unwrap();
+        // HOME builds no command, but its PREM keeps the EOL.
         assert!(axis.home(&user, 0.0, 1.0, 0.0, true).is_err());
-        assert_eq!(line.sent(), ["SVO A1"]);
+        assert_eq!(line.sent(), ["SVO A1\n"]);
     }
 
     /// drvPIE516.cc:365-372: POST, unaddressed, once the move is done, not

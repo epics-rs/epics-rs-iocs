@@ -463,11 +463,12 @@ impl AsynMotor for SpiiPlusAxis {
         Ok(())
     }
 
-    /// `PRIMITIVE`: INIT alone (devSPiiPlus.cc:181-185). C ends it with
-    /// `\r` ahead of the port's own, so an empty line follows it on the C
-    /// wire; that separator has nothing to separate here.
+    /// `PRIMITIVE`: INIT and a CR ahead of the port's own, so an empty line
+    /// follows it on the wire (devSPiiPlus.cc:182-186).
     fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
-        self.lock().command_bytes(init)?;
+        let mut msg = init.to_vec();
+        msg.push(b'\r');
+        self.lock().command_bytes(&msg)?;
         Ok(())
     }
 
@@ -700,11 +701,12 @@ mod tests {
         p
     }
 
+    /// devSPiiPlus.cc:182-186.
     #[test]
     fn init_goes_out_alone() {
         let (line, mut axis) = rig("spiiInit", CommandMode::Direct);
         axis.primitive(&AsynUser::default(), b"enable(0)").unwrap();
-        assert_eq!(line.sent(), ["enable(0)"]);
+        assert_eq!(line.sent(), ["enable(0)\r"]);
     }
 
     /// devSPiiPlus.cc:187-203 and drvSPiiPlus.cc:403-409: PREM after the
