@@ -347,7 +347,8 @@ async fn publish_image(
         return false;
     };
     array.unique_id = array_counter;
-    array.timestamp = start;
+    // C never calls updateTimeStamp, so epicsTS stays zero
+    // (merlinDetector.cpp:255-258).
     array.time_stamp = start.as_f64();
     array.attributes = build_attributes(&header.attrs, acquisition_header);
     // C stores no array size, type or time-stamp param per frame; the
@@ -429,7 +430,8 @@ async fn publish_profiles(
         .await;
 
     array.unique_id = array_counter;
-    array.timestamp = start;
+    // C never calls updateTimeStamp, so epicsTS stays zero
+    // (merlinDetector.cpp:255-258).
     array.time_stamp = start.as_f64();
     array.attributes = build_attributes(&header.attrs, acquisition_header);
     // C stores no array size, type or time-stamp param per frame; the

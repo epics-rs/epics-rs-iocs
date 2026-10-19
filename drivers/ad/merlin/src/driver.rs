@@ -1044,6 +1044,23 @@ mod tests {
         handle
     }
 
+    /// merlinTask stamps timeStamp and never calls updateTimeStamp
+    /// (merlinDetector.cpp:255-258): epicsTS is the zero NDArray starts with.
+    #[test]
+    fn a_frame_carries_no_epics_timestamp() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::ad_core::timestamp::EpicsTimestamp;
+        let (sender, mut receiver) = ndarray_channel("MERLIN_FRAME_TS_SINK", 4);
+        let mut output = NDArrayOutput::new();
+        output.add(sender);
+        // 1 MiB of the limit is the flat-field buffer.
+        let det = detector_sized("MERLIN_FRAME_TS", 2 << 20);
+        run_quad_frame("MERLIN_FRAME_TS", det, output);
+        let array = receiver.blocking_recv().expect("the frame's array");
+        assert!(array.time_stamp > 0.0);
+        assert_eq!(array.timestamp, EpicsTimestamp::default());
+    }
+
     /// merlinDetector.cpp sets the array size and type params only in the
     /// constructor (:1494-1497) and never the time-stamp ones: a frame
     /// leaves them all as they were.
