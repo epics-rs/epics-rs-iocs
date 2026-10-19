@@ -160,8 +160,8 @@ fn a_failed_write_hands_the_record_no_message() {
 
 #[test]
 fn a_failed_get_settings_is_an_error_status() {
-    // Nothing listens, so the detector boots disconnected and getSettings is
-    // refused at the gate with Disconnected.
+    // Nothing listens, so the asyn port is down and refuses getSettings'
+    // queries with Disconnected.
     let ip = DrvAsynIPPort::new("MYTHEN_WS_DEAD_IP", DEAD_ADDR).expect("ip port");
     let (runtime, _) = create_port_runtime(
         &claim_port("MYTHEN_WS_DEAD_IP").unwrap(),

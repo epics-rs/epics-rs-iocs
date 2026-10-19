@@ -1,19 +1,13 @@
-//! No command reaches the socket while the detector is marked disconnected, and
-//! an acquisition is what brings it back.
+//! An acquisition brings back a detector that was silent at boot.
 //!
-//! Every command costs the full 5 s `M1K_TIMEOUT` against a detector that is
-//! powered off but whose address still routes, and they are serialized through
-//! the port's single request queue: the records that process at `iocInit` used
-//! to cost minutes between them. The gate is what makes them cost nothing, and
-//! the probe is what stops "nothing" from being permanent — C never re-reads the
-//! module count after its constructor (mythen.cpp:1363), so a detector that was
-//! off at boot stays unusable there until the IOC restarts.
+//! C never re-reads the module count after its constructor (mythen.cpp:1363),
+//! so a detector that was off at boot stays unusable there until the IOC
+//! restarts; the probe is what closes that.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
 
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::runtime as rt;
@@ -30,16 +24,11 @@ use mythen::transport::Transport;
 /// The module count the detector reports once it starts answering.
 const NMODULES: i32 = 2;
 
-/// A fast-fail has to be fast enough to be visibly not a timeout: `M1K_TIMEOUT`
-/// is 5 s, so a second is two orders of magnitude of headroom either way.
-const FAST: Duration = Duration::from_secs(1);
-
 /// A detector that reads every command but only answers while `answering` is
 /// set, and reports every command it was sent.
 ///
 /// Silence rather than a closed port: a detector that is powered off behind a
-/// switch that still routes is exactly a socket that accepts and never replies,
-/// and it is the case whose per-command cost is the full timeout.
+/// switch that still routes is exactly a socket that accepts and never replies.
 fn switchable_detector(answering: Arc<AtomicBool>) -> (PortHandle, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -99,7 +88,7 @@ fn reply_to(command: &str) -> Vec<u8> {
 }
 
 #[test]
-fn no_command_is_sent_while_the_detector_is_disconnected_and_an_acquisition_brings_it_back() {
+fn an_acquisition_brings_back_a_detector_silent_at_boot() {
     let answering = Arc::new(AtomicBool::new(false));
     let (handle, received) = switchable_detector(answering.clone());
     let det = Arc::new(Detector::new(Transport::new(handle), "MYTHEN_RECONNECT"));
@@ -118,31 +107,7 @@ fn no_command_is_sent_while_the_detector_is_disconnected_and_an_acquisition_brin
         ADStatus::Disconnected as i32
     );
 
-    // The constructor runs four queries. Only the first may reach the wire:
-    // the failure it reports is what the other three are refused on, and that
-    // is the whole difference between a boot that costs one timeout and one
-    // that costs four.
-    let commands: Vec<String> = received.try_iter().collect();
-    assert_eq!(
-        commands,
-        vec!["-get version"],
-        "a command was sent after the detector was marked disconnected"
-    );
-
-    // --- A request while disconnected never reaches the socket -------------
-    let start = Instant::now();
-    let refused = det.set_frames(7, 0);
-    let elapsed = start.elapsed();
-    assert!(refused.is_err(), "a disconnected detector accepted a write");
-    assert!(
-        elapsed < FAST,
-        "the write waited {elapsed:?}, so it went to the socket instead of failing at the gate"
-    );
-    assert_eq!(
-        received.try_iter().count(),
-        0,
-        "a command reached the socket while the detector was disconnected"
-    );
+    received.try_iter().for_each(drop);
 
     // The module count is still unknown, so there is still no readout length —
     // which is what the probe below has to fix, not the connection alone.
