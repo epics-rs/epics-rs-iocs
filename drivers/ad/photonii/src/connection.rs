@@ -116,13 +116,23 @@ impl P2Util {
     }
 }
 
+/// `fromPhotonII_` as C posts it: up to the NUL the read appended.
 fn decode(data: Vec<u8>) -> String {
-    String::from_utf8_lossy(&data).trim_end().to_string()
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    String::from_utf8_lossy(&data[..end]).into_owned()
 }
 
 #[cfg(test)]
 mod is_timeout_tests {
     use super::*;
+
+    /// Trailing blanks and the `\r` of an EOS a timeout split stay in the
+    /// line C posts (asynInterposeEos.c:89, PhotonII.cpp:260).
+    #[test]
+    fn a_line_keeps_its_trailing_bytes() {
+        assert_eq!(decode(b"wrote 3 \r".to_vec()), "wrote 3 \r");
+        assert_eq!(decode(b"ok\0junk".to_vec()), "ok");
+    }
 
     #[test]
     fn a_timeout_maps_to_timeout() {
