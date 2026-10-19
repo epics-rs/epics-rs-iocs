@@ -69,7 +69,7 @@ const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'stat
         name,
         choice,
         link_type: DbLinkType::InstIo,
-        dset: Dset::new(number, funcs, false),
+        dset: Dset::new(number, funcs, false).with_init(device_support::dev_init),
     }
 }
 
@@ -117,4 +117,26 @@ async fn main() -> CaResult<()> {
     ));
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every devMW100_* dset has `init` (devMW100_*.c), so dbDumpDevice shows
+    /// slot 1 and the dset init passes reach it.
+    #[test]
+    fn every_dset_runs_dev_init() {
+        let dev_init: fn(bool) = device_support::dev_init;
+        for (record_type, rows) in DEVICES {
+            for row in *rows {
+                assert_eq!(
+                    row.dset.init.map(|f| f as usize),
+                    Some(dev_init as usize),
+                    "{record_type} {}",
+                    row.name
+                );
+            }
+        }
+    }
 }
