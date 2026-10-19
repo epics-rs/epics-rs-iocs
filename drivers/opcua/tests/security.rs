@@ -17,7 +17,9 @@ fn a_policy_uri_prints_as_c_names_it() {
 }
 
 mod setup_security {
-    use async_opcua::types::{EndpointDescription, MessageSecurityMode};
+    use async_opcua::types::{
+        EndpointDescription, MessageSecurityMode, StatusCode, UserTokenPolicy, UserTokenType,
+    };
     use opcua::client::{AsyncOpcuaConnector, Identity, UaConnector};
     use opcua::session::SessionConfig;
 
@@ -88,6 +90,151 @@ mod setup_security {
         );
         config.set_option("sec-policy", "Basic128Rsa15").unwrap();
         assert!(config.select_endpoint(&offered()).is_none());
+    }
+
+    const BINARY: &str = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary";
+
+    fn token(id: &str, token_type: UserTokenType, policy: &str) -> UserTokenPolicy {
+        UserTokenPolicy {
+            policy_id: id.into(),
+            token_type,
+            security_policy_uri: policy.into(),
+            ..Default::default()
+        }
+    }
+
+    fn with_tokens(
+        mut e: EndpointDescription,
+        tokens: Vec<UserTokenPolicy>,
+    ) -> EndpointDescription {
+        e.user_identity_tokens = Some(tokens);
+        e
+    }
+
+    /// `responseGetEndpoints` (open62541.c:45155-45320) takes the first endpoint
+    /// in the server's order, not the most secure, and the first token policy on
+    /// it for the identity.
+    #[test]
+    fn a_none_session_takes_the_first_none_endpoint_with_a_token_for_it() {
+        let config = SessionConfig::new("s", "opc.tcp://10.0.0.1:4840");
+        let anonymous = token("anon", UserTokenType::Anonymous, "");
+        let user = token("user", UserTokenType::UserName, SHA256);
+        let mut https = with_tokens(
+            endpoint("opc.tcp://srv:4840", MessageSecurityMode::None, NONE, 9),
+            vec![anonymous.clone()],
+        );
+        https.transport_profile_uri =
+            "http://opcfoundation.org/UA-Profile/Transport/https-uabinary".into();
+        let mut binary = with_tokens(
+            endpoint("opc.tcp://srv:4840", MessageSecurityMode::None, NONE, 1),
+            vec![user.clone(), anonymous.clone()],
+        );
+        binary.transport_profile_uri = BINARY.into();
+        let offered = [
+            with_tokens(
+                endpoint("opc.tcp://srv:4840", MessageSecurityMode::Sign, SHA256, 5),
+                vec![anonymous.clone()],
+            ),
+            with_tokens(
+                endpoint("opc.tcp://srv:4840", MessageSecurityMode::None, NONE, 8),
+                vec![user.clone()],
+            ),
+            https,
+            binary,
+            with_tokens(
+                endpoint("opc.tcp://srv:4840", MessageSecurityMode::None, NONE, 7),
+                vec![anonymous.clone()],
+            ),
+        ];
+        let e = config
+            .connect_endpoint(
+                &offered,
+                MessageSecurityMode::None,
+                None,
+                UserTokenType::Anonymous,
+            )
+            .unwrap();
+        assert_eq!(e.security_level, 1);
+        assert_eq!(e.endpoint_url.as_ref(), "opc.tcp://10.0.0.1:4840");
+        assert_eq!(e.user_identity_tokens, Some(vec![anonymous]));
+    }
+
+    /// A non-anonymous token policy whose own security policy the client lacks
+    /// is passed over.
+    #[test]
+    fn a_token_policy_on_an_unsupported_policy_is_passed_over() {
+        let config = SessionConfig::new("s", "opc.tcp://srv:4840");
+        let rot13 = token(
+            "rot13",
+            UserTokenType::UserName,
+            "http://example.org/SecurityPolicy#Rot13",
+        );
+        let user = token("user", UserTokenType::UserName, SHA256);
+        let offered = [with_tokens(
+            endpoint(
+                "opc.tcp://srv:4840",
+                MessageSecurityMode::SignAndEncrypt,
+                SHA256,
+                7,
+            ),
+            vec![rot13, user.clone()],
+        )];
+        let e = config
+            .connect_endpoint(
+                &offered,
+                MessageSecurityMode::SignAndEncrypt,
+                Some(SHA256),
+                UserTokenType::UserName,
+            )
+            .unwrap();
+        assert_eq!(e.user_identity_tokens, Some(vec![user]));
+    }
+
+    /// No endpoint, and an endpoint with no token policy for the identity, are
+    /// both BadInternalError in open62541.
+    #[test]
+    fn no_endpoint_or_no_token_is_bad_internal_error() {
+        let config = SessionConfig::new("s", "opc.tcp://srv:4840");
+        let offered = [
+            with_tokens(
+                endpoint("opc.tcp://srv:4840", MessageSecurityMode::None, NONE, 0),
+                vec![token("anon", UserTokenType::Anonymous, "")],
+            ),
+            with_tokens(
+                endpoint("opc.tcp://srv:4840", MessageSecurityMode::Sign, SHA256, 3),
+                vec![token("anon", UserTokenType::Anonymous, "")],
+            ),
+        ];
+        assert_eq!(
+            config.connect_endpoint(
+                &offered,
+                MessageSecurityMode::None,
+                None,
+                UserTokenType::UserName
+            ),
+            Err(StatusCode::BadInternalError)
+        );
+        assert_eq!(
+            config.connect_endpoint(
+                &offered,
+                MessageSecurityMode::Sign,
+                Some(NONE),
+                UserTokenType::Anonymous
+            ),
+            Err(StatusCode::BadInternalError)
+        );
+        assert_eq!(
+            config
+                .connect_endpoint(
+                    &offered,
+                    MessageSecurityMode::Sign,
+                    Some(SHA256),
+                    UserTokenType::Anonymous
+                )
+                .unwrap()
+                .security_level,
+            3
+        );
     }
 
     #[tokio::test]

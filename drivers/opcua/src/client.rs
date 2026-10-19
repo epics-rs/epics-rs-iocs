@@ -21,8 +21,8 @@ use async_opcua::core::ResponseMessage;
 use async_opcua::crypto::SecurityPolicy;
 use async_opcua::types::{
     DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
-    MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, TimestampsToReturn, Variant,
-    WriteValue, custom::DataTypeTree,
+    MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, TimestampsToReturn, UserTokenType,
+    Variant, WriteValue, custom::DataTypeTree,
 };
 use async_trait::async_trait;
 use epics_rs::base::runtime::log::errlog_vprintf;
@@ -210,8 +210,14 @@ impl UaConnector for AsyncOpcuaConnector {
         })?;
 
         let identity = identity.token()?;
-        let connected = if config.security_mode == SecurityMode::None {
-            client.connect_to_endpoint_directly(config.unsecured_endpoint(), identity)
+        let token = match identity {
+            IdentityToken::Anonymous => UserTokenType::Anonymous,
+            IdentityToken::UserName(..) => UserTokenType::UserName,
+            IdentityToken::X509(..) => UserTokenType::Certificate,
+            IdentityToken::IssuedToken(..) => UserTokenType::IssuedToken,
+        };
+        let (mode, policy) = if config.security_mode == SecurityMode::None {
+            (MessageSecurityMode::None, None)
         } else {
             if !config.url.starts_with("opc.tcp") {
                 errlog_vprintf(format_args!(
@@ -227,14 +233,27 @@ impl UaConnector for AsyncOpcuaConnector {
             let endpoint = config
                 .select_endpoint(&endpoints)
                 .ok_or("security discovery and setup failed with status noMatchingEndpoint")?;
-            client.connect_to_endpoint_directly(endpoint, identity)
-        };
-        let (session, event_loop) = connected.map_err(|e| {
-            format!(
-                "connect service failed with status {}",
-                status_name(e.status())
+            (
+                endpoint.security_mode,
+                Some(endpoint.security_policy_uri.as_ref().to_string()),
             )
-        })?;
+        };
+
+        // `UA_Client_connect` reads the endpoints again and picks the one to
+        // connect to by itself, for `sec-mode=None` as for any other.
+        let failed = |status: StatusCode| {
+            format!("connect service failed with status {}", status_name(status))
+        };
+        let endpoints = client
+            .get_server_endpoints_from_url(config.url.as_str())
+            .await
+            .map_err(|e| failed(e.status()))?;
+        let endpoint = config
+            .connect_endpoint(&endpoints, mode, policy.as_deref(), token)
+            .map_err(failed)?;
+        let (session, event_loop) = client
+            .connect_to_endpoint_directly(endpoint, identity)
+            .map_err(|e| failed(e.status()))?;
 
         // The event loop makes the one attempt `session_retry_limit(0)` allows
         // and ends with its status; the session state stays `Connecting`, so

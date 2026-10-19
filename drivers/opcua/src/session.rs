@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use async_opcua::crypto::SecurityPolicy;
 use async_opcua::types::{
     AttributeId, DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
-    MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, Variant, WriteValue,
+    MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, UserTokenType, Variant, WriteValue,
 };
 use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
@@ -289,14 +289,44 @@ impl SessionConfig {
         })
     }
 
-    /// The endpoint a `sec-mode=None` session connects to without discovery.
-    pub fn unsecured_endpoint(&self) -> EndpointDescription {
-        EndpointDescription {
-            endpoint_url: self.url.as_str().into(),
-            security_policy_uri: SecurityPolicy::None.to_uri().into(),
-            security_mode: MessageSecurityMode::None,
-            ..Default::default()
-        }
+    /// The endpoint `UA_Client_connect` settles on (`responseGetEndpoints`,
+    /// open62541.c:45155-45330): the first binary-transport endpoint, in the
+    /// server's order, with `mode` and — when set — `policy`, that has a user
+    /// token policy for `token`. That token policy is the only one left on it,
+    /// so the client cannot pick another, and the session still connects to its
+    /// own URL. No such endpoint is BadInternalError, as in open62541.
+    pub fn connect_endpoint(
+        &self,
+        endpoints: &[EndpointDescription],
+        mode: MessageSecurityMode,
+        policy: Option<&str>,
+        token: UserTokenType,
+    ) -> Result<EndpointDescription, StatusCode> {
+        const BINARY: &str = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary";
+        let supported = |uri: &str| SecurityPolicy::from_uri(uri) != SecurityPolicy::Unknown;
+        endpoints
+            .iter()
+            .filter(|e| {
+                let transport = e.transport_profile_uri.as_ref();
+                (transport.is_empty() || transport == BINARY)
+                    && e.security_mode == mode
+                    && policy.is_none_or(|p| p == e.security_policy_uri.as_ref())
+                    && supported(e.security_policy_uri.as_ref())
+            })
+            .find_map(|e| {
+                let tokens = e.user_identity_tokens.as_deref().unwrap_or_default();
+                let chosen = tokens.iter().find(|t| {
+                    let uri = t.security_policy_uri.as_ref();
+                    t.token_type == token
+                        && (token == UserTokenType::Anonymous || uri.is_empty() || supported(uri))
+                })?;
+                Some(EndpointDescription {
+                    endpoint_url: self.url.as_str().into(),
+                    user_identity_tokens: Some(vec![chosen.clone()]),
+                    ..e.clone()
+                })
+            })
+            .ok_or(StatusCode::BadInternalError)
     }
 
     /// The nodes the client will put in one Read (`SessionOpen62541.cpp:2461-2465`):
