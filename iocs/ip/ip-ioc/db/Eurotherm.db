@@ -42,8 +42,9 @@ record(ai, "$(P)ET:trash3") {
 }
 
 record(ao, "$(P)ET:Setpoint") {
-# ipApp/Db/Eurotherm.db:47 has DTYP "<none>", which no base accepts
-  field(DTYP, "asyn ao Eurotherm")
+# field(DTYP,"asyn ao Eurotherm")
+# field(DTYP,"<none>")
+  field(DTYP, "<none>")
   field(SDIS, "$(P)ET:ReadTemperature.VAL  NPP MS")
   field(FLNK, "$(P)ET:ack.VAL  PP MS")
   field(OUT, "@asyn($(PORT))FMT=SL%4.0lf,TERM=03")
@@ -51,8 +52,9 @@ record(ao, "$(P)ET:Setpoint") {
 }
 
 record(ao, "$(P)ET:RampRate") {
-# ipApp/Db/Eurotherm.db:57 has DTYP "<none>", which no base accepts
-  field(DTYP, "asyn ao Eurotherm")
+# field(DTYP,"asyn ao Eurotherm")
+# field(DTYP,"<none>")
+  field(DTYP, "<none>")
   field(SDIS, "$(P)ET:ReadTemperature.VAL  NPP MS")
   field(FLNK, "$(P)ET:ack0.VAL  PP MS")
   field(OUT, "@asyn($(PORT))FMT=SR%4.0lf,TERM=03")
@@ -99,8 +101,9 @@ record(stringin, "$(P)ET:ack0") {
 }
 
 record(stringout, "$(P)ET:ReadSetpoint") {
-# ipApp/Db/Eurotherm.db:106 has DTYP "<none>", which no base accepts
-  field(DTYP, "asyn so Eurotherm")
+# field(DTYP,"asyn so Eurotherm")
+# field(DTYP,"<none>")
+  field(DTYP, "<none>")
   field(SDIS, "0")
   field(FLNK, "$(P)ET:trash1.VAL  PP MS")
   field(VAL, "SP")
@@ -108,8 +111,9 @@ record(stringout, "$(P)ET:ReadSetpoint") {
 }
 
 record(stringout, "$(P)ET:ReadRampRate") {
-# ipApp/Db/Eurotherm.db:116 has DTYP "<none>", which no base accepts
-  field(DTYP, "asyn so Eurotherm")
+# field(DTYP,"asyn so Eurotherm")
+# field(DTYP,"<none>")
+  field(DTYP, "<none>")
   field(SDIS, "0")
   field(FLNK, "$(P)ET:trash2.VAL  PP MS")
   field(VAL, "SR")
@@ -121,8 +125,9 @@ record(stringout, "$(P)ET:ReadRampRate") {
 # (The only reason that link is PP is to make
 # its target post the new value.)
 record(stringout, "$(P)ET:QueryTemperature") {
-# ipApp/Db/Eurotherm.db:130 has DTYP "<none>", which no base accepts
-  field(DTYP, "asyn so Eurotherm")
+# field(DTYP,"asyn so Eurotherm")
+# field(DTYP,"<none>")
+  field(DTYP, "<none>")
   field(SDIS, "$(P)ET:DoneReading.PACT  NPP MS")
   field(FLNK, "$(P)ET:trash3.VAL  PP MS")
   field(VAL, "PV")

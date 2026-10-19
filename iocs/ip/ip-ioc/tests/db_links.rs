@@ -56,9 +56,8 @@ fn tpg261_records_use_dev_tpg261() {
     }
 }
 
-/// ipApp/Db's Eurotherm.db: the controller is read through devXxStrParm and
-/// written through devXxEurotherm. Upstream ships the writers with DTYP
-/// `<none>` (:47, :57, :106, :116, :130), which no base accepts.
+/// ipApp/Db's Eurotherm.db: the controller is read through devXxStrParm,
+/// and its devXxEurotherm records ship with DTYP `<none>`.
 #[test]
 fn eurotherm_records_read_through_dev_xx_str_parm() {
     let records = device_records("Eurotherm.db");
@@ -66,8 +65,7 @@ fn eurotherm_records_read_through_dev_xx_str_parm() {
     let count = |dtyp: &str| records.iter().filter(|(_, d, _)| d == dtyp).count();
     assert_eq!(count("asyn ai stringParm"), 6, "{records:?}");
     assert_eq!(count("asyn si stringParm"), 2, "{records:?}");
-    assert_eq!(count("asyn ao Eurotherm"), 2, "{records:?}");
-    assert_eq!(count("asyn so Eurotherm"), 3, "{records:?}");
+    assert_eq!(count("<none>"), 5, "{records:?}");
 }
 
 /// ipApp/Db's heidND261.db: one devAiHeidND261 ai feeding two calcs.
