@@ -746,4 +746,14 @@ mod tests {
             .collect();
         assert_eq!(io, ["<flush>", "mxsettings N_oscillations 3", "<read>"]);
     }
+
+    /// pilatusDetector.cpp:922: writeCamserver flushes stale input before
+    /// every write.
+    #[test]
+    fn every_camserver_write_flushes_first() {
+        let (mut det, log) = rig("PILATUS_CAM_FLUSH", ok);
+        det.cam_write("Exposure x.tif", 1.0);
+        det.cam_write("K", 1.0);
+        assert_eq!(*log.lock(), ["<flush>", "Exposure x.tif", "<flush>", "K"]);
+    }
 }
