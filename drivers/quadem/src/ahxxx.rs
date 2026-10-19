@@ -517,6 +517,12 @@ impl QuadEmDevice for AhxxxDriver {
             .store(proto::is_ah401_series(self.model), Ordering::Release);
         self.base_reset()
     }
+
+    /// C++ `drvAHxxx::exitHandler` (drvAHxxx.cpp:805-810): the meter stops
+    /// streaming when the IOC goes.
+    fn exit_handler(&mut self) {
+        let _ = self.set_acquire(0);
+    }
 }
 
 // ===========================================================================
@@ -944,6 +950,60 @@ mod tests {
             .read_int32_blocking(rt.params.model, 0)
             .unwrap();
         assert_eq!(model, QeModel::Ah501d as i32);
+    }
+
+    /// C++ `drvAHxxx::exitHandler` is `setAcquire(0)` (drvAHxxx.cpp:805-810),
+    /// so the hook drvQuadEM arms at IOC exit sends the meter `ACQ OFF`.
+    #[test]
+    fn the_exit_handler_stops_the_meter() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let reply: &[u8] = if buf[..n].starts_with(b"VER") {
+                    b"AH401D 2.0\r\n"
+                } else {
+                    b"ACK\r\n"
+                };
+                if sock.write_all(reply).is_err() {
+                    break;
+                }
+            }
+        });
+        let (_io, _meter) = crate::octet::create_ip_port(
+            "QE_AH_EXIT_IP",
+            &addr.to_string(),
+            proto::AHXXX_TIMEOUT,
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_EXIT").unwrap(),
+            "QE_AH_EXIT_IP",
+            4,
+            0,
+            "AH401D",
+        )
+        .unwrap();
+        // reset() already stopped the meter once.
+        let _ = rx.try_iter().count();
+
+        rt.port_handle()
+            .with_driver_blocking(|d: &mut AhxxxDriver| d.exit_handler())
+            .unwrap();
+        let sent: String = rx.try_iter().collect();
+        assert!(sent.starts_with("ACQ OFF"), "{sent:?}");
     }
 
     /// C++ sets the input EOS only in setAcquire (drvAHxxx.cpp:465-472): a
