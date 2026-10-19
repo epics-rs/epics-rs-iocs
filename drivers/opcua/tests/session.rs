@@ -436,6 +436,38 @@ fn a_bad_session_option_is_passed_over() {
     assert_eq!(config.security_mode, opcua::client::SecurityMode::Best);
 }
 
+/// C compares the mode with `==` (`SessionOpen62541.cpp:378-389`).
+#[test]
+fn sec_mode_is_matched_case_exactly() {
+    use opcua::client::SecurityMode;
+
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    for value in ["none", "NONE", "sign", "signandencrypt", "Best"] {
+        config.set_option("sec-mode", value).unwrap();
+        assert_eq!(config.security_mode, SecurityMode::Best, "{value}");
+    }
+    errlog_flush();
+    errlog_remove_listener(id);
+    assert_eq!(
+        *lines.lock(),
+        vec!["invalid security-mode (valid: best None Sign SignAndEncrypt)\n"; 5]
+    );
+    for (value, mode) in [
+        ("None", SecurityMode::None),
+        ("Sign", SecurityMode::Sign),
+        ("SignAndEncrypt", SecurityMode::SignAndEncrypt),
+        ("best", SecurityMode::Best),
+    ] {
+        config.set_option("sec-mode", value).unwrap();
+        assert_eq!(config.security_mode, mode, "{value}");
+    }
+}
+
 #[test]
 fn sec_policy_takes_the_short_name_and_keeps_the_uri() {
     let mut config = SessionConfig::new("sess", "opc.tcp://host");

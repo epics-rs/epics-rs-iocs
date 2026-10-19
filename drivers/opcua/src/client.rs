@@ -583,11 +583,11 @@ pub enum SecurityMode {
 
 impl SecurityMode {
     pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
+        match s {
             "best" => Some(SecurityMode::Best),
-            "none" => Some(SecurityMode::None),
-            "sign" => Some(SecurityMode::Sign),
-            "signandencrypt" => Some(SecurityMode::SignAndEncrypt),
+            "None" => Some(SecurityMode::None),
+            "Sign" => Some(SecurityMode::Sign),
+            "SignAndEncrypt" => Some(SecurityMode::SignAndEncrypt),
             _ => None,
         }
     }
