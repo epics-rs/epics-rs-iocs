@@ -45,7 +45,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    AxisUser, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, has_motor_axis,
+    AxisUser, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, has_motor_axis, index,
 };
 use epics_rs::motor::trace::MotorTrace;
 
@@ -65,6 +65,9 @@ const PULSES_PER_STEP: f64 = 1000.0;
 
 /// Max errors to drain per `clearErrors` call (safety bound on the queue read).
 const MAX_ERROR_DRAIN: usize = 32;
+
+/// MOTOR_STATUS_PROBLEM, MSTA bit 9 of the MOTOR_STATUS_* run.
+const STATUS_PROBLEM: usize = index::STATUS_DIRECTION + 9;
 
 // MCS2 channel status-word bits (C header).
 const ACTIVELY_MOVING: i64 = 0x0001;
@@ -129,6 +132,9 @@ pub struct Mcs2Controller {
     reasons: Option<Mcs2Reasons>,
     /// C's `pasynUserSelf`.
     trace: MotorTrace,
+    /// What [`Self::clear_errors`] set on address 0, for the next axis to
+    /// hand the poller.
+    sets: PortSets,
 }
 
 impl Mcs2Controller {
@@ -141,6 +147,7 @@ impl Mcs2Controller {
             ident: String::new(),
             reasons: None,
             trace,
+            sets: PortSets::default(),
         };
         ctrl.clear_errors();
         match ctrl.query(":DEV:SNUM?") {
@@ -203,20 +210,22 @@ impl Mcs2Controller {
     /// Drain the controller error queue (C `clearErrors`): read the error count
     /// and consume that many `:SYST:ERR?` entries, so queued errors do not carry
     /// over between commands, printing each and tracing its meaning
-    /// (smarActMCS2MotorDriver.cpp:121-162). Best-effort; ignores I/O
-    /// errors. C also sets `motorStatusProblem_` at address 0 from the
-    /// I/O status (:164-166), overwriting axis 0's whatever axis drained;
-    /// that C defect is not copied, and axis 0's poll owns the bit.
-    fn clear_errors(&self) {
-        let count = self
-            .query(":SYST:ERR:COUN?")
-            .ok()
-            .map(|r| atoi(&r))
-            .unwrap_or(0);
+    /// (smarActMCS2MotorDriver.cpp:121-162). An I/O error ends the drain.
+    /// C then sets `motorStatusProblem_` on address 0 from that status and
+    /// posts address 0, whichever axis drained (:164-166): the controller's
+    /// own error queue, reported on the controller's address.
+    fn clear_errors(&mut self) {
+        let problem = self.drain_errors().is_err();
+        self.sets
+            .set(0, STATUS_PROBLEM, ParamValue::Int32(i32::from(problem)));
+        self.sets.call_param_callbacks(0);
+    }
+
+    /// [`Self::clear_errors`] up to C's `skip:` label.
+    fn drain_errors(&self) -> AsynResult<()> {
+        let count = atoi(&self.query(":SYST:ERR:COUN?")?);
         for _ in 0..count.clamp(0, MAX_ERROR_DRAIN as i32) {
-            let Ok(reply) = self.query(":SYST:ERR?") else {
-                break;
-            };
+            let reply = self.query(":SYST:ERR?")?;
             // C's printf leaves the line open; rs ends it.
             println!("{reply}");
             self.trace.print_self(
@@ -227,6 +236,7 @@ impl Mcs2Controller {
                 ),
             );
         }
+        Ok(())
     }
 }
 
@@ -384,7 +394,7 @@ impl AxisReport for Mcs2AxisReport {
         if level == 0 {
             return;
         }
-        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         let c = self.channel;
         // C ignores every status but the last and parses what arrived.
         let query = |what: &str| ctrl.exchange(&format!(":CHAN{c}:{what}?"));
@@ -532,7 +542,9 @@ impl AsynMotor for Mcs2Axis {
     }
 
     fn take_port_sets(&mut self) -> PortSets {
-        std::mem::take(&mut self.sets)
+        let mut sets = std::mem::take(&mut self.sets);
+        sets.append(std::mem::take(&mut self.lock().sets));
+        sets
     }
 
     /// C `MCS2Axis::poll`'s `skip` label sets only `motorStatusProblem_`
@@ -599,7 +611,7 @@ impl AsynMotor for Mcs2Axis {
         if !forward {
             ref_opt |= START_DIRECTION;
         }
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
         ctrl.write_only(&format!(":CHAN{c}:REF:OPT {ref_opt}"))?;
         ctrl.clear_errors();
         ctrl.write_only(&format!(
@@ -805,6 +817,58 @@ mod tests {
         assert_eq!(traced, 4, "{text}");
     }
 
+    /// smarActMCS2MotorDriver.cpp:164-166: clearErrors sets
+    /// `motorStatusProblem_` on address 0 from its I/O status and posts
+    /// address 0, whichever axis drained.
+    #[test]
+    fn cleared_errors_set_the_problem_bit_on_address_0() {
+        use epics_rs::asyn::interfaces::motor::PortSet;
+        use motor_common::testing::LineRig;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fail = Arc::new(AtomicBool::new(false));
+        let fails = fail.clone();
+        let (_rig, io) = LineRig::failing(
+            "mcs2ProblemAddr0",
+            |_| "0\r\n".to_string(),
+            move |cmd| fails.load(Ordering::SeqCst) && cmd.trim_end() == ":SYST:ERR:COUN?",
+        );
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2ProblemAddr0", 0));
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let mut axes = [Mcs2Axis::new(ctrl.clone(), 0), Mcs2Axis::new(ctrl, 2)];
+        for axis in &mut axes {
+            axis.take_port_sets();
+        }
+        let user = AsynUser::default();
+        for (axis, failing) in [(1, true), (0, false), (0, true), (1, false)] {
+            fail.store(failing, Ordering::SeqCst);
+            axes[axis].home(&user, 0.0, 1.0, 1.0, true).unwrap();
+            let posted: Vec<String> = axes[axis]
+                .take_port_sets()
+                .into_iter()
+                .map(|set| match set {
+                    PortSet::Set {
+                        addr,
+                        reason,
+                        value: ParamValue::Int32(v),
+                    } if reason == STATUS_PROBLEM => format!("problem {addr} {v}"),
+                    PortSet::Callbacks(addr) => format!("callbacks {addr}"),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            // home drains the queue four times (:415-427).
+            let once = [
+                format!("problem 0 {}", i32::from(failing)),
+                "callbacks 0".into(),
+            ];
+            assert_eq!(
+                posted,
+                vec![once; 4].concat(),
+                "channel {} failing {failing}",
+                axes[axis].channel
+            );
+        }
+    }
+
     /// smarActMCS2MotorDriver.cpp:125 reads the error count with `atoi`.
     #[test]
     fn the_error_count_is_read_with_atoi() {
@@ -859,6 +923,8 @@ mod tests {
         let mut ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2PollSets", 0));
         ctrl.set_reasons(Mcs2Reasons::from_slice([10, 11, 12, 13, 14, 15]));
         let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        // The constructors' clearErrors posts.
+        axis.take_port_sets();
         axis.poll(&AsynUser::default()).unwrap();
         let sets: Vec<(usize, i32)> = axis
             .take_port_sets()
