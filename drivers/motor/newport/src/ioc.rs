@@ -2002,7 +2002,6 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
             let controller = match Mm4000Controller::new(
                 handle,
                 &port_name,
-                &port_name,
                 num_axes as usize,
                 cache_ttl,
             ) {

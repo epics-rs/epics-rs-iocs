@@ -160,12 +160,11 @@ pub struct Mm4000Controller {
     /// The octet port C's `pController->pasynUser` prints its exchange
     /// errors on.
     serial_port: String,
-    /// The motor port whose axis users the poller prints on
-    /// (drvMotorAsyn.c:413).
-    motor_port: String,
     firmware: String,
     model: Mm4000Model,
     num_axes: usize,
+    /// Each axis's `pAxis->logParam`, which the poller prints on.
+    logs: Vec<Arc<AxisLog>>,
     cache: Mm4000PollData,
     fetched_at: Option<Instant>,
     cache_ttl: Duration,
@@ -228,17 +227,16 @@ impl Mm4000Controller {
     pub fn new(
         handle: SyncIOHandle,
         serial_port: &str,
-        motor_port: &str,
         num_axes: usize,
         cache_ttl: Duration,
     ) -> Result<Self, Mm4000Refusal> {
         let mut ctrl = Self {
             handle,
             serial_port: serial_port.to_owned(),
-            motor_port: motor_port.to_owned(),
             firmware: String::new(),
             model: Mm4000Model::Mm4000,
             num_axes,
+            logs: (0..num_axes).map(|_| Arc::default()).collect(),
             cache: Mm4000PollData::default(),
             fetched_at: None,
             cache_ttl,
@@ -279,10 +277,10 @@ impl Mm4000Controller {
         let mut ctrl = Self {
             handle,
             serial_port: serial_port.to_owned(),
-            motor_port: serial_port.to_owned(),
             firmware: String::new(),
             model: Mm4000Model::Mm4000,
             num_axes: 0,
+            logs: Vec::new(),
             cache: Mm4000PollData::default(),
             fetched_at: None,
             cache_ttl,
@@ -300,6 +298,7 @@ impl Mm4000Controller {
         };
         ctrl.model = model;
         ctrl.num_axes = strtok_count(&read(&ctrl, "TH;"));
+        ctrl.logs = (0..ctrl.num_axes).map(|_| Arc::default()).collect();
         ctrl.start_status(false);
         Ok(ctrl)
     }
@@ -499,10 +498,9 @@ impl Mm4000Controller {
                 match self.write_read("TE;") {
                     Ok(te) => {
                         if !te_ok(&te) {
-                            for axis in 0..self.num_axes {
-                                self.print_error(
-                                    &self.motor_port,
-                                    axis as i32,
+                            for log in &self.logs {
+                                log.print(
+                                    TraceMask::ERROR,
                                     format_args!("MM4000Poller: controller error {te}\n"),
                                 );
                             }
@@ -515,10 +513,9 @@ impl Mm4000Controller {
             // C MM4000Poller sets only motorAxisCommError; every other
             // parameter keeps the last value read.
             Err(e) => {
-                for axis in 0..self.num_axes {
-                    self.print_error(
-                        &self.motor_port,
-                        axis as i32,
+                for log in &self.logs {
+                    log.print(
+                        TraceMask::ERROR,
                         format_args!("MM4000Poller: error reading status={}\n", e.status() as i32),
                     );
                 }
@@ -634,7 +631,7 @@ impl Mm4000Axis {
         axis: usize,
         poll_failure: PollFailure,
     ) -> Self {
-        let (model1, model, step_size, home_preset, low_limit, high_limit, encoder_present) = {
+        let (model1, model, log, step_size, home_preset, low_limit, high_limit, encoder_present) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // C `&inputBuff[3]`: skip the echoed `nCC` prefix.
             let query = |cc: &str| {
@@ -649,6 +646,7 @@ impl Mm4000Axis {
             (
                 ctrl.is_model1(),
                 ctrl.model(),
+                ctrl.logs[axis - 1].clone(),
                 step_size,
                 home_preset,
                 low_limit,
@@ -659,7 +657,7 @@ impl Mm4000Axis {
         Self {
             controller,
             card,
-            log: Arc::default(),
+            log,
             axis,
             model,
             step_size,
@@ -698,7 +696,8 @@ impl Mm4000Axis {
         self.params.clone()
     }
 
-    /// The log `drvAsynMotorConfigure` attaches.
+    /// The log `drvAsynMotorConfigure` attaches, which the controller's
+    /// poll prints on too.
     pub fn log(&self) -> Arc<AxisLog> {
         self.log.clone()
     }
@@ -1705,7 +1704,7 @@ mod tests {
         )
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        let ctrl = Mm4000Controller::new(io, "mm4000_dead", "mm4000_dead_motor", 1, Duration::ZERO)
+        let ctrl = Mm4000Controller::new(io, "mm4000_dead", 1, Duration::ZERO)
             .ok()
             .unwrap();
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
@@ -1754,7 +1753,7 @@ mod tests {
         )
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
-        let ctrl = Mm4000Controller::new(io, "mm4000_te", "mm4000_te_motor", 2, Duration::ZERO)
+        let ctrl = Mm4000Controller::new(io, "mm4000_te", 2, Duration::ZERO)
             .ok()
             .unwrap();
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
@@ -1803,7 +1802,7 @@ mod tests {
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let ttl = Duration::from_secs(3600);
-        let ctrl = Mm4000Controller::new(io, "mm4000_moved", "mm4000_moved_motor", 1, ttl)
+        let ctrl = Mm4000Controller::new(io, "mm4000_moved", 1, ttl)
             .ok()
             .unwrap();
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
@@ -1856,7 +1855,7 @@ mod tests {
             let io =
                 SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
             assert!(
-                Mm4000Controller::new(io, name, name, num_axes, Duration::ZERO).is_err(),
+                Mm4000Controller::new(io, name, num_axes, Duration::ZERO).is_err(),
                 "{name}"
             );
         }
@@ -1944,7 +1943,7 @@ mod tests {
             }
             .to_string()
         });
-        let ctrl = Mm4000Controller::new(io, "mm4kForceLine", "mm4kForce", 2, Duration::ZERO)
+        let ctrl = Mm4000Controller::new(io, "mm4kForceLine", 2, Duration::ZERO)
             .ok()
             .unwrap();
         let ctrl = Arc::new(Mutex::new(ctrl));
@@ -1989,10 +1988,12 @@ mod tests {
     }
 
     /// Two model-2 axes of card 2 on port `port`, their logs attached by
-    /// drvAsynMotorConfigure, axis 1's trace going to a file under `mask`.
+    /// drvAsynMotorConfigure, axis 1's trace going to a file under `mask`;
+    /// `te` is the `TE;` reply.
     async fn traced_axes(
         port: &'static str,
         mask: TraceMask,
+        te: &'static str,
     ) -> (Vec<Arc<Mutex<Mm4000Axis>>>, std::path::PathBuf) {
         use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
         use epics_rs::base::server::iocsh::registry::ArgValue;
@@ -2006,7 +2007,7 @@ mod tests {
                 "VE;" => "VEMM4005 Version 2.0",
                 "MS;" => "1MS@,2MSE",
                 "TP;" => "1TP0.0,2TP-1.25",
-                "TE;" => "TE@",
+                "TE;" => te,
                 "1TU" => "1TU0.001",
                 "2TU" => "2TU0.001",
                 "2TL" => "2TL-10.0",
@@ -2015,7 +2016,7 @@ mod tests {
             }
             .to_string()
         });
-        let ctrl = Mm4000Controller::new(io, line, port, 2, Duration::ZERO)
+        let ctrl = Mm4000Controller::new(io, line, 2, Duration::ZERO)
             .ok()
             .unwrap();
         let ctrl = Arc::new(Mutex::new(ctrl));
@@ -2065,7 +2066,7 @@ mod tests {
     /// poller posts C's masked status bits.
     #[epics_rs::base::epics_test]
     async fn the_port_reads_back_what_the_driver_keeps() {
-        let (axes, _path) = traced_axes("mm4kParams", TraceMask::ERROR).await;
+        let (axes, _path) = traced_axes("mm4kParams", TraceMask::ERROR, "TE@").await;
         let port = PortManager::global()
             .find_port_handle("mm4kParams")
             .unwrap();
@@ -2099,7 +2100,7 @@ mod tests {
     /// bit, also on the poll after a move.
     #[epics_rs::base::epics_test]
     async fn the_done_parameter_is_the_moving_bit() {
-        let (axes, _path) = traced_axes("mm4kDone", TraceMask::ERROR).await;
+        let (axes, _path) = traced_axes("mm4kDone", TraceMask::ERROR, "TE@").await;
         let user = AsynUser::default();
         let mut axis = axes[0].lock().unwrap();
         axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
@@ -2112,7 +2113,7 @@ mod tests {
     /// with an ERROR line on the axis's log.
     #[epics_rs::base::epics_test]
     async fn refusals_print_the_c_error_lines() {
-        let (axes, path) = traced_axes("mm4kRefuse", TraceMask::ERROR).await;
+        let (axes, path) = traced_axes("mm4kRefuse", TraceMask::ERROR, "TE@").await;
         let user = AsynUser::default();
         let mut axis = axes[1].lock().unwrap();
         assert!(axis.set_encoder_ratio(&user, 2.0).is_err());
@@ -2136,7 +2137,7 @@ mod tests {
     /// function the driver does not set print an ERROR line and fail.
     #[epics_rs::base::epics_test]
     async fn unknown_functions_print_the_c_error_lines() {
-        let (_axes, path) = traced_axes("mm4kUnknown", TraceMask::ERROR).await;
+        let (_axes, path) = traced_axes("mm4kUnknown", TraceMask::ERROR, "TE@").await;
         let port = PortManager::global()
             .find_port_handle("mm4kUnknown")
             .unwrap();
@@ -2159,7 +2160,7 @@ mod tests {
     /// home and a stop print their FLOW lines, 0-based axis, unscaled.
     #[epics_rs::base::epics_test]
     async fn motion_commands_print_the_c_flow_lines() {
-        let (axes, path) = traced_axes("mm4kMotion", TraceMask::FLOW).await;
+        let (axes, path) = traced_axes("mm4kMotion", TraceMask::FLOW, "TE@").await;
         let user = AsynUser::default();
         let mut axis = axes[1].lock().unwrap();
         axis.move_absolute(&user, 1500.0, 10.0, 200.0, 400.0)
@@ -2184,7 +2185,7 @@ mod tests {
     /// position in controller units.
     #[epics_rs::base::epics_test]
     async fn the_poll_prints_the_c_iodriver_line() {
-        let (axes, path) = traced_axes("mm4kPoll", TraceMask::IO_DRIVER).await;
+        let (axes, path) = traced_axes("mm4kPoll", TraceMask::IO_DRIVER, "TE@").await;
         axes[1].lock().unwrap().poll(&AsynUser::default()).unwrap();
         // The poller's own startup poll may land in the file too.
         let text = take_trace(&path);
@@ -2194,6 +2195,20 @@ mod tests {
                 line,
                 "MM4000Poller: axis 1 axisStatus=45, position=-1.250000\n"
             );
+        }
+    }
+
+    /// drvMM4000Asyn.c:713: the poller's error lines print on each axis's
+    /// logParam, which drvAsynMotorConfigure points at the motor port.
+    #[epics_rs::base::epics_test]
+    async fn the_poller_errors_print_on_the_axis_log() {
+        let (axes, path) = traced_axes("mm4kTeErr", TraceMask::ERROR, "TEC").await;
+        axes[0].lock().unwrap().poll(&AsynUser::default()).unwrap();
+        // The poller's own startup pass may land in the file too.
+        let text = take_trace(&path);
+        assert!(!text.is_empty());
+        for line in text.split_inclusive('\n') {
+            assert_eq!(line, "MM4000Poller: controller error TEC\n");
         }
     }
 }
