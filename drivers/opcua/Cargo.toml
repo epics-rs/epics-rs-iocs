@@ -12,6 +12,7 @@ epics-rs = { workspace = true }
 async_opcua = { package = "async-opcua", version = "0.18", default-features = false, features = [
     "client",
 ] }
+futures-util = { version = "0.3", default-features = false }
 parking_lot = "0.12"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "macros"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

@@ -715,8 +715,12 @@ impl SessionWorker {
 
             match self.serve().await {
                 ServeOutcome::Shutdown => return,
-                ServeOutcome::Disconnected => {
-                    connect_now = self.autoconnect();
+                // open62541 reconnects a lost session on its next
+                // `UA_Client_run_iterate`, whatever autoconnect says, and a
+                // failure is what leaves the connect status
+                // (`connectIterate`, `SessionOpen62541.cpp:2374`).
+                ServeOutcome::Lost => {
+                    connect_now = true;
                 }
                 ServeOutcome::DisconnectRequested => {
                     connect_now = false;
@@ -826,8 +830,9 @@ impl SessionWorker {
     /// Serve requests until the connection drops or the IOC shuts down.
     async fn serve(&mut self) -> ServeOutcome {
         let Some(connection) = self.connection.clone() else {
-            return ServeOutcome::Disconnected;
+            return ServeOutcome::Lost;
         };
+        let mut closed = connection.closed();
         // open62541's background connectivity check: one Read of the server
         // state at a time, the next one an interval after the last answer.
         let mut check = None;
@@ -847,6 +852,11 @@ impl SessionWorker {
                     }
                     None => return ServeOutcome::Shutdown,
                 },
+
+                _ = &mut closed => {
+                    self.disconnect(&connection, End::Lost).await;
+                    return ServeOutcome::Lost;
+                }
 
                 request = self.commands.recv() => match request {
                     Some((priority, Request::Read { handle })) => {
@@ -880,15 +890,15 @@ impl SessionWorker {
                             "OPC UA Session {}: server inactive\n",
                             self.handle.name
                         ));
-                        self.disconnect(&connection, End::Lost(StatusCode::BadTimeout)).await;
-                        return ServeOutcome::Disconnected;
+                        self.disconnect(&connection, End::Lost).await;
+                        return ServeOutcome::Lost;
                     }
                 }
 
                 _ = tokio::time::sleep_until(flush_at.into()), if self.has_pending() => {
-                    if let Err(status) = self.flush(&connection).await {
-                        self.disconnect(&connection, End::Lost(status)).await;
-                        return ServeOutcome::Disconnected;
+                    if self.flush(&connection).await.is_err() {
+                        self.disconnect(&connection, End::Lost).await;
+                        return ServeOutcome::Lost;
                     }
                 }
             }
@@ -1444,13 +1454,10 @@ impl SessionWorker {
         {
             let mut client = self.handle.client.lock();
             client.registered = 0;
-            match end {
-                End::Requested => client.link = Link::Closed,
-                End::Lost(status) => {
-                    client.link = Link::Lost;
-                    client.connect_status = status;
-                }
-            }
+            client.link = match end {
+                End::Requested => Link::Closed,
+                End::Lost => Link::Lost,
+            };
         }
         // The ACTIVATED -> CREATED arm (`SessionOpen62541.cpp:2520-2523`), which
         // every way out of a session passes.
@@ -1477,8 +1484,9 @@ impl SessionWorker {
 enum End {
     /// `opcuaDisconnect`: open62541 closes the session and the channel.
     Requested,
-    /// The server or the connection to it failed with this status.
-    Lost(StatusCode),
+    /// The server or the connection to it failed. The connect status stays
+    /// `Good`, as open62541 reports it with the state change.
+    Lost,
 }
 
 /// The items monitored on one connection, at their client handle less one:
@@ -1488,7 +1496,7 @@ type Monitored = Arc<Mutex<Vec<Arc<Mutex<Item>>>>>;
 
 enum ServeOutcome {
     Shutdown,
-    Disconnected,
+    Lost,
     DisconnectRequested,
 }
 

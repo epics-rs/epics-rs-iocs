@@ -68,6 +68,8 @@ struct Mock {
     connects: Mutex<Vec<SessionConfig>>,
     /// Refuse this many connect attempts before accepting one.
     refuse_connects: Mutex<usize>,
+    /// The server drops the connection.
+    lost: tokio::sync::Notify,
 }
 
 impl Mock {
@@ -232,6 +234,10 @@ impl UaConnection for Mock {
 
     async fn disconnect(&self) {
         self.calls.lock().disconnects += 1;
+    }
+
+    async fn closed(&self) {
+        self.lost.notified().await
     }
 }
 
@@ -1172,6 +1178,7 @@ async fn a_connection_error_takes_the_session_down_and_tells_every_record() {
     until(|| handle.is_connected()).await;
     drain(&leaf0);
 
+    *mock.refuse_connects.lock() = 1;
     mock.behave(|b| b.read_error = Some(StatusCode::BadConnectionClosed));
     handle.request(Priority::Low, Request::Read { handle: 0 });
     until(|| !handle.is_connected()).await;
@@ -1201,6 +1208,7 @@ async fn a_lost_connection_prints_disconnected() {
     handle.control(Control::Connect);
     until(|| handle.is_connected()).await;
 
+    *mock.refuse_connects.lock() = 1;
     mock.behave(|b| b.read_error = Some(StatusCode::BadConnectionClosed));
     handle.request(Priority::Low, Request::Read { handle: 0 });
     until(|| !handle.is_connected()).await;
@@ -1290,15 +1298,74 @@ async fn the_shown_connection_state_follows_the_client() {
     until(|| !handle.is_connected()).await;
     assert_eq!(shown_state(&handle), "Good Closed Closed registered=0");
 
+    // The lost session's one reconnect attempt is refused, so its status is
+    // the connect status (the C shows BadDisconnect for a refused TCP connect).
     handle.control(Control::Connect);
     until(|| handle.is_connected()).await;
+    *mock.refuse_connects.lock() = 1;
     mock.behave(|b| b.read_error = Some(StatusCode::BadConnectionClosed));
     handle.request(Priority::Low, Request::Read { handle: 0 });
-    until(|| !handle.is_connected()).await;
+    until(|| mock.connects.lock().len() == 4).await;
+    until(|| shown_state(&handle) == "BadNotConnected Created Fresh registered=0").await;
+}
+
+/// open62541 notices a dropped connection in `UA_Client_run_iterate` with no
+/// request outstanding, takes the session to CREATED/FRESH and makes one
+/// reconnect attempt at once, autoconnect or not (`connectIterate`).
+#[tokio::test]
+async fn a_connection_the_server_drops_is_lost_and_retried_once() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    let (item0, leaf0) = item("sess ns=2;s=Sensor register=y monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    drain(&leaf0);
+    let reads = mock.calls.lock().reads.len();
+
+    *mock.refuse_connects.lock() = 1;
+    mock.lost.notify_one();
+    until(|| shown_state(&handle) == "BadNotConnected Created Fresh registered=0").await;
+    assert!(!handle.is_connected());
+    assert_eq!(drain(&leaf0)[0].reason, ProcessReason::ConnectionLoss);
+    assert_eq!(mock.calls.lock().reads.len(), reads);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(mock.connects.lock().len(), 2);
+
+    errlog_flush();
+    errlog_remove_listener(id);
+    let lines = lines.lock();
     assert_eq!(
-        shown_state(&handle),
-        "BadConnectionClosed Created Fresh registered=0"
+        lines
+            .iter()
+            .filter(|l| *l == "OPC UA session sess: disconnected\n")
+            .count(),
+        1
     );
+    assert!(!lines.iter().any(|l| l.contains("connect service failed")));
+}
+
+#[tokio::test]
+async fn a_connection_the_server_drops_reconnects_at_once() {
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+
+    mock.lost.notify_one();
+    until(|| mock.connects.lock().len() == 2).await;
+    until(|| handle.is_connected()).await;
+    assert_eq!(mock.calls.lock().disconnects, 1);
+    assert_eq!(shown_state(&handle), "Good Activated Open registered=0");
 }
 
 #[tokio::test]
@@ -1889,6 +1956,7 @@ async fn an_idle_session_whose_server_stops_answering_goes_inactive() {
             .any(|r| r.len() == 1 && r[0].node_id == state)
     );
 
+    *mock.refuse_connects.lock() = 1;
     mock.behave(|b| b.read_error = Some(StatusCode::BadTimeout));
     until(|| !handle.is_connected()).await;
     errlog_flush();

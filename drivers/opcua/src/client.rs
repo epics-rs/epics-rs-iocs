@@ -16,7 +16,8 @@ use std::time::Duration;
 use async_opcua::client::custom_types::DataTypeTreeBuilder;
 use async_opcua::client::services::{CreateSubscription, Read, Write};
 use async_opcua::client::{
-    ClientBuilder, IdentityToken, Session, Subscription, SubscriptionCallbacks, UARequest,
+    ClientBuilder, IdentityToken, Session, SessionPollResult, Subscription, SubscriptionCallbacks,
+    UARequest,
 };
 use async_opcua::core::ResponseMessage;
 use async_opcua::crypto::SecurityPolicy;
@@ -27,8 +28,9 @@ use async_opcua::types::{
 };
 use async_trait::async_trait;
 use epics_rs::base::runtime::log::errlog_vprintf;
+use futures_util::TryStreamExt;
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::session::{SessionConfig, status_name};
 use crate::subscription::SubscriptionConfig;
@@ -96,6 +98,11 @@ pub trait UaConnection: Send + Sync {
         items: Vec<MonitoredItemCreateRequest>,
     ) -> Result<Vec<MonitoredItemCreateResult>, StatusCode>;
     async fn disconnect(&self);
+    /// Resolves when the connection is gone from under the session — open62541's
+    /// `closeSecureChannel` in `UA_Client_run_iterate`.
+    async fn closed(&self) {
+        std::future::pending::<()>().await
+    }
     /// The endpoint the session runs on, as [`SessionConfig::connect_endpoint`]
     /// gave it.
     fn endpoint(&self) -> Option<EndpointDescription> {
@@ -307,28 +314,40 @@ impl UaConnector for AsyncOpcuaConnector {
 
         // The event loop makes the one attempt `session_retry_limit(0)` allows
         // and ends with its status; the session state stays `Connecting`, so
-        // its end is the only failure signal.
-        let mut handle = event_loop.spawn();
-        let ended = tokio::select! {
+        // its end is the only failure signal. It also ends on a lost
+        // connection, before it would reconnect: the session worker owns
+        // reconnecting.
+        let (ended_tx, ended) = watch::channel(());
+        let mut handle = tokio::spawn(async move {
+            let _ended = ended_tx;
+            let events = event_loop.enter();
+            tokio::pin!(events);
+            loop {
+                match events.try_next().await {
+                    Ok(Some(SessionPollResult::ConnectionLost(status))) | Err(status) => {
+                        return status;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => return StatusCode::Good,
+                }
+            }
+        });
+        let failed_with = tokio::select! {
             true = session.wait_for_connection() => None,
             ended = &mut handle => Some(ended.unwrap_or(StatusCode::BadInternalError)),
         };
-        if let Some(status) = ended {
+        if let Some(status) = failed_with {
             return Err(failed(status));
         }
 
-        Ok(Arc::new(AsyncOpcuaConnection {
-            session,
-            _event_loop: handle,
-        }))
+        Ok(Arc::new(AsyncOpcuaConnection { session, ended }))
     }
 }
 
 struct AsyncOpcuaConnection {
     session: Arc<Session>,
-    /// Dropping this aborts the session's event loop, which is what closes the
-    /// connection when the driver drops the session.
-    _event_loop: tokio::task::JoinHandle<StatusCode>,
+    /// Never sent on; it closes when the session's event loop ends.
+    ended: watch::Receiver<()>,
 }
 
 #[async_trait]
@@ -479,6 +498,11 @@ impl UaConnection for AsyncOpcuaConnection {
 
     async fn disconnect(&self) {
         let _ = self.session.disconnect().await;
+    }
+
+    async fn closed(&self) {
+        let mut ended = self.ended.clone();
+        while ended.changed().await.is_ok() {}
     }
 
     fn endpoint(&self) -> Option<EndpointDescription> {
