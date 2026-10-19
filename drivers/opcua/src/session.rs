@@ -7,6 +7,7 @@
 //! items. Records never touch the connection.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -265,14 +266,15 @@ impl SessionConfig {
     /// `SessionOpen62541::setupSecurity` (`SessionOpen62541.cpp:1060-1086`):
     /// of the server's opc.tcp endpoints whose mode and policy the session
     /// accepts and whose policy the client supports, the one with the highest
-    /// security level. The session still connects to its own URL.
+    /// security level, with its number in the server's list. The session still
+    /// connects to its own URL.
     pub fn select_endpoint(
         &self,
         endpoints: &[EndpointDescription],
-    ) -> Option<EndpointDescription> {
+    ) -> Option<(usize, EndpointDescription)> {
         let mode = self.security_mode.as_message_security_mode();
-        let mut selected: Option<&EndpointDescription> = None;
-        for e in endpoints {
+        let mut selected: Option<(usize, &EndpointDescription)> = None;
+        for (number, e) in endpoints.iter().enumerate() {
             let policy = e.security_policy_uri.as_ref();
             if e.endpoint_url.as_ref().starts_with("opc.tcp")
                 && (self.security_mode == SecurityMode::Best || e.security_mode == mode)
@@ -280,15 +282,20 @@ impl SessionConfig {
                     .security_policy
                     .as_deref()
                     .is_none_or(|p| p.contains("#None") || p == policy)
-                && selected.is_none_or(|s| e.security_level > s.security_level)
+                && selected.is_none_or(|(_, s)| e.security_level > s.security_level)
                 && SecurityPolicy::from_uri(policy) != SecurityPolicy::Unknown
             {
-                selected = Some(e);
+                selected = Some((number, e));
             }
         }
-        selected.map(|e| EndpointDescription {
-            endpoint_url: self.url.as_str().into(),
-            ..e.clone()
+        selected.map(|(number, e)| {
+            (
+                number,
+                EndpointDescription {
+                    endpoint_url: self.url.as_str().into(),
+                    ..e.clone()
+                },
+            )
         })
     }
 
@@ -456,7 +463,10 @@ pub struct ClientState {
     /// `connectStatus`: what the last connect attempt, or the connection, ended
     /// with.
     pub connect_status: StatusCode,
-    pub link: Link,
+    /// `channelState` and `sessionState`: where the last state change left
+    /// them, which a failed attempt does not touch.
+    pub channel: ChannelState,
+    pub session: SessionState,
     /// `securityInfo`: the security the session last connected with.
     pub security_mode: MessageSecurityMode,
     pub security_policy_uri: String,
@@ -472,7 +482,8 @@ impl Default for ClientState {
     fn default() -> Self {
         Self {
             connect_status: StatusCode::BadInvalidState,
-            link: Link::Closed,
+            channel: ChannelState::Closed,
+            session: SessionState::Closed,
             security_mode: MessageSecurityMode::None,
             security_policy_uri: String::new(),
             server: ServerInfo::default(),
@@ -482,29 +493,99 @@ impl Default for ClientState {
     }
 }
 
-/// open62541's session and secure channel states where the worker leaves
-/// them.
+/// open62541's secure channel state, as `SessionOpen62541.cpp:153-174` names
+/// it: the states a client's channel passes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Link {
-    /// Never connected, or disconnected on request.
+pub enum ChannelState {
+    Fresh,
+    HelSent,
+    AckReceived,
+    OpnSent,
+    Open,
     Closed,
-    Activated,
-    /// The server went away: the channel was reset and the session survives
-    /// it (`closeSecureChannel`, open62541.c:45716-45739).
-    Lost,
 }
 
-impl Link {
-    /// (`sessionState`, `channelState`) as `SessionOpen62541.cpp:154-188`
-    /// names them.
-    fn names(self) -> (&'static str, &'static str) {
-        match self {
-            Link::Closed => ("Closed", "Closed"),
-            Link::Activated => ("Activated", "Open"),
-            Link::Lost => ("Created", "Fresh"),
-        }
+impl fmt::Display for ChannelState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ChannelState::Fresh => "Fresh",
+            ChannelState::HelSent => "HelSent",
+            ChannelState::AckReceived => "AckReceived",
+            ChannelState::OpnSent => "OPNSent",
+            ChannelState::Open => "Open",
+            ChannelState::Closed => "Closed",
+        })
     }
 }
+
+/// open62541's session state, as `SessionOpen62541.cpp:176-188` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Closed,
+    CreateRequested,
+    Created,
+    ActivateRequested,
+    Activated,
+    Closing,
+}
+
+impl fmt::Display for SessionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            SessionState::Closed => "Closed",
+            SessionState::CreateRequested => "CreateRequested",
+            SessionState::Created => "Created",
+            SessionState::ActivateRequested => "ActivateRequested",
+            SessionState::Activated => "Activated",
+            SessionState::Closing => "Closing",
+        })
+    }
+}
+
+/// The states open62541 reports to `connectionStatusChanged`, one report
+/// per entry, on its way through each transition.
+type Walk = [(ChannelState, SessionState)];
+
+/// `UA_Client_connect` on a new client: the channel, then a new session.
+const CONNECT: &Walk = &[
+    (ChannelState::HelSent, SessionState::Closed),
+    (ChannelState::AckReceived, SessionState::Closed),
+    (ChannelState::OpnSent, SessionState::Closed),
+    (ChannelState::Open, SessionState::Closed),
+    (ChannelState::Open, SessionState::CreateRequested),
+    (ChannelState::Open, SessionState::Created),
+    (ChannelState::Open, SessionState::ActivateRequested),
+    (ChannelState::Open, SessionState::Activated),
+];
+
+/// open62541 reconnecting a lost session: a new channel, on which the
+/// session it kept is activated again (`connectIterate`,
+/// open62541.c:45447-45560). This port creates a new session instead, and
+/// reports the server's acceptance of the old one.
+const RECONNECT: &Walk = &[
+    (ChannelState::HelSent, SessionState::Created),
+    (ChannelState::AckReceived, SessionState::Created),
+    (ChannelState::OpnSent, SessionState::Created),
+    (ChannelState::Open, SessionState::Created),
+    (ChannelState::Open, SessionState::ActivateRequested),
+    (ChannelState::Open, SessionState::Activated),
+];
+
+/// `UA_Client_disconnect`: CloseSession, then the channel
+/// (open62541.c:45740-45824). The session never passes CREATED, so C's
+/// "disconnected" line does not come. The C oracle prints it anyway when the
+/// session has a subscription (5/5 runs with one, 0/3 without): open62541 1.2
+/// re-sends Publish while CLOSING (`UA_Client_Subscriptions_backgroundPublish`,
+/// open62541.c:48202 in opcua's end2endTest/server) and aborts the channel.
+/// That library defect is not copied.
+const CLOSE: &Walk = &[
+    (ChannelState::Open, SessionState::Closing),
+    (ChannelState::Closed, SessionState::Closed),
+];
+
+/// The connection lost under an activated session (`closeSecureChannel`,
+/// open62541.c:45716-45739); the session survives it, to be activated again.
+const LOSE: &Walk = &[(ChannelState::Closed, SessionState::Created)];
 
 /// Out-of-band commands from iocsh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,17 +666,17 @@ impl SessionHandle {
         let items = self.items.lock().clone();
         let mut subscriptions = self.subscriptions.lock().clone();
         subscriptions.sort_by(|a, b| a.name.cmp(&b.name));
-        let (session_state, channel_state) = client.link.names();
         let server = &client.server;
         writeln!(
             out,
-            "session={} url={} connect status={} sessionState={session_state} \
-             channelState={channel_state} sec-mode={:?}({}) sec-policy={}({}) debug={} \
-             batch r/w={}/{}({}/{}) autoconnect={} items={} registered={} subscriptions={} \
-             reader={} writer={}",
+            "session={} url={} connect status={} sessionState={} channelState={} \
+             sec-mode={:?}({}) sec-policy={}({}) debug={} batch r/w={}/{}({}/{}) autoconnect={} \
+             items={} registered={} subscriptions={} reader={} writer={}",
             self.name,
             config.url,
             status_name(client.connect_status),
+            client.session,
+            client.channel,
             client.security_mode,
             config.security_mode.as_str(),
             security_policy_string(&client.security_policy_uri),
@@ -690,6 +771,17 @@ struct Connected {
     connection: Arc<dyn UaConnection>,
 }
 
+/// What C's `client` holds while the session is down.
+#[derive(Debug, Clone, Copy)]
+enum Down {
+    /// Nothing: never set up, or deleted (`client = nullptr`).
+    NoClient,
+    /// The client of a connect whose security setup failed. C keeps it until
+    /// the next connect or disconnect deletes it, which prints nothing
+    /// (`SessionOpen62541.cpp:545-553`).
+    SetupFailed,
+}
+
 /// Create a session and its worker. The worker must be spawned.
 pub fn create(
     config: SessionConfig,
@@ -736,6 +828,7 @@ impl SessionWorker {
     /// The worker's whole life: connect, serve, reconnect.
     async fn run(mut self) {
         let mut next: Option<Attempt> = None;
+        let mut down = Down::NoClient;
         loop {
             let Some(attempt) = next.take() else {
                 tokio::select! {
@@ -743,17 +836,21 @@ impl SessionWorker {
                         Some((Order::Connect { manual }, done)) => {
                             next = Some(Attempt::Connect { manual, done: Some(done) });
                         }
-                        Some((Order::Disconnect, _)) => {}
+                        Some((Order::Disconnect, _)) => self.disconnect_down(&mut down),
                         None => return,
                     },
-                    _ = exiting(&mut self.exit) => return,
+                    _ = exiting(&mut self.exit) => {
+                        self.disconnect_down(&mut down);
+                        return;
+                    }
                 }
                 continue;
             };
             let connected = match self.connect(attempt).await {
                 None => return,
                 Some(Ok(connected)) => connected,
-                Some(Err(())) => {
+                Some(Err(failed)) => {
+                    down = failed;
                     // `opcua_ConnectTimeout` is both the connect timeout and the
                     // interval between attempts (`iocshVariables.h:24`); an
                     // `opcuaConnect` meanwhile is C's immediate `connect(true)`.
@@ -772,10 +869,13 @@ impl SessionWorker {
                                     next = Some(Attempt::Connect { manual, done: Some(done) });
                                     break;
                                 }
-                                Some((Order::Disconnect, _)) => {}
+                                Some((Order::Disconnect, _)) => self.disconnect_down(&mut down),
                                 None => return,
                             },
-                            _ = exiting(&mut self.exit) => return,
+                            _ = exiting(&mut self.exit) => {
+                                self.disconnect_down(&mut down);
+                                return;
+                            }
                         }
                     }
                     continue;
@@ -791,8 +891,64 @@ impl SessionWorker {
                 ServeOutcome::Lost(client) => {
                     next = Some(Attempt::Reconnect(client));
                 }
-                ServeOutcome::DisconnectRequested => {}
+                ServeOutcome::DisconnectRequested => down = Down::NoClient,
             }
+        }
+    }
+
+    /// `SessionOpen62541::disconnect` while the session is down
+    /// (`SessionOpen62541.cpp:605-613`).
+    fn disconnect_down(&self, down: &mut Down) {
+        if matches!(down, Down::NoClient) && self.debug() > 0 {
+            eprintln!("Session {} already disconnected", self.handle.name);
+        }
+        *down = Down::NoClient;
+    }
+
+    /// `SessionOpen62541::connectionStatusChanged` for each state open62541
+    /// reports on the way (`SessionOpen62541.cpp:2384-2531`): every change of
+    /// the channel's state, then of the session's, and a session that drops
+    /// from ACTIVATED to CREATED is disconnected.
+    fn walk(&self, walk: &Walk) {
+        let debug = self.debug() > 0;
+        let name = &self.handle.name;
+        let mut client = self.handle.client.lock();
+        for &(channel, session) in walk {
+            client.connect_status = StatusCode::Good;
+            if channel != client.channel {
+                if debug {
+                    eprintln!(
+                        "Session {name}: secure channel state changed from {} to {channel}",
+                        client.channel
+                    );
+                }
+                client.channel = channel;
+            }
+            if session != client.session {
+                if debug {
+                    eprintln!(
+                        "Session {name}: session state changed from {} to {session}",
+                        client.session
+                    );
+                }
+                if session == SessionState::Created && client.session == SessionState::Activated {
+                    errlog_vprintf(format_args!("OPC UA session {name}: disconnected\n"));
+                }
+                client.session = session;
+            }
+        }
+    }
+
+    /// `connectionStatusChanged` with a bad status, which leaves the states
+    /// as they were (`SessionOpen62541.cpp:2375-2382`).
+    fn irrecoverable(&self, status: StatusCode) {
+        self.handle.client.lock().connect_status = status;
+        if self.debug() > 0 {
+            println!(
+                "Session {} irrecoverably failed: {}",
+                self.handle.name,
+                status_name(status)
+            );
         }
     }
 
@@ -836,8 +992,10 @@ impl SessionWorker {
     /// first: C's `atExit` deletes the client, which abandons a connect still
     /// in flight, while an activation already under way holds the client lock
     /// and finishes.
-    async fn connect(&mut self, attempt: Attempt) -> Option<Result<Connected, ()>> {
+    async fn connect(&mut self, attempt: Attempt) -> Option<Result<Connected, Down>> {
         let config = self.handle.config.lock().clone();
+        // C's `connect`, as against open62541's reconnect.
+        let fresh = matches!(attempt, Attempt::Connect { .. });
         // `done` lives until the attempt is through.
         let (manual, _done, mut client) = match attempt {
             Attempt::Connect { manual, done } => {
@@ -848,8 +1006,6 @@ impl SessionWorker {
                 match setup {
                     Ok(client) => (manual, done, client),
                     Err(e) => {
-                        // A bad status leaves the C's session and channel
-                        // states as they were (`SessionOpen62541.cpp:2375-2382`).
                         if let Some(status) = e.status {
                             self.handle.client.lock().connect_status = status;
                         }
@@ -859,11 +1015,15 @@ impl SessionWorker {
                                 self.handle.name
                             ));
                         }
-                        return Some(Err(()));
+                        return Some(Err(Down::SetupFailed));
                     }
                 }
             }
-            Attempt::Reconnect(client) => (false, None, client),
+            Attempt::Reconnect(client) => {
+                // `initConnect` resets the channel for a new connection.
+                self.walk(&[(ChannelState::Fresh, SessionState::Created)]);
+                (false, None, client)
+            }
         };
         let connection = tokio::select! {
             connection = client.connect() => connection,
@@ -872,31 +1032,36 @@ impl SessionWorker {
         let connection = match connection {
             Ok(connection) => connection,
             Err(status) => {
-                self.handle.client.lock().connect_status = status;
-                if manual || config.debug > 0 {
-                    errlog_vprintf(format_args!(
-                        "OPC UA session {}: connect service failed with status {}\n",
+                self.irrecoverable(status);
+                if fresh {
+                    if manual || config.debug > 0 {
+                        errlog_vprintf(format_args!(
+                            "OPC UA session {}: connect service failed with status {}\n",
+                            self.handle.name,
+                            status_name(status)
+                        ));
+                    }
+                } else if config.debug > 0 {
+                    // The worker thread gives up and deletes the client
+                    // (`SessionOpen62541.cpp:1487-1491`).
+                    eprintln!(
+                        "Session {} worker thread error: status:{}",
                         self.handle.name,
                         status_name(status)
-                    ));
+                    );
                 }
-                return Some(Err(()));
+                // `UA_Client_delete` reports the status once more.
+                self.irrecoverable(status);
+                return Some(Err(Down::NoClient));
             }
         };
-        if config.debug > 0 {
-            eprintln!("Session {}: connect service succeeded", self.handle.name);
-        }
-        let endpoint = connection.endpoint();
-        {
-            let mut client = self.handle.client.lock();
-            client.connect_status = StatusCode::Good;
-            client.link = Link::Activated;
-            if let Some(endpoint) = &endpoint {
-                client.security_mode = endpoint.security_mode;
-                client.security_policy_uri = endpoint.security_policy_uri.to_string();
+        self.walk(if fresh { CONNECT } else { RECONNECT });
+        if let Some(endpoint) = connection.endpoint() {
+            {
+                let mut state = self.handle.client.lock();
+                state.security_mode = endpoint.security_mode;
+                state.security_policy_uri = endpoint.security_policy_uri.to_string();
             }
-        }
-        if let Some(endpoint) = endpoint {
             self.report_connected(client.identity(), &endpoint);
         }
         // C reads each capability on its own and keeps its default when the
@@ -938,6 +1103,13 @@ impl SessionWorker {
 
         self.add_monitored_items(&connection, &subscriptions, &monitored)
             .await;
+        // `UA_Client_connect` returns once the `ACTIVATED` arm is through, and
+        // C's connect starts the worker thread (`SessionOpen62541.cpp:577-598`,
+        // `:1467`).
+        if fresh && config.debug > 0 {
+            eprintln!("Session {}: connect service succeeded", self.handle.name);
+            eprintln!("Session {} worker thread starts", self.handle.name);
+        }
         Some(Ok(Connected { client, connection }))
     }
 
@@ -967,7 +1139,11 @@ impl SessionWorker {
                     }
                     Some((Order::Connect { manual }, _)) => {
                         if manual || self.debug() > 0 {
-                            eprintln!("Session {} already connected (Activated)", self.handle.name);
+                            eprintln!(
+                                "Session {} already connected ({})",
+                                self.handle.name,
+                                self.handle.client.lock().session
+                            );
                         }
                     }
                     None => return ServeOutcome::Shutdown,
@@ -1568,26 +1744,21 @@ impl SessionWorker {
     async fn disconnect(&mut self, connection: &Arc<dyn UaConnection>, end: End) {
         connection.disconnect().await;
         *self.handle.status.lock() = ConnectionStatus::Down;
-        {
-            let mut client = self.handle.client.lock();
-            client.registered = 0;
-            client.link = match end {
-                End::Requested => Link::Closed,
-                End::Lost => Link::Lost,
-            };
-        }
-        // The ACTIVATED -> CREATED arm (`SessionOpen62541.cpp:2520-2523`). A
-        // requested disconnect ends C's session in CLOSED and skips it. The C
-        // oracle prints it anyway when the session has a subscription (5/5
-        // runs with one, 0/3 without): open62541 1.2 re-sends Publish while
-        // CLOSING (`UA_Client_Subscriptions_backgroundPublish`, open62541.c:48202
-        // in opcua's end2endTest/server) and aborts the channel. That library
-        // defect is not copied.
-        if matches!(end, End::Lost) {
-            errlog_vprintf(format_args!(
-                "OPC UA session {}: disconnected\n",
-                self.handle.name
-            ));
+        // The channel's CLOSED arm (`SessionOpen62541.cpp:2393-2397`).
+        self.handle.client.lock().registered = 0;
+        match end {
+            End::Requested => {
+                self.walk(CLOSE);
+                if self.debug() > 0 {
+                    // The worker thread finds the client gone
+                    // (`SessionOpen62541.cpp:1473-1476`).
+                    eprintln!(
+                        "Session {} worker thread: client destroyed. Exiting.",
+                        self.handle.name
+                    );
+                }
+            }
+            End::Lost => self.walk(LOSE),
         }
         // Requests queued for a connection that no longer exists would be
         // answered against the next one; the C leaves them in `outstandingOps`

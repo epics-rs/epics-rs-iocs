@@ -24,6 +24,9 @@ use opcua::queue::{ConnectionStatus, ProcessReason, Update};
 use opcua::session::{self, Control, Priority, Request, SessionConfig, SessionHandle};
 use opcua::subscription::SubscriptionConfig;
 
+mod console;
+use console::Console;
+
 // -------------------------------------------------------------- the test double
 
 #[derive(Clone, Default)]
@@ -72,6 +75,8 @@ struct Mock {
     setups: Mutex<usize>,
     /// Refuse this many connect attempts before accepting one.
     refuse_connects: Mutex<usize>,
+    /// Fail this many security setups before one succeeds.
+    fail_setups: Mutex<usize>,
     /// The server drops the connection.
     lost: tokio::sync::Notify,
 }
@@ -94,6 +99,13 @@ struct MockConnector(Arc<Mock>);
 impl UaConnector for MockConnector {
     async fn setup(&self, config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
         *self.0.setups.lock() += 1;
+        let mut fail = self.0.fail_setups.lock();
+        if *fail > 0 {
+            *fail -= 1;
+            return Err(SetupError::new(
+                "security discovery and setup failed with status fatal",
+            ));
+        }
         Ok(Box::new(MockClient {
             mock: self.0.clone(),
             config: config.clone(),
@@ -2087,5 +2099,197 @@ async fn an_idle_session_whose_server_stops_answering_goes_inactive() {
             .lock()
             .iter()
             .any(|l| l == "OPC UA Session sess: server inactive\n")
+    );
+}
+
+// ------------------------------------------------------------- console lines
+
+/// The lines C prints from the session's connection handling.
+fn state_lines(console: Console) -> Vec<String> {
+    console
+        .lines()
+        .into_iter()
+        .filter(|l| {
+            l.starts_with("Session sess")
+                && [
+                    "state changed",
+                    "irrecoverably",
+                    "worker thread",
+                    "connect service",
+                    "already",
+                    "(setupIdentity)",
+                ]
+                .iter()
+                .any(|part| l.contains(part))
+        })
+        .collect()
+}
+
+/// A session at debug 1 whose control orders resolve — the sender dropped —
+/// once the worker has carried them out.
+fn debug_session(mock: &Arc<Mock>) -> Arc<SessionHandle> {
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    config.set_option("debug", "1").unwrap();
+    spawn(config, mock, vec![])
+}
+
+const IDENTITY: &str = "Session sess: (setupIdentity) setting Anonymous token";
+
+/// The states open62541 1.2 reports through `stateCallback` on the way up, as
+/// `connectionStatusChanged` prints them (`SessionOpen62541.cpp:2384-2408`).
+const CONNECTED: [&str; 8] = [
+    "Session sess: secure channel state changed from Closed to HelSent",
+    "Session sess: secure channel state changed from HelSent to AckReceived",
+    "Session sess: secure channel state changed from AckReceived to OPNSent",
+    "Session sess: secure channel state changed from OPNSent to Open",
+    "Session sess: session state changed from Closed to CreateRequested",
+    "Session sess: session state changed from CreateRequested to Created",
+    "Session sess: session state changed from Created to ActivateRequested",
+    "Session sess: session state changed from ActivateRequested to Activated",
+];
+
+const LOST: [&str; 3] = [
+    "Session sess: secure channel state changed from Open to Closed",
+    "Session sess: session state changed from Activated to Created",
+    "Session sess: secure channel state changed from Closed to Fresh",
+];
+
+/// `connect` (`SessionOpen62541.cpp:577-584`), then `run` (`:1466-1467`).
+const STARTED: [&str; 2] = [
+    "Session sess: connect service succeeded",
+    "Session sess worker thread starts",
+];
+
+#[tokio::test]
+async fn a_connect_and_a_requested_disconnect_print_the_c_state_lines() {
+    let mock = Mock::arc();
+    let console = Console::capture();
+    let handle = debug_session(&mock);
+    let _ = handle.control(Control::Connect).unwrap().await;
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let lines = state_lines(console);
+
+    let mut expected = vec![IDENTITY];
+    expected.extend(CONNECTED);
+    expected.extend(STARTED);
+    expected.extend([
+        "Session sess: session state changed from Activated to Closing",
+        "Session sess: secure channel state changed from Open to Closed",
+        "Session sess: session state changed from Closing to Closed",
+        "Session sess worker thread: client destroyed. Exiting.",
+    ]);
+    assert_eq!(lines, expected);
+}
+
+/// open62541 re-activates the session it kept on the client it kept
+/// (`connectIterate`, `responseActivateSession`): no setup, and no
+/// `connect service` or `worker thread starts` line.
+#[tokio::test]
+async fn a_lost_session_that_reconnects_prints_the_reactivation() {
+    let mock = Mock::arc();
+    let console = Console::capture();
+    let handle = debug_session(&mock);
+    let _ = handle.control(Control::Connect).unwrap().await;
+    mock.lost.notify_one();
+    until(|| mock.connects.lock().len() == 2).await;
+    until(|| handle.is_connected()).await;
+    let lines = state_lines(console);
+
+    let mut expected = vec![IDENTITY];
+    expected.extend(CONNECTED);
+    expected.extend(STARTED);
+    expected.extend(LOST);
+    expected.extend([
+        "Session sess: secure channel state changed from Fresh to HelSent",
+        "Session sess: secure channel state changed from HelSent to AckReceived",
+        "Session sess: secure channel state changed from AckReceived to OPNSent",
+        "Session sess: secure channel state changed from OPNSent to Open",
+        "Session sess: session state changed from Created to ActivateRequested",
+        "Session sess: session state changed from ActivateRequested to Activated",
+    ]);
+    assert_eq!(lines, expected);
+}
+
+/// The reconnect inside `UA_Client_run_iterate` fails: the bad state status,
+/// then `run` gives up (`:1487-1491`) and `disconnect` deletes the client,
+/// which reports the status again. A later connect starts from the states
+/// the lost session left, and a disconnect then finds no client (`:607-612`).
+#[tokio::test]
+async fn a_lost_session_whose_reconnect_fails_prints_the_worker_error() {
+    let mock = Mock::arc();
+    let console = Console::capture();
+    let handle = debug_session(&mock);
+    let _ = handle.control(Control::Connect).unwrap().await;
+    *mock.refuse_connects.lock() = 1;
+    mock.lost.notify_one();
+    until(|| mock.connects.lock().len() == 2).await;
+    until(|| shown_state(&handle) == "BadNotConnected Created Fresh registered=0").await;
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let _ = handle.control(Control::Connect).unwrap().await;
+    let lines = state_lines(console);
+
+    let mut expected = vec![IDENTITY];
+    expected.extend(CONNECTED);
+    expected.extend(STARTED);
+    expected.extend(LOST);
+    expected.extend([
+        "Session sess irrecoverably failed: BadNotConnected",
+        "Session sess worker thread error: status:BadNotConnected",
+        "Session sess irrecoverably failed: BadNotConnected",
+        "Session sess already disconnected",
+        IDENTITY,
+        "Session sess: secure channel state changed from Fresh to HelSent",
+        "Session sess: session state changed from Created to Closed",
+    ]);
+    expected.extend(&CONNECTED[1..]);
+    expected.extend(STARTED);
+    assert_eq!(lines, expected);
+}
+
+/// `UA_Client_connect` fails: the bad status from inside it, then once more
+/// from `UA_Client_delete` (`:586-592`); no worker thread was started, and
+/// the client is gone.
+#[tokio::test]
+async fn a_refused_connect_prints_its_status_twice_and_leaves_no_client() {
+    let mock = Mock::arc();
+    *mock.refuse_connects.lock() = 1;
+    let console = Console::capture();
+    let handle = debug_session(&mock);
+    let _ = handle.control(Control::Connect).unwrap().await;
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let lines = state_lines(console);
+
+    assert_eq!(
+        lines,
+        [
+            IDENTITY,
+            "Session sess irrecoverably failed: BadNotConnected",
+            "Session sess irrecoverably failed: BadNotConnected",
+            "Session sess already disconnected",
+        ]
+    );
+}
+
+/// A failed security setup leaves C's client in place (`:545-553`), so a
+/// disconnect deletes it without a line; one with no client says so.
+#[tokio::test]
+async fn a_disconnect_after_a_failed_setup_is_silent() {
+    let mock = Mock::arc();
+    *mock.fail_setups.lock() = 1;
+    let console = Console::capture();
+    let handle = debug_session(&mock);
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let _ = handle.control(Control::Connect).unwrap().await;
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let lines = state_lines(console);
+
+    assert_eq!(
+        lines,
+        [
+            "Session sess already disconnected",
+            "Session sess already disconnected",
+        ]
     );
 }

@@ -2,6 +2,8 @@
 
 use opcua::client::security_policy_string;
 
+mod console;
+
 #[test]
 fn a_policy_uri_prints_as_c_names_it() {
     assert_eq!(security_policy_string(""), "None");
@@ -69,7 +71,8 @@ mod setup_security {
     #[test]
     fn best_takes_the_highest_supported_opc_tcp_level_at_the_session_url() {
         let config = SessionConfig::new("s", "opc.tcp://10.0.0.1:4840");
-        let e = config.select_endpoint(&offered()).unwrap();
+        let (number, e) = config.select_endpoint(&offered()).unwrap();
+        assert_eq!(number, 2);
         assert_eq!(e.security_level, 7);
         assert_eq!(e.endpoint_url.as_ref(), "opc.tcp://10.0.0.1:4840");
     }
@@ -79,13 +82,13 @@ mod setup_security {
         let mut config = SessionConfig::new("s", "opc.tcp://srv:4840");
         config.set_option("sec-mode", "Sign").unwrap();
         assert_eq!(
-            config.select_endpoint(&offered()).unwrap().security_level,
+            config.select_endpoint(&offered()).unwrap().1.security_level,
             3
         );
         // A requested None policy matches any policy, as C's find("#None").
         config.set_option("sec-policy", "None").unwrap();
         assert_eq!(
-            config.select_endpoint(&offered()).unwrap().security_level,
+            config.select_endpoint(&offered()).unwrap().1.security_level,
             3
         );
         config.set_option("sec-policy", "Basic128Rsa15").unwrap();
@@ -355,5 +358,97 @@ mod setup_security {
     async fn a_session_url_that_does_not_resolve_is_connection_closed() {
         let err = connect_without_security("opc.tcp://no-such-host.invalid:4840", "nohost").await;
         assert_eq!(err, StatusCode::BadConnectionClosed);
+    }
+
+    /// The session's own lines from `setupClientSecurityInfo`, the PKI set-up
+    /// and `setupSecurity`, at debug 1, after setting it up on `url`.
+    async fn setup_lines(url: &str, options: &[(&str, &str)], tag: &str) -> Vec<String> {
+        let pki = std::env::temp_dir().join(format!("opcua-{tag}-{}", std::process::id()));
+        let mut config = SessionConfig::new("s", url);
+        config.pki_dir = Some(pki.to_string_lossy().into_owned());
+        for (name, value) in options {
+            config.set_option(name, value).unwrap();
+        }
+        config.set_option("debug", "1").unwrap();
+        let console = crate::console::Console::capture();
+        let _ = AsyncOpcuaConnector::new().setup(&config).await;
+        let lines = console.lines();
+        let _ = std::fs::remove_dir_all(&pki);
+        lines
+            .into_iter()
+            .filter(|l| l.starts_with("Session s:"))
+            .collect()
+    }
+
+    /// `SessionOpen62541.cpp:1029-1040`, after the client security info
+    /// (`:1219-1225`) and the PKI provider (`:516-522`).
+    #[tokio::test]
+    async fn a_session_without_security_prints_its_setup() {
+        let lines = setup_lines(
+            "opc.tcp://127.0.0.1:4840",
+            &[("sec-mode", "None")],
+            "dbgnone",
+        )
+        .await;
+        assert_eq!(
+            lines,
+            [
+                "Session s: (setupClientSecurityInfo) no client certificate configured",
+                "Session s: (connect) setting up PKI provider",
+                "Session s: (setupIdentity) setting Anonymous token",
+                "Session s: (setupSecurity) no security configured ",
+            ]
+        );
+    }
+
+    /// `SessionOpen62541.cpp:1043-1059`.
+    #[tokio::test]
+    async fn a_dead_discovery_url_prints_the_failed_get_endpoints() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("opc.tcp://127.0.0.1:{port}");
+        let lines = setup_lines(&url, &[], "dbgdead").await;
+        assert_eq!(
+            lines,
+            [
+                "Session s: (setupClientSecurityInfo) no client certificate configured".to_string(),
+                "Session s: (connect) setting up PKI provider".to_string(),
+                "Session s: (setupIdentity) setting Anonymous token".to_string(),
+                format!("Session s: (setupSecurity) reading endpoints from {url}"),
+                format!(
+                    "Session s: (setupSecurity) UaDiscovery::getEndpoints from {url} failed \
+                     with status BadDisconnect"
+                ),
+            ]
+        );
+    }
+
+    /// `SessionOpen62541.cpp:1172-1201`: C only checks that each file reads.
+    #[tokio::test]
+    async fn a_client_certificate_prints_its_files() {
+        let files = [(); 2].map(|_| {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), "not checked").unwrap();
+            file
+        });
+        let [cert, key] = files
+            .each_ref()
+            .map(|f| f.path().to_string_lossy().into_owned());
+        let lines = setup_lines(
+            "opc.tcp://127.0.0.1:4840",
+            &[("sec-mode", "None"), ("cert", &cert), ("key", &key)],
+            "dbgcert",
+        )
+        .await;
+        assert_eq!(
+            lines[..2],
+            [
+                format!("Session s: (initClientSecurity) loading client certificate {cert}"),
+                format!("Session s: (initClientSecurity) loading client private key {key}"),
+            ]
+        );
     }
 }

@@ -243,6 +243,8 @@ impl UaConnector for AsyncOpcuaConnector {
         // The session's own options win over the client-wide ones; what neither
         // sets falls back to the `async-opcua` default PKI location.
         let client = self.security();
+        // `opcuaSetupPKI` names the PKI locations (`SessionOpen62541.cpp:516-531`).
+        let client_pki_root = client.pki_root.is_some();
         let pki_dir = config
             .pki_dir
             .clone()
@@ -250,6 +252,25 @@ impl UaConnector for AsyncOpcuaConnector {
             .unwrap_or_else(|| DEFAULT_PKI_DIR.to_string());
         let certificate = config.certificate_path.clone().or(client.certificate_path);
         let private_key = config.private_key_path.clone().or(client.private_key_path);
+        let name = &config.name;
+        let debug = config.debug > 0;
+
+        // `setupClientSecurityInfo` (`SessionOpen62541.cpp:1167-1226`).
+        if debug {
+            match (&certificate, &private_key) {
+                (Some(certificate), Some(private_key)) => {
+                    println!(
+                        "Session {name}: (initClientSecurity) loading client certificate {certificate}"
+                    );
+                    println!(
+                        "Session {name}: (initClientSecurity) loading client private key {private_key}"
+                    );
+                }
+                _ => println!(
+                    "Session {name}: (setupClientSecurityInfo) no client certificate configured"
+                ),
+            }
+        }
 
         let mut builder = ClientBuilder::new()
             .application_name(&self.application_name)
@@ -273,10 +294,17 @@ impl UaConnector for AsyncOpcuaConnector {
                 errors.join(", ")
             ))
         })?;
+        if debug && (config.pki_dir.is_some() || client_pki_root) {
+            println!("Session {name}: (connect) setting up PKI provider");
+        }
 
+        // `setupSecurity` (`SessionOpen62541.cpp:1020-1160`).
         let identity = config.setup_identity();
         let token = identity.token().map_err(SetupError::new)?;
         let secured = if config.security_mode == SecurityMode::None {
+            if debug {
+                println!("Session {name}: (setupSecurity) no security configured ");
+            }
             None
         } else {
             if !config.url.starts_with("opc.tcp") {
@@ -288,21 +316,49 @@ impl UaConnector for AsyncOpcuaConnector {
                     "security discovery and setup failed with status fatal",
                 ));
             }
+            let url = &config.url;
+            if debug {
+                println!("Session {name}: (setupSecurity) reading endpoints from {url}");
+            }
             let endpoints = client
-                .get_server_endpoints_from_url(config.url.as_str())
+                .get_server_endpoints_from_url(url.as_str())
                 .await
                 .map_err(|e| {
+                    let status = network_status(e.status());
+                    if debug {
+                        println!(
+                            "Session {name}: (setupSecurity) UaDiscovery::getEndpoints from {url} \
+                             failed with status {}",
+                            status_name(status)
+                        );
+                    }
                     SetupError::service(
-                        network_status(e.status()),
+                        status,
                         "security discovery and setup failed with status cantConnect",
                     )
                 })?;
-            Some(config.select_endpoint(&endpoints).ok_or_else(|| {
-                SetupError::service(
+            let Some((number, endpoint)) = config.select_endpoint(&endpoints) else {
+                if debug {
+                    println!(
+                        "Session {name}: (setupSecurity) found no endpoint that matches the \
+                         security requirements"
+                    );
+                }
+                return Err(SetupError::service(
                     StatusCode::Good,
                     "security discovery and setup failed with status noMatchingEndpoint",
-                )
-            })?)
+                ));
+            };
+            if debug {
+                println!(
+                    "Session {name}: (setupSecurity) found matching endpoint number {number}, \
+                     using mode={:?} policy={} (level {})",
+                    endpoint.security_mode,
+                    security_policy_string(endpoint.security_policy_uri.as_ref()),
+                    endpoint.security_level
+                );
+            }
+            Some(endpoint)
         };
         Ok(Box::new(AsyncOpcuaClient {
             client,
