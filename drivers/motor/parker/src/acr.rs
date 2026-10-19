@@ -420,23 +420,23 @@ impl AcrAxis {
         }
     }
 
-    /// Write the common jog acceleration and velocity for a motion command.
+    /// Write the common jog acceleration and velocity for a motion command;
+    /// the command after them overwrites their statuses
+    /// (ACRMotorDriver.cpp:336-388).
     fn set_jog_speed(
         &self,
         ctrl: &AcrController,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        ctrl.write_only(&format!(
+        let (acceleration, velocity) = (self.scaled(acceleration)?, self.scaled(velocity)?);
+        let _ = ctrl.write_only(&format!(
             "{} JOG ACC {:.6}",
             self.name,
-            CFloat(self.scaled(acceleration)?)
-        ))?;
-        ctrl.write_only(&format!(
-            "{} JOG VEL {:.6}",
-            self.name,
-            CFloat(self.scaled(velocity)?)
-        ))
+            CFloat(acceleration)
+        ));
+        let _ = ctrl.write_only(&format!("{} JOG VEL {:.6}", self.name, CFloat(velocity)));
+        Ok(())
     }
 }
 
@@ -445,6 +445,11 @@ impl AsynMotor for AcrAxis {
     /// (ACRMotorDriver.cpp).
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM
+    }
+
+    /// ACRMotorDriver.cpp:307.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
     }
 
     fn move_absolute(
@@ -525,12 +530,10 @@ impl AsynMotor for AcrAxis {
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        let position = self.scaled(position)?;
         let ctrl = self.lock();
-        ctrl.write_only(&format!(
-            "{} RES {:.6}",
-            self.name,
-            CFloat(self.scaled(position)?)
-        ))?;
+        // REN's status overwrites RES's (ACRMotorDriver.cpp:400-409).
+        let _ = ctrl.write_only(&format!("{} RES {:.6}", self.name, CFloat(position)));
         ctrl.write_only(&format!("{} JOG REN", self.name))
     }
 
@@ -597,6 +600,18 @@ mod tests {
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
+    #[test]
+    fn the_constructor_calls_back() {
+        let (handle, _) = SyncIOHandle::connect_port(
+            "ACR_CALLBACK",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
+        let controller = Arc::new(Mutex::new(AcrController::new(handle)));
+        assert!(AcrAxis::new(controller, 0).constructor_calls_param_callbacks());
+    }
+
     /// A failed PPU query keeps the axis with no encoder or gain support and
     /// refuses motion rather than dividing by an unset PPU.
     #[test]
@@ -615,6 +630,47 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.message(), "AXIS0: PPU was never read");
         assert!(axis.poll(&AsynUser::new(0)).is_err());
+    }
+
+    /// C overwrites the JOG ACC/VEL and RES statuses with the command's
+    /// (ACRMotorDriver.cpp:336-409).
+    #[test]
+    fn a_refused_setting_still_sends_the_command_after_it() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::failing(
+            "acrRefused",
+            |cmd| {
+                if cmd == "AXIS0 PPU" {
+                    "1".into()
+                } else {
+                    String::new()
+                }
+            },
+            |cmd| cmd.contains(" JOG ACC ") || cmd.contains(" RES ") || cmd.ends_with("JOG HOME 1"),
+        );
+        let controller = Arc::new(Mutex::new(AcrController::new(io)));
+        let mut axis = AcrAxis::new(controller, 0);
+        assert_eq!(axis.pulses_per_unit, Some(1.0));
+        rig.sent();
+        let user = AsynUser::new(0);
+        axis.move_absolute(&user, 2.0, 0.0, 3.0, 4.0).unwrap();
+        axis.move_relative(&user, -2.0, 0.0, 3.0, 4.0).unwrap();
+        axis.move_velocity(&user, 0.0, -3.0, 4.0).unwrap();
+        assert!(axis.home(&user, 0.0, 3.0, 4.0, true).is_err());
+        axis.set_position(&user, 5.0).unwrap();
+        let speed = ["AXIS0 JOG ACC 4.000000", "AXIS0 JOG VEL 3.000000"];
+        let mut expected = Vec::new();
+        for command in [
+            "JOG ABS 2.000000",
+            "JOG INC -2.000000",
+            "JOG REV",
+            "JOG HOME 1",
+        ] {
+            expected.extend(speed.map(String::from));
+            expected.push(format!("{CTL_Y}:AXIS0 {command}"));
+        }
+        expected.extend(["AXIS0 RES 5.000000", "AXIS0 JOG REN"].map(String::from));
+        assert_eq!(rig.sent(), expected);
     }
 
     /// A port that records what it is sent and answers nothing.

@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{atoi, nint};
 
 /// `MICOS_NUM_CARDS`.
@@ -38,6 +38,9 @@ impl MicosController {
 
     /// `send_mess` then `recv_mess`: the reply, empty when none came.
     fn ask(&self, msg: &str) -> String {
+        // write_read flushes first; C reads with no flush past motor_init
+        // (drvMicos.cc:355), so one late reply shifts every later answer: a
+        // C defect, not copied.
         match self
             .handle
             .write_read(0, msg.as_bytes(), BUFF_SIZE)
@@ -58,22 +61,14 @@ impl MicosController {
     }
 }
 
-/// `motor_init`: `ts` to each of the `num_axis` addresses, three tries
-/// each; then echo off (`ef`) and stop (`ab1`) on every one. False when an
-/// address never answered, which leaves the whole card unconfigured.
+/// `motor_init`'s probe: `ts` to each of the `num_axis` addresses, three
+/// tries each. False when an address never answered, which leaves the whole
+/// card unconfigured.
 ///
 /// C counts the tries across all addresses, so after the first three only
 /// one try is left per address; each gets three here.
 pub fn micos_probe(ctrl: &MicosController, num_axis: i32) -> bool {
-    let answered =
-        (0..num_axis).all(|n| (0..3).any(|_| !ctrl.ask(&format!("{CTLA}{n}ts")).is_empty()));
-    if answered {
-        for n in 0..num_axis {
-            ctrl.send(&format!("{CTLA}{n}ef"));
-            ctrl.send(&format!("{CTLA}{n}ab1"));
-        }
-    }
-    answered
+    (0..num_axis).all(|n| (0..3).any(|_| !ctrl.ask(&format!("{CTLA}{n}ts")).is_empty()))
 }
 
 /// One MoCo driver: one motor.
@@ -88,11 +83,20 @@ pub struct DrvMicosAxis {
     high_limit: f64,
     low_limit: f64,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl DrvMicosAxis {
+    /// MoCo address `axis` as `motor_init` takes it up: echo off (`ef`),
+    /// stop (`ab1`), then its status (drvMicos.cc:527-553).
     pub fn new(controller: Arc<Mutex<MicosController>>, axis: i32) -> Self {
-        Self {
+        {
+            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            ctrl.send(&format!("{CTLA}{axis}ef"));
+            ctrl.send(&format!("{CTLA}{axis}ab1"));
+        }
+        let mut axis = Self {
             controller,
             axis,
             status: MotorStatus {
@@ -104,7 +108,10 @@ impl DrvMicosAxis {
             high_limit: 0.0,
             low_limit: 0.0,
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        };
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, MicosController> {
@@ -132,18 +139,20 @@ impl DrvMicosAxis {
         self.send(&[motion])
     }
 
-    /// `SET_ACCEL`, which the record sends only for a positive rate.
+    /// `SET_ACCEL`.
     fn accel(commands: &mut Vec<String>, acceleration: f64) {
-        if acceleration > 0.0 {
-            commands.push(format!("da{},ud", clamp(acceleration, 1_000_000)));
-        }
+        commands.push(format!("da{},ud", clamp(acceleration, 1_000_000)));
     }
 
     /// The record's `SET_VELOCITY`, `SET_ACCEL` (`SET_VEL_BASE` sends
     /// nothing), then `motion`.
     fn motion(&mut self, velocity: f64, acceleration: f64, motion: String) -> AsynResult<()> {
         let mut commands = vec![format!("dv{},ud", clamp(velocity, 1_000_000))];
-        Self::accel(&mut commands, acceleration);
+        // A move's or home's SET_ACCEL only at a positive rate
+        // (motorRecord.cc:874); a jog's at any (:2141).
+        if acceleration > 0.0 {
+            Self::accel(&mut commands, acceleration);
+        }
         self.send_move(commands, motion)
     }
 }
@@ -161,6 +170,13 @@ fn hex_byte(reply: &[u8], j: usize) -> i64 {
         (Some(hi), Some(lo)) => i64::from(hi * 16 + lo),
         (Some(hi), None) => i64::from(hi),
         _ => 0,
+    }
+}
+
+impl Model1Motor for DrvMicosAxis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 
@@ -347,11 +363,9 @@ mod tests {
             _ => String::new(),
         });
         let ctrl = MicosController::new(io);
-        (
-            line,
-            DrvMicosAxis::new(Arc::new(Mutex::new(ctrl)), 0),
-            moving,
-        )
+        let axis = DrvMicosAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        (line, axis, moving)
     }
 
     fn post(text: &[u8]) -> PostMessage {
@@ -394,9 +408,22 @@ mod tests {
         axis.set_high_limit(&user, 900.0).unwrap();
         axis.set_move_strings(&user, b"P", None).unwrap();
         axis.move_velocity(&user, 0.0, 10.0, 0.0).unwrap();
-        assert_eq!(line.sent(), ["P", "\x010ma900"]);
+        assert_eq!(line.sent(), ["\x010da0,ud", "P", "\x010ma900"]);
         axis.set_move_strings(&user, b"P", None).unwrap();
         axis.home(&user, 0.0, 10.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["\x010dv10,ud", "P", "\x010gh"]);
+    }
+
+    /// motorRecord.cc:2141, :3068: a jog's SET_ACCEL goes out at any rate,
+    /// a move's only at a positive one (:874).
+    #[test]
+    fn a_jog_sends_set_accel_at_a_zero_rate() {
+        let (line, mut axis, _) = rig("micosJogAccel");
+        let user = AsynUser::default();
+        axis.set_high_limit(&user, 900.0).unwrap();
+        axis.move_velocity(&user, 0.0, 10.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["\x010da0,ud", "\x010ma900"]);
+        axis.move_absolute(&user, 100.0, 0.0, 500.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["\x010dv500,ud", "\x010ma100"]);
     }
 }

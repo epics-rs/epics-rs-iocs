@@ -473,8 +473,9 @@ impl AsynMotor for PmacCsAxis {
         } else if system.program != 0 {
             // Abort first so the motors are back in closed loop; then append the
             // program run to the demand, so the demand and its start are one
-            // command.
-            system.command(axis, &format!("&{cs}A"))?;
+            // command. The abort's status is overwritten by the move's
+            // (pmacAsynCoord.c:509-521).
+            let _ = system.command(axis, &format!("&{cs}A"));
             command.push_str(&format!("B{}R", system.program));
         }
         let sent = system.command(axis, &command);
@@ -910,6 +911,19 @@ mod tests {
         // pmacAsynCoord.c:660-665: done is the system's status alone.
         assert!(axis.poll(&user).unwrap().done);
         assert_eq!(get.get_integer(function::DONE), Some(1));
+    }
+
+    /// pmacAsynCoord.c:508-516: the move's status overwrites the abort's,
+    /// so a refused abort still sends the move.
+    #[test]
+    fn a_refused_abort_still_sends_the_move() {
+        let (mut axis, system, sent, fail) = idle_axis("pmac_cs_abort", Duration::ZERO);
+        lock(&system).program = 10;
+        *fail.lock().unwrap() = vec!["&1A".to_string()];
+        sent.lock().unwrap().clear();
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 20000.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(*sent.lock().unwrap(), ["&1Q71=2.000000000000B10R"]);
     }
 
     /// pmacAsynCoord.c motorAxisMove wakes the poller: the poll after a move

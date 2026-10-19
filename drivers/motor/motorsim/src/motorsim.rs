@@ -1092,7 +1092,7 @@ mod tests {
         let get = axis.getter();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let sink = calls.clone();
-        get.params().set_callback(Arc::new(move |changed: &[i32]| {
+        get.params().add_callback(Arc::new(move |changed: &[i32]| {
             sink.lock().unwrap().push(changed.to_vec());
         }));
         axis.set_double(&user(), function::P_GAIN, 0.5).unwrap();

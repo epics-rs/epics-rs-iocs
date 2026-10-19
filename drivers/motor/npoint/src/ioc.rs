@@ -40,8 +40,8 @@ pub fn c300_create_controller_command() -> CommandDef {
             let port_name = req_string(args, 0, "Port name")?;
             let asyn_port = req_string(args, 1, "C300 port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
-            if num_axes < 1 {
-                return Err("C300CreateController: numAxes must be > 0".into());
+            if num_axes < 0 {
+                return Err("C300CreateController: numAxes must not be negative".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
@@ -71,4 +71,22 @@ pub fn c300_create_controller_command() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// C iocsh passes a missing numAxes as 0 (iocsh.cpp:839-840), and C's
+/// controller then has no axes.
+#[cfg(test)]
+mod missing_num_axes {
+    use super::*;
+    use motor_common::testing::port_after;
+
+    #[epics_rs::base::epics_test]
+    async fn a_c300_with_no_axes() {
+        let args = vec![
+            ArgValue::String("c300NoAxes".into()),
+            ArgValue::String("c300NoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(c300_create_controller_command(), args, "c300NoAxes").await);
+    }
 }

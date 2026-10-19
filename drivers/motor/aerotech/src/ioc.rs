@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
@@ -387,7 +387,7 @@ pub fn soloist_config_command() -> CommandDef {
                     return;
                 };
                 let controller = Arc::new(Mutex::new(controller));
-                let motor: Arc<Mutex<dyn AsynMotor>> =
+                let motor: Arc<Mutex<dyn Model1Motor>> =
                     Arc::new(Mutex::new(DrvSoloistAxis::new(controller, setup)));
                 init.axis(0, motor);
             })?;
@@ -577,5 +577,66 @@ mod report {
              Soloist controller 1, port=solRepB, address=0, id: MySoloist \n    \
              Soloist controller 2 connection failed.\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvSoloist.cc:734: `motor_init` reads the axis's status once, after
+    /// its last init query, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_the_status_once_and_the_record_starts_from_it() {
+        let setup = vec![ArgValue::Int(1), ArgValue::Int(10)];
+        run_command(soloist_setup_command(), setup).await;
+        let (line, _io) = LineRig::new("solInitLine", |cmd| {
+            match cmd.trim_end() {
+                "GETPARM(3)" => "%2",
+                "AXISSTATUS()" => "%4",
+                "PFBKPROG()" => "%7",
+                _ => "%0",
+            }
+            .into()
+        });
+        let config = vec![
+            ArgValue::Int(0),
+            ArgValue::String("solInitLine".into()),
+            ArgValue::Int(0),
+        ];
+        run_command(soloist_config_command(), config).await;
+        drvsup_init().await;
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "NONE",
+                "GETPARM(265)",
+                "GETPARM(257)",
+                "GETPARM(58)",
+                "GETPARM(33)",
+                "ABORT",
+                "GETPARM(3)",
+                "GETPARM(108)",
+                "GETPARM(47)",
+                "GETPARM(48)",
+                "GETPARM(106)",
+                "AXISSTATUS()",
+                "AXISFAULT()",
+                "PFBKPROG()",
+            ]
+        );
+        let db = record_init(
+            r##"record(motor, "sol:m0") { field(DTYP, "Soloist") field(OUT, "#C0 S0 @") field(MRES, "0.5") }"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("sol:m0.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("sol:m0.DRBV").unwrap(), EpicsValue::Double(7.0));
     }
 }

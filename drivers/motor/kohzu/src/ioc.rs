@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
@@ -84,7 +84,7 @@ pub fn sc800_config_command() -> CommandDef {
                 );
                 let controller = Arc::new(Mutex::new(controller));
                 for index in 0..num_axes {
-                    let motor: Arc<Mutex<dyn AsynMotor>> =
+                    let motor: Arc<Mutex<dyn Model1Motor>> =
                         Arc::new(Mutex::new(KohzuAxis::new(controller.clone(), index)));
                     init.axis(index as i32, motor);
                 }
@@ -213,5 +213,54 @@ mod tests {
                  port=sc800RepGpib, address=4, id: SC-400 Ver7 \n"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvSC800.cc:605-621: `motor_init` reads each axis's status once, past
+    /// IDN, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_once() {
+        let int = ArgValue::Int;
+        run_command(sc800_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("sc800InitLine", |cmd| {
+            match cmd.trim_start_matches('\u{2}').trim_end() {
+                "IDN" => "C\tIDN0\t200\t1".into(),
+                "RDP1/0" => "C\tRDP1\t14".into(),
+                "RDP2/0" => "C\tRDP2\t3".into(),
+                s if s.starts_with("STR1/") => {
+                    format!("C\tSTR{}\t1\t0\t0\t0\t0\t0\t0\t0", &s[5..])
+                }
+                c => format!("C\t{c}\t0"),
+            }
+        });
+        let config = vec![int(0), ArgValue::String("sc800InitLine".into()), int(0)];
+        run_command(sc800_config_command(), config).await;
+        drvsup_init().await;
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_start_matches('\u{2}').trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "IDN", "STR1/1", "RDP1/0", "RSY1/21", "STR1/2", "RDP2/0", "RSY2/21"
+            ]
+        );
+        let db = record_init(
+            r##"
+record(motor, "sc800:m1") { field(DTYP, "SC-800") field(OUT, "#C0 S0 @") }
+record(motor, "sc800:m2") { field(DTYP, "SC-800") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("sc800:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("sc800:m2.RMP").unwrap(), EpicsValue::Long(3));
     }
 }

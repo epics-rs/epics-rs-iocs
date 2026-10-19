@@ -293,6 +293,11 @@ impl AsynMotor for PmacAxis {
         PollFailure::NONE
     }
 
+    /// pmacAxis.cpp:100.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     fn take_port_sets(&mut self) -> PortSets {
         std::mem::take(&mut self.sets)
     }
@@ -369,7 +374,9 @@ impl AsynMotor for PmacAxis {
         let mut controller = lock(&self.controller);
         controller.clear_deferred(axis);
         if self.amp_enabled || self.fatal_following {
-            controller.abort_cs_motion(axis)?;
+            // C drops the CS abort's status and still sends the jog stop
+            // (pmacAxis.cpp:381-390).
+            let _ = controller.abort_cs_motion(axis);
             controller.command(&format!("#{axis} J/ M{axis}40=1"))
         } else {
             // Just set the in-position bit, so the record stops waiting.
@@ -389,6 +396,9 @@ impl AsynMotor for PmacAxis {
         controller.command(&format!(
             "#{axis}K M{axis}61={counts}*I{axis}08 M{axis}62={counts}*I{axis}08"
         ))?;
+        // C defect not copied: with no encoder axis `command` still holds
+        // this J/ when the closing write meant for the encoder's J/ runs, so
+        // C sends it twice (pmacController.cpp:423-427, :448-449, :469-471).
         controller.command(&format!("#{axis}J/"))?;
 
         let config = controller.axis_config(axis);
@@ -628,6 +638,13 @@ fn decode_axis_status(status1: u32, status2: u32, deferred: bool) -> AxisFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_constructor_calls_back() {
+        let controller = PmacController::new("pmacCallback", "pmacCallbackLow", 0, None);
+        let axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
+        assert!(axis.constructor_calls_param_callbacks());
+    }
 
     #[test]
     fn speed_preamble_matches_c_format() {

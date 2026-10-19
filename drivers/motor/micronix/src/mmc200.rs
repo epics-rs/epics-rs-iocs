@@ -334,19 +334,15 @@ impl Mmc200Axis {
     }
 
     /// C `sendAccelAndVelocity`: `VEL`, then `ACC` and `DEC` (accel used for
-    /// both), each scaled by `resolution_`.
-    fn send_accel_vel(
-        &self,
-        ctrl: &Mmc200Controller,
-        acceleration: f64,
-        velocity: f64,
-    ) -> AsynResult<()> {
+    /// both), each scaled by `resolution_`. Every caller overwrites the
+    /// status C returns with its own command's (MMC200Driver.cpp:300-360),
+    /// so none is returned.
+    fn send_accel_vel(&self, ctrl: &Mmc200Controller, acceleration: f64, velocity: f64) {
         let axis = self.axis_index;
         let res = self.resolution;
-        ctrl.write(&format!("{axis}VEL{:.3}", CFloat(velocity * res)))?;
-        ctrl.write(&format!("{axis}ACC{:.3}", CFloat(acceleration * res)))?;
-        ctrl.write(&format!("{axis}DEC{:.3}", CFloat(acceleration * res)))?;
-        Ok(())
+        let _ = ctrl.write(&format!("{axis}VEL{:.3}", CFloat(velocity * res)));
+        let _ = ctrl.write(&format!("{axis}ACC{:.3}", CFloat(acceleration * res)));
+        let _ = ctrl.write(&format!("{axis}DEC{:.3}", CFloat(acceleration * res)));
     }
 
     /// The controller model reported by `VER?` (diagnostic).
@@ -362,6 +358,12 @@ impl AsynMotor for Mmc200Axis {
         PollFailure::PROBLEM
     }
 
+    /// An MMC-ETH module returns before the constructor's
+    /// `callParamCallbacks` (MMC200Driver.cpp:192-193, :271).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        self.model != MODEL_ETH
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -372,7 +374,7 @@ impl AsynMotor for Mmc200Axis {
     ) -> AsynResult<()> {
         let n = self.axis_index;
         let ctrl = self.lock();
-        self.send_accel_vel(&ctrl, acceleration, velocity)?;
+        self.send_accel_vel(&ctrl, acceleration, velocity);
         ctrl.write(&format!("{n}MVA{:.6}", CFloat(position * self.resolution)))?;
         Ok(())
     }
@@ -387,7 +389,7 @@ impl AsynMotor for Mmc200Axis {
     ) -> AsynResult<()> {
         let n = self.axis_index;
         let ctrl = self.lock();
-        self.send_accel_vel(&ctrl, acceleration, velocity)?;
+        self.send_accel_vel(&ctrl, acceleration, velocity);
         ctrl.write(&format!("{n}MVR{:.6}", CFloat(distance * self.resolution)))?;
         Ok(())
     }
@@ -405,10 +407,10 @@ impl AsynMotor for Mmc200Axis {
         let jog_percent =
             (velocity * self.resolution / self.max_velocity * 100.0).clamp(-100.0, 100.0);
         let ctrl = self.lock();
-        ctrl.write(&format!(
+        let _ = ctrl.write(&format!(
             "{n}JAC{:.3}",
             CFloat(acceleration * self.resolution)
-        ))?;
+        ));
         ctrl.write(&format!("{n}JOG{:.3}", CFloat(jog_percent)))?;
         Ok(())
     }
@@ -423,9 +425,9 @@ impl AsynMotor for Mmc200Axis {
     ) -> AsynResult<()> {
         let n = self.axis_index;
         let ctrl = self.lock();
-        self.send_accel_vel(&ctrl, acceleration, velocity)?;
+        self.send_accel_vel(&ctrl, acceleration, velocity);
         // C `HCG1` selects the forward home direction, `HCG0` the reverse.
-        ctrl.write(&format!("{n}HCG{}", if forward { 1 } else { 0 }))?;
+        let _ = ctrl.write(&format!("{n}HCG{}", if forward { 1 } else { 0 }));
         ctrl.write(&format!("{n}HOM"))?;
         Ok(())
     }
@@ -509,6 +511,22 @@ mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
     use std::time::Duration;
+
+    #[test]
+    fn only_a_motor_axis_constructor_calls_back() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("mmc200EthCallback", |_| "#MMC-ETH v1".into());
+        let eth = Mmc200Axis::new(Arc::new(Mutex::new(Mmc200Controller::new(io))), 0, false);
+        assert!(!eth.constructor_calls_param_callbacks());
+        let (handle, _) =
+            SyncIOHandle::connect_port("MMC200_CALLBACK", 0, Duration::ZERO, InterfaceType::Octet);
+        let dead = Mmc200Axis::new(
+            Arc::new(Mutex::new(Mmc200Controller::new(handle))),
+            0,
+            false,
+        );
+        assert!(dead.constructor_calls_param_callbacks());
+    }
 
     #[test]
     fn an_axis_of_an_unanswering_controller_is_built_with_a_problem() {
@@ -606,6 +624,51 @@ mod tests {
         let sent: Vec<String> = rig.sent().iter().map(|c| c.trim_end().to_owned()).collect();
         assert!(sent.contains(&"1CER".to_owned()), "{sent:?}");
         assert!(sent.contains(&"1MOT?".to_owned()), "{sent:?}");
+    }
+
+    /// C sets `status =` on each write and returns the last
+    /// (MMC200Driver.cpp:300-387): a refused setting still sends the
+    /// command after it.
+    #[test]
+    fn a_refused_setting_still_sends_the_command_after_it() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::failing(
+            "mmc200Refused",
+            |cmd| {
+                match cmd.trim_end() {
+                    "1VER?" => "#MMC-200 v4.1",
+                    "1REZ?" => "#1000",
+                    "1UST?" => "#8",
+                    "1VMX?" => "#2.5",
+                    _ => "#0",
+                }
+                .into()
+            },
+            |cmd| {
+                let cmd = cmd.trim_end();
+                ["1VEL", "1JAC", "1HCG"].iter().any(|p| cmd.starts_with(p)) || cmd == "1HOM"
+            },
+        );
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
+        let mut axis = Mmc200Axis::new(controller, 0, false);
+        rig.sent();
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        axis.move_relative(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
+        assert!(axis.home(&user, 0.0, 1.0, 1.0, true).is_err());
+        let sent: Vec<String> = rig
+            .sent()
+            .iter()
+            .map(|c| c.trim_end().get(..4).unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "1VEL", "1ACC", "1DEC", "1MVA", "1VEL", "1ACC", "1DEC", "1MVR", "1JAC", "1JOG",
+                "1VEL", "1ACC", "1DEC", "1HCG", "1HOM"
+            ]
+        );
     }
 
     /// C `sprintf("%dVEL%.3f")` / `"%dMVA%.6f"` spell a non-finite value

@@ -740,18 +740,14 @@ impl SpiiPlusAxis {
         steps * self.resolution
     }
 
-    /// Send the ACC/DEC/VEL preamble of a point-to-point move (C `move`).
-    fn set_move_params(
-        &self,
-        ctrl: &SpiiPlusController,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    /// Send the ACC/DEC/VEL preamble of a point-to-point move (C `move`),
+    /// whose statuses C overwrites with the move's (SPiiPlusDriver.cpp:
+    /// 968-976).
+    fn set_move_params(&self, ctrl: &SpiiPlusController, velocity: f64, acceleration: f64) {
         let a = self.axis;
-        ctrl.command(&format!("ACC({a})={}", fmt(self.units(acceleration))))?;
-        ctrl.command(&format!("DEC({a})={}", fmt(self.units(acceleration))))?;
-        ctrl.command(&format!("VEL({a})={}", fmt(self.units(velocity))))?;
-        Ok(())
+        let _ = ctrl.command(&format!("ACC({a})={}", fmt(self.units(acceleration))));
+        let _ = ctrl.command(&format!("DEC({a})={}", fmt(self.units(acceleration))));
+        let _ = ctrl.command(&format!("VEL({a})={}", fmt(self.units(velocity))));
     }
 }
 
@@ -772,9 +768,8 @@ impl AsynMotor for SpiiPlusAxis {
     ) -> AsynResult<()> {
         let ctrl = self.lock();
         let a = self.axis;
-        self.set_move_params(&ctrl, velocity, acceleration)?;
-        ctrl.command(&format!("PTP {a}, {}", fmt(self.units(position))))?;
-        Ok(())
+        self.set_move_params(&ctrl, velocity, acceleration);
+        ctrl.command(&format!("PTP {a}, {}", fmt(self.units(position))))
     }
 
     fn move_relative(
@@ -787,9 +782,8 @@ impl AsynMotor for SpiiPlusAxis {
     ) -> AsynResult<()> {
         let ctrl = self.lock();
         let a = self.axis;
-        self.set_move_params(&ctrl, velocity, acceleration)?;
-        ctrl.command(&format!("PTP/r {a}, {}", fmt(self.units(distance))))?;
-        Ok(())
+        self.set_move_params(&ctrl, velocity, acceleration);
+        ctrl.command(&format!("PTP/r {a}, {}", fmt(self.units(distance))))
     }
 
     fn move_velocity(
@@ -802,13 +796,13 @@ impl AsynMotor for SpiiPlusAxis {
         let ctrl = self.lock();
         let a = self.axis;
         // C moveVelocity sets ACC/DEC then JOG/v with the |velocity| magnitude
-        // and a separate direction sign (it does not change the normal VEL).
-        ctrl.command(&format!("ACC({a})={}", fmt(self.units(acceleration))))?;
-        ctrl.command(&format!("DEC({a})={}", fmt(self.units(acceleration))))?;
+        // and a separate direction sign (it does not change the normal VEL),
+        // returning JOG's status over the others (SPiiPlusDriver.cpp:1000-1010).
+        let _ = ctrl.command(&format!("ACC({a})={}", fmt(self.units(acceleration))));
+        let _ = ctrl.command(&format!("DEC({a})={}", fmt(self.units(acceleration))));
         let dir = if velocity > 0.0 { '+' } else { '-' };
         let speed = self.units(velocity.abs());
-        ctrl.command(&format!("JOG/v {a}, {}, {dir}", fmt(speed)))?;
-        Ok(())
+        ctrl.command(&format!("JOG/v {a}, {}, {dir}", fmt(speed)))
     }
 
     fn home(
@@ -1963,6 +1957,26 @@ mod tests {
         line.lock().unwrap().sent.clear();
         axis.set_position(&AsynUser::default(), 3.0).unwrap();
         assert_eq!(line.lock().unwrap().sent, ["SET RPOS(0)=6"]);
+    }
+
+    /// C overwrites each writeReadAck's status with the next one's
+    /// (SPiiPlusDriver.cpp:959-1013), so a refused ACC still sends the move
+    /// after it, and the move's status is returned.
+    #[test]
+    fn a_refused_setting_still_sends_the_move_after_it() {
+        let (ctrl, line) = fake("spiiRefused", 1, &[("STEPF", &[0.5]), ("EFAC", &[2.0])]);
+        let mut axis = SpiiPlusAxis::new(ctrl, 0);
+        line.lock().unwrap().refused.insert("ACC(0)=16".into());
+        line.lock().unwrap().sent.clear();
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 10.0, 0.0, 4.0, 8.0).unwrap();
+        axis.move_velocity(&user, 0.0, 4.0, 8.0).unwrap();
+        let sent = std::mem::take(&mut line.lock().unwrap().sent);
+        for want in ["DEC(0)=16", "VEL(0)=8", "PTP 0, 20", "JOG/v 0, 8, +"] {
+            assert!(sent.iter().any(|c| c == want), "{want}: {sent:?}");
+        }
+        line.lock().unwrap().refused.insert("PTP 0, 20".into());
+        assert!(axis.move_absolute(&user, 10.0, 0.0, 4.0, 8.0).is_err());
     }
 
     #[test]

@@ -123,11 +123,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{nint, parse_int_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -202,7 +204,8 @@ impl PIC630Controller {
             return Ok(());
         }
         // Consume + discard the echo. The exchange flushes stale input first,
-        // so a stray line cannot be taken for the echo; C ignores the echo
+        // so a stray line cannot be taken for the echo; C reads with no flush
+        // (drvPIC630.cc:354), a C defect not copied. C ignores the echo
         // read's outcome, and so does this.
         let _ = self.handle.write_read(0, cmd, READ_BUF);
         Ok(())
@@ -244,14 +247,15 @@ pub struct PIC630Axis {
     low_limit: Option<f64>,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIC630Axis {
     /// Construct one axis: send `{addr}DC{current}` (set drive current) then
-    /// `{addr}AB` (stop), then seed the initial status — matching the per-axis
-    /// order of C `motor_init`'s init loop. `signal` is 0-based; wire address
-    /// is `signal + 1`. A failed initial poll is not an error (C leaves the
-    /// zeroed defaults in place).
+    /// `{addr}AB` (stop), then read its status — the per-axis order of C
+    /// `motor_init`'s init loop (drvPIC630.cc:538-552). `signal` is 0-based;
+    /// wire address is `signal + 1`.
     pub fn new(controller: Arc<Mutex<PIC630Controller>>, signal: u8, current: i32) -> Self {
         let addr = signal + 1;
         let mut axis = Self {
@@ -261,14 +265,14 @@ impl PIC630Axis {
             low_limit: None,
             last_status: MotorStatus::default(),
             strings: MoveStrings::default(),
+            init_status: None,
         };
 
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let _ = ctrl.send(&format!("{addr}DC{current}"));
         let _ = ctrl.send(&format!("{addr}AB"));
-        let polled = axis.poll_locked(&ctrl);
         drop(ctrl);
-        axis.apply(polled);
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -335,6 +339,13 @@ impl PIC630Axis {
     /// `SET_ACCEL` fragment: `NINT(acc)` clamped to `[0, 500000]`.
     fn sa(acceleration: f64) -> i32 {
         nint(acceleration).clamp(0, 500_000)
+    }
+}
+
+impl Model1Motor for PIC630Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 

@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::{AsynMotor, Model1Motor};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -146,7 +146,7 @@ pub fn im483pl_config_command() -> CommandDef {
                 let axes = im483pl_probe(&controller);
                 let controller = Arc::new(Mutex::new(controller));
                 for signal in 0..axes {
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(
                         DrvIm483Axis::im483pl(controller.clone(), signal),
                     ));
                     init.axis(signal as i32, motor);
@@ -204,7 +204,7 @@ pub fn im483sm_config_command() -> CommandDef {
                     return;
                 };
                 let controller = Arc::new(Mutex::new(controller));
-                let motor: Arc<Mutex<dyn AsynMotor>> =
+                let motor: Arc<Mutex<dyn Model1Motor>> =
                     Arc::new(Mutex::new(DrvIm483Axis::im483sm(controller)));
                 init.axis(0, motor);
                 init.describe(format!("port={asyn_port}, id: {ident}"));
@@ -254,14 +254,14 @@ pub fn mdrive_config_command() -> CommandDef {
                     return;
                 };
                 let controller = MDriveController::new(handle);
-                let (ident, drives) = mdrive_probe(&controller, card);
-                if !drives.is_empty() {
+                let (ident, drives) = mdrive_probe(&controller);
+                if drives > 0 {
                     init.describe(format!("port={asyn_port}, id: {ident}"));
                 }
                 let controller = Arc::new(Mutex::new(controller));
-                for (signal, drive) in drives.into_iter().enumerate() {
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
-                        DrvMDriveAxis::new(controller.clone(), signal, drive),
+                for signal in 0..drives {
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(
+                        DrvMDriveAxis::new(controller.clone(), card, signal, &ident),
                     ));
                     init.axis(signal as i32, motor);
                 }
@@ -666,5 +666,129 @@ mod extra_params {
         let sent = line.sent();
         let c2 = sent.iter().position(|s| s == "APR C2").unwrap();
         assert_eq!(sent[c2 + 1], "APR LR", "{sent:?}");
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    fn trimmed(line: &LineRig) -> Vec<String> {
+        line.sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect()
+    }
+
+    /// drvIM483PL.cc:601: `motor_init` reads each axis's status once, past
+    /// the probe, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn im483pl_motor_init_reads_each_status_once() {
+        let int = ArgValue::Int;
+        run_command(im483pl_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("im483plInitLine", |cmd| {
+            let cmd = cmd.trim_end();
+            match cmd {
+                "A Z 0" => "A Z 014".into(),
+                "B Z 0" => "B Z 03".into(),
+                c if !c.starts_with(['A', 'B']) => String::new(),
+                c => format!("{c} 0"),
+            }
+        });
+        let config = vec![int(0), ArgValue::String("im483plInitLine".into())];
+        run_command(im483pl_config_command(), config).await;
+        drvsup_init().await;
+        let mut want: Vec<String> = ["A Z 0", "B Z 0", "C Z 0", "C Z 0", "C Z 0"]
+            .map(String::from)
+            .to_vec();
+        for name in ["A", "B"] {
+            let queries = ["^", "Z 0", "] 0", "] 1", "z 0"];
+            want.extend(queries.iter().map(|q| format!("{name} {q}")));
+        }
+        assert_eq!(trimmed(&line), want);
+        let db = record_init(
+            r##"
+record(motor, "im483pl:m1") { field(DTYP, "IM483PL") field(OUT, "#C0 S0 @") }
+record(motor, "im483pl:m2") { field(DTYP, "IM483PL") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("im483pl:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("im483pl:m2.RMP").unwrap(), EpicsValue::Long(3));
+    }
+
+    /// drvIM483SM.cc:633: the one axis's status is read once, past the
+    /// sign-on.
+    #[epics_rs::base::epics_test]
+    async fn im483sm_motor_init_reads_the_status_once() {
+        let int = ArgValue::Int;
+        run_command(im483sm_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("im483smInitLine", |cmd| match cmd.trim_end() {
+            "Z 0" => "Z 0  7".into(),
+            "" => "IM483SM".into(),
+            c => format!("{c}   0"),
+        });
+        let config = vec![int(0), ArgValue::String("im483smInitLine".into())];
+        run_command(im483sm_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(trimmed(&line), ["\u{3}", "", "^", "Z 0", "] 0", "] 1"]);
+        let db = record_init(
+            r##"
+record(motor, "im483sm:m1") { field(DTYP, "IM483SM") field(OUT, "#C0 S0 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("im483sm:m1.RMP").unwrap(), EpicsValue::Long(7));
+    }
+
+    /// drvMDrive.cc:633-725: `motor_init` reads each drive's encoder and
+    /// inputs, then its status, before the next drive's; the record starts
+    /// from that read.
+    #[epics_rs::base::epics_test]
+    async fn mdrive_motor_init_reads_each_status_after_its_own_inputs() {
+        let int = ArgValue::Int;
+        run_command(mdrive_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("mdriveInitLine", |cmd| {
+            let cmd = cmd.trim_end();
+            let (drive, query) = cmd.split_at(1);
+            match (drive, query) {
+                ("1" | "2", "PR VR") => "3.009".into(),
+                (_, "PR VR") => String::new(),
+                ("1", "PR PN") => "MDI17E".into(),
+                ("1", "PR P") => "14".into(),
+                ("2", "PR P") => "3".into(),
+                (_, "PR S1") => "2,0".into(),
+                (_, "PR S2") => "3,0".into(),
+                (_, q) if q.starts_with("PR S") => "0,0".into(),
+                _ => "0".into(),
+            }
+        });
+        let config = vec![int(0), ArgValue::String("mdriveInitLine".into())];
+        run_command(mdrive_config_command(), config).await;
+        drvsup_init().await;
+        let mut want: Vec<String> = ["1PR VR", "2PR VR", "3PR VR", "3PR VR", "3PR VR"]
+            .map(String::from)
+            .to_vec();
+        for (drive, encoder) in [("1", true), ("2", false)] {
+            let mut queries = vec!["PR PN", "PR S1", "PR S2", "PR S3", "PR S4"];
+            queries.extend(["PR MV", "PR P", "PR I1", "PR I2"]);
+            if encoder {
+                queries.push("PR C2");
+            }
+            queries.push("PR V");
+            want.extend(queries.iter().map(|q| format!("{drive}{q}")));
+        }
+        assert_eq!(trimmed(&line), want);
+        let db = record_init(
+            r##"
+record(motor, "mdrive:m1") { field(DTYP, "MDrive") field(OUT, "#C0 S0 @") }
+record(motor, "mdrive:m2") { field(DTYP, "MDrive") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("mdrive:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("mdrive:m2.RMP").unwrap(), EpicsValue::Long(3));
     }
 }

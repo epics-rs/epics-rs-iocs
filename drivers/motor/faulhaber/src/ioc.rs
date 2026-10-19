@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -52,8 +52,8 @@ pub fn mcdc2805_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
             let num_motors = c_int(args, 1);
-            if !(1..=8).contains(&num_motors) {
-                return Err("MCDC2805Config: numMotors must be 1..=8".into());
+            if !(0..=8).contains(&num_motors) {
+                return Err("MCDC2805Config: numMotors must be 0..=8".into());
             }
             let asyn_port = req_string(args, 2, "asyn port name")?;
 
@@ -69,7 +69,7 @@ pub fn mcdc2805_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
                 for node in 0..num_axes {
                     let ax = FaulhaberAxis::new(controller.clone(), node);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(ax));
                     init.axis(node as i32, motor);
                 }
                 if num_axes > 0 {
@@ -121,6 +121,27 @@ mod tests {
     use super::*;
     use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
+    /// C iocsh passes a missing module count as 0 (iocsh.cpp:839-840); C
+    /// stores it (drvMCDC2805.cc:511) and motor_init probes no module.
+    #[epics_rs::base::epics_test]
+    async fn a_missing_module_count_probes_no_module() {
+        let int = ArgValue::Int;
+        run_command(mcdc2805_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("mcdcNoModules", |_| "MCDC 2805".into());
+        let config = vec![
+            int(0),
+            ArgValue::Missing,
+            ArgValue::String("mcdcNoModules".into()),
+        ];
+        run_command(mcdc2805_config_command(), config).await;
+        drvsup_init().await;
+        assert!(line.sent().is_empty());
+        assert_eq!(
+            driver_report("drvMCDC2805", 0),
+            "    MCDC2805 controller 0 connection failed.\n"
+        );
+    }
+
     /// drvMCDC2805.cc:584-626: after the VER probe every setup command is a
     /// bare send_mess, so a refused `SOR 0` keeps the card and its axes.
     #[epics_rs::base::epics_test]
@@ -142,5 +163,57 @@ mod tests {
             driver_report("drvMCDC2805", 0),
             "    MCDC2805SM controller #0, port=mcdcSetupRefused, id: V1 \n"
         );
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvMCDC2805.cc:584-623: `motor_init` sets up each node and reads its
+    /// status once, before the next node's set-up, and the record starts
+    /// from that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_after_its_own_setup() {
+        let int = ArgValue::Int;
+        run_command(mcdc2805_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("mcdcInitLine", |cmd| match cmd.trim_end() {
+            "0POS" => "14".into(),
+            "1POS" => "3".into(),
+            c if c.ends_with("VER") => "V1".into(),
+            c if c.ends_with("GST") => "0000000".into(),
+            c if c.ends_with("GAST") => "00".into(),
+            c if c.ends_with("GV") => "0".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), int(2), ArgValue::String("mcdcInitLine".into())];
+        run_command(mcdc2805_config_command(), config).await;
+        drvsup_init().await;
+        let mut want: Vec<String> = ["0VER", "1VER"].map(String::from).into();
+        for node in 0..2 {
+            for cmd in [
+                "SOR 0", "REFIN", "HP7", "HB6", "HD2", "HL1", "HA1", "CAHOSEQ", "GST", "POS",
+                "GAST", "GV",
+            ] {
+                want.push(format!("{node}{cmd}"));
+            }
+        }
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        assert_eq!(sent, want);
+        let db = record_init(
+            r##"
+record(motor, "mcdc:m1") { field(DTYP, "MCDC2805") field(OUT, "#C0 S0 @") }
+record(motor, "mcdc:m2") { field(DTYP, "MCDC2805") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("mcdc:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("mcdc:m2.RMP").unwrap(), EpicsValue::Long(3));
     }
 }

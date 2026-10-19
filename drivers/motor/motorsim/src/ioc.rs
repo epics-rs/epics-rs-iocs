@@ -277,10 +277,11 @@ impl ControllerParams for MotorSimReport {
             "Simulation motor driver {port}, numAxes={}",
             ctx.num_axes()
         );
-        let axes = self.holder.axes.lock().unwrap_or_else(|e| e.into_inner());
+        let ports = self.holder.ports.lock().unwrap_or_else(|e| e.into_inner());
+        let axes = ports.get(port).map_or(&[][..], Vec::as_slice);
         for addr in 0..ctx.num_axes() as i32 {
             let _ = writeln!(out, "  axis {addr}");
-            let Some(axis) = axes.get(&MotorSimHolder::axis_key(port, addr.into())) else {
+            let Some(axis) = axes.get(addr as usize) else {
                 continue;
             };
             if level > 0 {
@@ -291,26 +292,22 @@ impl ControllerParams for MotorSimReport {
                 axis.report(out, soft_limits);
             }
         }
-        drop(axes);
+        drop(ports);
         ctx.report(out, level);
     }
 }
 
-/// The concrete axes keyed by `"{portName}:{axis}"` for `motorSimConfigAxis`.
+/// The concrete axes of each controller port, for `motorSimConfigAxis`.
 pub struct MotorSimHolder {
-    axes: Mutex<HashMap<String, Arc<Mutex<MotorSimAxis>>>>,
+    ports: Mutex<HashMap<String, Vec<Arc<Mutex<MotorSimAxis>>>>>,
 }
 
 impl MotorSimHolder {
     /// Create an empty holder.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            axes: Mutex::new(HashMap::new()),
+            ports: Mutex::new(HashMap::new()),
         })
-    }
-
-    fn axis_key(port_name: &str, axis: i64) -> String {
-        format!("{port_name}:{axis}")
     }
 
     /// `motorSimCreateController(portName, numAxes, priority, stackSize)`.
@@ -338,6 +335,7 @@ impl MotorSimHolder {
                 };
                 register_port_with(ctx, &port_name, num_axes as i32, report)?;
                 let poller = Controller::new();
+                let mut axes = Vec::new();
                 for index in 0..num_axes {
                     let axis = Arc::new(Mutex::new(MotorSimAxis::new(
                         DEFAULT_LOW_LIMIT,
@@ -347,12 +345,13 @@ impl MotorSimHolder {
                     )));
                     let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
                     poller.install(asyn_user(&port_name, index as i32), motor)?;
-                    holder
-                        .axes
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(Self::axis_key(&port_name, index), axis);
+                    axes.push(axis);
                 }
+                holder
+                    .ports
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(port_name.clone(), axes);
                 // motorSimController's one motorSimTask polls every axis
                 // each DELTA (motorSimDriver.cpp:244), forcing none.
                 poller.start(&port_name, POLL_MS, POLL_MS, 0);
@@ -384,14 +383,26 @@ impl MotorSimHolder {
                 let home = req_int(args, 4, "Home position")?;
                 let start = req_int(args, 5, "Start posn")?;
 
-                let axes = holder.axes.lock().unwrap_or_else(|e| e.into_inner());
-                let Some(handle) = axes.get(&Self::axis_key(&port_name, axis)) else {
+                let ports = holder.ports.lock().unwrap_or_else(|e| e.into_inner());
+                // C's list is initialized by the first controller.
+                if ports.is_empty() {
+                    println!(
+                        "motorSimDriver:motorSimConfigAxis: ERROR, controller list not initialized"
+                    );
+                    return Ok(CommandOutcome::Continue);
+                }
+                let Some(axes) = ports.get(&port_name) else {
                     println!("Controller not found");
                     return Ok(CommandOutcome::Continue);
                 };
                 println!(
                     "motorSimDriver:motorSimConfigAxis: configuring controller {port_name} axis {axis}"
                 );
+                // C defect: config on getAxis(axis) unchecked crashes on the
+                // NULL past the last axis (motorSimDriver.cpp:504).
+                let Some(handle) = usize::try_from(axis).ok().and_then(|a| axes.get(a)) else {
+                    return Ok(CommandOutcome::Continue);
+                };
                 handle.lock().unwrap_or_else(|e| e.into_inner()).config(
                     hi as f64,
                     low as f64,
@@ -417,6 +428,49 @@ mod one_poller {
     use motor_common::testing::{pollers, pollers_after};
 
     use super::*;
+
+    /// motorSimDriver.cpp:494-509: before any controller exists, for a port
+    /// that is not one, for an axis, and for an axis past the port's last.
+    #[epics_rs::base::epics_test]
+    async fn config_axis_prints_what_c_prints() {
+        use motor_common::testing::{child_stdout, in_child, run_command};
+        if !in_child() {
+            let out = child_stdout(module_path!(), "config_axis_prints_what_c_prints");
+            let lines: Vec<_> = out
+                .lines()
+                .filter_map(|l| l.rsplit(" ... ").next())
+                .filter(|l| l.contains("motorSimConfigAxis") || l.contains("Controller"))
+                .collect();
+            let configuring = "motorSimDriver:motorSimConfigAxis: configuring controller simCfg";
+            assert_eq!(
+                lines,
+                [
+                    "motorSimDriver:motorSimConfigAxis: ERROR, controller list not initialized",
+                    "Controller not found",
+                    &format!("{configuring} axis 1"),
+                    &format!("{configuring} axis 2"),
+                ],
+                "{out}"
+            );
+            return;
+        }
+        let holder = MotorSimHolder::new();
+        let config = |port: &str, axis| {
+            [ArgValue::String(port.into())]
+                .into_iter()
+                .chain([axis, 100, -100, 0, 0].map(ArgValue::Int))
+                .collect()
+        };
+        run_command(holder.config_axis_command(), config("simCfg", 0)).await;
+        let create = [ArgValue::String("simCfg".into())]
+            .into_iter()
+            .chain([2, 0, 0].map(ArgValue::Int))
+            .collect();
+        run_command(holder.create_controller_command(), create).await;
+        run_command(holder.config_axis_command(), config("simCfgNone", 0)).await;
+        run_command(holder.config_axis_command(), config("simCfg", 1)).await;
+        run_command(holder.config_axis_command(), config("simCfg", 2)).await;
+    }
 
     /// motorSimController's one motorSimTask polls every axis.
     #[epics_rs::base::epics_test]
@@ -535,6 +589,120 @@ mod one_poller {
             assert!(init.join().unwrap(), "{out}");
         }
         assert_eq!(pollers(), 1);
+    }
+
+    /// A second drvAsynMotorConfigure on the card leaves the first port its
+    /// callback, which C's second setCallback replaces; see
+    /// [`motor_common::param_lib::Params::add_callback`].
+    #[epics_rs::base::epics_test]
+    async fn a_second_configure_keeps_the_first_port_posted() {
+        use std::future::Future;
+
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::asyn::manager::PortManager;
+        use motor_common::drv_motor_asyn::function;
+        use motor_common::testing::run_command;
+
+        let args = [12, 0, -100, 100, 0, 1, 1, 0].map(ArgValue::Int).to_vec();
+        run_command(motor_sim_create_command(), args).await;
+        let mut gains = Vec::new();
+        for name in ["simFirst", "simSecond"] {
+            let args = vec![
+                ArgValue::String(name.into()),
+                ArgValue::String(DRIVER.into()),
+                ArgValue::Int(12),
+                ArgValue::Int(1),
+            ];
+            run_command(drv_asyn_motor_configure_command(vec![&MOTOR_SIM]), args).await;
+            let filter = InterruptFilter {
+                reason: Some(function::P_GAIN as usize),
+                addr: Some(0),
+                iface: Some(InterfaceType::Float64),
+                ..InterruptFilter::default()
+            };
+            let port = PortManager::global().find_port_handle(name).unwrap();
+            gains.push(
+                port.interrupts()
+                    .register_interrupt_user(filter, 0)
+                    .unwrap(),
+            );
+        }
+
+        let writer = PortManager::global().find_port_handle("simSecond").unwrap();
+        std::thread::spawn(move || {
+            writer.write_float64_blocking(function::P_GAIN as usize, 0, 0.75)
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        for (name, (_sub, gain)) in ["simFirst", "simSecond"].iter().zip(&mut gains) {
+            let called_back = std::pin::pin!(gain.recv()).poll(&mut cx);
+            assert!(
+                matches!(called_back, std::task::Poll::Ready(Some(_))),
+                "{name}"
+            );
+        }
+    }
+
+    /// A devMotorSim record on the axis does not take the
+    /// drvAsynMotorConfigure port's callback, as C's setCallback does
+    /// (devMotorSim.c:173): the record adds none.
+    #[epics_rs::base::epics_test]
+    async fn a_record_on_the_axis_leaves_the_port_its_callback() {
+        use std::future::Future;
+
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::asyn::manager::PortManager;
+        use motor_common::drv_motor_asyn::function;
+        use motor_common::testing::run_command;
+
+        let args = [11, 0, -100, 100, 0, 1, 1, 0].map(ArgValue::Int).to_vec();
+        run_command(motor_sim_create_command(), args).await;
+        let args = vec![
+            ArgValue::String("simOpened".into()),
+            ArgValue::String(DRIVER.into()),
+            ArgValue::Int(11),
+            ArgValue::Int(1),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&MOTOR_SIM]), args).await;
+        let port = PortManager::global().find_port_handle("simOpened").unwrap();
+        let filter = InterruptFilter {
+            reason: Some(function::P_GAIN as usize),
+            addr: Some(0),
+            iface: Some(InterfaceType::Float64),
+            ..InterruptFilter::default()
+        };
+        let (_sub, mut gain) = port
+            .interrupts()
+            .register_interrupt_user(filter, 0)
+            .unwrap();
+        let init = std::thread::spawn(|| {
+            let ctx = DeviceSupportContext {
+                record_type: "motor",
+                dtyp: DEV_MOTOR_SIM.choice,
+                inp: "",
+                out: "#C11 S0 @motorSim",
+            };
+            device_support_factory()(&ctx).is_some()
+        });
+        while !init.is_finished() {
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(init.join().unwrap());
+
+        let writer = port.clone();
+        std::thread::spawn(move || {
+            writer.write_float64_blocking(function::P_GAIN as usize, 0, 0.75)
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let called_back = std::pin::pin!(gain.recv()).poll(&mut cx);
+        assert!(matches!(called_back, std::task::Poll::Ready(Some(_))));
     }
 
     /// C `motorAxisReport` (drvMotorSim.c:132-166), the drvet `dbior`

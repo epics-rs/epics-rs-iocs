@@ -144,13 +144,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{nint, parse_value_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -304,8 +304,8 @@ impl PIC862Controller {
     }
 
     /// Write a query and read its reply as one exchange that first flushes
-    /// stale input, so a stray line cannot shift every later reply by one
-    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    /// stale input. C flushes only at `set_status` (drvPIC862.cc:226), so a late reply
+    /// shifts its answers until the next poll: a C defect, not copied.
     fn exchange(&self, cmd: &str) -> (String, usize) {
         Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
     }
@@ -387,16 +387,17 @@ pub struct PIC862Axis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIC862Axis {
-    /// Construct the controller's one axis, seeding the initial status (C
-    /// `motor_init`'s `set_status(card_index, motor_index)` call). A failed
-    /// initial poll is not an error — C leaves the zeroed defaults in place
-    /// either way.
+    /// Construct the controller's one axis and read its status, as C
+    /// `motor_init`'s `set_status(card_index, motor_index)` does
+    /// (drvPIC862.cc:580).
     pub fn new(controller: Arc<Mutex<PIC862Controller>>) -> Self {
         let mut axis = Self {
-            controller: controller.clone(),
+            controller,
             high_limit: None,
             low_limit: None,
             failure: PollFailure::NONE,
@@ -407,11 +408,9 @@ impl PIC862Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            init_status: None,
         };
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(polled) = ctrl.poll_status() {
-            axis.last_status = status_from_polled(&polled);
-        }
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -431,6 +430,13 @@ impl PIC862Axis {
         }
         line.extend_from_slice(command.as_bytes());
         self.lock().send_bytes(&line)
+    }
+}
+
+impl Model1Motor for PIC862Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -812,5 +818,34 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPIC862.cc:239-254 exit stores what motor_init prepared (:568-577,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once past
+    /// RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("c862InitFail", |last| match last {
+            "TS" | "TP" => String::new(),
+            _ => "C-862\r".into(),
+        });
+        let ctrl = Arc::new(Mutex::new(PIC862Controller::new(io, 1).unwrap()));
+        let mut first = PIC862Axis::new(ctrl.clone());
+        let mut again = PIC862Axis::new(ctrl);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            again.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 }

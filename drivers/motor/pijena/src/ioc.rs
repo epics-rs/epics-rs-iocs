@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -74,7 +74,7 @@ pub fn pijeds_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
                 for axis in 0..num_axes {
                     let ax = PiJedsAxis::new(controller.clone(), axis);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(ax));
                     init.axis(axis as i32, motor);
                 }
                 init.describe(line);
@@ -165,5 +165,49 @@ mod tests {
         );
         let controller = PiJedsController::new(io).unwrap();
         assert_eq!(controller.num_axes(), 1);
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvPIJEDS.cc:643-673: `motor_init` counts the axes, then reads each
+    /// axis's status once, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pijeds_motor_init_reads_each_status_once() {
+        let int = ArgValue::Int;
+        run_command(pijeds_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("jedsInitLine", |cmd| {
+            match cmd.trim_end() {
+                "" => "DSM V1.959",
+                "mess,0" => "mess,0,0.014",
+                "mess,1" => "mess,1,0.003",
+                "stat,0" => "stat,0,133",
+                "stat,1" => "stat,1,133",
+                _ => "mess,2,not present",
+            }
+            .into()
+        });
+        let config = vec![int(0), ArgValue::String("jedsInitLine".into()), int(0)];
+        run_command(pijeds_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            line.sent(),
+            [
+                "", "mess,0", "mess,1", "mess,2", "stat,0", "mess,0", "stat,1", "mess,1"
+            ]
+        );
+        let db = record_init(
+            "record(motor, \"m1\") { field(DTYP, \"PIJEDS\") field(OUT, \"#C0 S0 @\") }\n\
+             record(motor, \"m2\") { field(DTYP, \"PIJEDS\") field(OUT, \"#C0 S1 @\") }\n",
+        )
+        .await;
+        assert_eq!(
+            [db.get_pv("m1.RMP").unwrap(), db.get_pv("m2.RMP").unwrap()],
+            [EpicsValue::Long(14), EpicsValue::Long(3)]
+        );
     }
 }

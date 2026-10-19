@@ -202,7 +202,8 @@ pub struct EnsembleAxis {
     failed: Option<MotorStatus>,
     status_writes: Vec<StatusWrite>,
     /// `HomeSetup` word; bit 0 is the home direction, updated by [`Self::home`].
-    home_direction: u32,
+    /// C's `int homeDirection`, so its `%d` prints a high bit signed.
+    home_direction: i32,
     /// `ReverseMotionDirection` parameter.
     reverse_direc: bool,
     /// `EndOfTravelLimitSetup` word (limit-switch active levels).
@@ -234,9 +235,10 @@ impl EnsembleAxis {
                 .get_param(axis, PARAM_HOME_OFFSET)
                 .map(|s| atof(&s))
                 .unwrap_or(0.0);
+            // C `atoi`, which is `(int) strtol`.
             let home_direction = ctrl
                 .get_param(axis, PARAM_HOME_SETUP)
-                .map(|s| atol(&s) as u32)
+                .map(|s| atol(&s) as i32)
                 .unwrap_or(0);
             let swconfig = ctrl
                 .get_param(axis, PARAM_END_OF_TRAVEL_LIMIT_SETUP)
@@ -1000,6 +1002,21 @@ mod tests {
                 format!("GETPARM(@0, {PARAM_REVERSE_MOTION_DIRECTION})"),
             ]
         );
+    }
+
+    /// drvEnsembleAsyn.cc:577-584: `HomeSetup` is a C `int`, so a word with
+    /// the high bit set goes out signed.
+    #[test]
+    fn a_home_sends_the_home_setup_word_signed() {
+        let reply = |cmd: &str| match cmd.trim_end() {
+            c if c == format!("GETPARM(@0, {PARAM_HOME_SETUP})") => "%-1".into(),
+            _ => "%0".into(),
+        };
+        let (line, mut axis) = rig_axis("ensHomeSetupLine", reply, |_| false);
+        axis.home(&AsynUser::new(0), 0.0, 1.0, 1.0, true).unwrap();
+        let sent = line.sent();
+        let setup = format!("SETPARM @0, {PARAM_HOME_SETUP}, -2");
+        assert!(sent.contains(&setup), "{sent:?}");
     }
 
     /// drvEnsembleAsyn.cc:451-456: an enable that finds a fault prints it

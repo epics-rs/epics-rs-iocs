@@ -443,11 +443,12 @@ impl Anf2Axis {
     }
 
     /// Shared `move`/`moveVelocity`/`home` prologue: clear the
-    /// command/configuration register and give the controller 50ms.
-    fn clear_command_reg(&self) -> AsynResult<()> {
-        self.lock().write_array(self.axis_no, &ZERO5)?;
+    /// command/configuration register and give the controller 50ms. Each
+    /// caller overwrites its status with the command's
+    /// (ANF2Driver.cpp:650-800).
+    fn clear_command_reg(&self) {
+        let _ = self.lock().write_array(self.axis_no, &ZERO5);
         sleep(Duration::from_millis(50));
-        Ok(())
     }
 
     fn do_move(
@@ -458,7 +459,7 @@ impl Anf2Axis {
         max_velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.clear_command_reg()?;
+        self.clear_command_reg();
 
         let acceleration = Self::correct_accel(
             self.base_speed as f64,
@@ -472,9 +473,9 @@ impl Anf2Axis {
         reg[COMMAND] = if relative { 0x2 << 16 } else { 0x1 << 16 };
         reg[POSITION] = nint(position);
 
-        self.lock().write_array(self.axis_no, &reg)?;
+        let status = self.lock().write_array(self.axis_no, &reg);
         sleep(Duration::from_millis(50));
-        Ok(())
+        status
     }
 
     /// C `resetErrors`, called automatically from `poll` on a command-error
@@ -522,7 +523,7 @@ impl AsynMotor for Anf2Axis {
     ) -> AsynResult<()> {
         // The jog command requires a different stop than a move command.
         self.jogging = true;
-        self.clear_command_reg()?;
+        self.clear_command_reg();
 
         let mut reg = ZERO5;
         if velocity > 0.0 {
@@ -533,9 +534,9 @@ impl AsynMotor for Anf2Axis {
         }
         Self::send_accel_and_velocity(&mut reg, acceleration, velocity);
 
-        self.lock().write_array(self.axis_no, &reg)?;
+        let status = self.lock().write_array(self.axis_no, &reg);
         sleep(Duration::from_millis(50));
-        Ok(())
+        status
     }
 
     fn home(
@@ -546,7 +547,7 @@ impl AsynMotor for Anf2Axis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        self.clear_command_reg()?;
+        self.clear_command_reg();
 
         let acceleration =
             Self::correct_accel(self.base_speed as f64, min_velocity, velocity, acceleration);
@@ -562,11 +563,11 @@ impl AsynMotor for Anf2Axis {
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let ctrl = self.lock();
         // The stop commands ignore all 32-bit registers beyond the first.
-        ctrl.write_array(self.axis_no, &ZERO5[..1])?;
+        let status = ctrl.write_array(self.axis_no, &ZERO5[..1]);
         if self.jogging {
             drop(ctrl);
             self.jogging = false;
-            Ok(())
+            status
         } else {
             // Hold move: works well with normal moves (an immediate stop cuts
             // the pulses without deceleration and invalidates the position).
@@ -575,16 +576,16 @@ impl AsynMotor for Anf2Axis {
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.lock().write_array(self.axis_no, &ZERO5)?;
+        let _ = self.lock().write_array(self.axis_no, &ZERO5);
         sleep(Duration::from_millis(100));
 
         let mut reg = ZERO5;
         reg[COMMAND] = 0x200 << 16;
         reg[POSITION] = nint(position);
 
-        self.lock().write_array(self.axis_no, &reg)?;
+        let status = self.lock().write_array(self.axis_no, &reg);
         sleep(Duration::from_millis(200));
-        Ok(())
+        status
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
@@ -734,6 +735,43 @@ mod tests {
         let corrected = Anf2Axis::correct_accel(500.0, 0.0, 2500.0, 1000.0);
         // accelTime = 2500 / 1000 = 2.5; corrected = (2500 - 500) / 2.5 = 800.
         assert!((corrected - 800.0).abs() < 1e-9);
+    }
+
+    /// C sets `status =` on each register write and returns the last
+    /// (ANF2Driver.cpp:650-890): a refused clear still sends the command,
+    /// and stop clears `jogging_` whatever the clear returned.
+    #[test]
+    fn a_refused_clear_still_sends_the_command_after_it() {
+        use crate::regs::fake;
+        fake::publish("anf2RefusedIn");
+        fake::publish("anf2RefusedOut");
+        fake::refuse("anf2RefusedOut", &ZERO5);
+        fake::refuse("anf2RefusedOut", &ZERO5[..1]);
+        let ctrl = Anf2Controller::new("anf2RefusedIn", "anf2RefusedOut", 1).0;
+        let mut ax = Anf2Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0, 1, 0);
+        fake::written("anf2RefusedOut");
+        let user = AsynUser::new(0);
+        let commands = || -> Vec<i32> {
+            fake::written("anf2RefusedOut")
+                .into_iter()
+                .filter(|(_, data)| data.len() == 5 && *data != ZERO5)
+                .map(|(_, data)| data[COMMAND])
+                .collect()
+        };
+        ax.move_absolute(&user, 10.0, 0.0, 100.0, 1000.0).unwrap();
+        ax.move_relative(&user, 10.0, 0.0, 100.0, 1000.0).unwrap();
+        ax.home(&user, 0.0, 100.0, 1000.0, true).unwrap();
+        ax.set_position(&user, 5.0).unwrap();
+        assert_eq!(commands(), [0x1 << 16, 0x2 << 16, 0x20 << 16, 0x200 << 16]);
+        ax.stop(&user, 0.0).unwrap();
+        assert_eq!(
+            fake::written("anf2RefusedOut"),
+            [(0, vec![0]), (0, vec![0x4 << 16])]
+        );
+        ax.move_velocity(&user, 0.0, 100.0, 1000.0).unwrap();
+        assert_eq!(commands(), [0x80 << 16]);
+        assert!(ax.stop(&user, 0.0).is_err());
+        assert!(!ax.jogging);
     }
 
     #[test]

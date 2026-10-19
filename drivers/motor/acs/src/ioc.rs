@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::{AsynMotor, Model1Motor};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -47,8 +47,8 @@ pub fn mcb4b_create_controller_command() -> CommandDef {
             let port_name = req_string(args, 0, "Port name")?;
             let asyn_port = req_string(args, 1, "MCB-4B port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
-            if num_axes < 1 {
-                return Err("MCB4BCreateController: numAxes must be > 0".into());
+            if num_axes < 0 {
+                return Err("MCB4BCreateController: numAxes must not be negative".into());
             }
             let num_axes = num_axes as usize;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
@@ -136,7 +136,7 @@ pub fn mcb4b_config_command() -> CommandDef {
                 }
                 let controller = Arc::new(Mutex::new(controller));
                 for index in 0..MCB4B_NUM_AXES {
-                    let motor: Arc<Mutex<dyn AsynMotor>> =
+                    let motor: Arc<Mutex<dyn Model1Motor>> =
                         Arc::new(Mutex::new(DrvMcb4bAxis::new(controller.clone(), index)));
                     init.axis(index as i32, motor);
                 }
@@ -242,5 +242,71 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("  axis "), "{text}");
+    }
+}
+
+/// C iocsh passes a missing numAxes as 0 (iocsh.cpp:839-840), and C's
+/// controller then has no axes.
+#[cfg(test)]
+mod missing_num_axes {
+    use super::*;
+    use motor_common::testing::port_after;
+
+    #[epics_rs::base::epics_test]
+    async fn an_mcb4b_with_no_axes() {
+        let args = vec![
+            ArgValue::String("mcb4bNoAxes".into()),
+            ArgValue::String("mcb4bNoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(mcb4b_create_controller_command(), args, "mcb4bNoAxes").await);
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvMCB4B.cc:489-506: `motor_init` stops each axis and reads its
+    /// status once, before the next axis's stop, and the record starts from
+    /// that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_after_its_own_stop() {
+        let int = ArgValue::Int;
+        run_command(mcb4b_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("mcb4bInitLine", |cmd| match cmd.trim_end() {
+            "#00P" => "#00P=+14".into(),
+            "#01P" => "#01P=+3".into(),
+            c if c.ends_with('P') => format!("{c}=+0"),
+            c if c.ends_with('E') => format!("{c}=00"),
+            c if c.ends_with('X') => format!("{c}=0"),
+            _ => "OK".into(),
+        });
+        let config = vec![int(0), ArgValue::String("mcb4bInitLine".into())];
+        run_command(mcb4b_config_command(), config).await;
+        drvsup_init().await;
+        let mut want = vec!["#00X".to_owned()];
+        for axis in 0..4 {
+            for cmd in ['Q', 'X', 'E', 'P'] {
+                want.push(format!("#{axis:02}{cmd}"));
+            }
+        }
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        assert_eq!(sent, want);
+        let db = record_init(
+            r##"
+record(motor, "mcb4b:m1") { field(DTYP, "ACS MCB-4B") field(OUT, "#C0 S0 @") }
+record(motor, "mcb4b:m2") { field(DTYP, "ACS MCB-4B") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("mcb4b:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("mcb4b:m2.RMP").unwrap(), EpicsValue::Long(3));
     }
 }

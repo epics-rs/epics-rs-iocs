@@ -10,6 +10,7 @@ use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::devices::register_axis;
 
@@ -261,11 +262,15 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
             let card = c_int(args, 2);
             let num_axes = c_int(args, 3);
             let Some(driver) = drivers.iter().find(|d| d.name == driver_name) else {
-                println!("drvAsynMotorConfigure ERROR: Can't find driver: {driver_name}");
+                errlog_vprintf(format_args!(
+                    "drvAsynMotorConfigure ERROR: Can't find driver: {driver_name}\n"
+                ));
                 return Ok(CommandOutcome::Continue);
             };
             let Ok(claim) = claim_port(&port_name) else {
-                println!("drvAsynMotorConfigure ERROR: Can't register port");
+                errlog_vprintf(format_args!(
+                    "drvAsynMotorConfigure ERROR: Can't register port\n"
+                ));
                 return Ok(CommandOutcome::Continue);
             };
             // The driver's one task polls the card's axes in turn.
@@ -277,7 +282,13 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
             let mut records = Vec::new();
             for addr in 0..num_axes {
                 let (Some(controller), Some(axis)) = (&controller, driver.open(card, addr)) else {
-                    println!("drvAsynMotorConfigure: Failed to open axis {addr}");
+                    PortManager::global().trace_manager().print(
+                        Some(&port_name),
+                        None,
+                        0,
+                        TraceMask::ERROR,
+                        format_args!("drvAsynMotorConfigure: Failed to open axis {addr}\n"),
+                    );
                     axes.push(None);
                     continue;
                 };
@@ -286,6 +297,10 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                     addr,
                 };
                 let opened = controller.open(user, axis.motor.clone())?;
+                let poster = opened
+                    .axis
+                    .status_poster()
+                    .ok_or("a model-2 open has no status poster")?;
                 records.push(opened.axis);
                 let wakeup = opened.poll_cmd_tx;
                 axis.log.attach(&port_name, addr);
@@ -294,6 +309,7 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                     axis.setter,
                     axis.getter,
                     wakeup,
+                    poster,
                 )));
             }
             if let Some(log) = &*driver.log.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -545,6 +561,66 @@ mod axis_log {
 }
 
 #[cfg(all(test, feature = "testing", target_os = "linux"))]
+mod configure_lines {
+    use super::*;
+    use crate::testing::run_command;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+
+    static LINES: Model2 = Model2::new("configureLines", 0);
+
+    fn args(port: &str, driver: &str, num_axes: i64) -> Vec<ArgValue> {
+        vec![
+            ArgValue::String(port.into()),
+            ArgValue::String(driver.into()),
+            ArgValue::Int(0),
+            ArgValue::Int(num_axes),
+        ]
+    }
+
+    /// drvMotorAsyn.c:290-293, :325-327: an unknown driver and a taken port
+    /// are errlogPrintf'd; an axis the driver cannot open is asynPrint'd on
+    /// the port's user (:394-397).
+    #[epics_rs::base::epics_test]
+    async fn configure_reports_through_errlog_and_the_port_trace() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
+        let path = std::env::temp_dir().join(format!("model2-config-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        PortManager::global()
+            .trace_manager()
+            .set_trace_file(Some("configureLinesPort"), TraceFile::File(file));
+        LINES.set_card(0, vec![sim_axis(Arc::default())], 100, 1000);
+        let cmd = || drv_asyn_motor_configure_command(vec![&LINES]);
+        run_command(cmd(), args("configureLinesNone", "noSuchDriver", 1)).await;
+        run_command(cmd(), args("configureLinesPort", "configureLines", 2)).await;
+        run_command(cmd(), args("configureLinesPort", "configureLines", 1)).await;
+        errlog_flush();
+        errlog_remove_listener(id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            *lines.lock().unwrap(),
+            [
+                "drvAsynMotorConfigure ERROR: Can't find driver: noSuchDriver",
+                "drvAsynMotorConfigure ERROR: Can't register port",
+            ]
+        );
+        let traced: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            traced,
+            ["drvAsynMotorConfigure: Failed to open axis 1"],
+            "{text}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "testing", target_os = "linux"))]
 mod asyn_writes {
     use super::*;
     use crate::testing::run_command;
@@ -780,6 +856,57 @@ mod asyn_reads {
     }
 
     use std::future::Future;
+
+    /// devMotorAsyn's statusCallback is intCallback's genericPointer client:
+    /// every callback hands it the axis's status, a gain set's that changed
+    /// no status included, and a set that changed nothing calls nothing back
+    /// (drvMotorAsyn.c:822-920, paramLib.c:252-275).
+    #[epics_rs::base::epics_test]
+    async fn every_callback_posts_the_axis_status_to_the_motor_record() {
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::base::runtime::sync::mpsc;
+        use epics_rs::motor::device_state::AxisSubscribers;
+        use epics_rs::motor::device_support::MotorAxis;
+        use epics_rs::motor::poll_loop::ToAxis;
+
+        let params = Arc::new(Params::default());
+        let driver = Arc::new(Mutex::new(Stored(params.clone())));
+        let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let (motor_tx, mut posted) = mpsc::unbounded_channel();
+        let user = TraceUser::Model2 {
+            port: "postPort".into(),
+            addr: 0,
+        };
+        let timeout = std::time::Duration::from_secs(1);
+        let record = MotorAxis::new(
+            user,
+            driver.clone(),
+            timeout,
+            poll_tx.clone(),
+            motor_tx,
+            AxisSubscribers::new(),
+        );
+        let poster = record.status_poster().unwrap();
+        let axis = Axis::new(driver.clone(), driver, params.clone(), poll_tx, poster);
+        let mut port = DrvMotorAsyn::new("postPort", vec![Some(axis)]);
+        let mut next = || match posted.try_recv() {
+            Ok(ToAxis::Callback(status)) => Some(status),
+            Ok(other) => panic!("{other:?}"),
+            Err(_) => None,
+        };
+
+        // The driver's poll.
+        params.set_double(function::POSITION, 2.5).unwrap();
+        params.set_integer(function::DONE, 1).unwrap();
+        params.call_callback();
+        let polled = next().unwrap();
+        assert_eq!((polled.position, polled.done), (2.5, true));
+        let mut gain = AsynUser::new(function::P_GAIN as usize).with_addr(0);
+        port.write_float64(&mut gain, 0.75).unwrap();
+        assert_eq!(next(), Some(polled), "the gain set posted nothing");
+        port.write_float64(&mut gain, 0.75).unwrap();
+        assert_eq!(next(), None);
+    }
 
     static READ: Model2 = Model2::new("read", 0);
 

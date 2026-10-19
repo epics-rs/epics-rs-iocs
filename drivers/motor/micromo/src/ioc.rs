@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -61,8 +61,8 @@ pub fn mvp2001_create_controller_command() -> CommandDef {
             let port_name = req_string(args, 0, "Port name")?;
             let asyn_port = req_string(args, 1, "MVP 2001 port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
-            if num_axes < 1 {
-                return Err("MVP2001CreateController: numAxes must be > 0".into());
+            if num_axes < 0 {
+                return Err("MVP2001CreateController: numAxes must not be negative".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
@@ -208,7 +208,7 @@ pub fn micromo_config_command() -> CommandDef {
                 }
                 let chain = Arc::new(Mutex::new(chain));
                 for (signal, limits) in limits.into_iter().enumerate() {
-                    let motor: Arc<Mutex<dyn AsynMotor>> =
+                    let motor: Arc<Mutex<dyn Model1Motor>> =
                         Arc::new(Mutex::new(DrvMvp2001Axis::new(chain.clone(), signal)));
                     init.axis_with_build_trans(
                         signal as i32,
@@ -331,6 +331,87 @@ mod report {
             text.contains(&format!("{head}{axis}Port: mvpRep\n")),
             "{text}"
         );
+    }
+}
+
+/// C iocsh passes a missing numAxes as 0 (iocsh.cpp:839-840), and C's
+/// controller then has no axes.
+#[cfg(test)]
+mod missing_num_axes {
+    use super::*;
+    use motor_common::testing::port_after;
+
+    #[epics_rs::base::epics_test]
+    async fn an_mvp2001_with_no_axes() {
+        let args = vec![
+            ArgValue::String("mvpNoAxes".into()),
+            ArgValue::String("mvpNoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(mvp2001_create_controller_command(), args, "mvpNoAxes").await);
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvMVP2001.cc:711-720: once every controller's limits are read, each
+    /// is homed and its status read in turn, once, and the record starts
+    /// from that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_once_after_its_ho() {
+        let int = ArgValue::Int;
+        run_command(micromo_setup_command(), vec![int(1), int(10)]).await;
+        // Each command answers once, terminator then reply, so a flush ends.
+        let reads = Mutex::new((String::new(), 0));
+        let (line, _io) = LineRig::new("mvpInitLine", move |cmd| {
+            let mut reads = reads.lock().unwrap();
+            if reads.0 != cmd {
+                *reads = (cmd.to_string(), 0);
+            }
+            reads.1 += 1;
+            let reply = match cmd.trim_end() {
+                "1 ST" | "2 ST" => "0001 0000",
+                "1 POS" => "0001 0000000E",
+                "2 POS" => "0002 00000003",
+                _ => return String::new(),
+            };
+            match reads.1 {
+                1 => "\r".into(),
+                2 => reply.into(),
+                _ => String::new(),
+            }
+        });
+        let config = vec![int(0), ArgValue::String("mvpInitLine".into())];
+        run_command(micromo_config_command(), config).await;
+        drvsup_init().await;
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        let mut want: Vec<String> = ["1 ST", "2 ST", "3 ST", "3 ST", "3 ST"]
+            .map(String::from)
+            .into();
+        for addr in [1, 2] {
+            for cmd in ["V 0", "HO", "EN", "LL -", "LL"] {
+                want.push(format!("{addr} {cmd}"));
+            }
+        }
+        want.extend(["1 HO", "1 ST", "1 POS", "2 HO", "2 ST", "2 POS"].map(String::from));
+        assert_eq!(sent, want);
+        let db = record_init(
+            r##"
+record(motor, "mvp:m1") { field(DTYP, "MVP2001") field(OUT, "#C0 S0 @512,100") }
+record(motor, "mvp:m2") { field(DTYP, "MVP2001") field(OUT, "#C0 S1 @512,100") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("mvp:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("mvp:m2.RMP").unwrap(), EpicsValue::Long(3));
     }
 }
 

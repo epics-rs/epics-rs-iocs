@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::init_read;
 use motor_common::util::{atof, atoi, nint};
 
 /// `PC6K_NUM_CARDS`.
@@ -114,14 +115,15 @@ pub struct AxisLimits {
 }
 
 /// `motor_init`'s probe and set-up of one card: `TREV` naming a 6K, echo
-/// off, all axes stopped, continuous commands on, then each answering axis's
-/// travel limits, with the `TREV` reply C keeps as `brdptr->ident`. `None`
-/// leaves the card unconfigured, as C does.
+/// off, all axes stopped, continuous commands on, then the answering axes
+/// counted, with the `TREV` reply C keeps as `brdptr->ident`. `None` leaves
+/// the card unconfigured, as C does. Each axis is then set up by
+/// [`DrvPc6kAxis::new`].
 ///
 /// C keeps `cardFound` across cards, so a card after a found one counts as
 /// found whatever it answers, and counts axes with no bound past
 /// `MAX_AXIS`; each card is probed on its own here and stops at `MAX_AXIS`.
-pub fn motor_init(card: &Pc6kCard) -> Option<(String, Vec<AxisLimits>)> {
+pub fn motor_init(card: &Pc6kCard) -> Option<(String, usize)> {
     let ident = (0..3).find_map(|_| {
         let reply = String::from_utf8_lossy(&card.ask("TREV")).into_owned();
         (reply.contains("TREV") && reply.contains("6K")).then_some(reply)
@@ -139,24 +141,25 @@ pub fn motor_init(card: &Pc6kCard) -> Option<(String, Vec<AxisLimits>)> {
     while total < MAX_AXIS && card.query(&format!("{}TPC", total + 1)).is_some() {
         total += 1;
     }
-    let limits = (1..=total)
-        .map(|axis| {
-            // AXSDEF picks the resolution queried; C keeps it for nothing.
-            let servo = card
-                .query(&format!("{axis}AXSDEF"))
-                .is_some_and(|v| v.starts_with('1'));
-            card.query(&format!("{axis}{}", if servo { "ERES" } else { "DRES" }));
-            let mut limits = AxisLimits::default();
-            if let Some(v) = card.query(&format!("{axis}LSNEG")) {
-                limits.low = atof(&v);
-            }
-            if let Some(v) = card.query(&format!("{axis}LSPOS")) {
-                limits.high = atof(&v);
-            }
-            limits
-        })
-        .collect();
-    Some((ident, limits))
+    Some((ident, total))
+}
+
+/// `motor_init`'s queries of axis `axis`: its type, resolution and travel
+/// limits.
+fn axis_limits(card: &Pc6kCard, axis: usize) -> AxisLimits {
+    // AXSDEF picks the resolution queried; C keeps it for nothing.
+    let servo = card
+        .query(&format!("{axis}AXSDEF"))
+        .is_some_and(|v| v.starts_with('1'));
+    card.query(&format!("{axis}{}", if servo { "ERES" } else { "DRES" }));
+    let mut limits = AxisLimits::default();
+    if let Some(v) = card.query(&format!("{axis}LSNEG")) {
+        limits.low = atof(&v);
+    }
+    if let Some(v) = card.query(&format!("{axis}LSPOS")) {
+        limits.high = atof(&v);
+    }
+    limits
 }
 
 /// `PC6KUpLoad`'s lines of `text`: each `fgets` of at most `BUFF_SIZE - 1`
@@ -202,12 +205,15 @@ pub struct DrvPc6kAxis {
     /// When the last motion started: C's motor task reads no status until
     /// `MOTION_DELAY` after it, the GO's prompt read away by then.
     started: Option<Instant>,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl DrvPc6kAxis {
-    /// Axis `signal + 1` of `card`, with the limits [`motor_init`] read for
-    /// it, its status read as `motor_init` ends.
-    pub fn new(card: Arc<Mutex<Pc6kCard>>, signal: usize, limits: AxisLimits) -> Self {
+    /// Axis `signal + 1` of `card` as `motor_init` sets it up: its limits
+    /// read, then its status, before the next axis's (drvPC6K.cc:880-914).
+    pub fn new(card: Arc<Mutex<Pc6kCard>>, signal: usize) -> Self {
+        let limits = axis_limits(&card.lock().unwrap_or_else(|e| e.into_inner()), signal + 1);
         let mut axis = Self {
             card,
             axis: signal + 1,
@@ -222,8 +228,9 @@ impl DrvPc6kAxis {
             strings: None,
             post: None,
             started: None,
+            init_status: None,
         };
-        let _ = axis.poll(&AsynUser::new(0));
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -289,6 +296,13 @@ fn refused(message: &str) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
         message: message.into(),
+    }
+}
+
+impl Model1Motor for DrvPc6kAxis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.status.clone(), self.poll_failure())
     }
 }
 
@@ -396,9 +410,12 @@ impl AsynMotor for DrvPc6kAxis {
         Ok(())
     }
 
-    /// `PRIMITIVE`: INIT as it is.
+    /// `PRIMITIVE`: INIT and `PC6K_OUT_EOS` ahead of the port's own, so an
+    /// empty line follows it on the wire (devPC6K.cc:194-198).
     fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
-        self.lock().command(init);
+        let mut msg = init.to_vec();
+        msg.push(b'\n');
+        self.lock().command(msg);
         Ok(())
     }
 
@@ -514,7 +531,7 @@ mod tests {
             }
         });
         let card = Arc::new(Mutex::new(Pc6kCard::new(io)));
-        let mut axis = DrvPc6kAxis::new(card, 0, AxisLimits::default());
+        let mut axis = DrvPc6kAxis::new(card, 0);
         let user = AsynUser::new(0);
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
@@ -527,5 +544,43 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPC6K.cc:326-339 exit stores what motor_init prepared (:859-869,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once the card
+    /// is past RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        use motor_common::testing::LineRig;
+        let (_line, io) = LineRig::new("pc6kInitFail", |_| String::new());
+        let card = Arc::new(Mutex::new(Pc6kCard::new(io)));
+        let mut first = DrvPc6kAxis::new(card.clone(), 0);
+        let mut second = DrvPc6kAxis::new(card, 1);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
+    }
+
+    /// devPC6K.cc:194-198.
+    #[test]
+    fn init_goes_out_with_its_eos() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::new("pc6kInit", |_| String::new());
+        let card = Arc::new(Mutex::new(Pc6kCard::new(io)));
+        let mut axis = DrvPc6kAxis::new(card, 0);
+        line.sent();
+        axis.primitive(&AsynUser::new(0), b"1DRIVE1").unwrap();
+        assert_eq!(line.sent(), ["1DRIVE1\n"]);
     }
 }

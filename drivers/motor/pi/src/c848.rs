@@ -25,16 +25,17 @@
 //! wraps *each* command in its own `motor_start_trans_com`/`motor_end_trans_com`
 //! pair, so a move's `SET_VELOCITY` and `MOVE_ABS` are **two separate writes**,
 //! each independently getting the column-5 axis byte — whereas the C-844
-//! `strcat`s a whole move into one `AXIS n;`-prefixed message. (The
-//! `ENABLE_TORQUE` "CLR then SVO" split is the same per-command-message
-//! mechanism used twice inside one build call.)
+//! `strcat`s a whole move into one `AXIS n;`-prefixed message. (C's
+//! `ENABLE_TORQUE` ends a first transaction for `CLR` inside one build call,
+//! but never appends `CLR` to it; see `set_closed_loop`.)
 //!
 //! ## Connect (`motor_init`)
 //! `*IDN?` (retry up to 3× until a non-empty reply → `brdptr->ident`). Then the
 //! axis count is discovered: `CST? {A..D}` until a reply whose body (`&buff[2]`)
-//! is `"NOSTAGE"`. For each present axis, `REF? {letter}` sets the
-//! `reference` flag (`&buff[2] == "0"` → `false`, else
-//! `true`), which governs `LOAD_POS`. Every axis has encoder + gain support.
+//! is `"NOSTAGE"`. Then for each present axis, ahead of its status,
+//! `REF? {letter}` sets the `reference` flag (`&buff[2] == "0"` → `false`,
+//! else `true`), which governs `LOAD_POS`. Every axis has encoder + gain
+//! support.
 //!
 //! ## Status
 //! Per axis, under one lock (C `set_status`):
@@ -93,14 +94,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{nint, parse_int_at, parse_value_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -160,26 +161,25 @@ enum CommState {
 }
 
 /// Shared multi-axis controller endpoint: owns the octet handle, the probed
-/// axis count + per-axis reference flags, and the (controller-wide) comm
-/// debounce state.
+/// axis count, and the (controller-wide) comm debounce state.
 pub struct PIC848Controller {
     handle: SyncIOHandle,
     ident: String,
     comm_state: CommState,
-    /// Per-axis reference-switch flag (index = signal), from `REF?` at connect.
-    references: Vec<bool>,
+    /// Axes with a configured stage, from the `CST?` probe.
+    num_axes: u8,
 }
 
 impl PIC848Controller {
     /// Connect, identify, and probe a C-848 (C `motor_init`'s per-card block):
     /// `*IDN?` retried up to 3×, then `CST?` per axis to count stages
-    /// (stopping at `NOSTAGE`) and `REF?` per axis for the reference flag.
+    /// (stopping at `NOSTAGE`).
     pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
         let mut ctrl = Self {
             handle,
             ident: String::new(),
             comm_state: CommState::Normal,
-            references: Vec::new(),
+            num_axes: 0,
         };
 
         for _ in 0..3 {
@@ -200,9 +200,7 @@ impl PIC848Controller {
             if cst.get(2..) == Some("NOSTAGE") {
                 break;
             }
-            // REF? {letter} -> "{L}={0|1}"; body "0" => no reference switch.
-            let refr = ctrl.query(&format!("REF? {letter}"));
-            ctrl.references.push(refr.get(2..) != Some("0"));
+            ctrl.num_axes += 1;
         }
 
         Ok(ctrl)
@@ -215,13 +213,7 @@ impl PIC848Controller {
 
     /// Number of axes with a configured stage (probed via `CST?`).
     pub fn num_axes(&self) -> u8 {
-        self.references.len() as u8
-    }
-
-    /// Whether axis `signal` has a reference (home) switch (C
-    /// `cntrl->reference[signal]`).
-    fn reference(&self, signal: u8) -> bool {
-        self.references[signal as usize]
+        self.num_axes
     }
 
     /// Write a command, no reply expected (C `send_mess`). No terminator (port
@@ -240,8 +232,8 @@ impl PIC848Controller {
     }
 
     /// Write a query and read its reply as one exchange that first flushes
-    /// stale input, so a stray line cannot shift every later reply by one
-    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    /// stale input. C flushes only at `set_status` (drvPIC848.cc:237), so a late reply
+    /// shifts its answers until the next poll: a C defect, not copied.
     fn exchange(&self, cmd: &str) -> String {
         Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
     }
@@ -321,22 +313,26 @@ pub struct PIC848Axis {
     /// C `no_motion_count`: polls the position sat still while a move was
     /// held; a MOTION command restarts it (motordrvCom.cc:435).
     no_motion_count: u32,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIC848Axis {
-    /// Construct axis `signal` (0-based; wire letter `A`+`signal`), seeding the
-    /// initial status (C `motor_init`'s `set_status`). A failed initial poll is
-    /// not an error.
+    /// Construct axis `signal` (0-based; wire letter `A`+`signal`): its `REF?`,
+    /// then its status, the per-axis order of C `motor_init`
+    /// (drvPIC848.cc:589-598).
     pub fn new(controller: Arc<Mutex<PIC848Controller>>, card: i32, signal: u8) -> Self {
+        let letter = axis_letter(signal);
+        // REF? {letter} -> "{L}={0|1}"; body "0" => no reference switch.
         let reference = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            ctrl.reference(signal)
+            ctrl.query(&format!("REF? {letter}")).get(2..) != Some("0")
         };
         let mut axis = Self {
-            controller: controller.clone(),
+            controller,
             card,
             signal,
-            letter: axis_letter(signal),
+            letter,
             reference,
             failure: PollFailure::NONE,
             last_status: MotorStatus {
@@ -347,12 +343,9 @@ impl PIC848Axis {
             },
             strings: MoveStrings::default(),
             no_motion_count: 0,
+            init_status: None,
         };
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(polled) = ctrl.poll_status(signal) {
-            drop(ctrl);
-            axis.apply(polled, false);
-        }
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -413,6 +406,13 @@ impl PIC848Axis {
     }
 }
 
+impl Model1Motor for PIC848Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
+    }
+}
+
 impl AsynMotor for PIC848Axis {
     fn poll_failure(&self) -> PollFailure {
         self.failure
@@ -430,8 +430,10 @@ impl AsynMotor for PIC848Axis {
         self.no_motion_count = 0;
         let line = self.move_line(&format!("MOV  {l}{:.5}", CFloat(position * POS_RES)));
         let ctrl = self.lock();
-        // SET_VELOCITY ("VEL  L {v}") then MOVE_ABS ("MOV  L{p}") — two writes.
-        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
+        // SET_VELOCITY ("VEL  L {v}") then MOVE_ABS ("MOV  L{p}") — two writes;
+        // motordrvCom sends each whatever the one before returned
+        // (motordrvCom.cc:397-484).
+        let _ = ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)));
         ctrl.send_bytes(&line)
     }
 
@@ -447,7 +449,7 @@ impl AsynMotor for PIC848Axis {
         self.no_motion_count = 0;
         let line = self.move_line(&format!("MVR  {l}{:+.5}", CFloat(distance * POS_RES)));
         let ctrl = self.lock();
-        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
+        let _ = ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)));
         ctrl.send_bytes(&line)
     }
 
@@ -477,7 +479,7 @@ impl AsynMotor for PIC848Axis {
         self.no_motion_count = 0;
         let line = self.move_line(&format!("REF  {l}"));
         let ctrl = self.lock();
-        ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)))?;
+        let _ = ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)));
         ctrl.send_bytes(&line)
     }
 
@@ -508,8 +510,12 @@ impl AsynMotor for PIC848Axis {
         let ctrl = self.lock();
         if enable {
             // Enabling while torque is disabled first clears the axis status.
+            // C formats `CLR  #` but never appends it before ending that
+            // transaction, so it goes out empty and send_mess sends nothing
+            // (devPIC848.cc:253-260, drvPIC848.cc:373-374); that C defect is
+            // not copied.
             if !self.last_status.powered {
-                ctrl.send(&format!("CLR  {l}"))?;
+                let _ = ctrl.send(&format!("CLR  {l}"));
             }
             ctrl.send(&format!("SVO  {l}1"))
         } else {
@@ -651,20 +657,55 @@ mod tests {
     /// Axis A of a one-stage C-848 on a [`LineRig`] whose `STA? A` reply
     /// follows `sta`.
     fn strings_rig(name: &str) -> (LineRig, PIC848Axis, Arc<AtomicU32>) {
+        refusing_rig(name, |_| false)
+    }
+
+    /// [`strings_rig`] with each write `refused` picks recorded and refused.
+    fn refusing_rig(
+        name: &str,
+        refused: fn(&str) -> bool,
+    ) -> (LineRig, PIC848Axis, Arc<AtomicU32>) {
         let sta = Arc::new(AtomicU32::new(DONE));
         let st = sta.clone();
-        let (line, io) = LineRig::new(name, move |last| match last {
-            "*IDN?" => "C-848".into(),
-            "CST? A" => "A=M-110".into(),
-            "CST? B" => "B=NOSTAGE".into(),
-            "REF? A" => "A=0".into(),
-            "STA? A" => format!("A={}", st.load(Ordering::SeqCst)),
-            _ => "A=0".into(),
-        });
+        let (line, io) = LineRig::failing(
+            name,
+            move |last| match last {
+                "*IDN?" => "C-848".into(),
+                "CST? A" => "A=M-110".into(),
+                "CST? B" => "B=NOSTAGE".into(),
+                "REF? A" => "A=0".into(),
+                "STA? A" => format!("A={}", st.load(Ordering::SeqCst)),
+                _ => "A=0".into(),
+            },
+            refused,
+        );
         let ctrl = PIC848Controller::new(io).unwrap();
         let axis = PIC848Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0);
         line.sent();
         (line, axis, sta)
+    }
+
+    /// devPIC848.cc:326: the velocity and the command are each a message of
+    /// their own, whose status C's motor task drops. The CLR is rs's own (C
+    /// never sends it, see `set_closed_loop`), and SVO still follows it.
+    #[test]
+    fn a_refused_message_still_sends_the_ones_after_it() {
+        let (line, mut axis, _) = refusing_rig("c848Refused", |cmd| {
+            cmd.starts_with("VEL  A ") || cmd == "CLR  A" || cmd == "REF  A"
+        });
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 1.0, 0.0, 2.0, 0.0).unwrap();
+        axis.move_relative(&user, -1.0, 0.0, 2.0, 0.0).unwrap();
+        assert!(axis.home(&user, 0.0, 2.0, 0.0, true).is_err());
+        axis.last_status.powered = false;
+        axis.set_closed_loop(&user, true).unwrap();
+        let sent: Vec<String> = line.sent().iter().map(|c| c[..4].to_string()).collect();
+        assert_eq!(
+            sent,
+            [
+                "VEL ", "MOV ", "VEL ", "MVR ", "VEL ", "REF ", "CLR ", "SVO "
+            ]
+        );
     }
 
     fn post(text: &[u8]) -> PostMessage {
@@ -884,5 +925,36 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPIC848.cc:249-264 exit stores what motor_init prepared (:577-586,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once past
+    /// RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("c848InitFail", |last| match last {
+            "*IDN?" => "C-848".into(),
+            "CST? A" => "A=M-110".into(),
+            "CST? B" => "B=M-110".into(),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(PIC848Controller::new(io).unwrap()));
+        let mut first = PIC848Axis::new(ctrl.clone(), 0, 0);
+        let mut second = PIC848Axis::new(ctrl, 0, 1);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 }

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::{AsynMotor, Model1Motor};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::base::server::iocsh::registry::*;
@@ -301,8 +301,8 @@ pub fn corvus_create_controller_command() -> CommandDef {
             let port_name = req_string(args, 0, "Port name")?;
             let corvus_port = req_string(args, 1, "SMC corvus port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
-            if !(1..=3).contains(&num_axes) {
-                return Err("SMCcorvusCreateController: numAxes must be 1..=3".into());
+            if !(0..=3).contains(&num_axes) {
+                return Err("SMCcorvusCreateController: numAxes must be 0..=3".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
@@ -368,8 +368,8 @@ pub fn hydra_create_controller_command() -> CommandDef {
             let port_name = req_string(args, 0, "Port name")?;
             let hydra_port = req_string(args, 1, "SMC hydra port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
-            if !(1..=2).contains(&num_axes) {
-                return Err("SMChydraCreateController: numAxes must be 1..=2".into());
+            if !(0..=2).contains(&num_axes) {
+                return Err("SMChydraCreateController: numAxes must be 0..=2".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
@@ -435,8 +435,8 @@ pub fn taurus_create_controller_command() -> CommandDef {
             let port_name = req_string(args, 0, "Port name")?;
             let taurus_port = req_string(args, 1, "SMC Taurus port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
-            if num_axes < 1 {
-                return Err("SMCTaurusCreateController: numAxes must be > 0".into());
+            if num_axes < 0 {
+                return Err("SMCTaurusCreateController: numAxes must not be negative".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
@@ -566,7 +566,7 @@ pub fn micos_config_command() -> CommandDef {
                 }
                 let controller = Arc::new(Mutex::new(controller));
                 for signal in 0..num_axis {
-                    let motor: Arc<Mutex<dyn AsynMotor>> =
+                    let motor: Arc<Mutex<dyn Model1Motor>> =
                         Arc::new(Mutex::new(DrvMicosAxis::new(controller.clone(), signal)));
                     init.axis(signal, motor);
                 }
@@ -850,5 +850,82 @@ mod taurus_limit_type {
         assert_eq!(io.read_int32(high).unwrap(), 1);
         GARBLED.store(true, Ordering::Relaxed);
         assert!(io.read_int32(low).is_err());
+    }
+}
+
+/// C iocsh passes a missing numAxes as 0 (iocsh.cpp:839-840), and C's
+/// controller then has no axes.
+#[cfg(test)]
+mod missing_num_axes {
+    use super::*;
+    use motor_common::testing::port_after;
+
+    #[epics_rs::base::epics_test]
+    async fn a_corvus_with_no_axes() {
+        let args = vec![
+            ArgValue::String("corvusNoAxes".into()),
+            ArgValue::String("corvusNoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(corvus_create_controller_command(), args, "corvusNoAxes").await);
+    }
+
+    #[epics_rs::base::epics_test]
+    async fn a_hydra_with_no_axes() {
+        let args = vec![
+            ArgValue::String("hydraNoAxes".into()),
+            ArgValue::String("hydraNoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(hydra_create_controller_command(), args, "hydraNoAxes").await);
+    }
+
+    #[epics_rs::base::epics_test]
+    async fn a_taurus_with_no_axes() {
+        let args = vec![
+            ArgValue::String("taurusNoAxes".into()),
+            ArgValue::String("taurusNoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(taurus_create_controller_command(), args, "taurusNoAxes").await);
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvMicos.cc:527-553: `motor_init` turns each address's echo off,
+    /// stops it and reads its status once, before the next address's; the
+    /// record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_after_its_own_stop() {
+        let int = ArgValue::Int;
+        run_command(micos_setup_command(), vec![int(1), int(2), int(10)]).await;
+        let (line, _io) = LineRig::new("micosInitLine", |cmd| match cmd {
+            "\x010ts" | "\x011ts" => "0S0:04 00 00 00 00 00 00".into(),
+            "\x010tp" => "0P0:14".into(),
+            "\x011tp" => "1P1:3".into(),
+            _ => String::new(),
+        });
+        let config = vec![int(0), ArgValue::String("micosInitLine".into())];
+        run_command(micos_config_command(), config).await;
+        drvsup_init().await;
+        let mut want: Vec<String> = vec!["\x010ts".into(), "\x011ts".into()];
+        for n in 0..2 {
+            want.extend(["ef", "ab1", "ts", "tp"].map(|c| format!("\x01{n}{c}")));
+        }
+        assert_eq!(line.sent(), want);
+        let db = record_init(
+            r##"
+record(motor, "micos:m1") { field(DTYP, "Micos MoCo") field(OUT, "#C0 S0 @") }
+record(motor, "micos:m2") { field(DTYP, "Micos MoCo") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("micos:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("micos:m2.RMP").unwrap(), EpicsValue::Long(3));
     }
 }

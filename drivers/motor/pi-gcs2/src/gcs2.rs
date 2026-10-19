@@ -123,7 +123,7 @@ use epics_rs::motor::controller_port::{
     AxisUser, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, index,
 };
 use epics_rs::motor::flags::{DriverCall, MotorCommand};
-use motor_common::util::{atof, atoi, nint};
+use motor_common::util::{atof, atoi, nint, strtol};
 use motor_common::{ControllerParams, ControllerReport};
 
 /// Response buffer size for a single reply line.
@@ -219,33 +219,6 @@ fn get_value_f64(reply: &str) -> AsynResult<f64> {
         .ok_or_else(|| pigcs2_err(format!("no '=' in reply {reply:?}")))
 }
 
-/// C `strtol(s, NULL, radix)`: leading blanks, a sign and, in base 16, a
-/// `0x` are read; base 0 reads a `0x` as 16 and a leading `0` as 8; no
-/// digit is 0 and an overflow saturates.
-fn strtol(s: &str, radix: u32) -> i64 {
-    let t = s.trim_start();
-    let (negative, t) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    let (t, radix) = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        Some(rest)
-            if matches!(radix, 0 | 16) && rest.starts_with(|c: char| c.is_ascii_hexdigit()) =>
-        {
-            (rest, 16)
-        }
-        _ if radix == 0 && t.starts_with('0') => (t, 8),
-        _ if radix == 0 => (t, 10),
-        _ => (t, radix),
-    };
-    let n = t.chars().take_while(|c| c.is_digit(radix)).count();
-    if n == 0 {
-        return 0;
-    }
-    let value = i64::from_str_radix(&t[..n], radix).unwrap_or(i64::MAX);
-    if negative { -value } else { value }
-}
-
 fn get_value_bool(reply: &str) -> AsynResult<bool> {
     value_str(reply)
         .map(|v| atoi(v) != 0)
@@ -328,7 +301,7 @@ fn status_from_bitmask(mask: u32) -> (bool, bool, bool, bool, bool) {
 fn status_mask_at(reply: &str, axis_no: usize) -> Option<u32> {
     let idx = 2 + axis_no * 4;
     let mask_str = reply.get(idx..)?;
-    Some(strtol(mask_str.get(..4).unwrap_or(mask_str), 16) as u32)
+    Some(strtol(mask_str.get(..4).unwrap_or(mask_str).as_bytes(), 16).0 as u32)
 }
 
 /// The C controller class `PIGCSController::CreateGCSController`
@@ -632,7 +605,7 @@ impl PIGCS2Controller {
                 e.status() as i32
             )
         })?;
-        let moving = strtol(&reply, 16) != 0;
+        let moving = strtol(reply.as_bytes(), 16).0 != 0;
         let hexapod = &mut self.hexapod;
         hexapod.any_moving = moving;
         hexapod.moving = moving;
@@ -664,7 +637,8 @@ impl PIGCS2Controller {
 
     /// C `PIGCSController::init`: probe `VEL?` and discover the axes with
     /// `SAI?`. The constructor ignores its status, so a failed `SAI?` leaves
-    /// no axes.
+    /// no axes; the hexapod and E-517 `init`s return it before their own
+    /// steps (PIHexapodController.cpp:25-29, PIE517Controller.cpp:28-32).
     pub fn init(&mut self) {
         // C only checks the transport status of the VEL? probe, not its
         // content (any real controller reply — even an error message — means
@@ -676,7 +650,9 @@ impl PIGCS2Controller {
                 false
             }
         };
-        self.axis_names = self.find_connected_axes().unwrap_or_default();
+        if self.find_connected_axes().is_err() {
+            return;
+        }
         if self.model.is_hexapod() {
             self.init_hexapod();
         }
@@ -926,29 +902,44 @@ impl PIGCS2Controller {
         );
     }
 
-    /// `SAI?`: every connected axis name, one per reply line less its
-    /// trailing spaces (C `findConnectedAxes`).
-    fn find_connected_axes(&self) -> AsynResult<Vec<String>> {
+    /// `SAI?` into `axis_names`: every connected axis name, one per reply
+    /// line less its trailing spaces (C `findConnectedAxes`), those found
+    /// before a failure kept as C keeps `m_axesIDs`.
+    fn find_connected_axes(&mut self) -> AsynResult<()> {
+        self.axis_names.clear();
         if self.model.is_hexapod() {
             // PIHexapodController::findConnectedAxes asks nothing.
-            return Ok(["X", "Y", "Z", "U", "V", "W"].map(String::from).to_vec());
+            self.axis_names = ["X", "Y", "Z", "U", "V", "W"].map(String::from).to_vec();
+            return Ok(());
         }
         if self.model == Model::C702 {
             // PIC702Controller::findConnectedAxes: one word of one-char
             // axes, last first.
             let word = self.query("SAI?")?;
+            // C returns with m_nrFoundAxes the word's length and no axis IDs
+            // (PIC702Controller.cpp:82-86), so its constructor names axes
+            // from NULL: a C defect, not copied; no axes are kept.
             if word.len() >= MAX_NR_AXES {
                 return Err(pigcs2_err(format!("{} axes in SAI? reply", word.len())));
             }
-            return Ok(word.chars().rev().map(String::from).collect());
+            self.axis_names = word.chars().rev().map(String::from).collect();
+            return Ok(());
         }
         let raw = self.send_and_receive("SAI?")?;
-        Ok(String::from_utf8_lossy(&raw)
+        let names = String::from_utf8_lossy(&raw)
             .split('\n')
             .map(|line| line.trim_end_matches(['\r', '\0', ' ']))
             .filter(|name| !name.is_empty())
             .map(String::from)
-            .collect())
+            .collect::<Vec<_>>();
+        for name in names {
+            // C keeps the axes found before the one past MAX_NR_AXES.
+            if self.axis_names.len() == MAX_NR_AXES {
+                return Err(pigcs2_err(format!("over {MAX_NR_AXES} axes in SAI? reply")));
+            }
+            self.axis_names.push(name);
+        }
+        Ok(())
     }
 
     /// C `getGCSError`: a non-zero code prints, with its message, once
@@ -1324,7 +1315,7 @@ impl PIGCS2Controller {
             if !self.hexapod.reads_status {
                 return Ok(true);
             }
-            return Ok(strtol(&self.query_char(4)?, 10) & 0x10000 != 0);
+            return Ok(strtol(self.query_char(4)?.as_bytes(), 10).0 & 0x10000 != 0);
         }
         if self.model == Model::C702 {
             return Ok(self.get_gcs_parameter(axis, PARA_C702_REFERENCED)? > 0.1);
@@ -1453,7 +1444,7 @@ impl PIGCS2Controller {
     /// C `getMoving`: `#5`'s hex word masked by the axis's
     /// `m_movingStateMask`.
     fn get_moving(&self, mask: i64) -> AsynResult<bool> {
-        Ok(strtol(&self.query_char(5)?, 16) & mask != 0)
+        Ok(strtol(self.query_char(5)?.as_bytes(), 16).0 & mask != 0)
     }
 
     /// `PIGCSPiezoController::getStatus`: `SRG? {axis} 1`'s mask, no limits;
@@ -1475,7 +1466,8 @@ impl PIGCS2Controller {
             self.piezo.srg.set(false);
             return Err(pigcs2_err(format!("no '=' in reply {reply:?}")));
         };
-        let (homing, moving, _, _, servo) = status_from_bitmask(strtol(value, 0) as u32);
+        let (homing, moving, _, _, servo) =
+            status_from_bitmask(strtol(value.as_bytes(), 0).0 as u32);
         self.trace(
             TraceMask::FLOW,
             format_args!(
@@ -2440,6 +2432,13 @@ impl PIGCS2Axis {
 }
 
 impl AsynMotor for PIGCS2Axis {
+    /// `PIasynAxis::Init`, run right after the constructor
+    /// (PIasynController.cpp:188-189), ends in `callParamCallbacks`
+    /// (PIasynAxis.cpp:101).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     fn take_port_sets(&mut self) -> PortSets {
         std::mem::take(&mut self.sets)
     }
@@ -2725,6 +2724,22 @@ mod tests {
     use epics_rs::asyn::interfaces::motor::PortSet;
     use epics_rs::asyn::port_handle::PortHandle;
     use epics_rs::asyn::request::ParamSetValue;
+
+    /// PIasynAxis.cpp:101, run from PIasynController.cpp:189.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2CtorCallback", |last| {
+            if last == "ERR?" { "0" } else { "1=1" }.into()
+        });
+        let ctrl = PIGCS2Controller::new(io, "gcs2CtorCallback");
+        let axis = PIGCS2Axis::new(
+            Arc::new(Mutex::new(ctrl)),
+            "1".into(),
+            0,
+            "gcs2CtorCallback",
+        );
+        assert!(axis.constructor_calls_param_callbacks());
+    }
 
     /// The controller poll, its sets applied as the poller does.
     fn post_poll(ctrl: &Mutex<PIGCS2Controller>, port: &PortHandle) {
@@ -3323,6 +3338,42 @@ mod tests {
                 "{idn}"
             );
         }
+    }
+
+    /// `PIGCSController::init` returns `findConnectedAxes`' status
+    /// (PIGCSController.cpp:702-706), and `PIE517Controller::init` returns
+    /// it before `TPC?` (PIE517Controller.cpp:28-32): a refused `SAI?`, or
+    /// a 65th axis, which keeps the first 64 (PIGCSController.cpp:729-737).
+    #[test]
+    fn an_e517_whose_axis_search_fails_sets_nothing_online() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::failing(
+            "gcs2E517NoSai",
+            |last| match last {
+                "TPC?" => "3".into(),
+                last => piezo_reply(last),
+            },
+            |cmd| cmd == "SAI?",
+        );
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2E517NoSai");
+        ctrl.set_model(Model::E517);
+        ctrl.init();
+        assert_eq!(sent_lines(&line), ["VEL?", "SAI?"]);
+        assert!(ctrl.axis_names().is_empty());
+
+        let (line, io) = LineRig::queued("gcs2E517Sai65", |cmd| match cmd {
+            "SAI?" => (0..65)
+                .map(|n| format!("A{n}{}", if n < 64 { " " } else { "" }))
+                .collect(),
+            "TPC?" => vec!["3".into()],
+            _ => vec!["0".into()],
+        });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2E517Sai65");
+        ctrl.set_model(Model::E517);
+        ctrl.init();
+        assert_eq!(sent_lines(&line), ["VEL?", "SAI?"]);
+        assert_eq!(ctrl.axis_names().len(), 64);
+        assert_eq!(ctrl.axis_names()[63], "A63");
     }
 
     /// An E-517 asks no `TRS?` or `FRF?` (PIE517Controller.h:35-36), halts
@@ -5658,6 +5709,17 @@ mod tests {
         let (_line, io) = motor_common::testing::LineRig::new("gcs2Moving0x", |_| "0x2".into());
         let ctrl = PIGCS2Controller::new(io, "gcs2Moving0x");
         assert!(ctrl.get_moving(2).unwrap());
+        assert!(!ctrl.get_moving(1).unwrap());
+    }
+
+    /// PIGCSController.cpp:591-605: an overflowing `#5` word is
+    /// `strtol`'s `LONG_MIN`, which carries no axis bit.
+    #[test]
+    fn an_overflowing_moving_word_is_long_min() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2MovingMin", |_| {
+            "-FFFFFFFFFFFFFFFFFFFF".into()
+        });
+        let ctrl = PIGCS2Controller::new(io, "gcs2MovingMin");
         assert!(!ctrl.get_moving(1).unwrap());
     }
 

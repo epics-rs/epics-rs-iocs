@@ -44,11 +44,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -168,6 +170,9 @@ impl PiJedsController {
     /// Send a query command and return its reply, stripped of framing control
     /// bytes (STX/ETX) and surrounding whitespace.
     fn query(&self, cmd: &str) -> AsynResult<String> {
+        // write_read flushes first; C flushes only at set_status
+        // (drvPIJEDS.cc:257), so a late reply shifts its answers until the
+        // next poll: a C defect, not copied.
         let (raw, status) = self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
@@ -204,13 +209,15 @@ pub struct PiJedsAxis {
     strings: MoveStrings,
     /// The last failed poll's verdict, per axis as each axis polls alone.
     failure: PollFailure,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PiJedsAxis {
-    /// Construct axis `axis` (0-based). No hardware setup is needed beyond the
-    /// controller identification already done in [`PiJedsController::new`].
+    /// Construct axis `axis` (0-based) and read its status, as `motor_init`'s
+    /// `set_status` does (drvPIJEDS.cc:673).
     pub fn new(controller: Arc<Mutex<PiJedsController>>, axis: usize) -> Self {
-        Self {
+        let mut me = Self {
             controller,
             axis,
             prev_position: 0.0,
@@ -224,7 +231,10 @@ impl PiJedsAxis {
             },
             strings: MoveStrings::default(),
             failure: PollFailure::NONE,
-        }
+            init_status: None,
+        };
+        me.init_status = Some(me.poll(&AsynUser::new(0)));
+        me
     }
 
     fn lock(&self) -> MutexGuard<'_, PiJedsController> {
@@ -257,28 +267,36 @@ impl PiJedsAxis {
 
     /// Send an absolute move to `position` (steps) after its slew velocity
     /// (C `SET_VELOCITY` + `MOVE_ABS`); the record sends SET_VELOCITY
-    /// whatever the rate.
+    /// whatever the rate. Each message goes out whatever the one before it
+    /// returned, as `send_mess` ignores the write (drvPIJEDS.cc:449-453).
     fn issue_move(&mut self, position: f64, velocity: f64) -> AsynResult<()> {
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        ctrl.write_cmd(&format!(
+        let _ = ctrl.write_cmd(&format!(
             "sr,{},{:.*}",
             self.axis,
             MAX_RES,
             velocity * DRIVE_RESOLUTION
-        ))?;
-        self.send_prem(&ctrl, &prem)?;
-        ctrl.write_cmd(&format!(
+        ));
+        let _ = self.send_prem(&ctrl, &prem);
+        let _ = ctrl.write_cmd(&format!(
             "set,{},{:.*}",
             self.axis,
             MAX_RES,
             position * DRIVE_RESOLUTION
-        ))?;
-        self.go(&ctrl)?;
+        ));
+        let status = self.go(&ctrl);
         drop(ctrl);
         self.moving = true;
         self.no_motion_count = 0;
-        Ok(())
+        status
+    }
+}
+
+impl Model1Motor for PiJedsAxis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -329,7 +347,7 @@ impl AsynMotor for PiJedsAxis {
         // C JOG only sets the slew rate — the E-516 has no continuous jog.
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        self.send_prem(&ctrl, &prem)?;
+        let _ = self.send_prem(&ctrl, &prem);
         ctrl.write_cmd(&format!(
             "sr,{},{:.*}",
             self.axis,
@@ -352,13 +370,13 @@ impl AsynMotor for PiJedsAxis {
         // POST goes at the next poll that reports done.
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        ctrl.write_cmd(&format!(
+        let _ = ctrl.write_cmd(&format!(
             "sr,{},{:.*}",
             self.axis,
             MAX_RES,
             velocity * DRIVE_RESOLUTION
-        ))?;
-        self.send_prem(&ctrl, &prem)?;
+        ));
+        let _ = self.send_prem(&ctrl, &prem);
         self.go(&ctrl)
     }
 
@@ -542,6 +560,34 @@ mod tests {
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
+    /// drvPIJEDS.cc:292-306 exit stores what motor_init prepared (:660-669,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once the
+    /// controller is past RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("pijedsInitFail", |last| match last {
+            "" => "DSM V1.959".into(),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(PiJedsController::new(io).unwrap()));
+        let mut first = PiJedsAxis::new(ctrl.clone(), 0);
+        let mut second = PiJedsAxis::new(ctrl, 1);
+        let prepared = MotorStatus {
+            has_encoder: true,
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
+    }
+
     /// devPIJEDS.cc:190-191: INIT as its own message, named like any queued
     /// one.
     #[test]
@@ -585,6 +631,38 @@ mod tests {
         axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
         axis.home(&user, 0.0, 2000.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["sr,0,2.000", "cl,0,1", "stat,0"]);
+    }
+
+    /// drvPIJEDS.cc:449-453: `send_mess` ignores the write's status, so a
+    /// refused write leaves the ones after it going out; the last one's
+    /// status is returned.
+    #[test]
+    fn a_refused_write_still_sends_the_ones_after_it() {
+        let (line, io) = LineRig::failing(
+            "pijedsRefused",
+            |last| match last {
+                "" => "DSM V1.959".into(),
+                "mess,0" => "mess,0,0".into(),
+                "stat,0" => "stat,0,133".into(),
+                _ => "not present".into(),
+            },
+            |cmd| cmd.starts_with("sr,") || cmd.starts_with("cl,"),
+        );
+        let ctrl = PiJedsController::new(io).unwrap();
+        let mut axis = PiJedsAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
+        axis.move_absolute(&user, 1500.0, 0.0, 2000.0, 0.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            ["sr,0,2.000", "cl,0,1", "set,0,1.500", "stat,0"]
+        );
+        axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
+        axis.home(&user, 0.0, 2000.0, 0.0, true).unwrap();
+        assert_eq!(line.sent(), ["sr,0,2.000", "cl,0,1", "stat,0"]);
+        assert!(axis.set_closed_loop(&user, true).is_err());
+        assert_eq!(line.sent(), ["cl,0,1"]);
     }
 
     /// drvPIJEDS.cc:388-395: POST once the move settles, not while it runs,

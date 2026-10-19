@@ -187,14 +187,16 @@ impl OemAxis {
         let addr = self.address;
         let ctrl = self.lock();
         let v = velocity / ctrl.pulses_per_unit[self.axis_no];
-        ctrl.command(&format!("{addr}MN"))?;
-        ctrl.command(&format!("{addr}A{a:.2}", a = CFloat(a)))?;
-        ctrl.command(&format!("{addr}V{v:.2}", v = CFloat(v)))?;
-        ctrl.command(&format!("{addr}D{target:.0}", target = CFloat(target)))?;
-        ctrl.command(&format!("{addr}G"))?;
+        // Each command's status overwrites the one before
+        // (OEMMotorDriver.cpp:230-253).
+        let _ = ctrl.command(&format!("{addr}MN"));
+        let _ = ctrl.command(&format!("{addr}A{a:.2}", a = CFloat(a)));
+        let _ = ctrl.command(&format!("{addr}V{v:.2}", v = CFloat(v)));
+        let _ = ctrl.command(&format!("{addr}D{target:.0}", target = CFloat(target)));
+        let status = ctrl.command(&format!("{addr}G"));
         drop(ctrl);
         self.homed = false;
-        Ok(())
+        status
     }
 }
 
@@ -396,14 +398,15 @@ impl AsynMotor for OemAxis {
         let addr = self.address;
         let ctrl = self.lock();
         let v = velocity / ctrl.pulses_per_unit[self.axis_no];
-        ctrl.command(&format!("{addr}MC"))?;
-        ctrl.command(&format!("{addr}V{v:.2}", v = CFloat(v)))?;
+        // As the move (OEMMotorDriver.cpp:255-280).
+        let _ = ctrl.command(&format!("{addr}MC"));
+        let _ = ctrl.command(&format!("{addr}V{v:.2}", v = CFloat(v)));
         // C maps forward -> H-, reverse -> H+.
-        ctrl.command(&format!("{addr}H{}", if forward { '-' } else { '+' }))?;
-        ctrl.command(&format!("{addr}G"))?;
+        let _ = ctrl.command(&format!("{addr}H{}", if forward { '-' } else { '+' }));
+        let status = ctrl.command(&format!("{addr}G"));
         drop(ctrl);
         self.homed = true;
-        Ok(())
+        status
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -555,6 +558,49 @@ mod tests {
     use epics_rs::motor::controller_port::index;
     use epics_rs::motor::devices::{register_axis, register_controller_port};
     use epics_rs::motor::trace::TraceUser;
+
+    /// C overwrites each command's status with the next one's and sets
+    /// `homed` whatever they returned (OEMMotorDriver.cpp:230-280).
+    #[test]
+    fn a_refused_command_still_sends_the_ones_after_it() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::failing(
+            "oemRefused",
+            |_| "OK".into(),
+            |cmd| ["1MC", "1H-", "1MN"].contains(&cmd),
+        );
+        let controller = Arc::new(Mutex::new(OemController::new(io, 1)));
+        controller.lock().unwrap().pulses_per_unit[0] = 2.0;
+        let mut axis = OemAxis::new(controller, 0);
+        rig.sent();
+        let user = AsynUser::new(0);
+        axis.home(&user, 0.0, 3.0, 4.0, true).unwrap();
+        assert!(axis.homed);
+        axis.move_absolute(&user, 7.0, 1.0, 3.0, 4.0).unwrap();
+        assert!(!axis.homed);
+        assert_eq!(
+            rig.sent(),
+            [
+                "1MC", "1V1.50", "1H-", "1G", "1MN", "1A0.50", "1V1.50", "1D7", "1G"
+            ]
+        );
+    }
+
+    /// A refused `G` is what the move and the home return, and C sets
+    /// `homed` after it all the same (OEMMotorDriver.cpp:247-250, :274-277).
+    #[test]
+    fn a_refused_go_still_sets_homed() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing("oemRefusedGo", |_| "OK".into(), |cmd| cmd == "1G");
+        let controller = Arc::new(Mutex::new(OemController::new(io, 1)));
+        controller.lock().unwrap().pulses_per_unit[0] = 2.0;
+        let mut axis = OemAxis::new(controller, 0);
+        let user = AsynUser::new(0);
+        assert!(axis.home(&user, 0.0, 3.0, 4.0, true).is_err());
+        assert!(axis.homed);
+        assert!(axis.move_absolute(&user, 7.0, 1.0, 3.0, 4.0).is_err());
+        assert!(!axis.homed);
+    }
 
     #[test]
     fn an_axis_of_a_missing_port_is_still_built() {

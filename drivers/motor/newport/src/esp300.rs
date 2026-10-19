@@ -30,14 +30,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atof, atoi, is_unsolicited_limit_error, leading_hex};
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 
 /// C `BUFF_SIZE`: the most one read takes.
 const READ_BUF: usize = 100;
@@ -149,8 +149,9 @@ impl Esp300Controller {
 
     /// Write a command and read the reply (C `send_mess` + `recv_mess`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        // C writes then reads with no flush, so one stray line shifts every
-        // later reply; write_read flushes first. The ESP300 firmware can
+        // C writes then reads with no flush (drvESP300.cc:534), so one stray
+        // line shifts every later reply; write_read flushes first, a C defect
+        // not copied. The ESP300 firmware can
         // still put an unsolicited hard-limit error (E35..E42) ahead of the
         // real reply, which C recv_mess re-reads past; it tests the read with
         // its CR (drvESP300.cc:536).
@@ -214,6 +215,8 @@ pub struct Esp300Axis {
     /// (RETRY), `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next (COMM_ERR).
     failure: PollFailure,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl Esp300Axis {
@@ -257,9 +260,9 @@ impl Esp300Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            init_status: None,
         };
-        // C motor_init ignores set_status's verdict.
-        let _ = ax.set_status();
+        ax.init_status = Some(ax.poll(&AsynUser::new(0)));
         ax
     }
 
@@ -307,6 +310,13 @@ impl Esp300Axis {
         }
         line.extend_from_slice(command.as_bytes());
         self.lock().write_bytes(&line)
+    }
+}
+
+impl Model1Motor for Esp300Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -604,10 +614,10 @@ mod tests {
                     .find(|(k, _)| *k == c)
                     .map_or("", |(_, v)| v),
             };
-            // Each line read ends in its CR, as an ESP300 reply does.
-            let line = |s: &str| match s {
+            // Each line ends in the CR the LF input EOS leaves.
+            let line = |l: &str| match l {
                 "" => Vec::new(),
-                s => format!("{s}\r").into_bytes(),
+                l => format!("{l}\r").into_bytes(),
             };
             let (first, next) = reply.split_once('\n').unwrap_or((reply, ""));
             self.reply = line(first);
@@ -1046,5 +1056,39 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvESP300.cc:249-266 exit stores the status motor_init prepared
+    /// (:802-816, EA_PRESENT and GAIN_SUPPORT for an encoder), plus the
+    /// COMM_ERR bits on the second failure.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (ctrl, _sent) = esp300_line(
+            "esp300InitFail",
+            &[
+                ("TB?", "0, 0, NO ERROR DETECTED"),
+                ("01ZB?", "100"),
+                ("01SU?", "0.001"),
+                ("02ZB?", "100"),
+                ("02SU?", "0.001"),
+            ],
+        );
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let prepared = MotorStatus {
+            has_encoder: true,
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        let mut first = Esp300Axis::new(ctrl.clone(), 1);
+        let mut second = Esp300Axis::new(ctrl, 2);
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 }
