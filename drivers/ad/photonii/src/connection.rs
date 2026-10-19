@@ -62,10 +62,17 @@ impl P2Util {
 
     /// Send one command line and return p2util's reply (C `writePhotonII`,
     /// which is `asynOctetSyncIO::writeRead`: flush, write, read one line).
-    pub fn write_read(&self, command: &str, timeout: Duration) -> Result<String, ChannelError> {
-        let (reply, status) = self
-            .handle
-            .port()?
+    /// The reply is what C's `fromPhotonII_` holds, also after a failed read.
+    pub fn write_read(
+        &self,
+        command: &str,
+        timeout: Duration,
+    ) -> (String, Result<(), ChannelError>) {
+        let port = match self.handle.port() {
+            Ok(port) => port,
+            Err(e) => return (String::new(), Err(e.into())),
+        };
+        let (reply, status) = port
             .submit_octet_read_blocking(
                 OctetReadOp::WriteRead {
                     data: command.as_bytes().to_vec(),
@@ -74,8 +81,7 @@ impl P2Util {
                 self.user(timeout),
             )
             .into_parts();
-        status?;
-        Ok(decode(reply))
+        (decode(reply), status.map_err(ChannelError::from))
     }
 
     /// Read one line p2util sent unprompted (C `readPhotonII`), e.g. the
