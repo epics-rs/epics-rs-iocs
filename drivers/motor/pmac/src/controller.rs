@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use epics_libcom_rs::cfmt::CFloat;
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::interfaces::motor::PortSets;
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
@@ -259,15 +259,36 @@ impl PmacController {
     }
 
     fn exchange_raw(&self, command: &str) -> (Vec<u8>, AsynResult<()>) {
+        const FUNCTION: &str = "pmacController::lowLevelWriteRead";
+        self.own
+            .print_self(TraceMask::FLOW, format_args!("{FUNCTION}\n"));
         let Some(handle) = self.handle.as_ref() else {
             return (
                 Vec::new(),
                 Err(pmac_err("no low level asynOctetSyncIO port")),
             );
         };
+        self.low.print(
+            TraceMask::IO_DRIVER,
+            0,
+            format_args!("{FUNCTION}: command: {command}\n"),
+        );
         let (raw, status) = handle
             .write_read(0, command.as_bytes(), PMAC_MAXBUF)
             .into_parts();
+        // C prints the caller's `response` buffer, which a failed write left
+        // holding an earlier command's reply (pmacController.cpp:349): a C
+        // defect, not copied; that line prints nothing for the reply.
+        let read = match &status {
+            Err(e) => e.octet_step() == Some(OctetStep::Read),
+            Ok(()) => true,
+        };
+        let response = if read { &raw[..] } else { &[] };
+        let end = response
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(response.len());
+        let response = String::from_utf8_lossy(&response[..end]).into_owned();
         let status = status.inspect_err(|e| {
             self.low.print(
                 TraceMask::ERROR,
@@ -282,6 +303,11 @@ impl PmacController {
                 let _ = port.disconnect_blocking();
             }
         });
+        self.low.print(
+            TraceMask::IO_DRIVER,
+            0,
+            format_args!("{FUNCTION}: response: {response}\n"),
+        );
         (raw, status)
     }
 

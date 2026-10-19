@@ -122,7 +122,9 @@ impl PhotonIIDetector {
         }
         let base = &mut self.ad.port_base;
         base.set_string_param(self.ad.params.string_to_server, 0, command)?;
-        base.set_string_param(self.ad.params.string_from_server, 0, reply)?;
+        if let Some(reply) = reply {
+            base.set_string_param(self.ad.params.string_from_server, 0, reply)?;
+        }
         Ok(())
     }
 
@@ -613,6 +615,163 @@ mod tests {
                 .unwrap(),
             b"set ok"
         );
+    }
+
+    /// A p2util that answers the first command with `set ok` and refuses
+    /// every write after it.
+    struct DeadAfterOne {
+        base: PortDriverBase,
+        writes: usize,
+    }
+
+    impl PortDriver for DeadAfterOne {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.writes += 1;
+            if self.writes > 1 {
+                return Err(epics_rs::asyn::error::AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "write refused".into(),
+                });
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            buf[..6].copy_from_slice(b"set ok");
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                6,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
+        }
+    }
+
+    /// A failed write leaves `fromPhotonII_` as it was (asynOctetSyncIO.c:
+    /// 254-257), so StringFromServer keeps the last reply
+    /// (PhotonII.cpp:236-237).
+    #[test]
+    fn a_failed_write_keeps_string_from_server() {
+        let ip = "PII_DEAD_IP";
+        let mut base = PortDriverBase::new(
+            ip,
+            1,
+            Default::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.init_connected(true);
+        let fake = DeadAfterOne { base, writes: 0 };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(ip).unwrap(), fake, RuntimeConfig::default()).unwrap();
+        let p2 = P2Util::new(SyncIOHandle::from_handle(
+            runtime.port_handle().clone(),
+            0,
+            Duration::ZERO,
+        ));
+        std::mem::forget(runtime);
+        let shared = Arc::new(SharedState {
+            stop_requested: AtomicBool::new(false),
+        });
+        let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
+        let mut det = PhotonIIDetector::new("PII_DEAD", p2, 0, shared, tx).unwrap();
+        det.command("set a").unwrap();
+        det.command("set b").unwrap();
+        let (p, base) = (det.ad.params, &det.ad.port_base);
+        assert_eq!(
+            base.get_string_param(p.string_to_server, 0).unwrap(),
+            b"set b"
+        );
+        assert_eq!(
+            base.get_string_param(p.string_from_server, 0).unwrap(),
+            b"set ok"
+        );
+    }
+
+    /// A p2util that answers each command with `ok`, then sends `progress`
+    /// unprompted on every read, which a timeout cuts.
+    struct Chatty {
+        base: PortDriverBase,
+        answer: bool,
+    }
+
+    impl PortDriver for Chatty {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.answer = true;
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            if std::mem::take(&mut self.answer) {
+                buf[..2].copy_from_slice(b"ok");
+                return OctetReadResult::ok(2, EomReason::empty());
+            }
+            buf[..8].copy_from_slice(b"progress");
+            OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "line cut by a timeout".into(),
+                }),
+                ..OctetReadResult::ok(8, EomReason::empty())
+            }
+        }
+    }
+
+    /// readPhotonII posts every read's bytes, a timeout's included
+    /// (PhotonII.cpp:250-260).
+    #[test]
+    fn a_cut_line_while_waiting_for_a_frame_reaches_string_from_server() {
+        let ip = "PII_CHAT_IP";
+        let mut base = PortDriverBase::new(
+            ip,
+            1,
+            Default::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.init_connected(true);
+        let fake = Chatty {
+            base,
+            answer: false,
+        };
+        let (fake_rt, _) =
+            create_port_runtime(&claim_port(ip).unwrap(), fake, RuntimeConfig::default()).unwrap();
+        let cmd = SyncIOHandle::from_handle(fake_rt.port_handle().clone(), 0, Duration::ZERO);
+        std::mem::forget(fake_rt);
+        let rt = create_photonii_detector(&claim_port("PII_CHAT").unwrap(), cmd, 1 << 20).unwrap();
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let p = rt.ad_params;
+        let from = || {
+            rt.port_handle()
+                .get_string_param_blocking(p.string_from_server, 0, 256)
+                .unwrap()
+        };
+        sync.write_int32(p.acquire, 1).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while from() != b"progress" && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let seen = from();
+        // The stop's abort command posts its own reply.
+        sync.write_int32(p.acquire, 0).unwrap();
+        assert_eq!(seen, b"progress");
     }
 
     /// PhotonII.cpp:117: MaxSize is the sensor, 768 x 1024.

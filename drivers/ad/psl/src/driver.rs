@@ -168,6 +168,12 @@ impl PslDetector {
         let (reply, status) = self.server.exchange(command);
         let base = &mut self.ad.port_base;
         base.set_string_param(self.ad.params.string_to_server, 0, command)?;
+        // A failed write leaves fromServer_ holding the last reply, which C
+        // posts again and parses as this one's: the parse is a C defect, not
+        // copied.
+        let Some(reply) = reply else {
+            return Ok((String::new(), status));
+        };
         base.set_string_param(self.ad.params.string_from_server, 0, reply.clone())?;
         Ok((reply, status))
     }
@@ -1105,6 +1111,149 @@ mod tests {
         assert!(crate::task::has_new_data(&det.server).unwrap());
         let mut det = served_detector("PSL_CUT_VERSION", b"PSLViewer-5.0", true);
         assert!(!det.connect_to_server().unwrap());
+    }
+
+    /// A PSLViewer that answers its reads from `reads` in turn, each with
+    /// whether a timeout cuts it, and times out once they run out. A write
+    /// of `refused` fails.
+    struct Scripted {
+        base: PortDriverBase,
+        reads: std::collections::VecDeque<(&'static [u8], bool)>,
+        refused: &'static str,
+    }
+
+    impl PortDriver for Scripted {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            if data == self.refused.as_bytes() {
+                return Err(AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Error,
+                    message: "write refused".into(),
+                });
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            let (reply, cut) = self.reads.pop_front().unwrap_or((b"", true));
+            buf[..reply.len()].copy_from_slice(reply);
+            let read = OctetReadResult::ok(reply.len(), EomReason::empty());
+            if !cut {
+                return read;
+            }
+            OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Timeout,
+                    message: "read cut by a timeout".into(),
+                }),
+                ..read
+            }
+        }
+    }
+
+    /// A [`Scripted`] server on port `name`.
+    fn scripted(
+        name: &str,
+        reads: &[(&'static [u8], bool)],
+        refused: &'static str,
+    ) -> (PslServer, PortHandle) {
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            Default::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.init_connected(true);
+        let server = Scripted {
+            base,
+            reads: reads.iter().copied().collect(),
+            refused,
+        };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), server, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        let server = PslServer::new(SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO));
+        (server, handle)
+    }
+
+    /// getImage parses what the GetImage read delivered whatever its status
+    /// (PSL.cpp:523-582): a header a timeout cut after its first data bytes
+    /// still starts the frame.
+    #[test]
+    fn a_cut_get_image_read_starts_the_frame() {
+        let (server, handle) = scripted(
+            "PSL_CUT_IMAGE",
+            &[(b"L;2;2;4;ab", true), (b"cd", false)],
+            "",
+        );
+        let (header, payload) = match crate::task::read_frame(&server, &handle) {
+            Ok(frame) => frame,
+            Err(_) => panic!("the cut GetImage read aborted the frame"),
+        };
+        assert_eq!((header.width, header.height), (2, 2));
+        assert_eq!(payload, b"abcd");
+    }
+
+    /// getImage's error line counts the bytes the failed block read
+    /// delivered (PSL.cpp:588-591).
+    #[test]
+    fn a_failed_block_read_prints_its_byte_count() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+        let name = "PSL_BLOCK_CUT";
+        let (server, handle) = scripted(name, &[(b"L;2;2;4;ab", false), (b"c", true)], "");
+        let path = std::env::temp_dir().join(format!("psl-{name}-{}", std::process::id()));
+        let file = Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_info_mask(Some(name), TraceInfoMask::empty());
+        trace.set_trace_file(Some(name), TraceFile::File(file.clone()));
+        trace.set_device_trace_info_mask(name, 0, TraceInfoMask::empty());
+        trace.set_device_trace_file(name, 0, TraceFile::File(file));
+        assert!(crate::task::read_frame(&server, &handle).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            text,
+            "PSL:getImage: error reading image, status=1, dataLen=4, nCopied=2, maxRead=2, \
+             nRead=1\n"
+        );
+    }
+
+    /// A failed write leaves fromServer_ holding the last reply
+    /// (asynOctetSyncIO.c:254-257), which writeReadServer posts again
+    /// (PSL.cpp:312-314): StringFromServer keeps it.
+    #[test]
+    fn a_failed_write_keeps_string_from_server() {
+        // GetVersion's wrong answer ends the constructor (PSL.cpp:168-173).
+        let reads = [(b"bad" as &[u8], false), (b"5", false)];
+        let (server, _) = scripted("PSL_DEAD_IP", &reads, "GetCam");
+        let shared = Arc::new(SharedState {
+            stop_requested: AtomicBool::new(false),
+        });
+        let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
+        let mut det = PslDetector::new("PSL_DEAD", server, 1 << 20, shared, tx)
+            .unwrap()
+            .0;
+        let p = det.ad.params;
+        assert_eq!(det.command_status("GetCamNum").unwrap().0, "5");
+        let (reply, status) = det.command_status("GetCam").unwrap();
+        assert!(status.is_err());
+        assert_eq!(reply, "");
+        assert_eq!(string_param(&det, p.string_to_server), "GetCam");
+        assert_eq!(string_param(&det, p.string_from_server), "5");
     }
 
     /// getConfig stores GetRecordPath's answer as it came, without

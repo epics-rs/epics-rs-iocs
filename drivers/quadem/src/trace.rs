@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
 pub use epics_rs::asyn::trace::TraceMask;
@@ -116,16 +116,27 @@ impl StatusExchange {
     /// One query. The command is recorded, and the reply as C's `inString_`
     /// holds it: the bytes the read delivered whatever its status, since the
     /// EOS layer NUL-terminates the buffer on every read
-    /// (asynInterposeEos.c:251), failed ones included.
+    /// (asynInterposeEos.c:251), failed ones included. A failed write skips
+    /// the read and leaves `inString_` as it was (asynOctetSyncIO.c:254-257).
     pub fn query(&mut self, io: &OctetIo, out: &str, buf_size: usize) -> Reply {
         self.out.clear();
         self.out.push_str(out);
         let (raw, status) = io.write_read(out, buf_size).into_parts();
-        self.inp = reply_text(&raw);
-        Reply {
-            text: self.inp.clone(),
-            status,
+        let read = match &status {
+            Err(e) => e.octet_step() == Some(OctetStep::Read),
+            Ok(()) => true,
+        };
+        if read {
+            self.inp = reply_text(&raw);
         }
+        // C then parses the previous command's reply (drvAHxxx.cpp:697-700):
+        // a C defect, not copied.
+        let text = if read {
+            self.inp.clone()
+        } else {
+            String::new()
+        };
+        Reply { text, status }
     }
 }
 
@@ -221,6 +232,61 @@ mod tests {
             .query(&io, "CHN ?", 64)
             .parse(|r| r.strip_prefix("CHN ").map(drop), bad);
         assert_eq!(err.unwrap_err().status(), AsynStatus::Timeout);
+    }
+
+    /// A meter that answers `RNG 3` once, then fails every write.
+    struct DeadAfterOne(PortDriverBase, usize);
+
+    impl PortDriver for DeadAfterOne {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.1 += 1;
+            if self.1 > 1 {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "write failed".into(),
+                });
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            buf[..5].copy_from_slice(b"RNG 3");
+            OctetReadResult::ok(5, EomReason::empty())
+        }
+    }
+
+    /// A failed write leaves `inString_` holding the previous reply for C's
+    /// error line (drvAHxxx.cpp:801-803), and that reply is not parsed as
+    /// this command's.
+    #[test]
+    fn a_failed_write_keeps_the_previous_reply_unparsed() {
+        let (io, _runtime) = published_port(
+            "QE_DEAD_AFTER_ONE",
+            DeadAfterOne(
+                PortDriverBase::new(
+                    "QE_DEAD_AFTER_ONE",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                0,
+            ),
+        );
+        let mut last = StatusExchange::default();
+        let range = |r: &str| r.strip_prefix("RNG ")?.parse::<i32>().ok();
+        let bad = |_: &str| unreachable!("the write is the failure");
+
+        assert_eq!(last.query(&io, "RNG ?", 64).parse(range, bad).unwrap(), 3);
+
+        let err = last.query(&io, "CHN ?", 64).parse(range, bad);
+        assert_eq!(err.unwrap_err().status(), AsynStatus::Error);
+        assert_eq!((last.out.as_str(), last.inp.as_str()), ("CHN ?", "RNG 3"));
     }
 
     impl PortDriver for Meter {
