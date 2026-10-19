@@ -19,7 +19,7 @@ use async_opcua::types::{
 };
 use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::client::{
     ConnectError, CreatedSubscription, Identity, SecurityMode, ServerInfo, UaConnection,
@@ -443,6 +443,7 @@ pub struct SessionHandle {
     pub client: Mutex<ClientState>,
     commands: mpsc::UnboundedSender<(Priority, Request)>,
     control: mpsc::UnboundedSender<Control>,
+    exit: watch::Sender<bool>,
 }
 
 /// What `SessionOpen62541::show` reports of the open62541 client under the
@@ -519,6 +520,13 @@ impl SessionHandle {
 
     pub fn control(&self, control: Control) {
         let _ = self.control.send(control);
+    }
+
+    /// End the session for good (`SessionOpen62541::atExit`): a connected one
+    /// closes as `opcuaDisconnect` closes it, an attempt in flight is abandoned
+    /// as `UA_Client_delete` abandons it, and the worker returns.
+    pub fn exit(&self) {
+        self.exit.send_replace(true);
     }
 
     pub fn is_connected(&self) -> bool {
@@ -621,6 +629,7 @@ pub struct SessionWorker {
     connector: Arc<dyn UaConnector>,
     commands: mpsc::UnboundedReceiver<(Priority, Request)>,
     control: mpsc::UnboundedReceiver<Control>,
+    exit: watch::Receiver<bool>,
     connection: Option<Arc<dyn UaConnection>>,
     /// Read and write requests waiting for a service call, highest priority first.
     reads: [VecDeque<u32>; 3],
@@ -634,6 +643,7 @@ pub fn create(
 ) -> (Arc<SessionHandle>, SessionWorker) {
     let (commands_tx, commands) = mpsc::unbounded_channel();
     let (control_tx, control) = mpsc::unbounded_channel();
+    let (exit_tx, exit) = watch::channel(false);
     let handle = Arc::new(SessionHandle {
         name: config.name.clone(),
         config: Mutex::new(config),
@@ -644,12 +654,14 @@ pub fn create(
         client: Mutex::new(ClientState::default()),
         commands: commands_tx,
         control: control_tx,
+        exit: exit_tx,
     });
     let worker = SessionWorker {
         handle: handle.clone(),
         connector,
         commands,
         control,
+        exit,
         connection: None,
         reads: Default::default(),
         writes: Default::default(),
@@ -666,17 +678,22 @@ impl SessionWorker {
         loop {
             if self.connection.is_none() {
                 if !connect_now {
-                    match self.control.recv().await {
-                        Some(Control::Connect) => {
-                            connect_now = true;
-                            manual = true;
-                        }
-                        Some(Control::Disconnect) => continue,
-                        None => return,
+                    tokio::select! {
+                        control = self.control.recv() => match control {
+                            Some(Control::Connect) => {
+                                connect_now = true;
+                                manual = true;
+                            }
+                            Some(Control::Disconnect) => {}
+                            None => return,
+                        },
+                        _ = exiting(&mut self.exit) => return,
                     }
                     continue;
                 }
-                let attempt = self.connect().await;
+                let Some(attempt) = self.connect().await else {
+                    return;
+                };
                 let was_manual = std::mem::take(&mut manual);
                 if let Err(e) = attempt {
                     // A bad status leaves the C's session and channel states
@@ -707,6 +724,7 @@ impl SessionWorker {
                                 Some(Control::Disconnect) => {}
                                 None => return,
                             },
+                            _ = exiting(&mut self.exit) => return,
                         }
                     }
                     continue;
@@ -764,10 +782,20 @@ impl SessionWorker {
     /// limits and namespaces, rebuild the node ids, register the nodes, create
     /// the subscriptions, read every item once, run the `bini=write` writes,
     /// then add the monitored items.
-    async fn connect(&mut self) -> Result<(), ConnectError> {
+    ///
+    /// `None` when the session exits first: C's `atExit` deletes the client,
+    /// which abandons a connect still in flight, while an activation already
+    /// under way holds the client lock and finishes.
+    async fn connect(&mut self) -> Option<Result<(), ConnectError>> {
         let config = self.handle.config.lock().clone();
         let identity = config.setup_identity();
-        let connection = self.connector.connect(&config, &identity).await?;
+        let connection = tokio::select! {
+            connection = self.connector.connect(&config, &identity) => match connection {
+                Ok(connection) => connection,
+                Err(e) => return Some(Err(e)),
+            },
+            _ = exiting(&mut self.exit) => return None,
+        };
         if config.debug > 0 {
             eprintln!("Session {}: connect service succeeded", self.handle.name);
         }
@@ -824,7 +852,7 @@ impl SessionWorker {
 
         self.add_monitored_items(&connection, &subscriptions, &monitored)
             .await;
-        Ok(())
+        Some(Ok(()))
     }
 
     /// Serve requests until the connection drops or the IOC shuts down.
@@ -841,6 +869,11 @@ impl SessionWorker {
             let flush_at = self.next_flush();
             tokio::select! {
                 biased;
+
+                _ = exiting(&mut self.exit) => {
+                    self.disconnect(&connection, End::Requested).await;
+                    return ServeOutcome::Shutdown;
+                }
 
                 control = self.control.recv() => match control {
                     Some(Control::Disconnect) => {
@@ -1476,6 +1509,11 @@ impl SessionWorker {
                 .set_incoming_event(ProcessReason::ConnectionLoss);
         }
     }
+}
+
+/// Resolves once [`SessionHandle::exit`] is called.
+async fn exiting(exit: &mut watch::Receiver<bool>) {
+    let _ = exit.wait_for(|exit| *exit).await;
 }
 
 /// How a connection ended.

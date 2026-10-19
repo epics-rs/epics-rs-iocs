@@ -9,10 +9,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_opcua::types::NodeId;
+use epics_rs::base::runtime::exit::at_exit;
 use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::runtime::task::block_on_sync;
 use parking_lot::Mutex;
+use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 
 use crate::client::UaConnector;
 use crate::ioc::glob_match;
@@ -194,11 +199,19 @@ impl Registry {
         }
 
         let workers = std::mem::take(&mut inner.workers);
+        let sessions = inner.sessions.clone();
         drop(inner);
         errlog_vprintf(format_args!("OPC UA: Autoconnecting sessions\n"));
-        for worker in workers {
-            tokio::spawn(worker.run());
-        }
+        let workers = workers
+            .into_iter()
+            .map(|worker| tokio::spawn(worker.run()))
+            .collect();
+        // C registers it from `initHookAfterIocRunning` too
+        // (`SessionOpen62541.cpp:2705`).
+        let runtime = Handle::current();
+        at_exit("OPC UA sessions", move || {
+            disconnect_at_exit(&runtime, sessions, workers)
+        });
     }
 
     /// Bind one record to its item: a new item on a session or subscription, or
@@ -383,4 +396,30 @@ impl NameResolver for Registry {
     fn is_session(&self, name: &str) -> bool {
         self.inner.lock().session(name).is_some()
     }
+}
+
+/// `SessionOpen62541::atExit` (`SessionOpen62541.cpp:2713-2723`). The sessions
+/// close side by side rather than one after another, so together they wait at
+/// most what open62541's synchronous CloseSession waits for one (the client's
+/// 5 s `timeout`).
+fn disconnect_at_exit(
+    runtime: &Handle,
+    sessions: Vec<Arc<SessionHandle>>,
+    workers: Vec<JoinHandle<()>>,
+) {
+    errlog_vprintf(format_args!("OPC UA: Disconnecting sessions\n"));
+    for session in &sessions {
+        session.exit();
+    }
+    // The exit callbacks may run on a thread outside the workers' runtime,
+    // whose timer the timeout needs.
+    let _runtime = runtime.enter();
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        for worker in workers {
+            let _ = worker.await;
+        }
+    });
+    // A thread that may not block here (a current-thread runtime's) has asked
+    // the sessions to close and cannot see them do it.
+    let _ = block_on_sync(ended);
 }
