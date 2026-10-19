@@ -260,16 +260,23 @@ fn send_command(
     reply_buf: usize,
     status_read: Option<usize>,
 ) -> AsynResult<()> {
-    let result = link
+    let (data, status) = link
         .sync
         .write_read(OCTET_REASON, command.as_bytes(), reply_buf)
-        .and_then(|data| {
-            *reply = data;
-            match status_read {
-                Some(status_buf) => link.sync.read_octet(OCTET_REASON, status_buf).map(drop),
-                None => Ok(()),
+        .into_parts();
+    let result = status.and_then(|()| {
+        *reply = data;
+        match status_read {
+            // The status line is never inspected, only its status.
+            Some(status_buf) => {
+                link.sync
+                    .read_octet(OCTET_REASON, status_buf)
+                    .into_parts()
+                    .1
             }
-        });
+            None => Ok(()),
+        }
+    });
     if let Err(e) = &result {
         link.print_self(
             TraceMask::ERROR,

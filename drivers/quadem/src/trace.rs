@@ -11,7 +11,7 @@ use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
 pub use epics_rs::asyn::trace::TraceMask;
 
-use crate::octet::{OctetIo, ReadOutcome};
+use crate::octet::{OctetIo, ReadOutcome, reply_text};
 
 /// A holder of the driver port's trace: the driver itself inside a port
 /// method, its [`PortHandle`] on a driver thread.
@@ -45,16 +45,11 @@ macro_rules! asyn_print {
 }
 
 /// The `status`, `nRead` and `eomReason` C prints for a read it rejected.
-pub fn read_result(r: &AsynResult<ReadOutcome>) -> (AsynStatus, usize, u32) {
-    match r {
-        Ok(o) => (AsynStatus::Success, o.data.len(), o.eom.bits()),
-        Err(e) => {
-            let (n, eom) = e
-                .partial_read()
-                .map_or((0, 0), |p| (p.data.len(), p.eom_reason.bits()));
-            (e.status(), n, eom)
-        }
-    }
+pub fn read_result(read: &ReadOutcome, status: &AsynResult<()>) -> (AsynStatus, usize, u32) {
+    let status = status
+        .as_ref()
+        .map_or_else(|e| e.status(), |()| AsynStatus::Success);
+    (status, read.data.len(), read.eom.bits())
 }
 
 /// `asynPrintIO(pasynUserSelf, mask, data, len, ...)` from a driver thread.
@@ -76,8 +71,13 @@ pub fn print_io(handle: &PortHandle, mask: TraceMask, data: &[u8], args: fmt::Ar
 
 /// The line every quadEM read thread prints for a read it rejected that was
 /// not a timeout; `origin` is C's `"%s::%s"` (or `"%s:%s"`) prefix.
-pub fn print_read_error(handle: &PortHandle, origin: &str, read: &AsynResult<ReadOutcome>) {
-    let (status, n_read, eom) = read_result(read);
+pub fn print_read_error(
+    handle: &PortHandle,
+    origin: &str,
+    read: &ReadOutcome,
+    status: &AsynResult<()>,
+) {
+    let (status, n_read, eom) = read_result(read, status);
     asyn_print!(
         *handle,
         ERROR,
@@ -118,7 +118,9 @@ impl StatusExchange {
     pub fn query(&mut self, io: &OctetIo, out: &str, buf_size: usize) -> AsynResult<String> {
         self.out.clear();
         self.out.push_str(out);
-        let resp = io.write_read(out, buf_size)?;
+        let (raw, status) = io.write_read(out, buf_size).into_parts();
+        status?;
+        let resp = reply_text(&raw);
         self.inp.clone_from(&resp);
         Ok(resp)
     }

@@ -96,7 +96,8 @@ impl Mcb4bController {
     /// [`command`](Self::command) for a record string's raw bytes.
     pub(crate) fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
         // C writeReadController: pasynOctetSyncIO->writeRead.
-        let raw = self.handle.write_read(0, cmd, READ_BUF)?;
+        let (raw, status) = self.handle.write_read(0, cmd, READ_BUF).into_parts();
+        status?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_end_matches(['\r', '\n', '\0']).to_string())
     }

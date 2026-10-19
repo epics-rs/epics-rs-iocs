@@ -76,6 +76,7 @@
 //!   registries already reject a duplicate port *name* on their own.
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::trace::TraceMask;
@@ -289,9 +290,11 @@ impl PortDriver for ColbyDriver {
             .map_err(|_| wire::record_error(AsynStatus::Error))
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        self.do_read_octet(user, buf)
-            .map_err(|_| wire::record_error(AsynStatus::Error))
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        match self.do_read_octet(user, buf) {
+            Ok(n) => OctetReadResult::ok(n, EomReason::empty()),
+            Err(_) => OctetReadResult::failed(wire::record_error(AsynStatus::Error)),
+        }
     }
 
     /// C `writeItRaw`: always a no-op, `*nbytes=0` unconditionally — no

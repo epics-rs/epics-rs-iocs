@@ -25,7 +25,7 @@ use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::claim_port;
-use epics_rs::asyn::request::{PortCalls, RequestOp};
+use epics_rs::asyn::request::{OctetRead, OctetReadOp, PortCalls, RequestOp};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -44,9 +44,17 @@ pub struct ReadOutcome {
     pub eom: EomReason,
 }
 
+/// A read's bytes and end reason beside its status, which C reads together
+/// (`nRead`, `eomReason`, the returned `asynStatus`).
+pub fn outcome(read: OctetRead) -> (ReadOutcome, AsynResult<()>) {
+    let eom = read.eom();
+    let (data, status) = read.into_parts();
+    (ReadOutcome { data, eom }, status)
+}
+
 impl ReadOutcome {
     pub fn as_str(&self) -> String {
-        String::from_utf8_lossy(&self.data).trim_end().to_string()
+        reply_text(&self.data)
     }
 }
 
@@ -130,17 +138,18 @@ impl OctetIo {
 
     /// `asynOctetSyncIO->writeRead`: flush stale input, write, read one
     /// EOS-terminated response.
-    pub fn write_read(&self, out: &str, buf_size: usize) -> AsynResult<String> {
-        let result = self.port()?.submit_blocking(
-            RequestOp::OctetWriteRead {
-                data: out.as_bytes().to_vec(),
-                buf_size,
-                flush: true,
-            },
-            self.user(),
-        )?;
-        let data = result.data.unwrap_or_default();
-        Ok(String::from_utf8_lossy(&data).trim_end().to_string())
+    pub fn write_read(&self, out: &str, buf_size: usize) -> OctetRead {
+        self.read(OctetReadOp::WriteRead {
+            data: out.as_bytes().to_vec(),
+            buf_size,
+        })
+    }
+
+    fn read(&self, op: OctetReadOp) -> OctetRead {
+        match self.port() {
+            Ok(port) => port.submit_octet_read_blocking(op, self.user()),
+            Err(e) => OctetRead::failed(e),
+        }
     }
 
     /// `asynOctetSyncIO->write`.
@@ -155,38 +164,28 @@ impl OctetIo {
     }
 
     /// `asynOctetSyncIO->read` with the port's input EOS active.
-    pub fn read_line(&self, buf_size: usize) -> AsynResult<ReadOutcome> {
-        let result = self
-            .port()?
-            .submit_blocking(RequestOp::OctetRead { buf_size }, self.user())?;
-        Ok(ReadOutcome {
-            data: result.data.unwrap_or_default(),
-            eom: EomReason::from_bits_truncate(result.eom_reason),
-        })
+    pub fn read_line(&self, buf_size: usize) -> OctetRead {
+        self.read(OctetReadOp::Read { buf_size })
     }
 
     /// Count-terminated read with the input EOS suppressed — the binary data
     /// path. Equivalent to C++'s `setInputEos("", 0)` followed by
     /// `pasynOctet->read(..., nRequested, ...)`, but the suppression is scoped
     /// to this call.
-    pub fn read_binary(&self, buf_size: usize) -> AsynResult<ReadOutcome> {
-        let result = self
-            .port()?
-            .submit_blocking(RequestOp::OctetReadBinary { buf_size }, self.user())?;
-        Ok(ReadOutcome {
-            data: result.data.unwrap_or_default(),
-            eom: EomReason::from_bits_truncate(result.eom_reason),
-        })
+    pub fn read_binary(&self, buf_size: usize) -> OctetRead {
+        self.read(OctetReadOp::ReadBinary { buf_size })
     }
 
     /// One `pasynOctet->read` under [`Self::locked`], EOS-terminated.
-    pub fn locked_read_line(&self, buf_size: usize) -> AsynResult<ReadOutcome> {
-        self.locked(move |port| port.read_line(buf_size))?
+    pub fn locked_read_line(&self, buf_size: usize) -> OctetRead {
+        self.locked(move |port| port.read_line(buf_size))
+            .unwrap_or_else(OctetRead::failed)
     }
 
     /// One `pasynOctet->read` under [`Self::locked`], EOS suppressed.
-    pub fn locked_read_binary(&self, buf_size: usize) -> AsynResult<ReadOutcome> {
-        self.locked(move |port| port.read_binary(buf_size))?
+    pub fn locked_read_binary(&self, buf_size: usize) -> OctetRead {
+        self.locked(move |port| port.read_binary(buf_size))
+            .unwrap_or_else(OctetRead::failed)
     }
 
     /// `pasynOctetSyncIO->setInputEos`. C's SyncIO EOS setters take
@@ -211,16 +210,10 @@ impl OctetIo {
     }
 }
 
-/// What C++ prints as `inString_` after a `writeReadMeter`: the reply, or on a
-/// failure whatever the read did transfer.
-pub fn reply_text(reply: AsynResult<String>) -> String {
-    match reply {
-        Ok(text) => text,
-        Err(e) => e
-            .partial_read()
-            .map(|p| String::from_utf8_lossy(&p.data).trim_end().to_string())
-            .unwrap_or_default(),
-    }
+/// A reply as C++ keeps it in `inString_`: whatever the read transferred,
+/// trailing whitespace dropped.
+pub fn reply_text(data: &[u8]) -> String {
+    String::from_utf8_lossy(data).trim_end().to_string()
 }
 
 fn octet_user(timeout: Duration) -> AsynUser {
@@ -236,23 +229,19 @@ pub struct LockedOctet<'a> {
 }
 
 impl LockedOctet<'_> {
-    fn read(&mut self, op: RequestOp) -> AsynResult<ReadOutcome> {
-        let result = self.calls.call(&op, octet_user(self.timeout))?;
-        Ok(ReadOutcome {
-            data: result.data.unwrap_or_default(),
-            eom: EomReason::from_bits_truncate(result.eom_reason),
-        })
-    }
-
     /// `pasynOctet->read` with the port's input EOS active.
-    pub fn read_line(&mut self, buf_size: usize) -> AsynResult<ReadOutcome> {
-        self.read(RequestOp::OctetRead { buf_size })
+    pub fn read_line(&mut self, buf_size: usize) -> OctetRead {
+        self.calls
+            .octet_read(OctetReadOp::Read { buf_size }, octet_user(self.timeout))
     }
 
     /// `pasynOctet->read` with the input EOS suppressed; see
     /// [`OctetIo::read_binary`].
-    pub fn read_binary(&mut self, buf_size: usize) -> AsynResult<ReadOutcome> {
-        self.read(RequestOp::OctetReadBinary { buf_size })
+    pub fn read_binary(&mut self, buf_size: usize) -> OctetRead {
+        self.calls.octet_read(
+            OctetReadOp::ReadBinary { buf_size },
+            octet_user(self.timeout),
+        )
     }
 
     /// `pasynOctet->flush`.
@@ -351,6 +340,14 @@ pub(crate) mod tests {
             InterfaceMask::UNMIGRATED_ALL,
             InterfaceMask::UNMIGRATED_INTERRUPTS,
         ));
+        published_port(name, driver)
+    }
+
+    /// `driver` registered as port `name`, and a 100 ms user on it.
+    pub(crate) fn published_port(
+        name: &str,
+        driver: impl PortDriver + 'static,
+    ) -> (OctetIo, PortRuntimeHandle) {
         let claim = claim_port(name).unwrap();
         let (runtime, _actor) =
             create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
@@ -391,7 +388,8 @@ pub(crate) mod tests {
             &InterruptGate::opened(),
         )
         .unwrap();
-        let err = io.locked_read_line(64).unwrap_err();
+        let (_, status) = io.locked_read_line(64).into_parts();
+        let err = status.unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error, "{err:?}");
         assert!(
             err.to_string().contains("127.0.0.1:1 disconnected:"),

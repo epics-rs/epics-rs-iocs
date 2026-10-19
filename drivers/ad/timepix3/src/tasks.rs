@@ -3316,6 +3316,19 @@ async fn publish_image(ctx: &Ctx, addr: usize, array: impl Into<PublishedArray>)
 mod tests {
     use super::*;
 
+    /// A read the test expects to succeed, as its bytes.
+    trait BytesOk {
+        fn bytes_ok(self) -> Vec<u8>;
+    }
+
+    impl BytesOk for epics_rs::asyn::request::OctetRead {
+        fn bytes_ok(self) -> Vec<u8> {
+            let (bytes, status) = self.into_parts();
+            status.unwrap();
+            bytes
+        }
+    }
+
     use serde_json::json;
 
     /// A u64 sum reaches the Int64Array as C's cast leaves it.
@@ -3722,7 +3735,7 @@ mod tests {
         assert_eq!(h.read_int32(p.img_effective_frames, 0).await.unwrap(), 10);
         assert_eq!(h.read_int32(p.img_frames_summed, 0).await.unwrap(), 1);
         assert_eq!(
-            h.read_octet(p.img_retention_status, 0, 64).await.unwrap(),
+            h.read_octet(p.img_retention_status, 0, 64).await.bytes_ok(),
             b"OK: 10 frames, 512 MiB\0"
         );
         // 2 u64 running + 2 UINT16 current + the window's 2 u64 and one
@@ -4172,7 +4185,7 @@ mod tests {
         assert_eq!(
             h.read_octet(p.prv_hst_retention_status, 0, 64)
                 .await
-                .unwrap(),
+                .bytes_ok(),
             b"OK: 10 frames, 512 MiB\0"
         );
         // 2 u64 running + 3 f64 edges, a 3-value time axis, the window's
@@ -4636,22 +4649,24 @@ mod tests {
             );
             assert_eq!(h.read_int32(p.det_connected, 0).await.unwrap(), 0, "{name}");
             assert_eq!(
-                h.read_octet(p.det_type, 0, 64).await.unwrap(),
+                h.read_octet(p.det_type, 0, 64).await.bytes_ok(),
                 b"null\0",
                 "{name}"
             );
             assert_eq!(
-                h.read_octet(ctx.ad.base.sdk_version, 0, 64).await.unwrap(),
+                h.read_octet(ctx.ad.base.sdk_version, 0, 64)
+                    .await
+                    .bytes_ok(),
                 b"old\0",
                 "{name}"
             );
             assert_eq!(
-                h.read_octet(p.status, 0, 64).await.unwrap(),
+                h.read_octet(p.status, 0, 64).await.bytes_ok(),
                 b"\0",
                 "{name}"
             );
             assert_eq!(
-                h.read_octet(ctx.ad.status_message, 0, 64).await.unwrap(),
+                h.read_octet(ctx.ad.status_message, 0, 64).await.bytes_ok(),
                 b"Detector disconnected\0",
                 "{name}"
             );
@@ -5090,7 +5105,7 @@ mod tests {
         assert_eq!(h.read_int32(p.http_code, 0).await.unwrap(), 200);
         assert_eq!(h.read_int32(p.serval_connected, 0).await.unwrap(), 1);
         assert_eq!(h.read_int32(p.det_connected, 0).await.unwrap(), 1);
-        assert_eq!(h.read_octet(p.det_type, 0, 64).await.unwrap(), b"TPX3\0");
+        assert_eq!(h.read_octet(p.det_type, 0, 64).await.bytes_ok(), b"TPX3\0");
         assert_eq!(
             h.read_int32(ctx.ad.status, 0).await.unwrap(),
             ADStatus::Idle as i32
@@ -5131,12 +5146,12 @@ mod tests {
             );
             assert_eq!(h.read_int32(p.det_connected, 0).await.unwrap(), 0, "{name}");
             assert_eq!(
-                h.read_octet(p.det_type, 0, 64).await.unwrap(),
+                h.read_octet(p.det_type, 0, 64).await.bytes_ok(),
                 b"null\0",
                 "{name}"
             );
             assert_eq!(
-                h.read_octet(ctx.ad.status_message, 0, 64).await.unwrap(),
+                h.read_octet(ctx.ad.status_message, 0, 64).await.bytes_ok(),
                 format!("{message}\0").as_bytes(),
                 "{name}"
             );
@@ -5574,7 +5589,7 @@ mod tests {
             (ctx, url, text)
         }
         async fn octet(ctx: &Ctx, reason: usize) -> String {
-            let v = ctx.handle.read_octet(reason, 0, 128).await.unwrap();
+            let v = ctx.handle.read_octet(reason, 0, 128).await.bytes_ok();
             String::from_utf8(v)
                 .unwrap()
                 .trim_end_matches('\0')
@@ -5670,7 +5685,7 @@ mod tests {
                 ctx.handle
                     .read_octet(ctx.ad.status_message, 0, 64)
                     .await
-                    .unwrap(),
+                    .bytes_ok(),
                 b"Connected; reconnect state refresh incomplete\0"
             );
             assert_eq!(
@@ -5730,7 +5745,7 @@ mod tests {
         assert_eq!(h.read_int64(p.free_space, 0).await.unwrap(), 7_000_000_000);
         assert_eq!(h.read_int64(p.lower_limit, 0).await.unwrap(), 42);
         assert_eq!(
-            h.read_octet(p.status, 0, 64).await.unwrap(),
+            h.read_octet(p.status, 0, 64).await.bytes_ok(),
             b"DA_RECORDING\0"
         );
         assert_eq!(h.read_int32(p.pipeline_state, 0).await.unwrap(), 1);
@@ -5746,7 +5761,7 @@ mod tests {
         )
         .await;
         assert!(!ctx.apply(check_connection(ctx.reader())).await);
-        assert_eq!(h.read_octet(p.status, 0, 64).await.unwrap(), b"\0");
+        assert_eq!(h.read_octet(p.status, 0, 64).await.bytes_ok(), b"\0");
         assert_eq!(h.read_int32(p.pipeline_state, 0).await.unwrap(), -1);
     }
 

@@ -10,7 +10,7 @@
 
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::asyn::error::{AsynResult, AsynStatus};
-use epics_rs::asyn::request::{RequestOp, RequestResult};
+use epics_rs::asyn::request::{OctetRead, OctetReadOp, RequestOp, RequestResult};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -135,28 +135,28 @@ impl MarccdDriver {
         let user = AsynUser::default()
             .with_addr(SERVER_ADDR)
             .with_timeout(secs(timeout));
-        let status = match self.server_submit(
-            RequestOp::OctetRead {
-                buf_size: MAX_MESSAGE_SIZE,
-            },
-            user,
-        ) {
-            Ok(result) => {
-                let data = result.data.unwrap_or_default();
-                self.from = String::from_utf8_lossy(&data).into_owned();
-                AsynStatus::Success
-            }
-            Err(e) => {
-                // C's asynOctetSyncIO null-terminates at nbytesTransfered,
-                // which is 0 on a failed read.
-                self.from.clear();
-                self.trace_server_error(&format!(
-                    "marCCD:readServer, timeout={timeout:.6}, status={} received 0 bytes\n\n",
-                    e.status() as i32
-                ));
-                e.status()
-            }
+        let read = match self.server.port() {
+            Ok(port) => port.submit_octet_read_blocking(
+                OctetReadOp::Read {
+                    buf_size: MAX_MESSAGE_SIZE,
+                },
+                user,
+            ),
+            Err(e) => OctetRead::failed(e),
         };
+        // C's asynOctetSyncIO null-terminates at nbytesTransfered, which
+        // counts what a failed read did transfer.
+        let (data, status) = read.into_parts();
+        self.from = String::from_utf8_lossy(&data).into_owned();
+        let status = status.map_or_else(|e| e.status(), |()| AsynStatus::Success);
+        if status != AsynStatus::Success {
+            self.trace_server_error(&format!(
+                "marCCD:readServer, timeout={timeout:.6}, status={} received {} bytes\n{}\n",
+                status as i32,
+                data.len(),
+                self.from
+            ));
+        }
 
         let from = std::mem::take(&mut self.from);
         self.set_str(self.ad.params.string_from_server, &from);

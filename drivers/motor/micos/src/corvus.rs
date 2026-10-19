@@ -90,22 +90,37 @@ impl CorvusController {
 
     /// Write a query and read one reply line.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        // C writeReadController: pasynOctetSyncIO->writeRead.
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-        Ok(String::from_utf8_lossy(&raw)
+        let (reply, status) = self.exchange(cmd);
+        status.map(|()| reply)
+    }
+
+    /// C `writeReadController`: `inString_` beside the status. The EOS layer
+    /// NUL-terminates the buffer on every read, so a failed read leaves the
+    /// bytes it delivered, which the callers that ignore the status parse.
+    fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
+        let (raw, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        let reply = String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
-            .to_string())
+            .to_string();
+        (reply, status)
     }
 
     /// Read every axis position (`pos`) as a vector of exactly `num_axes`
-    /// engineering-unit values.
+    /// engineering-unit values. C `sscanf`s the reply whatever the exchange
+    /// returned (SMCcorvusDriver.cpp:258-264, :340-346); a reply short of
+    /// `num_axes` values fails here, where C would send the uninitialised
+    /// positions.
     fn read_positions(&self) -> AsynResult<Vec<f64>> {
-        let reply = self.query("pos")?;
+        let (reply, status) = self.exchange("pos");
         let values: Vec<f64> = reply
             .split_whitespace()
             .filter_map(|tok| tok.parse::<f64>().ok())
             .collect();
         if values.len() < self.num_axes {
+            status?;
             return Err(corvus_err(format!(
                 "corvus: pos returned {} values, expected {}",
                 values.len(),
@@ -159,10 +174,7 @@ impl CorvusAxis {
                 )));
             }
             // C ignores each exchange's status and parses what it got.
-            let read = |verb: &str| {
-                ctrl.query(&format!("{} {verb}", axis_no + 1))
-                    .unwrap_or_default()
-            };
+            let read = |verb: &str| ctrl.exchange(&format!("{} {verb}", axis_no + 1)).0;
             let pitch = atof(&read("getpitch"));
             let pole_pairs = atoi(&read("getpolepairs"));
             let cl_period = atof(&read("getclperiod"));
@@ -438,6 +450,35 @@ mod tests {
         assert!(status.problem && !status.done, "{status:?}");
     }
 
+    /// SMCcorvusDriver.cpp:166-183 and :258-264 parse `inString_` whatever
+    /// `writeReadController` returned, so replies cut by a timeout still set
+    /// `axisRes` and the other axes' targets of a move.
+    #[test]
+    fn replies_cut_by_a_timeout_are_still_parsed() {
+        use motor_common::testing::LineRig;
+        let (line, handle) = LineRig::cut(
+            "corvusCutReplies",
+            |cmd| match cmd.trim_end() {
+                "2 getpitch" => "2".into(),
+                "2 getpolepairs" => "1".into(),
+                "pos" => "1.0 2.0".into(),
+                _ => String::new(),
+            },
+            |_| true,
+        );
+        let controller = Arc::new(Mutex::new(CorvusController::new(handle, 2)));
+        let mut axis = CorvusAxis::new(controller, 1, "").unwrap();
+        assert_eq!(axis.members.state().axis_res, 0.5);
+        line.sent();
+        let _ = axis.move_absolute(&AsynUser::default(), 6.0, 0.0, 2.0, 4.0);
+        let sent = line.sent();
+        assert!(
+            sent.iter()
+                .any(|s| s.trim_end() == "1.000000 3.000000 move"),
+            "{sent:?}"
+        );
+    }
+
     /// C `SMCcorvusAxis::moveVelocity`'s FLOW line, on the axis's
     /// `pasynUser_` (SMCcorvusDriver.cpp:304-306).
     #[test]
@@ -483,10 +524,17 @@ mod tests {
                 Ok(data.len())
             }
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = b"1.0 2.0";
             buf[..reply.len()].copy_from_slice(reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

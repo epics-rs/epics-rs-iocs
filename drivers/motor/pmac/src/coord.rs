@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use epics_libcom_rs::cfmt::CFloat;
-use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::error::{AsynError, AsynResult, OctetStep};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -245,12 +245,20 @@ impl PmacCoordSystem {
     /// its line. C returns MOTOR_AXIS_OK on a refused (BELL) reply
     /// (pmacAsynCoord.c:345); that C defect is not copied (see the crate doc).
     fn write_read(&mut self, axis: usize, command: &str) -> AsynResult<String> {
-        checked_reply(command, self.transfer(axis, command, false)?)
+        let (raw, status) = self.exchange(axis, command, false);
+        status?;
+        checked_reply(command, raw)
     }
 
-    /// [`Self::write_read`] without the BELL check: the reply as C sees it.
+    /// [`Self::write_read`] without the BELL check: the reply as C sees it,
+    /// whatever the status, so a failed read still holds what it delivered.
     /// Only a `log_global` read leaves the axis's log quiet.
-    fn transfer(&mut self, axis: usize, command: &str, log_global: bool) -> AsynResult<Vec<u8>> {
+    fn exchange(
+        &mut self,
+        axis: usize,
+        command: &str,
+        log_global: bool,
+    ) -> (Vec<u8>, AsynResult<()>) {
         let log = (!log_global).then(|| &self.logs[axis - 1]);
         let reference = self.reference;
         if let Some(log) = log {
@@ -259,8 +267,13 @@ impl PmacCoordSystem {
                 format_args!("Sending to PMAC C.S. ref {reference} command : {command}\n"),
             );
         }
-        let reply = self.handle.write_read(0, command.as_bytes(), PMAC_MAXBUF);
-        if let (Some(log), Ok(raw)) = (log, &reply)
+        let (raw, status) = self
+            .handle
+            .write_read(0, command.as_bytes(), PMAC_MAXBUF)
+            .into_parts();
+        // C logs whatever arrived, before it looks at the status
+        // (pmacAsynCoord.c:331-335).
+        if let Some(log) = log
             && !raw.is_empty()
         {
             let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -275,8 +288,8 @@ impl PmacCoordSystem {
         // C `motorAxisWriteRead`'s comm error (pmacAsynCoord.c:336, 345).
         let _ = self
             .params(axis)
-            .set_integer(function::COMM_ERROR, i32::from(reply.is_err()));
-        reply.inspect_err(|e| {
+            .set_integer(function::COMM_ERROR, i32::from(status.is_err()));
+        let status = status.inspect_err(|e| {
             self.trace.print(
                 TraceMask::ERROR,
                 0,
@@ -289,7 +302,8 @@ impl PmacCoordSystem {
                     e.message_display()
                 ),
             );
-        })
+        });
+        (raw, status)
     }
 
     /// C `drvPmacGetAxesStatus`: `&{cs}??` for the status words, then one
@@ -298,14 +312,11 @@ impl PmacCoordSystem {
         let cs = self.cs;
         // C `drvPmacGetCoordStatus(first_axis, ...)`.
         let command = format!("&{cs}??");
-        let (cmd_status, response) = match self.transfer(1, &command, true) {
-            // C `MOTOR_AXIS_ERROR`, over the empty response buffer.
-            Err(_) => (-1, String::new()),
-            Ok(raw) => (
-                0,
-                String::from_utf8_lossy(&raw).trim_matches('\0').to_string(),
-            ),
-        };
+        let (raw, read) = self.exchange(1, &command, true);
+        // C `MOTOR_AXIS_ERROR`; `response` starts empty and a failed read
+        // leaves in it what it delivered.
+        let cmd_status = if read.is_ok() { 0 } else { -1 };
+        let response = String::from_utf8_lossy(&raw).trim_matches('\0').to_string();
         // C goes on to the positions whatever the status read gave.
         let nvals = scan_cs_status(&response, &mut self.status);
         if cmd_status != 0 || nvals != 3 {
@@ -323,9 +334,15 @@ impl PmacCoordSystem {
         for axis in 1..=CS_AXES {
             query.push_str(&format!("Q8{axis}"));
         }
-        // A failed read leaves C's position buffer uninitialised; that
+        // C parses whatever a failed read delivered, as for a short reply.
+        // A failed write leaves its position buffer uninitialised; that
         // garbage is not posted here.
-        let raw = self.transfer(1, &query, true)?;
+        let (raw, read) = self.exchange(1, &query, true);
+        let cmd_status = match read {
+            Ok(()) => 0,
+            Err(e) if e.octet_step() == Some(OctetStep::Read) => -1,
+            Err(e) => return Err(e),
+        };
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         let response = String::from_utf8_lossy(&raw[..end]);
         let positions = parse_cs_positions(&response, CS_AXES)
@@ -337,7 +354,7 @@ impl PmacCoordSystem {
                         0,
                         format_args!(
                             "drvPmacAxisGetStatus: not all status values returned. Status: \
-                             0\nCommand :{query}\nResponse1:{response}\n"
+                             {cmd_status}\nCommand :{query}\nResponse1:{response}\n"
                         ),
                     );
                 }
@@ -786,10 +803,17 @@ mod tests {
             self.sent.lock().unwrap().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let n = self.reply.len();
             buf[..n].copy_from_slice(&self.reply);
-            Ok(n)
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                n,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

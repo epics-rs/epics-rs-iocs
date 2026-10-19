@@ -636,7 +636,11 @@ pub(crate) mod tests {
             self.written.lock().unwrap().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             self.reads.fetch_add(1, Ordering::Relaxed);
             let mut reply = std::mem::take(&mut self.reply);
             if reply.is_empty() {
@@ -644,7 +648,10 @@ pub(crate) mod tests {
                 reply = next.unwrap_or_default().into_bytes();
             }
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
         fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
             self.reply.clear();

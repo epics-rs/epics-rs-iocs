@@ -18,6 +18,7 @@ use epics_rs::asyn::interfaces::motor::{
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::device_support::{BuildTrans, DialLimitReset, LimitBuild};
 
 use motor_common::util::{atoi, nint};
 
@@ -61,8 +62,8 @@ impl Mvp2001Chain {
     /// empty when none came.
     fn recv(&self) -> String {
         let _ = self.handle.read_octet(0, BUFF_SIZE);
-        match self.handle.read_octet(0, BUFF_SIZE) {
-            Ok(raw) if !raw.is_empty() => {
+        match self.handle.read_octet(0, BUFF_SIZE).into_parts() {
+            (raw, Ok(())) if !raw.is_empty() => {
                 sleep(Duration::from_millis(100));
                 String::from_utf8_lossy(&raw).into_owned()
             }
@@ -83,10 +84,10 @@ impl Mvp2001Chain {
             return;
         };
         let quick = SyncIOHandle::from_handle(port.clone(), 0, Duration::ZERO);
-        while quick
-            .read_octet(0, BUFF_SIZE)
-            .is_ok_and(|raw| !raw.is_empty())
-        {}
+        while matches!(
+            quick.read_octet(0, BUFF_SIZE).into_parts(),
+            (raw, Ok(())) if !raw.is_empty()
+        ) {}
     }
 }
 
@@ -144,13 +145,51 @@ fn ano(max_ma: i32) -> i32 {
     nint(f64::from(max_ma) * 0.865909 + 2103.431)
 }
 
+/// devMVP2001's `build_trans` on the soft limits of one controller, from
+/// the travel limits [`motor_init`] read for it. SET_HIGH_LIMIT and
+/// SET_LOW_LIMIT send nothing (devMVP2001.cc:430-448).
+pub struct Mvp2001Build {
+    /// `motor_info->low_limit` / `high_limit`.
+    limits: (i32, i32),
+}
+
+impl Mvp2001Build {
+    pub fn new(limits: (i32, i32)) -> Self {
+        Self { limits }
+    }
+}
+
+impl BuildTrans for Mvp2001Build {
+    /// A raw limit past the controller's is ERROR and resets the record's
+    /// dial limit to it. C writes DHLM for SET_HIGH_LIMIT and DLLM for
+    /// SET_LOW_LIMIT at |MRES|, but under MRES < 0 the record sends DHLM as
+    /// SET_LOW_LIMIT (motorRecord.cc:4246), so C leaves the refused DHLM
+    /// past the controller and rewrites DLLM: here the dial limit the raw
+    /// one maps to is reset, which is C's for MRES > 0.
+    fn limit(&self, high: bool, raw: f64, mres: f64) -> LimitBuild {
+        let (low, high_limit) = self.limits;
+        let (limit, past) = if high {
+            (high_limit, nint(raw) > high_limit)
+        } else {
+            (low, nint(raw) < low)
+        };
+        if !past {
+            return LimitBuild::Built;
+        }
+        let dial = f64::from(limit) * mres;
+        LimitBuild::Refused(Some(if high == (mres > 0.0) {
+            DialLimitReset::Dhlm(dial)
+        } else {
+            DialLimitReset::Dllm(dial)
+        }))
+    }
+}
+
 /// One controller of a model-1 MVP 2001 chain.
 pub struct DrvMvp2001Axis {
     chain: Arc<Mutex<Mvp2001Chain>>,
     /// The controller's chain address, `signal + 1`.
     addr: usize,
-    /// `motor_info->low_limit` / `high_limit`, read at init.
-    limits: (i32, i32),
     /// The record's OUT parm, `"ENC_CPR,MAX_mA"`.
     parm: String,
     /// The record's VELO in steps/s, `mr->velo / fabs(mr->mres)`.
@@ -172,14 +211,12 @@ pub struct DrvMvp2001Axis {
 }
 
 impl DrvMvp2001Axis {
-    /// Controller `signal + 1` of `chain`, with the travel limits
-    /// [`motor_init`] read for it: zeroed once more and its status read, as
-    /// `motor_init` ends.
-    pub fn new(chain: Arc<Mutex<Mvp2001Chain>>, signal: usize, limits: (i32, i32)) -> Self {
+    /// Controller `signal + 1` of `chain`: zeroed once more and its status
+    /// read, as `motor_init` ends.
+    pub fn new(chain: Arc<Mutex<Mvp2001Chain>>, signal: usize) -> Self {
         let mut axis = Self {
             chain,
             addr: signal + 1,
-            limits,
             parm: String::new(),
             record_velocity: 0.0,
             failure: PollFailure::NONE,
@@ -351,22 +388,6 @@ impl AsynMotor for DrvMvp2001Axis {
         Ok(())
     }
 
-    /// `SET_HIGH_LIMIT`: nothing is sent; a limit past the controller's is
-    /// refused.
-    fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        if nint(position) > self.limits.1 {
-            return Err(refused("MVP2001: high limit past the controller's"));
-        }
-        Ok(())
-    }
-
-    fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        if nint(position) < self.limits.0 {
-            return Err(refused("MVP2001: low limit past the controller's"));
-        }
-        Ok(())
-    }
-
     fn set_out_parm(&mut self, _user: &AsynUser, parm: &[u8]) -> AsynResult<()> {
         self.parm = String::from_utf8_lossy(parm).into_owned();
         Ok(())
@@ -456,6 +477,22 @@ mod tests {
         assert_eq!(hex_at("", 8), 0);
     }
 
+    /// devMVP2001.cc:430-448: a raw limit at the controller's is built, one
+    /// past it is refused and resets the dial limit it maps to, which under
+    /// MRES < 0 is the other one (motorRecord.cc:4246).
+    #[test]
+    fn a_limit_past_the_controllers_resets_its_dial_limit() {
+        use DialLimitReset::{Dhlm, Dllm};
+        let build = Mvp2001Build::new((-100000, 100000));
+        assert_eq!(build.limit(true, 100000.4, 0.5), LimitBuild::Built);
+        assert_eq!(build.limit(false, -100000.4, 0.5), LimitBuild::Built);
+        let refused = |reset| LimitBuild::Refused(Some(reset));
+        assert_eq!(build.limit(true, 100000.5, 0.5), refused(Dhlm(50000.0)));
+        assert_eq!(build.limit(false, -100000.5, 0.5), refused(Dllm(-50000.0)));
+        assert_eq!(build.limit(true, 200000.0, -0.5), refused(Dllm(-50000.0)));
+        assert_eq!(build.limit(false, -200000.0, -0.5), refused(Dhlm(50000.0)));
+    }
+
     #[test]
     fn ano_holds_the_current_to_the_manual_range() {
         assert_eq!(ano(500), nint(500.0 * 0.865909 + 2103.431));
@@ -477,7 +514,7 @@ mod tests {
             _ => String::new(),
         });
         let chain = Arc::new(Mutex::new(Mvp2001Chain::new(io)));
-        let mut axis = DrvMvp2001Axis::new(chain, 0, (0, 0));
+        let mut axis = DrvMvp2001Axis::new(chain, 0);
         let user = AsynUser::new(0);
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
@@ -503,7 +540,7 @@ mod tests {
             _ => String::new(),
         });
         let chain = Arc::new(Mutex::new(Mvp2001Chain::new(io)));
-        let mut axis = DrvMvp2001Axis::new(chain, 0, (0, 0));
+        let mut axis = DrvMvp2001Axis::new(chain, 0);
         let user = AsynUser::new(0);
         axis.set_out_parm(&user, b"4000,500").unwrap();
         axis.set_record_fields(
@@ -536,7 +573,7 @@ mod tests {
             _ => String::new(),
         });
         let chain = Arc::new(Mutex::new(Mvp2001Chain::new(io)));
-        let mut axis = DrvMvp2001Axis::new(chain, 0, (0, 0));
+        let mut axis = DrvMvp2001Axis::new(chain, 0);
         let user = AsynUser::new(0);
         axis.set_out_parm(&user, b"4000,500").unwrap();
         axis.set_move_strings(&user, b"ZZ", None).unwrap();

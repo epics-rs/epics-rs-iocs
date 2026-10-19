@@ -94,15 +94,24 @@ pub fn write_read(link: &OctetLink, cmd: &str) -> Result<String, OctetFailure> {
 
 /// [`write_read`]'s reply as the device sent it.
 pub fn write_read_bytes(link: &OctetLink, cmd: &str) -> Result<Vec<u8>, OctetFailure> {
-    let sent = write_all(link, cmd)?;
-    match link.sync.read_octet(OCTET_REASON, 4096) {
-        Ok(raw) => Ok(raw),
-        Err(error) => Err(OctetFailure {
-            received: error.partial_read().map_or(0, |p| p.nbytes_transferred()),
-            error,
-            sent,
-        }),
-    }
+    let (raw, status) = exchange(link, cmd);
+    status.map(|()| raw)
+}
+
+/// [`write_read_bytes`] with the bytes a failed read delivered, which C's
+/// buffer holds; a failed write reads none.
+pub fn exchange(link: &OctetLink, cmd: &str) -> (Vec<u8>, Result<(), OctetFailure>) {
+    let sent = match write_all(link, cmd) {
+        Ok(sent) => sent,
+        Err(f) => return (Vec::new(), Err(f)),
+    };
+    let (raw, status) = link.sync.read_octet(OCTET_REASON, 4096).into_parts();
+    let status = status.map_err(|error| OctetFailure {
+        received: raw.len(),
+        error,
+        sent,
+    });
+    (raw, status)
 }
 
 /// Send `cmd` without reading a reply (C `pasynOctetSyncIO->write`).
@@ -113,7 +122,8 @@ pub fn write_only(link: &OctetLink, cmd: &str) -> Result<(), OctetFailure> {
 /// Read a reply with no command sent first (used where a caller already
 /// wrote and only needs to drain an extra line, e.g. Colby's serial echo).
 pub fn read_only(link: &OctetLink) -> AsynResult<String> {
-    let raw = link.sync.read_octet(OCTET_REASON, 4096)?;
+    let (raw, status) = link.sync.read_octet(OCTET_REASON, 4096).into_parts();
+    status?;
     Ok(String::from_utf8_lossy(&raw).into_owned())
 }
 
