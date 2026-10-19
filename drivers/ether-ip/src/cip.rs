@@ -800,8 +800,8 @@ pub fn get_usint(raw: &[u8], element: usize) -> Option<u8> {
 
 /// Read `element` as a string, at most `max` bytes including the terminator.
 ///
-/// UPSTREAM FIX: the C's `T_CIP_STRING` branch does
-/// `memcpy(buffer, buf, size); *(buffer+size) = '\0';` -- it copies `size`
+/// C defect, not copied: the C's `T_CIP_STRING` branch (ether_ip.c:1443-1444)
+/// does `memcpy(buffer, buf, size); *(buffer+size) = '\0';` -- it copies `size`
 /// bytes and then writes a terminator at `buffer[size]`, one byte past the
 /// caller's buffer (`stringin` passes MAX_STRING_SIZE with a MAX_STRING_SIZE
 /// array), and it ignores the actual data length. We bound the copy by both the
