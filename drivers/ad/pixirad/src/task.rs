@@ -440,7 +440,7 @@ async fn status_loop(ctx: StatusContext) {
             ("READ_HV_CURRENT", ctx.params.hv_current),
         ];
 
-        let mut updates = Vec::new();
+        let mut found = Vec::new();
         let mut cold_temp = None;
         let mut hot_temp = None;
         let mut box_temp = None;
@@ -464,38 +464,25 @@ async fn status_loop(ctx: StatusContext) {
                 "READ_BOX_HUM" => humidity = Some(value),
                 _ => {}
             }
-            updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(value)));
+            found.push((reason, value));
         }
 
         // C computed the dew point from whatever was last in the parameter
         // library, so a broadcast that was missing the humidity produced a dew
         // point from a stale reading and could switch the cooling off on it.
-        let (Some(cold_temp), Some(hot_temp), Some(box_temp), Some(humidity)) =
-            (cold_temp, hot_temp, box_temp, humidity)
-        else {
-            let _ = ctx.handle.set_params_and_notify(0, updates).await;
-            continue;
+        let cooling = match (cold_temp, hot_temp, box_temp, humidity) {
+            (Some(cold_temp), Some(hot_temp), Some(box_temp), Some(humidity)) => {
+                let dew_point = protocol::dew_point(humidity, box_temp);
+                Some((
+                    dew_point,
+                    protocol::cooling_status(cold_temp, hot_temp, dew_point),
+                ))
+            }
+            _ => None,
         };
-
-        let dew_point = protocol::dew_point(humidity, box_temp);
-        let cooling_status = protocol::cooling_status(cold_temp, hot_temp, dew_point);
-        updates.push(ParamSetValue::new(
-            ctx.params.dew_point,
-            0,
-            ParamValue::Float64(dew_point),
-        ));
-        updates.push(ParamSetValue::new(
-            ctx.params.cooling_status,
-            0,
-            ParamValue::Int32(cooling_status as i32),
-        ));
-        let _ = ctx.handle.set_params_and_notify(0, updates).await;
-
-        if cooling_status.is_error() {
-            let _ = ctx
-                .handle
-                .with_driver(PixiradDetector::switch_cooling_off)
-                .await;
-        }
+        let _ = ctx
+            .handle
+            .with_driver(move |d: &mut PixiradDetector| d.post_status(&found, cooling))
+            .await;
     }
 }

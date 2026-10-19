@@ -256,11 +256,26 @@ impl PixiradDetector {
         self.command(&command)
     }
 
-    /// C statusTask's error branch, run under the port lock: CoolingState off,
-    /// `setCoolingAndHV` (its status ignored), `callParamCallbacks`.
-    pub(crate) fn switch_cooling_off(&mut self) -> AsynResult<()> {
-        self.set_int32(self.params.cooling_state, 0)?;
-        let _ = self.set_cooling_and_hv();
+    /// One pass of C statusTask under the port lock: the broadcast readings,
+    /// then the dew point and cooling status when every input arrived, then on
+    /// an error CoolingState off and `setCoolingAndHV` (its status ignored),
+    /// and one `callParamCallbacks`, which posts in that order.
+    pub(crate) fn post_status(
+        &mut self,
+        readings: &[(usize, f64)],
+        cooling: Option<(f64, CoolingStatus)>,
+    ) -> AsynResult<()> {
+        for &(reason, value) in readings {
+            self.set_float64(reason, value)?;
+        }
+        if let Some((dew_point, status)) = cooling {
+            self.set_float64(self.params.dew_point, dew_point)?;
+            self.set_int32(self.params.cooling_status, status as i32)?;
+            if status.is_error() {
+                self.set_int32(self.params.cooling_state, 0)?;
+                let _ = self.set_cooling_and_hv();
+            }
+        }
         self.ad.port_base.call_param_callbacks(0)
     }
 
@@ -872,54 +887,119 @@ mod tests {
             .unwrap();
     }
 
-    /// C statusTask switches the cooling off through `setCoolingAndHV`, whose
-    /// `writeReadServer` publishes the exchange (pixirad.cpp:1363-1369, :916-924).
-    #[test]
-    fn the_status_task_publishes_its_cooling_off_exchange() {
-        let name = "PIXI_STATUS_OFF";
-        let det = detector(name, Some("NEVER"));
-        let (ad, params) = (det.ad.params, det.params);
-        let (runtime, _) =
-            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
-        let handle = runtime.port_handle().clone();
-        std::mem::forget(runtime);
-        let port = std::net::UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        task::start_status_task(StatusContext {
-            status_port: port,
-            handle: handle.clone(),
-            ad_params: ad,
-            params,
-        });
-        let published = |reason: usize| {
-            handle
+    /// A status task on a box that takes every command, fed broadcasts by the
+    /// test; its port is open, as after iocInit.
+    struct StatusTask {
+        handle: PortHandle,
+        ad: ADBaseParams,
+        params: PixiradParams,
+        port: u16,
+    }
+
+    impl StatusTask {
+        fn start(name: &str) -> Self {
+            let det = detector(name, Some("NEVER"));
+            let (ad, params) = (det.ad.params, det.params);
+            let claim = claim_port(name).unwrap();
+            let (runtime, _) = create_port_runtime(&claim, det, RuntimeConfig::default()).unwrap();
+            let handle = runtime.port_handle().clone();
+            claim
+                .publish(handle.clone(), &epics_rs::asyn::registry::open_owner())
+                .unwrap();
+            std::mem::forget(runtime);
+            let port = std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            task::start_status_task(StatusContext {
+                status_port: port,
+                handle: handle.clone(),
+                ad_params: ad,
+                params,
+            });
+            Self {
+                handle,
+                ad,
+                params,
+                port,
+            }
+        }
+
+        fn published(&self, reason: usize) -> Vec<u8> {
+            self.handle
                 .with_driver_blocking(move |d: &mut PixiradDetector| {
                     d.ad.port_base.get_string_param(reason, 0).unwrap().to_vec()
                 })
                 .unwrap()
-        };
-        // A cold side at 45 C is TColdError.
-        let message = "READ_TCOLD 45.0 READ_THOT 25.0 READ_BOX_TEMP 20.0 READ_BOX_HUM 10.0 \
-                       READ_PELTIER_PWR 1.0 READ_HV 350.0 READ_HV_CURRENT 0.1";
-        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while !published(ad.string_to_server).starts_with(b"DAQ:! INIT") {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the cooling-off exchange never reached ADStringToServer"
-            );
-            sender
-                .send_to(message.as_bytes(), ("127.0.0.1", port))
-                .unwrap();
-            std::thread::sleep(Duration::from_millis(200));
         }
+
+        /// Broadcast a cold side at 45 C (TColdError) until the cooling-off
+        /// exchange is published.
+        fn overheat(&self) {
+            let message = "READ_TCOLD 45.0 READ_THOT 25.0 READ_BOX_TEMP 20.0 READ_BOX_HUM 10.0 \
+                           READ_PELTIER_PWR 1.0 READ_HV 350.0 READ_HV_CURRENT 0.1";
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !self
+                .published(self.ad.string_to_server)
+                .starts_with(b"DAQ:! INIT")
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the cooling-off exchange never reached ADStringToServer"
+                );
+                sender
+                    .send_to(message.as_bytes(), ("127.0.0.1", self.port))
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+
+    /// C statusTask switches the cooling off through `setCoolingAndHV`, whose
+    /// `writeReadServer` publishes the exchange (pixirad.cpp:1363-1369, :916-924).
+    #[test]
+    fn the_status_task_publishes_its_cooling_off_exchange() {
+        let st = StatusTask::start("PIXI_STATUS_OFF");
+        st.overheat();
         let command = protocol::init(INITIAL_COOLING_VALUE, 0, INITIAL_HV_VALUE, 1);
-        assert_eq!(published(ad.string_to_server), command.as_bytes());
-        assert_eq!(published(ad.string_from_server), b"GOT: OK");
-        assert_eq!(published(ad.status_message), b"Server returned OK");
+        assert_eq!(st.published(st.ad.string_to_server), command.as_bytes());
+        assert_eq!(st.published(st.ad.string_from_server), b"GOT: OK");
+        assert_eq!(st.published(st.ad.status_message), b"Server returned OK");
+    }
+
+    /// C statusTask posts the readings, CoolingState and the exchange in one
+    /// `callParamCallbacks` (pixirad.cpp:1325-1370), which posts in the order
+    /// the parameters were set (asynPortDriver.cpp:841-843).
+    #[test]
+    fn the_status_task_posts_its_cooling_off_in_one_pass() {
+        let st = StatusTask::start("PIXI_STATUS_PASS");
+        // The open flush has run by the time the actor answers.
+        st.published(st.ad.string_to_server);
+        let mut posts = st.handle.interrupts().subscribe_async(256, 0);
+        st.overheat();
+        let mut reasons = Vec::new();
+        while let Ok(v) = posts.try_recv() {
+            reasons.push(v.reason);
+        }
+        let p = st.params;
+        assert_eq!(
+            reasons,
+            [
+                st.ad.temperature_actual,
+                p.hot_temperature,
+                p.box_temperature,
+                p.box_humidity,
+                p.peltier_power,
+                p.hv_actual,
+                p.hv_current,
+                p.dew_point,
+                p.cooling_status,
+                p.cooling_state,
+                st.ad.string_to_server,
+            ]
+        );
     }
 
     #[test]
