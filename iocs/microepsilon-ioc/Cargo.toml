@@ -8,4 +8,5 @@ publish = false
 microepsilon = { path = "../../drivers/microepsilon" }
 epics-rs = { workspace = true, features = ["asyn", "bridge"] }
 asyn-rs = { workspace = true, features = ["epics"] }
+stream-rs = { workspace = true }
 tokio = { version = "1", features = ["full"] }

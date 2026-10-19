@@ -2594,6 +2594,7 @@ dependencies = [
  "asyn-rs",
  "epics-rs",
  "microepsilon",
+ "stream-rs",
  "tokio",
 ]
 
@@ -4321,6 +4322,18 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stream-rs"
+version = "0.32.0"
+source = "git+file:///home/stevek/work/epics-rs?rev=3b8cc7585dd7d48f905ca5298609c434884578e6#3b8cc7585dd7d48f905ca5298609c434884578e6"
+dependencies = [
+ "asyn-rs",
+ "chrono",
+ "epics-base-rs",
+ "libc",
+ "parking_lot",
+]
 
 [[package]]
 name = "strength_reduce"
