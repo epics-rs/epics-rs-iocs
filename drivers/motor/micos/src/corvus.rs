@@ -150,9 +150,6 @@ pub struct CorvusAxis {
     controller: Arc<Mutex<CorvusController>>,
     members: Arc<SmcMembers>,
     num_axes: usize,
-    /// What the last poll left: C keeps every parameter a poll did not
-    /// write (asynMotorAxis params persist across polls).
-    last_status: MotorStatus,
     /// The record's soft limits in steps (C `motorHighLimit_`/`motorLowLimit_`),
     /// the jog targets.
     high_limit: f64,
@@ -202,7 +199,6 @@ impl CorvusAxis {
             members: Arc::new(members),
             num_axes,
             trace: MotorTrace::new(port, axis_no as i32),
-            last_status: MotorStatus::default(),
             high_limit: 0.0,
             low_limit: 0.0,
         })
@@ -379,22 +375,9 @@ impl AsynMotor for CorvusAxis {
         Ok(())
     }
 
-    /// C `SMCcorvusAxis::poll`: a failed exchange skips the rest and sets
-    /// only Problem; C's poller ignores the returned error, so no COMM_ERR.
-    /// Problem is set from the comm status alone, overwriting the drive-off
-    /// problem (SMCcorvusDriver.cpp:473-477).
-    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
-        let mut status = self.last_status.clone();
-        status.problem = self.poll_into(&mut status).is_err();
-        self.last_status = status.clone();
-        *out = status;
-        Ok(())
-    }
-}
-
-impl CorvusAxis {
-    /// Write each field as C sets its parameter, in C's order.
-    fn poll_into(&self, status: &mut MotorStatus) -> AsynResult<()> {
+    /// C `SMCcorvusAxis::poll`: each field is set as C sets its parameter,
+    /// and a failed exchange skips the rest (SMCcorvusDriver.cpp:381-481).
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
 
         // C sscanf's into locals: a short reply leaves the position unset.
@@ -435,6 +418,8 @@ impl CorvusAxis {
             let drive_on = atoi(&ctrl.query(&format!("{} getmp", self.axis_no() + 1))?);
             status.powered = drive_on != 0;
         }
+        // `skip` on a good poll, over the drive-off problem (:473-477).
+        status.problem = false;
         Ok(())
     }
 }
@@ -442,7 +427,6 @@ impl CorvusAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use motor_common::testing::Polled;
 
     #[test]
     fn the_constructor_calls_back() {
@@ -461,7 +445,7 @@ mod tests {
     /// C's status_ starts at 0 and the constructor sets no status bit; only
     /// a good poll sets Done (SMCcorvusDriver.cpp:431).
     #[test]
-    fn an_unanswering_controller_s_axis_polls_problem_without_done() {
+    fn an_unanswering_controller_s_axis_fails_its_poll_without_done() {
         use epics_rs::asyn::interfaces::InterfaceType;
         let (handle, _) = SyncIOHandle::connect_port(
             "CORVUS_DEAD",
@@ -471,8 +455,47 @@ mod tests {
         );
         let controller = Arc::new(Mutex::new(CorvusController::new(handle, 1)));
         let mut axis = CorvusAxis::new(controller, 0, "").unwrap();
-        let status = axis.polled(&AsynUser::default()).unwrap();
-        assert!(status.problem && !status.done, "{status:?}");
+        let mut status = MotorStatus::default();
+        assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
+        assert!(!status.done, "{status:?}");
+    }
+
+    /// SMCcorvusDriver.cpp:381-481 sets only what it read before a failed
+    /// read's `skip`, over the params as they stood, the Done=0 a move start
+    /// set included (asynMotorController.cpp:301).
+    #[test]
+    fn a_failed_read_leaves_the_done_a_move_start_set() {
+        use motor_common::testing::LineRig;
+        let refused = Arc::new(Mutex::new(String::new()));
+        let pick = refused.clone();
+        let (_line, handle) = LineRig::failing(
+            "corvusMoveStartDone",
+            |cmd| match cmd.trim_end() {
+                "1 getpitch" | "1 getpolepairs" | "1 getmp" => "1".into(),
+                "pos" => "2.0".into(),
+                "st" => "0".into(),
+                "1 getsw" | "1 getswst" => "0 0".into(),
+                _ => String::new(),
+            },
+            move |cmd| *pick.lock().unwrap() == cmd.trim_end(),
+        );
+        let controller = Arc::new(Mutex::new(CorvusController::new(handle, 1)));
+        let mut axis = CorvusAxis::new(controller, 0, "").unwrap();
+        let user = AsynUser::default();
+        // The PROBLEM the poller raised over an earlier failure; `skip` clears it.
+        let mut status = MotorStatus {
+            problem: true,
+            ..MotorStatus::default()
+        };
+        axis.poll(&user, &mut status).unwrap();
+        assert!(
+            status.done && status.powered && !status.problem,
+            "{status:?}"
+        );
+        status.done = false;
+        *refused.lock().unwrap() = "pos".into();
+        assert!(axis.poll(&user, &mut status).is_err());
+        assert!(!status.done, "{status:?}");
     }
 
     /// SMCcorvusDriver.cpp:166-183 and :258-264 parse `inString_` whatever
@@ -610,7 +633,6 @@ mod tests {
             }),
             num_axes: 2,
             trace: MotorTrace::default(),
-            last_status: MotorStatus::default(),
             high_limit: 10.0,
             low_limit: -10.0,
         };
