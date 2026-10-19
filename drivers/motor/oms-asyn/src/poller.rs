@@ -158,7 +158,7 @@ pub fn start(
         StackSizeClass::Medium,
         move || poller.run(),
     ) {
-        eprintln!("epicsThreadCreate: {e}");
+        epics_rs::base::stderr_println!("epicsThreadCreate: {e}");
     }
 }
 
