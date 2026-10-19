@@ -403,41 +403,43 @@ pub fn setup_pki_args(args: [Option<&str>; 4]) -> Option<[&str; 4]> {
     ok.then(|| args.map(|a| a.unwrap_or_default()))
 }
 
-/// `opcuaOptions(pattern, [options])` — the pattern selects sessions and
-/// subscriptions by name (`iocshIntegration.cpp:299-360`).
-///
-/// Returns how many names it applied the options to; none is an error, as it is
-/// in the C ("no matching session or subscription").
-pub fn set_options(
-    registry: &Registry,
-    pattern: &str,
-    options: &[(String, String)],
-) -> Result<usize, String> {
-    let mut names: Vec<String> = registry
-        .sessions()
-        .iter()
-        .map(|s| s.name.clone())
-        .filter(|name| glob_match(pattern, name))
-        .collect();
-    names.extend(registry.glob_subscriptions(pattern));
-    if names.is_empty() {
-        return Err(format!("no session or subscription matches '{pattern}'"));
+/// `opcuaOptions(pattern, [options])` (`iocshIntegration.cpp:305-365`): every
+/// option goes to each session the pattern matches, or, when it matches none,
+/// to each subscription it matches.
+pub fn options_command(registry: &Registry, pattern: Option<&str>, options: &[&str]) {
+    let Some(pattern) = pattern.filter(|p| !p.is_empty()) else {
+        errlog_vprintf(format_args!("missing argument #1 (pattern for name)\n"));
+        return;
+    };
+    if pattern == "help" {
+        println!("{OPTIONS_USAGE}");
+        return;
     }
-    for name in &names {
-        for (key, value) in options {
-            // The C's catch: report, and apply nothing further.
-            match registry.session(name) {
-                Ok(session) => {
-                    if let Err(e) = session.set_option(key, value) {
-                        eprintln!("ERROR : {e}");
-                        return Ok(names.len());
-                    }
-                }
-                Err(_) => registry.set_subscription_option(name, key, value),
-            }
+    if options.is_empty() {
+        errlog_vprintf(format_args!("missing argument #2 (options)\n"));
+        return;
+    }
+    let sessions = registry.glob_sessions(pattern);
+    let applied = if !sessions.is_empty() {
+        walk_options(options, |key, value| {
+            sessions.iter().try_for_each(|s| s.set_option(key, value))
+        })
+    } else {
+        let subscriptions = registry.glob_subscriptions(pattern);
+        if subscriptions.is_empty() {
+            errlog_vprintf(format_args!("No matches for pattern '{pattern}'\n"));
+            return;
         }
+        walk_options(options, |key, value| {
+            for name in &subscriptions {
+                registry.set_subscription_option(name, key, value);
+            }
+            Ok(())
+        })
+    };
+    if let Err(e) = applied {
+        eprintln!("ERROR : {e}");
     }
-    Ok(names.len())
 }
 
 /// `opcuaShow(pattern, verbosity)` (`iocshIntegration.cpp:379-410`): what every

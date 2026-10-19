@@ -265,3 +265,66 @@ fn the_usage_texts_are_the_c_ones() {
         "Valid subscription options are:\ndebug              debug level [default 0 = no debug]\npriority           priority level [default 0(lowest) .. 255]\n"
     ));
 }
+
+#[test]
+fn options_name_their_missing_arguments() {
+    let registry = registry();
+    for pattern in [None, Some("")] {
+        assert_eq!(
+            lines(|| ioc::options_command(&registry, pattern, &["debug=1"])),
+            ["missing argument #1 (pattern for name)\n"]
+        );
+    }
+    assert_eq!(
+        lines(|| ioc::options_command(&registry, Some("S1"), &[])),
+        ["missing argument #2 (options)\n"]
+    );
+    assert_eq!(
+        lines(|| ioc::options_command(&registry, Some("NOPE"), &["debug=1"])),
+        ["No matches for pattern 'NOPE'\n"]
+    );
+}
+
+/// A pattern that matches a session never reaches a subscription; one that
+/// matches none falls back to the subscriptions.
+#[test]
+fn options_go_to_the_matching_sessions_before_any_subscription() {
+    let registry = registry();
+    ioc::session_command(&registry, Some("S1"), Some("opc.tcp://h:4840"), &[]);
+    ioc::subscription_command(&registry, Some("SUB1"), Some("S1"), 0.0, &[]);
+    let session = registry.session("S1").unwrap();
+    let subscription_debug = || session.subscriptions.lock()[0].debug;
+
+    assert!(lines(|| ioc::options_command(&registry, Some("S*"), &["debug=2"])).is_empty());
+    assert_eq!(session.config.lock().debug, 2);
+    assert_eq!(subscription_debug(), 0);
+
+    assert!(lines(|| ioc::options_command(&registry, Some("SU*"), &["debug=3"])).is_empty());
+    assert_eq!(subscription_debug(), 3);
+    assert_eq!(session.config.lock().debug, 2);
+}
+
+/// Each option goes to every matching session before the next option, and an
+/// option a session refuses ends the command (the C's catch).
+#[test]
+fn an_option_reaches_every_session_before_the_next_one() {
+    let registry = registry();
+    for (name, url) in [("S1", "opc.tcp://h:4840"), ("S2", "opc.tcp://h:4841")] {
+        ioc::session_command(&registry, Some(name), Some(url), &[]);
+    }
+    assert_eq!(
+        lines(|| ioc::options_command(
+            &registry,
+            Some("S?"),
+            &["nodes-max=3:bad", "autoconnect=q", "nodes-max=9"]
+        )),
+        ["option 'bad' must follow 'key=value' format - ignored\n"]
+    );
+    for name in ["S1", "S2"] {
+        assert_eq!(
+            registry.session(name).unwrap().config.lock().nodes_max,
+            3,
+            "{name}"
+        );
+    }
+}

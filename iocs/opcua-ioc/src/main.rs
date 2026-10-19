@@ -240,11 +240,8 @@ fn commands(
         {
             let registry = registry.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let pattern = sval(args, 0).unwrap_or_default();
-                let options = ioc::parse_options(&strs(&argv(args, 1)));
-                if let Err(e) = ioc::set_options(&registry, &pattern, &options) {
-                    eprintln!("opcuaOptions: {e}");
-                }
+                let options = argv(args, 1);
+                ioc::options_command(&registry, sval(args, 0).as_deref(), &strs(&options));
                 Ok(CommandOutcome::Continue)
             }
         },
