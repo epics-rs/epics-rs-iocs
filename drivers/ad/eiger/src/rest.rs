@@ -219,7 +219,7 @@ pub type RestResult<T> = Result<T, RestError>;
 
 /// restApi.cpp's `ERR`/`ERR_ARGS`, which print to stderr.
 fn rest_err(function: &str, msg: &str) {
-    eprintln!("RestApi::{function}: {msg}");
+    epics_rs::base::stderr_println!("RestApi::{function}: {msg}");
 }
 
 /// `epicsSocketConvertErrnoToString`: the OS text without Rust's

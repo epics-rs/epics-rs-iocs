@@ -961,7 +961,8 @@ async fn save_task(
 fn write_file(s: &Shared, name: &str, path: &str, data: &[u8], perms: u32) -> bool {
     use std::io::Write;
 
-    let perror = |call: &str, e: &std::io::Error| eprintln!("{call}: {}", strerror(e));
+    let perror =
+        |call: &str, e: &std::io::Error| epics_rs::base::stderr_println!("{call}: {}", strerror(e));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -1172,7 +1173,9 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
             }
             Ok(None) => {}
             Err(crate::stream::StreamError::WrongHtype(h)) => {
-                eprintln!("StreamApi::getHeader: wrong header type, htype={h}");
+                epics_rs::base::stderr_println!(
+                    "StreamApi::getHeader: wrong header type, htype={h}"
+                );
                 s.trace().err("streamTask", "got stray packet, ignoring");
             }
             Err(_) => {
@@ -1228,7 +1231,9 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                     .await
                     .is_err()
                 {
-                    eprintln!("StreamApi::getFrame: failed to allocate NDArray for frame {number}");
+                    epics_rs::base::stderr_println!(
+                        "StreamApi::getFrame: failed to allocate NDArray for frame {number}"
+                    );
                     s.trace().err("streamTask", "failed to get frame packet");
                     return false;
                 }
@@ -1314,7 +1319,9 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
                 .await
                 .is_err()
             {
-                eprintln!("Stream2Api::getFrame: failed to allocate NDArray for frame");
+                epics_rs::base::stderr_println!(
+                    "Stream2Api::getFrame: failed to allocate NDArray for frame"
+                );
             }
         }
     }
