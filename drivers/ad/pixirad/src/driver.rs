@@ -170,11 +170,15 @@ impl PixiradDetector {
     /// Ask the box who it is (C's constructor).
     fn identify(&mut self) -> AsynResult<()> {
         let reply = self.exchange(&protocol::get_firmware_version())?.reply;
-        if let Some((serial, version)) = protocol::parse_firmware_version(&reply) {
-            let base = &mut self.ad.port_base;
-            base.set_string_param(self.ad.params.base.serial_number, 0, serial)?;
-            base.set_string_param(self.ad.params.base.firmware_version, 0, version)?;
-        }
+        // C bug, pixirad.cpp:448-449, :564-566: both are set whatever the
+        // reply, and a part `sscanf` did not match publishes the uninitialised
+        // `serialNumber` and a `tempString` still holding the driver version.
+        // Here such a part is empty.
+        let (serial, version) = protocol::parse_firmware_version(&reply);
+        let base = &mut self.ad.port_base;
+        let p = self.ad.params.base;
+        base.set_string_param(p.serial_number, 0, serial.unwrap_or_default())?;
+        base.set_string_param(p.firmware_version, 0, version.unwrap_or_default())?;
 
         let reply = self.exchange(&protocol::get_additional_info())?.reply;
         // C added the length of the marker to a null `strstr` result and
@@ -752,6 +756,15 @@ mod tests {
                 .get_float64_param(det.params.hit_threshold, 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_dead_box_still_sets_serial_number_and_firmware_version() {
+        let det = detector("PIXI_DEAD_ID", None);
+        let p = det.ad.params.base;
+        for reason in [p.serial_number, p.firmware_version] {
+            assert_eq!(det.ad.port_base.get_string_param(reason, 0).unwrap(), b"");
+        }
     }
 
     #[test]

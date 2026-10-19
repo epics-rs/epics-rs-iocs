@@ -114,17 +114,19 @@ pub fn reply_is_ok(command: &str, reply: &str) -> bool {
     command.contains("SYS:?") || reply.contains("GOT:")
 }
 
-/// `DETECTOR <serial> FRMW_VER: <version>` → (serial, version).
-pub fn parse_firmware_version(reply: &str) -> Option<(String, String)> {
+/// `DETECTOR <serial> FRMW_VER: <version>` → (serial, version), each present
+/// as far as C's `sscanf` got before the reply stopped matching.
+pub fn parse_firmware_version(reply: &str) -> (Option<String>, Option<String>) {
     let mut tokens = reply.split_whitespace();
-    if tokens.next()? != "DETECTOR" {
-        return None;
-    }
-    let serial = tokens.next()?.to_string();
-    if tokens.next()? != "FRMW_VER:" {
-        return None;
-    }
-    Some((serial, tokens.next()?.to_string()))
+    let serial = match (tokens.next(), tokens.next()) {
+        (Some("DETECTOR"), Some(serial)) => serial.to_string(),
+        _ => return (None, None),
+    };
+    let version = match (tokens.next(), tokens.next()) {
+        (Some("FRMW_VER:"), Some(version)) => Some(version.to_string()),
+        _ => None,
+    };
+    (Some(serial), version)
 }
 
 /// Everything after `ADDITIONAL INFO:`.
@@ -240,9 +242,13 @@ mod tests {
     fn firmware_version_is_split_into_serial_and_version() {
         assert_eq!(
             parse_firmware_version("DETECTOR PX8-007 FRMW_VER: 3.14\r\n"),
-            Some(("PX8-007".to_string(), "3.14".to_string()))
+            (Some("PX8-007".to_string()), Some("3.14".to_string()))
         );
-        assert_eq!(parse_firmware_version("nonsense"), None);
+        assert_eq!(
+            parse_firmware_version("DETECTOR PX8-007"),
+            (Some("PX8-007".to_string()), None)
+        );
+        assert_eq!(parse_firmware_version("nonsense"), (None, None));
     }
 
     #[test]
