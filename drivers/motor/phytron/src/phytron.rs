@@ -13,13 +13,9 @@
 //! - phyMOTION frames carry a trailing `:` plus a two-hex-digit XOR checksum
 //!   over `<addr><command>:`; the MCC omits the CRC.
 //! - The reply is `STX <ACK|NAK> <data> [":" <CRC>] ETX`. `ACK` (0x06) means
-//!   success, `NAK` (0x15) failure. The startup script sets the input EOS to
-//!   `"\x03"` (ETX); this driver owns the output framing (it appends STX..ETX),
-//!   so the script must NOT set an output EOS.
-//!
-//! The reply parser accepts the payload whether or not the transport left the
-//! trailing ETX in the buffer (an EOS-configured port strips it; a raw read
-//! keeps it), matching the C driver's `find('\x03')` which tolerates both.
+//!   success, `NAK` (0x15) failure. The driver owns the framing both ways,
+//!   so the port sets no EOS: a reply without its ETX is invalid, as C's
+//!   `find_first_of('\x03')` makes it, and an input EOS of ETX would strip it.
 //!
 //! ## Controller / axis addressing
 //!
@@ -210,9 +206,7 @@ fn build_frame(ctrl_type: CtrlType, address: u8, cmd: &str) -> Vec<u8> {
 }
 
 /// The body of `STX <ACK|NAK> <data> [":" <CRC>] [ETX]`, its ACK or NAK
-/// kept, as C `sendPhytronCommand` checks it before the ACK test. The
-/// trailing ETX may already be stripped by the port's input EOS, so both an
-/// EOS-stripped and a raw buffer are accepted.
+/// kept, as C `sendPhytronCommand` checks it before the ACK test.
 fn parse_frame(raw: &[u8]) -> AsynResult<Vec<u8>> {
     let start = raw
         .iter()
@@ -221,7 +215,7 @@ fn parse_frame(raw: &[u8]) -> AsynResult<Vec<u8>> {
     let after = &raw[start + 1..];
     let body = match after.iter().position(|&b| b == ETX) {
         Some(i) => &after[..i],
-        None => after,
+        None => return Err(phytron_err("phytron: reply without ETX")),
     };
     let mut resp = body.to_vec();
 
@@ -2444,11 +2438,12 @@ mod tests {
     }
 
     #[test]
-    fn reply_payload_accepts_eos_stripped_etx() {
-        // No trailing ETX (input EOS consumed it), no CRC: STX ACK data.
+    fn reply_payload_rejects_a_reply_without_etx() {
+        // A read that ended before ETX (an input EOS that consumed it, or a
+        // short raw read): C returns phytronInvalidReturn, not "678".
         let mut resp = vec![STX, ACK];
         resp.extend_from_slice(b"678");
-        assert_eq!(reply_payload(&resp, true).unwrap(), "678");
+        assert_eq!(reply_payload(&resp, true), Err(6));
     }
 
     #[test]
