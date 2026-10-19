@@ -890,7 +890,7 @@ impl Mm4000Axis {
 impl Model1Motor for Mm4000Axis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.last.clone(), self.poll_failure())
     }
 }
 
@@ -1670,6 +1670,26 @@ mod tests {
         axes[0].home(&user, 0.0, 10.0, 0.0, true).unwrap();
         let wire = sent.lock().unwrap().clone();
         assert!(wire.iter().all(|c| !c.contains("AC")), "{wire:?}");
+    }
+
+    /// drvMM4000.cc:763-811: a `motor_init` read that start_status's
+    /// unanswered MS; failed (RETRY, :341-353) stores the GAIN_SUPPORT
+    /// `motor_init` set, and EA_PRESENT on axis 2's closed loop.
+    #[test]
+    fn model1_a_failed_init_read_keeps_what_motor_init_set() {
+        let (axes, _, _) = model1_card("mm4000_m1_init_fail", &["MS;"], Duration::ZERO);
+        let init: Vec<_> = axes
+            .unwrap()
+            .iter_mut()
+            .map(|axis| axis.take_init_status())
+            .collect();
+        let prepared = |encoder| MotorStatus {
+            gain_support: true,
+            has_encoder: encoder,
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init, [prepared(false), prepared(true)]);
     }
 
     /// An unanswered MS; is a RETRY, which asks TH; but no TP; or TE; and
