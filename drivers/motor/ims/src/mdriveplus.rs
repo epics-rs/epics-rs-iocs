@@ -255,10 +255,17 @@ impl ImsLine {
     /// Write a query and read one reply line (C `writeReadController`:
     /// `pasynOctetSyncIO->writeRead`, which flushes a stray line first).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
+        let (reply, status) = self.exchange_text(cmd);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::write_read`]'s reply beside its status. The EOS layer
+    /// NUL-terminates `resp` on every read, so a failed read leaves the bytes
+    /// it delivered, which the callers that ignore the status parse.
+    fn exchange_text(&self, cmd: &str) -> (String, AsynResult<()>) {
         let (raw, status) = self.exchange(cmd);
-        status?;
         let s = String::from_utf8_lossy(&raw);
-        Ok(s.trim_matches(['\r', '\n', '\0', ' ']).to_string())
+        (s.trim_matches(['\r', '\n', '\0', ' ']).to_string(), status)
     }
 
     /// C `writeReadController`'s writeRead and its trace line, which
@@ -544,8 +551,9 @@ impl ImsMDrivePlusAxis {
 
     /// C `readHomeAndLimitConfig`, console lines included.
     fn read_home_and_limit_config(&mut self) {
-        // MForce 1 answers `PR VR` with an error, so its status is ignored.
-        let version = self.write_read("PR VR").unwrap_or_default();
+        // MForce 1 answers `PR VR` with an error, so its status is ignored
+        // and its reply parsed (ImsMDrivePlusMotorController.cpp:172-178).
+        let version = self.line.exchange_text("PR VR").0;
         if !version.is_empty() {
             println!("Controller version {version}");
         }
@@ -582,9 +590,8 @@ impl ImsMDrivePlusAxis {
             println!("{RULE}");
             println!("Checking setup for home, pos and neg limit switches:");
             for input_no in 1..=4 {
-                let resp = self
-                    .write_read(&format!("PR S{input_no}"))
-                    .unwrap_or_default();
+                // C prints and parses `resp` whatever the status (:213-216).
+                let resp = self.line.exchange_text(&format!("PR S{input_no}")).0;
                 println!("{resp}");
                 self.set_switch(atoi(&resp), input_no);
             }
@@ -1175,6 +1182,42 @@ mod tests {
 
     /// ImsMDrivePlusMotorAxis.cpp:464-470: the stall flag sets both
     /// motorStatusFollowingError_ and motorStatusSlip_, MSTA bits 6 and 4.
+    /// ImsMDrivePlusMotorController.cpp:172-178 and :213-216 ignore the
+    /// status of `PR VR` and `PR S1`-`PR S4` and parse `resp`, so a reply cut
+    /// by a timeout still picks the model and maps the limit inputs.
+    #[test]
+    fn config_replies_cut_by_a_timeout_are_still_parsed() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::cut(
+            "imsCutLmm",
+            |last| match last.trim_end() {
+                "PR VR" => "LMM 3.0".into(),
+                _ => "0".into(),
+            },
+            |last| last.trim_end() == "PR VR",
+        );
+        ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), "imsCutLmm"), "imsCutLmm");
+        // An LMM skips the MForce S1-S4 probe.
+        let sent = rig.sent();
+        assert!(!sent.iter().any(|c| c.trim_end() == "PR S1"), "{sent:?}");
+
+        let (_rig, io) = LineRig::cut(
+            "imsCutS",
+            |last| match last.trim_end() {
+                "PR VR" => "1.000".into(),
+                "PR S2" => "2,0,0".into(),
+                "PR S3" => "3,0,0".into(),
+                _ => "0".into(),
+            },
+            |last| last.trim_end().starts_with("PR S"),
+        );
+        let axis = ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), "imsCutS"), "imsCutS");
+        assert_eq!(
+            (axis.pos_limit_switch, axis.neg_limit_switch),
+            (Some(2), Some(3))
+        );
+    }
+
     #[test]
     fn a_stall_sets_following_error_and_slip() {
         use epics_rs::motor::flags::MstaFlags;
