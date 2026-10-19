@@ -77,6 +77,7 @@ use epics_rs::motor::controller_port::{AxisUser, ParamWrite, has_motor_axis, ind
 use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::epics_string::print_escaped;
 use motor_common::util::{atof, atoi, nint};
 use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
@@ -849,6 +850,8 @@ pub struct PhytronController {
     axis_status: Option<usize>,
     /// C `do_initial_readout_`, cleared by the first controller poll.
     do_initial_readout: bool,
+    /// C `sCtrlType_`, escaped.
+    type_name: String,
 }
 
 impl PhytronController {
@@ -868,7 +871,28 @@ impl PhytronController {
             encoder_ratios: HashMap::new(),
             axis_status: None,
             do_initial_readout: true,
+            type_name: String::new(),
         }
+    }
+
+    /// C `sCtrlType_`, which phytronIO reads.
+    pub fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    /// The constructor's type queries (phytronAxisMotor.cpp:214-238). C
+    /// keeps a failed query's reply buffer in the type; nothing is kept
+    /// here. `print_escaped` is C `escapeC` but for a leading NUL.
+    pub fn read_type(&mut self) {
+        let reply = |cmd: &str| self.send(cmd, true).ok();
+        let name = match self.ctrl_type {
+            CtrlType::Phymotion => reply("IM0").unwrap_or_default(),
+            CtrlType::Mcc => {
+                let iar = reply("IAR").unwrap_or_default();
+                mcc_type(&iar, reply("1P48R").as_deref())
+            }
+        };
+        self.type_name = print_escaped(name.as_bytes());
     }
 
     /// What C `epicsInithookFunction` (phytronAxisMotor.cpp:1003-1024)
@@ -1172,6 +1196,21 @@ impl PhytronController {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
+}
+
+/// C's MCC type (phytronAxisMotor.cpp:216-233): `MCC-` and the `IAR`
+/// reply, then the stage `1P48R` names when it answers.
+fn mcc_type(iar: &str, p48: Option<&str>) -> String {
+    let mut name = format!("MCC-{iar}");
+    match p48.map(|p| (p, parse_int64(p))) {
+        None | Some((_, Some(0))) => {}
+        Some((_, Some(1))) => name.push_str(" LIN"),
+        Some((p, _)) => {
+            name.push_str(" type");
+            name.push_str(p);
+        }
+    }
+    name
 }
 
 /// C `appendRequestString` (phytronAxisMotor.cpp:1879-1907): the poll's
@@ -2559,6 +2598,20 @@ mod tests {
         assert!(!s.problem);
         let s = step_home_state(0, 0x2000, false, CtrlType::Phymotion);
         assert!(s.problem); // power-stage error in the 0xE800 mask
+    }
+
+    /// phytronAxisMotor.cpp:216-238.
+    #[test]
+    fn the_type_is_what_c_composes_from_its_queries() {
+        assert_eq!(mcc_type("2", Some("0")), "MCC-2");
+        assert_eq!(mcc_type("1", Some(" 1 ")), "MCC-1 LIN");
+        assert_eq!(mcc_type("1", Some("0x7")), "MCC-1 type0x7");
+        assert_eq!(mcc_type("1", Some("x")), "MCC-1 typex");
+        assert_eq!(mcc_type("", None), "MCC-");
+        let (ctrl, _, written) = lines_with("phyType", |_| Some("phy\x07MOTION".into()));
+        ctrl.lock().unwrap().read_type();
+        assert_eq!(ctrl.lock().unwrap().type_name(), "phy\\aMOTION");
+        assert_eq!(written.lock().unwrap()[..], ["IM0"]);
     }
 
     #[test]

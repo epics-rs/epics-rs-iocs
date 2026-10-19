@@ -180,6 +180,7 @@ fn register_controller(
     if reset_at_boot {
         controller.reset_at_boot(&name);
     }
+    controller.read_type();
     let port = PortManager::global()
         .find_port_handle(&name)
         .map_err(|e| format!("{cmd_name}: {e}"))?;
