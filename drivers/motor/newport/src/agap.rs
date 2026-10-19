@@ -142,20 +142,28 @@ impl AgapController {
     }
 
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        // C writeReadController: pasynOctetSyncIO->writeRead.
+        let (reply, status) = self.exchange(cmd);
+        status.map(|()| reply)
+    }
+
+    /// C `writeReadController`: `inString_` beside the status. The EOS layer
+    /// NUL-terminates the buffer on every read, so a failed read leaves the
+    /// bytes it delivered, which the callers that ignore the status parse.
+    fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
         let (reply, status) = self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
-        status?;
-        Ok(String::from_utf8_lossy(&reply).into_owned())
+        (String::from_utf8_lossy(&reply).into_owned(), status)
     }
 
-    /// C `getClosedLoop`. Caller holds the controller lock.
-    fn read_closed_loop(&self) -> AsynResult<bool> {
-        let resp = self.write_read(&format!("{}MM?", self.controller_id))?;
-        // AGAP_CONEX.cpp:332 reads an uninitialised status on a bad reply, a C defect.
-        parse_closed_loop(&resp).ok_or_else(|| parse_error("MM?"))
+    /// C `getClosedLoop`: the `MM?` reply parsed whatever the exchange
+    /// returned, beside its status. Caller holds the controller lock.
+    /// AGAP_CONEX.cpp:332 reads an uninitialised status on a bad reply, a C
+    /// defect; that is `None` here.
+    fn read_closed_loop(&self) -> (Option<bool>, AsynResult<()>) {
+        let (resp, status) = self.exchange(&format!("{}MM?", self.controller_id));
+        (parse_closed_loop(&resp), status)
     }
 }
 
@@ -199,10 +207,10 @@ impl AxisReport for AgapAxisReport {
         let (kp, ki, lf) = {
             let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
             let id = ctrl.controller_id;
-            // C ignores each read's status; a failed one reads as 0.
+            // C ignores each read's status and parses what arrived.
             let read = |letters: &str| {
-                let reply = ctrl.write_read(&format!("{id}{letters}{}?", self.axis_name));
-                parse_value_at(&reply.unwrap_or_default(), 4).unwrap_or(0.0)
+                let (reply, _) = ctrl.exchange(&format!("{id}{letters}{}?", self.axis_name));
+                parse_value_at(&reply, 4).unwrap_or(0.0)
             };
             (read("KP"), read("KI"), read("LF"))
         };
@@ -247,7 +255,7 @@ impl AgapAxis {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             if ctrl.version.contains("CONEX-AGAP") {
                 let id = ctrl.controller_id;
-                let reply = |cmd: String| ctrl.write_read(&cmd).unwrap_or_default();
+                let reply = |cmd: String| ctrl.exchange(&cmd).0;
                 let value_at = |cmd: String, at| parse_value_at(&reply(cmd), at).unwrap_or(0.0);
                 Shown {
                     stage_id: reply(format!("{id}ID?")).get(3..).unwrap_or("").to_string(),
@@ -397,7 +405,8 @@ impl AsynMotor for AgapAxis {
                     PidGainKind::Proportional => ("KP", KP_MAX),
                     _ => ("KI", KI_MAX),
                 };
-                let was_closed = ctrl.read_closed_loop()?;
+                // C ignores getClosedLoop's status (AGAP_CONEX.cpp:343/359).
+                let was_closed = ctrl.read_closed_loop().0.unwrap_or(false);
                 ctrl.write(&format!("{id}MM0"))?;
                 ctrl.write(&format!(
                     "{id}{letter}{}{:.6}",
@@ -433,7 +442,9 @@ impl AsynMotor for AgapAxis {
         // TS reply, a C defect.
         let moving =
             parse_moving(&ctrl.write_read(&format!("{id}TS"))?).ok_or_else(|| parse_error("TS"))?;
-        let powered = ctrl.read_closed_loop()?;
+        let (powered, mm) = ctrl.read_closed_loop();
+        mm?;
+        let powered = powered.ok_or_else(|| parse_error("MM?"))?;
 
         Ok(MotorStatus {
             position,
@@ -450,6 +461,49 @@ impl AsynMotor for AgapAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AGAP_CONEX.cpp:207-247 and :343 ignore writeReadController's status
+    /// and parse `inString_`, so replies cut by a timeout still set the stage
+    /// readings, and a gain write still restores the closed loop `MM?`
+    /// reported.
+    #[test]
+    fn replies_cut_by_a_timeout_are_still_parsed() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::cut(
+            "agap_cut",
+            |last| {
+                match last {
+                    "1VE" => "1VE CONEX-AGAP 1.0",
+                    "1ID?" => "1IDAGAP-STAGE",
+                    "1SU?" => "1SU0.0002",
+                    "1SLV?" => "1SLV-1.5",
+                    "1SRV?" => "1SRV1.5",
+                    "1MM?" => "1MM33",
+                    _ => "",
+                }
+                .to_string()
+            },
+            |last| last != "1VE",
+        );
+        let trace = MotorTrace::new("agap_cut", 0);
+        let ctrl = Arc::new(Mutex::new(AgapController::new(io, 1, trace).unwrap()));
+        let mut axis = AgapAxis::new(ctrl, 1);
+        let shown = &axis.shown;
+        assert_eq!(
+            (
+                shown.stage_id.as_str(),
+                shown.encoder_increment,
+                shown.low_limit,
+                shown.high_limit
+            ),
+            ("AGAP-STAGE", 0.0002, -1.5, 1.5)
+        );
+        line.sent();
+        axis.set_pid_gain(&AsynUser::default(), PidGainKind::Proportional, 0.5)
+            .unwrap();
+        let sent = line.sent();
+        assert_eq!(sent.last().map(String::as_str), Some("1MM1"), "{sent:?}");
+    }
 
     #[test]
     fn parse_moving_reads_controller_state_byte() {
