@@ -131,27 +131,7 @@ enum Locking {
 /// a failed one reported, then the callbacks for `addr`.
 pub(crate) fn apply_updates(base: &mut PortDriverBase, addr: i32, updates: &[ParamSetValue]) {
     for u in updates {
-        let outcome = match u {
-            ParamSetValue::Value {
-                reason,
-                addr,
-                value,
-            } => base.set_param_value(*reason, *addr, value.clone()),
-            ParamSetValue::UInt32Digital {
-                reason,
-                addr,
-                value,
-                mask,
-                interrupt_mask,
-            } => base.set_uint32_param(*reason, *addr, *value, *mask, *interrupt_mask),
-            ParamSetValue::Status {
-                reason,
-                addr,
-                status,
-                alarm_status,
-                alarm_severity,
-            } => base.set_param_status(*reason, *addr, *status, *alarm_status, *alarm_severity),
-        };
+        let outcome = base.set_param(u);
         if let Err(e) = outcome {
             adlog::print(
                 base,

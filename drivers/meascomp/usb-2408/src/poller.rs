@@ -1,9 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamValue;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase};
+use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
@@ -327,7 +326,7 @@ fn poller_loop(
         let _ = handle.with_driver_blocking::<MultiFunctionDriver, _>(move |driver| {
             let base = driver.base_mut();
             for update in updates {
-                let _ = apply(base, update);
+                let _ = base.set_param(&update);
             }
             if !goto_error {
                 for addr in 0..MAX_SIGNALS as i32 {
@@ -351,29 +350,4 @@ fn get_int(handle: &PortHandle, reason: usize, addr: i32) -> i32 {
 /// C `getDoubleParam`; see [`get_int`].
 fn get_float(handle: &PortHandle, reason: usize, addr: i32) -> f64 {
     handle.read_float64_blocking(reason, addr).unwrap_or(0.0)
-}
-
-/// One `setXxxParam` of the poll pass.
-fn apply(base: &mut PortDriverBase, update: ParamSetValue) -> AsynResult<()> {
-    match update {
-        ParamSetValue::Value {
-            reason,
-            addr,
-            value,
-        } => base.set_param_value(reason, addr, value),
-        ParamSetValue::UInt32Digital {
-            reason,
-            addr,
-            value,
-            mask,
-            interrupt_mask,
-        } => base.set_uint32_param(reason, addr, value, mask, interrupt_mask),
-        ParamSetValue::Status {
-            reason,
-            addr,
-            status,
-            alarm_status,
-            alarm_severity,
-        } => base.set_param_status(reason, addr, status, alarm_status, alarm_severity),
-    }
 }

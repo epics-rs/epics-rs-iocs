@@ -964,8 +964,6 @@ mod tests {
             u,
             ParamSetValue::Status {
                 status: AsynStatus::Disconnected,
-                alarm_status: 0,
-                alarm_severity: 0,
                 ..
             }
         )));
