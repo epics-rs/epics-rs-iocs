@@ -563,7 +563,7 @@ impl Record for DigitelRecord {
     /// C `digitelRecord.c::special` — record which `SPC_MOD` field changed, and
     /// clamp the setpoint / hysteresis fields. `TYPE` carries `SPC_MOD` but the
     /// C `special()` has no arm for it, so it is a no-op here too.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(&mut self, field: &str, after: bool, _common: &CommonFields) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -778,17 +778,17 @@ mod tests {
     #[test]
     fn special_sets_the_flag_bits() {
         let mut r = DigitelRecord::default();
-        r.special("DSPL", true).unwrap();
+        r.special("DSPL", true, &CommonFields::default()).unwrap();
         assert_eq!(r.flgs, MOD_DSPL);
 
         let mut r = DigitelRecord::default();
-        r.special("S2MS", true).unwrap();
+        r.special("S2MS", true, &CommonFields::default()).unwrap();
         assert_eq!(r.spfg, MOD_SNMS[1]);
         assert_eq!(r.flgs, MOD_SETP);
 
         // The "before" callback latches nothing.
         let mut r = DigitelRecord::default();
-        r.special("DSPL", false).unwrap();
+        r.special("DSPL", false, &CommonFields::default()).unwrap();
         assert_eq!(r.flgs, 0);
     }
 
@@ -796,13 +796,13 @@ mod tests {
     fn special_clamps_setpoints_to_the_1e_minus_3_ceiling() {
         let mut r = DigitelRecord::default();
         r.sps[0] = 1.0; // way above the ceiling
-        r.special("SP1S", true).unwrap();
+        r.special("SP1S", true, &CommonFields::default()).unwrap();
         assert_eq!(r.sps[0], DIGITEL_MAXSP);
         assert_eq!(r.spfg, MOD_SPNS[0]);
         assert_eq!(r.flgs, MOD_SETP);
 
         r.shs[2] = -1.0; // below the floor
-        r.special("S3HS", true).unwrap();
+        r.special("S3HS", true, &CommonFields::default()).unwrap();
         assert_eq!(r.shs[2], DIGITEL_MINHY);
         assert!(r.spfg & MOD_SNHS[2] != 0);
     }
@@ -810,7 +810,7 @@ mod tests {
     #[test]
     fn type_special_is_a_no_op() {
         let mut r = DigitelRecord::default();
-        r.special("TYPE", true).unwrap();
+        r.special("TYPE", true, &CommonFields::default()).unwrap();
         assert_eq!(r.flgs, 0);
         assert_eq!(r.spfg, 0);
     }

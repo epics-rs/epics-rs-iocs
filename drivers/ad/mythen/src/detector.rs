@@ -106,15 +106,14 @@ impl Detector {
     }
 
     /// C `writeReadMeter`, mythen.cpp:239, which prints on every failed
-    /// exchange — including one the gate refused, where C would have sent it
-    /// and failed.
+    /// exchange — including one the asyn port refused while disconnected.
     fn meter<T>(
         &self,
         what: &str,
         exchange: impl FnOnce(&Transport) -> AsynResult<T>,
     ) -> AsynResult<T> {
         *self.out_string.lock() = what.to_string();
-        let result = self.io(what, exchange);
+        let result = self.exchange(exchange);
         if result.is_err() {
             self.trace_error("mythen:writeReadMeter: error!\n");
         }
@@ -126,30 +125,12 @@ impl Detector {
         self.connected.load(Ordering::Acquire)
     }
 
-    /// The gate every detector command passes through.
-    ///
-    /// INVARIANT: while the detector is marked disconnected no command reaches
-    /// the socket. Each one would otherwise sit out the full 5 s
-    /// [`M1K_TIMEOUT`](crate::transport::M1K_TIMEOUT), and they are serialized
-    /// through the port's single request queue — the 37 records that process at
-    /// `iocInit` cost minutes between them instead of nothing at all.
-    ///
-    /// The caller gets [`AsynStatus::Disconnected`] instead, which is the
-    /// record layer's own word for it.
-    fn io<T>(
-        &self,
-        what: &str,
-        exchange: impl FnOnce(&Transport) -> AsynResult<T>,
-    ) -> AsynResult<T> {
-        if !self.is_connected() {
-            return Err(disconnected(what));
-        }
-        self.exchange(exchange)
-    }
-
     /// Run one command and let its outcome own the connection state.
     ///
-    /// The only writer of `connected`, and the only path to the socket. Every
+    /// The only writer of `connected`, and the only path to the socket. There
+    /// is no gate in front of it: as in C, a detector that does not answer is
+    /// refused by the asyn port itself, asynError for the send that fails and
+    /// asynDisconnected while the port is down (asynManager.c:1549-1553). Every
     /// error inside here is the detector failing to answer in full — a timeout
     /// with nothing in hand, or a reply too short to decode — so every one of
     /// them means disconnected. Replies the detector *did* send and the driver
@@ -161,8 +142,7 @@ impl Detector {
         result
     }
 
-    /// The one command allowed past the gate: the probe that can bring the
-    /// detector back.
+    /// The probe that brings a detector that stopped answering back.
     ///
     /// C has no such path — a detector that was off when the IOC booted stays
     /// unusable until the IOC is restarted, because C's constructor is the only
@@ -287,7 +267,7 @@ impl Detector {
         self.state.acquiring.store(false, Ordering::Release);
         // C sends `-stop` straight through pasynOctetSyncIO, not
         // writeReadMeter, and prints its own line.
-        self.io("-stop", |t| t.send_command("-stop"))
+        self.exchange(|t| t.send_command("-stop"))
             .inspect_err(|_| self.trace_error("mythen:setAcquire: error!\n"))?;
         Ok(())
     }
@@ -523,19 +503,7 @@ impl Detector {
             "-readout"
         };
         *self.out_string.lock() = command.to_string();
-        self.io(command, |t| t.readout(command, expect, timeout))
-    }
-}
-
-/// The error a caller gets while the detector is marked disconnected: the
-/// command was never sent.
-fn disconnected(what: &str) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Disconnected,
-        message: format!(
-            "mythen: [{what}] not sent: the detector is disconnected — write ADAcquire to probe \
-             it again"
-        ),
+        self.exchange(|t| t.readout(command, expect, timeout))
     }
 }
 
