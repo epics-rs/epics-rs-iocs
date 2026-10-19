@@ -25,9 +25,9 @@
 //! wraps *each* command in its own `motor_start_trans_com`/`motor_end_trans_com`
 //! pair, so a move's `SET_VELOCITY` and `MOVE_ABS` are **two separate writes**,
 //! each independently getting the column-5 axis byte — whereas the C-844
-//! `strcat`s a whole move into one `AXIS n;`-prefixed message. (The
-//! `ENABLE_TORQUE` "CLR then SVO" split is the same per-command-message
-//! mechanism used twice inside one build call.)
+//! `strcat`s a whole move into one `AXIS n;`-prefixed message. (C's
+//! `ENABLE_TORQUE` ends a first transaction for `CLR` inside one build call,
+//! but never appends `CLR` to it; see `set_closed_loop`.)
 //!
 //! ## Connect (`motor_init`)
 //! `*IDN?` (retry up to 3× until a non-empty reply → `brdptr->ident`). Then the
@@ -510,6 +510,10 @@ impl AsynMotor for PIC848Axis {
         let ctrl = self.lock();
         if enable {
             // Enabling while torque is disabled first clears the axis status.
+            // C formats `CLR  #` but never appends it before ending that
+            // transaction, so it goes out empty and send_mess sends nothing
+            // (devPIC848.cc:253-260, drvPIC848.cc:373-374); that C defect is
+            // not copied.
             if !self.last_status.powered {
                 let _ = ctrl.send(&format!("CLR  {l}"));
             }
@@ -681,8 +685,9 @@ mod tests {
         (line, axis, sta)
     }
 
-    /// devPIC848.cc:253-260, :326: the velocity, the CLR and the command are
-    /// each a message of their own, whose status C's motor task drops.
+    /// devPIC848.cc:326: the velocity and the command are each a message of
+    /// their own, whose status C's motor task drops. The CLR is rs's own (C
+    /// never sends it, see `set_closed_loop`), and SVO still follows it.
     #[test]
     fn a_refused_message_still_sends_the_ones_after_it() {
         let (line, mut axis, _) = refusing_rig("c848Refused", |cmd| {

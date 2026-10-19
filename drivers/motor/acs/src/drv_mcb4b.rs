@@ -328,12 +328,16 @@ mod tests {
     }
 
     /// motordrvCom sends each message of a transaction and ignores what
-    /// send_mess returns (motordrvCom.cc:397-484): a refused V, R or PREM
-    /// still sends the command after it.
+    /// send_mess returns (motordrvCom.cc:397-484): a refused V, R, PREM or
+    /// C= still sends the command after it.
     #[test]
     fn a_refused_message_still_sends_the_ones_after_it() {
         let (line, mut axis, _) = refusing_rig("mcb4bRefused", |cmd| {
-            cmd.starts_with("#01V=") || cmd.starts_with("#01R=") || cmd == "P" || cmd == "#01H-"
+            cmd.starts_with("#01V=")
+                || cmd.starts_with("#01R=")
+                || cmd.starts_with("#01C=")
+                || cmd == "P"
+                || cmd == "#01H-"
         });
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"P", None).unwrap();

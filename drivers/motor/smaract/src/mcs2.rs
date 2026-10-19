@@ -764,7 +764,12 @@ mod tests {
         let (rig, io) = LineRig::failing(
             "mcs2Refused",
             |_| String::new(),
-            |cmd| cmd.contains(":ACC") || cmd.contains(":MMOD 4") || cmd.contains(":REF0"),
+            |cmd| {
+                cmd.contains(":ACC")
+                    || cmd.contains(":MMOD 0")
+                    || cmd.contains(":MMOD 4")
+                    || cmd.contains(":REF0")
+            },
         );
         let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2Refused", 0));
         let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);

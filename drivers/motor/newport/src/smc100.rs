@@ -326,6 +326,41 @@ mod tests {
         );
     }
 
+    /// A refused `AC` is sendAccelAndVelocity's status: the move overwrites
+    /// it with PA's or PR's (SMC100Driver.cpp:184-191), and moveVelocity
+    /// skips on it (:222-223).
+    #[test]
+    fn a_refused_acceleration_stops_only_the_jog() {
+        let (line, io) = LineRig::failing(
+            "smc100_refused_ac",
+            |last| match last {
+                "1SR?" => "1SR25".to_string(),
+                "1SL?" => "1SL-5".to_string(),
+                _ => String::new(),
+            },
+            |cmd| cmd.starts_with("1AC"),
+        );
+        let mut axis = Smc100Axis::new(io, 1, 1.0, MotorTrace::new("SMC100_T", 0));
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 2.0, 0.0, 3.0, 4.0).unwrap();
+        axis.move_relative(&user, 2.0, 0.0, 3.0, 4.0).unwrap();
+        assert!(axis.move_velocity(&user, 0.0, 3.0, 4.0).is_err());
+        assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(true)]);
+        assert_eq!(
+            line.sent(),
+            [
+                "1VA3.000000",
+                "1AC4.000000",
+                "1PA2.000000",
+                "1VA3.000000",
+                "1AC4.000000",
+                "1PR2.000000",
+                "1VA3.000000",
+                "1AC4.000000",
+            ]
+        );
+    }
+
     /// SMC100Driver.cpp:243-249: only a positive jog velocity goes to the
     /// high limit.
     #[test]

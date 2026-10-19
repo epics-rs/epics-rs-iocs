@@ -586,6 +586,22 @@ mod tests {
         );
     }
 
+    /// A refused `G` is what the move and the home return, and C sets
+    /// `homed` after it all the same (OEMMotorDriver.cpp:247-250, :274-277).
+    #[test]
+    fn a_refused_go_still_sets_homed() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing("oemRefusedGo", |_| "OK".into(), |cmd| cmd == "1G");
+        let controller = Arc::new(Mutex::new(OemController::new(io, 1)));
+        controller.lock().unwrap().pulses_per_unit[0] = 2.0;
+        let mut axis = OemAxis::new(controller, 0);
+        let user = AsynUser::new(0);
+        assert!(axis.home(&user, 0.0, 3.0, 4.0, true).is_err());
+        assert!(axis.homed);
+        assert!(axis.move_absolute(&user, 7.0, 1.0, 3.0, 4.0).is_err());
+        assert!(!axis.homed);
+    }
+
     #[test]
     fn an_axis_of_a_missing_port_is_still_built() {
         let (handle, _) = SyncIOHandle::connect_port(
