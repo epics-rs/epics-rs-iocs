@@ -17,9 +17,11 @@
 use std::collections::BTreeMap;
 
 use async_opcua::types::{
-    Array, ByteString, DateTime, LocalizedText, QualifiedName, UAString, Variant,
-    VariantScalarTypeId, VariantTypeId, XmlElement,
+    Array, ByteString, LocalizedText, QualifiedName, UAString, Variant, VariantScalarTypeId,
+    VariantTypeId, XmlElement,
 };
+
+use crate::print::ua_print;
 
 /// `EnumChoices` (`DataElement.h:25`) — an enumeration's value → name map, as
 /// read from the server's type dictionary.
@@ -335,13 +337,12 @@ fn kind_name(v: &Variant) -> String {
 }
 
 /// The `%s %.*s` of the out-of-bounds line: the variant's type, then the
-/// value as `UA_print` renders it (empty for a variant without a type).
+/// value as `UA_print` renders it (`DataElementOpen62541Leaf.h:830-837`).
 fn describe(v: &Variant) -> String {
-    let printed = match (scalar_number(v), scalar_text(v)) {
-        (Some(n), _) => n.to_string(),
-        (_, Some(text)) => format!("'{text}'"),
-        _ if matches!(v, Variant::Empty) => String::new(),
-        _ => format!("{v:?}"),
+    let printed = match v {
+        // C skips `UA_print` for a variant without a type.
+        Variant::Empty => String::new(),
+        _ => ua_print(v).unwrap_or_else(|| format!("{v:?}")),
     };
     format!("{} {printed}", type_name(v))
 }
@@ -392,13 +393,13 @@ fn is_choice(choices: &EnumChoices, n: Number) -> bool {
 
 /// Read any variant as text (`readScalar(char*, len)`,
 /// `DataElementOpen62541Leaf.cpp:300-455`) — the stringin/stringout/lsi/lso path.
-///
-/// Deviation from the C, documented rather than reproduced: the C falls back to
-/// open62541's `UA_print` for every type kind it does not special-case, so the
-/// exact text of an exotic type (Guid, NodeId, StatusCode, ...) is that
-/// library's rendering. This port formats those with the `async-opcua` type's
-/// own `Display`, which is not byte-identical for every type.
+/// A kind with no text of its own is printed by `UA_print` (`:422-426`).
 pub fn read_string(v: &Variant, choices: Option<&EnumChoices>) -> ReadResult<String> {
+    let unsupported = || ReadError::UnsupportedKind {
+        kind: kind_name(v),
+        value: describe(v),
+        target: "epicsString",
+    };
     // An enumeration prints as its choice name; a value with no matching choice
     // falls through to the numeric text (`DataElementOpen62541Leaf.cpp:411-421`).
     if let (Some(choices), Some(n)) = (choices, scalar_number(v))
@@ -413,17 +414,10 @@ pub fn read_string(v: &Variant, choices: Option<&EnumChoices>) -> ReadResult<Str
         Variant::LocalizedText(lt) => lt.text.as_ref().to_string(),
         Variant::QualifiedName(qn) => qn.name.as_ref().to_string(),
         Variant::ByteString(bs) => hex_encode(bs.as_ref()),
-        Variant::DateTime(dt) => format_local_time(dt),
         // The C hands the raw byte(s) to the record's char buffer
         // (`DataElementOpen62541Leaf.cpp:402-409`).
         Variant::Byte(b) => String::from_utf8_lossy(&[*b]).into_owned(),
         Variant::SByte(b) => String::from_utf8_lossy(&[*b as u8]).into_owned(),
-        Variant::Boolean(b) => b.to_string(),
-        Variant::Float(x) => x.to_string(),
-        Variant::Double(x) => x.to_string(),
-        Variant::Guid(g) => g.to_string(),
-        Variant::NodeId(id) => id.to_string(),
-        Variant::StatusCode(s) => format!("{s}"),
         Variant::Array(a) if matches!(a.value_type, VariantScalarTypeId::Byte) => {
             let bytes: Vec<u8> = a
                 .values
@@ -435,16 +429,11 @@ pub fn read_string(v: &Variant, choices: Option<&EnumChoices>) -> ReadResult<Str
                 .collect();
             String::from_utf8_lossy(&bytes).into_owned()
         }
-        other => match scalar_number(other) {
-            Some(n) => n.to_string(),
-            None => {
-                return Err(ReadError::UnsupportedKind {
-                    kind: kind_name(other),
-                    value: describe(other),
-                    target: "epicsString",
-                });
-            }
-        },
+        // C dereferences the null type of a variant without a value (`:353`).
+        Variant::Empty => return Err(unsupported()),
+        Variant::Array(_) => return Err(unsupported()),
+        // All but a structure decoded into a generated type.
+        other => ua_print(other).ok_or_else(unsupported)?,
     })
 }
 
@@ -455,16 +444,6 @@ fn enum_choice_name(choices: &EnumChoices, n: Number) -> Option<&str> {
         Number::Float(_) => return None,
     };
     choices.get(&key).map(String::as_str)
-}
-
-/// The C prints a DateTime in *local* time — it adds
-/// `UA_DateTime_localTimeUtcOffset()` before formatting
-/// (`DataElementOpen62541Leaf.cpp:393-400`).
-fn format_local_time(dt: &DateTime) -> String {
-    dt.as_chrono()
-        .with_timezone(&chrono::Local)
-        .format("%Y-%m-%dT%H:%M:%S%.9f")
-        .to_string()
 }
 
 /// `printByteString` (`DataElementOpen62541Leaf.cpp:244-255`) — upper-case hex,
