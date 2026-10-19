@@ -880,8 +880,9 @@ enum Follow {
     Same,
     /// The PLC's value was copied into the record.
     Copied,
-    /// The PLC differs and FORCE keeps the record's value.
-    Forced,
+    /// The PLC differs and the record keeps its value: FORCE, or a DINT
+    /// ao whose breakpoint table cannot back-convert it.
+    Kept,
 }
 
 impl EtherIpDevice {
@@ -907,7 +908,7 @@ impl EtherIpDevice {
                 common.udf = 0;
                 !periodic
             }
-            Ok(Follow::Forced) => !periodic,
+            Ok(Follow::Kept) => !periodic,
             Ok(Follow::GetFailed | Follow::Same) | Err(_) => false,
         }
     }
@@ -947,11 +948,10 @@ impl EtherIpDevice {
                     return Ok(Follow::Same);
                 }
                 if force {
-                    return Ok(Follow::Forced);
+                    return Ok(Follow::Kept);
                 }
                 drop(data);
-                $copy(plc)?;
-                return Ok(Follow::Copied);
+                return $copy(plc);
             }};
         }
 
@@ -962,7 +962,9 @@ impl EtherIpDevice {
                     follow!(
                         cip::get_double(&data.buf, element),
                         |plc: &f64| *plc != val,
-                        |plc: f64| record.set_val(EpicsValue::Double(plc))
+                        |plc: f64| record
+                            .set_val(EpicsValue::Double(plc))
+                            .map(|()| Follow::Copied)
                     )
                 }
                 _ => {
@@ -970,11 +972,7 @@ impl EtherIpDevice {
                     follow!(
                         cip::get_dint(&data.buf, element),
                         |plc: &i32| *plc != rval,
-                        |plc: i32| if record.apply_raw_readback(plc) {
-                            Ok(())
-                        } else {
-                            record.set_val(EpicsValue::Long(plc))
-                        }
+                        |plc: i32| back_convert_ao(record, plc)
                     )
                 }
             },
@@ -986,7 +984,9 @@ impl EtherIpDevice {
                 follow!(
                     cip::get_lint(&data.buf, element),
                     |plc: &i64| *plc != val,
-                    |plc: i64| record.set_val(EpicsValue::Int64(plc))
+                    |plc: i64| record
+                        .set_val(EpicsValue::Int64(plc))
+                        .map(|()| Follow::Copied)
                 )
             }
             "bo" | "mbbo" | "mbboDirect" => {
@@ -996,9 +996,11 @@ impl EtherIpDevice {
                     get_bits(&data.buf, element, mask, bits),
                     |plc: &u32| *plc != rval,
                     |plc: u32| if record.apply_raw_readback(plc as i32) {
-                        Ok(())
+                        Ok(Follow::Copied)
                     } else {
-                        record.set_val(EpicsValue::Long(plc as i32))
+                        record
+                            .set_val(EpicsValue::Long(plc as i32))
+                            .map(|()| Follow::Copied)
                     }
                 )
             }
@@ -1010,7 +1012,9 @@ impl EtherIpDevice {
                 follow!(
                     cip::get_string(&data.buf, element, size),
                     |plc: &String| *plc != val,
-                    |plc: String| record.put_field_internal("VAL", EpicsValue::String(plc.into()))
+                    |plc: String| record
+                        .put_field_internal("VAL", EpicsValue::String(plc.into()))
+                        .map(|()| Follow::Copied)
                 )
             }
             _ => Ok(Follow::GetFailed),
@@ -1074,6 +1078,24 @@ fn read_waveform(
         }
     };
     Ok(Some(value))
+}
+
+/// check_ao_callback's DINT copy (devEtherIP.c:398-424), "copied from ao
+/// init": the raw value through the record's init convert into VAL, RVAL
+/// left as it was. A breakpoint table that cannot take it leaves VAL and
+/// UDF alone and raises nothing, and the record still processes.
+fn back_convert_ao(record: &mut dyn Record, raw: i32) -> CaResult<Follow> {
+    let rval = record.get_field("RVAL");
+    record.put_field("RVAL", EpicsValue::Long(raw))?;
+    let converted = record.dset_init_convert().is_some();
+    if let Some(rval) = rval {
+        record.put_field("RVAL", rval)?;
+    }
+    Ok(if converted {
+        Follow::Copied
+    } else {
+        Follow::Kept
+    })
 }
 
 fn nobt(record: &dyn Record) -> usize {
@@ -1506,6 +1528,29 @@ mod tests {
         }
         assert!(!real.data.lock().do_write);
         assert!(!dint.data.lock().do_write);
+    }
+
+    /// check_ao_callback's DINT back-convert breaks on a breakpoint table
+    /// that cannot take the PLC's value (devEtherIP.c:416-420): VAL, RVAL
+    /// and UDF stay as they were, nothing is raised, and the record still
+    /// processes.
+    #[test]
+    fn an_ao_whose_table_cannot_back_convert_keeps_its_value() {
+        use epics_rs::base::server::records::ao::AoRecord;
+        define_plc("aobpt", "127.0.0.1", 0);
+        let mut record = AoRecord::default();
+        record.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        let mut dev = EtherIpDevice::new("@aobpt D S 1", true);
+        dev.init(&mut record).unwrap();
+        let tag = dev.tag.clone().unwrap();
+        set_tag(&tag, CipType::Dint, &7i32.to_le_bytes());
+
+        let mut common = CommonFields::default();
+        assert!(dev.check_callback(&mut record, &mut common));
+        assert_eq!(common.udf, 1);
+        assert_eq!(record.get_field("RVAL"), Some(EpicsValue::Long(0)));
+        assert_eq!(record.get_field("VAL"), Some(EpicsValue::Double(0.0)));
+        assert_eq!(common.sevr, AlarmSeverity::NoAlarm);
     }
 
     /// check_bo_callback: the record's process forms RVAL from VAL and
