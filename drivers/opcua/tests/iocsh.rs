@@ -354,3 +354,22 @@ fn an_option_reaches_every_session_before_the_next_one() {
         );
     }
 }
+
+/// `SessionOpen62541::initHook` announces the autoconnect whatever the
+/// sessions want (`SessionOpen62541.cpp:2699`).
+#[tokio::test]
+async fn starting_the_sessions_announces_the_autoconnect() {
+    let registry = registry();
+    ioc::session_command(
+        &registry,
+        Some("S1"),
+        Some("opc.tcp://h:4840"),
+        &["autoconnect=n"],
+    );
+    assert_eq!(
+        lines(|| {
+            registry.start();
+        }),
+        ["OPC UA: Autoconnecting sessions\n"]
+    );
+}

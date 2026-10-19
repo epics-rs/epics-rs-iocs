@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_opcua::types::NodeId;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 
 use crate::client::UaConnector;
@@ -158,13 +159,14 @@ impl Registry {
             .collect()
     }
 
-    /// Start every session's worker. Called once, after `iocInit`, so that the
-    /// items of every record are in place before the first connection.
+    /// Start every session's worker (`SessionOpen62541::initHook`). Called once,
+    /// after `iocInit`, so that the items of every record are in place before
+    /// the first connection.
     ///
     /// An element record whose `opcuaItem` record failed its init *after* the
     /// element bound is reported here: init order is not load order in this
     /// port, so only now is the item known never to be adopted.
-    pub fn start(&self) -> usize {
+    pub fn start(&self) {
         let mut inner = self.inner.lock();
         for (name, item) in &inner.item_records {
             let item = item.lock();
@@ -181,12 +183,11 @@ impl Registry {
         }
 
         let workers = std::mem::take(&mut inner.workers);
-        let started = workers.len();
         drop(inner);
+        errlog_vprintf(format_args!("OPC UA: Autoconnecting sessions\n"));
         for worker in workers {
             tokio::spawn(worker.run());
         }
-        started
     }
 
     /// Bind one record to its item: a new item on a session or subscription, or

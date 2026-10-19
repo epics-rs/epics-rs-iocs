@@ -485,10 +485,7 @@ async fn main() -> CaResult<()> {
     // initial read covers all of them (`SessionOpen62541::initHook`).
     app = app.register_after_init({
         let registry = registry.clone();
-        move || {
-            let started = registry.start();
-            eprintln!("opcua: {started} session(s) started");
-        }
+        move || registry.start()
     });
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
