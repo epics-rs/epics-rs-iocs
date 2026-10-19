@@ -290,7 +290,7 @@ impl DrvMDriveAxis {
 impl Model1Motor for DrvMDriveAxis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.status.clone(), self.poll_failure())
     }
 }
 
@@ -590,6 +590,41 @@ mod tests {
         r.moving.store(true, Ordering::SeqCst);
         r.minus.store(true, Ordering::SeqCst);
         assert_eq!(r.poll_extra(), ["1DE=0"]);
+    }
+
+    /// drvMDrive.cc:639-725: a failed `motor_init` read stores the
+    /// GAIN_SUPPORT and EA_PRESENT `motor_init` sets on a drive with an
+    /// encoder, the first raising nothing (RETRY) and the next
+    /// CNTRL_COMM_ERR and RA_PROBLEM (:270-282).
+    #[test]
+    fn a_failed_init_read_keeps_what_motor_init_set() {
+        let (_line, io) = LineRig::new("mdriveInitFail", |_| String::new());
+        let controller = Arc::new(Mutex::new(MDriveController::new(io)));
+        let init = |signal, ident| {
+            DrvMDriveAxis::new(controller.clone(), 0, signal, ident).take_init_status()
+        };
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init(0, "MDI1E"), prepared);
+        assert_eq!(
+            init(1, "MDI1E"),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
+        assert_eq!(
+            init(2, "MDI1"),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..MotorStatus::default()
+            }
+        );
     }
 
     /// drvMDrive.cc:263-283: a first unanswered `PR MV` is RETRY (nothing
