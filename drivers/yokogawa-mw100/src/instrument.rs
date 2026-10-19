@@ -15,8 +15,7 @@ use epics_rs::base::server::database::DeviceDone;
 use epics_rs::base::server::driver_support::DriverSupport;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::fmt::Write as _;
-use std::io;
+use std::io::{self, Write as _};
 use std::net::{SocketAddrV4, TcpStream};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
@@ -312,16 +311,16 @@ impl Instrument {
 
     /// `mw100_channel_get_egu` (`drvMW100.c:1918-1935`): only `Signal`/`Math`
     /// have a case at all — `UNIT`'s own link grammar never reaches Comm/Const.
-    pub fn channel_get_egu(&self, family: ChannelFamily, channel: u32) -> String {
+    pub fn channel_get_egu(&self, family: ChannelFamily, channel: u32) -> Vec<u8> {
         let cache = self.cache();
         let idx = (channel - 1) as usize;
         match family {
             ChannelFamily::Signal => match cache.ch_type[idx] {
-                ChannelType::None | ChannelType::Unknown => String::new(),
+                ChannelType::None | ChannelType::Unknown => Vec::new(),
                 _ => cache.ch_info[idx].unit.clone(),
             },
             ChannelFamily::Math => cache.calc_info[idx].unit.clone(),
-            ChannelFamily::Comm | ChannelFamily::Const => String::new(),
+            ChannelFamily::Comm | ChannelFamily::Const => Vec::new(),
         }
     }
 
@@ -330,7 +329,7 @@ impl Instrument {
     /// port's single `Vec<ExprInfo>` (sized for the full 300-channel range)
     /// deliberately does not reproduce — see [`crate::codec`] docs on the
     /// buffer-overflow defect that split caused.
-    pub fn channel_get_expr(&self, channel: u32) -> String {
+    pub fn channel_get_expr(&self, channel: u32) -> Vec<u8> {
         self.cache().calc_expr[(channel - 1) as usize].expr.clone()
     }
 
@@ -441,13 +440,13 @@ impl Instrument {
     /// Two-way "empty"-or-string, simpler than GM10's three-way scheme —
     /// `sprintf(str,"empty")` is the C source's literal fallback
     /// (`drvMW100.c:1702-1703`).
-    pub fn module_string(&self, module: usize) -> String {
+    pub fn module_string(&self, module: usize) -> Vec<u8> {
         let cache = self.cache();
         let m = &cache.modules[module];
         if m.use_flag {
             m.module_string.clone()
         } else {
-            "empty".to_string()
+            b"empty".to_vec()
         }
     }
 
@@ -459,10 +458,10 @@ impl Instrument {
         cache.modules[module].model
     }
 
-    pub fn module_code(&self, module: usize) -> String {
+    pub fn module_code(&self, module: usize) -> Vec<u8> {
         let cache = self.cache();
         if !cache.modules[module].use_flag {
-            return String::new();
+            return Vec::new();
         }
         cache.modules[module].code.clone()
     }
@@ -588,8 +587,7 @@ impl Actor {
         match &raw {
             RawResponse::Error(bytes) => {
                 self.cache.lock().error.flag = true;
-                let text = String::from_utf8_lossy(bytes);
-                let Some(code) = parse_error_code(&text) else {
+                let Some(code) = parse_error_code(bytes) else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "malformed E1 error header",
@@ -684,7 +682,7 @@ impl Actor {
             let (model, code, speed, number) = classify_module_string(&line.set_message);
             let module = &mut cache.modules[line.index];
             module.use_flag = true;
-            module.module_string = String::from_utf8_lossy(&line.set_message).into_owned();
+            module.module_string = line.set_message.to_vec();
             module.model = model;
             module.code = code;
             module.speed = speed;
@@ -1050,6 +1048,7 @@ impl Registry {
         let Some(name) = device.filter(|d| valid_device_name(d)) else {
             return false;
         };
+        // ASCII by valid_device_name, so nothing is lost.
         let name = String::from_utf8_lossy(name).into_owned();
         if self.devices.lock().iter().any(|d| d.name == name) {
             return false;
@@ -1106,7 +1105,7 @@ fn valid_device_name(name: &[u8]) -> bool {
 /// `mw100_report` (`drvMW100.c:459-505`).
 impl DriverSupport for Registry {
     fn report(&self, level: i32) -> Option<Vec<u8>> {
-        let mut out = String::new();
+        let mut out = Vec::new();
         for (cnt, device) in self.devices.lock().iter().enumerate() {
             let _ = writeln!(
                 out,
@@ -1116,17 +1115,19 @@ impl DriverSupport for Registry {
                 device.instrument.peer_address
             );
             if level != 0 {
-                out.push_str("        Modules:\n");
+                out.extend_from_slice(b"        Modules:\n");
                 for (i, module) in device.instrument.cache().modules.iter().take(6).enumerate() {
                     if module.use_flag {
-                        let _ = writeln!(out, "        #{}: {}", i + 1, module.module_string);
+                        let _ = write!(out, "        #{}: ", i + 1);
+                        out.extend_from_slice(&module.module_string);
+                        out.push(b'\n');
                     } else {
                         let _ = writeln!(out, "        #{}: empty", i + 1);
                     }
                 }
             }
         }
-        Some(out.into_bytes())
+        Some(out)
     }
 }
 
@@ -1136,7 +1137,7 @@ impl DriverSupport for Registry {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::net::TcpListener;
 
     pub(crate) fn ascii_frame(body: &[u8]) -> Vec<u8> {
@@ -1405,7 +1406,10 @@ mod tests {
         let instrument = Instrument::connect_to(addr).unwrap();
 
         assert!(instrument.module_presence(0));
-        assert_eq!(instrument.channel_get_egu(ChannelFamily::Signal, 1), "DEGC");
+        assert_eq!(
+            instrument.channel_get_egu(ChannelFamily::Signal, 1),
+            b"DEGC"
+        );
         assert_eq!(instrument.analog_get(ChannelFamily::Signal, 1), 1.234);
         // float comm_input[]/constant[] (drvMW100.c:436-437) round atof.
         assert_eq!(
@@ -1445,6 +1449,61 @@ mod tests {
                 "SK?\r\n",
                 "CE0\r\n",
             ]
+        );
+    }
+
+    /// C copies the unit's text into the module string, code, unit and
+    /// expression byte for byte (drvMW100.c:587-631, :796-800, :984-988),
+    /// and the report and stringin records print those bytes.
+    #[test]
+    fn device_text_reaches_records_and_the_report_byte_for_byte() {
+        fn bytes(v: impl AsRef<[u8]>) -> Vec<u8> {
+            v.as_ref().to_vec()
+        }
+        let module = b"MX110-U\xffV-M06";
+        let mut cf0 = b"0xxx".to_vec();
+        cf0.extend_from_slice(module);
+        cf0.extend_from_slice(b"xxx");
+        cf0.extend_from_slice(module);
+        cf0.extend_from_slice(b"x\r\nE");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device(
+            listener,
+            vec![
+                b"E0\r\n".to_vec(),
+                ascii_frame(&cf0),
+                is0_all_zero(),
+                ascii_frame(b"N 0001DEG\xff ,003\n"),
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+                ascii_frame(b"xxx001xxxxA\xff1,\nE"),
+                one_record_fd1_binary(),
+                empty_fo1_binary(),
+                ascii_frame(b"xxx001,-7.5\nE"),
+                ascii_frame(b"xxx01,12.5\nE"),
+            ],
+        );
+        let instrument = Instrument::connect_to(addr).unwrap();
+        device.join().unwrap();
+
+        assert_eq!(bytes(instrument.module_string(0)), module);
+        assert_eq!(bytes(instrument.module_code(0)), b"U\xffV");
+        assert_eq!(
+            bytes(instrument.channel_get_egu(ChannelFamily::Signal, 1)),
+            b"DEG\xff"
+        );
+        assert_eq!(bytes(instrument.channel_get_expr(1)), b"A\xff1");
+
+        let registry = Registry::new();
+        registry.insert_connected("dau1", instrument);
+        let report = registry.report(1).unwrap();
+        let line = b"        #1: MX110-U\xffV-M06\n";
+        assert!(
+            report.windows(line.len()).any(|w| w == line),
+            "{}",
+            String::from_utf8_lossy(&report)
         );
     }
 
@@ -1493,7 +1552,7 @@ mod tests {
 
         let dau2 = registry.get("dau2").unwrap();
         assert!(dau2.tx.get().is_none());
-        assert_eq!(dau2.module_string(0), "MX110-UNV-M06");
+        assert_eq!(dau2.module_string(0), b"MX110-UNV-M06");
         assert!(!registry.init_mw100(Some(b"dau2"), Some(b"192.0.2.1")));
         assert_eq!(
             registry.report(1).unwrap(),
