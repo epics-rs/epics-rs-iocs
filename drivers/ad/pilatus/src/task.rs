@@ -123,10 +123,8 @@ async fn cmd_loop(mut w: Worker, mut rx: rt::CommandReceiver<Cmd>) {
                 pilatus_status(&mut w.ctx, &mut first_status_call, &mut version).await
             }
             Cmd::AbortAcquire => {
-                w.ctx
-                    .cam_write_read("camcmd k", CAMSERVER_DEFAULT_TIMEOUT)
-                    .await;
-                w.ctx.cam_write("K", CAMSERVER_DEFAULT_TIMEOUT).await;
+                w.ctx.cam_write_read("camcmd k", CAMSERVER_DEFAULT_TIMEOUT);
+                w.ctx.cam_write("K", CAMSERVER_DEFAULT_TIMEOUT);
                 // C: epicsThreadSleep(2) to let camserver stop acquiring.
                 rt::sleep(secs(2.0)).await;
                 let reason = w.ctx.ad.status_message;
@@ -135,15 +133,14 @@ async fn cmd_loop(mut w: Worker, mut rx: rt::CommandReceiver<Cmd>) {
             }
             Cmd::ImgPath(path) => {
                 w.ctx
-                    .cam_write_read(&cmd_imgpath(&path), CAMSERVER_DEFAULT_TIMEOUT)
-                    .await;
+                    .cam_write_read(&cmd_imgpath(&path), CAMSERVER_DEFAULT_TIMEOUT);
                 w.ctx.check_path().await;
                 w.ctx.callbacks().await;
             }
             Cmd::ReadBadPixelFile(file) => read_bad_pixel_file(&mut w, &file).await,
             Cmd::ReadFlatFieldFile(file) => read_flat_field_file(&mut w, &file).await,
             Cmd::Raw(cmd) => {
-                w.ctx.cam_write_read(&cmd, CAMSERVER_DEFAULT_TIMEOUT).await;
+                w.ctx.cam_write_read(&cmd, CAMSERVER_DEFAULT_TIMEOUT);
                 w.ctx.callbacks().await;
             }
         }
@@ -167,40 +164,35 @@ async fn set_acquire_params(ctx: &mut Ctx) {
         ival = 1;
         ctx.set_i32(ctx.ad.num_images, ival);
     }
-    ctx.cam_write_read(&cmd_nimages(ival), CAMSERVER_DEFAULT_TIMEOUT)
-        .await;
+    ctx.cam_write_read(&cmd_nimages(ival), CAMSERVER_DEFAULT_TIMEOUT);
 
     let mut ival = ctx.get_i32(ctx.ad.num_exposures).await.unwrap_or(0);
     if ival < 1 {
         ival = 1;
         ctx.set_i32(ctx.ad.num_exposures, ival);
     }
-    ctx.cam_write_read(&cmd_nexpframe(ival), CAMSERVER_DEFAULT_TIMEOUT)
-        .await;
+    ctx.cam_write_read(&cmd_nexpframe(ival), CAMSERVER_DEFAULT_TIMEOUT);
 
     let mut dval = ctx.get_f64(ctx.ad.acquire_time).await.unwrap_or(-1.0);
     if dval < 0.0 {
         dval = 1.0;
         ctx.set_f64(ctx.ad.acquire_time, dval);
     }
-    ctx.cam_write_read(&cmd_exptime(dval), CAMSERVER_DEFAULT_TIMEOUT)
-        .await;
+    ctx.cam_write_read(&cmd_exptime(dval), CAMSERVER_DEFAULT_TIMEOUT);
 
     let mut dval = ctx.get_f64(ctx.ad.acquire_period).await.unwrap_or(-1.0);
     if dval < 0.0 {
         dval = 2.0;
         ctx.set_f64(ctx.ad.acquire_period, dval);
     }
-    ctx.cam_write_read(&cmd_expperiod(dval), CAMSERVER_DEFAULT_TIMEOUT)
-        .await;
+    ctx.cam_write_read(&cmd_expperiod(dval), CAMSERVER_DEFAULT_TIMEOUT);
 
     let mut dval = ctx.get_f64(ctx.p.delay_time).await.unwrap_or(-1.0);
     if dval < 0.0 {
         dval = 0.0;
         ctx.set_f64(ctx.p.delay_time, dval);
     }
-    ctx.cam_write_read(&cmd_delay(dval), CAMSERVER_DEFAULT_TIMEOUT)
-        .await;
+    ctx.cam_write_read(&cmd_delay(dval), CAMSERVER_DEFAULT_TIMEOUT);
 
     let mut ival = ctx.get_i32(ctx.p.gap_fill).await.unwrap_or(-2);
     if !(-2..=0).contains(&ival) {
@@ -209,12 +201,11 @@ async fn set_acquire_params(ctx: &mut Ctx) {
     }
     // -2 means GapFill is not supported (single-element detector).
     if ival != -2 {
-        ctx.cam_write_read(&cmd_gapfill(ival), CAMSERVER_DEFAULT_TIMEOUT)
-            .await;
+        ctx.cam_write_read(&cmd_gapfill(ival), CAMSERVER_DEFAULT_TIMEOUT);
     }
 
     // Read back the pixel count-rate cut-off.
-    let status = ctx.cam_write_read("Tau", 5.0).await;
+    let status = ctx.cam_write_read("Tau", 5.0);
     if status == AsynStatus::Success
         && let Some(cutoff) = parse_tau_cutoff(ctx.from())
     {
@@ -242,7 +233,7 @@ async fn set_threshold(w: &mut Worker) {
     ctx.callbacks().await;
 
     // This command can take 96 seconds on a 6M.
-    let status = ctx.cam_write_read(&cmd, 110.0).await;
+    let status = ctx.cam_write_read(&cmd, 110.0);
     let new_status = if status != AsynStatus::Success {
         ADStatus::Error
     } else {
@@ -252,7 +243,7 @@ async fn set_threshold(w: &mut Worker) {
     ctx.set_i32(ctx.p.threshold_apply, 0);
 
     // Read back the actual threshold setting, in case we are out of bounds.
-    let status = ctx.cam_write_read("SetThreshold", 5.0).await;
+    let status = ctx.cam_write_read("SetThreshold", 5.0);
     if status == AsynStatus::Success
         && let Some(ev) = parse_threshold_ev(ctx.from())
     {
@@ -260,7 +251,7 @@ async fn set_threshold(w: &mut Worker) {
     }
 
     // Read back the actual energy setting.
-    let status = ctx.cam_write_read("SetEnergy", 5.0).await;
+    let status = ctx.cam_write_read("SetEnergy", 5.0);
     if status == AsynStatus::Success {
         let ev = parse_energy_setting(ctx.from());
         ctx.set_f64(ctx.p.energy, ev as f64 / 1000.0);
@@ -290,12 +281,10 @@ async fn reset_module_power(w: &mut Worker, version: (i32, i32, i32)) {
     w.ctx.set_str(reason, "Resetting module power");
     w.ctx.callbacks().await;
     let reset_time = w.ctx.get_i32(w.ctx.p.reset_power_time).await.unwrap_or(0);
-    w.ctx
-        .cam_write_read(
-            &cmd_reset_module_power(reset_time),
-            CAMSERVER_RESET_POWER_TIMEOUT + reset_time as f64,
-        )
-        .await;
+    w.ctx.cam_write_read(
+        &cmd_reset_module_power(reset_time),
+        CAMSERVER_RESET_POWER_TIMEOUT + reset_time as f64,
+    );
     // The threshold must be set after resetting module power.
     set_threshold(w).await;
 }
@@ -307,7 +296,7 @@ async fn pilatus_status(
     version: &mut (i32, i32, i32),
 ) {
     if *first_status_call {
-        let status = ctx.cam_write_read("version", 1.0).await;
+        let status = ctx.cam_write_read("version", 1.0);
         if status == AsynStatus::Success {
             if let Some(v) = parse_version(ctx.from()) {
                 ctx.set_str(ctx.p.tvx_version, v.version_string.clone());
@@ -329,7 +318,7 @@ async fn pilatus_status(
         *first_status_call = false;
     }
 
-    let status = ctx.cam_write_read("thread", 1.0).await;
+    let status = ctx.cam_write_read("thread", 1.0);
     if status == AsynStatus::Success {
         // Fixed (upstream-c-defects.md #12): resolve each channel independently
         // so a partial reply for one channel never leaks another channel's
@@ -795,12 +784,10 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
 
         // Reset the MX settings start angle.
         let start_angle = w.ctx.get_f64(w.ctx.p.start_angle).await.unwrap_or(0.0);
-        w.ctx
-            .cam_write_read(
-                &cmd_mx_f64("Start_angle", start_angle),
-                CAMSERVER_DEFAULT_TIMEOUT,
-            )
-            .await;
+        w.ctx.cam_write_read(
+            &cmd_mx_f64("Start_angle", start_angle),
+            CAMSERVER_DEFAULT_TIMEOUT,
+        );
 
         // Send the header string. This needs to be sent for each exposure.
         let header = w
@@ -808,8 +795,7 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
             .get_str(w.ctx.p.header_string, MAX_HEADER_STRING_LEN)
             .await;
         w.ctx
-            .cam_write_read(&cmd_header_string(&header), CAMSERVER_DEFAULT_TIMEOUT)
-            .await;
+            .cam_write_read(&cmd_header_string(&header), CAMSERVER_DEFAULT_TIMEOUT);
 
         let mut full_file_name = create_file_name(&mut w.ctx).await;
         let mode = TriggerMode::from_i32(trigger_mode);
@@ -832,10 +818,10 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
         w.ctx.set_str(reason, "Starting exposure");
         // Send the acquire command and wait for the 15 OK response. C discards
         // this status.
-        w.ctx.cam_write_read(&exposure_cmd, 2.0).await;
+        w.ctx.cam_write_read(&exposure_cmd, 2.0);
         // Do another read in case there is an ERR string at the end of the
         // input buffer.
-        status = w.ctx.cam_read(0.0).await;
+        status = w.ctx.cam_read(0.0);
 
         let mut array_callbacks = 0;
         multiple_file_next_image = 0;
@@ -863,7 +849,7 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
                 w.ctx.set_str(reason, "Waiting for 7OK response");
                 w.ctx.callbacks().await;
                 let timeout = ((num_exposures - 1) as f64 * acquire_period) + acquire_time;
-                status = w.ctx.cam_read(timeout + CAMSERVER_ACQUIRE_TIMEOUT).await;
+                status = w.ctx.cam_read(timeout + CAMSERVER_ACQUIRE_TIMEOUT);
                 if status != AsynStatus::Success {
                     acquire = false;
                     aborted = true;
@@ -871,10 +857,8 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
                         let reason = w.ctx.ad.status_message;
                         w.ctx
                             .set_str(reason, "Timeout waiting for camserver response");
-                        w.ctx
-                            .cam_write_read("camcmd k", CAMSERVER_DEFAULT_TIMEOUT)
-                            .await;
-                        w.ctx.cam_write("K", CAMSERVER_DEFAULT_TIMEOUT).await;
+                        w.ctx.cam_write_read("camcmd k", CAMSERVER_DEFAULT_TIMEOUT);
+                        w.ctx.cam_write("K", CAMSERVER_DEFAULT_TIMEOUT);
                     }
                     continue;
                 }
@@ -949,9 +933,10 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
 
             if num_images == 1 {
                 if mode == Some(TriggerMode::Alignment) {
-                    w.ctx
-                        .cam_write_read(&cmd_exposure(TriggerMode::Alignment, &full_file_name), 2.0)
-                        .await;
+                    w.ctx.cam_write_read(
+                        &cmd_exposure(TriggerMode::Alignment, &full_file_name),
+                        2.0,
+                    );
                 } else {
                     acquire = false;
                 }
@@ -977,16 +962,14 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
             let reason = w.ctx.ad.status_message;
             w.ctx.set_str(reason, "Waiting for 7OK response");
             w.ctx.callbacks().await;
-            status = w.ctx.cam_read(timeout).await;
+            status = w.ctx.cam_read(timeout);
             // On a timeout camserver could still be acquiring, so send a stop.
             if status == AsynStatus::Timeout {
                 let reason = w.ctx.ad.status_message;
                 w.ctx
                     .set_str(reason, "Timeout waiting for camserver response");
-                w.ctx
-                    .cam_write_read("camcmd k", CAMSERVER_DEFAULT_TIMEOUT)
-                    .await;
-                w.ctx.cam_write("K", CAMSERVER_DEFAULT_TIMEOUT).await;
+                w.ctx.cam_write_read("camcmd k", CAMSERVER_DEFAULT_TIMEOUT);
+                w.ctx.cam_write("K", CAMSERVER_DEFAULT_TIMEOUT);
                 aborted = true;
             }
         }
