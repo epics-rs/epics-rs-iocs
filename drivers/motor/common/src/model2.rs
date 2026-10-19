@@ -383,7 +383,7 @@ mod tests {
         use epics_rs::base::server::driver_support::find_driver_support;
         REPORTING.register_report(|level| format!("level {level}\n"));
         let drvet = find_driver_support("motorTestReport").unwrap();
-        assert_eq!(drvet.report(1).unwrap(), "level 1\n");
+        assert_eq!(drvet.report(1).unwrap(), b"level 1\n");
     }
 
     #[test]

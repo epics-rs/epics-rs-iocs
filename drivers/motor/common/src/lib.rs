@@ -81,8 +81,8 @@ pub fn register_driver_report(
 ) {
     struct Drvet<F>(F);
     impl<F: Fn(i32) -> String + Send + Sync + 'static> DriverSupport for Drvet<F> {
-        fn report(&self, level: i32) -> Option<String> {
-            Some((self.0)(level))
+        fn report(&self, level: i32) -> Option<Vec<u8>> {
+            Some((self.0)(level).into_bytes())
         }
     }
     register_driver_support(name, Arc::new(Drvet(report)));
