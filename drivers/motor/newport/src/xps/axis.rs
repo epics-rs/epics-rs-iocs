@@ -106,6 +106,8 @@ pub struct XpsAxis {
     moving: bool,
     /// The status the last poll left, C's parameter-library values.
     last_status: MotorStatus,
+    /// What the last write set, for [`AsynMotor::take_status_writes`].
+    status_writes: Vec<StatusWrite>,
     /// C's `pasynUser_`: the motor port and axis number every error line
     /// prints on and names as `[port,axis]`.
     trace: MotorTrace,
@@ -173,6 +175,7 @@ impl XpsAxis {
                 vbas_supported: false,
                 ..Default::default()
             },
+            status_writes: Vec::new(),
             trace,
         };
         // C reads the corrector into `xpsCorrectorInfo_`, which nothing here
@@ -818,7 +821,14 @@ impl AsynMotor for XpsAxis {
             return Err(e.into());
         }
         self.moving = true;
+        // XPSAxis.cpp:359, posted by the write's callParamCallbacks.
+        self.last_status.problem = false;
+        self.status_writes.push(StatusWrite::Problem(false));
         Ok(())
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 
     fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
@@ -1648,6 +1658,25 @@ mod tests {
             ["GroupStatusGet", "GroupStatusGet", "GroupHomeSearch"],
             "{log:?}"
         );
+    }
+
+    /// C home clears PROBLEM once GroupHomeSearch is sent (XPSAxis.cpp:359),
+    /// and the write posts it; a refused one returns before.
+    #[test]
+    fn home_clears_problem_once_the_search_is_sent() {
+        let (mut axes, line) = fake_line_axes("xps_home_problem", "MOTOR_T", "", false, &["G1.P1"]);
+        let mut axis = axes.remove(0);
+        let user = AsynUser::new(0);
+        *line.group_status.lock().unwrap() = 0;
+        assert!(axis.poll(&user).unwrap().problem, "status 0 is NOTINIT");
+        *line.fail.lock().unwrap() = "GroupHomeSearch";
+        assert!(axis.home(&user, 0.0, 1.0, 1.0, true).is_err());
+        assert_eq!(axis.take_status_writes(), []);
+        *line.fail.lock().unwrap() = "";
+        axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
+        assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(false)]);
+        *line.fail.lock().unwrap() = "GroupStatusGet";
+        assert!(!axis.poll(&user).unwrap().problem, "a failed poll keeps it");
     }
 
     /// XPSAxis.cpp:566-575 fails the poll on GroupStatusStringGet; :628 ignores
