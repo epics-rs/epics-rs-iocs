@@ -77,7 +77,6 @@ epics-rs-iocs/
 │   ├── ur-robot/               # Universal Robots arm (RTDE/script/dashboard/gripper)
 │   ├── love/                   # Love Controls PID controller (RS-485)
 │   ├── delaygen/               # SRS DG645 / Colby PDL-100A / Coherent SDG
-│   ├── syringepump/            # Teledyne ISCO / ISCO Modbus / Vindum pumps
 │   ├── microepsilon/           # capaNCDT6200 displacement sensor
 │   ├── yokogawa-gm10/          # Yokogawa GM10 data acquisition
 │   └── yokogawa-mw100/         # Yokogawa MW100 data acquisition
@@ -1069,8 +1068,7 @@ StreamDevice templates:
 | `teledynePumpH.template` | `Run`, `PistonUp`, `Stop`, `Remote`, `Local`, `PressSet`, `PressSeq`, `PressSend`, `MaxFlow`, `MaxFlowSeq`, `MaxFlowSend`, `Scanner`, `Vol`, `Pressure`, `PressSet_RBV`, `Flow`, `MaxFlow_RBV` (the last five each with `PARSE`/`Format` aSubs), `Status`, `Units`, `Mode`, `ID`, `Command`, `CmdProc`, `CmdReply`, `AlarmI`, `Refill`, `GetRefillLimit`, `SetRefillRate(+Calc)`, `SetDigitalOut`, `SetDigitalCalc1`, `AutoFillSeq1/2`, `ControlVentSeq/2` (44 records) |
 
 Modbus-wired templates (loaded directly by `iocs/syringepump-ioc`'s
-st.cmd against `drvModbusAsynConfigure` ports, not the `syringepump`
-driver crate):
+st.cmd against `drvModbusAsynConfigure` ports):
 
 | db template | Records |
 |---|---|

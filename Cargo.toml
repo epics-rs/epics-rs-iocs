@@ -65,7 +65,6 @@ members = [
     "drivers/delaygen",
     "drivers/love",
     "drivers/scaler974",
-    "drivers/syringepump",
     "drivers/microepsilon",
     "iocs/ad/eiger-ioc",
     "iocs/ad/mythen-ioc",

@@ -4398,13 +4398,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "syringepump"
-version = "0.1.0"
-dependencies = [
- "epics-rs",
-]
-
-[[package]]
 name = "syringepump-ioc"
 version = "0.1.0"
 dependencies = [
