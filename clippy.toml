@@ -1,0 +1,8 @@
+# A line printed with `eprint!` / `eprintln!` reaches stderr as one `write` per
+# format piece, so another thread's stdout line can land inside it. Non-test
+# code prints through `stderr_print!` / `stderr_println!` (`epics_rs::base`),
+# which stage the line whole first, as glibc's `fprintf` does.
+disallowed-macros = [
+    { path = "std::eprint", reason = "use stderr_print!: one write per line" },
+    { path = "std::eprintln", reason = "use stderr_println!: one write per line" },
+]
