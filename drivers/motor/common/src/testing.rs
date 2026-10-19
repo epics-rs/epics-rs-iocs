@@ -75,6 +75,12 @@ impl PortDriver for Line {
         self.base.set_output_eos(user.addr, eos);
         Ok(())
     }
+    fn get_input_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
+        Ok(self.base.input_eos(user.addr).to_vec())
+    }
+    fn get_output_eos(&self, user: &AsynUser) -> AsynResult<Vec<u8>> {
+        Ok(self.base.output_eos(user.addr).to_vec())
+    }
     fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         let reply = match &mut self.answer {
             Answer::Last(reply) => reply(&self.command),
