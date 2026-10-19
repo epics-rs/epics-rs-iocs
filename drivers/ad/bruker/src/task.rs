@@ -317,12 +317,12 @@ async fn publish_frame(
     // status socket — and then let readSFRM write NROWS*NCOLS pixels into it: a
     // frame file bigger than the reported geometry ran off the end of the
     // buffer. The array is the size of the frame that was actually read.
-    let data_size = image.data.len() * 4;
     // C dereferences a refused alloc unchecked (BISDetector.cpp:588); here the frame
-    // is dropped after the pool's limit line.
+    // is dropped after the pool's limit line. C allocates NDInt32 there, though
+    // DataType says UInt32, and readSFRM stores the unsigned pixels in it.
     let Ok(mut array) = ctx.pool.alloc_with(
         vec![NDDimension::new(image.cols), NDDimension::new(image.rows)],
-        NDDataBuffer::U32(image.data),
+        NDDataBuffer::I32(image.data.into_iter().map(|v| v as i32).collect()),
     ) else {
         return Ok(());
     };
@@ -334,29 +334,6 @@ async fn publish_frame(
         .await
         .unwrap_or_else(|_| SystemTime::now())
         .into();
-
-    set_params(
-        ctx,
-        vec![
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size_x,
-                0,
-                ParamValue::Int32(image.cols as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size_y,
-                0,
-                ParamValue::Int32(image.rows as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size,
-                0,
-                ParamValue::Int32(data_size as i32),
-            ),
-            ParamSetValue::new(ctx.ad_params.base.n_dimensions, 0, ParamValue::Int32(2)),
-        ],
-    )
-    .await;
 
     ctx.output.publish(array).await;
     Ok(())

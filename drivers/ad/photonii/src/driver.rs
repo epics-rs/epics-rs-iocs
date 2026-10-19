@@ -533,6 +533,88 @@ mod tests {
         );
     }
 
+    /// PhotonII.cpp:412 publishes every frame type but Dark, so an ADC0 frame
+    /// reaches the plugins.
+    #[test]
+    fn an_adc0_frame_is_published() {
+        use crate::types::FrameType;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use std::io::{BufRead, BufReader, Write};
+
+        let dir = std::env::temp_dir().join(format!("pii-adc0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // p2util: "OK" to every line; after a grab, the frame file and its
+        // `wrote N bytes to "<file>"` line.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut out = conn.try_clone().unwrap();
+            for line in BufReader::new(conn).lines() {
+                let line = line.unwrap();
+                out.write_all(b"OK\r\n").unwrap();
+                let words: Vec<&str> = line.split_whitespace().collect();
+                if words.first() != Some(&"grab") {
+                    continue;
+                }
+                let arg = |flag: &str| words[words.iter().position(|w| *w == flag).unwrap() + 1];
+                let file = format!("{}/{}_0001.raw", arg("--dstdir"), arg("--basename"));
+                std::thread::sleep(Duration::from_millis(200));
+                std::fs::write(&file, vec![0u8; crate::raw::frame_bytes()]).unwrap();
+                write!(
+                    out,
+                    "wrote {} bytes to \"{file}\"\r\n",
+                    crate::raw::frame_bytes()
+                )
+                .unwrap();
+            }
+        });
+
+        let ip = "PII_ADC0_IP";
+        let (ip_rt, _) = create_port_runtime(
+            &claim_port(ip).unwrap(),
+            DrvAsynIPPort::new_configured(ip, &addr.to_string(), false, false).unwrap(),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        // iocPhotonII/st.cmd's EOS.
+        let eos_user = || AsynUser::default().with_addr(0);
+        ip_rt
+            .port_handle()
+            .set_input_eos_blocking(eos_user(), b"\r\n")
+            .unwrap();
+        ip_rt
+            .port_handle()
+            .set_output_eos_blocking(eos_user(), b"\n")
+            .unwrap();
+        let cmd = SyncIOHandle::from_handle(ip_rt.port_handle().clone(), 0, Duration::from_secs(2));
+        let rt = create_photonii_detector(&claim_port("PII_ADC0").unwrap(), cmd, 1 << 26).unwrap();
+        let (tx, mut rx) = ndarray_channel("PII_ADC0_SINK", 4);
+        rt.connect_downstream(tx);
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let p = rt.ad_params;
+        sync.write_octet(p.base.file_path, dir.to_str().unwrap().as_bytes())
+            .unwrap();
+        sync.write_octet(p.base.file_name, b"adc").unwrap();
+        sync.write_int32(p.base.array_callbacks, 1).unwrap();
+        sync.write_int32(rt.params.num_darks, 1).unwrap();
+        sync.write_int32(p.frame_type, FrameType::Adc0 as i32)
+            .unwrap();
+        sync.write_int32(p.acquire, 1).unwrap();
+
+        let (got_tx, got_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = got_tx.send(rx.blocking_recv());
+        });
+        let frame = got_rx.recv_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(frame, Ok(Some(_))),
+            "no ADC0 frame reached the plugins"
+        );
+        std::mem::forget((ip_rt, rt));
+    }
+
     /// PhotonII.cpp:117: MaxSize is the sensor, 768 x 1024.
     #[test]
     fn max_size_is_the_sensor() {

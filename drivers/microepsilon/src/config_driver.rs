@@ -52,7 +52,7 @@ use epics_rs::asyn::user::AsynUser;
 use crate::wire_config as wire;
 
 /// asyn reason used for octet transactions against the underlying serial/IP
-/// port (mirrors `love`/`syringepump`/`delaygen`'s `OCTET_REASON`/transport
+/// port (mirrors `love`/`delaygen`'s `OCTET_REASON`/transport
 /// convention in this workspace).
 const TRANSPORT_REASON: usize = 0;
 
@@ -98,8 +98,8 @@ enum Command {
 
 /// Command name (the `drvInfo` string a db link's `@asyn(port,0)
 /// CommandName` supplies), matched case-insensitively. Position in this
-/// table *is* the asyn reason, 0-based (mirrors `drivers/syringepump`'s
-/// `COMMAND_NAMES` convention) -- one entry per `capaNCDT6200.proto` block.
+/// table *is* the asyn reason, 0-based -- one entry per
+/// `capaNCDT6200.proto` block.
 const TRIGGER_NAMES: &[(&str, Command)] = &[
     ("GrabWelcomeText", Command::GrabWelcomeText),
     ("QueryVer", Command::QueryVer),
