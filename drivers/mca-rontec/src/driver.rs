@@ -921,8 +921,8 @@ mod tests {
             Ok(())
         }
 
-        fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
-            self.input_eos.clone()
+        fn get_input_eos(&self, _user: &AsynUser) -> AsynResult<Vec<u8>> {
+            Ok(self.input_eos.clone())
         }
     }
 
