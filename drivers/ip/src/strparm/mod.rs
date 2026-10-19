@@ -13,7 +13,7 @@ use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
+use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::{AsynUser, timeout_from_secs};
 use epics_rs::base::calc::engine::scanf::sscanf;
@@ -237,19 +237,16 @@ impl CellBody for Job {
             if let Err(e) = port.call(&RequestOp::SetInputEos { eos }, self.user()) {
                 self.eos_failed("setInputEos", &e);
             }
-            let read = port.call(
-                &RequestOp::OctetRead {
-                    buf_size: self.nchar,
-                },
-                self.user(),
-            );
-            (ex.status, ex.read) = match read {
-                Ok(r) => (0, r.data.unwrap_or_default()),
-                Err(e) => (
-                    e.c_status_code(),
-                    e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
-                ),
-            };
+            let (read, status) = port
+                .octet_read(
+                    OctetReadOp::Read {
+                        buf_size: self.nchar,
+                    },
+                    self.user(),
+                )
+                .into_parts();
+            ex.read = read;
+            ex.status = status.map_or_else(|e| e.c_status_code(), |()| 0);
         }
     }
 
@@ -652,8 +649,8 @@ impl DeviceSupport for DevStrParm {
 #[cfg(test)]
 mod tests {
     use epics_rs::asyn::error::AsynResult;
-    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
-    use epics_rs::asyn::request::RequestResult;
+    use epics_rs::asyn::interpose::EomReason;
+    use epics_rs::asyn::request::{OctetRead, RequestResult};
     use epics_rs::base::server::records::ai::AiRecord;
     use epics_rs::base::server::records::ao::AoRecord;
     use epics_rs::base::server::records::bi::BiRecord;
@@ -722,22 +719,22 @@ mod tests {
                 RequestOp::OctetWrite { data } => {
                     format!("write {:?}", String::from_utf8_lossy(data))
                 }
-                RequestOp::OctetRead { buf_size } => format!("read {buf_size}"),
+                RequestOp::OctetRead { buf_size, .. } => format!("read {buf_size}"),
                 other => format!("{other:?}"),
             });
             match op {
-                RequestOp::OctetRead { .. } if self.timeout => Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "timeout".into(),
+                RequestOp::OctetRead { .. } => {
+                    let status = if self.timeout {
+                        Err(AsynError::Status {
+                            status: AsynStatus::Timeout,
+                            message: "timeout".into(),
+                        })
+                    } else {
+                        Ok(())
+                    };
+                    let read = OctetRead::new(self.reply.clone(), EomReason::empty(), status);
+                    Ok(RequestResult::octet_read(read, 0))
                 }
-                .with_partial_read(PartialOctetRead {
-                    data: self.reply.clone(),
-                    eom_reason: EomReason::empty(),
-                })),
-                RequestOp::OctetRead { .. } => Ok(RequestResult::octet_read(
-                    self.reply.clone(),
-                    self.reply.len(),
-                )),
                 _ => Ok(RequestResult::write_ok()),
             }
         }

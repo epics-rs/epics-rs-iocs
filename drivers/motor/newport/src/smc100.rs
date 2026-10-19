@@ -69,7 +69,11 @@ impl Smc100Axis {
 
     /// Write a command and read the reply (C `writeReadController`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        let reply = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let (reply, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        status?;
         Ok(String::from_utf8_lossy(&reply).into_owned())
     }
 

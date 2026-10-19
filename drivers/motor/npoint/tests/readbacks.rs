@@ -37,7 +37,11 @@ impl PortDriver for Wire {
         self.frame = data.to_vec();
         Ok(data.len())
     }
-    fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn io_read_octet(
+        &mut self,
+        _user: &AsynUser,
+        buf: &mut [u8],
+    ) -> epics_rs::asyn::interpose::OctetReadResult {
         // `A0`, the register, the value, `EOS`.
         let mut reply = self.frame.get(..5).unwrap_or_default().to_vec();
         reply.extend_from_slice(&VALUE.to_le_bytes());
@@ -45,7 +49,10 @@ impl PortDriver for Wire {
         let n = reply.len().min(buf.len());
         buf[..n].copy_from_slice(&reply[..n]);
         self.frame.clear();
-        Ok(n)
+        epics_rs::asyn::interpose::OctetReadResult::ok(
+            n,
+            epics_rs::asyn::interpose::EomReason::empty(),
+        )
     }
 }
 

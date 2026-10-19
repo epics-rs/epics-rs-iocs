@@ -2760,10 +2760,17 @@ mod one_poller {
             fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
                 Ok(data.len())
             }
-            fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            fn io_read_octet(
+                &mut self,
+                _: &AsynUser,
+                buf: &mut [u8],
+            ) -> epics_rs::asyn::interpose::OctetReadResult {
                 let n = self.1.len().min(buf.len());
                 buf[..n].copy_from_slice(&self.1.as_bytes()[..n]);
-                Ok(n)
+                epics_rs::asyn::interpose::OctetReadResult::ok(
+                    n,
+                    epics_rs::asyn::interpose::EomReason::empty(),
+                )
             }
         }
         let base = PortDriverBase::new(

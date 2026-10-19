@@ -24,7 +24,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{PortCalls, RequestOp};
+use epics_rs::asyn::request::{OctetReadOp, PortCalls, RequestOp};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::task::CallbackPriority;
@@ -56,22 +56,13 @@ struct OctetRead {
 }
 
 fn octet_read(port: &mut dyn PortCalls, user: AsynUser, size: usize) -> OctetRead {
-    match port.call(&RequestOp::OctetRead { buf_size: size }, user) {
-        Ok(r) => OctetRead {
-            data: r.data.unwrap_or_default(),
-            eom: r.eom_reason,
-            err: None,
-        },
-        Err(e) => {
-            let (data, eom) = e
-                .partial_read()
-                .map_or((Vec::new(), 0), |p| (p.data.clone(), p.eom_reason.bits()));
-            OctetRead {
-                data,
-                eom,
-                err: Some(e),
-            }
-        }
+    let read = port.octet_read(OctetReadOp::Read { buf_size: size }, user);
+    let eom = read.eom().bits();
+    let (data, status) = read.into_parts();
+    OctetRead {
+        data,
+        eom,
+        err: status.err(),
     }
 }
 

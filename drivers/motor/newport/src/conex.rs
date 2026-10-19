@@ -312,9 +312,16 @@ fn write_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
 }
 
 fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
-    // C writeReadController: pasynOctetSyncIO->writeRead.
-    let reply = handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-    Ok(String::from_utf8_lossy(&reply).into_owned())
+    let (reply, status) = exchange(handle, cmd);
+    status.map(|()| reply)
+}
+
+/// C `writeReadController`: `inString_` beside the status. The EOS layer
+/// NUL-terminates the buffer on every read, so a failed read leaves the bytes
+/// it delivered, which the callers that ignore the status parse.
+fn exchange(handle: &SyncIOHandle, cmd: &str) -> (String, AsynResult<()>) {
+    let (reply, status) = handle.write_read(0, cmd.as_bytes(), READ_BUF).into_parts();
+    (String::from_utf8_lossy(&reply).into_owned(), status)
 }
 
 /// A Newport CONEX single-axis driver implementing [`AsynMotor`].
@@ -366,10 +373,10 @@ impl AxisReport for ConexAxisReport {
         if level <= 0 {
             return;
         }
-        // C ignores each read's status; a failed one reads as 0.
+        // C ignores each read's status and parses what arrived.
         let read = |code: &str| {
-            let reply = write_read_raw(&self.handle, &query(self.controller_id, code));
-            parse_value_at(&reply.unwrap_or_default(), 3).unwrap_or(0.0)
+            let (reply, _) = exchange(&self.handle, &query(self.controller_id, code));
+            parse_value_at(&reply, 3).unwrap_or(0.0)
         };
         let mut gains = self.gains.lock().unwrap_or_else(|e| e.into_inner());
         if matches!(
@@ -422,10 +429,9 @@ impl ConexAxis {
     /// `trace` is C's `pasynUserSelf`.
     pub fn new(handle: SyncIOHandle, controller_id: i32, trace: &MotorTrace) -> Option<Self> {
         let handle = Arc::new(handle);
-        // C writeReadController status is ignored past VE, and a failed read
-        // leaves an empty reply that atof reads as 0.
-        let reply =
-            |cmd: &str| write_read_raw(&handle, &query(controller_id, cmd)).unwrap_or_default();
+        // C writeReadController status is ignored past VE: a failed read is
+        // parsed for what it delivered, and atof reads nothing as 0.
+        let reply = |cmd: &str| exchange(&handle, &query(controller_id, cmd)).0;
         let value_at = |cmd: &str, at: usize| parse_value_at(&reply(cmd), at).unwrap_or(0.0);
 
         // Firmware version → model. C reads `&inString_[4]` for the VE reply
@@ -546,11 +552,12 @@ impl ConexAxis {
         write_read_raw(&self.handle, cmd)
     }
 
-    /// C `AG_CONEXAxis::getClosedLoop`.
-    fn get_closed_loop(&self) -> AsynResult<bool> {
-        let resp = self.write_read(&query(self.controller_id, "MM?"))?;
-        // AG_CONEX.cpp:430 reads an uninitialised status on a bad reply, a C defect.
-        parse_closed_loop(&resp).ok_or_else(|| parse_error("MM?"))
+    /// C `AG_CONEXAxis::getClosedLoop`: the `MM?` reply parsed whatever the
+    /// exchange returned, beside its status. AG_CONEX.cpp:430 reads an
+    /// uninitialised status on a bad reply, a C defect; that is `None` here.
+    fn get_closed_loop(&self) -> (Option<bool>, AsynResult<()>) {
+        let (resp, status) = exchange(&self.handle, &query(self.controller_id, "MM?"));
+        (parse_closed_loop(&resp), status)
     }
 
     /// `stepSize_`, refused at 0 or non-finite (module Units note).
@@ -681,7 +688,8 @@ impl AsynMotor for ConexAxis {
             return Ok(());
         }
         let max = self.model.gain_max();
-        let was_closed = self.get_closed_loop()?;
+        // C ignores getClosedLoop's status (AG_CONEX.cpp:442/459/476).
+        let was_closed = self.get_closed_loop().0.unwrap_or(false);
         self.write(&cmd_set_closed_loop(self.controller_id, false))?;
 
         let cmd = match kind {
@@ -725,7 +733,9 @@ impl AsynMotor for ConexAxis {
         .ok_or_else(|| parse_error("TS"))?;
 
         // Power-on = closed-loop enabled (MM?).
-        let powered = self.get_closed_loop()?;
+        let (powered, mm) = self.get_closed_loop();
+        mm?;
+        let powered = powered.ok_or_else(|| parse_error("MM?"))?;
 
         Ok(MotorStatus {
             position,
@@ -745,6 +755,43 @@ impl AsynMotor for ConexAxis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+
+    /// AG_CONEX.cpp:217-268 and :442 ignore writeReadController's status
+    /// past VE and parse `inString_`, so replies cut by a timeout still set
+    /// the step size and limits, and a gain write still restores the closed
+    /// loop `MM?` reported.
+    #[test]
+    fn replies_cut_by_a_timeout_are_still_parsed() {
+        let (line, io) = LineRig::cut(
+            "conex_cut",
+            |last| {
+                match last {
+                    "1VE" => "1VE CONEX-CC 2.0",
+                    "1SU?" => "1SU0.0001",
+                    "1SL?" => "1SL-12.5",
+                    "1SR?" => "1SR12.5",
+                    "1MM?" => "1MM33",
+                    _ => "",
+                }
+                .to_string()
+            },
+            |last| last != "1VE",
+        );
+        let mut axis = ConexAxis::new(io, 1, &MotorTrace::new("conex_cut", 0)).unwrap();
+        assert_eq!(
+            (axis.step_size, axis.low_limit, axis.high_limit),
+            (0.0001, -12.5, 12.5)
+        );
+        line.sent();
+        axis.set_pid_gain(&AsynUser::default(), PidGainKind::Proportional, 0.5)
+            .unwrap();
+        let sent = line.sent();
+        assert_eq!(
+            sent.last().map(String::as_str),
+            Some(cmd_set_closed_loop(1, true).as_str()),
+            "{sent:?}"
+        );
+    }
 
     /// AG_CONEX.cpp: a CONEX-CC's stepSize_ is SU? / 1; moves, VA and AC
     /// are steps * stepSize_, TP / stepSize_, the jog target the soft limit

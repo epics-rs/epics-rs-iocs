@@ -155,33 +155,23 @@ impl PmacIpInterpose {
     }
 
     /// Ask the PMAC whether it has response data waiting (C `pmacReadReady`).
-    /// Returns false on any I/O failure, as C does.
+    /// Only a successful 2-byte reply says yes; C reads that reply even when
+    /// the request write failed (:422-431).
     fn read_ready(&mut self, user: &AsynUser, next: &mut dyn OctetNext) -> bool {
         let mut u = probe_user(user);
         // C sends wLength = htons(2) — the size of the reply it then reads.
-        if next
-            .write(&mut u, &header(VR_UPLOAD, VR_PMAC_READREADY, 0, 0, 2))
-            .is_err()
-        {
-            return false;
-        }
+        let _ = next.write(&mut u, &header(VR_UPLOAD, VR_PMAC_READREADY, 0, 0, 2));
         let mut reply = [0u8; 2];
-        match next.read(user, &mut reply) {
-            Ok(r) => r.nbytes_transferred == 2 && reply[0] != 0,
-            Err(_) => false,
-        }
+        let r = next.read(user, &mut reply);
+        r.status.is_ok() && r.nbytes_transferred == 2 && reply[0] != 0
     }
 
     /// Ask the PMAC to send up to `maxchars` buffered response bytes
-    /// (C `sendPmacGetBuffer`).
-    fn get_buffer(
-        &mut self,
-        user: &AsynUser,
-        next: &mut dyn OctetNext,
-        maxchars: usize,
-    ) -> AsynResult<()> {
+    /// (C `sendPmacGetBuffer`). Both C callers overwrite its status with the
+    /// read that follows (:376/:381, :606/:608), so it returns none.
+    fn get_buffer(&mut self, user: &AsynUser, next: &mut dyn OctetNext, maxchars: usize) {
         let mut u = probe_user(user);
-        next.write(
+        let _ = next.write(
             &mut u,
             &header(
                 VR_UPLOAD,
@@ -190,63 +180,53 @@ impl PmacIpInterpose {
                 0,
                 maxchars.min(u16::MAX as usize) as u16,
             ),
-        )?;
-        Ok(())
-    }
-
-    /// C `thisRead`: what a read put in [`Self::in_buf`], which a failed read
-    /// carries in its error.
-    fn transferred(&mut self, result: &AsynResult<OctetReadResult>) -> usize {
-        match result {
-            Ok(r) => r.nbytes_transferred,
-            Err(e) => e.partial_read().map_or(0, |p| {
-                self.in_buf[..p.data.len()].copy_from_slice(&p.data);
-                p.data.len()
-            }),
-        }
+        );
     }
 
     /// Refill [`Self::in_buf`] from the socket (C `readResponse`). If the first
     /// read times out with nothing, poll `READREADY` and, if the PMAC says it
-    /// has data, issue a `GETBUFFER` and read once more.
+    /// has data, issue a `GETBUFFER` and read once more. C's `thisRead` and
+    /// status, both.
     fn read_response(
         &mut self,
         user: &AsynUser,
         next: &mut dyn OctetNext,
         maxchars: usize,
-    ) -> AsynResult<usize> {
+    ) -> (usize, AsynResult<()>) {
         let maxchars = maxchars.min(INPUT_SIZE);
         if maxchars == 0 {
-            return Ok(0);
+            return (0, Ok(()));
         }
 
         let mut result = next.read(user, &mut self.in_buf[..maxchars]);
-        let mut n = self.transferred(&result);
 
         // C: `status == asynTimeout && thisRead == 0 && pasynUser->timeout > 0`.
-        if n == 0
+        if result.nbytes_transferred == 0
             && result
+                .status
                 .as_ref()
-                .err()
-                .is_some_and(|e| e.status() == AsynStatus::Timeout)
+                .is_err_and(|e| e.status() == AsynStatus::Timeout)
             && user.timeout.is_some_and(|t| !t.is_zero())
             && self.read_ready(user, next)
         {
-            self.get_buffer(user, next, maxchars)?;
+            self.get_buffer(user, next, maxchars);
             result = next.read(user, &mut self.in_buf[..maxchars]);
-            n = self.transferred(&result);
         }
 
+        let n = result.nbytes_transferred;
+        let mut status = result.status;
         if n > 0 {
             // C: a timeout that still delivered bytes is a success.
+            if status
+                .as_ref()
+                .is_err_and(|e| e.status() == AsynStatus::Timeout)
+            {
+                status = Ok(());
+            }
             self.tail = 0;
             self.head = n;
-            return Ok(n);
         }
-        match result {
-            Ok(_) => Ok(0),
-            Err(e) => Err(e),
-        }
+        (n, status)
     }
 }
 
@@ -260,14 +240,10 @@ impl OctetInterpose for PmacIpInterpose {
         user: &AsynUser,
         buf: &mut [u8],
         next: &mut dyn OctetNext,
-    ) -> AsynResult<OctetReadResult> {
+    ) -> OctetReadResult {
         let maxchars = buf.len();
         if maxchars == 0 {
-            return Ok(OctetReadResult {
-                nbytes_transferred: 0,
-                eom_reason: EomReason::CNT,
-                taken_back: 0,
-            });
+            return OctetReadResult::ok(0, EomReason::CNT);
         }
 
         let mut n_read = 0usize;
@@ -316,37 +292,26 @@ impl OctetInterpose for PmacIpInterpose {
             // Buffer empty. On every refill after the first, prompt the PMAC for
             // more of the response before reading (C `readIt`, `!initialRead`).
             if !initial_read && self.read_ready(user, next) {
-                self.get_buffer(user, next, maxchars - n_read)?;
+                self.get_buffer(user, next, maxchars - n_read);
             }
-            let this_read = match self.read_response(user, next, maxchars - n_read) {
-                Ok(n) => n,
-                Err(e) => {
-                    status = Err(e);
-                    0
-                }
-            };
+            let this_read;
+            (this_read, status) = self.read_response(user, next, maxchars - n_read);
             initial_read = false;
             if status.is_err() || this_read == 0 {
                 break;
             }
         }
 
-        // C returns the partial data alongside the error status; the Rust
-        // signature is either/or, so bytes win — a message that terminated
-        // properly is a success even if a later probe read timed out.
-        if n_read > 0 {
-            return Ok(OctetReadResult {
-                nbytes_transferred: n_read,
-                eom_reason: EomReason::CNT,
-                taken_back: 0,
-            });
+        // C returns the bytes it gathered beside the status (:609-616).
+        let eom = if n_read > 0 {
+            EomReason::CNT
+        } else {
+            EomReason::empty()
+        };
+        OctetReadResult {
+            status,
+            ..OctetReadResult::ok(n_read, eom)
         }
-        status?;
-        Ok(OctetReadResult {
-            nbytes_transferred: 0,
-            eom_reason: EomReason::empty(),
-            taken_back: 0,
-        })
     }
 
     /// C `writeIt`.
@@ -462,7 +427,6 @@ pub fn pmac_asyn_ip_configure_command() -> CommandDef {
 mod tests {
     use super::*;
     use epics_rs::asyn::error::AsynError;
-    use epics_rs::asyn::interpose::PartialOctetRead;
 
     /// A base layer that replays a canned byte stream and records writes.
     struct MockBase {
@@ -470,6 +434,11 @@ mod tests {
         written: Vec<Vec<u8>>,
         /// Bytes the timeout after `to_read` runs dry still delivered.
         partial: Vec<u8>,
+        /// The first read fails with this status and nothing, ahead of
+        /// `to_read`.
+        fail_first: Option<AsynStatus>,
+        /// Writes of these `Request` codes fail (they are still recorded).
+        fail_writes: Vec<u8>,
     }
 
     impl MockBase {
@@ -478,39 +447,46 @@ mod tests {
                 to_read: reads.iter().map(|r| r.to_vec()).collect(),
                 written: Vec::new(),
                 partial: Vec::new(),
+                fail_first: None,
+                fail_writes: Vec::new(),
             }
         }
     }
 
+    fn read_failure(status: AsynStatus, n: usize) -> OctetReadResult {
+        OctetReadResult {
+            status: Err(AsynError::Status {
+                status,
+                message: "read failed".into(),
+            }),
+            ..OctetReadResult::ok(n, EomReason::empty())
+        }
+    }
+
     impl OctetNext for MockBase {
-        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        fn read(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            if let Some(status) = self.fail_first.take() {
+                return read_failure(status, 0);
+            }
             if self.to_read.is_empty() {
                 let partial = std::mem::take(&mut self.partial);
-                let err = AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "read timeout".into(),
-                };
-                if partial.is_empty() {
-                    return Err(err);
-                }
                 buf[..partial.len()].copy_from_slice(&partial);
-                return Err(err.with_partial_read(PartialOctetRead {
-                    data: partial,
-                    eom_reason: EomReason::empty(),
-                }));
+                return read_failure(AsynStatus::Timeout, partial.len());
             }
             let chunk = self.to_read.remove(0);
             let n = chunk.len().min(buf.len());
             buf[..n].copy_from_slice(&chunk[..n]);
-            Ok(OctetReadResult {
-                nbytes_transferred: n,
-                eom_reason: EomReason::empty(),
-                taken_back: 0,
-            })
+            OctetReadResult::ok(n, EomReason::empty())
         }
 
         fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             self.written.push(data.to_vec());
+            if self.fail_writes.contains(&data[1]) {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "write failed".into(),
+                });
+            }
             Ok(data.len())
         }
 
@@ -538,7 +514,8 @@ mod tests {
         assert_eq!(&base.written[0][HEADER_LEN..], b"#1 P\r");
 
         let mut buf = [0u8; 32];
-        let r = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        let r = stack.dispatch_read(&user, &mut buf, &mut base);
+        r.status.unwrap();
         assert_eq!(&buf[..r.nbytes_transferred], b"5\r");
         assert!(r.eom_reason.contains(EomReason::EOS));
     }
@@ -598,7 +575,8 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 64];
 
-        let r = layer.read(&user, &mut buf, &mut base).unwrap();
+        let r = layer.read(&user, &mut buf, &mut base);
+        r.status.unwrap();
         assert_eq!(&buf[..r.nbytes_transferred], b"100\r-100\r\x06");
     }
 
@@ -611,7 +589,8 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 64];
 
-        let r = layer.read(&user, &mut buf, &mut base).unwrap();
+        let r = layer.read(&user, &mut buf, &mut base);
+        r.status.unwrap();
         assert_eq!(&buf[..r.nbytes_transferred], b"\x07ERR003\r\x06");
     }
 
@@ -622,7 +601,8 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 64];
 
-        let r = layer.read(&user, &mut buf, &mut base).unwrap();
+        let r = layer.read(&user, &mut buf, &mut base);
+        r.status.unwrap();
         assert_eq!(&buf[..r.nbytes_transferred], b"\x02data\r\x06");
     }
 
@@ -633,7 +613,8 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 64];
 
-        let r = layer.read(&user, &mut buf, &mut base).unwrap();
+        let r = layer.read(&user, &mut buf, &mut base);
+        r.status.unwrap();
         assert_eq!(&buf[..r.nbytes_transferred], b"100\x06");
     }
 
@@ -650,7 +631,8 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 64];
 
-        let r = layer.read(&user, &mut buf, &mut base).unwrap();
+        let r = layer.read(&user, &mut buf, &mut base);
+        r.status.unwrap();
         assert_eq!(&buf[..r.nbytes_transferred], b"100\r-100\r\x06");
         // The probes went out as headers: READREADY then GETBUFFER.
         assert_eq!(base.written[0][1], 0xC2);
@@ -667,9 +649,103 @@ mod tests {
             AsynUser::default().with_timeout_opt(Some(std::time::Duration::from_millis(100)));
         let mut buf = [0u8; 64];
 
-        let r = layer.read(&user, &mut buf, &mut base).unwrap();
+        let r = layer.read(&user, &mut buf, &mut base);
+        r.status.unwrap();
         assert_eq!(&buf[..r.nbytes_transferred], b"100\r\x06");
         assert!(base.written.is_empty());
+    }
+
+    #[test]
+    fn a_zero_byte_timeout_polls_readready_and_reads_the_buffer() {
+        // C pmacAsynIPPort.c:371-382: nothing arrived in time, so ask the PMAC
+        // whether it holds a reply, fetch it with GETBUFFER and read again.
+        let mut layer = PmacIpInterpose::new();
+        let mut base = MockBase::new(&[b"\x01\x00", b"100\r\x06"]);
+        base.fail_first = Some(AsynStatus::Timeout);
+        let user =
+            AsynUser::default().with_timeout_opt(Some(std::time::Duration::from_millis(100)));
+        let mut buf = [0u8; 64];
+
+        let r = layer.read(&user, &mut buf, &mut base);
+        r.status.unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"100\r\x06");
+        assert_eq!(base.written[0][1], 0xC2); // VR_PMAC_READREADY
+        assert_eq!(base.written[1][1], 0xC5); // VR_PMAC_GETBUFFER
+    }
+
+    #[test]
+    fn a_failed_getbuffer_write_still_reads_the_reply() {
+        // C discards sendPmacGetBuffer's status in readResponse (:376-381)
+        // and readIt (:606-608), and pmacReadReady reads its reply after a
+        // failed request write (:422-431).
+        let mut layer = PmacIpInterpose::new();
+        let mut base = MockBase::new(&[b"\x01\x00", b"100\r\x06"]);
+        base.fail_first = Some(AsynStatus::Timeout);
+        base.fail_writes = vec![VR_PMAC_READREADY, VR_PMAC_GETBUFFER];
+        let user =
+            AsynUser::default().with_timeout_opt(Some(std::time::Duration::from_millis(100)));
+        let mut buf = [0u8; 64];
+
+        let r = layer.read(&user, &mut buf, &mut base);
+        r.status.unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"100\r\x06");
+
+        // A refill after the first: the reply's tail is still read.
+        let mut layer = PmacIpInterpose::new();
+        let mut base = MockBase::new(&[b"100\r", b"\x01\x00", b"-100\r\x06"]);
+        base.fail_writes = vec![VR_PMAC_READREADY, VR_PMAC_GETBUFFER];
+        let r = layer.read(&AsynUser::default(), &mut buf, &mut base);
+        r.status.unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"100\r-100\r\x06");
+    }
+
+    #[test]
+    fn a_zero_byte_timeout_with_no_timeout_set_does_not_poll() {
+        // C gates the poll on `pasynUser->timeout > 0`.
+        let mut layer = PmacIpInterpose::new();
+        let mut base = MockBase::new(&[]);
+        base.fail_first = Some(AsynStatus::Timeout);
+        let user = AsynUser::default().with_timeout_opt(Some(std::time::Duration::ZERO));
+        let mut buf = [0u8; 64];
+
+        let r = layer.read(&user, &mut buf, &mut base);
+        assert_eq!(r.nbytes_transferred, 0);
+        assert_eq!(
+            r.status.unwrap_err().status(),
+            AsynStatus::Timeout,
+            "the zero-byte timeout reaches the caller"
+        );
+        assert!(base.written.is_empty());
+    }
+
+    #[test]
+    fn a_zero_byte_failure_other_than_timeout_does_not_poll() {
+        // C polls only on `status == asynTimeout`.
+        let mut layer = PmacIpInterpose::new();
+        let mut base = MockBase::new(&[]);
+        base.fail_first = Some(AsynStatus::Error);
+        let user =
+            AsynUser::default().with_timeout_opt(Some(std::time::Duration::from_millis(100)));
+        let mut buf = [0u8; 64];
+
+        let r = layer.read(&user, &mut buf, &mut base);
+        assert_eq!(r.status.unwrap_err().status(), AsynStatus::Error);
+        assert!(base.written.is_empty());
+    }
+
+    #[test]
+    fn a_reply_cut_by_a_timeout_comes_back_beside_it() {
+        // C readIt returns `nRead` with readResponse's status (:609-616): the
+        // reply had begun, the refill timed out with nothing.
+        let mut layer = PmacIpInterpose::new();
+        let mut base = MockBase::new(&[b"100\r", b"\x00\x00"]);
+        let user =
+            AsynUser::default().with_timeout_opt(Some(std::time::Duration::from_millis(100)));
+        let mut buf = [0u8; 64];
+
+        let r = layer.read(&user, &mut buf, &mut base);
+        assert_eq!(&buf[..r.nbytes_transferred], b"100\r");
+        assert_eq!(r.status.unwrap_err().status(), AsynStatus::Timeout);
     }
 
     #[test]
@@ -679,7 +755,8 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 4];
 
-        let r = layer.read(&user, &mut buf, &mut base).unwrap();
+        let r = layer.read(&user, &mut buf, &mut base);
+        r.status.unwrap();
         assert_eq!(r.nbytes_transferred, 4);
         assert_eq!(&buf[..4], b"1234");
     }
@@ -693,7 +770,8 @@ mod tests {
         let user = AsynUser::default();
         let mut buf = [0u8; 3];
 
-        let r = layer.read(&user, &mut buf, &mut base).unwrap();
+        let r = layer.read(&user, &mut buf, &mut base);
+        r.status.unwrap();
         assert_eq!(r.nbytes_transferred, 3);
         assert_eq!(&buf[..3], b"\x07E\x06");
     }

@@ -18,7 +18,7 @@ use epics_rs::asyn::error::{AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{ParamSetValue, RequestOp, RequestResult};
+use epics_rs::asyn::request::{OctetRead, OctetReadOp, ParamSetValue, RequestOp, RequestResult};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -141,26 +141,18 @@ impl Camserver {
             let user = AsynUser::default()
                 .with_addr(CAM_ADDR)
                 .with_timeout(secs(ASYN_POLL_TIME));
-            status = match self.submit(
-                RequestOp::OctetRead {
-                    buf_size: MAX_MESSAGE_SIZE,
-                },
-                user,
-            ) {
-                Ok(result) => {
-                    let data = result.data.unwrap_or_default();
-                    self.from = String::from_utf8_lossy(&data).into_owned();
-                    AsynStatus::Success
-                }
-                Err(e) => {
-                    // C's asynOctetSyncIO null-terminates at `nbytesTransfered`,
-                    // which counts what a timed-out read still delivered.
-                    self.from = e.partial_read().map_or_else(String::new, |p| {
-                        String::from_utf8_lossy(&p.data).into_owned()
-                    });
-                    e.status()
-                }
+            let op = OctetReadOp::Read {
+                buf_size: MAX_MESSAGE_SIZE,
             };
+            let read = match self.port.port() {
+                Ok(port) => port.submit_octet_read_blocking(op, user),
+                Err(e) => OctetRead::failed(e),
+            };
+            // C's fromCamserver ends at `nbytesTransfered`, which counts what a
+            // timed-out read still delivered.
+            let (data, result) = read.into_parts();
+            self.from = String::from_utf8_lossy(&data).into_owned();
+            status = result.map_or_else(|e| e.status(), |()| AsynStatus::Success);
 
             // C checks for an abort delivered during the read, so the next
             // acquisition does not inherit it.
@@ -445,7 +437,7 @@ mod tests {
     use crate::task::Shared;
     use epics_rs::ad_core::runtime as rt;
     use epics_rs::asyn::error::AsynError;
-    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+    use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
     use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::create_port_runtime;
@@ -566,11 +558,7 @@ mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
-        fn io_read_octet_eom(
-            &mut self,
-            _user: &AsynUser,
-            buf: &mut [u8],
-        ) -> AsynResult<(usize, EomReason)> {
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             let (data, timed_out) = if self.reads.len() > 1 {
                 self.reads.pop_front().unwrap()
             } else {
@@ -578,19 +566,16 @@ mod tests {
             };
             buf[..data.len()].copy_from_slice(data);
             if !timed_out {
-                return Ok((data.len(), EomReason::EOS));
+                return OctetReadResult::ok(data.len(), EomReason::EOS);
             }
-            let err = AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "read timeout".into(),
-            };
-            if data.is_empty() {
-                return Err(err);
+            OctetReadResult {
+                nbytes_transferred: data.len(),
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }),
+                ..OctetReadResult::ok(0, EomReason::empty())
             }
-            Err(err.with_partial_read(PartialOctetRead {
-                data: data.to_vec(),
-                eom_reason: EomReason::empty(),
-            }))
         }
     }
 

@@ -1337,10 +1337,8 @@ impl PhytronController {
             return Err(7);
         }
         let frame = build_frame(self.ctrl_type, self.address, cmd);
-        let raw = self
-            .handle
-            .write_read(0, &frame, READ_BUF)
-            .map_err(|e| e.status() as i32)?;
+        let (raw, status) = self.handle.write_read(0, &frame, READ_BUF).into_parts();
+        status.map_err(|e| e.status() as i32)?;
         reply_bytes(&raw, ack_only)
     }
 
@@ -2176,10 +2174,17 @@ mod tests {
             self.written.lock().unwrap().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = std::mem::take(&mut self.reply);
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
@@ -2449,10 +2454,17 @@ mod tests {
             self.written.lock().unwrap().push(line);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = std::mem::take(&mut self.reply);
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 

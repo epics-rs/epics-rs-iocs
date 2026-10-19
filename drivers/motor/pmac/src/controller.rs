@@ -138,10 +138,11 @@ pub fn pmac_err(message: impl Into<String>) -> AsynError {
 /// command left the record believing it had been accepted. Here a `<BELL>` reply
 /// is an error.
 pub fn octet_write_read(handle: &SyncIOHandle, command: &str) -> AsynResult<String> {
-    checked_reply(
-        command,
-        handle.write_read(0, command.as_bytes(), PMAC_MAXBUF)?,
-    )
+    let (raw, status) = handle
+        .write_read(0, command.as_bytes(), PMAC_MAXBUF)
+        .into_parts();
+    status?;
+    checked_reply(command, raw)
 }
 
 pub(crate) fn checked_reply(command: &str, raw: Vec<u8>) -> AsynResult<String> {
@@ -237,34 +238,51 @@ impl PmacController {
     /// C `lowLevelWriteRead` with C's view of the reply: a `<BELL>` reply is
     /// a reply, for the queries whose `sscanf` then rejects it.
     pub(crate) fn reply(&self, command: &str) -> AsynResult<String> {
-        let raw = self.transfer(command)?;
-        Ok(String::from_utf8_lossy(&raw).trim_matches('\0').to_string())
+        let (reply, status) = self.exchange(command);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::reply`] whatever the status: C's `response`, which a failed
+    /// read leaves holding what it delivered.
+    pub(crate) fn exchange(&self, command: &str) -> (String, AsynResult<()>) {
+        let (raw, status) = self.exchange_raw(command);
+        let reply = String::from_utf8_lossy(&raw).trim_matches('\0').to_string();
+        (reply, status)
     }
 
     /// A failed transfer disconnects the low-level port (pmacController.cpp:
     /// 335-343): the rest of the pass fails at once instead of timing out
     /// command by command, and the port's autoconnect brings the line back.
     fn transfer(&self, command: &str) -> AsynResult<Vec<u8>> {
-        let handle = self
-            .handle
-            .as_ref()
-            .ok_or_else(|| pmac_err("no low level asynOctetSyncIO port"))?;
-        handle
+        let (raw, status) = self.exchange_raw(command);
+        status.map(|()| raw)
+    }
+
+    fn exchange_raw(&self, command: &str) -> (Vec<u8>, AsynResult<()>) {
+        let Some(handle) = self.handle.as_ref() else {
+            return (
+                Vec::new(),
+                Err(pmac_err("no low level asynOctetSyncIO port")),
+            );
+        };
+        let (raw, status) = handle
             .write_read(0, command.as_bytes(), PMAC_MAXBUF)
-            .inspect_err(|e| {
-                self.low.print(
-                    TraceMask::ERROR,
-                    0,
-                    format_args!(
-                        "pmacController::lowLevelWriteRead: Error from \
+            .into_parts();
+        let status = status.inspect_err(|e| {
+            self.low.print(
+                TraceMask::ERROR,
+                0,
+                format_args!(
+                    "pmacController::lowLevelWriteRead: Error from \
                          pasynOctetSyncIO->writeRead. command: {command}, status={}\n",
-                        e.c_status_code()
-                    ),
-                );
-                if let Ok(port) = handle.port() {
-                    let _ = port.disconnect_blocking();
-                }
-            })
+                    e.c_status_code()
+                ),
+            );
+            if let Ok(port) = handle.port() {
+                let _ = port.disconnect_blocking();
+            }
+        });
+        (raw, status)
     }
 
     /// Send a command whose reply carries no value (moves, jogs, set-position).

@@ -145,7 +145,8 @@ impl Pm500Controller {
     }
 
     fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd, READ_BUF)?;
+        let (raw, status) = self.handle.write_read(0, cmd, READ_BUF).into_parts();
+        status?;
         let reply = String::from_utf8_lossy(&raw).into_owned();
         if reply.starts_with("SE") {
             errlog_message("recv_mess(): PM500 system error.\n");
@@ -500,11 +501,17 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
-            Err(epics_rs::asyn::error::AsynError::Status {
-                status: epics_rs::asyn::error::AsynStatus::Timeout,
-                message: "timeout".into(),
-            })
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            _buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            epics_rs::asyn::interpose::OctetReadResult::failed(
+                epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Timeout,
+                    message: "timeout".into(),
+                },
+            )
         }
     }
 
@@ -566,10 +573,17 @@ mod tests {
             self.sent.lock().unwrap().push(cmd);
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
             let reply = std::mem::take(&mut self.reply);
             buf[..reply.len()].copy_from_slice(&reply);
-            Ok(reply.len())
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
         }
     }
 
