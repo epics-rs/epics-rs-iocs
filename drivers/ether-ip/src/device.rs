@@ -844,10 +844,7 @@ impl EtherIpDevice {
                 }
             }
             "stringout" | "lso" => {
-                let val = match record.get_field("VAL") {
-                    Some(EpicsValue::String(s)) => s.to_string(),
-                    _ => String::new(),
-                };
+                let val = string_val(record);
                 match cip::get_string(&data.buf, element, string_size(record)) {
                     Some(cur) if cur == val => false,
                     Some(_) => cip::put_string(&mut data.buf, &val),
@@ -1007,14 +1004,13 @@ impl EtherIpDevice {
             }
             "stringout" | "lso" => {
                 let size = string_size(record);
-                let val = match record.get_field("VAL") {
-                    Some(EpicsValue::String(s)) => s.to_string(),
-                    _ => String::new(),
-                };
+                let val = string_val(record);
+                // C `strcpy`s the whole string into VAL; lso's `set_val` is
+                // the dbGetLinkLS read, which cuts a string to 39 bytes.
                 follow!(
                     cip::get_string(&data.buf, element, size),
                     |plc: &String| *plc != val,
-                    |plc: String| record.set_val(EpicsValue::String(plc.into()))
+                    |plc: String| record.put_field_internal("VAL", EpicsValue::String(plc.into()))
                 )
             }
             _ => Ok(Follow::GetFailed),
@@ -1112,6 +1108,19 @@ fn string_size(record: &dyn Record) -> usize {
     match record.record_type() {
         "lsi" | "lso" => count_field(record, "SIZV"),
         _ => MAX_STRING_SIZE,
+    }
+}
+
+/// VAL as the string C compares and writes: stringout serves a String, lso
+/// its NUL-terminated char buffer.
+fn string_val(record: &dyn Record) -> String {
+    match record.get_field("VAL") {
+        Some(EpicsValue::String(s)) => s.to_string(),
+        Some(EpicsValue::CharArray(bytes)) => {
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        }
+        _ => String::new(),
     }
 }
 
@@ -1580,6 +1589,28 @@ mod tests {
         );
         dev.write(&mut record).unwrap();
         assert!(!tag.data.lock().do_write);
+        assert!(!dev.check_callback(&mut record, &mut common));
+    }
+
+    /// check_lso_callback copies the PLC's string whole up to SIZV, and
+    /// lso_write compares VAL's chars against it, so a string longer than a
+    /// DBR_STRING is taken once and not written back.
+    #[test]
+    fn an_lso_follows_and_compares_its_char_val() {
+        use epics_rs::base::server::records::lso::LsoRecord;
+        define_plc("lsolong", "127.0.0.1", 0);
+        let mut record = LsoRecord::default();
+        let mut dev = EtherIpDevice::new("@lsolong S S 1", true);
+        dev.init(&mut record).unwrap();
+        let tag = dev.tag.clone().unwrap();
+        let long = "y".repeat(60);
+        set_string_tag(&tag, &long);
+
+        let mut common = CommonFields::default();
+        assert!(dev.check_callback(&mut record, &mut common));
+        assert_eq!(string_val(&record), long);
+        dev.write(&mut record).unwrap();
+        assert!(!tag.data.lock().do_write, "lso wrote back");
         assert!(!dev.check_callback(&mut record, &mut common));
     }
 
