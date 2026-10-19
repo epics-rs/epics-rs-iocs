@@ -250,7 +250,11 @@ impl PIC662Axis {
         let mut axis = Self {
             controller,
             failure: PollFailure::NONE,
-            last_status: MotorStatus::default(),
+            // drvPIC662.cc:565-574 prepares no bits.
+            last_status: MotorStatus {
+                vbas_supported: false,
+                ..MotorStatus::default()
+            },
             strings: MoveStrings::default(),
             no_motion_count: 0,
             init_status: None,
@@ -311,7 +315,7 @@ impl PIC662Axis {
 impl Model1Motor for PIC662Axis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -493,6 +497,33 @@ mod tests {
             .into_iter()
             .filter(|l| l != "*ESR?" && l != "POS?")
             .collect()
+    }
+
+    /// drvPIC662.cc:235-250 exit stores what motor_init prepared (:565-574,
+    /// no bits), with both COMM_ERR bits once past RETRY; the port's
+    /// no-VBAS flag stays on it as on every poll.
+    #[test]
+    fn a_failed_init_read_keeps_what_motor_init_set() {
+        let (_line, io) = LineRig::new("pic662InitFail", |last| match last {
+            "*IDN?" => "E-662".into(),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(PIC662Controller::new(io).unwrap()));
+        let mut first = PIC662Axis::new(ctrl.clone());
+        let mut again = PIC662Axis::new(ctrl);
+        let prepared = MotorStatus {
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            again.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 
     /// devPIC662.cc:183-184: INIT as its own message.
