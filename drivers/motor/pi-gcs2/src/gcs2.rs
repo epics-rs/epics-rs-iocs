@@ -637,7 +637,8 @@ impl PIGCS2Controller {
 
     /// C `PIGCSController::init`: probe `VEL?` and discover the axes with
     /// `SAI?`. The constructor ignores its status, so a failed `SAI?` leaves
-    /// no axes.
+    /// no axes; the hexapod and E-517 `init`s return it before their own
+    /// steps (PIHexapodController.cpp:25-29, PIE517Controller.cpp:28-32).
     pub fn init(&mut self) {
         // C only checks the transport status of the VEL? probe, not its
         // content (any real controller reply — even an error message — means
@@ -649,7 +650,9 @@ impl PIGCS2Controller {
                 false
             }
         };
-        self.axis_names = self.find_connected_axes().unwrap_or_default();
+        if self.find_connected_axes().is_err() {
+            return;
+        }
         if self.model.is_hexapod() {
             self.init_hexapod();
         }
@@ -899,12 +902,15 @@ impl PIGCS2Controller {
         );
     }
 
-    /// `SAI?`: every connected axis name, one per reply line less its
-    /// trailing spaces (C `findConnectedAxes`).
-    fn find_connected_axes(&self) -> AsynResult<Vec<String>> {
+    /// `SAI?` into `axis_names`: every connected axis name, one per reply
+    /// line less its trailing spaces (C `findConnectedAxes`), those found
+    /// before a failure kept as C keeps `m_axesIDs`.
+    fn find_connected_axes(&mut self) -> AsynResult<()> {
+        self.axis_names.clear();
         if self.model.is_hexapod() {
             // PIHexapodController::findConnectedAxes asks nothing.
-            return Ok(["X", "Y", "Z", "U", "V", "W"].map(String::from).to_vec());
+            self.axis_names = ["X", "Y", "Z", "U", "V", "W"].map(String::from).to_vec();
+            return Ok(());
         }
         if self.model == Model::C702 {
             // PIC702Controller::findConnectedAxes: one word of one-char
@@ -913,15 +919,24 @@ impl PIGCS2Controller {
             if word.len() >= MAX_NR_AXES {
                 return Err(pigcs2_err(format!("{} axes in SAI? reply", word.len())));
             }
-            return Ok(word.chars().rev().map(String::from).collect());
+            self.axis_names = word.chars().rev().map(String::from).collect();
+            return Ok(());
         }
         let raw = self.send_and_receive("SAI?")?;
-        Ok(String::from_utf8_lossy(&raw)
+        let names = String::from_utf8_lossy(&raw)
             .split('\n')
             .map(|line| line.trim_end_matches(['\r', '\0', ' ']))
             .filter(|name| !name.is_empty())
             .map(String::from)
-            .collect())
+            .collect::<Vec<_>>();
+        for name in names {
+            // C keeps the axes found before the one past MAX_NR_AXES.
+            if self.axis_names.len() == MAX_NR_AXES {
+                return Err(pigcs2_err(format!("over {MAX_NR_AXES} axes in SAI? reply")));
+            }
+            self.axis_names.push(name);
+        }
+        Ok(())
     }
 
     /// C `getGCSError`: a non-zero code prints, with its message, once
@@ -3320,6 +3335,42 @@ mod tests {
                 "{idn}"
             );
         }
+    }
+
+    /// `PIGCSController::init` returns `findConnectedAxes`' status
+    /// (PIGCSController.cpp:702-706), and `PIE517Controller::init` returns
+    /// it before `TPC?` (PIE517Controller.cpp:28-32): a refused `SAI?`, or
+    /// a 65th axis, which keeps the first 64 (PIGCSController.cpp:729-737).
+    #[test]
+    fn an_e517_whose_axis_search_fails_sets_nothing_online() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::failing(
+            "gcs2E517NoSai",
+            |last| match last {
+                "TPC?" => "3".into(),
+                last => piezo_reply(last),
+            },
+            |cmd| cmd == "SAI?",
+        );
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2E517NoSai");
+        ctrl.set_model(Model::E517);
+        ctrl.init();
+        assert_eq!(sent_lines(&line), ["VEL?", "SAI?"]);
+        assert!(ctrl.axis_names().is_empty());
+
+        let (line, io) = LineRig::queued("gcs2E517Sai65", |cmd| match cmd {
+            "SAI?" => (0..65)
+                .map(|n| format!("A{n}{}", if n < 64 { " " } else { "" }))
+                .collect(),
+            "TPC?" => vec!["3".into()],
+            _ => vec!["0".into()],
+        });
+        let mut ctrl = PIGCS2Controller::new(io, "gcs2E517Sai65");
+        ctrl.set_model(Model::E517);
+        ctrl.init();
+        assert_eq!(sent_lines(&line), ["VEL?", "SAI?"]);
+        assert_eq!(ctrl.axis_names().len(), 64);
+        assert_eq!(ctrl.axis_names()[63], "A63");
     }
 
     /// An E-517 asks no `TRS?` or `FRF?` (PIE517Controller.h:35-36), halts
