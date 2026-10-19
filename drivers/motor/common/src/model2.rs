@@ -297,6 +297,10 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                     addr,
                 };
                 let opened = controller.open(user, axis.motor.clone())?;
+                let poster = opened
+                    .axis
+                    .status_poster()
+                    .ok_or("a model-2 open has no status poster")?;
                 records.push(opened.axis);
                 let wakeup = opened.poll_cmd_tx;
                 axis.log.attach(&port_name, addr);
@@ -305,6 +309,7 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                     axis.setter,
                     axis.getter,
                     wakeup,
+                    poster,
                 )));
             }
             if let Some(log) = &*driver.log.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -851,6 +856,57 @@ mod asyn_reads {
     }
 
     use std::future::Future;
+
+    /// devMotorAsyn's statusCallback is intCallback's genericPointer client:
+    /// every callback hands it the axis's status, a gain set's that changed
+    /// no status included, and a set that changed nothing calls nothing back
+    /// (drvMotorAsyn.c:822-920, paramLib.c:252-275).
+    #[epics_rs::base::epics_test]
+    async fn every_callback_posts_the_axis_status_to_the_motor_record() {
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::base::runtime::sync::mpsc;
+        use epics_rs::motor::device_state::AxisSubscribers;
+        use epics_rs::motor::device_support::MotorAxis;
+        use epics_rs::motor::poll_loop::ToAxis;
+
+        let params = Arc::new(Params::default());
+        let driver = Arc::new(Mutex::new(Stored(params.clone())));
+        let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let (motor_tx, mut posted) = mpsc::unbounded_channel();
+        let user = TraceUser::Model2 {
+            port: "postPort".into(),
+            addr: 0,
+        };
+        let timeout = std::time::Duration::from_secs(1);
+        let record = MotorAxis::new(
+            user,
+            driver.clone(),
+            timeout,
+            poll_tx.clone(),
+            motor_tx,
+            AxisSubscribers::new(),
+        );
+        let poster = record.status_poster().unwrap();
+        let axis = Axis::new(driver.clone(), driver, params.clone(), poll_tx, poster);
+        let mut port = DrvMotorAsyn::new("postPort", vec![Some(axis)]);
+        let mut next = || match posted.try_recv() {
+            Ok(ToAxis::Callback(status)) => Some(status),
+            Ok(other) => panic!("{other:?}"),
+            Err(_) => None,
+        };
+
+        // The driver's poll.
+        params.set_double(function::POSITION, 2.5).unwrap();
+        params.set_integer(function::DONE, 1).unwrap();
+        params.call_callback();
+        let polled = next().unwrap();
+        assert_eq!((polled.position, polled.done), (2.5, true));
+        let mut gain = AsynUser::new(function::P_GAIN as usize).with_addr(0);
+        port.write_float64(&mut gain, 0.75).unwrap();
+        assert_eq!(next(), Some(polled), "the gain set posted nothing");
+        port.write_float64(&mut gain, 0.75).unwrap();
+        assert_eq!(next(), None);
+    }
 
     static READ: Model2 = Model2::new("read", 0);
 
