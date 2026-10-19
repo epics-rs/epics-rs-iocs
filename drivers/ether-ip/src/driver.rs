@@ -667,10 +667,14 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
                     d.r_response = 4 + data.len();
                     // Estimate the write sizes from the read, as the C does:
                     // a write request is the read request plus the type+data
-                    // block, and its response is a bare MR header.
-                    let type_and_data = d.r_response - 4;
-                    d.w_request = d.r_request + type_and_data;
-                    d.w_response = 4;
+                    // block, and its response is a bare MR header. A reply
+                    // with no type and data gives none, and no scan reads
+                    // the tag.
+                    (d.w_request, d.w_response) = if data.is_empty() {
+                        (0, 0)
+                    } else {
+                        (d.r_request + data.len(), 4)
+                    };
                     crate::eip_printf!(
                         5,
                         "  tag '{}': req {}, resp {} bytes\n",
@@ -1339,6 +1343,29 @@ mod registry_tests {
             assert!(d.buf.is_empty());
         }
         assert!(rx.try_recv().is_err(), "no record was processed");
+        drop(c);
+        server.join().unwrap();
+    }
+
+    /// drvEtherIP.c:417-421: a probe reply without type and data gives the
+    /// tag no write sizes, which keeps it out of every scan.
+    #[test]
+    fn a_probe_reply_without_data_takes_the_tag_out_of_the_scan() {
+        let (port, server) = plc_answering(Some(vec![0xCC, 0, 0, 0]));
+        let plc = Arc::new(Plc::on_port("probeempty", "127.0.0.1", 0, port));
+        let tag = plc.add_tag(1.0, "T", 1).unwrap();
+        let mut c = Connection::startup(
+            "127.0.0.1",
+            port,
+            0,
+            Duration::from_secs(5),
+            encap::DEFAULT_BUFFER_LIMIT,
+        )
+        .unwrap();
+        assert!(complete_tag_infos(&plc, &mut c));
+        let d = tag.data.lock();
+        assert_eq!((d.r_response, d.w_request, d.w_response), (4, 0, 0));
+        drop(d);
         drop(c);
         server.join().unwrap();
     }
