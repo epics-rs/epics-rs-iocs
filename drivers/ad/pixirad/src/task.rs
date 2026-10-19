@@ -374,7 +374,6 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
 // ────────────────────────────────── status ───────────────────────────────────
 
 pub(crate) struct StatusContext {
-    pub status_port: u16,
     pub handle: PortHandle,
     pub ad_params: ADBaseParams,
     pub params: PixiradParams,
@@ -392,22 +391,33 @@ impl StatusContext {
     }
 }
 
-pub(crate) fn start_status_task(ctx: StatusContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PixiradStatusTask", move || status_loop(ctx))
+pub(crate) fn start_status_task(
+    status_port: u16,
+    ctx: StatusContext,
+) -> std::thread::JoinHandle<()> {
+    rt::run_thread_named("PixiradStatusTask", move || async move {
+        match udp::bind_status_socket(status_port) {
+            Ok(socket) => status_loop(socket, ctx).await,
+            // C returns here still holding the port lock, which wedges the
+            // port; only the task stops.
+            Err(e) => ctx.trace_error(&format!("pixirad:statusTask: {e}\n")),
+        }
+    })
+}
+
+/// The status task on a socket the caller already holds, so no other socket
+/// can take the port between a bind and the task's own.
+#[cfg(test)]
+pub(crate) fn start_status_task_on(
+    socket: std::net::UdpSocket,
+    ctx: StatusContext,
+) -> std::thread::JoinHandle<()> {
+    rt::run_thread_named("PixiradStatusTask", move || status_loop(socket, ctx))
 }
 
 /// Read the environmental broadcast, work out the dew point, and switch the
 /// cooling off if the box is in trouble (C `statusTask`).
-async fn status_loop(ctx: StatusContext) {
-    let socket = match udp::bind_status_socket(ctx.status_port) {
-        Ok(socket) => socket,
-        Err(e) => {
-            // C returns here still holding the port lock, which wedges the
-            // port; only the task stops.
-            ctx.trace_error(&format!("pixirad:statusTask: {e}\n"));
-            return;
-        }
-    };
+async fn status_loop(socket: std::net::UdpSocket, ctx: StatusContext) {
     // C blocked in `recvfrom` for ever; a timeout keeps the loop alive when the
     // box stops broadcasting.
     let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));

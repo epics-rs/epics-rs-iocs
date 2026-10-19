@@ -613,12 +613,14 @@ pub fn create_pixirad_detector(
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
 
-    let mut threads = vec![task::start_status_task(StatusContext {
+    let mut threads = vec![task::start_status_task(
         status_port,
-        handle: runtime_handle.port_handle().clone(),
-        ad_params,
-        params,
-    })];
+        StatusContext {
+            handle: runtime_handle.port_handle().clone(),
+            ad_params,
+            params,
+        },
+    )];
     // C starts the data tasks on an uninitialised sensor; without one there is
     // no frame to read.
     if let Some(sensor) = sensor {
@@ -907,17 +909,16 @@ mod tests {
                 .publish(handle.clone(), &epics_rs::asyn::registry::open_owner())
                 .unwrap();
             std::mem::forget(runtime);
-            let port = std::net::UdpSocket::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port();
-            task::start_status_task(StatusContext {
-                status_port: port,
-                handle: handle.clone(),
-                ad_params: ad,
-                params,
-            });
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = socket.local_addr().unwrap().port();
+            task::start_status_task_on(
+                socket,
+                StatusContext {
+                    handle: handle.clone(),
+                    ad_params: ad,
+                    params,
+                },
+            );
             Self {
                 handle,
                 ad,
