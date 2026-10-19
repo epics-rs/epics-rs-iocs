@@ -1,5 +1,7 @@
 //! The test process's stdout and stderr, captured into one file.
 
+#![allow(clippy::disallowed_macros, reason = "tests may keep eprint!")]
+
 /// Fds 1 and 2 into one file, so stdout and stderr lines keep the order they
 /// were printed in.
 pub struct Console {
