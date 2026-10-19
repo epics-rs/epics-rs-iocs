@@ -130,6 +130,10 @@ fn poller_loop(
             let mut snap = PollSnapshot::default();
             if let Ok(dev) = device.lock() {
                 'error: {
+                    // C reads every DIO_INFO_NUM_PORTS port (drvMultiFunction.cpp:
+                    // 2604-2631), but uldaq refuses the 2408's AUXPORT1/2 without
+                    // an expansion board (DioUsb24xx.cpp:41), so every C poll ends
+                    // there before any input is read. That C defect is not copied.
                     match dev.digital_in(uldaq_sys::AUXPORT) {
                         Ok(data) => snap.digital_input = Some(data),
                         Err(e) => {
