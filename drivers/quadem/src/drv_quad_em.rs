@@ -862,8 +862,9 @@ pub trait QuadEmDevice {
     /// `drvQuadEM::reset` is pure virtual; [`Self::base_reset`] is its body.
     fn reset(&mut self) -> AsynResult<()>;
     /// `drvQuadEM::exitHandler`, run at IOC exit by the hook
-    /// [`start_callback_task`] arms; the base does nothing (drvQuadEM.cpp:656).
-    fn exit_handler(&mut self) {}
+    /// [`start_callback_task`] arms. The base's is empty (drvQuadEM.cpp:656)
+    /// and every C driver overrides it, so each driver here states its own.
+    fn exit_handler(&mut self);
 
     /// C++ `drvQuadEM::writeInt32`. Every step runs whatever an earlier one
     /// returned, as C's `status |=` does; the first failure is what the record
@@ -1596,6 +1597,7 @@ mod tests {
         fn reset(&mut self) -> AsynResult<()> {
             self.step("reset")
         }
+        fn exit_handler(&mut self) {}
     }
 
     /// The status C's write returns, in its numbering, and its errorMessage.
