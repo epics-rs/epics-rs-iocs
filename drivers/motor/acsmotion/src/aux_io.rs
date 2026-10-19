@@ -83,8 +83,9 @@ impl PortDriver for SpiiPlusAuxIo {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
-        // C posts the callbacks of address 0 rather than of the channel
-        // written; the base posts the channel's.
+        // C posts address 0's callbacks (SPiiPlusAuxDriver.cpp:143) where
+        // writeFloat64 and the poller post the channel's (:193, :257): a C
+        // defect, not copied; the base posts the channel's.
         self.base.write_uint32_digital_param(user, value, mask)?;
         if user.reason == self.params.digital_output {
             let chan = self.base.get_address(user.addr, user.reason)?;
