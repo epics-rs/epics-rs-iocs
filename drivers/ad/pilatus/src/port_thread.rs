@@ -3,17 +3,18 @@
 //! the port's own thread, so a write queued behind one lands only after it.
 
 use epics_rs::ad_core::driver::ADStatus;
+use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::trace::TraceMask;
 
 use crate::camserver::CamParams;
 use crate::driver::PilatusDriver;
 use crate::protocol::{
-    cmd_delay, cmd_expperiod, cmd_exptime, cmd_gapfill, cmd_nexpframe, cmd_nimages,
+    cmd_delay, cmd_expperiod, cmd_exptime, cmd_gapfill, cmd_imgpath, cmd_nexpframe, cmd_nimages,
     cmd_reset_module_power, cmd_set_threshold, gain_index, parse_energy_setting, parse_tau_cutoff,
     parse_threshold_ev, parse_version, thread_channel_values,
 };
-use crate::types::{CAMSERVER_DEFAULT_TIMEOUT, CAMSERVER_RESET_POWER_TIMEOUT, TriggerMode};
+use crate::types::{CAMSERVER_DEFAULT_TIMEOUT, CAMSERVER_RESET_POWER_TIMEOUT, TriggerMode, secs};
 
 impl PilatusDriver {
     /// C `getIntegerParam`; `None` while the parameter is undefined.
@@ -38,9 +39,45 @@ impl PilatusDriver {
         self.ad.port_base.set_str(reason, value.into());
     }
 
+    /// C `writeCamserver`.
+    fn cam_write(&mut self, cmd: &str, timeout: f64) -> AsynStatus {
+        self.cam.write(&mut self.ad.port_base, cmd, timeout)
+    }
+
     /// C `writeReadCamserver`.
     pub(crate) fn cam_write_read(&mut self, cmd: &str, timeout: f64) -> AsynStatus {
         self.cam.write_read(&mut self.ad.port_base, cmd, timeout)
+    }
+
+    /// C's `ADAcquire = 0` branch while acquiring (pilatusDetector.cpp:1406-1416).
+    pub(crate) fn abort_acquire(&mut self) {
+        self.cam_write_read("camcmd k", CAMSERVER_DEFAULT_TIMEOUT);
+        self.cam_write("K", CAMSERVER_DEFAULT_TIMEOUT);
+        // Sleep for two seconds to allow acquisition to stop in camserver.
+        std::thread::sleep(secs(2.0));
+        let reason = self.ad.params.status_message;
+        self.set_str(reason, "Acquisition aborted");
+    }
+
+    /// C's `NDFilePath` branch of `writeOctet` (pilatusDetector.cpp:1612-1615).
+    pub(crate) fn img_path(&mut self, path: &str) {
+        self.cam_write_read(&cmd_imgpath(path), CAMSERVER_DEFAULT_TIMEOUT);
+        self.check_path();
+    }
+
+    /// C `asynNDArrayDriver::checkPath()` (asynNDArrayDriver.cpp:98-111).
+    fn check_path(&mut self) {
+        let base = self.ad.params.base;
+        let Ok(path) = self.ad.port_base.get_string_param(base.file_path, 0) else {
+            return;
+        };
+        let mut path = String::from_utf8_lossy(path).into_owned();
+        if path.is_empty() {
+            return;
+        }
+        let exists = check_path_str(&mut path);
+        self.set_str(base.file_path, path);
+        self.set_i32(base.file_path_exists, i32::from(exists));
     }
 
     /// C `setAcquireParams()`.

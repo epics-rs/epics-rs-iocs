@@ -36,7 +36,7 @@ use crate::protocol::{
     cmd_cbf_template_file, cmd_mx_f64, cmd_mx_i32, cmd_mx_pair, cmd_oscill_axis,
 };
 use crate::task::{Cmd, Shared, Worker, start_acq_task, start_cmd_task};
-use crate::types::{Event, TriggerMode};
+use crate::types::{CAMSERVER_DEFAULT_TIMEOUT, Event, TriggerMode};
 
 /// C `DRIVER_VERSION.DRIVER_REVISION.DRIVER_MODIFICATION`.
 const DRIVER_VERSION: &str = "2.9.0";
@@ -208,7 +208,7 @@ impl PortDriver for PilatusDriver {
                 }
                 if value == 0 && acquiring {
                     det.stop.signal();
-                    det.send(Cmd::AbortAcquire);
+                    det.abort_acquire();
                 }
             } else if function == params.trigger_mode
                 || function == params.num_images
@@ -221,7 +221,10 @@ impl PortDriver for PilatusDriver {
             } else if function == p.reset_power {
                 det.reset_module_power();
             } else if function == p.num_oscill {
-                det.send(Cmd::Raw(cmd_mx_i32("N_oscillations", value)));
+                det.cam_write_read(
+                    &cmd_mx_i32("N_oscillations", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == params.read_status {
                 if !acquiring {
                     det.pilatus_status();
@@ -287,49 +290,79 @@ impl PortDriver for PilatusDriver {
             {
                 det.set_acquire_params();
             } else if function == p.wavelength {
-                det.send(Cmd::Raw(cmd_mx_f64("Wavelength", value)));
+                det.cam_write_read(&cmd_mx_f64("Wavelength", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.energy_low || function == p.energy_high {
                 // C ignores both statuses and gets 0 (pilatusDetector.cpp:1511-1512).
                 let low = det.f64_or_zero(p.energy_low);
                 let high = det.f64_or_zero(p.energy_high);
-                det.send(Cmd::Raw(cmd_mx_pair("Energy_range", low, high)));
+                det.cam_write_read(
+                    &cmd_mx_pair("Energy_range", low, high),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.det_dist {
-                det.send(Cmd::Raw(cmd_mx_f64("Detector_distance", value / 1000.0)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Detector_distance", value / 1000.0),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.det_voffset {
-                det.send(Cmd::Raw(cmd_mx_f64("Detector_Voffset", value / 1000.0)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Detector_Voffset", value / 1000.0),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.beam_x || function == p.beam_y {
                 // As above (pilatusDetector.cpp:1523-1524).
                 let x = det.f64_or_zero(p.beam_x);
                 let y = det.f64_or_zero(p.beam_y);
-                det.send(Cmd::Raw(cmd_mx_pair("Beam_xy", x, y)));
+                det.cam_write_read(&cmd_mx_pair("Beam_xy", x, y), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.flux {
-                det.send(Cmd::Raw(cmd_mx_f64("Flux", value)));
+                det.cam_write_read(&cmd_mx_f64("Flux", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.filter_transm {
-                det.send(Cmd::Raw(cmd_mx_f64("Filter_transmission", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Filter_transmission", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.start_angle {
-                det.send(Cmd::Raw(cmd_mx_f64("Start_angle", value)));
+                det.cam_write_read(&cmd_mx_f64("Start_angle", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.angle_incr {
-                det.send(Cmd::Raw(cmd_mx_f64("Angle_increment", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Angle_increment", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.det_2theta {
-                det.send(Cmd::Raw(cmd_mx_f64("Detector_2theta", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Detector_2theta", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.polarization {
-                det.send(Cmd::Raw(cmd_mx_f64("Polarization", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Polarization", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.alpha {
-                det.send(Cmd::Raw(cmd_mx_f64("Alpha", value)));
+                det.cam_write_read(&cmd_mx_f64("Alpha", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.kappa {
-                det.send(Cmd::Raw(cmd_mx_f64("Kappa", value)));
+                det.cam_write_read(&cmd_mx_f64("Kappa", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.phi {
-                det.send(Cmd::Raw(cmd_mx_f64("Phi", value)));
+                det.cam_write_read(&cmd_mx_f64("Phi", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.phi_incr {
-                det.send(Cmd::Raw(cmd_mx_f64("Phi_increment", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Phi_increment", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.chi {
-                det.send(Cmd::Raw(cmd_mx_f64("Chi", value)));
+                det.cam_write_read(&cmd_mx_f64("Chi", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.chi_incr {
-                det.send(Cmd::Raw(cmd_mx_f64("Chi_increment", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Chi_increment", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function == p.omega {
-                det.send(Cmd::Raw(cmd_mx_f64("Omega", value)));
+                det.cam_write_read(&cmd_mx_f64("Omega", value), CAMSERVER_DEFAULT_TIMEOUT);
             } else if function == p.omega_incr {
-                det.send(Cmd::Raw(cmd_mx_f64("Omega_increment", value)));
+                det.cam_write_read(
+                    &cmd_mx_f64("Omega_increment", value),
+                    CAMSERVER_DEFAULT_TIMEOUT,
+                );
             } else if function < p.delay_time {
                 // ADDriver::writeFloat64 is asynPortDriver's (pilatusDetector.cpp:1571).
                 status = det.ad.port_base.write_float64_param(user, value);
@@ -362,11 +395,11 @@ impl PortDriver for PilatusDriver {
         } else if function == p.flat_field_file {
             self.send(Cmd::ReadFlatFieldFile(value.clone()));
         } else if function == params.base.file_path {
-            self.send(Cmd::ImgPath(value.clone()));
+            self.img_path(&value);
         } else if function == p.oscill_axis {
-            self.send(Cmd::Raw(cmd_oscill_axis(&value)));
+            self.cam_write_read(&cmd_oscill_axis(&value), CAMSERVER_DEFAULT_TIMEOUT);
         } else if function == p.cbf_template_file {
-            self.send(Cmd::Raw(cmd_cbf_template_file(&value)));
+            self.cam_write_read(&cmd_cbf_template_file(&value), CAMSERVER_DEFAULT_TIMEOUT);
         } else if function < p.first() {
             let _ = self.ad.write_octet(user, data);
         }
@@ -666,13 +699,14 @@ mod tests {
 
     #[test]
     fn a_pair_write_sends_zero_for_its_unset_partner() {
-        let (cmd_tx, mut cmd_rx) = rt::command_channel::<Cmd>(4);
+        let sent = recording_camserver("PILATUS_PAIR_CAM");
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
         let links = DriverLinks {
             cmd_tx,
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             shared: Arc::new(Mutex::new(Shared::default())),
-            cam: no_camserver(),
+            cam: camserver("PILATUS_PAIR_CAM"),
         };
         let mut det = PilatusDriver::new("PILATUS_PAIR", 8, 8, 0, links).unwrap();
         let p = det.p;
@@ -680,13 +714,52 @@ mod tests {
         for (reason, name) in [(p.energy_low, "Energy_range"), (p.beam_x, "Beam_xy")] {
             let mut user = AsynUser::new(reason);
             det.write_float64(&mut user, 2.5).unwrap();
-            match cmd_rx.try_recv() {
-                Ok(Cmd::Raw(cmd)) => {
-                    assert_eq!(cmd, format!("mxsettings {name} 2.500000,0.000000"))
-                }
-                other => panic!("{name}: {other:?}"),
-            }
+            assert_eq!(
+                sent.lock().last().map(String::as_str),
+                Some(format!("mxsettings {name} 2.500000,0.000000").as_str())
+            );
         }
+    }
+
+    /// A FilePath write runs C's `imgpath` then `asynNDArrayDriver::checkPath()`
+    /// (pilatusDetector.cpp:1612-1615, asynNDArrayDriver.cpp:98-111): an empty
+    /// path leaves FilePathExists undefined, any other is written back with its
+    /// separator.
+    #[test]
+    fn a_file_path_write_runs_ndarray_driver_check_path() {
+        let sent = recording_camserver("PILATUS_CHECK_PATH_CAM");
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let links = DriverLinks {
+            cmd_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+            cam: camserver("PILATUS_CHECK_PATH_CAM"),
+        };
+        let mut det = PilatusDriver::new("PILATUS_CHECK_PATH", 8, 8, 0, links).unwrap();
+        let (file_path, exists) = (
+            det.ad.params.base.file_path,
+            det.ad.params.base.file_path_exists,
+        );
+
+        det.write_octet(&mut AsynUser::new(file_path), b"").unwrap();
+        assert_eq!(sent.lock().last().map(String::as_str), Some("imgpath "));
+        assert!(
+            det.ad.port_base.get_int32_param(exists, 0).is_err(),
+            "an empty FilePath leaves FilePathExists undefined"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+        det.write_octet(&mut AsynUser::new(file_path), dir_path.as_bytes())
+            .unwrap();
+        assert_eq!(sent.lock().last(), Some(&format!("imgpath {dir_path}")));
+        assert_eq!(
+            det.ad.port_base.get_string_param(file_path, 0).unwrap(),
+            format!("{dir_path}/").as_bytes(),
+            "checkPath writes the path back with its separator"
+        );
+        assert_eq!(det.ad.port_base.get_int32_param(exists, 0).unwrap(), 1);
     }
 
     /// ADDriver::writeFloat64 is asynPortDriver's (pilatusDetector.cpp:1571),
@@ -807,6 +880,40 @@ mod tests {
             buf[..reply.len()].copy_from_slice(reply);
             Ok((reply.len(), epics_rs::asyn::interpose::EomReason::EOS))
         }
+    }
+
+    /// A camserver user on `port`.
+    fn camserver(port: &str) -> Arc<SyncIOHandle> {
+        Arc::new(SyncIOHandle::connect_port(port, 0, Duration::ZERO, InterfaceType::Octet).0)
+    }
+
+    /// Registers an ungated [`GatedCamserver`] as `port` and returns what it
+    /// is sent.
+    fn recording_camserver(port: &str) -> Arc<Mutex<Vec<String>>> {
+        use epics_rs::asyn::manager::{PortManager, claim_port_driver};
+        use epics_rs::asyn::port::PortFlags;
+        use epics_rs::asyn::registry::open_owner;
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let rt = PortManager::new()
+            .register_port(
+                claim_port_driver(port).unwrap(),
+                GatedCamserver {
+                    base: PortDriverBase::new(
+                        port,
+                        1,
+                        PortFlags::default(),
+                        InterfaceMask::UNMIGRATED_ALL,
+                        InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    ),
+                    sent: sent.clone(),
+                    gate: None,
+                },
+                &open_owner(),
+            )
+            .unwrap();
+        std::mem::forget(rt);
+        sent
     }
 
     /// C runs setAcquireParams inside writeFloat64 on the port thread

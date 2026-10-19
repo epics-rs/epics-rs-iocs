@@ -30,7 +30,7 @@ use crate::image::{
     apply_flat_field, apply_flat_field_floor, correct_bad_pixels, decode_tiff, flat_field_average,
     parse_bad_pixel_file,
 };
-use crate::protocol::{cmd_exposure, cmd_header_string, cmd_imgpath, cmd_mx_f64};
+use crate::protocol::{cmd_exposure, cmd_header_string, cmd_mx_f64};
 use crate::types::{
     BadPixel, CAMSERVER_ACQUIRE_TIMEOUT, CAMSERVER_DEFAULT_TIMEOUT, Event, FILE_READ_DELAY,
     MAX_FILENAME_LEN, MAX_HEADER_STRING_LEN, TriggerMode, secs,
@@ -41,17 +41,10 @@ use crate::types::{
 /// port, so the actor enqueues these instead.
 #[derive(Debug)]
 pub enum Cmd {
-    /// C's `ADAcquire == 0` branch: `camcmd k`, `K`, sleep 2 s.
-    AbortAcquire,
-    /// C's `NDFilePath` branch: `imgpath <path>` then `checkPath()`.
-    ImgPath(String),
     /// C `readBadPixelFile()`.
     ReadBadPixelFile(String),
     /// C `readFlatFieldFile()`.
     ReadFlatFieldFile(String),
-    /// A camserver command already formatted by the actor (`mxsettings ...`,
-    /// `mxsettings N_oscillations ...`), sent with `CAMSERVER_DEFAULT_TIMEOUT`.
-    Raw(String),
 }
 
 /// State shared between the port actor and the two worker threads.
@@ -91,27 +84,8 @@ pub(crate) fn start_cmd_task(
 async fn cmd_loop(mut w: Worker, mut rx: rt::CommandReceiver<Cmd>) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            Cmd::AbortAcquire => {
-                w.ctx.cam_write_read("camcmd k", CAMSERVER_DEFAULT_TIMEOUT);
-                w.ctx.cam_write("K", CAMSERVER_DEFAULT_TIMEOUT);
-                // C: epicsThreadSleep(2) to let camserver stop acquiring.
-                rt::sleep(secs(2.0)).await;
-                let reason = w.ctx.ad.status_message;
-                w.ctx.set_str(reason, "Acquisition aborted");
-                w.ctx.callbacks().await;
-            }
-            Cmd::ImgPath(path) => {
-                w.ctx
-                    .cam_write_read(&cmd_imgpath(&path), CAMSERVER_DEFAULT_TIMEOUT);
-                w.ctx.check_path().await;
-                w.ctx.callbacks().await;
-            }
             Cmd::ReadBadPixelFile(file) => read_bad_pixel_file(&mut w, &file).await,
             Cmd::ReadFlatFieldFile(file) => read_flat_field_file(&mut w, &file).await,
-            Cmd::Raw(cmd) => {
-                w.ctx.cam_write_read(&cmd, CAMSERVER_DEFAULT_TIMEOUT);
-                w.ctx.callbacks().await;
-            }
         }
     }
 }
@@ -909,112 +883,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(read.is_ok(), "readFlatFieldFile panicked");
         assert_eq!(h.read_int32_blocking(p.flat_field_valid, 0).unwrap(), 0);
-        std::mem::forget(runtime);
-    }
-
-    /// A FilePath write runs C's `imgpath` then `asynNDArrayDriver::checkPath()`
-    /// (pilatusDetector.cpp:1612-1615, asynNDArrayDriver.cpp:98-111): an empty
-    /// path leaves FilePathExists undefined, any other is written back with its
-    /// separator.
-    #[test]
-    fn a_file_path_write_runs_ndarray_driver_check_path() {
-        use crate::driver::{DriverLinks, PilatusDriver};
-        use epics_rs::ad_core::plugin::channel::NDArrayOutput;
-        use epics_rs::asyn::interfaces::InterfaceType;
-        use epics_rs::asyn::runtime::config::RuntimeConfig;
-        use epics_rs::asyn::runtime::port::create_port_runtime;
-        use epics_rs::asyn::sync_io::SyncIOHandle;
-
-        let (cmd_tx, cmd_rx) = rt::command_channel::<Cmd>(4);
-        let shared = Arc::new(Mutex::new(Shared::default()));
-        let stop = Arc::new(Event::new());
-        let det = PilatusDriver::new(
-            "PILATUS_CHECK_PATH",
-            2,
-            1,
-            0,
-            DriverLinks {
-                cmd_tx,
-                start: Arc::new(Event::new()),
-                stop: stop.clone(),
-                shared: shared.clone(),
-                cam: Arc::new(
-                    epics_rs::asyn::sync_io::SyncIOHandle::connect_port(
-                        "PILATUS_NO_CAM",
-                        0,
-                        std::time::Duration::ZERO,
-                        epics_rs::asyn::interfaces::InterfaceType::Octet,
-                    )
-                    .0,
-                ),
-            },
-        )
-        .unwrap();
-        let (ad, p, pool) = (det.ad.params, det.p, det.ad.pool.clone());
-        let (runtime, _) = create_port_runtime(
-            &epics_rs::asyn::registry::claim_port("PILATUS_CHECK_PATH").unwrap(),
-            det,
-            RuntimeConfig::default(),
-        )
-        .unwrap();
-        let h = runtime.port_handle().clone();
-        let (cam, _) = SyncIOHandle::connect_port(
-            "PILATUS_CHECK_PATH_NO_CAMSERVER",
-            0,
-            std::time::Duration::ZERO,
-            InterfaceType::Octet,
-        );
-        let w = Worker {
-            ctx: Ctx::new(h.clone(), Arc::new(cam), ad, p, stop),
-            shared,
-            output: ArrayPublisher::new(Arc::new(Mutex::new(NDArrayOutput::new()))),
-            pool,
-        };
-        let _cmd_thread = start_cmd_task(w, cmd_rx);
-        let (file_path, exists) = (ad.base.file_path, ad.base.file_path_exists);
-        // The command thread runs its queue in order: once a later oscillation
-        // axis command is on ADStringToServer, the FilePath command has finished.
-        let write_path = |path: Vec<u8>, marker: &'static str| {
-            let writes = h.clone();
-            let written = rt::run_thread_named("PilatusCheckPathTest", move || async move {
-                writes.write_octet(file_path, 0, path).await.unwrap();
-                writes
-                    .write_octet(p.oscill_axis, 0, marker.into())
-                    .await
-                    .unwrap();
-            })
-            .join();
-            assert!(written.is_ok(), "writes refused");
-            let sent = format!("mxsettings Oscillation_axis {marker}");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while String::from_utf8_lossy(
-                &h.get_string_param_blocking(ad.string_to_server, 0, 256)
-                    .unwrap(),
-            ) != sent
-            {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "command thread stalled"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        };
-
-        write_path(Vec::new(), "a");
-        assert!(
-            h.read_int32_blocking(exists, 0).is_err(),
-            "an empty FilePath leaves FilePathExists undefined"
-        );
-
-        let dir = tempfile::tempdir().unwrap();
-        let dir_path = dir.path().to_str().unwrap().to_string();
-        write_path(dir_path.clone().into_bytes(), "b");
-        assert_eq!(
-            String::from_utf8_lossy(&h.get_string_param_blocking(file_path, 0, 256).unwrap()),
-            format!("{dir_path}/"),
-            "checkPath writes the path back with its separator"
-        );
-        assert_eq!(h.read_int32_blocking(exists, 0).unwrap(), 1);
         std::mem::forget(runtime);
     }
 
