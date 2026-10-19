@@ -289,7 +289,7 @@ impl SmartMotorAxis {
 impl Model1Motor for SmartMotorAxis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, MotorStatus::default(), self.poll_failure())
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -668,6 +668,45 @@ mod tests {
         silent.store(true, Ordering::Relaxed);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvSmartMotor.cc:248-262 exit stores what motor_init prepared
+    /// (:648-658, GAIN_SUPPORT and EA_PRESENT), with both COMM_ERR bits once
+    /// past RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+        use std::sync::atomic::Ordering;
+
+        let chain = chain("smartInitFail");
+        let silent = chain.silent.clone();
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("smartInitFail").unwrap(),
+            chain,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl =
+            SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        silent.store(true, Ordering::Relaxed);
+        let mut first = SmartMotorAxis::new(ctrl.clone(), 0);
+        let mut second = SmartMotorAxis::new(ctrl, 1);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 
     /// devSmartMotor.cc:190-191: V= and A= are counts/s times VCONFAC and
