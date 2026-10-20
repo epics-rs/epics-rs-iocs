@@ -704,6 +704,16 @@ mod tests {
         array_callbacks: i32,
         max_memory: usize,
     ) -> SimDetectorRuntime {
+        single_image_detector_sized(name, 8, NDDataType::UInt8, array_callbacks, max_memory)
+    }
+
+    fn single_image_detector_sized(
+        name: &str,
+        size: i32,
+        data_type: NDDataType,
+        array_callbacks: i32,
+        max_memory: usize,
+    ) -> SimDetectorRuntime {
         use epics_rs::ad_core::driver::ImageMode;
         use epics_rs::asyn::param::ParamValue;
         use epics_rs::asyn::registry::claim_port;
@@ -711,9 +721,9 @@ mod tests {
 
         let rt = create_sim_detector(
             &claim_port(name).unwrap(),
-            8,
-            8,
-            NDDataType::UInt8,
+            size,
+            size,
+            data_type,
             0,
             max_memory,
         )
@@ -845,6 +855,46 @@ mod tests {
         let free = pool.num_free_buffers();
         h.write_int32_blocking(p.pool_pre_alloc, 0, 1).unwrap();
         assert_eq!(pool.num_free_buffers(), free + 2);
+        std::mem::forget(rt);
+    }
+
+    /// C converts each image into pArrays[0] under the driver lock and keeps
+    /// it there through the exposure, readout and callbacks
+    /// (simDetector.cpp:694-699, :824-828), so free-running, a reader never
+    /// finds the slot empty once the first image is there.
+    #[test]
+    fn a_free_running_acquisition_never_leaves_parrays0_empty() {
+        use epics_rs::ad_core::driver::ImageMode;
+        use std::time::{Duration, Instant};
+
+        let rt =
+            single_image_detector_sized("SIM_SLOT_FREE", 1024, NDDataType::UInt16, 0, 64_000_000);
+        let (h, ad) = (rt.runtime_handle.port_handle(), rt.ad_params);
+        h.write_int32_blocking(ad.image_mode, 0, ImageMode::Continuous as i32)
+            .unwrap();
+        h.write_float64_blocking(ad.acquire_time, 0, 0.0).unwrap();
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        let owner = rt.pool().owner().clone();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while owner.array(0).is_none() {
+            assert!(Instant::now() < deadline, "no image");
+            std::thread::yield_now();
+        }
+        let first = h.read_int32_blocking(ad.base.array_counter, 0).unwrap();
+        let (mut samples, mut empty) = (0u32, 0u32);
+        while h.read_int32_blocking(ad.base.array_counter, 0).unwrap() < first + 3 {
+            assert!(Instant::now() < deadline, "no third image");
+            for _ in 0..100 {
+                samples += 1;
+                empty += u32::from(owner.array(0).is_none());
+                std::thread::yield_now();
+            }
+        }
+        h.write_int32_blocking(ad.acquire, 0, 0).unwrap();
+        assert_eq!(
+            empty, 0,
+            "{empty} of {samples} samples found pArrays[0] empty"
+        );
         std::mem::forget(rt);
     }
 

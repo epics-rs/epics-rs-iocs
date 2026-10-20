@@ -122,14 +122,17 @@ async fn sim_task(mut ctx: CSimTaskContext) {
             NDDimension::new(MAX_SIGNALS),
             NDDimension::new(cfg.num_time_points),
         ];
-        // C releases pArrays[0] just before the alloc (ADCSimDetector.cpp:150-151).
-        ctx.pool.owner().store_array(0, None);
-        let Ok(mut image) = ctx.pool.alloc(dims, cfg.data_type) else {
+        // C releases pArrays[0] and allocates the frame into it under the
+        // driver lock (ADCSimDetector.cpp:150-151).
+        let Some(image) = ctx.pool.owner().replace_array(0, || {
+            let mut image = ctx.pool.alloc(dims, cfg.data_type).ok()?;
+            image.data = result.data;
+            Some(image)
+        }) else {
             continue;
         };
-        image.data = result.data;
 
-        image.unique_id = unique_id;
+        let id = unique_id;
         unique_id += 1;
 
         let array_counter = ctx
@@ -139,8 +142,8 @@ async fn sim_task(mut ctx: CSimTaskContext) {
             .unwrap_or(0)
             + 1;
 
-        image.time_stamp = EpicsTimestamp::now().as_f64();
-        image.timestamp = ctx
+        let time_stamp = EpicsTimestamp::now().as_f64();
+        let timestamp = ctx
             .handle
             .update_time_stamp()
             .await
@@ -151,8 +154,14 @@ async fn sim_task(mut ctx: CSimTaskContext) {
         // driver cannot use (it hardcodes `max_addr = 1`), so no attributes are
         // attached.
 
-        let image = image.share();
-        ctx.pool.owner().store_array(0, Some(image.array().clone()));
+        // Stamped in place in pArrays[0] (ADCSimDetector.cpp:307-313).
+        let Ok(image) = ctx.pool.owner().refill(0, image, |image| {
+            image.unique_id = id;
+            image.time_stamp = time_stamp;
+            image.timestamp = timestamp;
+        }) else {
+            continue;
+        };
 
         // `doCallbacksGenericPointer(pImage, NDArrayData, 0)` — unconditional:
         // ADCSimDetector never tests `NDArrayCallbacks`.

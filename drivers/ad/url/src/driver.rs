@@ -393,6 +393,72 @@ mod tests {
         std::mem::forget(rt);
     }
 
+    /// C's readImage releases pArrays[0] and reads the next image into it
+    /// under the driver lock, which URLTask holds through the stamps and
+    /// callbacks (URLDriver.cpp:132-137, :220-252), so free-running, a reader
+    /// never finds the slot empty once the first image is there.
+    #[test]
+    fn a_free_running_acquisition_never_leaves_parrays0_empty() {
+        use epics_rs::ad_core::driver::ImageMode;
+        use epics_rs::asyn::param::ParamValue;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::request::ParamSetValue;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("url-slot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("frame.png");
+        image::DynamicImage::ImageLuma8(image::GrayImage::new(2, 2))
+            .save(&png)
+            .unwrap();
+
+        let rt = create_url_detector(&claim_port("URL_SLOT_FREE").unwrap(), 1 << 20).unwrap();
+        let (h, ad) = (rt.port_handle(), rt.ad_params);
+        h.set_params_and_notify_blocking(
+            0,
+            vec![
+                ParamSetValue::new(
+                    rt.url_params.url_name,
+                    0,
+                    ParamValue::Octet(format!("file://{}", png.display()).into_bytes().into()),
+                ),
+                ParamSetValue::new(ad.base.array_callbacks, 0, ParamValue::Int32(0)),
+                ParamSetValue::new(
+                    ad.image_mode,
+                    0,
+                    ParamValue::Int32(ImageMode::Continuous as i32),
+                ),
+                ParamSetValue::new(ad.acquire_period, 0, ParamValue::Float64(0.0)),
+            ],
+        )
+        .unwrap();
+
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        let owner = rt.pool().owner().clone();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while owner.array(0).is_none() {
+            assert!(Instant::now() < deadline, "no image");
+            std::thread::yield_now();
+        }
+        let first = h.read_int32_blocking(ad.base.array_counter, 0).unwrap();
+        let (mut samples, mut empty) = (0u32, 0u32);
+        while h.read_int32_blocking(ad.base.array_counter, 0).unwrap() < first + 3 {
+            assert!(Instant::now() < deadline, "no third image");
+            for _ in 0..100 {
+                samples += 1;
+                empty += u32::from(owner.array(0).is_none());
+                std::thread::yield_now();
+            }
+        }
+        h.write_int32_blocking(ad.acquire, 0, 0).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            empty, 0,
+            "{empty} of {samples} samples found pArrays[0] empty"
+        );
+        std::mem::forget(rt);
+    }
+
     /// C keeps the last image in pArrays[0] until the next alloc
     /// (URLDriver.cpp:132-134), published or not.
     #[test]

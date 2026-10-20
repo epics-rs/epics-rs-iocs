@@ -553,15 +553,16 @@ mod tests {
                 NDDataType::Float64,
             )
             .unwrap();
-        f.det
-            .owner
-            .store_array(0, Some(image.share().array().clone()));
+        f.det.owner.store_array(0, image.share().array().clone());
         f.det
             .port_base
             .set_int32_param(f.det.nd.pool_num_pre_alloc_buffers, 0, 2)
             .unwrap();
         f.write_i32(f.det.nd.pool_pre_alloc, 0, 1);
-        assert_eq!(f.get_i32(f.det.nd.pool_free_buffers, 0), 2);
+        // C posts the pool after each copy, before releasing them
+        // (asynNDArrayDriver.cpp:733-741).
+        assert_eq!(f.get_i32(f.det.nd.pool_free_buffers, 0), 0);
+        assert_eq!(f.det.pool.num_free_buffers(), 2);
     }
 
     /// ADCSimDetector.cpp:370 runs asynNDArrayDriver::writeInt32, whose
