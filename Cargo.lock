@@ -2146,6 +2146,7 @@ version = "0.1.0"
 name = "ip-devices"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
 ]
 

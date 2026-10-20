@@ -16,6 +16,7 @@ pub mod protocol;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::interfaces::InterfaceType;
@@ -348,8 +349,8 @@ impl DeviceSupport for DevAiMks {
             TraceMask::IO_DEVICE,
             format_args!(
                 "devAiMKS record={name}, gauge_str={code}, lopr={:.6}, hopr={:.6}\n",
-                double(record, "LOPR"),
-                double(record, "HOPR")
+                CFloat(double(record, "LOPR")),
+                CFloat(double(record, "HOPR"))
             ),
         );
 
