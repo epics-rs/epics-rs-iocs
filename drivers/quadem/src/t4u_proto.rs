@@ -626,11 +626,7 @@ pub fn parse_calibration(ini: &Ini) -> Option<Calibration> {
                 };
                 table.slope[range][channel] = slope;
                 table.offset[range][channel] = offset;
-                println!(
-                    "Calibration Range {range} Channel {channel} Slope {} Offset {}",
-                    CFloat(f64::from(slope)),
-                    CFloat(f64::from(offset))
-                );
+                println!("{}", calibration_line(range, channel, slope, offset));
             }
         }
         Some(table)
@@ -640,6 +636,15 @@ pub fn parse_calibration(ini: &Ini) -> Option<Calibration> {
         cw: load(cw_name)?,
         pulsed: load(pulsed_name)?,
     })
+}
+
+/// C drvT4UDirect_EM.cpp:402's line for one loaded pair.
+fn calibration_line(range: usize, channel: usize, slope: f32, offset: f32) -> String {
+    format!(
+        "Calibration Range {range} Channel {channel} Slope {} Offset {}",
+        CFloat(f64::from(slope)),
+        CFloat(f64::from(offset))
+    )
 }
 
 /// C++ `sscanf(curr_val.c_str(), " \" %f , %f \" ")`: the opening quote must
@@ -1144,5 +1149,17 @@ ChannelD=\"0.9527919082805758, 1.4346421308430505e-05\"
             "l.1: ini parsing failed, section not closed"
         );
         assert!(parse_ini("").unwrap().get("config", "selected").is_none());
+    }
+
+    #[test]
+    fn calibration_slopes_print_as_printf_f() {
+        assert_eq!(
+            calibration_line(2, 3, 0.8823025, 1.0223252e-10),
+            "Calibration Range 2 Channel 3 Slope 0.882303 Offset 0.000000"
+        );
+        assert_eq!(
+            calibration_line(0, 0, f32::NAN, -f32::NAN),
+            "Calibration Range 0 Channel 0 Slope nan Offset -nan"
+        );
     }
 }
