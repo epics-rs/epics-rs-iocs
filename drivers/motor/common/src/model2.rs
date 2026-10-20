@@ -185,6 +185,33 @@ impl Model2 {
         });
     }
 
+    /// What `Config` built for `card`, polled from now on by a task of the
+    /// driver's own, as each driver's `Config` starts its poller
+    /// (drvEnsembleAsyn.cc:1026), replacing an earlier `Config` of it.
+    pub fn start_card(
+        &self,
+        card: i32,
+        axes: Vec<Model2Axis>,
+        moving_poll_ms: u64,
+        idle_poll_ms: u64,
+    ) -> Result<(), String> {
+        let poller = Arc::new(Controller::new());
+        for (signal, axis) in (0..).zip(&axes) {
+            // No asyn user until drvAsynMotorConfigure opens it: the drvet's
+            // axis, which devMotorSim reaches by name (devMotorSim.c:139).
+            let user = TraceUser::MotorInterface {
+                device: "Motor Simulation",
+                driver: self.name,
+                card,
+                signal,
+            };
+            poller.open(user, axis.motor.clone())?;
+        }
+        poller.start_driver_thread(moving_poll_ms, idle_poll_ms, self.forced_fast_polls);
+        self.set_card_on(card, axes, poller);
+        Ok(())
+    }
+
     /// What `Config` built for `card`, polled by the driver's own `poller`,
     /// replacing an earlier `Config` of it.
     pub fn set_card_on(&self, card: i32, axes: Vec<Model2Axis>, poller: Arc<Controller>) {

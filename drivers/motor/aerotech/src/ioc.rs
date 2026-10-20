@@ -226,7 +226,7 @@ pub fn ensemble_config_command() -> CommandDef {
                 .unwrap_or_else(|e| e.into_inner())
                 .wait_mode_nowait();
             lock_cards(&ENSEMBLE_CARDS)[card as usize].axes = reports;
-            MOTOR_ENSEMBLE.set_card(card, axes, moving_poll_ms, idle_poll_ms);
+            MOTOR_ENSEMBLE.start_card(card, axes, moving_poll_ms, idle_poll_ms)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -446,29 +446,35 @@ mod report {
             .into()
         });
         run_command(ensemble_config_command(), config(1, "ensRepLine", 1)).await;
-        let axis = "Axis 0\n   axisStatus:  0x0\n   home preset: 2.500000\n   \
+        // axisStatus is the poller's AXISSTATUS.
+        let axis = "Axis 0\n   axisStatus:  0x5\n   home preset: 2.500000\n   \
                     step size:   0.001000\n   max digits:  5\n";
         assert_eq!(
-            driver_report("motorEnsemble", 1),
+            reported("motorEnsemble", 1, "axisStatus:  0x5\n").await,
             format!(
                 "    moving poll period: 0.000000\n    idle poll period: 0.000000\n    \
                  moving poll period: 0.100000\n    idle poll period: 1.000000\n{axis}"
             )
         );
         assert_eq!(driver_report("motorEnsemble", 0), "");
+    }
 
-        // The poller's AXISSTATUS lands in axisStatus.
-        let args = vec![
-            ArgValue::String("ensRep".into()),
-            ArgValue::String("motorEnsemble".into()),
-            ArgValue::Int(1),
-            ArgValue::Int(1),
-        ];
-        run_command(
-            drv_asyn_motor_configure_command(vec![&MOTOR_ENSEMBLE]),
-            args,
-        )
-        .await;
+    /// drvEnsembleAsyn.cc:1022-1027: EnsembleAsynConfig starts
+    /// EnsemblePoller, whose first pass (:698) polls the axes before any
+    /// drvAsynMotorConfigure.
+    #[epics_rs::base::epics_test]
+    async fn ensemble_config_starts_its_poller() {
+        run_command(ensemble_setup_command(), vec![ArgValue::Int(1)]).await;
+        let (_line, _io) = LineRig::new("ensPollLine", |cmd| {
+            match cmd.trim_end() {
+                "GETPARM(@0, 140)" => "%X",
+                c if c.starts_with("GETPARM(@") && c.ends_with(", 140)") => "!",
+                "AXISSTATUS(@0)" => "%5",
+                _ => "%0",
+            }
+            .into()
+        });
+        run_command(ensemble_config_command(), config(0, "ensPollLine", 1)).await;
         let text = reported("motorEnsemble", 1, "axisStatus:  0x5\n").await;
         assert!(text.contains("Axis 0\n   axisStatus:  0x5\n"), "{text}");
     }
