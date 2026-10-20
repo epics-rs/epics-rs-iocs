@@ -62,6 +62,7 @@ impl PollShared {
         debug_assert_eq!(axes.len(), index);
         axes.push(AxisState {
             status: MotorStatus {
+                done: true,
                 has_encoder,
                 ..MotorStatus::default()
             },
@@ -870,6 +871,20 @@ pub(crate) mod tests {
         let user = AsynUser::default();
         assert_eq!(rig.axes[0].polled(&user).unwrap().position, 3000.0);
         assert_eq!(rig.axes[1].polled(&user).unwrap().position, -5.0);
+    }
+
+    /// Init's DONE=1 stands through a loop that finds an axis at rest with
+    /// no done flag, as one reads after power-up.
+    #[test]
+    fn an_axis_at_rest_without_a_done_flag_keeps_init_s_done() {
+        let mut idle = HEALTHY.to_vec();
+        idle.extend([("AM;RI;", "PNNN,MNNN"), ("AM;RV;", "0,0")]);
+        let mut rig = rig("omsInitDone", 2, &idle);
+        poller(&rig).pass();
+        let user = AsynUser::default();
+        for axis in &mut rig.axes {
+            assert!(axis.polled(&user).unwrap().done);
+        }
     }
 
     /// C `homing`: set by home(), cleared by the loop that finds the axis
