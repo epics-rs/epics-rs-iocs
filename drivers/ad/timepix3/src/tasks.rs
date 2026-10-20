@@ -7,9 +7,9 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
@@ -307,18 +307,24 @@ impl Ctx {
     /// C's unlocked `getAttributes` from a stream worker, evaluated where its
     /// PARAM values live.
     async fn worker_attributes(&self, array: &mut DriverArray) {
+        if let Some(fresh) = self.driver_attributes().await {
+            array.attributes.copy_from(&fresh);
+        }
+    }
+
+    /// The set [`Self::worker_attributes`] copies; `None` with no attributes
+    /// loaded.
+    async fn driver_attributes(&self) -> Option<NDAttributeList> {
         let owner = self.pool.owner().clone();
         if owner.attributes().lock().list.is_empty() {
-            return;
+            return None;
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.shared.port_jobs.push(move |base| {
             let _ = tx.send(owner.attributes().lock().update(base));
         });
         self.flush_jobs();
-        if let Ok(fresh) = rx.await {
-            array.attributes.copy_from(&fresh);
-        }
+        rx.await.ok()
     }
 
     async fn post_as(&self, locking: Locking, addr: i32, updates: Vec<ParamSetValue>) {
@@ -2268,18 +2274,19 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
         (StreamKind::PrvImg1, Frame::Image(f)) => return preview_frame(ctx, PRV_IMG1, f).await,
         (StreamKind::Img, Frame::Image(f)) => {
             let addr = threshold_addr(f.threshold_id, IMG_ADDR, IMG_THRESHOLD1_ADDR);
-            // C releases pArrays[addr] before allocating its replacement
+            // C releases pArrays[addr] and allocates its replacement into it
             // (serval_stream.cpp:803-809).
-            ctx.pool.owner().release_array(addr);
-            let Some(mut array) = image_array(
-                ctx,
-                &f,
-                f.pixels.clone(),
-                &adlog::err(
-                    adlog::PROCESS_IMG_DATA_LINE,
-                    "Failed to allocate NDArray or NDArray has no data pointer",
-                ),
-            ) else {
+            let Some(array) = ctx.pool.owner().replace_array(addr, || {
+                image_array(
+                    ctx,
+                    &f,
+                    f.pixels.clone(),
+                    &adlog::err(
+                        adlog::PROCESS_IMG_DATA_LINE,
+                        "Failed to allocate NDArray or NDArray has no data pointer",
+                    ),
+                )
+            }) else {
                 return false;
             };
             let p = ctx.p;
@@ -2326,7 +2333,10 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                     )
                     .collect(),
             );
-            attach_attributes(ctx, &mut array, &f).await;
+            let stamps = frame_stamps(ctx, &f).await;
+            let Ok(array) = ctx.pool.owner().refill(addr, array, stamps) else {
+                return false;
+            };
 
             // processImgFrame runs after getAttributes, on threshold 0 only and
             // only while ImgAccumulationEnable is set (serval_stream.cpp:948-982).
@@ -2373,8 +2383,6 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                     publish_img_sum(ctx, 3, f.width, f.height, sum_n, uid).await;
                 }
             }
-            let array = array.share();
-            ctx.pool.owner().store_array(addr, array.array().clone());
             publish_image(ctx, addr, array).await;
             ctx.trace(
                 TraceMask::IO_DRIVER,
@@ -2501,18 +2509,20 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
 async fn preview_frame(ctx: &Arc<Ctx>, s: Preview, mut f: crate::stream::ImageFrame) -> bool {
     log_json_header(ctx, s, &f.header);
     let addr = threshold_addr(f.threshold_id, s.th0, s.th1);
-    // C releases pArrays[addr] before allocating its replacement (:165-171).
-    ctx.pool.owner().release_array(addr);
     let pixels = std::mem::take(&mut f.pixels);
-    let Some(mut array) = image_array(
-        ctx,
-        &f,
-        pixels,
-        &adlog::err(
-            adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
-            &format!("{} failed to allocate NDArray", s.tag),
-        ),
-    ) else {
+    // C releases pArrays[addr] and allocates its replacement into it
+    // (:165-178).
+    let Some(array) = ctx.pool.owner().replace_array(addr, || {
+        image_array(
+            ctx,
+            &f,
+            pixels,
+            &adlog::err(
+                adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+                &format!("{} failed to allocate NDArray", s.tag),
+            ),
+        )
+    }) else {
         return false;
     };
     if s.metadata {
@@ -2558,9 +2568,10 @@ async fn preview_frame(ctx: &Arc<Ctx>, s: Preview, mut f: crate::stream::ImageFr
                 .collect(),
         );
     }
-    attach_attributes(ctx, &mut array, &f).await;
-    let array = array.share();
-    ctx.pool.owner().store_array(addr, array.array().clone());
+    let stamps = frame_stamps(ctx, &f).await;
+    let Ok(array) = ctx.pool.owner().refill(addr, array, stamps) else {
+        return false;
+    };
     publish_image(ctx, addr, array).await;
 
     let pair_done = {
@@ -2670,21 +2681,10 @@ async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
         );
         return;
     }
-    owner.release_array(s.diff);
     let dims = vec![
         NDDimension::new(t0.dims[0].size),
         NDDimension::new(t0.dims[1].size),
     ];
-    let Ok(mut diff) = ctx.pool.alloc(dims, NDDataType::Int32) else {
-        ctx.trace(
-            TraceMask::ERROR,
-            &adlog::err(
-                func,
-                &format!("{} failed to allocate threshold-diff NDArray", s.tag),
-            ),
-        );
-        return;
-    };
     fn band<T: Copy + Into<i64>>(out: &mut [i32], t0: &[T], t1: &[T], clip: bool) {
         for (o, (a, b)) in out.iter_mut().zip(t0.iter().zip(t1)) {
             // C subtracts the sources cast to int32.
@@ -2692,41 +2692,56 @@ async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
             *o = if clip { d.max(0) } else { d };
         }
     }
-    let NDDataBuffer::I32(out) = &mut diff.data else {
-        unreachable!("an Int32 allocation")
-    };
-    match (&t0.data, &t1.data) {
-        (NDDataBuffer::U32(a), NDDataBuffer::U32(b)) => band(out, a, b, clip),
-        (NDDataBuffer::U16(a), NDDataBuffer::U16(b)) => band(out, a, b, clip),
-        (NDDataBuffer::U8(a), NDDataBuffer::U8(b)) => band(out, a, b, clip),
-        (a, b) => {
+    // C releases pArrays[addrDiff] and fills the band in the slot; a refused
+    // alloc or an unsupported pair leaves it NULL (serval_stream.cpp:402-447).
+    let Some(diff) = owner.replace_array(s.diff, || {
+        let Ok(mut diff) = ctx.pool.alloc(dims, NDDataType::Int32) else {
             ctx.trace(
                 TraceMask::ERROR,
                 &adlog::err(
                     func,
-                    &format!(
-                        "{} threshold diff skipped: unsupported source types {} / {}",
-                        s.tag,
-                        a.data_type() as i32,
-                        b.data_type() as i32
-                    ),
+                    &format!("{} failed to allocate threshold-diff NDArray", s.tag),
                 ),
             );
-            return;
+            return None;
+        };
+        let NDDataBuffer::I32(out) = &mut diff.data else {
+            unreachable!("an Int32 allocation")
+        };
+        match (&t0.data, &t1.data) {
+            (NDDataBuffer::U32(a), NDDataBuffer::U32(b)) => band(out, a, b, clip),
+            (NDDataBuffer::U16(a), NDDataBuffer::U16(b)) => band(out, a, b, clip),
+            (NDDataBuffer::U8(a), NDDataBuffer::U8(b)) => band(out, a, b, clip),
+            (a, b) => {
+                ctx.trace(
+                    TraceMask::ERROR,
+                    &adlog::err(
+                        func,
+                        &format!(
+                            "{} threshold diff skipped: unsupported source types {} / {}",
+                            s.tag,
+                            a.data_type() as i32,
+                            b.data_type() as i32
+                        ),
+                    ),
+                );
+                return None;
+            }
         }
-    }
-    diff.unique_id = t0_frame;
-    diff.time_stamp = t0.time_stamp;
-    diff.timestamp = t0.timestamp;
-    diff.attributes.copy_from(&t0.attributes);
-    diff.attributes.add(NDAttribute::new_static(
-        "ThresholdBandPass",
-        "Preview threshold band-pass",
-        NDAttrSource::Driver,
-        NDAttrValue::String(if clip { "max(0,T0-T1)" } else { "T0-T1" }.into()),
-    ));
-    let diff = diff.share();
-    owner.store_array(s.diff, diff.array().clone());
+        diff.unique_id = t0_frame;
+        diff.time_stamp = t0.time_stamp;
+        diff.timestamp = t0.timestamp;
+        diff.attributes.copy_from(&t0.attributes);
+        diff.attributes.add(NDAttribute::new_static(
+            "ThresholdBandPass",
+            "Preview threshold band-pass",
+            NDAttrSource::Driver,
+            NDAttrValue::String(if clip { "max(0,T0-T1)" } else { "T0-T1" }.into()),
+        ));
+        Some(diff)
+    }) else {
+        return;
+    };
     ctx.shared.preview[s.index].lock().last_diff_t0 = t0_frame;
     publish_image(ctx, s.diff, diff).await;
     ctx.trace(
@@ -3249,20 +3264,30 @@ fn image_array(
 
 /// C hands the frame the getAttributes set plus ThresholdID, and no
 /// ColorMode attribute (serval_stream.cpp:236-240, :291-296, :886-890,
-/// :942-947); C ignores the getAttributes status.
-async fn attach_attributes(ctx: &Ctx, array: &mut DriverArray, f: &crate::stream::ImageFrame) {
-    array.unique_id = f.frame_number;
+/// :942-947); C ignores the getAttributes status. C sets them on the frame
+/// in pArrays[addr], so the change is for `ArrayOwner::refill`.
+async fn frame_stamps(ctx: &Ctx, f: &crate::stream::ImageFrame) -> impl FnOnce(&mut NDArray) {
+    let unique_id = f.frame_number;
     // serval_stream.cpp:237-240, :886-890: the clock for timeStamp, then the
     // port's stamp for epicsTS.
-    array.time_stamp = EpicsTimestamp::now().as_f64();
-    array.timestamp = ctx.port_time_stamp().await;
-    ctx.worker_attributes(array).await;
-    array.attributes.add(NDAttribute::new_static(
-        "ThresholdID",
-        "Serval jsonimage thresholdID",
-        NDAttrSource::Driver,
-        NDAttrValue::Int32(f.threshold_id),
-    ));
+    let time_stamp = EpicsTimestamp::now().as_f64();
+    let timestamp = ctx.port_time_stamp().await;
+    let fresh = ctx.driver_attributes().await;
+    let threshold_id = f.threshold_id;
+    move |array| {
+        array.unique_id = unique_id;
+        array.time_stamp = time_stamp;
+        array.timestamp = timestamp;
+        if let Some(fresh) = fresh {
+            array.attributes.copy_from(&fresh);
+        }
+        array.attributes.add(NDAttribute::new_static(
+            "ThresholdID",
+            "Serval jsonimage thresholdID",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(threshold_id),
+        ));
+    }
 }
 
 async fn publish_image(ctx: &Ctx, addr: usize, array: impl Into<PublishedArray>) {
@@ -5143,6 +5168,57 @@ mod tests {
         assert_eq!(rx[&IMG_ADDR].pending(), 0);
     }
 
+    /// C allocates each preview and Img frame straight into pArrays[addr] and
+    /// stamps it there, and fills the band in its slot
+    /// (serval_stream.cpp:170-178, :402-413, :803-809), so a reader never
+    /// finds a slot empty once its first frame is there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frames_never_leave_their_parrays_slot_empty() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ctx = Arc::new(idle_ctx("TPX_SLOTS"));
+        set_synced(&ctx, ctx.p.both_counters, 0, 1).await;
+        let frame = |threshold_id, frame_number| {
+            Frame::Image(crate::stream::ImageFrame {
+                width: 512,
+                height: 512,
+                format: crate::stream::PixelFormat::UInt16,
+                frame_number,
+                time_at_frame: 0.0,
+                threshold_id,
+                integration_size: 0,
+                pixels: vec![(frame_number % 7) as u32; 512 * 512],
+                header: Value::Null,
+            })
+        };
+        let addrs = [PRV_IMG_ADDR, 8, 9, IMG_ADDR];
+        let done = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let (owner, done) = (ctx.pool.owner().clone(), done.clone());
+            std::thread::spawn(move || {
+                let (mut seen, mut empty) = ([false; 4], [0u32; 4]);
+                while !done.load(Ordering::Relaxed) {
+                    for (i, &addr) in addrs.iter().enumerate() {
+                        match owner.array(addr) {
+                            Some(_) => seen[i] = true,
+                            None if seen[i] => empty[i] += 1,
+                            None => {}
+                        }
+                    }
+                }
+                (seen, empty)
+            })
+        };
+        for n in 0..100 {
+            assert!(handle_frame(&ctx, StreamKind::PrvImg, frame(1, n)).await);
+            assert!(handle_frame(&ctx, StreamKind::PrvImg, frame(0, n)).await);
+            assert!(handle_frame(&ctx, StreamKind::Img, frame(0, n)).await);
+        }
+        done.store(true, Ordering::Relaxed);
+        let (seen, empty) = sampler.join().unwrap();
+        assert_eq!(seen, [true; 4]);
+        assert_eq!(empty, [0; 4], "empty samples at {addrs:?}");
+    }
+
     /// The PrvImg threshold-0 frame is C's pArrays[0]
     /// (NDARRAY_ADDR_PRVIMG_THRESHOLD0, ADTimePix.h:907; serval_stream.cpp:177),
     /// so PreAllocBuffers copies it (asynNDArrayDriver.cpp:717-726).
@@ -6148,7 +6224,7 @@ mod tests {
             .pool
             .alloc_with(dims(), NDDataBuffer::U32(vec![1]))
             .unwrap();
-        attach_attributes(&ctx, &mut array, &frame).await;
+        frame_stamps(&ctx, &frame).await(&mut array);
         assert_eq!(array.timestamp, EpicsTimestamp::from(fixed));
 
         let (tx, mut rx) = epics_rs::ad_core::plugin::channel::ndarray_channel("TPX_TS_SINK", 4);
