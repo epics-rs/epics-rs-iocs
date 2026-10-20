@@ -3,6 +3,7 @@
 //! as drvFX4 builds it: no TLS, no zlib. A failure is ixwebsocket's
 //! `errorInfo.reason`, the text drvFX4's onError prints.
 
+use epics_rs::base::types::c_parse::atoi;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
@@ -370,11 +371,9 @@ fn parse_url(url: &str) -> Option<Url> {
     }
 
     // clParseURL::GetPort: atoi, then 1..=65535 or the scheme's port.
-    let atoi = port
-        .parse::<i64>()
-        .unwrap_or(if port.is_empty() { 0 } else { i64::MAX }) as i32;
-    let port = if (1..=65535).contains(&atoi) {
-        atoi
+    let n = atoi(port);
+    let port = if (1..=65535).contains(&n) {
+        n
     } else {
         match protocol.as_str() {
             "ws" | "http" => 80,
