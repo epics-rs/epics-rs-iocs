@@ -19,7 +19,7 @@ use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 
 use crate::rng::Rng;
 use crate::types::{SimMode, SineOperation};
@@ -762,7 +762,7 @@ impl SimEngine {
         cfg: &SimConfig,
         pool: &DriverPool,
         reset_requested: bool,
-    ) -> Result<DriverArray, &'static str> {
+    ) -> Result<PublishedArray, &'static str> {
         let layout = Layout::for_color_mode(cfg.color_mode);
         let sx = cfg.geometry.max_size_x as usize;
         let sy = cfg.geometry.max_size_y as usize;
@@ -836,11 +836,11 @@ impl SimEngine {
             dims_out[c] = NDDimension::new(3);
         }
 
-        // C releases pArrays[0] after the reset, just before the convert
-        // (simDetector.cpp:696).
-        pool.owner().release_array(0);
-        pool.convert(raw, &dims_out, cfg.data_type)
-            .map_err(|_| "error allocating buffer in convert()")
+        // C releases pArrays[0] after the reset and converts into it under
+        // the driver lock (simDetector.cpp:694-699).
+        pool.owner()
+            .replace_array(0, || pool.convert(raw, &dims_out, cfg.data_type).ok())
+            .ok_or("error allocating buffer in convert()")
     }
 }
 

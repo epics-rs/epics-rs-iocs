@@ -8,7 +8,7 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
+use epics_rs::ad_core::ndarray_pool::{DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -119,7 +119,7 @@ impl SimTaskContext {
 
     /// `simDetector::computeImage` (simDetector.cpp:505-718).
     /// The error is the text of `computeImage`'s own asynPrint.
-    async fn compute_image(&self, engine: &mut SimEngine) -> Result<DriverArray, &'static str> {
+    async fn compute_image(&self, engine: &mut SimEngine) -> Result<PublishedArray, &'static str> {
         let (mut cfg, read_ok) = self.sim.read_config(&self.handle, &self.ad).await;
         if !read_ok {
             self.handle.trace().output_device(
@@ -221,7 +221,8 @@ async fn sim_task(mut ctx: SimTaskContext) {
         .await;
         ctx.set_shutter(true).await;
 
-        let mut image = match ctx.compute_image(&mut engine).await {
+        // It stays in pArrays[0] through the exposure wait.
+        let image = match ctx.compute_image(&mut engine).await {
             Ok(image) => image,
             Err(e) => {
                 // FIXED (doc/upstream-c-defects.md #2): upstream does
@@ -270,9 +271,6 @@ async fn sim_task(mut ctx: SimTaskContext) {
 
         if !acquire {
             // `writeInt32` already stored ADAcquire=0.
-            ctx.pool
-                .owner()
-                .store_array(0, image.share().array().clone());
             continue;
         }
 
@@ -295,22 +293,25 @@ async fn sim_task(mut ctx: SimTaskContext) {
         )
         .await;
 
-        image.unique_id = image_counter;
         // `updateTimeStamps` only stamps the NDArray; C's simDetector never
         // writes the NDTimeStamp / NDEpicsTSSec parameters.
-        image.update_time_stamps(
-            ctx.handle
-                .update_time_stamp()
-                .await
-                .unwrap_or_else(|_| SystemTime::now())
-                .into(),
-        );
+        let stamp = ctx
+            .handle
+            .update_time_stamp()
+            .await
+            .unwrap_or_else(|_| SystemTime::now())
+            .into();
+        // simTask stamps pArrays[0] in place (simDetector.cpp:824-828).
+        let Ok(image) = ctx.pool.owner().refill(0, image, |image| {
+            image.unique_id = image_counter;
+            image.update_time_stamps(stamp);
+        }) else {
+            continue;
+        };
 
-        let image = image.share();
         if array_callbacks {
-            ctx.publisher.publish(image.clone()).await;
+            ctx.publisher.publish(image).await;
         }
-        ctx.pool.owner().store_array(0, image.array().clone());
 
         // See if acquisition is done.
         if image_mode == ImageMode::Single
