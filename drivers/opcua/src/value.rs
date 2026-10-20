@@ -441,7 +441,12 @@ pub fn read_string(v: &Variant, choices: Option<&EnumChoices>) -> ReadResult<Vec
         }
         // C dereferences the null type of a variant without a value (`:353`).
         Variant::Empty => return Err(unsupported()),
-        Variant::Array(_) => return Err(unsupported()),
+        // The C reads the payload pointer, an array's first element
+        // (`:350-351`); an empty array's points at the sentinel.
+        Variant::Array(a) => match a.values.first() {
+            Some(first) => return read_string(first, choices),
+            None => return Err(unsupported()),
+        },
         // All but a structure decoded into a generated type.
         other => ua_print(other).ok_or_else(unsupported)?,
     })
@@ -678,6 +683,11 @@ pub fn write_scalar<T: ScalarTarget>(
 /// `:1056-1064`), so writing a string record to a Double node always raised
 /// `WRITE_ALARM`/`INVALID` with "value out of range" and never sent anything.
 pub fn write_string(value: &str, incoming: &Variant, choices: Option<&EnumChoices>) -> WriteResult {
+    // The C switches on `incomingData.type` and never asks whether the node is
+    // an array (`DataElementOpen62541Leaf.cpp:878`): it sends a scalar.
+    if let Variant::Array(a) = incoming {
+        return write_string(value, &element_template(a), choices);
+    }
     let out_of_range = || WriteError::OutOfRange {
         text: Some(value.to_string()),
     };
@@ -753,6 +763,33 @@ pub fn write_string(value: &str, incoming: &Variant, choices: Option<&EnumChoice
             });
         }
     })
+}
+
+/// A scalar of `a`'s element type: its first element, whose locale or
+/// namespace a text write keeps, or a default one when it is empty.
+fn element_template(a: &Array) -> Variant {
+    if let Some(first) = a.values.first() {
+        return first.clone();
+    }
+    match a.value_type {
+        VariantScalarTypeId::Boolean => Variant::Boolean(false),
+        VariantScalarTypeId::SByte => Variant::SByte(0),
+        VariantScalarTypeId::Byte => Variant::Byte(0),
+        VariantScalarTypeId::Int16 => Variant::Int16(0),
+        VariantScalarTypeId::UInt16 => Variant::UInt16(0),
+        VariantScalarTypeId::Int32 => Variant::Int32(0),
+        VariantScalarTypeId::UInt32 => Variant::UInt32(0),
+        VariantScalarTypeId::Int64 => Variant::Int64(0),
+        VariantScalarTypeId::UInt64 => Variant::UInt64(0),
+        VariantScalarTypeId::Float => Variant::Float(0.0),
+        VariantScalarTypeId::Double => Variant::Double(0.0),
+        VariantScalarTypeId::String => Variant::String(UAString::null()),
+        VariantScalarTypeId::XmlElement => Variant::XmlElement(XmlElement::default()),
+        VariantScalarTypeId::LocalizedText => Variant::LocalizedText(Box::default()),
+        VariantScalarTypeId::QualifiedName => Variant::QualifiedName(Box::default()),
+        VariantScalarTypeId::ByteString => Variant::ByteString(ByteString::null()),
+        _ => Variant::Empty,
+    }
 }
 
 /// Build the outgoing variant for an array record value (`writeArray<ET>`,
