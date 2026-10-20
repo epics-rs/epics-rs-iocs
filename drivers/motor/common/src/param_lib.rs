@@ -4,6 +4,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::interfaces::motor::{MotorStatus, StatusWrite};
 
 use crate::drv_motor_asyn::function;
@@ -202,7 +203,9 @@ impl Params {
         let _ = writeln!(out, "Number of parameters is: {NUM_PARAMS}");
         for (i, val) in vals.iter().enumerate() {
             let _ = match val {
-                Val::Double(v) => writeln!(out, "Parameter {i} is a double, value {v:.6}"),
+                Val::Double(v) => {
+                    writeln!(out, "Parameter {i} is a double, value {:.6}", CFloat(*v))
+                }
                 Val::Int(v) => writeln!(out, "Parameter {i} is an integer, value {v}"),
                 Val::Undef => writeln!(out, "Parameter {i} is undefined"),
             };
@@ -221,6 +224,24 @@ mod tests {
             sink.lock().unwrap().push(changed.to_vec());
         }));
         calls
+    }
+
+    /// paramLib.c:309 prints a double with `%f`.
+    #[test]
+    fn dump_prints_doubles_as_c_percent_f() {
+        let params = Params::default();
+        params.set_double(0, f64::NAN).unwrap();
+        params.set_double(1, -f64::NAN).unwrap();
+        let mut out = String::new();
+        params.dump(&mut out);
+        assert!(
+            out.contains("Parameter 0 is a double, value nan\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Parameter 1 is a double, value -nan\n"),
+            "{out}"
+        );
     }
 
     #[test]
