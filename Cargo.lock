@@ -2445,6 +2445,7 @@ dependencies = [
 name = "mca"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "mca-rs",
  "tokio",
