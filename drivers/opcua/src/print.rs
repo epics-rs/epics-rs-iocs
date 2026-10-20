@@ -14,12 +14,12 @@ use epics_libcom_rs::cfmt::CFloat;
 use crate::session::status_name;
 use crate::value::type_name;
 
-/// `UA_print` of a variant's value. `None` for a structure the session
-/// decoded: `printStructure` walks the type's members, which the generated
-/// `async-opcua` types do not expose.
-pub fn ua_print(v: &Variant) -> Option<String> {
+/// `UA_print` of a variant's value, as the bytes of the `UA_String` it fills.
+/// `None` for a structure the session decoded: `printStructure` walks the
+/// type's members, which the generated `async-opcua` types do not expose.
+pub fn ua_print(v: &Variant) -> Option<Vec<u8>> {
     let mut printer = Printer {
-        out: String::new(),
+        out: Vec::new(),
         depth: 0,
         offset: chrono::Local::now().offset().local_minus_utc(),
     };
@@ -28,7 +28,7 @@ pub fn ua_print(v: &Variant) -> Option<String> {
 }
 
 struct Printer {
-    out: String,
+    out: Vec<u8>,
     depth: usize,
     /// `UA_DateTime_localTimeUtcOffset`, in seconds.
     offset: i32,
@@ -36,15 +36,13 @@ struct Printer {
 
 impl Printer {
     fn push(&mut self, s: &str) {
-        self.out.push_str(s);
+        self.out.extend_from_slice(s.as_bytes());
     }
 
     /// `UA_PrintContext_addNewlineTabs`.
     fn newline(&mut self) {
-        self.out.push('\n');
-        for _ in 0..self.depth {
-            self.out.push('\t');
-        }
+        self.out.push(b'\n');
+        self.out.extend(std::iter::repeat_n(b'\t', self.depth));
     }
 
     /// The next member of a `{ ... }` block: `,` after the one before it, a
@@ -86,7 +84,7 @@ impl Printer {
             Variant::Double(x) => self.push(&CFloat(*x).to_string()),
             Variant::String(s) => self.string(s),
             Variant::XmlElement(x) if x.is_ua_null() => self.push("NullString"),
-            Variant::XmlElement(x) => self.quoted(&x.to_string()),
+            Variant::XmlElement(x) => self.quoted(x.to_string().as_bytes()),
             Variant::DateTime(dt) => self.push(&date_time(dt, self.offset)),
             Variant::Guid(g) => self.push(&g.to_string()),
             Variant::StatusCode(s) => self.push(status_name(*s)),
@@ -121,15 +119,15 @@ impl Printer {
         Some(())
     }
 
-    fn quoted(&mut self, s: &str) {
+    fn quoted(&mut self, s: &[u8]) {
         self.push("\"");
-        self.push(s);
+        self.out.extend_from_slice(s);
         self.push("\"");
     }
 
     fn string(&mut self, s: &UAString) {
         match s.value() {
-            Some(s) => self.quoted(s),
+            Some(s) => self.quoted(s.as_bytes()),
             None => self.push("NullString"),
         }
     }
@@ -138,7 +136,7 @@ impl Printer {
         if b.is_null() {
             self.push("NullByteString");
         } else {
-            self.quoted(&b.as_base64());
+            self.quoted(b.as_base64().as_bytes());
         }
     }
 
@@ -201,7 +199,7 @@ impl Printer {
             self.member(first, "DataType");
             self.push(&body.encoding_id().to_string());
             self.member(first, "Body");
-            self.quoted(&String::from_utf8_lossy(body.raw_body()));
+            self.quoted(body.raw_body());
             self.close();
         }
         Some(())

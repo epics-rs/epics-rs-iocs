@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use async_opcua::types::Variant;
+use async_opcua::types::{Variant, VariantScalarTypeId};
 use epics_rs::base::error::{CaError, CaResult, LinkRefusal};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
@@ -360,7 +360,7 @@ impl OpcuaDevice {
         let rec = item_record(record, &self.record_name)?;
         rec.set_acted(ok);
         rec.statcode = status.bits();
-        rec.stattext = truncate(&status.to_string(), 40).to_string();
+        rec.stattext = status.to_string().as_str().into();
         // UDF belongs to the record here: `opcua_action_item` never writes it,
         // the record support's `readwrite` wrapper clears it on dset success
         // (`opcuaItemRecord.cpp:159-162`) — which is what `set_acted` ports.
@@ -457,7 +457,7 @@ impl OpcuaDevice {
             Op::LongString => {
                 value::write_string(&long_string(record)?, incoming, choices).map_err(err)
             }
-            Op::Array => outgoing_array(record, incoming).map_err(err),
+            Op::Array => outgoing_array(record, incoming, choices).map_err(err),
             Op::Item => Err("the item record has no value of its own".to_string().into()),
         }
     }
@@ -610,11 +610,11 @@ impl OpcuaDevice {
             // lsi/lso clamp the string to SIZV themselves and set LEN from it.
             Op::LongString => {
                 let v = value::read_string(data, choices)?;
-                put(record, "VAL", EpicsValue::CharArray(v.into_bytes().into()))?;
+                put(record, "VAL", EpicsValue::CharArray(v.into()))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Op::Array => {
-                store_array(data, record)?;
+                store_array(data, choices, record)?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             // The item record takes no value from the node — its elements do.
@@ -700,7 +700,7 @@ impl OpcuaDevice {
             posts.push((ENUM_VALUE_FIELDS[i].to_string(), EpicsValue::ULong(*value)));
             posts.push((
                 ENUM_STRING_FIELDS[i].to_string(),
-                EpicsValue::String(truncate(name, 25).into()),
+                EpicsValue::String(truncate(name.as_bytes(), 25).into()),
             ));
         }
         // Clear the slots the server does not use, so no stale string shows and
@@ -851,8 +851,8 @@ impl OpcuaDevice {
             // (`opcuaItemRecord.cpp:56-71`).
             let (session, subscription, bini) = names;
             let item_record = item_record(record, &self.record_name)?;
-            item_record.sess = session;
-            item_record.subs = subscription;
+            item_record.sess = session.as_str().into();
+            item_record.subs = subscription.as_str().into();
             if item_record.bini == 0 {
                 item_record.bini = bini_index(bini);
             }
@@ -1149,13 +1149,10 @@ fn no_conversion(record: &dyn Record) -> bool {
     short(record, "LINR").unwrap_or(0) == 0
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    // EPICS field sizes are byte counts; never split a character in half.
-    let mut end = s.len().min(max);
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
+/// EPICS field sizes are byte counts, and the C copies that many bytes even
+/// when the last character is cut in half (`DataElementOpen62541Leaf.cpp:427-431`).
+fn truncate(s: &[u8], max: usize) -> &[u8] {
+    &s[..s.len().min(max)]
 }
 
 // ------------------------------------------------------------------------ arrays
@@ -1163,21 +1160,31 @@ fn truncate(s: &str, max: usize) -> String {
 /// The record's VAL keeps its element type (its FTVL), so an incoming array is
 /// converted to exactly that type — the C picks the `readArray<T>` overload from
 /// FTVL (`devOpcua.cpp:1083-1134`).
-fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), Failure> {
+fn store_array(
+    data: &Variant,
+    choices: Option<&EnumChoices>,
+    record: &mut dyn Record,
+) -> Result<(), Failure> {
     let nelm = usize::try_from(long(record, "NELM").unwrap_or(0)).unwrap_or(0);
     let current = field(record, "VAL")?;
 
     let value = match current {
-        // FTVL = CHAR doubles as a long string (`devOpcua.cpp:1084-1087`), so a
-        // String node lands in it as its bytes.
-        EpicsValue::CharArray(_) | EpicsValue::UCharArray(_) => {
-            let bytes = match data {
-                Variant::String(_) | Variant::ByteString(_) | Variant::LocalizedText(_) => {
-                    value::read_string(data, None)?.into_bytes()
-                }
-                _ => value::read_array_u8(data)?,
-            };
-            EpicsValue::CharArray(clamp(bytes, nelm).into())
+        // FTVL = CHAR is always the long-string read (`devOpcua.cpp:1084-1087`):
+        // text keeps a NUL's room (`DataElementOpen62541Leaf.cpp:346`), Byte
+        // data may fill the buffer (`:408`).
+        EpicsValue::CharArray(_) => {
+            let bytes = matches!(data, Variant::Byte(_) | Variant::SByte(_))
+                || matches!(data, Variant::Array(a) if matches!(
+                    a.value_type,
+                    VariantScalarTypeId::Byte | VariantScalarTypeId::SByte
+                ));
+            let room = if bytes { nelm } else { nelm.saturating_sub(1) };
+            EpicsValue::CharArray(clamp(value::read_string(data, choices)?, room).into())
+        }
+        // FTVL = UCHAR is the `epicsUInt8` overload: a ByteString's raw bytes
+        // or a Byte/Boolean array (`DataElementOpen62541Leaf.cpp:652-662`).
+        EpicsValue::UCharArray(_) => {
+            EpicsValue::UCharArray(clamp(value::read_array_u8(data)?, nelm).into())
         }
         EpicsValue::ShortArray(_) => {
             EpicsValue::ShortArray(clamp(value::read_array::<i16>(data)?, nelm).into())
@@ -1206,7 +1213,7 @@ fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), Failure> {
         EpicsValue::StringArray(_) => EpicsValue::StringArray(
             clamp(value::read_string_array(data)?, nelm)
                 .into_iter()
-                .map(|s| truncate(&s, 39).into())
+                .map(|s| truncate(s.as_bytes(), 39).into())
                 .collect(),
         ),
         other => return Err(format!("VAL is not an array ({other:?})").into()),
@@ -1216,16 +1223,20 @@ fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), Failure> {
 
 /// VAL comes back NORD elements long, which is exactly what the C sends
 /// (`writeArray(prec->bptr, prec->nord)`).
-fn outgoing_array(record: &mut dyn Record, incoming: &Variant) -> value::WriteResult {
+fn outgoing_array(
+    record: &mut dyn Record,
+    incoming: &Variant,
+    choices: Option<&EnumChoices>,
+) -> value::WriteResult {
     let current = record.get_field("VAL").unwrap_or(EpicsValue::Long(0));
     match current {
-        EpicsValue::CharArray(v) | EpicsValue::UCharArray(v) => match incoming {
-            Variant::String(_) | Variant::ByteString(_) | Variant::LocalizedText(_) => {
-                let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
-                value::write_string(&String::from_utf8_lossy(&v[..end]), incoming, None)
-            }
-            _ => value::write_array_u8(&v, incoming),
-        },
+        // FTVL = CHAR is always the long-string write (`devOpcua.cpp:1162-1164`).
+        EpicsValue::CharArray(v) => {
+            let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
+            value::write_string(&String::from_utf8_lossy(&v[..end]), incoming, choices)
+        }
+        // `writeArray<epicsUInt8>` (`DataElementOpen62541Leaf.cpp:1238-1252`).
+        EpicsValue::UCharArray(v) => value::write_array_u8(&v, incoming),
         EpicsValue::ShortArray(v) => value::write_array(&v, incoming),
         EpicsValue::UShortArray(v) => value::write_array(&v, incoming),
         EpicsValue::LongArray(v) => value::write_array(&v, incoming),

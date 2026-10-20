@@ -8,12 +8,14 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use async_opcua::types::{StatusCode, Variant};
+use async_opcua::types::{
+    Array, QualifiedName, StatusCode, UAString, Variant, VariantScalarTypeId,
+};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
 use epics_rs::base::server::device_support::{DeviceAlarm, DeviceReadOutcome, DeviceSupport};
-use epics_rs::base::server::record::{AlarmSeverity, ProcessContext, Record, ScanType};
+use epics_rs::base::server::record::{AlarmSeverity, Ftype, ProcessContext, Record, ScanType};
 use epics_rs::base::server::records::ai::AiRecord;
 use epics_rs::base::server::records::ao::AoRecord;
 use epics_rs::base::server::records::bi::BiRecord;
@@ -243,6 +245,41 @@ fn stringin_truncates_to_the_epics_string_size() {
         field(&record, "VAL"),
         EpicsValue::String("x".repeat(39).into())
     );
+}
+
+/// EPICS string sizes are byte counts: the C copies 39 bytes even through the
+/// middle of a character (`DataElementOpen62541Leaf.cpp:427-431`).
+#[test]
+fn stringin_cuts_at_the_byte_size_inside_a_character() {
+    let registry = registry();
+    let mut record = StringinRecord::new("");
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    let long = format!("{}\u{e9}", "x".repeat(38));
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::String(long.as_str().into()),
+    );
+
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::String(long.as_bytes()[..39].into())
+    );
+}
+
+#[test]
+fn stringin_takes_a_byte_node_as_its_raw_byte() {
+    let registry = registry();
+    let mut record = StringinRecord::new("");
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    incoming(&mut device, &leaf, &mut record, Variant::Byte(0xff));
+
+    assert_eq!(field(&record, "VAL"), EpicsValue::String(vec![0xff].into()));
 }
 
 #[test]
@@ -475,6 +512,27 @@ fn the_servers_enumeration_fills_a_state_table_the_database_left_empty() {
     assert!(rx.try_recv().is_err());
 }
 
+/// A state string is cut at 25 bytes, as `strncpy` cuts it (`devOpcua.cpp:723`).
+#[test]
+fn a_state_name_from_the_server_is_cut_at_the_byte_size() {
+    let registry = registry();
+    let mut record = MbbiRecord::new(0);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    let name = format!("{}\u{e9}", "x".repeat(24));
+    let mut choices = EnumChoices::new();
+    choices.insert(3, name.clone());
+    leaf.lock().choices = Some(Arc::new(choices));
+
+    incoming(&mut device, &leaf, &mut record, Variant::UInt32(3));
+
+    assert_eq!(
+        field(&record, "ZRST"),
+        EpicsValue::String(name.as_bytes()[..25].into())
+    );
+}
+
 #[test]
 fn a_state_table_the_database_defined_is_not_overwritten_by_the_server() {
     let registry = registry();
@@ -658,6 +716,28 @@ fn an_array_longer_than_nelm_is_clamped() {
     );
 }
 
+/// Each element is cut at 39 bytes (`DataElementOpen62541Leaf.cpp:548-551`).
+#[test]
+fn a_string_waveform_cuts_each_element_at_the_byte_size() {
+    let registry = registry();
+    let mut record = WaveformRecord::new(2, DbFieldType::String);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    let long = format!("{}\u{e9}", "x".repeat(38));
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::from(vec![UAString::from(long.as_str()), UAString::from("ok")]),
+    );
+
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::StringArray(vec![long.as_bytes()[..39].into(), "ok".into()].into())
+    );
+}
+
 #[test]
 fn a_char_waveform_holds_a_string_node_as_its_bytes() {
     let registry = registry();
@@ -675,6 +755,206 @@ fn a_char_waveform_holds_a_string_node_as_its_bytes() {
     assert_eq!(
         field(&record, "VAL"),
         EpicsValue::CharArray(b"text".to_vec().into())
+    );
+}
+
+/// FTVL = UCHAR is the `epicsUInt8` array overload, never the long-string
+/// path (`DataElementOpen62541Leaf.cpp:652-662`): a ByteString node is its
+/// raw bytes, any other scalar node is not an array.
+#[test]
+fn a_uchar_waveform_reads_a_bytestring_raw_and_refuses_a_string_node() {
+    let registry = registry();
+    let mut record = WaveformRecord::new(8, DbFieldType::UChar);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::ByteString(vec![0x01, 0xff].into()),
+    );
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::UCharArray(vec![0x01, 0xff].into())
+    );
+    assert_eq!(device.last_alarm(), None);
+
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::String("text".into()),
+    );
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 3,
+            msg: ""
+        })
+    );
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::UCharArray(vec![0x01, 0xff].into())
+    );
+}
+
+/// `writeArray<epicsUInt8>` (`DataElementOpen62541Leaf.cpp:1238-1252`).
+#[test]
+fn a_uchar_aao_writes_a_bytestring_raw_and_refuses_a_string_node() {
+    let registry = registry();
+    let mut record = WaveformRecord::with_kind(ArrayKind::Aao);
+    record.put_field("NELM", EpicsValue::Long(4)).unwrap();
+    record
+        .put_field("FTVL", EpicsValue::Short(Ftype::UChar.index()))
+        .unwrap();
+    record
+        .put_field("VAL", EpicsValue::UCharArray(vec![0x41, 0x42].into()))
+        .unwrap();
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    typed(&leaf, Variant::ByteString(vec![0u8].into()));
+    outgoing(&mut device, &mut record);
+    assert_eq!(
+        leaf.lock().outgoing,
+        Some(Variant::ByteString(vec![0x41, 0x42].into()))
+    );
+    assert_eq!(device.last_alarm(), None);
+
+    leaf.lock().outgoing = None;
+    typed(&leaf, Variant::String("".into()));
+    outgoing(&mut device, &mut record);
+    assert_eq!(leaf.lock().outgoing, None);
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 2,
+            sevr: 3,
+            msg: ""
+        })
+    );
+}
+
+fn byte_array(bytes: &[u8]) -> Variant {
+    let elements: Vec<Variant> = bytes.iter().map(|b| Variant::Byte(*b)).collect();
+    Variant::Array(Box::new(
+        Array::new(VariantScalarTypeId::Byte, elements).unwrap(),
+    ))
+}
+
+fn idle_busy() -> EnumChoices {
+    let mut choices = EnumChoices::new();
+    choices.insert(3, "Idle".to_string());
+    choices.insert(7, "Busy".to_string());
+    choices
+}
+
+/// A device alarm's STAT and SEVR.
+type Alarm = Option<(u16, u16)>;
+
+fn alarm(device: &OpcuaDevice) -> Alarm {
+    device.last_alarm().map(|a| (a.stat, a.sevr))
+}
+
+/// The alarm and VAL of a FTVL = CHAR waveform after one update of `v`.
+fn char_waveform_reads(nelm: i32, choices: Option<EnumChoices>, v: Variant) -> (Alarm, EpicsValue) {
+    let registry = registry();
+    let mut record = WaveformRecord::new(nelm, DbFieldType::Char);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+    leaf.lock().choices = choices.map(Arc::new);
+    incoming(&mut device, &leaf, &mut record, v);
+    (alarm(&device), field(&record, "VAL"))
+}
+
+fn text(bytes: &[u8]) -> (Alarm, EpicsValue) {
+    (None, EpicsValue::CharArray(bytes.to_vec().into()))
+}
+
+/// FTVL = CHAR is always `readScalar(char*, nelm)`
+/// (`DataElementOpen62541Leaf.cpp:300-455`): any node reads as its text, and
+/// an array node as its first element, the payload the C points at
+/// (`:350-351`); only a Byte array is taken whole (`:402-409`).
+#[test]
+fn a_char_waveform_reads_any_node_as_text() {
+    let qn = Variant::QualifiedName(Box::new(QualifiedName::new(2, "name")));
+    let strings = Variant::from(vec![UAString::from("ab"), UAString::from("cd")]);
+    assert_eq!(
+        [
+            char_waveform_reads(8, None, Variant::Int32(42)),
+            char_waveform_reads(8, None, qn),
+            char_waveform_reads(8, Some(idle_busy()), Variant::Int32(3)),
+            char_waveform_reads(8, None, Variant::from(vec![true, false])),
+            char_waveform_reads(8, None, strings),
+        ],
+        [
+            text(b"42"),
+            text(b"name"),
+            text(b"Idle"),
+            text(b"true"),
+            text(b"ab"),
+        ]
+    );
+}
+
+/// Text keeps a NUL's room (`n = len-1`, `:346`); a Byte array may fill the
+/// buffer (`n++`, `:408`).
+#[test]
+fn a_char_waveform_cuts_text_at_nelm_less_one_and_bytes_at_nelm() {
+    assert_eq!(
+        [
+            char_waveform_reads(4, None, Variant::String("abcdef".into())),
+            char_waveform_reads(4, None, byte_array(&[1, 2, 3, 4, 5])),
+        ],
+        [text(b"abc"), text(&[1, 2, 3, 4])]
+    );
+}
+
+/// The alarm and outgoing value of a FTVL = CHAR aao holding `text`, writing
+/// to a node last seen as `node`.
+fn char_aao_sends(
+    text: &str,
+    choices: Option<EnumChoices>,
+    node: Variant,
+) -> (Alarm, Option<Variant>) {
+    let registry = registry();
+    let mut record = WaveformRecord::with_kind(ArrayKind::Aao);
+    record.put_field("NELM", EpicsValue::Long(8)).unwrap();
+    record
+        .put_field("FTVL", EpicsValue::Short(Ftype::Char.index()))
+        .unwrap();
+    record
+        .put_field("VAL", EpicsValue::CharArray(text.as_bytes().into()))
+        .unwrap();
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+    leaf.lock().choices = choices.map(Arc::new);
+    typed(&leaf, node);
+    outgoing(&mut device, &mut record);
+    let sent = leaf.lock().outgoing.clone();
+    (alarm(&device), sent)
+}
+
+/// FTVL = CHAR is always `writeScalar(char*, nord)` (`:867-1120`), which
+/// parses the text into a scalar of the node's type — for an array node its
+/// element type, as the C never asks whether it is one (`:878`).
+#[test]
+fn a_char_aao_sends_the_scalar_its_text_parses_to() {
+    assert_eq!(
+        [
+            char_aao_sends("42", None, Variant::Int32(0)),
+            char_aao_sends("Busy", Some(idle_busy()), Variant::Int32(0)),
+            char_aao_sends("200", None, byte_array(&[0, 0])),
+            char_aao_sends("200", None, byte_array(&[])),
+        ],
+        [
+            (None, Some(Variant::Int32(42))),
+            (None, Some(Variant::Int32(7))),
+            (None, Some(Variant::Byte(200))),
+            (None, Some(Variant::Byte(200))),
+        ]
     );
 }
 
