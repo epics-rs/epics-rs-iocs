@@ -1258,3 +1258,60 @@ fn del_record_refuses_to_let_the_link_go() {
     let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
     assert!(device.del_record().is_err());
 }
+
+/// What `printByteString` writes into a `len`-byte buffer: whole hex pairs
+/// while `l < len-3` (`DataElementOpen62541Leaf.cpp:245-255`). Under 3 the C
+/// wraps and overruns the buffer; rs writes nothing.
+#[test]
+fn a_bytestring_reads_as_whole_hex_pairs() {
+    let bytes: Vec<u8> = (0..30).collect();
+    let hex = |pairs: usize| -> Vec<u8> {
+        bytes[..pairs]
+            .iter()
+            .flat_map(|b| format!("{b:02X}").into_bytes())
+            .collect()
+    };
+    let node = || Variant::ByteString(bytes.clone().into());
+
+    let stringin = {
+        let registry = registry();
+        let mut record = StringinRecord::new("");
+        let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+        incoming(&mut device, &leaf(&registry), &mut record, node());
+        field(&record, "VAL")
+    };
+    let lsi = {
+        let registry = registry();
+        let mut record = LsiRecord::new("");
+        record.sizv = 21;
+        let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+        incoming(&mut device, &leaf(&registry), &mut record, node());
+        field(&record, "VAL")
+    };
+    let strings = {
+        let registry = registry();
+        let mut record = WaveformRecord::new(1, DbFieldType::String);
+        let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+        let array = Variant::from(vec![async_opcua::types::ByteString::from(bytes.clone())]);
+        incoming(&mut device, &leaf(&registry), &mut record, array);
+        field(&record, "VAL")
+    };
+    assert_eq!(
+        [
+            char_waveform_reads(10, None, node()).1,
+            char_waveform_reads(11, None, node()).1,
+            char_waveform_reads(2, None, node()).1,
+            stringin,
+            lsi,
+            strings,
+        ],
+        [
+            EpicsValue::CharArray(hex(4).into()),
+            EpicsValue::CharArray(hex(4).into()),
+            EpicsValue::CharArray(Vec::new().into()),
+            EpicsValue::String(hex(19).into()),
+            EpicsValue::CharArray([hex(9), vec![0]].concat().into()),
+            EpicsValue::StringArray(vec![hex(19).into()].into()),
+        ]
+    );
+}

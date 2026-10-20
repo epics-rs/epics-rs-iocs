@@ -187,23 +187,28 @@ fn an_enum_value_must_be_one_of_its_choices() {
 
 // ------------------------------------------------------------- string reads
 
+/// A char buffer no read below fills.
+const ROOM: usize = 4096;
+
 #[test]
 fn strings_localized_text_and_qualified_names_read_as_their_text() {
     assert_eq!(
-        read_string(&Variant::String(UAString::from("text")), None),
+        read_string(&Variant::String(UAString::from("text")), None, ROOM),
         Ok(b"text".to_vec())
     );
     assert_eq!(
         read_string(
             &Variant::LocalizedText(Box::new(LocalizedText::new("de", "Wert"))),
-            None
+            None,
+            ROOM
         ),
         Ok(b"Wert".to_vec())
     );
     assert_eq!(
         read_string(
             &Variant::QualifiedName(Box::new(QualifiedName::new(2, "Name"))),
-            None
+            None,
+            ROOM
         ),
         Ok(b"Name".to_vec())
     );
@@ -214,7 +219,8 @@ fn a_byte_string_reads_as_upper_case_hex() {
     assert_eq!(
         read_string(
             &Variant::ByteString(ByteString::from(vec![0x0a, 0xff])),
-            None
+            None,
+            ROOM
         ),
         Ok(b"0AFF".to_vec())
     );
@@ -224,21 +230,27 @@ fn a_byte_string_reads_as_upper_case_hex() {
 fn an_enum_reads_as_its_choice_name_and_falls_back_to_the_number() {
     let c = choices();
     assert_eq!(
-        read_string(&Variant::Int32(7), Some(&c)),
+        read_string(&Variant::Int32(7), Some(&c), ROOM),
         Ok(b"Fault".to_vec())
     );
-    assert_eq!(read_string(&Variant::Int32(3), Some(&c)), Ok(b"3".to_vec()));
+    assert_eq!(
+        read_string(&Variant::Int32(3), Some(&c), ROOM),
+        Ok(b"3".to_vec())
+    );
 }
 
 #[test]
 fn numbers_and_booleans_read_as_text() {
-    assert_eq!(read_string(&Variant::Int32(-5), None), Ok(b"-5".to_vec()));
     assert_eq!(
-        read_string(&Variant::Double(1.5), None),
+        read_string(&Variant::Int32(-5), None, ROOM),
+        Ok(b"-5".to_vec())
+    );
+    assert_eq!(
+        read_string(&Variant::Double(1.5), None, ROOM),
         Ok(b"1.500000".to_vec())
     );
     assert_eq!(
-        read_string(&Variant::Boolean(true), None),
+        read_string(&Variant::Boolean(true), None, ROOM),
         Ok(b"true".to_vec())
     );
 }
@@ -247,15 +259,19 @@ fn numbers_and_booleans_read_as_text() {
 /// (`DataElementOpen62541Leaf.cpp:402-409`).
 #[test]
 fn a_byte_reads_as_its_raw_byte() {
-    assert_eq!(read_string(&Variant::Byte(0xff), None), Ok(vec![0xff]));
-    assert_eq!(read_string(&Variant::SByte(-1), None), Ok(vec![0xff]));
+    assert_eq!(
+        read_string(&Variant::Byte(0xff), None, ROOM),
+        Ok(vec![0xff])
+    );
+    assert_eq!(read_string(&Variant::SByte(-1), None, ROOM), Ok(vec![0xff]));
     assert_eq!(
         read_string(
             &array(
                 VariantScalarTypeId::Byte,
                 vec![Variant::Byte(b'A'), Variant::Byte(0xff)]
             ),
-            None
+            None,
+            ROOM
         ),
         Ok(vec![b'A', 0xff])
     );
@@ -265,7 +281,8 @@ fn a_byte_reads_as_its_raw_byte() {
                 VariantScalarTypeId::SByte,
                 vec![Variant::SByte(-1), Variant::SByte(65)]
             ),
-            None
+            None,
+            ROOM
         ),
         Ok(vec![0xff, b'A'])
     );
@@ -277,7 +294,7 @@ fn a_byte_reads_as_its_raw_byte() {
 // for the same value, from the amalgamation the C module builds with.
 
 fn print(v: Variant) -> String {
-    String::from_utf8(read_string(&v, None).expect("printable")).expect("text")
+    String::from_utf8(read_string(&v, None, ROOM).expect("printable")).expect("text")
 }
 
 /// A variant inside a variant, which `UA_print` shows with its type.
@@ -591,7 +608,7 @@ fn an_undecoded_structure_reads_as_ua_print_renders_it() {
         "X".to_string(),
     ));
     assert_eq!(
-        read_string(&Variant::ExtensionObject(raw), None),
+        read_string(&Variant::ExtensionObject(raw), None, ROOM),
         Ok(
             b"ExtensionObject(XML Encoded) {\n\tDataType: ns=2;i=5005,\n\tBody: \"\xff\"\n}"
                 .to_vec()
@@ -706,8 +723,8 @@ fn a_string_array_reads_every_text_like_element_type() {
         ],
     );
     assert_eq!(
-        read_string_array(&strings),
-        Ok(vec!["a".to_string(), "b".to_string()])
+        read_string_array(&strings, ROOM),
+        Ok(vec![b"a".to_vec(), b"b".to_vec()])
     );
 
     let texts = array(
@@ -716,7 +733,7 @@ fn a_string_array_reads_every_text_like_element_type() {
             "en", "hello",
         )))],
     );
-    assert_eq!(read_string_array(&texts), Ok(vec!["hello".to_string()]));
+    assert_eq!(read_string_array(&texts, ROOM), Ok(vec![b"hello".to_vec()]));
 }
 
 // -------------------------------------------------------------------- writes

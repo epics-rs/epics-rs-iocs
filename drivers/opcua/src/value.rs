@@ -394,11 +394,13 @@ fn is_choice(choices: &EnumChoices, n: Number) -> bool {
     key.is_some_and(|k| choices.contains_key(&k))
 }
 
-/// Read any variant as the bytes the C copies into the record's char buffer
-/// (`readScalar(char*, len)`, `DataElementOpen62541Leaf.cpp:300-455`) — the
-/// stringin/stringout/lsi/lso path. A kind with no text of its own is printed
+/// Read any variant as the bytes the C copies into the record's `len`-byte
+/// char buffer (`readScalar(char*, len)`, `DataElementOpen62541Leaf.cpp:300-455`)
+/// — the stringin/stringout/lsi/lso and FTVL=CHAR path. Text keeps a NUL's
+/// room (`n = len-1`, `:346`), Byte data may fill the buffer (`n++`, `:408`),
+/// a ByteString is whole hex pairs. A kind with no text of its own is printed
 /// by `UA_print` (`:422-426`).
-pub fn read_string(v: &Variant, choices: Option<&EnumChoices>) -> ReadResult<Vec<u8>> {
+pub fn read_string(v: &Variant, choices: Option<&EnumChoices>, len: usize) -> ReadResult<Vec<u8>> {
     let unsupported = || ReadError::UnsupportedKind {
         kind: kind_name(v),
         value: describe(v),
@@ -409,47 +411,64 @@ pub fn read_string(v: &Variant, choices: Option<&EnumChoices>) -> ReadResult<Vec
     if let (Some(choices), Some(n)) = (choices, scalar_number(v))
         && let Some(name) = enum_choice_name(choices, n)
     {
-        return Ok(name.as_bytes().to_vec());
+        return Ok(cut_text(name.as_bytes().to_vec(), len));
     }
 
-    Ok(match v {
+    let text = match v {
         Variant::String(s) => s.as_ref().as_bytes().to_vec(),
         Variant::XmlElement(x) => x.to_string().into_bytes(),
         Variant::LocalizedText(lt) => lt.text.as_ref().as_bytes().to_vec(),
         Variant::QualifiedName(qn) => qn.name.as_ref().as_bytes().to_vec(),
-        Variant::ByteString(bs) => hex_encode(bs.as_ref()).into_bytes(),
-        // The C hands the raw byte(s) to the record's char buffer
-        // (`DataElementOpen62541Leaf.cpp:402-409`). Its `n++` (`:408`) lets a
-        // byte array fill the whole buffer with no NUL; that C defect is not
-        // copied, so the record cuts these bytes like any other text.
-        Variant::Byte(b) => vec![*b],
-        Variant::SByte(b) => vec![*b as u8],
+        Variant::ByteString(bs) => return Ok(print_byte_string(bs.as_ref(), len)),
+        // The C hands the raw byte(s) to the record's char buffer (`:402-409`).
+        Variant::Byte(_) | Variant::SByte(_) => return Ok(raw_bytes([v], len)),
         Variant::Array(a)
             if matches!(
                 a.value_type,
                 VariantScalarTypeId::Byte | VariantScalarTypeId::SByte
             ) =>
         {
-            a.values
-                .iter()
-                .filter_map(|e| match e {
-                    Variant::Byte(b) => Some(*b),
-                    Variant::SByte(b) => Some(*b as u8),
-                    _ => None,
-                })
-                .collect()
+            return Ok(raw_bytes(&a.values, len));
         }
         // C dereferences the null type of a variant without a value (`:353`).
         Variant::Empty => return Err(unsupported()),
         // The C reads the payload pointer, an array's first element
         // (`:350-351`); an empty array's points at the sentinel.
         Variant::Array(a) => match a.values.first() {
-            Some(first) => return read_string(first, choices),
+            Some(first) => return read_string(first, choices, len),
             None => return Err(unsupported()),
         },
         // All but a structure decoded into a generated type.
         other => ua_print(other).ok_or_else(unsupported)?,
-    })
+    };
+    Ok(cut_text(text, len))
+}
+
+/// Byte data may fill a `len`-byte buffer (`n++`, `:408`).
+fn raw_bytes<'a>(values: impl IntoIterator<Item = &'a Variant>, len: usize) -> Vec<u8> {
+    values
+        .into_iter()
+        .filter_map(|e| match e {
+            Variant::Byte(b) => Some(*b),
+            Variant::SByte(b) => Some(*b as u8),
+            _ => None,
+        })
+        .take(len)
+        .collect()
+}
+
+/// Text in a `len`-byte buffer keeps a NUL's room (`n = len-1`).
+fn cut_text(mut text: Vec<u8>, len: usize) -> Vec<u8> {
+    text.truncate(len.saturating_sub(1));
+    text
+}
+
+/// `printByteString` (`DataElementOpen62541Leaf.cpp:245-255`) into a
+/// `len`-byte buffer: whole hex pairs while `l < len-3`. Under 3 the C's
+/// `size_t` wraps and it writes past the buffer; that is not copied.
+fn print_byte_string(bytes: &[u8], len: usize) -> Vec<u8> {
+    let pairs = len.saturating_sub(2) / 2;
+    hex_encode(&bytes[..bytes.len().min(pairs)]).into_bytes()
 }
 
 fn enum_choice_name(choices: &EnumChoices, n: Number) -> Option<&str> {
@@ -590,20 +609,21 @@ pub fn read_array_u8(v: &Variant) -> ReadResult<Vec<u8>> {
     }
 }
 
-/// String arrays (`readArray(char*, len, num, ...)`,
-/// `DataElementOpen62541Leaf.cpp:487-600`): String, XmlElement, LocalizedText,
-/// QualifiedName and ByteString (hex-encoded) all read as text.
-pub fn read_string_array(v: &Variant) -> ReadResult<Vec<String>> {
+/// String arrays of `len`-byte elements (`readArray(char*, len, num, ...)`,
+/// `DataElementOpen62541Leaf.cpp:487-600`): String, XmlElement, LocalizedText
+/// and QualifiedName read as text cut at `len-1` bytes, a ByteString as whole
+/// hex pairs (`:570-574`).
+pub fn read_string_array(v: &Variant, len: usize) -> ReadResult<Vec<Vec<u8>>> {
     let array = as_array(v)?;
     array
         .values
         .iter()
         .map(|e| match e {
-            Variant::String(s) => Ok(s.as_ref().to_string()),
-            Variant::XmlElement(x) => Ok(x.to_string()),
-            Variant::LocalizedText(lt) => Ok(lt.text.as_ref().to_string()),
-            Variant::QualifiedName(qn) => Ok(qn.name.as_ref().to_string()),
-            Variant::ByteString(bs) => Ok(hex_encode(bs.as_ref())),
+            Variant::String(s) => Ok(cut_text(s.as_ref().as_bytes().to_vec(), len)),
+            Variant::XmlElement(x) => Ok(cut_text(x.to_string().into_bytes(), len)),
+            Variant::LocalizedText(lt) => Ok(cut_text(lt.text.as_ref().as_bytes().to_vec(), len)),
+            Variant::QualifiedName(qn) => Ok(cut_text(qn.name.as_ref().as_bytes().to_vec(), len)),
+            Variant::ByteString(bs) => Ok(print_byte_string(bs.as_ref(), len)),
             other => Err(ReadError::ArrayTypeMismatch {
                 incoming: type_name(other),
                 target: "epicsString",
