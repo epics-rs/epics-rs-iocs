@@ -524,6 +524,20 @@ impl MultiFunctionDriver {
             .set_float64_param(p.wave_gen_dwell_actual, 0, dwell)?;
         self.base
             .set_float64_param(p.wave_gen_total_time, 0, dwell * num_points as f64)?;
+        // C keeps the axis of the requested dwell after AOutScan returns the
+        // rate it runs (drvMultiFunction.cpp:1738-1757). C defect, not copied
+        // (upstream-c-defects #230).
+        let time_wf = if first_type == wave_gen::WAVE_TYPE_USER {
+            p.wave_gen_user_time_wf
+        } else {
+            p.wave_gen_int_time_wf
+        };
+        let times = wave_dig::time_axis(num_points as i32, dwell);
+        updates.push(ParamSetValue::array(
+            time_wf,
+            0,
+            ParamValue::Float32Array(times.into()),
+        ));
         Ok(0)
     }
 

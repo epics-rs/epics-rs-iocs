@@ -375,6 +375,13 @@ impl PortDriver for CtrDriver {
                 );
                 self.base
                     .set_float64_param(self.params.mca_dwell_time, 0, actual_dwell)?;
+                // C writes the dwell the clock runs back without recomputing
+                // its axis (drvUSBCTR.cpp:711, :873-880). C defect, not copied
+                // (upstream-c-defects #230).
+                let times = mcs::compute_times(&mut st.mcs, num_channels, actual_dwell);
+                let times = ParamValue::Float32Array(times.into());
+                self.base
+                    .do_callbacks_array(self.params.mcs_time_wf, 0, times)?;
                 self.base
                     .set_int32_param(self.params.mcs_current_point, 0, 0)?;
             }
@@ -792,6 +799,34 @@ mod tests {
                 .is_empty(),
             "the time base was stored"
         );
+    }
+
+    /// The start writes back the dwell ulDaqInScan runs and posts the axis
+    /// of that dwell (upstream-c-defects #230); on the null handle the scan
+    /// fails and the dwell stays the one asked for.
+    #[test]
+    fn an_mcs_start_posts_the_time_base_of_the_dwell_it_runs() {
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let mut drv = CtrDriver::new("CTRSTART", DaqDevice::unconnected(), 16).unwrap();
+        let p = drv.params;
+        drv.base.set_int32_param(p.mca_num_channels, 0, 4).unwrap();
+        drv.base
+            .set_float64_param(p.mca_dwell_time, 0, 0.25)
+            .unwrap();
+        drv.base.own_interrupts(InterruptGate::opened());
+        drv.base.call_param_callbacks(0).unwrap();
+        let mut rx = drv.base.interrupts.subscribe_async(256, 4096);
+
+        let _ = drv.write_int32(&mut AsynUser::new(p.mca_start_acquire), 1);
+        let axes: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| v.reason == p.mcs_time_wf)
+            .map(|v| match v.value {
+                ParamValue::Float32Array(a) => a.to_vec(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(axes, [vec![0.0f32, 0.25, 0.5, 0.75]]);
     }
 
     #[test]

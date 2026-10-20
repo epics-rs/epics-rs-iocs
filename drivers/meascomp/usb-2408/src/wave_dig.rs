@@ -234,6 +234,10 @@ pub fn start_wave_dig(
                 0,
                 ParamValue::Float64(dwell * num_points as f64),
             ),
+            // C keeps the axis of the requested dwell after AInScan returns
+            // the rate it runs (drvMultiFunction.cpp:1905-1915). C defect,
+            // not copied (upstream-c-defects #230).
+            compute_wave_dig_times(params, num_points as i32, dwell),
         ],
     )
 }
