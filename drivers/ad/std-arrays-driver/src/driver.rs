@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -266,18 +267,18 @@ impl NdStdArraysDriver {
             .port_base
             .set_int32_param(self.ndsa.next_element, 0, new_next as i32)?;
 
-        // NDDriverStdArrays.cpp:256-266: post the current write index back onto
-        // the NDDimensions (ARRAY_DIMENSIONS) parameter.
+        // NDDriverStdArrays.cpp:256-266: post the current write index on
+        // NDDimensions (ARRAY_DIMENSIONS), storing nothing.
         let current_index = convert::current_index(
             new_next as i32,
             num_dimensions,
             &self.dim_prod,
             &self.array_dimensions,
         );
-        self.ad.port_base.params.set_int32_array(
+        self.ad.port_base.do_callbacks_array(
             self.ad.params.base.array_dimensions,
             0,
-            current_index.to_vec(),
+            ParamValue::Int32Array(current_index.into()),
         )?;
 
         if append_mode == 0 {
@@ -916,6 +917,50 @@ mod tests {
         f.set_i32(f.det.ndsa.next_element, 7);
         f.write_i32(f.det.ndsa.new_array, 1);
         assert_eq!(f.get_i32(f.det.ndsa.next_element), 0);
+    }
+
+    /// C posts the write index with `doCallbacksInt32Array`
+    /// (NDDriverStdArrays.cpp:264): typed, ahead of the write's
+    /// `callParamCallbacks`, and stored nowhere.
+    #[test]
+    fn the_write_index_posts_typed_ahead_of_the_params_and_is_not_stored() {
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+        let mut f = Fixture::new();
+        f.set_i32(
+            f.det.ad.params.base.data_type,
+            NDDataType::Float64 as u8 as i32,
+        );
+        f.set_i32(f.det.ad.params.base.n_dimensions, 1);
+        f.write_dims(&[4]);
+        f.write_i32(f.det.ad.params.acquire, 1);
+        let dims = f.det.ad.params.base.array_dimensions;
+        let next = f.det.ndsa.next_element;
+        let stored = f.det.ad.port_base.params.get_int32_array(dims, 0).ok();
+        f.det.ad.port_base.own_interrupts(InterruptGate::opened());
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let _sub = f
+            .det
+            .ad
+            .port_base
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                if [dims, next].contains(&iv.reason) {
+                    log.lock().push((iv.reason, iv.iface))
+                }
+            })
+            .unwrap();
+        f.write_f64_array(&[1.0, 2.0]);
+        assert_eq!(
+            *seen.lock(),
+            [(dims, Some(InterfaceType::Int32Array)), (next, None)]
+        );
+        assert_eq!(
+            f.det.ad.port_base.params.get_int32_array(dims, 0).ok(),
+            stored
+        );
     }
 
     #[test]
