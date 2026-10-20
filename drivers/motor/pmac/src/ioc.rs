@@ -23,7 +23,6 @@ use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::trace::{MotorTrace, TraceUser};
 
@@ -85,20 +84,14 @@ enum ConnectError {
 /// every PMAC reply ends in ACK, so without it every read times out.
 fn connect_octet(port: &str, addr: i32) -> Result<SyncIOHandle, ConnectError> {
     let entry = get_port(port).ok_or(ConnectError::NoPort)?;
-    let user = || AsynUser::new(0).with_addr(addr);
-    entry
-        .handle
-        .set_input_eos_blocking(user(), b"\x06")
+    let handle = SyncIOHandle::from_handle(entry.handle.clone(), addr, PMAC_TIMEOUT);
+    handle
+        .set_input_eos(0, b"\x06")
         .map_err(ConnectError::InputEos)?;
-    entry
-        .handle
-        .set_output_eos_blocking(user(), b"\r")
+    handle
+        .set_output_eos(0, b"\r")
         .map_err(ConnectError::OutputEos)?;
-    Ok(SyncIOHandle::from_handle(
-        entry.handle.clone(),
-        addr,
-        PMAC_TIMEOUT,
-    ))
+    Ok(handle)
 }
 
 /// C `pmacController`'s constructor (pmacController.cpp:194-200) and its
@@ -119,16 +112,11 @@ fn low_level_port_connect(self_port: &str, port: &str, addr: i32) -> Option<Sync
             );
             Some(handle)
         }
-        Ok(entry) => {
-            let user = || AsynUser::new(0).with_addr(addr);
-            let refused = entry
-                .set_input_eos_blocking(user(), b"\x06")
+        Ok(_) => {
+            let refused = handle
+                .set_input_eos(0, b"\x06")
                 .map_err(|e| ("input", e))
-                .and_then(|()| {
-                    entry
-                        .set_output_eos_blocking(user(), b"\r")
-                        .map_err(|e| ("output", e))
-                });
+                .and_then(|()| handle.set_output_eos(0, b"\r").map_err(|e| ("output", e)));
             let Err((which, e)) = refused else {
                 return Some(handle);
             };
@@ -760,6 +748,7 @@ mod tests {
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
     use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::asyn::user::AsynUser;
     use motor_common::testing::Polled;
 
     /// A port with no EOS support of its own: both sets are refused.
@@ -1024,6 +1013,34 @@ mod tests {
         // C keeps the unconnected user; only a refused EOS set clears it.
         assert!(low_level_port_connect("pmacTest", "pmacNoSuchPort", 0).is_some());
         assert!(controller_on("pmacNoSuchPort").write_read("I100").is_err());
+    }
+
+    /// pmacController.cpp:255-266, pmacAsynCoord.c:292-301: both connects set
+    /// the EOS with `pasynOctetSyncIO`, which prints its TRACEIO_DEVICE lines.
+    #[test]
+    fn both_connects_set_the_eos_as_asyn_octet_sync_io() {
+        use epics_rs::asyn::trace::TraceMask;
+        use motor_common::testing::LineRig;
+
+        let name = "pmacSyncIoEos";
+        let (_line, io) = LineRig::new(name, |_| String::new());
+        let trace = io.port().unwrap().trace().clone();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        assert!(low_level_port_connect("pmacSyncIoSelf", name, 0).is_some());
+        assert!(connect_octet(name, 0).is_ok());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.split_once(" asynOctetSyncIO ").map(|(_, call)| call))
+            .collect();
+        let pair = ["setInputEos eoslen 1", "setOutputEos eoslen 1"];
+        assert_eq!(lines, [pair, pair].concat(), "{text}");
     }
 
     #[test]
