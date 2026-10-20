@@ -5,8 +5,6 @@
 //! Usage:
 //!   cargo run -p microepsilon-ioc -- st.cmd
 
-use std::sync::Arc;
-
 use epics_rs::asyn::asyn_record;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::base::error::CaResult;
@@ -34,7 +32,7 @@ async fn main() -> CaResult<()> {
     // asyn device support, plus `stream` and its iocsh commands.
     app = stream_rs::dev::register_app(app);
 
-    let port_manager = Arc::new(PortManager::new());
+    let port_manager = PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // capaNCDT6200Configure(portName, IPaddress, IPport) -- C

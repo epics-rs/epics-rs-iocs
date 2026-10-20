@@ -1411,7 +1411,7 @@ mod tests {
     ) -> PvDatabase {
         let f = factory(registry_with("mw100dev", instrument));
         let ctx = DeviceSupportContext {
-            record_type: record.record_type(),
+            record_type: "bo",
             dtyp: DTYP,
             inp: "",
             out: link,

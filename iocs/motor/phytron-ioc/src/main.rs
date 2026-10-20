@@ -10,8 +10,6 @@
 //!   cargo run -p phytron-ioc -- st.cmd          # phyMOTION MCM
 //!   cargo run -p phytron-ioc -- st.mcc.cmd      # MCC-1 / MCC-2
 
-use std::sync::Arc;
-
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -43,7 +41,7 @@ async fn main() -> CaResult<()> {
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides the drvAsyn*PortConfigure family.
-    let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
+    let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // Phytron create-controller / create-axis commands share a controller-name

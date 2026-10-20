@@ -9,8 +9,6 @@
 //!   cargo run -p oms-asyn-ioc -- st.cmd          # MAXnet
 //!   cargo run -p oms-asyn-ioc -- st.mxa.cmd      # MXA
 
-use std::sync::Arc;
-
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -39,7 +37,7 @@ async fn main() -> CaResult<()> {
     }
 
     // Standard asyn iocsh commands — provides the drvAsyn*PortConfigure family.
-    let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
+    let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // OMS config commands + motor device support.

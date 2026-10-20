@@ -6,7 +6,6 @@
 //! Usage:
 //!   cargo run -p scaler974-ioc -- iocs/scaler974-ioc/st.cmd
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::base::error::CaResult;
@@ -77,7 +76,7 @@ async fn main() -> CaResult<()> {
 
     // Standard asyn iocsh commands — provides drvAsynSerialPortConfigure /
     // drvAsynIPPortConfigure / asynOctetSetInputEos / asynOctetSetOutputEos.
-    let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
+    let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // initScaler974(portName,serialPort,serialAddr,poll)

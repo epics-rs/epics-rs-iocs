@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::ffi::{CStr, c_char};
 use std::fmt;
 
 use uldaq_sys::{self, ERR_MSG_LEN, ERR_NO_ERROR};
@@ -25,7 +25,7 @@ pub struct ErrorMessage(pub uldaq_sys::UlError);
 
 impl fmt::Display for ErrorMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut buf = [0i8; ERR_MSG_LEN];
+        let mut buf = [0 as c_char; ERR_MSG_LEN];
         unsafe {
             uldaq_sys::ulGetErrMsg(self.0, buf.as_mut_ptr());
         }

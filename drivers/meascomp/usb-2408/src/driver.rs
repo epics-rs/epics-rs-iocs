@@ -29,6 +29,12 @@ fn device_addr(addr: i32) -> i32 {
     if addr == -1 { 0 } else { addr }
 }
 
+/// C `mapTriggerType` (drvMultiFunction.cpp:1383-1435): the cbw trigger
+/// types 0..19 except the two hysteresis gates have a uldaq trigger.
+fn trigger_mode_maps(value: i32) -> bool {
+    matches!(value, 0 | 1 | 4..=19)
+}
+
 /// The element count of a waveform read: C's `*nIn > (size_t)numPoints` cap
 /// (drvMultiFunction.cpp:2463, :2496), where a negative count casts huge and
 /// caps nothing. The copy still stops at the data, which C reads past.
@@ -935,6 +941,19 @@ impl PortDriver for MultiFunctionDriver {
                 FUNCTION,
                 "Setting temperature wiring",
             );
+        } else if reason == self.params.trigger_mode {
+            // C's Linux build only caches the mapped type, which no scan
+            // reads (drvMultiFunction.cpp:2074-2083).
+            if !trigger_mode_maps(value) {
+                trace.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}::mapTriggerType unsupported cbwTriggerType={value}\n"
+                    ),
+                );
+                status = -1;
+            }
+            trace.report_error(status, FUNCTION, "Setting trigger mode");
         } else if reason == self.params.pulse_gen_run {
             // C starts on any 1, running or not: a counted train ends unseen.
             let device = self.device.clone();
@@ -1333,6 +1352,17 @@ pub fn create_usb_2408(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_mode_refuses_the_hysteresis_gates_and_out_of_range() {
+        let mapped: Vec<i32> = (-1..=20).filter(|&v| trigger_mode_maps(v)).collect();
+        assert_eq!(
+            mapped,
+            [
+                0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            ]
+        );
+    }
 
     #[test]
     fn get_bounds_is_the_converter_range_of_an_analog_value() {

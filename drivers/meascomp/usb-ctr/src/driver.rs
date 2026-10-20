@@ -240,6 +240,37 @@ impl PortDriver for CtrDriver {
         &mut self.base
     }
 
+    /// C `USBCTR::report` (drvUSBCTR.cpp:1545-1570): the timers, scaler and
+    /// MCS state, then `asynPortDriver::report`.
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(out, "  Port: {}", self.base.port_name);
+        if level >= 1 {
+            let _ = writeln!(out, "  Pulse generators:");
+            for (i, running) in self.pulse_running.iter().enumerate() {
+                let _ = writeln!(out, "    {i}: Running:{}", i32::from(*running));
+            }
+            let current_point = self.int(self.params.mcs_current_point, 0);
+            let st = self.state.lock().unwrap();
+            let _ = writeln!(out, "  numCounters: {}", st.num_counters);
+            let _ = writeln!(out, "  Scaler:");
+            let _ = writeln!(out, "    Running: {}", i32::from(st.scaler.running));
+            // C keeps both arrays as epicsInt32.
+            for i in 0..st.num_counters {
+                let _ = writeln!(
+                    out,
+                    "    {i}: preset={}, count={}",
+                    st.scaler.presets[i] as i32, st.scaler.counts[i] as i32
+                );
+            }
+            let _ = writeln!(out, "  MCS:");
+            let _ = writeln!(out, "    Running: {}", i32::from(st.mcs.running));
+            let _ = writeln!(out, "    maxTimePoints: {}", self.max_time_points);
+            let _ = writeln!(out, "    MCSErased: {}", i32::from(st.mcs.erased));
+            let _ = writeln!(out, "    currentPoint: {current_point}");
+        }
+        self.asyn_port_driver_report(out, level);
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let mut status: UlError = 0;
         let trace = self.state.lock().unwrap().trace.clone();
@@ -318,6 +349,7 @@ impl PortDriver for CtrDriver {
                 let num_channels = num_channels.max(0) as usize;
                 let dev = self.device.lock().unwrap();
                 let mut st = self.state.lock().unwrap();
+                st.mcs.erased = false;
                 let dwell = self.float(self.params.mca_dwell_time, 0);
                 let ch_adv = self.int(self.params.mca_ch_advance_source, 0);
                 let prescale = self.int(self.params.mca_prescale, 0);

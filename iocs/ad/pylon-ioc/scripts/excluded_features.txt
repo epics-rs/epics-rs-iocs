@@ -1,0 +1,20 @@
+# GenICam features kept out of the generated database, one regex per line
+# (matched against the whole feature name), each tagged with what is dropped:
+#   all     - both the _RBV and the output record
+#   output  - the output record; the _RBV record stays as a readback
+
+# Driven by the standard areaDetector parameters (ad-genicam-rs
+# ADGenICam::create_features); a second record would write behind them.
+all AcquisitionMode|AcquisitionFrameCount|AcquisitionFrameRate(Abs)?|AcquisitionFrameRateEnabled?
+all Binning(Horizontal|Vertical)|Width(Max)?|Height(Max)?|Offset[XY]|PixelFormat
+all ExposureTime(Abs)?|ExposureAuto|ExposureMode|Gain(Raw|RawChannelA)?|GainAuto
+all TriggerMode|TriggerOverlap|TriggerSoftware|TriggerSource
+all Device(VendorName|ModelName|SerialNumber|ID|FirmwareVersion|Version|Temperature)|TemperatureAbs
+
+# Driven by pylon's StartGrabbing/StopGrabbing.
+all AcquisitionStart|AcquisitionStop|TLParamsLocked|PayloadSize
+
+# Reset, persist or rewrite the camera itself.
+output DeviceReset|DeviceFeaturePersistence\w*|DeviceRegistersStreaming\w*
+output UserSetSave|UserSetDefault|File\w*|BslStaticDefectPixelCorrectionReload
+output Gev(Persistent|CurrentIPConfiguration|IPConfiguration)\w*

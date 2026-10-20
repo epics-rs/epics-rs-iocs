@@ -4,6 +4,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::runtime::general_time::EPICS_EPOCH_UNIX_SECS;
 use meascomp::analog_in::AInScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
@@ -323,11 +324,14 @@ pub fn stop_wave_dig(
     updates
 }
 
+/// Seconds past the EPICS epoch, as C stamps each absolute-time point with
+/// `now.secPastEpoch + now.nsec/1.e9`.
 fn current_time_secs() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+        - EPICS_EPOCH_UNIX_SECS as f64
 }
 
 /// Array callbacks carrying the digitized data: WAVEDIG_VOLT_WF for each
@@ -392,6 +396,16 @@ pub fn time_axis(num_points: i32, dwell: f64) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_time_counts_from_the_epics_epoch() {
+        let unix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let offset = unix - current_time_secs();
+        assert!((offset - 631_152_000.0).abs() < 1.0, "offset {offset}");
+    }
 
     #[test]
     fn inputs_9_to_16_get_their_waveforms() {

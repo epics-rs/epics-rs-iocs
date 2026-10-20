@@ -36,6 +36,8 @@ async fn main() -> CaResult<()> {
     // registry with the stdRecords.dbd manifest); the db files this IOC
     // loads use it, as a C IOC links the owning module's .dbd.
     app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+    // Universal asyn device support, and with it asyn.dbd's shell commands
+    // (asynReport, asynSetTraceMask, ...) on PortManager::global().
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     let autosave_config = Arc::new(Mutex::new(

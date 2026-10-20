@@ -8,8 +8,6 @@
 //! Usage:
 //!   cargo run -p acsmotion-ioc -- st.cmd
 
-use std::sync::Arc;
-
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -47,7 +45,7 @@ async fn main() -> CaResult<()> {
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides the serial/IP port configure verbs.
-    let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
+    let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // SPiiPlus iocsh commands + motor device support.

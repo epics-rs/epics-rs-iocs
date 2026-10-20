@@ -7,6 +7,7 @@ use uldaq_sys::*;
 
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::runtime::general_time::EPICS_EPOCH_UNIX_SECS;
 
 use crate::params::*;
 use crate::scaler::print_get_status;
@@ -36,6 +37,8 @@ pub struct McsState {
     pub chan_map: Vec<usize>,
     /// C `MCSPoint0Skip`: the scan's first point is not stored.
     pub point0_skip: bool,
+    /// C `MCSErased_`, which only `report` reads.
+    pub erased: bool,
 }
 
 impl McsState {
@@ -58,6 +61,7 @@ impl McsState {
             counter_enable: 0x1FF, // all 9 enabled by default
             chan_map: Vec::new(),
             point0_skip: false,
+            erased: false,
         }
     }
 }
@@ -73,6 +77,7 @@ impl McsState {
 /// clock, which an acquisition in progress keeps counting from. C
 /// `USBCTR::eraseMCS`; the time bases are left alone.
 pub fn erase_mcs(state: &mut McsState, num_points: usize) {
+    state.erased = true;
     for buf in &mut state.mcs_buffers {
         let n = num_points.min(buf.len());
         buf[..n].fill(0);
@@ -401,16 +406,29 @@ pub fn stop_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) -> 
     None
 }
 
+/// Seconds past the EPICS epoch, as C stamps each absolute-time point with
+/// `now.secPastEpoch + now.nsec/1.e9`.
 fn current_time_secs() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+        - EPICS_EPOCH_UNIX_SECS as f64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_time_counts_from_the_epics_epoch() {
+        let unix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let offset = unix - current_time_secs();
+        assert!((offset - 631_152_000.0).abs() < 1.0, "offset {offset}");
+    }
 
     #[test]
     fn a_completed_scan_counts_every_point() {
