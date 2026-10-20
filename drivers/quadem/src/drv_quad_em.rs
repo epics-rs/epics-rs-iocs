@@ -766,7 +766,8 @@ impl QuadEmShared {
         }
 
         // C++ sets QE_DOUBLE_DATA and fires callbacks on each of the 11
-        // addresses, then does one Int32Array callback of the truncated values.
+        // addresses, then does one doCallbacksInt32Array of the truncated
+        // values (drvQuadEM.cpp:277-282).
         for (addr, value) in sample.iter().enumerate() {
             let _ = handle.set_params_and_notify_blocking(
                 addr as i32,
@@ -778,13 +779,10 @@ impl QuadEmShared {
             );
         }
         let int_data: Vec<i32> = sample.iter().map(|v| *v as i32).collect();
-        let _ = handle.set_params_and_notify_blocking(
+        let _ = handle.do_callbacks_array_blocking(
+            params.int_array_data,
             0,
-            vec![ParamSetValue::new(
-                params.int_array_data,
-                0,
-                ParamValue::Int32Array(int_data.into()),
-            )],
+            ParamValue::Int32Array(int_data.into()),
         );
     }
 }
@@ -1900,6 +1898,63 @@ mod tests {
                 "read_status"
             ]
         );
+    }
+
+    /// computePositions posts the truncated sample with
+    /// doCallbacksInt32Array (drvQuadEM.cpp:282): on the asynInt32Array
+    /// interface, without storing it.
+    #[test]
+    fn compute_positions_posts_the_int_array_as_an_array_callback() {
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        struct Bare(QuadEmBase);
+        impl PortDriver for Bare {
+            fn base(&self) -> &PortDriverBase {
+                &self.0.port_base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0.port_base
+            }
+        }
+        let name = "QE_INT_ARRAY_CB";
+        let mut base = QuadEmBase::new(name, 0).unwrap();
+        let params = base.params;
+        base.port_base.own_interrupts(InterruptGate::opened());
+        // The boot sweep's post of what the constructor set.
+        for addr in 0..=QE_MAX_DATA as i32 {
+            base.port_base.call_param_callbacks(addr).unwrap();
+        }
+        let (rt, _actor) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            Bare(base),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = rt.port_handle().clone();
+        let mut rx = handle.interrupts().subscribe_async(64, 64);
+
+        QuadEmShared::new(16)
+            .0
+            .compute_positions(&handle, &params, &[1.0, 2.0, 4.0, 8.0]);
+        // The round trip also lets the posts reach the ring.
+        let stored = handle
+            .with_driver_blocking(move |d: &mut Bare| {
+                d.0.port_base
+                    .params
+                    .get_int32_array(params.int_array_data, 0)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(stored.is_empty(), "the sample was stored");
+        let posted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| v.reason == params.int_array_data)
+            .map(|v| v.iface)
+            .collect();
+        assert_eq!(posted, [Some(InterfaceType::Int32Array)]);
     }
 
     #[test]
