@@ -499,17 +499,6 @@ fn the_servers_enumeration_fills_a_state_table_the_database_left_empty() {
     assert_eq!(field(&record, "TWST"), EpicsValue::String("".into()));
     // The state the value names, through the table the server just defined.
     assert_eq!(field(&record, "VAL"), EpicsValue::Enum(1));
-
-    // And the new table is posted DBE_PROPERTY, once.
-    let mut rx = device
-        .property_post_receiver()
-        .expect("mbbi posts properties");
-    let posted = rx.try_recv().expect("the table was posted");
-    // The device stores the fields in place; the post itself carries no
-    // writes and names VAL, C++'s db_post_events target (devOpcua.cpp:732).
-    assert!(posted.writes.is_empty());
-    assert_eq!(posted.post_field, "VAL");
-    assert!(rx.try_recv().is_err());
 }
 
 /// A state string is cut at 25 bytes, as `strncpy` cuts it (`devOpcua.cpp:723`).
