@@ -648,6 +648,16 @@ mod asyn_writes {
             ));
             Ok(())
         }
+        fn move_relative(
+            &mut self,
+            _: &AsynUser,
+            _distance: f64,
+            _min_velocity: f64,
+            _velocity: f64,
+            _acceleration: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
         fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, forward: bool) -> AsynResult<()> {
             self.0.push(format!("home {forward}"));
             Ok(())
@@ -808,6 +818,16 @@ mod asyn_reads {
 
     impl AsynMotor for Stored {
         fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
+        fn move_relative(
             &mut self,
             _: &AsynUser,
             _: f64,
