@@ -442,6 +442,9 @@ impl AsynMotor for Mvp2001Axis {
             .ok_or_else(|| micromo_err(format!("MVP2001: unparseable POS reply {pos_reply:?}")))?;
 
         status.position = position as f64;
+        // C sets no motorEncoderPosition_ though its constructor sets
+        // HasEncoder (MVP2001Driver.cpp:206, :453), so UEIP reads 0. C
+        // defect, not copied: POS is the encoder count.
         status.encoder_position = position as f64;
 
         // Status word (4 hex chars).
