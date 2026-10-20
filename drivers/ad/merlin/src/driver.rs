@@ -809,6 +809,7 @@ mod tests {
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+    use epics_rs::asyn::param::ParamValue;
     use epics_rs::asyn::port::PortFlags;
     use epics_rs::asyn::registry::claim_port;
     use std::time::Duration;
@@ -1012,14 +1013,30 @@ mod tests {
 
     /// One 256x256 quad data frame through handle_frame, on `det`'s port.
     fn run_quad_frame(name: &str, det: MerlinDetector, output: NDArrayOutput) -> PortHandle {
+        let ctx = quad_frame_context(name, det, output);
+        let handle = ctx.handle.clone();
+        run_quad_frame_in(ctx);
+        handle
+    }
+
+    /// The data task's context on `det`'s port, before any frame.
+    fn quad_frame_context(
+        name: &str,
+        det: MerlinDetector,
+        output: NDArrayOutput,
+    ) -> AcquisitionContext {
         let (ad_params, params, init_param) = (det.ad.params, det.params, det.init_param);
         let pool = det.ad.pool.clone();
         let shared = det.shared.clone();
-        let (runtime, _) =
-            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
+        let claim = claim_port(name).unwrap();
+        let (runtime, _) = create_port_runtime(&claim, det, RuntimeConfig::default()).unwrap();
         let handle = runtime.port_handle().clone();
+        // Published open, so its callbacks post.
+        claim
+            .publish(handle.clone(), &epics_rs::asyn::registry::open_owner())
+            .unwrap();
         std::mem::forget(runtime);
-        let ctx = AcquisitionContext {
+        AcquisitionContext {
             data: MpxConnection::new(
                 SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO),
                 MPX_MAXLINE,
@@ -1032,7 +1049,10 @@ mod tests {
             init_param,
             det_type: DetectorType::MerlinQuad,
             shared,
-        };
+        }
+    }
+
+    fn run_quad_frame_in(ctx: AcquisitionContext) {
         let mut body = crate::protocol::tests::quad_header(768, 1);
         body.resize(768 + 256 * 256 * 2, 0);
         epics_rs::ad_core::runtime::run_thread(move || async move {
@@ -1041,7 +1061,49 @@ mod tests {
         })
         .join()
         .unwrap();
-        handle
+    }
+
+    /// merlinTask only stores what a frame the pool refuses sets (the counters,
+    /// :145-152, and the status message, :441-442) and `continue`s past its
+    /// callParamCallbacks (:305): the next driver callback posts them.
+    #[test]
+    fn a_refused_frame_posts_nothing_until_the_next_callback() {
+        let det = detector_sized("MERLIN_REFUSED_POSTS", 1000);
+        let (message, counter) = (
+            det.ad.params.status_message,
+            det.ad.params.base.array_counter,
+        );
+        let ctx = quad_frame_context("MERLIN_REFUSED_POSTS", det, NDArrayOutput::new());
+        let handle = ctx.handle.clone();
+        let mut posts = handle.interrupts().subscribe_async(256, 64);
+        run_quad_frame_in(ctx);
+        let mut watched = || {
+            handle.read_int32_blocking(counter, 0).unwrap();
+            let mut seen = Vec::new();
+            // Only what the frame sets: the open flush's zero and empty
+            // message can still be arriving.
+            while let Ok(v) = posts.try_recv() {
+                match v.value {
+                    ParamValue::Int32(n) if v.reason == counter && n != 0 => {
+                        seen.push(format!("counter {n}"))
+                    }
+                    ParamValue::Octet(text) if v.reason == message && !text.is_empty() => {
+                        seen.push(format!("message {}", String::from_utf8_lossy(&text)))
+                    }
+                    _ => {}
+                }
+            }
+            seen
+        };
+        assert_eq!(watched(), Vec::<String>::new());
+        handle.call_param_callbacks_blocking(0).unwrap();
+        assert_eq!(
+            watched(),
+            [
+                "counter 1",
+                "message Error: run out of buffers in detector driver"
+            ]
+        );
     }
 
     /// merlinTask stamps timeStamp and never calls updateTimeStamp
