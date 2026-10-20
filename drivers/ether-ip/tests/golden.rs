@@ -77,22 +77,27 @@ fn tag_path_two_indexed_levels() {
 }
 
 /// `EIP_parse_tag` reads the element with `atol` into a `size_t`: leading
-/// space and sign are taken, an overflow saturates, and a value past 32 bits
-/// still picks the 32-bit form, whose bytes and `[%u]` keep the low half.
+/// space and sign are taken, an overflow saturates at `LONG_MAX`, and a
+/// value past 32 bits, which only a 64-bit `long` holds, still picks the
+/// 32-bit form, whose bytes and `[%u]` keep the low half.
 #[test]
 fn tag_path_element_is_atol_into_size_t() {
+    use std::ffi::c_long;
+    let [past_u32, past_long] = if c_long::BITS == 64 {
+        [
+            ("910178002A0000000000", "x[0]"),
+            ("910178002A00FFFFFFFF", "x[4294967295]"),
+        ]
+    } else {
+        [("910178002A00FFFFFF7F", "x[2147483647]"); 2]
+    };
     let cases = [
         ("x[ 3]", 3, "910178002803", "x[3]"),
         ("x[+7]", 3, "910178002807", "x[7]"),
         ("x[0x10]", 3, "910178002800", "x[0]"),
         ("x[-1]", 5, "910178002A00FFFFFFFF", "x[4294967295]"),
-        ("x[4294967296]", 5, "910178002A0000000000", "x[0]"),
-        (
-            "x[99999999999999999999]",
-            5,
-            "910178002A00FFFFFFFF",
-            "x[4294967295]",
-        ),
+        ("x[4294967296]", 5, past_u32.0, past_u32.1),
+        ("x[99999999999999999999]", 5, past_long.0, past_long.1),
     ];
     for (s, words, path, shown) in cases {
         assert_eq!(tag(s).path_words(), words, "{s}");
