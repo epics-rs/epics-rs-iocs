@@ -3800,15 +3800,16 @@ mod tests {
 
     /// The typed posts of `reasons` that reached `rx`, after a round trip
     /// lets the port's jobs run.
-    async fn typed_posts(
+    /// Every post of `reasons`, with its interface; a flush's is untyped.
+    async fn posts(
         ctx: &Ctx,
         rx: &mut epics_rs::asyn::interrupt::AsyncInterruptReceiver,
         reasons: &[usize],
-    ) -> Vec<(usize, epics_rs::asyn::interfaces::InterfaceType)> {
+    ) -> Vec<(usize, Option<epics_rs::asyn::interfaces::InterfaceType>)> {
         let _ = ctx.handle.read_int32(ctx.p.img_frames_summed, 0).await;
         std::iter::from_fn(|| rx.try_recv().ok())
             .filter(|v| reasons.contains(&v.reason))
-            .filter_map(|v| v.iface.map(|iface| (v.reason, iface)))
+            .map(|v| (v.reason, v.iface))
             .collect()
     }
 
@@ -3842,11 +3843,11 @@ mod tests {
             p.img_image_sum_n_frames,
         ];
         assert_eq!(
-            typed_posts(&ctx, &mut rx, &watched).await,
+            posts(&ctx, &mut rx, &watched).await,
             [
-                (p.img_image_data, I::Int64Array),
-                (p.img_image_frame, I::Int32Array),
-                (p.img_image_sum_n_frames, I::Int64Array),
+                (p.img_image_data, Some(I::Int64Array)),
+                (p.img_image_frame, Some(I::Int32Array)),
+                (p.img_image_sum_n_frames, Some(I::Int64Array)),
             ]
         );
         // readInt32Array still serves the current frame (mask_io.cpp:54-90).
@@ -3880,12 +3881,12 @@ mod tests {
             p.prv_hst_histogram_frame,
         ];
         assert_eq!(
-            typed_posts(&ctx, &mut rx, &watched).await,
+            posts(&ctx, &mut rx, &watched).await,
             [
-                (p.prv_hst_histogram_sum_n_frames, I::Int64Array),
-                (p.prv_hst_histogram_time_ms, I::Float64Array),
-                (p.prv_hst_histogram_data, I::Int64Array),
-                (p.prv_hst_histogram_frame, I::Int32Array),
+                (p.prv_hst_histogram_sum_n_frames, Some(I::Int64Array)),
+                (p.prv_hst_histogram_time_ms, Some(I::Float64Array)),
+                (p.prv_hst_histogram_data, Some(I::Int64Array)),
+                (p.prv_hst_histogram_frame, Some(I::Int32Array)),
             ]
         );
         std::mem::forget(runtime);
