@@ -64,6 +64,8 @@ use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_libcom_rs::runtime::epics_string::print_escaped;
+use epics_rs::base::types::EpicsValue;
+use epics_rs::base::types::c_parse::{NumericField, parse_auto_base_units_null};
 use motor_common::util::{atof, atoi, nint};
 use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
@@ -259,24 +261,10 @@ pub(crate) fn c_isspace(c: char) -> bool {
 /// C `epicsParseInt64(value, &v, 0, NULL)`: a base-0 integer with only
 /// white space around it.
 pub(crate) fn parse_int64(value: &str) -> Option<i64> {
-    let t = value.trim_matches(c_isspace);
-    let (neg, body) = match t.as_bytes().first() {
-        Some(b'-') => (true, &t[1..]),
-        Some(b'+') => (false, &t[1..]),
-        _ => (false, t),
-    };
-    let (radix, digits) = if body.len() > 2 && (body.starts_with("0x") || body.starts_with("0X")) {
-        (16, &body[2..])
-    } else if body.len() > 1 && body.starts_with('0') {
-        (8, &body[1..])
-    } else {
-        (10, body)
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        return None;
+    match parse_auto_base_units_null(NumericField::Int64, value) {
+        Some(EpicsValue::Int64(v)) => Some(v),
+        _ => None,
     }
-    let v = i64::from_str_radix(digits, radix).ok()?;
-    Some(if neg { -v } else { v })
 }
 
 /// C writeOption's boolean words (phytronAxisMotor.cpp:745-754).
@@ -1515,7 +1503,9 @@ impl PhytronController {
 }
 
 /// C's MCC type (phytronAxisMotor.cpp:216-233): `MCC-` and the `IAR`
-/// reply, then the stage `1P48R` names when it answers.
+/// reply, then the stage `1P48R` names when it answers. C reads `1P48R`
+/// with `epicsParseLong`; only 0 and 1 are told apart, which the Int64 read
+/// gives at either long width.
 fn mcc_type(iar: &str, p48: Option<&str>) -> String {
     let mut name = format!("MCC-{iar}");
     match p48.map(|p| (p, parse_int64(p))) {
@@ -2787,6 +2777,24 @@ mod tests {
         axis.move_absolute(&AsynUser::new(0), 1.0, 10.0, 100.0, 5000.0)
             .unwrap();
         assert!(!written.lock().unwrap().iter().any(|c| c.starts_with("SEC")));
+    }
+
+    /// libCom `epicsParseInt64(value, &v, 0, NULL)`, as the compiled base
+    /// answers.
+    #[test]
+    fn option_integers_are_epics_parse_int64() {
+        let cases = [
+            ("-9223372036854775808", Some(i64::MIN)),
+            ("-0x8000000000000000", Some(i64::MIN)),
+            ("0b11", Some(3)),
+            (" 0x10 ", Some(16)),
+            ("9223372036854775808", None),
+            ("08", None),
+            ("1 2", None),
+        ];
+        for (value, want) in cases {
+            assert_eq!(parse_int64(value), want, "{value:?}");
+        }
     }
 
     /// C writeOption's poll method values (phytronAxisMotor.cpp:676-708).
