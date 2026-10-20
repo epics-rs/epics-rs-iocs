@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
 use epics_rs::ad_core::driver::{ADDriver, ImageMode};
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
@@ -160,7 +161,8 @@ impl Worker {
                     "mar345:readServer, timeout={timeout:.6}, status={} received {} bytes\n{}\n",
                     status as i32,
                     data.len(),
-                    self.from
+                    self.from,
+                    timeout = CFloat(timeout)
                 ),
             );
         }
