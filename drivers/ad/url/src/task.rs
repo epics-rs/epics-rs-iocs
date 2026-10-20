@@ -176,17 +176,20 @@ async fn acquire_one_image(
         .await
         .unwrap_or_else(|_| std::time::SystemTime::now())
         .into();
-    // C releases pArrays[0] just before the alloc (URLDriver.cpp:132-133).
-    ctx.pool.owner().release_array(0);
-    // C dereferences a refused alloc unchecked (URLDriver.cpp:133); here the frame
-    // is dropped after the pool's limit line.
-    let Ok(mut array) = ctx.pool.alloc_with(decoded.dims, decoded.data) else {
+    // C releases pArrays[0] and allocates into it under the driver lock
+    // (URLDriver.cpp:132-133), where it stays through the callbacks. C
+    // dereferences a refused alloc unchecked; here the frame is dropped after
+    // the pool's limit line.
+    let Some(array) = ctx.pool.owner().replace_array(0, || {
+        let mut array = ctx.pool.alloc_with(decoded.dims, decoded.data).ok()?;
+        array.unique_id = image_counter;
+        array.timestamp = end_ts;
+        array.time_stamp = start_time.as_f64();
+        array.attributes = attributes;
+        Some(array)
+    }) else {
         return Ok(());
     };
-    array.unique_id = image_counter;
-    array.timestamp = end_ts;
-    array.time_stamp = start_time.as_f64();
-    array.attributes = attributes;
 
     let _ = ctx
         .handle
@@ -222,11 +225,9 @@ async fn acquire_one_image(
         )
         .await;
 
-    let array = array.share();
     if array_callbacks {
-        ctx.publisher.publish(array.clone()).await;
+        ctx.publisher.publish(array).await;
     }
-    ctx.pool.owner().store_array(0, array.array().clone());
 
     Ok(())
 }
