@@ -2050,7 +2050,7 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 c.model = model as i32;
                 c.axes = reports.take().unwrap_or_default();
             });
-            MOTOR_MM4000.set_card(card, axes, moving_poll_ms, idle_poll_ms);
+            MOTOR_MM4000.start_card(card, axes, moving_poll_ms, idle_poll_ms)?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -3611,6 +3611,34 @@ mod report {
         let text = driver_report("motorMM4000", 1);
         let again = detail(0, "MM4005 Version 2.0", 1, "0.300000", "3.000000");
         assert!(text.starts_with(&format!("{again}{zero}{zero}")), "{text}");
+    }
+
+    /// drvMM4000Asyn.c:899-903: MM4000AsynConfig starts MM4000Poller, whose
+    /// `MS;` polls the axes before any drvAsynMotorConfigure.
+    #[epics_rs::base::epics_test]
+    async fn mm4000_asyn_config_starts_its_poller() {
+        use motor_common::testing::LineRig;
+        let int = ArgValue::Int;
+        run_command(mm4000_asyn_setup_command(), vec![int(1)]).await;
+        let (line, _io) = LineRig::new("mm4kPollLine", |last| {
+            match last {
+                "VE;" => "VEMM4005 Version 2.0",
+                "TP;" => "1TP0.0",
+                "MS;" => "1MS@",
+                _ => "",
+            }
+            .to_string()
+        });
+        let port = ArgValue::String("mm4kPollLine".into());
+        let config = vec![int(0), port, int(0), int(1), int(100), int(1000)];
+        run_command(mm4000_asyn_config_command(), config).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut sent = line.sent();
+        while !sent.iter().any(|c| c == "MS;") && std::time::Instant::now() < deadline {
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+            sent.extend(line.sent());
+        }
+        assert!(sent.iter().any(|c| c == "MS;"), "{sent:?}");
     }
 
     /// SMC100Controller::report then SMC100Axis::report
