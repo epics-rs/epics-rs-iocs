@@ -961,7 +961,12 @@ impl DeviceSupport for OpcuaDevice {
     }
 
     fn reconcile_readback_callback(&mut self) {
-        self.pulse_pass = false;
+        // Still set: the pass never reached `read` and its update is queued.
+        if std::mem::take(&mut self.pulse_pass)
+            && let Some(bound) = &self.bound
+        {
+            bound.leaf.lock().owe_wake();
+        }
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

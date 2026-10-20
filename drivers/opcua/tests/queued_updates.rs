@@ -8,20 +8,23 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use async_opcua::types::{NodeId, Variant};
+use async_opcua::types::{NodeId, StatusCode, Variant};
 use epics_rs::base::server::database::{ProcStack, PvDatabase};
 use epics_rs::base::server::ioc_builder::IocBuilder;
 use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use epics_rs::base::types::EpicsValue;
 use opcua::device_support;
 use opcua::item::Leaf;
-use opcua::queue::ProcessReason;
+use opcua::queue::{ProcessReason, Update};
 use opcua::registry::Registry;
 use parking_lot::Mutex;
 
 use common::{Server, registry};
+
+/// menuAlarmStat DISABLE.
+const DISABLE: f64 = 18.0;
 
 const fn row(name: &'static str) -> DevSup {
     DevSup {
@@ -193,4 +196,150 @@ async fn a_pass_no_pulse_brought_reads_and_leaves_the_queued_update() {
     go_tx.send(()).unwrap();
     assert_eq!(proc_pass.join().unwrap(), 1);
     assert!(drained(&leaf, Duration::from_secs(2)).await);
+}
+
+/// An IOC with `LI` on `Sim.Int32` (42), unmonitored, plus `extra` records,
+/// and `LI`'s leaf.
+async fn longin_ioc(li_fields: &str, extra: &str) -> (Arc<PvDatabase>, Arc<Mutex<Leaf>>) {
+    let server = Arc::new(Server {
+        nodes: vec![(NodeId::new(2, "Sim.Int32"), Variant::Int32(42))],
+        ..Default::default()
+    });
+    let registry = registry(&server, "autoconnect=y");
+    let (db, _) = IocBuilder::new()
+        .register_dynamic_device_support(DEVICES, device_support::factory(registry.clone()))
+        .db_string(
+            &format!(
+                "record(longin, \"LI\") {{ field(DTYP, \"OPCUA\") \
+                 field(INP, \"@S1 ns=2;s=Sim.Int32 monitor=n\") {li_fields} }}\n{extra}"
+            ),
+            &Default::default(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.scan_control().run();
+    registry.start();
+    let leaf = {
+        let session = registry.session("S1").unwrap();
+        let items = session.items.lock();
+        items[0].lock().leaves[0].clone()
+    };
+    (db, leaf)
+}
+
+fn value(v: i32) -> Update {
+    Update::new(
+        ProcessReason::IncomingData,
+        Some(Variant::Int32(v)),
+        StatusCode::Good,
+        SystemTime::now(),
+    )
+}
+
+/// An update whose pass DISA stopped stays queued with no wake-up, which the
+/// C never sends again (`DataElementOpen62541Leaf.cpp:129-134`). The next
+/// update wakes the record for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_a_disabled_pass_left_queued_goes_with_the_next() {
+    let (db, leaf) = longin_ioc("", "").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while db.get_pv("LI").ok() != Some(EpicsValue::Long(42))
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(drained(&leaf, Duration::from_secs(2)).await);
+
+    db.put_record_field_from_ca("LI", "DISA", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    leaf.lock().push(value(7));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while db.get_pv("LI.STAT").ok().and_then(|v| v.to_f64()) != Some(DISABLE)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The pass holds the record until its reconcile is done.
+    drop(db.lock_record("LI"));
+    assert_eq!(
+        leaf.lock().queue().len(),
+        1,
+        "the disabled pass took nothing"
+    );
+
+    db.put_record_field_from_ca("LI", "DISA", EpicsValue::Short(0))
+        .await
+        .unwrap();
+    leaf.lock().push(value(8));
+    assert!(drained(&leaf, Duration::from_secs(2)).await);
+    assert_eq!(db.get_pv("LI").ok(), Some(EpicsValue::Long(8)));
+}
+
+/// A pulse's pass in simulation mode reads SVAL, not the device, so its update
+/// stays queued with no wake-up; the next update wakes the record for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_a_simulated_pass_left_queued_goes_with_the_next() {
+    let (db, leaf) = longin_ioc("", "").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while db.get_pv("LI").ok() != Some(EpicsValue::Long(42))
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(drained(&leaf, Duration::from_secs(2)).await);
+
+    db.put_record_field_from_ca("LI", "SIMM", EpicsValue::Enum(1))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("LI", "SVAL", EpicsValue::Long(5))
+        .await
+        .unwrap();
+    assert_eq!(db.get_pv("LI").ok(), Some(EpicsValue::Long(42)));
+    leaf.lock().push(value(7));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while db.get_pv("LI").ok() != Some(EpicsValue::Long(5))
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(db.lock_record("LI"));
+    assert_eq!(
+        leaf.lock().queue().len(),
+        1,
+        "the simulated pass took nothing"
+    );
+
+    db.put_record_field_from_ca("LI", "SIMM", EpicsValue::Enum(0))
+        .await
+        .unwrap();
+    leaf.lock().push(value(8));
+    assert!(drained(&leaf, Duration::from_secs(2)).await);
+    assert_eq!(db.get_pv("LI").ok(), Some(EpicsValue::Long(8)));
+}
+
+/// A record that stays disabled takes one pass per update and no more. Each
+/// pass of `LI` reads SDIS, which processes `ON` and so counts in `N`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_record_takes_one_pass_per_update() {
+    let (db, leaf) = longin_ioc(
+        "field(SDIS, \"ON PP\")",
+        "record(calc, \"ON\") { field(CALC, \"1\") field(FLNK, \"N\") }\n\
+         record(calc, \"N\") { field(CALC, \"VAL+1\") }\n",
+    )
+    .await;
+    let passes = || db.get_pv("N").unwrap().to_f64().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while leaf.lock().queue().len() < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let before = passes();
+    assert!(before >= 1.0, "LI processed while disabled");
+
+    leaf.lock().push(value(7));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(passes(), before + 1.0);
 }

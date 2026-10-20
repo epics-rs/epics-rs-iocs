@@ -40,8 +40,10 @@ pub struct Leaf {
     pub link: LinkInfo,
     /// Incoming updates, one popped per record process cycle. Only
     /// [`Self::push`] and [`Self::pop`] touch it, so a non-empty queue always
-    /// has a wake-up pending.
+    /// has a wake-up pending or `owed` one.
     queue: UpdateQueue,
+    /// A pass a wake brought took nothing ([`Self::owe_wake`]).
+    owed: bool,
     /// The value the record last wrote, waiting to go out.
     pub outgoing: Option<Variant>,
     /// Set when `outgoing` has not reached the server yet (`markAsDirty`).
@@ -70,6 +72,7 @@ impl Leaf {
             record_type: record_type.to_string(),
             link,
             queue,
+            owed: false,
             outgoing: None,
             dirty: false,
             incoming: None,
@@ -93,11 +96,22 @@ impl Leaf {
     }
 
     /// Queue an update and wake the record if this is the one it will see first
-    /// (`pushUpdate`'s `wasFirst`, `DataElementOpen62541Leaf.cpp:134`).
+    /// (`pushUpdate`'s `wasFirst`, `DataElementOpen62541Leaf.cpp:134`) or a
+    /// wake is owed.
     pub fn push(&mut self, update: Update) {
-        if self.queue.push(update) {
+        let first = self.queue.push(update);
+        if std::mem::take(&mut self.owed) || first {
             self.wake();
         }
+    }
+
+    /// The pass a wake brought never reached the device (DISA, a breakpoint),
+    /// so the update it was for is queued with no wake left. The C leaves it
+    /// there, waking only on the first push (`DataElementOpen62541Leaf.cpp:
+    /// 129-134`), a defect not copied. Waking now would spin on a record that
+    /// stays disabled, so the next push wakes.
+    pub fn owe_wake(&mut self) {
+        self.owed = true;
     }
 
     /// Take the update this pass processes for, and wake the record again if
