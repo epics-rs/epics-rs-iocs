@@ -504,7 +504,6 @@ impl KohzuAxis {
 
         self.last_status = MotorStatus {
             position: position as f64,
-            encoder_position: position as f64,
             velocity: 0.0,
             direction,
             done,
@@ -776,6 +775,25 @@ mod tests {
                 ..prepared
             }
         );
+    }
+
+    /// drvSC800.cc set_status sets no encoder_position; motor_init's 0
+    /// (:611) is what the record's REP shows.
+    #[test]
+    fn the_poll_sets_no_encoder_position() {
+        let (_line, io) = LineRig::new("sc800NoRep", |last| {
+            match last.trim_start_matches('\u{2}') {
+                "IDN" => "C\tIDN0\t200\t1.0".into(),
+                "STR1/1" => "C\tSTR1\t1\t0\t0\t0\t0\t0\t0\t0".into(),
+                "RDP1/0" => "C\tRDP1\t1234".into(),
+                "RSY1/21" => "C\tRSY1\t21\t0".into(),
+                c => format!("C\t{c}"),
+            }
+        });
+        let ctrl = KohzuController::new(io).unwrap();
+        let mut axis = KohzuAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let s = axis.polled(&AsynUser::default()).unwrap();
+        assert_eq!((s.position, s.encoder_position), (1234.0, 0.0));
     }
 
     #[test]
