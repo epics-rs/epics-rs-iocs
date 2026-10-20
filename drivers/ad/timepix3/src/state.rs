@@ -13,7 +13,6 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
-use epics_rs::ad_core::ndarray_pool::PublishedArray;
 use epics_rs::asyn::port::PortDriverBase;
 use parking_lot::{Condvar, Mutex};
 
@@ -56,9 +55,9 @@ pub struct StreamEndpoints {
     pub prv_hst: Option<(String, u16)>,
 }
 
-/// C `PreviewJsonimageStream`'s state (serval_stream.cpp:59-85) and the
-/// `pArrays` slots its band-pass reads: the last frame at each threshold's
-/// address and the last band-pass. Index 0 is PrvImg, 1 PrvImg1.
+/// C `PreviewJsonimageStream`'s state (serval_stream.cpp:59-85); the frames
+/// its band-pass reads are the pool owner's `pArrays` slots. Index 0 is
+/// PrvImg, 1 PrvImg1.
 pub struct PreviewState {
     /// C `jsonHeadersRemaining`.
     pub json_headers: i32,
@@ -70,10 +69,6 @@ pub struct PreviewState {
     pub last_seen_frame: i32,
     /// C `lastDiffT0Frame`, -1 for none.
     pub last_diff_t0: i32,
-    /// C `pArrays[ndAddrThreshold0]`, `pArrays[ndAddrThreshold1]`.
-    pub last: [Option<PublishedArray>; 2],
-    /// C `pArrays[ndAddrThreshDiff]`.
-    pub diff: Option<PublishedArray>,
 }
 
 impl Default for PreviewState {
@@ -84,8 +79,6 @@ impl Default for PreviewState {
             t0_orphan: false,
             last_seen_frame: -1,
             last_diff_t0: -1,
-            last: [None, None],
-            diff: None,
         }
     }
 }

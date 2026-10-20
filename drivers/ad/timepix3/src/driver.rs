@@ -2774,9 +2774,8 @@ impl TimePix3Driver {
             let mut preview = preview.lock();
             preview.json_headers = log_headers;
             preview.reset_pairing();
-            // C `releasePreviewBandArrays` (serval_stream.cpp:470-481).
-            preview.diff = None;
         }
+        tasks::release_preview_band_arrays(&self.ad.pool);
         self.shared.rates.lock().prv_img.restart();
         self.sync_stream_endpoints();
         self.start_stream_workers()?;

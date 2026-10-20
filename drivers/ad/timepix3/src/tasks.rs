@@ -2495,10 +2495,9 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
 /// makes the band-pass. `false` is a refused allocation.
 async fn preview_frame(ctx: &Arc<Ctx>, s: Preview, mut f: crate::stream::ImageFrame) -> bool {
     log_json_header(ctx, s, &f.header);
-    let slot = usize::from(f.threshold_id == 1);
     let addr = threshold_addr(f.threshold_id, s.th0, s.th1);
     // C releases pArrays[addr] before allocating its replacement (:165-171).
-    ctx.shared.preview[s.index].lock().last[slot] = None;
+    ctx.pool.owner().store_array(addr, None);
     let pixels = std::mem::take(&mut f.pixels);
     let Some(mut array) = image_array(
         ctx,
@@ -2556,7 +2555,9 @@ async fn preview_frame(ctx: &Arc<Ctx>, s: Preview, mut f: crate::stream::ImageFr
     }
     attach_attributes(ctx, &mut array, &f).await;
     let array = array.share();
-    ctx.shared.preview[s.index].lock().last[slot] = Some(array.clone());
+    ctx.pool
+        .owner()
+        .store_array(addr, Some(array.array().clone()));
     publish_image(ctx, addr, array).await;
 
     let pair_done = {
@@ -2608,6 +2609,13 @@ async fn preview_frame(ctx: &Arc<Ctx>, s: Preview, mut f: crate::stream::ImageFr
     true
 }
 
+/// C `releasePreviewBandArrays` (serval_stream.cpp:470-481).
+pub(crate) fn release_preview_band_arrays(pool: &DriverPool) {
+    for s in [PRV_IMG, PRV_IMG1] {
+        pool.owner().store_array(s.diff, None);
+    }
+}
+
 /// C `emitPreviewThresholdDiff` (serval_stream.cpp:366-468): T0 - T1 of the
 /// stream's last two frames as Int32, clipped at 0 when PrvImgThreshDiffClip.
 async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
@@ -2623,15 +2631,9 @@ async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
         .await
         .unwrap_or(0)
         != 0;
-    let (t0, t1, last_diff_t0) = {
-        let state = ctx.shared.preview[s.index].lock();
-        (
-            state.last[0].clone(),
-            state.last[1].clone(),
-            state.last_diff_t0,
-        )
-    };
-    let (Some(t0), Some(t1)) = (t0, t1) else {
+    let last_diff_t0 = ctx.shared.preview[s.index].lock().last_diff_t0;
+    let owner = ctx.pool.owner();
+    let (Some(t0), Some(t1)) = (owner.array(s.th0), owner.array(s.th1)) else {
         return;
     };
     let (t0_frame, t1_frame) = (t0.unique_id, t1.unique_id);
@@ -2665,7 +2667,7 @@ async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
         );
         return;
     }
-    ctx.shared.preview[s.index].lock().diff = None;
+    owner.store_array(s.diff, None);
     let dims = vec![
         NDDimension::new(t0.dims[0].size),
         NDDimension::new(t0.dims[1].size),
@@ -2721,11 +2723,8 @@ async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
         NDAttrValue::String(if clip { "max(0,T0-T1)" } else { "T0-T1" }.into()),
     ));
     let diff = diff.share();
-    {
-        let mut state = ctx.shared.preview[s.index].lock();
-        state.diff = Some(diff.clone());
-        state.last_diff_t0 = t0_frame;
-    }
+    owner.store_array(s.diff, Some(diff.array().clone()));
+    ctx.shared.preview[s.index].lock().last_diff_t0 = t0_frame;
     publish_image(ctx, s.diff, diff).await;
     ctx.trace(
         TraceMask::IO_DRIVER,
@@ -5139,6 +5138,55 @@ mod tests {
         assert!(handle_frame(&ctx, StreamKind::Img, frame(1, 9, vec![1, 1])).await);
         assert_eq!(next(&mut rx, IMG_THRESHOLD1_ADDR).await.unique_id, 9);
         assert_eq!(rx[&IMG_ADDR].pending(), 0);
+    }
+
+    /// The PrvImg threshold-0 frame is C's pArrays[0]
+    /// (NDARRAY_ADDR_PRVIMG_THRESHOLD0, ADTimePix.h:907; serval_stream.cpp:177),
+    /// so PreAllocBuffers copies it (asynNDArrayDriver.cpp:717-726).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prv_img_frame_is_the_pre_alloc_template() {
+        let ctx = Arc::new(idle_ctx_at(
+            "TPX_PREALLOC",
+            "http://127.0.0.1:1",
+            Some(b"<Attributes></Attributes>"),
+        ));
+        set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
+        let frame = Frame::Image(crate::stream::ImageFrame {
+            width: 2,
+            height: 1,
+            format: crate::stream::PixelFormat::UInt16,
+            frame_number: 4,
+            time_at_frame: 0.0,
+            threshold_id: 0,
+            integration_size: 0,
+            pixels: vec![2, 4],
+            header: Value::Null,
+        });
+        assert!(handle_frame(&ctx, StreamKind::PrvImg, frame).await);
+        let base = ctx.ad.base;
+        ctx.handle
+            .write_int32(base.pool_poll_stats, 0, 1)
+            .await
+            .unwrap();
+        let before = ctx
+            .handle
+            .read_int32(base.pool_alloc_buffers, 0)
+            .await
+            .unwrap();
+        ctx.handle
+            .write_int32(base.pool_num_pre_alloc_buffers, 0, 2)
+            .await
+            .unwrap();
+        ctx.handle
+            .write_int32(base.pool_pre_alloc, 0, 1)
+            .await
+            .unwrap();
+        let after = ctx
+            .handle
+            .read_int32(base.pool_alloc_buffers, 0)
+            .await
+            .unwrap();
+        assert_eq!(after - before, 2);
     }
 
     /// The first PrvImgLogHeaders PrvImg headers are logged as nlohmann
