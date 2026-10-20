@@ -144,9 +144,10 @@ impl C300Controller {
 
     /// Probe axis `index` (0-based) at construction: query the stage range (to
     /// confirm the axis, mark encoder/gain support and set `bitsPerUnit_`)
-    /// and the digital-input scale factor. Returns `(di_scale_factor,
-    /// has_encoder)`.
-    fn probe_axis(&mut self, index: usize) -> (f64, bool) {
+    /// and the digital-input scale factor. Returns the scale factor and what
+    /// the C constructor sets on the axis's status (C300MotorDriver.cpp:
+    /// 226-244).
+    fn probe_axis(&mut self, index: usize) -> (f64, Vec<StatusWrite>) {
         let chan = index + 1;
         let range = self
             .query(&format!("SYST:CHAN{chan}:STAG:RANG?"))
@@ -155,16 +156,26 @@ impl C300Controller {
             // 2^20 bits per total range (C300MotorDriver.cpp:232-233).
             axis.bits_per_unit = 1_048_576.0 / range;
         }
-        let has_encoder = range.is_ok_and(|r| r != 0.0);
+        let mut writes = match range {
+            Err(_) => vec![StatusWrite::Problem(true)],
+            Ok(r) if r != 0.0 => vec![
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true),
+            ],
+            Ok(_) => Vec::new(),
+        };
 
-        let di_scale_factor = self
-            .query(&format!("SYST:CHAN{chan}:DI:FACT?"))
+        let factor = self.query(&format!("SYST:CHAN{chan}:DI:FACT?"));
+        if factor.is_err() {
+            writes.push(StatusWrite::Problem(true));
+        }
+        let di_scale_factor = factor
             .map(|r| atof(&r))
             .ok()
             .filter(|&f| f != 0.0)
             .unwrap_or(1.0);
 
-        (di_scale_factor, has_encoder)
+        (di_scale_factor, writes)
     }
 
     fn axis(&mut self, index: usize) -> &mut AxisState {
@@ -222,7 +233,7 @@ pub struct C300Axis {
 impl C300Axis {
     /// Construct axis `index` (0-based), probing its stage range and DI factor.
     pub fn new(controller: Arc<Mutex<C300Controller>>, index: usize) -> Self {
-        let (di_scale_factor, has_encoder) = controller
+        let (di_scale_factor, status_writes) = controller
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .probe_axis(index);
@@ -231,15 +242,7 @@ impl C300Axis {
             index,
             chan: format!("CHAN{}", index + 1),
             di_scale_factor_inv: 1.0 / di_scale_factor,
-            // C300MotorDriver.cpp:234-236.
-            status_writes: if has_encoder {
-                vec![
-                    StatusWrite::GainSupport(true),
-                    StatusWrite::HasEncoder(true),
-                ]
-            } else {
-                Vec::new()
-            },
+            status_writes,
         }
     }
 
@@ -387,7 +390,10 @@ mod tests {
         );
         let controller = Arc::new(Mutex::new(C300Controller::new(handle, 1)));
         let mut axis = C300Axis::new(controller, 0);
-        assert!(axis.take_status_writes().is_empty());
+        assert_eq!(
+            axis.take_status_writes(),
+            [StatusWrite::Problem(true), StatusWrite::Problem(true)]
+        );
     }
 
     fn c300_replies(cmd: &str) -> String {
@@ -427,6 +433,26 @@ mod tests {
             [
                 StatusWrite::GainSupport(true),
                 StatusWrite::HasEncoder(true)
+            ]
+        );
+    }
+
+    /// C300MotorDriver.cpp:228-231, :241-244: a failed range or DI factor
+    /// read sets PROBLEM in the constructor.
+    #[test]
+    fn a_failed_constructor_read_sets_problem() {
+        let (_rig, io) =
+            motor_common::testing::LineRig::failing("c300CtorProblem", c300_replies, |cmd| {
+                cmd.trim_end() == "SYST:CHAN1:DI:FACT?"
+            });
+        let controller = Arc::new(Mutex::new(C300Controller::new(io, 1)));
+        let mut axis = C300Axis::new(controller, 0);
+        assert_eq!(
+            axis.take_status_writes(),
+            [
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true),
+                StatusWrite::Problem(true)
             ]
         );
     }
