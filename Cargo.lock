@@ -3836,7 +3836,7 @@ dependencies = [
 [[package]]
 name = "rust-hdf5"
 version = "0.7.7"
-source = "git+file:///home/stevek/work/rust-hdf5?rev=e88fef8f5054e9db43ea201df98593e43eeefabe#e88fef8f5054e9db43ea201df98593e43eeefabe"
+source = "git+file:///home/stevek/work/rust-hdf5?rev=eccdf45682156886996306b1904bf157c4eb716d#eccdf45682156886996306b1904bf157c4eb716d"
 dependencies = [
  "bzip2",
  "fearless_simd 1.1.0",
