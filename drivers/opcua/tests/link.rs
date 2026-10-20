@@ -407,6 +407,7 @@ fn info_tags_set_defaults_that_link_options_then_override() {
 
 /// Each tag's deprecation line comes just before the tag is parsed, so a bad
 /// tag stops the lines at its own (`linkParser.cpp:104-185`).
+#[cfg(unix)]
 #[test]
 fn a_bad_info_tag_stops_the_deprecation_lines() {
     let mut info = HashMap::new();

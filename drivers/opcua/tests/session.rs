@@ -24,7 +24,9 @@ use opcua::queue::{ConnectionStatus, ProcessReason, Update};
 use opcua::session::{self, Control, Priority, Request, SessionConfig, SessionHandle};
 use opcua::subscription::SubscriptionConfig;
 
+#[cfg(unix)]
 mod console;
+#[cfg(unix)]
 use console::Console;
 
 // -------------------------------------------------------------- the test double
@@ -897,6 +899,7 @@ async fn namespaces_the_server_lacks_are_reported_in_uri_order() {
 }
 
 /// `SessionOpen62541.cpp:879-883`.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_read_namespace_array_is_reported_at_debug() {
     let mut mock = Mock::default();
@@ -1196,6 +1199,7 @@ async fn a_short_read_answer_is_reported() {
 /// The request and completion debug lines carry the service call's
 /// transaction id (`SessionOpen62541.cpp:696-701`, `:774-779`, `:2543-2547`,
 /// `:2587-2592`, `:2618-2622`, `:2641-2646`).
+#[cfg(unix)]
 #[tokio::test]
 async fn read_and_write_debug_lines_name_the_transaction() {
     let mock = Mock::arc();
@@ -1629,6 +1633,7 @@ async fn a_monitored_item_carries_the_links_monitoring_parameters() {
 /// The `ACTIVATED` arm creates every subscription, in name order, before the
 /// initial read, and adds their monitored items only after it
 /// (`SessionOpen62541.cpp:2493-2516`).
+#[cfg(unix)]
 #[tokio::test]
 async fn subscriptions_are_created_before_the_initial_read_and_monitor_after_it() {
     let mock = Mock::arc();
@@ -1908,6 +1913,7 @@ async fn an_item_shows_what_the_server_revised() {
 /// C++ streams print a double with 6 significant digits (`%g`), in
 /// `ItemOpen62541::show` and in the monitored-item debug line
 /// (`SubscriptionOpen62541.cpp:186-191`).
+#[cfg(unix)]
 #[tokio::test]
 async fn sampling_and_deadband_print_as_a_cpp_stream_does() {
     let mock = Mock::arc();
@@ -2139,6 +2145,7 @@ async fn an_idle_session_whose_server_stops_answering_goes_inactive() {
 // ------------------------------------------------------------- console lines
 
 /// The lines C prints from the session's connection handling.
+#[cfg(unix)]
 fn state_lines(console: Console) -> Vec<String> {
     console
         .lines()
@@ -2161,6 +2168,7 @@ fn state_lines(console: Console) -> Vec<String> {
 
 /// A session at debug 1 whose control orders resolve — the sender dropped —
 /// once the worker has carried them out.
+#[cfg(unix)]
 fn debug_session(mock: &Arc<Mock>) -> Arc<SessionHandle> {
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
     config.autoconnect = false;
@@ -2168,10 +2176,12 @@ fn debug_session(mock: &Arc<Mock>) -> Arc<SessionHandle> {
     spawn(config, mock, vec![])
 }
 
+#[cfg(unix)]
 const IDENTITY: &str = "Session sess: (setupIdentity) setting Anonymous token";
 
 /// The states open62541 1.2 reports through `stateCallback` on the way up, as
 /// `connectionStatusChanged` prints them (`SessionOpen62541.cpp:2384-2408`).
+#[cfg(unix)]
 const CONNECTED: [&str; 8] = [
     "Session sess: secure channel state changed from Closed to HelSent",
     "Session sess: secure channel state changed from HelSent to AckReceived",
@@ -2183,6 +2193,7 @@ const CONNECTED: [&str; 8] = [
     "Session sess: session state changed from ActivateRequested to Activated",
 ];
 
+#[cfg(unix)]
 const LOST: [&str; 3] = [
     "Session sess: secure channel state changed from Open to Closed",
     "Session sess: session state changed from Activated to Created",
@@ -2190,11 +2201,13 @@ const LOST: [&str; 3] = [
 ];
 
 /// `connect` (`SessionOpen62541.cpp:577-584`), then `run` (`:1466-1467`).
+#[cfg(unix)]
 const STARTED: [&str; 2] = [
     "Session sess: connect service succeeded",
     "Session sess worker thread starts",
 ];
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_connect_and_a_requested_disconnect_print_the_c_state_lines() {
     let mock = Mock::arc();
@@ -2219,6 +2232,7 @@ async fn a_connect_and_a_requested_disconnect_print_the_c_state_lines() {
 /// open62541 re-activates the session it kept on the client it kept
 /// (`connectIterate`, `responseActivateSession`): no setup, and no
 /// `connect service` or `worker thread starts` line.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_lost_session_that_reconnects_prints_the_reactivation() {
     let mock = Mock::arc();
@@ -2249,6 +2263,7 @@ async fn a_lost_session_that_reconnects_prints_the_reactivation() {
 /// then `run` gives up (`:1487-1491`) and `disconnect` deletes the client,
 /// which reports the status again. A later connect starts from the states
 /// the lost session left, and a disconnect then finds no client (`:607-612`).
+#[cfg(unix)]
 #[tokio::test]
 async fn a_lost_session_whose_reconnect_fails_prints_the_worker_error() {
     let mock = Mock::arc();
@@ -2284,6 +2299,7 @@ async fn a_lost_session_whose_reconnect_fails_prints_the_worker_error() {
 /// `UA_Client_connect` fails: the bad status from inside it, then once more
 /// from `UA_Client_delete` (`:586-592`); no worker thread was started, and
 /// the client is gone.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_refused_connect_prints_its_status_twice_and_leaves_no_client() {
     let mock = Mock::arc();
@@ -2307,6 +2323,7 @@ async fn a_refused_connect_prints_its_status_twice_and_leaves_no_client() {
 
 /// A failed security setup leaves C's client in place (`:545-553`), so a
 /// disconnect deletes it without a line; one with no client says so.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_disconnect_after_a_failed_setup_is_silent() {
     let mock = Mock::arc();
