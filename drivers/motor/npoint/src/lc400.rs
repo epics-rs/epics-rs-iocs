@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
 use epics_rs::asyn::param::{ParamType, ParamValue};
@@ -732,12 +733,12 @@ impl WriteHook for Lc400WriteHook {
                 TraceMask::ERROR,
                 format_args!(
                     "LC400MotorDriver:writeFloat64: error, status={} function={function}, value={value:.6}\n",
-                    e.status() as i32
+                    e.status() as i32, value = CFloat(value)
                 ),
             ),
             Ok(()) => write.print(
                 TraceMask::IO_DRIVER,
-                format_args!("LC400MotorDriver:writeFloat64: function={function}, value={value:.6}\n"),
+                format_args!("LC400MotorDriver:writeFloat64: function={function}, value={value:.6}\n", value = CFloat(value)),
             ),
         }
         WriteOutcome::default()
@@ -786,6 +787,8 @@ impl ControllerParams for Lc400ControllerParams {
              idle poll period={idle:.6}",
             ctx.port_name(),
             ctx.num_axes(),
+            moving = CFloat(moving),
+            idle = CFloat(idle),
         );
         if level > 0 {
             for axis in 0..ctx.num_axes() {

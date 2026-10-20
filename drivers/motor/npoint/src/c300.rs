@@ -44,6 +44,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynResult, OctetStep};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -213,8 +214,8 @@ impl ControllerParams for C300Params {
             "C300 motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll,
-            self.idle_poll,
+            CFloat(self.moving_poll),
+            CFloat(self.idle_poll),
         );
         if level > 0 {
             let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -224,7 +225,9 @@ impl ControllerParams for C300Params {
                     out,
                     "  axis {axis}\n  bitsPerUnit_ = {:.6}\n    encoder position={:.6}\n    \
                      theory position={:.6}\n    limits=0x0\n",
-                    state.bits_per_unit, state.encoder_position, state.theory_position,
+                    CFloat(state.bits_per_unit),
+                    CFloat(state.encoder_position),
+                    CFloat(state.theory_position),
                 );
             }
         }
