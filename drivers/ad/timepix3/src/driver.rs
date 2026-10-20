@@ -2462,10 +2462,14 @@ impl TimePix3Driver {
         self.ad
             .port_base
             .set_param_status(p.pixel_config_diff, 0, AsynStatus::Success)?;
+        // Stored as C's pixelConfigDiff_, which readInt32Array serves.
+        let diff = ParamValue::Int32Array(diff.into());
         self.ad
             .port_base
-            .params
-            .set_int32_array(p.pixel_config_diff, 0, diff)?;
+            .set_param_value(p.pixel_config_diff, 0, diff.clone())?;
+        self.ad
+            .port_base
+            .do_callbacks_array(p.pixel_config_diff, 0, diff)?;
 
         let msg = match (failed, bpc.is_some()) {
             (true, _) => "PixelConfig refresh completed with one or more chip errors.",
@@ -7594,6 +7598,70 @@ mod tests {
                 "PixelConfig refresh completed with one or more chip errors.".into()
             )
         );
+    }
+
+    /// refreshPixelConfig posts PixelConfigDiff with doCallbacksInt32Array,
+    /// typed and before the closing callParamCallbacks that carries
+    /// WriteMsg (serval_http.cpp:1274-1290).
+    #[test]
+    fn refresh_pixel_config_posts_the_diff_as_an_array_callback() {
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+        let reply: &'static str =
+            Box::leak(format!("\"{}AA==\"", "AAAA".repeat(21845)).into_boxed_str());
+        let routes: &'static [(&str, &str)] =
+            Box::leak(Box::new([("GET /detector/chips/0/PixelConfig", reply)]));
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let shared = Arc::new(Shared::new());
+        shared.note_family(DetectorFamily::Tpx3);
+        let name = "TPX_PIXCFG_POST";
+        let mut det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new(&fake_serval_with("\0", routes))),
+            shared,
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let dir = calibration_files(&mut det, name);
+        std::fs::remove_file(dir.join("cal.bpc")).unwrap();
+        let p = det.p;
+        for (reason, value) in [
+            (p.pix_count, 65536),
+            (p.row_len, 1),
+            (p.number_of_chips, 1),
+            (p.number_of_rows, 256),
+        ] {
+            det.ad.port_base.set_int32_param(reason, 0, value).unwrap();
+        }
+        let base = &mut det.ad.port_base;
+        base.own_interrupts(InterruptGate::opened());
+        for addr in 0..MAX_ADDR as i32 {
+            base.call_param_callbacks(addr).unwrap();
+        }
+        let mut rx = base.interrupts.subscribe_async(1024, 1 << 21);
+        assert!(det.refresh_pixel_config().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+        let done = b"PixelConfig refresh complete; BPC comparison skipped.";
+        let posted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| {
+                (v.reason == p.pixel_config_diff && v.iface.is_some())
+                    || matches!(&v.value, ParamValue::Octet(text) if text[..] == done[..])
+            })
+            .map(|v| (v.reason, v.iface))
+            .collect();
+        assert_eq!(
+            posted,
+            [
+                (p.pixel_config_diff, Some(InterfaceType::Int32Array)),
+                (p.write_msg, None),
+            ]
+        );
+        // readInt32Array still serves the diff (mask_io.cpp:38-52).
+        let mut buf = vec![-1; 4];
+        let user = AsynUser::new(p.pixel_config_diff);
+        assert_eq!(det.read_int32_array(&user, &mut buf).unwrap(), 4);
+        assert_eq!(buf, [0; 4]);
     }
 
     /// The masked-pixel export names its file after the BPC, lists every
