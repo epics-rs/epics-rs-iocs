@@ -12,10 +12,12 @@
 //! `RecordProcessResult::AsyncPending` is reachable from *record* support only.
 //! So the record is never left `PACT`.
 //!
-//! What replaces it: the driver owns each record's update queue and pulses the
-//! record's I/O Intr channel whenever an update lands. The pulse is what
-//! processes the record ([`DeviceSupport::io_intr_scan_independent`] is `true`,
-//! so it fires whatever the record's `SCAN`), and the framework runs that pass
+//! What replaces it: the driver owns each record's update queue and keeps a
+//! pulse on the record's I/O Intr channel while an update is queued
+//! ([`Leaf::pop`](crate::item::Leaf::pop) pulses again when it leaves one
+//! behind). The pulse is what processes the record
+//! ([`DeviceSupport::io_intr_scan_independent`] is `true`, so it fires
+//! whatever the record's `SCAN`), and the framework runs that pass
 //! as a driver-callback cycle. On an output record that cycle reads in place of
 //! writing ([`OpcuaDevice::output_callback_readback`]), as the C write dsets pop
 //! the update in place of writing it (`devOpcua.cpp:418-435`). So the two
@@ -293,8 +295,8 @@ impl OpcuaDevice {
         let default_reason = rec.default_reason();
         let reason = match ordered {
             Some(reason) => reason,
-            None => match self.bound()?.leaf.lock().queue.pop() {
-                Some((update, _)) => update.reason,
+            None => match self.bound()?.leaf.lock().pop() {
+                Some(update) => update.reason,
                 None => ProcessReason::None,
             },
         };
@@ -932,9 +934,9 @@ impl DeviceSupport for OpcuaDevice {
         if self.op == Op::Item {
             return self.item_action(record);
         }
-        let popped = { self.bound()?.leaf.lock().queue.pop() };
+        let popped = { self.bound()?.leaf.lock().pop() };
         match popped {
-            Some((update, _)) => self.deliver(update, record),
+            Some(update) => self.deliver(update, record),
             // An output reads only in the readback pass of an I/O Intr pulse,
             // which is only fired for an update — an empty queue means another
             // pass already took it. No pop, so nothing said about UDF (the C

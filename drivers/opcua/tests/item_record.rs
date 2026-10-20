@@ -214,7 +214,7 @@ fn up(leaf: &Arc<Mutex<Leaf>>) {
 }
 
 fn queue(leaf: &Arc<Mutex<Leaf>>, reason: ProcessReason, status: StatusCode) {
-    leaf.lock().queue.push(Update::new(
+    leaf.lock().push(Update::new(
         reason,
         None,
         status,
@@ -242,8 +242,8 @@ async fn settled(mock: &Arc<Mock>, leaf: &Arc<Mutex<Leaf>>) {
     until(|| !mock.calls.lock().reads.is_empty()).await;
     until(|| {
         matches!(
-            leaf.lock().queue.pop(),
-            Some((update, _)) if update.reason == ProcessReason::ReadComplete
+            leaf.lock().pop(),
+            Some(update) if update.reason == ProcessReason::ReadComplete
         )
     })
     .await;
@@ -290,6 +290,33 @@ fn a_bini_the_database_set_is_not_overwritten_by_the_link() {
     );
 
     assert_eq!(record.bini, 1);
+}
+
+// --------------------------------------------------------- one pass per update
+
+/// The item's pass, like every record's, wakes the record again when it leaves
+/// an update queued, and not when it takes the last one.
+#[test]
+fn an_item_pass_that_leaves_an_update_queued_wakes_the_record_again() {
+    let registry = offline();
+    let mut record = OpcuaItemRecord::default();
+    let mut device = bind(&registry, "ITEM", &mut record, "S ns=2;s=Struct monitor=n");
+    let mut wake = device.io_intr_receiver().expect("the record has a wake-up");
+    let leaf = leaf_of(&mut record);
+    up(&leaf);
+    leaf.lock().request_processing(ProcessReason::ReadFailure);
+    leaf.lock().request_processing(ProcessReason::WriteFailure);
+    assert!(wake.try_recv().is_ok(), "the first update wakes the record");
+    assert!(
+        wake.try_recv().is_err(),
+        "the second finds it already woken"
+    );
+
+    process(&mut device, &mut record);
+    assert!(wake.try_recv().is_ok(), "one update is still queued");
+
+    process(&mut device, &mut record);
+    assert!(wake.try_recv().is_err(), "nothing is left to wake for");
 }
 
 // ---------------------------------------------------------------------- failures
@@ -637,7 +664,7 @@ async fn woc_immediate_with_nothing_dirty_sends_nothing() {
 
     put(&mut item, "WOC", EpicsValue::Enum(1));
     assert!(
-        leaf.lock().queue.pop().is_none(),
+        leaf.lock().pop().is_none(),
         "no element has written, so the item asks for no write"
     );
 

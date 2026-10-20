@@ -96,7 +96,7 @@ fn incoming(
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::Up;
         leaf.incoming = Some(v.clone());
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::IncomingData,
             Some(v),
             StatusCode::Good,
@@ -782,7 +782,7 @@ fn bini_write_asks_an_output_record_to_send_its_value() {
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::InitialWrite;
         leaf.incoming = Some(Variant::Int32(0));
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::WriteRequest,
             None,
             StatusCode::Good,
@@ -794,6 +794,35 @@ fn bini_write_asks_an_output_record_to_send_its_value() {
 
     assert_eq!(leaf.lock().outgoing, Some(Variant::Int32(5)));
     assert!(leaf.lock().dirty);
+}
+
+// ------------------------------------------------------------ one pass per update
+
+/// A pass that pops an update with another queued behind it wakes the record
+/// again; the pass that pops the last one does not
+/// (`if (nextReason) pcon->requestRecordProcessing(nextReason)`,
+/// `devOpcua.cpp:408`).
+#[test]
+fn a_pass_that_leaves_an_update_queued_wakes_the_record_again() {
+    let registry = registry();
+    let mut record = LonginRecord::new(0);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let mut wake = device.io_intr_receiver().expect("the record has a wake-up");
+    let leaf = leaf(&registry);
+    leaf.lock().state = ConnectionStatus::Up;
+    leaf.lock().request_processing(ProcessReason::ReadFailure);
+    leaf.lock().request_processing(ProcessReason::WriteFailure);
+    assert!(wake.try_recv().is_ok(), "the first update wakes the record");
+    assert!(
+        wake.try_recv().is_err(),
+        "the second finds it already woken"
+    );
+
+    device.read(&mut record).expect("the update is delivered");
+    assert!(wake.try_recv().is_ok(), "one update is still queued");
+
+    device.read(&mut record).expect("the update is delivered");
+    assert!(wake.try_recv().is_err(), "nothing is left to wake for");
 }
 
 // ---------------------------------------------------------------- failure reasons
@@ -832,7 +861,7 @@ fn each_failure_reason_raises_its_own_alarm() {
             },
         ),
     ] {
-        leaf.lock().queue.push(Update::new(
+        leaf.lock().push(Update::new(
             reason,
             None,
             StatusCode::Good,
@@ -843,7 +872,7 @@ fn each_failure_reason_raises_its_own_alarm() {
     }
 
     // A completed write leaves the record alone.
-    leaf.lock().queue.push(Update::new(
+    leaf.lock().push(Update::new(
         ProcessReason::WriteComplete,
         None,
         StatusCode::Good,
@@ -863,7 +892,7 @@ fn a_bad_status_code_carries_no_value() {
     {
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::Up;
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::IncomingData,
             Some(Variant::Int32(9)),
             StatusCode::BadNodeIdUnknown,
@@ -893,7 +922,7 @@ fn an_uncertain_status_code_carries_its_value_with_a_minor_alarm() {
     {
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::Up;
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::IncomingData,
             Some(Variant::Int32(9)),
             StatusCode::UncertainLastUsableValue,
