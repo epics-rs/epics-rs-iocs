@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 
+use epics_rs::base::types::c_parse::{atoi, strtol};
+
 use crate::drv_quad_em::{QE_MAX_INPUTS, QeTriggerPolarity};
 
 /// C++ `PCR4_TIMEOUT` (1 s).
@@ -139,19 +141,19 @@ pub fn sample_time(values_per_read: i32) -> f64 {
 pub fn parse_version(resp: &str) -> Option<(String, i32)> {
     let firmware = resp.strip_prefix("VERSION:")?;
     let idx = firmware.find("PCR4v")?;
-    let digits = &firmware[idx + "PCR4v".len()..];
-    let end = digits
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(digits.len());
-    let version = digits[..end].parse::<i32>().ok()?;
+    let version = atoi(&firmware[idx + "PCR4v".len()..]);
     Some((firmware.to_string(), version))
 }
 
 /// C++ `readStatus`: `sscanf(inString_, "RANGE:%1d", &range)` — the meter can
-/// answer with four ranges, only the first digit is taken.
+/// answer with four ranges, only the first digit is taken. The width counts
+/// after `%d`'s white-space skip, so a sign fills it and fails.
 pub fn parse_range(resp: &str) -> Option<i32> {
-    let rest = resp.strip_prefix("RANGE:")?;
-    rest.chars().next()?.to_digit(10).map(|d| d as i32)
+    let rest = resp
+        .strip_prefix("RANGE:")?
+        .trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (value, consumed) = strtol(&rest.as_bytes()[..rest.len().min(1)], 10);
+    (consumed > 0).then_some(value as i32)
 }
 
 /// C++ `readStatus`: `sscanf(inString_, "CHANNELS:%d", &numChannels)`.
@@ -164,9 +166,9 @@ pub fn parse_values_per_read(resp: &str) -> Option<i32> {
     parse_int_after(resp, "SPR:")
 }
 
+/// glibc's `%d` stores `(int) strtol(s, &end, 10)`.
 fn parse_int_after(resp: &str, prefix: &str) -> Option<i32> {
-    let rest = resp.strip_prefix(prefix)?.trim_start();
-    let (value, consumed) = strtod(rest);
+    let (value, consumed) = strtol(resp.strip_prefix(prefix)?, 10);
     (consumed > 0).then_some(value as i32)
 }
 
@@ -334,6 +336,23 @@ mod tests {
         assert_eq!(v, 1);
     }
 
+    /// `atoi(pos + 5)`: space and sign are taken, no digit is 0, and an
+    /// overflow is glibc's `(int) strtol`; the firmware is kept either way.
+    #[test]
+    fn version_revision_is_atoi() {
+        use std::ffi::c_long;
+        let wrapped = if c_long::BITS == 64 { 2 } else { i32::MAX };
+        for (resp, v) in [
+            ("VERSION:PCR4v 2", 2),
+            ("VERSION:PCR4v+3", 3),
+            ("VERSION:PCR4vX", 0),
+            ("VERSION:PCR4v4294967298 1.0", wrapped),
+            ("VERSION:PCR4v99999999999999999999", c_long::MAX as i32),
+        ] {
+            assert_eq!(parse_version(resp), Some((resp[8..].to_string(), v)));
+        }
+    }
+
     #[test]
     fn version_reply_without_model_is_rejected_not_dereferenced() {
         // Upstream calls atoi(strstr(...) + 5) with no NULL check here.
@@ -352,6 +371,32 @@ mod tests {
         assert_eq!(parse_num_channels("RANGE:0"), None);
         assert_eq!(parse_values_per_read("SPR:100"), Some(100));
         assert_eq!(parse_values_per_read("SPR:x"), None);
+    }
+
+    /// glibc `sscanf`: `%d` stores `(int) strtol(s, &end, 10)`, and `%1d`
+    /// skips white space before reading its one byte.
+    #[test]
+    fn status_integers_are_glibc_scanf_d() {
+        use std::ffi::c_long;
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
+        assert_eq!(parse_range("RANGE: 3"), Some(3));
+        assert_eq!(parse_range("RANGE:\t5x"), Some(5));
+        assert_eq!(parse_range("RANGE:-1"), None);
+        assert_eq!(parse_range("RANGE:+3"), None);
+        assert_eq!(parse_range("RANGE:"), None);
+        assert_eq!(parse_num_channels("CHANNELS: 4"), Some(4));
+        assert_eq!(parse_num_channels("CHANNELS:0x10"), Some(0));
+        assert_eq!(parse_num_channels("CHANNELS:1e3"), Some(1));
+        assert_eq!(parse_num_channels("CHANNELS:1.9"), Some(1));
+        assert_eq!(parse_num_channels("CHANNELS:inf"), None);
+        assert_eq!(parse_num_channels("CHANNELS:-"), None);
+        assert_eq!(parse_num_channels("CHANNELS:4294967297"), Some(wrapped));
+        assert_eq!(
+            parse_num_channels("CHANNELS:99999999999999999999"),
+            Some(c_long::MAX as i32)
+        );
+        assert_eq!(parse_values_per_read("SPR:-5"), Some(-5));
+        assert_eq!(parse_values_per_read("SPR:\x0b7"), Some(7));
     }
 
     #[test]
