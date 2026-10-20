@@ -28,9 +28,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
-use epics_rs::asyn::request::OctetReadOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::user::AsynUser;
 
 use crate::types::MAX_MESSAGE_SIZE;
 
@@ -111,17 +109,10 @@ impl BisServer {
 }
 
 fn exchange(io: &SyncIOHandle, command: &str, timeout: Duration) -> Exchange {
-    let handle = match io.port() {
-        Ok(handle) => handle,
-        Err(e) => return Exchange::NotSent(e),
-    };
-    let user = AsynUser::new(0).with_addr(0).with_timeout(timeout);
-    let op = OctetReadOp::WriteRead {
-        data: command.as_bytes().to_vec(),
-        buf_size: MAX_MESSAGE_SIZE,
-    };
-
-    match handle.submit_octet_read_blocking(op, user).into_parts() {
+    let reply = io
+        .with_timeout(timeout)
+        .write_read(0, command.as_bytes(), MAX_MESSAGE_SIZE);
+    match reply.into_parts() {
         (reply, Ok(())) => Exchange::Read {
             reply: reply_text(&reply),
             status: Ok(()),

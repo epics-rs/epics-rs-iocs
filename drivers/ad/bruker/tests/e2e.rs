@@ -694,3 +694,68 @@ fn the_driver_version_is_left_to_adcore() {
         sync.read_octet(ad.base.ad_core_version, 64).bytes_ok()
     );
 }
+
+/// `writeBIS` and `statusTask` talk to BIS through `pasynOctetSyncIO`
+/// (BISDetector.cpp:316, :404), whose writeRead and read print their
+/// TRACEIO_DEVICE lines (asynOctetSyncIO.c:194-200, :219-223, :259-266).
+#[test]
+fn the_bis_sockets_print_their_sync_io_lines() {
+    use epics_rs::asyn::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceMask};
+    let command = TcpListener::bind("127.0.0.1:0").expect("command listener");
+    let status = TcpListener::bind("127.0.0.1:0").expect("status listener");
+    let command_addr = format!("127.0.0.1:{}", command.local_addr().unwrap().port());
+    let status_addr = format!("127.0.0.1:{}", status.local_addr().unwrap().port());
+    fake_bis(command, status);
+
+    let name = "BISSYNCIO";
+    let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    let file = Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+    let traced = |port: &str, addr: &str, input_eos: &[u8], output_eos: &[u8]| {
+        let handle = ip_port(port, addr, input_eos, output_eos);
+        handle
+            .trace()
+            .set_trace_file(Some(port), TraceFile::File(file.clone()));
+        handle
+            .trace()
+            .set_trace_mask(Some(port), TraceMask::IO_DEVICE);
+        handle
+            .trace()
+            .set_trace_info_mask(Some(port), TraceInfoMask::PORT);
+        handle
+            .trace()
+            .set_trace_io_mask(Some(port), TraceIoMask::ASCII);
+        handle
+    };
+    let detector = create_bruker_detector(
+        &claim_port(name).unwrap(),
+        user(traced("BISSYNCIO_COMMAND", &command_addr, b"]", b"\n")),
+        user(traced("BISSYNCIO_STATUS", &status_addr, b"\n", b"")),
+        0,
+    )
+    .expect("the detector port");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    sync.write_int32(detector.ad_params.bin_x, 2)
+        .expect("binning 2");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let text = std::fs::read_to_string(&path).unwrap();
+        if (text.contains("asynOctetSyncIO read:\n[DETECTORSTATUS")
+            && text.contains("asynOctetSyncIO wrote:\n[ChangeFrameSize"))
+            || std::time::Instant::now() >= deadline
+        {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _ = std::fs::remove_file(&path);
+    assert!(text.contains("BISSYNCIO_COMMAND"), "{text}");
+    assert!(
+        text.contains("asynOctetSyncIO wrote:\n[ChangeFrameSize"),
+        "{text}"
+    );
+    assert!(
+        text.contains("asynOctetSyncIO read:\n[DETECTORSTATUS"),
+        "{text}"
+    );
+}
