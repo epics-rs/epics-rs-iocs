@@ -408,12 +408,14 @@ impl Detector {
 
         let tau = self.get_float("-get tau")?;
         if !(tau == -1.0 || tau > 0.0) {
-            return Err(self.settings_error("-get tau", tau.to_string()));
+            return Err(self.settings_error("-get tau", CFloat(f64::from(tau)).g().to_string()));
         }
 
         let threshold = self.get_float("-get kthresh")?;
         if threshold < 0.0 {
-            return Err(self.settings_error("-get kthresh", threshold.to_string()));
+            return Err(
+                self.settings_error("-get kthresh", CFloat(f64::from(threshold)).g().to_string())
+            );
         }
 
         let mut settings = Settings {
@@ -433,7 +435,9 @@ impl Detector {
         if self.firmware_major() >= 3 {
             let energy = self.get_float("-get energy")?;
             if energy < 0.0 {
-                return Err(self.settings_error("-get energy", energy.to_string()));
+                return Err(
+                    self.settings_error("-get energy", CFloat(f64::from(energy)).g().to_string())
+                );
             }
             settings.energy = Some(f64::from(energy));
 
@@ -547,6 +551,88 @@ mod tests {
         fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
             buf[..4].fill(0);
             OctetReadResult::ok(4, EomReason::CNT)
+        }
+    }
+
+    /// A mythen that answers each `-get` float query with its scripted value
+    /// and every other query with 0.
+    struct Floats {
+        base: PortDriverBase,
+        last: Vec<u8>,
+        floats: [(&'static str, f32); 3],
+    }
+
+    impl PortDriver for Floats {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.last = data.to_vec();
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            let reply = self
+                .floats
+                .iter()
+                .find(|(command, _)| command.as_bytes() == self.last)
+                .map_or([0; 4], |(_, v)| v.to_le_bytes());
+            buf[..4].copy_from_slice(&reply);
+            OctetReadResult::ok(4, EomReason::CNT)
+        }
+    }
+
+    /// mythen.cpp:793 traces a refused reply with C's raw `inString`; rs
+    /// names the float it decoded, as %g since that text has no C spelling.
+    #[test]
+    fn refused_float_reply_names_the_value_as_c_percent_g() {
+        for (i, (refused, value, text)) in [
+            ("-get tau", f32::NAN, "nan"),
+            ("-get tau", -f32::NAN, "-nan"),
+            ("-get kthresh", -1e-5, "-1e-05"),
+            ("-get energy", -2.5e-7, "-2.5e-07"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("MYTHEN_DET_REFUSED_FLOAT_{i}");
+            let base = PortDriverBase::new(
+                &name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            );
+            let mut floats = [
+                ("-get tau", -1.0),
+                ("-get kthresh", 0.0),
+                ("-get energy", 0.0),
+            ];
+            floats.iter_mut().find(|(c, _)| *c == refused).unwrap().1 = value;
+            let driver = Floats {
+                base,
+                last: Vec::new(),
+                floats,
+            };
+            let (runtime, _) = create_port_runtime(
+                &claim_port(&name).unwrap(),
+                driver,
+                RuntimeConfig::default(),
+            )
+            .unwrap();
+            let det = Detector::new(Transport::new(runtime.port_handle().clone()), &name);
+            det.state.firmware_major.store(3, Ordering::Release);
+            match det.get_settings() {
+                Err(AsynError::Status { message, .. }) => {
+                    assert_eq!(
+                        message,
+                        format!("mythen: [{refused}] unexpected reply: {text}")
+                    );
+                }
+                other => panic!("{refused}: {other:?}"),
+            }
         }
     }
 
