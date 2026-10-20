@@ -52,7 +52,7 @@ use epics_rs::motor::flags::MstaFlags;
 use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
-use motor_common::util::{atof, atoi, strtol};
+use motor_common::util::{atof, atoi, long_to_int, strtol};
 
 /// Reply read buffer size (C `MAX_BUFF_LEN`).
 const READ_BUF: usize = 80;
@@ -86,7 +86,7 @@ fn parse_input_setup(block: &[u8]) -> Vec<(i32, i32)> {
             let mut nums = line
                 .split(|b| !b.is_ascii_digit())
                 .filter(|f| !f.is_empty())
-                .map(|f| strtol(f, 10).0 as i32);
+                .map(|f| long_to_int(strtol(f, 10).0));
             Some((nums.next()?, nums.next()?))
         })
         .collect()
@@ -102,7 +102,7 @@ fn scan_switch_type(resp: &str) -> Option<i32> {
         .count();
     match strtol(&b[at..b.len().min(at + 4)], 10) {
         (_, 0) => None,
-        (value, _) => Some(value as i32),
+        (value, _) => Some(long_to_int(value)),
     }
 }
 

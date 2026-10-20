@@ -117,7 +117,7 @@ pub fn parse_error_header(payload: &str) -> Option<(i32, Option<i32>)> {
 fn scanf_int(s: &str) -> Option<(i32, &str)> {
     match epics_rs::base::types::c_parse::strtol(s, 10) {
         (_, 0) => None,
-        (v, end) => Some((v as i32, &s[end..])),
+        (v, end) => Some((epics_rs::base::types::c_parse::long_to_int(v), &s[end..])),
     }
 }
 
@@ -953,7 +953,7 @@ mod tests {
         use std::ffi::c_long;
         assert_eq!(
             parse_orec("ORec,99999999999999999999"),
-            Some(c_long::MAX as i32)
+            Some(epics_rs::base::types::c_parse::long_to_int(c_long::MAX))
         );
         let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
         assert_eq!(

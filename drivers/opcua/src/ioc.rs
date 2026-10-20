@@ -12,7 +12,7 @@ use std::sync::Arc;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::task::block_on_sync;
 use epics_rs::base::server::RecordFactory;
-use epics_rs::base::types::c_parse::strtol;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use crate::client::ClientSecurity;
 use crate::defaults;
@@ -178,7 +178,7 @@ fn debug_requested(options: &[(String, String)]) -> bool {
     options
         .iter()
         .rfind(|(key, _)| key == "debug")
-        .is_some_and(|(_, value)| strtol(value, 0).0 as i32 != 0)
+        .is_some_and(|(_, value)| long_to_int(strtol(value, 0).0) != 0)
 }
 
 /// `opcuaSession(name, URL, [options])` (`iocshIntegration.cpp:124-183`).

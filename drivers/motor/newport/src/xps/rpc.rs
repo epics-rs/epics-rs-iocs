@@ -36,7 +36,7 @@ use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::base::types::c_parse::strtol;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use crate::util::{atof, atoi};
 
@@ -138,7 +138,7 @@ impl XpsReply {
     pub fn code(&self) -> i32 {
         match strtol(&self.0, 0) {
             (_, 0) => -1,
-            (v, _) => v as i32,
+            (v, _) => long_to_int(v),
         }
     }
 
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn an_overflowing_bitmask_is_strtol_cast_to_int() {
         let r = XpsReply("0,99999999999999999999".to_string());
-        assert_eq!(r.bits(1), std::os::raw::c_long::MAX as i32 as u32);
+        assert_eq!(r.bits(1), long_to_int(std::os::raw::c_long::MAX) as u32);
     }
 
     /// C `sscanf(ReturnedValue, "%i", &ret)` is base 0: octal, hex and, with

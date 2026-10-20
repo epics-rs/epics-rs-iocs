@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use epics_rs::base::types::c_parse::strtol;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use crate::drv_quad_em::{QE_MAX_INPUTS, QeAcquireMode, QeModel, QeReadFormat};
 
@@ -214,7 +214,7 @@ pub fn parse_res(resp: &str) -> Option<i32> {
 fn parse_int_after(resp: &str, prefix: &str) -> Option<i32> {
     let rest = resp.strip_prefix(prefix)?.trim_start();
     let (value, consumed) = strtol(rest, 10);
-    (consumed > 0).then_some(value as i32)
+    (consumed > 0).then_some(long_to_int(value))
 }
 
 /// C++ `readStatus`: `"HVS OFF"` means the bias is off; anything else carries
@@ -299,7 +299,7 @@ pub fn parse_ascii_ah401(line: &str, num_channels: usize) -> [f64; QE_MAX_INPUTS
     let mut rest = line;
     for r in raw.iter_mut().take(num_channels.min(QE_MAX_INPUTS)) {
         let (value, consumed) = strtol(rest, 10);
-        *r = f64::from(value as i32);
+        *r = f64::from(long_to_int(value));
         rest = &rest[consumed..];
     }
     raw
@@ -415,7 +415,7 @@ pub fn parse_ascii_ah501(line: &str, resolution: i32, num_channels: usize) -> [f
     let mut rest = line;
     for r in raw.iter_mut().take(num_channels.min(QE_MAX_INPUTS)) {
         let (value, consumed) = strtol(rest, 16);
-        let value = i64::from(value as i32);
+        let value = i64::from(long_to_int(value));
         rest = &rest[consumed..];
         *r = if resolution == 16 {
             sign_transform_16(value) as f64
@@ -540,7 +540,13 @@ mod tests {
             4,
         );
         let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
-        let want = [7, wrapped, c_long::MIN as i32, c_long::MAX as i32].map(f64::from);
+        let want = [
+            7,
+            wrapped,
+            long_to_int(c_long::MIN),
+            long_to_int(c_long::MAX),
+        ]
+        .map(f64::from);
         assert_eq!(raw, want);
     }
 
@@ -687,7 +693,7 @@ mod tests {
         use std::ffi::c_long;
         assert_eq!(
             parse_chn("CHN -9223372036854775808"),
-            Some(c_long::MIN as i32)
+            Some(long_to_int(c_long::MIN))
         );
     }
 

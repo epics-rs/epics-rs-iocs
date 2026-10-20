@@ -100,7 +100,7 @@ use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
-use epics_rs::base::types::c_parse::strtol;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{nint, parse_value_at};
@@ -140,7 +140,7 @@ fn parse_status_reg(reply: &str) -> Option<u16> {
     // glibc's %d is (int) strtol(s, &end, 10).
     match strtol(&b[2..], 10) {
         (_, 0) => None,
-        (v, _) => Some(v as i32 as u16),
+        (v, _) => Some(long_to_int(v) as u16),
     }
 }
 

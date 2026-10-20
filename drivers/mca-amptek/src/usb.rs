@@ -582,6 +582,7 @@ mod tests {
     /// cuts 4294967297 to 1 and 99999999999999999999 to -1.
     #[test]
     fn the_serial_is_glibc_atoi() {
+        use epics_rs::base::types::c_parse::long_to_int;
         use std::ffi::c_long;
         let wrapped = if c_long::BITS == 64 {
             1
@@ -591,7 +592,7 @@ mod tests {
         for (address, serial) in [
             (" 12ab", 12),
             ("4294967297", wrapped),
-            ("99999999999999999999", c_long::MAX as i32 as u32),
+            ("99999999999999999999", long_to_int(c_long::MAX) as u32),
         ] {
             let (mut usb, _) = usb(vec![FakeDevice::dp5(|_| Ok(vec![1]))]);
             let mut asked = None;

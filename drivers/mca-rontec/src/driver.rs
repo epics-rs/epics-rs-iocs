@@ -720,6 +720,7 @@ mod tests {
     /// truncated to `int`.
     #[test]
     fn elapsed_real_time_is_glibc_atoi_of_the_ms_reply() {
+        use epics_rs::base::types::c_parse::long_to_int;
         use std::ffi::c_long;
         use std::sync::Mutex;
         static MS: Mutex<&[u8]> = Mutex::new(b"");
@@ -737,8 +738,8 @@ mod tests {
             (b"!MS abc", 0),
             (b"!MS -2147483648", i32::MIN),
             (b"!MS 4294967297", wrapped),
-            (b"!MS 99999999999999999999", c_long::MAX as i32),
-            (b"!MS -99999999999999999999", c_long::MIN as i32),
+            (b"!MS 99999999999999999999", long_to_int(c_long::MAX)),
+            (b"!MS -99999999999999999999", long_to_int(c_long::MIN)),
         ] {
             *MS.lock().unwrap() = ms;
             rig.submit(RequestOp::Int32Write { value: 1 }, McaReason::ReadStatus)

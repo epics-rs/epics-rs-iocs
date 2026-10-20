@@ -44,7 +44,7 @@ pub fn atof(s: &str) -> f64 {
 
 /// C `strtol`, `atoi` (`(int) strtol(s, NULL, 10)`) and `atol` at this
 /// platform's `long`, as glibc reads them under `_GNU_SOURCE`.
-pub use epics_rs::base::types::c_parse::{atoi, atol, strtol};
+pub use epics_rs::base::types::c_parse::{atoi, atol, long_to_int, strtol};
 
 /// Parse leading hex digits as `u32` (C `sscanf` `%x`); `None` if there is no
 /// hex digit (C `sscanf` count `!= 1`).
@@ -122,8 +122,8 @@ mod tests {
             i32::MAX
         };
         assert_eq!(atoi("3000000000"), wrapped);
-        assert_eq!(atoi("99999999999999999999"), c_long::MAX as i32);
-        assert_eq!(atoi("-99999999999999999999"), c_long::MIN as i32);
+        assert_eq!(atoi("99999999999999999999"), long_to_int(c_long::MAX));
+        assert_eq!(atoi("-99999999999999999999"), long_to_int(c_long::MIN));
         assert_eq!(atoi("\x0b\x0c 12"), 12);
     }
 

@@ -88,7 +88,7 @@ fn parse_channel_address_end(arg: &str) -> Option<(ChannelAddress, usize)> {
         _ => return None,
     };
     let (value, len) = c_parse::strtol(&arg.as_bytes()[start..], 10);
-    let index = value as i32;
+    let index = c_parse::long_to_int(value);
     if index <= 0 || index > max {
         return None;
     }

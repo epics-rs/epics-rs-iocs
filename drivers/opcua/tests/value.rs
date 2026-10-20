@@ -854,16 +854,17 @@ fn a_namespace_is_read_as_atoi_reads_it() {
     // glibc's `(int) strtol`: `\v` is skipped, and the `long` saturates
     // before it is truncated.
     assert_eq!(namespace("\x0b5|n"), 5);
+    use epics_rs::base::types::c_parse::long_to_int;
     use std::ffi::c_long;
     let wrapped = if c_long::BITS == 64 { 1 } else { u16::MAX };
     assert_eq!(namespace("4294967297|n"), wrapped);
     assert_eq!(
         namespace("99999999999999999999|n"),
-        c_long::MAX as i32 as u16
+        long_to_int(c_long::MAX) as u16
     );
     assert_eq!(
         namespace("-99999999999999999999|n"),
-        c_long::MIN as i32 as u16
+        long_to_int(c_long::MIN) as u16
     );
 }
 

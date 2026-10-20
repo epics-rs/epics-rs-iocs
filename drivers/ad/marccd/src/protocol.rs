@@ -9,7 +9,7 @@
 //! every command and splits replies on `\n`. The strings below carry no
 //! terminator.
 
-use epics_rs::base::types::c_parse::strtol;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 // ---------------------------------------------------------------------------
 // scanf-style primitives
@@ -30,7 +30,7 @@ fn expect_lit<'a>(s: &'a str, lit: &str) -> Option<&'a str> {
 fn scan_i32(s: &str) -> Option<(i32, &str)> {
     match strtol(s, 10) {
         (_, 0) => None,
-        (v, end) => Some((v as i32, &s[end..])),
+        (v, end) => Some((long_to_int(v), &s[end..])),
     }
 }
 
@@ -208,7 +208,7 @@ pub fn cmd_start_series_timed(
 
 /// C `getState`: `marState = strtol(fromServer, NULL, 0)` into an `int`.
 pub fn parse_state(reply: &str) -> i32 {
-    strtol(reply, 0).0 as i32
+    long_to_int(strtol(reply, 0).0)
 }
 
 /// C `sscanf(fromServer, "%d", &value)`. `None` when no integer converts (C
@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(parse_state("0b11"), 3);
         assert_eq!(
             parse_state("99999999999999999999"),
-            std::ffi::c_long::MAX as i32
+            long_to_int(std::ffi::c_long::MAX)
         );
     }
 
@@ -370,7 +370,7 @@ mod tests {
     fn int_out_of_range_is_glibc_s_cut_to_int() {
         use std::ffi::c_long;
         let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
-        let saturated = c_long::MAX as i32;
+        let saturated = long_to_int(c_long::MAX);
         assert_eq!(parse_int("4294967297"), Some(wrapped));
         assert_eq!(parse_int("99999999999999999999"), Some(saturated));
         assert_eq!(parse_pair("99999999999999999999,2"), Some((saturated, 2)));

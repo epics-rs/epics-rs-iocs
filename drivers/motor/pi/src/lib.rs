@@ -25,7 +25,7 @@ pub use e517::{PIE517Axis, PIE517Controller};
 pub use e710::{PIE710Axis, PIE710Controller};
 pub use e816::{PIE816Axis, PIE816Controller};
 
-use motor_common::util::strtol;
+use motor_common::util::{long_to_int, strtol};
 
 /// C `sscanf(s, "%d", &out)` for the E-series piezo status reads: glibc's
 /// `(int) strtol`, `None` when the field has no digits. The E-516/E-517/E-816
@@ -36,7 +36,7 @@ use motor_common::util::strtol;
 pub(crate) fn scan_int(s: &str) -> Option<i32> {
     match strtol(s.as_bytes(), 10) {
         (_, 0) => None,
-        (value, _) => Some(value as i32),
+        (value, _) => Some(long_to_int(value)),
     }
 }
 

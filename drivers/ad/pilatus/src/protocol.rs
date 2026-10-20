@@ -10,7 +10,7 @@
 //! every command and splits replies on the `0x18` (CAN) byte camserver sends
 //! after each reply. The strings below therefore carry no terminator.
 
-use epics_rs::base::types::c_parse::strtol;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use crate::types::{GAIN_STRINGS, TriggerMode};
 
@@ -33,7 +33,7 @@ pub(crate) fn expect_lit<'a>(s: &'a str, lit: &str) -> Option<&'a str> {
 pub(crate) fn scan_i32(s: &str) -> Option<(i32, &str)> {
     match strtol(s, 10) {
         (_, 0) => None,
-        (v, end) => Some((v as i32, &s[end..])),
+        (v, end) => Some((long_to_int(v), &s[end..])),
     }
 }
 
@@ -649,7 +649,7 @@ mod tests {
             parse_version("Code release: 99999999999999999999.1.2")
                 .unwrap()
                 .major,
-            Some(c_long::MAX as i32)
+            Some(long_to_int(c_long::MAX))
         );
     }
 

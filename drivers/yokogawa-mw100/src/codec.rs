@@ -120,7 +120,7 @@ pub fn parse_error_code(payload: &[u8]) -> Option<i32> {
     let rest = payload.strip_prefix(b"E1")?;
     match c_parse::strtol(rest, 10) {
         (_, 0) => None,
-        (code, _) => Some(code as i32),
+        (code, _) => Some(c_parse::long_to_int(code)),
     }
 }
 
@@ -1736,11 +1736,11 @@ mod tests {
         assert_eq!(c_atoi(b" 12 "), 12);
         assert_eq!(
             c_atoi(b"-99999999999999999999"),
-            std::ffi::c_long::MIN as i32
+            c_parse::long_to_int(std::ffi::c_long::MIN)
         );
         assert_eq!(
             c_atoi(b"99999999999999999999"),
-            std::ffi::c_long::MAX as i32
+            c_parse::long_to_int(std::ffi::c_long::MAX)
         );
     }
 
