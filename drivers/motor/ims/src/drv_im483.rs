@@ -18,7 +18,6 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
 };
-use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -78,9 +77,7 @@ impl Im483Controller {
 
     /// `pasynOctetSyncIO->flush`.
     fn flush(&self) {
-        if let Ok(port) = self.handle.port() {
-            let _ = port.submit_blocking(RequestOp::Flush, AsynUser::new(0));
-        }
+        let _ = self.handle.flush(0);
     }
 }
 
@@ -490,6 +487,27 @@ mod tests {
         let (_sm_line, sm) = silent("im483smInitFail");
         let sm = DrvIm483Axis::im483sm(sm).take_init_status();
         assert_eq!(sm, MotorStatus::default());
+    }
+
+    /// drvIM483PL.cc:555, drvIM483SM.cc:552: the flush is
+    /// `pasynOctetSyncIO->flush`, which prints its TRACEIO_DEVICE line.
+    #[test]
+    fn the_flush_is_asyn_octet_sync_io_s() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+
+        let name = "im483Flush";
+        let (_line, io) = motor_common::testing::LineRig::new(name, |_| String::new());
+        let trace = io.port().unwrap().trace().clone();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        Im483Controller::new(io).flush();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("asynOctetSyncIO flush\n"), "{text}");
     }
 
     /// drvIM483SM.cc:551-555: the probe flushes ahead of the ETX, not after

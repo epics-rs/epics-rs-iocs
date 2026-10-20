@@ -590,9 +590,7 @@ impl ImsMDrivePlusAxis {
                     println!("Have device name going party modus, line ending LF.");
                     b"\n"
                 };
-                if let Ok(port) = self.line.handle.port() {
-                    let _ = port.set_output_eos_blocking(AsynUser::new(0).with_addr(0), eos);
-                }
+                let _ = self.line.handle.set_output_eos(0, eos);
             }
             let block = self.read_input_setup().unwrap_or_default();
             let text = block.split(|&b| b == 0).next().unwrap_or_default();
@@ -1252,6 +1250,37 @@ mod tests {
         assert_eq!(
             (axis.pos_limit_switch, axis.neg_limit_switch),
             (Some(2), Some(3))
+        );
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:191-199: a Lexium MDrive's output
+    /// EOS is `pasynOctetSyncIO->setOutputEos`'s, which prints its
+    /// TRACEIO_DEVICE line.
+    #[test]
+    fn an_lmd_sets_its_output_eos_as_asyn_octet_sync_io() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use motor_common::testing::LineRig;
+
+        let name = "imsLmdEos";
+        let (_rig, io) = LineRig::new(name, |last| match last.trim_end() {
+            "PR VR" => "LMD 1.0".into(),
+            _ => "0".into(),
+        });
+        let trace = io.port().unwrap().trace().clone();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), name), name);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains("asynOctetSyncIO setOutputEos eoslen 1\n"),
+            "{text}"
         );
     }
 
