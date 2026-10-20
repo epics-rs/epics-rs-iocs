@@ -89,22 +89,10 @@ pub fn anf2_create_controller_command() -> CommandDef {
     )
 }
 
-/// C `strtoul(hexConfig, NULL, 16)`: leading blanks and an optional `0x`,
-/// then the longest run of hex digits, 0 when there is none; `None` where C's
-/// `errno` is set (overflow).
+/// C `strtoul(hexConfig, NULL, 16)`; `None` where C's `errno` is set
+/// (overflow).
 fn strtoul_hex(text: &str) -> Option<u64> {
-    let text = text.trim_start();
-    let text = text
-        .strip_prefix("0x")
-        .or_else(|| text.strip_prefix("0X"))
-        .unwrap_or(text);
-    let end = text
-        .find(|c: char| !c.is_ascii_hexdigit())
-        .unwrap_or(text.len());
-    match &text[..end] {
-        "" => Some(0),
-        digits => u64::from_str_radix(digits, 16).ok(),
-    }
+    epics_rs::base::types::c_parse::strtoul_errno(text, 16).map(|(v, _)| v)
 }
 
 /// Build `ANF2CreateAxis(ANF2Name, axis, hexConfig, baseSpeed, homingTimeout)`,
@@ -533,6 +521,9 @@ mod tests {
         assert_eq!(strtoul_hex(" 86zz"), Some(0x86));
         assert_eq!(strtoul_hex("zz"), Some(0));
         assert_eq!(strtoul_hex("0x1ffffffffffffffff"), None);
+        // glibc takes a sign and negates modulo 2^64, errno clear.
+        assert_eq!(strtoul_hex("+86"), Some(0x86));
+        assert_eq!(strtoul_hex("-1"), Some(u64::MAX));
     }
 }
 
