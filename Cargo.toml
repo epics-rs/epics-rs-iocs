@@ -288,3 +288,6 @@ mca-rs = { git = "file:///home/stevek/work/epics-rs", rev = "3f977f92535c4447e88
 motor-rs = { git = "file:///home/stevek/work/epics-rs", rev = "3f977f92535c4447e88bc420ef5746f84a57e288" }
 scaler-rs = { git = "file:///home/stevek/work/epics-rs", rev = "3f977f92535c4447e88bc420ef5746f84a57e288" }
 stream-rs = { git = "file:///home/stevek/work/epics-rs", rev = "3f977f92535c4447e88bc420ef5746f84a57e288" }
+# Local rust-hdf5 fixes (rh5-rank0 fix/swmr-unlimited-grid, off v0.7.7),
+# released later as one batch; qa drops or repoints this line at that release.
+rust-hdf5 = { path = "/home/stevek/work/_tgt/mockdiff/rh5-rank0" }
