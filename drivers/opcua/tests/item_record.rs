@@ -233,12 +233,20 @@ async fn until(f: impl Fn() -> bool) {
 }
 
 /// Wait for the session's initial read of the item to reach the record, and take
-/// the update it queued — every test below is about what the record does *next*,
-/// so the queue must start from the state a live IOC reaches right after
-/// `iocInit`: connected, read once, nothing outstanding.
+/// every update queued up to it — the connectionLoss each item takes before its
+/// session connects (`SessionOpen62541.cpp:2701`), then the read's. Every test
+/// below is about what the record does *next*, so the queue must start from the
+/// state a live IOC reaches right after `iocInit`: connected, read once,
+/// nothing outstanding.
 async fn settled(mock: &Arc<Mock>, leaf: &Arc<Mutex<Leaf>>) {
     until(|| !mock.calls.lock().reads.is_empty()).await;
-    until(|| leaf.lock().queue.pop().is_some()).await;
+    until(|| {
+        matches!(
+            leaf.lock().queue.pop(),
+            Some((update, _)) if update.reason == ProcessReason::ReadComplete
+        )
+    })
+    .await;
 }
 
 // ------------------------------------------------------------------------- init
